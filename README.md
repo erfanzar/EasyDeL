@@ -1,4 +1,5 @@
-#EasyDL 
+# EasyDL 
+
 EasyDL is an open-source library designed to accelerate and optimize the training process of machine learning models. This library is primarily focused on PyTorch, and the team behind EasyDL is planning to add support for JAX/Flax and TensorFlow in the future.
 
 ## Installation
@@ -27,5 +28,5 @@ EasyDL is an open-source project, and contributions are welcome. If you would li
 ## License
 EasyDL is released under the Apache v2 license. Please see the LICENSE file in the root directory of this project for more information.
 
-Contact
+## Contact
 If you have any questions or comments about EasyDL, you can reach out to the team behind EasyDL
