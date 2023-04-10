@@ -4,9 +4,9 @@ from .utils.checker import package_checker, is_jax_available, is_torch_available
     is_tensorflow_available
 
 if is_torch_available():
-    from .modules import CAdamW
-if is_jax_available():
     ...
+if is_jax_available():
+    from .utils import make_shard_and_gather_fns
 if is_tensorflow_available():
     ...
 if is_flax_available():
