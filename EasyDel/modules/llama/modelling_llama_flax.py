@@ -62,9 +62,10 @@ ACT2CLS = {
 
 
 def compute_freq(dim: int, man_length: int, theta: int = 10000):
-    freq = 1 / (theta ** (jnp.arange(0, dim, 2)))
+    freq = 1 / (theta ** (jnp.arange(0, dim, 2) / dim))
     t = jnp.arange(man_length)
     m = jnp.einsum('i,j->ij', t, freq)
+    m = jnp.concatenate([m, m], axis=-1)
     cos = jnp.cos(m)
     sin = jnp.sin(m)
     return cos, sin
@@ -78,6 +79,9 @@ def rotate_half(tensor):
 
 
 def apply_rotary_embedding(q, k, c, s):
+    b, h, l, d = q.shape
+    c = c[0, 0, :l, :]
+    s = s[0, 0, :l, :]
     q = (q * c) + (rotate_half(q) * s)
     k = (k * c) + (rotate_half(k) * s)
     return q, k
@@ -86,13 +90,13 @@ def apply_rotary_embedding(q, k, c, s):
 class PMSNorm(nn.Module):
     dim: int
     eps: float
-    dtype = jnp.float32
+    dtype: jnp.dtype = jnp.float32
 
     def setup(self) -> None:
-        self.weight = self.param('weight', nn.ones(key=0, shape=(self.dim,), dtype=self.dtype))
+        self.weight = self.param('weight', nn.ones, (self.dim,), self.dtype)
 
     def norm(self, x):
-        return x * (1 / jnp.sqrt(x.pow(2).mean(axis=-1) + self.eps))
+        return x * (1 / jnp.sqrt(jnp.power(x, 2).mean(-1, keepdims=True) + self.eps))
 
     def __call__(self, x):
         return self.weight * self.norm(x)
@@ -108,7 +112,7 @@ class RoEM(nn.Module):
     def __call__(self, x, max_l):
         if self.sin.shape[0] < max_l:
             self.cos, self.sin = compute_freq(dim, max_l)
-        return self.cos, self.sin.device()
+        return self.cos[jnp.newaxis, jnp.newaxis, :, :], self.sin[jnp.newaxis, jnp.newaxis, :, :]
 
 
 class LlamaSelfAttention(nn.Module):
@@ -119,7 +123,7 @@ class LlamaSelfAttention(nn.Module):
         dense = partial(nn.Dense,
                         features=self.config.hidden_size,
                         kernel_init=nn.initializers.normal(self.config.initializer_range),
-                        use_bias=False, dtype=self.dtype
+                        use_bias=False, dtype=self.dtype, param_dtype=self.dtype
                         )
         self.k_proj = dense()
         self.v_proj = dense()
@@ -130,18 +134,18 @@ class LlamaSelfAttention(nn.Module):
     def __call__(self, input_ids: jnp.array, attention_mask=None):
         b, t, c = input_ids.shape
         vs = (b, t, self.config.num_attention_heads, c // self.config.num_attention_heads)
-        k = self.k_proj(input_ids).reshape(vs).swapaxis(1, 2)
-        q = self.q_proj(input_ids).reshape(vs).swapaxis(1, 2)
-        v = self.v_proj(input_ids).reshape(vs).swapaxis(1, 2)
-        cos, sin = self.rotary_embedding(x=x, max_l=t)
+        k = self.k_proj(input_ids).reshape(vs).swapaxes(1, 2)
+        q = self.q_proj(input_ids).reshape(vs).swapaxes(1, 2)
+        v = self.v_proj(input_ids).reshape(vs).swapaxes(1, 2)
+        cos, sin = self.rotary_embedding(x=k, max_l=t)
         kv_seq_length = k.shape[-2]
         k, q = apply_rotary_embedding(k=k, q=q, c=cos, s=sin)
         attn = q @ k.swapaxes(2, 3) / math.sqrt(k.shape[-1])
         if attention_mask is not None:
-            assert attention_mask.shape == [b, 1, t, kv_seq_length]
+            # assert attention_mask.shape == [b, 1, t, kv_seq_length]
             attn += attention_mask
         attn = nn.softmax(attn, axis=-1)
-        attn = (attn @ v).swapaxis(1, 2).reshape(b, t, c)
+        attn = (attn @ v).swapaxes(1, 2).reshape(b, t, c)
         return self.o_proj(attn)
 
 
@@ -152,11 +156,11 @@ class LlamaMLP(nn.Module):
     def setup(self) -> None:
         dense = partial(nn.Dense,
                         kernel_init=nn.initializers.normal(self.config.initializer_range),
-                        use_bias=False, dtype=self.dtype
+                        use_bias=False, dtype=self.dtype, param_dtype=self.dtype
                         )
-        self.gate_proj = dense(feauters=self.config.intermediate_size)
-        self.up_proj = dense(feauters=self.config.intermediate_size)
-        self.down_proj = dense(feauters=self.config.hidden_size)
+        self.gate_proj = dense(features=self.config.intermediate_size)
+        self.up_proj = dense(features=self.config.intermediate_size)
+        self.down_proj = dense(features=self.config.hidden_size)
         self.act = ACT2CLS[self.config.hidden_act]
 
     def __call__(self, x):
@@ -168,10 +172,11 @@ class LlamaBlock(nn.Module):
     dtype: jnp.dtype = jnp.float32
 
     def setup(self) -> None:
-        self.self_attn = LlamaSelfAttention(config=config)
-        self.mlp = LlamaMLP(config=config)
-        self.input_layernorm = PMSNorm(dim=config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = PMSNorm(dim=config.hidden_size, eps=config.rms_norm_eps)
+        self.self_attn = LlamaSelfAttention(config=self.config, dtype=self.dtype)
+        self.mlp = LlamaMLP(config=self.config, dtype=self.dtype)
+        self.input_layernorm = PMSNorm(dim=self.config.hidden_size, eps=self.config.rms_norm_eps, dtype=self.dtype)
+        self.post_attention_layernorm = PMSNorm(dim=self.config.hidden_size, eps=self.config.rms_norm_eps,
+                                                dtype=self.dtype)
 
     def __call__(self, hidden_state, attention_mask=None):
         residual = hidden_state
@@ -185,7 +190,7 @@ class LlamaBlock(nn.Module):
         return hidden_state
 
 
-class LlamaModel(FlaxPreTrainedModel):
+class FlaxLlamaModule(nn.Module):
     config: LlamaConfig
     dtype: jnp.dtype = jnp.float32
 
@@ -193,30 +198,31 @@ class LlamaModel(FlaxPreTrainedModel):
         self.padding_idx = self.config.pad_token_id
         self.vocab_size = self.config.vocab_size
 
-        self.embed_tokens = nn.Embed(self.config.vocab_size, self.config.hidden_size, self.padding_idx)
-        self.layers = [LlamaBlock(self.config) for _ in range(self.config.num_hidden_layers)]
-        self.norm = LlamaRMSNorm(dim=self.config.hidden_size, eps=self.config.rms_norm_eps)
+        self.embed_tokens = nn.Embed(self.config.vocab_size, self.config.hidden_size)
+        self.layers = [LlamaBlock(self.config, dtype=self.dtype) for _ in range(self.config.num_hidden_layers)]
+        self.norm = PMSNorm(dim=self.config.hidden_size, eps=self.config.rms_norm_eps, dtype=self.dtype)
 
-    def __call__(self, input_ids: jnp.array = None,
+    def __call__(self,
+                 input_ids: jnp.array = None,
                  attention_mask: jnp.array = None,
-                 inputs_embeds: jnp.array = None,
+
                  return_dict=True):
 
-        assert not inputs_embeds is None and not inputs_embeds is None, 'both input_ids,inputs_embeds cant be None'
+        hidden_state = self.embed_tokens(input_ids)
 
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
-        hidden_state = inputs_embeds
         b, s, _ = hidden_state.shape
         if attention_mask is None:
-            attention_mask = jnp.ones(b, 1, s, s)
+            attention_mask = jnp.ones((b, 1, s, s))
+        attention_mask = jnp.where(nn.make_causal_mask(input_ids) == 0, -6548, 0) + jnp.where(attention_mask > 0, 0,
+                                                                                              -6548)
+
         for layer in self.layers:
             hidden_state = layer(hidden_state, attention_mask=attention_mask)
 
         hidden_state = self.norm(hidden_state)
         if return_dict:
             return FlaxBaseModelOutput(
-                hidden_state=hidden_state,
+                hidden_states=hidden_state,
                 last_hidden_state=hidden_state
             )
         else:
@@ -224,27 +230,31 @@ class LlamaModel(FlaxPreTrainedModel):
 
 
 class FlaxLlamaModel(FlaxPreTrainedModel):
-    module = LlamaModel
+    module_class = FlaxLlamaModule
 
 
-class LlamaForCausalLM(nn.Module):
+class FlaxLlamaForCausalLM(nn.Module):
     config: LlamaConfig
     dtype: jnp.dtype = jnp.float32
 
     def setup(self) -> None:
-        self.model = FlaxLlamaModel(config=self.config, dtype=self.dtype)
-        self.lm_head = nn.Dense(feauters=self.config.vocab_size, use_bias=False,
+        self.model = FlaxLlamaModule(config=self.config, dtype=self.dtype)
+        self.lm_head = nn.Dense(features=self.config.vocab_size, use_bias=False, dtype=self.dtype,
+                                param_dtype=self.dtype,
                                 kernel_init=nn.initializers.normal(self.config.initializer_range))
 
     def __call__(self,
                  input_ids: jnp.array,
                  attention_mask: jnp.array = None,
-                 return_dict: Optional[bool] = True,
-                 inputs_embeds: Optional[jnp.array] = None, ):
-        hidden_state = self.model(input_ids=input_ids,
-                                  attention_mask=attention_mask,
-                                  return_dict=return_dict,
-                                  inputs_embeds=inputs_embeds)
+                 return_dict: Optional[bool] = False,
+                 ):
+        output = self.model(input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            return_dict=return_dict,
+                            )
+
+        hidden_state = output.last_hidden_state if return_dict else output
+
         pred = self.lm_head(hidden_state)
         if return_dict:
             return FlaxCausalLMOutput(
@@ -253,4 +263,4 @@ class LlamaForCausalLM(nn.Module):
                 # attentions=None,
             )
         else:
-            return pred
+            return pred,

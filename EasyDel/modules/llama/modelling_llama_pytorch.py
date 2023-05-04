@@ -12,10 +12,17 @@ from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
 
-if os.environ['USE_JIT'] == '1':
-    Module = torch.jit.ScriptModule
-    function = torch.jit.script_method
-else:
+try:
+    if os.environ['USE_JIT'] == '1':
+        Module = torch.jit.ScriptModule
+        function = torch.jit.script_method
+    else:
+        Module = nn.Module
+
+
+        def function(func):
+            return func
+except KeyError:
     Module = nn.Module
 
 
