@@ -7,11 +7,12 @@ from transformers import PretrainedConfig, FlaxPreTrainedModel
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 from functools import partial
 from typing import Optional
+from einops import rearrange
 
 
-class LlamaConfig(PretrainedConfig):
-    # HuggingFace LlamaConfig
-    model_type = "llama"
+class FlaxLLamaConfig(PretrainedConfig):
+    # HuggingFace FlaxLLamaConfig
+    model_type = "LLama"
 
     def __init__(
             self,
@@ -103,20 +104,21 @@ class PMSNorm(nn.Module):
 
 
 class RoEM(nn.Module):
-    config: LlamaConfig
+    config: FlaxLLamaConfig
 
     def setup(self) -> None:
         dim = self.config.hidden_size // self.config.num_attention_heads
         self.cos, self.sin = compute_freq(dim, self.config.max_position_embeddings)
+        self.dim = dim
 
     def __call__(self, x, max_l):
         if self.sin.shape[0] < max_l:
-            self.cos, self.sin = compute_freq(dim, max_l)
+            self.cos, self.sin = compute_freq(self.dim, max_l)
         return self.cos[jnp.newaxis, jnp.newaxis, :, :], self.sin[jnp.newaxis, jnp.newaxis, :, :]
 
 
-class LlamaSelfAttention(nn.Module):
-    config: LlamaConfig
+class LLamaSelfAttention(nn.Module):
+    config: FlaxLLamaConfig
     dtype: jnp.dtype = jnp.float32
 
     def setup(self) -> None:
@@ -137,8 +139,9 @@ class LlamaSelfAttention(nn.Module):
         k = self.k_proj(input_ids).reshape(vs).swapaxes(1, 2)
         q = self.q_proj(input_ids).reshape(vs).swapaxes(1, 2)
         v = self.v_proj(input_ids).reshape(vs).swapaxes(1, 2)
+
         cos, sin = self.rotary_embedding(x=k, max_l=t)
-        kv_seq_length = k.shape[-2]
+
         k, q = apply_rotary_embedding(k=k, q=q, c=cos, s=sin)
         attn = q @ k.swapaxes(2, 3) / math.sqrt(k.shape[-1])
         if attention_mask is not None:
@@ -149,8 +152,8 @@ class LlamaSelfAttention(nn.Module):
         return self.o_proj(attn)
 
 
-class LlamaMLP(nn.Module):
-    config: LlamaConfig
+class LLamaMLP(nn.Module):
+    config: FlaxLLamaConfig
     dtype: jnp.dtype = jnp.float32
 
     def setup(self) -> None:
@@ -167,13 +170,13 @@ class LlamaMLP(nn.Module):
         return self.down_proj(self.act(self.gate_proj(x)) * self.up_proj(x))
 
 
-class LlamaBlock(nn.Module):
-    config: LlamaConfig
+class LLamaBlock(nn.Module):
+    config: FlaxLLamaConfig
     dtype: jnp.dtype = jnp.float32
 
     def setup(self) -> None:
-        self.self_attn = LlamaSelfAttention(config=self.config, dtype=self.dtype)
-        self.mlp = LlamaMLP(config=self.config, dtype=self.dtype)
+        self.self_attn = LLamaSelfAttention(config=self.config, dtype=self.dtype)
+        self.mlp = LLamaMLP(config=self.config, dtype=self.dtype)
         self.input_layernorm = PMSNorm(dim=self.config.hidden_size, eps=self.config.rms_norm_eps, dtype=self.dtype)
         self.post_attention_layernorm = PMSNorm(dim=self.config.hidden_size, eps=self.config.rms_norm_eps,
                                                 dtype=self.dtype)
@@ -190,8 +193,26 @@ class LlamaBlock(nn.Module):
         return hidden_state
 
 
-class FlaxLlamaModule(nn.Module):
-    config: LlamaConfig
+class FlaxLLamaPretrainedModel(FlaxPreTrainedModel):
+    module_class: nn.Module = None
+    module_config: FlaxLLamaConfig
+    base_model_prefix: str = 'model'
+
+    def __init__(
+            self,
+            config: FlaxLLamaConfig,
+            input_shape=(1, 1),
+            seed: int = 0,
+            dtype: jnp.dtype = jnp.float32,
+            _do_init: bool = False,
+            **kwargs,
+    ):
+        module = self.module_class(config=config, dtype=dtype, **kwargs)
+        super().__init__(config, module, input_shape=input_shape, seed=seed, dtype=dtype, _do_init=_do_init)
+
+
+class FlaxLLamaModule(nn.Module):
+    config: FlaxLLamaConfig
     dtype: jnp.dtype = jnp.float32
 
     def setup(self) -> None:
@@ -199,7 +220,7 @@ class FlaxLlamaModule(nn.Module):
         self.vocab_size = self.config.vocab_size
 
         self.embed_tokens = nn.Embed(self.config.vocab_size, self.config.hidden_size)
-        self.layers = [LlamaBlock(self.config, dtype=self.dtype) for _ in range(self.config.num_hidden_layers)]
+        self.layers = [LLamaBlock(self.config, dtype=self.dtype) for _ in range(self.config.num_hidden_layers)]
         self.norm = PMSNorm(dim=self.config.hidden_size, eps=self.config.rms_norm_eps, dtype=self.dtype)
 
     def __call__(self,
@@ -229,16 +250,16 @@ class FlaxLlamaModule(nn.Module):
             return hidden_state
 
 
-class FlaxLlamaModel(FlaxPreTrainedModel):
-    module_class = FlaxLlamaModule
+class FlaxLLamaModel(FlaxLLamaPretrainedModel):
+    module_class = FlaxLLamaModule
 
 
-class FlaxLlamaForCausalLM(nn.Module):
-    config: LlamaConfig
+class FlaxLLamaForCausalLMModule(nn.Module):
+    config: FlaxLLamaConfig
     dtype: jnp.dtype = jnp.float32
 
     def setup(self) -> None:
-        self.model = FlaxLlamaModule(config=self.config, dtype=self.dtype)
+        self.model = FlaxLLamaModule(config=self.config, dtype=self.dtype)
         self.lm_head = nn.Dense(features=self.config.vocab_size, use_bias=False, dtype=self.dtype,
                                 param_dtype=self.dtype,
                                 kernel_init=nn.initializers.normal(self.config.initializer_range))
@@ -264,3 +285,7 @@ class FlaxLlamaForCausalLM(nn.Module):
             )
         else:
             return pred,
+
+
+class FlaxLLamaForCausalLM(FlaxLLamaModel):
+    module_class = FlaxLLamaForCausalLMModule
