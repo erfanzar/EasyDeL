@@ -148,8 +148,8 @@ remat = nn_partitioning.remat
 class RMSNorm(nn.Module):
     dim: int
     eps: float = 1e-6
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
+    dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.bfloat16
 
     def setup(self) -> None:
         self.weight = self.param(
@@ -163,48 +163,76 @@ class RMSNorm(nn.Module):
         return x * jax.lax.rsqrt(jnp.square(x).mean(-1, keepdims=True) + self.eps)
 
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
+        x = x.astype(jnp.promote_types(self.dtype, jnp.bfloat16))
         output = self._norm(x).astype(self.dtype)
         weight = jnp.asarray(self.weight, self.dtype)
         return output * weight
 
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, dtype: jnp.dtype = jnp.float32) -> jnp.ndarray:
-    freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(dtype) / dim))
-    t = jnp.arange(end)  # type: ignore
-    freqs = jnp.outer(t, freqs).astype(dtype)
-    sin, cos = jnp.sin(freqs), jnp.cos(freqs)
-    freqs_cis = jnp.complex64(cos + 1j * sin)
-    return jnp.asarray(freqs_cis)
+def rotate_half(x):
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2:]
+    return jnp.concatenate([-x2, x1], axis=-1)
 
 
-def apply_rotary_emb(
-        xq: jnp.ndarray,
-        xk: jnp.ndarray,
-        freqs_cis: jnp.ndarray,
-        dtype: jnp.dtype = jnp.float32,
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    reshape_xq = xq.astype(jnp.float32).reshape(*xq.shape[:-1], -1, 2)
-    reshape_xk = xk.astype(jnp.float32).reshape(*xk.shape[:-1], -1, 2)
+OLD_METHOD = True
+if OLD_METHOD:
+    def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0,
+                             dtype: jnp.dtype = jnp.bfloat16) -> jnp.ndarray:
+        freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(dtype) / dim))
+        t = jnp.arange(end)  # type: ignore
+        freqs = jnp.outer(t, freqs).astype(dtype)
+        sin, cos = jnp.sin(freqs), jnp.cos(freqs)
+        freqs_cis = jnp.complex64(cos + 1j * sin)
+        return jnp.asarray(freqs_cis)
 
-    xq_ = jax.lax.complex(reshape_xq[..., 0], reshape_xq[..., 1])
-    xk_ = jax.lax.complex(reshape_xk[..., 0], reshape_xk[..., 1])
 
-    freqs_cis = jnp.reshape(freqs_cis, (*freqs_cis.shape[:2], 1, *freqs_cis.shape[2:]))
+    def apply_rotary_emb(
+            xq: jnp.ndarray,
+            xk: jnp.ndarray,
+            freqs_cis: jnp.ndarray,
+            dtype: jnp.dtype = jnp.bfloat16,
+    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        reshape_xq = xq.astype(jnp.float32).reshape(*xq.shape[:-1], -1, 2)
+        reshape_xk = xk.astype(jnp.float32).reshape(*xk.shape[:-1], -1, 2)
 
-    xq_out = xq_ * freqs_cis
-    xq_out = jnp.stack((jnp.real(xq_out), jnp.imag(xq_out)), axis=-1).reshape(*xq_out.shape[:-1], -1)
+        xq_ = jax.lax.complex(reshape_xq[..., 0], reshape_xq[..., 1])
+        xk_ = jax.lax.complex(reshape_xk[..., 0], reshape_xk[..., 1])
 
-    xk_out = xk_ * freqs_cis
-    xk_out = jnp.stack((jnp.real(xk_out), jnp.imag(xk_out)), axis=-1).reshape(*xk_out.shape[:-1], -1)
+        freqs_cis = jnp.reshape(freqs_cis, (*freqs_cis.shape[:2], 1, *freqs_cis.shape[2:]))
 
-    return xq_out.astype(dtype), xk_out.astype(dtype)
+        xq_out = xq_ * freqs_cis
+        xq_out = jnp.stack((jnp.real(xq_out), jnp.imag(xq_out)), axis=-1).reshape(*xq_out.shape[:-1], -1)
+
+        xk_out = xk_ * freqs_cis
+        xk_out = jnp.stack((jnp.real(xk_out), jnp.imag(xk_out)), axis=-1).reshape(*xk_out.shape[:-1], -1)
+
+        return xq_out.astype(dtype), xk_out.astype(dtype)
+else:
+    def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0,
+                             dtype: jnp.dtype = jnp.bfloat16) -> jnp.ndarray:
+        freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(dtype) / dim))
+        t = jnp.arange(end)
+        freqs = jnp.einsum('i,j->ij', t, freqs).astype(dtype)
+        return jnp.concatenate([freqs, freqs], axis=-1)
+
+
+    def apply_rotary_emb(xq: jnp.ndarray,
+                         xk: jnp.ndarray,
+                         freqs_cis: jnp.ndarray,
+                         dtype: jnp.dtype = jnp.bfloat16, ):
+        freqs_cis = freqs_cis[:, :, jnp.newaxis, :]
+        sin, cos = jnp.sin(freqs_cis), jnp.cos(freqs_cis)
+
+        xq = (cos * xq) + (sin * rotate_half(xq))
+        xk = (cos * xk) + (sin * rotate_half(xk))
+        return xq.astype(dtype), xk.astype(dtype)
 
 
 class FlaxLLaMAAttention(nn.Module):
     config: LLaMAConfig
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
+    dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self):
@@ -347,7 +375,7 @@ class FlaxLLaMAAttention(nn.Module):
             dropout_rng=dropout_rng,
             dropout_rate=self.config.attn_pdrop,
             deterministic=deterministic,
-            dtype=jnp.promote_types(self.dtype, jnp.float32),
+            dtype=jnp.promote_types(self.dtype, jnp.bfloat16),
             precision=self.precision,
         )
         attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "mp", None, None))
@@ -362,8 +390,8 @@ class FlaxLLaMAAttention(nn.Module):
 
 class FlaxLLaMAMLP(nn.Module):
     config: LLaMAConfig
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
+    dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
@@ -403,8 +431,8 @@ class FlaxLLaMAMLP(nn.Module):
 
 class FlaxLLaMABlock(nn.Module):
     config: LLaMAConfig
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
+    dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
@@ -474,7 +502,7 @@ class FlaxLLaMAPreTrainedModel(FlaxPreTrainedModel):
             config: LLaMAConfig,
             input_shape: Tuple = (1, 1),
             seed: int = 0,
-            dtype: jnp.dtype = jnp.float32,
+            dtype: jnp.dtype = jnp.bfloat16,
             _do_init: bool = True,
             **kwargs,
     ):
@@ -540,6 +568,7 @@ class FlaxLLaMAPreTrainedModel(FlaxPreTrainedModel):
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
+            add_params_field: bool = False
     ):
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -562,7 +591,7 @@ class FlaxLLaMAPreTrainedModel(FlaxPreTrainedModel):
         if dropout_rng is not None:
             rngs["dropout"] = dropout_rng
 
-        inputs = {"params": params or self.params}
+        inputs = {"params": params or self.params} if add_params_field else params or self.params
 
         if past_key_values:
             inputs["cache"] = past_key_values
@@ -597,8 +626,8 @@ class FlaxLLaMAPreTrainedModel(FlaxPreTrainedModel):
 
 class FlaxLLaMABlockCollection(nn.Module):
     config: LLaMAConfig
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
+    dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self):
@@ -666,8 +695,8 @@ class FlaxLLaMABlockCollection(nn.Module):
 
 class FlaxLLaMAModule(nn.Module):
     config: LLaMAConfig
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
+    dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self):
@@ -737,8 +766,8 @@ class FlaxLLaMAModel(FlaxLLaMAPreTrainedModel):
 
 class FlaxLLaMAForCausalLMModule(nn.Module):
     config: LLaMAConfig
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
+    dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self):
