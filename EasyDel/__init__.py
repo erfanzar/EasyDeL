@@ -10,7 +10,11 @@ if is_jax_available():
 if is_tensorflow_available():
     ...
 if is_flax_available():
-    from .modules import FlaxLlamaModel, LlamaConfig, FlaxLlamaForCausalLM, LLaMAModel, LLaMAForCausalLM
+    from .modules import FlaxLlamaModel, LlamaConfig, FlaxLlamaForCausalLM, LLaMAModel, LLaMAForCausalLM, \
+        FlaxLTModelModule, FlaxLTConfig, FlaxLTForCausalLM, FlaxLTModel, GPTJConfig, FlaxGPTJModule, \
+        FlaxGPTJForCausalLMModule, FlaxGPTJModel, FlaxGPTJForCausalLM
+
 __all__ = __version__, 'package_checker', 'is_jax_available', 'is_torch_available', 'is_flax_available', \
-    'is_tensorflow_available', 'FlaxLlamaForCausalLM', 'FlaxLlamaForCausalLM', 'LLaMAModel', 'LLaMAForCausalLM', \
-    'LlamaConfig'
+    'is_tensorflow_available', 'LlamaConfig', 'LLaMAForCausalLM', 'LLaMAModel', 'FlaxLlamaForCausalLM', 'FlaxLlamaModel', \
+    'FlaxGPTJModule', 'FlaxGPTJForCausalLMModule', 'FlaxGPTJModel', 'FlaxGPTJForCausalLM', 'GPTJConfig', \
+    'FlaxLTModel', 'FlaxLTConfig', 'FlaxLTModelModule', 'FlaxLTForCausalLM'
