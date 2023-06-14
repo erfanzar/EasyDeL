@@ -5,13 +5,9 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="08ad205b-709f-455b-86db-91293f595cd3" name="Changes" comment="">
-      <change afterPath="$PROJECT_DIR$/EasyDel/modules/mosaic_mpt/__init__.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/EasyDel/modules/mosaic_mpt/modelling_mpt_flax.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/EasyDel/modules/gpt_j/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/modules/gpt_j/__init__.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/EasyDel/modules/gpt_j/modelling_gpt_j.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/modules/gpt_j/modelling_gpt_j_flax.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/EasyDel/utils/utils.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/utils/utils.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/pyproject.toml" beforeDir="false" afterPath="$PROJECT_DIR$/pyproject.toml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/setup.py" beforeDir="false" afterPath="$PROJECT_DIR$/setup.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.gitignore" beforeDir="false" afterPath="$PROJECT_DIR$/.gitignore" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/modules/mosaic_mpt/modelling_mpt_flax.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/modules/mosaic_mpt/modelling_mpt_flax.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -22,6 +18,7 @@
     <option name="RECENT_TEMPLATES">
       <list>
         <option value="Python Script" />
+        <option value="Jupyter Notebook" />
       </list>
     </option>
   </component>
@@ -92,7 +89,8 @@
       <updated>1686484291658</updated>
       <workItem from="1686484292842" duration="2671000" />
       <workItem from="1686569916737" duration="787000" />
-      <workItem from="1686662766563" duration="1300000" />
+      <workItem from="1686662766563" duration="2288000" />
+      <workItem from="1686726437192" duration="11294000" />
     </task>
     <servers />
   </component>
