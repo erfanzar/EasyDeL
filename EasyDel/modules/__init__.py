@@ -1,7 +1,9 @@
-from .llama import LlamaConfig, LLaMAModel, LLaMAForCausalLM, FlaxLlamaModel, FlaxLlamaForCausalLM
+from .llama import LLaMAConfig, LLaMAModel, LLaMAForCausalLM, FlaxLLaMAModel, FlaxLLaMAForCausalLM
 from .gpt_j import FlaxGPTJModule, FlaxGPTJForCausalLMModule, FlaxGPTJModel, FlaxGPTJForCausalLM, GPTJConfig
 from .lucid_transformer import FlaxLTModel, FlaxLTConfig, FlaxLTModelModule, FlaxLTForCausalLM
+from .mosaic_mpt import MptConfig, MptModel, MptForCausalLM
 
-__all__ = ['LlamaConfig', 'LLaMAForCausalLM', 'LLaMAModel', 'FlaxLlamaForCausalLM', 'FlaxLlamaModel',
+__all__ = ['LLaMAConfig', 'LLaMAForCausalLM', 'LLaMAModel', 'FlaxLLaMAForCausalLM', 'FlaxLLaMAModel',
            'FlaxGPTJModule', 'FlaxGPTJForCausalLMModule', 'FlaxGPTJModel', 'FlaxGPTJForCausalLM', 'GPTJConfig',
-           'FlaxLTModel', 'FlaxLTConfig', 'FlaxLTModelModule', 'FlaxLTForCausalLM']
+           'FlaxLTModel', 'FlaxLTConfig', 'FlaxLTModelModule', 'FlaxLTForCausalLM',
+           "MptConfig", "MptModel", "MptForCausalLM"]

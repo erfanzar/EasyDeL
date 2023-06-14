@@ -1,3 +1,5 @@
+import math
+
 from flax import linen as nn
 from flax.serialization import to_bytes, from_bytes, to_state_dict, from_state_dict
 from jax import grad, jit
@@ -6,7 +8,8 @@ from typing import Optional, Dict, Union, Tuple
 from transformers import FlaxPreTrainedModel, PretrainedConfig
 from jax import numpy as jnp
 import jax
-from jax.experimental.pjit import pjit, PartitionSpec
+from jax.interpreters import pxla
+from jax.experimental.pjit import pjit, PartitionSpec, with_sharding_constraint as wsc
 from transformers.modeling_flax_outputs import FlaxCausalLMOutput, FlaxBaseModelOutput
 from jax.random import split, PRNGKey
 from functools import partial
@@ -20,6 +23,32 @@ ACT2FN = {
     "gelu_new": partial(nn.gelu, approximate=True),
 
 }
+
+
+def get_names_from_parition_spec(partition_specs):
+    names = set()
+    if isinstance(partition_specs, dict):
+        partition_specs = partition_specs.values()
+    for item in partition_specs:
+        if item is None:
+            continue
+        elif isinstance(item, str):
+            names.add(item)
+        else:
+            names.update(get_names_from_parition_spec(item))
+
+    return list(names)
+
+
+def names_in_mesh(*names):
+    return set(names) <= set(pxla.thread_resources.env.physical_mesh.axis_names)
+
+
+def with_sharding_constraint(x, partition_specs):
+    axis_names = get_names_from_parition_spec(partition_specs)
+    if names_in_mesh(*axis_names):
+        x = wsc(x, partition_specs)
+    return x
 
 
 class MptConfig(PretrainedConfig):
@@ -41,6 +70,7 @@ class MptConfig(PretrainedConfig):
         self.max_seq_len = max_seq_len
         self.vocab_size = vocab_size
         self.resid_prob_drop = resid_prob_drop
+        self.use_bias = use_bias
         self.emb_prob_drop = emb_prob_drop
         self.learned_pos_emb = learned_pos_emb
         self.act_fn = act_fn
@@ -56,7 +86,6 @@ class MptConfig(PretrainedConfig):
         if 'loss_fn' in kwargs:
             del kwargs['loss_fn']
         super().__init__(**kwargs)
-        self._validate_config()
 
     @staticmethod
     def _set_config_defaults(config, config_defaults):
@@ -66,12 +95,55 @@ class MptConfig(PretrainedConfig):
         return config
 
     @staticmethod
-    def get_partition_rules():
+    def get_partition_rules(fully_fsdp: bool = False):
         return (
-            ('mlp.up.kernel', PartitionSpec('fsdp', 'mp')),
-            ('mlp.up.bias', PartitionSpec('fsdp', 'mp')),
-            ('mlp.down.kernel', PartitionSpec('fsdp', 'mp')),
-            ('mlp.down.bias', PartitionSpec('fsdp', 'mp'))
+
+            ("transformer/wte/embedding", PartitionSpec("mp", "fsdp")),
+            ("transformer/wpe/embedding", PartitionSpec("mp", "fsdp")),
+
+            ("attn/w_qkv/kernel", PartitionSpec("fsdp", "mp")),
+            ("attn/wo/kernel", PartitionSpec("mp", "fsdp")),
+            ("attn/w_qkv/bias", PartitionSpec("fsdp", "mp")),
+            ("attn/wo/bias", PartitionSpec("mp", "fsdp")),
+
+            ("ffn/down/kernel", PartitionSpec("fsdp", "mp")),
+            ("ffn/up/kernel", PartitionSpec("fsdp", "mp")),
+            ("ffn/down/kernel", PartitionSpec("fsdp", "mp")),
+            ("ffn/up/kernel", PartitionSpec("fsdp", "mp")),
+
+            ("attention_norm/kernel", PartitionSpec(None)),
+            ("norm_f/kernel", PartitionSpec(None)),
+            ("norm_f/bias", PartitionSpec(None)),
+
+            ("transformer/norm_f/kernel", PartitionSpec(None)),
+            ("transformer/norm_f/bias", PartitionSpec(None)),
+            ("lm_head/kernel", PartitionSpec("fsdp", "mp")),
+            ("lm_head/bias", PartitionSpec("fsdp", "mp")),
+            ('.*', PartitionSpec(None)),
+        ) if not fully_fsdp else (
+
+            ("transformer/wte/embedding", PartitionSpec("fsdp")),
+            ("transformer/wpe/embedding", PartitionSpec("fsdp")),
+
+            ("attn/w_qkv/kernel", PartitionSpec("fsdp")),
+            ("attn/wo/kernel", PartitionSpec("fsdp")),
+            ("attn/w_qkv/bias", PartitionSpec("fsdp")),
+            ("attn/wo/bias", PartitionSpec("fsdp")),
+
+            ("ffn/down/kernel", PartitionSpec("fsdp")),
+            ("ffn/up/kernel", PartitionSpec("fsdp")),
+            ("ffn/down/kernel", PartitionSpec("fsdp")),
+            ("ffn/up/kernel", PartitionSpec("fsdp")),
+
+            ("attention_norm/kernel", PartitionSpec(None)),
+            ("norm_f/kernel", PartitionSpec(None)),
+            ("norm_f/bias", PartitionSpec(None)),
+
+            ("transformer/norm_f/kernel", PartitionSpec(None)),
+            ("transformer/norm_f/bias", PartitionSpec(None)),
+            ("lm_head/kernel", PartitionSpec("fsdp")),
+            ("lm_head/bias", PartitionSpec("fsdp")),
+            ('.*', PartitionSpec(None)),
         )
 
 
@@ -103,7 +175,7 @@ class MptMLP(nn.Module):
     config: MptConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision = None
+    precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
         self.up = nn.Dense(self.config.d_model * self.config.expansion_ratio, kernel_init=jax.nn.initializers.normal(),
@@ -122,7 +194,7 @@ class MptAttention(nn.Module):
     config: MptConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision = None
+    precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
         self.w_qkv = nn.Dense(self.config.d_model * 3, kernel_init=jax.nn.initializers.normal(),
@@ -143,11 +215,16 @@ class MptAttention(nn.Module):
         if self.config.qk_ln:
             q = self.q_ln(q)
             k = self.k_ln(k)
+        q = with_sharding_constraint(q, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
+        k = with_sharding_constraint(k, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
+        v = with_sharding_constraint(v, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
         q = rearrange(q, 'b s (h d) -> b s h d', h=self.config.n_heads)
         k = rearrange(k, 'b s (h d) -> b s h d', h=self.config.n_heads)
         v = rearrange(v, 'b s (h d) -> b s h d', h=self.config.n_heads)
         d = q.shape[-1]
-        atw = jnp.einsum('...qhd,...khd->...hqk', q, k, precision=self.precision) * jax.lax.rsqrt(d)
+        atw = jnp.einsum('...qhd,...khd->...hqk', q, k, precision=self.precision) * jax.lax.rsqrt(
+            jnp.asarray(d).astype(v.dtype))
+        atw = with_sharding_constraint(atw, PartitionSpec(('dp', 'fsdp'), 'mp', None, None))
         if attn_bias is not None:
             atw += attn_bias
         mv = jnp.finfo(atw).min
@@ -155,7 +232,7 @@ class MptAttention(nn.Module):
         if attention_mask is not None:
             attention_mask = jnp.where(attention_mask.reshape(b, 1, 1, s) == 1, 0, mv)
             atw += attention_mask
-        atw += mask
+        atw += mask[:, :, :s, :s]
         atw = nn.softmax(atw, -1)
         atw = jnp.einsum('...hqk,...khd->...qhd', atw, v)
         return self.wo(atw.reshape(inp_shape))
@@ -165,7 +242,7 @@ class MptBlock(nn.Module):
     config: MptConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision = None
+    precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
         self.norm_1 = nn.LayerNorm()
@@ -185,7 +262,7 @@ class MptCollection(nn.Module):
     config: MptConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision = None
+    precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
         self.blocks = [
@@ -208,9 +285,10 @@ class MptCollection(nn.Module):
 
 def build_alibi(max_length, num_attention_heads, alibi_max: int = 8):
     w_range = jnp.arange(1 - max_length, 1).reshape(1, 1, 1, max_length)
-    cp2 = jnp.power(2, jnp.ceil(jnp.log2(num_attention_heads)))
+    # cp2 = jnp.power(2, jnp.ceil(jnp.log2(num_attention_heads)))
+    cp2 = 2 ** math.ceil(math.log2(num_attention_heads))
     h_range = jnp.arange(1, 1 + num_attention_heads, ).reshape(1, -1, 1, 1)
-    h_range = jnp.matmul(h_range, alibi_max / cp2)
+    h_range = jnp.matmul(h_range, jnp.asarray(alibi_max / cp2).reshape(1, 1))
     slop = 1 / jnp.power(2, h_range)
     if cp2 != num_attention_heads:
         slop = jnp.concatenate([slop[1::2], slop[::2]], axis=-1)[:num_attention_heads]
@@ -222,7 +300,7 @@ class MptModule(nn.Module):
     config: MptConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision = None
+    precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
         self.wte = nn.Embed(num_embeddings=self.config.vocab_size, features=self.config.d_model)
@@ -253,18 +331,27 @@ class MptModule(nn.Module):
 
 
 class MptPretrainedModel(FlaxPreTrainedModel):
-    module: nn.Module = None
+    module_class: nn.Module = None
     config_class: MptConfig = MptConfig
 
-    def __init__(self, config, _do_init: bool = False):
-        super().__init__(_do_init=_do_init, config=config, module=self.module)
+    def __init__(self, config, dtype: jnp.dtype = jnp.float32, param_dtype: jnp.dtype = jnp.float32,
+                 _do_init: bool = False,
+                 input_shape: Tuple = (1, 16), **kwargs):
+        module = self.module_class(
+            config,
+            dtype=dtype,
+            param_dtype=param_dtype
+        )
+        super().__init__(_do_init=_do_init, config=config, input_shape=input_shape, module=module, **kwargs)
 
     def init_weights(self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None) -> FrozenDict:
+
         if params is None:
             return self.module.init(
-                rng,
+                rngs=rng,
                 input_ids=jnp.ones(input_shape, dtype='i4'),
                 attention_mask=jnp.ones(input_shape, dtype='i4'),
+
             )['params']
         else:
             return params
@@ -280,16 +367,23 @@ class MptPretrainedModel(FlaxPreTrainedModel):
         )
         return predict
 
+    def prepare_inputs_for_generation(self, input_ids, attention_mask=None):
+
+        return {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask
+        }
+
 
 class MptModel(MptPretrainedModel):
-    module = MptModule
+    module_class = MptModule
 
 
 class MptForCausalLMModule(nn.Module):
     config: MptConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision = None
+    precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
         self.transformer = MptModule(
@@ -316,4 +410,4 @@ class MptForCausalLMModule(nn.Module):
 
 
 class MptForCausalLM(MptPretrainedModel):
-    module = MptForCausalLMModule
+    module_class = MptForCausalLMModule
