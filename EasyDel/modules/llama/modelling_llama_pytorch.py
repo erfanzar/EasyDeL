@@ -30,7 +30,7 @@ except KeyError:
         return func
 
 
-class LLaMAConfig(PretrainedConfig):
+class LlamaConfig(PretrainedConfig):
     def __init__(self,
                  initializer_range: float = 0.02,
                  hidden_size: int = 768,
@@ -63,7 +63,7 @@ class LLaMAConfig(PretrainedConfig):
         self.initializer_range = initializer_range
 
 
-class LLaMARMSNorm(Module):
+class LlamaRMSNorm(Module):
     def __init__(self, hidden_size, eps=1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
@@ -78,7 +78,7 @@ class LLaMARMSNorm(Module):
         return self.weight * hidden_states
 
 
-class LLaMARotaryEmbedding(Module):
+class LlamaRotaryEmbedding(Module):
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
         super().__init__()
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float().to(device) / dim))
@@ -121,14 +121,14 @@ def apply_rotary_pos_emb(q, k, cos, sin, offset: int = 0):
     return q_embed, k_embed
 
 
-class LLaMAMLP(Module):
+class LlamaMLP(Module):
     def __init__(
             self,
             hidden_size: int,
             intermediate_size: int,
 
     ):
-        # same as what used on LLaMA
+        # same as what used on Llama
         super().__init__()
         self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
@@ -156,7 +156,7 @@ class Conv1D(Module):
         return out.view(out_size)
 
 
-class LLaMAAttention(Module):
+class LlamaAttention(Module):
 
     def __init__(self, hidden_size: int, num_heads: int):
         super().__init__()
@@ -208,7 +208,7 @@ class LLaMAAttention(Module):
             bias=False,
         )
 
-        self.rotary_emb = LLaMARotaryEmbedding(self.head_dim)
+        self.rotary_emb = LlamaRotaryEmbedding(self.head_dim)
 
     def _shape(self, tensor: torch.Tensor, seq_length: int, bsz: int):
         return tensor.view(bsz, seq_length, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
@@ -289,19 +289,19 @@ def _make_causal_mask(input_ids: torch.Tensor, dtype: torch.dtype):
     return mask[None, None, :, :].expand(bsz, 1, tgt_len, tgt_len)
 
 
-class LLaMABlock(Module):
-    def __init__(self, config: LLaMAConfig):
+class LlamaBlock(Module):
+    def __init__(self, config: LlamaConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = LLaMAAttention(
+        self.self_attn = LlamaAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
         )
-        self.mlp = LLaMAMLP(
+        self.mlp = LlamaMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size, )
-        self.input_layernorm = LLaMARMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = LLaMARMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     @function
     def forward(
@@ -337,17 +337,17 @@ class LLaMABlock(Module):
         return outputs
 
 
-class LLaMAModel(PreTrainedModel):
+class LlamaModel(PreTrainedModel):
 
-    def __init__(self, config: LLaMAConfig):
-        super(LLaMAModel, self).__init__(config)
+    def __init__(self, config: LlamaConfig):
+        super(LlamaModel, self).__init__(config)
 
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList([LLaMABlock(config) for _ in range(config.num_hidden_layers)])
-        self.norm = LLaMARMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.layers = nn.ModuleList([LlamaBlock(config) for _ in range(config.num_hidden_layers)])
+        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.gradient_checkpointing = False
         self.config = config
@@ -372,7 +372,7 @@ class LLaMAModel(PreTrainedModel):
 
     @staticmethod
     def _set_gradient_checkpointing(module, value=False):
-        if isinstance(module, LLaMABlock):
+        if isinstance(module, LlamaBlock):
             module.gradient_checkpointing = value
 
     @staticmethod
@@ -435,10 +435,10 @@ class LLaMAModel(PreTrainedModel):
         return hidden_states
 
 
-class LLaMAForCausalLM(PreTrainedModel):
-    def __init__(self, config: LLaMAConfig):
-        super(LLaMAForCausalLM, self).__init__(config)
-        self.model = LLaMAModel(config)
+class LlamaForCausalLM(PreTrainedModel):
+    def __init__(self, config: LlamaConfig):
+        super(LlamaForCausalLM, self).__init__(config)
+        self.model = LlamaModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.config = config
 
