@@ -366,8 +366,8 @@ class FlaxMptPretrainedModel(FlaxPreTrainedModel):
         params = {'params': params or self.params} if add_params_field else params or self.params
         predict = self.module.apply(
             params,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
+            input_ids=jnp.asarray(input_ids, dtype='i4'),
+            attention_mask=jnp.asarray(attention_mask, dtype='i4') if attention_mask is not None else attention_mask,
             return_dict=return_dict
         )
         return predict
