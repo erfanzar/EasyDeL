@@ -274,9 +274,10 @@ class FlaxMptCollection(nn.Module):
                 config=self.config,
                 dtype=self.dtype,
                 param_dtype=self.param_dtype,
-                precision=self.precision
+                precision=self.precision,
+                name=str(i)
             )
-            for _ in range(
+            for i in range(
                 self.config.n_layers
             )
         ]
