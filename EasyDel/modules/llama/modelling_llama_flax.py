@@ -55,8 +55,8 @@ def with_sharding_constraint(x, partition_specs):
     return x
 
 
-class LLaMAConfig(PretrainedConfig):
-    model_type = "llama"
+class LlamaConfig(PretrainedConfig):
+    model_type = "Llama"
 
     def __init__(
             self,
@@ -229,8 +229,8 @@ else:
         return xq.astype(dtype), xk.astype(dtype)
 
 
-class FlaxLLaMAAttention(nn.Module):
-    config: LLaMAConfig
+class FlaxLlamaAttention(nn.Module):
+    config: LlamaConfig
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[jax.lax.Precision, str]] = None
@@ -388,8 +388,8 @@ class FlaxLLaMAAttention(nn.Module):
         return outputs
 
 
-class FlaxLLaMAMLP(nn.Module):
-    config: LLaMAConfig
+class FlaxLlamaMLP(nn.Module):
+    config: LlamaConfig
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[jax.lax.Precision, str]] = None
@@ -429,20 +429,20 @@ class FlaxLLaMAMLP(nn.Module):
         return x
 
 
-class FlaxLLaMABlock(nn.Module):
-    config: LLaMAConfig
+class FlaxLlamaBlock(nn.Module):
+    config: LlamaConfig
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
-        self.attention = FlaxLLaMAAttention(
+        self.attention = FlaxLlamaAttention(
             self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
         )
-        self.feed_forward = FlaxLLaMAMLP(
+        self.feed_forward = FlaxLlamaMLP(
             self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -492,14 +492,14 @@ class FlaxLLaMABlock(nn.Module):
         return (hidden_states,) + attn_outputs[1:]
 
 
-class FlaxLLaMAPreTrainedModel(FlaxPreTrainedModel):
-    config_class = LLaMAConfig
+class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
+    config_class = LlamaConfig
     base_model_prefix = "transformer"
     module_class: nn.Module = None
 
     def __init__(
             self,
-            config: LLaMAConfig,
+            config: LlamaConfig,
             input_shape: Tuple = (1, 1),
             seed: int = 0,
             dtype: jnp.dtype = jnp.bfloat16,
@@ -624,14 +624,14 @@ class FlaxLLaMAPreTrainedModel(FlaxPreTrainedModel):
         return outputs
 
 
-class FlaxLLaMABlockCollection(nn.Module):
-    config: LLaMAConfig
+class FlaxLlamaBlockCollection(nn.Module):
+    config: LlamaConfig
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self):
-        block = FlaxLLaMABlock
+        block = FlaxLlamaBlock
 
         self.blocks = [
             block(self.config, name=str(i), dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision)
@@ -693,8 +693,8 @@ class FlaxLLaMABlockCollection(nn.Module):
         return outputs
 
 
-class FlaxLLaMAModule(nn.Module):
-    config: LLaMAConfig
+class FlaxLlamaModule(nn.Module):
+    config: LlamaConfig
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[jax.lax.Precision, str]] = None
@@ -710,7 +710,7 @@ class FlaxLLaMAModule(nn.Module):
             param_dtype=self.param_dtype,
         )
         self.dropout = nn.Dropout(rate=self.config.embd_pdrop)
-        self.h = FlaxLLaMABlockCollection(self.config, dtype=self.dtype, param_dtype=self.param_dtype,
+        self.h = FlaxLlamaBlockCollection(self.config, dtype=self.dtype, param_dtype=self.param_dtype,
                                           precision=self.precision)
         self.ln_f = RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps, dtype=self.dtype,
                             param_dtype=self.param_dtype)
@@ -760,18 +760,18 @@ class FlaxLLaMAModule(nn.Module):
         )
 
 
-class FlaxLLaMAModel(FlaxLLaMAPreTrainedModel):
-    module_class = FlaxLLaMAModule
+class FlaxLlamaModel(FlaxLlamaPreTrainedModel):
+    module_class = FlaxLlamaModule
 
 
-class FlaxLLaMAForCausalLMModule(nn.Module):
-    config: LLaMAConfig
+class FlaxLlamaForCausalLMModule(nn.Module):
+    config: LlamaConfig
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self):
-        self.transformer = FlaxLLaMAModule(self.config, dtype=self.dtype)
+        self.transformer = FlaxLlamaModule(self.config, dtype=self.dtype)
         self.lm_head = nn.Dense(
             self.config.vocab_size,
             dtype=self.dtype,
@@ -825,8 +825,8 @@ class FlaxLLaMAForCausalLMModule(nn.Module):
         return FlaxCausalLMOutput(logits=lm_logits, hidden_states=outputs.hidden_states, attentions=outputs.attentions)
 
 
-class FlaxLLaMAForCausalLM(FlaxLLaMAPreTrainedModel):
-    module_class = FlaxLLaMAForCausalLMModule
+class FlaxLlamaForCausalLM(FlaxLlamaPreTrainedModel):
+    module_class = FlaxLlamaForCausalLMModule
 
     def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[jnp.DeviceArray] = None):
         batch_size, seq_length = input_ids.shape
