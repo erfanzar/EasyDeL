@@ -1,1 +1,1 @@
-from .modelling_mpt_flax import MptConfig, MptModel, MptForCausalLM
+from .modelling_mpt_flax import MptConfig, FlaxMptModel, FlaxMptForCausalLM

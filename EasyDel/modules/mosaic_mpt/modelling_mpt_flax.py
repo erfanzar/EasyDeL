@@ -175,7 +175,7 @@ class RMSNorm(nn.Module):
         return output * weight
 
 
-class MptMLP(nn.Module):
+class FlaxMptMLP(nn.Module):
     config: MptConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -194,7 +194,7 @@ class MptMLP(nn.Module):
         return self.down(self.act(self.up(x)))
 
 
-class MptAttention(nn.Module):
+class FlaxMptAttention(nn.Module):
     config: MptConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -242,7 +242,7 @@ class MptAttention(nn.Module):
         return self.wo(atw.reshape(inp_shape))
 
 
-class MptBlock(nn.Module):
+class FlaxMptBlock(nn.Module):
     config: MptConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -251,10 +251,10 @@ class MptBlock(nn.Module):
     def setup(self) -> None:
         self.norm_1 = nn.LayerNorm(use_bias=self.config.use_norm_bias)
         self.norm_2 = nn.LayerNorm(use_bias=self.config.use_norm_bias)
-        self.attn = MptAttention(config=self.config, dtype=self.dtype, param_dtype=self.param_dtype,
-                                 precision=self.precision)
-        self.ffn = MptMLP(config=self.config, dtype=self.dtype, param_dtype=self.param_dtype,
-                          precision=self.precision)
+        self.attn = FlaxMptAttention(config=self.config, dtype=self.dtype, param_dtype=self.param_dtype,
+                                     precision=self.precision)
+        self.ffn = FlaxMptMLP(config=self.config, dtype=self.dtype, param_dtype=self.param_dtype,
+                              precision=self.precision)
 
     def __call__(self, x, attn_bias=None, attention_mask=None):
         x = self.attn(self.norm_1(x), attn_bias=attn_bias, attention_mask=attention_mask) + x
@@ -262,7 +262,7 @@ class MptBlock(nn.Module):
         return x
 
 
-class MptCollection(nn.Module):
+class FlaxMptCollection(nn.Module):
     config: MptConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -270,7 +270,7 @@ class MptCollection(nn.Module):
 
     def setup(self) -> None:
         self.blocks = [
-            MptBlock(
+            FlaxMptBlock(
                 config=self.config,
                 dtype=self.dtype,
                 param_dtype=self.param_dtype,
@@ -300,7 +300,7 @@ def build_alibi(max_length, num_attention_heads, alibi_max: int = 8):
     return alibi
 
 
-class MptModule(nn.Module):
+class FlaxMptModule(nn.Module):
     config: MptConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -310,7 +310,7 @@ class MptModule(nn.Module):
         self.wte = nn.Embed(num_embeddings=self.config.vocab_size, features=self.config.d_model)
         if not self.config.alibi:
             self.wpe = nn.Embed(num_embeddings=self.config.vocab_size, features=self.config.max_seq_len)
-        self.h = MptCollection(
+        self.h = FlaxMptCollection(
             config=self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -334,7 +334,7 @@ class MptModule(nn.Module):
             return (hidden_state,)
 
 
-class MptPretrainedModel(FlaxPreTrainedModel):
+class FlaxMptPretrainedModel(FlaxPreTrainedModel):
     module_class: nn.Module = None
     config_class: MptConfig = MptConfig
 
@@ -379,18 +379,18 @@ class MptPretrainedModel(FlaxPreTrainedModel):
         }
 
 
-class MptModel(MptPretrainedModel):
-    module_class = MptModule
+class FlaxMptModel(FlaxMptPretrainedModel):
+    module_class = FlaxMptModule
 
 
-class MptForCausalLMModule(nn.Module):
+class FlaxFlaxMptForCausalLMModule(nn.Module):
     config: MptConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
-        self.transformer = MptModule(
+        self.transformer = FlaxMptModule(
             config=self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -417,5 +417,5 @@ class MptForCausalLMModule(nn.Module):
             return (logits,)
 
 
-class MptForCausalLM(MptPretrainedModel):
-    module_class = MptForCausalLMModule
+class FlaxMptForCausalLM(FlaxMptPretrainedModel):
+    module_class = FlaxFlaxMptForCausalLMModule
