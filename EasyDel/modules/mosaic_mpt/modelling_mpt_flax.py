@@ -61,9 +61,11 @@ class MptConfig(PretrainedConfig):
                  learned_pos_emb: bool = True, act_fn: str = 'gelu',
                  logit_scale: Optional[Union[float, str]] = None, no_bias: bool = False, verbose: int = 0,
                  embedding_fraction: float = 1.0, use_cache: bool = False, qk_ln: bool = True,
+                 use_norm_bias: bool = False,
                  **kwargs):
 
         self.d_model = d_model
+        self.use_norm_bias = use_norm_bias
         self.n_heads = n_heads
         self.n_layers = n_layers
         self.expansion_ratio = expansion_ratio
@@ -203,8 +205,8 @@ class MptAttention(nn.Module):
         self.wo = nn.Dense(self.config.d_model, kernel_init=jax.nn.initializers.normal(), use_bias=self.config.use_bias,
                            dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision)
         if self.config.qk_ln:
-            self.q_ln = nn.LayerNorm()
-            self.k_ln = nn.LayerNorm()
+            self.q_ln = nn.LayerNorm(use_bias=self.config.use_norm_bias)
+            self.k_ln = nn.LayerNorm(use_bias=self.config.use_norm_bias)
         self.causal_mask = nn.make_causal_mask(jnp.ones((1, self.config.max_seq_len)))
 
     def __call__(self, x, attn_bias=None, attention_mask=None):
@@ -245,8 +247,8 @@ class MptBlock(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
-        self.norm_1 = nn.LayerNorm()
-        self.norm_2 = nn.LayerNorm()
+        self.norm_1 = nn.LayerNorm(use_bias=self.config.use_norm_bias)
+        self.norm_2 = nn.LayerNorm(use_bias=self.config.use_norm_bias)
         self.attn = MptAttention(config=self.config, dtype=self.dtype, param_dtype=self.param_dtype,
                                  precision=self.precision)
         self.ffn = MptMLP(config=self.config, dtype=self.dtype, param_dtype=self.param_dtype,
@@ -312,7 +314,7 @@ class MptModule(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.norm_f = nn.LayerNorm()
+        self.norm_f = nn.LayerNorm(use_bias=self.config.use_norm_bias)
 
     def __call__(self, input_ids: jnp.DeviceArray, attention_mask: jnp.DeviceArray = None, return_dict: bool = True):
         b, s = input_ids.shape
