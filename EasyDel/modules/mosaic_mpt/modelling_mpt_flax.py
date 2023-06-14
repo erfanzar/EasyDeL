@@ -61,11 +61,13 @@ class MptConfig(PretrainedConfig):
                  learned_pos_emb: bool = True, act_fn: str = 'gelu',
                  logit_scale: Optional[Union[float, str]] = None, no_bias: bool = False, verbose: int = 0,
                  embedding_fraction: float = 1.0, use_cache: bool = False, qk_ln: bool = True,
+                 use_lm_head: bool = False,
                  use_norm_bias: bool = False,
                  **kwargs):
 
         self.d_model = d_model
         self.use_norm_bias = use_norm_bias
+        self.use_lm_head = use_lm_head
         self.n_heads = n_heads
         self.n_layers = n_layers
         self.expansion_ratio = expansion_ratio
@@ -394,14 +396,18 @@ class MptForCausalLMModule(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.lm_head = nn.Dense(self.config.vocab_size, kernel_init=jax.nn.initializers.normal(),
-                                use_bias=self.config.use_bias,
-                                dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision)
+        if self.config.use_lm_head:
+            self.lm_head = nn.Dense(self.config.vocab_size, kernel_init=jax.nn.initializers.normal(),
+                                    use_bias=self.config.use_bias,
+                                    dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision)
 
     def __call__(self, input_ids: jnp.DeviceArray, attention_mask: jnp.DeviceArray = None, return_dict: bool = True):
         predict: FlaxBaseModelOutput = self.transformer(input_ids=input_ids, attention_mask=attention_mask,
                                                         return_dict=True)
-        logits = self.lm_head(predict.last_hidden_state)
+        if self.config.use_lm_head:
+            logits = self.lm_head(predict.last_hidden_state)
+        else:
+            logits = predict.last_hidden_state @ self.transformer.wte.embedding.T
         if return_dict:
             return FlaxCausalLMOutput(
                 logits=logits,
