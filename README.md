@@ -12,6 +12,13 @@ To install EasyDeL, you can use pip:
 pip install easydel
 ```
 
+## Available Models Are
+
+- Llama     (Support `FSDP` ,`MP` ,`DP`)
+- GPT-J     (Support `FSDP` ,`MP` ,`DP`)
+- LT        (Support `FSDP` ,`MP` ,`DP`)
+- MosaicMPT (Support `FSDP` ,`MP` ,`DP`)
+
 ## Usage
 
 To use EasyDeL in your project, you will need to import the library in your Python script and use its various functions
