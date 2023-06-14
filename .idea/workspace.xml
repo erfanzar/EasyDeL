@@ -5,12 +5,7 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="08ad205b-709f-455b-86db-91293f595cd3" name="Changes" comment="">
-      <change beforePath="$PROJECT_DIR$/.gitignore" beforeDir="false" afterPath="$PROJECT_DIR$/.gitignore" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/EasyDel/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/__init__.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/EasyDel/modules/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/modules/__init__.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/EasyDel/modules/llama/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/modules/llama/__init__.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/EasyDel/modules/mosaic_mpt/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/modules/mosaic_mpt/__init__.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/EasyDel/modules/mosaic_mpt/modelling_mpt_flax.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/modules/mosaic_mpt/modelling_mpt_flax.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -118,7 +113,7 @@
       <workItem from="1686484292842" duration="2671000" />
       <workItem from="1686569916737" duration="787000" />
       <workItem from="1686662766563" duration="2288000" />
-      <workItem from="1686726437192" duration="13279000" />
+      <workItem from="1686726437192" duration="17783000" />
     </task>
     <servers />
   </component>
