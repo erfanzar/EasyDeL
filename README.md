@@ -1,24 +1,25 @@
 # EasyDeL
 
 EasyDeL (Easy Deep Learning) is an open-source library designed to accelerate and optimize the training process of
-machine learning models. This library is primarily focused on Jax/Flax and Plan to offer easy and fine solutions to
+machine learning models. This library is primarily focused on Jax/Flax and plans to offer easy and fine solutions to
 train Flax/Jax Models on the `TPU/GPU`
 
 ## Installation
 
 To install EasyDeL, you can use pip:
-
+### Not on PyPi yet!
 ```bash
 pip install easydel
 ```
 
 ## Available Models Are
 
-- Llama     (Support `FSDP` ,`MP` ,`DP`)
-- GPT-J     (Support `FSDP` ,`MP` ,`DP`)
-- LT        (Support `FSDP` ,`MP` ,`DP`)
-- MosaicMPT (Support `FSDP` ,`MP` ,`DP`)
+- Llama     (Support `FSDP` , `MP`,`DP`)
+- GPT-J     (Support `FSDP` , `MP`,`DP`)
+- LT        (Support `FSDP` , `MP` , `DP`)
+- MosaicMPT (Support `FSDP` , `MP` ,` DP`)
 
+you can also tell me the model you want in Flax/Jax version and ill try my best to built it ;)
 ## Usage
 
 To use EasyDeL in your project, you will need to import the library in your Python script and use its various functions
