@@ -74,6 +74,7 @@ class FalconConfig(PretrainedConfig):
             alibi=False,
             bias=False,
             parallel_attn=False,
+            max_seq_len=2048,
             **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -83,6 +84,7 @@ class FalconConfig(PretrainedConfig):
         self.n_head = n_head
         self.layer_norm_epsilon = layer_norm_epsilon
         self.initializer_range = initializer_range
+        self.max_seq_len = max_seq_len
         self.use_cache = use_cache
         self.apply_residual_connection_post_layernorm = apply_residual_connection_post_layernorm
         self.hidden_dropout = hidden_dropout
@@ -107,9 +109,29 @@ class FalconConfig(PretrainedConfig):
     @staticmethod
     def get_partition_rules(fully_fsdp: bool = False):
         return (
-            ('self_attention/w_qkv/kernel', PartitionSpec('fsdp', 'mp')),
-            ...
-            # TODO
+            ('wte/embedding', PartitionSpec('fsdp', 'mp')),
+            ('self_attention/w_qkv/(kernel|bias)', PartitionSpec('fsdp', 'mp')),
+            ('self_attention/wo/(kernel|bias)', PartitionSpec('fsdp', 'mp')),
+            ('mlp/down/(kernel|bias)', PartitionSpec('fsdp', 'mp')),
+            ('mlp/up/(kernel|bias)', PartitionSpec('mp', 'fsdp')),
+            ('lm_head/kernel', PartitionSpec('fsdp', 'mp')),
+            ('transformer/ln_f/bias', PartitionSpec('fsdp', 'mp')),
+            ('transformer/ln_f/scale', PartitionSpec('fsdp', 'mp')),
+            ('transformer/post_attention_layernorm/scale', PartitionSpec('mp', 'fsdp')),
+            ('transformer/post_attention_layernorm/bias', PartitionSpec('mp', 'fsdp')),
+            ('.*', PartitionSpec('fsdp', 'mp'))
+        ) if not fully_fsdp else (
+            ('wte/embedding', PartitionSpec('fsdp')),
+            ('self_attention/w_qkv/(kernel|bias)', PartitionSpec('fsdp')),
+            ('self_attention/wo/(kernel|bias)', PartitionSpec('fsdp')),
+            ('mlp/down/(kernel|bias)', PartitionSpec('fsdp')),
+            ('mlp/up/(kernel|bias)', PartitionSpec('fsdp')),
+            ('lm_head/kernel', PartitionSpec('fsdp')),
+            ('transformer/ln_f/bias', PartitionSpec('fsdp')),
+            ('transformer/ln_f/scale', PartitionSpec('fsdp')),
+            ('transformer/post_attention_layernorm/scale', PartitionSpec('fsdp')),
+            ('transformer/post_attention_layernorm/bias', PartitionSpec('fsdp')),
+            ('.*', PartitionSpec('fsdp'))
         )
 
     @staticmethod
@@ -185,7 +207,7 @@ class FlaxFalconAttention(nn.Module):
         )
         self.head_dim = head_dim
         if not self.config.alibi:
-            self.freq = precompute_freqs_cis(head_dim, self.config.max_length, dtype=self.dtype)
+            self.freq = precompute_freqs_cis(head_dim, self.config.max_seq_len, dtype=self.dtype)
 
     def __call__(self,
                  hidden_states: jnp.DeviceArray,
@@ -194,13 +216,18 @@ class FlaxFalconAttention(nn.Module):
                  ):
         b, s, d = hidden_states.shape
         q, k, v = jnp.split(self.w_qkv(hidden_states), 3, -1)
+        q = with_sharding_constraint(q, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
+        k = with_sharding_constraint(k, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
+        v = with_sharding_constraint(v, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
         k = rearrange(k, 'b s (h d) -> b s h d', h=self.config.n_head)
         q = rearrange(q, 'b s (h d) -> b s h d', h=self.config.n_head)
         v = rearrange(v, 'b s (h d) -> b s h d', h=self.config.n_head)
         if not self.config.alibi:
-            freq = self.freq[:b]
+            freq = self.freq[:s].reshape(1, s, -1)
             q, k = apply_rotary_emb(q, k, freq, self.dtype)
         attn = jnp.einsum('...qhd,...khd->...hqk', q, k, precision=self.precision)
+        attn = with_sharding_constraint(attn, PartitionSpec(("dp", "fsdp"), "mp", None, None))
+
         if alibi is not None:
             attn += attn
         attn = attn * self.factor_scale
@@ -362,16 +389,14 @@ class FlaxFalconModule(nn.Module):
         causal_mask = nn.make_causal_mask(
             input_ids,
         )
-        print(causal_mask.shape)
-        mv = jnp.finfo(hidden_states)
-        causal_mask = jnp.where(causal_mask == 1, 0, mv)
-        print(causal_mask.shape)
-        attention_mask = jnp.where(attention_mask == 1, 0, mv)
-        print(attention_mask.shape)
+
+        mv = jnp.finfo(hidden_states).min
+        attention_mask = jnp.where(attention_mask == 1, 0, mv) + jnp.where(causal_mask == 1, 0, mv)
+
         causal_mask += attention_mask
         output = self.ln_f(self.h(
             hidden_states=hidden_states,
-            attention_mask=causal_mask,
+            attention_mask=attention_mask,
             alibi=alibi
         ))
 
@@ -388,7 +413,7 @@ class FlaxFalconPretrainedModel(FlaxPreTrainedModel):
     config_class = FalconConfig
 
     def __init__(self, config, _do_init=False, dtype: jnp.dtype = jnp.float32, param_dtype: jnp.dtype = jnp.float32,
-                 input_shape: Tuple = (1, 26)):
+                 input_shape: Tuple = (1, 12)):
         module = self.module_class(config=config, dtype=dtype, param_dtype=param_dtype)
         super().__init__(_do_init=_do_init, module=module, config=config, dtype=dtype, input_shape=input_shape)
 
