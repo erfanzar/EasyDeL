@@ -193,7 +193,7 @@ class FlaxFalconAttention(nn.Module):
     def setup(self) -> None:
         head_dim = self.config.hidden_size // self.config.n_head
         self.w_qkv = nn.Dense(
-            features=self.config.hidden_size * 3,
+            features=3 * self.config.hidden_size if not self.config.multi_query else (self.hidden_size + 2 * head_dim),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=self.config.bias
