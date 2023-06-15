@@ -6,6 +6,8 @@
   <component name="ChangeListManager">
     <list default="true" id="08ad205b-709f-455b-86db-91293f595cd3" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/__init__.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/modules/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/modules/__init__.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/EasyDel/modules/falcon/modelling_falcon_flax.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/modules/falcon/modelling_falcon_flax.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -82,9 +84,6 @@
       <module name="EasyDeL" />
       <option name="INTERPRETER_OPTIONS" value="" />
       <option name="PARENT_ENVS" value="true" />
-      <envs>
-        <env name="PYTHONUNBUFFERED" value="1" />
-      </envs>
       <option name="SDK_HOME" value="" />
       <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$" />
       <option name="IS_MODULE_SDK" value="true" />
@@ -120,7 +119,7 @@
       <workItem from="1686726437192" duration="19074000" />
       <workItem from="1686759910414" duration="82000" />
       <workItem from="1686759993630" duration="2050000" />
-      <workItem from="1686818314317" duration="5913000" />
+      <workItem from="1686818314317" duration="7718000" />
     </task>
     <servers />
   </component>

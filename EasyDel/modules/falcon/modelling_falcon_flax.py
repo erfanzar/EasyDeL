@@ -350,7 +350,7 @@ class FlaxFalconModule(nn.Module):
                  ):
         batch, seq_len = input_ids.shape
         hidden_states = self.wte(
-            inputs=input_ids
+            inputs=input_ids.astype(jnp.int32)
         )
         if attention_mask is None:
             attention_mask = jnp.ones(
@@ -362,8 +362,13 @@ class FlaxFalconModule(nn.Module):
         causal_mask = nn.make_causal_mask(
             input_ids,
         )
+        print(causal_mask.shape)
         mv = jnp.finfo(hidden_states)
-        causal_mask = jnp.where(causal_mask == 1, 0, mv) + jnp.where(attention_mask == 1, 0, mv)
+        causal_mask = jnp.where(causal_mask == 1, 0, mv)
+        print(causal_mask.shape)
+        attention_mask = jnp.where(attention_mask == 1, 0, mv)
+        print(attention_mask.shape)
+        causal_mask += attention_mask
         output = self.ln_f(self.h(
             hidden_states=hidden_states,
             attention_mask=causal_mask,
@@ -404,8 +409,9 @@ class FlaxFalconPretrainedModel(FlaxPreTrainedModel):
         params = {'params': params or self.params} if add_params_field else params or self.params
         predict = self.module.apply(
             params,
-            input_ids=jnp.asarray(input_ids, dtype='i4'),
-            attention_mask=jnp.asarray(attention_mask, dtype='i4') if attention_mask is not None else attention_mask,
+            input_ids=jnp.asarray(input_ids, dtype=jnp.int32),
+            attention_mask=jnp.asarray(attention_mask,
+                                       dtype=jnp.int32) if attention_mask is not None else attention_mask,
             return_dict=return_dict
         )
         return predict
