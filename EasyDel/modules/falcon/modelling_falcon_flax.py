@@ -193,7 +193,8 @@ class FlaxFalconAttention(nn.Module):
     def setup(self) -> None:
         head_dim = self.config.hidden_size // self.config.n_head
         self.w_qkv = nn.Dense(
-            features=3 * self.config.hidden_size if not self.config.multi_query else (self.hidden_size + 2 * head_dim),
+            features=3 * self.config.hidden_size if not self.config.multi_query else (
+                    self.config.hidden_size + 2 * head_dim),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=self.config.bias
@@ -206,6 +207,7 @@ class FlaxFalconAttention(nn.Module):
             use_bias=self.config.bias
         )
         self.head_dim = head_dim
+        assert self.head_dim * self.config.n_head == self.config.hidden_size
         if not self.config.alibi:
             self.freq = precompute_freqs_cis(head_dim, self.config.max_seq_len, dtype=self.dtype)
 
@@ -215,13 +217,25 @@ class FlaxFalconAttention(nn.Module):
                  attention_mask: jnp.DeviceArray = None,
                  ):
         b, s, d = hidden_states.shape
-        q, k, v = jnp.split(self.w_qkv(hidden_states), 3, -1)
-        q = with_sharding_constraint(q, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
-        k = with_sharding_constraint(k, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
-        v = with_sharding_constraint(v, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
-        k = rearrange(k, 'b s (h d) -> b s h d', h=self.config.n_head)
-        q = rearrange(q, 'b s (h d) -> b s h d', h=self.config.n_head)
-        v = rearrange(v, 'b s (h d) -> b s h d', h=self.config.n_head)
+        qkv = self.w_qkv(hidden_states)
+        if not self.config.multi_query:
+            q, k, v = jnp.split(qkv, 3, -1)
+            q = with_sharding_constraint(q, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
+            k = with_sharding_constraint(k, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
+            v = with_sharding_constraint(v, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
+            k = rearrange(k, 'b s (h d) -> b s h d', h=self.config.n_head)
+            q = rearrange(q, 'b s (h d) -> b s h d', h=self.config.n_head)
+            v = rearrange(v, 'b s (h d) -> b s h d', h=self.config.n_head)
+        else:
+            qkv = qkv.reshape(
+                b, s, self.config.n_head + 2, -1
+            )
+            q, k, v = qkv[..., :-2, :], qkv[..., [-2], :], qkv[..., [-1], :]
+
+            q = with_sharding_constraint(q, PartitionSpec(('dp', 'fsdp'), None, None, 'mp'))
+            k = with_sharding_constraint(k, PartitionSpec(('dp', 'fsdp'), None, None, 'mp'))
+            v = with_sharding_constraint(v, PartitionSpec(('dp', 'fsdp'), None, None, 'mp'))
+
         if not self.config.alibi:
             freq = self.freq[:s].reshape(1, s, -1)
             q, k = apply_rotary_emb(q, k, freq, self.dtype)
@@ -231,8 +245,10 @@ class FlaxFalconAttention(nn.Module):
         if alibi is not None:
             attn += attn
         attn = attn * self.factor_scale
+
         if attention_mask is not None:
             attn += attention_mask
+
         attn = jax.nn.softmax(attn, axis=-1)
         attn = jnp.einsum('...hqk,...khd->...qhd', attn, v, precision=self.precision).reshape((b, s, d))
         return self.wo(attn)
