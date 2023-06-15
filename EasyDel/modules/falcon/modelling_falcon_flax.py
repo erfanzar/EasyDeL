@@ -106,7 +106,11 @@ class FalconConfig(PretrainedConfig):
 
     @staticmethod
     def get_partition_rules(fully_fsdp: bool = False):
-        ...
+        return (
+            ('self_attention/w_qkv/kernel', PartitionSpec('fsdp', 'mp')),
+            ...
+            # TODO
+        )
 
     @staticmethod
     def get_mesh_names():
@@ -159,43 +163,219 @@ def apply_rotary_emb(
 
 
 class FlaxFalconAttention(nn.Module):
-    def setup(self) -> None:
-        ...
+    config: FalconConfig
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[Union[jax.lax.Precision, str]] = None
 
-    def __call__(self, *args, **kwargs):
-        ...
+    def setup(self) -> None:
+        head_dim = self.config.hidden_size // self.config.n_head
+        self.w_qkv = nn.Dense(
+            features=self.config.hidden_size * 3,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            use_bias=self.config.bias
+        )
+        self.factor_scale = 1 / math.sqrt(head_dim)
+        self.wo = nn.Dense(
+            features=self.config.hidden_size,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            use_bias=self.config.bias
+        )
+        self.head_dim = head_dim
+        if not self.config.alibi:
+            self.freq = precompute_freqs_cis(head_dim, self.config.max_length, dtype=self.dtype)
+
+    def __call__(self,
+                 hidden_states: jnp.DeviceArray,
+                 alibi: jnp.DeviceArray = None,
+                 attention_mask: jnp.DeviceArray = None,
+                 ):
+        b, s, d = hidden_states.shape
+        q, k, v = jnp.split(self.w_qkv(hidden_states), 3, -1)
+        k = rearrange(k, 'b s (h d) -> b s h d', h=self.config.n_head)
+        q = rearrange(q, 'b s (h d) -> b s h d', h=self.config.n_head)
+        v = rearrange(v, 'b s (h d) -> b s h d', h=self.config.n_head)
+        if not self.config.alibi:
+            freq = self.freq[:b]
+            q, k = apply_rotary_emb(q, k, freq, self.dtype)
+        attn = jnp.einsum('...qhd,...khd->...hqk', q, k, precision=self.precision)
+        if alibi is not None:
+            attn += attn
+        attn = attn * self.factor_scale
+        if attention_mask is not None:
+            attn += attention_mask
+        attn = jax.nn.softmax(attn, axis=-1)
+        attn = jnp.einsum('...hqk,...khd->...qhd', attn, v, precision=self.precision).reshape((b, s, d))
+        return self.wo(attn)
 
 
 class FlaxFalconMlp(nn.Module):
-    def setup(self) -> None:
-        ...
+    config: FalconConfig
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[Union[jax.lax.Precision, str]] = None
 
-    def __call__(self, *args, **kwargs):
-        ...
+    def setup(self) -> None:
+        self.up = nn.Dense(
+            features=self.config.hidden_size * 4,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            use_bias=self.config.bias
+        )
+        self.down = nn.Dense(
+            features=self.config.hidden_size,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            use_bias=self.config.bias
+        )
+
+    def __call__(self, x):
+        return self.down(nn.gelu(self.up(x)))
 
 
 class FlaxFalconBlock(nn.Module):
-    def setup(self) -> None:
-        ...
+    config: FalconConfig
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[Union[jax.lax.Precision, str]] = None
 
-    def __call__(self, *args, **kwargs):
-        ...
+    def setup(self) -> None:
+        config = self.config
+        self.input_layernorm = nn.LayerNorm(epsilon=config.layer_norm_epsilon,
+                                            dtype=self.dtype)
+        if not config.parallel_attn:
+            self.post_attention_layernorm = nn.LayerNorm(epsilon=config.layer_norm_epsilon,
+                                                         dtype=self.dtype)
+
+        self.mlp = FlaxFalconMlp(
+            config=config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision
+        )
+        self.self_attention = FlaxFalconAttention(
+            config=config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision
+        )
+
+    def __call__(self,
+                 hidden_states: jnp.DeviceArray,
+                 alibi: jnp.DeviceArray,
+                 attention_mask: jnp.DeviceArray,
+                 ):
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+
+        attn = self.self_attention(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            alibi=alibi
+        )
+        if not self.config.parallel_attn:
+            residual = attn + residual
+            hidden_states = self.post_attention_layernorm(residual)
+
+        mlp_out = self.mlp(hidden_states)
+        if self.config.parallel_attn:
+            mlp_out += attn
+        return mlp_out + residual
 
 
 class FlaxFalconCollection(nn.Module):
-    def setup(self) -> None:
-        ...
+    config: FalconConfig
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[Union[jax.lax.Precision, str]] = None
 
-    def __call__(self, *args, **kwargs):
-        ...
+    def setup(self) -> None:
+        self.blocks = [
+            FlaxFalconBlock(
+                config=self.config,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+                precision=self.precision,
+                name=str(i)
+            )
+            for i in range(
+                self.config.n_layer
+            )
+        ]
+
+    def __call__(self,
+                 hidden_states: jnp.DeviceArray,
+                 alibi: jnp.DeviceArray,
+                 attention_mask: jnp.DeviceArray,
+
+                 ):
+        for b in self.blocks:
+            hidden_states = b(
+
+                attention_mask=attention_mask,
+                hidden_states=hidden_states,
+                alibi=alibi
+            )
+        return hidden_states
 
 
 class FlaxFalconModule(nn.Module):
-    def setup(self) -> None:
-        ...
+    config: FalconConfig
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[Union[jax.lax.Precision, str]] = None
 
-    def __call__(self, *args, **kwargs):
-        ...
+    def setup(self) -> None:
+        self.wte = nn.Embed(
+            num_embeddings=self.config.vocab_size,
+            features=self.config.hidden_size,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype
+        )
+        self.h = FlaxFalconCollection(
+            config=self.config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision
+        )
+        self.ln_f = nn.LayerNorm(dtype=self.dtype, param_dtype=self.param_dtype, epsilon=self.config.layer_norm_epsilon)
+
+    def __call__(self,
+                 input_ids: jnp.int32 = None,
+                 attention_mask: Optional[jnp.DeviceArray] = None,
+                 use_cache: Optional[bool] = None,
+                 return_dict: Optional[bool] = None,
+                 ):
+        batch, seq_len = input_ids.shape
+        hidden_states = self.wte(
+            inputs=input_ids
+        )
+        if attention_mask is None:
+            attention_mask = jnp.ones(
+                (batch, seq_len)
+            )
+
+        alibi = build_alibi(seq_len, self.config
+                            .n_head, 8) if self.config.alibi else None
+        causal_mask = nn.make_causal_mask(
+            input_ids,
+        )
+        mv = jnp.finfo(hidden_states)
+        causal_mask = jnp.where(causal_mask == 1, 0, mv) + jnp.where(attention_mask == 1, 0, mv)
+        output = self.ln_f(self.h(
+            hidden_states=hidden_states,
+            attention_mask=causal_mask,
+            alibi=alibi
+        ))
+
+        if return_dict:
+            return FlaxBaseModelOutput(
+                last_hidden_state=output,
+            )
+        else:
+            return output,
 
 
 class FlaxFalconPretrainedModel(FlaxPreTrainedModel):
@@ -242,11 +422,35 @@ class FlaxFalconModel(FlaxFalconPretrainedModel):
 
 
 class FlaxFalconForCausalLMModule(nn.Module):
-    def setup(self) -> None:
-        ...
+    config: FalconConfig
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[Union[jax.lax.Precision, str]] = None
 
-    def __call__(self, *args, **kwargs):
-        ...
+    def setup(self) -> None:
+        self.transformer = FlaxFalconModule(
+            config=self.config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision
+        )
+        self.lm_head = nn.Dense(
+            self.config.vocab_size,
+            use_bias=False
+        )
+
+    def __call__(self, input_ids, attention_mask, return_dict: bool = False):
+        output = self.lm_head(self.transformer(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            return_dict=True
+        ).last_hidden_state)
+        if return_dict:
+            return FlaxCausalLMOutput(
+                logits=output
+            )
+        else:
+            return output,
 
 
 class FlaxFalconForCausalLM(FlaxFalconPretrainedModel):
