@@ -1,5 +1,6 @@
 import jax
 from jax import numpy as jnp
+import torch
 
 
 # CONVERTER Falcon-7B
@@ -30,3 +31,44 @@ def convert_pt_to_flax_7b(state_dict_pt, n_layers: int, device=jax.devices('cpu'
         state_dict_flax[('lm_head'), ('kernel')] = jnp.transpose(
             state_dict_pt[f'lm_head.weight'].cpu().detach().numpy(), (1, 0))
     return state_dict_flax
+
+
+def convert_flax_to_pt_7b(state_dict_flax, n_layers: int, device=torch.device('cpu'), dtype=jnp.float16):
+    # CONVERTER MPT-7B
+    state_dict_pt = {}
+    state_dict_pt['transformer.word_embeddings.weight'] = torch.from_numpy(state_dict_flax[
+                                                                               ('transformer', 'wte', 'embedding')]).to(
+        device, dtype)
+
+    for i in range(n_layers):
+        state_dict_pt[f'transformer.h.{i}.input_layernorm.weight'] = torch.from_numpy(state_dict_flax[
+                                                                                          ('transformer', 'h', f'{i}',
+                                                                                           'input_layernorm',
+                                                                                           'scale')]).to(
+            device)
+        state_dict_pt[f'transformer.h.{i}.input_layernorm.bias'] = torch.from_numpy(state_dict_flax[
+                                                                                        ('transformer', 'h', f'{i}',
+                                                                                         'input_layernorm',
+                                                                                         'bias')]).to(
+            device)
+        state_dict_pt[f'transformer.h.{i}.mlp.dense_4h_to_h.weight'] = torch.from_numpy(
+            jnp.transpose(state_dict_flax[('transformer', 'h', f'{i}', 'mlp', 'down', 'kernel')], (1, 0))).to(device)
+        state_dict_pt[f'transformer.h.{i}.mlp.dense_h_to_4h.weight'] = torch.from_numpy(
+            jnp.transpose(state_dict_flax[('transformer', 'h', f'{i}', 'mlp', 'up', 'kernel')], (1, 0))).to(device)
+        state_dict_pt[f'transformer.h.{i}.self_attention.query_key_value.weight'] = torch.from_numpy(
+            jnp.transpose(state_dict_flax[('transformer', 'h', f'{i}', 'self_attention', 'w_qkv', 'kernel')],
+                          (1, 0))).to(device)
+        state_dict_pt[f'transformer.h.{i}.self_attention.dense.weight'] = torch.from_numpy(
+            jnp.transpose(state_dict_flax[('transformer', 'h', f'{i}', 'self_attention', 'wo', 'kernel')], (1, 0))).to(
+            device)
+
+    state_dict_pt['transformer.ln_f.weight'] = torch.from_numpy(state_dict_flax[
+                                                                    ('transformer', 'ln_f', 'scale')]).to(device)
+    state_dict_pt['transformer.ln_f.bias'] = torch.from_numpy(state_dict_flax[
+                                                                  ('transformer', 'ln_f', 'bias')]).to(device)
+
+    state_dict_pt['lm_head.weight'] = torch.from_numpy(
+        jnp.transpose(state_dict_flax[('lm_head', 'kernel')], (1, 0))).to(
+        device)
+
+    return state_dict_pt
