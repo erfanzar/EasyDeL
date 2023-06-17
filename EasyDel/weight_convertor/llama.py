@@ -1,8 +1,7 @@
 from jax import numpy as jnp
 import jax
 import torch
-from fjutils import StreamingCheckpointer, float_tensor_to_dtype
-from flax.traverse_util import flatten_dict, unflatten_dict
+from EasyDel.weight_convertor.utils import load_and_convert_checkpoint
 
 
 def convert_pt_to_flax(state_dict_pt, n_layers: int, device=jax.devices('cpu')[0]):
@@ -35,28 +34,6 @@ def convert_pt_to_flax(state_dict_pt, n_layers: int, device=jax.devices('cpu')[0
             state_dict_pt[f'lm_head.weight'].cpu().detach().numpy(),
             (1, 0))
     return state_dict_flax
-
-
-def match_keywords(string, positives, negatives):
-    for positive in positives:
-        if positive not in string:
-            return False
-    for negative in negatives:
-        if negative in string:
-            return False
-    return True
-
-
-def load_and_convert_checkpoint(path):
-    _, flax_params = StreamingCheckpointer.load_trainstate_checkpoint(path)
-    flax_params = flatten_dict(flax_params['params'], sep='.')
-    torch_params = {}
-    for key, tensor in flax_params.items():
-        if match_keywords(key, ["kernel"], ["norm", 'ln_f']):
-            tensor = tensor.T
-        tensor = float_tensor_to_dtype(tensor, 'fp16')
-        torch_params[key] = torch.from_numpy(tensor)
-    return torch_params
 
 
 def convert_flax_to_pt(torch_params, n_layers, dim, num_attention_heads):
