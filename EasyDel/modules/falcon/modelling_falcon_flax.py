@@ -139,16 +139,24 @@ class FalconConfig(PretrainedConfig):
         return 'dp', 'fsdp', 'mp'
 
 
-def build_alibi(max_length, num_attention_heads, alibi_max: int = 8):
-    w_range = jnp.arange(1 - max_length, 1).reshape(1, 1, 1, max_length)
-    cp2 = 2 ** math.ceil(math.log2(num_attention_heads))
-    h_range = jnp.arange(1, 1 + num_attention_heads, ).reshape(1, -1, 1, 1)
-    h_range = jnp.matmul(h_range, jnp.asarray(alibi_max / cp2).reshape(1, 1))
-    slop = 1 / jnp.power(2, h_range)
+def built_bloom_alibi(attention_mask, num_attention_heads):
+    b, s = attention_mask.shape
+    cp2 = 2 ** math.floor(math.log2(num_attention_heads))
+    base = jnp.asarray(
+        2 ** (- (2 ** -(math.log2(cp2) - 3))), dtype=jnp.float32
+    )
+    powers = jnp.arange(1, 1 + cp2, dtype=jnp.float32)
+    slops = jnp.power(base, powers)
     if cp2 != num_attention_heads:
-        slop = jnp.concatenate([slop[1::2], slop[::2]], axis=-1)[:num_attention_heads]
-    alibi = (w_range * slop).reshape(1, num_attention_heads, 1, max_length)
-    return alibi
+        extra_base = jnp.asarray(
+            2 ** (-(2 ** (math.log2(2 * cp2) - 3))), dtype=jnp.float32
+        )
+        num_rem_heads = min(cp2, num_attention_heads - cp2)
+        extra_power = jnp.arange(1, 1 + 2 * num_rem_heads, 2, dtype=jnp.dtype)
+        slops = jnp.concatenate([slops, jnp.power(extra_base, extra_power)], axis=0)
+    arange_tensor = (((jnp.cumsum(attention_mask, axis=-1)) - 1) * attention_mask)[:, jnp.newaxis, :]
+    alibi = slops[..., jnp.newaxis].astype(jnp.bfloat16) * arange_tensor
+    return alibi.reshape(b, num_attention_heads, 1, s)
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0,
@@ -217,6 +225,7 @@ class FlaxFalconAttention(nn.Module):
                  attention_mask: jnp.DeviceArray = None,
                  ):
         b, s, d = hidden_states.shape
+
         qkv = self.w_qkv(hidden_states)
         if not self.config.multi_query:
             q, k, v = jnp.split(qkv, 3, -1)
@@ -243,7 +252,7 @@ class FlaxFalconAttention(nn.Module):
         attn = with_sharding_constraint(attn, PartitionSpec(("dp", "fsdp"), "mp", None, None))
 
         if alibi is not None:
-            attn += attn
+            attn += alibi
         attn = attn * self.factor_scale
 
         if attention_mask is not None:
@@ -356,7 +365,6 @@ class FlaxFalconCollection(nn.Module):
                  ):
         for b in self.blocks:
             hidden_states = b(
-
                 attention_mask=attention_mask,
                 hidden_states=hidden_states,
                 alibi=alibi
@@ -400,8 +408,8 @@ class FlaxFalconModule(nn.Module):
                 (batch, seq_len)
             )
 
-        alibi = build_alibi(seq_len, self.config
-                            .n_head, 8) if self.config.alibi else None
+        alibi = built_bloom_alibi(attention_mask, self.config
+                                  .n_head).astype(hidden_states.dtype) if self.config.alibi else None
         causal_mask = nn.make_causal_mask(
             input_ids,
         )
