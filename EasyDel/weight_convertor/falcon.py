@@ -26,6 +26,9 @@ def convert_pt_to_flax_7b(state_dict_pt, n_layers: int, device=jax.devices('cpu'
             state_dict_flax[('transformer', 'h', f'{i}', 'self_attention', 'wo', 'kernel')] = jnp.transpose(
                 state_dict_pt[f'transformer.h.{i}.self_attention.dense.weight'].cpu().detach().numpy(), (1, 0))
 
+            state_dict_flax[('transformer', 'h', f'{i}', 'post_attention_layernorm', 'scale')] = state_dict_pt[
+                f'transformer.h.{i}.post_attention_layernorm.weight'].cpu().detach().numpy()
+
             if bias:
                 state_dict_flax[
                     ('transformer', 'h', f'{i}', 'self_attention', 'w_qkv', 'bias')] = state_dict_pt[
@@ -36,6 +39,8 @@ def convert_pt_to_flax_7b(state_dict_pt, n_layers: int, device=jax.devices('cpu'
                     f'transformer.h.{i}.mlp.dense_4h_to_h.bias'].cpu().detach().numpy()
                 state_dict_flax[('transformer', 'h', f'{i}', 'mlp', 'up', 'bias')] = state_dict_pt[
                     f'transformer.h.{i}.mlp.dense_h_to_4h.bias'].cpu().detach().numpy()
+                state_dict_flax[('transformer', 'h', f'{i}', 'post_attention_layernorm', 'bias')] = state_dict_pt[
+                    f'transformer.h.{i}.post_attention_layernorm.bias'].cpu().detach().numpy()
 
         state_dict_flax[('transformer', 'ln_f', 'scale')] = state_dict_pt[
             f'transformer.ln_f.weight'].cpu().detach().numpy()
