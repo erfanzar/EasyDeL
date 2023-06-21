@@ -1,3 +1,4 @@
+import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from flax.linen import remat

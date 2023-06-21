@@ -69,6 +69,7 @@ class GPTNeoXConfig(PretrainedConfig):
             bos_token_id=0,
             eos_token_id=2,
             tie_word_embeddings=False,
+            gradient_checkpointing='everything_saveable',
             use_parallel_residual=True,
             **kwargs,
     ):
@@ -87,6 +88,7 @@ class GPTNeoXConfig(PretrainedConfig):
         self.layer_norm_eps = layer_norm_eps
         self.use_cache = use_cache
         self.tie_word_embeddings = tie_word_embeddings
+        self.gradient_checkpointing = gradient_checkpointing
         self.use_parallel_residual = use_parallel_residual
 
     @staticmethod
@@ -162,13 +164,52 @@ class FlaxGPTNeoXAttention(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
-        ...
+        self.head_size = self.config.hidden_size // self.config.num_attention_heads
+        self.freq_cis = precompute_freqs_cis(
+            dtype=self.dtype,
+            dim=self.head_size,
+            end=self.config.max_position_embeddings
+        )
+        self.w_qkv = nn.Dense(
+            3 * self.config.hidden_size
+        )
+        self.w_o = nn.Dense(
+            self.config.hidden_size
+        )
+
+        self.factor = jnp.sqrt(jnp.asarray(self.head_size, dtype=jnp.float32))
+        self.bias = nn.make_causal_mask(jnp.ones((1, self.config.max_position_embeddings)))
 
     def __call__(self,
                  hidden_states: jnp.DeviceArray,
                  attention_mask: jnp.DeviceArray = None,
                  ):
-        ...
+        b, s, d = hidden_states.shape
+        q, k, v = jnp.split(self.w_qkv(hidden_states), indices_or_sections=3, axis=-1)
+        freq = self.freq_cis[:s].reshape(1, s, -1)
+        q = with_sharding_constraint(q, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
+        k = with_sharding_constraint(k, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
+        v = with_sharding_constraint(v, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
+
+        q = rearrange(q, 'b s (h d) -> b s h d', h=self.config.num_attention_heads)
+        k = rearrange(k, 'b s (h d) -> b s h d', h=self.config.num_attention_heads)
+        v = rearrange(v, 'b s (h d) -> b s h d', h=self.config.num_attention_heads)
+        bias = jnp.where(self.bias == 1, 0, jnp.finfo(
+            hidden_states.dtype
+        ).min
+                         )
+        q, k = apply_rotary_emb(q, k, freqs_cis=freq, dtype=self.dtype)
+
+        attn = jnp.einsum(
+            '...qhd,...khd->...hqk', q, k, precision=self.precision
+        ) * self.factor
+        attn = attn + bias[:, :, :s, :s]
+        if attention_mask is not None:
+            attn += attention_mask
+        attn = jax.nn.softmax(attn, axis=-1)
+        attn = with_sharding_constraint(attn, PartitionSpec(('dp', 'fsdp'), 'mp', None, None))
+        attn = jnp.einsum('...hqk,..khd->qhd', attn, v, precision=self.precision)
+        attn = self.w_o(attn.reshape(b, s, d))
 
 
 class FlaxGPTNeoXMlp(nn.Module):
@@ -232,7 +273,6 @@ class FlaxGPTNeoXModule(nn.Module):
                  return_dict: Optional[bool] = None,
                  ):
         ...
-
 
 
 class FlaxGPTNeoXPretrainedModel(FlaxPreTrainedModel):
