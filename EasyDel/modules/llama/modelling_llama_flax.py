@@ -1,10 +1,7 @@
-import os
-from shutil import copyfile
 from typing import Any, Dict, List, Optional, Tuple, Union
-import json
-import tempfile
+
 from flax.linen import remat
-import numpy as np
+
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -19,9 +16,7 @@ from flax.linen import combine_masks, make_causal_mask
 
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_flax_utils import FlaxPreTrainedModel
-from transformers.utils import add_start_docstrings_to_model_forward
-from ml_collections import ConfigDict
-from mlxu import function_args_to_config
+
 from jax.interpreters import pxla
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 
@@ -111,17 +106,8 @@ class LlamaConfig(PretrainedConfig):
             **kwargs,
         )
 
-    @classmethod
-    def get_default_config(cls, updates=None):
-        config = function_args_to_config(cls.__init__)
-
-        if updates is not None:
-            config.update(ConfigDict(updates).copy_and_resolve_references())
-
-        return config
-
     @staticmethod
-    def get_partition_rules():
+    def get_partition_rules(fully_fsd: bool = True):
         return (
 
             ("transformer/wte/embedding", PS("mp", "fsdp")),
@@ -138,6 +124,23 @@ class LlamaConfig(PretrainedConfig):
 
             ("transformer/ln_f/kernel", PS(None)),
             ("lm_head/kernel", PS("fsdp", "mp")),
+            ('.*', PS(None)),
+        ) if not fully_fsd else (
+
+            ("transformer/wte/embedding", PS("fsdp")),
+
+            ("attention/(wq|wk|wv)/kernel", PS("fsdp")),
+            ("attention/wo/kernel", PS("fsdp")),
+
+            ("feed_forward/w1/kernel", PS("fsdp")),
+            ("feed_forward/w2/kernel", PS("fsdp")),
+            ("feed_forward/w3/kernel", PS("fsdp")),
+
+            ("attention_norm/kernel", PS(None)),
+            ("ffn_norm/kernel", PS(None)),
+
+            ("transformer/ln_f/kernel", PS(None)),
+            ("lm_head/kernel", PS("fsdp")),
             ('.*', PS(None)),
         )
 

@@ -82,4 +82,3 @@ def with_sharding_constraint(x, partition_specs):
     return x
 
 
-gradient_checkpointing = 'nothing_saveable'
