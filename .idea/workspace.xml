@@ -5,9 +5,11 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="08ad205b-709f-455b-86db-91293f595cd3" name="Changes" comment="">
-      <change afterPath="$PROJECT_DIR$/EasyDel/modules/gpt_neo_x/__init__.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/EasyDel/modules/gpt_neo_x/modelling_gpt_neo_x_flax.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/shelf/Uncommitted_changes_before_Update_at_13_06_23_17_11_[Changes]/shelved.patch" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/shelf/Uncommitted_changes_before_Update_at_13_06_23_17_11__Changes_.xml" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/modules/llama/modelling_llama_flax.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/modules/llama/modelling_llama_flax.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/utils/utils.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/utils/utils.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -131,7 +133,9 @@
       <workItem from="1687007148560" duration="562000" />
       <workItem from="1687008822546" duration="613000" />
       <workItem from="1687077735111" duration="7722000" />
-      <workItem from="1687249325553" duration="733000" />
+      <workItem from="1687249325553" duration="830000" />
+      <workItem from="1687251127194" duration="727000" />
+      <workItem from="1687331983157" duration="686000" />
     </task>
     <servers />
   </component>

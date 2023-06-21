@@ -3,7 +3,7 @@ from shutil import copyfile
 from typing import Any, Dict, List, Optional, Tuple, Union
 import json
 import tempfile
-
+from flax.linen import remat
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -18,12 +18,11 @@ from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks, make_causal_mask
 
 from transformers.configuration_utils import PretrainedConfig
-from transformers.modeling_flax_utils import ACT2FN, FlaxPreTrainedModel
-from transformers.utils import add_start_docstrings, add_start_docstrings_to_model_forward, logging
+from transformers.modeling_flax_utils import FlaxPreTrainedModel
+from transformers.utils import add_start_docstrings_to_model_forward
 from ml_collections import ConfigDict
-from mlxu import function_args_to_config, load_pickle, open_file
+from mlxu import function_args_to_config
 from jax.interpreters import pxla
-from transformers.tokenization_utils import PreTrainedTokenizer
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 
 from jax.experimental.pjit import with_sharding_constraint as wsc
@@ -53,6 +52,15 @@ def with_sharding_constraint(x, partition_specs):
     if names_in_mesh(*axis_names):
         x = wsc(x, partition_specs)
     return x
+
+
+def get_gradient_checkpoint_policy(name):
+    return {
+        'everything_saveable': jax.checkpoint_policies.everything_saveable,
+        'nothing_saveable': jax.checkpoint_policies.nothing_saveable,
+        'checkpoint_dots': jax.checkpoint_policies.checkpoint_dots,
+        'checkpoint_dots_with_no_batch_dims': jax.checkpoint_policies.checkpoint_dots_with_no_batch_dims,
+    }[name]
 
 
 class LlamaConfig(PretrainedConfig):
@@ -555,7 +563,6 @@ class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
         )
         return init_variables["cache"]
 
-    @add_start_docstrings_to_model_forward("")
     def __call__(
             self,
             input_ids,
@@ -632,6 +639,12 @@ class FlaxLlamaBlockCollection(nn.Module):
 
     def setup(self):
         block = FlaxLlamaBlock
+
+        if self.config.gradient_checkpointing != '':
+            block = remat(
+                block, static_argnums=(3, 4, 5),
+                policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing)
+            )
 
         self.blocks = [
             block(self.config, name=str(i), dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision)
