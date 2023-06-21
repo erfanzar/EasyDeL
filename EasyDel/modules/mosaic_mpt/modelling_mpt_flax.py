@@ -13,6 +13,7 @@ from jax.experimental.pjit import pjit, PartitionSpec, with_sharding_constraint 
 from transformers.modeling_flax_outputs import FlaxCausalLMOutput, FlaxBaseModelOutput
 from jax.random import split, PRNGKey
 from functools import partial
+import flax
 from einops import rearrange
 
 ACT2FN = {
@@ -62,7 +63,7 @@ class MptConfig(PretrainedConfig):
                  logit_scale: Optional[Union[float, str]] = None, no_bias: bool = False, verbose: int = 0,
                  embedding_fraction: float = 1.0, use_cache: bool = False, qk_ln: bool = True,
                  use_lm_head: bool = False,
-                 use_norm_bias: bool = False,
+                 use_norm_bias: bool = False, gradient_checkpointing: str = 'nothing_saveable',
                  **kwargs):
 
         self.d_model = d_model
@@ -76,6 +77,7 @@ class MptConfig(PretrainedConfig):
         self.resid_prob_drop = resid_prob_drop
         self.use_bias = use_bias
         self.emb_prob_drop = emb_prob_drop
+        self.gradient_checkpointing = gradient_checkpointing
         self.learned_pos_emb = learned_pos_emb
         self.act_fn = act_fn
         self.logit_scale = logit_scale
@@ -262,6 +264,15 @@ class FlaxMptBlock(nn.Module):
         return x
 
 
+def get_gradient_checkpoint_policy(name):
+    return {
+        'everything_saveable': jax.checkpoint_policies.everything_saveable,
+        'nothing_saveable': jax.checkpoint_policies.nothing_saveable,
+        'checkpoint_dots': jax.checkpoint_policies.checkpoint_dots,
+        'checkpoint_dots_with_no_batch_dims': jax.checkpoint_policies.checkpoint_dots_with_no_batch_dims,
+    }[name]
+
+
 class FlaxMptCollection(nn.Module):
     config: MptConfig
     dtype: jnp.dtype = jnp.float32
@@ -269,8 +280,16 @@ class FlaxMptCollection(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
+        block = FlaxMptBlock
+
+        if self.config.gradient_checkpointing != '':
+            block = flax.linen.remat(
+                block, static_argnums=(),
+                policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing)
+            )
+
         self.blocks = [
-            FlaxMptBlock(
+            block(
                 config=self.config,
                 dtype=self.dtype,
                 param_dtype=self.param_dtype,
