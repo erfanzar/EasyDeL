@@ -82,6 +82,7 @@ class LlamaConfig(PretrainedConfig):
             gradient_checkpointing='nothing_saveable',
             fcm_min_ratio=0.0,
             fcm_max_ratio=0.0,
+            use_pjit_attention_force: bool = True,
             **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -97,6 +98,7 @@ class LlamaConfig(PretrainedConfig):
         self.embd_pdrop = embd_pdrop
         self.attn_pdrop = attn_pdrop
         self.gradient_checkpointing = gradient_checkpointing
+        self.use_pjit_attention_force = use_pjit_attention_force
         self.fcm_min_ratio = fcm_min_ratio
         self.fcm_max_ratio = fcm_max_ratio
         super().__init__(
@@ -337,10 +339,10 @@ class FlaxLlamaAttention(nn.Module):
             fcm_mask=None,
     ):
         xq, xk, xv = self.wq(hidden_states), self.wk(hidden_states), self.wv(hidden_states)
-
-        xq = with_sharding_constraint(xq, PS(("dp", "fsdp"), None, "mp"))
-        xk = with_sharding_constraint(xk, PS(("dp", "fsdp"), None, "mp"))
-        xv = with_sharding_constraint(xv, PS(("dp", "fsdp"), None, "mp"))
+        if self.config.use_pjit_attention_force:
+            xq = with_sharding_constraint(xq, PS(("dp", "fsdp"), None, "mp"))
+            xk = with_sharding_constraint(xk, PS(("dp", "fsdp"), None, "mp"))
+            xv = with_sharding_constraint(xv, PS(("dp", "fsdp"), None, "mp"))
 
         xq = self._split_heads(xq)
         xk = self._split_heads(xk)
@@ -390,7 +392,8 @@ class FlaxLlamaAttention(nn.Module):
             dtype=jnp.promote_types(self.dtype, jnp.bfloat16),
             precision=self.precision,
         )
-        attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "mp", None, None))
+        if self.config.use_pjit_attention_force:
+            attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "mp", None, None))
 
         attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, xv, precision=self.precision)
         attn_output = self._merge_heads(attn_output)

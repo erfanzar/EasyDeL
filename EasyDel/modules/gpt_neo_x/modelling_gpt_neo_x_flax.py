@@ -210,6 +210,10 @@ class FlaxGPTNeoXAttention(nn.Module):
         attn = with_sharding_constraint(attn, PartitionSpec(('dp', 'fsdp'), 'mp', None, None))
         attn = jnp.einsum('...hqk,..khd->qhd', attn, v, precision=self.precision)
         attn = self.w_o(attn.reshape(b, s, d))
+        return attn
+
+
+from transformers import GPTNeoXForCausalLM
 
 
 class FlaxGPTNeoXMlp(nn.Module):
@@ -219,10 +223,12 @@ class FlaxGPTNeoXMlp(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
-        ...
+        self.dense_h_to_4h = nn.Dense(self.config.intermediate_size)
+        self.dense_4h_to_h = nn.Dense(self.config.hidden_size)
+        self.act = ACT2FN[self.config.hidden_act]
 
     def __call__(self, x):
-        ...
+        return self.dense_4h_to_h(self.act(self.dense_h_to_4h(x)))
 
 
 class FlaxGPTNeoXBlock(nn.Module):
