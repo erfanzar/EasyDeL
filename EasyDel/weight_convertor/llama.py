@@ -1,42 +1,56 @@
 from jax import numpy as jnp
 import jax
 import torch
-from EasyDel.weight_convertor.utils import load_and_convert_checkpoint
 
 
 def convert_pt_to_flax(state_dict_pt, n_layers: int, device=jax.devices('cpu')[0]):
     with jax.default_device(device):
         state_dict_flax = {}
-        state_dict_flax[('model'), ('wte'), ('embedding')] = state_dict_pt[
+        state_dict_flax[('model', 'wte', 'embedding')] = state_dict_pt[
             'model.embed_tokens.weight'].cpu().detach().numpy()
         for i in range(n_layers):
-            state_dict_flax[('model'), ('h'), (f'{i}'), ('attention_norm'), ('kernel')] = state_dict_pt[
+            state_dict_flax[('model', 'h', f'{i}', 'attention_norm', 'kernel')] = state_dict_pt[
                 f'model.layers.{i}.input_layernorm.weight'].cpu().detach().numpy()
-            state_dict_flax[('model'), ('h'), (f'{i}'), ('ffn_norm'), ('kernel')] = state_dict_pt[
+            state_dict_flax[('model', 'h', f'{i}', 'ffn_norm', 'kernel')] = state_dict_pt[
                 f'model.layers.{i}.post_attention_layernorm.weight'].cpu().detach().numpy()
-            state_dict_flax[('model'), ('h'), (f'{i}'), ('feed_forward'), ('down_proj'), ('kernel')] = jnp.transpose(
+            state_dict_flax[('model', 'h', f'{i}', 'feed_forward', 'down_proj', 'kernel')] = jnp.transpose(
                 state_dict_pt[f'model.layers.{i}.mlp.down_proj.weight'].cpu().detach().numpy(), (1, 0))
-            state_dict_flax[('model'), ('h'), (f'{i}'), ('feed_forward'), ('gate_proj'), ('kernel')] = jnp.transpose(
+            state_dict_flax[('model', 'h', f'{i}', 'feed_forward', 'gate_proj', 'kernel')] = jnp.transpose(
                 state_dict_pt[f'model.layers.{i}.mlp.gate_proj.weight'].cpu().detach().numpy(), (1, 0))
-            state_dict_flax[('model'), ('h'), (f'{i}'), ('feed_forward'), ('up_proj'), ('kernel')] = jnp.transpose(
+            state_dict_flax[('model', 'h', f'{i}', 'feed_forward', 'up_proj', 'kernel')] = jnp.transpose(
                 state_dict_pt[f'model.layers.{i}.mlp.up_proj.weight'].cpu().detach().numpy(), (1, 0))
-            state_dict_flax[('model'), ('h'), (f'{i}'), ('attention'), ('k_proj'), ('kernel')] = jnp.transpose(
+            state_dict_flax[('model', 'h', f'{i}', 'attention', 'k_proj', 'kernel')] = jnp.transpose(
                 state_dict_pt[f'model.layers.{i}.self_attn.k_proj.weight'].cpu().detach().numpy(), (1, 0))
-            state_dict_flax[('model'), ('h'), (f'{i}'), ('attention'), ('v_proj'), ('kernel')] = jnp.transpose(
+            state_dict_flax[('model', 'h', f'{i}', 'attention', 'v_proj', 'kernel')] = jnp.transpose(
                 state_dict_pt[f'model.layers.{i}.self_attn.v_proj.weight'].cpu().detach().numpy(), (1, 0))
-            state_dict_flax[('model'), ('h'), (f'{i}'), ('attention'), ('q_proj'), ('kernel')] = jnp.transpose(
+            state_dict_flax[('model', 'h', f'{i}', 'attention', 'q_proj', 'kernel')] = jnp.transpose(
                 state_dict_pt[f'model.layers.{i}.self_attn.q_proj.weight'].cpu().detach().numpy(), (1, 0))
-            state_dict_flax[('model'), ('h'), (f'{i}'), ('attention'), ('o_proj'), ('kernel')] = jnp.transpose(
+            state_dict_flax[('model', 'h', f'{i}', 'attention', 'o_proj', 'kernel')] = jnp.transpose(
                 state_dict_pt[f'model.layers.{i}.self_attn.o_proj.weight'].cpu().detach().numpy(), (1, 0))
 
-        state_dict_flax[('model'), ('ln_f'), ('kernel')] = state_dict_pt[f'model.norm.weight'].cpu().detach().numpy()
-        state_dict_flax[('lm_head'), ('kernel')] = jnp.transpose(
+        state_dict_flax[('model', 'ln_f', 'kernel')] = state_dict_pt[f'model.norm.weight'].cpu().detach().numpy()
+        state_dict_flax[('lm_head', 'kernel')] = jnp.transpose(
             state_dict_pt[f'lm_head.weight'].cpu().detach().numpy(),
             (1, 0))
     return state_dict_flax
 
 
-def convert_flax_to_pt(torch_params, n_layers, dim, num_attention_heads):
+def convert_flax_to_pt(flax_params, n_layers, dim, num_attention_heads, dtype=jnp.float16):
+    def match_keywords(string, ts, ns):
+        for t in ts:
+            if t not in string:
+                return False
+        for n in ns:
+            if n in string:
+                return False
+        return True
+
+    torch_params = {}
+    for key, tensor in flax_params.items():
+        if match_keywords(key, ['kernel'], ['none']):
+            tensor = tensor.T
+        torch_params[key] = torch.from_numpy(tensor.astype(dtype=dtype))
+
     def permute(w):
         return w.view(num_attention_heads, dim // num_attention_heads // 2, 2, dim).transpose(1, 2).reshape(dim, dim)
 
