@@ -19,7 +19,7 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_flax_utils import FlaxPreTrainedModel
 
 from jax.interpreters import pxla
-from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
+from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput, FlaxSequenceClassifierOutput
 
 from jax.experimental.pjit import with_sharding_constraint as wsc
 
@@ -869,3 +869,66 @@ class FlaxLlamaForCausalLM(FlaxLlamaPreTrainedModel):
         model_kwargs["past_key_values"] = model_outputs.past_key_values
         model_kwargs["position_ids"] = model_kwargs["position_ids"][:, -1:] + 1
         return model_kwargs
+
+
+class FlaxLlamaForSequenceClassificationModule(nn.Module):
+    config: LlamaConfig
+    dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.bfloat16
+    precision: Optional[Union[jax.lax.Precision, str]] = None
+    num_classes: int
+
+    def setup(self):
+        self.transformer = FlaxLlamaModule(self.config, dtype=self.dtype)
+        self.classifier = nn.Dense(
+            self.num_classes,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+            precision=self.precision,
+        )
+
+    def __call__(
+            self,
+            input_ids,
+            attention_mask=None,
+            position_ids=None,
+            deterministic: bool = True,
+            init_cache: bool = False,
+            output_attentions: bool = False,
+            output_hidden_states: bool = False,
+            return_dict: bool = True,
+    ):
+        batch_size, seq_length = input_ids.shape
+        if attention_mask is None:
+            attention_mask = jnp.ones_like(input_ids)
+        if position_ids is None:
+            position_ids = jnp.broadcast_to(
+                jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
+                (batch_size, seq_length)
+            )
+        outputs = self.transformer(
+            input_ids,
+            attention_mask,
+            position_ids,
+            deterministic=deterministic,
+            init_cache=init_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        hidden_states = outputs[0]
+        prediction = self.classifier(hidden_states)
+        if return_dict:
+            return FlaxSequenceClassifierOutput(
+                logits=prediction,
+                hidden_states=hidden_states
+            )
+        else:
+            return prediction,
+
+
+class FlaxLlamaForSequenceClassification(FlaxLlamaPreTrainedModel):
+    module_class = FlaxLlamaForSequenceClassificationModule

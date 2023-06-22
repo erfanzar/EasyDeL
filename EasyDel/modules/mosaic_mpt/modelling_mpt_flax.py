@@ -64,6 +64,7 @@ class MptConfig(PretrainedConfig):
                  embedding_fraction: float = 1.0, use_cache: bool = False, qk_ln: bool = True,
                  use_lm_head: bool = False,
                  use_norm_bias: bool = False, gradient_checkpointing: str = 'nothing_saveable',
+                 use_pjit_attention_force: bool = False,
                  **kwargs):
 
         self.d_model = d_model
@@ -77,6 +78,7 @@ class MptConfig(PretrainedConfig):
         self.resid_prob_drop = resid_prob_drop
         self.use_bias = use_bias
         self.emb_prob_drop = emb_prob_drop
+        self.use_pjit_attention_force=use_pjit_attention_force
         self.gradient_checkpointing = gradient_checkpointing
         self.learned_pos_emb = learned_pos_emb
         self.act_fn = act_fn
@@ -221,16 +223,18 @@ class FlaxMptAttention(nn.Module):
         if self.config.qk_ln:
             q = self.q_ln(q)
             k = self.k_ln(k)
-        q = with_sharding_constraint(q, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
-        k = with_sharding_constraint(k, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
-        v = with_sharding_constraint(v, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
+        if self.config.use_pjit_attention_force:
+            q = with_sharding_constraint(q, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
+            k = with_sharding_constraint(k, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
+            v = with_sharding_constraint(v, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
         q = rearrange(q, 'b s (h d) -> b s h d', h=self.config.n_heads)
         k = rearrange(k, 'b s (h d) -> b s h d', h=self.config.n_heads)
         v = rearrange(v, 'b s (h d) -> b s h d', h=self.config.n_heads)
         d = q.shape[-1]
         atw = jnp.einsum('...qhd,...khd->...hqk', q, k, precision=self.precision) * jax.lax.rsqrt(
             jnp.asarray(d).astype(v.dtype))
-        atw = with_sharding_constraint(atw, PartitionSpec(('dp', 'fsdp'), 'mp', None, None))
+        if self.config.use_pjit_attention_force:
+            atw = with_sharding_constraint(atw, PartitionSpec(('dp', 'fsdp'), 'mp', None, None))
         if attn_bias is not None:
             atw += attn_bias
         mv = jnp.finfo(atw).min
