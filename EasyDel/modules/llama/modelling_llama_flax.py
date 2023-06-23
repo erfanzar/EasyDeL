@@ -872,11 +872,11 @@ class FlaxLlamaForCausalLM(FlaxLlamaPreTrainedModel):
 
 
 class FlaxLlamaForSequenceClassificationModule(nn.Module):
+    num_classes: int
     config: LlamaConfig
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[jax.lax.Precision, str]] = None
-    num_classes: int
 
     def setup(self):
         self.transformer = FlaxLlamaModule(self.config, dtype=self.dtype)
