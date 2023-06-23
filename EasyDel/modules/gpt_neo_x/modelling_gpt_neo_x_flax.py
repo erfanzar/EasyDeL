@@ -95,28 +95,32 @@ class GPTNeoXConfig(PretrainedConfig):
     def get_partition_rules(fully_fsdp: bool = False):
         return (
             ('wte/embedding', PartitionSpec('fsdp', 'mp')),
-            ('self_attention/w_qkv/(kernel|bias)', PartitionSpec('fsdp', 'mp')),
-            ('self_attention/wo/(kernel|bias)', PartitionSpec('fsdp', 'mp')),
-            ('mlp/down/(kernel|bias)', PartitionSpec('fsdp', 'mp')),
-            ('mlp/up/(kernel|bias)', PartitionSpec('mp', 'fsdp')),
-            ('lm_head/kernel', PartitionSpec('fsdp', 'mp')),
-            ('transformer/ln_f/bias', PartitionSpec('fsdp', 'mp')),
-            ('transformer/ln_f/scale', PartitionSpec('fsdp', 'mp')),
-            ('transformer/post_attention_layernorm/scale', PartitionSpec('mp', 'fsdp')),
-            ('transformer/post_attention_layernorm/bias', PartitionSpec('mp', 'fsdp')),
-            ('.*', PartitionSpec('fsdp', 'mp'))
+            ('attention/w_qkv/(kernel|bias)', PartitionSpec('fsdp', 'mp')),
+            ('attention/wo/(kernel|bias)', PartitionSpec('fsdp', 'mp')),
+            ('mlp/dense_h_to_4h/(kernel|bias)', PartitionSpec('fsdp', 'mp')),
+            ('mlp/dense_4h_to_h/(kernel|bias)', PartitionSpec('mp', 'fsdp')),
+
+            ('post_attention_layernorm/(bias|scale)', PartitionSpec('fsdp', 'mp')),
+            ('input_layernorm/(bias|scale)', PartitionSpec('fsdp', 'mp')),
+
+            ('transformer/final_layer_norm/(scale|bias)', PartitionSpec('mp', 'fsdp')),
+            ('lm_head/kernel', PartitionSpec('mp', 'fsdp')),
+            ('.*', PartitionSpec(None))
         ) if not fully_fsdp else (
-            ('wte/embedding', PartitionSpec('fsdp')),
-            ('self_attention/w_qkv/(kernel|bias)', PartitionSpec('fsdp')),
-            ('self_attention/wo/(kernel|bias)', PartitionSpec('fsdp')),
-            ('mlp/down/(kernel|bias)', PartitionSpec('fsdp')),
-            ('mlp/up/(kernel|bias)', PartitionSpec('fsdp')),
+
+            ('embed_in/embedding', PartitionSpec('fsdp')),
+
+            ('attention/w_qkv/(kernel|bias)', PartitionSpec('fsdp')),
+            ('attention/wo/(kernel|bias)', PartitionSpec('fsdp')),
+            ('mlp/dense_h_to_4h/(kernel|bias)', PartitionSpec('fsdp')),
+            ('mlp/dense_4h_to_h/(kernel|bias)', PartitionSpec('fsdp')),
+
+            ('post_attention_layernorm/(bias|scale)', PartitionSpec('fsdp')),
+            ('input_layernorm/(bias|scale)', PartitionSpec('fsdp')),
+
+            ('transformer/final_layer_norm/(scale|bias)', PartitionSpec('fsdp')),
             ('lm_head/kernel', PartitionSpec('fsdp')),
-            ('transformer/ln_f/bias', PartitionSpec('fsdp')),
-            ('transformer/ln_f/scale', PartitionSpec('fsdp')),
-            ('transformer/post_attention_layernorm/scale', PartitionSpec('fsdp')),
-            ('transformer/post_attention_layernorm/bias', PartitionSpec('fsdp')),
-            ('.*', PartitionSpec('fsdp'))
+            ('.*', PartitionSpec(None))
         )
 
     @staticmethod
@@ -213,9 +217,6 @@ class FlaxGPTNeoXAttention(nn.Module):
         return attn
 
 
-from transformers import GPTNeoXForCausalLM
-
-
 class FlaxGPTNeoXMlp(nn.Module):
     config: GPTNeoXConfig
     dtype: jnp.dtype = jnp.float32
@@ -238,13 +239,57 @@ class FlaxGPTNeoXBlock(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
-        ...
+        self.use_parallel_residual = self.config.use_parallel_residual
+        self.input_layernorm = nn.LayerNorm(
+            epsilon=self.config.layer_norm_eps,
+            dtype=self.dtype
+        )
+        self.post_attention_layernorm = nn.LayerNorm(
+            epsilon=self.config.layer_norm_eps,
+            dtype=self.dtype
+        )
+        self.attention = FlaxGPTNeoXAttention(
+            config=self.config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision
+        )
+        self.mlp = FlaxGPTNeoXMlp(
+            config=self.config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision
+        )
 
     def __call__(self,
                  hidden_states: jnp.DeviceArray,
                  attention_mask: jnp.DeviceArray,
                  ):
-        ...
+        attn = self.attention(
+            self.input_layernorm(hidden_states),
+            attention_mask=attention_mask
+        )
+
+        if self.use_parallel_residual:
+            mlp = self.mlp(
+                self.post_attention_layernorm(
+                    hidden_states
+                )
+            )
+            hidden_states = mlp + hidden_states + attn
+        else:
+            hidden_states = attn + hidden_states
+            hidden_states = self.mlp(self.post_attention_layernorm(hidden_states)) + hidden_states
+        return hidden_states
+
+
+def get_gradient_checkpoint_policy(name):
+    return {
+        'everything_saveable': jax.checkpoint_policies.everything_saveable,
+        'nothing_saveable': jax.checkpoint_policies.nothing_saveable,
+        'checkpoint_dots': jax.checkpoint_policies.checkpoint_dots,
+        'checkpoint_dots_with_no_batch_dims': jax.checkpoint_policies.checkpoint_dots_with_no_batch_dims,
+    }[name]
 
 
 class FlaxGPTNeoXCollection(nn.Module):
@@ -254,14 +299,39 @@ class FlaxGPTNeoXCollection(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
-        ...
+        block = FlaxGPTNeoXBlock
+        if self.config.gradient_checkpointing != '':
+            block = nn.remat(
+                block, static_argnums=None,
+                policy=get_gradient_checkpoint_policy(
+                    self.config.gradient_checkpointing
+                ),
+
+            )
+        self.blocks = [
+            block(
+                config=self.config,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+                precision=self.precision,
+                name=str(i)
+            )
+            for i in range(
+                self.config.num_hidden_layers
+            )
+        ]
 
     def __call__(self,
                  hidden_states: jnp.DeviceArray,
                  attention_mask: jnp.DeviceArray,
 
                  ):
-        ...
+        for block in self.blocks:
+            hidden_states = block(
+                hidden_states,
+                attention_mask=attention_mask
+            )
+        return hidden_states
 
 
 class FlaxGPTNeoXModule(nn.Module):
@@ -271,14 +341,37 @@ class FlaxGPTNeoXModule(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
-        ...
+        self.embed_in = nn.Embed(self.config.vocab_size, self.config.hidden_size)
+        self.layers = FlaxGPTNeoXCollection(
+            config=self.config,
+            param_dtype=self.param_dtype,
+            dtype=self.dtype,
+            precision=self.precision
+        )
+        self.final_layer_norm = nn.LayerNorm(
+            epsilon=self.config.layer_norm_eps,
+            dtype=self.dtype
+        )
 
     def __call__(self,
                  input_ids: jnp.int32 = None,
                  attention_mask: Optional[jnp.DeviceArray] = None,
                  return_dict: Optional[bool] = None,
                  ):
-        ...
+        b, s = input_ids.shape
+        hidden_state = self.embed_in(
+            inputs=input_ids
+        )
+        hidden_state = self.final_layer_norm(self.layers(
+            hidden_state=hidden_state,
+            attention_mask=attention_mask
+        ))
+        if return_dict:
+            return FlaxBaseModelOutput(
+                last_hidden_state=hidden_state
+            )
+        else:
+            return hidden_state,
 
 
 class FlaxGPTNeoXPretrainedModel(FlaxPreTrainedModel):
@@ -332,10 +425,20 @@ class FlaxGPTNeoXForCausalLMModule(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
-        ...
+        self.transformer = FlaxGPTNeoXModule(
+            config=self.config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision
+        )
+        self.lm_head = nn.Dense(
+            self.config.vocab_size,
+            use_bias=False
+        )
 
     def __call__(self, input_ids, attention_mask, return_dict: bool = False):
-        ...
+        pred = self.transformer(input_ids=input_ids, attention_mask=attention_mask, return_dict=True).last_hidden_state
+        return self.lm_head(pred)
 
 
 class FlaxGPTNeoXForCausalLM(FlaxGPTNeoXPretrainedModel):

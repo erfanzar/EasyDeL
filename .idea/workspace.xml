@@ -4,7 +4,12 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="08ad205b-709f-455b-86db-91293f595cd3" name="Changes" comment="" />
+    <list default="true" id="08ad205b-709f-455b-86db-91293f595cd3" name="Changes" comment="">
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/modules/gpt_neo_x/modelling_gpt_neo_x_flax.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/modules/gpt_neo_x/modelling_gpt_neo_x_flax.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/pyproject.toml" beforeDir="false" afterPath="$PROJECT_DIR$/pyproject.toml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/setup.py" beforeDir="false" afterPath="$PROJECT_DIR$/setup.py" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -128,6 +133,8 @@
       <workItem from="1687008822546" duration="613000" />
       <workItem from="1687077735111" duration="6957000" />
       <workItem from="1687406608503" duration="6649000" />
+      <workItem from="1687432440538" duration="1671000" />
+      <workItem from="1687517084542" duration="924000" />
     </task>
     <servers />
   </component>
