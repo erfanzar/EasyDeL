@@ -1,0 +1,14 @@
+jax
+flax
+fjutils~=0.0.5
+numpy~=1.24.3
+typing~=3.7.4.3
+transformers~=4.30.2
+erutils==1.4.0
+einops~=0.6.1
+optax~=0.1.5
+msgpack~=1.0.5
+ipython~=8.14.0
+tqdm~=4.64.1
+datasets~=2.13.1
+setuptools~=59.6.0
