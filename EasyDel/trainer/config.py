@@ -1,6 +1,6 @@
 import os.path
 import pathlib
-from typing import OrderedDict, List
+from typing import OrderedDict, List, Union
 
 import fjutils.optimizers
 import torch.utils.tensorboard
@@ -32,22 +32,22 @@ class TrainArguments(
             model_name: str,
             num_train_epochs: int,
             total_batch_size: int = 32,
-            max_steps: int | None = None,
+            max_steps: Union[int, None] = None,
             optimizer: str = 'lion',
             scheduler: str = 'linear',
-            learning_rate: int | float = 5e-5,
-            learning_rate_end: None | float = 5e-6,
+            learning_rate: Union[int, float] = 5e-5,
+            learning_rate_end: Union[None, float] = 5e-6,
             weight_decay: float = 0.01,
             gradient_checkpointing: str = 'nothing_saveable',
-            max_length: int | None = 4096,
-            sharding_array: tuple | int = (1, -1, 1),
+            max_length: Union[int, None] = 4096,
+            sharding_array: Union[tuple, int] = (1, -1, 1),
             is_fine_tuning: bool = True,
             do_train: bool = True,
             do_eval: bool = False,
-            do_test: bool | None = False,
-            backend: str | None = None,
+            do_test: Union[bool, None] = False,
+            backend: Union[str, None] = None,
             extra_optimizer_kwargs: dict = {},
-            save_steps: int | None = None,
+            save_steps: Union[int, None] = None,
             save_dir: str = 'easydel_ckpt',
             **kwargs
     ):
