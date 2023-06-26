@@ -5,10 +5,15 @@ from typing import Optional, Union, Any
 
 import torch
 import torch.utils.checkpoint
-from erutils import make2d
+
 from torch import nn
 from transformers import PretrainedConfig, PreTrainedModel
 from transformers.utils import logging
+
+
+def make2d(tensor):
+    return tensor.view(-1, tensor.size(-1))
+
 
 logger = logging.get_logger(__name__)
 
