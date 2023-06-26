@@ -1,4 +1,5 @@
 import dataclasses
+import os
 import typing
 
 from EasyDel.trainer.config import TrainArguments
@@ -85,7 +86,8 @@ def finetuner(
         use_wandb: bool = True,
         custom_rule=None,
         extra_configs=None,
-        ids_to_pop_from_dataset=[]
+        ids_to_pop_from_dataset=[],
+        remove_ckpt_after_load: bool = False,
 ) -> OutputFineTuner:
     if extra_configs is None:
         extra_configs = {}
@@ -194,6 +196,8 @@ def finetuner(
         _, params = StreamingCheckpointer.load_trainstate_checkpoint(
             f'params::{ckpt_path}', train_state_shape, shard_fns
         )
+        if remove_ckpt_after_load:
+            os.remove(ckpt_path)
 
         sharded_train_state_ = sharded_create_from_params_fn(params)
         timer(
