@@ -1,3 +1,6 @@
+import dataclasses
+import typing
+
 from EasyDel.trainer.config import TrainArguments
 
 import jax
@@ -6,7 +9,8 @@ import optax
 from transformers import FlaxAutoModelForCausalLM, AutoConfig
 from IPython.display import clear_output
 from tqdm import tqdm
-
+from EasyDel.utils.utils import Timers
+from torch.utils.tensorboard import SummaryWriter
 from jax.experimental.pjit import pjit, with_sharding_constraint, PartitionSpec
 from flax.training import train_state
 from jax import numpy as jnp
@@ -39,6 +43,17 @@ def predict(state, input_ids):
     return input_ids
 
 
+@dataclasses.dataclass
+class OutputFineTuner:
+    train_state: typing.Any
+    predict_fun: typing.Any
+    mesh: typing.Any
+    ckpt_stream: typing.Any
+    gather_fns: typing.Any
+    shard_fns: typing.Any
+    last_save_file_name: str
+
+
 def finetuner(
         dataset,
         ckpt_path,
@@ -47,8 +62,10 @@ def finetuner(
         dtype=jnp.bfloat16,
         param_dtype=jnp.bfloat16,
         fully_fsdp=True,
+        use_wandb: bool = True,
         custom_rule=None
-):
+) -> OutputFineTuner:
+    wandb_runtime = training_arguments.get_wandb_init() if use_wandb else None
     max_length = training_arguments.max_length
 
     def collate_fn(batch):
@@ -60,7 +77,7 @@ def finetuner(
 
     dataloader = DataLoader(dataset, collate_fn=collate_fn,
                             batch_size=training_arguments.total_batch_size, drop_last=True)
-    max_steps = training_arguments.num_epochs * len(
+    max_steps = training_arguments.num_train_epochs * len(
         dataloader) if training_arguments.max_steps is None else training_arguments.max_steps
     config = AutoConfig.from_pretrained(training_arguments.model_id, trust_remote_code=True
                                         , gradient_checkpointing=training_arguments.gradient_checkpointing,
@@ -76,7 +93,10 @@ def finetuner(
     def init_fn():
         # from flax.training import train_state
         params__ = model.init_weights(jax.random.PRNGKey(0), (1, max_length))
-        params__ = model.to_bf16(params__)
+        if dtype == jnp.bfloat16:
+            params__ = model.to_bf16(params__)
+        elif dtype == jnp.float16:
+            params__ = model.to_fp16(params__)
         return train_state.TrainState.create(
             tx=tx,
             params=flax.core.freeze({'params': params__}),
@@ -136,6 +156,11 @@ def finetuner(
                     learning_rates.append(scheduler(i).tolist())
                     pbar.update(1)
                     clear_output(True)
+                    if use_wandb:
+                        wandb_runtime.log(
+                            {'loss': loss, 'learning_rate': scheduler(sharded_train_state_.step.tolist()).tolist(),
+                             'step': sharded_train_state_.step.tolist()}
+                        )
                     pbar.set_postfix(loss=loss, learning_rate=scheduler(sharded_train_state_.step.tolist()).tolist(),
                                      step=sharded_train_state_.step.tolist())
                 else:
@@ -146,5 +171,20 @@ def finetuner(
                     ckpt_streamer.save_checkpoint(sharded_train_state_.params['params'],
                                                   filename,
                                                   gather_fns=gather_fns.params['params'])
+        if training_arguments.save_steps is None:
+            filename = f'{training_arguments.model_name}-{sum(losses) / len(losses)}-{i}'
+            print(f'Saving Model to \033[1;30m{filename}\033[1;0m')
+            ckpt_streamer.save_checkpoint(sharded_train_state_.params['params'],
+                                          filename,
+                                          gather_fns=gather_fns.params['params'])
 
-    return sharded_train_state_
+    output = OutputFineTuner(
+        last_save_file_name=filename,
+        predict_fun=sharded_predict,
+        train_state=sharded_train_state_,
+        mesh=mesh,
+        shard_fns=shard_fns,
+        gather_fns=gather_fns,
+        ckpt_stream=ckpt_streamer
+    )
+    return output
