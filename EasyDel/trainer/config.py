@@ -1,7 +1,10 @@
 import os.path
+import pathlib
 from typing import OrderedDict, List
 
 import fjutils.optimizers
+import torch.utils.tensorboard
+import wandb
 from fjutils import StreamingCheckpointer
 from jax.experimental.mesh_utils import create_device_mesh
 
@@ -28,7 +31,7 @@ class TrainArguments(
             model_id: str,
             model_name: str,
             num_train_epochs: int,
-            total_batch_size: int,
+            total_batch_size: int = 32,
             max_steps: int | None = None,
             optimizer: str = 'lion',
             scheduler: str = 'linear',
@@ -82,10 +85,26 @@ class TrainArguments(
         self.do_test = do_test
         self.save_steps = save_steps
         self.save_dir = save_dir
+        torch.set_default_device('cpu')
         self.__dict__.update(**kwargs)
 
     def __call__(self):
         return {k: v for k, v in self.__dict__.items()}
+
+    def get_meter_dict(self):
+        return {f"hyperparameters/{k}": v for k, v in self.__dict__.items() if
+                isinstance(v, (int, float, str, bool, torch.Tensor))}
+
+    def get_wandb_init(self):
+        return wandb.init(
+            project=f'easydel-{self.model_name}',
+            config=self(),
+            tags=[
+                'Easy Del',
+                'OST-OpenSourceTransformers',
+                'Jax/Flax'
+            ]
+        )
 
     def __repr__(self):
         string = f'TrainingArguments(\n'
@@ -94,14 +113,20 @@ class TrainArguments(
         string += ')'
         return string
 
+    def get_path(self):
+        return pathlib.Path(
+            self.save_dir, self.model_name
+        )
+
     def ckpt_path_exists(self):
-        if not os.path.exists(self.save_dir):
-            os.mkdir(self.save_dir)
+        path = self.get_path()
+        if not path.exists():
+            path.mkdir(parents=True)
 
     def get_mesh(self):
         return Mesh(
             create_device_mesh(
-                self.array_devices
+                self.array_devices.shape
             ),
             self.get_mesh_names()
         )
@@ -112,7 +137,7 @@ class TrainArguments(
 
     def get_optimizer_and_scheduler(self, steps=None):
         steps = self.max_steps or steps
-        assert steps is not None
+        assert steps is not None, 'if you haven\'t pass max steps to init you should pass init in func'
         if self.optimizer == 'adafactor':
             if self.scheduler == 'linear':
                 tx, sc = fjutils.optimizers.get_adafactor_with_linear_scheduler(
@@ -182,4 +207,12 @@ class TrainArguments(
         return tx, sc
 
     def get_streaming_checkpointer(self):
-        return StreamingCheckpointer(StreamingCheckpointer.get_default_config(), self.save_dir)
+        return StreamingCheckpointer(StreamingCheckpointer.get_default_config(),
+                                     os.path.join(self.save_dir, self.model_name))
+
+    def get_board(self):
+        return torch.utils.tensorboard.SummaryWriter(
+            log_dir=str(self.get_path()),
+            comment=f'{self.model_name}',
+            filename_suffix='easydel'
+        )
