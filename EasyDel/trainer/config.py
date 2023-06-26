@@ -63,7 +63,7 @@ class TrainArguments(
         assert optimizer in AVAILABLE_OPTIMIZERS, f'{optimizer} is not recognized, ' \
                                                   f'available optimizers are {AVAILABLE_OPTIMIZERS}'
 
-        self.array_devices = jnp.asarray([len(jax.devices(backend))]).reshape(sharding_array)
+        self.array_devices = jnp.ones(len(jax.devices(backend))).reshape(sharding_array)
         self.array_devices_shape = self.array_devices.shape
         self.model_id = model_id
         self.num_train_epochs = num_train_epochs
