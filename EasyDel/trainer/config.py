@@ -18,7 +18,7 @@ AVAILABLE_GRADIENT_CHECK_POINTING: List[str] = ['everything_saveable',
                                                 'nothing_saveable',
                                                 'checkpoint_dots',
                                                 'checkpoint_dots_with_no_batch_dims']
-AVAILABLE_BACKENDS: List[str | None] = [
+AVAILABLE_BACKENDS: List[str] = [
     'cpu', 'gpu', 'tpu', None
 ]
 
