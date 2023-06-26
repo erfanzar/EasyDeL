@@ -73,7 +73,9 @@ train_args = TrainArguments(
     do_eval=False,  # it's optional but supported 
     backend='tpu',  # default backed is set to cpu so you must define you want to use tpu cpu or gpu
     max_length=max_length,  # Note that you have to change this in the model config too
-    gradient_checkpointing='nothing_saveable'
+    gradient_checkpointing='nothing_saveable',
+    sharding_array=(1, -1, 1)  # the way to shard model across gpu,cpu or TPUs with using sharding array (1, -1, 1)
+    # everything training will be in fully fsdp automatic and share data between devices
 )
 dataset = load_dataset('TRAIN_DATASET')
 dataset_train = dataset['train']
