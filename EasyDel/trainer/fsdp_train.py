@@ -92,9 +92,11 @@ def finetuner(
     timer(
         'configuring data loaders'
     ).stop()
+    timer.log(['configuring data loaders'])
     timer(
         'loading / creating config, model, optimizers'
     ).start()
+
     config = AutoConfig.from_pretrained(training_arguments.model_id, trust_remote_code=True
                                         , gradient_checkpointing=training_arguments.gradient_checkpointing,
                                         use_pjit_attention_force=use_pjit_attention_force, **extra_configs
@@ -108,6 +110,7 @@ def finetuner(
     timer(
         'loading / creating config, model, optimizers'
     ).stop()
+    timer.log(['loading / creating config, model, optimizers'])
 
     def init_fn():
         # from flax.training import train_state
@@ -157,6 +160,7 @@ def finetuner(
     timer(
         'creating functions'
     ).stop()
+    timer.log(['creating functions'])
     with mesh:
         timer(
             'loading parameters'
@@ -170,8 +174,9 @@ def finetuner(
         timer(
             'loading parameters'
         ).stop()
+        timer.log(['loading parameters'])
         count_params(sharded_train_state_.params)
-        timer.log(timer.timers.keys())
+
         timer.write(timer.timers.keys(), 0)
         pbar = tqdm(total=max_steps)
         i = sharded_train_state_.step.tolist()
@@ -191,7 +196,8 @@ def finetuner(
                     clear_output(True)
                     if use_wandb:
                         wandb_runtime.log(
-                            {'loss': loss, 'learning_rate': scheduler(sharded_train_state_.step.tolist()).tolist(),
+                            {'loss': loss.tolist(),
+                             'learning_rate': scheduler(sharded_train_state_.step.tolist()).tolist(),
                              'step': sharded_train_state_.step.tolist()}
                         )
                     pbar.set_postfix(loss=loss, learning_rate=scheduler(sharded_train_state_.step.tolist()).tolist(),
