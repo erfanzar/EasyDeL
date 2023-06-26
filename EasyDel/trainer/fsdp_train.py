@@ -10,7 +10,7 @@ from transformers import FlaxAutoModelForCausalLM, AutoConfig
 from IPython.display import clear_output
 from tqdm import tqdm
 from EasyDel.utils.utils import Timers
-from torch.utils.tensorboard import SummaryWriter
+
 from jax.experimental.pjit import pjit, with_sharding_constraint, PartitionSpec
 from flax.training import train_state
 from jax import numpy as jnp
@@ -65,6 +65,10 @@ def finetuner(
         use_wandb: bool = True,
         custom_rule=None
 ) -> OutputFineTuner:
+    timer = Timers(
+        use_wandb=False,
+        tensorboard_writer=training_arguments.get_board()
+    )
     wandb_runtime = training_arguments.get_wandb_init() if use_wandb else None
     max_length = training_arguments.max_length
 
@@ -75,10 +79,19 @@ def finetuner(
             rs[key] = jnp.stack(ssp).reshape(-1, ssp[0].shape[-1])
         return rs
 
+    timer(
+        'configuring data loaders'
+    ).start()
     dataloader = DataLoader(dataset, collate_fn=collate_fn,
                             batch_size=training_arguments.total_batch_size, drop_last=True)
     max_steps = training_arguments.num_train_epochs * len(
         dataloader) if training_arguments.max_steps is None else training_arguments.max_steps
+    timer(
+        'configuring data loaders'
+    ).stop()
+    timer(
+        'loading / creating config, model, optimizers'
+    ).start()
     config = AutoConfig.from_pretrained(training_arguments.model_id, trust_remote_code=True
                                         , gradient_checkpointing=training_arguments.gradient_checkpointing,
                                         use_pjit_attention_force=use_pjit_attention_force
@@ -89,6 +102,9 @@ def finetuner(
                                                  param_dtype=param_dtype,
                                                  _do_init=False)
     tx, scheduler = training_arguments.get_optimizer_and_scheduler(max_steps)
+    timer(
+        'loading / creating config, model, optimizers'
+    ).stop()
 
     def init_fn():
         # from flax.training import train_state
@@ -111,6 +127,9 @@ def finetuner(
             params=params_
         )
 
+    timer(
+        'creating functions'
+    ).start()
     train_state_shape = jax.eval_shape(init_fn)
     train_state_partition_spec = match_partition_rules(
         config.get_partition_rules(fully_fsdp=fully_fsdp) if custom_rule is None else custom_rule,
@@ -132,14 +151,25 @@ def finetuner(
     mesh = training_arguments.get_mesh()
     training_arguments.ckpt_path_exists()
     ckpt_streamer = training_arguments.get_streaming_checkpointer()
+    timer(
+        'creating functions'
+    ).stop()
     with mesh:
+        timer(
+            'loading parameters'
+        ).start()
         shard_fns, gather_fns = make_shard_and_gather_fns(train_state_partition_spec, dtype_specs=dtype)
         _, params = StreamingCheckpointer.load_trainstate_checkpoint(
             f'params::{ckpt_path}', train_state_shape, shard_fns
         )
-        sharded_train_state_ = sharded_create_from_params_fn(params)
-        count_params(sharded_train_state_.params)
 
+        sharded_train_state_ = sharded_create_from_params_fn(params)
+        timer(
+            'loading parameters'
+        ).stop()
+        count_params(sharded_train_state_.params)
+        timer.log(timer.timers.keys())
+        timer.write(timer.timers.keys(), 0)
         pbar = tqdm(total=max_steps)
         i = sharded_train_state_.step.tolist()
         losses = []

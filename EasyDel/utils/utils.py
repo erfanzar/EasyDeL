@@ -142,7 +142,7 @@ class Timers:
             if self.use_wandb:
                 wandb.log({f"timers/{name}": value}, step=iteration)
 
-    def log(self, names, normalizer=1.0, reset=True, print_rank_0_only=False):
+    def log(self, names, normalizer=1.0, reset=True):
         assert normalizer > 0.0
 
         string = "time (ms)"
