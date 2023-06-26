@@ -35,6 +35,25 @@ def fsdp_train_step(state, batch):
     return state, loss__
 
 
+def fsdp_eval_step(state, batch_eval):
+    batch_eval = with_sharding_constraint(
+        batch_eval,
+        PartitionSpec(
+            ('dp', 'fsdp'))
+    )
+
+    def calculate_loss(params):
+        logits = state.apply_fn(params=params, **batch_eval,
+                                return_dict=True).logits
+        loss = optax.softmax_cross_entropy_with_integer_labels(logits=logits[..., :-1, :],
+                                                               labels=batch_eval['input_ids'][..., 1:])
+        loss = jnp.mean(loss)
+        return loss
+
+    loss__ = calculate_loss(state.params)
+    return loss__
+
+
 def predict(state, input_ids):
     input_ids = with_sharding_constraint(input_ids, PartitionSpec(('dp', 'fsdp')))
     pred = state.apply_fn(params=state.params, input_ids=input_ids, return_dict=True)
@@ -55,16 +74,18 @@ class OutputFineTuner:
 
 
 def finetuner(
-        dataset,
+        dataset_train,
         ckpt_path,
         training_arguments: TrainArguments,
         use_pjit_attention_force: bool = True,
+        dataset_eval=None,
         dtype=jnp.bfloat16,
         param_dtype=jnp.bfloat16,
         fully_fsdp=True,
         use_wandb: bool = True,
         custom_rule=None,
-        extra_configs=None
+        extra_configs=None,
+        ids_to_pop_from_dataset=[]
 ) -> OutputFineTuner:
     if extra_configs is None:
         extra_configs = {}
@@ -85,10 +106,14 @@ def finetuner(
     timer(
         'configuring data loaders'
     ).start()
-    dataloader = DataLoader(dataset, collate_fn=collate_fn,
-                            batch_size=training_arguments.total_batch_size, drop_last=True)
-    max_steps = training_arguments.num_train_epochs * len(
-        dataloader) if training_arguments.max_steps is None else training_arguments.max_steps
+    dataloader_train = DataLoader(dataset_train, collate_fn=collate_fn,
+                                  batch_size=training_arguments.total_batch_size, drop_last=True)
+    max_steps_train = training_arguments.num_train_epochs * len(
+        dataloader_train) if training_arguments.max_steps is None else training_arguments.max_steps
+    if dataset_eval is not None and training_arguments.do_eval:
+        dataloader_eval = DataLoader(dataset_eval, collate_fn=collate_fn,
+                                     batch_size=training_arguments.total_batch_size, drop_last=True)
+        max_steps_eval = len(dataloader_eval) if training_arguments.max_steps is None else training_arguments.max_steps
     timer(
         'configuring data loaders'
     ).stop()
@@ -106,7 +131,7 @@ def finetuner(
     model = FlaxAutoModelForCausalLM.from_config(config, trust_remote_code=True, dtype=dtype,
                                                  param_dtype=param_dtype,
                                                  _do_init=False)
-    tx, scheduler = training_arguments.get_optimizer_and_scheduler(max_steps)
+    tx, scheduler = training_arguments.get_optimizer_and_scheduler(max_steps_train)
     timer(
         'loading / creating config, model, optimizers'
     ).stop()
@@ -178,17 +203,19 @@ def finetuner(
         count_params(sharded_train_state_.params)
 
         timer.write(timer.timers.keys(), 0)
-        pbar = tqdm(total=max_steps)
+        pbar = tqdm(total=max_steps_train)
         i = sharded_train_state_.step.tolist()
         losses = []
         pbar.update(sharded_train_state_.step.tolist())
         learning_rates = []
         for ep in range(training_arguments.num_train_epochs):
-            for batch in dataloader:
+            for batch in dataloader_train:
                 i += 1
-                if i < max_steps:
+                if i < max_steps_train:
 
                     _ = batch.pop('token_type_ids', None)
+                    for i in ids_to_pop_from_dataset:
+                        _ = batch.pop(i, None)
                     sharded_train_state_, loss = sharded_train_step_fn(sharded_train_state_, batch)
                     losses.append(loss)
                     learning_rates.append(scheduler(i).tolist())
@@ -210,6 +237,21 @@ def finetuner(
                     ckpt_streamer.save_checkpoint(sharded_train_state_.params['params'],
                                                   filename,
                                                   gather_fns=gather_fns.params['params'])
+
+        if training_arguments.do_eval:
+            if dataset_eval is not None:
+                pbar_eval = tqdm(total=max_steps_eval)
+                for i_eval, batch_eval in enumerate(dataloader_eval):
+                    _ = batch_eval.pop('token_type_ids', None)
+                    for i in ids_to_pop_from_dataset:
+                        _ = batch_eval.pop(i, None)
+                    loss_eval = fsdp_eval_step(sharded_train_state_, batch_eval=batch_eval)
+                    pbar_eval.update(1)
+                    if use_wandb:
+                        wandb_runtime.log(
+                            {'loss_eval': loss_eval.tolist()}
+                        )
+                    pbar_eval.set_postfix(loss_eval=loss_eval.tolist())
         if training_arguments.save_steps is None:
             filename = f'{training_arguments.model_name}-{sum(losses) / len(losses)}-{i}'
             print(f'Saving Model to \033[1;30m{filename}\033[1;0m')
