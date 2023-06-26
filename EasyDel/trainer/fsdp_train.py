@@ -63,8 +63,11 @@ def finetuner(
         param_dtype=jnp.bfloat16,
         fully_fsdp=True,
         use_wandb: bool = True,
-        custom_rule=None
+        custom_rule=None,
+        extra_configs=None
 ) -> OutputFineTuner:
+    if extra_configs is None:
+        extra_configs = {}
     timer = Timers(
         use_wandb=False,
         tensorboard_writer=training_arguments.get_board()
@@ -94,7 +97,7 @@ def finetuner(
     ).start()
     config = AutoConfig.from_pretrained(training_arguments.model_id, trust_remote_code=True
                                         , gradient_checkpointing=training_arguments.gradient_checkpointing,
-                                        use_pjit_attention_force=use_pjit_attention_force
+                                        use_pjit_attention_force=use_pjit_attention_force, **extra_configs
                                         )
 
     assert hasattr(config, 'get_partition_rules')
