@@ -193,7 +193,7 @@ def finetuner(
                     losses.append(loss)
                     learning_rates.append(scheduler(i).tolist())
                     pbar.update(1)
-                    clear_output(True)
+                    # clear_output(True)
                     if use_wandb:
                         wandb_runtime.log(
                             {'loss': loss.tolist(),
