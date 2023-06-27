@@ -110,7 +110,7 @@ class LlamaConfig(PretrainedConfig):
         )
 
     @staticmethod
-    def get_partition_rules(fully_fsd: bool = True):
+    def get_partition_rules(fully_fsdp: bool = True):
         return (
 
             ("transformer/wte/embedding", PS("mp", "fsdp")),
@@ -128,7 +128,7 @@ class LlamaConfig(PretrainedConfig):
             ("transformer/ln_f/kernel", PS(None)),
             ("lm_head/kernel", PS("fsdp", "mp")),
             ('.*', PS(None)),
-        ) if not fully_fsd else (
+        ) if not fully_fsdp else (
 
             ("transformer/wte/embedding", PS("fsdp")),
 
