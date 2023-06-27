@@ -2,6 +2,8 @@ import dataclasses
 import os
 import typing
 
+import wandb
+
 from EasyDel.trainer.config import TrainArguments
 
 import jax
@@ -286,6 +288,7 @@ def finetuner(
         gather_fns=gather_fns,
         ckpt_stream=ckpt_streamer
     )
+    wandb.finish()
     return output
 
 
@@ -500,4 +503,5 @@ def pre_trainer_or_base_trainer(
         gather_fns=gather_fns,
         ckpt_stream=ckpt_streamer
     )
+    wandb.finish()
     return output
