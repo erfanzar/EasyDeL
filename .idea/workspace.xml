@@ -5,8 +5,9 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="08ad205b-709f-455b-86db-91293f595cd3" name="Changes" comment="">
+      <change afterPath="$PROJECT_DIR$/EasyDel/configs/__init__.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/EasyDel/configs/configs.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/EasyDel/modules/falcon/modelling_falcon_flax.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/modules/falcon/modelling_falcon_flax.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -141,7 +142,8 @@
       <workItem from="1687850139266" duration="2536000" />
       <workItem from="1687856516040" duration="111000" />
       <workItem from="1687868006846" duration="3272000" />
-      <workItem from="1687936106608" duration="1959000" />
+      <workItem from="1687936106608" duration="3275000" />
+      <workItem from="1687957126274" duration="714000" />
     </task>
     <servers />
   </component>

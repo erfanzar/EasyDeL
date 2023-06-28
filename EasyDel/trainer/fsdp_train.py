@@ -234,36 +234,39 @@ def finetuner(
         losses = []
         pbar.update(sharded_train_state_.step.tolist())
         learning_rates = []
-        for ep in range(training_arguments.num_train_epochs):
-            for batch in dataloader_train:
-                i += 1
-                if i < max_steps_train:
+        try:
+            for ep in range(training_arguments.num_train_epochs):
+                for batch in dataloader_train:
+                    i += 1
+                    if i < max_steps_train:
 
-                    _ = batch.pop('token_type_ids', None)
-                    for i in ids_to_pop_from_dataset:
-                        _ = batch.pop(i, None)
-                    sharded_train_state_, loss = sharded_train_step_fn(sharded_train_state_, batch)
-                    losses.append(loss)
-                    learning_rates.append(scheduler(i).tolist())
-                    pbar.update(1)
-                    # clear_output(True)
-                    if use_wandb:
-                        wandb_runtime.log(
-                            {'loss': loss.tolist(),
-                             'learning_rate': scheduler(sharded_train_state_.step.tolist()).tolist(),
-                             'step': sharded_train_state_.step.tolist()}
-                        )
-                    pbar.set_postfix(loss=loss, learning_rate=scheduler(sharded_train_state_.step.tolist()).tolist(),
-                                     step=sharded_train_state_.step.tolist())
-                else:
-                    break
-                if training_arguments.save_steps is not None and i % training_arguments.save_steps == 0:
-                    filename = f'{training_arguments.model_name}-{sum(losses) / len(losses)}-{i}'
-                    print(f'Saving Model to \033[1;30m{filename}\033[1;0m')
-                    ckpt_streamer.save_checkpoint(sharded_train_state_.params['params'],
-                                                  filename,
-                                                  gather_fns=gather_fns.params['params'])
-
+                        _ = batch.pop('token_type_ids', None)
+                        for i in ids_to_pop_from_dataset:
+                            _ = batch.pop(i, None)
+                        sharded_train_state_, loss = sharded_train_step_fn(sharded_train_state_, batch)
+                        losses.append(loss)
+                        learning_rates.append(scheduler(i).tolist())
+                        pbar.update(1)
+                        # clear_output(True)
+                        if use_wandb:
+                            wandb_runtime.log(
+                                {'loss': loss.tolist(),
+                                 'learning_rate': scheduler(sharded_train_state_.step.tolist()).tolist(),
+                                 'step': sharded_train_state_.step.tolist()}
+                            )
+                        pbar.set_postfix(loss=loss,
+                                         learning_rate=scheduler(sharded_train_state_.step.tolist()).tolist(),
+                                         step=sharded_train_state_.step.tolist())
+                    else:
+                        break
+                    if training_arguments.save_steps is not None and i % training_arguments.save_steps == 0:
+                        filename = f'{training_arguments.model_name}-{sum(losses) / len(losses)}-{i}'
+                        print(f'Saving Model to \033[1;30m{filename}\033[1;0m')
+                        ckpt_streamer.save_checkpoint(sharded_train_state_.params['params'],
+                                                      filename,
+                                                      gather_fns=gather_fns.params['params'])
+        except KeyboardInterrupt:
+            print('\033[1;30m KeyboardInterrupt At training model Will return current state of the model * \033[1;0m')
         if training_arguments.do_eval:
             if dataset_eval is not None:
                 pbar_eval = tqdm(total=max_steps_eval)
@@ -296,6 +299,7 @@ def finetuner(
         ckpt_stream=ckpt_streamer
     )
     wandb.finish()
+
     return output
 
 
