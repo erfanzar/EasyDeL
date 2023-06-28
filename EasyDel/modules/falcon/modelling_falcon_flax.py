@@ -75,6 +75,8 @@ class FalconConfig(PretrainedConfig):
             bias=False,
             parallel_attn=False,
             max_seq_len=2048,
+            use_pjit_attention_force: bool = False,
+            gradient_checkpointing: str = 'nothing_saveable',
             **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -90,10 +92,12 @@ class FalconConfig(PretrainedConfig):
         self.hidden_dropout = hidden_dropout
         self.attention_dropout = attention_dropout
         self.bos_token_id = bos_token_id
+        self.use_pjit_attention_force = use_pjit_attention_force
         self.eos_token_id = eos_token_id
         self.multi_query = multi_query
         self.alibi = alibi
         self.bias = bias
+        self.gradient_checkpointing = gradient_checkpointing
         self.parallel_attn = parallel_attn
 
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
@@ -229,9 +233,10 @@ class FlaxFalconAttention(nn.Module):
         qkv = self.w_qkv(hidden_states)
         if not self.config.multi_query:
             q, k, v = jnp.split(qkv, 3, -1)
-            q = with_sharding_constraint(q, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
-            k = with_sharding_constraint(k, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
-            v = with_sharding_constraint(v, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
+            if self.config.use_pjit_attention_force:
+                q = with_sharding_constraint(q, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
+                k = with_sharding_constraint(k, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
+                v = with_sharding_constraint(v, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
             k = rearrange(k, 'b s (h d) -> b s h d', h=self.config.n_head)
             q = rearrange(q, 'b s (h d) -> b s h d', h=self.config.n_head)
             v = rearrange(v, 'b s (h d) -> b s h d', h=self.config.n_head)
@@ -240,16 +245,17 @@ class FlaxFalconAttention(nn.Module):
                 b, s, self.config.n_head + 2, -1
             )
             q, k, v = qkv[..., :-2, :], qkv[..., [-2], :], qkv[..., [-1], :]
-
-            q = with_sharding_constraint(q, PartitionSpec(('dp', 'fsdp'), None, None, 'mp'))
-            k = with_sharding_constraint(k, PartitionSpec(('dp', 'fsdp'), None, None, 'mp'))
-            v = with_sharding_constraint(v, PartitionSpec(('dp', 'fsdp'), None, None, 'mp'))
+            if self.config.use_pjit_attention_force:
+                q = with_sharding_constraint(q, PartitionSpec(('dp', 'fsdp'), None, None, 'mp'))
+                k = with_sharding_constraint(k, PartitionSpec(('dp', 'fsdp'), None, None, 'mp'))
+                v = with_sharding_constraint(v, PartitionSpec(('dp', 'fsdp'), None, None, 'mp'))
 
         if not self.config.alibi:
             freq = self.freq[:s].reshape(1, s, -1)
             q, k = apply_rotary_emb(q, k, freq, self.dtype)
         attn = jnp.einsum('...qhd,...khd->...hqk', q, k, precision=self.precision)
-        attn = with_sharding_constraint(attn, PartitionSpec(("dp", "fsdp"), "mp", None, None))
+        if self.config.use_pjit_attention_force:
+            attn = with_sharding_constraint(attn, PartitionSpec(("dp", "fsdp"), "mp", None, None))
 
         if alibi is not None:
             attn += alibi
@@ -337,6 +343,15 @@ class FlaxFalconBlock(nn.Module):
         return mlp_out + residual
 
 
+def get_gradient_checkpoint_policy(name):
+    return {
+        'everything_saveable': jax.checkpoint_policies.everything_saveable,
+        'nothing_saveable': jax.checkpoint_policies.nothing_saveable,
+        'checkpoint_dots': jax.checkpoint_policies.checkpoint_dots,
+        'checkpoint_dots_with_no_batch_dims': jax.checkpoint_policies.checkpoint_dots_with_no_batch_dims,
+    }[name]
+
+
 class FlaxFalconCollection(nn.Module):
     config: FalconConfig
     dtype: jnp.dtype = jnp.float32
@@ -344,8 +359,14 @@ class FlaxFalconCollection(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
+        block = FlaxFalconBlock
+        if self.config.gradient_checkpointing != '':
+            block = nn.remat(
+                block,
+                policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing)
+            )
         self.blocks = [
-            FlaxFalconBlock(
+            block(
                 config=self.config,
                 dtype=self.dtype,
                 param_dtype=self.param_dtype,
