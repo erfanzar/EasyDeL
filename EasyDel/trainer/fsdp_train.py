@@ -92,7 +92,9 @@ def finetuner(
         remove_ckpt_after_load: bool = False,
         model_class=None,
         configs_to_init_model_class=None,
-        do_last_save: bool = True
+        do_last_save: bool = True,
+        model_parameters=None,
+        do_shard_fns=True
 ) -> OutputFineTuner:
     if extra_configs is None:
         extra_configs = {}
@@ -208,9 +210,14 @@ def finetuner(
             'loading parameters'
         ).start()
         shard_fns, gather_fns = make_shard_and_gather_fns(train_state_partition_spec, dtype_specs=dtype)
-        _, params = StreamingCheckpointer.load_trainstate_checkpoint(
-            f'params::{ckpt_path}', train_state_shape, shard_fns
-        )
+        if model_parameters is None:
+            _, params = StreamingCheckpointer.load_trainstate_checkpoint(
+                f'params::{ckpt_path}', train_state_shape, shard_fns
+            )
+        else:
+            params = model_parameters if not do_shard_fns else jax.tree_util.tree_map(lambda f, x: f(x), shard_fns,
+                                                                                      model_parameters)
+
         if remove_ckpt_after_load:
             os.remove(ckpt_path)
 
