@@ -7,7 +7,7 @@ train Flax/Jax Models on the `TPU/GPU`
 ## Installation
 
 To install EasyDeL, you can use pip:
-### Not on PyPi yet!
+### Availalbe on PyPi
 ```bash
 pip install easydel
 ```
@@ -25,14 +25,14 @@ you can also tell me the model you want in Flax/Jax version and ill try my best 
 
 ## FineTuning
 
-with using EasyDel FineTuning LLM (CausalLanguageModels) are easy as much as possible with using jax and flax
+with using EasyDel FineTuning LLM (CausalLanguageModels) are easy as much as possible with using Jax and Flax
 and having the benefit of TPUs for the best speed here's a simple code to use in order to finetune your own MPT / LLama 
 or any other models supported by EasyDel
 
 #### Step One
 
-download converted model weights in order to finetune or convert the weights of the model you want with using 
-weight_convertor in library example
+download converted model weights in order to finetune or convert the weights of the model you want to use
+weight_convertor in the library example
 
 ```python
 import jax
