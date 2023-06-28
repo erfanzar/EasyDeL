@@ -2,9 +2,9 @@ import math
 
 import jax.nn.initializers
 from jax import numpy as jnp
-from jax.random import PRNGKey, split
+
 from functools import partial
-from jax import jit
+
 from jax.experimental.pjit import with_sharding_constraint as _wish_sharding_constraint
 from jax.interpreters import pxla
 from flax import linen as nn
