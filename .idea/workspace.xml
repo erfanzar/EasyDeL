@@ -5,8 +5,8 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="08ad205b-709f-455b-86db-91293f595cd3" name="Changes" comment="">
-      <change beforePath="$PROJECT_DIR$/.idea/shelf/Uncommitted_changes_before_Update_at_21_06_23_17_55_[Changes]/shelved.patch" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/shelf/Uncommitted_changes_before_Update_at_21_06_23_17_55__Changes_.xml" beforeDir="false" />
+      <change afterPath="$PROJECT_DIR$/EasyDel/modules/palm/__init__.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/EasyDel/modules/palm/modelling_palm_flax.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -144,6 +144,8 @@
       <workItem from="1687868006846" duration="3272000" />
       <workItem from="1687936106608" duration="3275000" />
       <workItem from="1687957126274" duration="714000" />
+      <workItem from="1688027674287" duration="145000" />
+      <workItem from="1688039965887" duration="8535000" />
     </task>
     <servers />
   </component>
