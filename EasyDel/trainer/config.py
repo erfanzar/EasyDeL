@@ -172,7 +172,6 @@ class TrainArguments(
                 tx, sc = fjutils.optimizers.get_lion_with_cosine_scheduler(
                     learning_rate=self.learning_rate,
                     steps=steps,
-                    weight_decay=self.weight_decay,
                     **self.extra_optimizer_kwargs
                 )
             elif self.scheduler == 'none':
