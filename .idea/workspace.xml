@@ -5,6 +5,8 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="08ad205b-709f-455b-86db-91293f595cd3" name="Changes" comment="">
+      <change afterPath="$PROJECT_DIR$/EasyDel/modules/t5/__init__.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/EasyDel/modules/t5/modelling_t5_flax.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/EasyDel/modules/palm/modelling_palm_flax.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/modules/palm/modelling_palm_flax.py" afterDir="false" />
     </list>
@@ -145,7 +147,7 @@
       <workItem from="1687957126274" duration="714000" />
       <workItem from="1688027674287" duration="145000" />
       <workItem from="1688039965887" duration="10538000" />
-      <workItem from="1688104174694" duration="3942000" />
+      <workItem from="1688104174694" duration="4667000" />
     </task>
     <servers />
   </component>
