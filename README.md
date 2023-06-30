@@ -20,6 +20,7 @@ pip install easydel
 - MosaicMPT (Support `FSDP`, `MP`,` DP`)
 - GPTNeoX   (TODO `FSDP`, `MP`, `DP`)
 - Falcon    (Support `FSDP`, `MP`, `DP`)
+- Palm      (Support `FSDP`, `MP`, `DP`)
 
 you can also tell me the model you want in Flax/Jax version and ill try my best to build it ;)
 
