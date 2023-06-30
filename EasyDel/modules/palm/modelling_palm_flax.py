@@ -12,6 +12,33 @@ from jax import numpy as np
 from transformers.modeling_flax_outputs import FlaxCausalLMOutput
 from transformers import PretrainedConfig
 from jax.experimental.pjit import with_sharding_constraint as wsc, PartitionSpec
+from jax.interpreters import pxla
+
+
+def get_names_from_parition_spec(partition_specs):
+    names = set()
+    if isinstance(partition_specs, dict):
+        partition_specs = partition_specs.values()
+    for item in partition_specs:
+        if item is None:
+            continue
+        elif isinstance(item, str):
+            names.add(item)
+        else:
+            names.update(get_names_from_parition_spec(item))
+
+    return list(names)
+
+
+def names_in_mesh(*names):
+    return set(names) <= set(pxla.thread_resources.env.physical_mesh.axis_names)
+
+
+def with_sharding_constraint(x, partition_specs):
+    axis_names = get_names_from_parition_spec(partition_specs)
+    if names_in_mesh(*axis_names):
+        x = wsc(x, partition_specs)
+    return x
 
 
 class PalmConfig(PretrainedConfig):
@@ -182,11 +209,14 @@ class ParallelPalmBlock(nn.Module):
         q = rearrange(q, '... n (h d) -> ... h n d', h=self.num_attention_heads) * self.scale
 
         sim = jnp.einsum('... h i d, ... j d -> ... h i j', q, k)
+        if self.config.use_pjit_attention_force:
+            sim = with_sharding_constraint(sim, PartitionSpec(('dp', 'fsdp'), 'mp', None, None))
         mask_value = jnp.finfo(hidden_state).min
         attn = nn.softmax(np.where(causal_mask, sim, mask_value), axis=-1)
 
         out = jnp.einsum('... h i j, ... j d -> ... h i d', attn, v)
-
+        if self.config.use_pjit_attention_force:
+            out = with_sharding_constraint(out, PartitionSpec(('dp', 'fsdp'), 'mp', None, None))
         attn_out = rearrange(out, '... h n hd -> ... n (h hd)') @ self.attn_wo
 
         ff_out = (ff * nn.swish(ff_gate)) @ self.ff_wo
