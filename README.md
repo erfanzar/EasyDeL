@@ -18,7 +18,7 @@ pip install easydel
 - GPT-J     (Support `FSDP`, `MP`,` DP`)
 - LT        (Support `FSDP`, `MP`, `DP`)
 - MosaicMPT (Support `FSDP`, `MP`,` DP`)
-- GPTNeoX   (TODO `FSDP`, `MP`, `DP`)
+- GPTNeoX   (Support `FSDP`, `MP`, `DP`)
 - Falcon    (Support `FSDP`, `MP`, `DP`)
 - Palm      (Support `FSDP`, `MP`, `DP`)
 - T5        (Support `FSDP`, `MP`, `DP`)
