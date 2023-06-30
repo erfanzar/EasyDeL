@@ -1,14 +1,17 @@
-from typing import List, Any, Union, Optional
+from typing import Union, Optional, Tuple, Any, Mapping
 
 import jax
 import jax.numpy as jnp
 import numpy as onp
+import transformers.modeling_flax_outputs
 from einops import rearrange
 import flax.linen as nn
+from flax.core import FrozenDict
 
 from jax import numpy as np
-
+from transformers.modeling_flax_outputs import FlaxCausalLMOutput
 from transformers import PretrainedConfig
+from jax.experimental.pjit import with_sharding_constraint as wsc, PartitionSpec
 
 
 class PalmConfig(PretrainedConfig):
@@ -25,6 +28,7 @@ class PalmConfig(PretrainedConfig):
                  eos_token_id: int = 1,
                  gradient_checkpointing='nothing_saveable',
                  use_pjit_attention_force: bool = False,
+                 use_tie_word_embedding: bool = True
                  ):
         super().__init__(
             bos_token_id=bos_token_id,
@@ -36,11 +40,41 @@ class PalmConfig(PretrainedConfig):
         self.use_pjit_attention_force = use_pjit_attention_force
         self.gradient_checkpointing = gradient_checkpointing
         self.num_attention_heads = num_attention_heads
+        self.use_tie_word_embedding = use_tie_word_embedding
         self.num_hidden_layers = num_hidden_layers
         self.hidden_size = hidden_size
         self.vocab_size = vocab_size
         self.eps = eps
         self.max_length = max_length
+
+    @staticmethod
+    def _set_config_defaults(config, config_defaults):
+        for (k, v) in config_defaults.items():
+            if k not in config:
+                config[k] = v
+        return config
+
+    @staticmethod
+    def get_partition_rules(fully_fsdp: bool = False):
+        return (
+            ('wi/kernel', PartitionSpec('fsdp')),
+            ('attn_wo/kernel', PartitionSpec('fsdp', 'mp')),
+            ('ff_wo/kernel', PartitionSpec('fsdp', 'mp')),
+            ('wte/embedding', PartitionSpec('fsdp', 'mp')),
+            ('lm_head/kernel', PartitionSpec('fsdp')),
+            ('post_norm/kernel', PartitionSpec('fsdp')),
+            ('norm/kernel', PartitionSpec('fsdp', 'mp')),
+            ('.*', PartitionSpec(None)),
+        ) if not fully_fsdp else (
+            ('wi/kernel', PartitionSpec('fsdp')),
+            ('attn_wo/kernel', PartitionSpec('fsdp')),
+            ('ff_wo/kernel', PartitionSpec('fsdp')),
+            ('wte/embedding', PartitionSpec('fsdp')),
+            ('lm_head/kernel', PartitionSpec('fsdp')),
+            ('post_norm/kernel', PartitionSpec('fsdp')),
+            ('norm/kernel', PartitionSpec('fsdp')),
+            ('.*', PartitionSpec('fsdp')),
+        )
 
 
 class RMSNorm(nn.Module):
@@ -90,7 +124,7 @@ def apply_rotary_embedding(xq, xk, freq_cis, dtype=jnp.bfloat16):
     xk = complex_k * freq_cis
     xq = jnp.stack([jnp.real(xq), jnp.imag(xq)], axis=-1).reshape(xq.shape[:-1], -1)
     xk = jnp.stack([jnp.real(xk), jnp.imag(xk)], axis=-1).reshape(xk.shape[:-1], -1)
-    return xq.astype(dtype), xk.dtype(dtype)
+    return xq.astype(dtype), xk.astype(dtype)
 
 
 class ParallelPalmBlock(nn.Module):
@@ -195,14 +229,66 @@ class ParallelCollection(nn.Module):
             )
         ]
 
-    def __call__(self, hidden_state, freq_cis, causal_mask):
+    def __call__(self, hidden_state, freq_cis, causal_mask, output_attention=False):
+        saves = []
         for block in self.blocks:
             hidden_state = block(
                 hidden_state=hidden_state,
                 freq_cis=freq_cis,
                 causal_mask=causal_mask
-            )
-        return hidden_state
+            ) + hidden_state
+            if output_attention:
+                saves.append(hidden_state)
+        return hidden_state, saves
+
+
+class PalmPretrainedModel(transformers.FlaxPreTrainedModel):
+    module_class: nn.Module
+    config_class = PalmConfig
+    dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.bfloat16
+    precision: Optional[Union[jax.lax.Precision, str]] = None
+
+    def __init__(self, config: PalmConfig, input_shape=(1, 1), _do_init=False):
+        module = self.module_class(
+            config=config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision
+        )
+        super().__init__(
+            config=config,
+            input_shape=input_shape,
+            _do_init=_do_init,
+            module=module
+        )
+
+    def init_weights(self, rng: jax.random.PRNGKey,
+                     input_shape: Tuple,
+                     params: FrozenDict = None
+                     ) -> [Mapping[str, Any], FrozenDict]:
+
+        if params is None:
+            return self.module.init(
+                rngs=rng,
+                input_ids=jnp.ones(input_shape, dtype='i4'),
+                attention_mask=jnp.ones(input_shape, dtype='i4'),
+
+            )['params']
+        else:
+            return params
+
+    def __call__(self, input_ids, attention_mask=None, params=None, add_params_field: bool = False,
+                 return_dict: bool = True, output_attention: bool = False):
+        params = {'params': params or self.params} if add_params_field else params or self.params
+        predict = self.module.apply(
+            params,
+            input_ids=jnp.asarray(input_ids, dtype='i4'),
+            attention_mask=jnp.asarray(attention_mask, dtype='i4') if attention_mask is not None else attention_mask,
+            return_dict=return_dict,
+            output_attention=output_attention
+        )
+        return predict
 
 
 class PalmModule(nn.Module):
@@ -230,9 +316,115 @@ class PalmModule(nn.Module):
             self.config.max_length,
             dtype=self.dtype
         )
+
+        self.ln_f = RMSNorm(
+            dim=self.config.hidden_size,
+            dtype=self.dtype,
+            precision=self.precision,
+            param_dtype=self.param_dtype,
+            eps=self.config.eps
+        )
         self.causal_mask = nn.make_causal_mask(jnp.ones(
             1, self.config.max_length
         ))
 
-    def __call__(self, input_ids, attention_mask, return_dict: bool = True):
-        ...
+    def make_causal_mask(self, attention_mask=None):
+        assert attention_mask is not None
+        b, s = attention_mask.shape
+        mask = attention_mask + self.causal_mask
+        mask = jnp.where(
+            mask == 2,
+            1, 0
+        ).astype(jnp.bool_)
+        return mask.reshape(b, 1, 1, s)
+
+    def __call__(self,
+                 input_ids: jnp.DeviceArray,
+                 attention_mask: jnp.DeviceArray = None,
+                 return_dict: bool = True,
+                 output_attention: bool = False):
+        batch, seq_len = input_ids.shape
+        if attention_mask is None:
+            attention_mask = jnp.ones(
+                (batch, seq_len),
+                dtype=jnp.int32
+            )
+
+        mask = self.make_causal_mask(
+            attention_mask=attention_mask
+        )
+        hidden_state = self.wte(
+            inputs=input_ids
+        )
+        hidden_state, atn = self.block(
+            hidden_state=hidden_state,
+            causal_mask=mask,
+            output_attention=output_attention,
+            freq_cis=self.freq_cis[:seq_len].reshape(1, seq_len, -1)
+        )
+        hidden_state = self.ln_f(
+            hidden_state
+        )
+
+        if return_dict:
+            return transformers.modeling_flax_outputs.FlaxBaseModelOutput(
+                last_hidden_state=hidden_state,
+                hidden_states=atn
+            )
+        else:
+            return hidden_state, atn
+
+
+class PalmModel(PalmPretrainedModel):
+    module_class = PalmModule
+
+
+class FlaxPalmForCausalLMModule(nn.Module):
+    config: PalmConfig
+    dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.bfloat16
+    precision: Optional[Union[jax.lax.Precision, str]] = None
+
+    def setup(self) -> None:
+        self.path_way = PalmModule(
+            config=self.config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision
+        )
+        if not self.config.use_tie_word_embedding:
+            self.lm_head = self.param(
+                'kernel',
+                jax.nn.initializers.normal,
+                (self.config.hidden_size, self.config.vocab_size),
+                self.param_dtype
+            )
+
+    def __call__(self,
+                 input_ids: jnp.DeviceArray,
+                 attention_mask: jnp.DeviceArray = None,
+                 return_dict: bool = True,
+                 output_attention: bool = False):
+        out = self.path_way(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            return_dict=True,
+            output_attention=output_attention
+        )
+        last_state = out.last_hidden_state
+        if not self.config.use_tie_word_embedding:
+            last_state = last_state @ self.lm_head
+        else:
+            last_state = last_state @ self.path_way.wte.embedding.T
+
+        if return_dict:
+            return FlaxCausalLMOutput(
+                logits=last_state,
+                hidden_states=out.hidden_states
+            )
+        else:
+            return last_state, out.hidden_states if output_attention else last_state,
+
+
+class FlaxPalmForCausalLM(PalmPretrainedModel):
+    module_class = FlaxPalmForCausalLMModule
