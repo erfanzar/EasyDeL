@@ -4,11 +4,16 @@ from .lucid_transformer import FlaxLTModel, FlaxLTConfig, FlaxLTModelModule, Fla
 from .mosaic_mpt import MptConfig, FlaxMptModel, FlaxMptForCausalLM
 from .falcon import FalconConfig, FlaxFalconModel, FlaxFalconForCausalLM
 from .gpt_neo_x import FlaxGPTNeoXForCausalLM, GPTNeoXConfig, FlaxGPTNeoXModel
+from .palm import PalmConfig, PalmModel, FlaxPalmForCausalLM
+from .t5 import FlaxT5ForConditionalGeneration, FlaxT5Model
 
 __all__ = ['LlamaConfig', 'LlamaForCausalLM', 'LlamaModel', 'FlaxLlamaForCausalLM', 'FlaxLlamaModel',
            'FlaxGPTJModule', 'FlaxGPTJForCausalLMModule', 'FlaxGPTJModel', 'FlaxGPTJForCausalLM', 'GPTJConfig',
            'FlaxLTModel', 'FlaxLTConfig', 'FlaxLTModelModule', 'FlaxLTForCausalLM',
            "MptConfig", "FlaxMptModel", "FlaxMptForCausalLM",
            "FalconConfig", "FlaxFalconModel", "FlaxFalconForCausalLM",
-           "FlaxGPTNeoXForCausalLM", "GPTNeoXConfig", "FlaxGPTNeoXModel"
+           "FlaxGPTNeoXForCausalLM", "GPTNeoXConfig", "FlaxGPTNeoXModel",
+           "FlaxT5ForConditionalGeneration", "FlaxT5Model",
+           "PalmConfig", "PalmModel", "FlaxPalmForCausalLM"
+
            ]
