@@ -13,7 +13,8 @@ if is_flax_available():
     from .modules import FlaxLlamaModel, LlamaConfig, FlaxLlamaForCausalLM, LlamaModel, LlamaForCausalLM, \
         FlaxLTModelModule, FlaxLTConfig, FlaxLTForCausalLM, FlaxLTModel, GPTJConfig, FlaxGPTJModule, \
         FlaxGPTJForCausalLMModule, FlaxGPTJModel, FlaxGPTJForCausalLM, FlaxMptForCausalLM, MptConfig, FlaxMptModel, \
-        FlaxFalconForCausalLM, FlaxFalconModel, FalconConfig, FlaxGPTNeoXForCausalLM, GPTNeoXConfig, FlaxGPTNeoXModel
+        FlaxFalconForCausalLM, FlaxFalconModel, FalconConfig, FlaxGPTNeoXForCausalLM, GPTNeoXConfig, FlaxGPTNeoXModel, \
+        FlaxT5ForConditionalGeneration, FlaxT5Model, FlaxPalmForCausalLM, PalmModel, PalmConfig
 from .trainer import finetuner, TrainArguments, fsdp_train_step
 
 __all__ = __version__, 'package_checker', 'is_jax_available', 'is_torch_available', 'is_flax_available', \
@@ -24,4 +25,6 @@ __all__ = __version__, 'package_checker', 'is_jax_available', 'is_torch_availabl
     'FlaxLTModel', 'FlaxLTConfig', 'FlaxLTModelModule', 'FlaxLTForCausalLM', \
     "FlaxMptForCausalLM", "MptConfig", "FlaxMptModel", \
     "FlaxFalconForCausalLM", "FlaxFalconModel", "FalconConfig", \
-    "FlaxGPTNeoXForCausalLM", "GPTNeoXConfig", "FlaxGPTNeoXModel"
+    "FlaxGPTNeoXForCausalLM", "GPTNeoXConfig", "FlaxGPTNeoXModel", \
+    "FlaxT5ForConditionalGeneration", "FlaxT5Model", \
+    "FlaxPalmForCausalLM", "PalmModel", "PalmConfig"
