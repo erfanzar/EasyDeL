@@ -21,6 +21,7 @@ pip install easydel
 - GPTNeoX   (TODO `FSDP`, `MP`, `DP`)
 - Falcon    (Support `FSDP`, `MP`, `DP`)
 - Palm      (Support `FSDP`, `MP`, `DP`)
+- T5        (Support `FSDP`, `MP`, `DP`)
 
 you can also tell me the model you want in Flax/Jax version and ill try my best to build it ;)
 
