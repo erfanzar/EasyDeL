@@ -5,8 +5,10 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="08ad205b-709f-455b-86db-91293f595cd3" name="Changes" comment="">
-      <change beforePath="$PROJECT_DIR$/.idea/shelf/Uncommitted_changes_before_Update_at_24_06_23_10_21_[Changes]/shelved.patch" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/shelf/Uncommitted_changes_before_Update_at_24_06_23_10_21__Changes_.xml" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/__init__.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/modules/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/modules/__init__.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/modules/t5/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/modules/t5/__init__.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -146,6 +148,9 @@
       <workItem from="1688027674287" duration="145000" />
       <workItem from="1688039965887" duration="10538000" />
       <workItem from="1688104174694" duration="9209000" />
+      <workItem from="1688203324311" duration="862000" />
+      <workItem from="1688211270145" duration="1428000" />
+      <workItem from="1688283947344" duration="621000" />
     </task>
     <servers />
   </component>

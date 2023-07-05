@@ -444,6 +444,7 @@ def pre_trainer_or_base_trainer(
         'creating functions'
     ).stop()
     timer.log(['creating functions'])
+
     with mesh:
         timer(
             'loading parameters'
@@ -457,7 +458,14 @@ def pre_trainer_or_base_trainer(
         ).stop()
         timer.log(['loading parameters'])
         count_params(sharded_train_state_.params)
-
+        if use_wandb:
+            wandb_runtime.log(
+                {
+                    'model billion parameters': sum(
+                        i.size for i in
+                        jax.tree_util.tree_flatten(flax.core.unfreeze(sharded_train_state_.params))[0]) / 1e9
+                }
+            )
         timer.write(timer.timers.keys(), 0)
         pbar = tqdm(total=max_steps_train)
         i = sharded_train_state_.step.tolist()
