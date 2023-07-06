@@ -1,4 +1,5 @@
 from .config import TrainArguments
 from .fsdp_train import finetuner, fsdp_train_step
+from .training_utils import get_training_modules
 
-__all__ = 'TrainArguments', 'finetuner', 'fsdp_train_step'
+__all__ = 'TrainArguments', 'finetuner', 'fsdp_train_step', 'get_training_modules'
