@@ -21,14 +21,20 @@ from torch.utils.data import DataLoader
 from fjutils import match_partition_rules, make_shard_and_gather_fns, StreamingCheckpointer, count_params
 
 
-def fsdp_train_step(state, batch):
+def fsdp_train_step(state, batch, label_in_the_field=False, scope_logits=True):
     batch = with_sharding_constraint(batch, PartitionSpec(('dp', 'fsdp')))
 
     def calculate_loss(params):
         logits = state.apply_fn(params=params, **batch,
                                 return_dict=True).logits
-        loss = optax.softmax_cross_entropy_with_integer_labels(logits=logits[..., :-1, :],
-                                                               labels=batch['input_ids'][..., 1:])
+        if label_in_the_field:
+            loss = optax.softmax_cross_entropy_with_integer_labels(
+                logits=logits[..., :-1, :] if scope_logits else logits,
+                labels=batch['label'])
+        else:
+            loss = optax.softmax_cross_entropy_with_integer_labels(
+                logits=logits[..., :-1, :] if scope_logits else logits,
+                labels=batch['input_ids'][..., 1:])
         loss = jnp.mean(loss)
         return loss
 
@@ -94,7 +100,9 @@ def finetuner(
         configs_to_init_model_class=None,
         do_last_save: bool = True,
         model_parameters=None,
-        do_shard_fns=True
+        do_shard_fns: bool = True,
+        label_in_the_field: bool = False,
+        scope_logits: bool = True
 ) -> OutputFineTuner:
     if extra_configs is None:
         extra_configs = {}
@@ -192,7 +200,7 @@ def finetuner(
     )
     sharded_train_step_fn = pjit(
         fsdp_train_step,
-        in_shardings=(train_state_partition_spec, PartitionSpec()),
+        in_shardings=(train_state_partition_spec, PartitionSpec(), PartitionSpec(), PartitionSpec()),
         out_shardings=(train_state_partition_spec, PartitionSpec()),
         donate_argnums=(0, 0, 0),
     )
@@ -243,7 +251,8 @@ def finetuner(
                         _ = batch.pop('token_type_ids', None)
                         for i in ids_to_pop_from_dataset:
                             _ = batch.pop(i, None)
-                        sharded_train_state_, loss = sharded_train_step_fn(sharded_train_state_, batch)
+                        sharded_train_state_, loss = sharded_train_step_fn(sharded_train_state_, batch,
+                                                                           label_in_the_field, scope_logits)
                         losses.append(loss)
                         learning_rates.append(scheduler(i).tolist())
                         pbar.update(1)
@@ -317,7 +326,9 @@ def pre_trainer_or_base_trainer(
         ids_to_pop_from_dataset=[],
         model_class=None,
         configs_to_init_model_class=None,
-        do_last_save: bool = True
+        do_last_save: bool = True,
+        label_in_the_field=False,
+        scope_logits=True
 ) -> OutputFineTuner:
     if extra_configs is None:
         extra_configs = {}
@@ -420,7 +431,7 @@ def pre_trainer_or_base_trainer(
     )
     sharded_train_step_fn = pjit(
         fsdp_train_step,
-        in_shardings=(train_state_partition_spec, PartitionSpec()),
+        in_shardings=(train_state_partition_spec, PartitionSpec(), PartitionSpec(), PartitionSpec()),
         out_shardings=(train_state_partition_spec, PartitionSpec()),
         donate_argnums=(0, 0, 0),
     )
@@ -433,6 +444,7 @@ def pre_trainer_or_base_trainer(
         'creating functions'
     ).stop()
     timer.log(['creating functions'])
+
     with mesh:
         timer(
             'loading parameters'
@@ -446,7 +458,14 @@ def pre_trainer_or_base_trainer(
         ).stop()
         timer.log(['loading parameters'])
         count_params(sharded_train_state_.params)
-
+        if use_wandb:
+            wandb_runtime.log(
+                {
+                    'model billion parameters': sum(
+                        i.size for i in
+                        jax.tree_util.tree_flatten(flax.core.unfreeze(sharded_train_state_.params))[0]) / 1e9
+                }
+            )
         timer.write(timer.timers.keys(), 0)
         pbar = tqdm(total=max_steps_train)
         i = sharded_train_state_.step.tolist()
@@ -461,7 +480,8 @@ def pre_trainer_or_base_trainer(
                     _ = batch.pop('token_type_ids', None)
                     for i in ids_to_pop_from_dataset:
                         _ = batch.pop(i, None)
-                    sharded_train_state_, loss = sharded_train_step_fn(sharded_train_state_, batch)
+                    sharded_train_state_, loss = sharded_train_step_fn(sharded_train_state_, batch,
+                                                                       label_in_the_field, scope_logits)
                     losses.append(loss)
                     learning_rates.append(scheduler(i).tolist())
                     pbar.update(1)
