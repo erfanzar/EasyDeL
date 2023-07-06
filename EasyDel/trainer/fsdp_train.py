@@ -21,20 +21,16 @@ from torch.utils.data import DataLoader
 from fjutils import match_partition_rules, make_shard_and_gather_fns, StreamingCheckpointer, count_params
 
 
-def fsdp_train_step(state, batch, label_in_the_field=False, scope_logits=True):
+def fsdp_train_step(state, batch):
     batch = with_sharding_constraint(batch, PartitionSpec(('dp', 'fsdp')))
 
     def calculate_loss(params):
         logits = state.apply_fn(params=params, **batch,
                                 return_dict=True).logits
-        if label_in_the_field:
-            loss = optax.softmax_cross_entropy_with_integer_labels(
-                logits=logits[..., :-1, :] if scope_logits else logits,
-                labels=batch['label'])
-        else:
-            loss = optax.softmax_cross_entropy_with_integer_labels(
-                logits=logits[..., :-1, :] if scope_logits else logits,
-                labels=batch['input_ids'][..., 1:])
+
+        loss = optax.softmax_cross_entropy_with_integer_labels(
+            logits=logits[..., :-1, :],
+            labels=batch['input_ids'][..., 1:])
         loss = jnp.mean(loss)
         return loss
 
@@ -200,9 +196,9 @@ def finetuner(
     )
     sharded_train_step_fn = pjit(
         fsdp_train_step,
-        in_shardings=(train_state_partition_spec, PartitionSpec(), PartitionSpec(), PartitionSpec()),
+        in_shardings=(train_state_partition_spec, PartitionSpec()),
         out_shardings=(train_state_partition_spec, PartitionSpec()),
-        donate_argnums=(0, 0, 0),
+        donate_argnums=(0, 0),
     )
     sharded_predict = pjit(predict, out_shardings=PartitionSpec(),
                            in_shardings=(train_state_partition_spec, PartitionSpec()))
@@ -252,7 +248,7 @@ def finetuner(
                         for i in ids_to_pop_from_dataset:
                             _ = batch.pop(i, None)
                         sharded_train_state_, loss = sharded_train_step_fn(sharded_train_state_, batch,
-                                                                           label_in_the_field, scope_logits)
+                                                                           )
                         losses.append(loss)
                         learning_rates.append(scheduler(i).tolist())
                         pbar.update(1)
