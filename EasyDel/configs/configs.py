@@ -210,28 +210,28 @@ falcon_configs = {
 
 opt_configs = {
     '1.3b': {
-        {
-            "activation_dropout": 0.0,
-            "activation_function": "relu",
-            "attention_dropout": 0.0,
-            "bos_token_id": 2,
-            "do_layer_norm_before": True,
-            "dropout": 0.1,
-            "eos_token_id": 2,
-            "ffn_dim": 8192,
-            "hidden_size": 2048,
-            "init_std": 0.02,
-            "layerdrop": 0.0,
-            "max_position_embeddings": 2048,
-            "model_type": "opt",
-            "num_attention_heads": 32,
-            "num_hidden_layers": 24,
-            "pad_token_id": 1,
-            "prefix": "</s>",
-            "use_cache": True,
-            "vocab_size": 50272,
-            "word_embed_proj_dim": 2048
-        }
+
+        "activation_dropout": 0.0,
+        "activation_function": "relu",
+        "attention_dropout": 0.0,
+        "bos_token_id": 2,
+        "do_layer_norm_before": True,
+        "dropout": 0.1,
+        "eos_token_id": 2,
+        "ffn_dim": 8192,
+        "hidden_size": 2048,
+        "init_std": 0.02,
+        "layerdrop": 0.0,
+        "max_position_embeddings": 2048,
+        "model_type": "opt",
+        "num_attention_heads": 32,
+        "num_hidden_layers": 24,
+        "pad_token_id": 1,
+        "prefix": "</s>",
+        "use_cache": True,
+        "vocab_size": 50272,
+        "word_embed_proj_dim": 2048
+
     },
     '6.7b': {
         "_remove_final_layer_norm": False,
