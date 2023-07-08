@@ -1,5 +1,6 @@
 import os.path
 import pathlib
+import typing
 from typing import OrderedDict, List, Union
 
 import fjutils.optimizers
@@ -135,9 +136,20 @@ class TrainArguments(
             ]
         )
 
-    def __repr__(self):
+    def __str__(self):
         string = f'TrainingArguments(\n'
         for k, v in self.__call__().items():
+            if isinstance(v, typing.Callable):
+                def string_func(it_self):
+
+                    string_ = f'{it_self.__class__.__name__}(\n'
+                    for k_, v_ in it_self.__dict__.items():
+                        string_ += f'\t\t{k_} : {v_}\n'
+                    string_ += '\t)'
+                    return string_
+
+                v.__str__ = string_func
+                v = v.__str__(v)
             string += f'\t{k} : {v}\n'
         string += ')'
         return string
