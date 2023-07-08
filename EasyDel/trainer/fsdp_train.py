@@ -546,6 +546,7 @@ class CausalLMTrainer:
                  ckpt_path: typing.Union[str, os.PathLike] = None,
                  _do_init_fns: bool = True
                  ):
+        self.timer = None
         self.dataloader_train = None
         self.dataloader_eval = None
         self.model = None
@@ -572,10 +573,6 @@ class CausalLMTrainer:
         self.param_dtype = arguments.param_dtype
         if finetune:
             assert ckpt_path is not None, 'ckpt path can not be none when you are using finetune task'
-        self.timer = Timers(
-            use_wandb=False,
-            tensorboard_writer=arguments.get_board()
-        )
         if _do_init_fns:
             self.init_functions()
         else:
@@ -602,7 +599,10 @@ class CausalLMTrainer:
 
     def init_functions(self):
         self.wandb_runtime = self.arguments.get_wandb_init() if self.arguments.use_wandb else None
-
+        self.timer = Timers(
+            use_wandb=False,
+            tensorboard_writer=self.arguments.get_board()
+        )
         self.dataloader_train, self.max_steps_train, \
             self.dataloader_eval, self.max_steps_eval = self.configure_dataloader()
         self.model, self.tx, self.scheduler, self.config = self.configure_model()
@@ -613,7 +613,7 @@ class CausalLMTrainer:
         self.mesh = funcs[3]
         self.ckpt_streamer = funcs[4]
         self.init_fn = funcs[5]
-
+        
     def configure_dataloader(self):
 
         def collate_fn(batch):
