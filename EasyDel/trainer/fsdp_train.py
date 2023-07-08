@@ -3,6 +3,7 @@ import os
 import typing
 
 import wandb
+from datasets import Dataset
 
 from EasyDel.trainer.config import TrainArguments
 
@@ -19,6 +20,10 @@ from flax.training import train_state
 from jax import numpy as jnp
 from torch.utils.data import DataLoader
 from fjutils import match_partition_rules, make_shard_and_gather_fns, StreamingCheckpointer, count_params
+
+
+def prefix_print(prefix, string):
+    print(f'\033[1;36m{prefix}\033[1;0m : {string}')
 
 
 def fsdp_train_step(state, batch):
@@ -97,8 +102,6 @@ def finetuner(
         do_last_save: bool = True,
         model_parameters=None,
         do_shard_fns: bool = True,
-        label_in_the_field: bool = False,
-        scope_logits: bool = True
 ) -> OutputFineTuner:
     if extra_configs is None:
         extra_configs = {}
@@ -532,3 +535,253 @@ def pre_trainer_or_base_trainer(
     )
     wandb.finish()
     return output
+
+
+class CausalLMTrainer:
+    def __init__(self,
+                 arguments: TrainArguments,
+                 dataset_train: Dataset,
+                 dataset_eval: Dataset = None,
+                 finetune: bool = True,
+                 ckpt_path: typing.Union[str, os.PathLike] = None
+                 ):
+        self.dataloader_train = None
+        self.dataloader_eval = None
+        self.model = None
+        self.wandb_runtime = None
+        self.max_steps_train = None
+        self.max_steps_eval = None
+        self.config = None
+        self.scheduler = None
+        self.tx = None
+        self.sharded_create_from_params_fn = None
+        self.sharded_train_step_fn = None
+        self.sharded_predict = None
+        self.mesh = None
+        self.ckpt_streamer = None
+        self.init_fn = None
+        self.train_state_shape = None
+        self.train_state_partition_spec = None
+        self.arguments = arguments
+        self.dataset_train = dataset_train
+        self.dataset_eval = dataset_eval
+        self.finetune = finetune
+        self.ckpt_path = ckpt_path
+        self.dtype = arguments.dtype
+        self.param_dtype = arguments.param_dtype
+        if finetune:
+            assert ckpt_path is not None, 'ckpt path can not be none when you are using finetune task'
+        self.timer = Timers(
+            use_wandb=False,
+            tensorboard_writer=arguments.get_board()
+        )
+        self.init_functions()
+
+    def init_functions(self):
+        self.wandb_runtime = self.arguments.get_wandb_init() if self.arguments.use_wandb else None
+
+        self.dataloader_train, self.max_steps_train, \
+            self.dataloader_eval, self.max_steps_eval = self.configure_dataloader()
+        self.model, self.tx, self.scheduler, self.config = self.configure_model()
+        funcs = self.configure_functions()
+        self.sharded_create_from_params_fn = funcs[0]
+        self.sharded_train_step_fn = funcs[1]
+        self.sharded_predict = funcs[2]
+        self.mesh = funcs[3]
+        self.ckpt_streamer = funcs[4]
+        self.init_fn = funcs[5]
+
+    def configure_dataloader(self):
+
+        def collate_fn(batch):
+            rs = {}
+            for key in batch[0].keys():
+                ssp = [jnp.array(f[key])[..., -self.arguments.max_length:] for f in batch]
+                rs[key] = jnp.stack(ssp).reshape(-1, ssp[0].shape[-1])
+            return rs
+
+        dataloader_train = DataLoader(self.dataset_train, collate_fn=collate_fn,
+                                      batch_size=self.arguments.total_batch_size, drop_last=True)
+        max_steps_train = self.arguments.num_train_epochs * len(
+            dataloader_train) if self.arguments.max_steps is None else self.arguments.max_steps
+        if self.dataset_eval is not None and self.arguments.do_eval:
+            dataloader_eval = DataLoader(self.dataset_eval, collate_fn=collate_fn,
+                                         batch_size=self.arguments.total_batch_size, drop_last=True)
+            max_steps_eval = len(
+                dataloader_eval) if self.arguments.max_steps is None else self.arguments.max_steps
+
+        return dataloader_train, max_steps_train, dataloader_eval, max_steps_eval
+
+    def configure_model(self):
+        extra_configs = {} if self.arguments.extra_configs is None else self.arguments.extra_configs
+        if self.arguments.model_class is None:
+            config = AutoConfig.from_pretrained(self.arguments.model_id, trust_remote_code=True
+                                                , gradient_checkpointing=self.arguments.gradient_checkpointing,
+                                                use_pjit_attention_force=self.arguments.use_pjit_attention_force,
+                                                **extra_configs
+                                                )
+
+            assert hasattr(config, 'get_partition_rules')
+            model = FlaxAutoModelForCausalLM.from_config(config, trust_remote_code=True, dtype=self.arguments.dtype,
+                                                         param_dtype=self.arguments.param_dtype,
+                                                         _do_init=False)
+
+        else:
+            assert self.arguments.custom_rule is not None, 'if you are using custom model to init you must' \
+                                                           ' pass custom_rule for partition rules '
+            model = self.arguments.model_class(
+                **self.arguments.configs_to_init_model_class,
+                _do_init=False
+            )
+            config = self.arguments.configs_to_init_model_class['config']
+
+        tx, scheduler = self.arguments.get_optimizer_and_scheduler(self.max_steps_train)
+        return model, tx, scheduler, config
+
+    def configure_functions(self):
+        def init_fn():
+            params__ = self.model.init_weights(jax.random.PRNGKey(0), (1, self.arguments.max_length))
+            if self.arguments.dtype == jnp.bfloat16:
+                params__ = self.model.to_bf16(params__)
+            elif self.arguments.dtype == jnp.float16:
+                params__ = self.model.to_fp16(params__)
+            return train_state.TrainState.create(
+                tx=self.tx,
+                params=flax.core.freeze({'params': params__}),
+                apply_fn=self.model.__call__
+            )
+
+        def create_train_state_from_params(params_):
+            return train_state.TrainState.create(
+                tx=self.tx,
+                apply_fn=self.model.__call__,
+                params=params_
+            )
+
+        train_state_shape = jax.eval_shape(init_fn)
+        train_state_partition_spec = match_partition_rules(
+            self.config.get_partition_rules(
+                fully_fsdp=self.arguments.fully_fsdp) if self.arguments.custom_rule is None else self.arguments.custom_rule,
+            train_state_shape)
+        sharded_create_from_params_fn = pjit(
+            create_train_state_from_params,
+            in_shardings=(train_state_partition_spec.params,),
+            out_shardings=train_state_partition_spec,
+            donate_argnums=(0,)
+        )
+        sharded_train_step_fn = pjit(
+            fsdp_train_step,
+            in_shardings=(train_state_partition_spec, PartitionSpec()),
+            out_shardings=(train_state_partition_spec, PartitionSpec()),
+            donate_argnums=(0, 0),
+        )
+        sharded_predict = pjit(predict, out_shardings=PartitionSpec(),
+                               in_shardings=(train_state_partition_spec, PartitionSpec()))
+        mesh = self.arguments.get_mesh()
+        self.arguments.ckpt_path_exists()
+        ckpt_streamer = self.arguments.get_streaming_checkpointer()
+        self.train_state_partition_spec = train_state_partition_spec
+        self.train_state_shape = train_state_shape
+        return sharded_create_from_params_fn, sharded_train_step_fn, sharded_predict, mesh, ckpt_streamer, init_fn
+
+    def train(self, model_parameters: flax.core.FrozenDict = None) -> OutputFineTuner:
+        with self.mesh:
+            if self.finetune:
+                shard_fns, gather_fns = self.make_shard_and_gather_fns(self.train_state_partition_spec,
+                                                                       dtype_specs=self.dtype)
+                prefix_print(
+                    'Action', f'Loading Model From {self.ckpt_path}'
+                )
+                if model_parameters is None:
+                    _, params = StreamingCheckpointer.load_trainstate_checkpoint(
+                        f'params::{self.ckpt_path}', self.train_state_shape, shard_fns
+                    )
+                else:
+                    params = model_parameters if not self.arguments.do_shard_fns else jax.tree_util.tree_map(
+                        lambda f, x: f(x), shard_fns,
+                        model_parameters)
+
+                if self.arguments.remove_ckpt_after_load:
+                    os.remove(self.ckpt_path)
+
+                sharded_train_state_ = self.sharded_create_from_params_fn(params)
+
+                count_params(sharded_train_state_.params)
+            else:
+                sharded_train_state_ = self.init_fn()
+
+                count_params(sharded_train_state_.params)
+
+            pbar = tqdm(total=self.max_steps_train)
+            i = sharded_train_state_.step.tolist()
+            losses = []
+            pbar.update(sharded_train_state_.step.tolist())
+            learning_rates = []
+            try:
+                for ep in range(self.arguments.num_train_epochs):
+                    for batch in self.dataloader_train:
+                        i += 1
+                        if i < self.max_steps_train:
+
+                            _ = batch.pop('token_type_ids', None)
+                            for i in self.arguments.ids_to_pop_from_dataset:
+                                _ = batch.pop(i, None)
+                            sharded_train_state_, loss = self.sharded_train_step_fn(sharded_train_state_, batch,
+                                                                                    )
+                            losses.append(loss)
+                            learning_rates.append(self.scheduler(i).tolist())
+                            pbar.update(1)
+                            if self.arguments.use_wandb:
+                                self.wandb_runtime.log(
+                                    {'loss': loss.tolist(),
+                                     'learning_rate': self.scheduler(sharded_train_state_.step.tolist()).tolist(),
+                                     'step': sharded_train_state_.step.tolist()}
+                                )
+                            pbar.set_postfix(loss=loss,
+                                             learning_rate=self.scheduler(sharded_train_state_.step.tolist()).tolist(),
+                                             step=sharded_train_state_.step.tolist())
+                        else:
+                            break
+                        if self.arguments.save_steps is not None and i % self.arguments.save_steps == 0:
+                            filename = f'{self.arguments.model_name}-{sum(losses) / len(losses)}-{i}'
+                            print(f'Saving Model to \033[1;30m{filename}\033[1;0m')
+                            self.ckpt_streamer.save_checkpoint(sharded_train_state_.params['params'],
+                                                               filename,
+                                                               gather_fns=gather_fns.params['params'])
+            except KeyboardInterrupt:
+                print(
+                    '\033[1;30m KeyboardInterrupt At training model Will return current state of the model * \033[1;0m')
+            if self.arguments.do_eval:
+                if self.dataset_eval is not None:
+                    pbar_eval = tqdm(total=self.max_steps_eval)
+                    for i_eval, batch_eval in enumerate(self.dataloader_eval):
+                        _ = batch_eval.pop('token_type_ids', None)
+                        for i in self.arguments.ids_to_pop_from_dataset:
+                            _ = batch_eval.pop(i, None)
+                        loss_eval = fsdp_eval_step(sharded_train_state_, batch_eval=batch_eval)
+                        pbar_eval.update(1)
+                        if self.arguments.use_wandb:
+                            self.wandb_runtime.log(
+                                {'loss_eval': loss_eval.tolist()}
+                            )
+                        pbar_eval.set_postfix(loss_eval=loss_eval.tolist())
+            if self.arguments.save_steps is None and self.arguments.do_last_save:
+                filename = f'{self.arguments.model_name}-{sum(losses) / len(losses)}-{i}'
+                print(f'Saving Model to \033[1;30m{filename}\033[1;0m')
+                self.ckpt_streamer.save_checkpoint(sharded_train_state_.params['params'],
+                                                   filename,
+                                                   gather_fns=gather_fns.params['params'])
+            else:
+                filename = 'not_saved | None'
+        output = OutputFineTuner(
+            last_save_file_name=filename,
+            predict_fun=self.sharded_predict,
+            train_state=sharded_train_state_,
+            mesh=self.mesh,
+            shard_fns=shard_fns,
+            gather_fns=gather_fns,
+            ckpt_stream=self.ckpt_streamer
+        )
+        wandb.finish()
+
+        return output

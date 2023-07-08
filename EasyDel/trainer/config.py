@@ -49,9 +49,24 @@ class TrainArguments(
             extra_optimizer_kwargs: dict = {},
             save_steps: Union[int, None] = None,
             save_dir: str = 'easydel_ckpt',
+            use_pjit_attention_force: bool = True,
+            dtype=jnp.bfloat16,
+            param_dtype=jnp.bfloat16,
+            fully_fsdp=True,
+            use_wandb: bool = True,
+            custom_rule=None,
+            extra_configs=None,
+            ids_to_pop_from_dataset=[],
+            remove_ckpt_after_load: bool = False,
+            model_class=None,
+            configs_to_init_model_class=None,
+            do_last_save: bool = True,
+            model_parameters=None,
+            do_shard_fns: bool = True,
             **kwargs
     ):
         super().__init__()
+
         assert backend in AVAILABLE_BACKENDS, f'{backend} is not recognized, ' \
                                               f'available backends are {AVAILABLE_BACKENDS}'
         assert gradient_checkpointing in AVAILABLE_GRADIENT_CHECK_POINTING, f'{gradient_checkpointing} is not ' \
@@ -85,6 +100,20 @@ class TrainArguments(
         self.do_test = do_test
         self.save_steps = save_steps
         self.save_dir = save_dir
+        self.use_pjit_attention_force = use_pjit_attention_force
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.fully_fsdp = fully_fsdp
+        self.use_wandb = use_wandb
+        self.custom_rule = custom_rule
+        self.extra_configs = extra_configs
+        self.ids_to_pop_from_dataset = ids_to_pop_from_dataset
+        self.remove_ckpt_after_load = remove_ckpt_after_load
+        self.model_class = model_class
+        self.configs_to_init_model_class = configs_to_init_model_class
+        self.do_last_save = do_last_save
+        self.model_parameters = model_parameters
+        self.do_shard_fns = do_shard_fns
         torch.set_default_device('cpu')
         self.__dict__.update(**kwargs)
 
