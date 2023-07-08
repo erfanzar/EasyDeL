@@ -543,7 +543,8 @@ class CausalLMTrainer:
                  dataset_train: Dataset,
                  dataset_eval: Dataset = None,
                  finetune: bool = True,
-                 ckpt_path: typing.Union[str, os.PathLike] = None
+                 ckpt_path: typing.Union[str, os.PathLike] = None,
+                 _do_init_fns: bool = True
                  ):
         self.dataloader_train = None
         self.dataloader_eval = None
@@ -575,7 +576,29 @@ class CausalLMTrainer:
             use_wandb=False,
             tensorboard_writer=arguments.get_board()
         )
-        self.init_functions()
+        if _do_init_fns:
+            self.init_functions()
+        else:
+            prefix_print('Warning', 'you have set _do_init_fns to False so function will not me initialized you have '
+                                    f'to do in manually (simply with  trainer.init_functions() )')
+
+    def __str__(self):
+        string = f'CausalLMTrainer('
+        for k, v in self.__dict__.items():
+            if isinstance(v, typing.Callable):
+                def string_func(it_self):
+
+                    string_ = f'{it_self.__class__.__name__}(\n'
+                    for k_, v_ in it_self.__dict__.items():
+                        string_ += f'\t\t{k_} : {v_}\n'
+                    string_ += '\t)'
+                    return string_
+
+                v.__str__ = string_func
+                v = v.__str__(v)
+            string += f'\n\t{k} : {v}'
+        string += ')'
+        return string
 
     def init_functions(self):
         self.wandb_runtime = self.arguments.get_wandb_init() if self.arguments.use_wandb else None
