@@ -731,7 +731,7 @@ class CausalLMTrainer:
             'configure functions and sharding them'
         ).stop()
         self.timer.log(['configure functions and sharding them'])
-        with self.mesh:
+        with mesh:
             if self.finetune:
                 shard_fns, gather_fns = make_shard_and_gather_fns(train_state_partition_spec,
                                                                   dtype_specs=self.dtype)
