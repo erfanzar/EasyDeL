@@ -141,7 +141,6 @@ class TrainArguments(
         for k, v in self.__call__().items():
             if isinstance(v, typing.Callable):
                 def string_func(it_self):
-
                     string_ = f'{it_self.__class__.__name__}(\n'
                     for k_, v_ in it_self.__dict__.items():
                         string_ += f'\t\t{k_} : {v_}\n'
