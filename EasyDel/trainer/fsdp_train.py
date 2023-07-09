@@ -213,7 +213,7 @@ def finetuner(
     sharded_train_step_fn = pjit(
         fsdp_train_step,
         in_shardings=(train_state_partition_spec, PartitionSpec()),
-        out_shardings=(train_state_partition_spec, PartitionSpec()),
+        out_shardings=(train_state_partition_spec, PartitionSpec(), PartitionSpec()),
         donate_argnums=(0, 0),
     )
     sharded_predict = pjit(predict, out_shardings=PartitionSpec(),
@@ -445,8 +445,8 @@ def pre_trainer_or_base_trainer(
     )
     sharded_train_step_fn = pjit(
         fsdp_train_step,
-        in_shardings=(train_state_partition_spec, PartitionSpec(), PartitionSpec(), PartitionSpec()),
-        out_shardings=(train_state_partition_spec, PartitionSpec()),
+        in_shardings=(train_state_partition_spec, PartitionSpec(),),
+        out_shardings=(train_state_partition_spec, PartitionSpec(), PartitionSpec()),
         donate_argnums=(0, 0, 0),
     )
     sharded_predict = pjit(predict, out_shardings=PartitionSpec(),
@@ -744,7 +744,7 @@ class CausalLMTrainer:
         sharded_train_step_fn = pjit(
             fsdp_train_step,
             in_shardings=(train_state_partition_spec, PartitionSpec()),
-            out_shardings=(train_state_partition_spec, PartitionSpec()),
+            out_shardings=(train_state_partition_spec, PartitionSpec(), PartitionSpec()),
             donate_argnums=(0, 0),
         )
         sharded_predict = pjit(predict, out_shardings=PartitionSpec(),
