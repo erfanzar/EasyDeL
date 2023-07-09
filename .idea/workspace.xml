@@ -5,7 +5,6 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="08ad205b-709f-455b-86db-91293f595cd3" name="Changes" comment="">
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/EasyDel/trainer/fsdp_train.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/trainer/fsdp_train.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -152,7 +151,7 @@
       <workItem from="1688732403606" duration="602000" />
       <workItem from="1688832628741" duration="5085000" />
       <workItem from="1688895407885" duration="3041000" />
-      <workItem from="1688899325671" duration="2675000" />
+      <workItem from="1688899325671" duration="3391000" />
     </task>
     <servers />
   </component>
