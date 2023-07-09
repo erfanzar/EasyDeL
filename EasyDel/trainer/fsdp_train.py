@@ -39,15 +39,15 @@ def fsdp_train_step(state, batch):
     batch = with_sharding_constraint(batch, PartitionSpec(('dp', 'fsdp')))
 
     def calculate_loss(params):
-        batch
-        logits = state.apply_fn(params=params, **batch.copy().pop('labels'),
+        labels = batch.pop('labels')
+        logits = state.apply_fn(params=params, **batch,
                                 return_dict=True).logits
 
         loss = optax.softmax_cross_entropy_with_integer_labels(
             logits=logits[..., :-1, :],
-            labels=batch['labels'])
+            labels=labels)
         loss = jnp.mean(loss)
-        accuracy = calculate_accuracy(logits.argmax(axis=-1), batch['labels'])
+        accuracy = calculate_accuracy(logits.argmax(axis=-1), labels)
         return loss, accuracy
 
     grad_fn = jax.value_and_grad(calculate_loss, has_aux=True)
@@ -64,12 +64,13 @@ def fsdp_eval_step(state, batch_eval):
     )
 
     def calculate_loss(params):
-        logits = state.apply_fn(params=params, **batch_eval.copy().pop('labels'),
+        labels = batch_eval.pop('labels')
+        logits = state.apply_fn(params=params, **batch_eval,
                                 return_dict=True).logits
         loss = optax.softmax_cross_entropy_with_integer_labels(logits=logits[..., :-1, :],
-                                                               labels=batch_eval['labels'])
+                                                               labels=labels)
         loss = jnp.mean(loss)
-        accuracy = calculate_accuracy(logits.argmax(axis=-1), batch_eval['labels'])
+        accuracy = calculate_accuracy(logits.argmax(axis=-1), labels)
         return loss, accuracy
 
     loss__, accuracy = calculate_loss(state.params)
