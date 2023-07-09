@@ -1,5 +1,6 @@
 import dataclasses
 import os
+import time
 import typing
 
 import wandb
@@ -22,6 +23,14 @@ from torch.utils.data import DataLoader
 from fjutils import match_partition_rules, make_shard_and_gather_fns, StreamingCheckpointer, count_params
 
 
+def calculate_accuracy(predictions: jnp.DeviceArray, targets: jnp.DeviceArray):
+    predicted_classes = jnp.argmax(predictions, axis=1)
+    correct_predictions = (predicted_classes == targets).sum()
+    total_predictions = targets.shape[0]
+    accuracy = correct_predictions / total_predictions
+    return accuracy
+
+
 def prefix_print(prefix, string):
     print(f'\033[1;36m{prefix}\033[1;0m : {string}')
 
@@ -35,14 +44,15 @@ def fsdp_train_step(state, batch):
 
         loss = optax.softmax_cross_entropy_with_integer_labels(
             logits=logits[..., :-1, :],
-            labels=batch['input_ids'][..., 1:])
+            labels=batch['labels'])
         loss = jnp.mean(loss)
-        return loss
+        accuracy = calculate_accuracy(logits, batch['labels'])
+        return loss, accuracy
 
-    grad_fn = jax.value_and_grad(calculate_loss, has_aux=False)
-    loss__, grad = grad_fn(state.params)
+    grad_fn = jax.value_and_grad(calculate_loss, has_aux=True)
+    (loss__, accuracy__), grad = grad_fn(state.params)
     state = state.apply_gradients(grads=grad)
-    return state, loss__
+    return state, loss__, accuracy__
 
 
 def fsdp_eval_step(state, batch_eval):
@@ -56,7 +66,7 @@ def fsdp_eval_step(state, batch_eval):
         logits = state.apply_fn(params=params, **batch_eval,
                                 return_dict=True).logits
         loss = optax.softmax_cross_entropy_with_integer_labels(logits=logits[..., :-1, :],
-                                                               labels=batch_eval['input_ids'][..., 1:])
+                                                               labels=batch_eval['labels'])
         loss = jnp.mean(loss)
         return loss
 
@@ -248,10 +258,11 @@ def finetuner(
                     if i < max_steps_train:
 
                         _ = batch.pop('token_type_ids', None)
+                        batch['labels'] = batch['input_ids'][..., 1:]
                         for i in ids_to_pop_from_dataset:
                             _ = batch.pop(i, None)
-                        sharded_train_state_, loss = sharded_train_step_fn(sharded_train_state_, batch,
-                                                                           )
+                        sharded_train_state_, loss, accuracy = sharded_train_step_fn(sharded_train_state_, batch,
+                                                                                     )
                         losses.append(loss)
                         learning_rates.append(scheduler(i).tolist())
                         pbar.update(1)
@@ -477,10 +488,11 @@ def pre_trainer_or_base_trainer(
                 if i < max_steps_train:
 
                     _ = batch.pop('token_type_ids', None)
+                    batch['labels'] = batch['input_ids'][..., 1:]
                     for i in ids_to_pop_from_dataset:
                         _ = batch.pop(i, None)
-                    sharded_train_state_, loss = sharded_train_step_fn(sharded_train_state_, batch,
-                                                                       label_in_the_field, scope_logits)
+                    sharded_train_state_, loss, accuracy = sharded_train_step_fn(sharded_train_state_, batch,
+                                                                                 label_in_the_field, scope_logits)
                     losses.append(loss)
                     learning_rates.append(scheduler(i).tolist())
                     pbar.update(1)
@@ -603,9 +615,30 @@ class CausalLMTrainer:
             use_wandb=False,
             tensorboard_writer=self.arguments.get_board()
         )
+        self.timer(
+            'configure dataloaders'
+        ).start()
         self.dataloader_train, self.max_steps_train, \
             self.dataloader_eval, self.max_steps_eval = self.configure_dataloader()
+
+        self.timer(
+            'configure dataloaders'
+        ).stop()
+
+        self.timer.log(['configure dataloaders'])
+
+        self.timer(
+            'configure Model ,Optimizer ,Scheduler and Config'
+        ).start()
         self.model, self.tx, self.scheduler, self.config = self.configure_model()
+        self.timer(
+            'configure Model ,Optimizer ,Scheduler and Config'
+        ).stop()
+        self.timer.log(['configure Model ,Optimizer ,Scheduler and Config'])
+
+        self.timer(
+            'configure functions and sharding them'
+        ).start()
         funcs = self.configure_functions()
         self.sharded_create_from_params_fn = funcs[0]
         self.sharded_train_step_fn = funcs[1]
@@ -613,7 +646,11 @@ class CausalLMTrainer:
         self.mesh = funcs[3]
         self.ckpt_streamer = funcs[4]
         self.init_fn = funcs[5]
-        
+        self.timer(
+            'configure functions and sharding them'
+        ).stop()
+        self.timer.log(['configure functions and sharding them'])
+
     def configure_dataloader(self):
 
         def collate_fn(batch):
@@ -632,7 +669,8 @@ class CausalLMTrainer:
                                          batch_size=self.arguments.total_batch_size, drop_last=True)
             max_steps_eval = len(
                 dataloader_eval) if self.arguments.max_steps is None else self.arguments.max_steps
-
+        else:
+            dataloader_eval, max_steps_eval = None, 0
         return dataloader_train, max_steps_train, dataloader_eval, max_steps_eval
 
     def configure_model(self):
@@ -740,6 +778,14 @@ class CausalLMTrainer:
             losses = []
             pbar.update(sharded_train_state_.step.tolist())
             learning_rates = []
+            if self.arguments.use_wandb:
+                self.wandb_runtime.log(
+                    {
+                        'model billion parameters': sum(
+                            i.size for i in
+                            jax.tree_util.tree_flatten(flax.core.unfreeze(sharded_train_state_.params))[0]) / 1e9
+                    }
+                )
             try:
                 for ep in range(self.arguments.num_train_epochs):
                     for batch in self.dataloader_train:
@@ -747,10 +793,14 @@ class CausalLMTrainer:
                         if i < self.max_steps_train:
 
                             _ = batch.pop('token_type_ids', None)
+                            batch['labels'] = batch['input_ids'][..., 1:]
                             for i in self.arguments.ids_to_pop_from_dataset:
                                 _ = batch.pop(i, None)
-                            sharded_train_state_, loss = self.sharded_train_step_fn(sharded_train_state_, batch,
-                                                                                    )
+                            time_s = time.time()
+                            sharded_train_state_, loss, accuracy = self.sharded_train_step_fn(sharded_train_state_,
+                                                                                              batch,
+                                                                                              )
+                            ttl_time = time.time() - time_s
                             losses.append(loss)
                             learning_rates.append(self.scheduler(i).tolist())
                             pbar.update(1)
@@ -758,7 +808,10 @@ class CausalLMTrainer:
                                 self.wandb_runtime.log(
                                     {'loss': loss.tolist(),
                                      'learning_rate': self.scheduler(sharded_train_state_.step.tolist()).tolist(),
-                                     'step': sharded_train_state_.step.tolist()}
+                                     'step': sharded_train_state_.step.tolist(),
+                                     'step time': ttl_time,
+                                     'perplexity': jnp.exp(loss).tolist(),
+                                     'accuracy': accuracy}
                                 )
                             pbar.set_postfix(loss=loss,
                                              learning_rate=self.scheduler(sharded_train_state_.step.tolist()).tolist(),
