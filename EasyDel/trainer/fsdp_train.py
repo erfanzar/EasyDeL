@@ -39,15 +39,14 @@ def fsdp_train_step(state, batch):
     batch = with_sharding_constraint(batch, PartitionSpec(('dp', 'fsdp')))
 
     def calculate_loss(params):
-        labels = batch.pop('labels')
         logits = state.apply_fn(params=params, **batch,
                                 return_dict=True).logits
 
         loss = optax.softmax_cross_entropy_with_integer_labels(
             logits=logits[..., :-1, :],
-            labels=labels)
+            labels=batch['input_ids'][..., 1:])
         loss = jnp.mean(loss)
-        accuracy = calculate_accuracy(logits[..., :-1, :], labels)
+        accuracy = calculate_accuracy(logits[..., :-1, :], batch['input_ids'][..., 1:])
         return loss, accuracy
 
     grad_fn = jax.value_and_grad(calculate_loss, has_aux=True)
@@ -64,13 +63,12 @@ def fsdp_eval_step(state, batch_eval):
     )
 
     def calculate_loss(params):
-        labels = batch_eval.pop('labels')
         logits = state.apply_fn(params=params, **batch_eval,
                                 return_dict=True).logits
         loss = optax.softmax_cross_entropy_with_integer_labels(logits=logits[..., :-1, :],
-                                                               labels=labels)
+                                                               labels=batch['input_ids'][..., 1:])
         loss = jnp.mean(loss)
-        accuracy = calculate_accuracy(logits[..., :-1, :], labels)
+        accuracy = calculate_accuracy(logits[..., :-1, :], batch['input_ids'][..., 1:])
         return loss, accuracy
 
     loss__, accuracy = calculate_loss(state.params)
@@ -261,7 +259,7 @@ def finetuner(
                     if i < max_steps_train:
 
                         _ = batch.pop('token_type_ids', None)
-                        batch['labels'] = batch['input_ids'][..., 1:]
+
                         for i in ids_to_pop_from_dataset:
                             _ = batch.pop(i, None)
                         sharded_train_state_, loss, accuracy = sharded_train_step_fn(sharded_train_state_, batch,
@@ -294,7 +292,7 @@ def finetuner(
                 pbar_eval = tqdm(total=max_steps_eval)
                 for i_eval, batch_eval in enumerate(dataloader_eval):
                     _ = batch_eval.pop('token_type_ids', None)
-                    batch['labels'] = batch['input_ids'][..., 1:]
+
                     for i in ids_to_pop_from_dataset:
                         _ = batch_eval.pop(i, None)
                     loss_eval = fsdp_eval_step(sharded_train_state_, batch_eval=batch_eval)
@@ -492,7 +490,7 @@ def pre_trainer_or_base_trainer(
                 if i < max_steps_train:
 
                     _ = batch.pop('token_type_ids', None)
-                    batch['labels'] = batch['input_ids'][..., 1:]
+
                     for i in ids_to_pop_from_dataset:
                         _ = batch.pop(i, None)
                     sharded_train_state_, loss, accuracy = sharded_train_step_fn(sharded_train_state_, batch,
@@ -805,7 +803,7 @@ class CausalLMTrainer:
                         if i < self.max_steps_train:
 
                             _ = batch.pop('token_type_ids', None)
-                            batch['labels'] = batch['input_ids'][..., 1:]
+
                             for i in self.arguments.ids_to_pop_from_dataset:
                                 _ = batch.pop(i, None)
                             time_s = time.time()
@@ -846,7 +844,7 @@ class CausalLMTrainer:
                     pbar_eval = tqdm(total=self.max_steps_eval)
                     for i_eval, batch_eval in enumerate(self.dataloader_eval):
                         _ = batch_eval.pop('token_type_ids', None)
-                        batch['labels'] = batch['input_ids'][..., 1:]
+
                         for i in self.arguments.ids_to_pop_from_dataset:
                             _ = batch_eval.pop(i, None)
                         loss_eval, accuracy = fsdp_eval_step(sharded_train_state_, batch_eval=batch_eval)
