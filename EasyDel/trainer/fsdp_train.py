@@ -750,7 +750,7 @@ class CausalLMTrainer:
     def train(self, model_parameters: flax.core.FrozenDict = None) -> OutputFineTuner:
         with self.mesh:
             if self.finetune:
-                shard_fns, gather_fns = self.make_shard_and_gather_fns(self.train_state_partition_spec,
+                shard_fns, gather_fns = make_shard_and_gather_fns(self.train_state_partition_spec,
                                                                        dtype_specs=self.dtype)
                 prefix_print(
                     'Action', f'Loading Model From {self.ckpt_path}'

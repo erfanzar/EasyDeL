@@ -138,7 +138,7 @@ class TrainArguments(
 
     def __str__(self):
         string = f'TrainingArguments(\n'
-        for k, v in self.__dict__.items():
+        for k, v in self.__call__().items():
             if isinstance(v, typing.Callable):
                 def string_func(it_self):
 
