@@ -47,7 +47,7 @@ def fsdp_train_step(state, batch):
             logits=logits[..., :-1, :],
             labels=labels)
         loss = jnp.mean(loss)
-        accuracy = calculate_accuracy(logits, labels)
+        accuracy = calculate_accuracy(logits[..., :-1, :], labels)
         return loss, accuracy
 
     grad_fn = jax.value_and_grad(calculate_loss, has_aux=True)
@@ -824,7 +824,7 @@ class CausalLMTrainer:
                                      'step': sharded_train_state_.step.tolist(),
                                      'step time': ttl_time,
                                      'perplexity': jnp.exp(loss).tolist(),
-                                     'accuracy': accuracy,
+                                     'accuracy': accuracy.tolist(),
                                      'avg_accuracy': sum(accuracies) / len(accuracies)}
                                 )
                             pbar.set_postfix(loss=loss,
@@ -849,11 +849,12 @@ class CausalLMTrainer:
                         batch['labels'] = batch['input_ids'][..., 1:]
                         for i in self.arguments.ids_to_pop_from_dataset:
                             _ = batch_eval.pop(i, None)
-                        loss_eval = fsdp_eval_step(sharded_train_state_, batch_eval=batch_eval)
+                        loss_eval,accuracy = fsdp_eval_step(sharded_train_state_, batch_eval=batch_eval)
                         pbar_eval.update(1)
                         if self.arguments.use_wandb:
                             self.wandb_runtime.log(
-                                {'loss_eval': loss_eval.tolist()}
+                                {'loss_eval': loss_eval.tolist(),
+                                 'accuracy':accuracy.tolist()}
                             )
                         pbar_eval.set_postfix(loss_eval=loss_eval.tolist())
             if self.arguments.save_steps is None and self.arguments.do_last_save:
