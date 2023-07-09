@@ -39,14 +39,15 @@ def fsdp_train_step(state, batch):
     batch = with_sharding_constraint(batch, PartitionSpec(('dp', 'fsdp')))
 
     def calculate_loss(params):
+        labels = batch.pop('labels')
         logits = state.apply_fn(params=params, **batch,
                                 return_dict=True).logits
 
         loss = optax.softmax_cross_entropy_with_integer_labels(
             logits=logits[..., :-1, :],
-            labels=batch['input_ids'][..., 1:])
+            labels=labels)
         loss = jnp.mean(loss)
-        accuracy = calculate_accuracy(logits[..., :-1, :], batch['input_ids'][..., 1:])
+        accuracy = calculate_accuracy(logits[..., :-1, :], labels)
         return loss, accuracy
 
     grad_fn = jax.value_and_grad(calculate_loss, has_aux=True)
@@ -63,12 +64,13 @@ def fsdp_eval_step(state, batch_eval):
     )
 
     def calculate_loss(params):
+        labels = batch_eval.pop('labels')
         logits = state.apply_fn(params=params, **batch_eval,
                                 return_dict=True).logits
         loss = optax.softmax_cross_entropy_with_integer_labels(logits=logits[..., :-1, :],
-                                                               labels=batch['input_ids'][..., 1:])
+                                                               labels=labels)
         loss = jnp.mean(loss)
-        accuracy = calculate_accuracy(logits[..., :-1, :], batch['input_ids'][..., 1:])
+        accuracy = calculate_accuracy(logits[..., :-1, :], labels)
         return loss, accuracy
 
     loss__, accuracy = calculate_loss(state.params)
@@ -259,7 +261,7 @@ def finetuner(
                     if i < max_steps_train:
 
                         _ = batch.pop('token_type_ids', None)
-
+                        batch['labels'] = batch['input_ids'][..., 1:]
                         for i in ids_to_pop_from_dataset:
                             _ = batch.pop(i, None)
                         sharded_train_state_, loss, accuracy = sharded_train_step_fn(sharded_train_state_, batch,
@@ -292,7 +294,7 @@ def finetuner(
                 pbar_eval = tqdm(total=max_steps_eval)
                 for i_eval, batch_eval in enumerate(dataloader_eval):
                     _ = batch_eval.pop('token_type_ids', None)
-
+                    batch['labels'] = batch['input_ids'][..., 1:]
                     for i in ids_to_pop_from_dataset:
                         _ = batch_eval.pop(i, None)
                     loss_eval = fsdp_eval_step(sharded_train_state_, batch_eval=batch_eval)
@@ -490,7 +492,7 @@ def pre_trainer_or_base_trainer(
                 if i < max_steps_train:
 
                     _ = batch.pop('token_type_ids', None)
-
+                    batch['labels'] = batch['input_ids'][..., 1:]
                     for i in ids_to_pop_from_dataset:
                         _ = batch.pop(i, None)
                     sharded_train_state_, loss, accuracy = sharded_train_step_fn(sharded_train_state_, batch,
@@ -560,24 +562,8 @@ class CausalLMTrainer:
                  ckpt_path: typing.Union[str, os.PathLike] = None,
                  _do_init_fns: bool = True
                  ):
-        self.timer = None
-        self.dataloader_train = None
-        self.dataloader_eval = None
-        self.model = None
-        self.wandb_runtime = None
-        self.max_steps_train = None
-        self.max_steps_eval = None
-        self.config = None
-        self.scheduler = None
+
         self.tx = None
-        self.sharded_create_from_params_fn = None
-        self.sharded_train_step_fn = None
-        self.sharded_predict = None
-        self.mesh = None
-        self.ckpt_streamer = None
-        self.init_fn = None
-        self.train_state_shape = None
-        self.train_state_partition_spec = None
         self.arguments = arguments
         self.dataset_train = dataset_train
         self.dataset_eval = dataset_eval
@@ -645,21 +631,6 @@ class CausalLMTrainer:
         ).stop()
         self.timer.log(['configure Model ,Optimizer ,Scheduler and Config'])
 
-        self.timer(
-            'configure functions and sharding them'
-        ).start()
-        funcs = self.configure_functions()
-        self.sharded_create_from_params_fn = funcs[0]
-        self.sharded_train_step_fn = funcs[1]
-        self.sharded_predict = funcs[2]
-        self.mesh = funcs[3]
-        self.ckpt_streamer = funcs[4]
-        self.init_fn = funcs[5]
-        self.timer(
-            'configure functions and sharding them'
-        ).stop()
-        self.timer.log(['configure functions and sharding them'])
-
     def configure_dataloader(self):
 
         def collate_fn(batch):
@@ -708,7 +679,11 @@ class CausalLMTrainer:
         tx, scheduler = self.arguments.get_optimizer_and_scheduler(self.max_steps_train)
         return model, tx, scheduler, config
 
-    def configure_functions(self):
+    def train(self, model_parameters: flax.core.FrozenDict = None) -> OutputFineTuner:
+        self.timer(
+            'configure functions and sharding them'
+        ).start()
+
         def init_fn():
             params__ = self.model.init_weights(jax.random.PRNGKey(0), (1, self.arguments.max_length))
             if self.arguments.dtype == jnp.bfloat16:
@@ -750,21 +725,22 @@ class CausalLMTrainer:
         mesh = self.arguments.get_mesh()
         self.arguments.ckpt_path_exists()
         ckpt_streamer = self.arguments.get_streaming_checkpointer()
-        self.train_state_partition_spec = train_state_partition_spec
-        self.train_state_shape = train_state_shape
-        return sharded_create_from_params_fn, sharded_train_step_fn, sharded_predict, mesh, ckpt_streamer, init_fn
-
-    def train(self, model_parameters: flax.core.FrozenDict = None) -> OutputFineTuner:
+        train_state_partition_spec = train_state_partition_spec
+        train_state_shape = train_state_shape
+        self.timer(
+            'configure functions and sharding them'
+        ).stop()
+        self.timer.log(['configure functions and sharding them'])
         with self.mesh:
             if self.finetune:
-                shard_fns, gather_fns = make_shard_and_gather_fns(self.train_state_partition_spec,
+                shard_fns, gather_fns = make_shard_and_gather_fns(train_state_partition_spec,
                                                                   dtype_specs=self.dtype)
                 prefix_print(
                     'Action', f'Loading Model From {self.ckpt_path}'
                 )
                 if model_parameters is None:
                     _, params = StreamingCheckpointer.load_trainstate_checkpoint(
-                        f'params::{self.ckpt_path}', self.train_state_shape, shard_fns
+                        f'params::{self.ckpt_path}', train_state_shape, shard_fns
                     )
                 else:
                     params = model_parameters if not self.arguments.do_shard_fns else jax.tree_util.tree_map(
@@ -774,11 +750,11 @@ class CausalLMTrainer:
                 if self.arguments.remove_ckpt_after_load:
                     os.remove(self.ckpt_path)
 
-                sharded_train_state_ = self.sharded_create_from_params_fn(params)
+                sharded_train_state_ = sharded_create_from_params_fn(params)
 
                 count_params(sharded_train_state_.params)
             else:
-                sharded_train_state_ = self.init_fn()
+                sharded_train_state_ = init_fn()
 
                 count_params(sharded_train_state_.params)
 
@@ -803,13 +779,13 @@ class CausalLMTrainer:
                         if i < self.max_steps_train:
 
                             _ = batch.pop('token_type_ids', None)
-
+                            batch['labels'] = batch['input_ids'][..., 1:]
                             for i in self.arguments.ids_to_pop_from_dataset:
                                 _ = batch.pop(i, None)
                             time_s = time.time()
-                            sharded_train_state_, loss, accuracy = self.sharded_train_step_fn(sharded_train_state_,
-                                                                                              batch,
-                                                                                              )
+                            sharded_train_state_, loss, accuracy = sharded_train_step_fn(sharded_train_state_,
+                                                                                         batch,
+                                                                                         )
                             ttl_time = time.time() - time_s
                             losses.append(loss)
                             learning_rates.append(self.scheduler(i).tolist())
@@ -833,7 +809,7 @@ class CausalLMTrainer:
                         if self.arguments.save_steps is not None and i % self.arguments.save_steps == 0:
                             filename = f'{self.arguments.model_name}-{sum(losses) / len(losses)}-{i}'
                             print(f'Saving Model to \033[1;30m{filename}\033[1;0m')
-                            self.ckpt_streamer.save_checkpoint(sharded_train_state_.params['params'],
+                            ckpt_streamer.save_checkpoint(sharded_train_state_.params['params'],
                                                                filename,
                                                                gather_fns=gather_fns.params['params'])
             except KeyboardInterrupt:
@@ -844,7 +820,7 @@ class CausalLMTrainer:
                     pbar_eval = tqdm(total=self.max_steps_eval)
                     for i_eval, batch_eval in enumerate(self.dataloader_eval):
                         _ = batch_eval.pop('token_type_ids', None)
-
+                        batch['labels'] = batch['input_ids'][..., 1:]
                         for i in self.arguments.ids_to_pop_from_dataset:
                             _ = batch_eval.pop(i, None)
                         loss_eval, accuracy = fsdp_eval_step(sharded_train_state_, batch_eval=batch_eval)
@@ -858,19 +834,19 @@ class CausalLMTrainer:
             if self.arguments.save_steps is None and self.arguments.do_last_save:
                 filename = f'{self.arguments.model_name}-{sum(losses) / len(losses)}-{i}'
                 print(f'Saving Model to \033[1;30m{filename}\033[1;0m')
-                self.ckpt_streamer.save_checkpoint(sharded_train_state_.params['params'],
+                ckpt_streamer.save_checkpoint(sharded_train_state_.params['params'],
                                                    filename,
                                                    gather_fns=gather_fns.params['params'])
             else:
                 filename = 'not_saved | None'
         output = OutputFineTuner(
             last_save_file_name=filename,
-            predict_fun=self.sharded_predict,
+            predict_fun=sharded_predict,
             train_state=sharded_train_state_,
-            mesh=self.mesh,
+            mesh=mesh,
             shard_fns=shard_fns,
             gather_fns=gather_fns,
-            ckpt_stream=self.ckpt_streamer
+            ckpt_stream=ckpt_streamer
         )
         wandb.finish()
 
