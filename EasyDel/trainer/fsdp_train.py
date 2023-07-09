@@ -47,7 +47,7 @@ def fsdp_train_step(state, batch):
             logits=logits[..., :-1, :],
             labels=labels)
         loss = jnp.mean(loss)
-        accuracy = calculate_accuracy(logits.argmax(axis=-1), labels)
+        accuracy = calculate_accuracy(logits, labels)
         return loss, accuracy
 
     grad_fn = jax.value_and_grad(calculate_loss, has_aux=True)
