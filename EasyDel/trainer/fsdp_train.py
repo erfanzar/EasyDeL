@@ -46,7 +46,7 @@ def fsdp_train_step(state, batch):
             logits=logits[..., :-1, :],
             labels=batch['labels'])
         loss = jnp.mean(loss)
-        accuracy = calculate_accuracy(logits, batch['labels'])
+        accuracy = calculate_accuracy(logits.argmax(axis=-1), batch['labels'])
         return loss, accuracy
 
     grad_fn = jax.value_and_grad(calculate_loss, has_aux=True)
@@ -68,10 +68,11 @@ def fsdp_eval_step(state, batch_eval):
         loss = optax.softmax_cross_entropy_with_integer_labels(logits=logits[..., :-1, :],
                                                                labels=batch_eval['labels'])
         loss = jnp.mean(loss)
-        return loss
+        accuracy = calculate_accuracy(logits.argmax(axis=-1), batch_eval['labels'])
+        return loss, accuracy
 
-    loss__ = calculate_loss(state.params)
-    return loss__
+    loss__, accuracy = calculate_loss(state.params)
+    return loss__, accuracy
 
 
 def predict(state, input_ids):
@@ -291,6 +292,7 @@ def finetuner(
                 pbar_eval = tqdm(total=max_steps_eval)
                 for i_eval, batch_eval in enumerate(dataloader_eval):
                     _ = batch_eval.pop('token_type_ids', None)
+                    batch['labels'] = batch['input_ids'][..., 1:]
                     for i in ids_to_pop_from_dataset:
                         _ = batch_eval.pop(i, None)
                     loss_eval = fsdp_eval_step(sharded_train_state_, batch_eval=batch_eval)
@@ -776,6 +778,7 @@ class CausalLMTrainer:
             pbar = tqdm(total=self.max_steps_train)
             i = sharded_train_state_.step.tolist()
             losses = []
+            accuracies = []
             pbar.update(sharded_train_state_.step.tolist())
             learning_rates = []
             if self.arguments.use_wandb:
@@ -803,6 +806,7 @@ class CausalLMTrainer:
                             ttl_time = time.time() - time_s
                             losses.append(loss)
                             learning_rates.append(self.scheduler(i).tolist())
+                            accuracies.append(accuracy)
                             pbar.update(1)
                             if self.arguments.use_wandb:
                                 self.wandb_runtime.log(
@@ -811,7 +815,8 @@ class CausalLMTrainer:
                                      'step': sharded_train_state_.step.tolist(),
                                      'step time': ttl_time,
                                      'perplexity': jnp.exp(loss).tolist(),
-                                     'accuracy': accuracy}
+                                     'accuracy': accuracy,
+                                     'avg_accuracy': sum(accuracies) / len(accuracies)}
                                 )
                             pbar.set_postfix(loss=loss,
                                              learning_rate=self.scheduler(sharded_train_state_.step.tolist()).tolist(),
@@ -832,6 +837,7 @@ class CausalLMTrainer:
                     pbar_eval = tqdm(total=self.max_steps_eval)
                     for i_eval, batch_eval in enumerate(self.dataloader_eval):
                         _ = batch_eval.pop('token_type_ids', None)
+                        batch['labels'] = batch['input_ids'][..., 1:]
                         for i in self.arguments.ids_to_pop_from_dataset:
                             _ = batch_eval.pop(i, None)
                         loss_eval = fsdp_eval_step(sharded_train_state_, batch_eval=batch_eval)
