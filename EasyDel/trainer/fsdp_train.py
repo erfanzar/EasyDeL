@@ -562,8 +562,24 @@ class CausalLMTrainer:
                  ckpt_path: typing.Union[str, os.PathLike] = None,
                  _do_init_fns: bool = True
                  ):
-
+        self.timer = None
+        self.dataloader_train = None
+        self.dataloader_eval = None
+        self.model = None
+        self.wandb_runtime = None
+        self.max_steps_train = None
+        self.max_steps_eval = None
+        self.config = None
+        self.scheduler = None
         self.tx = None
+        self.sharded_create_from_params_fn = None
+        self.sharded_train_step_fn = None
+        self.sharded_predict = None
+        self.mesh = None
+        self.ckpt_streamer = None
+        self.init_fn = None
+        self.train_state_shape = None
+        self.train_state_partition_spec = None
         self.arguments = arguments
         self.dataset_train = dataset_train
         self.dataset_eval = dataset_eval
@@ -631,6 +647,21 @@ class CausalLMTrainer:
         ).stop()
         self.timer.log(['configure Model ,Optimizer ,Scheduler and Config'])
 
+        self.timer(
+            'configure functions and sharding them'
+        ).start()
+        funcs = self.configure_functions()
+        self.sharded_create_from_params_fn = funcs[0]
+        self.sharded_train_step_fn = funcs[1]
+        self.sharded_predict = funcs[2]
+        self.mesh = funcs[3]
+        self.ckpt_streamer = funcs[4]
+        self.init_fn = funcs[5]
+        self.timer(
+            'configure functions and sharding them'
+        ).stop()
+        self.timer.log(['configure functions and sharding them'])
+
     def configure_dataloader(self):
 
         def collate_fn(batch):
@@ -679,11 +710,7 @@ class CausalLMTrainer:
         tx, scheduler = self.arguments.get_optimizer_and_scheduler(self.max_steps_train)
         return model, tx, scheduler, config
 
-    def train(self, model_parameters: flax.core.FrozenDict = None) -> OutputFineTuner:
-        self.timer(
-            'configure functions and sharding them'
-        ).start()
-
+    def configure_functions(self):
         def init_fn():
             params__ = self.model.init_weights(jax.random.PRNGKey(0), (1, self.arguments.max_length))
             if self.arguments.dtype == jnp.bfloat16:
@@ -725,22 +752,21 @@ class CausalLMTrainer:
         mesh = self.arguments.get_mesh()
         self.arguments.ckpt_path_exists()
         ckpt_streamer = self.arguments.get_streaming_checkpointer()
-        train_state_partition_spec = train_state_partition_spec
-        train_state_shape = train_state_shape
-        self.timer(
-            'configure functions and sharding them'
-        ).stop()
-        self.timer.log(['configure functions and sharding them'])
-        with mesh:
+        self.train_state_partition_spec = train_state_partition_spec
+        self.train_state_shape = train_state_shape
+        return sharded_create_from_params_fn, sharded_train_step_fn, sharded_predict, mesh, ckpt_streamer, init_fn
+
+    def train(self, model_parameters: flax.core.FrozenDict = None) -> OutputFineTuner:
+        with self.mesh:
             if self.finetune:
-                shard_fns, gather_fns = make_shard_and_gather_fns(train_state_partition_spec,
+                shard_fns, gather_fns = make_shard_and_gather_fns(self.train_state_partition_spec,
                                                                   dtype_specs=self.dtype)
                 prefix_print(
                     'Action', f'Loading Model From {self.ckpt_path}'
                 )
                 if model_parameters is None:
                     _, params = StreamingCheckpointer.load_trainstate_checkpoint(
-                        f'params::{self.ckpt_path}', train_state_shape, shard_fns
+                        f'params::{self.ckpt_path}', self.train_state_shape, shard_fns
                     )
                 else:
                     params = model_parameters if not self.arguments.do_shard_fns else jax.tree_util.tree_map(
@@ -750,11 +776,11 @@ class CausalLMTrainer:
                 if self.arguments.remove_ckpt_after_load:
                     os.remove(self.ckpt_path)
 
-                sharded_train_state_ = sharded_create_from_params_fn(params)
+                sharded_train_state_ = self.sharded_create_from_params_fn(params)
 
                 count_params(sharded_train_state_.params)
             else:
-                sharded_train_state_ = init_fn()
+                sharded_train_state_ = self.init_fn()
 
                 count_params(sharded_train_state_.params)
 
@@ -783,14 +809,21 @@ class CausalLMTrainer:
                             for i in self.arguments.ids_to_pop_from_dataset:
                                 _ = batch.pop(i, None)
                             time_s = time.time()
-                            sharded_train_state_, loss, accuracy = sharded_train_step_fn(sharded_train_state_,
-                                                                                         batch,
-                                                                                         )
+                            sharded_train_state_, loss, accuracy = self.sharded_train_step_fn(sharded_train_state_,
+                                                                                              batch,
+                                                                                              )
                             ttl_time = time.time() - time_s
                             losses.append(loss)
                             learning_rates.append(self.scheduler(i).tolist())
                             accuracies.append(accuracy)
                             pbar.update(1)
+                            print({'loss': loss.tolist(),
+                                   'learning_rate': self.scheduler(sharded_train_state_.step.tolist()).tolist(),
+                                   'step': sharded_train_state_.step.tolist(),
+                                   'step time': ttl_time,
+                                   'perplexity': jnp.exp(loss).tolist(),
+                                   'accuracy': accuracy.tolist(),
+                                   'avg_accuracy': sum(accuracies) / len(accuracies)})
                             if self.arguments.use_wandb:
                                 self.wandb_runtime.log(
                                     {'loss': loss.tolist(),
@@ -809,7 +842,7 @@ class CausalLMTrainer:
                         if self.arguments.save_steps is not None and i % self.arguments.save_steps == 0:
                             filename = f'{self.arguments.model_name}-{sum(losses) / len(losses)}-{i}'
                             print(f'Saving Model to \033[1;30m{filename}\033[1;0m')
-                            ckpt_streamer.save_checkpoint(sharded_train_state_.params['params'],
+                            self.ckpt_streamer.save_checkpoint(sharded_train_state_.params['params'],
                                                                filename,
                                                                gather_fns=gather_fns.params['params'])
             except KeyboardInterrupt:
@@ -834,19 +867,19 @@ class CausalLMTrainer:
             if self.arguments.save_steps is None and self.arguments.do_last_save:
                 filename = f'{self.arguments.model_name}-{sum(losses) / len(losses)}-{i}'
                 print(f'Saving Model to \033[1;30m{filename}\033[1;0m')
-                ckpt_streamer.save_checkpoint(sharded_train_state_.params['params'],
+                self.ckpt_streamer.save_checkpoint(sharded_train_state_.params['params'],
                                                    filename,
                                                    gather_fns=gather_fns.params['params'])
             else:
                 filename = 'not_saved | None'
         output = OutputFineTuner(
             last_save_file_name=filename,
-            predict_fun=sharded_predict,
+            predict_fun=self.sharded_predict,
             train_state=sharded_train_state_,
-            mesh=mesh,
+            mesh=self.mesh,
             shard_fns=shard_fns,
             gather_fns=gather_fns,
-            ckpt_stream=ckpt_streamer
+            ckpt_stream=self.ckpt_streamer
         )
         wandb.finish()
 
