@@ -4,9 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="08ad205b-709f-455b-86db-91293f595cd3" name="Changes" comment="">
-      <change beforePath="$PROJECT_DIR$/EasyDel/trainer/fsdp_train.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/trainer/fsdp_train.py" afterDir="false" />
-    </list>
+    <list default="true" id="08ad205b-709f-455b-86db-91293f595cd3" name="Changes" comment="" />
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -151,7 +149,7 @@
       <workItem from="1688732403606" duration="602000" />
       <workItem from="1688832628741" duration="5085000" />
       <workItem from="1688895407885" duration="3041000" />
-      <workItem from="1688899325671" duration="3391000" />
+      <workItem from="1688899325671" duration="4225000" />
     </task>
     <servers />
   </component>

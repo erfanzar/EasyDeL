@@ -813,30 +813,28 @@ class CausalLMTrainer:
                                                                                               batch,
                                                                                               )
                             ttl_time = time.time() - time_s
+                            accuracy = accuracy / self.arguments.total_batch_size
                             losses.append(loss)
                             learning_rates.append(self.scheduler(i).tolist())
                             accuracies.append(accuracy)
                             pbar.update(1)
-                            print({'loss': loss.tolist(),
-                                   'learning_rate': self.scheduler(sharded_train_state_.step.tolist()).tolist(),
-                                   'step': sharded_train_state_.step.tolist(),
-                                   'step time': ttl_time,
-                                   'perplexity': jnp.exp(loss).tolist(),
-                                   'accuracy': accuracy.tolist(),
-                                   'avg_accuracy': sum(accuracies) / len(accuracies)})
+
                             if self.arguments.use_wandb:
                                 self.wandb_runtime.log(
-                                    {'loss': loss.tolist(),
-                                     'learning_rate': self.scheduler(sharded_train_state_.step.tolist()).tolist(),
-                                     'step': sharded_train_state_.step.tolist(),
-                                     'step time': ttl_time,
-                                     'perplexity': jnp.exp(loss).tolist(),
-                                     'accuracy': accuracy.tolist(),
-                                     'avg_accuracy': sum(accuracies) / len(accuracies)}
+                                    {
+                                        'loss': loss.tolist(),
+                                        'learning_rate': self.scheduler(sharded_train_state_.step.tolist()).tolist(),
+                                        'step': sharded_train_state_.step.tolist(),
+                                        'step time': ttl_time,
+                                        'perplexity': jnp.exp(loss).tolist(),
+                                        'accuracy': accuracy.tolist(),
+                                        'avg_accuracy': (sum(accuracies) / len(accuracies)).tolist()
+                                    }
                                 )
                             pbar.set_postfix(loss=loss,
                                              learning_rate=self.scheduler(sharded_train_state_.step.tolist()).tolist(),
-                                             step=sharded_train_state_.step.tolist())
+                                             step=sharded_train_state_.step.tolist(),
+                                             perplexity=jnp.exp(loss).tolist(), accuracy=accuracy)
                         else:
                             break
                         if self.arguments.save_steps is not None and i % self.arguments.save_steps == 0:
