@@ -171,6 +171,9 @@ class TrainArguments(
             self.get_mesh_names()
         )
 
+    def __repr__(self):
+        return self.__str__()
+
     @staticmethod
     def get_mesh_names():
         return 'dp', 'fsdp', 'mp'

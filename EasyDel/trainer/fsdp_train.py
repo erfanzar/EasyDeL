@@ -39,7 +39,8 @@ def fsdp_train_step(state, batch):
     batch = with_sharding_constraint(batch, PartitionSpec(('dp', 'fsdp')))
 
     def calculate_loss(params):
-        logits = state.apply_fn(params=params, **batch,
+        batch
+        logits = state.apply_fn(params=params, **batch.copy().pop('labels'),
                                 return_dict=True).logits
 
         loss = optax.softmax_cross_entropy_with_integer_labels(
@@ -63,7 +64,7 @@ def fsdp_eval_step(state, batch_eval):
     )
 
     def calculate_loss(params):
-        logits = state.apply_fn(params=params, **batch_eval,
+        logits = state.apply_fn(params=params, **batch_eval.copy().pop('labels'),
                                 return_dict=True).logits
         loss = optax.softmax_cross_entropy_with_integer_labels(logits=logits[..., :-1, :],
                                                                labels=batch_eval['labels'])
@@ -614,6 +615,9 @@ class CausalLMTrainer:
             string += f'\n\t{k} : {v}'
         string += ')'
         return string
+
+    def __repr__(self):
+        return self.__str__()
 
     def init_functions(self):
         self.wandb_runtime = self.arguments.get_wandb_init() if self.arguments.use_wandb else None
