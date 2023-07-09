@@ -79,9 +79,6 @@
       <module name="EasyDeL" />
       <option name="INTERPRETER_OPTIONS" value="" />
       <option name="PARENT_ENVS" value="true" />
-      <envs>
-        <env name="PYTHONUNBUFFERED" value="1" />
-      </envs>
       <option name="SDK_HOME" value="" />
       <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$" />
       <option name="IS_MODULE_SDK" value="true" />
@@ -148,6 +145,7 @@
       <workItem from="1688658484198" duration="1812000" />
       <workItem from="1688732403606" duration="602000" />
       <workItem from="1688832628741" duration="5085000" />
+      <workItem from="1688895407885" duration="3041000" />
     </task>
     <servers />
   </component>

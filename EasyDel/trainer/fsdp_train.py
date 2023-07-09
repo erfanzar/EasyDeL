@@ -24,7 +24,7 @@ from fjutils import match_partition_rules, make_shard_and_gather_fns, StreamingC
 
 
 def calculate_accuracy(predictions: jnp.DeviceArray, targets: jnp.DeviceArray):
-    predicted_classes = jnp.argmax(predictions, axis=1)
+    predicted_classes = jnp.argmax(predictions, axis=-1)
     correct_predictions = (predicted_classes == targets).sum()
     total_predictions = targets.shape[0]
     accuracy = correct_predictions / total_predictions
@@ -70,7 +70,7 @@ def fsdp_eval_step(state, batch_eval):
         loss = optax.softmax_cross_entropy_with_integer_labels(logits=logits[..., :-1, :],
                                                                labels=labels)
         loss = jnp.mean(loss)
-        accuracy = calculate_accuracy(logits.argmax(axis=-1), labels)
+        accuracy = calculate_accuracy(logits[..., :-1, :], labels)
         return loss, accuracy
 
     loss__, accuracy = calculate_loss(state.params)
@@ -849,12 +849,12 @@ class CausalLMTrainer:
                         batch['labels'] = batch['input_ids'][..., 1:]
                         for i in self.arguments.ids_to_pop_from_dataset:
                             _ = batch_eval.pop(i, None)
-                        loss_eval,accuracy = fsdp_eval_step(sharded_train_state_, batch_eval=batch_eval)
+                        loss_eval, accuracy = fsdp_eval_step(sharded_train_state_, batch_eval=batch_eval)
                         pbar_eval.update(1)
                         if self.arguments.use_wandb:
                             self.wandb_runtime.log(
                                 {'loss_eval': loss_eval.tolist(),
-                                 'accuracy':accuracy.tolist()}
+                                 'accuracy': accuracy.tolist()}
                             )
                         pbar_eval.set_postfix(loss_eval=loss_eval.tolist())
             if self.arguments.save_steps is None and self.arguments.do_last_save:
