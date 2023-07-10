@@ -620,6 +620,10 @@ class CausalLMTrainer:
     def __repr__(self):
         return self.__str__()
 
+    @staticmethod
+    def finish():
+        wandb.finish()
+
     def init_functions(self):
         self.wandb_runtime = self.arguments.get_wandb_init() if self.arguments.use_wandb else None
         self.timer = Timers(
