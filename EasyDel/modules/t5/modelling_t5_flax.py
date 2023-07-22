@@ -42,7 +42,8 @@ from transformers.modeling_flax_utils import (
 )
 
 from transformers import PretrainedConfig
-from jax.experimental.pjit import with_sharding_constraint as wsc, PartitionSpec
+from jax.experimental.pjit import with_sharding_constraint as wsc
+from jax.sharding import PartitionSpec
 
 
 def get_names_from_parition_spec(partition_specs):

@@ -25,7 +25,8 @@ from typing import Any, List, Mapping, Optional
 
 from functools import partial
 from typing import Optional, Tuple
-from jax.experimental.pjit import PartitionSpec, with_sharding_constraint as wsc
+from jax.experimental.pjit import with_sharding_constraint as wsc
+from jax.sharding import PartitionSpec
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
