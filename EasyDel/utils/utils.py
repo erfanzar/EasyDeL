@@ -117,6 +117,10 @@ class Timer:
         return elapsed_
 
 
+def prefix_str(prefix, string):
+    return f'\033[1;36m{prefix}\033[1;0m : {string}'
+
+
 class Timers:
     """Group of timers."""
 
@@ -145,10 +149,10 @@ class Timers:
     def log(self, names, normalizer=1.0, reset=True):
         assert normalizer > 0.0
 
-        string = "time (ms)"
         if isinstance(names, str):
             names = [names]
         for name in names:
             elapsed_time = self.timers[name].elapsed(reset=reset) * 1000.0 / normalizer
-            string += " | {} :  {:.2f}".format(name, elapsed_time)
+            string = prefix_str(f'Time For {name} (ms)', elapsed_time)
+
             print(string, flush=True)
