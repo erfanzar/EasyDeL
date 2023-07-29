@@ -7,7 +7,9 @@ train Flax/Jax Models on the `TPU/GPU`
 ## Installation
 
 To install EasyDeL, you can use pip:
+
 ### Availalbe on PyPi
+
 ```bash
 pip install easydel
 ```
@@ -28,7 +30,7 @@ you can also tell me the model you want in Flax/Jax version and ill try my best 
 ## FineTuning
 
 with using EasyDel FineTuning LLM (CausalLanguageModels) are easy as much as possible with using Jax and Flax
-and having the benefit of TPUs for the best speed here's a simple code to use in order to finetune your own MPT / LLama 
+and having the benefit of TPUs for the best speed here's a simple code to use in order to finetune your own MPT / LLama
 or any other models supported by EasyDel
 
 #### Step One
@@ -48,6 +50,8 @@ pytorch_model_state_dict = None  # StateDict of the model should be this one
 flax_params = convert_pt_to_flax_7b(pytorch_model_state_dict, number_of_layers, device)
 save_ckpt(flax_params, 'flax_param_easydel')
 ```
+
+#### Functional Programing method
 
 #### Step Two
 
@@ -101,7 +105,58 @@ print(f'Hey ! , here\'s where your model saved {model_and_extra_outputs.last_sav
 
 ```
 
-you can then convert it to pytorch for better use I don't recommend jax/flax for hosting models since 
+### OOP Method
+
+```python
+import jax.numpy
+from EasyDel import TrainArguments, CausalLMTrainer
+from datasets import load_dataset
+from EasyDel.configs import configs
+
+max_length = 4096
+conf = configs.mpt_configs['7b']
+conf['max_sequence_length'] = max_length
+conf['max_seq_len'] = max_length
+
+train_args = TrainArguments(
+    model_id='erfanzar/FlaxMpt-7B',
+    # right now you should use model supported with remote code from huggingface all model are supported and uploaded
+    model_name='my_first_model_to_train_using_easydel',
+    num_train_epochs=3,
+    learning_rate=1e-5,
+    learning_rate_end=1e-6,
+    optimizer='lion',  # 'adamw', 'lion', 'adafactor' are supported
+    scheduler='linear',  # 'linear' or 'cosine' or 'none'
+    weight_decay=0.01,
+    total_batch_size=16,
+    max_steps=None,  # None to let trainer Decide
+    do_train=True,
+    do_eval=False,  # it's optional but supported 
+    backend='tpu',  # default backed is set to cpu so you must define you want to use tpu cpu or gpu
+    max_length=max_length,  # Note that you have to change this in the model config too
+    gradient_checkpointing='nothing_saveable',
+    sharding_array=(1, -1, 1),  # the way to shard model across gpu,cpu or TPUs with using sharding array (1, -1, 1)
+    # everything training will be in fully fsdp automatic and share data between devices
+    use_pjit_attention_force=False,
+    extra_configs=conf,
+    remove_ckpt_after_load=True,
+
+)
+dataset = load_dataset('TRAIN_DATASET')
+dataset_train = dataset['train']
+dataset_eval = dataset['eval']
+
+trainer = CausalLMTrainer(train_args,
+                          dataset_train,
+                          ckpt_path='flax_param_easydel')
+model_and_extra_outputs = trainer.train()
+print(f'Hey ! , here\'s where your model saved {model_and_extra_outputs.last_save_file_name}')
+
+
+```
+
+
+you can then convert it to pytorch for better use I don't recommend jax/flax for hosting models since
 pytorch is better option for gpus
 
 ## Usage
