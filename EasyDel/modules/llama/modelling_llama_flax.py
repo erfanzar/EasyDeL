@@ -199,7 +199,7 @@ def rotate_half(x):
 def precompute_freqs_cis(
         method: str,
         dim: int, end: int, theta: float = 10000.0,
-        scaling_factor: int = 8,
+        scaling_factor: float = 8.,
         dtype: jnp.dtype = jnp.bfloat16) -> jnp.ndarray:
     if method == 'linear':
         freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(dtype) / dim))
@@ -291,7 +291,7 @@ class FlaxLlamaAttention(nn.Module):
 
         self.freqs_cis = precompute_freqs_cis(
             method=self.config.rope_scaling['type'],
-            scaling_factor=self.config.rope_scaling['rope_scaling'],
+            scaling_factor=float(self.config.rope_scaling['factor']),
             dim=self.head_dim,
             end=config.max_sequence_length * 2,
             dtype=self.dtype,
