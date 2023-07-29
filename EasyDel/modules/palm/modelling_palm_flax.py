@@ -11,7 +11,8 @@ from flax.core import FrozenDict
 from jax import numpy as np
 from transformers.modeling_flax_outputs import FlaxCausalLMOutput
 from transformers import PretrainedConfig
-from jax.experimental.pjit import with_sharding_constraint as wsc, PartitionSpec
+from jax.experimental.pjit import with_sharding_constraint as wsc
+from jax.sharding import PartitionSpec
 from jax.interpreters import pxla
 
 
