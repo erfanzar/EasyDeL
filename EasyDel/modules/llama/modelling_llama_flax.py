@@ -83,8 +83,14 @@ class LlamaConfig(PretrainedConfig):
             fcm_min_ratio=0.0,
             fcm_max_ratio=0.0,
             use_pjit_attention_force: bool = True,
+            rope_scaling=None,
             **kwargs,
     ):
+        if rope_scaling is None:
+            rope_scaling = {
+                "factor": 8.0,
+                "type": "linear"
+            }
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.initializer_range = initializer_range
@@ -101,6 +107,7 @@ class LlamaConfig(PretrainedConfig):
         self.use_pjit_attention_force = use_pjit_attention_force
         self.fcm_min_ratio = fcm_min_ratio
         self.fcm_max_ratio = fcm_max_ratio
+        self.rope_scaling = rope_scaling
         super().__init__(
             # pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -113,20 +120,20 @@ class LlamaConfig(PretrainedConfig):
     def get_partition_rules(fully_fsdp: bool = True):
         return (
 
-            ("transformer/wte/embedding", PS("mp", "fsdp")),
+            ("transformer/wte/embedding", PS("dp", "fsdp")),
 
-            ("attention/(wq|wk|wv)/kernel", PS("fsdp", "mp")),
-            ("attention/wo/kernel", PS("mp", "fsdp")),
+            ("attention/(wq|wk|wv)/kernel", PS("fsdp", "dp")),
+            ("attention/wo/kernel", PS("dp", "fsdp")),
 
-            ("feed_forward/w1/kernel", PS("fsdp", "mp")),
-            ("feed_forward/w2/kernel", PS("mp", "fsdp")),
-            ("feed_forward/w3/kernel", PS("fsdp", "mp")),
+            ("feed_forward/w1/kernel", PS("fsdp", "dp")),
+            ("feed_forward/w2/kernel", PS("dp", "fsdp")),
+            ("feed_forward/w3/kernel", PS("fsdp", "dp")),
 
             ("attention_norm/kernel", PS(None)),
             ("ffn_norm/kernel", PS(None)),
 
             ("transformer/ln_f/kernel", PS(None)),
-            ("lm_head/kernel", PS("fsdp", "mp")),
+            ("lm_head/kernel", PS("fsdp", "dp")),
             ('.*', PS(None)),
         ) if not fully_fsdp else (
 
@@ -189,58 +196,48 @@ def rotate_half(x):
     return jnp.concatenate([-x2, x1], axis=-1)
 
 
-OLD_METHOD = True
-if OLD_METHOD:
-    def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0,
-                             dtype: jnp.dtype = jnp.bfloat16) -> jnp.ndarray:
+def precompute_freqs_cis(
+        method: str,
+        dim: int, end: int, theta: float = 10000.0,
+        scaling_factor: int = 8,
+        dtype: jnp.dtype = jnp.bfloat16) -> jnp.ndarray:
+    if method == 'linear':
         freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(dtype) / dim))
-        t = jnp.arange(end)  # type: ignore
-        freqs = jnp.outer(t, freqs).astype(dtype)
-        sin, cos = jnp.sin(freqs), jnp.cos(freqs)
-        freqs_cis = jnp.complex64(cos + 1j * sin)
-        return jnp.asarray(freqs_cis)
+    elif method == 'dynamic':
+        base = theta * (
+                (scaling_factor * end / end) - (scaling_factor - 1)
+        ) ** (dim / (dim - 2))
+        freqs = 1.0 / (base ** (jnp.arange(0, dim, 2) / dim))
+    else:
+        raise ValueError(f'unknown {method} method for precompute_freqs_cis')
+    t = jnp.arange(end)  # type: ignore
+    freqs = jnp.outer(t, freqs).astype(dtype)
+    sin, cos = jnp.sin(freqs), jnp.cos(freqs)
+    freqs_cis = jnp.complex64(cos + 1j * sin)
+    return jnp.asarray(freqs_cis)
 
 
-    def apply_rotary_emb(
-            xq: jnp.ndarray,
-            xk: jnp.ndarray,
-            freqs_cis: jnp.ndarray,
-            dtype: jnp.dtype = jnp.bfloat16,
-    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        reshape_xq = xq.astype(jnp.float32).reshape(*xq.shape[:-1], -1, 2)
-        reshape_xk = xk.astype(jnp.float32).reshape(*xk.shape[:-1], -1, 2)
+def apply_rotary_emb(
+        xq: jnp.ndarray,
+        xk: jnp.ndarray,
+        freqs_cis: jnp.ndarray,
+        dtype: jnp.dtype = jnp.bfloat16,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    reshape_xq = xq.astype(jnp.float32).reshape(*xq.shape[:-1], -1, 2)
+    reshape_xk = xk.astype(jnp.float32).reshape(*xk.shape[:-1], -1, 2)
 
-        xq_ = jax.lax.complex(reshape_xq[..., 0], reshape_xq[..., 1])
-        xk_ = jax.lax.complex(reshape_xk[..., 0], reshape_xk[..., 1])
+    xq_ = jax.lax.complex(reshape_xq[..., 0], reshape_xq[..., 1])
+    xk_ = jax.lax.complex(reshape_xk[..., 0], reshape_xk[..., 1])
 
-        freqs_cis = jnp.reshape(freqs_cis, (*freqs_cis.shape[:2], 1, *freqs_cis.shape[2:]))
+    freqs_cis = jnp.reshape(freqs_cis, (*freqs_cis.shape[:2], 1, *freqs_cis.shape[2:]))
 
-        xq_out = xq_ * freqs_cis
-        xq_out = jnp.stack((jnp.real(xq_out), jnp.imag(xq_out)), axis=-1).reshape(*xq_out.shape[:-1], -1)
+    xq_out = xq_ * freqs_cis
+    xq_out = jnp.stack((jnp.real(xq_out), jnp.imag(xq_out)), axis=-1).reshape(*xq_out.shape[:-1], -1)
 
-        xk_out = xk_ * freqs_cis
-        xk_out = jnp.stack((jnp.real(xk_out), jnp.imag(xk_out)), axis=-1).reshape(*xk_out.shape[:-1], -1)
+    xk_out = xk_ * freqs_cis
+    xk_out = jnp.stack((jnp.real(xk_out), jnp.imag(xk_out)), axis=-1).reshape(*xk_out.shape[:-1], -1)
 
-        return xq_out.astype(dtype), xk_out.astype(dtype)
-else:
-    def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0,
-                             dtype: jnp.dtype = jnp.bfloat16) -> jnp.ndarray:
-        freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(dtype) / dim))
-        t = jnp.arange(end)
-        freqs = jnp.einsum('i,j->ij', t, freqs).astype(dtype)
-        return jnp.concatenate([freqs, freqs], axis=-1)
-
-
-    def apply_rotary_emb(xq: jnp.ndarray,
-                         xk: jnp.ndarray,
-                         freqs_cis: jnp.ndarray,
-                         dtype: jnp.dtype = jnp.bfloat16, ):
-        freqs_cis = freqs_cis[:, :, jnp.newaxis, :]
-        sin, cos = jnp.sin(freqs_cis), jnp.cos(freqs_cis)
-
-        xq = (cos * xq) + (sin * rotate_half(xq))
-        xk = (cos * xk) + (sin * rotate_half(xk))
-        return xq.astype(dtype), xk.astype(dtype)
+    return xq_out.astype(dtype), xk_out.astype(dtype)
 
 
 class FlaxLlamaAttention(nn.Module):
@@ -293,8 +290,10 @@ class FlaxLlamaAttention(nn.Module):
         self.causal_mask = make_causal_mask(jnp.ones((1, config.max_sequence_length), dtype="bool"), dtype="bool")
 
         self.freqs_cis = precompute_freqs_cis(
-            self.head_dim,
-            config.max_sequence_length * 2,
+            method=self.config.rope_scaling['type'],
+            scaling_factor=self.config.rope_scaling['rope_scaling'],
+            dim=self.head_dim,
+            end=config.max_sequence_length * 2,
             dtype=self.dtype,
         )
 
