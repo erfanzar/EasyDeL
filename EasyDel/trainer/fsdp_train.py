@@ -16,7 +16,8 @@ from IPython.display import clear_output
 from tqdm import tqdm
 from EasyDel.utils.utils import Timers
 
-from jax.experimental.pjit import pjit, with_sharding_constraint, PartitionSpec
+from jax.experimental.pjit import pjit, with_sharding_constraint
+from jax.sharding import PartitionSpec
 from flax.training import train_state
 from jax import numpy as jnp
 from torch.utils.data import DataLoader

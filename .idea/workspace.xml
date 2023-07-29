@@ -5,10 +5,11 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="08ad205b-709f-455b-86db-91293f595cd3" name="Changes" comment="">
-      <change beforePath="$PROJECT_DIR$/.idea/shelf/Uncommitted_changes_before_Update_at_09_07_23_11_10_[Changes]/shelved.patch" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/shelf/Uncommitted_changes_before_Update_at_09_07_23_11_10__Changes_.xml" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/shelf/Uncommitted_changes_before_Update_at_10_07_23_07_56_[Changes]/shelved.patch" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/__init__.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/trainer/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/trainer/__init__.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/trainer/config.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/trainer/config.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/trainer/fsdp_train.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/trainer/fsdp_train.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -84,9 +85,6 @@
       <module name="EasyDeL" />
       <option name="INTERPRETER_OPTIONS" value="" />
       <option name="PARENT_ENVS" value="true" />
-      <envs>
-        <env name="PYTHONUNBUFFERED" value="1" />
-      </envs>
       <option name="SDK_HOME" value="" />
       <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$" />
       <option name="IS_MODULE_SDK" value="true" />
@@ -153,8 +151,6 @@
       <workItem from="1688658484198" duration="1812000" />
       <workItem from="1688732403606" duration="602000" />
       <workItem from="1688832628741" duration="5085000" />
-      <workItem from="1689609879543" duration="696000" />
-      <workItem from="1690551027981" duration="197000" />
     </task>
     <servers />
   </component>

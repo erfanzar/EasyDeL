@@ -30,7 +30,8 @@ from jax.random import PRNGKey
 from transformers import PretrainedConfig
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxMaskedLMOutput
 from transformers.modeling_flax_utils import ACT2FN, FlaxPreTrainedModel, append_call_sample_docstring
-from jax.experimental.pjit import with_sharding_constraint as wsc, PartitionSpec
+from jax.experimental.pjit import with_sharding_constraint as wsc
+from jax.sharding import PartitionSpec
 from jax.interpreters import pxla
 from transformers import logging
 

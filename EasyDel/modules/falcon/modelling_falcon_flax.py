@@ -7,7 +7,8 @@ from transformers import FlaxPreTrainedModel, PretrainedConfig
 from jax import numpy as jnp
 import jax
 from jax.interpreters import pxla
-from jax.experimental.pjit import pjit, PartitionSpec, with_sharding_constraint as wsc
+from jax.experimental.pjit import pjit, with_sharding_constraint as wsc
+from jax.sharding import PartitionSpec
 from transformers.modeling_flax_outputs import FlaxCausalLMOutput, FlaxBaseModelOutput
 from jax.random import split, PRNGKey
 from functools import partial
