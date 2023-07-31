@@ -87,8 +87,8 @@ class LlamaConfig(PretrainedConfig):
             use_pjit_attention_force: bool = True,
             rope_scaling=None,
             use_flash_attention: bool = False,
-            flash_attn_query_chunk_size=1024,
-            flash_attn_key_chunk_size=2048,
+            flash_attn_query_chunk_size=512,
+            flash_attn_key_chunk_size=512,
             complex_rotary: bool = False,
             **kwargs,
     ):
