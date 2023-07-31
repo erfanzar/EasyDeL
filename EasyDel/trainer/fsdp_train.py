@@ -770,7 +770,7 @@ class CausalLMTrainer:
                 prefix_print(
                     'Action', f'Loading Model From {self.ckpt_path}'
                 )
-                print(f'{shard_fns}')
+
                 if model_parameters is None:
                     _, params = StreamingCheckpointer.load_trainstate_checkpoint(
                         f'params::{self.ckpt_path}', self.train_state_shape, shard_fns
