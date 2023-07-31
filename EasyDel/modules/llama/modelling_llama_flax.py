@@ -89,6 +89,7 @@ class LlamaConfig(PretrainedConfig):
             use_flash_attention: bool = False,
             flash_attn_query_chunk_size=1024,
             flash_attn_key_chunk_size=2048,
+            complex_rotary: bool = False,
             **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -111,6 +112,7 @@ class LlamaConfig(PretrainedConfig):
         self.use_flash_attention = use_flash_attention
         self.flash_attn_key_chunk_size = flash_attn_key_chunk_size
         self.flash_attn_query_chunk_size = flash_attn_query_chunk_size
+        self.complex_rotary = complex_rotary
         super().__init__(
             # pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -219,12 +221,6 @@ class RMSNorm(nn.Module):
         return output * weight
 
 
-def rotate_half(x):
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2:]
-    return jnp.concatenate([-x2, x1], axis=-1)
-
-
 def precompute_freqs_cis(
         method: str,
         dim: int, end: int, theta: float = 10000.0,
@@ -327,6 +323,9 @@ class FlaxLlamaAttention(nn.Module):
             dim=self.head_dim,
             end=config.max_sequence_length * 2,
             dtype=self.dtype,
+        ) if self.config.complex_rotary else create_sinusoidal_positions(
+            config.max_sequence_length,
+            self.head_dim
         )
 
     def _split_heads(self, hidden_states):
@@ -378,11 +377,13 @@ class FlaxLlamaAttention(nn.Module):
         xq = self._split_heads(xq)
         xk = self._split_heads(xk)
         xv = self._split_heads(xv)
-
         freqs_cis = jnp.take(self.freqs_cis, position_ids, axis=0)
-
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis, dtype=self.dtype)
-
+        if self.config.complex_rotary:
+            xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis, dtype=self.dtype)
+        else:
+            sincos = jnp.split(freqs_cis, 2, axis=-1)
+            xq = apply_rotary_pos_emb(xq, sincos)
+            xk = apply_rotary_pos_emb(xk, sincos)
         query_length, key_length = xq.shape[1], xk.shape[1]
 
         if self.has_variable("cache", "cached_key"):
