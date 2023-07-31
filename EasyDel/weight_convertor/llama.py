@@ -13,19 +13,19 @@ def convert_pt_to_flax(state_dict_pt, n_layers: int, device=jax.devices('cpu')[0
                 f'model.layers.{i}.input_layernorm.weight'].cpu().detach().numpy()
             state_dict_flax[('transformer', 'h', f'{i}', 'ffn_norm', 'kernel')] = state_dict_pt[
                 f'model.layers.{i}.post_attention_layernorm.weight'].cpu().detach().numpy()
-            state_dict_flax[('transformer', 'h', f'{i}', 'feed_forward', 'down_proj', 'kernel')] = jnp.transpose(
+            state_dict_flax[('transformer', 'h', f'{i}', 'feed_forward', 'w2', 'kernel')] = jnp.transpose(
                 state_dict_pt[f'model.layers.{i}.mlp.down_proj.weight'].cpu().detach().numpy(), (1, 0))
-            state_dict_flax[('transformer', 'h', f'{i}', 'feed_forward', 'gate_proj', 'kernel')] = jnp.transpose(
+            state_dict_flax[('transformer', 'h', f'{i}', 'feed_forward', 'w1', 'kernel')] = jnp.transpose(
                 state_dict_pt[f'model.layers.{i}.mlp.gate_proj.weight'].cpu().detach().numpy(), (1, 0))
-            state_dict_flax[('transformer', 'h', f'{i}', 'feed_forward', 'up_proj', 'kernel')] = jnp.transpose(
+            state_dict_flax[('transformer', 'h', f'{i}', 'feed_forward', 'w3', 'kernel')] = jnp.transpose(
                 state_dict_pt[f'model.layers.{i}.mlp.up_proj.weight'].cpu().detach().numpy(), (1, 0))
-            state_dict_flax[('transformer', 'h', f'{i}', 'attention', 'k_proj', 'kernel')] = jnp.transpose(
+            state_dict_flax[('transformer', 'h', f'{i}', 'attention', 'wk', 'kernel')] = jnp.transpose(
                 state_dict_pt[f'model.layers.{i}.self_attn.k_proj.weight'].cpu().detach().numpy(), (1, 0))
-            state_dict_flax[('transformer', 'h', f'{i}', 'attention', 'v_proj', 'kernel')] = jnp.transpose(
+            state_dict_flax[('transformer', 'h', f'{i}', 'attention', 'wv', 'kernel')] = jnp.transpose(
                 state_dict_pt[f'model.layers.{i}.self_attn.v_proj.weight'].cpu().detach().numpy(), (1, 0))
-            state_dict_flax[('transformer', 'h', f'{i}', 'attention', 'q_proj', 'kernel')] = jnp.transpose(
+            state_dict_flax[('transformer', 'h', f'{i}', 'attention', 'wq', 'kernel')] = jnp.transpose(
                 state_dict_pt[f'model.layers.{i}.self_attn.q_proj.weight'].cpu().detach().numpy(), (1, 0))
-            state_dict_flax[('transformer', 'h', f'{i}', 'attention', 'o_proj', 'kernel')] = jnp.transpose(
+            state_dict_flax[('transformer', 'h', f'{i}', 'attention', 'wo', 'kernel')] = jnp.transpose(
                 state_dict_pt[f'model.layers.{i}.self_attn.o_proj.weight'].cpu().detach().numpy(), (1, 0))
 
         state_dict_flax[('transformer', 'ln_f', 'kernel')] = state_dict_pt[f'model.norm.weight'].cpu().detach().numpy()
