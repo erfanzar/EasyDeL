@@ -39,6 +39,7 @@ class TrainArguments(
             scheduler: str = 'linear',
             learning_rate: Union[int, float] = 5e-5,
             learning_rate_end: Union[None, float] = 5e-6,
+            gradient_accumulation_steps: int = 1,
             weight_decay: float = 0.01,
             gradient_checkpointing: str = 'nothing_saveable',
             max_length: Union[int, None] = 4096,
@@ -117,6 +118,7 @@ class TrainArguments(
         self.do_last_save = do_last_save
         self.model_parameters = model_parameters
         self.do_shard_fns = do_shard_fns
+        self.gradient_accumulation_steps = gradient_accumulation_steps
         torch.set_default_device('cpu')
         self.__dict__.update(**kwargs)
 
