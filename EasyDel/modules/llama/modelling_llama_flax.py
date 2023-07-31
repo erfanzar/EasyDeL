@@ -170,12 +170,12 @@ remat = nn_partitioning.remat
 
 
 def create_sinusoidal_positions(num_pos, dim):
-    inv_freq = 1.0 / (10000 ** (np.arange(0, dim, 2) / dim))
-    sinusoid_inp = np.einsum("i , j -> i j", np.arange(num_pos), inv_freq).astype("float32")
-    sin, cos = np.sin(sinusoid_inp), np.cos(sinusoid_inp)
+    inv_freq = 1.0 / (10000 ** (jnp.arange(0, dim, 2) / dim))
+    sinusoid_inp = jnp.einsum("i , j -> i j", jnp.arange(num_pos), inv_freq).astype("float32")
+    sin, cos = jnp.sin(sinusoid_inp), jnp.cos(sinusoid_inp)
 
     sentinel = dim // 2 + dim % 2
-    out = np.zeros((num_pos, dim))
+    out = jnp.zeros((num_pos, dim))
     out[:, 0:sentinel] = sin
     out[:, sentinel:] = cos
 
