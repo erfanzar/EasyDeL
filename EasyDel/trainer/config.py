@@ -68,8 +68,8 @@ class TrainArguments(
     ):
         super().__init__()
         assert model_class is not None or model_id is not None, 'you cant pass model_class and model_id both None ' \
-                                                                 'you should at least pass one of them to build ' \
-                                                                 'model with'
+                                                                'you should at least pass one of them to build ' \
+                                                                'model with'
         assert backend in AVAILABLE_BACKENDS, f'{backend} is not recognized, ' \
                                               f'available backends are {AVAILABLE_BACKENDS}'
         assert gradient_checkpointing in AVAILABLE_GRADIENT_CHECK_POINTING, f'{gradient_checkpointing} is not ' \
@@ -205,6 +205,8 @@ class TrainArguments(
                     steps=steps,
                     **self.extra_optimizer_kwargs
                 )
+            elif self.scheduler == 'warm_up_cosine':
+                ...
         elif self.optimizer == 'lion':
             if self.scheduler == 'linear':
                 tx, sc = fjutils.optimizers.get_lion_with_linear_scheduler(
@@ -226,6 +228,8 @@ class TrainArguments(
                     steps=steps,
                     **self.extra_optimizer_kwargs
                 )
+            elif self.scheduler == 'warm_up_cosine':
+                ...
         elif self.optimizer == 'adamw':
             if self.scheduler == 'linear':
                 tx, sc = fjutils.optimizers.get_adamw_with_linear_scheduler(
@@ -248,6 +252,8 @@ class TrainArguments(
                     steps=steps,
                     **self.extra_optimizer_kwargs
                 )
+            elif self.scheduler == 'warm_up_cosine':
+                ...
         return tx, sc
 
     def get_streaming_checkpointer(self):
