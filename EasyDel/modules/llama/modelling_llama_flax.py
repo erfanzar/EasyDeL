@@ -1,6 +1,7 @@
 import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from einops import einops
 from flax.linen import remat
 
 import jax
@@ -22,6 +23,7 @@ from jax.interpreters import pxla
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput, FlaxSequenceClassifierOutput
 
 from jax.experimental.pjit import with_sharding_constraint as wsc
+from fjutils import dot_product_attention_multihead
 
 
 def get_names_from_parition_spec(partition_specs):
@@ -84,6 +86,9 @@ class LlamaConfig(PretrainedConfig):
             fcm_max_ratio=0.0,
             use_pjit_attention_force: bool = True,
             rope_scaling=None,
+            use_flash_attention: bool = False,
+            flash_attn_query_chunk_size=1024,
+            flash_attn_key_chunk_size=2048,
             **kwargs,
     ):
         if rope_scaling is None:
@@ -108,6 +113,9 @@ class LlamaConfig(PretrainedConfig):
         self.fcm_min_ratio = fcm_min_ratio
         self.fcm_max_ratio = fcm_max_ratio
         self.rope_scaling = rope_scaling
+        self.use_flash_attention = use_flash_attention
+        self.flash_attn_key_chunk_size = flash_attn_key_chunk_size
+        self.flash_attn_query_chunk_size = flash_attn_query_chunk_size
         super().__init__(
             # pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -380,21 +388,43 @@ class FlaxLlamaAttention(nn.Module):
             jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
             jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
         )
+        if self.config.use_flash_attention:
+            attn_weights = None
+            attention_mask = einops.rearrange(
+                combine_masks(attention_mask, fcm_mask),
+                '... s q k -> ... s 1 q k'
+            )
+            attn_output = dot_product_attention_multihead(
+                xq,
+                xk,
+                xv,
+                bias=attention_mask,
+                dropout_rng=dropout_rng,
+                dropout_rate=self.config.attn_pdrop,
+                enable_dropout=not deterministic and self.config.attn_pdrop > 0.0,
+                rescale_logits=True,
+                float32_logits=True,
+                causal_mask=True,
+                dtype=self.dtype,
+                precision=self.precision,
+                query_chunk_size=self.config.flash_attn_query_chunk_size,
+                key_chunk_size=self.config.flash_attn_key_chunk_size,
+            )
+        else:
+            attn_weights = dot_product_attention_weights(
+                xq,
+                xk,
+                bias=attention_bias,
+                dropout_rng=dropout_rng,
+                dropout_rate=self.config.attn_pdrop,
+                deterministic=deterministic,
+                dtype=jnp.promote_types(self.dtype, jnp.bfloat16),
+                precision=self.precision,
+            )
+            if self.config.use_pjit_attention_force:
+                attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "mp", None, None))
 
-        attn_weights = dot_product_attention_weights(
-            xq,
-            xk,
-            bias=attention_bias,
-            dropout_rng=dropout_rng,
-            dropout_rate=self.config.attn_pdrop,
-            deterministic=deterministic,
-            dtype=jnp.promote_types(self.dtype, jnp.bfloat16),
-            precision=self.precision,
-        )
-        if self.config.use_pjit_attention_force:
-            attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "mp", None, None))
-
-        attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, xv, precision=self.precision)
+            attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, xv, precision=self.precision)
         attn_output = self._merge_heads(attn_output)
         attn_output = self.wo(attn_output)
         attn_output = self.resid_dropout(attn_output, deterministic=deterministic)

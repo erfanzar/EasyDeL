@@ -25,6 +25,9 @@ from typing import Any, List, Mapping, Optional
 
 from functools import partial
 from typing import Optional, Tuple
+
+from einops import einops
+from fjutils import with_sharding_constraint
 from jax.experimental.pjit import with_sharding_constraint as wsc
 from jax.sharding import PartitionSpec
 import flax.linen as nn
@@ -45,6 +48,7 @@ from transformers import PreTrainedTokenizer, TensorType, is_torch_available
 from transformers.configuration_utils import PretrainedConfig
 from transformers.onnx import OnnxConfigWithPast, PatchingSpec
 from jax.interpreters import pxla
+from fjutils.flash_attention import dot_product_attention_multihead
 
 logger = logging.get_logger(__name__)
 
@@ -103,6 +107,10 @@ class GPTJConfig(PretrainedConfig):
             bos_token_id=50256,
             eos_token_id=50256,
             tie_word_embeddings=False,
+            use_pjit_attention_force: bool = False,
+            use_flash_attention: bool = False,
+            flash_attn_query_chunk_size=1024,
+            flash_attn_key_chunk_size=2048,
             **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -119,9 +127,12 @@ class GPTJConfig(PretrainedConfig):
         self.layer_norm_epsilon = layer_norm_epsilon
         self.initializer_range = initializer_range
         self.use_cache = use_cache
-
+        self.use_pjit_attention_force = use_pjit_attention_force
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
+        self.flash_attn_query_chunk_size = flash_attn_query_chunk_size
+        self.flash_attn_key_chunk_size = flash_attn_key_chunk_size
+        self.use_flash_attention = use_flash_attention
 
         super().__init__(
             bos_token_id=bos_token_id, eos_token_id=eos_token_id, tie_word_embeddings=tie_word_embeddings, **kwargs
@@ -384,9 +395,10 @@ class FlaxGPTJAttention(nn.Module):
         value = self.v_proj(hidden_states)
 
         # Force A local Sharding
-        query = with_sharding_constraint_(query, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
-        key = with_sharding_constraint_(key, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
-        value = with_sharding_constraint_(value, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
+        if self.config.use_pjit_attention_force:
+            query = with_sharding_constraint_(query, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
+            key = with_sharding_constraint_(key, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
+            value = with_sharding_constraint_(value, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
 
         query = self._split_heads(query)
         key = self._split_heads(key)
@@ -444,20 +456,43 @@ class FlaxGPTJAttention(nn.Module):
         )
 
         # usual dot product attention
-        attn_weights = dot_product_attention_weights(
-            query,
-            key,
-            bias=attention_bias,
-            dropout_rng=dropout_rng,
-            dropout_rate=self.config.attn_pdrop,
-            deterministic=deterministic,
-            dtype=self.dtype,
-            precision=None,
-        )
+        if self.config.use_flash_attention:
+            attn_weights = None
+            attention_mask = einops.rearrange(
+                attention_bias,
+                '... s q k -> ... s 1 q k'
+            )
+            attn_output = dot_product_attention_multihead(
+                query,
+                key,
+                value,
+                bias=attention_mask,
+                dropout_rng=dropout_rng,
+                dropout_rate=self.config.attn_pdrop,
+                enable_dropout=not deterministic and self.config.attn_pdrop > 0.0,
+                rescale_logits=True,
+                float32_logits=True,
+                causal_mask=True,
+                dtype=self.dtype,
+                precision=self.precision,
+                query_chunk_size=self.config.flash_attn_query_chunk_size,
+                key_chunk_size=self.config.flash_attn_key_chunk_size,
+            )
+        else:
+            attn_weights = dot_product_attention_weights(
+                query,
+                key,
+                bias=attention_bias,
+                dropout_rng=dropout_rng,
+                dropout_rate=self.config.attn_pdrop,
+                deterministic=deterministic,
+                dtype=jnp.promote_types(self.dtype, jnp.bfloat16),
+                precision=self.precision,
+            )
+            if self.config.use_pjit_attention_force:
+                attn_weights = with_sharding_constraint(attn_weights, PartitionSpec(("dp", "fsdp"), "mp", None, None))
 
-        attn_weights = with_sharding_constraint_(attn_weights, PartitionSpec(('dp', 'fsdp'), 'mp', None, None))
-
-        attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value)
+            attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value, precision=self.precision)
         attn_output = self._merge_heads(attn_output)
         attn_output = self.out_proj(attn_output)
         attn_output = self.resid_dropout(attn_output, deterministic=deterministic)

@@ -1,5 +1,6 @@
 import math
 
+import einops
 from flax import linen as nn
 from flax.serialization import to_bytes, from_bytes, to_state_dict, from_state_dict
 from jax import grad, jit
@@ -16,6 +17,7 @@ from jax.random import split, PRNGKey
 from functools import partial
 import flax
 from einops import rearrange
+from fjutils.flash_attention import dot_product_attention_multihead
 
 ACT2FN = {
     "gelu": partial(nn.gelu, approximate=False),
@@ -66,6 +68,9 @@ class MptConfig(PretrainedConfig):
                  use_lm_head: bool = False,
                  use_norm_bias: bool = False, gradient_checkpointing: str = 'nothing_saveable',
                  use_pjit_attention_force: bool = False,
+                 use_flash_attention: bool = False,
+                 flash_attn_query_chunk_size=1024,
+                 flash_attn_key_chunk_size=2048,
                  **kwargs):
 
         self.d_model = d_model
@@ -79,7 +84,7 @@ class MptConfig(PretrainedConfig):
         self.resid_prob_drop = resid_prob_drop
         self.use_bias = use_bias
         self.emb_prob_drop = emb_prob_drop
-        self.use_pjit_attention_force=use_pjit_attention_force
+        self.use_pjit_attention_force = use_pjit_attention_force
         self.gradient_checkpointing = gradient_checkpointing
         self.learned_pos_emb = learned_pos_emb
         self.act_fn = act_fn
@@ -90,6 +95,9 @@ class MptConfig(PretrainedConfig):
         self.verbose = verbose
         self.embedding_fraction = embedding_fraction
         self.use_cache = use_cache
+        self.use_flash_attention = use_flash_attention
+        self.flash_attn_key_chunk_size = flash_attn_key_chunk_size
+        self.flash_attn_query_chunk_size = flash_attn_query_chunk_size
         if 'name' in kwargs:
             del kwargs['name']
         if 'loss_fn' in kwargs:
@@ -107,18 +115,18 @@ class MptConfig(PretrainedConfig):
     def get_partition_rules(fully_fsdp: bool = False):
         return (
 
-            ("transformer/wte/embedding", PartitionSpec("mp", "fsdp")),
-            ("transformer/wpe/embedding", PartitionSpec("mp", "fsdp")),
+            ("transformer/wte/embedding", PartitionSpec("dp", "fsdp")),
+            ("transformer/wpe/embedding", PartitionSpec("dp", "fsdp")),
 
-            ("attn/w_qkv/kernel", PartitionSpec("fsdp", "mp")),
-            ("attn/wo/kernel", PartitionSpec("mp", "fsdp")),
-            ("attn/w_qkv/bias", PartitionSpec("fsdp", "mp")),
-            ("attn/wo/bias", PartitionSpec("mp", "fsdp")),
+            ("attn/w_qkv/kernel", PartitionSpec("fsdp", "dp")),
+            ("attn/wo/kernel", PartitionSpec("dp", "fsdp")),
+            ("attn/w_qkv/bias", PartitionSpec("fsdp", "dp")),
+            ("attn/wo/bias", PartitionSpec("dp", "fsdp")),
 
-            ("ffn/down/kernel", PartitionSpec("fsdp", "mp")),
-            ("ffn/up/kernel", PartitionSpec("fsdp", "mp")),
-            ("ffn/down/kernel", PartitionSpec("fsdp", "mp")),
-            ("ffn/up/kernel", PartitionSpec("fsdp", "mp")),
+            ("ffn/down/kernel", PartitionSpec("fsdp", "dp")),
+            ("ffn/up/kernel", PartitionSpec("fsdp", "dp")),
+            ("ffn/down/kernel", PartitionSpec("fsdp", "dp")),
+            ("ffn/up/kernel", PartitionSpec("fsdp", "dp")),
 
             ("attention_norm/kernel", PartitionSpec(None)),
             ("norm_f/kernel", PartitionSpec(None)),
@@ -126,8 +134,8 @@ class MptConfig(PretrainedConfig):
 
             ("transformer/norm_f/kernel", PartitionSpec(None)),
             ("transformer/norm_f/bias", PartitionSpec(None)),
-            ("lm_head/kernel", PartitionSpec("fsdp", "mp")),
-            ("lm_head/bias", PartitionSpec("fsdp", "mp")),
+            ("lm_head/kernel", PartitionSpec("fsdp", "dp")),
+            ("lm_head/bias", PartitionSpec("fsdp", "dp")),
             ('.*', PartitionSpec(None)),
         ) if not fully_fsdp else (
 
@@ -231,21 +239,54 @@ class FlaxMptAttention(nn.Module):
         q = rearrange(q, 'b s (h d) -> b s h d', h=self.config.n_heads)
         k = rearrange(k, 'b s (h d) -> b s h d', h=self.config.n_heads)
         v = rearrange(v, 'b s (h d) -> b s h d', h=self.config.n_heads)
-        d = q.shape[-1]
-        atw = jnp.einsum('...qhd,...khd->...hqk', q, k, precision=self.precision) * jax.lax.rsqrt(
-            jnp.asarray(d).astype(v.dtype))
-        if self.config.use_pjit_attention_force:
-            atw = with_sharding_constraint(atw, PartitionSpec(('dp', 'fsdp'), 'mp', None, None))
-        if attn_bias is not None:
-            atw += attn_bias
-        mv = jnp.finfo(atw).min
-        mask = jnp.where(self.causal_mask == 1, 0, mv)
-        if attention_mask is not None:
-            attention_mask = jnp.where(attention_mask.reshape(b, 1, 1, s) == 1, 0, mv)
-            atw += attention_mask
-        atw += mask[:, :, :s, :s]
-        atw = nn.softmax(atw, -1)
-        atw = jnp.einsum('...hqk,...khd->...qhd', atw, v)
+        if self.config.use_flash_attention:
+
+            attn_mask = einops.rearrange(
+                nn.combine_masks(
+                    jnp.where(self.causal_mask == 1, 0, jnp.finfo(jnp.ones((1,), dtype=self.dtype)).min)[:, :, :s, :s],
+                    jnp.where(attention_mask.reshape(b, 1, 1, s) == 1, 0,
+                              jnp.finfo(jnp.ones((1, 1), dtype=self.dtype)).min),
+                    attn_bias
+                ),
+                '...s q k->... s 1 q k'
+            ) if attn_bias is not None else einops.rearrange(
+                nn.combine_masks(
+                    jnp.where(self.causal_mask == 1, 0, jnp.finfo(jnp.ones((1,), dtype=self.dtype)).min)[:, :, :s, :s],
+                    jnp.where(attention_mask.reshape(b, 1, 1, s) == 1, 0,
+                              jnp.finfo(jnp.ones((1, 1), dtype=self.dtype)).min)
+                ),
+                '...s q k->... s 1 q k'
+            )
+            atw = dot_product_attention_multihead(
+                query=q,
+                key=k,
+                value=v,
+                dtype=self.dtype,
+                precision=self.precision,
+                dropout_rate=0.0,
+                enable_dropout=False,
+                float32_logits=True,
+                rescale_logits=True,
+                bias=attn_mask,
+                causal_mask=False,
+                key_chunk_size=self.config.flash_attn_key_chunk_size,
+                query_chunk_size=self.config.flash_attn_query_chunk_size
+            )
+        else:
+            d = q.shape[-1]
+            atw = jnp.einsum('...qhd,...khd->...hqk', q, k, precision=self.precision) * jax.lax.rsqrt(
+                jnp.asarray(d).astype(v.dtype))
+            if self.config.use_pjit_attention_force:
+                atw = with_sharding_constraint(atw, PartitionSpec(('dp', 'fsdp'), 'mp', None, None))
+            if attn_bias is not None:
+                atw += attn_bias
+            mask = jnp.where(self.causal_mask == 1, 0, jnp.finfo(atw).min)
+            if attention_mask is not None:
+                attention_mask = jnp.where(attention_mask.reshape(b, 1, 1, s) == 1, 0, jnp.finfo(atw).min)
+                atw += attention_mask
+            atw += mask[:, :, :s, :s]
+            atw = nn.softmax(atw, -1)
+            atw = jnp.einsum('...hqk,...khd->...qhd', atw, v)
         return self.wo(atw.reshape(inp_shape))
 
 
