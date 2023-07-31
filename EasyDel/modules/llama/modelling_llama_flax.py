@@ -392,7 +392,6 @@ class FlaxLlamaAttention(nn.Module):
                 combine_masks(attention_mask, fcm_mask),
                 '... s q k -> ... s 1 q k'
             ).astype(self.dtype)
-            print(self.dtype)
             attn_output = dot_product_attention_multihead(
                 xq,
                 xk,
