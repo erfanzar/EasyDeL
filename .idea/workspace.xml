@@ -6,7 +6,13 @@
   <component name="ChangeListManager">
     <list default="true" id="08ad205b-709f-455b-86db-91293f595cd3" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/EasyDel/trainer/fsdp_train.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/trainer/fsdp_train.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/__init__.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/configs/get_model_attr.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/configs/get_model_attr.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/modules/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/modules/__init__.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/modules/llama/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/modules/llama/__init__.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/modules/llama/modelling_llama_flax.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/modules/llama/modelling_llama_flax.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/modules/llama/modelling_llama_pytorch.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/setup.py" beforeDir="false" afterPath="$PROJECT_DIR$/setup.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -154,7 +160,7 @@
       <workItem from="1690631125031" duration="3994000" />
       <workItem from="1690789243968" duration="3491000" />
       <workItem from="1690796635974" duration="157000" />
-      <workItem from="1690796862497" duration="7370000" />
+      <workItem from="1690796862497" duration="8989000" />
     </task>
     <servers />
   </component>

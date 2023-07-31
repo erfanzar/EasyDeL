@@ -1,6 +1,6 @@
 import logging
 
-from EasyDel import LlamaForCausalLM, FlaxMptForCausalLM, FlaxGPTJForCausalLM, FlaxGPTNeoXForCausalLM, \
+from EasyDel import FlaxLlamaForCausalLM, FlaxMptForCausalLM, FlaxGPTJForCausalLM, FlaxGPTNeoXForCausalLM, \
     FlaxT5ForConditionalGeneration, FlaxOPTForCausalLM, FlaxFalconForCausalLM
 
 from EasyDel.configs.configs import llama_2_configs, gptj_configs, mpt_configs, opt_configs, falcon_configs, \
@@ -22,7 +22,7 @@ def get_model_and_config(model, model_type):
         logger.warning(f'config for {model} is not available you will receive config as None')
     try:
         if model == 'llama' or model == 'llama_2':
-            model_class = LlamaForCausalLM
+            model_class = FlaxLlamaForCausalLM
             if model == 'llama':
                 config_dict = llama_configs[model_type]
             elif model == 'llama_2':
