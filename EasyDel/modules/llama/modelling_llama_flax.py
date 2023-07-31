@@ -178,9 +178,8 @@ def create_sinusoidal_positions(num_pos, dim):
 
     sentinel = dim // 2 + dim % 2
     out = jnp.zeros((num_pos, dim))
-    out[:, 0:sentinel] = sin
-    out[:, sentinel:] = cos
-
+    out = out.at[:, 0: sentinel].set(sin)
+    out = out.at[:, sentinel:].set(cos)
     return jnp.array(out)
 
 
