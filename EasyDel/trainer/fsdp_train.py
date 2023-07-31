@@ -776,6 +776,14 @@ class CausalLMTrainer:
                         f'params::{self.ckpt_path}', self.train_state_shape, shard_fns
                     )
                 else:
+                    def create_train_state_from_params(params_):
+                        return train_state.TrainState.create(
+                            tx=self.tx,
+                            apply_fn=self.model.__call__,
+                            params=flax.core.freeze({'params': params_})
+                        )
+
+                    model_parameters = create_train_state_from_params(model_parameters)
                     params = model_parameters if not self.arguments.do_shard_fns else jax.tree_util.tree_map(
                         lambda f, x: f(x), shard_fns,
                         model_parameters)
