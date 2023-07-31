@@ -401,7 +401,7 @@ class FlaxLlamaAttention(nn.Module):
                 dropout_rate=self.config.attn_pdrop,
                 enable_dropout=not deterministic and self.config.attn_pdrop > 0.0,
                 rescale_logits=True,
-                float32_logits=True,
+                float32_logits=False,
                 causal_mask=True,
                 dtype=self.dtype,
                 precision=self.precision,
