@@ -391,7 +391,7 @@ class FlaxLlamaAttention(nn.Module):
             attention_mask = einops.rearrange(
                 combine_masks(attention_mask, fcm_mask),
                 '... s q k -> ... s 1 q k'
-            )
+            ).astype(self.dtype)
             print(self.dtype)
             attn_output = dot_product_attention_multihead(
                 xq,
@@ -401,7 +401,7 @@ class FlaxLlamaAttention(nn.Module):
                 dropout_rng=dropout_rng,
                 dropout_rate=self.config.attn_pdrop,
                 enable_dropout=not deterministic and self.config.attn_pdrop > 0.0,
-                rescale_logits=True,
+                rescale_logits=False,
                 float32_logits=False,
                 causal_mask=True,
                 dtype=self.dtype,
