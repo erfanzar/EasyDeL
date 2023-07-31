@@ -381,8 +381,8 @@ class FlaxLlamaAttention(nn.Module):
             xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis, dtype=self.dtype)
         else:
             sincos = jnp.split(freqs_cis, 2, axis=-1)
-            xq = apply_rotary_pos_emb(xq, sincos)
-            xk = apply_rotary_pos_emb(xk, sincos)
+            xq = apply_rotary_pos_emb(xq, sincos).astype(self.dtype)
+            xk = apply_rotary_pos_emb(xk, sincos).astype(self.dtype)
         query_length, key_length = xq.shape[1], xk.shape[1]
 
         if self.has_variable("cache", "cached_key"):
