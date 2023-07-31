@@ -761,7 +761,8 @@ class CausalLMTrainer:
         self.train_state_shape = train_state_shape
         return sharded_create_from_params_fn, sharded_train_step_fn, sharded_predict, mesh, ckpt_streamer, init_fn
 
-    def train(self, model_parameters: flax.core.FrozenDict = None) -> OutputFineTuner:
+    def train(self, model_parameters: flax.core.FrozenDict = None,
+              do_force_flatten_dict_gather_shard_fns: bool = True) -> OutputFineTuner:
         with self.mesh:
             if self.finetune:
                 shard_fns, gather_fns = make_shard_and_gather_fns(self.train_state_partition_spec,
@@ -769,6 +770,7 @@ class CausalLMTrainer:
                 prefix_print(
                     'Action', f'Loading Model From {self.ckpt_path}'
                 )
+                print(f'{shard_fns}')
                 if model_parameters is None:
                     _, params = StreamingCheckpointer.load_trainstate_checkpoint(
                         f'params::{self.ckpt_path}', self.train_state_shape, shard_fns
