@@ -91,11 +91,6 @@ class LlamaConfig(PretrainedConfig):
             flash_attn_key_chunk_size=2048,
             **kwargs,
     ):
-        if rope_scaling is None:
-            rope_scaling = {
-                "factor": 8.0,
-                "type": "linear"
-            }
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.initializer_range = initializer_range
@@ -209,16 +204,19 @@ def precompute_freqs_cis(
         dim: int, end: int, theta: float = 10000.0,
         scaling_factor: float = 8.,
         dtype: jnp.dtype = jnp.bfloat16) -> jnp.ndarray:
-    if method == 'linear':
-        freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(dtype) / dim))
-    elif method == 'dynamic':
-        base = theta * (
-                (scaling_factor * end / end) - (scaling_factor - 1)
-        ) ** (dim / (dim - 2))
-        freqs = 1.0 / (base ** (jnp.arange(0, dim, 2) / dim))
-    else:
-        raise ValueError(f'unknown {method} method for precompute_freqs_cis')
-    t = jnp.arange(end)  # type: ignore
+    freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(dtype) / dim))
+    t = jnp.arange(end)
+    if method is not None:
+        if method == 'linear':
+            t = t / scaling_factor
+        elif method == 'dynamic':
+            base = theta * (
+                    (scaling_factor * end / end) - (scaling_factor - 1)
+            ) ** (dim / (dim - 2))
+            freqs = 1.0 / (base ** (jnp.arange(0, dim, 2) / dim))
+        else:
+            raise ValueError(f'unknown {method} method for precompute_freqs_cis')
+
     freqs = jnp.outer(t, freqs).astype(dtype)
     sin, cos = jnp.sin(freqs), jnp.cos(freqs)
     freqs_cis = jnp.complex64(cos + 1j * sin)
@@ -298,8 +296,8 @@ class FlaxLlamaAttention(nn.Module):
         self.causal_mask = make_causal_mask(jnp.ones((1, config.max_sequence_length), dtype="bool"), dtype="bool")
 
         self.freqs_cis = precompute_freqs_cis(
-            method=self.config.rope_scaling['type'],
-            scaling_factor=float(self.config.rope_scaling['factor']),
+            method=self.config.rope_scaling['type'] if self.config.rope_scaling is not None else None,
+            scaling_factor=float(self.config.rope_scaling['factor'] if self.config.rope_scaling is not None else 1),
             dim=self.head_dim,
             end=config.max_sequence_length * 2,
             dtype=self.dtype,

@@ -10,10 +10,7 @@ llama_configs = {
         'rms_norm_eps': 1e-6,
         'use_cache': True,
         'tie_word_embeddings': False,
-        "rope_scaling": {
-            "factor": 8.0,
-            "type": "linear"
-        }
+        "rope_scaling": None
     },
     '7b': {
         'vocab_size': 32000,
@@ -26,10 +23,7 @@ llama_configs = {
         'rms_norm_eps': 1e-6,
         'use_cache': True,
         'tie_word_embeddings': False,
-        "rope_scaling": {
-            "factor": 8.0,
-            "type": "linear"
-        }
+        "rope_scaling": None
     },
     '13b': {
         'vocab_size': 32000,
@@ -42,10 +36,7 @@ llama_configs = {
         'rms_norm_eps': 1e-6,
         'use_cache': True,
         'tie_word_embeddings': False,
-        "rope_scaling": {
-            "factor": 8.0,
-            "type": "linear"
-        }
+        "rope_scaling": None
     },
     '30b': {
         'vocab_size': 32000,
@@ -58,10 +49,7 @@ llama_configs = {
         'rms_norm_eps': 1e-6,
         'use_cache': True,
         'tie_word_embeddings': False,
-        "rope_scaling": {
-            "factor": 8.0,
-            "type": "linear"
-        }
+        "rope_scaling": None
     },
     '65b': {
         'vocab_size': 32000,
@@ -74,10 +62,7 @@ llama_configs = {
         'rms_norm_eps': 1e-5,
         'use_cache': True,
         'tie_word_embeddings': False,
-        "rope_scaling": {
-            "factor": 8.0,
-            "type": "linear"
-        }
+        "rope_scaling": None
     }
 }
 
