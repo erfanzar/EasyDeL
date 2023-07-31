@@ -29,9 +29,10 @@ class TrainArguments(
 ):
     def __init__(
             self,
-            model_id: str,
             model_name: str,
             num_train_epochs: int,
+            model_id: str = None,
+            model_class=None,
             total_batch_size: int = 32,
             max_steps: Union[int, None] = None,
             optimizer: str = 'lion',
@@ -59,7 +60,6 @@ class TrainArguments(
             extra_configs=None,
             ids_to_pop_from_dataset=[],
             remove_ckpt_after_load: bool = False,
-            model_class=None,
             configs_to_init_model_class=None,
             do_last_save: bool = True,
             model_parameters=None,
@@ -67,7 +67,9 @@ class TrainArguments(
             **kwargs
     ):
         super().__init__()
-
+        assert model_class is not None and model_id is not None, 'you cant pass model_class and model_id both None ' \
+                                                                 'you should at least pass one of them to build ' \
+                                                                 'model with'
         assert backend in AVAILABLE_BACKENDS, f'{backend} is not recognized, ' \
                                               f'available backends are {AVAILABLE_BACKENDS}'
         assert gradient_checkpointing in AVAILABLE_GRADIENT_CHECK_POINTING, f'{gradient_checkpointing} is not ' \
