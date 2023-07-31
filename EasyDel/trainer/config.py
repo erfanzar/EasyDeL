@@ -67,7 +67,7 @@ class TrainArguments(
             **kwargs
     ):
         super().__init__()
-        assert model_class is not None and model_id is not None, 'you cant pass model_class and model_id both None ' \
+        assert model_class is not None or model_id is not None, 'you cant pass model_class and model_id both None ' \
                                                                  'you should at least pass one of them to build ' \
                                                                  'model with'
         assert backend in AVAILABLE_BACKENDS, f'{backend} is not recognized, ' \
