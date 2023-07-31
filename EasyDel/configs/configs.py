@@ -81,6 +81,57 @@ llama_configs = {
     }
 }
 
+llama_2_configs = {
+    '3b': {
+        'vocab_size': 32000,
+        'hidden_size': 3200,
+        'intermediate_size': 8640,
+        'num_hidden_layers': 26,
+        'num_attention_heads': 32,
+        'max_sequence_length': 2048,
+        'initializer_range': 0.02,
+        'rms_norm_eps': 1e-5,
+        'use_cache': True,
+        'tie_word_embeddings': False,
+        "rope_scaling": {
+            "factor": 8.0,
+            "type": "linear"
+        }
+    },
+    '7b': {
+        'vocab_size': 32000,
+        'hidden_size': 4096,
+        'intermediate_size': 11008,
+        'num_hidden_layers': 32,
+        'num_attention_heads': 32,
+        'max_sequence_length': 2048,
+        'initializer_range': 0.02,
+        'rms_norm_eps': 1e-5,
+        'use_cache': True,
+        'tie_word_embeddings': False,
+        "rope_scaling": {
+            "factor": 8.0,
+            "type": "linear"
+        }
+    },
+    '30b': {
+        'vocab_size': 32000,
+        'hidden_size': 6656,
+        'intermediate_size': 17920,
+        'num_hidden_layers': 60,
+        'num_attention_heads': 52,
+        'max_sequence_length': 2048,
+        'initializer_range': 0.02,
+        'rms_norm_eps': 1e-5,
+        'use_cache': True,
+        'tie_word_embeddings': False,
+        "rope_scaling": {
+            "factor": 8.0,
+            "type": "linear"
+        }
+    }
+}
+
 mpt_configs = {
     "1b": {
         "alibi": True,
