@@ -190,6 +190,7 @@ class TrainArguments(
                 tx, sc = fjutils.optimizers.get_adafactor_with_linear_scheduler(
                     learning_rate_start=self.learning_rate,
                     learning_rate_end=self.learning_rate_end,
+                    gradient_accumulation_steps=self.gradient_accumulation_steps,
                     steps=steps,
                     **self.extra_optimizer_kwargs
                 )
@@ -197,6 +198,7 @@ class TrainArguments(
                 tx, sc = fjutils.optimizers.get_adafactor_with_cosine_scheduler(
                     learning_rate=self.learning_rate,
                     steps=steps,
+                    gradient_accumulation_steps=self.gradient_accumulation_steps,
                     weight_decay=self.weight_decay,
                     **self.extra_optimizer_kwargs
                 )
@@ -205,21 +207,32 @@ class TrainArguments(
                     learning_rate_start=self.learning_rate,
                     learning_rate_end=self.learning_rate,
                     steps=steps,
+                    gradient_accumulation_steps=self.gradient_accumulation_steps,
                     **self.extra_optimizer_kwargs
                 )
             elif self.scheduler == 'warm_up_cosine':
-                ...
+                tx, sc = fjutils.optimizers.get_adafactor_with_warm_up_cosine_scheduler(
+                    learning_rate=self.learning_rate,
+                    steps=steps,
+                    weight_decay=self.weight_decay,
+                    gradient_accumulation_steps=self.gradient_accumulation_steps,
+                    **self.extra_optimizer_kwargs
+                )
+            else:
+                raise ValueError('seems like you have choose wrong type or unavailable scheduler')
         elif self.optimizer == 'lion':
             if self.scheduler == 'linear':
                 tx, sc = fjutils.optimizers.get_lion_with_linear_scheduler(
                     learning_rate_start=self.learning_rate,
                     learning_rate_end=self.learning_rate_end,
                     steps=steps,
+                    gradient_accumulation_steps=self.gradient_accumulation_steps,
                     **self.extra_optimizer_kwargs
                 )
             elif self.scheduler == 'cosine':
                 tx, sc = fjutils.optimizers.get_lion_with_cosine_scheduler(
                     learning_rate=self.learning_rate,
+                    gradient_accumulation_steps=self.gradient_accumulation_steps,
                     steps=steps,
                     **self.extra_optimizer_kwargs
                 )
@@ -228,21 +241,31 @@ class TrainArguments(
                     learning_rate_start=self.learning_rate,
                     learning_rate_end=self.learning_rate,
                     steps=steps,
+                    gradient_accumulation_steps=self.gradient_accumulation_steps,
                     **self.extra_optimizer_kwargs
                 )
             elif self.scheduler == 'warm_up_cosine':
-                ...
+                tx, sc = fjutils.optimizers.get_lion_with_warm_up_cosine_scheduler(
+                    learning_rate=self.learning_rate,
+                    steps=steps,
+                    gradient_accumulation_steps=self.gradient_accumulation_steps,
+                    **self.extra_optimizer_kwargs
+                )
+            else:
+                raise ValueError('seems like you have choose wrong type or unavailable scheduler')
         elif self.optimizer == 'adamw':
             if self.scheduler == 'linear':
                 tx, sc = fjutils.optimizers.get_adamw_with_linear_scheduler(
                     learning_rate_start=self.learning_rate,
                     learning_rate_end=self.learning_rate_end,
                     steps=steps,
+                    gradient_accumulation_steps=self.gradient_accumulation_steps,
                     **self.extra_optimizer_kwargs
                 )
             elif self.scheduler == 'cosine':
                 tx, sc = fjutils.optimizers.get_adamw_with_cosine_scheduler(
                     learning_rate=self.learning_rate,
+                    gradient_accumulation_steps=self.gradient_accumulation_steps,
                     steps=steps,
                     weight_decay=self.weight_decay,
                     **self.extra_optimizer_kwargs
@@ -251,11 +274,22 @@ class TrainArguments(
                 tx, sc = fjutils.optimizers.get_adamw_with_linear_scheduler(
                     learning_rate_start=self.learning_rate,
                     learning_rate_end=self.learning_rate,
+                    gradient_accumulation_steps=self.gradient_accumulation_steps,
                     steps=steps,
                     **self.extra_optimizer_kwargs
                 )
             elif self.scheduler == 'warm_up_cosine':
-                ...
+                tx, sc = fjutils.optimizers.get_adamw_with_warm_up_cosine_scheduler(
+                    learning_rate=self.learning_rate,
+                    steps=steps,
+                    weight_decay=self.weight_decay,
+                    gradient_accumulation_steps=self.gradient_accumulation_steps,
+                    **self.extra_optimizer_kwargs
+                )
+            else:
+                raise ValueError('seems like you have choose wrong type or unavailable scheduler')
+        else:
+            raise ValueError('seems like you have choose wrong type or unavailable optimizer')
         return tx, sc
 
     def get_streaming_checkpointer(self):
