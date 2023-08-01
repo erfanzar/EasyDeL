@@ -212,6 +212,10 @@ def rotate_half(x):
 
 def apply_rotary_emb_v2(array, sin, cos):
     _, s, *_ = array.shape
+    print(s)
+    print(array.shape)
+    print(cos.shape)
+    print(sin.shape)
     return einops.einsum(array, cos[:s], '... s d, s d -> ... s d') + \
         einops.einsum(rotate_half(array), sin[:s], '... s d, s d -> ... s d')
 
