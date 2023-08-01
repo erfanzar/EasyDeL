@@ -265,6 +265,7 @@ def precompute_freqs_cis(
         dtype: jnp.dtype = jnp.bfloat16) -> jnp.ndarray:
     freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(dtype) / dim))
     t = jnp.arange(end)
+
     if method is not None:
         if method == 'linear':
             t = t / scaling_factor
@@ -355,6 +356,7 @@ class FlaxLlamaAttention(nn.Module):
         self.causal_mask = make_causal_mask(jnp.ones((1, config.max_sequence_length), dtype="bool"), dtype="bool")
 
         if self.config.rotary_type == 'complex':
+            print('freq being generated for complex')
             self.freqs_cis = precompute_freqs_cis(
                 method=self.config.rope_scaling['type'] if self.config.rope_scaling is not None else None,
                 scaling_factor=float(self.config.rope_scaling['factor'] if self.config.rope_scaling is not None else 1),
@@ -363,11 +365,14 @@ class FlaxLlamaAttention(nn.Module):
                 dtype=self.dtype,
             )
         elif self.config.rotary_type == 'open':
+            print('freq being generated for open')
             self.freqs_cis = create_sinusoidal_positions(
                 config.max_sequence_length,
                 self.head_dim
             )
         elif self.config.rotary_type == 'lm2':
+
+            print('freq being generated for lm2')
             self.freqs_cis = pre_compute_frq_sin_cos(end=self.config.max_sequence_length,
                                                      dim=self.head_dim,
                                                      scale_factor=float(
@@ -429,15 +434,18 @@ class FlaxLlamaAttention(nn.Module):
         xv = self._split_heads(xv)
 
         if self.config.rotary_type == 'complex':
+            print('forward complex')
             freqs_cis = jnp.take(self.freqs_cis, position_ids, axis=0)
             xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis, dtype=self.dtype)
         elif self.config.rotary_type == 'open':
+            print('forward open')
             freqs_cis = jnp.take(self.freqs_cis, position_ids, axis=0)
             sincos = jnp.split(freqs_cis, 2, axis=-1)
             xq = apply_rotary_pos_emb(xq, sincos).astype(self.dtype)
             xk = apply_rotary_pos_emb(xk, sincos).astype(self.dtype)
             del sincos
         elif self.config.rotary_type == 'lm2':
+            print('forward lm2')
             cos, sin = self.freqs_cis
             xq = apply_rotary_emb_v2(array=xq, sin=sin, cos=cos)
             xk = apply_rotary_emb_v2(array=xk, sin=sin, cos=cos)
