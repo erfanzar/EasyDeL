@@ -81,6 +81,7 @@ class TrainArguments(
                                                   f'available schedulers are {AVAILABLE_SCHEDULERS}'
         assert optimizer in AVAILABLE_OPTIMIZERS, f'{optimizer} is not recognized, ' \
                                                   f'available optimizers are {AVAILABLE_OPTIMIZERS}'
+        total_batch_size *= gradient_accumulation_steps
         self.available_backends = len(jax.devices(backend))
         array_devices = jnp.ones((self.available_backends, 1)).reshape(sharding_array)
         self.array_devices_shape = array_devices.shape
@@ -185,6 +186,7 @@ class TrainArguments(
     def get_optimizer_and_scheduler(self, steps=None):
         steps = self.max_steps or steps
         assert steps is not None, 'if you haven\'t pass max steps to init you should pass init in func'
+
         if self.optimizer == 'adafactor':
             if self.scheduler == 'linear':
                 tx, sc = fjutils.optimizers.get_adafactor_with_linear_scheduler(
