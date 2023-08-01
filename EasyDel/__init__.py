@@ -14,10 +14,10 @@ if is_flax_available():
         FlaxFalconForCausalLM, FlaxFalconModel, FalconConfig, FlaxGPTNeoXForCausalLM, GPTNeoXConfig, FlaxGPTNeoXModel, \
         FlaxT5ForConditionalGeneration, FlaxT5Model, FlaxPalmForCausalLM, PalmModel, PalmConfig, T5Config, \
         FlaxOPTForCausalLM, FlaxOPTModel, OPTConfig
-from .trainer import finetuner, TrainArguments, fsdp_train_step, get_training_modules, CausalLMTrainer
+from .trainer import TrainArguments, fsdp_train_step, get_training_modules, CausalLMTrainer
 
 __all__ = 'package_checker', 'is_jax_available', 'is_torch_available', 'is_flax_available', \
-    'is_tensorflow_available', "finetuner", "TrainArguments", "fsdp_train_step", 'get_training_modules', \
+    'is_tensorflow_available', "TrainArguments", "fsdp_train_step", 'get_training_modules', \
     'FlaxLlamaForCausalLM', \
     'FlaxLlamaModel', 'FlaxGPTJModule', 'FlaxGPTJForCausalLMModule', \
     'FlaxGPTJModel', 'FlaxGPTJForCausalLM', 'GPTJConfig', \
