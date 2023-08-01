@@ -810,6 +810,7 @@ class CausalLMTrainer:
                         if i < self.max_steps_train:
 
                             batch['labels'] = batch['input_ids'][..., 1:]
+                            print(batch['input_ids'][..., 1:].shape)
                             for i in self.arguments.ids_to_pop_from_dataset:
                                 _ = batch.pop(i, None)
                             time_s = time.time()
