@@ -199,8 +199,8 @@ def apply_rotary_pos_emb(tensor, sincos):
 
 
 def pre_compute_frq_sin_cos(end: int, dim: int):
-    inv_freq = 1.0 / (10000 ** (jnp.arange(0, dim, 2) / dim))
-    frq = einops.einsum(jnp.arange(end), inv_freq, 'i, j -> i j')
+    inv_freq = 1.0 / (10000 ** (jnp.arange(0, dim, 2) / dim)).astype(jnp.float32)
+    frq = einops.einsum(jnp.arange(end), inv_freq, 'i, j -> i j').astype(jnp.float32)
     return einops.repeat(jnp.sin(frq), 's d -> s (i d)', i=2), einops.repeat(jnp.cos(frq), 's d -> s (i d)', i=2)
 
 
@@ -212,9 +212,10 @@ def rotate_half(x):
 
 def apply_rotary_emb_v2(array, sin, cos):
     _, _, s, *_ = array.shape
-
-    return einops.einsum(array, cos[:s], '... s d, s d -> ... s d') + \
-        einops.einsum(rotate_half(array), sin[:s], '... s d, s d -> ... s d')
+    dtype = array.dtype
+    array = array.astype(jnp.float32)
+    return (einops.einsum(array, cos[:s], '... s d, s d -> ... s d') +
+            einops.einsum(rotate_half(array), sin[:s], '... s d, s d -> ... s d')).astype(dtype)
 
 
 class RMSNorm(nn.Module):
