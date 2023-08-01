@@ -4,7 +4,13 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="08ad205b-709f-455b-86db-91293f595cd3" name="Changes" comment="" />
+    <list default="true" id="08ad205b-709f-455b-86db-91293f595cd3" name="Changes" comment="">
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/__init__.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/trainer/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/trainer/__init__.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/trainer/fsdp_train.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/trainer/fsdp_train.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/README.md" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -148,17 +154,7 @@
       <workItem from="1688658484198" duration="1812000" />
       <workItem from="1688732403606" duration="602000" />
       <workItem from="1688832628741" duration="5085000" />
-      <workItem from="1688895407885" duration="3041000" />
-      <workItem from="1688899325671" duration="4225000" />
-      <workItem from="1690619713804" duration="381000" />
-      <workItem from="1690631125031" duration="3994000" />
-      <workItem from="1690789243968" duration="3491000" />
-      <workItem from="1690796635974" duration="157000" />
-      <workItem from="1690796862497" duration="10956000" />
-      <workItem from="1690810418211" duration="211000" />
-      <workItem from="1690810763380" duration="1010000" />
-      <workItem from="1690881865188" duration="5898000" />
-      <workItem from="1690897915353" duration="922000" />
+      <workItem from="1690914567610" duration="1054000" />
     </task>
     <servers />
   </component>

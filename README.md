@@ -61,55 +61,6 @@ save_ckpt(flax_params, 'flax_param_easydel')
 
 now it's time to finetune or model
 
-```python
-import jax.numpy
-from EasyDel import TrainArguments, finetuner
-from datasets import load_dataset
-
-max_length = 4096
-train_args = TrainArguments(
-    model_id='erfanzar/FlaxMpt-7B',
-    # right now you should use model supported with remote code from huggingface all model are supported and uploaded
-    model_name='my_first_model_to_train_using_easydel',
-    num_train_epochs=3,
-    learning_rate=1e-5,
-    learning_rate_end=1e-6,
-    optimizer='lion',  # 'adamw', 'lion', 'adafactor','warm_up_cosine' are supported
-    scheduler='linear',  # 'linear' or 'cosine' or 'none'
-    weight_decay=0.01,
-    total_batch_size=16,
-    max_steps=None,  # None to let trainer Decide
-    do_train=True,
-    do_eval=False,  # it's optional but supported 
-    backend='tpu',  # default backed is set to cpu so you must define you want to use tpu cpu or gpu
-    max_length=max_length,  # Note that you have to change this in the model config too
-    gradient_checkpointing='nothing_saveable',
-    sharding_array=(1, -1, 1)  # the way to shard model across gpu,cpu or TPUs with using sharding array (1, -1, 1)
-    # everything training will be in fully fsdp automatic and share data between devices
-)
-dataset = load_dataset('TRAIN_DATASET')
-dataset_train = dataset['train']
-dataset_eval = dataset['eval']
-model_and_extra_outputs = finetuner(
-    dataset_train=dataset_train,
-    dataset_eval=dataset_eval,
-    training_arguments=train_args,
-    ckpt_path='flax_param_easydel',
-    use_wandb=True,
-    fully_fsdp=True,
-    extra_configs={
-        'max_seq_len': max_length
-        # this one is working for mpt config models check source for other models or see config.json file
-    },
-    dtype=jax.numpy.bfloat16,
-    param_dtype=jax.numpy.bfloat16,
-    use_pjit_attention_force=False,
-)
-print(f'Hey ! , here\'s where your model saved {model_and_extra_outputs.last_save_file_name}')
-
-```
-
-### OOP Method
 
 ```python
 import jax.numpy
@@ -144,7 +95,7 @@ train_args = TrainArguments(
     use_pjit_attention_force=False,
     extra_configs=conf,
     remove_ckpt_after_load=True,
-
+    gradient_accumulation_steps=8
 )
 dataset = load_dataset('TRAIN_DATASET')
 dataset_train = dataset['train']
