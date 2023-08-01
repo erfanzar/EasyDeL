@@ -87,8 +87,10 @@ class LlamaConfig(PretrainedConfig):
             use_pjit_attention_force: bool = True,
             rope_scaling=None,
             use_flash_attention: bool = False,
-            flash_attn_query_chunk_size=512,
-            flash_attn_key_chunk_size=512,
+            use_sacn_mlp: bool = False,
+            flash_attn_query_chunk_size=1024,
+            flash_attn_key_chunk_size=1024,
+            scan_mlp_chunk_size=1024,
             rotary_type: str = 'lm2',
             **kwargs,
     ):
@@ -112,9 +114,11 @@ class LlamaConfig(PretrainedConfig):
         self.fcm_max_ratio = fcm_max_ratio
         self.rope_scaling = rope_scaling
         self.use_flash_attention = use_flash_attention
+        self.use_sacn_mlp = use_sacn_mlp
         self.flash_attn_key_chunk_size = flash_attn_key_chunk_size
         self.flash_attn_query_chunk_size = flash_attn_query_chunk_size
         self.rotary_type = rotary_type
+        self.scan_mlp_chunk_size = scan_mlp_chunk_size
         super().__init__(
             # pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -198,9 +202,21 @@ def apply_rotary_pos_emb(tensor, sincos):
     return (tensor * cos_pos) + (rotate_every_two(tensor) * sin_pos)
 
 
-def pre_compute_frq_sin_cos(end: int, dim: int):
-    inv_freq = 1.0 / (10000 ** (jnp.arange(0, dim, 2) / dim)).astype(jnp.float32)
-    frq = einops.einsum(jnp.arange(end), inv_freq, 'i, j -> i j').astype(jnp.float32)
+def pre_compute_frq_sin_cos(end: int, dim: int, method: str = None, scale_factor: float = 8., theta=10000.):
+    if method is None:
+        inv_freq = 1.0 / (theta ** (jnp.arange(0, dim, 2) / dim)).astype(jnp.float32)
+        frq = einops.einsum(jnp.arange(end), inv_freq, 'i, j -> i j').astype(jnp.float32)
+    elif method == 'linear':
+        inv_freq = 1.0 / (theta ** (jnp.arange(0, dim, 2) / dim)).astype(jnp.float32)
+        frq = einops.einsum(jnp.arange(end) / scale_factor, inv_freq, 'i, j -> i j').astype(jnp.float32)
+    elif method == 'dynamic':
+        base = theta * (
+                (scale_factor * end / end) - (scale_factor - 1)
+        ) ** (dim / (dim - 2))
+        inv_freq = 1.0 / (base ** (jnp.arange(0, dim, 2) / dim)).astype(jnp.float32)
+        frq = einops.einsum(jnp.arange(end), inv_freq, 'i, j -> i j').astype(jnp.float32)
+    else:
+        raise ValueError('unknown type of rotary')
     return einops.repeat(jnp.sin(frq), 's d -> s (i d)', i=2), einops.repeat(jnp.cos(frq), 's d -> s (i d)', i=2)
 
 
@@ -352,7 +368,13 @@ class FlaxLlamaAttention(nn.Module):
                 self.head_dim
             )
         elif self.config.rotary_type == 'lm2':
-            self.freqs_cis = pre_compute_frq_sin_cos(self.config.max_sequence_length, self.head_dim)
+            self.freqs_cis = pre_compute_frq_sin_cos(end=self.config.max_sequence_length,
+                                                     dim=self.head_dim,
+                                                     scale_factor=float(
+                                                         self.config.rope_scaling['factor'] if
+                                                         self.config.rope_scaling is not None else 1),
+                                                     method=self.config.rope_scaling[
+                                                         'type'] if self.config.rope_scaling is not None else None)
         else:
             raise ValueError('Unknown type of rotary_embedding')
 
@@ -586,13 +608,33 @@ class FlaxLlamaBlock(nn.Module):
             fcm_mask=fcm_mask,
         )
         attn_output = attn_outputs[0]
-        hidden_states = hidden_states + attn_output
+        hidden_states += attn_output
+        if self.config.scan_mlp:
+            feed_forward_input = einops.rearrange(
+                self.ffn_norm(hidden_states),
+                '... (b s) d -> ... b s d',
+                b=self.config.scan_mlp_chunk_size
+            )
 
-        feed_forward_hidden_states = self.feed_forward(
-            self.ffn_norm(hidden_states),
-            deterministic=deterministic,
-        )
-        hidden_states = hidden_states + feed_forward_hidden_states
+            def mlp_forward(mlp, x):
+                return None, mlp(x, deterministic)
+
+            _, ffh = nn.scan(
+                mlp_forward,
+                variable_broadcast="params",
+                split_rngs={"params": False, "dropout": True},
+                in_axes=feed_forward_input.ndim - 3,
+                out_axes=feed_forward_input.ndim - 3,
+            )(self.feed_forward, feed_forward_input)
+            hidden_states = einops.rearrange(
+                ffh,
+                '... b s d -> ... (b s) d'
+            ) + hidden_states
+        else:
+            hidden_states = self.feed_forward(
+                self.ffn_norm(hidden_states),
+                deterministic=deterministic,
+            ) + hidden_states
 
         return (hidden_states,) + attn_outputs[1:]
 
