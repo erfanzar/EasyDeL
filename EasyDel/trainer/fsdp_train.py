@@ -636,7 +636,7 @@ class CausalLMTrainer:
         ).start()
         self.dataloader_train, self.max_steps_train, \
             self.dataloader_eval, self.max_steps_eval = self.configure_dataloader()
-
+        self.max_steps_train = self.max_steps_train // self.arguments.gradient_accumulation_steps
         self.timer(
             'configure dataloaders'
         ).stop()
@@ -809,7 +809,6 @@ class CausalLMTrainer:
                         i += 1
                         if i < self.max_steps_train:
 
-                            _ = batch.pop('token_type_ids', None)
                             batch['labels'] = batch['input_ids'][..., 1:]
                             for i in self.arguments.ids_to_pop_from_dataset:
                                 _ = batch.pop(i, None)
@@ -819,7 +818,7 @@ class CausalLMTrainer:
                                                                                               )
                             ttl_time = time.time() - time_s
                             accuracy = accuracy / self.arguments.total_batch_size
-                            losses.append(loss / self.arguments.gradient_accumulation_steps)
+                            losses.append(loss)
                             learning_rates.append(self.scheduler(i).tolist())
                             accuracies.append(accuracy)
                             pbar.update(1)
