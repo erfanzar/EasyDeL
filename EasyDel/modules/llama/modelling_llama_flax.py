@@ -609,7 +609,7 @@ class FlaxLlamaBlock(nn.Module):
         )
         attn_output = attn_outputs[0]
         hidden_states += attn_output
-        if self.config.scan_mlp:
+        if self.config.use_sacn_mlp:
             feed_forward_input = einops.rearrange(
                 self.ffn_norm(hidden_states),
                 '... (b s) d -> ... b s d',
