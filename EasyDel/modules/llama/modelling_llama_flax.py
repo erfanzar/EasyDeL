@@ -211,7 +211,7 @@ def rotate_half(x):
 
 
 def apply_rotary_emb_v2(array, sin, cos):
-    _, s, *_ = array.shape
+    _, _, s, *_ = array.shape
     print(s)
     print(array.shape)
     print(cos.shape)
