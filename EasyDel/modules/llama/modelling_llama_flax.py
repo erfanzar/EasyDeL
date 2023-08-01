@@ -89,9 +89,11 @@ class LlamaConfig(PretrainedConfig):
             use_flash_attention: bool = False,
             flash_attn_query_chunk_size=512,
             flash_attn_key_chunk_size=512,
-            complex_rotary: bool = False,
+            rotary_type: str = 'lm2',
             **kwargs,
     ):
+        assert rotary_type in ['open', 'complex',
+                               'lm2'], f'{rotary_type} is wrong type of rotary valid types are [open, complex,lm2]'
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.initializer_range = initializer_range
@@ -112,7 +114,7 @@ class LlamaConfig(PretrainedConfig):
         self.use_flash_attention = use_flash_attention
         self.flash_attn_key_chunk_size = flash_attn_key_chunk_size
         self.flash_attn_query_chunk_size = flash_attn_query_chunk_size
-        self.complex_rotary = complex_rotary
+        self.rotary_type = rotary_type
         super().__init__(
             # pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -334,16 +336,23 @@ class FlaxLlamaAttention(nn.Module):
 
         self.causal_mask = make_causal_mask(jnp.ones((1, config.max_sequence_length), dtype="bool"), dtype="bool")
 
-        self.freqs_cis = precompute_freqs_cis(
-            method=self.config.rope_scaling['type'] if self.config.rope_scaling is not None else None,
-            scaling_factor=float(self.config.rope_scaling['factor'] if self.config.rope_scaling is not None else 1),
-            dim=self.head_dim,
-            end=config.max_sequence_length * 2,
-            dtype=self.dtype,
-        ) if self.config.complex_rotary else create_sinusoidal_positions(
-            config.max_sequence_length,
-            self.head_dim
-        )
+        if self.config.rotary_type == 'complex':
+            self.freqs_cis = precompute_freqs_cis(
+                method=self.config.rope_scaling['type'] if self.config.rope_scaling is not None else None,
+                scaling_factor=float(self.config.rope_scaling['factor'] if self.config.rope_scaling is not None else 1),
+                dim=self.head_dim,
+                end=config.max_sequence_length * 2,
+                dtype=self.dtype,
+            )
+        elif self.config.rotary_type == 'open':
+            self.freqs_cis = create_sinusoidal_positions(
+                config.max_sequence_length,
+                self.head_dim
+            )
+        elif self.config.rotary_type == 'lm2':
+            self.freqs_cis = pre_compute_frq_sin_cos(self.config.max_sequence_length, self.head_dim)
+        else:
+            raise ValueError('Unknown type of rotary_embedding')
 
     def _split_heads(self, hidden_states):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.num_heads, self.head_dim))
@@ -394,14 +403,21 @@ class FlaxLlamaAttention(nn.Module):
         xq = self._split_heads(xq)
         xk = self._split_heads(xk)
         xv = self._split_heads(xv)
-        freqs_cis = jnp.take(self.freqs_cis, position_ids, axis=0)
-        if self.config.complex_rotary:
+
+        if self.config.rotary_type == 'complex':
+            freqs_cis = jnp.take(self.freqs_cis, position_ids, axis=0)
             xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis, dtype=self.dtype)
-        else:
+        elif self.config.rotary_type == 'open':
+            freqs_cis = jnp.take(self.freqs_cis, position_ids, axis=0)
             sincos = jnp.split(freqs_cis, 2, axis=-1)
             xq = apply_rotary_pos_emb(xq, sincos).astype(self.dtype)
             xk = apply_rotary_pos_emb(xk, sincos).astype(self.dtype)
             del sincos
+        elif self.config.rotary_type == 'lm2':
+            cos, sin = self.freqs_cis
+            xq = apply_rotary_emb_v2(array=xq, sin=sin, cos=cos)
+            xk = apply_rotary_emb_v2(array=xk, sin=sin, cos=cos)
+            del sin, cos
         query_length, key_length = xq.shape[1], xk.shape[1]
 
         if self.has_variable("cache", "cached_key"):
