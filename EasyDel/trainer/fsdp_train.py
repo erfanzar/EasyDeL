@@ -827,21 +827,25 @@ class CausalLMTrainer:
                             if self.arguments.use_wandb:
                                 self.wandb_runtime.log(
                                     {
-                                        'loss': loss.tolist() / self.arguments.gradient_accumulation_steps,
+                                        'accumulation_loss': loss.tolist() / self.arguments.gradient_accumulation_steps,
+                                        'loss': loss.tolist(),
                                         'learning_rate': self.scheduler(sharded_train_state_.step.tolist()).tolist(),
                                         'step': sharded_train_state_.step.tolist(),
                                         'step time': ttl_time,
-                                        'perplexity': jnp.exp(
+                                        'accumulation_perplexity': jnp.exp(
                                             loss / self.arguments.gradient_accumulation_steps).tolist(),
+                                        'perplexity': jnp.exp(loss).tolist(),
                                         'accuracy': accuracy.tolist(),
                                         'avg_accuracy': (sum(accuracies) / len(accuracies)).tolist()
                                     }
                                 )
-                            pbar.set_postfix(loss=loss / self.arguments.gradient_accumulation_steps,
+                            pbar.set_postfix(accumulation_loss=loss / self.arguments.gradient_accumulation_steps,
+                                             loss=loss,
                                              learning_rate=self.scheduler(sharded_train_state_.step.tolist()).tolist(),
                                              step=sharded_train_state_.step.tolist(),
-                                             perplexity=jnp.exp(
+                                             accumulation_perplexity=jnp.exp(
                                                  loss / self.arguments.gradient_accumulation_steps).tolist(),
+                                             perplexity=jnp.exp(loss).tolist(),
                                              accuracy=accuracy,
                                              )
                         else:
