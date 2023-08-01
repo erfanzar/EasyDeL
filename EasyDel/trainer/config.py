@@ -14,7 +14,7 @@ from jax import numpy as jnp
 import jax
 
 AVAILABLE_OPTIMIZERS: List[str] = ['adafactor', 'lion', 'adamw']
-AVAILABLE_SCHEDULERS: List[str] = ['linear', 'cosine', 'none','warm_up_cosine']
+AVAILABLE_SCHEDULERS: List[str] = ['linear', 'cosine', 'none', 'warm_up_cosine']
 AVAILABLE_GRADIENT_CHECK_POINTING: List[str] = ['everything_saveable',
                                                 'nothing_saveable',
                                                 'checkpoint_dots',
