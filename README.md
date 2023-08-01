@@ -16,14 +16,18 @@ pip install easydel
 
 ## Available Models Are
 
-- Llama     (Support `FSDP`, `MP`,` DP`)
-- GPT-J     (Support `FSDP`, `MP`,` DP`)
-- LT        (Support `FSDP`, `MP`, `DP`)
-- MosaicMPT (Support `FSDP`, `MP`,` DP`)
-- GPTNeoX   (Support `FSDP`, `MP`, `DP`)
-- Falcon    (Support `FSDP`, `MP`, `DP`)
-- Palm      (Support `FSDP`, `MP`, `DP`)
-- T5        (Support `FSDP`, `MP`, `DP`)
+- Llama     (Support `FSDP`, `MP`,` DP`)(_Supports gradient checkpointing_)
+- GPT-J     (Support `FSDP`, `MP`,` DP`)(_Supports gradient checkpointing_)
+- LT        (Support `FSDP`, `MP`, `DP`)(_Supports gradient checkpointing_)
+- MosaicMPT (Support `FSDP`, `MP`,` DP`)(_Supports gradient checkpointing_)
+- GPTNeoX   (Support `FSDP`, `MP`, `DP`)(_Supports gradient checkpointing_)
+- Falcon    (Support `FSDP`, `MP`, `DP`)(_Supports gradient checkpointing_)
+- Palm      (Support `FSDP`, `MP`, `DP`)(_Supports gradient checkpointing_)
+- T5        (Support `FSDP`, `MP`, `DP`)(_Supports gradient checkpointing_)
+
+
+
+- _LLama GPT-J MosaicMPT Falcon supports Flash Attention_
 
 you can also tell me the model you want in Flax/Jax version and ill try my best to build it ;)
 
@@ -70,7 +74,7 @@ train_args = TrainArguments(
     num_train_epochs=3,
     learning_rate=1e-5,
     learning_rate_end=1e-6,
-    optimizer='lion',  # 'adamw', 'lion', 'adafactor' are supported
+    optimizer='lion',  # 'adamw', 'lion', 'adafactor','warm_up_cosine' are supported
     scheduler='linear',  # 'linear' or 'cosine' or 'none'
     weight_decay=0.01,
     total_batch_size=16,
@@ -125,7 +129,7 @@ train_args = TrainArguments(
     num_train_epochs=3,
     learning_rate=1e-5,
     learning_rate_end=1e-6,
-    optimizer='lion',  # 'adamw', 'lion', 'adafactor' are supported
+    optimizer='lion',  # 'adamw', 'lion', 'adafactor','warm_up_cosine' are supported
     scheduler='linear',  # 'linear' or 'cosine' or 'none'
     weight_decay=0.01,
     total_batch_size=16,
@@ -154,7 +158,6 @@ print(f'Hey ! , here\'s where your model saved {model_and_extra_outputs.last_sav
 
 
 ```
-
 
 you can then convert it to pytorch for better use I don't recommend jax/flax for hosting models since
 pytorch is better option for gpus
