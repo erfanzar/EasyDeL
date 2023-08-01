@@ -600,41 +600,48 @@ class FlaxLlamaBlock(nn.Module):
     ):
         attn_outputs = self.attention(
             self.attention_norm(hidden_states),
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            deterministic=deterministic,
-            init_cache=init_cache,
-            output_attentions=output_attentions,
-            fcm_mask=fcm_mask,
+            attention_mask,
+            position_ids,
+            deterministic,
+            init_cache,
+            output_attentions,
+            fcm_mask,
         )
         attn_output = attn_outputs[0]
-        hidden_states += attn_output
-        if self.config.use_sacn_mlp:
+        hidden_states = hidden_states + attn_output
+
+        feed_forward_input = self.ffn_norm(hidden_states)
+
+        if self.config.scan_mlp:
             feed_forward_input = einops.rearrange(
-                self.ffn_norm(hidden_states),
+                feed_forward_input,
                 '... (b s) d -> ... b s d',
                 b=self.config.scan_mlp_chunk_size
             )
 
-            def mlp_forward(mlp, x):
+            def mlp_forward(mlp, carry, x):
                 return None, mlp(x, deterministic)
 
-            _, ffh = nn.scan(
+            scan_axis = feed_forward_input.ndim - 3
+
+            _, feed_forward_hidden_states = nn.scan(
                 mlp_forward,
                 variable_broadcast="params",
                 split_rngs={"params": False, "dropout": True},
-                in_axes=feed_forward_input.ndim - 3,
-                out_axes=feed_forward_input.ndim - 3,
-            )(self.feed_forward, feed_forward_input)
-            hidden_states = einops.rearrange(
-                ffh,
+                in_axes=scan_axis,
+                out_axes=scan_axis,
+            )(self.feed_forward, None, feed_forward_input)
+            feed_forward_hidden_states = einops.rearrange(
+                feed_forward_hidden_states,
                 '... b s d -> ... (b s) d'
-            ) + hidden_states
+            )
         else:
-            hidden_states = self.feed_forward(
-                self.ffn_norm(hidden_states),
-                deterministic=deterministic,
-            ) + hidden_states
+            feed_forward_hidden_states = self.feed_forward(
+                feed_forward_input,
+                deterministic,
+            )
+
+        hidden_states = hidden_states + feed_forward_hidden_states
 
         return (hidden_states,) + attn_outputs[1:]
 
