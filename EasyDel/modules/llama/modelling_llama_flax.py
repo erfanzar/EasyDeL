@@ -356,7 +356,7 @@ class FlaxLlamaAttention(nn.Module):
         self.causal_mask = make_causal_mask(jnp.ones((1, config.max_sequence_length), dtype="bool"), dtype="bool")
 
         if self.config.rotary_type == 'complex':
-            print('freq being generated for complex')
+
             self.freqs_cis = precompute_freqs_cis(
                 method=self.config.rope_scaling['type'] if self.config.rope_scaling is not None else None,
                 scaling_factor=float(self.config.rope_scaling['factor'] if self.config.rope_scaling is not None else 1),
@@ -365,14 +365,14 @@ class FlaxLlamaAttention(nn.Module):
                 dtype=self.dtype,
             )
         elif self.config.rotary_type == 'open':
-            print('freq being generated for open')
+
             self.freqs_cis = create_sinusoidal_positions(
                 config.max_sequence_length,
                 self.head_dim
             )
         elif self.config.rotary_type == 'lm2':
 
-            print('freq being generated for lm2')
+
             self.freqs_cis = pre_compute_frq_sin_cos(end=self.config.max_sequence_length,
                                                      dim=self.head_dim,
                                                      scale_factor=float(
