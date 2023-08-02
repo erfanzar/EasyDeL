@@ -122,7 +122,7 @@ class JAXServer(object):
         config.contains_auto_format = True
 
         config.max_length = 2048
-        config.max_new_length = 2048
+        config.max_new_tokens = 1024
         config.temperature = 0.1
 
         config.logging = False
@@ -154,8 +154,8 @@ class JAXServer(object):
 
         @functools.partial(
             pjit,
-            in_shardings=(self.rules, Ps(None), Ps(None), Ps(None)),
-            out_shardings=(Ps(None))
+            in_shardings=(self.rules, Ps(), Ps(), Ps()),
+            out_shardings=(Ps())
         )
         def greedy_generate(parameters, input_ids, attention_mask, temperature):
             input_ids = with_sharding_constraint(input_ids, Ps(('dp', 'fsdp')))
@@ -165,10 +165,13 @@ class JAXServer(object):
                 attention_mask=attention_mask,
                 params=parameters,
                 generation_config=GenerationConfig(
-                    max_new_tokens=1,
+                    max_new_tokens=self.config.max_new_tokens,
+                    max_length=self.config.max_length,
+
                     eos_token_id=tokenizer.eos_token_id,
                     pad_token_id=tokenizer.pad_token_id,
                     bos_token_id=tokenizer.bos_token_id,
+
                     temperature=temperature,
                     do_sample=False,
                     num_beams=1,
@@ -178,8 +181,8 @@ class JAXServer(object):
 
         @functools.partial(
             pjit,
-            in_shardings=(self.rules, Ps(None), Ps(None), Ps(None), Ps(None), Ps(None), Ps(None)),
-            out_shardings=(Ps(None))
+            in_shardings=(self.rules, Ps(), Ps(), Ps(), Ps(), Ps(), Ps()),
+            out_shardings=(Ps())
         )
         def generate(parameters, input_ids, attention_mask, temperature, top_k, top_p, do_sample):
             input_ids = with_sharding_constraint(input_ids, Ps(('dp', 'fsdp')))
@@ -189,10 +192,13 @@ class JAXServer(object):
                 attention_mask=attention_mask,
                 params=parameters,
                 generation_config=GenerationConfig(
-                    max_new_tokens=1,
+                    max_new_tokens=self.config.max_new_tokens,
+                    max_length=self.config.max_length,
+
                     eos_token_id=tokenizer.eos_token_id,
                     pad_token_id=tokenizer.pad_token_id,
                     bos_token_id=tokenizer.bos_token_id,
+
                     temperature=temperature,
                     do_sample=do_sample,
                     num_beams=1,
@@ -240,11 +246,11 @@ class JAXServer(object):
     def shard_params(self, params, partition_rules):
         rules = match_partition_rules(params=params, rules=partition_rules)
         self.rules = rules
-        shard_f, _ = make_shard_and_gather_fns(rules, get_float_dtype_by_name(self.config.dtype))
+        shard_fns, _ = make_shard_and_gather_fns(rules, get_float_dtype_by_name(self.config.dtype))
 
         with self.mesh:
             new_parameters = jax.tree_map(
-                lambda f, p: f(p), shard_f, params
+                lambda f, p: f(p), shard_fns, params
             )
         return new_parameters
 
