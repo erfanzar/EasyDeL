@@ -1,38 +1,38 @@
+import functools
 import typing
 
+import flax.core
 import gradio as gr
+import jax
 import uvicorn
 from fastapi import FastAPI
-from jax import numpy as jnp
-
-import jax
-from flax.core import freeze
-from jax.experimental import mesh_utils
-from fjutils import utils
-from flax.traverse_util import unflatten_dict
 from fjutils import easylm
-import multiprocessing as mp
+from fjutils import utils
+from flax.core import freeze
+from flax.traverse_util import unflatten_dict
+from jax import numpy as jnp
+from jax.experimental import mesh_utils, pjit
+
 from ml_collections import ConfigDict
 from pydantic import BaseModel
+from fjutils import get_float_dtype_by_name
+from jax.sharding import Mesh, PartitionSpec as Ps
+from transformers import GenerationConfig
 from EasyDel.serve.theme import seafoam
+from absl import logging
+from EasyDel.utils.utils import RNG
 
-dtypes = {
-    'fp16': jnp.float16,
-    'bf16': jnp.bfloat16,
-    'fp32': jnp.float32,
-    'fp64': jnp.float64,
-
-}
+pjit = pjit.pjit
 
 
 def get_dtype(dtype):
     if isinstance(dtype, str):
-        dtype = dtypes[dtype]
+        dtype = get_float_dtype_by_name(dtype)
     return dtype
 
 
 read_ckpt = utils.read_ckpt
-create_shard_gather_fns = easylm.make_shard_and_gather_fns
+make_shard_and_gather_fns = easylm.make_shard_and_gather_fns
 match_partition_rules = easylm.match_partition_rules
 with_sharding_constraint = easylm.with_sharding_constraint
 get_jax_mesh = easylm.get_jax_mesh
@@ -55,7 +55,7 @@ def shard_params(params, partition_rules,
         params
     )
     with mesh:
-        shard_fns, _ = create_shard_gather_fns(
+        shard_fns, _ = make_shard_and_gather_fns(
             ps, dtype
         )
         params = jax.tree_util.tree_map(lambda fn, x: fn(x), shard_fns, params)
@@ -77,9 +77,20 @@ class ChatRequest(BaseModel):
 class JAXServer(object):
 
     def __init__(self, config=None):
+        self._funcs_generated = False
+        self.model = None
+        self.rules = None
+
         self.config = self.get_default_config(config)
-        self.app = FastAPI()
+
         self.number_of_served_request_until_last_up_time = 0
+
+        self.rng_generator = RNG(self.config.seed)
+
+        array = jnp.ones((len(jax.devices()), 1)).reshape(self.config.mesh_axes_shape)
+        self.mesh = Mesh(mesh_utils.create_device_mesh(array.shape), self.config.mesh_axes_names)
+
+        self.app = FastAPI()
         self.app.post('/chat')(self.forward_chat)
         self.app.post('/instruct')(self.forward_instruct)
         self.app.get('/status')(self.status)
@@ -109,11 +120,22 @@ class JAXServer(object):
 
         config.chat_prefix = ''
         config.contains_auto_format = True
+
         config.max_length = 2048
+        config.max_new_length = 2048
         config.temperature = 0.1
+
         config.logging = False
 
-        config.dtype = 'bfloat16'
+        config.mesh_axes_names = ('dp', 'fsdp', 'mp')
+        config.mesh_axes_shape = (1, -1, 1)
+
+        config.dtype = 'fp16'
+
+        config.seed = 552
+
+        config.use_prefix_tokenizer = True
+
         if updates is not None:
             config.update(ConfigDict(updates).copy_and_resolve_references())
         return config
@@ -126,6 +148,105 @@ class JAXServer(object):
             'status': 'Ready',
             'number_of_served_request_until_last_up_time': f"{self.number_of_served_request_until_last_up_time}"
         }
+
+    def configure_generate_functions(self, model, tokenizer):
+        assert self.rules is not None, 'you should first shard params with using ``shard_params`` method'
+
+        @functools.partial(
+            pjit,
+            in_shardings=(self.rules, Ps(None), Ps(None), Ps(None)),
+            out_shardings=(Ps(None))
+        )
+        def greedy_generate(parameters, input_ids, attention_mask, temperature):
+            input_ids = with_sharding_constraint(input_ids, Ps(('dp', 'fsdp')))
+            attention_mask = with_sharding_constraint(attention_mask, Ps(('dp', 'fsdp')))
+            predict = model.generate(
+                input_ids,
+                attention_mask=attention_mask,
+                params=parameters,
+                generation_config=GenerationConfig(
+                    max_new_tokens=1,
+                    eos_token_id=tokenizer.eos_token_id,
+                    pad_token_id=tokenizer.pad_token_id,
+                    bos_token_id=tokenizer.bos_token_id,
+                    temperature=temperature,
+                    do_sample=False,
+                    num_beams=1,
+                )
+            ).sequences[:, input_ids.shape[1]:]
+            return predict
+
+        @functools.partial(
+            pjit,
+            in_shardings=(self.rules, Ps(None), Ps(None), Ps(None), Ps(None), Ps(None), Ps(None)),
+            out_shardings=(Ps(None))
+        )
+        def generate(parameters, input_ids, attention_mask, temperature, top_k, top_p, do_sample):
+            input_ids = with_sharding_constraint(input_ids, Ps(('dp', 'fsdp')))
+            attention_mask = with_sharding_constraint(attention_mask, Ps(('dp', 'fsdp')))
+            predict = model.generate(
+                input_ids,
+                attention_mask=attention_mask,
+                params=parameters,
+                generation_config=GenerationConfig(
+                    max_new_tokens=1,
+                    eos_token_id=tokenizer.eos_token_id,
+                    pad_token_id=tokenizer.pad_token_id,
+                    bos_token_id=tokenizer.bos_token_id,
+                    temperature=temperature,
+                    do_sample=do_sample,
+                    num_beams=1,
+                    top_p=top_p,
+                    top_k=top_k,
+                )
+            ).sequences[:, input_ids.shape[1]:]
+            return predict
+
+        self._generate = generate
+        self._greedy_generate = greedy_generate
+        self._funcs_generated = True
+
+    def generate(self,
+                 params: typing.Union[flax.core.FrozenDict, dict],
+                 input_ids: jnp.DeviceArray = None,
+                 attention_mask: jnp.DeviceArray = None,
+                 temperature: float = 1.,
+                 top_k: int = 50,
+                 top_p: float = 0.95,
+                 do_sample: bool = True
+                 ):
+        if not self._funcs_generated:
+            raise NotImplementedError(
+                'this method will be implemented automatically after using ``configure_generate_functions`` function')
+        else:
+            return self._generate(
+                params, input_ids, attention_mask, temperature, top_k, top_p, do_sample
+            )
+
+    def greedy_generate(self,
+                        params: typing.Union[flax.core.FrozenDict, dict],
+                        input_ids: jnp.DeviceArray = None,
+                        attention_mask: jnp.DeviceArray = None,
+                        temperature: float = 1
+                        ):
+        if not self._funcs_generated:
+            raise NotImplementedError(
+                'this method will be implemented automatically after using ``configure_generate_functions`` function')
+        else:
+            return self._greedy_generate(
+                params, input_ids, attention_mask, temperature
+            )
+
+    def shard_params(self, params, partition_rules):
+        rules = match_partition_rules(params=params, rules=partition_rules)
+        self.rules = rules
+        shard_f, _ = make_shard_and_gather_fns(rules, get_float_dtype_by_name(self.config.dtype))
+
+        with self.mesh:
+            new_parameters = jax.tree_map(
+                lambda f, p: f(p), shard_f, params
+            )
+        return new_parameters
 
     def forward_chat(self, data: ChatRequest):
         ...
@@ -188,6 +309,8 @@ class JAXServer(object):
         return block
 
     def fire(self):
+        assert self._funcs_generated, 'you have to first add your model and parameters into server before using fire ' \
+                                      'with using ``configure_generate_functions``'
         uvicorn.run(self.app, host=self.config.host, port=self.config.port)
 
 
@@ -285,6 +408,9 @@ class PyTorchServer(object):
     @staticmethod
     def forward(data):
         return NotImplementedError
+
+    def streaming_generator(self, ):
+        ...
 
     def forward_chat(self, data: ChatRequest):
         ...
