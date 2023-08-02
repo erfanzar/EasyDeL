@@ -434,18 +434,18 @@ class FlaxLlamaAttention(nn.Module):
         xv = self._split_heads(xv)
 
         if self.config.rotary_type == 'complex':
-            print('forward complex')
+
             freqs_cis = jnp.take(self.freqs_cis, position_ids, axis=0)
             xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis, dtype=self.dtype)
         elif self.config.rotary_type == 'open':
-            print('forward open')
+
             freqs_cis = jnp.take(self.freqs_cis, position_ids, axis=0)
             sincos = jnp.split(freqs_cis, 2, axis=-1)
             xq = apply_rotary_pos_emb(xq, sincos).astype(self.dtype)
             xk = apply_rotary_pos_emb(xk, sincos).astype(self.dtype)
             del sincos
         elif self.config.rotary_type == 'lm2':
-            print('forward lm2')
+
             cos, sin = self.freqs_cis
             xq = apply_rotary_emb_v2(array=xq, sin=sin, cos=cos)
             xk = apply_rotary_emb_v2(array=xk, sin=sin, cos=cos)
