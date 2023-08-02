@@ -214,8 +214,8 @@ class JAXServer(object):
 
     def generate(self,
                  params: typing.Union[flax.core.FrozenDict, dict],
-                 input_ids: jnp.DeviceArray = None,
-                 attention_mask: jnp.DeviceArray = None,
+                 input_ids: jnp.DeviceArray,
+                 attention_mask: jnp.DeviceArray,
                  temperature: float = 1.,
                  top_k: int = 50,
                  top_p: float = 0.95,
@@ -231,8 +231,8 @@ class JAXServer(object):
 
     def greedy_generate(self,
                         params: typing.Union[flax.core.FrozenDict, dict],
-                        input_ids: jnp.DeviceArray = None,
-                        attention_mask: jnp.DeviceArray = None,
+                        input_ids: jnp.DeviceArray,
+                        attention_mask: jnp.DeviceArray,
                         temperature: float = 1
                         ):
         if not self._funcs_generated:
