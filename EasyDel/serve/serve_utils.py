@@ -127,9 +127,9 @@ class JAXServer(object):
         config.contains_auto_format = True
 
         config.max_length = 2048
-        config.max_new_tokens = 1024
+        config.max_new_tokens = 512
 
-        config.max_stream_tokens = 1
+        config.max_stream_tokens = 128
 
         assert config.max_new_tokens % config.max_stream_tokens == 0, \
             'max_new_tokens should be divisible by  max_new_tokens' \
@@ -184,8 +184,6 @@ class JAXServer(object):
             out_shardings=(Ps())
         )
         def greedy_generate(parameters, input_ids, attention_mask):
-            print(f'input_ids shape : {input_ids.shape}')
-            print(f'attention_mask shape : {attention_mask.shape}')
             input_ids = with_sharding_constraint(input_ids, Ps(('dp', 'fsdp')))
             attention_mask = with_sharding_constraint(attention_mask, Ps(('dp', 'fsdp')))
             predict = model.generate(
@@ -213,8 +211,6 @@ class JAXServer(object):
         def generate(parameters, input_ids, attention_mask):
             input_ids = with_sharding_constraint(input_ids, Ps(('dp', 'fsdp')))
             attention_mask = with_sharding_constraint(attention_mask, Ps(('dp', 'fsdp')))
-            print(f'input_ids shape : {input_ids.shape}')
-            print(f'attention_mask shape : {attention_mask.shape}')
             predict = model.generate(
                 input_ids,
                 attention_mask=attention_mask,
@@ -239,13 +235,14 @@ class JAXServer(object):
         self._greedy_generate = greedy_generate
         self._funcs_generated = True
 
-    def auto_configure(self):
-        ...
+    def auto_configure(self, model, params, tokenizer, partition_rules):
+        self.shard_params(params=params, partition_rules=partition_rules)
+        self.configure_generate_functions(model, tokenizer)
 
     def generate(self,
                  params: Union[flax.core.FrozenDict, dict],
-                 input_ids: jnp.DeviceArray,
-                 attention_mask: jnp.DeviceArray,
+                 input_ids: jax.Array,
+                 attention_mask: jax.Array,
                  ):
         if not self._funcs_generated:
             raise NotImplementedError(
@@ -259,8 +256,8 @@ class JAXServer(object):
 
     def greedy_generate(self,
                         params: Union[flax.core.FrozenDict, dict],
-                        input_ids: jnp.DeviceArray,
-                        attention_mask: jnp.DeviceArray,
+                        input_ids: jax.Array,
+                        attention_mask: jax.Array,
                         ):
         if not self._funcs_generated:
             raise NotImplementedError(
@@ -352,13 +349,13 @@ class JAXServer(object):
                 string,
                 return_tensors='jax'
             )
+
         input_ids = tokens.input_ids
         attention_mask = tokens.attention_mask
-        i = 0
+        num_generated_tokens = 0
         pad = self.config.max_length - self.config.max_stream_tokens
-        print(input_ids.shape)
-        print(attention_mask.shape)
-        for i in trange((max_new_tokens or self.config.max_new_tokens) // self.config.max_stream_tokens,
+
+        for _ in trange((max_new_tokens or self.config.max_new_tokens) // self.config.max_stream_tokens,
                         disable=not self.config.logging):
             predicted_token = self.greedy_generate(
                 params=self.params,
@@ -370,6 +367,8 @@ class JAXServer(object):
                 attention_mask=attention_mask
             )
 
+            num_generated_tokens += predicted_token.shape[-1]
+
             input_ids = jnp.concatenate(
                 (input_ids, predicted_token), axis=-1
             )[:, -pad:]
@@ -377,12 +376,11 @@ class JAXServer(object):
                 (attention_mask, jnp.ones((len(attention_mask), self.config.max_stream_tokens), dtype=jnp.int32)),
                 axis=-1
             )[:, -pad:]
-            if predicted_token[0][-1] == self.tokenizer.eos_token_id or predicted_token[
-                0][-1] == self.prefix_tokenizer.eos_token_id:
+            if predicted_token[0][-1] == self.tokenizer.eos_token_id or predicted_token[0][
+                -1] == self.prefix_tokenizer.eos_token_id:
                 break
-        return self.tokenizer.decode(
-            input_ids[0][tokens.input_ids.shape[0]:]
-        ), (i + 1) * self.config.max_stream_tokens
+
+        return self.tokenizer.decode(input_ids[0][-num_generated_tokens:]), num_generated_tokens
 
     def process_chat_history(self, history: List):
         if len(history) == 0:
@@ -402,7 +400,8 @@ class JAXServer(object):
             greedy=greedy,
             max_new_tokens=max_new_tokens
         )
-        return '', history[-1].append(answer)
+        history.append([prompt, answer])
+        return '', history
 
     def create_gradio_ui(self):
         with gr.Blocks(
@@ -422,7 +421,8 @@ class JAXServer(object):
 
             with gr.Row():
                 with gr.Accordion('Advanced Options', open=False):
-                    max_new_tokens = gr.Slider(value=self.config.max_new_tokens, maximum=10000, minimum=1,
+                    max_new_tokens = gr.Slider(value=self.config.max_new_tokens, maximum=10000,
+                                               minimum=self.config.max_stream_tokens,
                                                label='Max New Tokens', step=1, )
                     max_length = gr.Slider(value=self.config.max_length, maximum=self.config.max_length, minimum=1,
                                            label='Max Length', step=1)

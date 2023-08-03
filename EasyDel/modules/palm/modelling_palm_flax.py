@@ -370,8 +370,8 @@ class PalmModule(nn.Module):
         return mask.reshape(b, 1, 1, s)
 
     def __call__(self,
-                 input_ids: jnp.DeviceArray,
-                 attention_mask: jnp.DeviceArray = None,
+                 input_ids: jax.Array,
+                 attention_mask: jax.Array = None,
                  return_dict: bool = True,
                  output_attention: bool = False):
         batch, seq_len = input_ids.shape
@@ -432,8 +432,8 @@ class FlaxPalmForCausalLMModule(nn.Module):
             )
 
     def __call__(self,
-                 input_ids: jnp.DeviceArray,
-                 attention_mask: jnp.DeviceArray = None,
+                 input_ids: jax.Array,
+                 attention_mask: jax.Array = None,
                  return_dict: bool = True,
                  output_attention: bool = False):
         out = self.path_way(

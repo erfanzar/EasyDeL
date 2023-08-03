@@ -128,7 +128,7 @@ class LTSelfAttention(nn.Module):
         self.v_proj = dense()
         self.scale = 1 / math.sqrt(self.config.hidden_size // self.config.hidden_size)
 
-    def __call__(self, hidden_state: jnp.DeviceArray, attention_mask=None):
+    def __call__(self, hidden_state: jax.Array, attention_mask=None):
         b, t, c = hidden_state.shape
         wq, wk, wv = self.q_proj(hidden_state), self.k_proj(hidden_state), self.v_proj(hidden_state)
 
@@ -177,7 +177,7 @@ class LTMlp(nn.Module):
         )
         self.act = ACT2CLS[self.config.hidden_act]
 
-    def __call__(self, hidden_state: jnp.DeviceArray):
+    def __call__(self, hidden_state: jax.Array):
         return self.down(self.act(self.up(hidden_state)))
 
 
@@ -204,7 +204,7 @@ class LTBlock(nn.Module):
             use_bias=False
         )
 
-    def __call__(self, hidden_state: jnp.DeviceArray, attention_mask: jnp.DeviceArray = None):
+    def __call__(self, hidden_state: jax.Array, attention_mask: jax.Array = None):
         hidden_state = hidden_state + self.attn(self.ln1(hidden_state), attention_mask)
         hidden_state = hidden_state + self.mlp(self.ln2(hidden_state))
         return hidden_state
@@ -219,7 +219,7 @@ class LTCollection(nn.Module):
         self.layers = [LTBlock(config=self.config, dtype=self.dtype, param_dtype=self.param_dtype) for _ in
                        range(self.config.num_hidden_layers)]
 
-    def __call__(self, hidden_state: jnp.DeviceArray, attention_mask: jnp.DeviceArray = None):
+    def __call__(self, hidden_state: jax.Array, attention_mask: jax.Array = None):
         cache = []
         for layer in self.layers:
             hidden_state = layer(hidden_state, attention_mask)
@@ -305,7 +305,7 @@ class FlaxLTModelModule(nn.Module):
         mxl = (mxl * slope).reshape(1, self.config.num_attention_heads, 1, sequence_length)
         return mxl
 
-    def __call__(self, input_ids: jnp.DeviceArray, attention_mask: jnp.DeviceArray = None, return_dict: bool = True):
+    def __call__(self, input_ids: jax.Array, attention_mask: jax.Array = None, return_dict: bool = True):
         b, s = input_ids.shape
         hidden_state = self.wte(input_ids.astype(dtype='i4'))
         alibi = self.build_alibi(s)
@@ -356,7 +356,7 @@ class FlaxLTModelForCausalLMModule(nn.Module):
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range)
         )
 
-    def __call__(self, input_ids: jnp.DeviceArray, attention_mask: jnp.DeviceArray = None, return_dict: bool = True):
+    def __call__(self, input_ids: jax.Array, attention_mask: jax.Array = None, return_dict: bool = True):
         base_model_prediction = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,

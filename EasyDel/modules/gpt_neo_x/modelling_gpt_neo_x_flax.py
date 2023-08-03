@@ -186,8 +186,8 @@ class FlaxGPTNeoXAttention(nn.Module):
         self.bias = nn.make_causal_mask(jnp.ones((1, self.config.max_position_embeddings)))
 
     def __call__(self,
-                 hidden_states: jnp.DeviceArray,
-                 attention_mask: jnp.DeviceArray = None,
+                 hidden_states: jax.Array,
+                 attention_mask: jax.Array = None,
                  ):
         b, s, d = hidden_states.shape
         q, k, v = jnp.split(self.w_qkv(hidden_states), indices_or_sections=3, axis=-1)
@@ -263,8 +263,8 @@ class FlaxGPTNeoXBlock(nn.Module):
         )
 
     def __call__(self,
-                 hidden_states: jnp.DeviceArray,
-                 attention_mask: jnp.DeviceArray,
+                 hidden_states: jax.Array,
+                 attention_mask: jax.Array,
                  ):
         attn = self.attention(
             self.input_layernorm(hidden_states),
@@ -323,8 +323,8 @@ class FlaxGPTNeoXCollection(nn.Module):
         ]
 
     def __call__(self,
-                 hidden_states: jnp.DeviceArray,
-                 attention_mask: jnp.DeviceArray,
+                 hidden_states: jax.Array,
+                 attention_mask: jax.Array,
 
                  ):
         for block in self.blocks:
@@ -356,7 +356,7 @@ class FlaxGPTNeoXModule(nn.Module):
 
     def __call__(self,
                  input_ids: jnp.int32 = None,
-                 attention_mask: Optional[jnp.DeviceArray] = None,
+                 attention_mask: Optional[jax.Array] = None,
                  return_dict: Optional[bool] = None,
                  ):
         b, s = input_ids.shape

@@ -360,7 +360,7 @@ class FlaxGPTJAttention(nn.Module):
         is_initialized = self.has_variable("cache", "cached_key")
         cached_key = self.variable("cache", "cached_key", jnp.zeros, key.shape, key.dtype)
         cached_value = self.variable("cache", "cached_value", jnp.zeros, value.shape, value.dtype)
-        cache_index = self.variable("cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32))
+        cache_index = self.variable("cache", "cache_index", lambda: jax.Array(0, dtype=jnp.int32))
 
         if is_initialized:
             *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
@@ -851,7 +851,7 @@ class FlaxGPTJForCausalLMModule(nn.Module):
 class FlaxGPTJForCausalLM(FlaxGPTJPreTrainedModel):
     module_class = FlaxGPTJForCausalLMModule
 
-    def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[jnp.DeviceArray] = None):
+    def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[jax.Array] = None):
 
         batch_size, seq_length = input_ids.shape
 

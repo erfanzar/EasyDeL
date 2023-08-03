@@ -6,7 +6,19 @@
   <component name="ChangeListManager">
     <list default="true" id="08ad205b-709f-455b-86db-91293f595cd3" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/modules/falcon/modelling_falcon_flax.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/modules/falcon/modelling_falcon_flax.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/modules/gpt_j/modelling_gpt_j_flax.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/modules/gpt_j/modelling_gpt_j_flax.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/modules/gpt_neo_x/modelling_gpt_neo_x_flax.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/modules/gpt_neo_x/modelling_gpt_neo_x_flax.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/modules/llama/modelling_llama_flax.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/modules/llama/modelling_llama_flax.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/modules/lucid_transformer/modelling_lt_flax.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/modules/lucid_transformer/modelling_lt_flax.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/modules/mosaic_mpt/modelling_mpt_flax.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/modules/mosaic_mpt/modelling_mpt_flax.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/modules/opt/modelling_opt_flax.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/modules/opt/modelling_opt_flax.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/modules/palm/modelling_palm_flax.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/modules/palm/modelling_palm_flax.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/modules/t5/modelling_t5_flax.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/modules/t5/modelling_t5_flax.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/EasyDel/serve/serve_utils.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/serve/serve_utils.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/trainer/fsdp_train.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/trainer/fsdp_train.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/requirements.txt" beforeDir="false" afterPath="$PROJECT_DIR$/requirements.txt" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/setup.py" beforeDir="false" afterPath="$PROJECT_DIR$/setup.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -106,6 +118,9 @@
       <module name="EasyDeL" />
       <option name="INTERPRETER_OPTIONS" value="" />
       <option name="PARENT_ENVS" value="true" />
+      <envs>
+        <env name="PYTHONUNBUFFERED" value="1" />
+      </envs>
       <option name="SDK_HOME" value="" />
       <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$" />
       <option name="IS_MODULE_SDK" value="true" />
@@ -177,6 +192,10 @@
       <workItem from="1691048007903" duration="2604000" />
       <workItem from="1691050724626" duration="330000" />
       <workItem from="1691051581762" duration="8253000" />
+      <workItem from="1691074127245" duration="1866000" />
+      <workItem from="1691077044241" duration="97000" />
+      <workItem from="1691080062937" duration="32000" />
+      <workItem from="1691080389407" duration="6846000" />
     </task>
     <servers />
   </component>
