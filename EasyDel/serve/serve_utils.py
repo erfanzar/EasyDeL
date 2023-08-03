@@ -63,14 +63,14 @@ def shard_params(params, partition_rules,
 
 
 class InstructRequest(BaseModel):
-    system: typing.Optional[typing.List[str]] = None
-    prompt: typing.List[str] = None
+    prompt: str
+    system: typing.Optional[str] = None
     temperature: typing.Optional[float] = None
 
 
 class ChatRequest(BaseModel):
     prompt: str
-    context: typing.List[str] = ''
+    history: typing.Union[typing.List[typing.List[str], typing.List[str]], None] = None
     temperature: typing.Optional[float] = None
 
 
