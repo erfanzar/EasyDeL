@@ -1,5 +1,5 @@
+import copy
 import functools
-import typing
 
 import flax.core
 import gradio as gr
@@ -8,6 +8,7 @@ import uvicorn
 from fastapi import FastAPI
 from fjutils import easylm
 from fjutils import utils
+from typing import Optional, List, Union
 from flax.core import freeze
 from flax.traverse_util import unflatten_dict
 from jax import numpy as jnp
@@ -17,6 +18,7 @@ from ml_collections import ConfigDict
 from pydantic import BaseModel
 from fjutils import get_float_dtype_by_name
 from jax.sharding import Mesh, PartitionSpec as Ps
+from tqdm import trange
 from transformers import GenerationConfig
 from EasyDel.serve.theme import seafoam
 from absl import logging
@@ -64,25 +66,27 @@ def shard_params(params, partition_rules,
 
 class InstructRequest(BaseModel):
     prompt: str
-    system: typing.Optional[str] = None
-    temperature: typing.Optional[float] = None
+    system: Optional[str] = None
+    temperature: Optional[float] = None
+    greedy: Optional[bool] = False
 
 
 class ChatRequest(BaseModel):
     prompt: str
-    history: typing.Union[typing.List[typing.List[str], typing.List[str]], None] = None
-    temperature: typing.Optional[float] = None
+    history: Union[List[List], None] = None
+    temperature: Optional[float] = None
+    greedy: Optional[bool] = False
 
 
 class JAXServer(object):
 
     def __init__(self, config=None):
-        self._funcs_generated = False
-        self.model = None
-        self.rules = None
+
+        self.prefix_tokenizer, self.params, self.tokenizer, self.model, \
+            self.rules, self._generate, self._greedy_generate = [None] * 7
 
         self.config = self.get_default_config(config)
-
+        self._funcs_generated = False
         self.number_of_served_request_until_last_up_time = 0
 
         self.rng_generator = RNG(self.config.seed)
@@ -114,7 +118,7 @@ class JAXServer(object):
         config.prompt_postfix_instruct = ''
 
         config.prompt_prefix_chat = '<|prompter|>'
-        config.prompt_postfix_chat = '</s>'
+        config.prompt_postfix_chat = '</s><|assistant|>'
 
         config.is_instruct = False
 
@@ -123,9 +127,18 @@ class JAXServer(object):
 
         config.max_length = 2048
         config.max_new_tokens = 1024
-        config.temperature = 0.1
 
-        config.logging = False
+        config.max_stream_tokens = 256
+
+        assert config.max_new_tokens % config.max_stream_tokens == 0, \
+            'max_new_tokens should be divisible by  max_new_tokens' \
+            f'{config.max_new_tokens % config.max_stream_tokens}'
+
+        config.temperature = 0.1
+        config.top_p = 0.95
+        config.top_k = 50
+
+        config.logging = True
 
         config.mesh_axes_names = ('dp', 'fsdp', 'mp')
         config.mesh_axes_shape = (1, -1, 1)
@@ -150,14 +163,26 @@ class JAXServer(object):
         }
 
     def configure_generate_functions(self, model, tokenizer):
+
         assert self.rules is not None, 'you should first shard params with using ``shard_params`` method'
+
+        if tokenizer.pad_token is None:
+            logging.info(
+                'Tokenizer does not contain padding token setting padding token to eos token for open end generation')
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = 'left'
+        tokenizer.truncation_side = 'left'
+        self.prefix_tokenizer = copy.deepcopy(tokenizer)
+        tokenizer.padding_side = 'right'
+        tokenizer.truncation_side = 'right'
+        self.tokenizer = copy.deepcopy(tokenizer)
 
         @functools.partial(
             pjit,
-            in_shardings=(self.rules, Ps(), Ps(), Ps()),
+            in_shardings=(self.rules, Ps(), Ps()),
             out_shardings=(Ps())
         )
-        def greedy_generate(parameters, input_ids, attention_mask, temperature):
+        def greedy_generate(parameters, input_ids, attention_mask):
             input_ids = with_sharding_constraint(input_ids, Ps(('dp', 'fsdp')))
             attention_mask = with_sharding_constraint(attention_mask, Ps(('dp', 'fsdp')))
             predict = model.generate(
@@ -165,14 +190,14 @@ class JAXServer(object):
                 attention_mask=attention_mask,
                 params=parameters,
                 generation_config=GenerationConfig(
-                    max_new_tokens=self.config.max_new_tokens,
+                    max_new_tokens=self.config.max_stream_tokens,
                     max_length=self.config.max_length,
 
                     eos_token_id=tokenizer.eos_token_id,
                     pad_token_id=tokenizer.pad_token_id,
                     bos_token_id=tokenizer.bos_token_id,
 
-                    temperature=temperature,
+                    temperature=self.config.temperature,
                     do_sample=False,
                     num_beams=1,
                 )
@@ -181,10 +206,10 @@ class JAXServer(object):
 
         @functools.partial(
             pjit,
-            in_shardings=(self.rules, Ps(), Ps(), Ps(), Ps(), Ps(), Ps()),
+            in_shardings=(self.rules, Ps(), Ps()),
             out_shardings=(Ps())
         )
-        def generate(parameters, input_ids, attention_mask, temperature, top_k, top_p, do_sample):
+        def generate(parameters, input_ids, attention_mask):
             input_ids = with_sharding_constraint(input_ids, Ps(('dp', 'fsdp')))
             attention_mask = with_sharding_constraint(attention_mask, Ps(('dp', 'fsdp')))
             predict = model.generate(
@@ -192,18 +217,18 @@ class JAXServer(object):
                 attention_mask=attention_mask,
                 params=parameters,
                 generation_config=GenerationConfig(
-                    max_new_tokens=self.config.max_new_tokens,
+                    max_new_tokens=self.config.max_stream_tokens,
                     max_length=self.config.max_length,
 
                     eos_token_id=tokenizer.eos_token_id,
                     pad_token_id=tokenizer.pad_token_id,
                     bos_token_id=tokenizer.bos_token_id,
 
-                    temperature=temperature,
-                    do_sample=do_sample,
+                    temperature=self.config.temperature,
+                    do_sample=True,
                     num_beams=1,
-                    top_p=top_p,
-                    top_k=top_k,
+                    top_p=self.config.top_p,
+                    top_k=self.config.top_k,
                 )
             ).sequences[:, input_ids.shape[1]:]
             return predict
@@ -212,36 +237,41 @@ class JAXServer(object):
         self._greedy_generate = greedy_generate
         self._funcs_generated = True
 
+    def process_gradio_chat(self):
+
+        return NotImplementedError
+
     def generate(self,
-                 params: typing.Union[flax.core.FrozenDict, dict],
+                 params: Union[flax.core.FrozenDict, dict],
                  input_ids: jnp.DeviceArray,
                  attention_mask: jnp.DeviceArray,
-                 temperature: float = 1.,
-                 top_k: int = 50,
-                 top_p: float = 0.95,
-                 do_sample: bool = True
                  ):
         if not self._funcs_generated:
             raise NotImplementedError(
                 'this method will be implemented automatically after using ``configure_generate_functions`` function')
         else:
             return self._generate(
-                params, input_ids, attention_mask, temperature, top_k, top_p, do_sample
+                params, input_ids, attention_mask
             )
 
     def greedy_generate(self,
-                        params: typing.Union[flax.core.FrozenDict, dict],
+                        params: Union[flax.core.FrozenDict, dict],
                         input_ids: jnp.DeviceArray,
                         attention_mask: jnp.DeviceArray,
-                        temperature: float = 1
                         ):
         if not self._funcs_generated:
             raise NotImplementedError(
                 'this method will be implemented automatically after using ``configure_generate_functions`` function')
         else:
+
             return self._greedy_generate(
-                params, input_ids, attention_mask, temperature
+                params, input_ids, attention_mask
             )
+
+    def save_params(self, params):
+
+        assert self.rules is not None, 'you first must shard params using ``shard_params`` method'
+        self.params = params
 
     def shard_params(self, params, partition_rules):
         rules = match_partition_rules(params=params, rules=partition_rules)
@@ -252,29 +282,95 @@ class JAXServer(object):
             new_parameters = jax.tree_map(
                 lambda f, p: f(p), shard_fns, params
             )
+        self.save_params(new_parameters)
         return new_parameters
 
     def forward_chat(self, data: ChatRequest):
-        print(data)
+
+        if not self._funcs_generated:
+            return {
+                'status': "down"
+            }
+
+        history = self.process_chat_history(data.history or [])
+        history += self.config.prompt_prefix_chat + data.prompt + self.config.prompt_postfix_chat
+        with self.mesh:
+            answer, used_tokens = self.process(
+                string=history,
+                greedy=data.greedy
+            )
+        self.number_of_served_request_until_last_up_time += 1
         return {
-            'status': self._funcs_generated
+            'input': f'{history}',
+            'answer': answer,
+            'tokens_used': used_tokens,
         }
 
     def forward_instruct(self, data: InstructRequest):
-        print(data)
+        if not self._funcs_generated:
+            return {
+                'status': "down"
+            }
+
+        string = self.config.instruct_format.format(instruct=data.prompt, system=data.system)
+        with self.mesh:
+            answer, used_tokens = self.process(
+                string=string,
+                greedy=data.greedy
+            )
+        self.number_of_served_request_until_last_up_time += 1
         return {
-            'status': self._funcs_generated
+            'input': f'{string}',
+            'answer': answer,
+            'tokens_used': used_tokens,
         }
 
-    @staticmethod
-    def forward(data):
-        return NotImplementedError
+    def process(self,
+                string,
+                greedy: bool = False
+                ):
+        tokens = self.prefix_tokenizer(
+            string,
+            max_length=self.config.max_length - self.config.max_stream_tokens,
+            padding='max_length',
+            return_tensors='jax'
+        ) \
+            if self.config.use_prefix_tokenizer else \
+            self.tokenizer(
+                string,
+                return_tensors='jax'
+            )
+        input_ids = tokens.input_ids
+        attention_mask = tokens.attention_mask
+        i = 0
+        pad = self.config.max_length - self.config.max_stream_tokens
+        for i in trange(self.config.max_new_tokens // self.config.max_stream_tokens, disable=not self.config.logging):
+            predicted_token = self.greedy_generate(
+                params=self.params,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
 
-    def process_chat(self, text, history, max_new_tokens, max_length, temperature):
-        print(self)
-        return 'NotImplementedYet'
+            ) if greedy else self.generate(
+                params=self.params,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
 
-    def process_chat_history(self, history: typing.List):
+            )
+            input_ids = jnp.concatenate(
+                (input_ids, predicted_token), axis=-1
+            )[:, -pad:]
+            attention_mask = jnp.concatenate(
+                (attention_mask, jnp.ones((len(attention_mask), self.config.max_stream_tokens), dtype=jnp.int32)),
+                axis=-1
+            )[:, -pad:]
+            if predicted_token[0][-1] == self.tokenizer.eos_token_id or predicted_token[
+                0][-1] == self.prefix_tokenizer.eos_token_id:
+                break
+        return self.tokenizer.decode(
+            input_ids[0][tokens.input_ids.shape[0]:]
+        ), (i + 1) * self.config.max_stream_tokens
+
+    def process_chat_history(self, history: List):
         if len(history) == 0:
             return ''
         else:
@@ -307,13 +403,13 @@ class JAXServer(object):
                     temperature = gr.Slider(value=0.2, maximum=1, minimum=0.1, label='Temperature', step=0.01)
 
             inputs = [text, cache, max_new_tokens, max_length, temperature]
-            sub_event = submit.click(fn=self.process_chat, inputs=inputs, outputs=[text, cache])
+            sub_event = submit.click(fn=self.process_gradio_chat, inputs=inputs, outputs=[text, cache])
 
             def clear_():
                 return []
 
             clear.click(fn=clear_, outputs=[cache])
-            txt_event = text.submit(fn=self.process_chat, inputs=inputs, outputs=[text, cache])
+            txt_event = text.submit(fn=self.process_gradio_chat, inputs=inputs, outputs=[text, cache])
 
             stop.click(fn=None, inputs=None, outputs=None, cancels=[txt_event, sub_event])
 
@@ -434,7 +530,7 @@ class PyTorchServer(object):
         print(self)
         return 'NotImplementedYet'
 
-    def process_chat_history(self, history: typing.List):
+    def process_chat_history(self, history: List):
         if len(history) == 0:
             return ''
         else:
