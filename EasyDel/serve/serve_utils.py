@@ -255,10 +255,16 @@ class JAXServer(object):
         return new_parameters
 
     def forward_chat(self, data: ChatRequest):
-        ...
+        print(data)
+        return {
+            'status': self._funcs_generated
+        }
 
     def forward_instruct(self, data: InstructRequest):
-        ...
+        print(data)
+        return {
+            'status': self._funcs_generated
+        }
 
     @staticmethod
     def forward(data):
