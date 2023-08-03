@@ -994,7 +994,7 @@ class FlaxLlamaForCausalLMModule(nn.Module):
 class FlaxLlamaForCausalLM(FlaxLlamaPreTrainedModel):
     module_class = FlaxLlamaForCausalLMModule
 
-    def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask = None):
+    def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[jax.Array] = None):
         batch_size, seq_length = input_ids.shape
 
         past_key_values = self.init_cache(batch_size, max_length)

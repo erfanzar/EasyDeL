@@ -24,7 +24,7 @@ from torch.utils.data import DataLoader
 from fjutils import match_partition_rules, make_shard_and_gather_fns, StreamingCheckpointer, count_params
 
 
-def calculate_accuracy(predictions: jnp.DeviceArray, targets: jnp.DeviceArray):
+def calculate_accuracy(predictions: jax.Array, targets: jax.Array):
     predicted_classes = jnp.argmax(predictions, axis=-1)
     correct_predictions = (predicted_classes == targets).sum()
     total_predictions = targets.shape[0]

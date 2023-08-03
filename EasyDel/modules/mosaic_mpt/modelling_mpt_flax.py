@@ -203,7 +203,7 @@ class FlaxMptMLP(nn.Module):
                              dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision)
         self.act = ACT2FN[self.config.act_fn]
 
-    def __call__(self, x: jnp.DeviceArray):
+    def __call__(self, x: jax.Array):
         return self.down(self.act(self.up(x)))
 
 
@@ -384,7 +384,7 @@ class FlaxMptModule(nn.Module):
         )
         self.norm_f = nn.LayerNorm(use_bias=self.config.use_norm_bias)
 
-    def __call__(self, input_ids: jnp.DeviceArray, attention_mask: jnp.DeviceArray = None, return_dict: bool = True):
+    def __call__(self, input_ids: jax.Array, attention_mask: jax.Array = None, return_dict: bool = True):
         b, s = input_ids.shape
         hidden_state = self.wte(input_ids)
         if self.config.alibi:
@@ -467,7 +467,7 @@ class FlaxFlaxMptForCausalLMModule(nn.Module):
                                     use_bias=self.config.use_bias,
                                     dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision)
 
-    def __call__(self, input_ids: jnp.DeviceArray, attention_mask: jnp.DeviceArray = None, return_dict: bool = True):
+    def __call__(self, input_ids: jax.Array, attention_mask: jax.Array = None, return_dict: bool = True):
         predict: FlaxBaseModelOutput = self.transformer(input_ids=input_ids, attention_mask=attention_mask,
                                                         return_dict=True)
         if self.config.use_lm_head:

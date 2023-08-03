@@ -381,7 +381,7 @@ class FlaxT5Attention(nn.Module):
         is_initialized = self.has_variable("cache", "cached_key")
         cached_key = self.variable("cache", "cached_key", jnp.zeros, key.shape, key.dtype)
         cached_value = self.variable("cache", "cached_value", jnp.zeros, value.shape, value.dtype)
-        cache_index = self.variable("cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32))
+        cache_index = self.variable("cache", "cache_index", lambda: jax.Array(0, dtype=jnp.int32))
 
         if is_initialized:
             *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
@@ -1533,8 +1533,8 @@ class FlaxT5ForConditionalGeneration(FlaxT5PreTrainedModel):
             self,
             decoder_input_ids,
             max_length,
-            attention_mask: Optional[jnp.DeviceArray] = None,
-            decoder_attention_mask: Optional[jnp.DeviceArray] = None,
+            attention_mask: Optional[jax.Array] = None,
+            decoder_attention_mask: Optional[jax.Array] = None,
             encoder_outputs=None,
             **kwargs,
     ):

@@ -225,9 +225,9 @@ class FlaxFalconAttention(nn.Module):
             self.freq = precompute_freqs_cis(head_dim, self.config.max_seq_len, dtype=self.dtype)
 
     def __call__(self,
-                 hidden_states: jnp.DeviceArray,
-                 alibi: jnp.DeviceArray = None,
-                 attention_mask: jnp.DeviceArray = None,
+                 hidden_states: jax.Array,
+                 alibi: jax.Array = None,
+                 attention_mask: jax.Array = None,
                  ):
         b, s, d = hidden_states.shape
 
@@ -322,9 +322,9 @@ class FlaxFalconBlock(nn.Module):
         )
 
     def __call__(self,
-                 hidden_states: jnp.DeviceArray,
-                 alibi: jnp.DeviceArray,
-                 attention_mask: jnp.DeviceArray,
+                 hidden_states: jax.Array,
+                 alibi: jax.Array,
+                 attention_mask: jax.Array,
                  ):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -380,9 +380,9 @@ class FlaxFalconCollection(nn.Module):
         ]
 
     def __call__(self,
-                 hidden_states: jnp.DeviceArray,
-                 alibi: jnp.DeviceArray,
-                 attention_mask: jnp.DeviceArray,
+                 hidden_states: jax.Array,
+                 alibi: jax.Array,
+                 attention_mask: jax.Array,
 
                  ):
         for b in self.blocks:
@@ -417,7 +417,7 @@ class FlaxFalconModule(nn.Module):
 
     def __call__(self,
                  input_ids: jnp.int32 = None,
-                 attention_mask: Optional[jnp.DeviceArray] = None,
+                 attention_mask: Optional[jax.Array] = None,
                  use_cache: Optional[bool] = None,
                  return_dict: Optional[bool] = None,
                  ):
