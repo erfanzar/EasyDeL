@@ -372,7 +372,6 @@ class FlaxLlamaAttention(nn.Module):
             )
         elif self.config.rotary_type == 'lm2':
 
-
             self.freqs_cis = pre_compute_frq_sin_cos(end=self.config.max_sequence_length,
                                                      dim=self.head_dim,
                                                      scale_factor=float(
@@ -995,7 +994,7 @@ class FlaxLlamaForCausalLMModule(nn.Module):
 class FlaxLlamaForCausalLM(FlaxLlamaPreTrainedModel):
     module_class = FlaxLlamaForCausalLMModule
 
-    def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[jnp.DeviceArray] = None):
+    def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask = None):
         batch_size, seq_length = input_ids.shape
 
         past_key_values = self.init_cache(batch_size, max_length)
