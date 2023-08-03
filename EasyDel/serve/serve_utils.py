@@ -21,7 +21,7 @@ from jax.sharding import Mesh, PartitionSpec as Ps
 from tqdm import trange
 from transformers import GenerationConfig
 from EasyDel.serve.theme import seafoam
-from absl import logging
+import logging
 from EasyDel.utils.utils import RNG
 
 pjit = pjit.pjit
@@ -98,7 +98,8 @@ class JAXServer(object):
         self.app.post('/chat')(self.forward_chat)
         self.app.post('/instruct')(self.forward_instruct)
         self.app.get('/status')(self.status)
-        self.app = gr.mount_gradio_app(self.app, self.create_gradio_ui(), '/gradio_app')
+        self.gradio_app = self.create_gradio_ui()
+        self.app = gr.mount_gradio_app(self.app, self.gradio_app, '/gradio_app')
 
     @staticmethod
     def get_default_config(updates=None):
@@ -128,7 +129,7 @@ class JAXServer(object):
         config.max_length = 2048
         config.max_new_tokens = 1024
 
-        config.max_stream_tokens = 256
+        config.max_stream_tokens = 1
 
         assert config.max_new_tokens % config.max_stream_tokens == 0, \
             'max_new_tokens should be divisible by  max_new_tokens' \
@@ -183,6 +184,8 @@ class JAXServer(object):
             out_shardings=(Ps())
         )
         def greedy_generate(parameters, input_ids, attention_mask):
+            print(f'input_ids shape : {input_ids.shape}')
+            print(f'attention_mask shape : {attention_mask.shape}')
             input_ids = with_sharding_constraint(input_ids, Ps(('dp', 'fsdp')))
             attention_mask = with_sharding_constraint(attention_mask, Ps(('dp', 'fsdp')))
             predict = model.generate(
@@ -191,8 +194,6 @@ class JAXServer(object):
                 params=parameters,
                 generation_config=GenerationConfig(
                     max_new_tokens=self.config.max_stream_tokens,
-                    max_length=self.config.max_length,
-
                     eos_token_id=tokenizer.eos_token_id,
                     pad_token_id=tokenizer.pad_token_id,
                     bos_token_id=tokenizer.bos_token_id,
@@ -212,13 +213,14 @@ class JAXServer(object):
         def generate(parameters, input_ids, attention_mask):
             input_ids = with_sharding_constraint(input_ids, Ps(('dp', 'fsdp')))
             attention_mask = with_sharding_constraint(attention_mask, Ps(('dp', 'fsdp')))
+            print(f'input_ids shape : {input_ids.shape}')
+            print(f'attention_mask shape : {attention_mask.shape}')
             predict = model.generate(
                 input_ids,
                 attention_mask=attention_mask,
                 params=parameters,
                 generation_config=GenerationConfig(
                     max_new_tokens=self.config.max_stream_tokens,
-                    max_length=self.config.max_length,
 
                     eos_token_id=tokenizer.eos_token_id,
                     pad_token_id=tokenizer.pad_token_id,
@@ -237,9 +239,8 @@ class JAXServer(object):
         self._greedy_generate = greedy_generate
         self._funcs_generated = True
 
-    def process_gradio_chat(self):
-
-        return NotImplementedError
+    def auto_configure(self):
+        ...
 
     def generate(self,
                  params: Union[flax.core.FrozenDict, dict],
@@ -248,11 +249,13 @@ class JAXServer(object):
                  ):
         if not self._funcs_generated:
             raise NotImplementedError(
-                'this method will be implemented automatically after using ``configure_generate_functions`` function')
-        else:
-            return self._generate(
-                params, input_ids, attention_mask
+                'this method will be implemented automatically after using ``configure_generate_functions`` function'
             )
+        else:
+            with self.mesh:
+                return self._generate(
+                    params, input_ids, attention_mask
+                )
 
     def greedy_generate(self,
                         params: Union[flax.core.FrozenDict, dict],
@@ -261,12 +264,13 @@ class JAXServer(object):
                         ):
         if not self._funcs_generated:
             raise NotImplementedError(
-                'this method will be implemented automatically after using ``configure_generate_functions`` function')
-        else:
-
-            return self._greedy_generate(
-                params, input_ids, attention_mask
+                'this method will be implemented automatically after using ``configure_generate_functions`` function'
             )
+        else:
+            with self.mesh:
+                return self._greedy_generate(
+                    params, input_ids, attention_mask
+                )
 
     def save_params(self, params):
 
@@ -274,6 +278,10 @@ class JAXServer(object):
         self.params = params
 
     def shard_params(self, params, partition_rules):
+
+        logging.log(
+            logging.INFO,
+            'the parameters will be sharded and ba saved inside server you can access them by ``JAXServer.params``')
         rules = match_partition_rules(params=params, rules=partition_rules)
         self.rules = rules
         shard_fns, _ = make_shard_and_gather_fns(rules, get_float_dtype_by_name(self.config.dtype))
@@ -283,6 +291,7 @@ class JAXServer(object):
                 lambda f, p: f(p), shard_fns, params
             )
         self.save_params(new_parameters)
+
         return new_parameters
 
     def forward_chat(self, data: ChatRequest):
@@ -294,11 +303,12 @@ class JAXServer(object):
 
         history = self.process_chat_history(data.history or [])
         history += self.config.prompt_prefix_chat + data.prompt + self.config.prompt_postfix_chat
-        with self.mesh:
-            answer, used_tokens = self.process(
-                string=history,
-                greedy=data.greedy
-            )
+
+        answer, used_tokens = self.process(
+            string=history,
+            greedy=data.greedy,
+            max_new_tokens=None
+        )
         self.number_of_served_request_until_last_up_time += 1
         return {
             'input': f'{history}',
@@ -313,11 +323,12 @@ class JAXServer(object):
             }
 
         string = self.config.instruct_format.format(instruct=data.prompt, system=data.system)
-        with self.mesh:
-            answer, used_tokens = self.process(
-                string=string,
-                greedy=data.greedy
-            )
+
+        answer, used_tokens = self.process(
+            string=string,
+            greedy=data.greedy,
+            max_new_tokens=None
+        )
         self.number_of_served_request_until_last_up_time += 1
         return {
             'input': f'{string}',
@@ -327,7 +338,8 @@ class JAXServer(object):
 
     def process(self,
                 string,
-                greedy: bool = False
+                greedy: bool = False,
+                max_new_tokens: int = None,
                 ):
         tokens = self.prefix_tokenizer(
             string,
@@ -344,18 +356,20 @@ class JAXServer(object):
         attention_mask = tokens.attention_mask
         i = 0
         pad = self.config.max_length - self.config.max_stream_tokens
-        for i in trange(self.config.max_new_tokens // self.config.max_stream_tokens, disable=not self.config.logging):
+        print(input_ids.shape)
+        print(attention_mask.shape)
+        for i in trange((max_new_tokens or self.config.max_new_tokens) // self.config.max_stream_tokens,
+                        disable=not self.config.logging):
             predicted_token = self.greedy_generate(
                 params=self.params,
                 input_ids=input_ids,
-                attention_mask=attention_mask,
-
+                attention_mask=attention_mask
             ) if greedy else self.generate(
                 params=self.params,
                 input_ids=input_ids,
-                attention_mask=attention_mask,
-
+                attention_mask=attention_mask
             )
+
             input_ids = jnp.concatenate(
                 (input_ids, predicted_token), axis=-1
             )[:, -pad:]
@@ -380,16 +394,26 @@ class JAXServer(object):
 
         return message_history
 
+    def process_gradio_chat(self, prompt, history, max_new_tokens, greedy):
+        string = self.process_chat_history(history)
+        string += self.config.prompt_prefix_chat + prompt + self.config.prompt_postfix_chat
+        answer, _ = self.process(
+            string=string,
+            greedy=greedy,
+            max_new_tokens=max_new_tokens
+        )
+        return '', history[-1].append(answer)
+
     def create_gradio_ui(self):
         with gr.Blocks(
                 theme=seafoam) as block:
-            gr.Markdown("#<h1><center>Powered by [EasyDeL](https://github.com/erfanzar/EasyDel)</center></h1>")
+            gr.Markdown("# <h1> <center>Powered by [EasyDeL](https://github.com/erfanzar/EasyDel) </center> </h1>")
             with gr.Row():
-                cache = gr.Chatbot(elem_id="EasyDel", label="EasyDel").style(container=True, height=600)
+                history = gr.Chatbot(elem_id="EasyDel", label="EasyDel").style(container=True, height=600)
 
             with gr.Row():
                 with gr.Column():
-                    text = gr.Textbox(show_label=False, placeholder='Message Box').style(container=False)
+                    prompt = gr.Textbox(show_label=False, placeholder='Message Box').style(container=False)
                 with gr.Column():
                     with gr.Row():
                         submit = gr.Button(variant="primary")
@@ -398,18 +422,20 @@ class JAXServer(object):
 
             with gr.Row():
                 with gr.Accordion('Advanced Options', open=False):
-                    max_new_tokens = gr.Slider(value=2048, maximum=3072, minimum=1, label='Max New Tokens', step=1, )
-                    max_length = gr.Slider(value=2048, maximum=4096, minimum=1, label='Max Length', step=1)
+                    max_new_tokens = gr.Slider(value=self.config.max_new_tokens, maximum=10000, minimum=1,
+                                               label='Max New Tokens', step=1, )
+                    max_length = gr.Slider(value=self.config.max_length, maximum=self.config.max_length, minimum=1,
+                                           label='Max Length', step=1)
                     temperature = gr.Slider(value=0.2, maximum=1, minimum=0.1, label='Temperature', step=0.01)
-
-            inputs = [text, cache, max_new_tokens, max_length, temperature]
-            sub_event = submit.click(fn=self.process_gradio_chat, inputs=inputs, outputs=[text, cache])
+                    greedy = gr.Checkbox(value=True, label='Greedy Search')
+            inputs = [prompt, history, max_new_tokens, greedy]
+            sub_event = submit.click(fn=self.process_gradio_chat, inputs=inputs, outputs=[prompt, history])
 
             def clear_():
                 return []
 
-            clear.click(fn=clear_, outputs=[cache])
-            txt_event = text.submit(fn=self.process_gradio_chat, inputs=inputs, outputs=[text, cache])
+            clear.click(fn=clear_, outputs=[history])
+            txt_event = prompt.submit(fn=self.process_gradio_chat, inputs=inputs, outputs=[prompt, history])
 
             stop.click(fn=None, inputs=None, outputs=None, cancels=[txt_event, sub_event])
 
@@ -543,7 +569,7 @@ class PyTorchServer(object):
     def create_gradio_ui(self):
         with gr.Blocks(
                 theme=seafoam) as block:
-            gr.Markdown("#<h1><center>Powered by [EasyDeL](https://github.com/erfanzar/EasyDel)</center></h1>")
+            gr.Markdown("<h1><center>Powered by [EasyDeL](https://github.com/erfanzar/EasyDel)</center></h1>")
             with gr.Row():
                 cache = gr.Chatbot(elem_id="EasyDel", label="EasyDel").style(container=True, height=600)
 
@@ -562,7 +588,7 @@ class PyTorchServer(object):
                     max_length = gr.Slider(value=2048, maximum=4096, minimum=1, label='Max Length', step=1)
                     temperature = gr.Slider(value=0.2, maximum=1, minimum=0.1, label='Temperature', step=0.01)
 
-            inputs = [text, cache, max_new_tokens, max_length, temperature]
+            inputs = [text, cache, max_new_tokens, max_length]
             sub_event = submit.click(fn=self.process_chat, inputs=inputs, outputs=[text, cache])
 
             def clear_():
