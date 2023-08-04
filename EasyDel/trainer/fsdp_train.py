@@ -97,8 +97,6 @@ class OutputFineTuner:
     last_save_file_name: str
 
 
-
-
 class CausalLMTrainer:
     def __init__(self,
                  arguments: TrainArguments,
@@ -252,6 +250,7 @@ class CausalLMTrainer:
                                                            ' pass custom_rule for partition rules '
             model = self.arguments.model_class(
                 **self.arguments.configs_to_init_model_class,
+                use_pjit_attention_force=self.arguments.use_pjit_attention_force,
                 _do_init=False
             )
             config = self.arguments.configs_to_init_model_class['config']
