@@ -23,6 +23,7 @@ from transformers import GenerationConfig
 from EasyDel.serve.theme import seafoam
 import logging
 from EasyDel.utils.utils import RNG
+import multiprocessing as mp
 
 pjit = pjit.pjit
 
@@ -82,8 +83,8 @@ class JAXServer(object):
 
     def __init__(self, config=None):
 
-        self.prefix_tokenizer, self.params, self.tokenizer, self.model, \
-            self.rules, self._generate, self._greedy_generate = [None] * 7
+        self.process_uvicorn, self.prefix_tokenizer, self.params, self.tokenizer, self.model, \
+            self.rules, self._generate, self._greedy_generate = [None] * 8
 
         self.config = self.get_default_config(config)
         self._funcs_generated = False
@@ -333,6 +334,22 @@ class JAXServer(object):
             'tokens_used': used_tokens,
         }
 
+    def forward_instruct_non_api(self, prompt, system, greedy):
+        data = InstructRequest(
+            prompt=prompt,
+            system=system,
+            greedy=greedy
+        )
+        return self.forward_instruct(data)
+
+    def forward_chat_non_api(self, prompt, history, greedy):
+        data = ChatRequest(
+            prompt=prompt,
+            history=history,
+            greedy=greedy
+        )
+        return self.forward_chat(data)
+
     def process(self,
                 string,
                 greedy: bool = False,
@@ -445,7 +462,18 @@ class JAXServer(object):
     def fire(self):
         assert self._funcs_generated, 'you have to first add your model and parameters into server before using fire ' \
                                       'with using ``configure_generate_functions``'
-        uvicorn.run(self.app, host=self.config.host, port=self.config.port)
+
+        def run():
+            uvicorn.run(self.app, host=self.config.host, port=self.config.port)
+
+        self.process_uvicorn = mp.Process(target=run)
+        self.process_uvicorn.start()
+
+    def end(self):
+        if self.process_uvicorn is not None:
+            self.process_uvicorn.join()
+        else:
+            logging.warning('you have to fire server before ending that this command will be ignored')
 
 
 class PyTorchServer(object):
