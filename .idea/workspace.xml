@@ -5,9 +5,13 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="08ad205b-709f-455b-86db-91293f595cd3" name="Changes" comment="">
-      <change afterPath="$PROJECT_DIR$/examples/training/causal-lm/llama.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/EasyDel/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/__init__.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/modules/llama/modelling_llama_flax.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/modules/llama/modelling_llama_flax.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/serve/serve_utils.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/serve/serve_utils.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/trainer/training_utils.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/trainer/training_utils.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/README.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/setup.py" beforeDir="false" afterPath="$PROJECT_DIR$/setup.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -88,9 +92,6 @@
       <module name="EasyDeL" />
       <option name="INTERPRETER_OPTIONS" value="" />
       <option name="PARENT_ENVS" value="true" />
-      <envs>
-        <env name="PYTHONUNBUFFERED" value="1" />
-      </envs>
       <option name="SDK_HOME" value="" />
       <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$" />
       <option name="IS_MODULE_SDK" value="true" />
@@ -188,7 +189,7 @@
       <workItem from="1691077044241" duration="97000" />
       <workItem from="1691080062937" duration="32000" />
       <workItem from="1691080389407" duration="8054000" />
-      <workItem from="1691133666752" duration="4055000" />
+      <workItem from="1691133666752" duration="10012000" />
     </task>
     <servers />
   </component>

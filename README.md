@@ -6,12 +6,20 @@ train Flax/Jax Models on the `TPU/GPU`
 
 ## Installation
 
-To install EasyDeL, you can use pip:
-
 ### Availalbe on PyPi
+
+To install EasyDeL, you can use pip:
 
 ```bash
 pip install easydel
+```
+
+### PyGit
+
+for the latest version (beta)
+
+```shell
+pip install git+https://github.com/erfanzar/EasyDel
 ```
 
 ## Available Models Are
@@ -26,10 +34,13 @@ pip install easydel
 - T5        (Support `FSDP`, `MP`, `DP`)(_Supports gradient checkpointing_)
 
 
-
 - _LLama GPT-J MosaicMPT Falcon supports Flash Attention_
 
 you can also tell me the model you want in Flax/Jax version and ill try my best to build it ;)
+
+## Tutorials
+
+_Tutorials on how to use and train or serve your models with EasyDel is available at examples dir_
 
 ## FineTuning
 
@@ -60,7 +71,6 @@ save_ckpt(flax_params, 'flax_param_easydel')
 #### Step Two
 
 now it's time to finetune or model
-
 
 ```python
 import jax.numpy

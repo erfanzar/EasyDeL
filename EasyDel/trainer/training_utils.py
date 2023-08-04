@@ -10,8 +10,7 @@ import jax
 import flax
 import optax
 from transformers import FlaxAutoModelForCausalLM, AutoConfig
-from IPython.display import clear_output
-from tqdm import tqdm
+from jax.sharding import PartitionSpec
 from EasyDel.utils.utils import Timers
 
 from jax.experimental.pjit import pjit, with_sharding_constraint

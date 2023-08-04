@@ -1,5 +1,3 @@
-from .utils.checker import package_checker, is_jax_available, is_torch_available, is_flax_available, \
-    is_tensorflow_available
 from .utils import make_shard_and_gather_fns
 from .modules import FlaxLlamaModel, FlaxLlamaForCausalLM, LlamaConfig, \
     FlaxLTModelModule, FlaxLTConfig, FlaxLTForCausalLM, FlaxLTModel, GPTJConfig, FlaxGPTJModule, \
@@ -9,8 +7,9 @@ from .modules import FlaxLlamaModel, FlaxLlamaForCausalLM, LlamaConfig, \
     FlaxOPTForCausalLM, FlaxOPTModel, OPTConfig
 from .trainer import TrainArguments, fsdp_train_step, get_training_modules, CausalLMTrainer
 
-__all__ = 'package_checker', 'is_jax_available', 'is_torch_available', 'is_flax_available', \
-    'is_tensorflow_available', "TrainArguments", "fsdp_train_step", 'get_training_modules', \
+__version__ = '0.0.20'
+
+__all__ = "TrainArguments", "fsdp_train_step", 'get_training_modules', \
     'FlaxLlamaForCausalLM', \
     'FlaxLlamaModel', 'FlaxGPTJModule', 'FlaxGPTJForCausalLMModule', \
     'FlaxGPTJModel', 'FlaxGPTJForCausalLM', 'GPTJConfig', \
@@ -20,4 +19,4 @@ __all__ = 'package_checker', 'is_jax_available', 'is_torch_available', 'is_flax_
     "FlaxGPTNeoXForCausalLM", "GPTNeoXConfig", "FlaxGPTNeoXModel", \
     "FlaxT5ForConditionalGeneration", "FlaxT5Model", \
     "FlaxPalmForCausalLM", "PalmModel", "PalmConfig", 'T5Config', \
-    "FlaxOPTForCausalLM", "FlaxOPTModel", "OPTConfig", 'CausalLMTrainer', 'LlamaConfig'
+    "FlaxOPTForCausalLM", "FlaxOPTModel", "OPTConfig", 'CausalLMTrainer', 'LlamaConfig', "__version__"

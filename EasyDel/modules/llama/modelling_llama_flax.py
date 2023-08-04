@@ -91,7 +91,8 @@ class LlamaConfig(PretrainedConfig):
             flash_attn_query_chunk_size=1024,
             flash_attn_key_chunk_size=1024,
             scan_mlp_chunk_size=1024,
-            rotary_type: str = 'lm2',
+            rotary_type: str = 'complex',
+            from_pt: bool = False,
             **kwargs,
     ):
         assert rotary_type in ['open', 'complex',
@@ -118,7 +119,8 @@ class LlamaConfig(PretrainedConfig):
         self.flash_attn_key_chunk_size = flash_attn_key_chunk_size
         self.flash_attn_query_chunk_size = flash_attn_query_chunk_size
         self.rotary_type = rotary_type
-        self.scan_mlp_chunk_size = scan_mlp_chunk_size
+        self.scan_mlp_chunk_size = scan_mlp_chunk_size,
+        self.from_pt = from_pt
         super().__init__(
             # pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -127,43 +129,79 @@ class LlamaConfig(PretrainedConfig):
             **kwargs,
         )
 
-    @staticmethod
-    def get_partition_rules(fully_fsdp: bool = True):
-        return (
+    def get_partition_rules(self, fully_fsdp: bool = True):
+        if not self.from_pt:
+            return (
 
-            ("transformer/wte/embedding", PS("dp", "fsdp")),
+                ("transformer/wte/embedding", PS("dp", "fsdp")),
 
-            ("attention/(wq|wk|wv)/kernel", PS("fsdp", "dp")),
-            ("attention/wo/kernel", PS("dp", "fsdp")),
+                ("attention/(wq|wk|wv)/kernel", PS("fsdp", "dp")),
+                ("attention/wo/kernel", PS("dp", "fsdp")),
 
-            ("feed_forward/w1/kernel", PS("fsdp", "dp")),
-            ("feed_forward/w2/kernel", PS("dp", "fsdp")),
-            ("feed_forward/w3/kernel", PS("fsdp", "dp")),
+                ("feed_forward/w1/kernel", PS("fsdp", "dp")),
+                ("feed_forward/w2/kernel", PS("dp", "fsdp")),
+                ("feed_forward/w3/kernel", PS("fsdp", "dp")),
 
-            ("attention_norm/kernel", PS(None)),
-            ("ffn_norm/kernel", PS(None)),
+                ("attention_norm/kernel", PS(None)),
+                ("ffn_norm/kernel", PS(None)),
 
-            ("transformer/ln_f/kernel", PS(None)),
-            ("lm_head/kernel", PS("fsdp", "dp")),
-            ('.*', PS(None)),
-        ) if not fully_fsdp else (
+                ("transformer/ln_f/kernel", PS(None)),
+                ("lm_head/kernel", PS("fsdp", "dp")),
+                ('.*', PS(None)),
+            ) if not fully_fsdp else (
 
-            ("transformer/wte/embedding", PS("fsdp")),
+                ("transformer/wte/embedding", PS("fsdp")),
 
-            ("attention/(wq|wk|wv)/kernel", PS("fsdp")),
-            ("attention/wo/kernel", PS("fsdp")),
+                ("attention/(wq|wk|wv)/kernel", PS("fsdp")),
+                ("attention/wo/kernel", PS("fsdp")),
 
-            ("feed_forward/w1/kernel", PS("fsdp")),
-            ("feed_forward/w2/kernel", PS("fsdp")),
-            ("feed_forward/w3/kernel", PS("fsdp")),
+                ("feed_forward/w1/kernel", PS("fsdp")),
+                ("feed_forward/w2/kernel", PS("fsdp")),
+                ("feed_forward/w3/kernel", PS("fsdp")),
 
-            ("attention_norm/kernel", PS(None)),
-            ("ffn_norm/kernel", PS(None)),
+                ("attention_norm/kernel", PS(None)),
+                ("ffn_norm/kernel", PS(None)),
 
-            ("transformer/ln_f/kernel", PS(None)),
-            ("lm_head/kernel", PS("fsdp")),
-            ('.*', PS(None)),
-        )
+                ("transformer/ln_f/kernel", PS(None)),
+                ("lm_head/kernel", PS("fsdp")),
+                ('.*', PS(None)),
+            )
+        else:
+            return (
+
+                ("model/embed_tokens/embedding", PS("dp", "fsdp")),
+
+                ("self_attn/(q_proj|k_proj|v_proj)/kernel", PS("fsdp", "dp")),
+                ("self_attn/o_proj/kernel", PS("dp", "fsdp")),
+
+                ("mlp/gate_proj/kernel", PS("fsdp", "dp")),
+                ("mlp/down_proj/kernel", PS("dp", "fsdp")),
+                ("mlp/up_proj/kernel", PS("fsdp", "dp")),
+
+                ("input_layernorm/kernel", PS(None)),
+                ("post_attention_layernorm/kernel", PS(None)),
+
+                ("model/norm/kernel", PS(None)),
+                ("lm_head/kernel", PS("fsdp", "dp")),
+                ('.*', PS(None)),
+            ) if not fully_fsdp else (
+
+                ("model/embed_tokens/embedding", PS("fsdp")),
+
+                ("self_attn/(q_proj|k_proj|v_proj)/kernel", PS("fsdp")),
+                ("self_attn/o_proj/kernel", PS("fsdp")),
+
+                ("mlp/gate_proj/kernel", PS("fsdp")),
+                ("mlp/down_proj/kernel", PS("fsdp")),
+                ("mlp/up_proj/kernel", PS("fsdp")),
+
+                ("input_layernorm/kernel", PS(None)),
+                ("post_attention_layernorm/kernel", PS(None)),
+
+                ("model/norm/kernel", PS(None)),
+                ("lm_head/kernel", PS("fsdp")),
+                ('.*', PS(None)),
+            )
 
     @staticmethod
     def get_weight_decay_exclusions():
@@ -325,6 +363,7 @@ class FlaxLlamaAttention(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
+            name='q_proj' if self.config.from_pt else 'wq'
         )
         self.wk = nn.Dense(
             config.num_attention_heads * self.head_dim,
@@ -333,6 +372,7 @@ class FlaxLlamaAttention(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
+            name='k_proj' if self.config.from_pt else 'wk'
         )
         self.wv = nn.Dense(
             config.num_attention_heads * self.head_dim,
@@ -341,6 +381,7 @@ class FlaxLlamaAttention(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
+            name='v_proj' if self.config.from_pt else 'wv'
         )
         self.wo = nn.Dense(
             config.hidden_size,
@@ -349,6 +390,7 @@ class FlaxLlamaAttention(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
+            name='o_proj' if self.config.from_pt else 'wo'
         )
 
         self.resid_dropout = nn.Dropout(rate=config.resid_pdrop)
@@ -538,6 +580,7 @@ class FlaxLlamaMLP(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
+            name='gate_proj' if self.config.from_pt else 'w1'
         )
         self.w2 = nn.Dense(
             config.hidden_size,
@@ -546,6 +589,7 @@ class FlaxLlamaMLP(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
+            name='down_proj' if self.config.from_pt else 'w2'
         )
         self.w3 = nn.Dense(
             config.intermediate_size,
@@ -554,6 +598,7 @@ class FlaxLlamaMLP(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
+            name='up_proj' if self.config.from_pt else 'w3'
         )
         self.dropout = nn.Dropout(rate=self.config.resid_pdrop)
 
@@ -575,24 +620,28 @@ class FlaxLlamaBlock(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
+            name='self_attn' if self.config.from_pt else 'attention'
         )
         self.feed_forward = FlaxLlamaMLP(
             self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
+            name='mlp' if self.config.from_pt else 'feed_forward'
         )
         self.attention_norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
+            name='input_layernorm' if self.config.from_pt else 'attention_norm'
         )
         self.ffn_norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
+            name='post_attention_layernorm' if self.config.from_pt else 'ffn_norm'
         )
 
     def __call__(
@@ -874,12 +923,13 @@ class FlaxLlamaModule(nn.Module):
             embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
+            name='embed_tokens' if self.config.from_pt else 'wte'
         )
         self.dropout = nn.Dropout(rate=self.config.embd_pdrop)
         self.h = FlaxLlamaBlockCollection(self.config, dtype=self.dtype, param_dtype=self.param_dtype,
-                                          precision=self.precision)
+                                          precision=self.precision, name='layers' if self.config.from_pt else 'h')
         self.ln_f = RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps, dtype=self.dtype,
-                            param_dtype=self.param_dtype)
+                            param_dtype=self.param_dtype, name='norm' if self.config.from_pt else 'ln_f')
 
     def __call__(
             self,
@@ -937,7 +987,11 @@ class FlaxLlamaForCausalLMModule(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self):
-        self.transformer = FlaxLlamaModule(self.config, dtype=self.dtype)
+        self.transformer = FlaxLlamaModule(self.config,
+                                           dtype=self.dtype,
+                                           param_dtype=self.param_dtype,
+                                           precision=self.precision,
+                                           name='model' if self.config.from_pt else 'transformer')
         self.lm_head = nn.Dense(
             self.config.vocab_size,
             dtype=self.dtype,

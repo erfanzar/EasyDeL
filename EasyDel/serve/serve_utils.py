@@ -423,7 +423,7 @@ class JAXServer(object):
                 with gr.Accordion('Advanced Options', open=False):
                     max_new_tokens = gr.Slider(value=self.config.max_new_tokens, maximum=10000,
                                                minimum=self.config.max_stream_tokens,
-                                               label='Max New Tokens', step=1, )
+                                               label='Max New Tokens', step=self.config.max_stream_tokens, )
                     max_length = gr.Slider(value=self.config.max_length, maximum=self.config.max_length, minimum=1,
                                            label='Max Length', step=1)
                     temperature = gr.Slider(value=0.2, maximum=1, minimum=0.1, label='Temperature', step=0.01)
@@ -451,6 +451,7 @@ class JAXServer(object):
 class PyTorchServer(object):
 
     def __init__(self, config=None):
+        logging.warning('PytorchServer is not built fully yet at this version')
         import torch as tr
         self.torch = tr
         self.config = self.get_default_config(config)
