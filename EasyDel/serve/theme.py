@@ -7,19 +7,19 @@ class Seafoam(Base):
     def __init__(
             self,
             *,
-            primary_hue: Union[colors.Color | str] = colors.emerald,
-            secondary_hue: Union[colors.Color | str] = colors.blue,
-            neutral_hue: Union[colors.Color | str] = colors.gray,
+            primary_hue: Union[colors.Color, str] = colors.emerald,
+            secondary_hue: Union[colors.Color, str] = colors.blue,
+            neutral_hue: Union[colors.Color, str] = colors.gray,
             spacing_size: Union[sizes.Size, str] = sizes.spacing_md,
             radius_size: Union[sizes.Size, str] = sizes.radius_md,
             text_size: Union[sizes.Size, str] = sizes.text_lg,
-            font: Union[fonts.Font | str]
+            font: Union[fonts.Font, str]
             = (
                     fonts.GoogleFont("Quicksand"),
                     "ui-sans-serif",
                     "sans-serif",
             ),
-            font_mono: Union[fonts.Font | str]
+            font_mono: Union[fonts.Font, str]
             = (
                     fonts.GoogleFont("IBM Plex Mono"),
                     "ui-monospace",
