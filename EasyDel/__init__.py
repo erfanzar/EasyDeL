@@ -6,8 +6,9 @@ from .modules import FlaxLlamaModel, FlaxLlamaForCausalLM, LlamaConfig, \
     FlaxT5ForConditionalGeneration, FlaxT5Model, FlaxPalmForCausalLM, PalmModel, PalmConfig, T5Config, \
     FlaxOPTForCausalLM, FlaxOPTModel, OPTConfig
 from .trainer import TrainArguments, fsdp_train_step, get_training_modules, CausalLMTrainer
+from .serve import JAXServer
 
-__version__ = '0.0.20'
+__version__ = '0.0.21'
 
 __all__ = "TrainArguments", "fsdp_train_step", 'get_training_modules', \
     'FlaxLlamaForCausalLM', \
@@ -19,4 +20,4 @@ __all__ = "TrainArguments", "fsdp_train_step", 'get_training_modules', \
     "FlaxGPTNeoXForCausalLM", "GPTNeoXConfig", "FlaxGPTNeoXModel", \
     "FlaxT5ForConditionalGeneration", "FlaxT5Model", \
     "FlaxPalmForCausalLM", "PalmModel", "PalmConfig", 'T5Config', \
-    "FlaxOPTForCausalLM", "FlaxOPTModel", "OPTConfig", 'CausalLMTrainer', 'LlamaConfig', "__version__"
+    "FlaxOPTForCausalLM", "FlaxOPTModel", "OPTConfig", 'CausalLMTrainer', 'LlamaConfig', "__version__",'JAXServer'
