@@ -615,14 +615,29 @@ class FlaxLlamaBlock(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
-        self.attention = FlaxLlamaAttention(
+        attn_block = FlaxLlamaAttention
+        if self.config.gradient_checkpointing != '':
+            attn_block = remat(
+                FlaxLlamaAttention, static_argnums=(3, 4, 5),
+                policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing)
+            )
+
+        self.attention = attn_block(
             self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
             name='self_attn' if self.config.from_pt else 'attention'
         )
-        self.feed_forward = FlaxLlamaMLP(
+        mlp_block = FlaxLlamaMLP
+
+        if self.config.gradient_checkpointing != '':
+            mlp_block = remat(
+                FlaxLlamaMLP, static_argnums=(1,),
+                policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing)
+            )
+
+        self.feed_forward = mlp_block(
             self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -841,12 +856,6 @@ class FlaxLlamaBlockCollection(nn.Module):
 
     def setup(self):
         block = FlaxLlamaBlock
-
-        if self.config.gradient_checkpointing != '':
-            block = remat(
-                block, static_argnums=(3, 4, 5),
-                policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing)
-            )
 
         self.blocks = [
             block(self.config, name=str(i), dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision)
