@@ -4,6 +4,7 @@ import functools
 import flax.core
 import gradio as gr
 import jax
+import tqdm
 import uvicorn
 from fastapi import FastAPI
 from fjutils import easylm
@@ -156,6 +157,35 @@ class JAXServer(object):
         if updates is not None:
             config.update(ConfigDict(updates).copy_and_resolve_references())
         return config
+
+    @classmethod
+    def load_from_ckpt(cls,
+                       ckpt_path,
+                       model,
+                       tokenizer,
+                       partition_rules,
+                       config=None,
+                       add_param_field: bool = True,
+                       use_cpu_index: int = 0,
+                       default_backend: str = 'cpu'):
+        assert default_backend in ['cpu', 'tpu', 'gpu'], 'correct backends are cpu gpu tpu'
+        if default_backend == 'cpu':
+            logging.info('Using offload parameters on CPU')
+        from flax.serialization import from_bytes
+        import msgpack
+        params = {}
+        with jax.default_device(jax.devices(default_backend)[use_cpu_index]):
+            with open(ckpt_path, 'rb') as fin:
+                unpacker = msgpack.Unpacker(fin, max_buffer_size=0, read_size=880000000)
+                for key, tensor in unpacker:
+                    key = tuple(key)
+                    params[key] = from_bytes(None, tensor)
+        params = unflatten_dict(params)
+        params = {'params': params} if add_param_field else params
+        server = cls(config)
+        server.shard_params(params=params, partition_rules=partition_rules)
+        server.configure_generate_functions(model=model, tokenizer=tokenizer)
+        return server
 
     def status(self):
         return {
@@ -356,6 +386,7 @@ class JAXServer(object):
                 string,
                 greedy: bool = False,
                 max_new_tokens: int = None,
+                pbar=tqdm.pbar
                 ):
         tokens = self.prefix_tokenizer(
             string,
@@ -374,8 +405,8 @@ class JAXServer(object):
         num_generated_tokens = 0
         pad = self.config.max_length - self.config.max_stream_tokens
 
-        for _ in trange((max_new_tokens or self.config.max_new_tokens) // self.config.max_stream_tokens,
-                        disable=not self.config.logging):
+        for _ in pbar(range((max_new_tokens or self.config.max_new_tokens) // self.config.max_stream_tokens),
+                      disable=not self.config.logging):
             predicted_token = self.greedy_generate(
                 params=self.params,
                 input_ids=input_ids,
@@ -412,23 +443,25 @@ class JAXServer(object):
 
         return message_history
 
-    def process_gradio_chat(self, prompt, history, max_new_tokens, greedy):
+    def process_gradio_chat(self, prompt, history, max_new_tokens, greedy, pbar):
         string = self.process_chat_history(history)
         string += self.config.prompt_prefix_chat + prompt + self.config.prompt_postfix_chat
         answer, _ = self.process(
             string=string,
             greedy=greedy,
-            max_new_tokens=max_new_tokens
+            max_new_tokens=max_new_tokens,
+            pbar=pbar
         )
         history.append([prompt, answer])
         return '', history
 
-    def process_gradio_instruct(self, prompt, system, max_new_tokens, greedy):
+    def process_gradio_instruct(self, prompt, system, max_new_tokens, greedy, pbar):
         string = self.config.instruct_format.format(system=system, instruct=prompt)
         answer, _ = self.process(
             string=string,
             greedy=greedy,
-            max_new_tokens=max_new_tokens
+            max_new_tokens=max_new_tokens,
+            pbar=pbar
         )
         return '', answer
 
@@ -456,8 +489,9 @@ class JAXServer(object):
                     max_length = gr.Slider(value=self.config.max_length, maximum=self.config.max_length, minimum=1,
                                            label='Max Length', step=1)
                     temperature = gr.Slider(value=0.2, maximum=1, minimum=0.1, label='Temperature', step=0.01)
+
                     greedy = gr.Checkbox(value=True, label='Greedy Search')
-            inputs = [prompt, history, max_new_tokens, greedy]
+            inputs = [prompt, history, max_new_tokens, greedy, gr.Progress]
             sub_event = submit.click(fn=self.process_gradio_chat, inputs=inputs, outputs=[prompt, history])
 
             def clear_():
@@ -496,7 +530,7 @@ class JAXServer(object):
                                            label='Max Length', step=1)
                     temperature = gr.Slider(value=0.2, maximum=1, minimum=0.1, label='Temperature', step=0.01)
                     greedy = gr.Checkbox(value=True, label='Greedy Search')
-            inputs = [prompt, system, max_new_tokens, greedy]
+            inputs = [prompt, system, max_new_tokens, greedy, gr.Progress]
             sub_event = submit.click(fn=self.process_gradio_instruct, inputs=inputs, outputs=[prompt, pred])
 
             def clear_():
