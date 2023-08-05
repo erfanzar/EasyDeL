@@ -355,8 +355,8 @@ class CausalLMTrainer:
 
                             batch['labels'] = batch['input_ids'][..., 1:]
 
-                            for i in self.arguments.ids_to_pop_from_dataset:
-                                _ = batch.pop(i, None)
+                            for ssb in self.arguments.ids_to_pop_from_dataset:
+                                _ = batch.pop(ssb, None)
                             time_s = time.time()
                             sharded_train_state_, loss, accuracy = self.sharded_train_step_fn(sharded_train_state_,
                                                                                               batch,
