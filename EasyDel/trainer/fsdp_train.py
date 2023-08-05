@@ -248,9 +248,10 @@ class CausalLMTrainer:
         else:
             assert self.arguments.custom_rule is not None, 'if you are using custom model to init you must' \
                                                            ' pass custom_rule for partition rules '
+            self.arguments.configs_to_init_model_class[
+                'config'].use_pjit_attention_force = self.arguments.use_pjit_attention_force
             model = self.arguments.model_class(
                 **self.arguments.configs_to_init_model_class,
-                use_pjit_attention_force=self.arguments.use_pjit_attention_force,
                 _do_init=False
             )
             config = self.arguments.configs_to_init_model_class['config']
