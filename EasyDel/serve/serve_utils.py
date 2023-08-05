@@ -519,7 +519,7 @@ class JAXServer(object):
                 clear = gr.Button(value='Clear Conversation')
             with gr.Column():
                 prompt = gr.Textbox(show_label=False, placeholder='Instruct Message').style(container=False)
-                system = gr.Textbox(value='You Are an helpful AI Assistant, generate long and useful answers',
+                system = gr.Textbox(value='You Are an helpful AI Assistant, generate good and helpful answers',
                                     show_label=False, placeholder='System Message').style(container=False)
 
             with gr.Row():
