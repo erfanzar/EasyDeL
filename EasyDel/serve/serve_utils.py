@@ -100,7 +100,9 @@ class JAXServer(object):
         self.app.post('/instruct')(self.forward_instruct)
         self.app.get('/status')(self.status)
         self.gradio_app_chat = self.create_gradio_ui_chat()
-        self.app = gr.mount_gradio_app(self.app, self.gradio_app_chat, '/gradio_app')
+        self.gradio_app_instruct = self.create_gradio_ui_instruct()
+        self.app = gr.mount_gradio_app(self.app, self.gradio_app_chat, '/gradio_chat')
+        self.app = gr.mount_gradio_app(self.app, self.gradio_app_instruct, '/gradio_instruct')
 
     @staticmethod
     def get_default_config(updates=None):
