@@ -491,7 +491,7 @@ class JAXServer(object):
                     temperature = gr.Slider(value=0.2, maximum=1, minimum=0.1, label='Temperature', step=0.01)
 
                     greedy = gr.Checkbox(value=True, label='Greedy Search')
-            inputs = [prompt, history, max_new_tokens, greedy, gr.Progress]
+            inputs = [prompt, history, max_new_tokens, greedy, gr.Progress(True)]
             sub_event = submit.click(fn=self.process_gradio_chat, inputs=inputs, outputs=[prompt, history])
 
             def clear_():
@@ -530,7 +530,7 @@ class JAXServer(object):
                                            label='Max Length', step=1)
                     temperature = gr.Slider(value=0.2, maximum=1, minimum=0.1, label='Temperature', step=0.01)
                     greedy = gr.Checkbox(value=True, label='Greedy Search')
-            inputs = [prompt, system, max_new_tokens, greedy, gr.Progress]
+            inputs = [prompt, system, max_new_tokens, greedy, gr.Progress(True)]
             sub_event = submit.click(fn=self.process_gradio_instruct, inputs=inputs, outputs=[prompt, pred])
 
             def clear_():
