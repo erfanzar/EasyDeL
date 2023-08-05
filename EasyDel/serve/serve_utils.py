@@ -131,9 +131,9 @@ class JAXServer(object):
         config.contains_auto_format = True
 
         config.max_length = 2048
-        config.max_new_tokens = 512
+        config.max_new_tokens = 2048
 
-        config.max_stream_tokens = 128
+        config.max_stream_tokens = 32
 
         assert config.max_new_tokens % config.max_stream_tokens == 0, \
             'max_new_tokens should be divisible by  max_new_tokens' \
@@ -491,7 +491,8 @@ class JAXServer(object):
                     temperature = gr.Slider(value=0.2, maximum=1, minimum=0.1, label='Temperature', step=0.01)
 
                     greedy = gr.Checkbox(value=True, label='Greedy Search')
-            inputs = [prompt, history, max_new_tokens, greedy, gr.Progress(True)]
+            pbar = gr.Progress(True)
+            inputs = [prompt, history, max_new_tokens, greedy, pbar]
             sub_event = submit.click(fn=self.process_gradio_chat, inputs=inputs, outputs=[prompt, history])
 
             def clear_():
@@ -530,7 +531,9 @@ class JAXServer(object):
                                            label='Max Length', step=1)
                     temperature = gr.Slider(value=0.2, maximum=1, minimum=0.1, label='Temperature', step=0.01)
                     greedy = gr.Checkbox(value=True, label='Greedy Search')
-            inputs = [prompt, system, max_new_tokens, greedy, gr.Progress(True)]
+
+            pbar = gr.Progress(True)
+            inputs = [prompt, system, max_new_tokens, greedy, pbar]
             sub_event = submit.click(fn=self.process_gradio_instruct, inputs=inputs, outputs=[prompt, pred])
 
             def clear_():
