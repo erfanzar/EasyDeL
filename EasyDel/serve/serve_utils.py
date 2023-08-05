@@ -406,7 +406,7 @@ class JAXServer(object):
         pad = self.config.max_length - self.config.max_stream_tokens
 
         for _ in pbar.tqdm(range((max_new_tokens or self.config.max_new_tokens) // self.config.max_stream_tokens),
-                           disable=not self.config.logging):
+                           ):
             predicted_token = self.greedy_generate(
                 params=self.params,
                 input_ids=input_ids,
