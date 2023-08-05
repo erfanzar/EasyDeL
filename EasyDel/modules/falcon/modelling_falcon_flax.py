@@ -439,9 +439,11 @@ class FlaxFalconModule(nn.Module):
         mv = jnp.finfo(hidden_states).min
         if attention_mask.ndim == 2:
             attention_mask = attention_mask[:, jnp.newaxis, jnp.newaxis, :]
-        attention_mask = jnp.where(attention_mask == 1, 0, mv) + jnp.where(causal_mask == 1, 0, mv)
-
-        causal_mask += attention_mask
+        # attention_mask = jnp.where(attention_mask == 1, 0, mv) + jnp.where(causal_mask == 1, 0, mv)
+        attention_mask += causal_mask
+        attention_mask = jnp.where(
+            attention_mask == 2, 0, mv
+        )
         output = self.ln_f(self.h(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
