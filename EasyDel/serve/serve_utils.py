@@ -399,7 +399,8 @@ class JAXServer(object):
                 -1] == self.prefix_tokenizer.eos_token_id:
                 break
 
-        return self.tokenizer.decode(input_ids[0][-num_generated_tokens:]), num_generated_tokens
+        return self.tokenizer.decode(input_ids[0][-num_generated_tokens:],
+                                     skip_special_tokens=True), num_generated_tokens
 
     def process_chat_history(self, history: List):
         if len(history) == 0:
