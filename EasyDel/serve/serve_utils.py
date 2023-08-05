@@ -386,7 +386,7 @@ class JAXServer(object):
                 string,
                 greedy: bool = False,
                 max_new_tokens: int = None,
-                pbar=tqdm.tqdm
+                pbar=tqdm
                 ):
         tokens = self.prefix_tokenizer(
             string,
@@ -405,8 +405,8 @@ class JAXServer(object):
         num_generated_tokens = 0
         pad = self.config.max_length - self.config.max_stream_tokens
 
-        for _ in pbar(range((max_new_tokens or self.config.max_new_tokens) // self.config.max_stream_tokens),
-                      disable=not self.config.logging):
+        for _ in pbar.tqdm(range((max_new_tokens or self.config.max_new_tokens) // self.config.max_stream_tokens),
+                           disable=not self.config.logging):
             predicted_token = self.greedy_generate(
                 params=self.params,
                 input_ids=input_ids,
@@ -443,7 +443,7 @@ class JAXServer(object):
 
         return message_history
 
-    def process_gradio_chat(self, prompt, history, max_new_tokens, greedy, pbar):
+    def process_gradio_chat(self, prompt, history, max_new_tokens, greedy, pbar=gr.Progress()):
         string = self.process_chat_history(history)
         string += self.config.prompt_prefix_chat + prompt + self.config.prompt_postfix_chat
         answer, _ = self.process(
@@ -455,7 +455,7 @@ class JAXServer(object):
         history.append([prompt, answer])
         return '', history
 
-    def process_gradio_instruct(self, prompt, system, max_new_tokens, greedy, pbar):
+    def process_gradio_instruct(self, prompt, system, max_new_tokens, greedy, pbar=gr.Progress()):
         string = self.config.instruct_format.format(system=system, instruct=prompt)
         answer, _ = self.process(
             string=string,
@@ -491,8 +491,8 @@ class JAXServer(object):
                     temperature = gr.Slider(value=0.2, maximum=1, minimum=0.1, label='Temperature', step=0.01)
 
                     greedy = gr.Checkbox(value=True, label='Greedy Search')
-            pbar = gr.Progress(True)
-            inputs = [prompt, history, max_new_tokens, greedy, pbar]
+
+            inputs = [prompt, history, max_new_tokens, greedy]
             sub_event = submit.click(fn=self.process_gradio_chat, inputs=inputs, outputs=[prompt, history])
 
             def clear_():
@@ -532,8 +532,7 @@ class JAXServer(object):
                     temperature = gr.Slider(value=0.2, maximum=1, minimum=0.1, label='Temperature', step=0.01)
                     greedy = gr.Checkbox(value=True, label='Greedy Search')
 
-            pbar = gr.Progress(True)
-            inputs = [prompt, system, max_new_tokens, greedy, pbar]
+            inputs = [prompt, system, max_new_tokens, greedy]
             sub_event = submit.click(fn=self.process_gradio_instruct, inputs=inputs, outputs=[prompt, pred])
 
             def clear_():
