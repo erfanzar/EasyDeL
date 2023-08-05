@@ -386,7 +386,7 @@ class JAXServer(object):
                 string,
                 greedy: bool = False,
                 max_new_tokens: int = None,
-                pbar=tqdm.pbar
+                pbar=tqdm.tqdm
                 ):
         tokens = self.prefix_tokenizer(
             string,
