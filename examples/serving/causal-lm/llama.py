@@ -73,6 +73,40 @@ flags.DEFINE_integer(
     help='number of tokens being streamed and generated at time '
 )
 
+flags.DEFINE_integer(
+    name="seed",
+    default=552,
+    help='seed'
+)
+
+flags.DEFINE_integer(
+    name="top_k",
+    default=50,
+    help='top_k to generate outputs'
+)
+flags.DEFINE_bool(
+    name='use_prefix_tokenizer',
+    default=True,
+    help='use_prefix_tokenizer'
+)
+flags.DEFINE_string(
+    name="dtype",
+    default='fp16',
+    help='model and parameters data type'
+)
+
+flags.DEFINE_float(
+    name='temperature',
+    default=0.1,
+    help='model temperature to generate outputs'
+)
+
+flags.DEFINE_float(
+    name='top_p',
+    default=0.95,
+    help='model top_p to generate outputs'
+)
+
 
 def main(argv):
     conf = EasyDel.configs.configs.llama_configs[FLAGS.model_type]
@@ -102,7 +136,17 @@ def main(argv):
                      "contains_auto_format ": True,
                      "max_length ": FLAGS.max_length,
                      "max_new_tokens ": FLAGS.max_new_tokens,
-                     "max_stream_tokens ": FLAGS.max_stream_tokens}
+                     "max_stream_tokens ": FLAGS.max_stream_tokens,
+                     "temperature ": FLAGS.temperature,
+                     "top_p ": FLAGS.top_p,
+                     "top_k ": FLAGS.top_k,
+                     "logging ": True,
+                     "mesh_axes_names ": ('dp', 'fsdp', 'mp'),
+                     "mesh_axes_shape ": (1, -1, 1),
+                     "dtype ": FLAGS.dtype,
+                     "seed ": FLAGS.seed,
+                     "use_prefix_tokenizer ": FLAGS.use_prefix_tokenizer
+                     }
     server = JAXServer.load_from_ckpt(
         ckpt_path=FLAGS.ckpt_path,
         model=model,
