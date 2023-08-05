@@ -816,7 +816,7 @@ class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
             rngs["dropout"] = dropout_rng
 
         inputs = {"params": params or self.params} if add_params_field else params or self.params
-
+        print(inputs)
         if past_key_values:
             inputs["cache"] = past_key_values
             mutable = ["cache"]
