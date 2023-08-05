@@ -99,8 +99,8 @@ class JAXServer(object):
         self.app.post('/chat')(self.forward_chat)
         self.app.post('/instruct')(self.forward_instruct)
         self.app.get('/status')(self.status)
-        self.gradio_app = self.create_gradio_ui()
-        self.app = gr.mount_gradio_app(self.app, self.gradio_app, '/gradio_app')
+        self.gradio_app_chat = self.create_gradio_ui_chat()
+        self.app = gr.mount_gradio_app(self.app, self.gradio_app_chat, '/gradio_app')
 
     @staticmethod
     def get_default_config(updates=None):
@@ -420,7 +420,16 @@ class JAXServer(object):
         history.append([prompt, answer])
         return '', history
 
-    def create_gradio_ui(self):
+    def process_gradio_instruct(self, prompt, system, max_new_tokens, greedy):
+        string = self.config.instruct_format.format(system=system, instruct=prompt)
+        answer, _ = self.process(
+            string=string,
+            greedy=greedy,
+            max_new_tokens=max_new_tokens
+        )
+        return '', answer
+
+    def create_gradio_ui_chat(self):
         with gr.Blocks(
                 theme=seafoam) as block:
             gr.Markdown("# <h1> <center>Powered by [EasyDeL](https://github.com/erfanzar/EasyDel) </center> </h1>")
@@ -453,6 +462,45 @@ class JAXServer(object):
 
             clear.click(fn=clear_, outputs=[history])
             txt_event = prompt.submit(fn=self.process_gradio_chat, inputs=inputs, outputs=[prompt, history])
+
+            stop.click(fn=None, inputs=None, outputs=None, cancels=[txt_event, sub_event])
+
+        block.queue()
+        return block
+
+    def create_gradio_ui_instruct(self):
+        with gr.Blocks(
+                theme=seafoam) as block:
+            gr.Markdown("# <h1> <center>Powered by [EasyDeL](https://github.com/erfanzar/EasyDel) </center> </h1>")
+            with gr.Row():
+                pred = gr.TextArea(elem_id="EasyDel", label="EasyDel").style(container=True, height=600)
+
+            with gr.Row():
+                submit = gr.Button(variant="primary")
+                stop = gr.Button(value='Stop ')
+                clear = gr.Button(value='Clear Conversation')
+            with gr.Column():
+                prompt = gr.Textbox(show_label=False, placeholder='Instruct Message').style(container=False)
+                system = gr.Textbox(value='You Are an helpful AI Assistant, generate long and useful answers',
+                                    show_label=False, placeholder='System Message').style(container=False)
+
+            with gr.Row():
+                with gr.Accordion('Advanced Options', open=False):
+                    max_new_tokens = gr.Slider(value=self.config.max_new_tokens, maximum=10000,
+                                               minimum=self.config.max_stream_tokens,
+                                               label='Max New Tokens', step=self.config.max_stream_tokens, )
+                    max_length = gr.Slider(value=self.config.max_length, maximum=self.config.max_length, minimum=1,
+                                           label='Max Length', step=1)
+                    temperature = gr.Slider(value=0.2, maximum=1, minimum=0.1, label='Temperature', step=0.01)
+                    greedy = gr.Checkbox(value=True, label='Greedy Search')
+            inputs = [prompt, system, max_new_tokens, greedy]
+            sub_event = submit.click(fn=self.process_gradio_instruct, inputs=inputs, outputs=[prompt, pred])
+
+            def clear_():
+                return ''
+
+            clear.click(fn=clear_, outputs=[pred])
+            txt_event = prompt.submit(fn=self.process_gradio_chat, inputs=inputs, outputs=[prompt, pred])
 
             stop.click(fn=None, inputs=None, outputs=None, cancels=[txt_event, sub_event])
 
