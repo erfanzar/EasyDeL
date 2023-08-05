@@ -502,7 +502,7 @@ class JAXServer(object):
                 return ''
 
             clear.click(fn=clear_, outputs=[pred])
-            txt_event = prompt.submit(fn=self.process_gradio_chat, inputs=inputs, outputs=[prompt, pred])
+            txt_event = prompt.submit(fn=self.process_gradio_instruct, inputs=inputs, outputs=[prompt, pred])
 
             stop.click(fn=None, inputs=None, outputs=None, cancels=[txt_event, sub_event])
 
