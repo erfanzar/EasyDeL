@@ -441,8 +441,8 @@ class FlaxFalconModule(nn.Module):
             attention_mask = attention_mask[:, jnp.newaxis, jnp.newaxis, :]
         # attention_mask = jnp.where(attention_mask == 1, 0, mv) + jnp.where(causal_mask == 1, 0, mv)
         *_, dim = attention_mask.shape
-        # print(attention_mask.shape)
-        # print(dim)
+        print(attention_mask.shape)
+        print(dim)
         attention_mask += causal_mask[:, :, :dim, :dim]
         attention_mask = jnp.where(
             attention_mask == 2, 0, mv
