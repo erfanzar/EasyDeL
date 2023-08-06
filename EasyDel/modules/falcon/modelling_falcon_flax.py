@@ -441,8 +441,7 @@ class FlaxFalconModule(nn.Module):
             attention_mask = attention_mask[:, jnp.newaxis, jnp.newaxis, :]
         # attention_mask = jnp.where(attention_mask == 1, 0, mv) + jnp.where(causal_mask == 1, 0, mv)
         *_, dim = attention_mask.shape
-        print(attention_mask.shape)
-        print(dim)
+
         attention_mask += causal_mask[:, :, :dim, :dim]
         attention_mask = jnp.where(
             attention_mask == 2, 0, mv
@@ -495,14 +494,8 @@ class FlaxFalconPretrainedModel(FlaxPreTrainedModel):
         return predict
 
     def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[jax.Array] = None):
-        batch_size, seq_length = input_ids.shape
-
-        extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
-        if attention_mask is not None:
-            extended_attention_mask = jax.lax.dynamic_update_slice(extended_attention_mask, attention_mask, (0, 0))
-
         return {
-            "attention_mask": extended_attention_mask,
+            "attention_mask": attention_mask,
         }
 
 
