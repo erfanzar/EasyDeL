@@ -42,6 +42,10 @@ you can also tell me the model you want in Flax/Jax version and ill try my best 
 
 _Tutorials on how to use and train or serve your models with EasyDel is available at examples dir_
 
+[_Serving_](https://github.com/erfanzar/EasyDeL/tree/main/examples/serving)
+
+[_Train_](https://github.com/erfanzar/EasyDeL/tree/main/examples/training/causal-lm)
+
 ## FineTuning
 
 with using EasyDel FineTuning LLM (CausalLanguageModels) are easy as much as possible with using Jax and Flax
