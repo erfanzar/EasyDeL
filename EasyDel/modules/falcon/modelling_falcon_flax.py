@@ -114,17 +114,17 @@ class FalconConfig(PretrainedConfig):
     @staticmethod
     def get_partition_rules(fully_fsdp: bool = False):
         return (
-            ('wte/embedding', PartitionSpec('fsdp', 'mp')),
-            ('self_attention/w_qkv/(kernel|bias)', PartitionSpec('fsdp', 'mp')),
-            ('self_attention/wo/(kernel|bias)', PartitionSpec('fsdp', 'mp')),
-            ('mlp/down/(kernel|bias)', PartitionSpec('fsdp', 'mp')),
-            ('mlp/up/(kernel|bias)', PartitionSpec('mp', 'fsdp')),
-            ('lm_head/kernel', PartitionSpec('fsdp', 'mp')),
-            ('transformer/ln_f/bias', PartitionSpec('fsdp', 'mp')),
-            ('transformer/ln_f/scale', PartitionSpec('fsdp', 'mp')),
-            ('transformer/post_attention_layernorm/scale', PartitionSpec('mp', 'fsdp')),
-            ('transformer/post_attention_layernorm/bias', PartitionSpec('mp', 'fsdp')),
-            ('.*', PartitionSpec('fsdp', 'mp'))
+            ('wte/embedding', PartitionSpec('dp', 'fsdp')),
+            ('self_attention/w_qkv/(kernel)', PartitionSpec('dp', 'fsdp')),
+            ('self_attention/wo/(kernel)', PartitionSpec('dp', 'fsdp')),
+            ('mlp/down/(kernel)', PartitionSpec('dp', 'fsdp')),
+            ('mlp/up/(kernel)', PartitionSpec('dp', 'fsdp')),
+            ('lm_head/kernel', PartitionSpec('dp', 'fsdp')),
+            ('transformer/ln_f/bias', PartitionSpec('fsdp')),
+            ('transformer/ln_f/scale', PartitionSpec('fsdp')),
+            ('transformer/post_attention_layernorm/scale', PartitionSpec('fsdp')),
+            ('transformer/post_attention_layernorm/bias', PartitionSpec('fsdp')),
+            ('.*', PartitionSpec('dp'))
         ) if not fully_fsdp else (
             ('wte/embedding', PartitionSpec('fsdp')),
             ('self_attention/w_qkv/(kernel|bias)', PartitionSpec('fsdp')),
