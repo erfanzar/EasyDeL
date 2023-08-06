@@ -334,7 +334,7 @@ class JAXServer(object):
         history = self.process_chat_history(data.history or [])
         history += self.config.prompt_prefix_chat + data.prompt + self.config.prompt_postfix_chat
 
-        answer, used_tokens = self.process(
+        response, used_tokens = self.process(
             string=history,
             greedy=data.greedy,
             max_new_tokens=None
@@ -342,7 +342,7 @@ class JAXServer(object):
         self.number_of_served_request_until_last_up_time += 1
         return {
             'input': f'{history}',
-            'answer': answer,
+            'response': response,
             'tokens_used': used_tokens,
         }
 
@@ -354,7 +354,7 @@ class JAXServer(object):
 
         string = self.config.instruct_format.format(instruct=data.prompt, system=data.system)
 
-        answer, used_tokens = self.process(
+        response, used_tokens = self.process(
             string=string,
             greedy=data.greedy,
             max_new_tokens=None
@@ -362,7 +362,7 @@ class JAXServer(object):
         self.number_of_served_request_until_last_up_time += 1
         return {
             'input': f'{string}',
-            'answer': answer,
+            'response': response,
             'tokens_used': used_tokens,
         }
 
@@ -446,24 +446,24 @@ class JAXServer(object):
     def process_gradio_chat(self, prompt, history, max_new_tokens, greedy, pbar=gr.Progress()):
         string = self.process_chat_history(history)
         string += self.config.prompt_prefix_chat + prompt + self.config.prompt_postfix_chat
-        answer, _ = self.process(
+        response, _ = self.process(
             string=string,
             greedy=greedy,
             max_new_tokens=max_new_tokens,
             pbar=pbar
         )
-        history.append([prompt, answer])
+        history.append([prompt, response])
         return '', history
 
     def process_gradio_instruct(self, prompt, system, max_new_tokens, greedy, pbar=gr.Progress()):
         string = self.config.instruct_format.format(system=system, instruct=prompt)
-        answer, _ = self.process(
+        response, _ = self.process(
             string=string,
             greedy=greedy,
             max_new_tokens=max_new_tokens,
             pbar=pbar
         )
-        return '', answer
+        return '', response
 
     def create_gradio_ui_chat(self):
         with gr.Blocks(
