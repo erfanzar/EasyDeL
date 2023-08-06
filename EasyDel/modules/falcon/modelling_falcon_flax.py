@@ -498,6 +498,9 @@ class FlaxFalconPretrainedModel(FlaxPreTrainedModel):
             "attention_mask": attention_mask,
         }
 
+    def update_inputs_for_generation(self, model_outputs, model_kwargs):
+        return model_kwargs
+
 
 class FlaxFalconModel(FlaxFalconPretrainedModel):
     module_class = FlaxFalconModule
