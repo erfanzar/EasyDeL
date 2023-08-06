@@ -321,6 +321,14 @@ class PalmPretrainedModel(transformers.FlaxPreTrainedModel):
         )
         return predict
 
+    def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[jax.Array] = None):
+        return {
+            "attention_mask": attention_mask,
+        }
+
+    def update_inputs_for_generation(self, model_outputs, model_kwargs):
+        return model_kwargs
+
 
 class PalmModule(nn.Module):
     config: PalmConfig

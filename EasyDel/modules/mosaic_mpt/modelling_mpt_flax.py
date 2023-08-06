@@ -437,12 +437,13 @@ class FlaxMptPretrainedModel(FlaxPreTrainedModel):
         )
         return predict
 
-    def prepare_inputs_for_generation(self, input_ids, attention_mask=None):
-
+    def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[jax.Array] = None):
         return {
-            'input_ids': input_ids,
-            'attention_mask': attention_mask
+            "attention_mask": attention_mask,
         }
+
+    def update_inputs_for_generation(self, model_outputs, model_kwargs):
+        return model_kwargs
 
 
 class FlaxMptModel(FlaxMptPretrainedModel):
