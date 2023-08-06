@@ -8,7 +8,7 @@ from .modules import FlaxLlamaModel, FlaxLlamaForCausalLM, LlamaConfig, \
 from .trainer import TrainArguments, fsdp_train_step, get_training_modules, CausalLMTrainer
 from .serve import JAXServer
 
-__version__ = '0.0.22'
+__version__ = '0.0.23'
 
 __all__ = "TrainArguments", "fsdp_train_step", 'get_training_modules', \
     'FlaxLlamaForCausalLM', \
