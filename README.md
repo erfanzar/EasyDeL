@@ -24,16 +24,14 @@ pip install git+https://github.com/erfanzar/EasyDel
 
 ## Available Models Are
 
-- Llama     (Support `FSDP`, `MP`,` DP`)(_Supports gradient checkpointing_)
-- GPT-J     (Support `FSDP`, `MP`,` DP`)(_Supports gradient checkpointing_)
-- LT        (Support `FSDP`, `MP`, `DP`)(_Supports gradient checkpointing_)
-- MosaicMPT (Support `FSDP`, `MP`,` DP`)(_Supports gradient checkpointing_)
-- GPTNeoX   (Support `FSDP`, `MP`, `DP`)(_Supports gradient checkpointing_)
-- Falcon    (Support `FSDP`, `MP`, `DP`)(_Supports gradient checkpointing_)
-- Palm      (Support `FSDP`, `MP`, `DP`)(_Supports gradient checkpointing_)
-- T5        (Support `FSDP`, `MP`, `DP`)(_Supports gradient checkpointing_)
-
-
+- **_Llama_**     (Support `FSDP`, `MP`,` DP`)(_Supports gradient checkpointing_)
+- **_GPT-J_**     (Support `FSDP`, `MP`,` DP`)(_Supports gradient checkpointing_)
+- **_LT_**        (Support `FSDP`, `MP`, `DP`)(_Supports gradient checkpointing_)
+- **_MosaicMPT_** (Support `FSDP`, `MP`,` DP`)(_Supports gradient checkpointing_)
+- **_GPTNeoX_**   (Support `FSDP`, `MP`, `DP`)(_Supports gradient checkpointing_)
+- **_Falcon_**    (Support `FSDP`, `MP`, `DP`)(_Supports gradient checkpointing_)
+- **_Palm_**      (Support `FSDP`, `MP`, `DP`)(_Supports gradient checkpointing_)
+- **_T5_**        (Support `FSDP`, `MP`, `DP`)(_Supports gradient checkpointing_)
 - _LLama GPT-J MosaicMPT Falcon supports Flash Attention_
 
 you can also tell me the model you want in Flax/Jax version and ill try my best to build it ;)
