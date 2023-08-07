@@ -214,7 +214,6 @@ class LlamaConfig(PretrainedConfig):
                      fcm_min_ratio: float = 0.0,
                      fcm_max_ratio: float = 0.0,
                      use_pjit_attention_force: bool = True,
-                     rope_scaling: Dict[str, Union[str, float]] = None,
                      use_flash_attention: bool = False,
                      use_sacn_mlp: bool = False,
                      flash_attn_query_chunk_size: int = 1024,
@@ -226,7 +225,6 @@ class LlamaConfig(PretrainedConfig):
         self.from_pt = from_pt
         self.use_flash_attention = use_flash_attention
         self.use_sacn_mlp = use_sacn_mlp
-        self.rope_scaling = rope_scaling
         self.embd_pdrop = embd_pdrop
         self.resid_pdrop = resid_pdrop
         self.embd_pdrop = embd_pdrop
