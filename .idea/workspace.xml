@@ -6,8 +6,6 @@
   <component name="ChangeListManager">
     <list default="true" id="08ad205b-709f-455b-86db-91293f595cd3" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/EasyDel/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/__init__.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/EasyDel/configs/configs.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/configs/configs.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/EasyDel/modules/llama/modelling_llama_flax.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/modules/llama/modelling_llama_flax.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -63,7 +61,7 @@
       <recent name="$PROJECT_DIR$" />
     </key>
   </component>
-  <component name="RunManager" selected="Python.io">
+  <component name="RunManager" selected="Python.env">
     <configuration default="true" type="PythonConfigurationType" factoryName="Python">
       <module name="EasyDL" />
       <option name="INTERPRETER_OPTIONS" value="" />
@@ -90,9 +88,6 @@
       <module name="EasyDeL" />
       <option name="INTERPRETER_OPTIONS" value="" />
       <option name="PARENT_ENVS" value="true" />
-      <envs>
-        <env name="PYTHONUNBUFFERED" value="1" />
-      </envs>
       <option name="SDK_HOME" value="" />
       <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$" />
       <option name="IS_MODULE_SDK" value="true" />
@@ -132,8 +127,8 @@
     </configuration>
     <recent_temporary>
       <list>
-        <item itemvalue="Python.io" />
         <item itemvalue="Python.env" />
+        <item itemvalue="Python.io" />
       </list>
     </recent_temporary>
   </component>
@@ -198,7 +193,7 @@
       <workItem from="1691051581762" duration="8253000" />
       <workItem from="1691234683772" duration="5228000" />
       <workItem from="1691310583977" duration="2378000" />
-      <workItem from="1691423193127" duration="1893000" />
+      <workItem from="1691423193127" duration="3727000" />
     </task>
     <servers />
   </component>
