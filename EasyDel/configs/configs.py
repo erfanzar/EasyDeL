@@ -5,7 +5,8 @@ llama_configs = {
         'intermediate_size': 8640,
         'num_hidden_layers': 26,
         'num_attention_heads': 32,
-        'max_sequence_length': 2048,
+        'num_key_value_heads': None,
+        'max_position_embeddings': 2048,
         'initializer_range': 0.02,
         'rms_norm_eps': 1e-6,
         'use_cache': True,
@@ -18,7 +19,8 @@ llama_configs = {
         'intermediate_size': 11008,
         'num_hidden_layers': 32,
         'num_attention_heads': 32,
-        'max_sequence_length': 2048,
+        'num_key_value_heads': None,
+        'max_position_embeddings': 2048,
         'initializer_range': 0.02,
         'rms_norm_eps': 1e-6,
         'use_cache': True,
@@ -31,7 +33,8 @@ llama_configs = {
         'intermediate_size': 13824,
         'num_hidden_layers': 40,
         'num_attention_heads': 40,
-        'max_sequence_length': 2048,
+        'num_key_value_heads': None,
+        'max_position_embeddings': 2048,
         'initializer_range': 0.02,
         'rms_norm_eps': 1e-6,
         'use_cache': True,
@@ -44,7 +47,8 @@ llama_configs = {
         'intermediate_size': 17920,
         'num_hidden_layers': 60,
         'num_attention_heads': 52,
-        'max_sequence_length': 2048,
+        'num_key_value_heads': None,
+        'max_position_embeddings': 2048,
         'initializer_range': 0.02,
         'rms_norm_eps': 1e-6,
         'use_cache': True,
@@ -57,7 +61,8 @@ llama_configs = {
         'intermediate_size': 22016,
         'num_hidden_layers': 80,
         'num_attention_heads': 64,
-        'max_sequence_length': 2048,
+        'num_key_value_heads': None,
+        'max_position_embeddings': 2048,
         'initializer_range': 0.02,
         'rms_norm_eps': 1e-5,
         'use_cache': True,
@@ -67,53 +72,57 @@ llama_configs = {
 }
 
 llama_2_configs = {
-    '3b': {
-        'vocab_size': 32000,
-        'hidden_size': 3200,
-        'intermediate_size': 8640,
-        'num_hidden_layers': 26,
-        'num_attention_heads': 32,
-        'max_sequence_length': 2048,
-        'initializer_range': 0.02,
-        'rms_norm_eps': 1e-5,
-        'use_cache': True,
-        'tie_word_embeddings': False,
-        "rope_scaling": {
-            "factor": 8.0,
-            "type": "linear"
-        }
-    },
+
     '7b': {
         'vocab_size': 32000,
         'hidden_size': 4096,
         'intermediate_size': 11008,
         'num_hidden_layers': 32,
         'num_attention_heads': 32,
-        'max_sequence_length': 2048,
+        'num_key_value_heads': None,
+        'max_position_embeddings': 2048,
         'initializer_range': 0.02,
         'rms_norm_eps': 1e-5,
         'use_cache': True,
         'tie_word_embeddings': False,
-        "rope_scaling": {
-            "factor": 8.0,
-            "type": "linear"
-        }
+        "rope_scaling": None
     },
-    '30b': {
-        'vocab_size': 32000,
-        'hidden_size': 6656,
-        'intermediate_size': 17920,
-        'num_hidden_layers': 60,
-        'num_attention_heads': 52,
-        'max_sequence_length': 2048,
-        'initializer_range': 0.02,
-        'rms_norm_eps': 1e-5,
-        'use_cache': True,
-        'tie_word_embeddings': False,
-        "rope_scaling": {
-            "factor": 8.0,
-            "type": "linear"
-        }
+    '13b': {
+        "bos_token_id": 1,
+        "eos_token_id": 2,
+        "hidden_act": "silu",
+        "hidden_size": 5120,
+        "initializer_range": 0.02,
+        "intermediate_size": 13824,
+        "max_position_embeddings": 4096,
+        "model_type": "llama",
+        "num_attention_heads": 40,
+        "num_hidden_layers": 40,
+        "num_key_value_heads": None,
+        "pretraining_tp": 1,
+        "rms_norm_eps": 1e-05,
+        "rope_scaling": None,
+        "tie_word_embeddings": False,
+        "use_cache": True,
+        "vocab_size": 32000
+    },
+    '70b': {
+        "bos_token_id": 1,
+        "eos_token_id": 2,
+        "hidden_act": "silu",
+        "hidden_size": 8192,
+        "initializer_range": 0.02,
+        "intermediate_size": 28672,
+        "max_position_embeddings": 4096,
+        "num_attention_heads": 64,
+        "num_hidden_layers": 80,
+        "num_key_value_heads": 8,
+        "pretraining_tp": 1,
+        "rms_norm_eps": 1e-05,
+        "rope_scaling": None,
+        "tie_word_embeddings": False,
+        "use_cache": True,
+        "vocab_size": 32000
     }
 }
 

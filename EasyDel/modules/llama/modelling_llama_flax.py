@@ -1,5 +1,4 @@
-import os
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Dict, Optional, Tuple, Union
 
 from einops import einops
 from flax.linen import remat
@@ -26,7 +25,7 @@ from jax.experimental.pjit import with_sharding_constraint as wsc
 from fjutils import dot_product_attention_multihead
 
 
-def get_names_from_parition_spec(partition_specs):
+def get_names_from_partition_spec(partition_specs):
     names = set()
     if isinstance(partition_specs, dict):
         partition_specs = partition_specs.values()
@@ -36,7 +35,7 @@ def get_names_from_parition_spec(partition_specs):
         elif isinstance(item, str):
             names.add(item)
         else:
-            names.update(get_names_from_parition_spec(item))
+            names.update(get_names_from_partition_spec(item))
 
     return list(names)
 
@@ -46,7 +45,7 @@ def names_in_mesh(*names):
 
 
 def with_sharding_constraint(x, partition_specs):
-    axis_names = get_names_from_parition_spec(partition_specs)
+    axis_names = get_names_from_partition_spec(partition_specs)
     if names_in_mesh(*axis_names):
         x = wsc(x, partition_specs)
     return x
@@ -66,49 +65,52 @@ class LlamaConfig(PretrainedConfig):
 
     def __init__(
             self,
-            vocab_size=32000,
-            hidden_size=4096,
-            intermediate_size=11008,
-            num_hidden_layers=32,
-            num_attention_heads=32,
-            max_sequence_length=2048,
-            rms_norm_eps=1e-6,
-            initializer_range=0.02,
-            use_cache=True,
-            bos_token_id=0,
-            eos_token_id=1,
-            resid_pdrop=0.0,
-            embd_pdrop=0.0,
-            attn_pdrop=0.0,
-            tie_word_embeddings=False,
-            gradient_checkpointing='nothing_saveable',
-            fcm_min_ratio=0.0,
-            fcm_max_ratio=0.0,
+            vocab_size: int = 32000,
+            hidden_size: int = 4096,
+            intermediate_size: int = 11008,
+            num_hidden_layers: int = 32,
+            num_attention_heads: int = 32,
+            num_key_value_heads: Optional[int] = None,
+            max_position_embeddings: int = 2048,
+            rms_norm_eps: float = 1e-6,
+            initializer_range: float = 0.02,
+            use_cache: bool = True,
+            bos_token_id: int = 0,
+            eos_token_id: int = 1,
+            resid_pdrop: float = 0.0,
+            embd_pdrop: float = 0.0,
+            attn_pdrop: float = 0.0,
+            tie_word_embeddings: bool = False,
+            gradient_checkpointing: str = 'nothing_saveable',
+            fcm_min_ratio: float = 0.0,
+            fcm_max_ratio: float = 0.0,
             use_pjit_attention_force: bool = True,
-            rope_scaling=None,
+            rope_scaling: Dict[str, Union[str, float]] = None,
             use_flash_attention: bool = False,
             use_sacn_mlp: bool = False,
-            flash_attn_query_chunk_size=1024,
-            flash_attn_key_chunk_size=1024,
-            scan_mlp_chunk_size=1024,
+            flash_attn_query_chunk_size: int = 1024,
+            flash_attn_key_chunk_size: int = 1024,
+            scan_mlp_chunk_size: int = 1024,
             rotary_type: str = 'complex',
             from_pt: bool = False,
             **kwargs,
     ):
         assert rotary_type in ['open', 'complex',
                                'lm2'], f'{rotary_type} is wrong type of rotary valid types are [open, complex,lm2]'
+        num_key_value_heads = num_key_value_heads or num_attention_heads
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.initializer_range = initializer_range
         self.intermediate_size = intermediate_size
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
-        self.max_sequence_length = max_sequence_length
+        self.max_position_embeddings = max_position_embeddings
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
         self.resid_pdrop = resid_pdrop
         self.embd_pdrop = embd_pdrop
         self.attn_pdrop = attn_pdrop
+        self.num_key_value_heads = num_key_value_heads
         self.gradient_checkpointing = gradient_checkpointing
         self.use_pjit_attention_force = use_pjit_attention_force
         self.fcm_min_ratio = fcm_min_ratio
@@ -200,7 +202,7 @@ class LlamaConfig(PretrainedConfig):
 
                 ("model/norm/kernel", PS(None)),
                 ("lm_head/kernel", PS("fsdp")),
-                ('.*', PS(None)),
+                ('.*', PS('fsdp')),
             )
 
     @staticmethod
@@ -352,12 +354,13 @@ class FlaxLlamaAttention(nn.Module):
 
     def setup(self):
         config = self.config
-        self.embed_dim = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = self.embed_dim // self.num_heads
+        self.hidden_size = config.hidden_size
+
+        self.head_dim_q = self.hidden_size // self.config.num_attention_heads
+        self.head_dim_kv = self.hidden_size // self.config.num_key_value_heads
 
         self.wq = nn.Dense(
-            config.num_attention_heads * self.head_dim,
+            config.num_attention_heads * self.head_dim_q,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
@@ -366,7 +369,7 @@ class FlaxLlamaAttention(nn.Module):
             name='q_proj' if self.config.from_pt else 'wq'
         )
         self.wk = nn.Dense(
-            config.num_attention_heads * self.head_dim,
+            config.num_key_value_heads * self.head_dim_kv,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
@@ -375,7 +378,7 @@ class FlaxLlamaAttention(nn.Module):
             name='k_proj' if self.config.from_pt else 'wk'
         )
         self.wv = nn.Dense(
-            config.num_attention_heads * self.head_dim,
+            config.num_key_value_heads * self.head_dim_kv,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
@@ -395,40 +398,10 @@ class FlaxLlamaAttention(nn.Module):
 
         self.resid_dropout = nn.Dropout(rate=config.resid_pdrop)
 
-        self.causal_mask = make_causal_mask(jnp.ones((1, config.max_sequence_length), dtype="bool"), dtype="bool")
-
-        if self.config.rotary_type == 'complex':
-
-            self.freqs_cis = precompute_freqs_cis(
-                method=self.config.rope_scaling['type'] if self.config.rope_scaling is not None else None,
-                scaling_factor=float(self.config.rope_scaling['factor'] if self.config.rope_scaling is not None else 1),
-                dim=self.head_dim,
-                end=config.max_sequence_length * 2,
-                dtype=self.dtype,
-            )
-        elif self.config.rotary_type == 'open':
-
-            self.freqs_cis = create_sinusoidal_positions(
-                config.max_sequence_length,
-                self.head_dim
-            )
-        elif self.config.rotary_type == 'lm2':
-
-            self.freqs_cis = pre_compute_frq_sin_cos(end=self.config.max_sequence_length,
-                                                     dim=self.head_dim,
-                                                     scale_factor=float(
-                                                         self.config.rope_scaling['factor'] if
-                                                         self.config.rope_scaling is not None else 1),
-                                                     method=self.config.rope_scaling[
-                                                         'type'] if self.config.rope_scaling is not None else None)
-        else:
-            raise ValueError('Unknown type of rotary_embedding')
-
-    def _split_heads(self, hidden_states):
-        return hidden_states.reshape(hidden_states.shape[:2] + (self.num_heads, self.head_dim))
+        self.causal_mask = make_causal_mask(jnp.ones((1, config.max_position_embeddings), dtype="bool"), dtype="bool")
 
     def _merge_heads(self, hidden_states):
-        return hidden_states.reshape(hidden_states.shape[:2] + (self.embed_dim,))
+        return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
 
     @nn.compact
     def _concatenate_to_cache(self, key, value, query, attention_mask):
@@ -457,6 +430,7 @@ class FlaxLlamaAttention(nn.Module):
     def __call__(
             self,
             hidden_states,
+            freqs_cis,
             attention_mask,
             position_ids,
             deterministic: bool = True,
@@ -470,24 +444,24 @@ class FlaxLlamaAttention(nn.Module):
             xk = with_sharding_constraint(xk, PS(("dp", "fsdp"), None, "mp"))
             xv = with_sharding_constraint(xv, PS(("dp", "fsdp"), None, "mp"))
 
-        xq = self._split_heads(xq)
-        xk = self._split_heads(xk)
-        xv = self._split_heads(xv)
+        xq = xq.reshape(xq.shape[:2] + (self.config.num_attention_heads, self.head_dim_q))
+        xk = xk.reshape(xk.shape[:2] + (self.config.num_key_value_heads, self.head_dim_kv))
+        xv = xv.reshape(xv.shape[:2] + (self.config.num_key_value_heads, self.head_dim_kv))
 
         if self.config.rotary_type == 'complex':
 
-            freqs_cis = jnp.take(self.freqs_cis, position_ids, axis=0)
+            freqs_cis = jnp.take(freqs_cis, position_ids, axis=0)
             xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis, dtype=self.dtype)
         elif self.config.rotary_type == 'open':
 
-            freqs_cis = jnp.take(self.freqs_cis, position_ids, axis=0)
+            freqs_cis = jnp.take(freqs_cis, position_ids, axis=0)
             sincos = jnp.split(freqs_cis, 2, axis=-1)
             xq = apply_rotary_pos_emb(xq, sincos).astype(self.dtype)
             xk = apply_rotary_pos_emb(xk, sincos).astype(self.dtype)
             del sincos
         elif self.config.rotary_type == 'lm2':
 
-            cos, sin = self.freqs_cis
+            cos, sin = freqs_cis
             xq = apply_rotary_emb_v2(array=xq, sin=sin, cos=cos)
             xk = apply_rotary_emb_v2(array=xk, sin=sin, cos=cos)
             del sin, cos
@@ -618,7 +592,7 @@ class FlaxLlamaBlock(nn.Module):
         attn_block = FlaxLlamaAttention
         if self.config.gradient_checkpointing != '':
             attn_block = remat(
-                FlaxLlamaAttention, static_argnums=(3, 4, 5),
+                FlaxLlamaAttention, static_argnums=(4, 5, 6),
                 policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing)
             )
 
@@ -662,6 +636,7 @@ class FlaxLlamaBlock(nn.Module):
     def __call__(
             self,
             hidden_states,
+            freqs_cis,
             attention_mask=None,
             position_ids=None,
             deterministic: bool = True,
@@ -671,6 +646,7 @@ class FlaxLlamaBlock(nn.Module):
     ):
         attn_outputs = self.attention(
             self.attention_norm(hidden_states),
+            freqs_cis,
             attention_mask,
             position_ids,
             deterministic,
@@ -865,6 +841,7 @@ class FlaxLlamaBlockCollection(nn.Module):
     def __call__(
             self,
             hidden_states,
+            freqs_cis,
             attention_mask=None,
             position_ids=None,
             deterministic: bool = True,
@@ -899,6 +876,7 @@ class FlaxLlamaBlockCollection(nn.Module):
 
             layer_outputs = block(
                 hidden_states,
+                freqs_cis,
                 attention_mask,
                 position_ids,
                 deterministic,
@@ -924,7 +902,6 @@ class FlaxLlamaModule(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self):
-        self.embed_dim = self.config.hidden_size
 
         self.wte = nn.Embed(
             self.config.vocab_size,
@@ -939,6 +916,32 @@ class FlaxLlamaModule(nn.Module):
                                           precision=self.precision, name='layers' if self.config.from_pt else 'h')
         self.ln_f = RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps, dtype=self.dtype,
                             param_dtype=self.param_dtype, name='norm' if self.config.from_pt else 'ln_f')
+        if self.config.rotary_type == 'complex':
+
+            self.freqs_cis = precompute_freqs_cis(
+                method=self.config.rope_scaling['type'] if self.config.rope_scaling is not None else None,
+                scaling_factor=float(self.config.rope_scaling['factor'] if self.config.rope_scaling is not None else 1),
+                dim=self.config.num_attention_heads,
+                end=self.config.max_position_embeddings * 2,
+                dtype=self.dtype,
+            )
+        elif self.config.rotary_type == 'open':
+
+            self.freqs_cis = create_sinusoidal_positions(
+                self.config.max_position_embeddings,
+                self.config.num_attention_heads
+            )
+        elif self.config.rotary_type == 'lm2':
+
+            self.freqs_cis = pre_compute_frq_sin_cos(end=self.config.max_position_embeddings,
+                                                     dim=self.config.num_attention_heads,
+                                                     scale_factor=float(
+                                                         self.config.rope_scaling['factor'] if
+                                                         self.config.rope_scaling is not None else 1),
+                                                     method=self.config.rope_scaling[
+                                                         'type'] if self.config.rope_scaling is not None else None)
+        else:
+            raise ValueError('Unknown type of rotary_embedding')
 
     def __call__(
             self,
@@ -946,17 +949,20 @@ class FlaxLlamaModule(nn.Module):
             attention_mask,
             position_ids,
             deterministic=True,
+            input_embeds=None,
             init_cache: bool = False,
             output_attentions: bool = False,
             output_hidden_states: bool = False,
             return_dict: bool = True,
     ):
-        input_embeds = self.wte(input_ids.astype("i4"))
+        if input_embeds is None:
+            input_embeds = self.wte(input_ids.astype("i4"))
 
         hidden_states = self.dropout(input_embeds, deterministic=deterministic)
 
         outputs = self.h(
             hidden_states,
+            self.freqs_cis,
             attention_mask,
             position_ids=position_ids,
             deterministic=deterministic,

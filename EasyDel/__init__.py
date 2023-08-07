@@ -20,4 +20,4 @@ __all__ = "TrainArguments", "fsdp_train_step", 'get_training_modules', \
     "FlaxGPTNeoXForCausalLM", "GPTNeoXConfig", "FlaxGPTNeoXModel", \
     "FlaxT5ForConditionalGeneration", "FlaxT5Model", \
     "FlaxPalmForCausalLM", "PalmModel", "PalmConfig", 'T5Config', \
-    "FlaxOPTForCausalLM", "FlaxOPTModel", "OPTConfig", 'CausalLMTrainer', 'LlamaConfig', "__version__",'JAXServer'
+    "FlaxOPTForCausalLM", "FlaxOPTModel", "OPTConfig", 'CausalLMTrainer', 'LlamaConfig', "__version__", 'JAXServer'
