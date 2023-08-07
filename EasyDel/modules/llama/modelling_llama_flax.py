@@ -224,18 +224,16 @@ class LlamaConfig(PretrainedConfig):
                      ):
         self.from_pt = from_pt
         self.use_flash_attention = use_flash_attention
-        self.use_sacn_mlp = use_sacn_mlp
         self.embd_pdrop = embd_pdrop
         self.resid_pdrop = resid_pdrop
-        self.embd_pdrop = embd_pdrop
+
         self.attn_pdrop = attn_pdrop
         self.tie_word_embeddings = tie_word_embeddings
         self.gradient_checkpointing = gradient_checkpointing
         self.fcm_min_ratio = fcm_min_ratio
         self.fcm_max_ratio = fcm_max_ratio
         self.use_pjit_attention_force = use_pjit_attention_force
-        self.rope_scaling = rope_scaling
-        self.use_flash_attention = use_flash_attention
+
         self.use_sacn_mlp = use_sacn_mlp
         self.flash_attn_query_chunk_size = flash_attn_query_chunk_size
         self.flash_attn_key_chunk_size = flash_attn_key_chunk_size
@@ -484,7 +482,11 @@ class FlaxLlamaAttention(nn.Module):
         xq = xq.reshape(xq.shape[:2] + (self.config.num_attention_heads, self.head_dim_q))
         xk = xk.reshape(xk.shape[:2] + (self.config.num_key_value_heads, self.head_dim_kv))
         xv = xv.reshape(xv.shape[:2] + (self.config.num_key_value_heads, self.head_dim_kv))
-
+        print(xq.shape)
+        print(xk.shape)
+        print(xv.shape)
+        print(freqs_cis.shape)
+        print('*' * 20)
         if self.config.rotary_type == 'complex':
 
             freqs_cis = jnp.take(freqs_cis, position_ids, axis=0)
@@ -502,6 +504,8 @@ class FlaxLlamaAttention(nn.Module):
             xq = apply_rotary_emb_v2(array=xq, sin=sin, cos=cos)
             xk = apply_rotary_emb_v2(array=xk, sin=sin, cos=cos)
             del sin, cos
+        else:
+            raise RuntimeError
         query_length, key_length = xq.shape[1], xk.shape[1]
 
         if self.has_variable("cache", "cached_key"):
@@ -912,14 +916,14 @@ class FlaxLlamaBlockCollection(nn.Module):
                 all_hidden_states += (hidden_states,)
 
             layer_outputs = block(
-                hidden_states,
-                freqs_cis,
-                attention_mask,
-                position_ids,
-                deterministic,
-                init_cache,
-                output_attentions,
-                fcm_mask,
+                hidden_states=hidden_states,
+                freqs_cis=freqs_cis,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                deterministic=deterministic,
+                init_cache=init_cache,
+                output_attentions=output_attentions,
+                fcm_mask=fcm_mask,
             )
             hidden_states = layer_outputs[0]
 
@@ -998,9 +1002,9 @@ class FlaxLlamaModule(nn.Module):
         hidden_states = self.dropout(input_embeds, deterministic=deterministic)
 
         outputs = self.h(
-            hidden_states,
-            self.freqs_cis,
-            attention_mask,
+            hidden_states=hidden_states,
+            freqs_cis=self.freqs_cis,
+            attention_mask=attention_mask,
             position_ids=position_ids,
             deterministic=deterministic,
             init_cache=init_cache,
