@@ -205,6 +205,45 @@ class LlamaConfig(PretrainedConfig):
                 ('.*', PS('fsdp')),
             )
 
+    def add_jax_args(self,
+                     resid_pdrop: float = 0.0,
+                     embd_pdrop: float = 0.0,
+                     attn_pdrop: float = 0.0,
+                     tie_word_embeddings: bool = False,
+                     gradient_checkpointing: str = 'nothing_saveable',
+                     fcm_min_ratio: float = 0.0,
+                     fcm_max_ratio: float = 0.0,
+                     use_pjit_attention_force: bool = True,
+                     rope_scaling: Dict[str, Union[str, float]] = None,
+                     use_flash_attention: bool = False,
+                     use_sacn_mlp: bool = False,
+                     flash_attn_query_chunk_size: int = 1024,
+                     flash_attn_key_chunk_size: int = 1024,
+                     scan_mlp_chunk_size: int = 1024,
+                     rotary_type: str = 'complex',
+                     from_pt: bool = True,
+                     ):
+        self.from_pt = from_pt
+        self.use_flash_attention = use_flash_attention
+        self.use_sacn_mlp = use_sacn_mlp
+        self.rope_scaling = rope_scaling
+        self.embd_pdrop = embd_pdrop
+        self.resid_pdrop = resid_pdrop
+        self.embd_pdrop = embd_pdrop
+        self.attn_pdrop = attn_pdrop
+        self.tie_word_embeddings = tie_word_embeddings
+        self.gradient_checkpointing = gradient_checkpointing
+        self.fcm_min_ratio = fcm_min_ratio
+        self.fcm_max_ratio = fcm_max_ratio
+        self.use_pjit_attention_force = use_pjit_attention_force
+        self.rope_scaling = rope_scaling
+        self.use_flash_attention = use_flash_attention
+        self.use_sacn_mlp = use_sacn_mlp
+        self.flash_attn_query_chunk_size = flash_attn_query_chunk_size
+        self.flash_attn_key_chunk_size = flash_attn_key_chunk_size
+        self.scan_mlp_chunk_size = scan_mlp_chunk_size
+        self.rotary_type = rotary_type
+
     @staticmethod
     def get_weight_decay_exclusions():
         return tuple()
