@@ -19,12 +19,12 @@ from ml_collections import ConfigDict
 from pydantic import BaseModel
 from fjutils import get_float_dtype_by_name
 from jax.sharding import Mesh, PartitionSpec as Ps
-from tqdm import trange
-from transformers import GenerationConfig
+from transformers import GenerationConfig, TextIteratorStreamer
 from EasyDel.serve.theme import seafoam
 import logging
 from EasyDel.utils.utils import RNG
 import multiprocessing as mp
+import torch
 
 pjit = pjit.pjit
 
@@ -91,7 +91,7 @@ class JAXServer(object):
         self._funcs_generated = False
         self.number_of_served_request_until_last_up_time = 0
 
-        self.rng_generator = RNG(self.config.seed)
+        self.rng_generator = RNG(42)
 
         array = jnp.ones((len(jax.devices()), 1)).reshape(self.config.mesh_axes_shape)
         self.mesh = Mesh(mesh_utils.create_device_mesh(array.shape), self.config.mesh_axes_names)
@@ -125,8 +125,6 @@ class JAXServer(object):
         config.prompt_prefix_chat = '<|prompter|>'
         config.prompt_postfix_chat = '</s><|assistant|>'
 
-        config.is_instruct = False
-
         config.chat_prefix = ''
         config.contains_auto_format = True
 
@@ -149,8 +147,6 @@ class JAXServer(object):
         config.mesh_axes_shape = (1, -1, 1)
 
         config.dtype = 'fp16'
-
-        config.seed = 552
 
         config.use_prefix_tokenizer = True
 
@@ -567,8 +563,7 @@ class PyTorchServer(object):
 
     def __init__(self, config=None):
         logging.warning('PytorchServer is not built fully yet at this version')
-        import torch as tr
-        self.torch = tr
+
         self.config = self.get_default_config(config)
         self.app = FastAPI()
         self.number_of_served_request_until_last_up_time = 0
@@ -598,45 +593,49 @@ class PyTorchServer(object):
         config.prompt_postfix_instruct = ''
 
         config.prompt_prefix_chat = '<|prompter|>'
-        config.prompt_postfix_chat = '</s>'
-
-        config.is_instruct = False
+        config.prompt_postfix_chat = '</s><|assistant|>'
 
         config.chat_prefix = ''
         config.contains_auto_format = True
-        config.max_length = 2048
-        config.temperature = 0.1
-        config.logging = False
 
-        config.max_gpu_perc_to_use = 0.90
-        config.dtype = 'float16'
+        config.max_length = 2048
+        config.max_new_tokens = 2048
+
+        config.temperature = 0.8
+        config.top_p = 0.95
+        config.top_k = 50
+
+        config.logging = True
+
+        config.dtype = 'fp16'
 
         if updates is not None:
             config.update(ConfigDict(updates).copy_and_resolve_references())
         return config
 
-    def get_gpu_memory(self, num_gpus_req=None):
+    @staticmethod
+    def get_gpu_memory(num_gpus_req=None):
 
         gpu_m = []
-        dc = self.torch.cuda.device_count()
-        num_gpus = self.torch.cuda.device_count() if num_gpus_req is None else min(num_gpus_req, dc)
+        dc = torch.cuda.device_count()
+        num_gpus = torch.cuda.device_count() if num_gpus_req is None else min(num_gpus_req, dc)
 
         for gpu_id in range(num_gpus):
-            with self.torch.cuda.device(gpu_id):
-                gpu_properties = self.torch.cuda.get_device_properties(self.torch.cuda.current_device())
+            with torch.cuda.device(gpu_id):
+                gpu_properties = torch.cuda.get_device_properties(torch.cuda.current_device())
                 gpu_m.append(
-                    (gpu_properties.total_memory / (1024 ** 3)) - (self.torch.cuda.memory_allocated() / (1024 ** 3)))
+                    (gpu_properties.total_memory / (1024 ** 3)) - (torch.cuda.memory_allocated() / (1024 ** 3)))
         return gpu_m
 
     def get_model_load_kwargs(self):
-        if self.config.dtype == 'float16':
-            dtype = self.torch.float16
-        elif self.config.dtype == 'float32':
-            dtype = self.torch.float32
-        elif self.config.dtype == 'bfloat16':
-            dtype = self.torch.bfloat16
+        if self.config.dtype == 'fp16':
+            dtype = torch.float16
+        elif self.config.dtype == 'fp32':
+            dtype = torch.float32
+        elif self.config.dtype == 'bf16':
+            dtype = torch.bfloat16
         else:
-            raise ValueError('unknown type available types are [float32 float16 bfloat16]')
+            raise ValueError('unknown type available types are [fp32 fp16 bf16]')
         load_kwargs = {
             'torch_dtype': dtype,
             'device_map': 'auto',
@@ -648,29 +647,51 @@ class PyTorchServer(object):
 
         return {
             'config': {k: v for k, v in self.config.__dict__.items()},
-            'devices': f"{self.torch.cuda.device_count()}",
+            'devices': f"{torch.cuda.device_count()}",
             'device_sharding': self.device_rolling,
             'max_memory': self.dict_max_memory_sharding,
             'status': 'Ready',
             'number_of_served_request_until_last_up_time': f"{self.number_of_served_request_until_last_up_time}"
         }
 
-    @staticmethod
-    def forward(data):
-        return NotImplementedError
+    def forward_instruct_non_api(self, prompt, system, greedy):
+        data = InstructRequest(
+            prompt=prompt,
+            system=system,
+            greedy=greedy
+        )
+        return self.forward_instruct(data)
 
-    def streaming_generator(self, ):
-        ...
+    def forward_chat_non_api(self, prompt, history, greedy):
+        data = ChatRequest(
+            prompt=prompt,
+            history=history,
+            greedy=greedy
+        )
+        return self.forward_chat(data)
 
-    def forward_chat(self, data: ChatRequest):
-        ...
+    def process(self,
+                string,
+                greedy: bool = False,
+                max_new_tokens: int = None,
+                pbar=tqdm
+                ):
+        tokens = self.tokenizer(
 
-    def forward_instruct(self, data: InstructRequest):
-        ...
+        )
+        input_ids = tokens.input_ids
+        attention_mask = tokens.attention_mask
+        num_generated_tokens = 0
+        pad = self.config.max_length - self.config.max_stream_tokens
 
-    def process_chat(self, text, history, max_new_tokens, max_length, temperature):
-        print(self)
-        return 'NotImplementedYet'
+        stream = TextIteratorStreamer(
+            tokenizer=self.tokenizer,
+            skip_prompt=True,
+            skip_special_tokens=True
+        )
+
+
+        return 1, 1
 
     def process_chat_history(self, history: List):
         if len(history) == 0:
@@ -682,16 +703,38 @@ class PyTorchServer(object):
 
         return message_history
 
-    def create_gradio_ui(self):
+    def process_gradio_chat(self, prompt, history, max_new_tokens, greedy, pbar=gr.Progress()):
+        string = self.process_chat_history(history)
+        string += self.config.prompt_prefix_chat + prompt + self.config.prompt_postfix_chat
+        response, _ = self.process(
+            string=string,
+            greedy=greedy,
+            max_new_tokens=max_new_tokens,
+            pbar=pbar
+        )
+        history.append([prompt, response])
+        return '', history
+
+    def process_gradio_instruct(self, prompt, system, max_new_tokens, greedy, pbar=gr.Progress()):
+        string = self.config.instruct_format.format(system=system, instruct=prompt)
+        response, _ = self.process(
+            string=string,
+            greedy=greedy,
+            max_new_tokens=max_new_tokens,
+            pbar=pbar
+        )
+        return '', response
+
+    def create_gradio_ui_chat(self):
         with gr.Blocks(
                 theme=seafoam) as block:
-            gr.Markdown("<h1><center>Powered by [EasyDeL](https://github.com/erfanzar/EasyDel)</center></h1>")
+            gr.Markdown("# <h1> <center>Powered by [EasyDeL](https://github.com/erfanzar/EasyDel) </center> </h1>")
             with gr.Row():
-                cache = gr.Chatbot(elem_id="EasyDel", label="EasyDel").style(container=True, height=600)
+                history = gr.Chatbot(elem_id="EasyDel", label="EasyDel").style(container=True, height=600)
 
             with gr.Row():
                 with gr.Column():
-                    text = gr.Textbox(show_label=False, placeholder='Message Box').style(container=False)
+                    prompt = gr.Textbox(show_label=False, placeholder='Message Box').style(container=False)
                 with gr.Column():
                     with gr.Row():
                         submit = gr.Button(variant="primary")
@@ -700,18 +743,63 @@ class PyTorchServer(object):
 
             with gr.Row():
                 with gr.Accordion('Advanced Options', open=False):
-                    max_new_tokens = gr.Slider(value=2048, maximum=3072, minimum=1, label='Max New Tokens', step=1, )
-                    max_length = gr.Slider(value=2048, maximum=4096, minimum=1, label='Max Length', step=1)
+                    max_new_tokens = gr.Slider(value=self.config.max_new_tokens, maximum=10000,
+                                               minimum=self.config.max_stream_tokens,
+                                               label='Max New Tokens', step=self.config.max_stream_tokens, )
+                    max_length = gr.Slider(value=self.config.max_length, maximum=self.config.max_length, minimum=1,
+                                           label='Max Length', step=1)
                     temperature = gr.Slider(value=0.2, maximum=1, minimum=0.1, label='Temperature', step=0.01)
 
-            inputs = [text, cache, max_new_tokens, max_length]
-            sub_event = submit.click(fn=self.process_chat, inputs=inputs, outputs=[text, cache])
+                    greedy = gr.Checkbox(value=True, label='Greedy Search')
+
+            inputs = [prompt, history, max_new_tokens, greedy]
+            sub_event = submit.click(fn=self.process_gradio_chat, inputs=inputs, outputs=[prompt, history])
 
             def clear_():
                 return []
 
-            clear.click(fn=clear_, outputs=[cache])
-            txt_event = text.submit(fn=self.process_chat, inputs=inputs, outputs=[text, cache])
+            clear.click(fn=clear_, outputs=[history])
+            txt_event = prompt.submit(fn=self.process_gradio_chat, inputs=inputs, outputs=[prompt, history])
+
+            stop.click(fn=None, inputs=None, outputs=None, cancels=[txt_event, sub_event])
+
+        block.queue()
+        return block
+
+    def create_gradio_ui_instruct(self):
+        with gr.Blocks(
+                theme=seafoam) as block:
+            gr.Markdown("# <h1> <center>Powered by [EasyDeL](https://github.com/erfanzar/EasyDel) </center> </h1>")
+            with gr.Row():
+                pred = gr.TextArea(elem_id="EasyDel", label="EasyDel").style(container=True, height=600)
+
+            with gr.Row():
+                submit = gr.Button(variant="primary")
+                stop = gr.Button(value='Stop ')
+                clear = gr.Button(value='Clear Conversation')
+            with gr.Column():
+                prompt = gr.Textbox(show_label=False, placeholder='Instruct Message').style(container=False)
+                system = gr.Textbox(value='You Are an helpful AI Assistant, generate good and helpful answers',
+                                    show_label=False, placeholder='System Message').style(container=False)
+
+            with gr.Row():
+                with gr.Accordion('Advanced Options', open=False):
+                    max_new_tokens = gr.Slider(value=self.config.max_new_tokens, maximum=10000,
+                                               minimum=self.config.max_stream_tokens,
+                                               label='Max New Tokens', step=self.config.max_stream_tokens, )
+                    max_length = gr.Slider(value=self.config.max_length, maximum=self.config.max_length, minimum=1,
+                                           label='Max Length', step=1)
+                    temperature = gr.Slider(value=0.2, maximum=1, minimum=0.1, label='Temperature', step=0.01)
+                    greedy = gr.Checkbox(value=True, label='Greedy Search')
+
+            inputs = [prompt, system, max_new_tokens, greedy]
+            sub_event = submit.click(fn=self.process_gradio_instruct, inputs=inputs, outputs=[prompt, pred])
+
+            def clear_():
+                return ''
+
+            clear.click(fn=clear_, outputs=[pred])
+            txt_event = prompt.submit(fn=self.process_gradio_instruct, inputs=inputs, outputs=[prompt, pred])
 
             stop.click(fn=None, inputs=None, outputs=None, cancels=[txt_event, sub_event])
 
@@ -719,4 +807,14 @@ class PyTorchServer(object):
         return block
 
     def fire(self):
-        uvicorn.run(self.app, host=self.config.host, port=self.config.port)
+        def run():
+            uvicorn.run(self.app, host=self.config.host, port=self.config.port)
+
+        self.process_uvicorn = mp.Process(target=run)
+        self.process_uvicorn.start()
+
+    def end(self):
+        if self.process_uvicorn is not None:
+            self.process_uvicorn.join()
+        else:
+            logging.warning('you have to fire server before ending that this command will be ignored')
