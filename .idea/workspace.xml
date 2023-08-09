@@ -5,9 +5,8 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="08ad205b-709f-455b-86db-91293f595cd3" name="Changes" comment="">
-      <change beforePath="$PROJECT_DIR$/.idea/shelf/Uncommitted_changes_before_Update_at_01_08_23_10_38_[Changes]/shelved.patch" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/shelf/Uncommitted_changes_before_Update_at_31_07_23_20_40_[Changes]/shelved.patch" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/serve/serve_utils.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/serve/serve_utils.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -197,6 +196,8 @@
       <workItem from="1691051581762" duration="8253000" />
       <workItem from="1691234683772" duration="5228000" />
       <workItem from="1691310583977" duration="2378000" />
+      <workItem from="1691568364869" duration="433000" />
+      <workItem from="1691582189453" duration="1653000" />
     </task>
     <servers />
   </component>
