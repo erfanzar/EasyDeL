@@ -12,7 +12,7 @@ config = LlamaConfig(from_pt=True)
 model = FlaxLlamaForCausalLM.from_pretrained('<here/pretrained>', config=config)
 params = model.params
 partition_rules = config.get_partition_rules()
-# not partition rules created from new key names not Easydel type
+# now partition rules created from new key names not Easydel type
 print(partition_rules)
 ```
 
