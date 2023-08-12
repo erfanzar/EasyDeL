@@ -1,14 +1,17 @@
 import copy
 import functools
+import os
+import typing
 
 import flax.core
 import gradio as gr
 import jax
 import tqdm
+import transformers
 import uvicorn
 from fastapi import FastAPI
-from fjutils import easylm
-from fjutils import utils
+from fjutils import make_shard_and_gather_fns, match_partition_rules, with_sharding_constraint
+from fjutils.utils import read_ckpt
 from typing import Optional, List, Union
 from flax.core import freeze
 from flax.traverse_util import unflatten_dict
@@ -33,13 +36,6 @@ def get_dtype(dtype):
     if isinstance(dtype, str):
         dtype = get_float_dtype_by_name(dtype)
     return dtype
-
-
-read_ckpt = utils.read_ckpt
-make_shard_and_gather_fns = easylm.make_shard_and_gather_fns
-match_partition_rules = easylm.match_partition_rules
-with_sharding_constraint = easylm.with_sharding_constraint
-get_jax_mesh = easylm.get_jax_mesh
 
 
 def shard_params(params, partition_rules,
@@ -282,6 +278,39 @@ class JAXServer(object):
                 return self._generate(
                     params, input_ids, attention_mask
                 )
+
+    @classmethod
+    def load(
+            cls,
+            model: transformers.FlaxPreTrainedModel,
+            config_model: transformers.PretrainedConfig,
+            tokenizer: transformers.PreTrainedTokenizer,
+            ckpt_path: typing.Union[str, os.PathLike],
+            config=None,
+            add_param_field: bool = True,
+            init_shape: tuple = (1, 1)
+    ):
+        assert hasattr(model,
+                       'init_weights'), 'model must contain init_weights func in order to init params for shard_fns'
+        assert hasattr(config_model, 'get_partition_rules'), 'config_model must contain get_partition_rules functions'
+
+        def _init():
+            return model.init_weights(jax.random.PRNGKey(0), init_shape)
+
+        shape = jax.eval_shape(_init)
+        rules = match_partition_rules(params=shape, rules=config_model.get_partition_rules(True))
+
+        shard_fns, _ = make_shard_and_gather_fns(rules, get_float_dtype_by_name(config.dtype))
+
+        params = read_ckpt(
+            path=ckpt_path, shard_fns=shard_fns
+        )
+        params = {'params': params} if add_param_field else params
+        server = cls(config=config)
+        server.rules = rules
+        server.params = params
+        server.configure_generate_functions(model, tokenizer)
+        return server
 
     def greedy_generate(self,
                         params: Union[flax.core.FrozenDict, dict],
@@ -689,7 +718,6 @@ class PyTorchServer(object):
             skip_prompt=True,
             skip_special_tokens=True
         )
-
 
         return 1, 1
 
