@@ -65,6 +65,7 @@ class TrainArguments(
             do_last_save: bool = True,
             model_parameters=None,
             do_shard_fns: bool = True,
+            track_memory: bool = True,
             **kwargs
     ):
         super().__init__()
@@ -120,6 +121,7 @@ class TrainArguments(
         self.model_parameters = model_parameters
         self.do_shard_fns = do_shard_fns
         self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.track_memory = track_memory
         torch.set_default_device('cpu')
         self.__dict__.update(**kwargs)
 

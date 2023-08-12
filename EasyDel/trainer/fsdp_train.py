@@ -3,6 +3,7 @@ import os
 import time
 import typing
 
+import IPython.display
 import wandb
 from datasets import Dataset
 
@@ -15,7 +16,7 @@ from transformers import FlaxAutoModelForCausalLM, AutoConfig
 from IPython.display import clear_output
 from tqdm import tqdm
 from EasyDel.utils.utils import Timers
-
+from EasyDel.smi import initialise_tracking, get_mem
 from jax.experimental.pjit import pjit, with_sharding_constraint
 from jax.sharding import PartitionSpec
 from flax.training import train_state
@@ -306,6 +307,9 @@ class CausalLMTrainer:
         return sharded_create_from_params_fn, sharded_train_step_fn, sharded_predict, mesh, ckpt_streamer, init_fn
 
     def train(self, model_parameters: flax.core.FrozenDict = None) -> OutputFineTuner:
+        dir_prefix: str = '/dev/shm'
+        if self.arguments.track_memory:
+            initialise_tracking(dir_prefix=dir_prefix)
         with self.mesh:
             if self.finetune:
                 shard_fns, gather_fns = make_shard_and_gather_fns(self.train_state_partition_spec,
@@ -366,6 +370,10 @@ class CausalLMTrainer:
                             losses.append(loss)
                             learning_rates.append(self.scheduler(i).tolist())
                             accuracies.append(accuracy)
+                            if self.arguments.track_memory:
+                                mem_res = get_mem(dir_prefix=dir_prefix)
+                            else:
+                                mem_res = 'Tracking Option is OFF'
                             pbar.update(1)
 
                             if self.arguments.use_wandb:
@@ -377,9 +385,13 @@ class CausalLMTrainer:
                                         'step time': ttl_time,
                                         'perplexity': jnp.exp(loss).tolist(),
                                         'accuracy': accuracy.tolist(),
-                                        'avg_accuracy': (sum(accuracies) / len(accuracies)).tolist()
+                                        'avg_accuracy': (sum(accuracies) / len(accuracies)).tolist(),
+                                        'mem_res': mem_res
                                     }
                                 )
+                            if self.arguments.track_memory:
+                                IPython.display.clear_output(True)
+                                pbar.display(mem_res)
                             pbar.set_postfix(loss=loss,
                                              learning_rate=self.scheduler(sharded_train_state_.step.tolist()).tolist(),
                                              step=sharded_train_state_.step.tolist(),
