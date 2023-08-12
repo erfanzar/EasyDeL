@@ -287,7 +287,7 @@ class JAXServer(object):
             tokenizer: transformers.PreTrainedTokenizer,
             ckpt_path: typing.Union[str, os.PathLike],
             config=None,
-            dtype: jnp.dtype = jnp.bfloat16,
+            dtype: str = 'fp16',
             add_param_field: bool = True,
             init_shape: tuple = (1, 1)
     ):
