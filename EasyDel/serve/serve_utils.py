@@ -497,11 +497,11 @@ class JAXServer(object):
                 theme=seafoam) as block:
             gr.Markdown("# <h1> <center>Powered by [EasyDeL](https://github.com/erfanzar/EasyDel) </center> </h1>")
             with gr.Row():
-                history = gr.Chatbot(elem_id="EasyDel", label="EasyDel").style(container=True, height=600)
+                history = gr.Chatbot(elem_id="EasyDel", label="EasyDel", container=True, height=600)
 
             with gr.Row():
                 with gr.Column():
-                    prompt = gr.Textbox(show_label=False, placeholder='Message Box').style(container=False)
+                    prompt = gr.Textbox(show_label=False, placeholder='Message Box', container=False)
                 with gr.Column():
                     with gr.Row():
                         submit = gr.Button(variant="primary")
@@ -545,9 +545,9 @@ class JAXServer(object):
                 stop = gr.Button(value='Stop ')
                 clear = gr.Button(value='Clear Conversation')
             with gr.Column():
-                prompt = gr.Textbox(show_label=False, placeholder='Instruct Message').style(container=False)
+                prompt = gr.Textbox(show_label=False, placeholder='Instruct Message', container=False)
                 system = gr.Textbox(value='You Are an helpful AI Assistant, generate good and helpful answers',
-                                    show_label=False, placeholder='System Message').style(container=False)
+                                    show_label=False, placeholder='System Message', container=False)
 
             with gr.Row():
                 with gr.Accordion('Advanced Options', open=False):
@@ -760,11 +760,11 @@ class PyTorchServer(object):
                 theme=seafoam) as block:
             gr.Markdown("# <h1> <center>Powered by [EasyDeL](https://github.com/erfanzar/EasyDel) </center> </h1>")
             with gr.Row():
-                history = gr.Chatbot(elem_id="EasyDel", label="EasyDel").style(container=True, height=600)
+                history = gr.Chatbot(elem_id="EasyDel", label="EasyDel", container=True, height=600)
 
             with gr.Row():
                 with gr.Column():
-                    prompt = gr.Textbox(show_label=False, placeholder='Message Box').style(container=False)
+                    prompt = gr.Textbox(show_label=False, placeholder='Message Box', container=False)
                 with gr.Column():
                     with gr.Row():
                         submit = gr.Button(variant="primary")
@@ -808,9 +808,9 @@ class PyTorchServer(object):
                 stop = gr.Button(value='Stop ')
                 clear = gr.Button(value='Clear Conversation')
             with gr.Column():
-                prompt = gr.Textbox(show_label=False, placeholder='Instruct Message').style(container=False)
+                prompt = gr.Textbox(show_label=False, placeholder='Instruct Message', container=False)
                 system = gr.Textbox(value='You Are an helpful AI Assistant, generate good and helpful answers',
-                                    show_label=False, placeholder='System Message').style(container=False)
+                                    show_label=False, placeholder='System Message', container=False)
 
             with gr.Row():
                 with gr.Accordion('Advanced Options', open=False):
