@@ -48,7 +48,7 @@ def fsdp_train_step(state, batch):
                                 return_dict=True).logits
 
         loss, accuracy = cross_entropy_loss_and_accuracy(
-            logits[:, :-1, :], labels, batch['attention_mask'].astype(jnp.float32)
+            logits[:, :-1, :], labels, batch['attention_mask'].astype(jnp.float32)[:, 1:]
         )
         return loss, accuracy
 
@@ -71,7 +71,7 @@ def fsdp_eval_step(state, batch_eval):
                                 return_dict=True).logits
 
         loss, accuracy = cross_entropy_loss_and_accuracy(
-            logits[:, :-1, :], labels, batch_eval['attention_mask'].astype(jnp.float32)
+            logits[:, :-1, :], labels, batch_eval['attention_mask'].astype(jnp.float32)[:, 1:]
         )
         return loss, accuracy
 
