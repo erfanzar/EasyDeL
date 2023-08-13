@@ -39,7 +39,8 @@ def prefix_print(prefix, string):
     print(f'\033[1;31m{prefix}\033[1;0m : {string}')
 
 
-def fsdp_train_step(state, batch, loss_fn):
+def fsdp_train_step(state, batch):
+    global loss_fn
     batch = with_sharding_constraint(batch, PartitionSpec(('dp', 'fsdp')))
 
     def calculate_loss(params):
@@ -63,7 +64,8 @@ def fsdp_train_step(state, batch, loss_fn):
     return state, loss__, accuracy__
 
 
-def fsdp_eval_step(state, batch_eval, loss_fn):
+def fsdp_eval_step(state, batch_eval):
+    global loss_fn
     batch_eval = with_sharding_constraint(
         batch_eval,
         PartitionSpec(
@@ -302,7 +304,7 @@ class CausalLMTrainer:
         )
         sharded_train_step_fn = pjit(
             fsdp_train_step,
-            in_shardings=(train_state_partition_spec, PartitionSpec(), PartitionSpec()),
+            in_shardings=(train_state_partition_spec, PartitionSpec()),
             out_shardings=(train_state_partition_spec, PartitionSpec(), PartitionSpec()),
             donate_argnums=(0, 0),
         )
@@ -436,7 +438,7 @@ class CausalLMTrainer:
                         batch['labels'] = batch['input_ids'][..., 1:]
                         for i in self.arguments.ids_to_pop_from_dataset:
                             _ = batch_eval.pop(i, None)
-                        loss_eval, accuracy = fsdp_eval_step(sharded_train_state_, batch_eval, loss_fn)
+                        loss_eval, accuracy = fsdp_eval_step(sharded_train_state_, batch_eval)
                         pbar_eval.update(1)
                         if self.arguments.use_wandb:
                             self.wandb_runtime.log(
