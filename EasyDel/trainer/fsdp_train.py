@@ -69,8 +69,7 @@ def fsdp_eval_step(state, batch_eval):
         labels = batch_eval.pop('labels')
         logits = state.apply_fn(params=params, **batch_eval,
                                 return_dict=True).logits
-        print(logits.shape)
-        print(labels.shape)
+
         loss, accuracy = cross_entropy_loss_and_accuracy(
             logits, labels, batch_eval['attention_mask'].astype(jnp.float32)
         )
@@ -298,6 +297,9 @@ class CausalLMTrainer:
                 labels = batch.pop('labels')
                 logits = state.apply_fn(params=params, **batch,
                                         return_dict=True).logits
+
+                print(logits.shape)
+                print(labels.shape)
 
                 loss, accuracy = loss_fn(
                     logits, labels, batch['attention_mask'].astype(jnp.float32)
