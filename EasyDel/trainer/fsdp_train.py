@@ -84,8 +84,8 @@ def fsdp_eval_step(state, batch_eval, loss_fn):
         )
         return loss, accuracy
 
-    loss__, accuracy = calculate_loss(state.params)
-    return loss__, accuracy
+    loss__, accuracy__ = calculate_loss(state.params)
+    return loss__, accuracy__
 
 
 def predict(state, input_ids):
@@ -321,12 +321,12 @@ class CausalLMTrainer:
             initialise_tracking(dir_prefix=dir_prefix)
 
         if self.arguments.loss_remat != '':
-            blockwise_cross_entropy = functools.partial(
+            blockwise_cross = functools.partial(
                 blockwise_cross_entropy,
                 chunk_size=self.arguments.loss_chunk,
                 policy=self.arguments.loss_remat
             )
-            loss_fn = blockwise_cross_entropy
+            loss_fn = blockwise_cross
         else:
             loss_fn = cross_entropy_loss_and_accuracy
         with self.mesh:
