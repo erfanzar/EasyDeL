@@ -288,7 +288,7 @@ class JAXServer(object):
             ckpt_path: typing.Union[str, os.PathLike],
             config=None,
             dtype: str = 'fp16',
-            add_param_field: bool = True,
+            add_param_field: bool = False,
             init_shape: tuple = (1, 1)
     ):
         assert hasattr(model,
@@ -307,6 +307,7 @@ class JAXServer(object):
             params = read_ckpt(
                 path=ckpt_path, shard_fns=flax.traverse_util.flatten_dict(shard_fns)
             )
+        params = flax.traverse_util.unflatten_dict(params)
         params = {'params': params} if add_param_field else params
 
         server.rules = rules
