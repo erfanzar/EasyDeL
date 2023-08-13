@@ -5,7 +5,7 @@ import time
 import typing
 
 import IPython.display
-import fjutils.easylm
+from fjutils.easylm import blockwise_cross_entropy, cross_entropy_loss_and_accuracy
 import wandb
 from datasets import Dataset
 
@@ -322,13 +322,13 @@ class CausalLMTrainer:
 
         if self.arguments.loss_remat != '':
             blockwise_cross_entropy = functools.partial(
-                fjutils.easylm.blockwise_cross_entropy,
+                blockwise_cross_entropy,
                 chunk_size=self.arguments.loss_chunk,
                 policy=self.arguments.loss_remat
             )
             loss_fn = blockwise_cross_entropy
         else:
-            loss_fn = fjutils.easylm.cross_entropy_loss_and_accuracy
+            loss_fn = cross_entropy_loss_and_accuracy
         with self.mesh:
             if self.finetune:
                 shard_fns, gather_fns = make_shard_and_gather_fns(self.train_state_partition_spec,
