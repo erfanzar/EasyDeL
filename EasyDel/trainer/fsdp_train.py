@@ -40,7 +40,6 @@ def prefix_print(prefix, string):
 
 
 def fsdp_train_step(state, batch):
-    global loss_fn
     batch = with_sharding_constraint(batch, PartitionSpec(('dp', 'fsdp')))
 
     def calculate_loss(params):
@@ -48,12 +47,7 @@ def fsdp_train_step(state, batch):
         logits = state.apply_fn(params=params, **batch,
                                 return_dict=True).logits
 
-        # loss = optax.softmax_cross_entropy_with_integer_labels(
-        #     logits=logits[..., :-1, :],
-        #     labels=labels)
-        # loss = jnp.mean(loss)
-        # accuracy = calculate_accuracy(logits[..., :-1, :], labels)
-        loss, accuracy = loss_fn(
+        loss, accuracy = cross_entropy_loss_and_accuracy(
             logits, labels, batch['attention_mask'].astype(jnp.float32)
         )
         return loss, accuracy
@@ -65,7 +59,6 @@ def fsdp_train_step(state, batch):
 
 
 def fsdp_eval_step(state, batch_eval):
-    global loss_fn
     batch_eval = with_sharding_constraint(
         batch_eval,
         PartitionSpec(
@@ -76,12 +69,8 @@ def fsdp_eval_step(state, batch_eval):
         labels = batch_eval.pop('labels')
         logits = state.apply_fn(params=params, **batch_eval,
                                 return_dict=True).logits
-        # loss = optax.softmax_cross_entropy_with_integer_labels(logits=logits[..., :-1, :],
-        #                                                        labels=labels)
-        # loss = jnp.mean(loss)
-        # accuracy = calculate_accuracy(logits[..., :-1, :], labels)
 
-        loss, accuracy = loss_fn(
+        loss, accuracy = cross_entropy_loss_and_accuracy(
             logits, labels, batch_eval['attention_mask'].astype(jnp.float32)
         )
         return loss, accuracy
@@ -291,6 +280,34 @@ class CausalLMTrainer:
                 params=params_
             )
 
+        if self.arguments.loss_remat != '':
+            blockwise_cross = functools.partial(
+                blockwise_cross_entropy,
+                chunk_size=self.arguments.loss_chunk,
+                policy=self.arguments.loss_remat
+            )
+            loss_fn = blockwise_cross
+        else:
+            loss_fn = cross_entropy_loss_and_accuracy
+
+        def fsdp_train_step_(state, batch):
+            batch = with_sharding_constraint(batch, PartitionSpec(('dp', 'fsdp')))
+
+            def calculate_loss(params):
+                labels = batch.pop('labels')
+                logits = state.apply_fn(params=params, **batch,
+                                        return_dict=True).logits
+
+                loss, accuracy = loss_fn(
+                    logits, labels, batch['attention_mask'].astype(jnp.float32)
+                )
+                return loss, accuracy
+
+            grad_fn = jax.value_and_grad(calculate_loss, has_aux=True)
+            (loss__, accuracy__), grad = grad_fn(state.params)
+            state = state.apply_gradients(grads=grad)
+            return state, loss__, accuracy__
+
         train_state_shape = jax.eval_shape(init_fn)
         train_state_partition_spec = match_partition_rules(
             self.config.get_partition_rules(
@@ -303,7 +320,7 @@ class CausalLMTrainer:
             donate_argnums=(0,)
         )
         sharded_train_step_fn = pjit(
-            fsdp_train_step,
+            fsdp_train_step_,
             in_shardings=(train_state_partition_spec, PartitionSpec()),
             out_shardings=(train_state_partition_spec, PartitionSpec(), PartitionSpec()),
             donate_argnums=(0, 0),
@@ -322,15 +339,6 @@ class CausalLMTrainer:
         if self.arguments.track_memory:
             initialise_tracking(dir_prefix=dir_prefix)
 
-        if self.arguments.loss_remat != '':
-            blockwise_cross = functools.partial(
-                blockwise_cross_entropy,
-                chunk_size=self.arguments.loss_chunk,
-                policy=self.arguments.loss_remat
-            )
-            loss_fn = blockwise_cross
-        else:
-            loss_fn = cross_entropy_loss_and_accuracy
         with self.mesh:
             if self.finetune:
                 shard_fns, gather_fns = make_shard_and_gather_fns(self.train_state_partition_spec,
