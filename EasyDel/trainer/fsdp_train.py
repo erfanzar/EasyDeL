@@ -299,7 +299,7 @@ class CausalLMTrainer:
                                         return_dict=True).logits[:, :-1, :]
 
                 loss, accuracy = loss_fn(
-                    logits, labels, batch['attention_mask'].astype(jnp.float32)[:, :-1, :]
+                    logits, labels, batch['attention_mask'].astype(jnp.float32)[:, 1:]
                 )
                 return loss, accuracy
 
