@@ -384,8 +384,7 @@ class CausalLMTrainer:
                                 _ = batch.pop(ssb, None)
                             time_s = time.time()
                             sharded_train_state_, loss, accuracy = self.sharded_train_step_fn(sharded_train_state_,
-                                                                                              batch,
-                                                                                              loss_fn
+                                                                                              batch
                                                                                               )
                             ttl_time = time.time() - time_s
                             losses.append(loss)
