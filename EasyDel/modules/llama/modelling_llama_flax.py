@@ -1,5 +1,6 @@
 from typing import Dict, Optional, Tuple, Union
 
+import fjutils.easylm
 from einops import einops
 from flax.linen import remat
 
@@ -537,21 +538,21 @@ class FlaxLlamaAttention(nn.Module):
                 combine_masks(attention_mask, fcm_mask),
                 '... s q k -> ... s 1 q k'
             ).astype(self.dtype)
-            attn_output = dot_product_attention_multihead(
-                xq,
-                xk,
-                xv,
-                bias=attention_mask.astype(self.dtype),
+            attn_output = fjutils.easylm.blockwise_dot_product_attention(
+                query=xq,
+                key=xk,
+                value=xv,
+                bias=attention_bias,
+                deterministic=deterministic,
                 dropout_rng=dropout_rng,
-                dropout_rate=self.config.attn_pdrop,
-                enable_dropout=not deterministic and self.config.attn_pdrop > 0.0,
-                rescale_logits=True,
-                float32_logits=False,
-                causal_mask=True,
-                dtype=self.dtype,
-                precision=self.precision,
+                attn_pdrop=self.config.attn_pdrop,
+                causal=True,
                 query_chunk_size=self.config.flash_attn_query_chunk_size,
                 key_chunk_size=self.config.flash_attn_key_chunk_size,
+                dtype=self.dtype,
+                policy=get_gradient_checkpoint_policy('nothing_saveable'),
+                precision=self.precision,
+                float32_logits=False if self.dtype == jnp.bfloat16 else True,
             )
         else:
             attn_weights = dot_product_attention_weights(
