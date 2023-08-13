@@ -303,7 +303,7 @@ class JAXServer(object):
         shard_fns, _ = make_shard_and_gather_fns(rules, get_float_dtype_by_name(config.dtype))
 
         params = read_ckpt(
-            path=ckpt_path, shard_fns=shard_fns
+            path=ckpt_path, shard_fns=flax.traverse_util.flatten_dict(shard_fns)
         )
         params = {'params': params} if add_param_field else params
         server = cls(config=config)
