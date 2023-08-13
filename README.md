@@ -3,10 +3,18 @@
 EasyDeL (Easy Deep Learning) is an open-source library designed to accelerate and optimize the training process of
 machine learning models. This library is primarily focused on Jax/Flax and plans to offer easy and fine solutions to
 train Flax/Jax Models on the `TPU/GPU`
+#### Note this Library needs golang to run (for some tracking stuff on TPU/GPU/CPU)
+
+install go on ubuntu be like
+
+```shell
+sudo apt-get update && apt-get upgrade -y
+sudo apt-get install golang -y 
+```
 
 ## Installation
 
-### Availalbe on PyPi
+### Available on PyPi
 
 To install EasyDeL, you can use pip:
 
