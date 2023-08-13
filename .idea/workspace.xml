@@ -4,7 +4,9 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="08ad205b-709f-455b-86db-91293f595cd3" name="Changes" comment="" />
+    <list default="true" id="08ad205b-709f-455b-86db-91293f595cd3" name="Changes" comment="">
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -85,6 +87,9 @@
       <module name="EasyDeL" />
       <option name="INTERPRETER_OPTIONS" value="" />
       <option name="PARENT_ENVS" value="true" />
+      <envs>
+        <env name="PYTHONUNBUFFERED" value="1" />
+      </envs>
       <option name="SDK_HOME" value="" />
       <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$" />
       <option name="IS_MODULE_SDK" value="true" />
@@ -195,6 +200,8 @@
       <workItem from="1691659255595" duration="4000" />
       <workItem from="1691659942312" duration="614000" />
       <workItem from="1691829569876" duration="5579000" />
+      <workItem from="1691909969951" duration="6205000" />
+      <workItem from="1691920050195" duration="11000" />
     </task>
     <servers />
   </component>
