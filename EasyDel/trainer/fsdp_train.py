@@ -296,10 +296,10 @@ class CausalLMTrainer:
             def calculate_loss(params):
                 labels = batch.pop('labels')
                 logits = state.apply_fn(params=params, **batch,
-                                        return_dict=True).logits
+                                        return_dict=True).logits[:, :-1, :]
 
                 loss, accuracy = loss_fn(
-                    logits[:, :-1, :], labels, batch['attention_mask'].astype(jnp.float32)
+                    logits, labels, batch['attention_mask'].astype(jnp.float32)[:, :-1, :]
                 )
                 return loss, accuracy
 
