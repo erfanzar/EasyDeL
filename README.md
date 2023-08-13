@@ -3,6 +3,7 @@
 EasyDeL (Easy Deep Learning) is an open-source library designed to accelerate and optimize the training process of
 machine learning models. This library is primarily focused on Jax/Flax and plans to offer easy and fine solutions to
 train Flax/Jax Models on the `TPU/GPU`
+
 #### Note this Library needs golang to run (for some tracking stuff on TPU/GPU/CPU)
 
 install go on ubuntu be like
@@ -40,6 +41,9 @@ pip install git+https://github.com/erfanzar/EasyDel
 - **_Falcon_**    (Support `FSDP`, `MP`, `DP`)(_Supports gradient checkpointing_)
 - **_Palm_**      (Support `FSDP`, `MP`, `DP`)(_Supports gradient checkpointing_)
 - **_T5_**        (Support `FSDP`, `MP`, `DP`)(_Supports gradient checkpointing_)
+- **_OPT_**       (Support `FSDP`, `MP`, `DP`)(_Supports gradient checkpointing_)
+
+[//]: # (- **_XGen_**      _Soon_)
 - _LLama GPT-J MosaicMPT Falcon supports Flash Attention_
 
 you can also tell me the model you want in Flax/Jax version and ill try my best to build it ;)
