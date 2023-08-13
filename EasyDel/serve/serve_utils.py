@@ -287,6 +287,7 @@ class JAXServer(object):
             tokenizer: transformers.PreTrainedTokenizer,
             ckpt_path: typing.Union[str, os.PathLike],
             config=None,
+            dtype: str = 'fp16',
             add_param_field: bool = True,
             init_shape: tuple = (1, 1)
     ):
@@ -300,7 +301,7 @@ class JAXServer(object):
         shape = jax.eval_shape(_init)
         rules = match_partition_rules(params=shape, rules=config_model.get_partition_rules(True))
 
-        shard_fns, _ = make_shard_and_gather_fns(rules, get_float_dtype_by_name(config.dtype))
+        shard_fns, _ = make_shard_and_gather_fns(rules, get_float_dtype_by_name(dtype))
 
         params = read_ckpt(
             path=ckpt_path, shard_fns=flax.traverse_util.flatten_dict(shard_fns)
