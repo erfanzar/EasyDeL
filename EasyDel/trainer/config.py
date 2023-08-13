@@ -66,6 +66,8 @@ class TrainArguments(
             model_parameters=None,
             do_shard_fns: bool = True,
             track_memory: bool = True,
+            loss_remat: str = 'nothing_saveable',
+            loss_chunk: int = 512,
             **kwargs
     ):
         super().__init__()
@@ -86,6 +88,7 @@ class TrainArguments(
         total_batch_size *= gradient_accumulation_steps
         array_devices = jnp.ones((self.available_backends, 1)).reshape(sharding_array)
         self.array_devices_shape = array_devices.shape
+
         self.model_id = model_id
         self.num_train_epochs = num_train_epochs
         self.total_batch_size = total_batch_size
@@ -122,6 +125,10 @@ class TrainArguments(
         self.do_shard_fns = do_shard_fns
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.track_memory = track_memory
+
+        self.loss_chunk = loss_chunk
+        self.loss_remat = loss_remat
+
         torch.set_default_device('cpu')
         self.__dict__.update(**kwargs)
 

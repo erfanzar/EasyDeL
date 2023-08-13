@@ -1,9 +1,11 @@
 import dataclasses
+import functools
 import os
 import time
 import typing
 
 import IPython.display
+import fjutils.easylm
 import wandb
 from datasets import Dataset
 
@@ -34,10 +36,10 @@ def calculate_accuracy(predictions: jax.Array, targets: jax.Array):
 
 
 def prefix_print(prefix, string):
-    print(f'\033[1;36m{prefix}\033[1;0m : {string}')
+    print(f'\033[1;31m{prefix}\033[1;0m : {string}')
 
 
-def fsdp_train_step(state, batch):
+def fsdp_train_step(state, batch, loss_fn):
     batch = with_sharding_constraint(batch, PartitionSpec(('dp', 'fsdp')))
 
     def calculate_loss(params):
@@ -45,11 +47,14 @@ def fsdp_train_step(state, batch):
         logits = state.apply_fn(params=params, **batch,
                                 return_dict=True).logits
 
-        loss = optax.softmax_cross_entropy_with_integer_labels(
-            logits=logits[..., :-1, :],
-            labels=labels)
-        loss = jnp.mean(loss)
-        accuracy = calculate_accuracy(logits[..., :-1, :], labels)
+        # loss = optax.softmax_cross_entropy_with_integer_labels(
+        #     logits=logits[..., :-1, :],
+        #     labels=labels)
+        # loss = jnp.mean(loss)
+        # accuracy = calculate_accuracy(logits[..., :-1, :], labels)
+        loss, accuracy = loss_fn(
+            logits, labels, batch['attention_mask'].astype(jnp.float32)
+        )
         return loss, accuracy
 
     grad_fn = jax.value_and_grad(calculate_loss, has_aux=True)
@@ -58,7 +63,7 @@ def fsdp_train_step(state, batch):
     return state, loss__, accuracy__
 
 
-def fsdp_eval_step(state, batch_eval):
+def fsdp_eval_step(state, batch_eval, loss_fn):
     batch_eval = with_sharding_constraint(
         batch_eval,
         PartitionSpec(
@@ -69,10 +74,14 @@ def fsdp_eval_step(state, batch_eval):
         labels = batch_eval.pop('labels')
         logits = state.apply_fn(params=params, **batch_eval,
                                 return_dict=True).logits
-        loss = optax.softmax_cross_entropy_with_integer_labels(logits=logits[..., :-1, :],
-                                                               labels=labels)
-        loss = jnp.mean(loss)
-        accuracy = calculate_accuracy(logits[..., :-1, :], labels)
+        # loss = optax.softmax_cross_entropy_with_integer_labels(logits=logits[..., :-1, :],
+        #                                                        labels=labels)
+        # loss = jnp.mean(loss)
+        # accuracy = calculate_accuracy(logits[..., :-1, :], labels)
+
+        loss, accuracy = loss_fn(
+            logits, labels, batch_eval['attention_mask'].astype(jnp.float32)
+        )
         return loss, accuracy
 
     loss__, accuracy = calculate_loss(state.params)
@@ -293,7 +302,7 @@ class CausalLMTrainer:
         )
         sharded_train_step_fn = pjit(
             fsdp_train_step,
-            in_shardings=(train_state_partition_spec, PartitionSpec()),
+            in_shardings=(train_state_partition_spec, PartitionSpec(), PartitionSpec()),
             out_shardings=(train_state_partition_spec, PartitionSpec(), PartitionSpec()),
             donate_argnums=(0, 0),
         )
@@ -310,6 +319,16 @@ class CausalLMTrainer:
         dir_prefix: str = '/dev/shm'
         if self.arguments.track_memory:
             initialise_tracking(dir_prefix=dir_prefix)
+
+        if self.arguments.loss_remat != '':
+            blockwise_cross_entropy = functools.partial(
+                fjutils.easylm.blockwise_cross_entropy,
+                chunk_size=self.arguments.loss_chunk,
+                policy=self.arguments.loss_remat
+            )
+            loss_fn = blockwise_cross_entropy
+        else:
+            loss_fn = fjutils.easylm.cross_entropy_loss_and_accuracy
         with self.mesh:
             if self.finetune:
                 shard_fns, gather_fns = make_shard_and_gather_fns(self.train_state_partition_spec,
@@ -364,9 +383,9 @@ class CausalLMTrainer:
                             time_s = time.time()
                             sharded_train_state_, loss, accuracy = self.sharded_train_step_fn(sharded_train_state_,
                                                                                               batch,
+                                                                                              loss_fn
                                                                                               )
                             ttl_time = time.time() - time_s
-                            accuracy = accuracy / self.arguments.total_batch_size
                             losses.append(loss)
                             learning_rates.append(self.scheduler(i).tolist())
                             accuracies.append(accuracy)
@@ -417,7 +436,7 @@ class CausalLMTrainer:
                         batch['labels'] = batch['input_ids'][..., 1:]
                         for i in self.arguments.ids_to_pop_from_dataset:
                             _ = batch_eval.pop(i, None)
-                        loss_eval, accuracy = fsdp_eval_step(sharded_train_state_, batch_eval=batch_eval)
+                        loss_eval, accuracy = fsdp_eval_step(sharded_train_state_, batch_eval, loss_fn)
                         pbar_eval.update(1)
                         if self.arguments.use_wandb:
                             self.wandb_runtime.log(
