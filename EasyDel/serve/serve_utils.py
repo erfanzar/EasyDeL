@@ -294,20 +294,21 @@ class JAXServer(object):
         assert hasattr(model,
                        'init_weights'), 'model must contain init_weights func in order to init params for shard_fns'
         assert hasattr(config_model, 'get_partition_rules'), 'config_model must contain get_partition_rules functions'
+        server = cls(config=config)
 
         def _init():
             return model.init_weights(jax.random.PRNGKey(0), init_shape)
 
         shape = jax.eval_shape(_init)
         rules = match_partition_rules(params=shape, rules=config_model.get_partition_rules(True))
+        with server.mesh:
+            shard_fns, _ = make_shard_and_gather_fns(rules, get_float_dtype_by_name(dtype))
 
-        shard_fns, _ = make_shard_and_gather_fns(rules, get_float_dtype_by_name(dtype))
-
-        params = read_ckpt(
-            path=ckpt_path, shard_fns=flax.traverse_util.flatten_dict(shard_fns)
-        )
+            params = read_ckpt(
+                path=ckpt_path, shard_fns=flax.traverse_util.flatten_dict(shard_fns)
+            )
         params = {'params': params} if add_param_field else params
-        server = cls(config=config)
+
         server.rules = rules
         server.params = params
         server.configure_generate_functions(model, tokenizer)
