@@ -309,7 +309,7 @@ class JAXServer(object):
         params = flax.traverse_util.unflatten_dict(params)
         params = {'params': params} if add_param_field else params
 
-        server.rules = rules
+        server.rules = {'params': rules} if add_param_field else rules
         server.params = params
         server.configure_generate_functions(model, tokenizer)
         return server
@@ -538,7 +538,7 @@ class JAXServer(object):
                 theme=seafoam) as block:
             gr.Markdown("# <h1> <center>Powered by [EasyDeL](https://github.com/erfanzar/EasyDel) </center> </h1>")
             with gr.Row():
-                pred = gr.TextArea(elem_id="EasyDel", label="EasyDel").style(container=True, height=600)
+                pred = gr.TextArea(elem_id="EasyDel", label="EasyDel", container=True, height=600)
 
             with gr.Row():
                 submit = gr.Button(variant="primary")
@@ -801,7 +801,7 @@ class PyTorchServer(object):
                 theme=seafoam) as block:
             gr.Markdown("# <h1> <center>Powered by [EasyDeL](https://github.com/erfanzar/EasyDel) </center> </h1>")
             with gr.Row():
-                pred = gr.TextArea(elem_id="EasyDel", label="EasyDel").style(container=True, height=600)
+                pred = gr.TextArea(elem_id="EasyDel", label="EasyDel", container=True, height=600)
 
             with gr.Row():
                 submit = gr.Button(variant="primary")
