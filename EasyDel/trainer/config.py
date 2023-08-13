@@ -67,7 +67,7 @@ class TrainArguments(
             do_shard_fns: bool = True,
             track_memory: bool = True,
             loss_remat: str = 'nothing_saveable',
-            loss_chunk: int = 512,
+            loss_chunk: int = 1024,
             **kwargs
     ):
         super().__init__()
