@@ -253,6 +253,30 @@ class LlamaConfig(PretrainedConfig):
 remat = nn_partitioning.remat
 
 
+def pre_compute_llama_freqs_cis(dim, end, theta: float = 10000.):
+    freqs = 1. / (theta ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim))
+    t = jnp.arange(end)
+    freq = jnp.einsum('i,j->ij', t, freqs)
+    freq = jnp.concatenate([freq, freq], axis=-1)
+    return jnp.cos(freq)[None, None, :, :], jnp.sin(freq)[None, None, :, :]
+
+
+def rotate_half_llama(x):
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2:]
+    return jnp.concatenate((-x2, x1), axis=-1)
+
+
+def apply_rotary_pos_emb_llama(q, k, cos, sin, position_ids):
+    cos = cos.squeeze(1).squeeze(0)
+    sin = sin.squeeze(1).squeeze(0)
+    cos = jnp.expand_dims(cos[position_ids], 1)
+    sin = jnp.expand_dims(sin[position_ids], 1)
+    q_embed = (q * cos) + (rotate_half_llama(q) * sin)
+    k_embed = (k * cos) + (rotate_half_llama(k) * sin)
+    return q_embed, k_embed
+
+
 def create_sinusoidal_positions(num_pos, dim):
     inv_freq = 1.0 / (10000 ** (jnp.arange(0, dim, 2) / dim))
     sinusoid_inp = jnp.einsum("i , j -> i j", jnp.arange(num_pos), inv_freq).astype("float32")
@@ -328,7 +352,7 @@ class RMSNorm(nn.Module):
         return x * jax.lax.rsqrt(jnp.square(x).mean(-1, keepdims=True) + self.eps)
 
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        x = x.astype(jnp.promote_types(self.dtype, jnp.bfloat16))
+        x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
         output = self._norm(x).astype(self.dtype)
         weight = jnp.asarray(self.weight, self.dtype)
         return output * weight
@@ -500,6 +524,10 @@ class FlaxLlamaAttention(nn.Module):
             cos, sin = freqs_cis
             xq = apply_rotary_emb_v2(array=xq, sin=sin, cos=cos)
             xk = apply_rotary_emb_v2(array=xk, sin=sin, cos=cos)
+            del sin, cos
+        elif self.config.rotary_type == 'normal':
+            cos, sin = freqs_cis
+            xq, xk = apply_rotary_pos_emb_llama(xq, xk, sin=sin, cos=cos, position_ids=position_ids)
             del sin, cos
         else:
             raise RuntimeError
@@ -977,6 +1005,11 @@ class FlaxLlamaModule(nn.Module):
                                                          self.config.rope_scaling is not None else 1),
                                                      method=self.config.rope_scaling[
                                                          'type'] if self.config.rope_scaling is not None else None)
+        elif self.config.rotary_type == 'normal':
+
+            self.freqs_cis = pre_compute_llama_freqs_cis(end=self.config.max_position_embeddings,
+                                                         dim=self.config.num_attention_heads,
+                                                         theta=10000.)
         else:
             raise ValueError('Unknown type of rotary_embedding')
 
@@ -1090,6 +1123,8 @@ class FlaxLlamaForCausalLMModule(nn.Module):
             lm_logits = self.lm_head.apply({"params": {"kernel": shared_kernel}}, hidden_states)
         else:
             lm_logits = self.lm_head(hidden_states)
+
+        lm_logits = lm_logits.astype(jnp.float32)
 
         if not return_dict:
             return (lm_logits,) + outputs[1:]
