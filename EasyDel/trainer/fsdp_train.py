@@ -355,8 +355,9 @@ class CausalLMTrainer:
                     prefix_print(
                         'Action', f'Sharding Passed Parameters'
                     )
+                    from flax.core import unfreeze
                     params = model_parameters if not self.arguments.do_shard_fns else jax.tree_util.tree_map(
-                        lambda f, x: f(x), shard_fns.params,
+                        lambda f, x: f(x), unfreeze(shard_fns.params),
                         model_parameters)
 
                 if self.arguments.remove_ckpt_after_load:
