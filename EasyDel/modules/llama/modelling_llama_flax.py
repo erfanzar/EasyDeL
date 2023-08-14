@@ -96,8 +96,9 @@ class LlamaConfig(PretrainedConfig):
             from_pt: bool = False,
             **kwargs,
     ):
-        assert rotary_type in ['open', 'complex',
-                               'lm2'], f'{rotary_type} is wrong type of rotary valid types are [open, complex,lm2]'
+        assert rotary_type in ['open', 'complex', 'normal'
+                                                  'lm2'], f'{rotary_type} is wrong type of rotary valid types' \
+                                                          f' are [open, complex,lm2,normal]'
         num_key_value_heads = num_key_value_heads or num_attention_heads
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
