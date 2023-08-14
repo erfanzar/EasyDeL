@@ -327,7 +327,7 @@ class JAXServer(object):
             params = jax.tree_util.tree_map(
                 lambda f, p: f(p), shard_fns, params
             )
-        params = flax.traverse_util.unflatten_dict(params)
+
         params = {'params': params} if add_param_field else params
 
         server.rules = {'params': rules} if add_param_field else rules

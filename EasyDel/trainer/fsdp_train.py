@@ -25,6 +25,7 @@ from flax.training import train_state
 from jax import numpy as jnp
 from torch.utils.data import DataLoader
 from fjutils import match_partition_rules, make_shard_and_gather_fns, StreamingCheckpointer, count_params
+from EasyDel.utils.utils import prefix_str
 
 
 def calculate_accuracy(predictions: jax.Array, targets: jax.Array):
@@ -33,10 +34,6 @@ def calculate_accuracy(predictions: jax.Array, targets: jax.Array):
     total_predictions = targets.shape[0]
     accuracy = correct_predictions / total_predictions
     return accuracy
-
-
-def prefix_print(prefix, string):
-    print(f'\033[1;31m{prefix}\033[1;0m : {string}')
 
 
 def fsdp_train_step(state, batch):
