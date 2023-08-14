@@ -133,7 +133,12 @@ class CausalLMTrainer:
         self.dtype = arguments.dtype
         self.param_dtype = arguments.param_dtype
         if finetune:
-            assert ckpt_path is not None, 'ckpt path can not be none when you are using finetune task'
+            if ckpt_path is None:
+                prefix_print(
+                    'Warning',
+                    'In case of using finetune = True and Passing ckpt_path = None you should pass parameters'
+                    'in train function'
+                )
         if _do_init_fns:
             self.init_functions()
         else:
