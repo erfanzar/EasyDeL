@@ -29,6 +29,7 @@ import logging
 from EasyDel.utils.utils import RNG
 import multiprocessing as mp
 import torch
+from EasyDel.utils.utils import prefix_str
 
 pjit = pjit.pjit
 
@@ -173,12 +174,25 @@ class JAXServer(object):
             logging.info(
                 'Tokenizer does not contain padding token setting padding token to eos token for open end generation')
             tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.padding_side = 'left'
-        tokenizer.truncation_side = 'left'
-        self.prefix_tokenizer = copy.deepcopy(tokenizer)
-        tokenizer.padding_side = 'right'
-        tokenizer.truncation_side = 'right'
-        self.tokenizer = copy.deepcopy(tokenizer)
+
+        try:
+            tokenizer.padding_side = 'left'
+            tokenizer.truncation_side = 'left'
+            self.prefix_tokenizer = copy.deepcopy(tokenizer)
+            tokenizer.padding_side = 'right'
+            tokenizer.truncation_side = 'right'
+            self.tokenizer = copy.deepcopy(tokenizer)
+        except:
+            prefix_str(
+                'Warning', f'The class Model of Tokenizer {type(tokenizer)} do not support deepcopy option '
+            )
+            if self.config.use_prefix_tokenizer:
+                tokenizer.padding_side = 'left'
+                tokenizer.truncation_side = 'left'
+            else:
+                tokenizer.padding_side = 'right'
+                tokenizer.truncation_side = 'right'
+            self.prefix_tokenizer = tokenizer
 
         @functools.partial(
             pjit,
