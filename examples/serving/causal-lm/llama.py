@@ -149,7 +149,7 @@ def main(argv):
         "use_prefix_tokenizer": FLAGS.use_prefix_tokenizer
     }
     server = JAXServer.load(
-        ckpt_path=FLAGS.ckpt_path,
+        path=FLAGS.ckpt_path,
         model=model,
         tokenizer=tokenizer,
         config_model=config,

@@ -143,42 +143,45 @@ To use EasyDeL in your project, you will need to import the library in your Pyth
 and classes. Here is an example of how to import EasyDeL and use its Model class:
 
 ```python
+from EasyDel import JAXServer, FlaxLlamaForCausalLM, LlamaConfig
+from transformers import AutoTokenizer
+import jax
 
-from EasyDel import FlaxLlamaForCausalLM, LlamaConfig
+model_id = 'meta-llama/Llama-2-7b-chat-hf'
 
-config = LlamaConfig.from_pretrained('owner/repo_id')
-# in case building from config
-model = FlaxLlamaForCausalLM(
-    config=config,
-    _do_init=True,  # To init Params (doing this manual is a better idea)
+tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+
+config = LlamaConfig.from_pretrained(
+    model_id,
+    rotary_type='complex'
 )
 
-# in case of loading
-```
-
-or simply just load a params
-
-```python
-# fjutils is an inside library for EasyDeL
-from fjutils.utils import read_ckpt
-
-params = read_ckpt('path_to_ckpt_(ostFormat,EasyDeLFormat,EasyLMFormat)',
-                   shard_fns=None  # shard fns in case to use with pjit to shard model
-                   )
-
-```
-
-or loading with train state just like
-
-```python
-from fjutils import StreamingCheckpointer
-
-ckpt_s = StreamingCheckpointer(
-    StreamingCheckpointer.get_default_config(),
-    'ckpt_dir'
+config.add_jax_args(
+    from_pt=True,
+    use_pjit_attention_force=False,
+    flash_attn_key_chunk_size=1024,
+    scan_mlp_chunk_size=1024,
+    use_flash_attention=False,
+    use_sacn_mlp=False
 )
-train_state, params = ckpt_s.load_checkpoint(
-    'params::path_to_ckpt_(ostFormat,EasyDeLFormat,EasyLMFormat)'
+
+with jax.default_device(jax.devices('cpu')[0]):
+    model = FlaxLlamaForCausalLM.from_pretrained(
+        model_id,
+        from_pt=True,
+        config=config,
+    )
+
+server = JAXServer.load_from_params(
+    model=model,
+    config_model=config,
+    tokenizer=tokenizer,
+    params=model.params,
+    add_param_field=True
+)
+
+predictions = server.process(
+    'String To The Model'
 )
 ```
 
