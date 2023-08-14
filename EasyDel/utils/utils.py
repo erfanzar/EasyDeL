@@ -121,6 +121,10 @@ def prefix_str(prefix, string):
     return f'\033[1;36m{prefix}\033[1;0m : {string}'
 
 
+def prefix_print(prefix, string):
+    print(f'\033[1;31m{prefix}\033[1;0m : {string}')
+
+
 class Timers:
     """Group of timers."""
 
