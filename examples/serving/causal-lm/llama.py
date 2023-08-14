@@ -148,13 +148,14 @@ def main(argv):
         "seed": FLAGS.seed,
         "use_prefix_tokenizer": FLAGS.use_prefix_tokenizer
     }
-    server = JAXServer.load_from_ckpt(
+    server = JAXServer.load(
         ckpt_path=FLAGS.ckpt_path,
         model=model,
         tokenizer=tokenizer,
-        partition_rules=config.get_partition_rules(True),
+        config_model=config,
         add_param_field=True,
-        config=config_server
+        config=config_server,
+        init_shape=(1, 1)
     )
     server.fire()
     # Done you have hosted your LLama model :)

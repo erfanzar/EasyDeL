@@ -30,12 +30,14 @@ def main():
     model = EasyDel.FlaxLlamaForCausalLM(config, _do_init=False)
     tokenizer = AutoTokenizer.from_pretrained('erfanzar/JaxLLama')
 
-    server = JAXServer.load_from_ckpt(
+    server = JAXServer.load(
         ckpt_path=ref,
         model=model,
         tokenizer=tokenizer,
-        partition_rules=config.get_partition_rules(True),
-        add_param_field=True
+        config_model=config,
+        add_param_field=True,
+        config=None,
+        init_shape=(1, 1)
     )
     # Launching the server
     server.fire()  # Launching Server Post and Get APIs with FastApi on https://ip:port/
@@ -201,12 +203,14 @@ def main():
     model = EasyDel.FlaxLlamaForCausalLM(config, _do_init=False)
     tokenizer = AutoTokenizer.from_pretrained('erfanzar/JaxLLama')
 
-    server = JAXServer.load_from_ckpt(
+    server = JAXServer.load(
         ckpt_path=ref,
         model=model,
         tokenizer=tokenizer,
-        partition_rules=config.get_partition_rules(True),
-        add_param_field=True
+        config_model=config,
+        add_param_field=True,
+        init_shape=(1, 1),
+        config=None,
     )
     # Predicting with Server
     text = "what is different between llama and alpacas"
