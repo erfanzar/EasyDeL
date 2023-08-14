@@ -25,7 +25,7 @@ from flax.training import train_state
 from jax import numpy as jnp
 from torch.utils.data import DataLoader
 from fjutils import match_partition_rules, make_shard_and_gather_fns, StreamingCheckpointer, count_params
-from EasyDel.utils.utils import prefix_str
+from EasyDel.utils.utils import prefix_print
 
 
 def calculate_accuracy(predictions: jax.Array, targets: jax.Array):
