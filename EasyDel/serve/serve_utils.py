@@ -262,7 +262,7 @@ class JAXServer(object):
             model: transformers.FlaxPreTrainedModel,
             config_model: transformers.PretrainedConfig,
             tokenizer: transformers.PreTrainedTokenizer,
-            ckpt_path: typing.Union[str, os.PathLike],
+            path: typing.Union[str, os.PathLike],
             config=None,
             add_param_field: bool = True,
             init_shape: tuple = (1, 1)
@@ -281,7 +281,7 @@ class JAXServer(object):
             shard_fns, _ = make_shard_and_gather_fns(rules, get_float_dtype_by_name(server.config.dtype))
 
             params = read_ckpt(
-                path=ckpt_path, shard_fns=flax.traverse_util.flatten_dict(shard_fns)
+                path=path, shard_fns=flax.traverse_util.flatten_dict(shard_fns)
             )
         params = flax.traverse_util.unflatten_dict(params)
         params = {'params': params} if add_param_field else params
