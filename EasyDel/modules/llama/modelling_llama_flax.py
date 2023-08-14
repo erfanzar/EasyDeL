@@ -271,8 +271,8 @@ def rotate_half_llama(x):
 def apply_rotary_pos_emb_llama(q, k, cos, sin, position_ids):
     cos = cos.squeeze(1).squeeze(0)
     sin = sin.squeeze(1).squeeze(0)
-    cos = jnp.expand_dims(cos[position_ids], 1)
-    sin = jnp.expand_dims(sin[position_ids], 1)
+    cos = jnp.expand_dims(cos[position_ids], 2)
+    sin = jnp.expand_dims(sin[position_ids], 2)
     q_embed = (q * cos) + (rotate_half_llama(q) * sin)
     k_embed = (k * cos) + (rotate_half_llama(k) * sin)
     return q_embed, k_embed
@@ -998,12 +998,12 @@ class FlaxLlamaModule(nn.Module):
 
             self.freqs_cis = create_sinusoidal_positions(
                 self.config.max_position_embeddings,
-                self.config.num_attention_heads
+                self.config.hidden_size // self.config.num_attention_heads
             )
         elif self.config.rotary_type == 'lm2':
 
             self.freqs_cis = pre_compute_frq_sin_cos(end=self.config.max_position_embeddings,
-                                                     dim=self.config.num_attention_heads,
+                                                     dim=self.config.hidden_size // self.config.num_attention_headss,
                                                      scale_factor=float(
                                                          self.config.rope_scaling['factor'] if
                                                          self.config.rope_scaling is not None else 1),
@@ -1012,7 +1012,7 @@ class FlaxLlamaModule(nn.Module):
         elif self.config.rotary_type == 'normal':
 
             self.freqs_cis = pre_compute_llama_freqs_cis(end=self.config.max_position_embeddings,
-                                                         dim=self.config.num_attention_heads,
+                                                         dim=self.config.hidden_size // self.config.num_attention_heads,
                                                          theta=10000.)
         else:
             raise ValueError('Unknown type of rotary_embedding')
