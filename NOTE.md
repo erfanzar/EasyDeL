@@ -1,7 +1,12 @@
+### Note 14Aug
+
+use `rotary_type='normal'` for llama2 or llama1 huggingface models
+
 ### Note
 
-llama model have different key or params name in case that you want to load the model from the huggingface
-(other pretrained llama) models you do not need to convert weight just pass the `from_pt=True` if `LlamaConfig`
+The llama model has a different key or params name in case you want to load the model from the hugging face
+(other pre-trained llama) models you do not need to convert weight just pass the `from_pt=True` if `LlamaConfig`
+
 
 #### Example
 
@@ -12,7 +17,7 @@ config = LlamaConfig(from_pt=True)
 model = FlaxLlamaForCausalLM.from_pretrained('<here/pretrained>', config=config)
 params = model.params
 partition_rules = config.get_partition_rules()
-# now partition rules created from new key names not Easydel type
+# Now partition rules are created from new key names, not Easydel type
 print(partition_rules)
 ```
 
