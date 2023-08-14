@@ -1003,7 +1003,7 @@ class FlaxLlamaModule(nn.Module):
         elif self.config.rotary_type == 'lm2':
 
             self.freqs_cis = pre_compute_frq_sin_cos(end=self.config.max_position_embeddings,
-                                                     dim=self.config.hidden_size // self.config.num_attention_headss,
+                                                     dim=self.config.hidden_size // self.config.num_attention_heads,
                                                      scale_factor=float(
                                                          self.config.rope_scaling['factor'] if
                                                          self.config.rope_scaling is not None else 1),
