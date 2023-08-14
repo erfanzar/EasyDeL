@@ -356,7 +356,7 @@ def precompute_freqs_cis(
     freqs = jnp.outer(t, freqs).astype(jnp.float32)
     sin, cos = jnp.sin(freqs).astype(jnp.float32), jnp.cos(freqs).astype(jnp.float32)
     freqs_cis = jnp.complex64(cos + 1j * sin)
-    return jnp.asarray(freqs_cis)
+    return jnp.asarray(freqs_cis, dtype=jnp.float32)
 
 
 def apply_rotary_emb(
@@ -960,8 +960,7 @@ class FlaxLlamaModule(nn.Module):
                 method=self.config.rope_scaling['type'] if self.config.rope_scaling is not None else None,
                 scaling_factor=float(self.config.rope_scaling['factor'] if self.config.rope_scaling is not None else 1),
                 dim=self.config.hidden_size // self.config.num_attention_heads,
-                end=self.config.max_position_embeddings * 2,
-                dtype=self.dtype,
+                end=self.config.max_position_embeddings * 2
             )
         elif self.config.rotary_type == 'open':
 
