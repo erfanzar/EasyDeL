@@ -13,6 +13,7 @@ from fastapi import FastAPI
 from fjutils import make_shard_and_gather_fns, match_partition_rules, with_sharding_constraint
 from fjutils.utils import read_ckpt
 from typing import Optional, List, Union
+from EasyDel.smi import get_mem, initialise_tracking
 from flax.core import freeze
 from flax.traverse_util import unflatten_dict
 from jax import numpy as jnp
@@ -88,7 +89,7 @@ class JAXServer(object):
         self.number_of_served_request_until_last_up_time = 0
 
         self.rng_generator = RNG(42)
-
+        initialise_tracking(0.5)
         array = jnp.ones((len(jax.devices()), 1)).reshape(self.config.mesh_axes_shape)
         self.mesh = Mesh(mesh_utils.create_device_mesh(array.shape), self.config.mesh_axes_names)
 
@@ -150,43 +151,19 @@ class JAXServer(object):
             config.update(ConfigDict(updates).copy_and_resolve_references())
         return config
 
-    @classmethod
-    def load_from_ckpt(cls,
-                       ckpt_path,
-                       model,
-                       tokenizer,
-                       partition_rules,
-                       config=None,
-                       add_param_field: bool = True,
-                       use_cpu_index: int = 0,
-                       default_backend: str = 'cpu'):
-        assert default_backend in ['cpu', 'tpu', 'gpu'], 'correct backends are cpu gpu tpu'
-        if default_backend == 'cpu':
-            logging.info('Using offload parameters on CPU')
-        from flax.serialization import from_bytes
-        import msgpack
-        params = {}
-        with jax.default_device(jax.devices(default_backend)[use_cpu_index]):
-            with open(ckpt_path, 'rb') as fin:
-                unpacker = msgpack.Unpacker(fin, max_buffer_size=0, read_size=880000000)
-                for key, tensor in unpacker:
-                    key = tuple(key)
-                    params[key] = from_bytes(None, tensor)
-        params = unflatten_dict(params)
-        params = {'params': params} if add_param_field else params
-        server = cls(config)
-        server.shard_params(params=params, partition_rules=partition_rules)
-        server.configure_generate_functions(model=model, tokenizer=tokenizer)
-        return server
-
     def status(self):
         return {
             'config': {k: v for k, v in self.config.__dict__.items()},
             'devices': f"{jax.devices()}",
             'number_of_backends': len(jax.devices()),
             'status': 'Ready',
-            'number_of_served_request_until_last_up_time': f"{self.number_of_served_request_until_last_up_time}"
+            'number_of_served_request_until_last_up_time': f"{self.number_of_served_request_until_last_up_time}",
+            'memory': f"{get_mem()}"
         }
+
+    @staticmethod
+    def get_memory():
+        return get_mem()
 
     def configure_generate_functions(self, model, tokenizer):
 
@@ -287,7 +264,7 @@ class JAXServer(object):
             tokenizer: transformers.PreTrainedTokenizer,
             ckpt_path: typing.Union[str, os.PathLike],
             config=None,
-            add_param_field: bool = False,
+            add_param_field: bool = True,
             init_shape: tuple = (1, 1)
     ):
         assert hasattr(model,
@@ -305,6 +282,36 @@ class JAXServer(object):
 
             params = read_ckpt(
                 path=ckpt_path, shard_fns=flax.traverse_util.flatten_dict(shard_fns)
+            )
+        params = flax.traverse_util.unflatten_dict(params)
+        params = {'params': params} if add_param_field else params
+
+        server.rules = {'params': rules} if add_param_field else rules
+        server.params = params
+        server.configure_generate_functions(model, tokenizer)
+        return server
+
+    @classmethod
+    def load_from_params(
+            cls,
+            model: transformers.FlaxPreTrainedModel,
+            config_model: transformers.PretrainedConfig,
+            tokenizer: transformers.PreTrainedTokenizer,
+            params: typing.Dict,
+            config=None,
+            add_param_field: bool = True,
+    ):
+        assert hasattr(model,
+                       'init_weights'), 'model must contain init_weights func in order to init params for shard_fns'
+        assert hasattr(config_model, 'get_partition_rules'), 'config_model must contain get_partition_rules functions'
+        server = cls(config=config)
+
+        with server.mesh:
+            rules = match_partition_rules(params=params, rules=config_model.get_partition_rules(True))
+            shard_fns, _ = make_shard_and_gather_fns(rules, get_float_dtype_by_name(server.config.dtype))
+
+            params = jax.tree_util.tree_map(
+                lambda f, p: f(p), shard_fns, params
             )
         params = flax.traverse_util.unflatten_dict(params)
         params = {'params': params} if add_param_field else params
