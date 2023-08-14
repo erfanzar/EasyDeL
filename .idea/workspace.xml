@@ -6,7 +6,6 @@
   <component name="ChangeListManager">
     <list default="true" id="08ad205b-709f-455b-86db-91293f595cd3" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/EasyDel/trainer/fsdp_train.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/trainer/fsdp_train.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -205,6 +204,9 @@
       <workItem from="1691920050195" duration="11000" />
       <workItem from="1691920117202" duration="5643000" />
       <workItem from="1691928788898" duration="639000" />
+      <workItem from="1691930139009" duration="5163000" />
+      <workItem from="1691999659518" duration="680000" />
+      <workItem from="1692001076538" duration="654000" />
     </task>
     <servers />
   </component>

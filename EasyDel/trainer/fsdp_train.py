@@ -343,16 +343,20 @@ class CausalLMTrainer:
             if self.finetune:
                 shard_fns, gather_fns = make_shard_and_gather_fns(self.train_state_partition_spec,
                                                                   dtype_specs=self.dtype)
-                prefix_print(
-                    'Action', f'Loading Model From {self.ckpt_path}'
-                )
+
                 if model_parameters is None:
+                    prefix_print(
+                        'Action', f'Loading Model From {self.ckpt_path}'
+                    )
                     _, params = StreamingCheckpointer.load_trainstate_checkpoint(
                         f'params::{self.ckpt_path}', self.train_state_shape, shard_fns
                     )
                 else:
+                    prefix_print(
+                        'Action', f'Sharding Passed Parameters'
+                    )
                     params = model_parameters if not self.arguments.do_shard_fns else jax.tree_util.tree_map(
-                        lambda f, x: f(x), shard_fns,
+                        lambda f, x: f(x), shard_fns.params,
                         model_parameters)
 
                 if self.arguments.remove_ckpt_after_load:
