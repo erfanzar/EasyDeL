@@ -498,6 +498,8 @@ class FlaxLlamaAttention(nn.Module):
             output_attentions: bool = False,
             fcm_mask=None,
     ):
+
+        sq_len = hidden_states.shape[1]
         xq, xk, xv = self.wq(hidden_states), self.wk(hidden_states), self.wv(hidden_states)
         if self.config.use_pjit_attention_force:
             xq = with_sharding_constraint(xq, PS(("dp", "fsdp"), None, "mp"))
@@ -527,7 +529,8 @@ class FlaxLlamaAttention(nn.Module):
             del sin, cos
         elif self.config.rotary_type == 'normal':
             cos, sin = freqs_cis
-            xq, xk = apply_rotary_pos_emb_llama(xq, xk, sin=sin, cos=cos, position_ids=position_ids)
+            xq, xk = apply_rotary_pos_emb_llama(xq, xk, sin=sin[:, :, :sq_len, :], cos=cos[:, :, :sq_len, :],
+                                                position_ids=position_ids)
             del sin, cos
         else:
             raise RuntimeError
