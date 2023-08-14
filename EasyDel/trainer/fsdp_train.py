@@ -351,17 +351,22 @@ class CausalLMTrainer:
                     _, params = StreamingCheckpointer.load_trainstate_checkpoint(
                         f'params::{self.ckpt_path}', self.train_state_shape, shard_fns
                     )
+
+                    if self.arguments.remove_ckpt_after_load:
+                        os.remove(self.ckpt_path)
                 else:
                     prefix_print(
                         'Action', f'Sharding Passed Parameters'
                     )
                     from flax.core import unfreeze
+                    if not isinstance(model_parameters, flax.core.FrozenDict):
+                        prefix_print(
+                            'Warning', f'Model Parameters should be like FrozenDict({"params" : params}) make sure to '
+                                       f'pass as type FrozenDict in case of not getting UnExcepted Errors '
+                        )
                     params = model_parameters if not self.arguments.do_shard_fns else jax.tree_util.tree_map(
-                        lambda f, x: f(x), unfreeze(shard_fns.params),
+                        lambda f, x: f(x), shard_fns.params,
                         model_parameters)
-
-                if self.arguments.remove_ckpt_after_load:
-                    os.remove(self.ckpt_path)
 
                 sharded_train_state_ = self.sharded_create_from_params_fn(params)
 
