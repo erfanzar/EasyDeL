@@ -339,7 +339,7 @@ def precompute_freqs_cis(
         dim: int, end: int, theta: float = 10000.0,
         scaling_factor: float = 8.,
         dtype: jnp.dtype = jnp.bfloat16) -> jnp.ndarray:
-    freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(dtype) / dim))
+    freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(jnp.float32) / dim))
     t = jnp.arange(end)
 
     if method is not None:
@@ -353,8 +353,8 @@ def precompute_freqs_cis(
         else:
             raise ValueError(f'unknown {method} method for precompute_freqs_cis')
 
-    freqs = jnp.outer(t, freqs).astype(dtype)
-    sin, cos = jnp.sin(freqs), jnp.cos(freqs)
+    freqs = jnp.outer(t, freqs).astype(jnp.float32)
+    sin, cos = jnp.sin(freqs).astype(jnp.float32), jnp.cos(freqs).astype(jnp.float32)
     freqs_cis = jnp.complex64(cos + 1j * sin)
     return jnp.asarray(freqs_cis)
 
