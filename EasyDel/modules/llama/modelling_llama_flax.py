@@ -83,8 +83,8 @@ class LlamaConfig(PretrainedConfig):
             attn_pdrop: float = 0.0,
             tie_word_embeddings: bool = False,
             gradient_checkpointing: str = 'nothing_saveable',
-            fcm_min_ratio: float = 0.0,
-            fcm_max_ratio: float = 0.0,
+            fcm_min_ratio: float = -1,
+            fcm_max_ratio: float = -1,
             use_pjit_attention_force: bool = True,
             rope_scaling: Dict[str, Union[str, float]] = None,
             use_flash_attention: bool = False,
@@ -94,12 +94,14 @@ class LlamaConfig(PretrainedConfig):
             scan_mlp_chunk_size: int = 1024,
             rotary_type: str = 'complex',
             from_pt: bool = False,
+            drop_fcm_mask: bool = True,
             **kwargs,
     ):
-        assert rotary_type in ['open', 'complex', 'normal'
-                                                  'lm2'], f'{rotary_type} is wrong type of rotary valid types' \
-                                                          f' are [open, complex,lm2,normal]'
+        assert rotary_type in ['open', 'complex', 'normal',
+                               'lm2'], f'{rotary_type} is wrong type of rotary valid types' \
+                                       f' are [open, complex,lm2,normal]'
         num_key_value_heads = num_key_value_heads or num_attention_heads
+
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.initializer_range = initializer_range
@@ -338,8 +340,8 @@ def apply_rotary_emb_v2(array, sin, cos):
 class RMSNorm(nn.Module):
     dim: int
     eps: float = 1e-6
-    dtype: jnp.dtype = jnp.bfloat16
-    param_dtype: jnp.dtype = jnp.bfloat16
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
 
     def setup(self) -> None:
         self.weight = self.param(
@@ -363,7 +365,7 @@ def precompute_freqs_cis(
         method: str,
         dim: int, end: int, theta: float = 10000.0,
         scaling_factor: float = 8.,
-        dtype: jnp.dtype = jnp.bfloat16) -> jnp.ndarray:
+        dtype: jnp.dtype = jnp.float32) -> jnp.ndarray:
     freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(jnp.float32) / dim))
     t = jnp.arange(end)
 
@@ -388,7 +390,7 @@ def apply_rotary_emb(
         xq: jnp.ndarray,
         xk: jnp.ndarray,
         freqs_cis: jnp.ndarray,
-        dtype: jnp.dtype = jnp.bfloat16,
+        dtype: jnp.dtype = jnp.float32,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     reshape_xq = xq.astype(jnp.float32).reshape(*xq.shape[:-1], -1, 2)
     reshape_xk = xk.astype(jnp.float32).reshape(*xk.shape[:-1], -1, 2)
@@ -409,8 +411,8 @@ def apply_rotary_emb(
 
 class FlaxLlamaAttention(nn.Module):
     config: LlamaConfig
-    dtype: jnp.dtype = jnp.bfloat16
-    param_dtype: jnp.dtype = jnp.bfloat16
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self):
@@ -584,7 +586,7 @@ class FlaxLlamaAttention(nn.Module):
                 dtype=self.dtype,
                 policy=get_gradient_checkpoint_policy('nothing_saveable'),
                 precision=self.precision,
-                float32_logits=False if self.dtype == jnp.bfloat16 else True,
+                float32_logits=False if self.dtype == jnp.float32 else True,
             )
         else:
             attn_weights = dot_product_attention_weights(
@@ -594,7 +596,7 @@ class FlaxLlamaAttention(nn.Module):
                 dropout_rng=dropout_rng,
                 dropout_rate=self.config.attn_pdrop,
                 deterministic=deterministic,
-                dtype=jnp.promote_types(self.dtype, jnp.bfloat16),
+                dtype=jnp.promote_types(self.dtype, jnp.float32),
                 precision=self.precision,
             )
             if self.config.use_pjit_attention_force:
@@ -610,8 +612,8 @@ class FlaxLlamaAttention(nn.Module):
 
 class FlaxLlamaMLP(nn.Module):
     config: LlamaConfig
-    dtype: jnp.dtype = jnp.bfloat16
-    param_dtype: jnp.dtype = jnp.bfloat16
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
@@ -654,8 +656,8 @@ class FlaxLlamaMLP(nn.Module):
 
 class FlaxLlamaBlock(nn.Module):
     config: LlamaConfig
-    dtype: jnp.dtype = jnp.bfloat16
-    param_dtype: jnp.dtype = jnp.bfloat16
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
@@ -773,7 +775,7 @@ class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
             config: LlamaConfig,
             input_shape: Tuple = (1, 1),
             seed: int = 0,
-            dtype: jnp.dtype = jnp.bfloat16,
+            dtype: jnp.dtype = jnp.float32,
             _do_init: bool = True,
             **kwargs,
     ):
@@ -896,8 +898,8 @@ class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
 
 class FlaxLlamaBlockCollection(nn.Module):
     config: LlamaConfig
-    dtype: jnp.dtype = jnp.bfloat16
-    param_dtype: jnp.dtype = jnp.bfloat16
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self):
@@ -967,8 +969,8 @@ class FlaxLlamaBlockCollection(nn.Module):
 
 class FlaxLlamaModule(nn.Module):
     config: LlamaConfig
-    dtype: jnp.dtype = jnp.bfloat16
-    param_dtype: jnp.dtype = jnp.bfloat16
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self):
@@ -1071,8 +1073,8 @@ class FlaxLlamaModel(FlaxLlamaPreTrainedModel):
 
 class FlaxLlamaForCausalLMModule(nn.Module):
     config: LlamaConfig
-    dtype: jnp.dtype = jnp.bfloat16
-    param_dtype: jnp.dtype = jnp.bfloat16
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self):
@@ -1165,8 +1167,8 @@ class FlaxLlamaForCausalLM(FlaxLlamaPreTrainedModel):
 class FlaxLlamaForSequenceClassificationModule(nn.Module):
     num_classes: int
     config: LlamaConfig
-    dtype: jnp.dtype = jnp.bfloat16
-    param_dtype: jnp.dtype = jnp.bfloat16
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self):

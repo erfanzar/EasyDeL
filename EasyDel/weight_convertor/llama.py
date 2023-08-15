@@ -1,6 +1,95 @@
+from pathlib import Path
+
+from fjutils import StreamingCheckpointer
 from jax import numpy as jnp
 import jax
 import torch
+
+
+def convert_hf_to_flax(checkpoints_dir, num_hidden_layers=32, num_attention_heads=32, hidden_size=4096,
+                       device=jax.devices('cpu')[0]):
+    # Edited From EasyLM
+    ckpt_paths = sorted(Path(checkpoints_dir).glob("*.bin"))
+    ckpt = {}
+    with jax.default_device(device):
+        for i, ckpt_path in enumerate(ckpt_paths):
+            checkpoint = torch.load(ckpt_path, map_location="cpu")
+            for k, v in checkpoint.items():
+                if k.startswith("model."):
+                    k = k[6:]
+                ckpt[k] = v
+
+        def inverse_permute(w):
+
+            reshaped_w = w.reshape(num_attention_heads, 2, hidden_size // num_attention_heads // 2, hidden_size)
+            transposed_w = reshaped_w.transpose(0, 2, 1, 3)
+            inverted_w = transposed_w.reshape(hidden_size, hidden_size)
+            return inverted_w
+
+        jax_weights = {
+            "transformer": {
+                "wte": {"embedding": ckpt["embed_tokens.weight"].numpy()},
+                "ln_f": {"kernel": ckpt["norm.weight"].numpy()},
+                "h": {
+                    "%d"
+                    % (layer): {
+                        "attention": {
+                            "wq": {
+                                "kernel": inverse_permute(
+
+                                    ckpt[f"layers.{layer}.self_attn.q_proj.weight"].numpy(),
+                                ).transpose()
+                            },
+                            "wk": {
+                                "kernel": inverse_permute(
+
+                                    ckpt[f"layers.{layer}.self_attn.k_proj.weight"].numpy(),
+                                ).transpose()
+                            },
+                            "wv": {
+                                "kernel": ckpt[f"layers.{layer}.self_attn.v_proj.weight"]
+                                .numpy()
+                                .transpose()
+                            },
+                            "wo": {
+                                "kernel": ckpt[f"layers.{layer}.self_attn.o_proj.weight"]
+                                .numpy()
+                                .transpose()
+                            },
+                        },
+                        "feed_forward": {
+                            "w1": {
+                                "kernel": ckpt[f"layers.{layer}.mlp.gate_proj.weight"]
+                                .numpy()
+                                .transpose()
+                            },
+                            "w2": {
+                                "kernel": ckpt[f"layers.{layer}.mlp.down_proj.weight"]
+                                .numpy()
+                                .transpose()
+                            },
+                            "w3": {
+                                "kernel": ckpt[f"layers.{layer}.mlp.up_proj.weight"]
+                                .numpy()
+                                .transpose()
+                            },
+                        },
+                        "attention_norm": {
+                            "kernel": ckpt[f"layers.{layer}.input_layernorm.weight"].numpy()
+                        },
+                        "ffn_norm": {
+                            "kernel": ckpt[
+                                f"layers.{layer}.post_attention_layernorm.weight"
+                            ].numpy()
+                        },
+                    }
+                    for layer in range(num_hidden_layers)
+                },
+            },
+            "lm_head": {"kernel": ckpt["lm_head.weight"].numpy().transpose()},
+        }
+
+        return jax_weights
 
 
 def convert_pt_to_flax(state_dict_pt, n_layers: int, device=jax.devices('cpu')[0]):
