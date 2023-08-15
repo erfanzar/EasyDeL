@@ -96,6 +96,7 @@ class LlamaConfig(PretrainedConfig):
             rotary_type: str = 'complex',
             from_pt: bool = False,
             do_torch_attn: bool = False,
+            use_torch_to_init_rope_normal=False,
             **kwargs,
     ):
         assert rotary_type in ['open', 'complex', 'normal', 'lm2'], f'{rotary_type} is wrong type ' \
@@ -110,6 +111,7 @@ class LlamaConfig(PretrainedConfig):
         self.initializer_range = initializer_range
         self.intermediate_size = intermediate_size
         self.num_hidden_layers = num_hidden_layers
+        self.use_torch_to_init_rope_normal = use_torch_to_init_rope_normal
         self.num_attention_heads = num_attention_heads
         self.max_position_embeddings = max_position_embeddings
         self.rms_norm_eps = rms_norm_eps
@@ -226,8 +228,9 @@ class LlamaConfig(PretrainedConfig):
                      flash_attn_query_chunk_size: int = 1024,
                      flash_attn_key_chunk_size: int = 1024,
                      scan_mlp_chunk_size: int = 1024,
-                     rotary_type: str = 'complex',
+                     rotary_type: str = 'normal',
                      from_pt: bool = True,
+                     use_torch_to_init_rope_normal=True
                      ):
         self.from_pt = from_pt
         self.use_flash_attention = use_flash_attention
@@ -246,6 +249,7 @@ class LlamaConfig(PretrainedConfig):
         self.flash_attn_key_chunk_size = flash_attn_key_chunk_size
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.rotary_type = rotary_type
+        self.use_torch_to_init_rope_normal = use_torch_to_init_rope_normal
 
     @staticmethod
     def get_weight_decay_exclusions():
@@ -257,6 +261,16 @@ class LlamaConfig(PretrainedConfig):
 
 
 remat = nn_partitioning.remat
+
+
+def pre_compute_llama_freqs_cis_torch(dim, end, theta: float = 10000.):
+    import torch
+    freq_cis = 1. / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+    t = torch.arange(end, dtype=torch.float32)
+    freq = torch.einsum('i,j->ij', t, freq_cis)
+    freq = torch.cat([freq, freq], dim=-1)
+    return jnp.asarray(torch.cos(freq)[None, None, :, :].detach().numpy(), dtype=jnp.float32), \
+        jnp.asarray(torch.sin(freq)[None, None, :, :].detach().numpy(), dtype=jnp.float32)
 
 
 def pre_compute_llama_freqs_cis(dim, end, theta: float = 10000.):
@@ -1055,10 +1069,16 @@ class FlaxLlamaModule(nn.Module):
                                                      method=self.config.rope_scaling[
                                                          'type'] if self.config.rope_scaling is not None else None)
         elif self.config.rotary_type == 'normal':
-
-            self.freqs_cis = pre_compute_llama_freqs_cis(end=self.config.max_position_embeddings,
-                                                         dim=self.config.hidden_size // self.config.num_attention_heads,
-                                                         theta=10000.)
+            if self.config.use_torch_to_init_rope_normal:
+                self.freqs_cis = pre_compute_llama_freqs_cis_torch(
+                    end=self.config.max_position_embeddings,
+                    dim=self.config.hidden_size // self.config.num_attention_heads,
+                    theta=10000.
+                )
+            else:
+                self.freqs_cis = pre_compute_llama_freqs_cis(end=self.config.max_position_embeddings,
+                                                             dim=self.config.hidden_size // self.config.num_attention_heads,
+                                                             theta=10000.)
         else:
             raise ValueError('Unknown type of rotary_embedding')
 
