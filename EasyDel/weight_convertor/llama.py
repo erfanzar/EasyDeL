@@ -95,7 +95,10 @@ def convert_hf_to_flax_load(checkpoints_dir, num_hidden_layers=32, num_attention
 def convert_hf_to_flax(ckpt, num_hidden_layers=32, num_attention_heads=32, hidden_size=4096,
                        device=jax.devices('cpu')[0]):
     # Edited From EasyLM
-
+    for k, v in ckpt.items():
+        if k.startswith("model."):
+            k = k[6:]
+        ckpt[k] = v
     with jax.default_device(device):
         def inverse_permute(w):
             reshaped_w = w.reshape(num_attention_heads, 2, hidden_size // num_attention_heads // 2, hidden_size)

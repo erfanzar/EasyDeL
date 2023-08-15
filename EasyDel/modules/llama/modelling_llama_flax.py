@@ -258,7 +258,7 @@ remat = nn_partitioning.remat
 
 def pre_compute_llama_freqs_cis(dim, end, theta: float = 10000.):
     freqs = 1. / (theta ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim))
-    t = jnp.arange(end)
+    t = jnp.arange(end, dtype=jnp.float32)
     freq = jnp.einsum('i,j->ij', t, freqs)
     freq = jnp.concatenate([freq, freq], axis=-1)
     return jnp.cos(freq)[None, None, :, :], jnp.sin(freq)[None, None, :, :]
@@ -271,13 +271,15 @@ def rotate_half_llama(x):
 
 
 def apply_rotary_pos_emb_llama(q, k, cos, sin, position_ids):
+    dt = k.dtype
+    q, k, cos, sin = (s.astype(jnp.float32) for s in [q, k, cos, sin])
     cos = cos.squeeze(1).squeeze(0)
     sin = sin.squeeze(1).squeeze(0)
     cos = jnp.expand_dims(cos[position_ids], 2)
     sin = jnp.expand_dims(sin[position_ids], 2)
-    q_embed = (q * cos) + (rotate_half_llama(q) * sin)
-    k_embed = (k * cos) + (rotate_half_llama(k) * sin)
-    return q_embed, k_embed
+    q_embed = jnp.add((q * cos), (rotate_half_llama(q) * sin))
+    k_embed = jnp.add((k * cos), (rotate_half_llama(k) * sin))
+    return q_embed.astype(dt), k_embed.astype(dt)
 
 
 def create_sinusoidal_positions(num_pos, dim):
