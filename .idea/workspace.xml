@@ -4,7 +4,9 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="08ad205b-709f-455b-86db-91293f595cd3" name="Changes" comment="" />
+    <list default="true" id="08ad205b-709f-455b-86db-91293f595cd3" name="Changes" comment="">
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -85,6 +87,9 @@
       <module name="EasyDeL" />
       <option name="INTERPRETER_OPTIONS" value="" />
       <option name="PARENT_ENVS" value="true" />
+      <envs>
+        <env name="PYTHONUNBUFFERED" value="1" />
+      </envs>
       <option name="SDK_HOME" value="" />
       <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$" />
       <option name="IS_MODULE_SDK" value="true" />
@@ -190,7 +195,20 @@
       <workItem from="1691051581762" duration="8253000" />
       <workItem from="1691234683772" duration="5228000" />
       <workItem from="1691310583977" duration="2378000" />
-      <workItem from="1691423193127" duration="4547000" />
+      <workItem from="1691568364869" duration="433000" />
+      <workItem from="1691582189453" duration="1850000" />
+      <workItem from="1691659255595" duration="4000" />
+      <workItem from="1691659942312" duration="614000" />
+      <workItem from="1691829569876" duration="5579000" />
+      <workItem from="1691909969951" duration="6205000" />
+      <workItem from="1691920050195" duration="11000" />
+      <workItem from="1691920117202" duration="5643000" />
+      <workItem from="1691928788898" duration="639000" />
+      <workItem from="1691930139009" duration="5163000" />
+      <workItem from="1691999659518" duration="680000" />
+      <workItem from="1692001076538" duration="11408000" />
+      <workItem from="1692016586490" duration="171000" />
+      <workItem from="1692018816020" duration="3849000" />
     </task>
     <servers />
   </component>
@@ -207,5 +225,8 @@
         </entry>
       </map>
     </option>
+  </component>
+  <component name="com.intellij.coverage.CoverageDataManagerImpl">
+    <SUITE FILE_PATH="coverage/EasyDeL$env.coverage" NAME="env Coverage Results" MODIFIED="1692009307844" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
   </component>
 </project>
