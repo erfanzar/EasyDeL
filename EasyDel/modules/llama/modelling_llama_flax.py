@@ -24,6 +24,7 @@ from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLM
 
 from jax.experimental.pjit import with_sharding_constraint as wsc
 from fjutils import dot_product_attention_multihead
+from fjutils.easylm import blockwise_dot_product_attention
 
 
 def get_names_from_partition_spec(partition_specs):
@@ -94,15 +95,17 @@ class LlamaConfig(PretrainedConfig):
             scan_mlp_chunk_size: int = 1024,
             rotary_type: str = 'complex',
             from_pt: bool = False,
-            drop_fcm_mask: bool = True,
+            do_torch_attn: bool = False,
             **kwargs,
     ):
-        assert rotary_type in ['open', 'complex', 'normal',
-                               'lm2'], f'{rotary_type} is wrong type of rotary valid types' \
-                                       f' are [open, complex,lm2,normal]'
+        assert rotary_type in ['open', 'complex', 'normal', 'lm2'], f'{rotary_type} is wrong type ' \
+                                                                    f'of rotary valid types' \
+                                                                    f' are [open, complex,lm2,normal]'
         num_key_value_heads = num_key_value_heads or num_attention_heads
-
+        if do_torch_attn:
+            print('\033[1;31mWarning\033[1;0m : do_torch_attn should be False that wont impact any good')
         self.vocab_size = vocab_size
+        self.do_torch_attn = do_torch_attn
         self.hidden_size = hidden_size
         self.initializer_range = initializer_range
         self.intermediate_size = intermediate_size
@@ -270,13 +273,13 @@ def rotate_half_llama(x):
     return jnp.concatenate((-x2, x1), axis=-1)
 
 
-def apply_rotary_pos_emb_llama(q, k, cos, sin, position_ids):
+def apply_rotary_pos_emb_llama(q, k, cos, sin, position_ids, index):
     dt = k.dtype
     q, k, cos, sin = (s.astype(jnp.float32) for s in [q, k, cos, sin])
     cos = cos.squeeze(1).squeeze(0)
     sin = sin.squeeze(1).squeeze(0)
-    cos = jnp.expand_dims(cos[position_ids], 2)
-    sin = jnp.expand_dims(sin[position_ids], 2)
+    cos = jnp.expand_dims(cos[position_ids], index)
+    sin = jnp.expand_dims(sin[position_ids], index)
     q_embed = jnp.add((q * cos), (rotate_half_llama(q) * sin))
     k_embed = jnp.add((k * cos), (rotate_half_llama(k) * sin))
     return q_embed.astype(dt), k_embed.astype(dt)
@@ -504,30 +507,44 @@ class FlaxLlamaAttention(nn.Module):
             fcm_mask=None,
     ):
 
-        sq_len = hidden_states.shape[1]
+        bsz, sq_len = hidden_states.shape[:2]
         xq, xk, xv = self.wq(hidden_states), self.wk(hidden_states), self.wv(hidden_states)
         if self.config.use_pjit_attention_force:
             xq = with_sharding_constraint(xq, PS(("dp", "fsdp"), None, "mp"))
             xk = with_sharding_constraint(xk, PS(("dp", "fsdp"), None, "mp"))
             xv = with_sharding_constraint(xv, PS(("dp", "fsdp"), None, "mp"))
 
-        xq = xq.reshape(xq.shape[:2] + (self.config.num_attention_heads, self.head_dim_q))
-        xk = xk.reshape(xk.shape[:2] + (self.config.num_key_value_heads, self.head_dim_kv))
-        xv = xv.reshape(xv.shape[:2] + (self.config.num_key_value_heads, self.head_dim_kv))
+        if self.config.do_torch_attn:
+            xq = xq.reshape(xq.shape[:2] + (self.config.num_attention_heads, self.head_dim_q)).transpose((0, 2, 1, 3))
+            xk = xk.reshape(xk.shape[:2] + (self.config.num_key_value_heads, self.head_dim_kv)).transpose((0, 2, 1, 3))
+            xv = xv.reshape(xv.shape[:2] + (self.config.num_key_value_heads, self.head_dim_kv)).transpose((0, 2, 1, 3))
+        else:
+            xq = xq.reshape(xq.shape[:2] + (self.config.num_attention_heads, self.head_dim_q))
+            xk = xk.reshape(xk.shape[:2] + (self.config.num_key_value_heads, self.head_dim_kv))
+            xv = xv.reshape(xv.shape[:2] + (self.config.num_key_value_heads, self.head_dim_kv))
 
         if self.config.rotary_type == 'complex':
-
+            if self.config.do_torch_attn:
+                raise ValueError(
+                    '`do_torch_attn` only works with rotary_type=normal not complex'
+                )
             freqs_cis = jnp.take(freqs_cis, position_ids, axis=0)
             xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis, dtype=self.dtype)
         elif self.config.rotary_type == 'open':
-
+            if self.config.do_torch_attn:
+                raise ValueError(
+                    '`do_torch_attn` only works with rotary_type=normal not open'
+                )
             freqs_cis = jnp.take(freqs_cis, position_ids, axis=0)
             sincos = jnp.split(freqs_cis, 2, axis=-1)
             xq = apply_rotary_pos_emb(xq, sincos).astype(self.dtype)
             xk = apply_rotary_pos_emb(xk, sincos).astype(self.dtype)
             del sincos
         elif self.config.rotary_type == 'lm2':
-
+            if self.config.do_torch_attn:
+                raise ValueError(
+                    '`do_torch_attn` only works with rotary_type=normal not lm2'
+                )
             cos, sin = freqs_cis
             xq = apply_rotary_emb_v2(array=xq, sin=sin, cos=cos)
             xk = apply_rotary_emb_v2(array=xk, sin=sin, cos=cos)
@@ -535,11 +552,14 @@ class FlaxLlamaAttention(nn.Module):
         elif self.config.rotary_type == 'normal':
             cos, sin = freqs_cis
             xq, xk = apply_rotary_pos_emb_llama(xq, xk, sin=sin[:, :, :sq_len, :], cos=cos[:, :, :sq_len, :],
-                                                position_ids=position_ids)
+                                                position_ids=position_ids, index=1 if self.config.do_torch_attn else 2)
             del sin, cos
         else:
             raise RuntimeError
-        query_length, key_length = xq.shape[1], xk.shape[1]
+        if self.config.do_torch_attn:
+            query_length, key_length = xq.shape[2], xk.shape[2]
+        else:
+            query_length, key_length = xq.shape[1], xk.shape[1]
 
         if self.has_variable("cache", "cached_key"):
             mask_shift = self.variables["cache"]["cache_index"]
@@ -551,8 +571,7 @@ class FlaxLlamaAttention(nn.Module):
             causal_mask = self.causal_mask[:, :, :query_length, :key_length]
 
         batch_size = hidden_states.shape[0]
-        causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
-
+        causal_mask = jnp.broadcast_to(causal_mask, (batch_size, 1, query_length, key_length))
         attention_mask = jnp.broadcast_to(jnp.expand_dims(attention_mask, axis=(-3, -2)), causal_mask.shape)
         attention_mask = combine_masks(attention_mask, causal_mask, fcm_mask)
 
@@ -568,44 +587,66 @@ class FlaxLlamaAttention(nn.Module):
             jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
             jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
         )
-        if self.config.use_flash_attention:
+        if self.config.use_flash_attention and not (self.has_variable("cache", "cached_key") or init_cache):
+            attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
+            attention_bias = lax.select(
+                attention_mask > 0,
+                jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
+                jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
+            )
             attn_weights = None
-            attention_mask = einops.rearrange(
-                combine_masks(attention_mask, fcm_mask),
-                '... s q k -> ... s 1 q k'
-            ).astype(self.dtype)
-            attn_output = fjutils.easylm.blockwise_dot_product_attention(
-                query=xq,
-                key=xk,
-                value=xv,
+            attn_output = blockwise_dot_product_attention(
+                xq,
+                xk,
+                xv,
                 bias=attention_bias,
                 deterministic=deterministic,
                 dropout_rng=dropout_rng,
                 attn_pdrop=self.config.attn_pdrop,
                 causal=True,
-                query_chunk_size=self.config.flash_attn_query_chunk_size,
-                key_chunk_size=self.config.flash_attn_key_chunk_size,
+                query_chunk_size=self.config.scan_query_chunk_size,
+                key_chunk_size=self.config.scan_key_chunk_size,
                 dtype=self.dtype,
                 policy=get_gradient_checkpoint_policy('nothing_saveable'),
                 precision=self.precision,
-                float32_logits=False if self.dtype == jnp.float32 else True,
-            )
-        else:
-            attn_weights = dot_product_attention_weights(
-                xq,
-                xk,
-                bias=attention_bias,
-                dropout_rng=dropout_rng,
-                dropout_rate=self.config.attn_pdrop,
-                deterministic=deterministic,
-                dtype=jnp.promote_types(self.dtype, jnp.float32),
-                precision=self.precision,
+                float32_logits=True,
             )
             if self.config.use_pjit_attention_force:
-                attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "mp", None, None))
+                attn_output = with_sharding_constraint(attn_output, PS(("dp", "fsdp"), None, "mp", None))
+            attn_output = self._merge_heads(attn_output)
+        else:
+            if not self.config.do_torch_attn:
+                attn_weights = dot_product_attention_weights(
+                    xq,
+                    xk,
+                    bias=attention_bias,
+                    dropout_rng=dropout_rng,
+                    dropout_rate=self.config.attn_pdrop,
+                    deterministic=deterministic,
+                    dtype=jnp.promote_types(self.dtype, jnp.float32),
+                    precision=self.precision,
 
-            attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, xv, precision=self.precision)
-        attn_output = self._merge_heads(attn_output)
+                )
+                if self.config.use_pjit_attention_force:
+                    attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "mp", None, None))
+
+                attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, xv, precision=self.precision)
+                attn_output = self._merge_heads(attn_output)
+            else:
+                attn_weights = jnp.matmul(xq, xk.transpose((0, 1, 3, 2)),
+                                          precision=jax.lax.Precision('highest')) / jnp.sqrt(self.head_dim_kv)
+                if attn_weights.shape != (bsz, self.config.num_key_value_heads, sq_len, sq_len):
+                    raise ValueError(
+                        f"Attention weights should be of size {(bsz, self.num_key_value_heads, sq_len, sq_len)}, but is"
+                        f" {attn_weights.shape}"
+                    )
+                attn_weights += attention_mask
+                attn_weights = jax.nn.softmax(attn_weights.astype('float32'), axis=-1).astype(xq.dtype)
+
+                attn_output = jnp.matmul(attn_weights, xv, precision=jax.lax.Precision('highest'))
+                attn_output = attn_output.transpose((0, 2, 1, 3))
+                attn_output = attn_output.reshape(bsz, sq_len, self.config.hidden_size)
+
         attn_output = self.wo(attn_output)
         attn_output = self.resid_dropout(attn_output, deterministic=deterministic)
         outputs = (attn_output, attn_weights) if output_attentions else (attn_output,)
