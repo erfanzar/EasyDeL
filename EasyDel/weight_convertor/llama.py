@@ -95,10 +95,10 @@ def convert_hf_to_flax_load(checkpoints_dir, num_hidden_layers=32, num_attention
 def convert_hf_to_flax(ckpt, num_hidden_layers=32, num_attention_heads=32, hidden_size=4096,
                        device=jax.devices('cpu')[0]):
     # Edited From EasyLM
-    for k, v in ckpt.items():
-        if k.startswith("model."):
-            k = k[6:]
-        ckpt[k] = v
+    # for k, v in ckpt.items():
+    #     if k.startswith("model."):
+    #         k = k[6:]
+    #     ckpt[k] = v
     with jax.default_device(device):
         def inverse_permute(w):
             reshaped_w = w.reshape(num_attention_heads, 2, hidden_size // num_attention_heads // 2, hidden_size)
@@ -108,8 +108,8 @@ def convert_hf_to_flax(ckpt, num_hidden_layers=32, num_attention_heads=32, hidde
 
         jax_weights = {
             "transformer": {
-                "wte": {"embedding": ckpt["embed_tokens.weight"].numpy()},
-                "ln_f": {"kernel": ckpt["norm.weight"].numpy()},
+                "wte": {"embedding": ckpt["model.embed_tokens.weight"].numpy()},
+                "ln_f": {"kernel": ckpt["model.norm.weight"].numpy()},
                 "h": {
                     "%d"
                     % (layer): {
@@ -117,49 +117,49 @@ def convert_hf_to_flax(ckpt, num_hidden_layers=32, num_attention_heads=32, hidde
                             "wq": {
                                 "kernel": inverse_permute(
 
-                                    ckpt[f"layers.{layer}.self_attn.q_proj.weight"].numpy(),
+                                    ckpt[f"model.layers.{layer}.self_attn.q_proj.weight"].numpy(),
                                 ).transpose()
                             },
                             "wk": {
                                 "kernel": inverse_permute(
 
-                                    ckpt[f"layers.{layer}.self_attn.k_proj.weight"].numpy(),
+                                    ckpt[f"model.layers.{layer}.self_attn.k_proj.weight"].numpy(),
                                 ).transpose()
                             },
                             "wv": {
-                                "kernel": ckpt[f"layers.{layer}.self_attn.v_proj.weight"]
+                                "kernel": ckpt[f"model.layers.{layer}.self_attn.v_proj.weight"]
                                 .numpy()
                                 .transpose()
                             },
                             "wo": {
-                                "kernel": ckpt[f"layers.{layer}.self_attn.o_proj.weight"]
+                                "kernel": ckpt[f"model.layers.{layer}.self_attn.o_proj.weight"]
                                 .numpy()
                                 .transpose()
                             },
                         },
                         "feed_forward": {
                             "w1": {
-                                "kernel": ckpt[f"layers.{layer}.mlp.gate_proj.weight"]
+                                "kernel": ckpt[f"model.layers.{layer}.mlp.gate_proj.weight"]
                                 .numpy()
                                 .transpose()
                             },
                             "w2": {
-                                "kernel": ckpt[f"layers.{layer}.mlp.down_proj.weight"]
+                                "kernel": ckpt[f"model.layers.{layer}.mlp.down_proj.weight"]
                                 .numpy()
                                 .transpose()
                             },
                             "w3": {
-                                "kernel": ckpt[f"layers.{layer}.mlp.up_proj.weight"]
+                                "kernel": ckpt[f"model.layers.{layer}.mlp.up_proj.weight"]
                                 .numpy()
                                 .transpose()
                             },
                         },
                         "attention_norm": {
-                            "kernel": ckpt[f"layers.{layer}.input_layernorm.weight"].numpy()
+                            "kernel": ckpt[f"model.layers.{layer}.input_layernorm.weight"].numpy()
                         },
                         "ffn_norm": {
                             "kernel": ckpt[
-                                f"layers.{layer}.post_attention_layernorm.weight"
+                                f"model.layers.{layer}.post_attention_layernorm.weight"
                             ].numpy()
                         },
                     }
