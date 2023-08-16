@@ -276,7 +276,7 @@ def pre_compute_llama_freqs_cis_torch(dim, end, theta: float = 10000.):
 def pre_compute_llama_freqs_cis(dim, end, theta: float = 10000.):
     freqs = 1. / (theta ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim))
     t = jnp.arange(end, dtype=jnp.float32)
-    freq = einsum(t, freqs, 'i,j->ij')
+    freq = einsum(t, freqs, 'i,j->i j')
     freq = jnp.concatenate([freq, freq], axis=-1)
     return jnp.cos(freq)[None, None, :, :], jnp.sin(freq)[None, None, :, :]
 
@@ -339,7 +339,7 @@ def pre_compute_frq_sin_cos(end: int, dim: int, method: str = None, scale_factor
         frq = einsum(jnp.arange(end), inv_freq, 'i, j -> i j').astype(jnp.float32)
     else:
         raise ValueError('unknown type of rotary')
-    return einops.repeat(jnp.sin(frq), 's d -> s (i d)', i=2), einops.repeat(jnp.cos(frq), 's d -> s (i d)', i=2)
+    return einops.repeat(jnp.cos(frq), 's d -> s (i d)', i=2), einops.repeat(jnp.sin(frq), 's d -> s (i d)', i=2)
 
 
 def rotate_half(x):
@@ -630,22 +630,31 @@ class FlaxLlamaAttention(nn.Module):
             attn_output = self._merge_heads(attn_output)
         else:
             if not self.config.do_torch_attn:
-                chosen_dtype = jnp.promote_types(self.dtype, jnp.float32)
-                ct = xq.dtype
-                xq, xk = [s.astype(chosen_dtype) for s in [xq, xk]]
-                # xq = xq / jnp.sqrt(self.head_dim_q)
-                attn_weights = einsum(
-                    xq, xk, '... q h d,... k h d->... h q k',
-
+                # chosen_dtype = jnp.promote_types(self.dtype, jnp.float32)
+                # ct = xq.dtype
+                # xq, xk = [s.astype(chosen_dtype) for s in [xq, xk]]
+                # # xq = xq / jnp.sqrt(self.head_dim_q)
+                # attn_weights = einsum(
+                #     xq, xk, '... q h d,... k h d->... h q k',
+                #
+                # )
+                # attn_weights /= jnp.sqrt(self.head_dim_q)
+                # attn_weights += attention_bias
+                # # normalize the attention weights
+                # attn_weights = jax.nn.softmax(attn_weights).astype(ct)
+                attn_weights = dot_product_attention_weights(
+                    query=xq,
+                    key=xk,
+                    bias=attention_bias,
+                    dtype=jnp.promote_types(self.dtype, jnp.float32),
+                    deterministic=deterministic,
+                    dropout_rate=self.config.attn_pdrop,
+                    precision=self.precision,
                 )
-                attn_weights /= jnp.sqrt(self.head_dim_q)
-                attn_weights += attention_bias
-                # normalize the attention weights
-                attn_weights = jax.nn.softmax(attn_weights).astype(ct)
                 if self.config.use_pjit_attention_force:
                     attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "mp", None, None))
 
-                attn_output = einsum(attn_weights, xv, "... h q k,... k h d->... q h d", )
+                attn_output = jnp.einsum(attn_weights, xv, "...hqk,...khd->...qhd", )
                 attn_output = self._merge_heads(attn_output)
             else:
                 attn_weights = jnp.matmul(xq, xk.transpose((0, 1, 3, 2)),
@@ -1025,6 +1034,46 @@ class FlaxLlamaBlockCollection(nn.Module):
         return outputs
 
 
+def create_freqs_cis_from_config(config: LlamaConfig):
+    if config.rotary_type == 'complex':
+
+        freqs_cis = precompute_freqs_cis(
+            method=config.rope_scaling['type'] if config.rope_scaling is not None else None,
+            scaling_factor=float(config.rope_scaling['factor'] if config.rope_scaling is not None else 1),
+            dim=config.hidden_size // config.num_attention_heads,
+            end=config.max_position_embeddings * 2
+        )
+    elif config.rotary_type == 'open':
+
+        freqs_cis = create_sinusoidal_positions(
+            config.max_position_embeddings,
+            config.hidden_size // config.num_attention_heads
+        )
+    elif config.rotary_type == 'lm2':
+
+        freqs_cis = pre_compute_frq_sin_cos(end=config.max_position_embeddings,
+                                            dim=config.hidden_size // config.num_attention_heads,
+                                            scale_factor=float(
+                                                config.rope_scaling['factor'] if
+                                                config.rope_scaling is not None else 1),
+                                            method=config.rope_scaling[
+                                                'type'] if config.rope_scaling is not None else None)
+    elif config.rotary_type == 'normal':
+        if config.use_torch_to_init_rope_normal:
+            freqs_cis = pre_compute_llama_freqs_cis_torch(
+                end=config.max_position_embeddings,
+                dim=config.hidden_size // config.num_attention_heads,
+                theta=10000.
+            )
+        else:
+            freqs_cis = pre_compute_llama_freqs_cis(end=config.max_position_embeddings,
+                                                    dim=config.hidden_size // config.num_attention_heads,
+                                                    theta=10000.)
+    else:
+        raise ValueError('Unknown type of rotary_embedding')
+    return freqs_cis
+
+
 class FlaxLlamaModule(nn.Module):
     config: LlamaConfig
     dtype: jnp.dtype = jnp.float32
@@ -1046,42 +1095,9 @@ class FlaxLlamaModule(nn.Module):
                                           precision=self.precision, name='layers' if self.config.from_pt else 'h')
         self.ln_f = RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps, dtype=self.dtype,
                             param_dtype=self.param_dtype, name='norm' if self.config.from_pt else 'ln_f')
-        if self.config.rotary_type == 'complex':
-
-            self.freqs_cis = precompute_freqs_cis(
-                method=self.config.rope_scaling['type'] if self.config.rope_scaling is not None else None,
-                scaling_factor=float(self.config.rope_scaling['factor'] if self.config.rope_scaling is not None else 1),
-                dim=self.config.hidden_size // self.config.num_attention_heads,
-                end=self.config.max_position_embeddings * 2
-            )
-        elif self.config.rotary_type == 'open':
-
-            self.freqs_cis = create_sinusoidal_positions(
-                self.config.max_position_embeddings,
-                self.config.hidden_size // self.config.num_attention_heads
-            )
-        elif self.config.rotary_type == 'lm2':
-
-            self.freqs_cis = pre_compute_frq_sin_cos(end=self.config.max_position_embeddings,
-                                                     dim=self.config.hidden_size // self.config.num_attention_heads,
-                                                     scale_factor=float(
-                                                         self.config.rope_scaling['factor'] if
-                                                         self.config.rope_scaling is not None else 1),
-                                                     method=self.config.rope_scaling[
-                                                         'type'] if self.config.rope_scaling is not None else None)
-        elif self.config.rotary_type == 'normal':
-            if self.config.use_torch_to_init_rope_normal:
-                self.freqs_cis = pre_compute_llama_freqs_cis_torch(
-                    end=self.config.max_position_embeddings,
-                    dim=self.config.hidden_size // self.config.num_attention_heads,
-                    theta=10000.
-                )
-            else:
-                self.freqs_cis = pre_compute_llama_freqs_cis(end=self.config.max_position_embeddings,
-                                                             dim=self.config.hidden_size // self.config.num_attention_heads,
-                                                             theta=10000.)
-        else:
-            raise ValueError('Unknown type of rotary_embedding')
+        self.freqs_cis = create_freqs_cis_from_config(
+            self.config
+        )
 
     def __call__(
             self,
