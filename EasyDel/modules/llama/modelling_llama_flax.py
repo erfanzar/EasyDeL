@@ -3,7 +3,7 @@ from typing import Dict, Optional, Tuple, Union
 import fjutils.easylm
 from einops import einops
 from flax.linen import remat
-
+from einops import einsum
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -276,7 +276,7 @@ def pre_compute_llama_freqs_cis_torch(dim, end, theta: float = 10000.):
 def pre_compute_llama_freqs_cis(dim, end, theta: float = 10000.):
     freqs = 1. / (theta ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim))
     t = jnp.arange(end, dtype=jnp.float32)
-    freq = jnp.einsum('i,j->ij', t, freqs)
+    freq = einsum(t, freqs, 'i,j->ij')
     freq = jnp.concatenate([freq, freq], axis=-1)
     return jnp.cos(freq)[None, None, :, :], jnp.sin(freq)[None, None, :, :]
 
@@ -301,7 +301,7 @@ def apply_rotary_pos_emb_llama(q, k, cos, sin, position_ids, index):
 
 def create_sinusoidal_positions(num_pos, dim):
     inv_freq = 1.0 / (10000 ** (jnp.arange(0, dim, 2) / dim))
-    sinusoid_inp = jnp.einsum("i , j -> i j", jnp.arange(num_pos), inv_freq).astype("float32")
+    sinusoid_inp = einsum(jnp.arange(num_pos), inv_freq, "i , j -> i j").astype("float32")
     sin, cos = jnp.sin(sinusoid_inp), jnp.cos(sinusoid_inp)
 
     sentinel = dim // 2 + dim % 2
@@ -327,16 +327,16 @@ def apply_rotary_pos_emb(tensor, sincos):
 def pre_compute_frq_sin_cos(end: int, dim: int, method: str = None, scale_factor: float = 8., theta=10000.):
     if method is None:
         inv_freq = 1.0 / (theta ** (jnp.arange(0, dim, 2) / dim)).astype(jnp.float32)
-        frq = einops.einsum(jnp.arange(end), inv_freq, 'i, j -> i j').astype(jnp.float32)
+        frq = einsum(jnp.arange(end), inv_freq, 'i, j -> i j').astype(jnp.float32)
     elif method == 'linear':
         inv_freq = 1.0 / (theta ** (jnp.arange(0, dim, 2) / dim)).astype(jnp.float32)
-        frq = einops.einsum(jnp.arange(end) / scale_factor, inv_freq, 'i, j -> i j').astype(jnp.float32)
+        frq = einsum(jnp.arange(end) / scale_factor, inv_freq, 'i, j -> i j').astype(jnp.float32)
     elif method == 'dynamic':
         base = theta * (
                 (scale_factor * end / end) - (scale_factor - 1)
         ) ** (dim / (dim - 2))
         inv_freq = 1.0 / (base ** (jnp.arange(0, dim, 2) / dim)).astype(jnp.float32)
-        frq = einops.einsum(jnp.arange(end), inv_freq, 'i, j -> i j').astype(jnp.float32)
+        frq = einsum(jnp.arange(end), inv_freq, 'i, j -> i j').astype(jnp.float32)
     else:
         raise ValueError('unknown type of rotary')
     return einops.repeat(jnp.sin(frq), 's d -> s (i d)', i=2), einops.repeat(jnp.cos(frq), 's d -> s (i d)', i=2)
@@ -352,8 +352,8 @@ def apply_rotary_emb_v2(array, sin, cos):
     _, _, s, *_ = array.shape
     dtype = array.dtype
     array = array.astype(jnp.float32)
-    return (einops.einsum(array, cos[:s], '... s d, s d -> ... s d') +
-            einops.einsum(rotate_half(array), sin[:s], '... s d, s d -> ... s d')).astype(dtype)
+    return (einsum(array, cos[:s], '... s d, s d -> ... s d') +
+            einsum(rotate_half(array), sin[:s], '... s d, s d -> ... s d')).astype(dtype)
 
 
 class RMSNorm(nn.Module):
@@ -630,21 +630,19 @@ class FlaxLlamaAttention(nn.Module):
             attn_output = self._merge_heads(attn_output)
         else:
             if not self.config.do_torch_attn:
-                attn_weights = dot_product_attention_weights(
-                    xq,
-                    xk,
-                    bias=attention_bias,
-                    dropout_rng=dropout_rng,
-                    dropout_rate=self.config.attn_pdrop,
-                    deterministic=deterministic,
-                    dtype=jnp.promote_types(self.dtype, jnp.float32),
-                    precision=self.precision,
+                chosen_dtype = jnp.promote_types(self.dtype, jnp.float32)
+                ct = xq.dtype
+                xq, xk, xv = [s.astype(chosen_dtype) for s in [xq, xk, xv]]
+                attn_weights = einsum(
+                    xq, xk, '...qhd,...khd->...hqk',
+                ) / jnp.sqrt(self.head_dim_q)
 
-                )
+                # normalize the attention weights
+                attn_weights = jax.nn.softmax(attn_weights).astype(ct)
                 if self.config.use_pjit_attention_force:
                     attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "mp", None, None))
 
-                attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, xv, precision=self.precision)
+                attn_output = einsum(attn_weights, xv, "...hqk,...khd->...qhd", )
                 attn_output = self._merge_heads(attn_output)
             else:
                 attn_weights = jnp.matmul(xq, xk.transpose((0, 1, 3, 2)),
