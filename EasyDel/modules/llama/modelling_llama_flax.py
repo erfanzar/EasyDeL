@@ -632,17 +632,20 @@ class FlaxLlamaAttention(nn.Module):
             if not self.config.do_torch_attn:
                 chosen_dtype = jnp.promote_types(self.dtype, jnp.float32)
                 ct = xq.dtype
-                xq, xk, xv = [s.astype(chosen_dtype) for s in [xq, xk, xv]]
+                xq, xk = [s.astype(chosen_dtype) for s in [xq, xk]]
+                # xq = xq / jnp.sqrt(self.head_dim_q)
                 attn_weights = einsum(
-                    xq, xk, '...qhd,...khd->...hqk',
-                ) / jnp.sqrt(self.head_dim_q)
+                    xq, xk, '... q h d,... k h d->... h q k',
 
+                )
+                attn_weights /= jnp.sqrt(self.head_dim_q)
+                attn_weights += attention_bias
                 # normalize the attention weights
                 attn_weights = jax.nn.softmax(attn_weights).astype(ct)
                 if self.config.use_pjit_attention_force:
                     attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "mp", None, None))
 
-                attn_output = einsum(attn_weights, xv, "...hqk,...khd->...qhd", )
+                attn_output = einsum(attn_weights, xv, "... h q k,... k h d->... q h d", )
                 attn_output = self._merge_heads(attn_output)
             else:
                 attn_weights = jnp.matmul(xq, xk.transpose((0, 1, 3, 2)),
