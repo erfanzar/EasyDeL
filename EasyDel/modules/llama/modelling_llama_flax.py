@@ -97,6 +97,7 @@ class LlamaConfig(PretrainedConfig):
             from_pt: bool = False,
             do_torch_attn: bool = False,
             use_torch_to_init_rope_normal=False,
+            attn_type='llama2',
             **kwargs,
     ):
         assert rotary_type in ['open', 'complex', 'normal', 'lm2'], f'{rotary_type} is wrong type ' \
@@ -118,6 +119,7 @@ class LlamaConfig(PretrainedConfig):
         self.use_cache = use_cache
         self.resid_pdrop = resid_pdrop
         self.embd_pdrop = embd_pdrop
+        self.attn_type = attn_type
         self.attn_pdrop = attn_pdrop
         self.num_key_value_heads = num_key_value_heads
         self.gradient_checkpointing = gradient_checkpointing
@@ -629,19 +631,7 @@ class FlaxLlamaAttention(nn.Module):
                 attn_output = with_sharding_constraint(attn_output, PS(("dp", "fsdp"), None, "mp", None))
             attn_output = self._merge_heads(attn_output)
         else:
-            if not self.config.do_torch_attn:
-                # chosen_dtype = jnp.promote_types(self.dtype, jnp.float32)
-                # ct = xq.dtype
-                # xq, xk = [s.astype(chosen_dtype) for s in [xq, xk]]
-                # # xq = xq / jnp.sqrt(self.head_dim_q)
-                # attn_weights = einsum(
-                #     xq, xk, '... q h d,... k h d->... h q k',
-                #
-                # )
-                # attn_weights /= jnp.sqrt(self.head_dim_q)
-                # attn_weights += attention_bias
-                # # normalize the attention weights
-                # attn_weights = jax.nn.softmax(attn_weights).astype(ct)
+            if not self.config.do_torch_attn and self.config.attn_type != 'llama2':
                 attn_weights = dot_product_attention_weights(
                     query=xq,
                     key=xk,
@@ -654,8 +644,10 @@ class FlaxLlamaAttention(nn.Module):
                 if self.config.use_pjit_attention_force:
                     attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "mp", None, None))
 
-                attn_output = jnp.einsum(attn_weights, xv, "...hqk,...khd->...qhd", )
+                attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, xv, )
                 attn_output = self._merge_heads(attn_output)
+            elif self.config.attn_type == 'llama2':
+                raise NotImplementedError()
             else:
                 attn_weights = jnp.matmul(xq, xk.transpose((0, 1, 3, 2)),
                                           precision=jax.lax.Precision('highest')) / jnp.sqrt(self.head_dim_kv)
