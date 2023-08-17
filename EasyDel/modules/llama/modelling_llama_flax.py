@@ -634,7 +634,7 @@ class FlaxLlamaAttention(nn.Module):
                 dtype=jnp.promote_types(self.dtype, jnp.float32),
                 deterministic=deterministic,
                 dropout_rate=self.config.attn_pdrop,
-                bias=attention_bias,
+                bias=attention_bias[:,:,:sq_len,:sq_len],
                 precision=self.precision,
 
             )
