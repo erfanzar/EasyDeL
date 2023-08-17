@@ -632,7 +632,7 @@ class FlaxLlamaAttention(nn.Module):
                 jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
                 jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
             )
-            attn_wight += attention_bias
+            attn_wight += attention_bias[:, :, :sq_len, :sq_len]
             attn_wight = jax.nn.softmax(
                 attn_wight.astype(
                     jnp.promote_types(
