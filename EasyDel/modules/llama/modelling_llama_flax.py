@@ -556,20 +556,24 @@ class FlaxLlamaAttention(nn.Module):
         cache_index = self.variable("cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32))
 
         if is_initialized:
-            *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
-            cur_index = cache_index.value
-            indices = (0,) * len(batch_dims) + (cur_index, 0, 0)
-            key = lax.dynamic_update_slice(cached_key.value, key, indices)
-            value = lax.dynamic_update_slice(cached_value.value, value, indices)
-            cached_key.value = key
-            cached_value.value = value
-            num_updated_cache_vectors = query.shape[1]
-            cache_index.value = cache_index.value + num_updated_cache_vectors
-            pad_mask = jnp.broadcast_to(
-                jnp.arange(max_length) < cur_index + num_updated_cache_vectors,
-                tuple(batch_dims) + (1, num_updated_cache_vectors, max_length),
-            )
-            attention_mask = combine_masks(pad_mask, attention_mask)
+            if self.config.attn_type == 'llama2':
+                ...
+            else:
+                *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
+                cur_index = cache_index.value
+                indices = (0,) * len(batch_dims) + (cur_index, 0, 0)
+                key = lax.dynamic_update_slice(cached_key.value, key, indices)
+                value = lax.dynamic_update_slice(cached_value.value, value, indices)
+                cached_key.value = key
+                cached_value.value = value
+                num_updated_cache_vectors = query.shape[1]
+                cache_index.value = cache_index.value + num_updated_cache_vectors
+
+                pad_mask = jnp.broadcast_to(
+                    jnp.arange(max_length) < cur_index + num_updated_cache_vectors,
+                    tuple(batch_dims) + (1, num_updated_cache_vectors, max_length),
+                )
+                attention_mask = combine_masks(pad_mask, attention_mask)
         return key, value, attention_mask
 
     def __call__(
