@@ -319,12 +319,15 @@ def pre_compute_pos_emb_llama2_complex(dim, end, theta: float = 10000.0):
 
 
 def apply_rotary_pos_emb_llama2(xq, xk, freqs_cis):
+    _, s, *_ = xq.shape
+
     dtype = jnp.promote_types(xq.dtype, jnp.float32)
     reshape_xq = xq.astype(dtype).reshape(*xq.shape[:-1], -1, 2)
     reshape_xk = xk.astype(dtype).reshape(*xk.shape[:-1], -1, 2)
 
     xq_ = jax.lax.complex(reshape_xq[..., 0], reshape_xq[..., 1])
     xk_ = jax.lax.complex(reshape_xk[..., 0], reshape_xk[..., 1])
+
     ndim = xq_.ndim
     assert 0 <= 1 < ndim
     assert freqs_cis.shape == (xq_.shape[1], xq_.shape[-1])
@@ -332,7 +335,8 @@ def apply_rotary_pos_emb_llama2(xq, xk, freqs_cis):
     freqs_cis = freqs_cis.reshape(*shape)
     xq_out = jnp.real(xq_ * freqs_cis)
     xk_out = jnp.real(xk_ * freqs_cis)
-    return xq_out.astype(xq), xk_out.astype(xk)
+
+    return xq_out.astype(xq.dtype), xk_out.astype(xk.dtype)
 
 
 def repeat_kv(x: jax.Array, n_rep: int) -> jax.Array:
@@ -497,6 +501,8 @@ class FlaxLlamaAttention(nn.Module):
         self.head_dim = self.config.hidden_size // self.config.num_attention_heads
         self.number_of_reps = self.config.num_attention_heads // self.config.num_key_value_heads
 
+        if self.number_of_reps == 1:
+            assert self.config.num_attention_heads == self.config.num_key_value_heads
         self.wq = nn.Dense(
             config.num_attention_heads * self.head_dim,
             dtype=self.dtype,
@@ -507,7 +513,7 @@ class FlaxLlamaAttention(nn.Module):
             name='q_proj' if self.config.from_pt else 'wq'
         )
         self.wk = nn.Dense(
-            self.config.num_key_value_heads * self.head_dim,
+            config.num_key_value_heads * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
@@ -516,7 +522,7 @@ class FlaxLlamaAttention(nn.Module):
             name='k_proj' if self.config.from_pt else 'wk'
         )
         self.wv = nn.Dense(
-            self.config.num_key_value_heads * self.head_dim,
+            config.num_key_value_heads * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
@@ -577,6 +583,7 @@ class FlaxLlamaAttention(nn.Module):
             output_attentions: bool = False,
             fcm_mask=None,
     ):
+
         if self.config.attn_type == 'llama2':
             bsz, sq_len = hidden_states.shape[:2]
             xq, xk, xv = self.wq(hidden_states), self.wk(hidden_states), self.wv(hidden_states)
@@ -584,18 +591,19 @@ class FlaxLlamaAttention(nn.Module):
             xq = xq.reshape(bsz, sq_len, self.config.num_attention_heads, self.head_dim)
             xk = xk.reshape(bsz, sq_len, self.config.num_key_value_heads, self.head_dim)
             xv = xv.reshape(bsz, sq_len, self.config.num_key_value_heads, self.head_dim)
-
+            freqs_cis = freqs_cis[:sq_len]
             xq, xk = apply_rotary_pos_emb_llama2(xq, xk, freqs_cis=freqs_cis)
             xk = repeat_kv(xk, self.number_of_reps)
             xv = repeat_kv(xv, self.number_of_reps)
-            xq, xv, xk = [s.transpose(0, 2, 1, 3) for s in [xq, xv, xk]]
-            attn_wight = jnp.matmul(
-                xq, xk.transpose(0, 1, 3, 2)
-            ) / math.sqrt(self.head_dim)
+            # xq /= math.sqrt(self.head_dim)
+            attn_wight = jnp.einsum('...qhd,...khd->...hqk', xq, xk)
+            attn_wight /= math.sqrt(self.head_dim)
             attn_wight += attention_mask
             attn_wight = jax.nn.softmax(attn_wight.astype(jnp.promote_types(self.dtype, jnp.float32)), axis=-1).astype(
                 attn_wight.dtype)
-            attn_wight = jnp.matmul(attn_wight, xv).transpose(0, 2, 1, 3)
+            attn_wight = jnp.einsum(
+                '...hqk,...khd->...qhd', attn_wight, xv
+            )
             out = self.wo(attn_wight.reshape(bsz, sq_len, -1))
             return (out, attn_wight) if output_attentions else (out,)
 
