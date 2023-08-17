@@ -541,9 +541,9 @@ class FlaxLlamaAttention(nn.Module):
         )
 
         self.resid_dropout = nn.Dropout(rate=config.resid_pdrop)
-        if self.config.attn_type != 'llama2':
-            self.causal_mask = make_causal_mask(jnp.ones((1, config.max_position_embeddings), dtype="bool"),
-                                                dtype="bool")
+
+        self.causal_mask = make_causal_mask(jnp.ones((1, config.max_position_embeddings), dtype="bool"),
+                                            dtype="bool")
 
     def _merge_heads(self, hidden_states):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
@@ -595,17 +595,43 @@ class FlaxLlamaAttention(nn.Module):
             xq, xk = apply_rotary_pos_emb_llama2(xq, xk, freqs_cis=freqs_cis)
             xk = repeat_kv(xk, self.number_of_reps)
             xv = repeat_kv(xv, self.number_of_reps)
-            # xq /= math.sqrt(self.head_dim)
-            attn_wight = jnp.einsum('...qhd,...khd->...hqk', xq, xk)
-            attn_wight /= math.sqrt(self.head_dim)
-            attn_wight += attention_mask
-            attn_wight = jax.nn.softmax(attn_wight.astype(jnp.promote_types(self.dtype, jnp.float32)), axis=-1).astype(
-                attn_wight.dtype)
-            attn_wight = jnp.einsum(
-                '...hqk,...khd->...qhd', attn_wight, xv
+            xq /= math.sqrt(self.head_dim)
+            attn_wight = jnp.einsum('...qhd,...khd->...hqk', xq, xk, precision=self.precision)
+
+            query_length, key_length = xq.shape[1], xk.shape[1]
+
+            if self.has_variable("cache", "cached_key"):
+                mask_shift = self.variables["cache"]["cache_index"]
+                max_decoder_length = self.variables["cache"]["cached_key"].shape[1]
+                causal_mask = lax.dynamic_slice(
+                    self.causal_mask, (0, 0, mask_shift, 0), (1, 1, query_length, max_decoder_length)
+                )
+            else:
+                causal_mask = self.causal_mask[:, :, :query_length, :key_length]
+
+            batch_size = hidden_states.shape[0]
+            causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
+            attention_mask = jnp.broadcast_to(jnp.expand_dims(attention_mask, axis=(-3, -2)), causal_mask.shape)
+            attention_mask = combine_masks(attention_mask, causal_mask, fcm_mask)
+            attention_bias = lax.select(
+                attention_mask > 0,
+                jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
+                jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
             )
+            attn_wight += attention_bias
+            attn_wight = jax.nn.softmax(
+                attn_wight.astype(
+                    jnp.promote_types(
+                        self.dtype, jnp.float32
+                    )
+                ), axis=-1,
+            ).astype(attn_wight.dtype)
+
+            # attn_wight = jnp.where(attention_mask, attn_wight, )
+            attn_wight = jnp.einsum('...hqk,...khd->...qhd', attn_wight, xv, precision=self.precision)
             out = self.wo(attn_wight.reshape(bsz, sq_len, -1))
             return (out, attn_wight) if output_attentions else (out,)
+
 
         else:
             bsz, sq_len = hidden_states.shape[:2]

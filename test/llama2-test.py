@@ -183,17 +183,17 @@ def test_attention(config: LlamaConfig):
         x=hidden_state,
         mask=mask
 
-    ))
+    )[0])
     pred_jax = flax_attn.apply(
         flax_params,
-        attention_mask=pt2jax(mask),
+        attention_mask=jnp.ones((1, config.max_position_embeddings), dtype=bool),
         hidden_states=jax_hidden_state,
         freqs_cis=freq_cis_jax,
         position_ids=jax_position_ids
     )[0]
     pred_jax = jnp.where(mask_1d[:, :, None], pred_jax, 0)
     pred_torch = jnp.where(mask_1d[:, :, None], pred_torch, 0)
-    indexes = -10000
+    indexes = 500
     is_close = np.isclose(pred_jax.reshape(-1)[:indexes], pred_torch.reshape(-1)[:indexes])
     table = [[pt, pj, cs] for pt, pj, cs in
              zip(pred_torch.reshape(-1)[:indexes], pred_jax.reshape(-1)[:indexes], is_close)]
