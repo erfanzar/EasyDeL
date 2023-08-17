@@ -36,3 +36,10 @@ print(partition_rules)
     ('.*', PS(None)),
 )
 ```
+
+
+### Using Changes : 
+
+#### In order to use OpenLlama Model set `attn_type=''` and `rotary_type='complex'`
+#### In order to use OpenLlama Model set `attn_type='llama2'` and `rotary_type='llama2'` 
+or `attn_type='normal'` and `rotary_type='normal'`
