@@ -12,7 +12,7 @@ try:
 except ValueError as vr:
     print(f'\033[1;31mWarning\033[1;0m : JAXServer Wont be Imported Be Cause {vr}')
     JAXServer = None
-__version__ = '0.0.25'
+__version__ = '0.0.26'
 
 __all__ = "TrainArguments", "fsdp_train_step", 'get_training_modules', \
     'FlaxLlamaForCausalLM', \
