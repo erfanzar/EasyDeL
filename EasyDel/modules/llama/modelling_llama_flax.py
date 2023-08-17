@@ -95,16 +95,16 @@ class LlamaConfig(PretrainedConfig):
             flash_attn_query_chunk_size: int = 1024,
             flash_attn_key_chunk_size: int = 1024,
             scan_mlp_chunk_size: int = 1024,
-            rotary_type: str = 'llama2',
+            rotary_type: str = 'llama',
             from_pt: bool = False,
 
             use_torch_to_init_rope_normal=False,
             attn_type='llama2',
             **kwargs,
     ):
-        assert rotary_type in ['open', 'complex', 'normal', 'lm2', 'llama2'], f'{rotary_type} is wrong type ' \
+        assert rotary_type in ['open', 'complex', 'llama', 'lm2', 'llama2'], f'{rotary_type} is wrong type ' \
                                                                               f'of rotary valid types' \
-                                                                              f' are [open, complex,lm2,normal,llama2]'
+                                                                              f' are [open, complex,lm2,llama,llama2]'
 
         if attn_type == 'llama2' and rotary_type != 'llama2':
             raise ValueError(
@@ -238,7 +238,7 @@ class LlamaConfig(PretrainedConfig):
                      flash_attn_query_chunk_size: int = 1024,
                      flash_attn_key_chunk_size: int = 1024,
                      scan_mlp_chunk_size: int = 1024,
-                     rotary_type: str = 'normal',
+                     rotary_type: str = 'llama',
                      from_pt: bool = True,
                      number_rep_kv: int = 1,
                      attn_type='llama2',
@@ -649,11 +649,9 @@ class FlaxLlamaAttention(nn.Module):
                 xk = with_sharding_constraint(xk, PS(("dp", "fsdp"), None, "mp"))
                 xv = with_sharding_constraint(xv, PS(("dp", "fsdp"), None, "mp"))
 
-            xq = xq.reshape(xq.shape[:2] + (self.config.num_attention_heads, self.head_dim))
-            xk = xk.reshape(
-                xk.shape[:2] + (self.config.num_key_value_heads, self.head_dim))
-            xv = xv.reshape(
-                xv.shape[:2] + ((self.config.num_attention_heads * self.config.number_rep_kv), self.head_dim))
+            xq = xq.reshape(bsz, sq_len, self.config.num_attention_heads, self.head_dim)
+            xk = xk.reshape(bsz, sq_len, self.config.num_key_value_heads, self.head_dim)
+            xv = xv.reshape(bsz, sq_len, self.config.num_key_value_heads, self.head_dim)
 
             if self.config.rotary_type == 'complex':
 
@@ -672,7 +670,7 @@ class FlaxLlamaAttention(nn.Module):
                 xq = forward_rotary_embedding(array=xq, sin=sin, cos=cos)
                 xk = forward_rotary_embedding(array=xk, sin=sin, cos=cos)
                 del sin, cos
-            elif self.config.rotary_type == 'normal':
+            elif self.config.rotary_type == 'llama':
                 cos, sin = freqs_cis
                 xq, xk = apply_rotary_pos_emb_llama(xq, xk, sin=sin[:, :, :sq_len, :], cos=cos[:, :, :sq_len, :],
                                                     position_ids=position_ids,
@@ -750,7 +748,7 @@ class FlaxLlamaAttention(nn.Module):
                 if self.config.use_pjit_attention_force:
                     attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "mp", None, None))
 
-                attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, xv, )
+                attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, xv)
                 attn_output = self._merge_heads(attn_output)
 
             attn_output = self.wo(attn_output)
@@ -1140,7 +1138,7 @@ def create_freqs_cis_from_config(config: LlamaConfig):
                                                 config.rope_scaling is not None else 1),
                                             method=config.rope_scaling[
                                                 'type'] if config.rope_scaling is not None else None)
-    elif config.rotary_type == 'normal':
+    elif config.rotary_type == 'llama':
         if config.use_torch_to_init_rope_normal:
             freqs_cis = pre_compute_llama_freqs_cis_torch(
                 end=config.max_position_embeddings,
