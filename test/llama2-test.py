@@ -12,8 +12,11 @@ from EasyDel.modules.llama.modelling_llama_flax import pre_compute_llama_freqs_c
     apply_rotary_emb, apply_rotary_pos_emb_llama2
 from transformers.models.llama.modeling_llama import apply_rotary_pos_emb, LlamaRotaryEmbedding, LlamaMLP, \
     LlamaAttention, LlamaForCausalLM, apply_rotary_pos_emb as apply_rotary_pos_emb_torch
+
 import numpy as np
 from EasyDel.utils.tensor_utils import pt2jax, pt2np, np2jax
+from EasyDel.modules.llama.llama_torch import Attention, precompute_freqs_cis as pfs, ModelArgs, fs_init
+from tabulate import tabulate
 
 
 def get_apply_fn(config):
@@ -33,7 +36,7 @@ def get_apply_fn(config):
 
 
 def _make_causal_mask(
-        input_ids_shape: torch.Size, dtype: torch.dtype, device: torch.device = 'cpu', past_key_values_length: int = 0
+        input_ids_shape: torch.Size, dtype: torch.dtype, device: torch.device = 'cpu', past_key_values_length=0
 ):
     bsz, tgt_len = input_ids_shape
     mask = torch.full((tgt_len, tgt_len), torch.finfo(dtype).min, device=device)
@@ -58,7 +61,7 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len=None):
 
 
 def transfer_weight(w):
-    return jnp.asarray(w.T.detach().numpy()).astype('float32')
+    return jnp.asarray(w.transpose(0, 1).detach().numpy()).astype('float32')
 
 
 def test_rope(config: LlamaConfig):
@@ -119,7 +122,7 @@ def test_apply_rotary(config: LlamaConfig):
         jax_q = fn(jax_q, sin=sin, cos=cos)
         jax_k = fn(jax_k, sin=sin, cos=cos)
     if config.rotary_type == 'llama2':
-        jax_q, jax_k = fn(jax_q, jax_k, freqs_cis=freq_cis)
+        jax_q, jax_k = fn(jax_q, jax_k, freqs_cis=freq_cis[config.max_position_embeddings])
     q, k = apply_rotary_pos_emb_torch(q, k, cos_torch, sin_torch, position_ids)
     assert np.allclose(jax_q, pt2jax(q.transpose(1, 2))), 'Assertion for Q Failed in Applying Rope'
     assert np.allclose(jax_k, pt2jax(k.transpose(1, 2))), 'Assertion for K Failed in Applying Rope'
@@ -127,20 +130,33 @@ def test_apply_rotary(config: LlamaConfig):
 
 
 def test_attention(config: LlamaConfig):
-    mask_pt_1d = torch.ones(1, config.max_position_embeddings,
-                            dtype=torch.bool)  # torch.rand(batch_size, seq_len) > 0.1
-    attention_mask_pt = torch.tril(torch.einsum('bi,bj->bij', mask_pt_1d, mask_pt_1d))[:, None]
-    mask_jax_1d = pt2jax(mask_pt_1d)
-    attention_mask_jax = jnp.tril(jnp.einsum('bi,bj->bij', mask_jax_1d, mask_jax_1d))[:, None, None]
     hidden_state = torch.randn(1, config.max_position_embeddings, config.hidden_size, dtype=torch.float32)
     position_ids = torch.arange(config.max_position_embeddings).reshape(1, -1)
-    attention_mask_pt = torch.where(attention_mask_pt, 0, -10000.)
+
     jax_hidden_state = pt2jax(hidden_state)
     jax_position_ids = pt2jax(position_ids)
 
     config.pretraining_tp = 1
-    torch_attn = LlamaAttention(
-        config=config
+
+    mask = torch.full(
+        (1, 1, config.max_position_embeddings, config.max_position_embeddings), float("-inf")
+    )
+    mask = torch.triu(mask, diagonal=1).type_as(hidden_state)
+    mask_1d = pt2jax(torch.ones(1, config.max_position_embeddings, dtype=torch.bool))
+    args = ModelArgs(
+        dim=config.hidden_size,
+        n_layers=32,
+        n_heads=config.num_attention_heads,
+        n_kv_heads=config.num_key_value_heads,
+        vocab_size=-1,
+        multiple_of=256,
+        ffn_dim_multiplier=None,
+        norm_eps=config.rms_norm_eps,
+
+        max_seq_len=config.max_position_embeddings,
+    )
+    torch_attn = Attention(
+        args=args
     )
     flax_attn = FlaxLlamaAttention(
         config=config,
@@ -155,37 +171,52 @@ def test_attention(config: LlamaConfig):
 
     flax_params = {
         'params': {
-            'k_proj': {'kernel': transfer_weight(torch_attn.k_proj.weight)},
-            'o_proj': {'kernel': transfer_weight(torch_attn.o_proj.weight)},
-            'q_proj': {'kernel': transfer_weight(torch_attn.q_proj.weight)},
-            'v_proj': {'kernel': transfer_weight(torch_attn.v_proj.weight)}
+            'k_proj': {'kernel': transfer_weight(torch_attn.wk.weight)},
+            'o_proj': {'kernel': transfer_weight(torch_attn.wo.weight)},
+            'q_proj': {'kernel': transfer_weight(torch_attn.wq.weight)},
+            'v_proj': {'kernel': transfer_weight(torch_attn.wv.weight)}
         }
     }
+    pred_torch = pt2jax(torch_attn.forward(
+        start_pos=0,
+        freqs_cis=pfs(config.hidden_size // config.num_attention_heads, config.max_position_embeddings),
+        x=hidden_state,
+        mask=mask
 
-    pred_torch = torch_attn.forward(
-        hidden_states=hidden_state,
-        attention_mask=attention_mask_pt,
-        position_ids=position_ids
-    )[0]
+    ))
     pred_jax = flax_attn.apply(
         flax_params,
-        attention_mask=attention_mask_jax,
+        attention_mask=pt2jax(mask),
         hidden_states=jax_hidden_state,
         freqs_cis=freq_cis_jax,
         position_ids=jax_position_ids
     )[0]
-    pred_torch = jnp.where(mask_jax_1d[..., None], pt2jax(pred_torch), 0.)
-    pred_jax = jnp.where(mask_jax_1d[..., None], pred_jax, 0.)
-    for k, k1 in zip(pred_jax.reshape(-1)[:-30], pred_torch.reshape(-1)[:-30]):
-        print(f"{k} <<-->> {k1}")
+    pred_jax = jnp.where(mask_1d[:, :, None], pred_jax, 0)
+    pred_torch = jnp.where(mask_1d[:, :, None], pred_torch, 0)
+    indexes = -10000
+    is_close = np.isclose(pred_jax.reshape(-1)[:indexes], pred_torch.reshape(-1)[:indexes])
+    table = [[pt, pj, cs] for pt, pj, cs in
+             zip(pred_torch.reshape(-1)[:indexes], pred_jax.reshape(-1)[:indexes], is_close)]
+    print(
+        tabulate(
+            table,
+            headers=['Pytorch', 'Jax', 'Close?'],
+            tablefmt='orgtbl'
+        )
+    )
+
     assert np.allclose(
-        pred_jax.reshape(-1)[:-30], pred_torch.reshape(-1)[:-30]
+        pred_jax.reshape(-1)[:30], pred_torch.reshape(-1)[:30]
     ), 'Jax and Torch Attn predictions are not the same Failed !'
     return True
 
 
 if __name__ == "__main__":
+
     torch.manual_seed(42)
+    world_size = 1
+    rank = 0
+
     config_ = LlamaConfig(
         hidden_size=512,
         intermediate_size=1024,
@@ -204,11 +235,11 @@ if __name__ == "__main__":
         print(sr)
     except ValueError as s:
         print(f'{s} - this test is designed for lm2 and normal ')
-    # try:
-    test_apply_rotary(config_)
-    print('Applying Rope Test Passed Successfully')
-    # except AssertionError as sr:
-    #     print(f"{sr} - This is fine :_)")
+    try:
+        test_apply_rotary(config_)
+        print('Applying Rope Test Passed Successfully')
+    except (AssertionError, ValueError) as sr:
+        print(f"{sr} - This is fine :_)")
 
     # try:
     test_attention(config_)

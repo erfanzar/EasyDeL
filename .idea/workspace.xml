@@ -5,7 +5,9 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="08ad205b-709f-455b-86db-91293f595cd3" name="Changes" comment="">
+      <change afterPath="$PROJECT_DIR$/EasyDel/modules/llama/llama_torch.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/__init__.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/EasyDel/modules/llama/modelling_llama_flax.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/modules/llama/modelling_llama_flax.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/test/llama2-test.py" beforeDir="false" afterPath="$PROJECT_DIR$/test/llama2-test.py" afterDir="false" />
     </list>
@@ -17,10 +19,10 @@
   <component name="FileTemplateManagerImpl">
     <option name="RECENT_TEMPLATES">
       <list>
+        <option value="Jupyter Notebook" />
         <option value="Python Stub" />
         <option value="Python Unit Test" />
         <option value="Python Script" />
-        <option value="Jupyter Notebook" />
       </list>
     </option>
   </component>
@@ -59,11 +61,13 @@
       <recent name="$PROJECT_DIR$/EasyDel/modules/gpt_j" />
     </key>
     <key name="MoveFile.RECENT_KEYS">
+      <recent name="$PROJECT_DIR$/EasyDel/modules/llama" />
+      <recent name="$PROJECT_DIR$/test" />
       <recent name="$PROJECT_DIR$/examples/serving/causal-lm" />
       <recent name="$PROJECT_DIR$" />
     </key>
   </component>
-  <component name="RunManager" selected="Python.env">
+  <component name="RunManager" selected="Python.llama2-test">
     <configuration default="true" type="PythonConfigurationType" factoryName="Python">
       <module name="EasyDL" />
       <option name="INTERPRETER_OPTIONS" value="" />
@@ -130,8 +134,31 @@
       <option name="INPUT_FILE" value="" />
       <method v="2" />
     </configuration>
+    <configuration name="llama2-test" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
+      <module name="EasyDeL" />
+      <option name="INTERPRETER_OPTIONS" value="" />
+      <option name="PARENT_ENVS" value="true" />
+      <envs>
+        <env name="PYTHONUNBUFFERED" value="1" />
+      </envs>
+      <option name="SDK_HOME" value="" />
+      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/test" />
+      <option name="IS_MODULE_SDK" value="true" />
+      <option name="ADD_CONTENT_ROOTS" value="true" />
+      <option name="ADD_SOURCE_ROOTS" value="true" />
+      <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
+      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/test/llama2-test.py" />
+      <option name="PARAMETERS" value="" />
+      <option name="SHOW_COMMAND_LINE" value="true" />
+      <option name="EMULATE_TERMINAL" value="false" />
+      <option name="MODULE_MODE" value="false" />
+      <option name="REDIRECT_INPUT" value="false" />
+      <option name="INPUT_FILE" value="" />
+      <method v="2" />
+    </configuration>
     <recent_temporary>
       <list>
+        <item itemvalue="Python.llama2-test" />
         <item itemvalue="Python.env" />
         <item itemvalue="Python.io" />
       </list>
@@ -198,9 +225,23 @@
       <workItem from="1691051581762" duration="8253000" />
       <workItem from="1691234683772" duration="5228000" />
       <workItem from="1691310583977" duration="2378000" />
-      <workItem from="1691423193127" duration="4547000" />
+      <workItem from="1691568364869" duration="433000" />
+      <workItem from="1691582189453" duration="1850000" />
+      <workItem from="1691659255595" duration="4000" />
+      <workItem from="1691659942312" duration="614000" />
+      <workItem from="1691829569876" duration="5579000" />
+      <workItem from="1691909969951" duration="6205000" />
+      <workItem from="1691920050195" duration="11000" />
+      <workItem from="1691920117202" duration="5643000" />
+      <workItem from="1691928788898" duration="639000" />
+      <workItem from="1691930139009" duration="5163000" />
+      <workItem from="1691999659518" duration="680000" />
+      <workItem from="1692001076538" duration="11408000" />
+      <workItem from="1692016586490" duration="171000" />
+      <workItem from="1692018816020" duration="3849000" />
       <workItem from="1692173473973" duration="3108000" />
       <workItem from="1692184650619" duration="9644000" />
+      <workItem from="1692259812291" duration="4622000" />
     </task>
     <servers />
   </component>
@@ -217,5 +258,8 @@
         </entry>
       </map>
     </option>
+  </component>
+  <component name="com.intellij.coverage.CoverageDataManagerImpl">
+    <SUITE FILE_PATH="coverage/EasyDeL$env.coverage" NAME="env Coverage Results" MODIFIED="1692009307844" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
   </component>
 </project>

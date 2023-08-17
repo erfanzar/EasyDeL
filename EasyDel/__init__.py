@@ -6,8 +6,12 @@ from .modules import FlaxLlamaModel, FlaxLlamaForCausalLM, LlamaConfig, \
     FlaxT5ForConditionalGeneration, FlaxT5Model, FlaxPalmForCausalLM, PalmModel, PalmConfig, T5Config, \
     FlaxOPTForCausalLM, FlaxOPTModel, OPTConfig
 from .trainer import TrainArguments, fsdp_train_step, get_training_modules, CausalLMTrainer
-from .serve import JAXServer
 
+try:
+    from .serve import JAXServer
+except ValueError as vr:
+    print(f'\033[1;31mWarning\033[1;0m : JAXServer Wont be Imported Be Cause {vr}')
+    JAXServer = None
 __version__ = '0.0.24'
 
 __all__ = "TrainArguments", "fsdp_train_step", 'get_training_modules', \
