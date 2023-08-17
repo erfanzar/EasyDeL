@@ -26,7 +26,7 @@ def get_apply_fn(config):
         fn = apply_rotary_pos_emb
     elif config.rotary_type == 'lm2':
         fn = forward_rotary_embedding
-    elif config.rotary_type == 'normal':
+    elif config.rotary_type == 'llama':
         fn = apply_rotary_pos_emb_llama
     elif config.rotary_type == 'llama2':
         fn = apply_rotary_pos_emb_llama2
@@ -109,7 +109,7 @@ def test_apply_rotary(config: LlamaConfig):
     # Applying
 
     fn = get_apply_fn(config)
-    if config.rotary_type == 'normal':
+    if config.rotary_type == 'llama':
         cos_jax, sin_jax = freq_cis
         jax_q, jax_k = fn(jax_q, jax_k, sin=sin_jax[:, :, :config.max_position_embeddings, :],
                           cos=cos_jax[:, :, :config.max_position_embeddings, :],
@@ -239,7 +239,7 @@ if __name__ == "__main__":
     except AssertionError as sr:
         print(sr)
     except ValueError as s:
-        print(f'{s} - this test is designed for lm2 and normal ')
+        print(f'{s} - this test is designed for lm2 and llama ')
     try:
         test_apply_rotary(config_)
         print('Applying Rope Test Passed Successfully')

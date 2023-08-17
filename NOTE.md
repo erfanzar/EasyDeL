@@ -1,6 +1,6 @@
 ### Note 14Aug
 
-use `rotary_type='normal'` for llama2 or llama1 huggingface models
+use `rotary_type='llama'` for llama2 or llama1 huggingface models
 
 ### Note
 
@@ -42,4 +42,4 @@ print(partition_rules)
 
 #### In order to use OpenLlama Model set `attn_type=''` and `rotary_type='complex'`
 #### In order to use OpenLlama Model set `attn_type='llama2'` and `rotary_type='llama2'` 
-or `attn_type='normal'` and `rotary_type='normal'`
+or `attn_type='llama'` and `rotary_type='llama'`
