@@ -153,7 +153,8 @@ tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 
 config = LlamaConfig.from_pretrained(
     model_id,
-    rotary_type='complex'
+    rotary_type='llama2'
+    # set attn_type tto llama2 if you are using llama models otherwise if you are using openllama pass 'complex'
 )
 
 config.add_jax_args(
@@ -162,7 +163,9 @@ config.add_jax_args(
     flash_attn_key_chunk_size=1024,
     scan_mlp_chunk_size=1024,
     use_flash_attention=False,
-    use_sacn_mlp=False
+    use_sacn_mlp=False,
+    attn_type='llama2',
+    # set attn_type tto llama2 if you are using llama models otherwise if you are using openllama pass ''
 )
 
 with jax.default_device(jax.devices('cpu')[0]):
