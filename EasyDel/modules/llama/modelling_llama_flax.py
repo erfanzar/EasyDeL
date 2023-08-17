@@ -588,13 +588,23 @@ class FlaxLlamaAttention(nn.Module):
             bsz, sq_len = hidden_states.shape[:2]
             xq, xk, xv = self.wq(hidden_states), self.wk(hidden_states), self.wv(hidden_states)
 
+            if self.config.use_pjit_attention_force:
+                xq = with_sharding_constraint(xq, PS(("dp", "fsdp"), None, "mp"))
+                xk = with_sharding_constraint(xk, PS(("dp", "fsdp"), None, "mp"))
+                xv = with_sharding_constraint(xv, PS(("dp", "fsdp"), None, "mp"))
+
             xq = xq.reshape(bsz, sq_len, self.config.num_attention_heads, self.head_dim)
             xk = xk.reshape(bsz, sq_len, self.config.num_key_value_heads, self.head_dim)
             xv = xv.reshape(bsz, sq_len, self.config.num_key_value_heads, self.head_dim)
+
             freqs_cis = freqs_cis[:sq_len]
             xq, xk = apply_rotary_pos_emb_llama2(xq, xk, freqs_cis=freqs_cis)
             xk = repeat_kv(xk, self.number_of_reps)
             xv = repeat_kv(xv, self.number_of_reps)
+
+            if self.has_variable("cache", "cached_key") or init_cache:
+                xk, xv, attention_mask = self._concatenate_to_cache(xk, xv, xq, attention_mask)
+
             xq /= math.sqrt(self.head_dim)
             attn_wight = jnp.einsum('...qhd,...khd->...hqk', xq, xk, precision=self.precision)
 
