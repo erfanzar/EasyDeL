@@ -95,7 +95,7 @@ class LlamaConfig(PretrainedConfig):
             flash_attn_query_chunk_size: int = 1024,
             flash_attn_key_chunk_size: int = 1024,
             scan_mlp_chunk_size: int = 1024,
-            rotary_type: str = 'complex',
+            rotary_type: str = 'llama2',
             from_pt: bool = False,
             do_torch_attn: bool = False,
             use_torch_to_init_rope_normal=False,
