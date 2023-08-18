@@ -39,7 +39,7 @@ _Tutorials on how to use and train or serve your models with EasyDel is availabl
 
 2. [_Train_](https://github.com/erfanzar/EasyDeL/tree/main/examples/training/causal-lm)
 
-3. [_Use Llama 2 Models_](https://github.com/erfanzar/EasyDeL/LLAMA.md)
+3. [_Use Llama 2 Models_](https://github.com/erfanzar/EasyDeL/blob/main/LLAMA.md)
 
 ## Available Models Are
 
