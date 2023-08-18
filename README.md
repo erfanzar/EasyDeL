@@ -65,11 +65,11 @@ or any other models supported by EasyDel
 #### Step One
 
 download converted model weights in order to finetune or convert the weights of the model you want to use
-weight_convertor in the library example
+transform in the library example
 
 ```python
 import jax
-from EasyDel.weight_convertor.mpt import convert_pt_to_flax_7b
+from EasyDel.transform.mpt import convert_pt_to_flax_7b
 from fjutils.utils import save_ckpt
 
 number_of_layers = 32  # its 32 hidden layers for Mpt 7B
@@ -79,8 +79,6 @@ pytorch_model_state_dict = None  # StateDict of the model should be this one
 flax_params = convert_pt_to_flax_7b(pytorch_model_state_dict, number_of_layers, device)
 save_ckpt(flax_params, 'flax_param_easydel')
 ```
-
-#### Functional Programing method
 
 #### Step Two
 
@@ -144,37 +142,22 @@ and classes. Here is an example of how to import EasyDeL and use its Model class
 
 ```python
 from EasyDel import JAXServer, FlaxLlamaForCausalLM, LlamaConfig
+from EasyDel.transform import llama_from_pretrained
 from transformers import AutoTokenizer
+
 import jax
 
 model_id = 'meta-llama/Llama-2-7b-chat-hf'
 
 tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 
-config = LlamaConfig.from_pretrained(
-    model_id,
-    rotary_type='llama2'
-    # set attn_type tto llama2 if you are using llama models otherwise if you are using openllama pass 'complex'
+params, config = llama_from_pretrained(model_id, jax.devices('cpu')[0])
+model = FlaxLlamaForCausalLM(
+    config,
+    dtype='float16',
+    param_dtype='float16',
+    _do_init=False,
 )
-
-config.add_jax_args(
-    from_pt=True,
-    use_pjit_attention_force=False,
-    flash_attn_key_chunk_size=1024,
-    scan_mlp_chunk_size=1024,
-    use_flash_attention=False,
-    use_sacn_mlp=False,
-    attn_type='llama2',
-    # set attn_type tto llama2 if you are using llama models otherwise if you are using openllama pass ''
-)
-
-with jax.default_device(jax.devices('cpu')[0]):
-    model = FlaxLlamaForCausalLM.from_pretrained(
-        model_id,
-        from_pt=True,
-        config=config,
-    )
-
 server = JAXServer.load_from_params(
     model=model,
     config_model=config,

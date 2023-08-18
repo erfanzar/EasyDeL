@@ -4,7 +4,7 @@ import torch
 
 
 # CONVERTER Falcon-7B
-def convert_pt_to_flax_7b(state_dict_pt, n_layers: int, device=jax.devices('cpu')[0], bias=False):
+def falcon_convert_pt_to_flax_7b(state_dict_pt, n_layers: int, device=jax.devices('cpu')[0], bias=False):
     with jax.default_device(device):
         state_dict_flax = {}
         state_dict_flax[('transformer', 'wte', 'embedding')] = state_dict_pt[
@@ -51,7 +51,7 @@ def convert_pt_to_flax_7b(state_dict_pt, n_layers: int, device=jax.devices('cpu'
     return state_dict_flax
 
 
-def convert_flax_to_pt_7b(state_dict_flax, n_layers: int, device="cpu", bias=False):
+def falcon_convert_flax_to_pt_7b(state_dict_flax, n_layers: int, device="cpu", bias=False):
     import torch
 
     state_dict_pt = {}

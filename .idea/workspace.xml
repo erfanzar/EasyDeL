@@ -6,8 +6,15 @@
   <component name="ChangeListManager">
     <list default="true" id="08ad205b-709f-455b-86db-91293f595cd3" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/modules/llama/llama_torch.py" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/EasyDel/modules/llama/modelling_llama_flax.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/modules/llama/modelling_llama_flax.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/NOTE.md" beforeDir="false" afterPath="$PROJECT_DIR$/NOTE.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/weight_convertor/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/transform/__init__.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/weight_convertor/falcon.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/transform/falcon.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/weight_convertor/llama.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/transform/llama.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/weight_convertor/mpt.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/transform/mpt.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/EasyDel/weight_convertor/utils.py" beforeDir="false" afterPath="$PROJECT_DIR$/EasyDel/transform/utils.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/README.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/test/llama2-test.py" beforeDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -242,7 +249,8 @@
       <workItem from="1692259812291" duration="11970000" />
       <workItem from="1692285378632" duration="5138000" />
       <workItem from="1692293871383" duration="2341000" />
-      <workItem from="1692302751826" duration="624000" />
+      <workItem from="1692302751826" duration="1493000" />
+      <workItem from="1692343044393" duration="2453000" />
     </task>
     <servers />
   </component>
