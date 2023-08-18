@@ -99,13 +99,13 @@ class LlamaConfig(PretrainedConfig):
             from_pt: bool = False,
 
             use_torch_to_init_rope_normal=False,
-            attn_type='llama2',
+            attn_type='llama',
             **kwargs,
     ):
-        assert rotary_type in ['open', 'complex', 'llama', 'lm2', 'llama2'], f'{rotary_type} is wrong type ' \
-                                                                              f'of rotary valid types' \
-                                                                              f' are [open, complex,lm2,llama,llama2]'
-
+        assert rotary_type in ['open', 'complex', 'llama', 'lm2', 'llama2'], f' {rotary_type} is wrong type ' \
+                                                                              f' of rotary valid types' \
+                                                                              f' is [open, complex,lm2, llama,llama2]'
+        assert attn_type in ['llama','llama2'], f" supported attn types are 'llama', 'llama2' so passed <<{attn_type}>> is unknown"
         if attn_type == 'llama2' and rotary_type != 'llama2':
             raise ValueError(
                 'in order to get good output if you using llama2 as attn type you should use rotary type or llama2 too'
