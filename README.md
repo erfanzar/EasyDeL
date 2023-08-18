@@ -31,6 +31,16 @@ for the latest version (beta)
 pip install git+https://github.com/erfanzar/EasyDel
 ```
 
+## Tutorials
+
+_Tutorials on how to use and train or serve your models with EasyDel is available at examples dir_
+
+1. [_Serving_](https://github.com/erfanzar/EasyDeL/tree/main/examples/serving)
+
+2. [_Train_](https://github.com/erfanzar/EasyDeL/tree/main/examples/training/causal-lm)
+
+3. [_Use Llama 2 Models_](https://github.com/erfanzar/EasyDeL/LLAMA.md)
+
 ## Available Models Are
 
 - **_Llama_**     (Support `FSDP`, `MP`,` DP`)(_Supports gradient checkpointing_)
@@ -44,17 +54,10 @@ pip install git+https://github.com/erfanzar/EasyDel
 - **_OPT_**       (Support `FSDP`, `MP`, `DP`)(_Supports gradient checkpointing_)
 
 [//]: # (- **_XGen_**      _Soon_)
+
 - _LLama GPT-J MosaicMPT Falcon supports Flash Attention_
 
 you can also tell me the model you want in Flax/Jax version and ill try my best to build it ;)
-
-## Tutorials
-
-_Tutorials on how to use and train or serve your models with EasyDel is available at examples dir_
-
-[_Serving_](https://github.com/erfanzar/EasyDeL/tree/main/examples/serving)
-
-[_Train_](https://github.com/erfanzar/EasyDeL/tree/main/examples/training/causal-lm)
 
 ## FineTuning
 
