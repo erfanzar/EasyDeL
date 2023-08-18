@@ -179,3 +179,13 @@ class RNG:
             split_rngs = jax.random.split(self.rng, num=len(keys) + 1)
             self.rng = split_rngs[0]
             return {key: val for key, val in zip(keys, split_rngs[1:])}
+
+
+def get_mesh(
+        shape: str = (1, -1, 1),
+        axis_names=('dp', 'fsdp', 'mp')
+):
+    from jax.sharding import Mesh
+    from jax.experimental import mesh_utils
+    array = jnp.ones((len(jax.devices()), 1)).reshape(shape)
+    return Mesh(mesh_utils.create_device_mesh(array.shape), axis_names)

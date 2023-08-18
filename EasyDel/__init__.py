@@ -1,4 +1,4 @@
-from .utils import make_shard_and_gather_fns
+from .utils import make_shard_and_gather_fns, get_mesh
 from .modules import FlaxLlamaModel, FlaxLlamaForCausalLM, LlamaConfig, \
     FlaxLTModelModule, FlaxLTConfig, FlaxLTForCausalLM, FlaxLTModel, GPTJConfig, FlaxGPTJModule, \
     FlaxGPTJForCausalLMModule, FlaxGPTJModel, FlaxGPTJForCausalLM, FlaxMptForCausalLM, MptConfig, FlaxMptModel, \
@@ -24,4 +24,5 @@ __all__ = "TrainArguments", "fsdp_train_step", 'get_training_modules', \
     "FlaxGPTNeoXForCausalLM", "GPTNeoXConfig", "FlaxGPTNeoXModel", \
     "FlaxT5ForConditionalGeneration", "FlaxT5Model", \
     "FlaxPalmForCausalLM", "PalmModel", "PalmConfig", 'T5Config', \
-    "FlaxOPTForCausalLM", "FlaxOPTModel", "OPTConfig", 'CausalLMTrainer', 'LlamaConfig', "__version__", 'JAXServer'
+    "FlaxOPTForCausalLM", "FlaxOPTModel", "OPTConfig", 'CausalLMTrainer', 'LlamaConfig', "__version__", 'JAXServer', \
+    'get_mesh'
