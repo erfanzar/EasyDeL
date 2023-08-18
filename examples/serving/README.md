@@ -52,30 +52,22 @@ if __name__ == "__main__":
 you can also load model itself from parameters like
 
 ```python
+import EasyDel.transform
+
 model_id = 'meta-llama/Llama-2-7b-chat-hf'
 
 tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 
-config = EasyDel.LlamaConfig.from_pretrained(
-    model_id,
-    rotary_type='complex'
+params, config = EasyDel.transform.llama_from_pretrained(
+    model_id=model_id
 )
-
-config.add_jax_args(
-    from_pt=True,
-    use_pjit_attention_force=False,
-    flash_attn_key_chunk_size=1024,
-    scan_mlp_chunk_size=1024,
-    use_flash_attention=False,
-    use_sacn_mlp=False
-)
-print(config)
 
 with jax.default_device(jax.devices('cpu')[0]):
-    model = EasyDel.FlaxLlamaForCausalLM.from_pretrained(
-        model_id,
-        from_pt=True,
+    model = EasyDel.FlaxLlamaForCausalLM(
         config=config,
+        _do_init=False,
+        dtype='float16',
+        param_dtype='float16'
     )
 
 server = JAXServer.load_from_params(
@@ -83,7 +75,7 @@ server = JAXServer.load_from_params(
     config_model=config,
     config=config_server,
     tokenizer=tokenizer,
-    params=model.params,
+    params=params,
     add_param_field=True
 )
 ```
