@@ -95,21 +95,11 @@ class LlamaConfig(PretrainedConfig):
             flash_attn_query_chunk_size: int = 1024,
             flash_attn_key_chunk_size: int = 1024,
             scan_mlp_chunk_size: int = 1024,
-            rotary_type: str = 'llama',
             from_pt: bool = False,
-
-            use_torch_to_init_rope_normal=False,
             attn_type='llama2',
             **kwargs,
     ):
-        assert rotary_type in ['open', 'complex', 'llama', 'lm2', 'llama2'], f'{rotary_type} is wrong type ' \
-                                                                              f'of rotary valid types' \
-                                                                              f' are [open, complex,lm2,llama,llama2]'
 
-        if attn_type == 'llama2' and rotary_type != 'llama2':
-            raise ValueError(
-                'in order to get good output if you using llama2 as attn type you should use rotary type or llama2 too'
-            )
         num_key_value_heads = num_key_value_heads or number_rep_kv * num_attention_heads
         self.num_key_value_heads = num_key_value_heads
         self.vocab_size = vocab_size
@@ -120,7 +110,7 @@ class LlamaConfig(PretrainedConfig):
         self.initializer_range = initializer_range
         self.intermediate_size = intermediate_size
         self.num_hidden_layers = num_hidden_layers
-        self.use_torch_to_init_rope_normal = use_torch_to_init_rope_normal
+
         self.num_attention_heads = num_attention_heads
         self.max_position_embeddings = max_position_embeddings
         self.rms_norm_eps = rms_norm_eps
@@ -138,7 +128,6 @@ class LlamaConfig(PretrainedConfig):
         self.use_sacn_mlp = use_sacn_mlp
         self.flash_attn_key_chunk_size = flash_attn_key_chunk_size
         self.flash_attn_query_chunk_size = flash_attn_query_chunk_size
-        self.rotary_type = rotary_type
         self.scan_mlp_chunk_size = scan_mlp_chunk_size,
         self.from_pt = from_pt
 
@@ -238,11 +227,9 @@ class LlamaConfig(PretrainedConfig):
                      flash_attn_query_chunk_size: int = 1024,
                      flash_attn_key_chunk_size: int = 1024,
                      scan_mlp_chunk_size: int = 1024,
-                     rotary_type: str = 'llama',
                      from_pt: bool = True,
                      number_rep_kv: int = 1,
-                     attn_type='llama2',
-                     use_torch_to_init_rope_normal=True
+                     attn_type='llama'
                      ):
         self.from_pt = from_pt
         self.use_flash_attention = use_flash_attention
@@ -262,8 +249,6 @@ class LlamaConfig(PretrainedConfig):
         self.flash_attn_query_chunk_size = flash_attn_query_chunk_size
         self.flash_attn_key_chunk_size = flash_attn_key_chunk_size
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
-        self.rotary_type = rotary_type
-        self.use_torch_to_init_rope_normal = use_torch_to_init_rope_normal
 
     @staticmethod
     def get_weight_decay_exclusions():
@@ -277,66 +262,6 @@ class LlamaConfig(PretrainedConfig):
 remat = nn_partitioning.remat
 
 
-def pre_compute_llama_freqs_cis_torch(dim, end, theta: float = 10000.):
-    import torch
-    freq_cis = 1. / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-    t = torch.arange(end, dtype=torch.float32)
-    freq = torch.einsum('i,j->ij', t, freq_cis)
-    freq = torch.cat([freq, freq], dim=-1)
-    return jnp.asarray(torch.cos(freq)[None, None, :, :].detach().numpy(), dtype=jnp.float32), \
-        jnp.asarray(torch.sin(freq)[None, None, :, :].detach().numpy(), dtype=jnp.float32)
-
-
-def pre_compute_llama_freqs_cis(dim, end, theta: float = 10000.):
-    freqs = 1. / (theta ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim))
-    t = jnp.arange(end, dtype=jnp.float32)
-    freq = einsum(t, freqs, 'i,j->i j')
-    freq = jnp.concatenate([freq, freq], axis=-1)
-    return jnp.cos(freq)[None, None, :, :], jnp.sin(freq)[None, None, :, :]
-
-
-def rotate_half_llama(x):
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2:]
-    return jnp.concatenate((-x2, x1), axis=-1)
-
-
-def pre_compute_pos_emb_llama2_complex(dim, end, theta: float = 10000.0):
-    """
-    in order to get correct outputs from the model you have to use torch for polar function otherwise you will
-    get nonsense outputs I have tried may method like
-    complex(jnp.sqrt(z.real**2 + z.imag**2),lax.atan2(z.imag, z.real))
-    but because we are using different backend (jax/pytorch) the outputs are way too different :)
-    """
-    import torch
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device)  # type: ignore
-    freqs = torch.outer(t, freqs).float()
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
-    return jnp.asarray(freqs_cis.detach().numpy())
-
-
-def apply_rotary_pos_emb_llama2(xq, xk, freqs_cis):
-    _, s, *_ = xq.shape
-
-    dtype = jnp.promote_types(xq.dtype, jnp.float32)
-    reshape_xq = xq.astype(dtype).reshape(*xq.shape[:-1], -1, 2)
-    reshape_xk = xk.astype(dtype).reshape(*xk.shape[:-1], -1, 2)
-
-    xq_ = jax.lax.complex(reshape_xq[..., 0], reshape_xq[..., 1])
-    xk_ = jax.lax.complex(reshape_xk[..., 0], reshape_xk[..., 1])
-
-    ndim = xq_.ndim
-    assert 0 <= 1 < ndim
-    assert freqs_cis.shape == (xq_.shape[1], xq_.shape[-1])
-    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(xq_.shape)]
-    freqs_cis = freqs_cis.reshape(*shape)
-    xq_out = jnp.real(xq_ * freqs_cis)
-    xk_out = jnp.real(xk_ * freqs_cis)
-
-    return xq_out.astype(xq.dtype), xk_out.astype(xk.dtype)
-
-
 def repeat_kv(x: jax.Array, n_rep: int) -> jax.Array:
     bs, s, n_kv_heads, head_dim = x.shape
     if n_rep == 1:
@@ -344,75 +269,6 @@ def repeat_kv(x: jax.Array, n_rep: int) -> jax.Array:
 
     return jnp.expand_dims(x[:, :, :, None, :], (bs, s, n_kv_heads, n_rep, head_dim)).reshape(bs, s, n_kv_heads * n_rep,
                                                                                               head_dim)
-
-
-def apply_rotary_pos_emb_llama(q, k, cos, sin, position_ids, index):
-    dt = k.dtype
-    q, k, cos, sin = (s.astype(jnp.float32) for s in [q, k, cos, sin])
-    cos = cos.squeeze(1).squeeze(0)
-    sin = sin.squeeze(1).squeeze(0)
-    cos = jnp.expand_dims(cos[position_ids], index)
-    sin = jnp.expand_dims(sin[position_ids], index)
-    q_embed = jnp.add((q * cos), (rotate_half_llama(q) * sin))
-    k_embed = jnp.add((k * cos), (rotate_half_llama(k) * sin))
-    return q_embed.astype(dt), k_embed.astype(dt)
-
-
-def create_sinusoidal_positions(num_pos, dim):
-    inv_freq = 1.0 / (10000 ** (jnp.arange(0, dim, 2) / dim))
-    sinusoid_inp = einsum(jnp.arange(num_pos), inv_freq, "i , j -> i j").astype("float32")
-    sin, cos = jnp.sin(sinusoid_inp), jnp.cos(sinusoid_inp)
-
-    sentinel = dim // 2 + dim % 2
-    out = jnp.zeros((num_pos, dim))
-    out = out.at[:, 0: sentinel].set(sin)
-    out = out.at[:, sentinel:].set(cos)
-    return jnp.array(out)
-
-
-def rotate_every_two(tensor):
-    rotate_half_tensor = jnp.stack((-tensor[:, :, :, 1::2], tensor[:, :, :, ::2]), axis=-1)
-    rotate_half_tensor = rotate_half_tensor.reshape(rotate_half_tensor.shape[:-2] + (-1,))
-    return rotate_half_tensor
-
-
-def apply_rotary_pos_emb(tensor, sincos):
-    sin_pos, cos_pos = sincos
-    sin_pos = sin_pos[:, :, None, :].repeat(2, 3)
-    cos_pos = cos_pos[:, :, None, :].repeat(2, 3)
-    return (tensor * cos_pos) + (rotate_every_two(tensor) * sin_pos)
-
-
-def pre_compute_frq_sin_cos(end: int, dim: int, method: str = None, scale_factor: float = 8., theta=10000.):
-    if method is None:
-        inv_freq = 1.0 / (theta ** (jnp.arange(0, dim, 2) / dim)).astype(jnp.float32)
-        frq = einsum(jnp.arange(end), inv_freq, 'i, j -> i j').astype(jnp.float32)
-    elif method == 'linear':
-        inv_freq = 1.0 / (theta ** (jnp.arange(0, dim, 2) / dim)).astype(jnp.float32)
-        frq = einsum(jnp.arange(end) / scale_factor, inv_freq, 'i, j -> i j').astype(jnp.float32)
-    elif method == 'dynamic':
-        base = theta * (
-                (scale_factor * end / end) - (scale_factor - 1)
-        ) ** (dim / (dim - 2))
-        inv_freq = 1.0 / (base ** (jnp.arange(0, dim, 2) / dim)).astype(jnp.float32)
-        frq = einsum(jnp.arange(end), inv_freq, 'i, j -> i j').astype(jnp.float32)
-    else:
-        raise ValueError('unknown type of rotary')
-    return einops.repeat(jnp.cos(frq), 's d -> s (i d)', i=2), einops.repeat(jnp.sin(frq), 's d -> s (i d)', i=2)
-
-
-def rotate_half(x):
-    x = einops.rearrange(x, '... (i x) -> ... i x', i=2)[..., ::-1, :]
-    x = x.at[..., 0, :].multiply(-1)
-    return einops.rearrange(x, '... i x -> ... (i x)')
-
-
-def forward_rotary_embedding(array, sin, cos):
-    *_, s, d = array.shape
-    dtype = array.dtype
-    array = array.astype(jnp.float32)
-    return (einsum(array, cos[:s, :d], '... s d, s d -> ... s d') +
-            einsum(rotate_half(array), sin[:s, :d], '... s d, s d -> ... s d')).astype(dtype)
 
 
 class RMSNorm(nn.Module):
@@ -442,8 +298,7 @@ class RMSNorm(nn.Module):
 def precompute_freqs_cis(
         method: str,
         dim: int, end: int, theta: float = 10000.0,
-        scaling_factor: float = 8.,
-        dtype: jnp.dtype = jnp.float32) -> jnp.ndarray:
+        scaling_factor: float = 8., **kwargs) -> jnp.ndarray:
     freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(jnp.float32) / dim))
     t = jnp.arange(end)
 
@@ -461,7 +316,7 @@ def precompute_freqs_cis(
     freqs = jnp.outer(t, freqs).astype(jnp.float32)
     sin, cos = jnp.sin(freqs).astype(jnp.float32), jnp.cos(freqs).astype(jnp.float32)
     freqs_cis = jnp.complex64(cos + 1j * sin)
-    return jnp.asarray(freqs_cis, dtype=jnp.float32)
+    return jnp.asarray(freqs_cis)
 
 
 def apply_rotary_emb(
@@ -476,6 +331,7 @@ def apply_rotary_emb(
     xq_ = jax.lax.complex(reshape_xq[..., 0], reshape_xq[..., 1])
     xk_ = jax.lax.complex(reshape_xk[..., 0], reshape_xk[..., 1])
 
+    # add head dim
     freqs_cis = jnp.reshape(freqs_cis, (*freqs_cis.shape[:2], 1, *freqs_cis.shape[2:]))
 
     xq_out = xq_ * freqs_cis
@@ -599,8 +455,8 @@ class FlaxLlamaAttention(nn.Module):
             xk = xk.reshape(bsz, sq_len, self.config.num_key_value_heads, self.head_dim)
             xv = xv.reshape(bsz, sq_len, self.config.num_key_value_heads, self.head_dim)
 
-            freqs_cis = freqs_cis[:sq_len]
-            xq, xk = apply_rotary_pos_emb_llama2(xq, xk, freqs_cis=freqs_cis)
+            freqs_cis = jnp.take(freqs_cis, position_ids, axis=0)
+            xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis, dtype=self.dtype)
             xk = repeat_kv(xk, self.number_of_reps)
             xv = repeat_kv(xv, self.number_of_reps)
 
@@ -634,7 +490,7 @@ class FlaxLlamaAttention(nn.Module):
                 dtype=jnp.promote_types(self.dtype, jnp.float32),
                 deterministic=deterministic,
                 dropout_rate=self.config.attn_pdrop,
-                bias=attention_bias[:,:,:sq_len,:sq_len],
+                bias=attention_bias[:, :, :sq_len, :sq_len],
                 precision=self.precision,
 
             )
@@ -653,31 +509,8 @@ class FlaxLlamaAttention(nn.Module):
             xk = xk.reshape(bsz, sq_len, self.config.num_key_value_heads, self.head_dim)
             xv = xv.reshape(bsz, sq_len, self.config.num_key_value_heads, self.head_dim)
 
-            if self.config.rotary_type == 'complex':
-
-                freqs_cis = jnp.take(freqs_cis, position_ids, axis=0)
-                xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis, dtype=self.dtype)
-            elif self.config.rotary_type == 'open':
-
-                freqs_cis = jnp.take(freqs_cis, position_ids, axis=0)
-                sincos = jnp.split(freqs_cis, 2, axis=-1)
-                xq = apply_rotary_pos_emb(xq, sincos).astype(self.dtype)
-                xk = apply_rotary_pos_emb(xk, sincos).astype(self.dtype)
-                del sincos
-            elif self.config.rotary_type == 'lm2':
-
-                cos, sin = freqs_cis
-                xq = forward_rotary_embedding(array=xq, sin=sin, cos=cos)
-                xk = forward_rotary_embedding(array=xk, sin=sin, cos=cos)
-                del sin, cos
-            elif self.config.rotary_type == 'llama':
-                cos, sin = freqs_cis
-                xq, xk = apply_rotary_pos_emb_llama(xq, xk, sin=sin[:, :, :sq_len, :], cos=cos[:, :, :sq_len, :],
-                                                    position_ids=position_ids,
-                                                    index=2)
-                del sin, cos
-            else:
-                raise RuntimeError
+            freqs_cis = jnp.take(freqs_cis, position_ids, axis=0)
+            xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis, dtype=self.dtype)
 
             query_length, key_length = xq.shape[1], xk.shape[1]
 
@@ -1114,53 +947,6 @@ class FlaxLlamaBlockCollection(nn.Module):
         return outputs
 
 
-def create_freqs_cis_from_config(config: LlamaConfig):
-    if config.rotary_type == 'complex':
-
-        freqs_cis = precompute_freqs_cis(
-            method=config.rope_scaling['type'] if config.rope_scaling is not None else None,
-            scaling_factor=float(config.rope_scaling['factor'] if config.rope_scaling is not None else 1),
-            dim=config.hidden_size // config.num_attention_heads,
-            end=config.max_position_embeddings * 2
-        )
-    elif config.rotary_type == 'open':
-
-        freqs_cis = create_sinusoidal_positions(
-            config.max_position_embeddings,
-            config.hidden_size // config.num_attention_heads
-        )
-    elif config.rotary_type == 'lm2':
-
-        freqs_cis = pre_compute_frq_sin_cos(end=config.max_position_embeddings,
-                                            dim=config.hidden_size // config.num_attention_heads,
-                                            scale_factor=float(
-                                                config.rope_scaling['factor'] if
-                                                config.rope_scaling is not None else 1),
-                                            method=config.rope_scaling[
-                                                'type'] if config.rope_scaling is not None else None)
-    elif config.rotary_type == 'llama':
-        if config.use_torch_to_init_rope_normal:
-            freqs_cis = pre_compute_llama_freqs_cis_torch(
-                end=config.max_position_embeddings,
-                dim=config.hidden_size // config.num_attention_heads,
-                theta=10000.
-            )
-        else:
-            freqs_cis = pre_compute_llama_freqs_cis(end=config.max_position_embeddings,
-                                                    dim=config.hidden_size // config.num_attention_heads,
-                                                    theta=10000.)
-
-    elif config.rotary_type == 'llama2':
-        freqs_cis = pre_compute_pos_emb_llama2_complex(
-            end=config.max_position_embeddings * 2,
-            dim=config.hidden_size // config.num_attention_heads,
-        )
-    else:
-        raise ValueError('Unknown type of rotary_embedding')
-
-    return freqs_cis
-
-
 class FlaxLlamaModule(nn.Module):
     config: LlamaConfig
     dtype: jnp.dtype = jnp.float32
@@ -1182,9 +968,12 @@ class FlaxLlamaModule(nn.Module):
                                           precision=self.precision, name='layers' if self.config.from_pt else 'h')
         self.ln_f = RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps, dtype=self.dtype,
                             param_dtype=self.param_dtype, name='norm' if self.config.from_pt else 'ln_f')
-
-        self.freqs_cis = create_freqs_cis_from_config(
-            self.config
+        config = self.config
+        self.freqs_cis = precompute_freqs_cis(
+            method=config.rope_scaling['type'] if config.rope_scaling is not None else None,
+            scaling_factor=float(config.rope_scaling['factor'] if config.rope_scaling is not None else 1),
+            dim=config.hidden_size // config.num_attention_heads,
+            end=config.max_position_embeddings * 2
         )
 
     def __call__(

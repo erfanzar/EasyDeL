@@ -4,20 +4,22 @@ from fjutils import StreamingCheckpointer
 from jax import numpy as jnp
 import jax
 import torch
+from transformers import LlamaForCausalLM
+from EasyDel.modules.llama import LlamaConfig
 
 
-def convert_hf_to_flax_load(checkpoints_dir, num_hidden_layers=32, num_attention_heads=32, hidden_size=4096,
+def llama_convert_hf_to_flax_load(checkpoints_dir, num_hidden_layers=32, num_attention_heads=32, hidden_size=4096,
                             device=jax.devices('cpu')[0]):
     # Edited From EasyLM
     ckpt_paths = sorted(Path(checkpoints_dir).glob("*.bin"))
-    ckpt = {}
+    state_dict = {}
     with jax.default_device(device):
         for i, ckpt_path in enumerate(ckpt_paths):
             checkpoint = torch.load(ckpt_path, map_location="cpu")
             for k, v in checkpoint.items():
                 if k.startswith("model."):
                     k = k[6:]
-                ckpt[k] = v
+                state_dict[k] = v
 
         def inverse_permute(w):
 
@@ -28,8 +30,8 @@ def convert_hf_to_flax_load(checkpoints_dir, num_hidden_layers=32, num_attention
 
         jax_weights = {
             "transformer": {
-                "wte": {"embedding": ckpt["embed_tokens.weight"].numpy()},
-                "ln_f": {"kernel": ckpt["norm.weight"].numpy()},
+                "wte": {"embedding": state_dict["embed_tokens.weight"].numpy()},
+                "ln_f": {"kernel": state_dict["norm.weight"].numpy()},
                 "h": {
                     "%d"
                     % (layer): {
@@ -37,48 +39,48 @@ def convert_hf_to_flax_load(checkpoints_dir, num_hidden_layers=32, num_attention
                             "wq": {
                                 "kernel": inverse_permute(
 
-                                    ckpt[f"layers.{layer}.self_attn.q_proj.weight"].numpy(),
+                                    state_dict[f"layers.{layer}.self_attn.q_proj.weight"].numpy(),
                                 ).transpose()
                             },
                             "wk": {
                                 "kernel": inverse_permute(
 
-                                    ckpt[f"layers.{layer}.self_attn.k_proj.weight"].numpy(),
+                                    state_dict[f"layers.{layer}.self_attn.k_proj.weight"].numpy(),
                                 ).transpose()
                             },
                             "wv": {
-                                "kernel": ckpt[f"layers.{layer}.self_attn.v_proj.weight"]
+                                "kernel": state_dict[f"layers.{layer}.self_attn.v_proj.weight"]
                                 .numpy()
                                 .transpose()
                             },
                             "wo": {
-                                "kernel": ckpt[f"layers.{layer}.self_attn.o_proj.weight"]
+                                "kernel": state_dict[f"layers.{layer}.self_attn.o_proj.weight"]
                                 .numpy()
                                 .transpose()
                             },
                         },
                         "feed_forward": {
                             "w1": {
-                                "kernel": ckpt[f"layers.{layer}.mlp.gate_proj.weight"]
+                                "kernel": state_dict[f"layers.{layer}.mlp.gate_proj.weight"]
                                 .numpy()
                                 .transpose()
                             },
                             "w2": {
-                                "kernel": ckpt[f"layers.{layer}.mlp.down_proj.weight"]
+                                "kernel": state_dict[f"layers.{layer}.mlp.down_proj.weight"]
                                 .numpy()
                                 .transpose()
                             },
                             "w3": {
-                                "kernel": ckpt[f"layers.{layer}.mlp.up_proj.weight"]
+                                "kernel": state_dict[f"layers.{layer}.mlp.up_proj.weight"]
                                 .numpy()
                                 .transpose()
                             },
                         },
                         "attention_norm": {
-                            "kernel": ckpt[f"layers.{layer}.input_layernorm.weight"].numpy()
+                            "kernel": state_dict[f"layers.{layer}.input_layernorm.weight"].numpy()
                         },
                         "ffn_norm": {
-                            "kernel": ckpt[
+                            "kernel": state_dict[
                                 f"layers.{layer}.post_attention_layernorm.weight"
                             ].numpy()
                         },
@@ -86,19 +88,14 @@ def convert_hf_to_flax_load(checkpoints_dir, num_hidden_layers=32, num_attention
                     for layer in range(num_hidden_layers)
                 },
             },
-            "lm_head": {"kernel": ckpt["lm_head.weight"].numpy().transpose()},
+            "lm_head": {"kernel": state_dict["lm_head.weight"].numpy().transpose()},
         }
 
         return jax_weights
 
 
-def convert_hf_to_flax(ckpt, num_hidden_layers=32, num_attention_heads=32, hidden_size=4096,
+def llama_convert_hf_to_flax(state_dict, num_hidden_layers=32, num_attention_heads=32, hidden_size=4096,
                        device=jax.devices('cpu')[0]):
-    # Edited From EasyLM
-    # for k, v in ckpt.items():
-    #     if k.startswith("model."):
-    #         k = k[6:]
-    #     ckpt[k] = v
     with jax.default_device(device):
         def inverse_permute(w):
             reshaped_w = w.reshape(num_attention_heads, 2, hidden_size // num_attention_heads // 2, hidden_size)
@@ -108,8 +105,8 @@ def convert_hf_to_flax(ckpt, num_hidden_layers=32, num_attention_heads=32, hidde
 
         jax_weights = {
             "transformer": {
-                "wte": {"embedding": ckpt["model.embed_tokens.weight"].numpy()},
-                "ln_f": {"kernel": ckpt["model.norm.weight"].numpy()},
+                "wte": {"embedding": state_dict["model.embed_tokens.weight"].numpy()},
+                "ln_f": {"kernel": state_dict["model.norm.weight"].numpy()},
                 "h": {
                     "%d"
                     % (layer): {
@@ -117,48 +114,48 @@ def convert_hf_to_flax(ckpt, num_hidden_layers=32, num_attention_heads=32, hidde
                             "wq": {
                                 "kernel": inverse_permute(
 
-                                    ckpt[f"model.layers.{layer}.self_attn.q_proj.weight"].numpy(),
+                                    state_dict[f"model.layers.{layer}.self_attn.q_proj.weight"].numpy(),
                                 ).transpose()
                             },
                             "wk": {
                                 "kernel": inverse_permute(
 
-                                    ckpt[f"model.layers.{layer}.self_attn.k_proj.weight"].numpy(),
+                                    state_dict[f"model.layers.{layer}.self_attn.k_proj.weight"].numpy(),
                                 ).transpose()
                             },
                             "wv": {
-                                "kernel": ckpt[f"model.layers.{layer}.self_attn.v_proj.weight"]
+                                "kernel": state_dict[f"model.layers.{layer}.self_attn.v_proj.weight"]
                                 .numpy()
                                 .transpose()
                             },
                             "wo": {
-                                "kernel": ckpt[f"model.layers.{layer}.self_attn.o_proj.weight"]
+                                "kernel": state_dict[f"model.layers.{layer}.self_attn.o_proj.weight"]
                                 .numpy()
                                 .transpose()
                             },
                         },
                         "feed_forward": {
                             "w1": {
-                                "kernel": ckpt[f"model.layers.{layer}.mlp.gate_proj.weight"]
+                                "kernel": state_dict[f"model.layers.{layer}.mlp.gate_proj.weight"]
                                 .numpy()
                                 .transpose()
                             },
                             "w2": {
-                                "kernel": ckpt[f"model.layers.{layer}.mlp.down_proj.weight"]
+                                "kernel": state_dict[f"model.layers.{layer}.mlp.down_proj.weight"]
                                 .numpy()
                                 .transpose()
                             },
                             "w3": {
-                                "kernel": ckpt[f"model.layers.{layer}.mlp.up_proj.weight"]
+                                "kernel": state_dict[f"model.layers.{layer}.mlp.up_proj.weight"]
                                 .numpy()
                                 .transpose()
                             },
                         },
                         "attention_norm": {
-                            "kernel": ckpt[f"model.layers.{layer}.input_layernorm.weight"].numpy()
+                            "kernel": state_dict[f"model.layers.{layer}.input_layernorm.weight"].numpy()
                         },
                         "ffn_norm": {
-                            "kernel": ckpt[
+                            "kernel": state_dict[
                                 f"model.layers.{layer}.post_attention_layernorm.weight"
                             ].numpy()
                         },
@@ -166,13 +163,13 @@ def convert_hf_to_flax(ckpt, num_hidden_layers=32, num_attention_heads=32, hidde
                     for layer in range(num_hidden_layers)
                 },
             },
-            "lm_head": {"kernel": ckpt["lm_head.weight"].numpy().transpose()},
+            "lm_head": {"kernel": state_dict["lm_head.weight"].numpy().transpose()},
         }
 
         return jax_weights
 
 
-def convert_pt_to_flax(state_dict_pt, n_layers: int, device=jax.devices('cpu')[0]):
+def llama_convert_pt_to_flax(state_dict_pt, n_layers: int, device=jax.devices('cpu')[0]):
     with jax.default_device(device):
         state_dict_flax = {}
         state_dict_flax[('transformer', 'wte', 'embedding')] = state_dict_pt[
@@ -204,7 +201,7 @@ def convert_pt_to_flax(state_dict_pt, n_layers: int, device=jax.devices('cpu')[0
     return state_dict_flax
 
 
-def convert_flax_to_pt(flax_params, n_layers, dim, num_attention_heads, dtype=jnp.float16):
+def llama_convert_flax_to_pt(flax_params, n_layers, dim, num_attention_heads, dtype=jnp.float16):
     def match_keywords(string, ts, ns):
         for t in ts:
             if t not in string:
@@ -260,3 +257,20 @@ def convert_flax_to_pt(flax_params, n_layers, dim, num_attention_heads, dtype=jn
         "lm_head.weight": torch_params["lm_head.kernel"],
     })
     return state_dict
+
+
+def llama_from_pretrained(model_id, device=jax.devices('cpu')[0]):
+    """
+    return: Weight or Params for EasyDel Model , Config
+    """
+    config = LlamaConfig.from_pretrained(model_id)
+    model = LlamaForCausalLM.from_pretrained(model_id)
+    easydel_wights = convert_hf_to_flax(
+        state_dict=model.state_dict(),
+        num_hidden_layers=config.num_hidden_layers,
+        hidden_size=config.hidden_size,
+        num_attention_heads=config.num_attention_heads,
+        device=device
+    )
+    config.add_jax_args()
+    return easydel_wights, config

@@ -4,7 +4,7 @@ import torch
 import numpy as np
 
 
-def convert_flax_to_pt_7b(state_dict_flax, n_layers: int, device=torch.device('cpu'), use_lm_head=False):
+def mpt_convert_flax_to_pt_7b(state_dict_flax, n_layers: int, device=torch.device('cpu'), use_lm_head=False):
     # CONVERTER MPT-7B
     state_dict_pt = {}
     state_dict_pt['transformer.wte.weight'] = torch.from_numpy(state_dict_flax[('transformer', 'wte', 'embedding')]).to(
@@ -36,7 +36,7 @@ def convert_flax_to_pt_7b(state_dict_flax, n_layers: int, device=torch.device('c
     return state_dict_pt
 
 
-def convert_pt_to_flax_7b(state_dict_pt, n_layers: int, device=jax.devices('cpu')[0], use_lm_head=False):
+def mpt_convert_pt_to_flax_7b(state_dict_pt, n_layers: int, device=jax.devices('cpu')[0], use_lm_head=False):
     # CONVERTER MPT-7B
     with jax.default_device(device):
         state_dict_flax = {}
@@ -63,7 +63,7 @@ def convert_pt_to_flax_7b(state_dict_pt, n_layers: int, device=jax.devices('cpu'
     return state_dict_flax
 
 
-def convert_pt_to_flax_1b(state_dict_pt, n_layers: int, device=jax.devices('cpu')[0], use_lm_head=False, ):
+def mpt_convert_pt_to_flax_1b(state_dict_pt, n_layers: int, device=jax.devices('cpu')[0], use_lm_head=False, ):
     # CONVERTER MPT-1B
     with jax.default_device(device):
         state_dict_flax = {}
@@ -95,7 +95,7 @@ def convert_pt_to_flax_1b(state_dict_pt, n_layers: int, device=jax.devices('cpu'
     return state_dict_flax
 
 
-def convert_flax_to_pt_1b(state_dict_flax, n_layers: int, device=torch.device('cpu'), use_lm_head=False):
+def mpt_convert_flax_to_pt_1b(state_dict_flax, n_layers: int, device=torch.device('cpu'), use_lm_head=False):
     # CONVERTER MPT-1B
     state_dict_pt = {}
     state_dict_pt['transformer.wte.weight'] = torch.from_numpy(state_dict_flax[
