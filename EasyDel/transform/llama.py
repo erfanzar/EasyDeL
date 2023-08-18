@@ -265,7 +265,7 @@ def llama_from_pretrained(model_id, device=jax.devices('cpu')[0]):
     """
     config = LlamaConfig.from_pretrained(model_id)
     model = LlamaForCausalLM.from_pretrained(model_id)
-    easydel_wights = convert_hf_to_flax(
+    easydel_wights = llama_convert_hf_to_flax(
         state_dict=model.state_dict(),
         num_hidden_layers=config.num_hidden_layers,
         hidden_size=config.hidden_size,
