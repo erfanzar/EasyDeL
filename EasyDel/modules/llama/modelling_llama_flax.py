@@ -227,7 +227,7 @@ class LlamaConfig(PretrainedConfig):
                      flash_attn_query_chunk_size: int = 1024,
                      flash_attn_key_chunk_size: int = 1024,
                      scan_mlp_chunk_size: int = 1024,
-                     from_pt: bool = True,
+                     from_pt: bool = False,
                      number_rep_kv: int = 1,
                      attn_type='llama'
                      ):
