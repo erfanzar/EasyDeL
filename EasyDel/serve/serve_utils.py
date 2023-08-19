@@ -286,10 +286,11 @@ class JAXServer(object):
         assert hasattr(config_model, 'get_partition_rules'), 'config_model must contain get_partition_rules functions'
         server = cls(config=config)
 
-        def _init():
-            return model.init_weights(jax.random.PRNGKey(0), init_shape)
+        with jax.default_device(jax.devices('cpu')[0]):
+            def _init():
+                return model.init_weights(jax.random.PRNGKey(0), init_shape)
 
-        shape = jax.eval_shape(_init)
+            shape = jax.eval_shape(_init)
         rules = match_partition_rules(params=shape, rules=config_model.get_partition_rules(True))
         with server.mesh:
             shard_fns, _ = make_shard_and_gather_fns(rules, get_float_dtype_by_name(server.config.dtype))
@@ -324,14 +325,13 @@ class JAXServer(object):
             rules = match_partition_rules(params=params, rules=config_model.get_partition_rules(True))
             shard_fns, _ = make_shard_and_gather_fns(rules, get_float_dtype_by_name(server.config.dtype))
 
-            params = jax.tree_util.tree_map(
-                lambda f, p: f(p), shard_fns, params
+            server.params = jax.tree_util.tree_map(
+                lambda f, p: f(p), {'params': shard_fns} if add_param_field else shard_fns,
+                {'params': params} if add_param_field else params
             )
 
-        params = {'params': params} if add_param_field else params
-
         server.rules = {'params': rules} if add_param_field else rules
-        server.params = params
+
         server.configure_generate_functions(model, tokenizer)
         return server
 
@@ -350,11 +350,6 @@ class JAXServer(object):
                     params, input_ids, attention_mask
                 )
 
-    def save_params(self, params):
-
-        assert self.rules is not None, 'you first must shard params using ``shard_params`` method'
-        self.params = params
-
     def shard_params(self, params, partition_rules):
 
         logging.log(
@@ -365,12 +360,11 @@ class JAXServer(object):
         shard_fns, _ = make_shard_and_gather_fns(rules, get_float_dtype_by_name(self.config.dtype))
 
         with self.mesh:
-            new_parameters = jax.tree_map(
+            self.params = jax.tree_map(
                 lambda f, p: f(p), shard_fns, params
             )
-        self.save_params(new_parameters)
 
-        return new_parameters
+        return self.params
 
     def forward_chat(self, data: ChatRequest):
 
