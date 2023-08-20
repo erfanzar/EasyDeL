@@ -360,7 +360,8 @@ class JAXServer(object):
             shard_fns = flax.traverse_util.flatten_dict(shard_fns)
             pbar = tqdm.tqdm(params.keys())
             for key in pbar:
-                params = shard_fns[tuple(key)](params)
+                key = tuple(key)
+                params = shard_fns[key](params(key))
                 pbar.write(server.get_memory())
             server.params = flax.traverse_util.unflatten_dict({'params': params} if add_param_field else params)
         server.rules = {'params': rules} if add_param_field else rules
