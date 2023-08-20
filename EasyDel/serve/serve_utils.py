@@ -6,6 +6,7 @@ import typing
 import flax.core
 import gradio as gr
 import jax
+import msgpack
 import tqdm
 import transformers
 import uvicorn
@@ -18,7 +19,7 @@ from flax.core import freeze
 from flax.traverse_util import unflatten_dict
 from jax import numpy as jnp
 from jax.experimental import mesh_utils, pjit
-
+from flax.serialization import to_bytes, from_bytes, to_state_dict, from_state_dict
 from ml_collections import ConfigDict
 from pydantic import BaseModel
 from fjutils import get_float_dtype_by_name
@@ -303,10 +304,19 @@ class JAXServer(object):
             logging.info(
                 'loading checkpoints'
             )
-            server.params = flax.traverse_util.unflatten_dict(read_ckpt(
-                path=path, shard_fns=flax.traverse_util.flatten_dict(shard_fns)
-            ))
 
+            shard_fns = flax.traverse_util.flatten_dict(shard_fns)
+            server.params = {}
+            with open(path, 'rb') as stream:
+                unpacker = msgpack.Unpacker(stream, read_size=83886080, max_buffer_size=0)
+                pbar = tqdm.tqdm(unpacker)
+                for key, value in pbar:
+                    key = tuple(key)
+                    tensor = from_bytes(None, value)
+                    tensor = shard_fns[key](tensor)
+                    server.params[key] = tensor
+                    pbar.write(server.get_memory())
+        server.params = flax.traverse_util.unflatten_dict(server.params)
         server.params = {'params': server.params} if add_param_field else server.params
 
         server.rules = {'params': rules} if add_param_field else rules
