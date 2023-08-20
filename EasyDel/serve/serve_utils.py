@@ -351,19 +351,19 @@ class JAXServer(object):
                 'sharding parameters across all of the chosen backend(tpu/gpu/cpu)s'
             )
             # Commented for debug
-            # server.params = jax.tree_util.tree_map(
-            #     lambda f, p: f(p), {'params': shard_fns} if add_param_field else shard_fns,
-            #     {'params': params} if add_param_field else params,
-            #
-            # )
-            params = flax.traverse_util.flatten_dict(params)
-            shard_fns = flax.traverse_util.flatten_dict(shard_fns)
-            pbar = tqdm.tqdm(params.keys())
-            for key in pbar:
-                key = tuple(key)
-                params[key] = shard_fns[key](params[key])
-                pbar.write(server.get_memory())
-            server.params = flax.traverse_util.unflatten_dict({'params': params} if add_param_field else params)
+            server.params = jax.tree_util.tree_map(
+                lambda f, p: f(p), {'params': shard_fns} if add_param_field else shard_fns,
+                {'params': params} if add_param_field else params,
+
+            )
+            # params = flax.traverse_util.flatten_dict(params)
+            # shard_fns = flax.traverse_util.flatten_dict(shard_fns)
+            # pbar = tqdm.tqdm(params.keys())
+            # for key in pbar:
+            #     key = tuple(key)
+            #     params[key] = shard_fns[key](params[key])
+            #     pbar.write(server.get_memory())
+            # server.params = flax.traverse_util.unflatten_dict({'params': params} if add_param_field else params)
         server.rules = {'params': rules} if add_param_field else rules
         logging.info(
             'configuring generate functions for the server'
