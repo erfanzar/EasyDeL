@@ -285,24 +285,34 @@ class JAXServer(object):
                        'init_weights'), 'model must contain init_weights func in order to init params for shard_fns'
         assert hasattr(config_model, 'get_partition_rules'), 'config_model must contain get_partition_rules functions'
         server = cls(config=config)
-
+        logging.info(
+            'running _init() func in order to make shard_fns'
+        )
         with jax.default_device(jax.devices('cpu')[0]):
             def _init():
                 return model.init_weights(jax.random.PRNGKey(0), init_shape)
 
             shape = jax.eval_shape(_init)
+        logging.info(
+            'matching partition rules'
+        )
         rules = match_partition_rules(params=shape, rules=config_model.get_partition_rules(True))
+
         with server.mesh:
             shard_fns, _ = make_shard_and_gather_fns(rules, get_float_dtype_by_name(server.config.dtype))
-
-            params = read_ckpt(
-                path=path, shard_fns=flax.traverse_util.flatten_dict(shard_fns)
+            logging.info(
+                'loading checkpoints'
             )
-        params = flax.traverse_util.unflatten_dict(params)
-        params = {'params': params} if add_param_field else params
+            server.params = flax.traverse_util.unflatten_dict(read_ckpt(
+                path=path, shard_fns=flax.traverse_util.flatten_dict(shard_fns)
+            ))
+
+        server.params = {'params': server.params} if add_param_field else server.params
 
         server.rules = {'params': rules} if add_param_field else rules
-        server.params = params
+        logging.info(
+            'configuring generate functions for the server'
+        )
         server.configure_generate_functions(model, tokenizer)
         return server
 
@@ -322,16 +332,24 @@ class JAXServer(object):
         server = cls(config=config)
 
         with server.mesh:
+            logging.info(
+                'matching partition rules'
+            )
             rules = match_partition_rules(params=params, rules=config_model.get_partition_rules(True))
             shard_fns, _ = make_shard_and_gather_fns(rules, get_float_dtype_by_name(server.config.dtype))
-
+            logging.info(
+                'sharding parameters across all of the chosen backend(tpu/gpu/cpu)s'
+            )
             server.params = jax.tree_util.tree_map(
                 lambda f, p: f(p), {'params': shard_fns} if add_param_field else shard_fns,
-                {'params': params} if add_param_field else params
+                {'params': params} if add_param_field else params,
+
             )
 
         server.rules = {'params': rules} if add_param_field else rules
-
+        logging.info(
+            'configuring generate functions for the server'
+        )
         server.configure_generate_functions(model, tokenizer)
         return server
 
