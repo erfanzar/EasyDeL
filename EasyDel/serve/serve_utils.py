@@ -280,7 +280,8 @@ class JAXServer(object):
             path: typing.Union[str, os.PathLike],
             config=None,
             add_param_field: bool = True,
-            init_shape: tuple = (1, 1)
+            init_shape: tuple = (1, 1),
+            do_memory_log=False
     ):
         assert hasattr(model,
                        'init_weights'), 'model must contain init_weights func in order to init params for shard_fns'
@@ -315,7 +316,9 @@ class JAXServer(object):
                     tensor = from_bytes(None, value)
                     tensor = shard_fns[key](tensor)
                     server.params[key] = tensor
-                    pbar.write(server.get_memory())
+                    if do_memory_log:
+                        pbar.write(server.get_memory())
+                    pbar.set_description('Sharding Params')
         server.params = flax.traverse_util.unflatten_dict(server.params)
         server.params = {'params': server.params} if add_param_field else server.params
 
@@ -335,6 +338,7 @@ class JAXServer(object):
             params: typing.Dict,
             config=None,
             add_param_field: bool = True,
+            do_memory_log=False
     ):
         assert hasattr(model,
                        'init_weights'), 'model must contain init_weights func in order to init params for shard_fns'
@@ -351,19 +355,24 @@ class JAXServer(object):
                 'sharding parameters across all of the chosen backend(tpu/gpu/cpu)s'
             )
             # Commented for debug
-            server.params = jax.tree_util.tree_map(
-                lambda f, p: f(p), {'params': shard_fns} if add_param_field else shard_fns,
-                {'params': params} if add_param_field else params,
+            # if not do_memory_log:
+            #     server.params = jax.tree_util.tree_map(
+            #         lambda f, p: f(p), {'params': shard_fns} if add_param_field else shard_fns,
+            #         {'params': params} if add_param_field else params,
+            #
+            #     )
+            # else:
+            params = flax.traverse_util.flatten_dict(params)
+            shard_fns = flax.traverse_util.flatten_dict(shard_fns)
+            pbar = tqdm.tqdm(params.keys())
+            for key in pbar:
+                key = tuple(key)
+                params[key] = shard_fns[key](params[key])
 
-            )
-            # params = flax.traverse_util.flatten_dict(params)
-            # shard_fns = flax.traverse_util.flatten_dict(shard_fns)
-            # pbar = tqdm.tqdm(params.keys())
-            # for key in pbar:
-            #     key = tuple(key)
-            #     params[key] = shard_fns[key](params[key])
-            #     pbar.write(server.get_memory())
-            # server.params = flax.traverse_util.unflatten_dict({'params': params} if add_param_field else params)
+                if do_memory_log:
+                    pbar.write(server.get_memory())
+                pbar.set_description('Sharding Params')
+            server.params = flax.traverse_util.unflatten_dict({'params': params} if add_param_field else params)
         server.rules = {'params': rules} if add_param_field else rules
         logging.info(
             'configuring generate functions for the server'
