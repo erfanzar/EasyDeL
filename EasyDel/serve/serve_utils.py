@@ -6,6 +6,7 @@ import typing
 import flax.core
 import gradio as gr
 import jax
+import msgpack
 import tqdm
 import transformers
 import uvicorn
@@ -18,7 +19,7 @@ from flax.core import freeze
 from flax.traverse_util import unflatten_dict
 from jax import numpy as jnp
 from jax.experimental import mesh_utils, pjit
-
+from flax.serialization import to_bytes, from_bytes, to_state_dict, from_state_dict
 from ml_collections import ConfigDict
 from pydantic import BaseModel
 from fjutils import get_float_dtype_by_name
@@ -279,7 +280,8 @@ class JAXServer(object):
             path: typing.Union[str, os.PathLike],
             config=None,
             add_param_field: bool = True,
-            init_shape: tuple = (1, 1)
+            init_shape: tuple = (1, 1),
+            do_memory_log=False
     ):
         assert hasattr(model,
                        'init_weights'), 'model must contain init_weights func in order to init params for shard_fns'
@@ -303,10 +305,21 @@ class JAXServer(object):
             logging.info(
                 'loading checkpoints'
             )
-            server.params = flax.traverse_util.unflatten_dict(read_ckpt(
-                path=path, shard_fns=flax.traverse_util.flatten_dict(shard_fns)
-            ))
 
+            shard_fns = flax.traverse_util.flatten_dict(shard_fns)
+            server.params = {}
+            with open(path, 'rb') as stream:
+                unpacker = msgpack.Unpacker(stream, read_size=83886080, max_buffer_size=0)
+                pbar = tqdm.tqdm(unpacker)
+                for key, value in pbar:
+                    key = tuple(key)
+                    tensor = from_bytes(None, value)
+                    tensor = shard_fns[key](tensor)
+                    server.params[key] = tensor
+                    if do_memory_log:
+                        pbar.write(server.get_memory())
+                    pbar.set_description('Sharding Params')
+        server.params = flax.traverse_util.unflatten_dict(server.params)
         server.params = {'params': server.params} if add_param_field else server.params
 
         server.rules = {'params': rules} if add_param_field else rules
@@ -325,6 +338,7 @@ class JAXServer(object):
             params: typing.Dict,
             config=None,
             add_param_field: bool = True,
+            do_memory_log=False
     ):
         assert hasattr(model,
                        'init_weights'), 'model must contain init_weights func in order to init params for shard_fns'
@@ -340,12 +354,25 @@ class JAXServer(object):
             logging.info(
                 'sharding parameters across all of the chosen backend(tpu/gpu/cpu)s'
             )
-            server.params = jax.tree_util.tree_map(
-                lambda f, p: f(p), {'params': shard_fns} if add_param_field else shard_fns,
-                {'params': params} if add_param_field else params,
+            # Commented for debug
+            # if not do_memory_log:
+            #     server.params = jax.tree_util.tree_map(
+            #         lambda f, p: f(p), {'params': shard_fns} if add_param_field else shard_fns,
+            #         {'params': params} if add_param_field else params,
+            #
+            #     )
+            # else:
+            params = flax.traverse_util.flatten_dict(params)
+            shard_fns = flax.traverse_util.flatten_dict(shard_fns)
+            pbar = tqdm.tqdm(params.keys())
+            for key in pbar:
+                key = tuple(key)
+                params[key] = shard_fns[key](params[key])
 
-            )
-
+                if do_memory_log:
+                    pbar.write(server.get_memory())
+                pbar.set_description('Sharding Params')
+            server.params = flax.traverse_util.unflatten_dict({'params': params} if add_param_field else params)
         server.rules = {'params': rules} if add_param_field else rules
         logging.info(
             'configuring generate functions for the server'
