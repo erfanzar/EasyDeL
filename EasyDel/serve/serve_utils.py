@@ -362,17 +362,19 @@ class JAXServer(object):
             #
             #     )
             # else:
-            # params = flax.traverse_util.flatten_dict(params)
-            # shard_fns = flax.traverse_util.flatten_dict(shard_fns)
+            params = flax.traverse_util.flatten_dict(params)
+            shard_fns = flax.traverse_util.flatten_dict(shard_fns)
             pbar = tqdm.tqdm(params.keys())
             for key in pbar:
+
                 key = tuple(key)
                 params[key] = shard_fns[key](params[key])
 
                 if do_memory_log:
                     pbar.write(server.get_memory())
                 pbar.set_description('Sharding Params')
-            server.params = flax.traverse_util.unflatten_dict({'params': params} if add_param_field else params)
+            server.params = flax.traverse_util.unflatten_dict(params)
+            server.params = {'params': server.params} if add_param_field else server.params
         server.rules = {'params': rules} if add_param_field else rules
         logging.info(
             'configuring generate functions for the server'
