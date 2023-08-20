@@ -362,8 +362,8 @@ class JAXServer(object):
             #
             #     )
             # else:
-            params = flax.traverse_util.flatten_dict(params)
-            shard_fns = flax.traverse_util.flatten_dict(shard_fns)
+            # params = flax.traverse_util.flatten_dict(params)
+            # shard_fns = flax.traverse_util.flatten_dict(shard_fns)
             pbar = tqdm.tqdm(params.keys())
             for key in pbar:
                 key = tuple(key)
