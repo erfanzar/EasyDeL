@@ -2,7 +2,7 @@
 
 EasyDeL (Easy Deep Learning) is an open-source library designed to accelerate and optimize the training process of
 machine learning models. This library is primarily focused on Jax/Flax and plans to offer easy and fine solutions to
-train Flax/Jax Models on the `TPU/GPU`
+train Flax/Jax Models on the `TPU/GPU` both for Serving and Training
 
 #### Note this Library needs golang to run (for some tracking stuff on TPU/GPU/CPU)
 
@@ -13,6 +13,32 @@ sudo apt-get update && apt-get upgrade -y
 sudo apt-get install golang -y 
 ```
 
+and you need Jax>=0.4.10 and FJutils>=0.0.15
+
+on TPUs be like
+
+_you can install other version too but easydel required at least version of 0.4.10_
+
+```shell
+!pip install jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html -q
+
+```
+
+on GPUs be like
+
+```shell
+pip install --upgrade pip
+
+# CUDA 12 installation
+# Note: wheels only available on linux.
+pip install --upgrade "jax[cuda12_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+
+# CUDA 11 installation
+# Note: wheels only available on linux.
+pip install --upgrade "jax[cuda11_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+
+```
+
 ## Installation
 
 ### Available on PyPi
@@ -21,14 +47,6 @@ To install EasyDeL, you can use pip:
 
 ```bash
 pip install easydel
-```
-
-### PyGit
-
-for the latest version (beta)
-
-```shell
-pip install git+https://github.com/erfanzar/EasyDel
 ```
 
 ## Tutorials
@@ -58,6 +76,29 @@ _Tutorials on how to use and train or serve your models with EasyDel is availabl
 - _LLama GPT-J MosaicMPT Falcon supports Flash Attention_
 
 you can also tell me the model you want in Flax/Jax version and ill try my best to build it ;)
+
+## Serving
+
+you can read docs or examples to see how `JAXServer` works but let me show you how you can simply host and serve a
+LLama2
+chat model (70B model is supported too)
+
+```shell
+python -m examples.serving.causal-lm.llama-2-chat \
+  --repo_id='meta-llama/Llama-2-7b-chat-hf' --max_length=4096 \
+  --max_new_tokens=2048 --max_stream_tokens=32 --temperature=0.6 \
+  --top_p=0.95 --top_k=50 \
+  --dtype='fp16' --use_prefix_tokenizer
+
+```
+
+you can use all of the llama models not just 'meta-llama/Llama-2-7b-chat-hf'
+
+'fp16' Or 'fp32' , 'bf16' are supported dtype
+
+make sure to use --use_prefix_tokenizer
+
+and you will get links or api to use model from gradio app chat/instruct or FastAPI apis
 
 ## FineTuning
 

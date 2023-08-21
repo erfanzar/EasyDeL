@@ -4,19 +4,36 @@
 
 #### All the Llama Models supported, and they will perform same as what they do in pytorch
 
-## Example of using Llama-7B Chat
+## Example of using Llama-7B Chat or any other model With Using JAXServer
+
+```shell
+python -m examples.serving.causal-lm.llama-2-chat \
+  --repo_id='meta-llama/Llama-2-7b-chat-hf' --max_length=4096 \
+  --max_new_tokens=2048 --max_stream_tokens=32 --temperature=0.6 \
+  --top_p=0.95 --top_k=50 \
+  --dtype='fp16' --use_prefix_tokenizer
+
+```
+
+you can use all of the llama models not just 'meta-llama/Llama-2-7b-chat-hf'
+
+'fp16' Or 'fp32' , 'bf16' are supported dtype
+
+make sure to use --use_prefix_tokenizer
+
+## Example of using Llama-7B Chat Without Using JAXServer
 
 here's a simple function to prompt the LlamaChat Models if you don't want to use them with `JAXServe` and
 want to use them manually but in case of using and serving `JAXServer` is recommended
 
 ```python
 DEFAULT_SYSTEM_PROMPT = "You are a helpful, respectful and honest assistant. Always answer "
-                        "as helpfully as possible, while being safe.  Your answers should not"
-                        " include any harmful, unethical, racist, sexist, toxic, dangerous, or "
-                        "illegal content. Please ensure that your responses are socially unbiased "
-                        "and positive in nature.\nIf a question does not make any sense, or is not "
-                        "factually coherent, explain why instead of answering something not correct. If "
-                        "you don't know the answer to a question, please don't share false information."
+"as helpfully as possible, while being safe.  Your answers should not"
+" include any harmful, unethical, racist, sexist, toxic, dangerous, or "
+"illegal content. Please ensure that your responses are socially unbiased "
+"and positive in nature.\nIf a question does not make any sense, or is not "
+"factually coherent, explain why instead of answering something not correct. If "
+"you don't know the answer to a question, please don't share false information."
 
 
 def get_prompt(message: str, chat_history,
