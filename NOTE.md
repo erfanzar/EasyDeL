@@ -1,12 +1,27 @@
-### Note 14Aug
+### Note 21Aug
 
-use `rotary_type='llama'` for llama2 or llama1 huggingface models
+You no longer need to use anything like rotary_type now complex works with all of the llama models so that options has
+been removed
+
+but you have to convert model with easydel like
+
+```python
+from EasyDel.transform import llama_from_pretrained, llama_convert_hf_to_flax
+
+params, config = llama_from_pretrained(
+    '<Model-id>'
+)
+# or
+params = llama_convert_hf_to_flax(
+    pytorch_model.state_dict(), num_hidden_layers=num_hidden_layers, num_attention_heads=num_attention_heads,
+    hidden_size=hidden_size
+)
+```
 
 ### Note
 
 The llama model has a different key or params name in case you want to load the model from the hugging face
 (other pre-trained llama) models you do not need to convert weight just pass the `from_pt=True` if `LlamaConfig`
-
 
 #### Example
 
@@ -36,10 +51,3 @@ print(partition_rules)
     ('.*', PS(None)),
 )
 ```
-
-
-### Using Changes : 
-
-#### In order to use OpenLlama Model set `attn_type=''` and `rotary_type='complex'`
-#### In order to use OpenLlama Model set `attn_type='llama2'` and `rotary_type='llama2'` 
-or `attn_type='llama'` and `rotary_type='llama'`
