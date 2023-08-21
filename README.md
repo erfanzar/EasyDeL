@@ -62,6 +62,7 @@ _Tutorials on how to use and train or serve your models with EasyDel is availabl
 ## Available Models Are
 
 - **_Llama_**     (Support `FSDP`, `MP`,` DP`)(_Supports gradient checkpointing_)
+- **_Llama2_**    (Support `FSDP`, `MP`,` DP`)(_Supports gradient checkpointing_)
 - **_GPT-J_**     (Support `FSDP`, `MP`,` DP`)(_Supports gradient checkpointing_)
 - **_LT_**        (Support `FSDP`, `MP`, `DP`)(_Supports gradient checkpointing_)
 - **_MosaicMPT_** (Support `FSDP`, `MP`,` DP`)(_Supports gradient checkpointing_)
@@ -113,14 +114,14 @@ transform in the library example
 
 ```python
 import jax
-from EasyDel.transform.mpt import convert_pt_to_flax_7b
+from EasyDel.transform import mpt_convert_pt_to_flax_7b
 from fjutils.utils import save_ckpt
 
 number_of_layers = 32  # its 32 hidden layers for Mpt 7B
 device = jax.devices('cpu')[0]  # offload on CPU
 
 pytorch_model_state_dict = None  # StateDict of the model should be this one
-flax_params = convert_pt_to_flax_7b(pytorch_model_state_dict, number_of_layers, device)
+flax_params = mpt_convert_pt_to_flax_7b(pytorch_model_state_dict, number_of_layers, device)
 save_ckpt(flax_params, 'flax_param_easydel')
 ```
 
