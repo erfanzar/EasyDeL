@@ -59,6 +59,28 @@ _Tutorials on how to use and train or serve your models with EasyDel is availabl
 
 you can also tell me the model you want in Flax/Jax version and ill try my best to build it ;)
 
+## Serving
+
+you can read docs or examples to see how `JAXServer` works but let me show you how you can simply host and serve a
+LLama2
+chat model (70B model is supported too)
+
+```shell
+python -m examples.serving.causal-lm.llama-2-chat \
+  --repo_id='meta-llama/Llama-2-7b-chat-hf' --max_length=4096 \
+  --max_new_tokens=2048 --max_stream_tokens=32 --temperature=0.6 \
+  --top_p=0.95 --top_k=50 \
+  --dtype='fp16' --use_prefix_tokenizer
+
+```
+
+you can use all of the llama models not just 'meta-llama/Llama-2-7b-chat-hf'
+
+'fp16' Or 'fp32' , 'bf16' are supported dtype
+
+make sure to use --use_prefix_tokenizer
+
+and you will get links or api to use model from gradio app chat/instruct or FastAPI apis
 ## FineTuning
 
 with using EasyDel FineTuning LLM (CausalLanguageModels) are easy as much as possible with using Jax and Flax
