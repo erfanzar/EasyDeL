@@ -5,7 +5,14 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="08ad205b-709f-455b-86db-91293f595cd3" name="Changes" comment="">
+      <change afterPath="$PROJECT_DIR$/examples/__init__.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/examples/serving/__init__.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/examples/serving/causal-lm/__init__.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/examples/serving/causal-lm/llama-2-chat.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/examples/training/__init__.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/examples/training/causal-lm/__init__.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/LLAMA.md" beforeDir="false" afterPath="$PROJECT_DIR$/LLAMA.md" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -257,6 +264,9 @@
       <workItem from="1692454703394" duration="1122000" />
       <workItem from="1692517085052" duration="4908000" />
       <workItem from="1692526635185" duration="1084000" />
+      <workItem from="1692529521139" duration="170000" />
+      <workItem from="1692607799384" duration="33000" />
+      <workItem from="1692607862589" duration="316000" />
     </task>
     <servers />
   </component>
