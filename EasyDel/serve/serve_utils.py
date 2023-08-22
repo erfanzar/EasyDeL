@@ -146,7 +146,7 @@ class JAXServer(object):
         config.mesh_axes_shape = (1, -1, 1)
 
         config.dtype = 'fp16'
-
+        config.stream_tokens_for_gradio = True
         config.use_prefix_tokenizer = True
 
         if updates is not None:
@@ -475,7 +475,7 @@ class JAXServer(object):
                 string,
                 greedy: bool = False,
                 max_new_tokens: int = None,
-                pbar=tqdm
+                stream: bool = False
                 ):
         tokens = self.prefix_tokenizer(
             string,
@@ -494,8 +494,7 @@ class JAXServer(object):
         num_generated_tokens = 0
         pad = self.config.max_length - self.config.max_stream_tokens
 
-        for _ in pbar.tqdm(range((max_new_tokens or self.config.max_new_tokens) // self.config.max_stream_tokens),
-                           ):
+        for _ in range((max_new_tokens or self.config.max_new_tokens) // self.config.max_stream_tokens):
             predicted_token = self.greedy_generate(
                 params=self.params,
                 input_ids=input_ids,
@@ -518,7 +517,8 @@ class JAXServer(object):
             if predicted_token[0][-1] == self.tokenizer.eos_token_id or predicted_token[0][
                 -1] == self.prefix_tokenizer.eos_token_id:
                 break
-
+            yield self.tokenizer.decode(input_ids[0][-num_generated_tokens:],
+                                        skip_special_tokens=True), num_generated_tokens
         return self.tokenizer.decode(input_ids[0][-num_generated_tokens:],
                                      skip_special_tokens=True), num_generated_tokens
 
@@ -532,26 +532,46 @@ class JAXServer(object):
 
         return message_history
 
-    def process_gradio_chat(self, prompt, history, max_new_tokens, greedy, pbar=gr.Progress()):
+    def process_gradio_chat(self, prompt, history, max_new_tokens, greedy):
         string = self.process_chat_history(history)
         string += self.config.prompt_prefix_chat + prompt + self.config.prompt_postfix_chat
-        response, _ = self.process(
-            string=string,
-            greedy=greedy,
-            max_new_tokens=max_new_tokens,
-            pbar=pbar
-        )
-        history.append([prompt, response])
+        if not self.config.stream_tokens_for_gradio:
+            response, _ = self.process(
+                string=string,
+                greedy=greedy,
+                max_new_tokens=max_new_tokens,
+            )
+            history.append([prompt, response])
+        else:
+            history.append([prompt, ''])
+            for response, _ in self.process(
+                    string=string,
+                    greedy=greedy,
+                    max_new_tokens=max_new_tokens,
+                    stream=True
+            ):
+                history[-1][-1] = response
+                yield '', history
         return '', history
 
-    def process_gradio_instruct(self, prompt, system, max_new_tokens, greedy, pbar=gr.Progress()):
+    def process_gradio_instruct(self, prompt, system, max_new_tokens, greedy):
         string = self.config.instruct_format.format(system=system, instruct=prompt)
-        response, _ = self.process(
-            string=string,
-            greedy=greedy,
-            max_new_tokens=max_new_tokens,
-            pbar=pbar
-        )
+        if not self.config.stream_tokens_for_gradio:
+            response, _ = self.process(
+                string=string,
+                greedy=greedy,
+                max_new_tokens=max_new_tokens,
+            )
+
+        else:
+            response = ''
+            for response, _ in self.process(
+                    string=string,
+                    greedy=greedy,
+                    max_new_tokens=max_new_tokens,
+                    stream=True
+            ):
+                yield '', response
         return '', response
 
     def create_gradio_ui_chat(self):
@@ -795,25 +815,23 @@ class PyTorchServer(object):
 
         return message_history
 
-    def process_gradio_chat(self, prompt, history, max_new_tokens, greedy, pbar=gr.Progress()):
+    def process_gradio_chat(self, prompt, history, max_new_tokens, greedy):
         string = self.process_chat_history(history)
         string += self.config.prompt_prefix_chat + prompt + self.config.prompt_postfix_chat
         response, _ = self.process(
             string=string,
             greedy=greedy,
-            max_new_tokens=max_new_tokens,
-            pbar=pbar
+            max_new_tokens=max_new_tokens
         )
         history.append([prompt, response])
         return '', history
 
-    def process_gradio_instruct(self, prompt, system, max_new_tokens, greedy, pbar=gr.Progress()):
+    def process_gradio_instruct(self, prompt, system, max_new_tokens, greedy):
         string = self.config.instruct_format.format(system=system, instruct=prompt)
         response, _ = self.process(
             string=string,
             greedy=greedy,
-            max_new_tokens=max_new_tokens,
-            pbar=pbar
+            max_new_tokens=max_new_tokens
         )
         return '', response
 
