@@ -1,6 +1,7 @@
 import copy
 import functools
 import os
+import threading
 import typing
 
 import flax.core
@@ -671,10 +672,26 @@ class JAXServer(object):
         else:
             logging.warning('you have to fire server before ending that this command will be ignored')
 
+    def launch(self,
+               share_chat: bool = False,
+               share_inst: bool = False
+               ):
+        share_kwargs = {}
+        assert not share_chat or not share_inst, 'you have to pass at least one of sharing options True'
+        if share_chat:
+            self.gradio_app_chat.launch(share=True)
+            share_kwargs['chat'] = self.gradio_app_chat.share_url
+        if share_inst:
+            self.gradio_app_instruct.launch(share=True)
+            share_kwargs['inst'] = self.gradio_app_instruct.share_url
+        return share_kwargs
+
 
 class PyTorchServer(object):
 
     def __init__(self, config=None):
+        self.model, self.tokenizer = [None] * 2
+
         logging.warning('PytorchServer is not built fully yet at this version')
 
         self.config = self.get_default_config(config)
@@ -785,25 +802,71 @@ class PyTorchServer(object):
 
     def process(self,
                 string,
-                greedy: bool = False,
                 max_new_tokens: int = None,
-                pbar=tqdm
+                max_length: int = None,
+                temperature: float = 0.6,
+                top_k=50,
+                top_p=0.9,
+                stream: bool = True
                 ):
+        assert self.model is not None, 'you should first load model with ``load`` method'
         tokens = self.tokenizer(
-
+            string,
+            return_tensors='pt'
         )
         input_ids = tokens.input_ids
         attention_mask = tokens.attention_mask
-        num_generated_tokens = 0
-        pad = self.config.max_length - self.config.max_stream_tokens
 
         stream = TextIteratorStreamer(
             tokenizer=self.tokenizer,
             skip_prompt=True,
             skip_special_tokens=True
         )
-
-        return 1, 1
+        if stream:
+            kwargs = dict(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                streamer=stream,
+                generation_config=transformers.GenerationConfig(
+                    bos_token_id=self.tokenizer.bos_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    max_length=max_length or self.config.max_length,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    max_new_tokens=max_new_tokens or self.config.max_new_tokens,
+                    num_beams=1
+                )
+            )
+            thread_ = threading.Thread(
+                target=self.model.generate,
+                kwargs=kwargs
+            )
+            thread_.start()
+            for string in stream:
+                yield string
+        else:
+            kwargs = dict(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                # streamer=stream,
+                generation_config=transformers.GenerationConfig(
+                    bos_token_id=self.tokenizer.bos_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    max_length=max_length or self.config.max_length,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    max_new_tokens=max_new_tokens or self.config.max_new_tokens,
+                    num_beams=1
+                )
+            )
+            pred = self.tokenizer.decode(self.model.generate(
+                **kwargs
+            ).logits[0])
+            return pred
 
     def process_chat_history(self, history: List):
         if len(history) == 0:
@@ -815,25 +878,71 @@ class PyTorchServer(object):
 
         return message_history
 
-    def process_gradio_chat(self, prompt, history, max_new_tokens, greedy):
-        string = self.process_chat_history(history)
-        string += self.config.prompt_prefix_chat + prompt + self.config.prompt_postfix_chat
-        response, _ = self.process(
-            string=string,
-            greedy=greedy,
-            max_new_tokens=max_new_tokens
+    def load(self, repo_id: str, tokenizer_repo: str = None, auto_config: bool = True, **kwargs):
+        load_kwargs = kwargs if not auto_config else self.get_model_load_kwargs()
+        load_kwargs = load_kwargs | kwargs
+        model = transformers.AutoModelForCausalLM.from_pretrained(
+            repo_id,
+            trust_remote_code=True,
+            **load_kwargs
         )
-        history.append([prompt, response])
-        return '', history
+        tokenizer = transformers.AutoTokenizer.from_pretrained(
+            tokenizer_repo or repo_id,
+            trust_remote_code=True
+        )
 
-    def process_gradio_instruct(self, prompt, system, max_new_tokens, greedy):
-        string = self.config.instruct_format.format(system=system, instruct=prompt)
-        response, _ = self.process(
-            string=string,
-            greedy=greedy,
-            max_new_tokens=max_new_tokens
-        )
-        return '', response
+        self.model = model
+        self.tokenizer = tokenizer
+
+    def process_gradio_chat(self,
+                            prompt,
+                            history,
+                            max_new_tokens,
+                            temperature,
+                            max_length,
+                            top_p,
+                            top_k
+                            ):
+        string = self.chat_format(prompt=prompt, history=history, system=None)
+        history.append([prompt, ''])
+        for response in self.process(
+                string=string,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                max_length=max_length,
+                top_p=top_p,
+                top_k=top_k
+        ):
+            history[-1][-1] = response
+            yield '', history
+
+    def instruct_format(self, system, instruct):
+        return self.config.instruct_format.format(system=system, instruct=instruct)
+
+    def chat_format(self, prompt: str, history: list, system=None):
+        string = self.process_chat_history(history)
+        string += (system or self.config.prompt_prefix_chat) + prompt + self.config.prompt_postfix_chat
+        return string
+
+    def process_gradio_instruct(self,
+                                prompt,
+                                system,
+                                max_new_tokens,
+                                temperature,
+                                max_length,
+                                top_p,
+                                top_k
+                                ):
+        string = self.instruct_format(system, prompt)
+        for response in self.process(
+                string=string,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                max_length=max_length,
+                top_p=top_p,
+                top_k=top_k
+        ):
+            yield '', response
 
     def create_gradio_ui_chat(self):
         with gr.Blocks(
@@ -859,10 +968,18 @@ class PyTorchServer(object):
                     max_length = gr.Slider(value=self.config.max_length, maximum=self.config.max_length, minimum=1,
                                            label='Max Length', step=1)
                     temperature = gr.Slider(value=0.2, maximum=1, minimum=0.1, label='Temperature', step=0.01)
+                    top_p = gr.Slider(value=0.9, maximum=1, minimum=0.1, label='Top P', step=0.01)
+                    top_k = gr.Slider(value=50, maximum=100, minimum=1, label='Top K', step=1)
 
-                    greedy = gr.Checkbox(value=True, label='Greedy Search')
-
-            inputs = [prompt, history, max_new_tokens, greedy]
+            inputs = [
+                prompt,
+                history,
+                max_new_tokens,
+                temperature,
+                max_length,
+                top_p,
+                top_k
+            ]
             sub_event = submit.click(fn=self.process_gradio_chat, inputs=inputs, outputs=[prompt, history])
 
             def clear_():
@@ -900,9 +1017,18 @@ class PyTorchServer(object):
                     max_length = gr.Slider(value=self.config.max_length, maximum=self.config.max_length, minimum=1,
                                            label='Max Length', step=1)
                     temperature = gr.Slider(value=0.2, maximum=1, minimum=0.1, label='Temperature', step=0.01)
-                    greedy = gr.Checkbox(value=True, label='Greedy Search')
+                    top_p = gr.Slider(value=0.9, maximum=1, minimum=0.1, label='Top P', step=0.01)
+                    top_k = gr.Slider(value=50, maximum=100, minimum=1, label='Top K', step=1)
 
-            inputs = [prompt, system, max_new_tokens, greedy]
+            inputs = [
+                prompt,
+                system,
+                max_new_tokens,
+                temperature,
+                max_length,
+                top_p,
+                top_k
+            ]
             sub_event = submit.click(fn=self.process_gradio_instruct, inputs=inputs, outputs=[prompt, pred])
 
             def clear_():
