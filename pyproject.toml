@@ -1,4 +1,4 @@
-[build-system]
+    [build-system]
 requires = ["setuptools>=46.4.0", "wheel>=0.34.2", "torch>=1.13.0", 'jax', 'flax', 'optax']
 build-backend = "setuptools.build_meta"
 
