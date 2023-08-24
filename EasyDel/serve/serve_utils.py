@@ -355,14 +355,6 @@ class JAXServer(object):
             logging.info(
                 'sharding parameters across all of the chosen backend(tpu/gpu/cpu)s'
             )
-            # Commented for debug
-            # if not do_memory_log:
-            #     server.params = jax.tree_util.tree_map(
-            #         lambda f, p: f(p), {'params': shard_fns} if add_param_field else shard_fns,
-            #         {'params': params} if add_param_field else params,
-            #
-            #     )
-            # else:
             params = flax.traverse_util.flatten_dict(params)
             shard_fns = flax.traverse_util.flatten_dict(shard_fns)
             pbar = tqdm.tqdm(params.keys())
@@ -518,24 +510,28 @@ class JAXServer(object):
             if predicted_token[0][-1] == self.tokenizer.eos_token_id or predicted_token[0][
                 -1] == self.prefix_tokenizer.eos_token_id:
                 break
-            yield self.tokenizer.decode(input_ids[0][-num_generated_tokens:],
-                                        skip_special_tokens=True), num_generated_tokens
+            if stream:
+                yield self.tokenizer.decode(input_ids[0][-num_generated_tokens:],
+                                            skip_special_tokens=True), num_generated_tokens
         return self.tokenizer.decode(input_ids[0][-num_generated_tokens:],
                                      skip_special_tokens=True), num_generated_tokens
 
-    def process_chat_history(self, history: List):
+    def chat_format(self, history, prompt, system=None) -> str:
         if len(history) == 0:
-            return ''
+            message_ = ''
         else:
-            message_history = ''
+            message_ = ''
             for message in history:
-                message_history += self.config.chat_format.format(prompt=message[0], assistant=message[1])
+                message_ += self.config.chat_format.format(prompt=message[0], assistant=message[1])
+        message_ += (system or self.config.prompt_prefix_chat) + prompt + self.config.prompt_postfix_chat
+        return message_
 
-        return message_history
+    def instruct_format(self, prompt, system) -> str:
+        return self.config.instruct_format.format(system=system, instruct=prompt)
 
     def process_gradio_chat(self, prompt, history, max_new_tokens, greedy):
-        string = self.process_chat_history(history)
-        string += self.config.prompt_prefix_chat + prompt + self.config.prompt_postfix_chat
+        string = self.chat_format(history, prompt)
+
         if not self.config.stream_tokens_for_gradio:
             response, _ = self.process(
                 string=string,
@@ -556,7 +552,7 @@ class JAXServer(object):
         return '', history
 
     def process_gradio_instruct(self, prompt, system, max_new_tokens, greedy):
-        string = self.config.instruct_format.format(system=system, instruct=prompt)
+        string = self.instruct_format(prompt=prompt, system=system)
         if not self.config.stream_tokens_for_gradio:
             response, _ = self.process(
                 string=string,
