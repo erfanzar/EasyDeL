@@ -523,14 +523,14 @@ class JAXServer(object):
             message_ = ''
             for message in history:
                 message_ += self.config.chat_format.format(prompt=message[0], assistant=message[1])
-        message_ += (system or self.config.prompt_prefix_chat) + prompt + self.config.prompt_postfix_chat
+        message_ += self.config.prompt_prefix_chat + prompt + self.config.prompt_postfix_chat
         return message_
 
     def instruct_format(self, prompt, system) -> str:
         return self.config.instruct_format.format(system=system, instruct=prompt)
 
-    def process_gradio_chat(self, prompt, history, max_new_tokens, greedy):
-        string = self.chat_format(history, prompt)
+    def process_gradio_chat(self, prompt, history, max_new_tokens, system, greedy):
+        string = self.chat_format(history=history, prompt=prompt, system=system)
 
         if not self.config.stream_tokens_for_gradio:
             response, _ = self.process(
@@ -595,10 +595,10 @@ class JAXServer(object):
                     max_length = gr.Slider(value=self.config.max_length, maximum=self.config.max_length, minimum=1,
                                            label='Max Length', step=1)
                     temperature = gr.Slider(value=0.2, maximum=1, minimum=0.1, label='Temperature', step=0.01)
-
+                    system = gr.Textbox(show_label=False, placeholder='System Prompt', container=False)
                     greedy = gr.Checkbox(value=True, label='Greedy Search')
 
-            inputs = [prompt, history, max_new_tokens, greedy]
+            inputs = [prompt, history, max_new_tokens, system, greedy]
             sub_event = submit.click(fn=self.process_gradio_chat, inputs=inputs, outputs=[prompt, history])
 
             def clear_():
