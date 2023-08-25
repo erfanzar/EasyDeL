@@ -469,9 +469,10 @@ class JAXServer(object):
 
     def process(self,
                 string,
+                *,
                 greedy: bool = False,
                 max_new_tokens: int = None,
-                stream: bool = False
+                **kwargs
                 ):
         tokens = self.prefix_tokenizer(
             string,
@@ -510,14 +511,12 @@ class JAXServer(object):
                 (attention_mask, jnp.ones((len(attention_mask), self.config.max_stream_tokens), dtype=jnp.int32)),
                 axis=-1
             )[:, -pad:]
+
+            yield self.tokenizer.decode(input_ids[0][-num_generated_tokens:],
+                                        skip_special_tokens=True), num_generated_tokens
             if predicted_token[0][-1] == self.tokenizer.eos_token_id or predicted_token[0][
                 -1] == self.prefix_tokenizer.eos_token_id:
                 break
-            if stream:
-                yield self.tokenizer.decode(input_ids[0][-num_generated_tokens:],
-                                            skip_special_tokens=True), num_generated_tokens
-        return (self.tokenizer.decode(input_ids[0][-num_generated_tokens:], skip_special_tokens=True),
-                num_generated_tokens)
 
     def chat_format(self, history, prompt, system=None) -> str:
         if len(history) == 0:
@@ -536,11 +535,13 @@ class JAXServer(object):
         string = self.chat_format(history=history, prompt=prompt, system=system)
 
         if not self.config.stream_tokens_for_gradio:
-            response, _ = self.process(
-                string=string,
-                greedy=greedy,
-                max_new_tokens=max_new_tokens,
-            )
+            response = ''
+            for response, _ in self.process(
+                    string=string,
+                    greedy=greedy,
+                    max_new_tokens=max_new_tokens,
+            ):
+                pass
             history.append([prompt, response])
         else:
             history.append([prompt, ''])
@@ -548,7 +549,6 @@ class JAXServer(object):
                     string=string,
                     greedy=greedy,
                     max_new_tokens=max_new_tokens,
-                    stream=True
             ):
                 history[-1][-1] = response
                 yield '', history
@@ -557,11 +557,13 @@ class JAXServer(object):
     def process_gradio_instruct(self, prompt, system, max_new_tokens, greedy):
         string = self.instruct_format(prompt=prompt, system=system)
         if not self.config.stream_tokens_for_gradio:
-            response, _ = self.process(
-                string=string,
-                greedy=greedy,
-                max_new_tokens=max_new_tokens,
-            )
+            response = ''
+            for response, _ in self.process(
+                    string=string,
+                    greedy=greedy,
+                    max_new_tokens=max_new_tokens,
+            ):
+                pass
 
         else:
             response = ''
@@ -598,7 +600,7 @@ class JAXServer(object):
                     max_length = gr.Slider(value=self.config.max_length, maximum=self.config.max_length, minimum=1,
                                            label='Max Length', step=1)
                     temperature = gr.Slider(value=0.2, maximum=1, minimum=0.1, label='Temperature', step=0.01)
-                    system = gr.Textbox(show_label=False, placeholder='System Prompt', container=False)
+                    system = gr.Textbox(show_label=False, placeholder='System Prompt', container=False, value='')
                     greedy = gr.Checkbox(value=True, label='Greedy Search')
 
             inputs = [prompt, history, max_new_tokens, system, greedy]
@@ -628,11 +630,11 @@ class JAXServer(object):
                 clear = gr.Button(value='Clear Conversation')
             with gr.Column():
                 prompt = gr.Textbox(show_label=False, placeholder='Instruct Message', container=False)
-                system = gr.Textbox(value='You Are an helpful AI Assistant, generate good and helpful answers',
-                                    show_label=False, placeholder='System Message', container=False)
 
             with gr.Row():
                 with gr.Accordion('Advanced Options', open=False):
+                    system = gr.Textbox(value='',
+                                        show_label=False, placeholder='System Message', container=False)
                     max_new_tokens = gr.Slider(value=self.config.max_new_tokens, maximum=10000,
                                                minimum=self.config.max_stream_tokens,
                                                label='Max New Tokens', step=self.config.max_stream_tokens, )
