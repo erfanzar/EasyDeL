@@ -413,8 +413,11 @@ class JAXServer(object):
                 'status': "down"
             }
 
-        history = self.process_chat_history(data.history or [])
-        history += self.config.prompt_prefix_chat + data.prompt + self.config.prompt_postfix_chat
+        history = self.chat_format(
+            prompt=data.prompt,
+            system=None,
+            history=data.history
+        )
 
         response, used_tokens = self.process(
             string=history,
@@ -513,8 +516,8 @@ class JAXServer(object):
             if stream:
                 yield self.tokenizer.decode(input_ids[0][-num_generated_tokens:],
                                             skip_special_tokens=True), num_generated_tokens
-        return self.tokenizer.decode(input_ids[0][-num_generated_tokens:],
-                                     skip_special_tokens=True), num_generated_tokens
+        return (self.tokenizer.decode(input_ids[0][-num_generated_tokens:], skip_special_tokens=True),
+                num_generated_tokens)
 
     def chat_format(self, history, prompt, system=None) -> str:
         if len(history) == 0:
