@@ -5,10 +5,10 @@ from .modules import FlaxLlamaModel, FlaxLlamaForCausalLM, LlamaConfig, \
     FlaxFalconForCausalLM, FlaxFalconModel, FalconConfig, FlaxGPTNeoXForCausalLM, GPTNeoXConfig, FlaxGPTNeoXModel, \
     FlaxT5ForConditionalGeneration, FlaxT5Model, FlaxPalmForCausalLM, PalmModel, PalmConfig, T5Config, \
     FlaxOPTForCausalLM, FlaxOPTModel, OPTConfig
-from .trainer import TrainArguments, fsdp_train_step, get_training_modules, CausalLMTrainer,JaxServerConfig
+from .trainer import TrainArguments, fsdp_train_step, get_training_modules, CausalLMTrainer
 
 try:
-    from .serve import JAXServer, PyTorchServer
+    from .serve import JAXServer, PyTorchServer, JaxServerConfig
 except ValueError as vr:
     print(f"\033[1;31mWarning\033[1;0m : JAXServer Wont be Imported Be Cause {vr}")
     JAXServer = None
@@ -25,4 +25,4 @@ __all__ = "TrainArguments", "fsdp_train_step", "get_training_modules", \
     "FlaxT5ForConditionalGeneration", "FlaxT5Model", \
     "FlaxPalmForCausalLM", "PalmModel", "PalmConfig", "T5Config", \
     "FlaxOPTForCausalLM", "FlaxOPTModel", "OPTConfig", "CausalLMTrainer", "LlamaConfig", "__version__", "JAXServer", \
-    "get_mesh", "PyTorchServer"
+    "get_mesh", "PyTorchServer", "JaxServerConfig"
