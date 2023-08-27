@@ -11,3 +11,6 @@ ipython~=8.14.0
 tqdm==4.65.0
 datasets==2.14.3
 setuptools~=68.0.0
+torch>=2.0.1
+fastapi
+gradio
