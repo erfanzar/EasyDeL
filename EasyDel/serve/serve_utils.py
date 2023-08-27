@@ -13,7 +13,7 @@ import transformers
 import uvicorn
 from fastapi import FastAPI
 from fjutils import make_shard_and_gather_fns, match_partition_rules, with_sharding_constraint
-from fjutils.utils import read_ckpt
+from dataclasses import dataclass, field, is_dataclass
 from typing import Optional, List, Union
 from EasyDel.smi import get_mem, initialise_tracking
 from flax.core import freeze
@@ -80,14 +80,54 @@ class ChatRequest(BaseModel):
     greedy: Optional[bool] = False
 
 
+@dataclass
+class JaxServerConfig:
+    host = '0.0.0.0'
+    port = 2059
+    instruct_format = '### SYSTEM:\n{system}\n### INSTRUCT:\n{instruct}\n### ASSISTANT:\n'
+    chat_format = '<|prompter|>{prompt}</s><|assistant|>{assistant}</s>'
+    batch_size = 1
+    system_prefix = ''
+    system = ''
+    prompt_prefix_instruct = ''
+    prompt_postfix_instruct = ''
+    prompt_prefix_chat = '<|prompter|>'
+    prompt_postfix_chat = '</s><|assistant|>'
+    chat_prefix = ''
+    contains_auto_format = True
+    max_length = 4096
+    max_new_tokens = 4096
+    max_stream_tokens = 64
+    temperature = 0.1
+    top_p = 0.95
+    top_k = 50
+    logging = True
+    mesh_axes_names = ('dp', 'fsdp', 'mp')
+    mesh_axes_shape = (1, -1, 1)
+    dtype = 'fp16'
+    stream_tokens_for_gradio = True
+    use_prefix_tokenizer = True
+    assert max_new_tokens % max_stream_tokens == 0, \
+        'max_new_tokens should be divisible by  max_new_tokens' \
+        f'{max_new_tokens % max_stream_tokens}'
+
+
 class JAXServer(object):
 
     def __init__(self, config=None):
 
         self.process_uvicorn, self.prefix_tokenizer, self.params, self.tokenizer, self.model, \
             self.rules, self._generate, self._greedy_generate = [None] * 8
-
-        self.config = self.get_default_config(config)
+        try:
+            if config is not None:
+                if is_dataclass(config):
+                    self.config = config
+                else:
+                    raise OSError
+            else:
+                raise OSError
+        except OSError:
+            self.config = self.get_default_config(config)
         self._funcs_generated = False
         self.number_of_served_request_until_last_up_time = 0
 
@@ -286,7 +326,8 @@ class JAXServer(object):
     ):
         assert hasattr(model,
                        'init_weights'), 'model must contain init_weights func in order to init params for shard_fns'
-        assert hasattr(config_model, 'get_partition_rules'), 'config_model must contain get_partition_rules functions'
+        assert hasattr(config_model,
+                       'get_partition_rules'), 'config_model must contain get_partition_rules functions'
         server = cls(config=config)
         logging.info(
             'running _init() func in order to make shard_fns'
@@ -343,7 +384,8 @@ class JAXServer(object):
     ):
         assert hasattr(model,
                        'init_weights'), 'model must contain init_weights func in order to init params for shard_fns'
-        assert hasattr(config_model, 'get_partition_rules'), 'config_model must contain get_partition_rules functions'
+        assert hasattr(config_model,
+                       'get_partition_rules'), 'config_model must contain get_partition_rules functions'
         server = cls(config=config)
 
         with server.mesh:
