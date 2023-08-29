@@ -101,6 +101,11 @@ make sure to use --use_prefix_tokenizer
 
 and you will get links or api to use model from gradio app chat/instruct or FastAPI apis
 
+## RLHF(Reinforcement Learning From Human Feedback)
+
+RLHF or Reinforcement Learning From Human Feedback is going to be available in the next
+versions of EasyDel
+
 ## FineTuning
 
 with using EasyDel FineTuning LLM (CausalLanguageModels) are easy as much as possible with using Jax and Flax

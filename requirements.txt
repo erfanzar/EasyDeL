@@ -14,3 +14,5 @@ setuptools~=68.0.0
 torch>=2.0.1
 fastapi
 gradio
+distrax
+rlax
