@@ -384,9 +384,17 @@ class FlaxMptModule(nn.Module):
         )
         self.norm_f = nn.LayerNorm(use_bias=self.config.use_norm_bias)
 
-    def __call__(self, input_ids: jax.Array, attention_mask: jax.Array = None, return_dict: bool = True):
+    def __call__(self,
+
+                 input_ids: jax.Array,
+                 attention_mask: jax.Array = None,
+                 return_dict: bool = True,
+                 extra_embedding: Optional[Union[jnp.ndarray, None]] = None
+                 ):
         b, s = input_ids.shape
         hidden_state = self.wte(input_ids)
+        hidden_state = hidden_state + extra_embedding if extra_embedding is not None else hidden_state
+
         if self.config.alibi:
             alibi = build_alibi(s, self.config.n_heads)
         else:
@@ -426,14 +434,20 @@ class FlaxMptPretrainedModel(FlaxPreTrainedModel):
         else:
             return params
 
-    def __call__(self, input_ids, attention_mask=None, params=None, add_params_field: bool = False,
-                 return_dict: bool = True):
+    def __call__(self,
+                 input_ids,
+                 attention_mask=None,
+                 params=None,
+                 add_params_field: bool = False,
+                 return_dict: bool = True,
+                 extra_embedding: Optional[Union[jnp.ndarray, None]] = None):
         params = {'params': params or self.params} if add_params_field else params or self.params
         predict = self.module.apply(
             params,
             input_ids=jnp.asarray(input_ids, dtype='i4'),
             attention_mask=jnp.asarray(attention_mask, dtype='i4') if attention_mask is not None else attention_mask,
-            return_dict=return_dict
+            return_dict=return_dict,
+            extra_embedding=extra_embedding
         )
         return predict
 
@@ -468,9 +482,18 @@ class FlaxFlaxMptForCausalLMModule(nn.Module):
                                     use_bias=self.config.use_bias,
                                     dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision)
 
-    def __call__(self, input_ids: jax.Array, attention_mask: jax.Array = None, return_dict: bool = True):
-        predict: FlaxBaseModelOutput = self.transformer(input_ids=input_ids, attention_mask=attention_mask,
-                                                        return_dict=True)
+    def __call__(self,
+                 input_ids: jax.Array,
+                 attention_mask: jax.Array = None,
+                 return_dict: bool = True,
+                 extra_embedding: Optional[Union[jnp.ndarray, None]] = None
+                 ):
+        predict: FlaxBaseModelOutput = self.transformer(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            return_dict=True,
+            extra_embedding=extra_embedding
+        )
         if self.config.use_lm_head:
             logits = self.lm_head(predict.last_hidden_state)
         else:
