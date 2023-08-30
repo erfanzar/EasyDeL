@@ -820,6 +820,7 @@ class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
+            extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
             add_params_field: bool = False
     ):
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -861,6 +862,7 @@ class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
             output_attentions,
             output_hidden_states,
             return_dict,
+            extra_embedding,
             rngs=rngs,
             mutable=mutable,
         )
@@ -987,10 +989,12 @@ class FlaxLlamaModule(nn.Module):
             output_attentions: bool = False,
             output_hidden_states: bool = False,
             return_dict: bool = True,
+            extra_embedding: Optional[Union[jnp.ndarray, None]] = None
     ):
         if input_embeds is None:
             input_embeds = self.wte(input_ids.astype("i4"))
 
+        input_embeds = input_embeds + extra_embedding if extra_embedding is not None else input_embeds
         hidden_states = self.dropout(input_embeds, deterministic=deterministic)
 
         outputs = self.h(
@@ -1059,6 +1063,7 @@ class FlaxLlamaForCausalLMModule(nn.Module):
             output_attentions: bool = False,
             output_hidden_states: bool = False,
             return_dict: bool = True,
+            extra_embedding: Optional[Union[jnp.ndarray, None]] = None
     ):
         batch_size, seq_length = input_ids.shape
         if attention_mask is None:
@@ -1077,6 +1082,7 @@ class FlaxLlamaForCausalLMModule(nn.Module):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            extra_embedding=extra_embedding
         )
 
         hidden_states = outputs[0]
@@ -1149,6 +1155,7 @@ class FlaxLlamaForSequenceClassificationModule(nn.Module):
             output_attentions: bool = False,
             output_hidden_states: bool = False,
             return_dict: bool = True,
+            extra_embedding: Optional[Union[jnp.ndarray, None]] = None
     ):
         batch_size, seq_length = input_ids.shape
         if attention_mask is None:
@@ -1167,6 +1174,7 @@ class FlaxLlamaForSequenceClassificationModule(nn.Module):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            extra_embedding=extra_embedding
         )
 
         hidden_states = outputs[0]
