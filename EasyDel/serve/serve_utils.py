@@ -13,7 +13,7 @@ import transformers
 import uvicorn
 from fastapi import FastAPI
 from fjutils import make_shard_and_gather_fns, match_partition_rules, with_sharding_constraint
-from fjutils.utils import read_ckpt
+from dataclasses import dataclass, field, is_dataclass
 from typing import Optional, List, Union
 from EasyDel.smi import get_mem, initialise_tracking
 from flax.core import freeze
@@ -80,14 +80,54 @@ class ChatRequest(BaseModel):
     greedy: Optional[bool] = False
 
 
+@dataclass
+class JaxServerConfig:
+    host = '0.0.0.0'
+    port = 2059
+    instruct_format = '### SYSTEM:\n{system}\n### INSTRUCT:\n{instruct}\n### ASSISTANT:\n'
+    chat_format = '<|prompter|>{prompt}</s><|assistant|>{assistant}</s>'
+    batch_size = 1
+    system_prefix = ''
+    system = ''
+    prompt_prefix_instruct = ''
+    prompt_postfix_instruct = ''
+    prompt_prefix_chat = '<|prompter|>'
+    prompt_postfix_chat = '</s><|assistant|>'
+    chat_prefix = ''
+    contains_auto_format = True
+    max_length = 4096
+    max_new_tokens = 4096
+    max_stream_tokens = 64
+    temperature = 0.1
+    top_p = 0.95
+    top_k = 50
+    logging = True
+    mesh_axes_names = ('dp', 'fsdp', 'mp')
+    mesh_axes_shape = (1, -1, 1)
+    dtype = 'fp16'
+    stream_tokens_for_gradio = True
+    use_prefix_tokenizer = True
+    assert max_new_tokens % max_stream_tokens == 0, \
+        'max_new_tokens should be divisible by  max_new_tokens' \
+        f'{max_new_tokens % max_stream_tokens}'
+
+
 class JAXServer(object):
 
     def __init__(self, config=None):
 
         self.process_uvicorn, self.prefix_tokenizer, self.params, self.tokenizer, self.model, \
             self.rules, self._generate, self._greedy_generate = [None] * 8
-
-        self.config = self.get_default_config(config)
+        try:
+            if config is not None:
+                if is_dataclass(config):
+                    self.config = config
+                else:
+                    raise OSError
+            else:
+                raise OSError
+        except OSError:
+            self.config = self.get_default_config(config)
         self._funcs_generated = False
         self.number_of_served_request_until_last_up_time = 0
 
@@ -286,7 +326,8 @@ class JAXServer(object):
     ):
         assert hasattr(model,
                        'init_weights'), 'model must contain init_weights func in order to init params for shard_fns'
-        assert hasattr(config_model, 'get_partition_rules'), 'config_model must contain get_partition_rules functions'
+        assert hasattr(config_model,
+                       'get_partition_rules'), 'config_model must contain get_partition_rules functions'
         server = cls(config=config)
         logging.info(
             'running _init() func in order to make shard_fns'
@@ -343,7 +384,8 @@ class JAXServer(object):
     ):
         assert hasattr(model,
                        'init_weights'), 'model must contain init_weights func in order to init params for shard_fns'
-        assert hasattr(config_model, 'get_partition_rules'), 'config_model must contain get_partition_rules functions'
+        assert hasattr(config_model,
+                       'get_partition_rules'), 'config_model must contain get_partition_rules functions'
         server = cls(config=config)
 
         with server.mesh:
@@ -469,9 +511,10 @@ class JAXServer(object):
 
     def process(self,
                 string,
+                *,
                 greedy: bool = False,
                 max_new_tokens: int = None,
-                stream: bool = False
+                **kwargs
                 ):
         tokens = self.prefix_tokenizer(
             string,
@@ -510,14 +553,12 @@ class JAXServer(object):
                 (attention_mask, jnp.ones((len(attention_mask), self.config.max_stream_tokens), dtype=jnp.int32)),
                 axis=-1
             )[:, -pad:]
-            if predicted_token[0][-1] == self.tokenizer.eos_token_id or predicted_token[0][
-                -1] == self.prefix_tokenizer.eos_token_id:
-                break
 
             yield self.tokenizer.decode(input_ids[0][-num_generated_tokens:],
                                         skip_special_tokens=True), num_generated_tokens
-        # return (self.tokenizer.decode(input_ids[0][-num_generated_tokens:], skip_special_tokens=True),
-        #         num_generated_tokens)
+            if predicted_token[0][-1] == self.tokenizer.eos_token_id or predicted_token[0][
+                -1] == self.prefix_tokenizer.eos_token_id:
+                break
 
     def chat_format(self, history, prompt, system=None) -> str:
         if len(history) == 0:
@@ -536,11 +577,13 @@ class JAXServer(object):
         string = self.chat_format(history=history, prompt=prompt, system=system)
 
         if not self.config.stream_tokens_for_gradio:
-            response, _ = self.process(
-                string=string,
-                greedy=greedy,
-                max_new_tokens=max_new_tokens,
-            )
+            response = ''
+            for response, _ in self.process(
+                    string=string,
+                    greedy=greedy,
+                    max_new_tokens=max_new_tokens,
+            ):
+                pass
             history.append([prompt, response])
         else:
             history.append([prompt, ''])
@@ -548,7 +591,6 @@ class JAXServer(object):
                     string=string,
                     greedy=greedy,
                     max_new_tokens=max_new_tokens,
-                    stream=True
             ):
                 history[-1][-1] = response
                 yield '', history
@@ -557,11 +599,13 @@ class JAXServer(object):
     def process_gradio_instruct(self, prompt, system, max_new_tokens, greedy):
         string = self.instruct_format(prompt=prompt, system=system)
         if not self.config.stream_tokens_for_gradio:
-            response, _ = self.process(
-                string=string,
-                greedy=greedy,
-                max_new_tokens=max_new_tokens,
-            )
+            response = ''
+            for response, _ in self.process(
+                    string=string,
+                    greedy=greedy,
+                    max_new_tokens=max_new_tokens,
+            ):
+                pass
 
         else:
             response = ''
@@ -595,11 +639,9 @@ class JAXServer(object):
                     max_new_tokens = gr.Slider(value=self.config.max_new_tokens, maximum=10000,
                                                minimum=self.config.max_stream_tokens,
                                                label='Max New Tokens', step=self.config.max_stream_tokens, )
-                    max_length = gr.Slider(value=self.config.max_length, maximum=self.config.max_length, minimum=1,
-                                           label='Max Length', step=1)
-                    temperature = gr.Slider(value=0.2, maximum=1, minimum=0.1, label='Temperature', step=0.01)
-                    system = gr.Textbox(show_label=False, placeholder='System Prompt', container=False)
-                    greedy = gr.Checkbox(value=True, label='Greedy Search')
+
+                    system = gr.Textbox(show_label=False, placeholder='System Prompt', container=False, value='')
+                    greedy = gr.Checkbox(value=False, label='Greedy Search')
 
             inputs = [prompt, history, max_new_tokens, system, greedy]
             sub_event = submit.click(fn=self.process_gradio_chat, inputs=inputs, outputs=[prompt, history])
@@ -628,18 +670,16 @@ class JAXServer(object):
                 clear = gr.Button(value='Clear Conversation')
             with gr.Column():
                 prompt = gr.Textbox(show_label=False, placeholder='Instruct Message', container=False)
-                system = gr.Textbox(value='You Are an helpful AI Assistant, generate good and helpful answers',
-                                    show_label=False, placeholder='System Message', container=False)
 
             with gr.Row():
                 with gr.Accordion('Advanced Options', open=False):
+                    system = gr.Textbox(value='',
+                                        show_label=False, placeholder='System Message', container=False)
                     max_new_tokens = gr.Slider(value=self.config.max_new_tokens, maximum=10000,
                                                minimum=self.config.max_stream_tokens,
                                                label='Max New Tokens', step=self.config.max_stream_tokens, )
-                    max_length = gr.Slider(value=self.config.max_length, maximum=self.config.max_length, minimum=1,
-                                           label='Max Length', step=1)
-                    temperature = gr.Slider(value=0.2, maximum=1, minimum=0.1, label='Temperature', step=0.01)
-                    greedy = gr.Checkbox(value=True, label='Greedy Search')
+
+                    greedy = gr.Checkbox(value=False, label='Greedy Search')
 
             inputs = [prompt, system, max_new_tokens, greedy]
             sub_event = submit.click(fn=self.process_gradio_instruct, inputs=inputs, outputs=[prompt, pred])
