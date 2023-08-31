@@ -66,7 +66,7 @@ class TrainArguments(
             model_parameters=None,
             do_shard_fns: bool = True,
             track_memory: bool = True,
-            loss_remat: str = 'nothing_saveable',
+            loss_remat: str = '',
             loss_chunk: int = 1024,
             **kwargs
     ):
