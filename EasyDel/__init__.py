@@ -14,6 +14,10 @@ except ValueError as vr:
     JAXServer = None
 __version__ = "0.0.30"
 
+# import os
+#
+# os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.1'  # don't use all gpu mem
+# os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # tell XLA to be quiet
 __all__ = "TrainArguments", "fsdp_train_step", "get_training_modules", \
     "FlaxLlamaForCausalLM", \
     "FlaxLlamaModel", "FlaxGPTJModule", "FlaxGPTJForCausalLMModule", \
