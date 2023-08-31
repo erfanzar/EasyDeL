@@ -107,6 +107,7 @@ class JaxServerConfig:
     dtype = 'fp16'
     stream_tokens_for_gradio = True
     use_prefix_tokenizer = True
+    pre_compile = True
     assert max_new_tokens % max_stream_tokens == 0, \
         'max_new_tokens should be divisible by  max_new_tokens' \
         f'{max_new_tokens % max_stream_tokens}'
@@ -148,48 +149,39 @@ class JAXServer(object):
     @staticmethod
     def get_default_config(updates=None):
         config = ConfigDict()
-        config.host = '0.0.0.0'
+
         config.port = 2059
-
-        config.instruct_format = '### SYSTEM:\n{system}\n### INSTRUCT:\n{instruct}\n### ASSISTANT:\n'
-        config.chat_format = '<|prompter|>{prompt}</s><|assistant|>{assistant}</s>'
-
         config.batch_size = 1
-
-        config.system_prefix = ''
-        config.system = ''
-
-        config.prompt_prefix_instruct = ''
-        config.prompt_postfix_instruct = ''
-
-        config.prompt_prefix_chat = '<|prompter|>'
-        config.prompt_postfix_chat = '</s><|assistant|>'
-
-        config.chat_prefix = ''
-        config.contains_auto_format = True
-
         config.max_length = 2048
         config.max_new_tokens = 2048
-
         config.max_stream_tokens = 32
+        config.temperature = 0.1
+        config.top_p = 0.95
+        config.top_k = 50
+        config.mesh_axes_shape = (1, -1, 1)
 
         assert config.max_new_tokens % config.max_stream_tokens == 0, \
             'max_new_tokens should be divisible by  max_new_tokens' \
             f'{config.max_new_tokens % config.max_stream_tokens}'
 
-        config.temperature = 0.1
-        config.top_p = 0.95
-        config.top_k = 50
-
-        config.logging = True
-
-        config.mesh_axes_names = ('dp', 'fsdp', 'mp')
-        config.mesh_axes_shape = (1, -1, 1)
-
+        config.host = '0.0.0.0'
         config.dtype = 'fp16'
+        config.mesh_axes_names = ('dp', 'fsdp', 'mp')
+        config.system_prefix = ''
+        config.system = ''
+        config.prompt_prefix_instruct = ''
+        config.prompt_postfix_instruct = ''
+        config.prompt_prefix_chat = '<|prompter|>'
+        config.prompt_postfix_chat = '</s><|assistant|>'
+        config.instruct_format = '### SYSTEM:\n{system}\n### INSTRUCT:\n{instruct}\n### ASSISTANT:\n'
+        config.chat_format = '<|prompter|>{prompt}</s><|assistant|>{assistant}</s>'
+        config.chat_prefix = ''
+
+        config.contains_auto_format = True
+        config.logging = True
         config.stream_tokens_for_gradio = True
         config.use_prefix_tokenizer = True
-
+        config.pre_compile = True
         if updates is not None:
             config.update(ConfigDict(updates).copy_and_resolve_references())
         return config
@@ -322,7 +314,8 @@ class JAXServer(object):
             config=None,
             add_param_field: bool = True,
             init_shape: tuple = (1, 1),
-            do_memory_log=False
+            do_memory_log: bool = False,
+            verbose: bool = True
     ):
         assert hasattr(model,
                        'init_weights'), 'model must contain init_weights func in order to init params for shard_fns'
@@ -369,6 +362,9 @@ class JAXServer(object):
             'configuring generate functions for the server'
         )
         server.configure_generate_functions(model, tokenizer)
+
+        if config.pre_compile:
+            server.compile(verbose=verbose)
         return server
 
     @classmethod
@@ -380,7 +376,8 @@ class JAXServer(object):
             params: typing.Dict,
             config=None,
             add_param_field: bool = True,
-            do_memory_log=False
+            do_memory_log: bool = False,
+            verbose: bool = True
     ):
         assert hasattr(model,
                        'init_weights'), 'model must contain init_weights func in order to init params for shard_fns'
@@ -415,7 +412,34 @@ class JAXServer(object):
             'configuring generate functions for the server'
         )
         server.configure_generate_functions(model, tokenizer)
+        if config.pre_compile:
+            server.compile(verbose=verbose)
         return server
+
+    def compile(self, verbose: bool = True) -> bool:
+        assert self._funcs_generated, 'funcs are not generated yet'
+        assert self.rules is not None, 'rules should not be None'
+        if self.config.use_prefix_tokenizer:
+            if verbose:
+                print('\033[1;91mCompiling Model Forwards Greedy/NonGreedy(Generate)')
+                print('Compiling Greedy Funcs')
+            _ = self.process(
+                string='',
+                max_new_tokens=self.config.max_new_tokens,
+                greedy=True
+            )
+            print('Compiling NonGreedy(Generate) Funcs\033[1;0m')
+            _ = self.process(
+                string='',
+                max_new_tokens=self.config.max_new_tokens,
+                greedy=False
+            )
+
+        else:
+            print(
+                '\033[1;41mSkip Compiling the compiling process is useless '
+                'when you are not using prefix tokenizer\033[1;0m')
+        return True
 
     def greedy_generate(self,
                         params: Union[flax.core.FrozenDict, dict],
