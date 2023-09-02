@@ -363,7 +363,7 @@ class JAXServer(object):
         )
         server.configure_generate_functions(model, tokenizer)
 
-        if config.pre_compile:
+        if server.config.pre_compile:
             server.compile(verbose=verbose)
         return server
 
@@ -412,7 +412,7 @@ class JAXServer(object):
             'configuring generate functions for the server'
         )
         server.configure_generate_functions(model, tokenizer)
-        if config.pre_compile:
+        if server.config.pre_compile:
             server.compile(verbose=verbose)
         return server
 
