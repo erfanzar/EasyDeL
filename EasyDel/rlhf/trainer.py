@@ -1,145 +1,97 @@
-import os.path
+import os
 import pathlib
-import typing
-from typing import OrderedDict, List, Union
+import pprint
 
-import fjutils.optimizers
-import torch.utils.tensorboard
-import wandb
+import datasets
 from fjutils import StreamingCheckpointer
-from jax.experimental.mesh_utils import create_device_mesh
-
-from jax.sharding import Mesh
 from jax import numpy as jnp
+from flax import linen as nn
+
+import flax
 import jax
 
-AVAILABLE_OPTIMIZERS: List[str] = ['adafactor', 'lion', 'adamw']
-AVAILABLE_SCHEDULERS: List[str] = ['linear', 'cosine', 'none', 'warm_up_cosine']
-AVAILABLE_GRADIENT_CHECK_POINTING: List[str] = ['everything_saveable',
-                                                'nothing_saveable',
-                                                'checkpoint_dots',
-                                                'checkpoint_dots_with_no_batch_dims']
-AVAILABLE_BACKENDS: List[str] = [
-    'cpu', 'gpu', 'tpu', None
-]
+import collections
+from typing import Union, Optional, List, Dict, OrderedDict, NamedTuple, Callable, Any, Sequence, assert_type
+
+from jax._src.maps import Mesh
+from jax.experimental.mesh_utils import create_device_mesh
+from transformers import PretrainedConfig
+from .utils import AVAILABLE_MODELS_FOR_RLHF, AVAILABLE_MODELS_CONFIG_FOR_RLHF
+from .reward import RewardModel
+from .ppo import ActorCritic
+from datasets import DatasetDict, Dataset, IterableDatasetDict, IterableDataset
+import fjutils
+import wandb
 
 
-class TrainArguments(
-    OrderedDict
-):
-    def __init__(
-            self,
-            model_name: str,
-            num_train_epochs: int,
-            model_id: str = None,
-            model_class=None,
-            total_batch_size: int = 32,
-            max_steps: Union[int, None] = None,
-            optimizer: str = 'lion',
-            scheduler: str = 'linear',
-            learning_rate: Union[int, float] = 5e-5,
-            learning_rate_end: Union[None, float] = 5e-6,
-            gradient_accumulation_steps: int = 1,
-            weight_decay: float = 0.01,
-            gradient_checkpointing: str = 'nothing_saveable',
-            max_length: Union[int, None] = 4096,
-            sharding_array: Union[tuple, int] = (1, -1, 1),
-            is_fine_tuning: bool = True,
-            do_train: bool = True,
-            do_eval: bool = False,
-            do_test: Union[bool, None] = False,
-            backend: Union[str, None] = None,
-            extra_optimizer_kwargs: dict = None,
-            save_steps: Union[int, None] = None,
-            save_dir: str = 'easydel_ckpt',
-            use_pjit_attention_force: bool = True,
-            dtype=jnp.bfloat16,
-            param_dtype=jnp.bfloat16,
-            fully_fsdp=True,
-            use_wandb: bool = True,
-            custom_rule=None,
-            extra_configs=None,
-            ids_to_pop_from_dataset: list = None,
-            remove_ckpt_after_load: bool = False,
-            configs_to_init_model_class=None,
-            do_last_save: bool = True,
-            model_parameters=None,
-            do_shard_fns: bool = True,
-            track_memory: bool = True,
-            loss_remat: str = '',
-            loss_chunk: int = 1024,
-            **kwargs
-    ):
-        super().__init__()
-        if ids_to_pop_from_dataset is None:
-            ids_to_pop_from_dataset = []
-        if extra_optimizer_kwargs is None:
-            extra_optimizer_kwargs = {}
-        assert model_class is not None or model_id is not None, 'you cant pass model_class and model_id both None ' \
-                                                                'you should at least pass one of them to build ' \
-                                                                'model with'
-        assert backend in AVAILABLE_BACKENDS, f'{backend} is not recognized, ' \
-                                              f'available backends are {AVAILABLE_BACKENDS}'
-        assert gradient_checkpointing in AVAILABLE_GRADIENT_CHECK_POINTING, f'{gradient_checkpointing} is not ' \
-                                                                            f'recognized, available gradient ' \
-                                                                            f'checkpointing methods are ' \
-                                                                            f'{AVAILABLE_GRADIENT_CHECK_POINTING}'
-        assert scheduler in AVAILABLE_SCHEDULERS, f'{scheduler} is not recognized, ' \
-                                                  f'available schedulers are {AVAILABLE_SCHEDULERS}'
-        assert optimizer in AVAILABLE_OPTIMIZERS, f'{optimizer} is not recognized, ' \
-                                                  f'available optimizers are {AVAILABLE_OPTIMIZERS}'
-        self.available_backends = len(jax.devices(backend))
-        total_batch_size *= gradient_accumulation_steps
-        array_devices = jnp.ones((self.available_backends, 1)).reshape(sharding_array)
-        self.array_devices_shape = array_devices.shape
-
-        self.model_id = model_id
-        self.num_train_epochs = num_train_epochs
-        self.total_batch_size = total_batch_size
-        self.max_steps = max_steps
-        self.optimizer = optimizer
-        self.scheduler = scheduler
-        self.extra_optimizer_kwargs = extra_optimizer_kwargs
-        self.learning_rate = learning_rate
-        self.learning_rate_end = learning_rate_end
-        self.weight_decay = weight_decay
-        self.model_name = model_name
-        self.gradient_checkpointing = gradient_checkpointing
-        self.max_length = max_length
-        self.sharding_array = sharding_array
-        self.is_fine_tuning = is_fine_tuning
-        self.do_train = do_train
-        self.do_eval = do_eval
-        self.do_test = do_test
-        self.save_steps = save_steps
-        self.save_dir = save_dir
-        self.use_pjit_attention_force = use_pjit_attention_force
+class RLHFConfig(PretrainedConfig):
+    def __init__(self,
+                 actor_lr: float = 1e-4,
+                 critic_lr: float = 1e-4,
+                 actor_wd: float = 0.,
+                 critic_wd: float = 0.,
+                 actor_adam_eps: float = 1e-7,
+                 critic_adam_eps: float = 1e-7,
+                 critic_pooled_values=True,
+                 actor_dropout: float = 0.,
+                 critic_dropout: float = 0.,
+                 betas=(0.9, 0.999),
+                 max_norm=None,
+                 eps_clip: float = 0.2,
+                 value_clip: float = 0.4,
+                 beta_s: float = .01,
+                 pad_value: Union[float, int] = 0.,
+                 minibatch_size: int = 16,
+                 epochs: int = 1,
+                 kl_div_loss_weight: Optional[float] = 0.100002167,
+                 optimizer: str = 'adam',
+                 scheduler: str = 'linear',
+                 dtype: Union[str, jnp.dtype] = 'bf16',
+                 param_dtype: Union[str, jnp.dtype] = 'bf16',
+                 precision: Optional[Union[str, jax.lax.Precision, None]] = 'fastest',
+                 sharding_array: tuple = (1, -1, 1),
+                 extra_optimizer_kwargs: dict = None,
+                 model_name: str = 'RLHF',
+                 save_dir: str = 'easydel_ckpt',
+                 backend: str = 'tpu',
+                 **kwargs):
+        super().__init__(**kwargs)
         self.dtype = dtype
         self.param_dtype = param_dtype
-        self.fully_fsdp = fully_fsdp
-        self.use_wandb = use_wandb
-        self.custom_rule = custom_rule
-        self.extra_configs = extra_configs
-        self.ids_to_pop_from_dataset = ids_to_pop_from_dataset
-        self.remove_ckpt_after_load = remove_ckpt_after_load
-        self.model_class = model_class
-        self.configs_to_init_model_class = configs_to_init_model_class
-        self.do_last_save = do_last_save
-        self.model_parameters = model_parameters
-        self.do_shard_fns = do_shard_fns
-        self.gradient_accumulation_steps = gradient_accumulation_steps
-        self.track_memory = track_memory
+        self.precision = precision
+        self.scheduler = scheduler
+        self.extra_optimizer_kwargs = extra_optimizer_kwargs
+        self.actor_lr = actor_lr
+        self.critic_lr = critic_lr
+        self.actor_wd = actor_wd
+        self.critic_wd = critic_wd
+        self.optimizer = optimizer
+        self.actor_adam_eps = actor_adam_eps
+        self.critic_adam_eps = critic_adam_eps
+        self.critic_pooled_values = critic_pooled_values
+        self.actor_dropout = actor_dropout
+        self.critic_dropout = critic_dropout
+        self.betas = betas
+        self.max_norm = max_norm
+        self.eps_clip = eps_clip
+        self.value_clip = value_clip
+        self.beta_s = beta_s
+        self.epochs = epochs
+        self.kl_div_loss_weight = kl_div_loss_weight
+        self.minibatch_size = minibatch_size
+        self.pad_value = pad_value
+        self.model_name = model_name
+        self.save_dir = save_dir
+        self.sharding_array = jnp.ones((1, jax.devices(backend=backend))).reshape(sharding_array).shape
 
-        self.loss_chunk = loss_chunk
-        self.loss_remat = loss_remat
-
-        torch.set_default_device('cpu')
-        self.__dict__.update(**kwargs)
-
-    def __call__(self):
-        return {k: v for k, v in self.__dict__.items()}
+    def get_path(self):
+        return pathlib.Path(
+            self.save_dir, self.model_name
+        )
 
     def get_meter_dict(self):
+
+        import torch
         return {f"hyperparameters/{k}": v for k, v in self.__dict__.items() if
                 isinstance(v, (int, float, str, bool, torch.Tensor))}
 
@@ -154,26 +106,9 @@ class TrainArguments(
             ]
         )
 
-    def __str__(self):
-        string = f'TrainingArguments(\n'
-        for k, v in self.__call__().items():
-            if isinstance(v, typing.Callable):
-                def string_func(it_self):
-                    string_ = f'{it_self.__class__.__name__}(\n'
-                    for k_, v_ in it_self.__dict__.items():
-                        string_ += f'\t\t{k_} : {v_}\n'
-                    string_ += '\t)'
-                    return string_
-
-                v.__str__ = string_func
-                v = v.__str__(v)
-            string += f'\t{k} : {v}\n'
-        string += ')'
-        return string
-
-    def get_path(self):
-        return pathlib.Path(
-            self.save_dir, self.model_name
+    def __call__(self):
+        return pprint.pformat(
+            {k: str(v) for k, v in self.__dict__.items()}
         )
 
     def ckpt_path_exists(self):
@@ -184,7 +119,7 @@ class TrainArguments(
     def get_mesh(self):
         return Mesh(
             create_device_mesh(
-                self.array_devices_shape
+                self.sharding_array
             ),
             self.get_mesh_names()
         )
@@ -312,8 +247,34 @@ class TrainArguments(
                                      os.path.join(self.save_dir, self.model_name))
 
     def get_board(self):
+        import torch
         return torch.utils.tensorboard.SummaryWriter(
             log_dir=str(self.get_path()),
             comment=f'{self.model_name}',
             filename_suffix='easydel'
         )
+
+
+class RLHFTrainer(nn.Module):
+    config: RLHFConfig
+    dataset: Union[DatasetDict, Dataset, IterableDatasetDict, IterableDataset]
+    tokenizer: Callable
+    model: AVAILABLE_MODELS_FOR_RLHF
+    reward_model: RewardModel
+    critic_model: Optional[AVAILABLE_MODELS_FOR_RLHF] = None
+    actor_critic: Optional[ActorCritic] = None
+
+    def setup(self) -> None:
+        if self.actor_critic is None:
+            self.actor_critic = ActorCritic(
+                model=self.model,
+                critic_model=self.critic_model,
+                pooled_values=False,
+                dtype=jnp.float32,
+                param_dtype=jnp.float32,
+                precision=jax.lax.Precision('fastest')
+
+            )
+
+    def __call__(self, *args, **kwargs):
+        ...
