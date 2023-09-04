@@ -1,22 +1,21 @@
 import copy
 import math
 
+import flax
+import jax
+
 from jax import numpy as jnp
 from jax import lax, random
 from flax import linen as nn
+
+import functools
+import collections
 
 from einops import rearrange, repeat, reduce
 from typing import Union, Optional, OrderedDict, NamedTuple, Callable, Any
 
 from EasyDel import FlaxMptForCausalLM, FlaxLlamaForCausalLM, MptConfig, LlamaConfig
-from .utils import log, log_prob, shift, masked_mean
-
-AVAILABLE_MODELS_FOR_RLHF = Union[
-    FlaxLlamaForCausalLM, FlaxMptForCausalLM
-]
-AVAILABLE_MODELS_CONFIG_FOR_RLHF = Union[
-    LlamaConfig, MptConfig
-]
+from .utils import log, log_prob, shift, masked_mean, AVAILABLE_MODELS_FOR_RLHF, AVAILABLE_MODELS_CONFIG_FOR_RLHF
 
 
 class PPOActionCriticReturn(NamedTuple):
@@ -30,14 +29,8 @@ class PPOActionCriticReturn(NamedTuple):
 
 class ActorCritic(nn.Module):
     model: AVAILABLE_MODELS_FOR_RLHF
-    config_model: AVAILABLE_MODELS_CONFIG_FOR_RLHF
     critic_model: Optional[AVAILABLE_MODELS_FOR_RLHF]
     pooled_values: bool = False
-    actor_lora: bool = True
-    critic_lora: bool = True
-    actor_lora_r: int = 8
-    critic_lora_r: int = 8
-
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
     precision: Optional[Union[None, lax.Precision]] = lax.Precision('fastest')
@@ -84,4 +77,12 @@ class ActorCritic(nn.Module):
 
         return logits, values
 
-# TODO: The rest is TODO
+
+@functools.partial(jax.jit, static_argnums=0)
+def policy_action(
+        apply_fn: Callable[..., Any],
+        params: flax.core.frozen_dict.FrozenDict,
+        state: jnp.ndarray,
+):
+    out = apply_fn({'params': params}, state)
+    return out
