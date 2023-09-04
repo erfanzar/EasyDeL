@@ -1,27 +1,57 @@
+import collections
 import os
 import pathlib
 import pprint
+import typing
+from typing import Union, Optional, Callable, List
 
-from fjutils import StreamingCheckpointer
-from jax import numpy as jnp
-from flax import linen as nn
-
-import flax
 import jax
-from fjutils import optimizers
-
-import collections
-from typing import Union, Optional, Callable
-
-from jax.sharding import Mesh
-from jax.experimental.mesh_utils import create_device_mesh
-from transformers import PretrainedConfig
-from .utils import AVAILABLE_MODELS_FOR_RLHF
-from .reward import RewardModel
-from .ppo import ActorCritic
-from datasets import DatasetDict, Dataset, IterableDatasetDict, IterableDataset
-
+import torch
 import wandb
+from datasets import DatasetDict, Dataset, IterableDatasetDict, IterableDataset
+from fjutils import StreamingCheckpointer
+from fjutils import optimizers
+from jax import numpy as jnp
+from jax.experimental.mesh_utils import create_device_mesh
+from jax.sharding import Mesh
+from torch.utils.data.dataloader import DataLoader
+from transformers import PretrainedConfig
+
+from .ppo import ActorCritic
+from .reward import RewardModel
+from .utils import AVAILABLE_MODELS_FOR_RLHF, shift, log_prob, masked_entropy
+
+Memory = collections.namedtuple('Memory', [
+    'logits',
+    'prompt_mask',
+    'attention_mask',
+    'action_prob',
+    'action_log_prob',
+    'reward',
+    'value'
+])
+
+
+class ExperienceDataset(Dataset):
+    def __init__(
+            self,
+            data: List[torch.Tensor],
+            device=None
+    ):
+        super().__init__()
+        self.data = data
+        self.device = device
+
+    def __len__(self):
+        return self.data[0].shape[0]
+
+    def __getitem__(self, ind):
+        return tuple(map(lambda t: t[ind].to(self.device), self.data))
+
+
+def create_dataloader(data, batch_size, shuffle=True, device=None, **kwargs):
+    ds = ExperienceDataset(data, device=device)
+    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, **kwargs)
 
 
 class RLHFConfig(PretrainedConfig):
@@ -31,6 +61,7 @@ class RLHFConfig(PretrainedConfig):
                  actor_wd: float = 0.,
                  critic_wd: float = 0.,
                  actor_adam_eps: float = 1e-7,
+                 gradient_accumulation_steps: int = 1,
                  critic_adam_eps: float = 1e-7,
                  critic_pooled_values=True,
                  actor_dropout: float = 0.,
@@ -81,6 +112,7 @@ class RLHFConfig(PretrainedConfig):
         self.minibatch_size = minibatch_size
         self.pad_value = pad_value
         self.model_name = model_name
+        self.gradient_accumulation_steps = gradient_accumulation_steps
         self.save_dir = save_dir
         self.sharding_array = jnp.ones((1, jax.devices(backend=backend))).reshape(sharding_array).shape
 
@@ -91,7 +123,6 @@ class RLHFConfig(PretrainedConfig):
 
     def get_meter_dict(self):
 
-        import torch
         return {f"hyperparameters/{k}": v for k, v in self.__dict__.items() if
                 isinstance(v, (int, float, str, bool, torch.Tensor))}
 
@@ -256,7 +287,6 @@ class RLHFConfig(PretrainedConfig):
                                      os.path.join(self.save_dir, self.model_name))
 
     def get_board(self):
-        import torch
         return torch.utils.tensorboard.SummaryWriter(
             log_dir=str(self.get_path()),
             comment=f'{self.model_name}',
@@ -264,26 +294,91 @@ class RLHFConfig(PretrainedConfig):
         )
 
 
-class RLHFTrainer(nn.Module):
-    config: RLHFConfig
-    dataset: Union[DatasetDict, Dataset, IterableDatasetDict, IterableDataset]
-    tokenizer: Callable
-    model: AVAILABLE_MODELS_FOR_RLHF
-    reward_model: RewardModel
-    critic_model: Optional[AVAILABLE_MODELS_FOR_RLHF] = None
-    actor_critic: Optional[ActorCritic] = None
+class RLHFTrainer:
 
-    def setup(self) -> None:
-        if self.actor_critic is None:
-            self.actor_critic = ActorCritic(
-                model=self.model,
-                critic_model=self.critic_model,
+    def __init__(self,
+                 config: RLHFConfig,
+                 dataset: Union[DatasetDict, Dataset, IterableDatasetDict, IterableDataset],
+                 tokenizer: Callable,
+                 model: AVAILABLE_MODELS_FOR_RLHF,
+                 reward_model: RewardModel,
+                 critic_model: Optional[AVAILABLE_MODELS_FOR_RLHF] = None,
+                 actor_critic: Optional[ActorCritic] = None
+                 ):
+        self.model = model
+
+        if actor_critic is None:
+            actor_critic = ActorCritic(
+                model=model,
+                critic_model=critic_model,
                 pooled_values=False,
-                dtype=self.config.dtype,
-                param_dtype=self.config.param_dtype,
-                precision=self.config.precision
+                dtype=config.dtype,
+                param_dtype=config.param_dtype,
+                precision=config.precision
 
             )
+        self.actor_critic = actor_critic
+        self.reward_model = reward_model
+        self.critic_model = critic_model
+
+        self.tokenizer = tokenizer
+        self.dataset = dataset
+        self.config = config
+
+        self.actor_optim, self.actor_scheduler = RLHFConfig.get_optimizer_and_scheduler(
+            learning_rate=config.actor_lr,
+            gradient_accumulation_steps=config.gradient_accumulation_steps,
+            steps=int(1e5) * 5,
+            scheduler=config.scheduler,
+            optimizer=config.optimizer,
+            learning_rate_end=config.actor_lr - 1e6
+        )
+
+        self.critic_optim, self.critic_scheduler = RLHFConfig.get_optimizer_and_scheduler(
+            learning_rate=config.critic_lr,
+            gradient_accumulation_steps=config.gradient_accumulation_steps,
+            steps=int(1e5) * 5,
+            scheduler=config.scheduler,
+            optimizer=config.optimizer,
+            learning_rate_end=config.critic_lr - 1e6
+        )
+
+    def learn(
+            self,
+            memory=typing.Deque[Memory]
+    ):
+        memories_stacked = ...
+        memory_dataloader = create_dataloader(
+            memories_stacked,
+            self.config.minibatch_size
+        )
+
+        for _ in range(
+                self.config.epochs
+        ):
+            for (
+                    input_ids,
+                    pm,
+                    attention_mask,
+                    old_action_probs,
+                    old_log_probs,
+                    rewards,
+                    old_values
+            ) in memory_dataloader:
+                action_masks = ~pm & attention_mask
+                action_logits, values = self.actor_critic(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask
+                )
+                action_logits = shift(action_logits, shift=1, axis=-2)
+                action_len = old_log_probs.shape[-1]
+                action_probs = jax.nn.softmax(action_logits, axis=-1)
+                action_log_probs = log_prob(action_probs, input_ids)
+                action_log_probs = action_log_probs[:, -action_len:]
+                entropies = masked_entropy(action_probs, attention_mask=action_masks)
+
+                kl_penalty = 0.
+                ...
 
     def __call__(self, *args, **kwargs):
         ...
