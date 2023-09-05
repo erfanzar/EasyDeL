@@ -10,15 +10,8 @@ from pathlib import Path
 import tqdm
 from jax import numpy as jnp
 from flax import linen as nn
-from EasyDel import FlaxMptForCausalLM, FlaxLlamaForCausalLM, MptConfig, LlamaConfig
+from .utils import AVAILABLE_MODELS_FOR_RLHF, AVAILABLE_MODELS_CONFIG_FOR_RLHF
 from fjutils import cross_entropy_loss_and_accuracy
-
-AVAILABLE_MODELS_FOR_RLHF = typing.Union[
-    FlaxLlamaForCausalLM, FlaxMptForCausalLM
-]
-AVAILABLE_MODELS_CONFIG_FOR_RLHF = typing.Union[
-    LlamaConfig, MptConfig
-]
 
 
 class RewardModel(nn.Module):
@@ -60,7 +53,6 @@ class RewardModel(nn.Module):
                  attention_mask: typing.Optional[typing.Union[jnp.ndarray, None]] = None,
                  prompt_mask: typing.Optional[typing.Union[jnp.ndarray, None]] = None,
                  prompt_length: typing.Optional[typing.Union[jnp.ndarray, None]] = None,
-                 labels: typing.Optional[typing.Union[jnp.ndarray, None]] = None,
                  sample: bool = False,
                  sample_temperature=1.,
                  **extra_model_inputs
@@ -118,7 +110,6 @@ class RewardModel(nn.Module):
         if not self.binned_output:
             pred = einops.rearrange(pred, '... 1 -> ...')
         if sample and self.binned_output:
-            assert labels is None
             pred = ((pred / max(sample_temperature, 1e-10)) + -jnp.log(-jnp.log(jnp.zeros_like(pred)))).argmax(-1)
 
         return pred
