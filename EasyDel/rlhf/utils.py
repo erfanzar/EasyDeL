@@ -4,6 +4,8 @@ from jax import lax, random
 from einops import rearrange
 from typing import Union, Optional, List
 
+from EasyDel import FlaxMptForCausalLM, FlaxLlamaForCausalLM, MptConfig, LlamaConfig
+
 
 # Converted from Pytorch To jax from LudicRrain Guy :)
 
@@ -104,3 +106,13 @@ def clipped_value_loss(values, rewards, old_values, clip):
     value_loss_1 = (value_clipped.flatten() - rewards) ** 2
     value_loss_2 = (values.flatten() - rewards) ** 2
     return jnp.mean(jnp.max(value_loss_1, value_loss_2))
+
+
+
+
+AVAILABLE_MODELS_FOR_RLHF = Union[
+    FlaxLlamaForCausalLM, FlaxMptForCausalLM
+]
+AVAILABLE_MODELS_CONFIG_FOR_RLHF = Union[
+    LlamaConfig, MptConfig
+]

@@ -49,7 +49,7 @@ class TrainArguments(
             do_eval: bool = False,
             do_test: Union[bool, None] = False,
             backend: Union[str, None] = None,
-            extra_optimizer_kwargs: dict = {},
+            extra_optimizer_kwargs: dict = None,
             save_steps: Union[int, None] = None,
             save_dir: str = 'easydel_ckpt',
             use_pjit_attention_force: bool = True,
@@ -59,18 +59,22 @@ class TrainArguments(
             use_wandb: bool = True,
             custom_rule=None,
             extra_configs=None,
-            ids_to_pop_from_dataset=[],
+            ids_to_pop_from_dataset: list = None,
             remove_ckpt_after_load: bool = False,
             configs_to_init_model_class=None,
             do_last_save: bool = True,
             model_parameters=None,
             do_shard_fns: bool = True,
             track_memory: bool = True,
-            loss_remat: str = 'nothing_saveable',
+            loss_remat: str = '',
             loss_chunk: int = 1024,
             **kwargs
     ):
         super().__init__()
+        if ids_to_pop_from_dataset is None:
+            ids_to_pop_from_dataset = []
+        if extra_optimizer_kwargs is None:
+            extra_optimizer_kwargs = {}
         assert model_class is not None or model_id is not None, 'you cant pass model_class and model_id both None ' \
                                                                 'you should at least pass one of them to build ' \
                                                                 'model with'

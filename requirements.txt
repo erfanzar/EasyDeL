@@ -1,7 +1,7 @@
 jax>=0.4.9
 flax~=0.7.1
 fjutils~=0.0.16
-numpy
+numpy~=1.25.2
 typing~=3.7.4.3
 transformers>=4.31.0
 einops~=0.6.1
@@ -12,7 +12,11 @@ tqdm==4.65.0
 datasets==2.14.3
 setuptools~=68.0.0
 torch>=2.0.1
-fastapi
-gradio
+fastapi~=0.103.0
+gradio~=3.41.2
 distrax
 rlax
+EasyDeL~=0.0.30
+wandb~=0.15.9
+uvicorn~=0.23.2
+pydantic~=2.3.0
