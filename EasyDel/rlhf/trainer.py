@@ -4,14 +4,21 @@ import pathlib
 import pprint
 import typing
 from typing import Union, Optional, Callable, List
-
+from fjutils import tracker
+import IPython
+import einops
+import fjutils
+import flax.training.train_state
 import jax
 import torch
+import tqdm.autonotebook
 import wandb
 from datasets import DatasetDict, Dataset, IterableDatasetDict, IterableDataset
 from fjutils import StreamingCheckpointer
 from fjutils import optimizers
 from jax import numpy as jnp
+from jax.sharding import PartitionSpec
+from jax.experimental import pjit
 from jax.experimental.mesh_utils import create_device_mesh
 from jax.sharding import Mesh
 from torch.utils.data.dataloader import DataLoader
@@ -19,7 +26,8 @@ from transformers import PretrainedConfig
 
 from .ppo import ActorCritic
 from .reward import RewardModel
-from .utils import AVAILABLE_MODELS_FOR_RLHF, shift, log_prob, masked_entropy
+from .utils import AVAILABLE_MODELS_FOR_RLHF, shift, log_prob, masked_entropy, masked_mean, masked_normalize, \
+    clipped_value_loss
 
 Memory = collections.namedtuple('Memory', [
     'logits',
@@ -85,8 +93,12 @@ class RLHFConfig(PretrainedConfig):
                  model_name: str = 'RLHF',
                  save_dir: str = 'easydel_ckpt',
                  backend: str = 'tpu',
+                 backend_offload: str = 'cpu',
+                 track_memory: bool = True,
                  **kwargs):
         super().__init__(**kwargs)
+        self.backend = backend
+        self.backend_offload = backend_offload
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision if not isinstance(precision, str) else jax.lax.Precision(precision)
@@ -306,7 +318,8 @@ class RLHFTrainer:
                  actor_critic: Optional[ActorCritic] = None
                  ):
         self.model = model
-
+        if config.track_memory:
+            tracker.initialise_tracking()
         if actor_critic is None:
             actor_critic = ActorCritic(
                 model=model,
@@ -345,28 +358,103 @@ class RLHFTrainer:
 
     def learn(
             self,
-            memory=typing.Deque[Memory]
+            memory: typing.Deque[Memory],
+            partition_rules: typing.Tuple[
+                typing.Tuple[
+                    str, jax.sharding.PartitionSpec
+                ]
+            ],
+            params_actor: flax.core.FrozenDict = None,
+            params_lm: flax.core.FrozenDict = None,
+
     ):
+        """
+        Memory Must be Deque of all prevision memories
+
+
+        params actor must be like FrozenDict{"params":...}
+        params_lm must be like FrozenDict{"params":...}
+        """
         memories_stacked = ...
         memory_dataloader = create_dataloader(
             memories_stacked,
             self.config.minibatch_size
         )
+        with jax.default_device(jax.devices(self.config.backend_offload)[0]):
+            if params_actor is None:
+                params_actor = self.actor_critic.init(
+                    {
+                        'params': jax.random.PRNGKey(
+                            0
+                        )
+                    },
+                    input_ids=jnp.ones((1, 1), dtype=jnp.int32),
+                    attention_mask=jnp.ones((1, 1), dtype=jnp.int32)
 
-        for _ in range(
-                self.config.epochs
+                )
+
+                params_actor = flax.traverse_util.unflatten_dict(
+                    params_actor
+                )['params']
+            else:
+                params_actor = flax.traverse_util.unflatten_dict(
+                    flax.core.unfreeze(params_actor)
+                )['params']
+
+            if params_lm is not None:
+                params_lm = flax.traverse_util.unflatten_dict(flax.core.unfreeze(params_lm)['params'])
+                lm_keys = [k for k in params_lm.keys()]
+                print(
+                    f'\033[1;31mLoadable Parameters from the Lm Params are {len(lm_keys)}'
+                )
+                for key, value in params_actor.items():
+                    if key in lm_keys:
+                        params_actor[key] = params_lm[value]
+
+            def create_train_state(
+                    params
+            ):
+                return flax.training.train_state.TrainState.create(
+                    params=params,
+                    apply_fn=self.actor_critic.apply,
+                    tx=self.actor_optim
+                )
+
+            shape = jax.eval_shape(create_train_state(params=params_actor))
+            partition_specs = fjutils.match_partition_rules(params=shape, rules=partition_rules)
+            shard_fns, _ = fjutils.make_shard_and_gather_fns(
+                partition_specs=partition_specs,
+                dtype_specs=self.config.dtype
+            )
+
+            sharded_create_train_state = pjit.pjit(
+                create_train_state,
+                in_shardings=PartitionSpec(),
+                out_shardings=(partition_specs,),
+                backend=self.config.backend
+            )
+
+        train_state = sharded_create_train_state(
+            params_actor
+        )
+
+        def forward(
+                train_state: flax.training.train_state.TrainState,
+                input_ids,
+                pm,
+                rewards,
+                old_values,
+                attention_mask,
+                old_action_probs,
+                old_log_probs,
         ):
-            for (
-                    input_ids,
-                    pm,
-                    attention_mask,
-                    old_action_probs,
-                    old_log_probs,
-                    rewards,
-                    old_values
-            ) in memory_dataloader:
+            def calculate_loss(params):
+                global rewards
+                global old_values
+
                 action_masks = ~pm & attention_mask
-                action_logits, values = self.actor_critic(
+                action_logits, values = train_state.apply_fn(
+                    params["params"],
                     input_ids=input_ids,
                     attention_mask=attention_mask
                 )
@@ -376,9 +464,81 @@ class RLHFTrainer:
                 action_log_probs = log_prob(action_probs, input_ids)
                 action_log_probs = action_log_probs[:, -action_len:]
                 entropies = masked_entropy(action_probs, attention_mask=action_masks)
+                kl_penalty = masked_mean(
+                    jnp.sum((old_action_probs * (jnp.log(old_action_probs) - jnp.log(action_probs))), axis=-1),
+                    attention_mask=attention_mask
+                ) * self.config.kl_div_loss_weight
 
-                kl_penalty = 0.
-                ...
+                rewards = rewards - kl_penalty
+                normalize_kwargs = dict()
+
+                if old_values.ndim == 2:
+                    old_values, values = map(lambda t: shift(t, shift=1, axis=-2), (old_values, values))
+
+                    old_values = old_values[:, -action_len:]
+                    values = values[:, -action_len:]
+                    rewards = einops.rearrange(rewards, 'b -> b 1')
+                    normalize_kwargs = dict(axis=-1, attention_mask=action_masks[:, -action_len:])
+
+                if values.ndim < rewards.ndim:
+                    values = einops.rearrange(values, '... -> ... 1')
+
+                ratios = (action_log_probs - old_log_probs).exp()
+                advantages = masked_normalize(rewards - old_values, **normalize_kwargs)
+
+                if advantages.ndim == 1:
+                    advantages = einops.rearrange(advantages, 'b -> b 1')
+
+                surr1 = ratios * advantages
+                surr2 = jnp.clip(ratios, 1 - self.config.eps_clip, 1 + self.config.eps_clip)
+                policy_loss = -jnp.minimum(surr1, surr2) - self.config.beta_s * entropies
+                loss = jnp.mean(policy_loss)
+
+                value_loss = jnp.mean(clipped_value_loss(values, rewards, old_values, self.config.value_clip))
+                return loss + value_loss
+
+            grad, loss = jax.grad(calculate_loss)(train_state.params)
+            train_state = train_state.apply_gradients(grads=grad)
+            return train_state, loss
+
+        pbar = tqdm.autonotebook.tqdm(
+            total=self.config.epochs * len(memory_dataloader)
+        )
+        if self.config.track_memory:
+            mem_res = tracker.get_mem()
+        else:
+            mem_res = 'Tracking Option is OFF'
+        for _ in range(
+                self.config.epochs
+        ):
+            for (
+                    input_ids_,
+                    pm_,
+                    attention_mask_,
+                    old_action_probs_,
+                    old_log_probs_,
+                    rewards_,
+                    old_values_
+            ) in memory_dataloader:
+                train_state, loss = forward(
+                    train_state=train_state,
+                    attention_mask=attention_mask_,
+                    input_ids=input_ids_,
+                    pm=pm_,
+                    rewards=rewards_,
+                    old_values=old_values_,
+                    old_log_probs=old_log_probs_,
+                    old_action_probs=old_action_probs_
+                )
+
+                pbar.set_postfix(
+                    loss=loss
+                )
+                if self.config.track_memory:
+                    IPython.display.clear_output(True)
+                    pbar.display(mem_res)
+                pbar.update(1)
+        return train_state
 
     def __call__(self, *args, **kwargs):
         ...
