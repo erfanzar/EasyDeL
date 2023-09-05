@@ -1,16 +1,22 @@
 import jax
 from jax import numpy as jnp
 import torch
-from transformers import FalconModel
+from tqdm import tqdm
 
 
 # CONVERTER Falcon-7B
-def falcon_convert_pt_to_flax_7b(state_dict_pt, n_layers: int, device=jax.devices('cpu')[0], bias=False):
+def falcon_convert_pt_to_flax_7b(
+        state_dict_pt, n_layers: int,
+        device=jax.devices('cpu')[0],
+        bias=False,
+        is_pb: bool = False
+):
     with jax.default_device(device):
-        state_dict_flax = {}
-        state_dict_flax[('transformer', 'wte', 'embedding')] = state_dict_pt[
-            'transformer.word_embeddings.weight'].cpu().detach().numpy()
-        for i in range(n_layers):
+        state_dict_flax = {('transformer', 'wte', 'embedding'): state_dict_pt[
+            'transformer.word_embeddings.weight'].cpu().detach().numpy()}
+        pbar = tqdm(iterable=range(n_layers))
+        for i in pbar:
+            pbar.set_description('Converting Layers')
             state_dict_flax[('transformer', 'h', f'{i}', 'input_layernorm', 'scale')] = state_dict_pt[
                 f'transformer.h.{i}.input_layernorm.weight'].cpu().detach().numpy()
             state_dict_flax[('transformer', 'h', f'{i}', 'input_layernorm', 'bias')] = state_dict_pt[
@@ -30,7 +36,11 @@ def falcon_convert_pt_to_flax_7b(state_dict_pt, n_layers: int, device=jax.device
                 state_dict_flax[('transformer', 'h', f'{i}', 'post_attention_layernorm', 'scale')] = state_dict_pt[
                     f'transformer.h.{i}.post_attention_layernorm.weight'].cpu().detach().numpy()
             except KeyError:
-                pass
+                if is_pb:
+                    raise KeyError(
+                        'tried to access some of model weight but they were unavailable please open a bug or '
+                        'check model config'
+                    )
             if bias:
                 state_dict_flax[
                     ('transformer', 'h', f'{i}', 'self_attention', 'w_qkv', 'bias')] = state_dict_pt[
@@ -45,7 +55,11 @@ def falcon_convert_pt_to_flax_7b(state_dict_pt, n_layers: int, device=jax.device
                     state_dict_flax[('transformer', 'h', f'{i}', 'post_attention_layernorm', 'bias')] = state_dict_pt[
                         f'transformer.h.{i}.post_attention_layernorm.bias'].cpu().detach().numpy()
                 except KeyError:
-                    pass
+                    if is_pb:
+                        raise KeyError(
+                            'tried to access some of model weight but they were unavailable please open a bug or '
+                            'check model config'
+                        )
         state_dict_flax[('transformer', 'ln_f', 'scale')] = state_dict_pt[
             f'transformer.ln_f.weight'].cpu().detach().numpy()
         state_dict_flax[('transformer', 'ln_f', 'bias')] = state_dict_pt[
@@ -62,7 +76,9 @@ def falcon_convert_flax_to_pt_7b(state_dict_flax, n_layers: int, device="cpu", b
     state_dict_pt['transformer.word_embeddings.weight'] = torch.from_numpy(
         state_dict_flax[('transformer', 'wte', 'embedding')]).to(device)
 
-    for i in range(n_layers):
+    pbar = tqdm(iterable=range(n_layers))
+    for i in pbar:
+        pbar.set_description('Converting Layers')
         state_dict_pt[f'transformer.h.{i}.input_layernorm.weight'] = torch.from_numpy(
             state_dict_flax[('transformer', 'h', f'{i}', 'input_layernorm', 'scale')]).to(device)
         state_dict_pt[f'transformer.h.{i}.input_layernorm.bias'] = torch.from_numpy(
