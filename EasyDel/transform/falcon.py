@@ -10,6 +10,7 @@ def falcon_from_pretrained(model_id, device=jax.devices('cpu')[0]):
     """
     return: Weight or Params for EasyDel Model , Config
     """
+    # Requested By vwxyzjn at https://github.com/erfanzar/EasyDeL/issues/15#issue-1881044170
     config = FalconConfig.from_pretrained(model_id)
     model = FalconForCausalLM.from_pretrained(model_id)
     easydel_wights = falcon_convert_pt_to_flax_7b(
