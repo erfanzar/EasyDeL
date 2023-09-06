@@ -53,29 +53,29 @@ def with_sharding_constraint(x, partition_specs):
 class FalconConfig(PretrainedConfig):
     model_type = "falcon"
     attribute_map = {
-        "num_hidden_layers": "n_layer",
-        "num_attention_heads": "n_head",
+        "num_hiddenum_hidden_layerss": "num_hidden_layers",
+        "num_attentionum_attention_headss": "num_attention_heads",
     }
 
     def __init__(
             self,
-            vocab_size=250880,
-            hidden_size=64,
-            n_layer=2,
-            n_head=8,
-            layer_norm_epsilon=1e-5,
-            initializer_range=0.02,
-            use_cache=True,
-            bos_token_id=1,
-            eos_token_id=2,
-            apply_residual_connection_post_layernorm=False,
-            hidden_dropout=0.0,
-            attention_dropout=0.0,
-            multi_query=False,
-            alibi=False,
-            bias=False,
-            parallel_attn=False,
-            max_seq_len=2048,
+            vocab_size: int = 250880,
+            hidden_size: int = 64,
+            num_hidden_layers: int = 2,
+            num_attention_heads: int = 8,
+            layer_norm_epsilon: float = 1e-5,
+            initializer_range: float = 0.02,
+            use_cache: bool = True,
+            bos_token_id: int = 1,
+            eos_token_id: int = 2,
+            apply_residual_connection_post_layernorm: bool = False,
+            hidden_dropout: float = 0.0,
+            attention_dropout: float = 0.0,
+            multi_query: bool = False,
+            alibi: bool = False,
+            bias: bool = False,
+            parallel_attn: bool = False,
+            max_seq_len: int = 2048,
             use_pjit_attention_force: bool = False,
             gradient_checkpointing: str = 'nothing_saveable',
             **kwargs,
@@ -83,8 +83,8 @@ class FalconConfig(PretrainedConfig):
         self.vocab_size = vocab_size
         n_embed = kwargs.pop("n_embed", None)
         self.hidden_size = hidden_size if n_embed is None else n_embed
-        self.n_layer = n_layer
-        self.n_head = n_head
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
         self.layer_norm_epsilon = layer_norm_epsilon
         self.initializer_range = initializer_range
         self.max_seq_len = max_seq_len
@@ -105,7 +105,7 @@ class FalconConfig(PretrainedConfig):
 
     @property
     def head_dim(self):
-        return self.hidden_size // self.n_head
+        return self.hidden_size // self.num_attention_heads
 
     @property
     def rotary(self):
@@ -122,8 +122,8 @@ class FalconConfig(PretrainedConfig):
             ('lm_head/kernel', PartitionSpec('dp', 'fsdp')),
             ('transformer/ln_f/bias', PartitionSpec('fsdp')),
             ('transformer/ln_f/scale', PartitionSpec('fsdp')),
-            ('transformer/post_attention_layernorm/scale', PartitionSpec('fsdp')),
-            ('transformer/post_attention_layernorm/bias', PartitionSpec('fsdp')),
+            ('transformer/post_attentionum_hidden_layersnorm/scale', PartitionSpec('fsdp')),
+            ('transformer/post_attentionum_hidden_layersnorm/bias', PartitionSpec('fsdp')),
             ('.*', PartitionSpec('dp'))
         ) if not fully_fsdp else (
             ('wte/embedding', PartitionSpec('fsdp')),
@@ -134,8 +134,8 @@ class FalconConfig(PretrainedConfig):
             ('lm_head/kernel', PartitionSpec('fsdp')),
             ('transformer/ln_f/bias', PartitionSpec('fsdp')),
             ('transformer/ln_f/scale', PartitionSpec('fsdp')),
-            ('transformer/post_attention_layernorm/scale', PartitionSpec('fsdp')),
-            ('transformer/post_attention_layernorm/bias', PartitionSpec('fsdp')),
+            ('transformer/post_attentionum_hidden_layersnorm/scale', PartitionSpec('fsdp')),
+            ('transformer/post_attentionum_hidden_layersnorm/bias', PartitionSpec('fsdp')),
             ('.*', PartitionSpec('fsdp'))
         )
 
@@ -143,25 +143,74 @@ class FalconConfig(PretrainedConfig):
     def get_mesh_names():
         return 'dp', 'fsdp', 'mp'
 
+    def add_jax_args(self,
+                     vocab_size: int = 250880,
+                     hidden_size: int = 64,
+                     num_hidden_layers: int = 2,
+                     num_attention_heads: int = 8,
+                     layer_norm_epsilon: float = 1e-5,
+                     initializer_range: float = 0.02,
+                     use_cache: bool = True,
+                     bos_token_id: int = 1,
+                     eos_token_id: int = 2,
+                     apply_residual_connection_post_layernorm: bool = False,
+                     hidden_dropout: float = 0.0,
+                     attention_dropout: float = 0.0,
+                     multi_query: bool = False,
+                     alibi: bool = False,
+                     bias: bool = False,
+                     parallel_attn: bool = False,
+                     max_seq_len: int = 2048,
+                     use_pjit_attention_force: bool = False,
+                     gradient_checkpointing: str = 'nothing_saveable',
+                     **kwargs,
+                     ):
+        basics = dict(
+            vocab_size=vocab_size,
+            hidden_size=hidden_size,
+            num_hidden_layers=num_hidden_layers,
+            num_attention_heads=num_attention_heads,
+            layer_norm_epsilon=layer_norm_epsilon,
+            initializer_range=initializer_range,
+            use_cache=use_cache,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            apply_residual_connection_post_layernorm=apply_residual_connection_post_layernorm,
+            hidden_dropout=hidden_dropout,
+            attention_dropout=attention_dropout,
+            multi_query=multi_query,
+            alibi=alibi,
+            bias=bias,
+            parallel_attn=parallel_attn,
+            max_seq_len=max_seq_len,
+            use_pjit_attention_force=use_pjit_attention_force,
+            gradient_checkpointing=gradient_checkpointing,
+            **kwargs
+        )
+        for k, v in basics.items():
+            if not hasattr(self, k):
+                setattr(self, k, v)
+        return self
 
-def built_bloom_alibi(attention_mask, num_attention_heads):
+
+def built_bloom_alibi(attention_mask, num_attentionum_attention_headss):
     b, s = attention_mask.shape
-    cp2 = 2 ** math.floor(math.log2(num_attention_heads))
+    cp2 = 2 ** math.floor(math.log2(num_attentionum_attention_headss))
     base = jnp.asarray(
         2 ** (- (2 ** -(math.log2(cp2) - 3))), dtype=jnp.float32
     )
     powers = jnp.arange(1, 1 + cp2, dtype=jnp.float32)
     slops = jnp.power(base, powers)
-    if cp2 != num_attention_heads:
+    if cp2 != num_attentionum_attention_headss:
         extra_base = jnp.asarray(
             2 ** (-(2 ** -(math.log2(2 * cp2) - 3))), dtype=jnp.float32
         )
-        num_rem_heads = min(cp2, num_attention_heads - cp2)
+        num_rem_heads = min(cp2, num_attentionum_attention_headss - cp2)
         extra_power = jnp.arange(1, 1 + 2 * num_rem_heads, 2, dtype=jnp.dtype)
         slops = jnp.concatenate([slops, jnp.power(extra_base, extra_power)], axis=0)
     arange_tensor = (((jnp.cumsum(attention_mask, axis=-1)) - 1) * attention_mask)[:, jnp.newaxis, :]
     alibi = slops[..., jnp.newaxis].astype(jnp.bfloat16) * arange_tensor
-    return alibi.reshape(b, num_attention_heads, 1, s)
+    return alibi.reshape(b, num_attentionum_attention_headss, 1, s)
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0,
@@ -204,7 +253,7 @@ class FlaxFalconAttention(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
-        head_dim = self.config.hidden_size // self.config.n_head
+        head_dim = self.config.hidden_size // self.config.num_attention_heads
         self.w_qkv = nn.Dense(
             features=3 * self.config.hidden_size if not self.config.multi_query else (
                     self.config.hidden_size + 2 * head_dim),
@@ -220,7 +269,7 @@ class FlaxFalconAttention(nn.Module):
             use_bias=self.config.bias
         )
         self.head_dim = head_dim
-        assert self.head_dim * self.config.n_head == self.config.hidden_size
+        assert self.head_dim * self.config.num_attention_heads == self.config.hidden_size
         if not self.config.alibi:
             self.freq = precompute_freqs_cis(head_dim, self.config.max_seq_len, dtype=self.dtype)
 
@@ -238,12 +287,12 @@ class FlaxFalconAttention(nn.Module):
                 q = with_sharding_constraint(q, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
                 k = with_sharding_constraint(k, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
                 v = with_sharding_constraint(v, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
-            k = rearrange(k, 'b s (h d) -> b s h d', h=self.config.n_head)
-            q = rearrange(q, 'b s (h d) -> b s h d', h=self.config.n_head)
-            v = rearrange(v, 'b s (h d) -> b s h d', h=self.config.n_head)
+            k = rearrange(k, 'b s (h d) -> b s h d', h=self.config.num_attention_heads)
+            q = rearrange(q, 'b s (h d) -> b s h d', h=self.config.num_attention_heads)
+            v = rearrange(v, 'b s (h d) -> b s h d', h=self.config.num_attention_heads)
         else:
             qkv = qkv.reshape(
-                b, s, self.config.n_head + 2, -1
+                b, s, self.config.num_attention_heads + 2, -1
             )
             q, k, v = qkv[..., :-2, :], qkv[..., [-2], :], qkv[..., [-1], :]
             if self.config.use_pjit_attention_force:
@@ -305,8 +354,8 @@ class FlaxFalconBlock(nn.Module):
         self.input_layernorm = nn.LayerNorm(epsilon=config.layer_norm_epsilon,
                                             dtype=self.dtype)
         if not config.parallel_attn:
-            self.post_attention_layernorm = nn.LayerNorm(epsilon=config.layer_norm_epsilon,
-                                                         dtype=self.dtype)
+            self.post_attentionum_hidden_layersnorm = nn.LayerNorm(epsilon=config.layer_norm_epsilon,
+                                                                   dtype=self.dtype)
 
         self.mlp = FlaxFalconMlp(
             config=config,
@@ -336,7 +385,7 @@ class FlaxFalconBlock(nn.Module):
         )
         if not self.config.parallel_attn:
             residual = attn + residual
-            hidden_states = self.post_attention_layernorm(residual)
+            hidden_states = self.post_attentionum_hidden_layersnorm(residual)
 
         mlp_out = self.mlp(hidden_states)
         if self.config.parallel_attn:
@@ -375,7 +424,7 @@ class FlaxFalconCollection(nn.Module):
                 name=str(i)
             )
             for i in range(
-                self.config.n_layer
+                self.config.num_hidden_layers
             )
         ]
 
@@ -431,7 +480,7 @@ class FlaxFalconModule(nn.Module):
             )
 
         alibi = built_bloom_alibi(attention_mask, self.config
-                                  .n_head).astype(hidden_states.dtype) if self.config.alibi else None
+                                  .num_attention_heads).astype(hidden_states.dtype) if self.config.alibi else None
         causal_mask = nn.make_causal_mask(
             input_ids,
         )
