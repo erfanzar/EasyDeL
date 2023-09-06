@@ -217,7 +217,10 @@ class CausalLMTrainer:
         def collate_fn(batch):
             rs = {}
             for key in batch[0].keys():
-                ssp = [jnp.array(f[key])[..., -self.arguments.max_length:] for f in batch]
+                if self.arguments.is_left_padded:
+                    ssp = [jnp.array(f[key])[..., -self.arguments.max_length:] for f in batch]
+                else:
+                    ssp = [jnp.array(f[key])[..., :self.arguments.max_length] for f in batch]
                 rs[key] = jnp.stack(ssp).reshape(-1, ssp[0].shape[-1])
             return rs
 

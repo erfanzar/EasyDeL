@@ -68,6 +68,7 @@ class TrainArguments(
             track_memory: bool = True,
             loss_remat: str = '',
             loss_chunk: int = 1024,
+            is_left_padded: bool = False,
             **kwargs
     ):
         super().__init__()
@@ -133,6 +134,7 @@ class TrainArguments(
         self.loss_chunk = loss_chunk
         self.loss_remat = loss_remat
 
+        self.is_left_padded = is_left_padded
         torch.set_default_device('cpu')
         self.__dict__.update(**kwargs)
 
