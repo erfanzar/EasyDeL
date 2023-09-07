@@ -112,6 +112,8 @@ class MptConfig(PretrainedConfig):
         self.use_flash_attention = use_flash_attention
         self.flash_attn_key_chunk_size = flash_attn_key_chunk_size
         self.flash_attn_query_chunk_size = flash_attn_query_chunk_size
+
+        self.from_pt = False
         if 'name' in kwargs:
             del kwargs['name']
         if 'loss_fn' in kwargs:
@@ -236,6 +238,8 @@ class MptConfig(PretrainedConfig):
         for k, v in basics.items():
             if not hasattr(self, k):
                 setattr(self, k, v)
+
+        self.from_pt = False
         return self
 
 

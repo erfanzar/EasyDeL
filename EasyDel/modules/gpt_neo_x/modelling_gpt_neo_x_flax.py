@@ -91,6 +91,7 @@ class GPTNeoXConfig(PretrainedConfig):
         self.tie_word_embeddings = tie_word_embeddings
         self.gradient_checkpointing = gradient_checkpointing
         self.use_parallel_residual = use_parallel_residual
+        self.from_pt = False
 
     @staticmethod
     def get_partition_rules(fully_fsdp: bool = False):
@@ -127,7 +128,9 @@ class GPTNeoXConfig(PretrainedConfig):
     @staticmethod
     def get_mesh_names():
         return 'dp', 'fsdp', 'mp'
-
+    def add_jax_args(self):
+        self.from_pt = False
+        ...
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0,
                          dtype: jnp.dtype = jnp.bfloat16) -> jnp.ndarray:

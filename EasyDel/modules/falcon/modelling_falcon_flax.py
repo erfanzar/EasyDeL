@@ -100,6 +100,7 @@ class FalconConfig(PretrainedConfig):
         self.bias = bias
         self.gradient_checkpointing = gradient_checkpointing
         self.parallel_attn = parallel_attn
+        self.from_pt = False
 
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
 
@@ -190,6 +191,8 @@ class FalconConfig(PretrainedConfig):
         for k, v in basics.items():
             if not hasattr(self, k):
                 setattr(self, k, v)
+
+        self.from_pt = False
         return self
 
 
