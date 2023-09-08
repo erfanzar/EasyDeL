@@ -543,7 +543,7 @@ class RLHFTrainer:
         )
 
         def forward(
-                train_state: flax.training.train_state.TrainState,
+                train_state: TrainStateActorAndCritic,
                 input_ids,
                 pm,
                 rewards,
@@ -557,7 +557,7 @@ class RLHFTrainer:
                 global old_values
 
                 action_masks = ~pm & attention_mask
-                action_logits, values = train_state.apply_fn(
+                action_logits, values = train_state.apply_fn_actor(
                     params["params"],
                     input_ids=input_ids,
                     attention_mask=attention_mask
@@ -595,15 +595,19 @@ class RLHFTrainer:
 
                 surr1 = ratios * advantages
                 surr2 = jnp.clip(ratios, 1 - self.config.eps_clip, 1 + self.config.eps_clip)
-                policy_loss = -jnp.minimum(surr1, surr2) - self.config.beta_s * entropies
-                loss = jnp.mean(policy_loss)
+                policy_loss = -jnp.minimum(surr1, surr2) - self.config.beta_s * entropies  # Policy Loss
+                loss = jnp.mean(policy_loss)  # Loss
 
-                value_loss = jnp.mean(clipped_value_loss(values, rewards, old_values, self.config.value_clip))
-                return loss + value_loss
+                value_loss = jnp.mean(
+                    clipped_value_loss(values, rewards, old_values, self.config.value_clip))  # VLoss
+                return loss, value_loss  # I need gradient for these two losses
 
-            grad, loss = jax.grad(calculate_loss)(train_state.params)
-            train_state = train_state.apply_gradients(grads=grad)
-            return train_state, loss
+            grad, (loss_, value_loss_) = jax.value_and_grad(calculate_loss)(train_state.actor_params)
+            train_state = train_state.apply_gradients(
+                grad_actor=grad,  # Based on Loss
+                grads_critic=...  # Based on Value Loss
+            )
+            return train_state, (loss_, value_loss_)
 
         pbar = tqdm.autonotebook.tqdm(
             total=self.config.epochs * len(memory_dataloader)
