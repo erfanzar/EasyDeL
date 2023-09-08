@@ -3,7 +3,9 @@ import os
 import pathlib
 import pprint
 import typing
-from typing import Union, Optional, Callable, List
+from typing import Union, Optional, Callable, List, Any
+
+import optax
 from fjutils import tracker
 import IPython
 import einops
@@ -16,6 +18,8 @@ import wandb
 from datasets import DatasetDict, Dataset, IterableDatasetDict, IterableDataset
 from fjutils import StreamingCheckpointer
 from fjutils import optimizers
+from flax import struct, core
+
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from jax.experimental import pjit
@@ -38,6 +42,77 @@ Memory = collections.namedtuple('Memory', [
     'reward',
     'value'
 ])
+
+
+class TrainStateActorAndCritic(struct.PyTreeNode):
+    step: int
+    apply_fn_critic: Callable = struct.field(pytree_node=False)
+    apply_fn_actor: Callable = struct.field(pytree_node=False)
+
+    actor_params: core.FrozenDict[str, Any] = struct.field(pytree_node=True)
+    critic_params: core.FrozenDict[str, Any] = struct.field(pytree_node=True)
+
+    actor_optim: optax.GradientTransformation = struct.field(pytree_node=False)
+    critic_optim: optax.GradientTransformation = struct.field(pytree_node=False)
+
+    actor_opt_state: optax.OptState = struct.field(pytree_node=True)
+    critic_opt_state: optax.OptState = struct.field(pytree_node=True)
+
+    def apply_gradients(self,
+                        *,
+                        grads_critic,
+                        grad_actor,
+                        **kwargs
+                        ):
+        updates_critic, new_state_critic = self.critic_optim.update(
+            grads_critic, self.critic_opt_state, self.critic_params)
+        critic_params = optax.apply_updates(self.critic_params, updates_critic)
+
+        updates_actor, new_state_actor = self.actor_optim.update(
+            grad_actor, self.actor_opt_state, self.actor_params
+        )
+        actor_params = optax.apply_updates(self.actor_params, updates_actor)
+
+        return self.replace(
+            critic_opt_state=new_state_critic,
+            actor_opt_state=new_state_actor,
+
+            critic_params=critic_params,
+            actor_params=actor_params,
+
+            step=self.step + 1,
+            **kwargs
+        )
+
+    @classmethod
+    def create(cls,
+               *,
+               apply_fn_critic,
+               apply_fn_actor,
+               actor_params,
+               critic_params,
+               actor_optim: optax.GradientTransformation,
+               critic_optim: optax.GradientTransformation,
+               **kwargs
+               ):
+        actor_opt_state = actor_optim.init(actor_params)
+        critic_opt_state = critic_optim.init(critic_params)
+        return cls(
+            step=0,
+
+            apply_fn_actor=apply_fn_actor,
+            apply_fn_critic=apply_fn_critic,
+
+            actor_params=actor_params,
+            critic_params=critic_params,
+
+            actor_optim=actor_optim,
+            critic_optim=critic_optim,
+
+            actor_opt_state=actor_opt_state,
+            critic_opt_state=critic_opt_state,
+            **kwargs,
+        )
 
 
 class ExperienceDataset(Dataset):
@@ -364,8 +439,9 @@ class RLHFTrainer:
                     str, jax.sharding.PartitionSpec
                 ]
             ],
-            params_actor: flax.core.FrozenDict = None,
-            params_lm: flax.core.FrozenDict = None,
+            params_actor: core.FrozenDict = None,
+            params_critic: core.FrozenDict = None,
+            params_lm: core.FrozenDict = None,
 
     ):
         """
@@ -401,26 +477,54 @@ class RLHFTrainer:
                     flax.core.unfreeze(params_actor)
                 )['params']
 
+            if params_critic is None:
+                params_critic = self.actor_critic.init(
+                    {
+                        'params': jax.random.PRNGKey(
+                            0
+                        )
+                    },
+                    input_ids=jnp.ones((1, 1), dtype=jnp.int32),
+                    attention_mask=jnp.ones((1, 1), dtype=jnp.int32)
+
+                )
+
+                params_critic = flax.traverse_util.unflatten_dict(
+                    params_critic
+                )['params']
+            else:
+                params_critic = flax.traverse_util.unflatten_dict(
+                    flax.core.unfreeze(params_actor)
+                )['params']
+
             if params_lm is not None:
                 params_lm = flax.traverse_util.unflatten_dict(flax.core.unfreeze(params_lm)['params'])
                 lm_keys = [k for k in params_lm.keys()]
+
                 print(
                     f'\033[1;31mLoadable Parameters from the Lm Params are {len(lm_keys)}'
                 )
                 for key, value in params_actor.items():
                     if key in lm_keys:
                         params_actor[key] = params_lm[value]
+                for key, value in params_critic.items():
+                    if key in lm_keys:
+                        params_critic[key] = params_lm[value]
 
             def create_train_state(
-                    params
+                    params_actor,
+                    params_critic
             ):
-                return flax.training.train_state.TrainState.create(
-                    params=params,
-                    apply_fn=self.actor_critic.apply,
-                    tx=self.actor_optim
+                return TrainStateActorAndCritic.create(
+                    actor_params=params_actor,
+                    critic_params=params_critic,
+                    actor_optim=self.actor_optim,
+                    critic_optim=self.critic_optim,
+                    apply_fn_critic=self.critic_model.apply,
+                    apply_fn_actor=self.actor_critic.apply
                 )
 
-            shape = jax.eval_shape(create_train_state(params=params_actor))
+            shape = jax.eval_shape(create_train_state(params_actor=params_actor, params_critic=params_critic))
             partition_specs = fjutils.match_partition_rules(params=shape, rules=partition_rules)
             shard_fns, _ = fjutils.make_shard_and_gather_fns(
                 partition_specs=partition_specs,
@@ -429,13 +533,13 @@ class RLHFTrainer:
 
             sharded_create_train_state = pjit.pjit(
                 create_train_state,
-                in_shardings=PartitionSpec(),
+                in_shardings=(PartitionSpec(), PartitionSpec()),
                 out_shardings=(partition_specs,),
                 backend=self.config.backend
             )
 
         train_state = sharded_create_train_state(
-            params_actor
+            params_actor, params_critic
         )
 
         def forward(
