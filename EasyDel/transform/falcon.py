@@ -15,7 +15,7 @@ def falcon_from_pretrained(model_id, device=jax.devices('cpu')[0]):
     model = FalconForCausalLM.from_pretrained(model_id)
     easydel_wights = falcon_convert_pt_to_flax_7b(
         state_dict=model.state_dict(),
-        num_hidden_layers=config.num_hiddenum_hidden_layers,
+        num_hidden_layers=config.num_hidden_layers,
         device=device
     )
     config.add_jax_args()
