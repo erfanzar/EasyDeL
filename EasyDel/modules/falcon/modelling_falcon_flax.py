@@ -61,8 +61,10 @@ class FalconConfig(PretrainedConfig):
             self,
             vocab_size: int = 250880,
             hidden_size: int = 64,
-            num_hidden_layers: int = 2,
-            num_attention_heads: int = 8,
+            num_hidden_layers: int = 32,
+            num_attention_heads: int = 71,
+            n_layers:int=32,
+            n_heads:int=71,
             layer_norm_epsilon: float = 1e-5,
             initializer_range: float = 0.02,
             use_cache: bool = True,
@@ -83,6 +85,8 @@ class FalconConfig(PretrainedConfig):
         self.vocab_size = vocab_size
         n_embed = kwargs.pop("n_embed", None)
         self.hidden_size = hidden_size if n_embed is None else n_embed
+        self.n_heads = n_heads
+        self.n_layers = n_layers
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
         self.layer_norm_epsilon = layer_norm_epsilon
