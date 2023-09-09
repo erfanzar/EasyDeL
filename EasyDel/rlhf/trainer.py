@@ -45,13 +45,15 @@ Memory = collections.namedtuple('Memory', [
 ])
 
 
-class TrainStateActorAndCritic(struct.PyTreeNode):
+class TrainStateRLHF(struct.PyTreeNode):
     step: int
     apply_fn_critic: Callable = struct.field(pytree_node=False)
+    apply_fn_reward: Callable = struct.field(pytree_node=False)
     apply_fn_actor: Callable = struct.field(pytree_node=False)
 
     actor_params: core.FrozenDict[str, Any] = struct.field(pytree_node=True)
     critic_params: core.FrozenDict[str, Any] = struct.field(pytree_node=True)
+    reward_params: core.FrozenDict[str, Any] = struct.field(pytree_node=True)
 
     actor_optim: optax.GradientTransformation = struct.field(pytree_node=False)
     critic_optim: optax.GradientTransformation = struct.field(pytree_node=False)
@@ -89,9 +91,11 @@ class TrainStateActorAndCritic(struct.PyTreeNode):
     def create(cls,
                *,
                apply_fn_critic,
+               apply_fn_reward,
                apply_fn_actor,
                actor_params,
                critic_params,
+               reward_params,
                actor_optim: optax.GradientTransformation,
                critic_optim: optax.GradientTransformation,
                **kwargs
@@ -103,9 +107,11 @@ class TrainStateActorAndCritic(struct.PyTreeNode):
 
             apply_fn_actor=apply_fn_actor,
             apply_fn_critic=apply_fn_critic,
+            apply_fn_reward=apply_fn_reward,
 
             actor_params=actor_params,
             critic_params=critic_params,
+            reward_params=reward_params,
 
             actor_optim=actor_optim,
             critic_optim=critic_optim,
@@ -436,7 +442,8 @@ class RLHFTrainer:
             self,
             params_lm: core.FrozenDict = None,
             params_actor: core.FrozenDict = None,
-            params_critic: core.FrozenDict = None
+            params_critic: core.FrozenDict = None,
+            params_reward: core.FrozenDict = None
     ):
         with ((jax.default_device(jax.devices(self.config.backend_offload)[0]))):
 
@@ -460,6 +467,26 @@ class RLHFTrainer:
                     flax.core.unfreeze(params_actor)
                 )['params']
 
+            if params_reward is None:
+                params_reward = self.reward_model.init(
+                    {
+                        'params': jax.random.PRNGKey(
+                            0
+                        )
+                    },
+                    input_ids=jnp.ones((1, 1), dtype=jnp.int32),
+                    attention_mask=jnp.ones((1, 1), dtype=jnp.int32)
+
+                )
+
+                params_reward = flax.traverse_util.unflatten_dict(
+                    params_reward
+                )['params']
+            else:
+                params_reward = flax.traverse_util.unflatten_dict(
+                    flax.core.unfreeze(params_reward)
+                )['params']
+
             if params_critic is None:
                 params_critic = self.actor_critic.init(
                     {
@@ -487,31 +514,83 @@ class RLHFTrainer:
                 print(
                     f'\033[1;31mLoadable Parameters from the Lm Params are {len(lm_keys)}'
                 )
-                for key, value in params_actor.items():
+                for key, _ in params_actor.items():
                     if key in lm_keys:
-                        params_actor[key] = params_lm[value]
-                for key, value in params_critic.items():
+                        params_actor[key] = params_lm[key]
+                for key, _ in params_critic.items():
                     if key in lm_keys:
-                        params_critic[key] = params_lm[value]
+                        params_critic[key] = params_lm[key]
+                for key, _ in params_reward.items():
+                    if key in lm_keys:
+                        params_reward[key] = params_lm[key]
 
             return (
                 params_lm,
                 params_actor,
-                params_critic
+                params_critic,
+                params_reward
             )
+
+    def configure_funcs(
+            self,
+            partition_rules,
+            params_lm: core.FrozenDict = None,
+            params_actor: core.FrozenDict = None,
+            params_critic: core.FrozenDict = None,
+            params_reward: core.FrozenDict = None
+    ):
+
+        params_lm, params_actor, params_critic, params_reward = self.init_params(
+            params_lm=params_lm,
+            params_actor=params_actor,
+            params_critic=params_critic,
+            params_reward=params_reward
+        )
+
+        def create_train_state(
+                params_actor_,
+                params_critic_,
+                params_reward_
+        ) -> Union[Any, TrainStateRLHF]:
+            return TrainStateRLHF.create(
+                actor_params=params_actor_,
+                critic_params=params_critic_,
+                reward_params=params_reward_,
+                actor_optim=self.actor_optim,
+                critic_optim=self.critic_optim,
+                apply_fn_critic=self.critic_model.apply,
+                apply_fn_actor=self.actor_critic.apply,
+                apply_fn_reward=self.reward_model.apply
+            )
+
+        shape = jax.eval_shape(
+            create_train_state(
+                params_actor_=params_actor,
+                params_critic_=params_critic,
+                params_reward_=params_reward
+            )
+        )
+        partition_specs = fjutils.match_partition_rules(params=shape, rules=partition_rules)
+        shard_fns, _ = fjutils.make_shard_and_gather_fns(
+            partition_specs=partition_specs,
+            dtype_specs=self.config.dtype
+        )
+
+        sharded_create_train_state = pjit.pjit(
+            create_train_state,
+            in_shardings=(PartitionSpec(), PartitionSpec(), PartitionSpec()),
+            out_shardings=(partition_specs,),
+            backend=self.config.backend
+        )
+
+        return sharded_create_train_state(
+            params_actor, params_critic, params_reward
+        )
 
     def learn(
             self,
             memory: typing.Deque[Memory],
-            partition_rules: typing.Tuple[
-                typing.Tuple[
-                    str, jax.sharding.PartitionSpec
-                ]
-            ],
-            params_actor: core.FrozenDict = None,
-            params_critic: core.FrozenDict = None,
-            params_lm: core.FrozenDict = None,
-
+            train_state: TrainStateRLHF,
     ):
         """
         Memory Must be Deque of all prevision memories
@@ -524,94 +603,9 @@ class RLHFTrainer:
             memory,
             self.config.minibatch_size
         )
-        with jax.default_device(jax.devices(self.config.backend_offload)[0]):
-            if params_actor is None:
-                params_actor = self.actor_critic.init(
-                    {
-                        'params': jax.random.PRNGKey(
-                            0
-                        )
-                    },
-                    input_ids=jnp.ones((1, 1), dtype=jnp.int32),
-                    attention_mask=jnp.ones((1, 1), dtype=jnp.int32)
-
-                )
-
-                params_actor = flax.traverse_util.unflatten_dict(
-                    params_actor
-                )['params']
-            else:
-                params_actor = flax.traverse_util.unflatten_dict(
-                    flax.core.unfreeze(params_actor)
-                )['params']
-
-            if params_critic is None:
-                params_critic = self.actor_critic.init(
-                    {
-                        'params': jax.random.PRNGKey(
-                            0
-                        )
-                    },
-                    input_ids=jnp.ones((1, 1), dtype=jnp.int32),
-                    attention_mask=jnp.ones((1, 1), dtype=jnp.int32)
-
-                )
-
-                params_critic = flax.traverse_util.unflatten_dict(
-                    params_critic
-                )['params']
-            else:
-                params_critic = flax.traverse_util.unflatten_dict(
-                    flax.core.unfreeze(params_actor)
-                )['params']
-
-            if params_lm is not None:
-                params_lm = flax.traverse_util.unflatten_dict(flax.core.unfreeze(params_lm)['params'])
-                lm_keys = [k for k in params_lm.keys()]
-
-                print(
-                    f'\033[1;31mLoadable Parameters from the Lm Params are {len(lm_keys)}'
-                )
-                for key, value in params_actor.items():
-                    if key in lm_keys:
-                        params_actor[key] = params_lm[value]
-                for key, value in params_critic.items():
-                    if key in lm_keys:
-                        params_critic[key] = params_lm[value]
-
-            def create_train_state(
-                    params_actor,
-                    params_critic
-            ):
-                return TrainStateActorAndCritic.create(
-                    actor_params=params_actor,
-                    critic_params=params_critic,
-                    actor_optim=self.actor_optim,
-                    critic_optim=self.critic_optim,
-                    apply_fn_critic=self.critic_model.apply,
-                    apply_fn_actor=self.actor_critic.apply
-                )
-
-            shape = jax.eval_shape(create_train_state(params_actor=params_actor, params_critic=params_critic))
-            partition_specs = fjutils.match_partition_rules(params=shape, rules=partition_rules)
-            shard_fns, _ = fjutils.make_shard_and_gather_fns(
-                partition_specs=partition_specs,
-                dtype_specs=self.config.dtype
-            )
-
-            sharded_create_train_state = pjit.pjit(
-                create_train_state,
-                in_shardings=(PartitionSpec(), PartitionSpec()),
-                out_shardings=(partition_specs,),
-                backend=self.config.backend
-            )
-
-        train_state = sharded_create_train_state(
-            params_actor, params_critic
-        )
 
         def forward(
-                train_state: TrainStateActorAndCritic,
+                train_state: TrainStateRLHF,
                 input_ids,
                 pm,
                 rewards,
@@ -720,6 +714,7 @@ class RLHFTrainer:
             self,
             params_actor: core.FrozenDict,
             params_critic: core.FrozenDict,
+            params_reward: core.FrozenDict,
             params_lm: core.FrozenDict,
             num_episodes=50000,
             max_time_steps=500,
@@ -732,6 +727,7 @@ class RLHFTrainer:
         time = 0
         memories = collections.deque([])
         max_train_eps = self.dataset['train'].num_rows
+        assert max_train_eps > max_batch_sizegit
 
         def get_rand():
             return int(random.random() * max_train_eps)
@@ -741,8 +737,9 @@ class RLHFTrainer:
             for time_step in range(max_time_steps):
                 time += 1
                 index = get_rand()
-                input_ids = self.dataset['train'][index]['input_ids']
-                attention_mask = self.dataset['train'][index]['attention_mask']
+                index = index - max_batch_size if index > max_batch_size else index
+                input_ids = self.dataset['train'][index:index + max_batch_size]['input_ids']
+                attention_mask = self.dataset['train'][index:index + max_batch_size]['attention_mask']
                 action, sequence, attention_mas, prompt_mask, action_logits, value = self.actor_critic.generate(
                     params=params_actor,
                     input_ids=einops.rearrange(
@@ -771,7 +768,8 @@ class RLHFTrainer:
                 sequence = einops.rearrange(sequence, 'n -> 1 n')
                 prompt_mask = einops.rearrange(prompt_mask, 'n -> 1 n')
 
-                reward = self.reward_model(
+                reward = self.reward_model.apply(
+                    params_reward,
                     sequence,
                     prompt_mask=prompt_mask,
                     attention_mask=attention_mask,
