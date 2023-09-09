@@ -2,6 +2,7 @@ import collections
 import os
 import pathlib
 import pprint
+import random
 import typing
 from typing import Union, Optional, Callable, List, Any
 
@@ -431,6 +432,74 @@ class RLHFTrainer:
             learning_rate_end=config.critic_lr - 1e6
         )
 
+    def init_params(
+            self,
+            params_lm: core.FrozenDict = None,
+            params_actor: core.FrozenDict = None,
+            params_critic: core.FrozenDict = None
+    ):
+        with ((jax.default_device(jax.devices(self.config.backend_offload)[0]))):
+
+            if params_actor is None:
+                params_actor = self.actor_critic.init(
+                    {
+                        'params': jax.random.PRNGKey(
+                            0
+                        )
+                    },
+                    input_ids=jnp.ones((1, 1), dtype=jnp.int32),
+                    attention_mask=jnp.ones((1, 1), dtype=jnp.int32)
+
+                )
+
+                params_actor = flax.traverse_util.unflatten_dict(
+                    params_actor
+                )['params']
+            else:
+                params_actor = flax.traverse_util.unflatten_dict(
+                    flax.core.unfreeze(params_actor)
+                )['params']
+
+            if params_critic is None:
+                params_critic = self.actor_critic.init(
+                    {
+                        'params': jax.random.PRNGKey(
+                            0
+                        )
+                    },
+                    input_ids=jnp.ones((1, 1), dtype=jnp.int32),
+                    attention_mask=jnp.ones((1, 1), dtype=jnp.int32)
+
+                )
+
+                params_critic = flax.traverse_util.unflatten_dict(
+                    params_critic
+                )['params']
+            else:
+                params_critic = flax.traverse_util.unflatten_dict(
+                    flax.core.unfreeze(params_actor)
+                )['params']
+
+            if params_lm is not None:
+                params_lm = flax.traverse_util.unflatten_dict(flax.core.unfreeze(params_lm)['params'])
+                lm_keys = [k for k in params_lm.keys()]
+
+                print(
+                    f'\033[1;31mLoadable Parameters from the Lm Params are {len(lm_keys)}'
+                )
+                for key, value in params_actor.items():
+                    if key in lm_keys:
+                        params_actor[key] = params_lm[value]
+                for key, value in params_critic.items():
+                    if key in lm_keys:
+                        params_critic[key] = params_lm[value]
+
+            return (
+                params_lm,
+                params_actor,
+                params_critic
+            )
+
     def learn(
             self,
             memory: typing.Deque[Memory],
@@ -451,9 +520,8 @@ class RLHFTrainer:
         params actor must be like FrozenDict{"params":...}
         params_lm must be like FrozenDict{"params":...}
         """
-        memories_stacked = ...
         memory_dataloader = create_dataloader(
-            memories_stacked,
+            memory,
             self.config.minibatch_size
         )
         with jax.default_device(jax.devices(self.config.backend_offload)[0]):
@@ -605,7 +673,7 @@ class RLHFTrainer:
             grad, (loss_, value_loss_) = jax.value_and_grad(calculate_loss)(train_state.actor_params)
             train_state = train_state.apply_gradients(
                 grad_actor=grad,  # Based on Loss
-                grads_critic=...  # Based on Value Loss
+                grads_critic=jax.grad(lambda p: value_loss_)(train_state.critic_params)  # Based on Value Loss
             )
             return train_state, (loss_, value_loss_)
 
@@ -648,5 +716,84 @@ class RLHFTrainer:
                 pbar.update(1)
         return train_state
 
-    def __call__(self, *args, **kwargs):
-        ...
+    def train(
+            self,
+            params_actor: core.FrozenDict,
+            params_critic: core.FrozenDict,
+            params_lm: core.FrozenDict,
+            num_episodes=50000,
+            max_time_steps=500,
+            update_time_steps=5000,
+            max_batch_size=16,
+            max_sequence_length=2048,
+            eos_token=None,
+            temperature=1.,
+    ):
+        time = 0
+        memories = collections.deque([])
+        max_train_eps = self.dataset['train'].num_rows
+
+        def get_rand():
+            return int(random.random() * max_train_eps)
+
+        pbar = tqdm.tqdm(iterable=range(num_episodes), desc='Episode')
+        for episode in pbar:
+            for time_step in range(max_time_steps):
+                time += 1
+                index = get_rand()
+                input_ids = self.dataset['train'][index]['input_ids']
+                attention_mask = self.dataset['train'][index]['attention_mask']
+                action, sequence, attention_mas, prompt_mask, action_logits, value = self.actor_critic.generate(
+                    params=params_actor,
+                    input_ids=einops.rearrange(
+                        input_ids, 'n -> 1 n'
+                    ),
+                    max_sequence_length=max_sequence_length,
+                    eos_token=eos_token,
+                    temperature=temperature,
+                    return_values=True
+
+                )
+                action_logits = shift(action_logits, shift=1, axis=-2)
+                action_probs = jax.nn.softmax(action_logits, axis=-1)
+                action_len = action.shape[-1]
+                action_log_prob = log_prob(action_probs, sequence)
+                action_log_prob = action_log_prob[:, -action_len:]
+                action = einops.rearrange(action, '1 ... -> ...')
+                sequence = jnp.concatenate(
+                    (
+                        input_ids, action
+                    ), axis=0
+                )
+                prompt_length = len(input_ids)
+                prompt_mask = jnp.arange(sequence.shape[-1]) < prompt_length
+
+                sequence = einops.rearrange(sequence, 'n -> 1 n')
+                prompt_mask = einops.rearrange(prompt_mask, 'n -> 1 n')
+
+                reward = self.reward_model(
+                    sequence,
+                    prompt_mask=prompt_mask,
+                    attention_mask=attention_mask,
+                    sample=True
+                )
+
+                rearrange_ = lambda t: einops.rearrange(t, '1 ... -> ...')
+
+                # store memory for learning
+
+                memories.append(Memory(*map(rearrange_, (
+                    sequence,
+                    prompt_mask,
+                    attention_mask,
+                    action_probs,
+                    action_log_prob,
+                    reward,
+                    value
+                ))))
+
+                # learn from the stored memories
+
+                if time % update_time_steps == 0:
+                    self.learn(memories)
+                    memories.clear()
