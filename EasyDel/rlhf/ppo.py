@@ -14,8 +14,7 @@ import collections
 from einops import rearrange, repeat, reduce
 from typing import Union, Optional, OrderedDict, NamedTuple, Callable, Any
 
-from EasyDel import FlaxMptForCausalLM, FlaxLlamaForCausalLM, MptConfig, LlamaConfig
-from .utils import log, log_prob, shift, masked_mean, AVAILABLE_MODELS_FOR_RLHF, AVAILABLE_MODELS_CONFIG_FOR_RLHF
+from .utils import log, log_prob, shift, masked_mean, AVAILABLE_MODELS_FOR_RLHF
 
 
 class PPOActionCriticReturn(NamedTuple):
