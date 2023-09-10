@@ -90,27 +90,27 @@ class GPTJConfig(PretrainedConfig):
 
     def __init__(
             self,
-            vocab_size=50400,
-            n_positions=2048,
-            n_embd=4096,
-            n_layer=28,
-            n_head=16,
-            rotary_dim=64,
-            n_inner=None,
-            activation_function="gelu_new",
-            resid_pdrop=0.0,
-            embd_pdrop=0.0,
-            attn_pdrop=0.0,
-            layer_norm_epsilon=1e-5,
-            initializer_range=0.02,
-            use_cache=True,
-            bos_token_id=50256,
-            eos_token_id=50256,
-            tie_word_embeddings=False,
+            vocab_size: int = 50400,
+            n_positions: int = 2048,
+            n_embd: int = 4096,
+            n_layer: int = 28,
+            n_head: int = 16,
+            rotary_dim: int = 64,
+            n_inner: int = None,
+            activation_function: str = "gelu_new",
+            resid_pdrop: float = 0.0,
+            embd_pdrop: float = 0.0,
+            attn_pdrop: float = 0.0,
+            layer_norm_epsilon: float = 1e-5,
+            initializer_range: int = 0.02,
+            use_cache: int = True,
+            bos_token_id: int = 50256,
+            eos_token_id: int = 50256,
+            tie_word_embeddings: bool = False,
             use_pjit_attention_force: bool = False,
             use_flash_attention: bool = False,
-            flash_attn_query_chunk_size=1024,
-            flash_attn_key_chunk_size=2048,
+            flash_attn_query_chunk_size: int = 1024,
+            flash_attn_key_chunk_size: int = 2048,
             **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -133,7 +133,7 @@ class GPTJConfig(PretrainedConfig):
         self.flash_attn_query_chunk_size = flash_attn_query_chunk_size
         self.flash_attn_key_chunk_size = flash_attn_key_chunk_size
         self.use_flash_attention = use_flash_attention
-
+        self.from_pt = False
         super().__init__(
             bos_token_id=bos_token_id, eos_token_id=eos_token_id, tie_word_embeddings=tie_word_embeddings, **kwargs
         )
@@ -205,6 +205,60 @@ class GPTJConfig(PretrainedConfig):
     @staticmethod
     def get_mesh_names():
         return ('dp', 'fsdp', 'mp')
+
+    def add_jax_args(
+            self,
+            vocab_size: int = 50400,
+            n_positions: int = 2048,
+            n_embd: int = 4096,
+            n_layer: int = 28,
+            n_head: int = 16,
+            rotary_dim: int = 64,
+            n_inner: int = None,
+            activation_function: str = "gelu_new",
+            resid_pdrop: float = 0.0,
+            embd_pdrop: float = 0.0,
+            attn_pdrop: float = 0.0,
+            layer_norm_epsilon: float = 1e-5,
+            initializer_range: int = 0.02,
+            use_cache: int = True,
+            bos_token_id: int = 50256,
+            eos_token_id: int = 50256,
+            tie_word_embeddings: bool = False,
+            use_pjit_attention_force: bool = False,
+            use_flash_attention: bool = False,
+            flash_attn_query_chunk_size: int = 1024,
+            flash_attn_key_chunk_size: int = 2048,
+    ):
+        basics = dict(
+            vocab_size=vocab_size,
+            n_positions=n_positions,
+            n_embd=n_embd,
+            n_layer=n_layer,
+            n_head=n_head,
+            rotary_dim=rotary_dim,
+            n_inner=n_inner,
+            activation_function=activation_function,
+            resid_pdrop=resid_pdrop,
+            embd_pdrop=embd_pdrop,
+            attn_pdrop=attn_pdrop,
+            layer_norm_epsilon=layer_norm_epsilon,
+            initializer_range=initializer_range,
+            use_cache=use_cache,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            tie_word_embeddings=tie_word_embeddings,
+            use_pjit_attention_force=use_pjit_attention_force,
+            use_flash_attention=use_flash_attention,
+            flash_attn_query_chunk_size=flash_attn_query_chunk_size,
+            flash_attn_key_chunk_size=flash_attn_key_chunk_size,
+        )
+
+        for k, v in basics.items():
+            if not hasattr(self, k):
+                setattr(self, k, v)
+        self.from_pt = False
+        return self
 
 
 class GPTJOnnxConfig(OnnxConfigWithPast):

@@ -2,16 +2,13 @@ import math
 import typing
 
 import einops
-import flax.core
+
 import jax
 from jax import lax
-from flax import struct
-from pathlib import Path
-import tqdm
+
 from jax import numpy as jnp
 from flax import linen as nn
 from .utils import AVAILABLE_MODELS_FOR_RLHF, AVAILABLE_MODELS_CONFIG_FOR_RLHF
-from fjutils import cross_entropy_loss_and_accuracy
 
 
 class RewardModel(nn.Module):

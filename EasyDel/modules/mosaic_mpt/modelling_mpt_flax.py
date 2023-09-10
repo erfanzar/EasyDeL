@@ -58,20 +58,34 @@ def with_sharding_constraint(x, partition_specs):
 class MptConfig(PretrainedConfig):
     model_type = 'mpt'
 
-    def __init__(self, d_model: int = 2048, n_heads: int = 16, n_layers: int = 24, expansion_ratio: int = 4,
-                 max_seq_len: int = 2048, vocab_size: int = 50368, resid_prob_drop: float = 0.0,
+    def __init__(self,
+                 d_model: int = 2048,
+                 n_heads: int = 16,
+                 n_layers: int = 24,
+                 expansion_ratio: int = 4,
+                 max_seq_len: int = 2048,
+                 vocab_size: int = 50368,
+                 resid_prob_drop: float = 0.0,
                  emb_prob_drop: float = 0.0,
-                 alibi: bool = True, use_bias: bool = True,
-                 learned_pos_emb: bool = True, act_fn: str = 'gelu',
-                 logit_scale: Optional[Union[float, str]] = None, no_bias: bool = False, verbose: int = 0,
-                 embedding_fraction: float = 1.0, use_cache: bool = False, qk_ln: bool = True,
+                 alibi: bool = True,
+                 use_bias: bool = True,
+                 learned_pos_emb: bool = True,
+                 act_fn: str = 'gelu',
+                 logit_scale: Optional[Union[float, str]] = None,
+                 no_bias: bool = False,
+                 verbose: int = 0,
+                 embedding_fraction: float = 1.0,
+                 use_cache: bool = False,
+                 qk_ln: bool = True,
                  use_lm_head: bool = False,
-                 use_norm_bias: bool = False, gradient_checkpointing: str = 'nothing_saveable',
+                 use_norm_bias: bool = False,
+                 gradient_checkpointing: str = 'nothing_saveable',
                  use_pjit_attention_force: bool = False,
                  use_flash_attention: bool = False,
-                 flash_attn_query_chunk_size=1024,
-                 flash_attn_key_chunk_size=2048,
-                 **kwargs):
+                 flash_attn_query_chunk_size: int = 1024,
+                 flash_attn_key_chunk_size: int = 2048,
+                 **kwargs
+                 ):
 
         self.d_model = d_model
         self.use_norm_bias = use_norm_bias
@@ -98,6 +112,8 @@ class MptConfig(PretrainedConfig):
         self.use_flash_attention = use_flash_attention
         self.flash_attn_key_chunk_size = flash_attn_key_chunk_size
         self.flash_attn_query_chunk_size = flash_attn_query_chunk_size
+
+        self.from_pt = False
         if 'name' in kwargs:
             del kwargs['name']
         if 'loss_fn' in kwargs:
@@ -162,6 +178,69 @@ class MptConfig(PretrainedConfig):
             ("lm_head/bias", PartitionSpec("fsdp")),
             ('.*', PartitionSpec(None)),
         )
+
+    def add_jax_args(self,
+                     d_model: int = 2048,
+                     n_heads: int = 16,
+                     n_layers: int = 24,
+                     expansion_ratio: int = 4,
+                     max_seq_len: int = 2048,
+                     vocab_size: int = 50368,
+                     resid_prob_drop: float = 0.0,
+                     emb_prob_drop: float = 0.0,
+                     alibi: bool = True,
+                     use_bias: bool = True,
+                     learned_pos_emb: bool = True,
+                     act_fn: str = 'gelu',
+                     logit_scale: Optional[Union[float, str]] = None,
+                     no_bias: bool = False,
+                     verbose: int = 0,
+                     embedding_fraction: float = 1.0,
+                     use_cache: bool = False,
+                     qk_ln: bool = True,
+                     use_lm_head: bool = False,
+                     use_norm_bias: bool = False,
+                     gradient_checkpointing: str = 'nothing_saveable',
+                     use_pjit_attention_force: bool = False,
+                     use_flash_attention: bool = False,
+                     flash_attn_query_chunk_size: int = 1024,
+                     flash_attn_key_chunk_size: int = 2048,
+                     **kwargs
+                     ):
+        basics = dict(
+            d_model=d_model,
+            n_heads=n_heads,
+            n_layers=n_layers,
+            expansion_ratio=expansion_ratio,
+            max_seq_len=max_seq_len,
+            vocab_size=vocab_size,
+            resid_prob_drop=resid_prob_drop,
+            emb_prob_drop=emb_prob_drop,
+            alibi=alibi,
+            use_bias=use_bias,
+            learned_pos_emb=learned_pos_emb,
+            act_fn=act_fn,
+            logit_scale=logit_scale,
+            no_bias=no_bias,
+            verbose=verbose,
+            embedding_fraction=embedding_fraction,
+            use_cache=use_cache,
+            qk_ln=qk_ln,
+            use_lm_head=use_lm_head,
+            use_norm_bias=use_norm_bias,
+            gradient_checkpointing=gradient_checkpointing,
+            use_pjit_attention_force=use_pjit_attention_force,
+            use_flash_attention=use_flash_attention,
+            flash_attn_query_chunk_size=flash_attn_query_chunk_size,
+            flash_attn_key_chunk_size=flash_attn_key_chunk_size,
+            **kwargs
+        )
+        for k, v in basics.items():
+            if not hasattr(self, k):
+                setattr(self, k, v)
+
+        self.from_pt = False
+        return self
 
 
 class RMSNorm(nn.Module):
