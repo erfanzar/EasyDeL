@@ -16,7 +16,7 @@ fastapi~=0.103.0
 gradio~=3.41.2
 distrax
 rlax
-EasyDeL~=0.0.30
 wandb~=0.15.9
 uvicorn~=0.23.2
 pydantic~=2.3.0
+tensorboard

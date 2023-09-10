@@ -169,7 +169,7 @@ def main(argv):
         config.rope_scaling = None
 
     train_args = TrainArguments(
-        model_class=EasyDel.FlaxLlamaForCausalLM,
+        model_class=EasyDel.FlaxGPTJForCausalLM,
         configs_to_init_model_class={'config': config, 'dtype': get_float_dtype_by_name(FLAGS.dtype),
                                      'param_dtype': get_float_dtype_by_name(FLAGS.dtype)},
         custom_rule=config.get_partition_rules(True),
