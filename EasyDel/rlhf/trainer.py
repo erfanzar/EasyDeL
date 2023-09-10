@@ -1,4 +1,5 @@
 import collections
+import functools
 import os
 import pathlib
 import pprint
@@ -437,6 +438,7 @@ class RLHFTrainer:
             optimizer=config.optimizer,
             learning_rate_end=config.critic_lr - 1e6
         )
+        self.mesh = config.get_mesh()
 
     def init_params(
             self,
@@ -585,7 +587,7 @@ class RLHFTrainer:
 
         return sharded_create_train_state(
             params_actor, params_critic, params_reward
-        )
+        ), partition_specs
 
     def learn(
             self,
@@ -594,10 +596,7 @@ class RLHFTrainer:
     ):
         """
         Memory Must be Deque of all prevision memories
-
-
-        params actor must be like FrozenDict{"params":...}
-        params_lm must be like FrozenDict{"params":...}
+        train_state : TrainStateRLHF Type
         """
         memory_dataloader = create_dataloader(
             memory,
@@ -716,6 +715,7 @@ class RLHFTrainer:
             params_critic: core.FrozenDict,
             params_reward: core.FrozenDict,
             params_lm: core.FrozenDict,
+            partition_rules,
             num_episodes=50000,
             max_time_steps=500,
             update_time_steps=5000,
@@ -724,74 +724,137 @@ class RLHFTrainer:
             eos_token=None,
             temperature=1.,
     ):
-        time = 0
-        memories = collections.deque([])
-        max_train_eps = self.dataset['train'].num_rows
-        assert max_train_eps > max_batch_sizegit
+        with self.mesh:
 
-        def get_rand():
-            return int(random.random() * max_train_eps)
+            time = 0
+            memories = collections.deque([])
+            max_train_eps = self.dataset['train'].num_rows
+            assert max_train_eps > max_batch_size
+            train_state, partition_specs = self.configure_funcs(
+                partition_rules=partition_rules,
+                params_lm=params_lm,
+                params_actor=params_actor,
+                params_critic=params_critic,
+                params_reward=params_reward
+            )
 
-        pbar = tqdm.tqdm(iterable=range(num_episodes), desc='Episode')
-        for episode in pbar:
-            for time_step in range(max_time_steps):
-                time += 1
-                index = get_rand()
-                index = index - max_batch_size if index > max_batch_size else index
-                input_ids = self.dataset['train'][index:index + max_batch_size]['input_ids']
-                attention_mask = self.dataset['train'][index:index + max_batch_size]['attention_mask']
-                action, sequence, attention_mas, prompt_mask, action_logits, value = self.actor_critic.generate(
-                    params=params_actor,
+            def get_rand():
+                return int(random.random() * max_train_eps)
+
+            @functools.partial(
+                pjit.pjit,
+                in_shardings=(
+                        partition_specs,
+                        PartitionSpec(),
+                        PartitionSpec()
+                ),
+                out_shardings=(
+                        PartitionSpec(),
+                        PartitionSpec(),
+                        PartitionSpec(),
+                        PartitionSpec(),
+                        PartitionSpec(),
+                        PartitionSpec(),
+                        PartitionSpec()
+                )
+            )
+            def step(
+                    train_state_: TrainStateRLHF,
+                    input_ids_,
+                    attention_mask_
+            ):
+                action_, sequence_, attention_mask_, prompt_mask_, action_logits_, value_ = self.actor_critic.generate(
+                    params=train_state_.actor_params,
                     input_ids=einops.rearrange(
-                        input_ids, 'n -> 1 n'
+                        input_ids_, 'n -> 1 n'
                     ),
+                    attention_mask_=attention_mask_,
                     max_sequence_length=max_sequence_length,
                     eos_token=eos_token,
                     temperature=temperature,
                     return_values=True
-
                 )
-                action_logits = shift(action_logits, shift=1, axis=-2)
-                action_probs = jax.nn.softmax(action_logits, axis=-1)
-                action_len = action.shape[-1]
-                action_log_prob = log_prob(action_probs, sequence)
-                action_log_prob = action_log_prob[:, -action_len:]
-                action = einops.rearrange(action, '1 ... -> ...')
-                sequence = jnp.concatenate(
+                action_logits_ = shift(action_logits_, shift=1, axis=-2)
+                action_probs_ = jax.nn.softmax(action_logits_, axis=-1)
+                action_len_ = action_.shape[-1]
+                action_log_prob_ = log_prob(action_probs_, sequence_)
+                action_log_prob_ = action_log_prob_[:, -action_len_:]
+                action_ = einops.rearrange(action_, '1 ... -> ...')
+                sequence_ = jnp.concatenate(
                     (
-                        input_ids, action
+                        input_ids_, action_
                     ), axis=0
                 )
-                prompt_length = len(input_ids)
-                prompt_mask = jnp.arange(sequence.shape[-1]) < prompt_length
+                prompt_length_ = len(input_ids_)
+                prompt_mask_ = jnp.arange(sequence_.shape[-1]) < prompt_length_
 
-                sequence = einops.rearrange(sequence, 'n -> 1 n')
-                prompt_mask = einops.rearrange(prompt_mask, 'n -> 1 n')
+                sequence_ = einops.rearrange(sequence_, 'n -> 1 n')
+                prompt_mask_ = einops.rearrange(prompt_mask_, 'n -> 1 n')
 
-                reward = self.reward_model.apply(
-                    params_reward,
-                    sequence,
-                    prompt_mask=prompt_mask,
-                    attention_mask=attention_mask,
+                reward_ = train_state_.apply_fn_reward(
+                    train_state_.reward_params,
+                    sequence_,
+                    prompt_mask=prompt_mask_,
+                    attention_mask=attention_mask_,
                     sample=True
                 )
+                return (
+                    sequence_,
+                    prompt_mask_,
+                    attention_mask_,
+                    action_probs_,
+                    action_log_prob_,
+                    reward_,
+                    value_
+                )
 
-                rearrange_ = lambda t: einops.rearrange(t, '1 ... -> ...')
+            sharded_step = step(
+                train_state_=train_state,
+                input_ids_=jnp.ones((1, 128), dtype=jnp.int32),
+                attention_mask_=jnp.ones((1, 128), dtype=jnp.int32),
+            )
+            rearrange_ = lambda t: einops.rearrange(t, '1 ... -> ...')
+            pbar = tqdm.tqdm(iterable=range(num_episodes), desc='Episode')
+            for _  in pbar:
+                for time_step in range(max_time_steps):
+                    time += 1
+                    index = get_rand()
+                    index = index - max_batch_size if index > max_batch_size else index
+                    input_ids = self.dataset['train'][index:index + max_batch_size]['input_ids']
+                    attention_mask = self.dataset['train'][index:index + max_batch_size]['attention_mask']
 
-                # store memory for learning
+                    (
+                        sequence,
+                        prompt_mask,
+                        attention_mask,
+                        action_probs,
+                        action_log_prob,
+                        reward,
+                        value
+                    ) = sharded_step(
+                        train_state,
+                        input_ids,
+                        attention_mask
+                    )
+                    pbar.set_postfix(
+                        time=time, time_step=f"{time_step}/{max_time_steps}"
+                    )
+                    memories.append(Memory(*map(rearrange_, (
+                        sequence,
+                        prompt_mask,
+                        attention_mask,
+                        action_probs,
+                        action_log_prob,
+                        reward,
+                        value
+                    ))))
 
-                memories.append(Memory(*map(rearrange_, (
-                    sequence,
-                    prompt_mask,
-                    attention_mask,
-                    action_probs,
-                    action_log_prob,
-                    reward,
-                    value
-                ))))
+                    # learn from the stored memories
 
-                # learn from the stored memories
-
-                if time % update_time_steps == 0:
-                    self.learn(memories)
-                    memories.clear()
+                    if time % update_time_steps == 0:
+                        train_state = self.learn(
+                            memories,
+                            train_state=train_state
+                        )
+                        memories.clear()
+        return train_state
