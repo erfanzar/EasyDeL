@@ -103,8 +103,9 @@ and you will get links or api to use model from gradio app chat/instruct or Fast
 
 ## RLHF(Reinforcement Learning From Human Feedback)
 
-RLHF or Reinforcement Learning From Human Feedback is going to be available in the next
-versions of EasyDel
+`RLHF` or Reinforcement Learning From Human Feedback is Available At the moment, but it's still
+under heavy development , because i don't have enough experience with Reinforcement Learning at the moment so its still
+in beta version but it's works and ill soon release a Tutorial For that
 
 ## FineTuning
 
