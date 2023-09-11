@@ -63,8 +63,8 @@ class FalconConfig(PretrainedConfig):
             hidden_size: int = 64,
             num_hidden_layers: int = 32,
             num_attention_heads: int = 71,
-            n_layers:int=32,
-            n_heads:int=71,
+            n_layers: int = 32,
+            n_heads: int = 71,
             layer_norm_epsilon: float = 1e-5,
             initializer_range: float = 0.02,
             use_cache: bool = True,
@@ -520,9 +520,14 @@ class FlaxFalconPretrainedModel(FlaxPreTrainedModel):
     module_class: nn.Module = None
     config_class = FalconConfig
 
-    def __init__(self, config, _do_init=False, dtype: jnp.dtype = jnp.float32, param_dtype: jnp.dtype = jnp.float32,
-                 input_shape: Tuple = (1, 12)):
-        module = self.module_class(config=config, dtype=dtype, param_dtype=param_dtype)
+    def __init__(self, config,
+                 _do_init=False,
+                 dtype: jnp.dtype = jnp.float32,
+                 param_dtype: jnp.dtype = jnp.float32,
+                 input_shape: Tuple = (1, 1024),
+                 precision: Optional[None, jax.lax.Precision] = jax.lax.Precision('fastest')
+                 ):
+        module = self.module_class(config=config, dtype=dtype, param_dtype=param_dtype, precision=precision)
         super().__init__(_do_init=_do_init, module=module, config=config, dtype=dtype, input_shape=input_shape)
 
     def init_weights(self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None) -> Dict:
