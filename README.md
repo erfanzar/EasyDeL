@@ -41,6 +41,10 @@ pip install --upgrade pip
 pip install --upgrade "jax[cuda11_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
 ```
 
+## Documentation
+
+Tadadad (Magic Sound) 💫 finally documents are ready at [EasyDel/Docs](https://erfanzar.github.io/EasyDeL/docs)
+
 ## Installation
 
 ### Available on PyPi
@@ -88,7 +92,7 @@ chat model (70B model is supported too)
 
 ```shell
 python -m examples.serving.causal-lm.llama-2-chat \
-  --repo_id='meta-llama/Llama-2-7b-chat-hf' --max_length=4096 \
+  --repo_id='meta-llama/Llama.md-2-7b-chat-hf' --max_length=4096 \
   --max_new_tokens=2048 --max_stream_tokens=32 --temperature=0.6 \
   --top_p=0.95 --top_k=50 \
   --dtype='fp16' --use_prefix_tokenizer
@@ -200,7 +204,7 @@ from transformers import AutoTokenizer
 
 import jax
 
-model_id = 'meta-llama/Llama-2-7b-chat-hf'
+model_id = 'meta-llama/Llama.md-2-7b-chat-hf'
 
 tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 

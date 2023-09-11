@@ -64,7 +64,7 @@ def get_gradient_checkpoint_policy(name):
 
 
 class LlamaConfig(PretrainedConfig):
-    model_type = "Llama"
+    model_type = "Llama.md"
 
     def __init__(
             self,

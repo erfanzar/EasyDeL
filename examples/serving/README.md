@@ -54,7 +54,7 @@ you can also load model itself from parameters like
 ```python
 import EasyDel.transform
 
-model_id = 'meta-llama/Llama-2-7b-chat-hf'
+model_id = 'meta-llama/Llama.md-2-7b-chat-hf'
 
 tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 
