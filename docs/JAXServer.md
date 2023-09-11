@@ -1,5 +1,3 @@
-# EasyDel 🧠
-
 ## JAXServer 🧬
 
 `JAXServer` is one of offered utilities by EasyDel, and it's help hosting using and doing process with LLMs
