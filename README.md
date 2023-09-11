@@ -6,37 +6,39 @@ train Flax/Jax Models on the `TPU/GPU` both for Serving and Training
 
 #### Note this Library needs golang to run (for some tracking stuff on TPU/GPU/CPU)
 
-install go on ubuntu be like
+#### Ubuntu GO installation
 
 ```shell
 sudo apt-get update && apt-get upgrade -y
 sudo apt-get install golang -y 
 ```
 
-and you need Jax>=0.4.10 and FJutils>=0.0.15
+#### Manjaro/Arch GO installation
 
-on TPUs be like
+```shell
+sudo pacman -Syyuu go
+```
 
 _you can install other version too but easydel required at least version of 0.4.10_
 
 ```shell
 !pip install jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html -q
-
 ```
 
 on GPUs be like
 
 ```shell
 pip install --upgrade pip
-
 # CUDA 12 installation
 # Note: wheels only available on linux.
 pip install --upgrade "jax[cuda12_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+```
 
+```shell
+pip install --upgrade pip
 # CUDA 11 installation
 # Note: wheels only available on linux.
 pip install --upgrade "jax[cuda11_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
-
 ```
 
 ## Installation

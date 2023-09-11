@@ -80,12 +80,13 @@ server = JAXServer.load_from_params(
 )
 ```
 
-### API
+### FastAPI 🌪
 
 #### Instruct API
 
 to Override this api you have to code `forward_instruct` just like what you want the default implementation of this
 function is
+
 ```python
 def forward_instruct(self, data: InstructRequest):
     if not self._funcs_generated:
@@ -94,12 +95,13 @@ def forward_instruct(self, data: InstructRequest):
         }
 
     string = self.config.instruct_format.format(instruct=data.prompt, system=data.system)
-
-    response, used_tokens = self.process(
-        string=string,
-        greedy=data.greedy,
-        max_new_tokens=None
-    )
+    response, used_tokens = [None] * 2
+    for response, used_tokens in self.process(
+            string=string,
+            greedy=data.greedy,
+            max_new_tokens=None
+    ):
+        ...
     self.number_of_served_request_until_last_up_time += 1
     return {
         'input': f'{string}',
@@ -108,7 +110,7 @@ def forward_instruct(self, data: InstructRequest):
     }
 ```
 
-Base Class :
+* BaseModel Class For PYData in FastAPI :
 
 ```python
 class InstructRequest(BaseModel):
@@ -118,7 +120,8 @@ class InstructRequest(BaseModel):
     greedy: Optional[bool] = False
 ```
 
-Using Example :
+* And here's an example of using this api via python and creating a simple client with using `requests` library in
+  python :
 
 ```python
 import requests
@@ -157,11 +160,13 @@ def forward_chat(self, data: ChatRequest):
     history = self.process_chat_history(data.history or [])
     history += self.config.prompt_prefix_chat + data.prompt + self.config.prompt_postfix_chat
 
-    response, used_tokens = self.process(
-        string=history,
-        greedy=data.greedy,
-        max_new_tokens=None
-    )
+    response, used_tokens = [None] * 2
+    for response, used_tokens in self.process(
+            string=history,
+            greedy=data.greedy,
+            max_new_tokens=None
+    ):
+        ...
     self.number_of_served_request_until_last_up_time += 1
     return {
         'input': f'{history}',
@@ -170,7 +175,7 @@ def forward_chat(self, data: ChatRequest):
     }
 ```
 
-Base Class :
+* BaseModel Class For PYData in FastAPI :
 
 ```python
 class ChatRequest(BaseModel):
@@ -180,7 +185,8 @@ class ChatRequest(BaseModel):
     greedy: Optional[bool] = False
 ```
 
-Using Example :
+* And here's an example of using this api via python and creating a simple client with using `requests` library in
+  python :
 
 ```python
 import requests
