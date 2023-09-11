@@ -47,7 +47,7 @@ pip install --upgrade "jax[cuda11_pip]" -f \
 
 * _EasyDel_:
     * Configs
-    * Modules
+    * [Modules](https://erfanzar.github.io/EasyDeL/docs/Models)
     * RLHF
     * [Serve](https://erfanzar.github.io/EasyDeL/docs/Serve)
     * SMI
