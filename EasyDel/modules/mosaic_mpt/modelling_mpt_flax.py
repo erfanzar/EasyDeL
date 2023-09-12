@@ -310,6 +310,12 @@ class FlaxMptAttention(nn.Module):
     def __call__(self, x, attn_bias=None, attention_mask=None):
         inp_shape = x.shape
         b, s, ds = inp_shape
+        if attention_mask is not None:
+            _, s = attention_mask.shape
+            assert inp_shape[
+                       1] == s, (f'hidden_state_size on hidden_state shape'
+                                 f' ({inp_shape[1]}) and attention_mask ({s}) miss match'
+                                 f' attention Shape : {attention_mask.shape} | hidden Shape : {x.shape}')
         qkv = self.w_qkv(x)
         q, k, v = jnp.split(qkv, 3, -1)
         if self.config.qk_ln:
@@ -365,7 +371,7 @@ class FlaxMptAttention(nn.Module):
                 atw += attn_bias
             mask = jnp.where(self.causal_mask == 1, 0, jnp.finfo(atw).min)
             if attention_mask is not None:
-                attention_mask = jax.lax.select(
+                attention_mask = jnp.where(
                     attention_mask.reshape(b, 1, 1, -1) == 1,
                     0,
                     jnp.finfo(atw).min
