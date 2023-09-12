@@ -220,7 +220,7 @@ server = JAXServer.load_from_params(
     config_model=config,
     tokenizer=tokenizer,
     params=model.params,
-    add_param_field=True
+    add_params_field=True
 )
 
 predictions = server.process(

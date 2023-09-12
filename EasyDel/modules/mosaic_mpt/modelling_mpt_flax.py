@@ -506,13 +506,20 @@ class FlaxMptPretrainedModel(FlaxPreTrainedModel):
     module_class: nn.Module = None
     config_class: MptConfig = MptConfig
 
-    def __init__(self, config, dtype: jnp.dtype = jnp.float32, param_dtype: jnp.dtype = jnp.float32,
+    def __init__(self,
+                 config,
+                 dtype: jnp.dtype = jnp.float32,
+                 param_dtype: jnp.dtype = jnp.float32,
                  _do_init: bool = False,
-                 input_shape: Tuple = (1, 16), **kwargs):
+                 precision: Optional[Union[jax.lax.Precision, None]] = jax.lax.Precision('fastest'),
+                 input_shape: Tuple = (1, 16),
+                 **kwargs
+                 ):
         module = self.module_class(
             config,
             dtype=dtype,
-            param_dtype=param_dtype
+            param_dtype=param_dtype,
+            precision=precision
         )
         super().__init__(_do_init=_do_init, config=config, input_shape=input_shape, module=module, **kwargs)
 
@@ -539,6 +546,8 @@ class FlaxMptPretrainedModel(FlaxPreTrainedModel):
         input_ids = jnp.asarray(input_ids, dtype='i4')
         if attention_mask is None:
             attention_mask = jnp.ones_like(input_ids, dtype='i4')
+
+        print('INPUT_ID : ', input_ids.shape)
         predict = self.module.apply(
             params,
             input_ids=input_ids,

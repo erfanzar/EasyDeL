@@ -108,7 +108,7 @@ server = MPTJaxServer.load_from_params(
         input_shape=(1, 1024)
     ),
     config_model=config,
-    add_param_field=True,
+    add_params_field=True,
     tokenizer=AutoTokenizer.from_pretrained('mosaicml/mpt-7b'),
     verbose=False,
     do_memory_log=True,

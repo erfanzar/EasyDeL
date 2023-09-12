@@ -35,7 +35,7 @@ def main():
         model=model,
         tokenizer=tokenizer,
         config_model=config,
-        add_param_field=True,
+        add_params_field=True,
         config=None,
         init_shape=(1, 1)
     )
@@ -76,7 +76,7 @@ server = JAXServer.load_from_params(
     config=config_server,
     tokenizer=tokenizer,
     params=params,
-    add_param_field=True
+    add_params_field=True
 )
 ```
 
@@ -245,7 +245,7 @@ def main():
         model=model,
         tokenizer=tokenizer,
         config_model=config,
-        add_param_field=True,
+        add_params_field=True,
         init_shape=(1, 1),
         config=None,
     )
