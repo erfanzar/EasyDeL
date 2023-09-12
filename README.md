@@ -6,38 +6,44 @@ train Flax/Jax Models on the `TPU/GPU` both for Serving and Training
 
 #### Note this Library needs golang to run (for some tracking stuff on TPU/GPU/CPU)
 
-install go on ubuntu be like
+#### Ubuntu GO installation
 
 ```shell
 sudo apt-get update && apt-get upgrade -y
 sudo apt-get install golang -y 
 ```
 
-and you need Jax>=0.4.10 and FJutils>=0.0.15
+#### Manjaro/Arch GO installation
 
-on TPUs be like
+```shell
+sudo pacman -Syyuu go
+```
 
 _you can install other version too but easydel required at least version of 0.4.10_
 
 ```shell
 !pip install jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html -q
-
 ```
 
 on GPUs be like
 
 ```shell
 pip install --upgrade pip
-
 # CUDA 12 installation
 # Note: wheels only available on linux.
 pip install --upgrade "jax[cuda12_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+```
 
+```shell
+pip install --upgrade pip
 # CUDA 11 installation
 # Note: wheels only available on linux.
 pip install --upgrade "jax[cuda11_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
-
 ```
+
+## Documentation
+
+Tadadad (Magic Sound) 💫 finally documents are ready at [EasyDel/Docs](https://erfanzar.github.io/EasyDeL/docs)
 
 ## Installation
 
@@ -86,7 +92,7 @@ chat model (70B model is supported too)
 
 ```shell
 python -m examples.serving.causal-lm.llama-2-chat \
-  --repo_id='meta-llama/Llama-2-7b-chat-hf' --max_length=4096 \
+  --repo_id='meta-llama/Llama.md-2-7b-chat-hf' --max_length=4096 \
   --max_new_tokens=2048 --max_stream_tokens=32 --temperature=0.6 \
   --top_p=0.95 --top_k=50 \
   --dtype='fp16' --use_prefix_tokenizer
@@ -103,8 +109,9 @@ and you will get links or api to use model from gradio app chat/instruct or Fast
 
 ## RLHF(Reinforcement Learning From Human Feedback)
 
-RLHF or Reinforcement Learning From Human Feedback is going to be available in the next
-versions of EasyDel
+`RLHF` or Reinforcement Learning From Human Feedback is Available At the moment, but it's still
+under heavy development , because i don't have enough experience with Reinforcement Learning at the moment so its still
+in beta version but it's works and ill soon release a Tutorial For that
 
 ## FineTuning
 
@@ -197,7 +204,7 @@ from transformers import AutoTokenizer
 
 import jax
 
-model_id = 'meta-llama/Llama-2-7b-chat-hf'
+model_id = 'meta-llama/Llama.md-2-7b-chat-hf'
 
 tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 

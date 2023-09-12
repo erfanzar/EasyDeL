@@ -8,7 +8,7 @@
 
 ```shell
 python -m examples.serving.causal-lm.llama-2-chat \
-  --repo_id='meta-llama/Llama-2-7b-chat-hf' --max_length=4096 \
+  --repo_id='meta-llama/Llama.md-2-7b-chat-hf' --max_length=4096 \
   --max_new_tokens=2048 --max_stream_tokens=32 --temperature=0.6 \
   --top_p=0.95 --top_k=50 \
   --dtype='fp16' --use_prefix_tokenizer
@@ -62,7 +62,7 @@ from transformers import AutoTokenizer, GenerationConfig
 from functools import partial
 
 # Let Use this model since runs fast and light, but you can use all the available llama models like llama, llama2, xgen... 
-model_id = 'meta-llama/Llama-2-7b-chat-hf'
+model_id = 'meta-llama/Llama.md-2-7b-chat-hf'
 tokenizer = AutoTokenizer.from_pretrained(
     model_id, trust_remote_code=True  # Optional
 )

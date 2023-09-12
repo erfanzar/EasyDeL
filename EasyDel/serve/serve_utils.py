@@ -479,20 +479,22 @@ class JAXServer(object):
                 'status': "down"
             }
 
-        history = self.chat_format(
+        string = self.chat_format(
             prompt=data.prompt,
             system=None,
             history=data.history
         )
 
-        response, used_tokens = self.process(
-            string=history,
-            greedy=data.greedy,
-            max_new_tokens=None
-        )
+        response, used_tokens = [None] * 2
+        for response, used_tokens in self.process(
+                string=string,
+                greedy=data.greedy,
+                max_new_tokens=None
+        ):
+            ...
         self.number_of_served_request_until_last_up_time += 1
         return {
-            'input': f'{history}',
+            'input': f'{string}',
             'response': response,
             'tokens_used': used_tokens,
         }
@@ -504,12 +506,13 @@ class JAXServer(object):
             }
 
         string = self.config.instruct_format.format(instruct=data.prompt, system=data.system)
-
-        response, used_tokens = self.process(
-            string=string,
-            greedy=data.greedy,
-            max_new_tokens=None
-        )
+        response, used_tokens = [None] * 2
+        for response, used_tokens in self.process(
+                string=string,
+                greedy=data.greedy,
+                max_new_tokens=None
+        ):
+            ...
         self.number_of_served_request_until_last_up_time += 1
         return {
             'input': f'{string}',
@@ -534,7 +537,7 @@ class JAXServer(object):
         return self.forward_chat(data)
 
     def process(self,
-                string,
+                string: str,
                 *,
                 greedy: bool = False,
                 max_new_tokens: int = None,
