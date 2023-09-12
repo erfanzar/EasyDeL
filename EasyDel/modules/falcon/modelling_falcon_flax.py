@@ -525,7 +525,7 @@ class FlaxFalconPretrainedModel(FlaxPreTrainedModel):
                  dtype: jnp.dtype = jnp.float32,
                  param_dtype: jnp.dtype = jnp.float32,
                  input_shape: Tuple = (1, 1024),
-                 precision: Optional[None, jax.lax.Precision] = jax.lax.Precision('fastest')
+                 precision: Optional[Union[None, jax.lax.Precision]] = jax.lax.Precision('fastest')
                  ):
         module = self.module_class(config=config, dtype=dtype, param_dtype=param_dtype, precision=precision)
         super().__init__(_do_init=_do_init, module=module, config=config, dtype=dtype, input_shape=input_shape)
