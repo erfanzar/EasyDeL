@@ -3,6 +3,7 @@ from jax import numpy as jnp
 import jax
 import torch
 import numpy as np
+from transformers import AutoModelForCausalLM
 
 
 def mpt_convert_flax_to_pt_7b(state_dict_flax, n_layers: int, device=torch.device('cpu'), use_lm_head=False):
@@ -140,12 +141,12 @@ def mpt_convert_flax_to_pt_1b(state_dict_flax, n_layers: int, device=torch.devic
     return state_dict
 
 
-def mpt_from_pretrained(model_id, device=jax.devices('cpu')[0]):
+def mpt_from_pretrained(model_id, device=jax.devices('cpu')[0], **kwargs):
     """
     return: Weight or Params for EasyDel Model , Config
     """
     config = MptConfig.from_pretrained(model_id)
-    model = FlaxMptForCausalLM.from_pretrained(model_id)
+    model = AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code=True, **kwargs)
     easydel_wights = mpt_convert_pt_to_flax_7b(
         state_dict=model.state_dict(),
         n_layers=config.num_hidden_layers,
