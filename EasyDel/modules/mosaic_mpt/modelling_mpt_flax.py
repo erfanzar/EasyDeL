@@ -307,9 +307,15 @@ class FlaxMptAttention(nn.Module):
             self.k_ln = nn.LayerNorm(use_bias=self.config.use_norm_bias)
         self.causal_mask = nn.make_causal_mask(jnp.ones((1, self.config.max_seq_len)))
 
-    def __call__(self, hidden_state, attn_bias=None, attention_mask=None):
+    def __call__(self,
+                 hidden_state,
+                 attention_mask,
+                 position_ids,
+                 attn_bias=None,
+                 ):
         inp_shape = hidden_state.shape
         b, s, ds = inp_shape
+
         if attention_mask is not None:
             _, s = attention_mask.shape
             assert inp_shape[
@@ -397,8 +403,10 @@ class FlaxMptBlock(nn.Module):
         self.ffn = FlaxMptMLP(config=self.config, dtype=self.dtype, param_dtype=self.param_dtype,
                               precision=self.precision)
 
-    def __call__(self, hidden_state, attn_bias=None, attention_mask=None):
-        hidden_state = (self.attn(self.norm_1(hidden_state), attn_bias=attn_bias, attention_mask=attention_mask) +
+    def __call__(self,
+                 hidden_state, attention_mask, position_ids, attn_bias=None, ):
+        hidden_state = (self.attn(self.norm_1(hidden_state), attn_bias=attn_bias, attention_mask=attention_mask,
+                                  position_ids=position_ids) +
                         hidden_state)
         hidden_state = self.ffn(self.norm_2(hidden_state)) + hidden_state
         return hidden_state
@@ -441,9 +449,14 @@ class FlaxMptCollection(nn.Module):
             )
         ]
 
-    def __call__(self, hidden_state, attn_bias=None, attention_mask=None):
+    def __call__(self, hidden_state, attention_mask, position_ids, attn_bias=None):
         for block in self.blocks:
-            hidden_state = block(hidden_state=hidden_state, attn_bias=attn_bias, attention_mask=attention_mask)
+            hidden_state = block(
+                hidden_state=hidden_state,
+                attn_bias=attn_bias,
+                attention_mask=attention_mask,
+                position_ids=position_ids
+            )
         return hidden_state
 
 
@@ -482,6 +495,7 @@ class FlaxMptModule(nn.Module):
 
                  input_ids: jax.Array,
                  attention_mask: jax.Array = None,
+                 position_ids: jax.Array = None,
                  return_dict: bool = True,
                  extra_embedding: Optional[Union[jnp.ndarray, None]] = None
                  ):
@@ -495,7 +509,8 @@ class FlaxMptModule(nn.Module):
             pos_id = self.wpe(jnp.arange(s, dtype='i4').reshape(1, -1))
             hidden_state += pos_id
             alibi = None
-        hidden_state = self.norm_f(self.h(hidden_state, attn_bias=alibi, attention_mask=attention_mask))
+        hidden_state = self.norm_f(
+            self.h(hidden_state, attn_bias=alibi, attention_mask=attention_mask, position_ids=position_ids))
         if return_dict:
             return FlaxBaseModelOutput(last_hidden_state=hidden_state, hidden_states=None)
         else:
@@ -524,12 +539,13 @@ class FlaxMptPretrainedModel(FlaxPreTrainedModel):
         super().__init__(_do_init=_do_init, config=config, input_shape=input_shape, module=module, **kwargs)
 
     def init_weights(self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None) -> FrozenDict:
-
+        input_ids = jnp.ones(input_shape, dtype='i4')
         if params is None:
             return self.module.init(
                 rngs=rng,
-                input_ids=jnp.ones(input_shape, dtype='i4'),
+                input_ids=input_ids,
                 attention_mask=jnp.ones(input_shape, dtype='i4'),
+                position_ids=jnp.broadcast_to(jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_shape)
 
             )['params']
         else:
@@ -538,32 +554,29 @@ class FlaxMptPretrainedModel(FlaxPreTrainedModel):
     def __call__(self,
                  input_ids,
                  attention_mask=None,
+                 position_ids=None,
                  params: dict = None,
                  add_params_field: bool = False,
                  return_dict: bool = True,
-                 extra_embedding: Optional[Union[jnp.ndarray, None]] = None):
+                 extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+                 ):
         params = {'params': params or self.params} if add_params_field else params or self.params
         input_ids = jnp.asarray(input_ids, dtype='i4')
         if attention_mask is None:
             attention_mask = jnp.ones_like(input_ids, dtype='i4')
-
-        print('INPUT_ID : ', input_ids.shape)
+        if position_ids is None:
+            position_ids = jnp.arange(0, attention_mask.shape[-1], 1, dtype='i4').reshape(
+                1, -1
+            ).repeat(input_ids.shape[0], axis=0)
         predict = self.module.apply(
             params,
             input_ids=input_ids,
             attention_mask=jnp.asarray(attention_mask, dtype='i4'),
             return_dict=return_dict,
-            extra_embedding=extra_embedding
+            extra_embedding=extra_embedding,
+            position_ids=position_ids
         )
         return predict
-
-    def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[jax.Array] = None):
-        return {
-            "attention_mask": attention_mask,
-        }
-
-    def update_inputs_for_generation(self, model_outputs, model_kwargs):
-        return model_kwargs
 
 
 class FlaxMptModel(FlaxMptPretrainedModel):
@@ -591,14 +604,18 @@ class FlaxFlaxMptForCausalLMModule(nn.Module):
     def __call__(self,
                  input_ids: jax.Array,
                  attention_mask: jax.Array = None,
+
+                 position_ids: jax.Array = None,
                  return_dict: bool = True,
-                 extra_embedding: Optional[Union[jnp.ndarray, None]] = None
+                 extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+
                  ):
         predict: FlaxBaseModelOutput = self.transformer(
             input_ids=input_ids,
             attention_mask=attention_mask,
             return_dict=True,
-            extra_embedding=extra_embedding
+            extra_embedding=extra_embedding,
+            position_ids=position_ids
         )
         if self.config.use_lm_head:
             logits = self.lm_head(predict.last_hidden_state)
@@ -615,3 +632,24 @@ class FlaxFlaxMptForCausalLMModule(nn.Module):
 
 class FlaxMptForCausalLM(FlaxMptPretrainedModel):
     module_class = FlaxFlaxMptForCausalLMModule
+
+    def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[jax.Array] = None):
+
+        batch_size, seq_length = input_ids.shape
+
+        extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
+        if attention_mask is not None:
+            position_ids = attention_mask.cumsum(axis=-1) - 1
+            extended_attention_mask = jax.lax.dynamic_update_slice(extended_attention_mask, attention_mask, (0, 0))
+        else:
+            position_ids = jnp.broadcast_to(jnp.arange(seq_length, dtype="i4")[None, :], (batch_size, seq_length))
+
+        return {
+            "attention_mask": extended_attention_mask,
+            "position_ids": position_ids,
+        }
+
+    def update_inputs_for_generation(self, model_outputs, model_kwargs):
+        model_kwargs["past_key_values"] = model_outputs.past_key_values
+        model_kwargs["position_ids"] = model_kwargs["position_ids"][:, -1:] + 1
+        return model_kwargs
