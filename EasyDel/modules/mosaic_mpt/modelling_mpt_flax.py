@@ -68,7 +68,7 @@ class MptConfig(PretrainedConfig):
                  resid_prob_drop: float = 0.0,
                  emb_prob_drop: float = 0.0,
                  alibi: bool = True,
-                 use_bias: bool = True,
+                 use_bias: bool = False,
                  learned_pos_emb: bool = True,
                  act_fn: str = 'gelu',
                  logit_scale: Optional[Union[float, str]] = None,
@@ -76,7 +76,7 @@ class MptConfig(PretrainedConfig):
                  verbose: int = 0,
                  embedding_fraction: float = 1.0,
                  use_cache: bool = False,
-                 qk_ln: bool = True,
+                 qk_ln: bool = False,
                  use_lm_head: bool = False,
                  use_norm_bias: bool = False,
                  gradient_checkpointing: str = 'nothing_saveable',
@@ -207,6 +207,9 @@ class MptConfig(PretrainedConfig):
                      flash_attn_key_chunk_size: int = 2048,
                      **kwargs
                      ):
+        if hasattr(self, 'attn_config'):
+            for k, v in self.attn_config.items():
+                setattr(self, k, v)
         basics = dict(
             d_model=d_model,
             n_heads=n_heads,
@@ -237,6 +240,7 @@ class MptConfig(PretrainedConfig):
         )
         for k, v in basics.items():
             if not hasattr(self, k):
+                print(f' Key {k} not found in loaded config setting that to default of {v}')
                 setattr(self, k, v)
 
         self.from_pt = False
