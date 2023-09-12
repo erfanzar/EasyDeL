@@ -57,7 +57,7 @@ class Llama2Host(JAXServer):
             config=config,
             params=param,
             tokenizer=tokenizer,
-            add_param_field=True,
+            add_params_field=True,
             do_memory_log=False
         )
 
@@ -80,7 +80,7 @@ class Llama2Host(JAXServer):
             model=model,
             config=config,
             tokenizer=tokenizer,
-            add_param_field=True,
+            add_params_field=True,
             do_memory_log=False
         )
 

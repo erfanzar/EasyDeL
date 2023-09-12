@@ -153,7 +153,7 @@ def main(argv):
         model=model,
         tokenizer=tokenizer,
         config_model=config,
-        add_param_field=True,
+        add_params_field=True,
         config=config_server,
         init_shape=(1, 1)
     )

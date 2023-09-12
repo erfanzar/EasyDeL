@@ -312,7 +312,7 @@ class JAXServer(object):
             tokenizer: transformers.PreTrainedTokenizer,
             path: typing.Union[str, os.PathLike],
             config=None,
-            add_param_field: bool = True,
+            add_params_field: bool = True,
             init_shape: tuple = (1, 1),
             do_memory_log: bool = False,
             verbose: bool = True
@@ -355,9 +355,9 @@ class JAXServer(object):
                         pbar.write(server.get_memory())
                     pbar.set_description('Sharding Params')
         server.params = flax.traverse_util.unflatten_dict(server.params)
-        server.params = {'params': server.params} if add_param_field else server.params
+        server.params = {'params': server.params} if add_params_field else server.params
 
-        server.rules = {'params': rules} if add_param_field else rules
+        server.rules = {'params': rules} if add_params_field else rules
         logging.info(
             'configuring generate functions for the server'
         )
@@ -375,7 +375,7 @@ class JAXServer(object):
             tokenizer: transformers.PreTrainedTokenizer,
             params: typing.Dict,
             config=None,
-            add_param_field: bool = True,
+            add_params_field: bool = True,
             do_memory_log: bool = False,
             verbose: bool = True
     ):
@@ -406,8 +406,8 @@ class JAXServer(object):
                     pbar.write(server.get_memory())
                 pbar.set_description('Sharding Params')
             server.params = flax.traverse_util.unflatten_dict(params)
-            server.params = {'params': server.params} if add_param_field else server.params
-        server.rules = {'params': rules} if add_param_field else rules
+            server.params = {'params': server.params} if add_params_field else server.params
+        server.rules = {'params': rules} if add_params_field else rules
         logging.info(
             'configuring generate functions for the server'
         )
