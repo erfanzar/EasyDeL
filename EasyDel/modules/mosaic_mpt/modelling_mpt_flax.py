@@ -286,8 +286,8 @@ class FlaxMptMLP(nn.Module):
                              dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision)
         self.act = ACT2FN[self.config.act_fn]
 
-    def __call__(self, x: jax.Array):
-        return self.down(self.act(self.up(x)))
+    def __call__(self, hidden_state: jax.Array):
+        return self.down(self.act(self.up(hidden_state)))
 
 
 class FlaxMptAttention(nn.Module):
@@ -307,16 +307,16 @@ class FlaxMptAttention(nn.Module):
             self.k_ln = nn.LayerNorm(use_bias=self.config.use_norm_bias)
         self.causal_mask = nn.make_causal_mask(jnp.ones((1, self.config.max_seq_len)))
 
-    def __call__(self, x, attn_bias=None, attention_mask=None):
-        inp_shape = x.shape
+    def __call__(self, hidden_state, attn_bias=None, attention_mask=None):
+        inp_shape = hidden_state.shape
         b, s, ds = inp_shape
         if attention_mask is not None:
             _, s = attention_mask.shape
             assert inp_shape[
                        1] == s, (f'hidden_state_size on hidden_state shape'
                                  f' ({inp_shape[1]}) and attention_mask ({s}) miss match'
-                                 f' attention Shape : {attention_mask.shape} | hidden Shape : {x.shape}')
-        qkv = self.w_qkv(x)
+                                 f' attention Shape : {attention_mask.shape} | hidden Shape : {hidden_state.shape}')
+        qkv = self.w_qkv(hidden_state)
         q, k, v = jnp.split(qkv, 3, -1)
         if self.config.qk_ln:
             q = self.q_ln(q)
@@ -397,10 +397,11 @@ class FlaxMptBlock(nn.Module):
         self.ffn = FlaxMptMLP(config=self.config, dtype=self.dtype, param_dtype=self.param_dtype,
                               precision=self.precision)
 
-    def __call__(self, x, attn_bias=None, attention_mask=None):
-        x = self.attn(self.norm_1(x), attn_bias=attn_bias, attention_mask=attention_mask) + x
-        x = self.ffn(self.norm_2(x)) + x
-        return x
+    def __call__(self, hidden_state, attn_bias=None, attention_mask=None):
+        hidden_state = (self.attn(self.norm_1(hidden_state), attn_bias=attn_bias, attention_mask=attention_mask) +
+                        hidden_state)
+        hidden_state = self.ffn(self.norm_2(hidden_state)) + hidden_state
+        return hidden_state
 
 
 def get_gradient_checkpoint_policy(name):
@@ -440,10 +441,10 @@ class FlaxMptCollection(nn.Module):
             )
         ]
 
-    def __call__(self, x, attn_bias=None, attention_mask=None):
+    def __call__(self, hidden_state, attn_bias=None, attention_mask=None):
         for block in self.blocks:
-            x = block(x=x, attn_bias=attn_bias, attention_mask=attention_mask)
-        return x
+            hidden_state = block(hidden_state=hidden_state, attn_bias=attn_bias, attention_mask=attention_mask)
+        return hidden_state
 
 
 def build_alibi(max_length, num_attention_heads, alibi_max: int = 8):
@@ -530,15 +531,18 @@ class FlaxMptPretrainedModel(FlaxPreTrainedModel):
     def __call__(self,
                  input_ids,
                  attention_mask=None,
-                 params=None,
+                 params: dict = None,
                  add_params_field: bool = False,
                  return_dict: bool = True,
                  extra_embedding: Optional[Union[jnp.ndarray, None]] = None):
         params = {'params': params or self.params} if add_params_field else params or self.params
+        input_ids = jnp.asarray(input_ids, dtype='i4')
+        if attention_mask is None:
+            attention_mask = jnp.ones_like(input_ids, dtype='i4')
         predict = self.module.apply(
             params,
-            input_ids=jnp.asarray(input_ids, dtype='i4'),
-            attention_mask=jnp.asarray(attention_mask, dtype='i4') if attention_mask is not None else attention_mask,
+            input_ids=input_ids,
+            attention_mask=jnp.asarray(attention_mask, dtype='i4'),
             return_dict=return_dict,
             extra_embedding=extra_embedding
         )
