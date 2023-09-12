@@ -365,7 +365,11 @@ class FlaxMptAttention(nn.Module):
                 atw += attn_bias
             mask = jnp.where(self.causal_mask == 1, 0, jnp.finfo(atw).min)
             if attention_mask is not None:
-                attention_mask = jnp.where(attention_mask.reshape(b, 1, 1, s) == 1, 0, jnp.finfo(atw).min)
+                attention_mask = jax.lax.select(
+                    attention_mask.reshape(b, 1, 1, -1) == 1,
+                    0,
+                    jnp.finfo(atw).min
+                )
                 atw += attention_mask
             atw += mask[:, :, :s, :s]
             atw = nn.softmax(atw, -1)
