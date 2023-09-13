@@ -14,7 +14,7 @@ import uvicorn
 from fastapi import FastAPI
 from fjutils import make_shard_and_gather_fns, match_partition_rules, with_sharding_constraint
 from dataclasses import dataclass, field, is_dataclass
-from typing import Optional, List, Union
+from typing import Optional, List, Union, Tuple
 from EasyDel.smi import get_mem, initialise_tracking
 from flax.core import freeze
 from flax.traverse_util import unflatten_dict
@@ -80,37 +80,65 @@ class ChatRequest(BaseModel):
     greedy: Optional[bool] = False
 
 
-@dataclass
 class JaxServerConfig:
-    host = '0.0.0.0'
-    port = 2059
-    instruct_format = '### SYSTEM:\n{system}\n### INSTRUCT:\n{instruct}\n### ASSISTANT:\n'
-    chat_format = '<|prompter|>{prompt}</s><|assistant|>{assistant}</s>'
-    batch_size = 1
-    system_prefix = ''
-    system = ''
-    prompt_prefix_instruct = ''
-    prompt_postfix_instruct = ''
-    prompt_prefix_chat = '<|prompter|>'
-    prompt_postfix_chat = '</s><|assistant|>'
-    chat_prefix = ''
-    contains_auto_format = True
-    max_length = 4096
-    max_new_tokens = 4096
-    max_stream_tokens = 64
-    temperature = 0.1
-    top_p = 0.95
-    top_k = 50
-    logging = True
-    mesh_axes_names = ('dp', 'fsdp', 'mp')
-    mesh_axes_shape = (1, -1, 1)
-    dtype = 'fp16'
-    stream_tokens_for_gradio = True
-    use_prefix_tokenizer = True
-    pre_compile = True
-    assert max_new_tokens % max_stream_tokens == 0, \
-        'max_new_tokens should be divisible by  max_new_tokens' \
-        f'{max_new_tokens % max_stream_tokens}'
+    def __init__(
+            self,
+            host: str = "0.0.0.0",
+            port: int = 2059,
+            instruct_format: str = '### SYSTEM:\n{system}\n### INSTRUCT:\n{instruct}\n### ASSISTANT:\n',
+            chat_format: str = '<|prompter|>{prompt}</s><|assistant|>{assistant}</s>',
+            batch_size: int = 1,
+            system_prefix: str = '',
+            system: str = '',
+            prompt_prefix_instruct: str = '',
+            prompt_postfix_instruct: str = '',
+            prompt_prefix_chat: str = '<|prompter|>',
+            prompt_postfix_chat: str = '</s><|assistant|>',
+            chat_prefix: str = '',
+            contains_auto_format: bool = True,
+            max_length: int = 4096,
+            max_new_tokens: int = 4096,
+            max_stream_tokens: int = 64,
+            temperature: float = 0.1,
+            top_p: float = 0.95,
+            top_k: int = 50,
+            logging: bool = True,
+            mesh_axes_names: Tuple[str] = ('dp', 'fsdp', 'mp'),
+            mesh_axes_shape: Tuple[int] = (1, -1, 1),
+            dtype: str = 'fp16',
+            stream_tokens_for_gradio: bool = True,
+            use_prefix_tokenizer: bool = True,
+            pre_compile: bool = True,
+    ):
+        self.host = host
+        self.port = port
+        self.instruct_format = instruct_format
+        self.chat_format = chat_format
+        self.batch_size = batch_size
+        self.system_prefix = system_prefix
+        self.system = system
+        self.prompt_prefix_instruct = prompt_prefix_instruct
+        self.prompt_postfix_instruct = prompt_postfix_instruct
+        self.prompt_prefix_chat = prompt_prefix_chat
+        self.prompt_postfix_chat = prompt_postfix_chat
+        self.chat_prefix = chat_prefix
+        self.contains_auto_format = contains_auto_format
+        self.max_length = max_length
+        self.max_new_tokens = max_new_tokens
+        self.max_stream_tokens = max_stream_tokens
+        self.temperature = temperature
+        self.top_p = top_p
+        self.top_k = top_k
+        self.logging = logging
+        self.mesh_axes_names = mesh_axes_names
+        self.mesh_axes_shape = mesh_axes_shape
+        self.dtype = dtype
+        self.stream_tokens_for_gradio = stream_tokens_for_gradio
+        self.use_prefix_tokenizer = use_prefix_tokenizer
+        self.pre_compile = pre_compile
+        assert max_new_tokens % max_stream_tokens == 0, \
+            'max_new_tokens should be divisible by  max_new_tokens' \
+            f'{max_new_tokens % max_stream_tokens}'
 
 
 class JAXServer(object):
@@ -119,16 +147,11 @@ class JAXServer(object):
 
         self.process_uvicorn, self.prefix_tokenizer, self.params, self.tokenizer, self.model, \
             self.rules, self._generate, self._greedy_generate = [None] * 8
-        try:
-            if config is not None:
-                if is_dataclass(config):
-                    self.config = config
-                else:
-                    raise OSError
-            else:
-                raise OSError
-        except OSError:
-            self.config = self.get_default_config(config)
+        assert config is None or isinstance(config, JaxServerConfig), 'config can be None or JaxServerConfig Type'
+        if config is None:
+            self.config = JaxServerConfig()
+        else:
+            self.config = config
         self._funcs_generated = False
         self.number_of_served_request_until_last_up_time = 0
 
@@ -145,46 +168,6 @@ class JAXServer(object):
         self.gradio_app_instruct = self.create_gradio_ui_instruct()
         self.app = gr.mount_gradio_app(self.app, self.gradio_app_chat, '/gradio_chat')
         self.app = gr.mount_gradio_app(self.app, self.gradio_app_instruct, '/gradio_instruct')
-
-    @staticmethod
-    def get_default_config(updates=None):
-        config = ConfigDict()
-
-        config.port = 2059
-        config.batch_size = 1
-        config.max_length = 2048
-        config.max_new_tokens = 2048
-        config.max_stream_tokens = 32
-        config.temperature = 0.1
-        config.top_p = 0.95
-        config.top_k = 50
-        config.mesh_axes_shape = (1, -1, 1)
-
-        assert config.max_new_tokens % config.max_stream_tokens == 0, \
-            'max_new_tokens should be divisible by  max_new_tokens' \
-            f'{config.max_new_tokens % config.max_stream_tokens}'
-
-        config.host = '0.0.0.0'
-        config.dtype = 'fp16'
-        config.mesh_axes_names = ('dp', 'fsdp', 'mp')
-        config.system_prefix = ''
-        config.system = ''
-        config.prompt_prefix_instruct = ''
-        config.prompt_postfix_instruct = ''
-        config.prompt_prefix_chat = '<|prompter|>'
-        config.prompt_postfix_chat = '</s><|assistant|>'
-        config.instruct_format = '### SYSTEM:\n{system}\n### INSTRUCT:\n{instruct}\n### ASSISTANT:\n'
-        config.chat_format = '<|prompter|>{prompt}</s><|assistant|>{assistant}</s>'
-        config.chat_prefix = ''
-
-        config.contains_auto_format = True
-        config.logging = True
-        config.stream_tokens_for_gradio = True
-        config.use_prefix_tokenizer = True
-        config.pre_compile = True
-        if updates is not None:
-            config.update(ConfigDict(updates).copy_and_resolve_references())
-        return config
 
     def status(self):
         return {
@@ -312,7 +295,7 @@ class JAXServer(object):
             tokenizer: transformers.PreTrainedTokenizer,
             path: typing.Union[str, os.PathLike],
             config=None,
-            add_param_field: bool = True,
+            add_params_field: bool = True,
             init_shape: tuple = (1, 1),
             do_memory_log: bool = False,
             verbose: bool = True
@@ -355,9 +338,9 @@ class JAXServer(object):
                         pbar.write(server.get_memory())
                     pbar.set_description('Sharding Params')
         server.params = flax.traverse_util.unflatten_dict(server.params)
-        server.params = {'params': server.params} if add_param_field else server.params
+        server.params = {'params': server.params} if add_params_field else server.params
 
-        server.rules = {'params': rules} if add_param_field else rules
+        server.rules = {'params': rules} if add_params_field else rules
         logging.info(
             'configuring generate functions for the server'
         )
@@ -375,7 +358,7 @@ class JAXServer(object):
             tokenizer: transformers.PreTrainedTokenizer,
             params: typing.Dict,
             config=None,
-            add_param_field: bool = True,
+            add_params_field: bool = True,
             do_memory_log: bool = False,
             verbose: bool = True
     ):
@@ -406,8 +389,8 @@ class JAXServer(object):
                     pbar.write(server.get_memory())
                 pbar.set_description('Sharding Params')
             server.params = flax.traverse_util.unflatten_dict(params)
-            server.params = {'params': server.params} if add_param_field else server.params
-        server.rules = {'params': rules} if add_param_field else rules
+            server.params = {'params': server.params} if add_params_field else server.params
+        server.rules = {'params': rules} if add_params_field else rules
         logging.info(
             'configuring generate functions for the server'
         )
@@ -423,17 +406,21 @@ class JAXServer(object):
             if verbose:
                 print('\033[1;91mCompiling Model Forwards Greedy/NonGreedy(Generate)')
                 print('Compiling Greedy Funcs')
-            _ = self.process(
-                string='',
-                max_new_tokens=self.config.max_new_tokens,
-                greedy=True
-            )
+
+            r, a = [None] * 2
+            for r, a in self.process(
+                    string='',
+                    max_new_tokens=self.config.max_stream_tokens,
+                    greedy=True
+            ):
+                ...
             print('Compiling NonGreedy(Generate) Funcs\033[1;0m')
-            _ = self.process(
-                string='',
-                max_new_tokens=self.config.max_new_tokens,
-                greedy=False
-            )
+            for r, a in self.process(
+                    string='',
+                    max_new_tokens=self.config.max_stream_tokens,
+                    greedy=False
+            ):
+                ...
 
         else:
             print(
@@ -849,6 +836,12 @@ class PyTorchServer(object):
             'status': 'Ready',
             'number_of_served_request_until_last_up_time': f"{self.number_of_served_request_until_last_up_time}"
         }
+
+    def forward_instruct(self, *args, **kwargs):
+        return NotImplementedError
+
+    def forward_chat(self, *args, **kwargs):
+        return NotImplementedError
 
     def forward_instruct_non_api(self, prompt, system, greedy):
         data = InstructRequest(
