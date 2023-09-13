@@ -402,7 +402,7 @@ class FlaxMptAttention(nn.Module):
             if self.config.use_pjit_attention_force:
                 atw = with_sharding_constraint(atw, PartitionSpec(('dp', 'fsdp'), 'mp', None, None))
             if attn_bias is not None:
-                atw += attn_bias
+                atw += attn_bias[:, :, :, :atw.shape[-1]]
             mask = jnp.where(self.causal_mask == 1, 0, jnp.finfo(atw).min)
             if attention_mask is not None:
                 attention_mask = jnp.where(
@@ -411,7 +411,7 @@ class FlaxMptAttention(nn.Module):
                     jnp.finfo(atw).min
                 )
                 atw += attention_mask
-            atw += mask[:, :, :s, :s]
+            atw += mask[:, :, :atw.shape[-2], :atw.shape[-1]]
             atw = nn.softmax(atw, -1)
             atw = jnp.einsum('...hqk,...khd->...qhd', atw, v)
         return self.wo(atw.reshape(inp_shape))
@@ -537,6 +537,7 @@ class FlaxMptModule(nn.Module):
             precision=self.precision
         )
         self.norm_f = nn.LayerNorm(use_bias=self.config.use_norm_bias)
+        self.alibi = build_alibi(self.config.max_seq_len, self.config.n_heads)
 
     def __call__(self,
 
@@ -550,11 +551,9 @@ class FlaxMptModule(nn.Module):
         b, s = input_ids.shape
         hidden_states = self.wte(input_ids)
         hidden_states = hidden_states + extra_embedding if extra_embedding is not None else hidden_states
-        print(
-            f"hidden_states : {hidden_states.shape}"
-        )
+
         if self.config.alibi:
-            alibi = build_alibi(s, self.config.n_heads)
+            alibi = self.alibi
         else:
             pos_id = self.wpe(jnp.arange(s, dtype='i4').reshape(1, -1))
             hidden_states += pos_id
@@ -648,6 +647,7 @@ class FlaxMptPretrainedModel(FlaxPreTrainedModel):
         if past_key_values is not None:
             params['cache'] = past_key_values
             mutable = ['cache']
+
         predict = self.module.apply(
             params,
             input_ids=input_ids,
@@ -658,6 +658,13 @@ class FlaxMptPretrainedModel(FlaxPreTrainedModel):
             init_cache=init_cache,
             mutable=mutable
         )
+        if past_key_values is not None and return_dict:
+            predict, past_key_values = predict
+            predict["past_key_values"] = flax.core.unfreeze(past_key_values["cache"])
+            return predict
+        elif past_key_values is not None and not return_dict:
+            predict, past_key_values = predict
+            predict = predict[:1] + (flax.core.unfreeze(past_key_values["cache"]),) + predict[1:]
         return predict
 
 
@@ -705,6 +712,7 @@ class FlaxFlaxMptForCausalLMModule(nn.Module):
         else:
             logits = predict.last_hidden_state @ self.transformer.wte.embedding.T
         if return_dict:
+
             return FlaxCausalLMOutput(
                 logits=logits,
                 hidden_states=predict.last_hidden_state
@@ -719,8 +727,9 @@ class FlaxMptForCausalLM(FlaxMptPretrainedModel):
     def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[jax.Array] = None):
 
         batch_size, seq_length = input_ids.shape
+
         past_key_values = self.init_cache(
-            batch_size, seq_length
+            batch_size, max_length
         )
         extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
         if attention_mask is not None:
