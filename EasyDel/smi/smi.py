@@ -7,7 +7,7 @@ import IPython.display
 import jax
 import threading
 
-import posix
+import os
 
 
 # Edited version of Jax-SMI from https://github.com/ayaka14732/jax-smi/
@@ -58,7 +58,7 @@ def initialise_tracking(interval: float = 1., dir_prefix: str = '/dev/shm') -> N
     def inner():
         while True:
             jax.profiler.save_device_memory_profile(f'{dir_prefix}/memory.prof.new')
-            posix.rename(f'{dir_prefix}/memory.prof.new', f'{dir_prefix}/memory.prof')
+            os.rename(f'{dir_prefix}/memory.prof.new', f'{dir_prefix}/memory.prof')
             time.sleep(interval)
 
     thread = threading.Thread(target=inner, daemon=True)
