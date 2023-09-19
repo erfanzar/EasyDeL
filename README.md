@@ -4,6 +4,10 @@ EasyDeL (Easy Deep Learning) is an open-source library designed to accelerate an
 machine learning models. This library is primarily focused on Jax/Flax and plans to offer easy and fine solutions to
 train Flax/Jax Models on the `TPU/GPU` both for Serving and Training (EasyDel will support mojo and be rewriten for mojo too)
 
+### Hybe For Next Version
+
+in the next release of EasyDel LLama and Falcon Models will have Mojo 🔥 Interface which can be fastest llama and falcon models ever (since mojo is 35000 times faster than Python and 2 times faster than C)
+
 #### Note this Library needs golang to run (for some tracking stuff on TPU/GPU/CPU)
 
 #### Ubuntu GO installation
