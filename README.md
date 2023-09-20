@@ -6,7 +6,7 @@ train Flax/Jax Models on the `TPU/GPU` both for Serving and Training (EasyDel wi
 
 ### Hybe For Next Version
 
-in the next release of EasyDel LLama and Falcon Models will have Mojo 🔥 Interface which can be fastest llama and falcon models ever (since mojo is 35000 times faster than Python and 2 times faster than C)
+in the next release of EasyDel LLama and Falcon Models will have Mojo 🔥 Interface which can be fastest llama and falcon models ever (since mojo is 35000 times faster than Python and 1.6~ times faster than C)
 
 #### Note this Library needs golang to run (for some tracking stuff on TPU/GPU/CPU)
 
