@@ -60,7 +60,7 @@ available for free, making them a valuable resource for researchers and develope
 
 ```python
 import jax
-from src.EasyDel import llama_from_pretrained
+from EasyDel import llama_from_pretrained
 
 params, config = llama_from_pretrained(
   'meta-llama/Llama-2-7b',
@@ -73,9 +73,9 @@ also keep that in mind that returned `config` includes `.get_partition_rules(fsd
 #### Use With JaxServer
 
 ```python
-from src.EasyDel import JAXServer, FlaxLlamaForCausalLM
+from EasyDel import JAXServer, FlaxLlamaForCausalLM
 import jax
-from src.EasyDel import llama_from_pretrained
+from EasyDel import llama_from_pretrained
 from transformers import AutoTokenizer
 
 params, config = llama_from_pretrained(

@@ -1,0 +1,44 @@
+struct FileBuffer[T: DType]:
+    var data: DTypePointer[DType.uint8]
+    var offset: Int
+    var size: Int
+
+    fn __init__(inout self: Self, data: DTypePointer[DType.uint8]):
+        self.data = data
+        self.offset = 0
+        self.size = 0
+
+    fn move_offset(inout self: Self, size: Int) raises:
+        var dmf: Int = self.offset + size
+        if dmf > self.size:
+            raise Error(
+                "Out of bounderies you can not move offset [Out of Range Data!]"
+            )
+        else:
+            self.offset += size
+
+    fn read_values(inout self: Self, size: Int) -> DTypePointer[T]:
+        let res = self.data.offset(size).bitcast[T]()
+        self.offset += sizeof[T]() + size
+        return res
+
+    fn get_offset(self: Self) -> Int:
+        return self.offset if self.offset < self.size else self.size
+
+
+fn read_numerical_value[T: DType](inout buffer: FileBuffer[T]) -> SIMD[T, 1]:
+    let res: SIMD[T, 1] = buffer.data.offset(buffer.offset).bitcast[T]().load(0)
+    buffer.offset += sizeof[T]()
+    return res
+
+
+fn read_string_value[
+    T: DType
+](inout buffer: FileBuffer[T], string_length: Int) -> Pointer[UInt8]:
+    var str = Pointer[UInt8].alloc(string_length + 1)
+    for i in range(string_length):
+        str.store(i, buffer.data.offset(buffer.offset).load(0))
+        buffer.offset += 1
+    str.store(string_length, 0)
+    return str
+

@@ -4,9 +4,9 @@ EasyDeL (Easy Deep Learning) is an open-source library designed to accelerate an
 machine learning models. This library is primarily focused on Jax/Flax and plans to offer easy and fine solutions to
 train Flax/Jax Models on the `TPU/GPU` both for Serving and Training (EasyDel will support mojo and be rewriten for mojo too)
 
-### Hybe For Next Version
+### Beta Version of EasyDel Mojo
 
-in the next release of EasyDel LLama and Falcon Models will have Mojo 🔥 Interface which can be fastest llama and falcon models ever (since mojo is 35000 times faster than Python and 1.6~ times faster than C)
+you are currenly on `mojo-beta` branch and this branch is currently developing the EasyDel for Mojo
 
 #### Note this Library needs golang to run (for some tracking stuff on TPU/GPU/CPU)
 
@@ -130,7 +130,7 @@ transform in the library example
 
 ```python
 import jax
-from src.EasyDel import mpt_convert_pt_to_flax_7b
+from EasyDel import mpt_convert_pt_to_flax_7b
 from fjutils.utils import save_ckpt
 
 number_of_layers = 32  # its 32 hidden layers for Mpt 7B
@@ -147,9 +147,9 @@ now it's time to finetune or model
 
 ```python
 import jax.numpy
-from src.EasyDel import TrainArguments, CausalLMTrainer
+from EasyDel import TrainArguments, CausalLMTrainer
 from datasets import load_dataset
-from src.EasyDel import configs
+from EasyDel import configs
 
 max_length = 4096
 conf = configs.mpt_configs['7b']
@@ -202,8 +202,8 @@ To use EasyDeL in your project, you will need to import the library in your Pyth
 and classes. Here is an example of how to import EasyDeL and use its Model class:
 
 ```python
-from src.EasyDel import JAXServer, FlaxLlamaForCausalLM, LlamaConfig
-from src.EasyDel import llama_from_pretrained
+from EasyDel import JAXServer, FlaxLlamaForCausalLM, LlamaConfig
+from EasyDel import llama_from_pretrained
 from transformers import AutoTokenizer
 
 import jax

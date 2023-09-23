@@ -67,7 +67,7 @@ and available for free, making them a valuable resource for researchers and deve
 
 ```python
 import jax
-from src.EasyDel.transform import mpt_from_pretrained
+from EasyDel.transform import mpt_from_pretrained
 
 params, config = mpt_from_pretrained(
   'mosaicml/mpt-7b',
@@ -82,7 +82,7 @@ also keep that in mind that returned `config` includes `.get_partition_rules(fsd
 ```python
 from EasyDel import JAXServer, FlaxMptForCausalLM
 import jax
-from src.EasyDel.transform import mpt_from_pretrained
+from EasyDel.transform import mpt_from_pretrained
 from transformers import AutoTokenizer
 
 params, config = mpt_from_pretrained(

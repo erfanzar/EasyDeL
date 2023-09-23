@@ -61,7 +61,7 @@ available for free, making them a valuable resource for researchers and develope
 
 ```python
 import jax
-from src.EasyDel import falcon_from_pretrained
+from EasyDel import falcon_from_pretrained
 
 params, config = falcon_from_pretrained(
   'tiiuae/falcon-7b',
@@ -74,9 +74,9 @@ also keep that in mind that returned `config` includes `.get_partition_rules(fsd
 #### Use With JaxServer
 
 ```python
-from src.EasyDel import JAXServer, FlaxFalconForCausalLM
+from EasyDel import JAXServer, FlaxFalconForCausalLM
 import jax
-from src.EasyDel import falcon_from_pretrained
+from EasyDel import falcon_from_pretrained
 from transformers import AutoTokenizer
 
 params, config = falcon_from_pretrained(

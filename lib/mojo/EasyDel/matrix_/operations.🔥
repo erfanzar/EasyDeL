@@ -1,0 +1,231 @@
+from algorithm.functional import vectorize, parallelize
+from runtime.llcl import Runtime, num_cores
+from tensor import Tensor, TensorSpec
+from utils.index import Index
+from math import math
+from algorithm import Static2DTileUnitFunc as Tile2DFunc
+
+
+
+
+fn argmax[T: DType](vals: Matrix[T]) -> Int:
+    var max__: Int = 0
+    var max_v: SIMD[T, 1] = vals[0]
+    for i in range(vals.rows):
+        if vals[i] > max_v:
+            max__ = max__
+            max_v = vals[i]
+    return max__
+
+
+fn matmul_naive[
+    T: DType, _nelts: Int
+](C: Matrix[T], A: Matrix[T], B: Matrix[T], _rt: Runtime):
+    for m in range(C.cols):
+        for k in range(A.rows):
+            for n in range(C.rows):
+                C[m, n] += A[m, k] * B[k, n]
+
+
+fn matmul_vectorized_manual[
+    T: DType, _nelts: Int
+](C: Matrix[T], A: Matrix[T], B: Matrix[T], _rt: Runtime):
+    for m in range(C.cols):
+        for k in range(A.rows):
+            for nv in range(0, C.rows, _nelts):
+                C.store[_nelts](
+                    m, nv, C.load[_nelts](m, nv) + A[m, k] * B.load[_nelts](k, nv)
+                )
+
+            # Handle remaining elements with scalars.
+            for n in range(_nelts * (C.rows // _nelts), C.rows):
+                C[m, n] += A[m, k] * B[k, n]
+
+
+fn matmul_vectorized[
+    T: DType, _nelts: Int
+](C: Matrix[T], A: Matrix[T], B: Matrix[T], _rt: Runtime):
+    for m in range(C.cols):
+        for k in range(A.rows):
+
+            @parameter
+            fn dot[nelts: Int](n: Int):
+                C.store[nelts](
+                    m, n, C.load[nelts](m, n) + A[m, k] * B.load[nelts](k, n)
+                )
+
+            vectorize[_nelts, dot](C.rows)
+
+
+fn tile[tiled_fn: Tile2DFunc, tile_x: Int, tile_y: Int](end_x: Int, end_y: Int):
+    for y in range(0, end_y, tile_y):
+        for x in range(0, end_x, tile_x):
+            tiled_fn[tile_x, tile_y](x, y)
+
+
+fn matmul_tiled_parallelized[
+    T: DType, _nelts: Int
+](C: Matrix[T], A: Matrix[T], B: Matrix[T], rt: Runtime):
+    @parameter
+    fn calc_row(m: Int):
+        @parameter
+        fn calc_tile[tile_x: Int, tile_y: Int](x: Int, y: Int):
+            for k in range(y, y + tile_y):
+
+                @parameter
+                fn dot[
+                    nelts: Int,
+                ](n: Int):
+                    C.store[nelts](
+                        m,
+                        n + x,
+                        C.load[nelts](m, n + x) + A[m, k] * B.load[nelts](k, n + x),
+                    )
+
+                vectorize[_nelts, dot](tile_x)
+
+        # We hardcode the tile factor to be 4.
+        alias tile_size = sizeof[T]()
+        tile[calc_tile, _nelts * tile_size, tile_size](A.rows, C.rows)
+
+    parallelize[calc_row](rt, C.cols, rt.parallelism_level())
+
+
+fn _matmul_parallelize_with_parallelism_level[
+    T: DType, nelts: Int
+](inout r: Matrix[T], a: Matrix[T], b: Matrix[T], runtime: Runtime):
+    @parameter
+    fn calc_row(m: Int):
+        for k in range(a.rows):
+
+            @parameter
+            fn dot[nelts: Int](n: Int):
+                r.store[nelts](
+                    m, n, r.load[nelts](m, n) + a[m, k] * b.load[nelts](k, n)
+                )
+
+            vectorize[nelts, dot](r.rows)
+
+    parallelize[calc_row](runtime, r.cols, runtime.parallelism_level())
+
+
+fn matmul_parallelized[
+    T: DType, nelts: Int
+](C: Matrix[T], A: Matrix[T], B: Matrix[T], rt: Runtime):
+    @parameter
+    fn compute_row(i: Int):
+        var tmp = SIMD[T, nelts](0)
+
+        @parameter
+        fn dot[_nelts: Int](j: Int):
+            if _nelts < nelts:
+                tmp[0] += (A.load[_nelts](j) * B.load[_nelts](i, j)).reduce_add()
+            else:
+                tmp += A.load[nelts](j) * B.load[nelts](i, j)
+
+        vectorize[nelts, dot](B.rows)
+        C[i] = tmp.reduce_add()
+
+    parallelize[compute_row](rt, B.cols, rt.parallelism_level())
+
+
+fn tensor_matmul[T: DType](a: Tensor[T], b: Tensor[T]) -> Tensor[T]:
+    fn get_row_col[T: DType](tensor_: Tensor[T]) -> Tuple[Int, Int]:
+        let shape = tensor_.shape()
+        let total_shape = tensor_.rank()
+        let cols = shape[total_shape - 1]
+        let rows = shape[total_shape - 2]
+        return rows, cols
+
+    let rc_a = get_row_col[T](a)
+    let rc_b = get_row_col[T](b)
+    var r = Tensor[T](TensorSpec(T, rc_a.get[0, Int](), rc_b.get[1, Int]()))
+    let rc_r = get_row_col[T](r)
+
+    for i in range(rc_r.get[1, Int]()):
+        for j in range(rc_a.get[0, Int]()):
+            for k in range(rc_r.get[0, Int]()):
+                r[Index(i, k)] = r[Index(i, k)] + (a[i, j] * b[j, k])
+    return r
+
+
+fn sigmoid_[T: DType](input_: SIMD[T, 1]) -> SIMD[T, 1]:
+    return 1.0 / (1.0 + math.exp(-input_))
+
+
+fn silu_[T: DType](input_: SIMD[T, 1]) -> SIMD[T, 1]:
+    return input_ * sigmoid_[T](input_)
+
+
+fn relu_[T: DType](input_: SIMD[T, 1]) -> SIMD[T, 1]:
+    return input_ if input_ > 0.0 else 0.0
+
+
+fn sigmoid[T: DType](matrix: Matrix[T], size: Int, runtime: Runtime):
+    @parameter
+    fn si(size_: Int):
+        matrix[size_] = sigmoid_[T](matrix[size_])
+
+    parallelize[si](runtime, size, runtime.parallelism_level())
+
+
+
+fn relu[T: DType](matrix: Matrix[T], size: Int, runtime: Runtime):
+    @parameter
+    fn si(size_: Int):
+        matrix[size_] = relu_[T](matrix[size_])
+
+    parallelize[si](runtime, size, runtime.parallelism_level())
+
+
+fn silu[T: DType](matrix: Matrix[T], size: Int, runtime: Runtime):
+    @parameter
+    fn si(size_: Int):
+        matrix[size_] = silu_[T](matrix[size_])
+
+    parallelize[si](runtime, size, runtime.parallelism_level())
+
+
+fn add_matrix[T: DType, nelts: Int](inout a: Matrix[T], b: Matrix[T], size: Int):
+    @parameter
+    fn _add[_nelts: Int](Size: Int):
+        a.data.offset(Size).simd_store[_nelts](
+            0, a.data.offset(Size).load(0) + b.data.offset(Size).load(0)
+        )
+
+    vectorize[nelts, _add](size)
+
+
+fn softmax[T: DType](inout x: DTypePointer[T], size: Int) -> None:
+    alias nelts = (2 * simdwidthof[T]())
+    var max_val: SIMD[T, 1] = -1e9
+
+    @parameter
+    fn _max[_nelts: Int](j: Int):
+        let val = x.simd_load[_nelts](j).reduce_max()
+        if val > max_val:
+            max_val = val
+
+    vectorize[nelts, _max](size)
+
+    # Exp and sum
+    var ssum: SIMD[T, 1] = 0.0
+
+    @parameter
+    fn _sum_exp[_nelts: Int](j: Int):
+        x.simd_store[_nelts](j, math.exp(x.simd_load[_nelts](j) - max_val))
+        ssum += x.simd_load[_nelts](j).reduce_add()
+
+    vectorize[nelts, _sum_exp](size)
+
+    @parameter
+    fn _norm[_nelts: Int](j: Int):
+        x.simd_store[_nelts](j, x.simd_load[_nelts](j) / ssum)
+
+    vectorize[nelts, _norm](size)
+
+fn matmul[
+    T: DType,nelts:Int
+](inout C: Matrix[T], A: Matrix[T], B: Matrix[T], rt: Runtime) -> None:
+    # matmul_parallelized[T](C, A, B, rt)
+    matmul_parallelized[T, nelts](C, A, B, rt)

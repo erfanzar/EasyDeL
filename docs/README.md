@@ -2,7 +2,7 @@
 
 EasyDeL (Easy Deep Learning) is an open-source library designed to accelerate and optimize the training process of
 machine learning models. This library is primarily focused on Jax/Flax and plans to offer easy and fine solutions to
-train Flax/Jax Models on the `TPU/GPU` both for Serving and Training
+train Flax/Jax Models on the `TPU/GPU` both for Serving and Training For both Python And Mojo🔥
 
 #### Note this Library needs golang to run (for some tracking stuff on TPU/GPU/CPU)
 
@@ -45,7 +45,7 @@ pip install --upgrade "jax[cuda11_pip]" -f \
 
 ## Documentations 🧭
 
-* _EasyDel_:
+* _EasyDel Python_:
     * Configs
     * [Modules](https://erfanzar.github.io/EasyDeL/docs/Models)
     * RLHF
@@ -54,3 +54,9 @@ pip install --upgrade "jax[cuda11_pip]" -f \
     * Trainer
     * Transform
     * Utils
+
+* _EasyDel Mojo🔥_ (Docs are on the way...):
+    * IO
+    * Matrix
+    * Tokenizer
+    * Utilities
