@@ -1,13 +1,11 @@
 import flax.core
 
-from EasyDel.transform import llama_from_pretrained
+from src.EasyDel import llama_from_pretrained
 
-from EasyDel import TrainArguments, CausalLMTrainer
+from src.EasyDel import TrainArguments, CausalLMTrainer
 from datasets import load_dataset
 from huggingface_hub import HfApi
-from EasyDel import configs
-from jax import numpy as jnp
-import EasyDel
+from src import EasyDel
 from absl import flags, app
 from fjutils import get_float_dtype_by_name
 

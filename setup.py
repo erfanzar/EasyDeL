@@ -27,4 +27,5 @@ setup(
         # add any other required dependencies here
     ],
     python_requires='>=3.8',
+    package_dir={'': 'Python-EasyDel'}
 )

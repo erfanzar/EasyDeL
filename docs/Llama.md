@@ -69,7 +69,7 @@ Here is a table comparing the different sizes of Llama models:
 
 ```python
 import jax
-from EasyDel.transform import llama_from_pretrained
+from src.EasyDel import llama_from_pretrained
 
 params, config = llama_from_pretrained(
     'meta-llama/Llama-2-7b',
@@ -84,7 +84,7 @@ also keep that in mind that returned `config` includes `.get_partition_rules(fsd
 ```python
 from EasyDel import JAXServer, FlaxLlamaForCausalLM
 import jax
-from EasyDel.transform import llama_from_pretrained
+from src.EasyDel.transform import llama_from_pretrained
 from transformers import AutoTokenizer
 
 params, config = llama_from_pretrained(

@@ -10,9 +10,9 @@ Model in EasyDel JAXServer with less than 50 lines of Code
 ### Example of Serving LLama 7B Instruct
 
 ```python
-from EasyDel.serve import JAXServer
+from src.EasyDel import JAXServer
 from huggingface_hub import hf_hub_download
-import EasyDel
+from src import EasyDel
 from transformers import AutoTokenizer
 
 
@@ -52,7 +52,7 @@ if __name__ == "__main__":
 you can also load model itself from parameters like
 
 ```python
-import EasyDel.transform
+import src.EasyDel.transform
 
 model_id = 'meta-llama/Llama.md-2-7b-chat-hf'
 
@@ -220,7 +220,7 @@ how it being run, num cores in use, number of generated prompt , number of reque
 ### Example of using Server Without hosting it
 
 ```python
-from EasyDel.serve import JAXServer
+from src.EasyDel.serve import JAXServer
 from huggingface_hub import hf_hub_download
 import EasyDel
 from transformers import AutoTokenizer

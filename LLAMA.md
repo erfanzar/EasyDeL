@@ -53,9 +53,9 @@ def get_prompt(message: str, chat_history,
 
 ```python
 import jax
-from EasyDel import get_mesh, FlaxLlamaForCausalLM
+from src.EasyDel import get_mesh, FlaxLlamaForCausalLM
 from fjutils import with_sharding_constraint, match_partition_rules, make_shard_and_gather_fns
-from EasyDel.transform import llama_from_pretrained
+from src.EasyDel import llama_from_pretrained
 from jax.experimental import pjit
 from jax.sharding import PartitionSpec as PS
 from transformers import AutoTokenizer, GenerationConfig
