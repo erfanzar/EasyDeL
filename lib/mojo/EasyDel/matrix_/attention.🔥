@@ -1,0 +1,35 @@
+from .matrix_struct import Matrix
+from runtime.llcl import Runtime
+from math import math
+from algorithm.functional import vectorize
+
+
+fn rms_norm[
+    T: DType, nelts: Int
+](
+    inout output: DTypePointer[T],
+    x: DTypePointer[T],
+    w: DTypePointer[T],
+    epsilon: SIMD[T, 1],
+    size: Int,
+    runtime: Runtime,
+):
+    var x_: SIMD[T, 1] = 0.0
+
+    @parameter
+    fn _sum_power_operation[_nelts: Int](i: Int):
+        if _nelts < nelts:
+            x_[0] += (x.offset(i).load(0) ** 2).reduce_add()
+        else:
+            x_ += x.offset(i).load(0) ** 2
+
+    var ss_: SIMD[T, 1] = x_.reduce_add()
+    ss_ = ss_ / size + epsilon
+    var f_x: SIMD[T, 1] = 1.0 / math.sqrt[T, 1](ss_)
+
+    @parameter
+    fn _norm[_nelts: Int](j: Int):
+        let val = w.simd_load[_nelts](j) * f_x * x.simd_load[_nelts](j)
+        output.offset(j).simd_store[_nelts](0, val)
+
+    vectorize[nelts, _norm](size)
