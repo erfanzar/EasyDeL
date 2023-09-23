@@ -130,7 +130,7 @@ transform in the library example
 
 ```python
 import jax
-from EasyDel.transform import mpt_convert_pt_to_flax_7b
+from src.EasyDel import mpt_convert_pt_to_flax_7b
 from fjutils.utils import save_ckpt
 
 number_of_layers = 32  # its 32 hidden layers for Mpt 7B
@@ -147,9 +147,9 @@ now it's time to finetune or model
 
 ```python
 import jax.numpy
-from EasyDel import TrainArguments, CausalLMTrainer
+from src.EasyDel import TrainArguments, CausalLMTrainer
 from datasets import load_dataset
-from EasyDel.configs import configs
+from src.EasyDel import configs
 
 max_length = 4096
 conf = configs.mpt_configs['7b']
@@ -202,8 +202,8 @@ To use EasyDeL in your project, you will need to import the library in your Pyth
 and classes. Here is an example of how to import EasyDeL and use its Model class:
 
 ```python
-from EasyDel import JAXServer, FlaxLlamaForCausalLM, LlamaConfig
-from EasyDel.transform import llama_from_pretrained
+from src.EasyDel import JAXServer, FlaxLlamaForCausalLM, LlamaConfig
+from src.EasyDel import llama_from_pretrained
 from transformers import AutoTokenizer
 
 import jax

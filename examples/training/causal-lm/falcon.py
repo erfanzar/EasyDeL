@@ -1,8 +1,7 @@
-from EasyDel import TrainArguments, CausalLMTrainer
+from src.EasyDel import TrainArguments, CausalLMTrainer
 from datasets import load_dataset
 from huggingface_hub import HfApi
-from EasyDel import configs
-import EasyDel
+from src import EasyDel
 from absl import flags, app
 from fjutils import get_float_dtype_by_name
 
@@ -160,7 +159,7 @@ def main(argv):
         config.use_flash_attention = FLAGS.use_flash_attention
         config.use_sacn_mlp = FLAGS.use_sacn_mlp
     else:
-        conf = EasyDel.configs.configs.falcon_configs[FLAGS.model_type]
+        conf = src.EasyDel.configs.configs.falcon_configs[FLAGS.model_type]
         config = EasyDel.FalconConfig(**conf, rotary_type=FLAGS.rotary_type)
         config.use_flash_attention = FLAGS.use_flash_attention
         config.use_sacn_mlp = FLAGS.use_sacn_mlp

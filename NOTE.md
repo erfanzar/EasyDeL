@@ -6,7 +6,7 @@ been removed
 but you have to convert model with easydel like
 
 ```python
-from EasyDel.transform import llama_from_pretrained, llama_convert_hf_to_flax
+from src.EasyDel import llama_from_pretrained, llama_convert_hf_to_flax
 
 params, config = llama_from_pretrained(
     '<Model-id>'
@@ -26,7 +26,7 @@ The llama model has a different key or params name in case you want to load the 
 #### Example
 
 ```python
-from EasyDel import LlamaConfig, FlaxLlamaForCausalLM
+from src.EasyDel import LlamaConfig, FlaxLlamaForCausalLM
 
 config = LlamaConfig(from_pt=True)
 model = FlaxLlamaForCausalLM.from_pretrained('<here/pretrained>', config=config)
