@@ -15,15 +15,15 @@ struct Matrix[T: DType]:
         self.layers = 1
         self.allocated = 0
 
-    fn __init__(inout self, rows: Int):
+    fn __init__(inout self, cols: Int):
         self.data = DTypePointer[T].alloc(0)
-        self.rows = rows
+        self.rows = 1
         self.layers = 1
-        self.cols = 1
+        self.cols = cols
         self.allocated = 0
 
     fn __init__(inout self, layers: Int, cols: Int, rows: Int):
-        self.__init__(rows, cols)
+        self.__init__(cols, rows)
         self.layers = layers
 
     fn __del__(owned self):
@@ -75,7 +75,7 @@ struct Matrix[T: DType]:
 
     @always_inline
     fn size(inout self) -> Int:
-        return self.cols * self.rows * self.layers
+        return self.cols * self.layers * self.rows  
 
     # Get item with Layer , column , Row
     @always_inline
@@ -133,5 +133,5 @@ struct Matrix[T: DType]:
 
     @always_inline
     fn shape(self: Self) -> Tuple[Int, Int, Int]:
-        var shape_: Tuple[Int, Int, Int] = (self.layers, self.cols, self.rows)
+        var shape_: Tuple[Int, Int, Int] = (self.layers, self.cols, self.cols)
         return shape_
