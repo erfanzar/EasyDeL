@@ -6,8 +6,6 @@ from math import math
 from algorithm import Static2DTileUnitFunc as Tile2DFunc
 
 
-
-
 fn argmax[T: DType](vals: Matrix[T]) -> Int:
     var max__: Int = 0
     var max_v: SIMD[T, 1] = vals[0]
@@ -91,7 +89,7 @@ fn matmul_tiled_parallelized[
     parallelize[calc_row](rt, C.cols, rt.parallelism_level())
 
 
-fn _matmul_parallelize_with_parallelism_level[
+fn matmul_parallelize_with_parallelism_level[
     T: DType, nelts: Int
 ](inout r: Matrix[T], a: Matrix[T], b: Matrix[T], runtime: Runtime):
     @parameter
@@ -169,7 +167,6 @@ fn sigmoid[T: DType](matrix: Matrix[T], size: Int, runtime: Runtime):
     parallelize[si](runtime, size, runtime.parallelism_level())
 
 
-
 fn relu[T: DType](matrix: Matrix[T], size: Int, runtime: Runtime):
     @parameter
     fn si(size_: Int):
@@ -196,8 +193,19 @@ fn add_matrix[T: DType, nelts: Int](inout a: Matrix[T], b: Matrix[T], size: Int)
     vectorize[nelts, _add](size)
 
 
-fn softmax[T: DType](inout x: DTypePointer[T], size: Int) -> None:
-    alias nelts = (2 * simdwidthof[T]())
+fn add_pointers[
+    T: DType, nelts: Int
+](inout a: DTypePointer[T], b: DTypePointer[T], size: Int):
+    @parameter
+    fn _add[_nelts: Int](Size: Int):
+        a.offset(Size).simd_store[_nelts](
+            0, a.offset(Size).load(0) + b.offset(Size).load(0)
+        )
+
+    vectorize[nelts, _add](size)
+
+
+fn softmax[T: DType, nelts: Int](inout x: DTypePointer[T], size: Int) -> None:
     var max_val: SIMD[T, 1] = -1e9
 
     @parameter
@@ -224,8 +232,9 @@ fn softmax[T: DType](inout x: DTypePointer[T], size: Int) -> None:
 
     vectorize[nelts, _norm](size)
 
+
 fn matmul[
-    T: DType,nelts:Int
+    T: DType, nelts: Int
 ](inout C: Matrix[T], A: Matrix[T], B: Matrix[T], rt: Runtime) -> None:
     # matmul_parallelized[T](C, A, B, rt)
     matmul_parallelized[T, nelts](C, A, B, rt)

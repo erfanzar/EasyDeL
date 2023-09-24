@@ -14,7 +14,7 @@ from .operations import (
     matmul_vectorized,
     tile,
     matmul_tiled_parallelized,
-    _matmul_parallelize_with_parallelism_level,
+    matmul_parallelize_with_parallelism_level,
     matmul_parallelized,
     tensor_matmul,
     sigmoid_,
@@ -25,4 +25,5 @@ from .operations import (
     silu,
     add_matrix,
     softmax,
+    add_pointers,
 )

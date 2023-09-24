@@ -17,6 +17,7 @@ from .utilities import (
     uint8_to_string_ref,
     string_num_to_int,
     read_file,
+    system_information,
 )
 
 from .matrix_ import (
@@ -29,7 +30,7 @@ from .matrix_ import (
     matmul_vectorized,
     tile,
     matmul_tiled_parallelized,
-    _matmul_parallelize_with_parallelism_level,
+    matmul_parallelize_with_parallelism_level,
     matmul_parallelized,
     tensor_matmul,
     sigmoid_,
@@ -40,4 +41,5 @@ from .matrix_ import (
     silu,
     add_matrix,
     softmax,
+    add_pointers,
 )

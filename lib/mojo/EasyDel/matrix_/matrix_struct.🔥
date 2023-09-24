@@ -46,14 +46,32 @@ struct Matrix[T: DType]:
         memset_zero(self.data, self.size())
 
     @always_inline
-    fn set_data_from_buffer(inout self, ptr: DTypePointer[T]):
+    fn set_data_from_buffer(inout self, ptr: DTypePointer[T]) -> None:
         self.data = ptr
+        return None
+
+    fn set_data_from_buffer(inout self, ptr: DTypePointer[T], rows: Int) -> None:
+        self.data = ptr
+        self.rows = rows
+        return None
 
     # set buf ptr with redefined rows, cols
-    fn set_data_from_buffer(inout self, ptr: DTypePointer[T], cols: Int, rows: Int):
+    fn set_data_from_buffer(
+        inout self, ptr: DTypePointer[T], cols: Int, rows: Int
+    ) -> None:
         self.data = ptr
         self.rows = rows
         self.cols = cols
+        return None
+
+    fn set_data_from_buffer(
+        inout self, ptr: DTypePointer[T], layers: Int, cols: Int, rows: Int
+    ) -> None:
+        self.data = ptr
+        self.rows = rows
+        self.cols = cols
+        self.layers = layers
+        return None
 
     @always_inline
     fn size(inout self) -> Int:
@@ -91,7 +109,7 @@ struct Matrix[T: DType]:
 
     @always_inline
     fn load[nelts: Int](self, z: Int, y: Int, x: Int) -> SIMD[T, nelts]:
-        return self.data.simd_load[nelts](z * self.layers + y * self.rows + x)
+        return self.data.simd_load[nelts](z * self.layers + y * self.cols + x)
 
     @always_inline
     fn load[nelts: Int](self, x: Int) -> SIMD[T, nelts]:
@@ -99,11 +117,11 @@ struct Matrix[T: DType]:
 
     @always_inline
     fn load[nelts: Int](self, y: Int, x: Int) -> SIMD[T, nelts]:
-        return self.data.simd_load[nelts](y * self.rows + x)
+        return self.data.simd_load[nelts](y * self.cols + x)
 
     @always_inline
     fn store[nelts: Int](self, z: Int, y: Int, x: Int, val: SIMD[T, nelts]):
-        self.data.simd_store[nelts](z * self.layers + y * self.rows + x, val)
+        self.data.simd_store[nelts](z * self.layers + y * self.cols + x, val)
 
     @always_inline
     fn store[nelts: Int](self, x: Int, val: SIMD[T, nelts]):
@@ -111,7 +129,7 @@ struct Matrix[T: DType]:
 
     @always_inline
     fn store[nelts: Int](self, y: Int, x: Int, val: SIMD[T, nelts]):
-        self.data.simd_store[nelts](y * self.rows + x, val)
+        self.data.simd_store[nelts](y * self.cols + x, val)
 
     @always_inline
     fn shape(self: Self) -> Tuple[Int, Int, Int]:

@@ -43,7 +43,7 @@ fn concatenate_string(
 
 
 fn string_ref_to_uint8(string: String) -> DynamicVector[UInt8]:
-    let vc: DynamicVector[UInt8] = DynamicVector[UInt8]()
+    var vc: DynamicVector[UInt8] = DynamicVector[UInt8]()
     for s in range(len(string)):
         vc.push_back(ord(string[s]))
     return vc
