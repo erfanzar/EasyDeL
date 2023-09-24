@@ -48,7 +48,7 @@ struct Tokenizer:
         self.max_token_length = (
             buffer.data.offset(buffer.offset).bitcast[DType.uint32]().load(0).to_int()
         )
-        buffer.offset += sizeof[Int]()
+        buffer.move_offset(sizeof[DType.uint32]())
         self.vocab_scores = DTypePointer[DType.float32].alloc(self.vocab_size)
         self.vocab = Pointer[Pointer[UInt8]].alloc(self.vocab_size)
 
@@ -56,14 +56,17 @@ struct Tokenizer:
         self.sorted_indices = DynamicVector[Int](0)
 
         for i in range(0, self.vocab_size):
-            self.vocab_scores.simd_store[1](i, read_numerical_value[DType.float32](buffer))
+            self.vocab_scores.simd_store[1](
+                i, buffer.read_numerical_value_dynamic[DType.float32](1).load(0)
+            )
             let string_length = (
                 buffer.data.offset(buffer.offset)
                 .bitcast[DType.uint32]()
                 .load(0)
                 .to_int()
             )
-            buffer.move_offset(sizeof[Int]())
+
+            buffer.move_offset(sizeof[DType.uint32]())
             self.vocab.store(i, read_string_value(buffer, string_length))
 
     fn sort(inout self) -> None:

@@ -89,10 +89,13 @@ fn read_numerical_value[T: DType](inout buffer: FileBuffer) raises -> SIMD[T, 1]
 fn read_string_value(
     inout buffer: FileBuffer, string_length: Int
 ) raises -> Pointer[UInt8]:
+
     let str = Pointer[UInt8].alloc(string_length + 1)
+
     for i in range(string_length):
         str.store(i, buffer.data.offset(buffer.offset).load(0))
         buffer.move_offset(1)
+
     str.store(string_length, 0)
     return str
 
