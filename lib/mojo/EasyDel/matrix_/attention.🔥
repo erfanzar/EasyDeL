@@ -14,22 +14,24 @@ fn rms_norm[
     size: Int,
     runtime: Runtime,
 ):
-    var x_: SIMD[T, 1] = 0.0
+    var loop_val: SIMD[T, nelts] = SIMD[T, nelts](0.0)
 
     @parameter
     fn _sum_power_operation[_nelts: Int](i: Int):
         if _nelts < nelts:
-            x_[0] += (x.offset(i).load(0) ** 2).reduce_add()
+            loop_val[0] += (x.offset(i).simd_load[_nelts](0) ** 2).reduce_add()
         else:
-            x_ += x.offset(i).load(0) ** 2
+            loop_val += x.offset(i).simd_load[nelts](0) ** 2
 
-    var ss_: SIMD[T, 1] = x_.reduce_add()
-    ss_ = ss_ / size + epsilon
-    var f_x: SIMD[T, 1] = 1.0 / math.sqrt[T, 1](ss_)
+    vectorize[nelts, _sum_power_operation](size)
+
+    var normed: SIMD[T, 1] = loop_val.reduce_add()
+    normed = normed / size + epsilon
+    normed = 1.0 / math.sqrt(normed)
 
     @parameter
-    fn _norm[_nelts: Int](j: Int):
-        let val = w.simd_load[_nelts](j) * f_x * x.simd_load[_nelts](j)
-        output.offset(j).simd_store[_nelts](0, val)
+    fn _norm[_nelts: Int](idx: Int):
+        let val = w.simd_load[_nelts](idx) * normed * x.simd_load[_nelts](idx)
+        output.offset(idx).simd_store[_nelts](0, val)
 
     vectorize[nelts, _norm](size)
