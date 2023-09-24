@@ -21,9 +21,9 @@ struct FileBuffer[T: DType]:
             self.offset += size
 
     fn read_values(inout self: Self, size: Int) raises -> DTypePointer[T]:
-        let res = self.data.offset(size).bitcast[T]()
+        let res = self.data.offset(self.offset).bitcast[T]()
 
-        self.move_offset(sizeof[T]() + size)
+        self.move_offset(sizeof[T]() * size)
         return res
 
     fn get_offset(self: Self) -> Int:

@@ -13,3 +13,4 @@ from .string import (
     uint8_to_string_ref,
     string_num_to_int,
 )
+from .info import system_information
