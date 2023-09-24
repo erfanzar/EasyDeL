@@ -5,67 +5,6 @@ from python import Python as Py
 from memory.memory import memset_zero
 
 
-struct Tokenizer[T: DType]:
-    var vocab: Pointer[Pointer[UInt8]]
-    var vocab_scores: DTypePointer[T]
-    var max_token_length: Int
-    var vocab_size: Int
-    var sorted_vocab: Pointer[Pointer[UInt8]]
-    var sorted_indices: DynamicVector[Int]
-
-    fn __init__(inout self, vocab_size: Int, inout buffer: FileBuffer[T]):
-        self.vocab_size = vocab_size
-        self.max_token_length = (
-            buffer.data.offset(buffer.offset).bitcast[DType.uint32]().load(0).to_int()
-        )
-        buffer.offset += sizeof[Int]()
-        self.vocab_scores = DTypePointer[T].alloc(self.vocab_size)
-        self.vocab = Pointer[Pointer[UInt8]].alloc(self.vocab_size)
-
-        self.sorted_vocab = Pointer[Pointer[UInt8]].alloc(0)
-        self.sorted_indices = DynamicVector[Int](0)
-
-        for i in range(0, self.vocab_size):
-            self.vocab_scores.simd_store[1](i, read_numerical_value[T](buffer))
-            let string_length = (
-                buffer.data.offset(buffer.offset)
-                .bitcast[DType.uint32]()
-                .load(0)
-                .to_int()
-            )
-            buffer.offset += sizeof[Int]()
-            self.vocab.store(i, read_string_value[T](buffer, string_length))
-
-    fn sort(inout self) -> None:
-        if len(self.sorted_indices) < self.vocab_size:
-            self.sorted_indices = DynamicVector[Int](self.vocab_size)
-            self.sorted_vocab = Pointer[Pointer[UInt8]].alloc(self.vocab_size)
-            for ii in range(self.vocab_size):
-                self.sorted_vocab.store(ii, self.vocab[ii])
-                self.sorted_indices.push_back(ii)
-
-        let n = self.vocab_size
-        loop_sort(self.sorted_vocab, self.sorted_indices, 0, n - 1)
-
-    fn find(inout self, token: Pointer[UInt8]) -> Int:
-        let n = self.vocab_size
-        if len(self.sorted_indices) < n:
-            self.sort()
-        var left = 0
-        var right = n - 1
-        while left <= right:
-            let mid = left + (right - left) // 2
-            let comparison = dif_string(self.sorted_vocab[mid], token)
-
-            if comparison == 0:
-                return self.sorted_indices[mid]
-            if comparison < 0:
-                left = mid + 1
-            else:
-                right = mid - 1
-        return -1
-
-
 struct Config[T: DType]:
     var hidden_size: Int
     var num_attention_heads: Int
@@ -117,7 +56,7 @@ struct Config[T: DType]:
         self.head_dims = self.hidden_size // self.num_attention_heads
         self.kv_dims = self.hidden_size // self.num_key_value_heads
 
-    fn __init__(inout self: Self, inout buffer: FileBuffer[T]) raises -> None:
+    fn __init__(inout self: Self, inout buffer: FileBuffer) raises -> None:
         self.hidden_size = (
             buffer.data.offset(buffer.offset).bitcast[DType.uint32]().load(0).to_int()
         )
@@ -221,70 +160,70 @@ struct LlamaWeights[T: DType]:
     var lm_head: Matrix[T]
 
     fn __init__(
-        inout self, config: Config[T], shared_weights: Int, inout buf: FileBuffer[T]
+        inout self, config: Config[T], shared_weights: Int, inout buf: FileBuffer
     ) raises:
         let sla: Int = buf.offset
 
         self.wte = Matrix[T](config.vocab_size, config.hidden_size)
-        self.wte.set_data_from_buffer(buf.read_values(self.wte.size()))
+        self.wte.set_data_from_buffer(buf.read_numerical_value_dynamic[T](self.wte.size()))
 
         self.input_norm_attn_weigth = Matrix[T](
             config.num_hidden_layers, config.hidden_size
         )
         self.input_norm_attn_weigth.set_data_from_buffer(
-            buf.read_values(self.input_norm_attn_weigth.size())
+            buf.read_numerical_value_dynamic[T](self.input_norm_attn_weigth.size())
         )
         self.wq = Matrix[T](
             config.num_hidden_layers, config.hidden_size, config.hidden_size
         )
-        self.wq.set_data_from_buffer(buf.read_values(self.wq.size()))
+        self.wq.set_data_from_buffer(buf.read_numerical_value_dynamic[T](self.wq.size()))
         self.wk = Matrix[T](
             config.num_hidden_layers, config.hidden_size, config.kv_dims
         )
-        self.wk.set_data_from_buffer(buf.read_values(self.wk.size()))
+        self.wk.set_data_from_buffer(buf.read_numerical_value_dynamic[T](self.wk.size()))
         self.wv = Matrix[T](
             config.num_hidden_layers, config.hidden_size, config.kv_dims
         )
-        self.wv.set_data_from_buffer(buf.read_values(self.wv.size()))
+        self.wv.set_data_from_buffer(buf.read_numerical_value_dynamic[T](self.wv.size()))
         self.wo = Matrix[T](
             config.num_hidden_layers, config.hidden_size, config.hidden_size
         )
-        self.wo.set_data_from_buffer(buf.read_values(self.wo.size()))
+        self.wo.set_data_from_buffer(buf.read_numerical_value_dynamic[T](self.wo.size()))
         self.post_norm_weigth = Matrix[T](config.num_hidden_layers, config.hidden_size)
         self.post_norm_weigth.set_data_from_buffer(
-            buf.read_values(self.post_norm_weigth.size())
+            buf.read_numerical_value_dynamic[T](self.post_norm_weigth.size())
         )
         self.w1 = Matrix[T](
             config.num_hidden_layers, config.hidden_size, config.intermediate_size
         )
-        self.w1.set_data_from_buffer(buf.read_values(self.w1.size()))
+        self.w1.set_data_from_buffer(buf.read_numerical_value_dynamic[T](self.w1.size()))
         self.w2 = Matrix[T](
             config.num_hidden_layers, config.hidden_size, config.intermediate_size
         )
-        self.w2.set_data_from_buffer(buf.read_values(self.w2.size()))
+        self.w2.set_data_from_buffer(buf.read_numerical_value_dynamic[T](self.w2.size()))
         self.w3 = Matrix[T](
             config.num_hidden_layers, config.hidden_size, config.intermediate_size
         )
-        self.w3.set_data_from_buffer(buf.read_values(self.w3.size()))
+        self.w3.set_data_from_buffer(buf.read_numerical_value_dynamic[T](self.w3.size()))
         self.final_norm_weight = Matrix[T](config.hidden_size)
         self.final_norm_weight.set_data_from_buffer(
-            buf.read_values(self.final_norm_weight.size())
+            buf.read_numerical_value_dynamic[T](self.final_norm_weight.size())
         )
         self.fcr = Matrix[T](
             config.max_position_embeddings,
             (config.hidden_size // config.num_attention_heads) // 2,
         )
-        self.fcr.set_data_from_buffer(buf.read_values(self.fcr.size()))
+        self.fcr.set_data_from_buffer(buf.read_numerical_value_dynamic[T](self.fcr.size()))
         self.fci = Matrix[T](
             config.max_position_embeddings,
             (config.hidden_size // config.num_attention_heads) // 2,
         )
-        self.fci.set_data_from_buffer(buf.read_values(self.fci.size()))
+        self.fci.set_data_from_buffer(buf.read_numerical_value_dynamic[T](self.fci.size()))
         self.lm_head = Matrix[T](config.vocab_size, config.hidden_size)
         self.lm_head.set_data_from_buffer(self.wte.data)
 
 
-fn read_file[T: DType](inout buffer: FileBuffer[T], filename: StringRef) raises -> None:
+fn read_file[T: DType](inout buffer: FileBuffer, filename: StringRef) raises -> None:
     let _os = Py.import_module("os")
     let size: Int = atol(_os.path.getsize(filename).to_string())
     buffer.size = size
