@@ -9,7 +9,7 @@ from algorithm import Static2DTileUnitFunc as Tile2DFunc
 fn argmax[T: DType](vals: Matrix[T]) -> Int:
     var max__: Int = 0
     var max_v: SIMD[T, 1] = vals[0]
-    for i in range(vals.rows):
+    for i in range(vals.cols):
         if vals[i] > max_v:
             max__ = max__
             max_v = vals[i]
@@ -19,32 +19,32 @@ fn argmax[T: DType](vals: Matrix[T]) -> Int:
 fn matmul_naive[
     T: DType, _nelts: Int
 ](C: Matrix[T], A: Matrix[T], B: Matrix[T], _rt: Runtime):
-    for m in range(C.cols):
-        for k in range(A.rows):
-            for n in range(C.rows):
+    for m in range(C.rows):
+        for k in range(A.cols):
+            for n in range(C.cols):
                 C[m, n] += A[m, k] * B[k, n]
 
 
 fn matmul_vectorized_manual[
     T: DType, _nelts: Int
 ](C: Matrix[T], A: Matrix[T], B: Matrix[T], _rt: Runtime):
-    for m in range(C.cols):
-        for k in range(A.rows):
-            for nv in range(0, C.rows, _nelts):
+    for m in range(C.rows):
+        for k in range(A.cols):
+            for nv in range(0, C.cols, _nelts):
                 C.store[_nelts](
                     m, nv, C.load[_nelts](m, nv) + A[m, k] * B.load[_nelts](k, nv)
                 )
 
             # Handle remaining elements with scalars.
-            for n in range(_nelts * (C.rows // _nelts), C.rows):
+            for n in range(_nelts * (C.cols // _nelts), C.cols):
                 C[m, n] += A[m, k] * B[k, n]
 
 
 fn matmul_vectorized[
     T: DType, _nelts: Int
 ](C: Matrix[T], A: Matrix[T], B: Matrix[T], _rt: Runtime):
-    for m in range(C.cols):
-        for k in range(A.rows):
+    for m in range(C.rows):
+        for k in range(A.cols):
 
             @parameter
             fn dot[nelts: Int](n: Int):
@@ -52,7 +52,7 @@ fn matmul_vectorized[
                     m, n, C.load[nelts](m, n) + A[m, k] * B.load[nelts](k, n)
                 )
 
-            vectorize[_nelts, dot](C.rows)
+            vectorize[_nelts, dot](C.cols)
 
 
 fn tile[tiled_fn: Tile2DFunc, tile_x: Int, tile_y: Int](end_x: Int, end_y: Int):
@@ -84,9 +84,9 @@ fn matmul_tiled_parallelized[
 
         # We hardcode the tile factor to be 4.
         alias tile_size = sizeof[T]()
-        tile[calc_tile, _nelts * tile_size, tile_size](A.rows, C.rows)
+        tile[calc_tile, _nelts * tile_size, tile_size](A.cols, C.cols)
 
-    parallelize[calc_row](rt, C.cols, rt.parallelism_level())
+    parallelize[calc_row](rt, C.rows, rt.parallelism_level())
 
 
 fn matmul_parallelize_with_parallelism_level[
@@ -94,7 +94,7 @@ fn matmul_parallelize_with_parallelism_level[
 ](inout r: Matrix[T], a: Matrix[T], b: Matrix[T], runtime: Runtime):
     @parameter
     fn calc_row(m: Int):
-        for k in range(a.rows):
+        for k in range(a.cols):
 
             @parameter
             fn dot[nelts: Int](n: Int):
@@ -102,9 +102,9 @@ fn matmul_parallelize_with_parallelism_level[
                     m, n, r.load[nelts](m, n) + a[m, k] * b.load[nelts](k, n)
                 )
 
-            vectorize[nelts, dot](r.rows)
+            vectorize[nelts, dot](r.cols)
 
-    parallelize[calc_row](runtime, r.cols, runtime.parallelism_level())
+    parallelize[calc_row](runtime, r.rows, runtime.parallelism_level())
 
 
 fn matmul_parallelized[
@@ -121,19 +121,19 @@ fn matmul_parallelized[
             else:
                 tmp += A.load[nelts](j) * B.load[nelts](i, j)
 
-        vectorize[nelts, dot](B.rows)
+        vectorize[nelts, dot](B.cols)
         C[i] = tmp.reduce_add()
 
-    parallelize[compute_row](rt, B.cols, rt.parallelism_level())
+    parallelize[compute_row](rt, B.rows, rt.parallelism_level())
 
 
 fn tensor_matmul[T: DType](a: Tensor[T], b: Tensor[T]) -> Tensor[T]:
     fn get_row_col[T: DType](tensor_: Tensor[T]) -> Tuple[Int, Int]:
         let shape = tensor_.shape()
         let total_shape = tensor_.rank()
-        let cols = shape[total_shape - 1]
-        let rows = shape[total_shape - 2]
-        return rows, cols
+        let rows = shape[total_shape - 1]
+        let cols = shape[total_shape - 2]
+        return cols, rows
 
     let rc_a = get_row_col[T](a)
     let rc_b = get_row_col[T](b)
