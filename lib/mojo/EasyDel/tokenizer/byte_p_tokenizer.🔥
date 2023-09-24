@@ -35,36 +35,36 @@ fn loop_sort(
         loop_sort(vector_, idx, _i + 2, highest)
 
 
-struct Tokenizer[T: DType]:
+struct Tokenizer:
     var vocab: Pointer[Pointer[UInt8]]
-    var vocab_scores: DTypePointer[T]
+    var vocab_scores: DTypePointer[DType.float32]
     var max_token_length: Int
     var vocab_size: Int
     var sorted_vocab: Pointer[Pointer[UInt8]]
     var sorted_indices: DynamicVector[Int]
 
-    fn __init__(inout self, vocab_size: Int, inout buffer: FileBuffer[T]):
+    fn __init__(inout self, vocab_size: Int, inout buffer: FileBuffer) raises:
         self.vocab_size = vocab_size
         self.max_token_length = (
             buffer.data.offset(buffer.offset).bitcast[DType.uint32]().load(0).to_int()
         )
         buffer.offset += sizeof[Int]()
-        self.vocab_scores = DTypePointer[T].alloc(self.vocab_size)
+        self.vocab_scores = DTypePointer[DType.float32].alloc(self.vocab_size)
         self.vocab = Pointer[Pointer[UInt8]].alloc(self.vocab_size)
 
         self.sorted_vocab = Pointer[Pointer[UInt8]].alloc(0)
         self.sorted_indices = DynamicVector[Int](0)
 
         for i in range(0, self.vocab_size):
-            self.vocab_scores.simd_store[1](i, read_numerical_value[T](buffer))
+            self.vocab_scores.simd_store[1](i, read_numerical_value[DType.float32](buffer))
             let string_length = (
                 buffer.data.offset(buffer.offset)
                 .bitcast[DType.uint32]()
                 .load(0)
                 .to_int()
             )
-            buffer.offset += sizeof[Int]()
-            self.vocab.store(i, read_string_value[T](buffer, string_length))
+            buffer.move_offset(sizeof[Int]())
+            self.vocab.store(i, read_string_value(buffer, string_length))
 
     fn sort(inout self) -> None:
         if len(self.sorted_indices) < self.vocab_size:
@@ -97,28 +97,28 @@ struct Tokenizer[T: DType]:
 
 
 fn load_tokenizer[
-    T: DType, nelts: Int
-](inout tokenizer: Tokenizer[T], inout buffer: FileBuffer[T]):
+    nelts: Int
+](inout tokenizer: Tokenizer, inout buffer: FileBuffer) raises:
     tokenizer.max_token_length = (
         buffer.data.offset(buffer.offset).bitcast[DType.uint32]().load(0).to_int()
     )
-    buffer.offset += sizeof[Int]()
+    buffer.move_offset(4)
 
     let length_: Int
-    let score_: SIMD[T, 1]
+    let score_: SIMD[DType.float32, 1]
     let string_: Pointer[UInt8]
 
     for i in range(0, tokenizer.vocab_size):
         # FOR EACH LOOP FRIST LOAD VOCAB INDEX NEXT LENGTH OF STRING THEN STRING IT SELF
-        score_ = buffer.data.offset(buffer.offset).bitcast[T]().load(0)
-        buffer.offset += sizeof[T]()
+        score_ = buffer.data.offset(buffer.offset).bitcast[DType.float32]().load(0)
+        buffer.move_offset(sizeof[DType.float32]())
 
         tokenizer.vocab_scores.simd_store[nelts](i, score_)
 
         length_ = (
             buffer.data.offset(buffer.offset).bitcast[DType.uint32]().load(0).to_int()
         )
-        buffer.offset += sizeof[Int]()
+        buffer.move_offset(sizeof[Int]())
 
         string_ = Pointer[UInt8].alloc(length_ + 1)
         for i in range(length_):
@@ -130,10 +130,8 @@ fn load_tokenizer[
     return None
 
 
-fn byte_pr_tokenizer_encoder[
-    T: DType
-](
-    inout input_ids: DynamicVector[Int], string: String, inout tokenizer: Tokenizer[T]
+fn byte_pr_tokenizer_encoder(
+    inout input_ids: DynamicVector[Int], string: String, inout tokenizer: Tokenizer
 ) raises:
     for position in range(len(string)):
         let char = string_to_pointer(string[position])
@@ -143,7 +141,7 @@ fn byte_pr_tokenizer_encoder[
             return
         input_ids.push_back(_id)
     while True:
-        var h_score: SIMD[T, 1] = -1e10
+        var h_score: SIMD[DType.float32, 1] = -1e10
         var b_i: Int = -1
         var b_x: Int = -1
 
