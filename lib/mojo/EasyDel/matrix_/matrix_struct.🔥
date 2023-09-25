@@ -115,11 +115,11 @@ struct Matrix[T: DType]:
 
     fn assertation(self: Self, z: Int, x: Int, y: Int) raises:
         if x > self.cols:
-            raise Error("Index columns out of range [X > MatrixF32.cols]")
+            raise Error("Index columns out of range [X > Matrix.cols]")
         if y > self.rows:
-            raise Error("Index rows out of range [Y > MatrixF32.rows]")
+            raise Error("Index rows out of range [Y > Matrix.rows]")
         if z > self.layers:
-            raise Error("Index layers out of range [Y > MatrixF32.layers]")
+            raise Error("Index layers out of range [Y > Matrix.layers]")
 
 
 struct MatrixF32:
@@ -363,8 +363,8 @@ struct MatrixBF16:
 
     fn assertation(self: Self, z: Int, x: Int, y: Int) raises:
         if x > self.cols:
-            raise Error("Index columns out of range [X > MatrixF32.cols]")
+            raise Error("Index columns out of range [X > MatrixFB16.cols]")
         if y > self.rows:
-            raise Error("Index rows out of range [Y > MatrixF32.rows]")
+            raise Error("Index rows out of range [Y > MatrixFB16.rows]")
         if z > self.layers:
-            raise Error("Index layers out of range [Y > MatrixF32.layers]")
+            raise Error("Index layers out of range [Y > MatrixFB16.layers]")
