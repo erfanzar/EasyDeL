@@ -27,5 +27,6 @@ from .operations import (
     softmax,
     add_pointers,
     rope_rotation_multi_head,
-    rope_rotation_multi_query
+    rope_rotation_multi_query,
+    rope_rotation,
 )
