@@ -110,32 +110,36 @@ struct LlamaRunStateF32:
     var rt: Runtime
 
     fn __init__(inout self, config: LlamaConfig):
-        self.x = MatrixF32(config.hidden_size)
+        self.x = MatrixF32(cols=config.hidden_size)
         self.x.alloc_zero()
-        self.x_normed = MatrixF32(config.hidden_size)
+        self.x_normed = MatrixF32(cols=config.hidden_size)
         self.x_normed.alloc_zero()
-        self.x_buffer = MatrixF32(config.hidden_size)
+        self.x_buffer = MatrixF32(cols=config.hidden_size)
         self.x_buffer.alloc_zero()
-        self.ffn_w1 = MatrixF32(config.intermediate_size)
+        self.ffn_w1 = MatrixF32(cols=config.intermediate_size)
         self.ffn_w1.alloc_zero()
-        self.ffn_w3 = MatrixF32(config.intermediate_size)
+        self.ffn_w3 = MatrixF32(cols=config.intermediate_size)
         self.ffn_w3.alloc_zero()
-        self.q = MatrixF32(config.hidden_size)
+        self.q = MatrixF32(cols=config.hidden_size)
         self.q.alloc_zero()
         self.k = MatrixF32(0, 0)
         self.v = MatrixF32(0, 0)
         self.attn_weights = MatrixF32(
-            config.max_position_embeddings, config.num_attention_heads
+            cols=config.max_position_embeddings, rows=config.num_attention_heads
         )
         self.attn_weights.alloc_zero()
-        self.logits = MatrixF32(config.vocab_size)
+        self.logits = MatrixF32(cols=config.vocab_size)
         self.logits.alloc_zero()
         self.key_cache = MatrixF32(
-            config.num_hidden_layers, config.kv_dims, config.max_position_embeddings
+            layers=config.num_hidden_layers,
+            cols=config.kv_dims,
+            rows=config.max_position_embeddings,
         )
         self.key_cache.alloc_zero()
         self.value_cache = MatrixF32(
-            config.num_hidden_layers, config.kv_dims, config.max_position_embeddings
+            layers=config.num_hidden_layers,
+            cols=config.kv_dims,
+            rows=config.max_position_embeddings,
         )
         self.value_cache.alloc_zero()
         self.rt = Runtime(num_cores() // 2)
@@ -157,32 +161,36 @@ struct LlamaRunStateBF16:
     var rt: Runtime
 
     fn __init__(inout self, config: LlamaConfig):
-        self.x = MatrixBF16(config.hidden_size)
+        self.x = MatrixBF16(cols=config.hidden_size)
         self.x.alloc_zero()
-        self.x_normed = MatrixBF16(config.hidden_size)
+        self.x_normed = MatrixBF16(cols=config.hidden_size)
         self.x_normed.alloc_zero()
-        self.x_buffer = MatrixBF16(config.hidden_size)
+        self.x_buffer = MatrixBF16(cols=config.hidden_size)
         self.x_buffer.alloc_zero()
-        self.ffn_w1 = MatrixBF16(config.intermediate_size)
+        self.ffn_w1 = MatrixBF16(cols=config.intermediate_size)
         self.ffn_w1.alloc_zero()
-        self.ffn_w3 = MatrixBF16(config.intermediate_size)
+        self.ffn_w3 = MatrixBF16(cols=config.intermediate_size)
         self.ffn_w3.alloc_zero()
-        self.q = MatrixBF16(config.hidden_size)
+        self.q = MatrixBF16(cols=config.hidden_size)
         self.q.alloc_zero()
         self.k = MatrixBF16(0, 0)
         self.v = MatrixBF16(0, 0)
         self.attn_weights = MatrixBF16(
-            config.max_position_embeddings, config.num_attention_heads
+            cols=config.max_position_embeddings, rows=config.num_attention_heads
         )
         self.attn_weights.alloc_zero()
-        self.logits = MatrixBF16(config.vocab_size)
+        self.logits = MatrixBF16(cols=config.vocab_size)
         self.logits.alloc_zero()
         self.key_cache = MatrixBF16(
-            config.num_hidden_layers, config.kv_dims, config.max_position_embeddings
+            layers=config.num_hidden_layers,
+            cols=config.kv_dims,
+            rows=config.max_position_embeddings,
         )
         self.key_cache.alloc_zero()
         self.value_cache = MatrixBF16(
-            config.num_hidden_layers, config.kv_dims, config.max_position_embeddings
+            layers=config.num_hidden_layers,
+            cols=config.kv_dims,
+            rows=config.max_position_embeddings,
         )
         self.value_cache.alloc_zero()
         self.rt = Runtime(num_cores() // 2)
@@ -207,62 +215,78 @@ struct LlamaWeightsF32:
     fn __init__(
         inout self, config: LlamaConfig, shared_weights: Bool, inout buf: FileBuffer
     ) raises:
-        self.wte = MatrixF32(config.hidden_size, config.vocab_size)
+        self.wte = MatrixF32(cols=config.hidden_size, rows=config.vocab_size)
         self.wte.set_data_from_buffer(buf.read_value_float32(self.wte.size()))
 
         self.input_norm_attn_weigth = MatrixF32(
-            config.hidden_size, config.num_hidden_layers
+            cols=config.hidden_size, rows=config.num_hidden_layers
         )
         self.input_norm_attn_weigth.set_data_from_buffer(
             buf.read_value_float32(self.input_norm_attn_weigth.size())
         )
         self.wq = MatrixF32(
-            config.num_hidden_layers, config.hidden_size, config.hidden_size
+            layers=config.num_hidden_layers,
+            cols=config.hidden_size,
+            rows=config.hidden_size,
         )
         self.wq.set_data_from_buffer(buf.read_value_float32(self.wq.size()))
         self.wk = MatrixF32(
-            config.num_hidden_layers, config.kv_dims, config.hidden_size
+            layers=config.num_hidden_layers,
+            cols=config.kv_dims,
+            rows=config.hidden_size,
         )
         self.wk.set_data_from_buffer(buf.read_value_float32(self.wk.size()))
         self.wv = MatrixF32(
-            config.num_hidden_layers, config.kv_dims, config.hidden_size
+            layers=config.num_hidden_layers,
+            cols=config.kv_dims,
+            rows=config.hidden_size,
         )
         self.wv.set_data_from_buffer(buf.read_value_float32(self.wv.size()))
         self.wo = MatrixF32(
-            config.num_hidden_layers, config.hidden_size, config.hidden_size
+            layers=config.num_hidden_layers,
+            cols=config.hidden_size,
+            rows=config.hidden_size,
         )
         self.wo.set_data_from_buffer(buf.read_value_float32(self.wo.size()))
-        self.post_norm_weigth = MatrixF32(config.hidden_size, config.num_hidden_layers)
+        self.post_norm_weigth = MatrixF32(
+            cols=config.hidden_size, rows=config.num_hidden_layers
+        )
         self.post_norm_weigth.set_data_from_buffer(
             buf.read_value_float32(self.post_norm_weigth.size())
         )
         self.w1 = MatrixF32(
-            config.num_hidden_layers, config.hidden_size, config.intermediate_size
+            layers=config.num_hidden_layers,
+            cols=config.hidden_size,
+            rows=config.intermediate_size,
         )
         self.w1.set_data_from_buffer(buf.read_value_float32(self.w1.size()))
         self.w2 = MatrixF32(
-            config.num_hidden_layers, config.hidden_size, config.intermediate_size
+            layers=config.num_hidden_layers,
+            cols=config.hidden_size,
+            rows=config.intermediate_size,
         )
         self.w2.set_data_from_buffer(buf.read_value_float32(self.w2.size()))
         self.w3 = MatrixF32(
-            config.num_hidden_layers, config.hidden_size, config.intermediate_size
+            layers=config.num_hidden_layers,
+            cols=config.hidden_size,
+            rows=config.intermediate_size,
         )
         self.w3.set_data_from_buffer(buf.read_value_float32(self.w3.size()))
-        self.final_norm_weight = MatrixF32(config.hidden_size)
+        self.final_norm_weight = MatrixF32(cols=config.hidden_size)
         self.final_norm_weight.set_data_from_buffer(
             buf.read_value_float32(self.final_norm_weight.size())
         )
         self.fcr = MatrixF32(
-            config.max_position_embeddings,
-            (config.hidden_size // config.num_attention_heads) // 2,
+            cols=config.max_position_embeddings,
+            rows=(config.hidden_size // config.num_attention_heads) // 2,
         )
         self.fcr.set_data_from_buffer(buf.read_value_float32(self.fcr.size()))
         self.fci = MatrixF32(
-            config.max_position_embeddings,
-            (config.hidden_size // config.num_attention_heads) // 2,
+            cols=config.max_position_embeddings,
+            rows=(config.hidden_size // config.num_attention_heads) // 2,
         )
         self.fci.set_data_from_buffer(buf.read_value_float32(self.fci.size()))
-        self.lm_head = MatrixF32(config.vocab_size, config.hidden_size)
+        self.lm_head = MatrixF32(cols=config.vocab_size, rows=config.hidden_size)
         self.lm_head.set_data_from_buffer(
             self.wte.data if shared_weights else buf.read_value_float32(
                 self.lm_head.size()
@@ -289,62 +313,78 @@ struct LlamaWeightsBF16:
     fn __init__(
         inout self, config: LlamaConfig, shared_weights: Bool, inout buf: FileBuffer
     ) raises:
-        self.wte = MatrixBF16(config.hidden_size, config.vocab_size)
+        self.wte = MatrixBF16(cols=config.hidden_size, rows=config.vocab_size)
         self.wte.set_data_from_buffer(buf.read_value_bfloat16(self.wte.size()))
 
         self.input_norm_attn_weigth = MatrixBF16(
-            config.hidden_size, config.num_hidden_layers
+            cols=config.hidden_size, rows=config.num_hidden_layers
         )
         self.input_norm_attn_weigth.set_data_from_buffer(
             buf.read_value_bfloat16(self.input_norm_attn_weigth.size())
         )
         self.wq = MatrixBF16(
-            config.num_hidden_layers, config.hidden_size, config.hidden_size
+            layers=config.num_hidden_layers,
+            cols=config.hidden_size,
+            rows=config.hidden_size,
         )
         self.wq.set_data_from_buffer(buf.read_value_bfloat16(self.wq.size()))
         self.wk = MatrixBF16(
-            config.num_hidden_layers, config.kv_dims, config.hidden_size
+            layers=config.num_hidden_layers,
+            cols=config.kv_dims,
+            rows=config.hidden_size,
         )
         self.wk.set_data_from_buffer(buf.read_value_bfloat16(self.wk.size()))
         self.wv = MatrixBF16(
-            config.num_hidden_layers, config.kv_dims, config.hidden_size
+            layers=config.num_hidden_layers,
+            cols=config.kv_dims,
+            rows=config.hidden_size,
         )
         self.wv.set_data_from_buffer(buf.read_value_bfloat16(self.wv.size()))
         self.wo = MatrixBF16(
-            config.num_hidden_layers, config.hidden_size, config.hidden_size
+            layers=config.num_hidden_layers,
+            cols=config.hidden_size,
+            rows=config.hidden_size,
         )
         self.wo.set_data_from_buffer(buf.read_value_bfloat16(self.wo.size()))
-        self.post_norm_weigth = MatrixBF16(config.hidden_size, config.num_hidden_layers)
+        self.post_norm_weigth = MatrixBF16(
+            cols=config.hidden_size, rows=config.num_hidden_layers
+        )
         self.post_norm_weigth.set_data_from_buffer(
             buf.read_value_bfloat16(self.post_norm_weigth.size())
         )
         self.w1 = MatrixBF16(
-            config.num_hidden_layers, config.hidden_size, config.intermediate_size
+            layers=config.num_hidden_layers,
+            cols=config.hidden_size,
+            rows=config.intermediate_size,
         )
         self.w1.set_data_from_buffer(buf.read_value_bfloat16(self.w1.size()))
         self.w2 = MatrixBF16(
-            config.num_hidden_layers, config.hidden_size, config.intermediate_size
+            layers=config.num_hidden_layers,
+            cols=config.hidden_size,
+            rows=config.intermediate_size,
         )
         self.w2.set_data_from_buffer(buf.read_value_bfloat16(self.w2.size()))
         self.w3 = MatrixBF16(
-            config.num_hidden_layers, config.hidden_size, config.intermediate_size
+            layers=config.num_hidden_layers,
+            cols=config.hidden_size,
+            rows=config.intermediate_size,
         )
         self.w3.set_data_from_buffer(buf.read_value_bfloat16(self.w3.size()))
-        self.final_norm_weight = MatrixBF16(config.hidden_size)
+        self.final_norm_weight = MatrixBF16(cols=config.hidden_size)
         self.final_norm_weight.set_data_from_buffer(
             buf.read_value_bfloat16(self.final_norm_weight.size())
         )
         self.fcr = MatrixBF16(
-            config.max_position_embeddings,
-            (config.hidden_size // config.num_attention_heads) // 2,
+            cols=config.max_position_embeddings,
+            rows=(config.hidden_size // config.num_attention_heads) // 2,
         )
         self.fcr.set_data_from_buffer(buf.read_value_bfloat16(self.fcr.size()))
         self.fci = MatrixBF16(
-            config.max_position_embeddings,
-            (config.hidden_size // config.num_attention_heads) // 2,
+            cols=config.max_position_embeddings,
+            rows=(config.hidden_size // config.num_attention_heads) // 2,
         )
         self.fci.set_data_from_buffer(buf.read_value_bfloat16(self.fci.size()))
-        self.lm_head = MatrixBF16(config.vocab_size, config.hidden_size)
+        self.lm_head = MatrixBF16(cols=config.vocab_size, rows=config.hidden_size)
         self.lm_head.set_data_from_buffer(
             self.wte.data if shared_weights else buf.read_value_bfloat16(
                 self.lm_head.size()
