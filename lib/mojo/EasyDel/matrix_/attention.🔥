@@ -134,3 +134,164 @@ fn rms_norm[
         output.offset(idx).simd_store[_nelts](0, val)
 
     vectorize[nelts, _norm](size)
+
+
+# New Rope From Llama2.mojo https://github.com/tairov/llama2.mojo/blob/master/llama2.mojo
+
+fn rope_rotation_multi_head(
+    inout q: DTypePointer[DType.float32],
+    inout k: DTypePointer[DType.float32],
+    fcr_row: DTypePointer[DType.float32],
+    fci_row: DTypePointer[DType.float32],
+    num_attention_heads: Int,
+    num_key_values_head: Int,
+    head_dims: Int,
+) -> None:
+    let off_rot = head_dims // 2
+    for i in range(num_attention_heads):
+        for j in range(head_dims // 2):
+            let cu_fcr = fcr_row.offset(j).load(0)
+            let cu_fci = fci_row.offset(j).load(0)
+            let q0 = q.offset(i * head_dims + j).load(0)
+            let q1 = q.offset(i * head_dims + j + off_rot).load(0)
+            q.offset(i * head_dims + j).store(0, q0 * cu_fcr - q1 * cu_fci)
+            q.offset(i * head_dims + j + off_rot).store(0, q0 * cu_fci + q1 * cu_fcr)
+            if i < num_key_values_head:
+                let k0 = k.offset(i * head_dims + j).load(0)
+                let k1 = k.offset(i * head_dims + j + off_rot).load(0)
+                k.offset(i * head_dims + j).store(0, k0 * cu_fcr - k1 * cu_fci)
+                k.offset(i * head_dims + j + off_rot).store(
+                    0, k0 * cu_fci + k1 * cu_fcr
+                )
+
+fn rope_rotation_multi_head(
+    inout q: DTypePointer[DType.float16],
+    inout k: DTypePointer[DType.float16],
+    fcr_row: DTypePointer[DType.float16],
+    fci_row: DTypePointer[DType.float16],
+    num_attention_heads: Int,
+    num_key_values_head: Int,
+    head_dims: Int,
+) -> None:
+    let off_rot = head_dims // 2
+    for i in range(num_attention_heads):
+        for j in range(head_dims // 2):
+            let cu_fcr = fcr_row.offset(j).load(0)
+            let cu_fci = fci_row.offset(j).load(0)
+            let q0 = q.offset(i * head_dims + j).load(0)
+            let q1 = q.offset(i * head_dims + j + off_rot).load(0)
+            q.offset(i * head_dims + j).store(0, q0 * cu_fcr - q1 * cu_fci)
+            q.offset(i * head_dims + j + off_rot).store(0, q0 * cu_fci + q1 * cu_fcr)
+            if i < num_key_values_head:
+                let k0 = k.offset(i * head_dims + j).load(0)
+                let k1 = k.offset(i * head_dims + j + off_rot).load(0)
+                k.offset(i * head_dims + j).store(0, k0 * cu_fcr - k1 * cu_fci)
+                k.offset(i * head_dims + j + off_rot).store(
+                    0, k0 * cu_fci + k1 * cu_fcr
+                )
+
+fn rope_rotation_multi_head(
+    inout q: DTypePointer[DType.bfloat16],
+    inout k: DTypePointer[DType.bfloat16],
+    fcr_row: DTypePointer[DType.bfloat16],
+    fci_row: DTypePointer[DType.bfloat16],
+    num_attention_heads: Int,
+    num_key_values_head: Int,
+    head_dims: Int,
+) -> None:
+    let off_rot = head_dims // 2
+    for i in range(num_attention_heads):
+        for j in range(head_dims // 2):
+            let cu_fcr = fcr_row.offset(j).load(0)
+            let cu_fci = fci_row.offset(j).load(0)
+            let q0 = q.offset(i * head_dims + j).load(0)
+            let q1 = q.offset(i * head_dims + j + off_rot).load(0)
+            q.offset(i * head_dims + j).store(0, q0 * cu_fcr - q1 * cu_fci)
+            q.offset(i * head_dims + j + off_rot).store(0, q0 * cu_fci + q1 * cu_fcr)
+            if i < num_key_values_head:
+                let k0 = k.offset(i * head_dims + j).load(0)
+                let k1 = k.offset(i * head_dims + j + off_rot).load(0)
+                k.offset(i * head_dims + j).store(0, k0 * cu_fcr - k1 * cu_fci)
+                k.offset(i * head_dims + j + off_rot).store(
+                    0, k0 * cu_fci + k1 * cu_fcr
+                )
+
+fn rope_rotation_multi_query(
+    inout q: DTypePointer[DType.float32],
+    inout k: DTypePointer[DType.float32],
+    fcr_row: DTypePointer[DType.float32],
+    fci_row: DTypePointer[DType.float32],
+    num_attention_heads: Int,
+    num_key_values_head: Int,
+    head_dims: Int,
+) -> None:
+    let off_rot = 1
+    for i in range(num_attention_heads):
+        for j in range(0, head_dims, 2):
+            let cu_fcr = fcr_row.offset(j // 2).load(0)
+            let cu_fci = fci_row.offset(j // 2).load(0)
+            let q0 = q.offset(i * head_dims + j).load(0)
+            let q1 = q.offset(i * head_dims + j + off_rot).load(0)
+            q.offset(i * head_dims + j).store(0, q0 * cu_fcr - q1 * cu_fci)
+            q.offset(i * head_dims + j + off_rot).store(0, q0 * cu_fci + q1 * cu_fcr)
+            if i < num_key_values_head:
+                let k0 = k.offset(i * head_dims + j).load(0)
+                let k1 = k.offset(i * head_dims + j + off_rot).load(0)
+                k.offset(i * head_dims + j).store(0, k0 * cu_fcr - k1 * cu_fci)
+                k.offset(i * head_dims + j + off_rot).store(
+                    0, k0 * cu_fci + k1 * cu_fcr
+                )
+
+
+fn rope_rotation_multi_query(
+    inout q: DTypePointer[DType.float16],
+    inout k: DTypePointer[DType.float16],
+    fcr_row: DTypePointer[DType.float16],
+    fci_row: DTypePointer[DType.float16],
+    num_attention_heads: Int,
+    num_key_values_head: Int,
+    head_dims: Int,
+) -> None:
+    let off_rot = 1
+    for i in range(num_attention_heads):
+        for j in range(0, head_dims, 2):
+            let cu_fcr = fcr_row.offset(j // 2).load(0)
+            let cu_fci = fci_row.offset(j // 2).load(0)
+            let q0 = q.offset(i * head_dims + j).load(0)
+            let q1 = q.offset(i * head_dims + j + off_rot).load(0)
+            q.offset(i * head_dims + j).store(0, q0 * cu_fcr - q1 * cu_fci)
+            q.offset(i * head_dims + j + off_rot).store(0, q0 * cu_fci + q1 * cu_fcr)
+            if i < num_key_values_head:
+                let k0 = k.offset(i * head_dims + j).load(0)
+                let k1 = k.offset(i * head_dims + j + off_rot).load(0)
+                k.offset(i * head_dims + j).store(0, k0 * cu_fcr - k1 * cu_fci)
+                k.offset(i * head_dims + j + off_rot).store(
+                    0, k0 * cu_fci + k1 * cu_fcr
+                )
+
+
+fn rope_rotation_multi_query(
+    inout q: DTypePointer[DType.bfloat16],
+    inout k: DTypePointer[DType.bfloat16],
+    fcr_row: DTypePointer[DType.bfloat16],
+    fci_row: DTypePointer[DType.bfloat16],
+    num_attention_heads: Int,
+    num_key_values_head: Int,
+    head_dims: Int,
+) -> None:
+    let off_rot = 1
+    for i in range(num_attention_heads):
+        for j in range(0, head_dims, 2):
+            let cu_fcr = fcr_row.offset(j // 2).load(0)
+            let cu_fci = fci_row.offset(j // 2).load(0)
+            let q0 = q.offset(i * head_dims + j).load(0)
+            let q1 = q.offset(i * head_dims + j + off_rot).load(0)
+            q.offset(i * head_dims + j).store(0, q0 * cu_fcr - q1 * cu_fci)
+            q.offset(i * head_dims + j + off_rot).store(0, q0 * cu_fci + q1 * cu_fcr)
+            if i < num_key_values_head:
+                let k0 = k.offset(i * head_dims + j).load(0)
+                let k1 = k.offset(i * head_dims + j + off_rot).load(0)
+                k.offset(i * head_dims + j).store(0, k0 * cu_fcr - k1 * cu_fci)
+                k.offset(i * head_dims + j + off_rot).store(
+                    0, k0 * cu_fci + k1 * cu_fcr
+                )
