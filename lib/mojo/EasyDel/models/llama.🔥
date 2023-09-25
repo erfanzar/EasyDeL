@@ -5,12 +5,12 @@ from python import Python as Py
 from memory.memory import memset_zero
 
 
-struct Config[T: DType]:
+struct LlamaConfig:
     var hidden_size: Int
     var num_attention_heads: Int
     var num_hidden_layers: Int
     var vocab_size: Int
-    var rms_norm_eps: SIMD[T, 1]
+    var rms_norm_eps: Float32
     var number_rep_kv: Int
     var max_position_embeddings: Int
     var num_key_value_heads: Int
@@ -24,7 +24,7 @@ struct Config[T: DType]:
         num_attention_heads: Int,
         num_hidden_layers: Int,
         vocab_size: Int,
-        rms_norm_eps: SIMD[T, 1],
+        rms_norm_eps: Float32,
         number_rep_kv: Int,
         max_position_embeddings: Int,
         num_key_value_heads: Int,
@@ -94,133 +94,262 @@ struct Config[T: DType]:
         return None
 
 
-struct RunState[T: DType]:
-    var x: Matrix[T]  # hidden_size
-    var x_norm: Matrix[T]  # normed state hidden_size
-    var k: Matrix[T]  # Key Matrix 0,0
-    var v: Matrix[T]  # Value Matrix 0,0
-    var q: Matrix[T]  # Query Matrix hidden_size
-    var o: Matrix[T]  # hidden_size ,hidden_size
-    var attn_weights: Matrix[T]  # head_dims, max position embeddings
-    var k_cache: Matrix[T]  # num_layers ,max position embeddings ,head_dims
-    var v_cache: Matrix[T]  # num_layers ,max position embeddings ,head_dims
-    var ffn_w1: Matrix[T]  # i size
-    var ffn_w3: Matrix[T]  # i size
-    var logits: Matrix[T]  # Matrix vocab size
+struct LlamaRunStateF32:
+    var x: MatrixF32
+    var x_normed: MatrixF32
+    var x_buffer: MatrixF32
+    var ffn_w1: MatrixF32
+    var ffn_w3: MatrixF32
+    var q: MatrixF32
+    var k: MatrixF32
+    var v: MatrixF32
+    var attn_weights: MatrixF32
+    var logits: MatrixF32
+    var key_cache: MatrixF32
+    var value_cache: MatrixF32
     var rt: Runtime
 
-    fn __init__(inout self: Self, config: Config[T]) -> None:
-        self.x = Matrix[T](config.hidden_size)
+    fn __init__(inout self, config: LlamaConfig):
+        self.x = MatrixF32(config.hidden_size)
         self.x.alloc_zero()
-        self.x_norm = Matrix[T](config.hidden_size)
-        self.x_norm.alloc_zero()
-        self.q = Matrix[T](config.hidden_size)
-        self.q.alloc_zero()
-        self.k = Matrix[T](0, 0)
-        self.k.alloc_zero()
-        self.v = Matrix[T](0, 0)
-        self.v.alloc_zero()
-        self.o = Matrix[T](config.hidden_size, config.hidden_size)
-        self.o.alloc_zero()
-        self.attn_weights = Matrix[T](config.head_dims, config.max_position_embeddings)
-        self.attn_weights.alloc_zero()
-        self.v_cache = Matrix[T](
-            config.num_hidden_layers, config.max_position_embeddings, config.kv_dims
-        )
-        self.v_cache.alloc_zero()
-        self.k_cache = Matrix[T](
-            config.num_hidden_layers, config.max_position_embeddings, config.kv_dims
-        )
-        self.k_cache.alloc_zero()
-
-        self.ffn_w1 = Matrix[T](config.intermediate_size)
+        self.x_normed = MatrixF32(config.hidden_size)
+        self.x_normed.alloc_zero()
+        self.x_buffer = MatrixF32(config.hidden_size)
+        self.x_buffer.alloc_zero()
+        self.ffn_w1 = MatrixF32(config.intermediate_size)
         self.ffn_w1.alloc_zero()
-        self.ffn_w3 = Matrix[T](config.intermediate_size)
+        self.ffn_w3 = MatrixF32(config.intermediate_size)
         self.ffn_w3.alloc_zero()
-
-        self.logits = Matrix[T](config.vocab_size)
+        self.q = MatrixF32(config.hidden_size)
+        self.q.alloc_zero()
+        self.k = MatrixF32(0, 0)
+        self.v = MatrixF32(0, 0)
+        self.attn_weights = MatrixF32(
+            config.max_position_embeddings, config.num_attention_heads
+        )
+        self.attn_weights.alloc_zero()
+        self.logits = MatrixF32(config.vocab_size)
         self.logits.alloc_zero()
+        self.key_cache = MatrixF32(
+            config.num_hidden_layers, config.kv_dims, config.max_position_embeddings
+        )
+        self.key_cache.alloc_zero()
+        self.value_cache = MatrixF32(
+            config.num_hidden_layers, config.kv_dims, config.max_position_embeddings
+        )
+        self.value_cache.alloc_zero()
         self.rt = Runtime(num_cores() // 2)
 
 
-struct LlamaWeights[T: DType]:
-    var wte: Matrix[T]
-    var fcr: Matrix[T]
-    var fci: Matrix[T]
-    var input_norm_attn_weigth: Matrix[T]
-    var wq: Matrix[T]
-    var wk: Matrix[T]
-    var wv: Matrix[T]
-    var wo: Matrix[T]
-    var post_norm_weigth: Matrix[T]
-    var w1: Matrix[T]
-    var w3: Matrix[T]
-    var w2: Matrix[T]
-    var final_norm_weight: Matrix[T]
-    var lm_head: Matrix[T]
+struct LlamaRunStateBF16:
+    var x: MatrixBF16
+    var x_normed: MatrixBF16
+    var x_buffer: MatrixBF16
+    var ffn_w1: MatrixBF16
+    var ffn_w3: MatrixBF16
+    var q: MatrixBF16
+    var k: MatrixBF16
+    var v: MatrixBF16
+    var attn_weights: MatrixBF16
+    var logits: MatrixBF16
+    var key_cache: MatrixBF16
+    var value_cache: MatrixBF16
+    var rt: Runtime
+
+    fn __init__(inout self, config: LlamaConfig):
+        self.x = MatrixBF16(config.hidden_size)
+        self.x.alloc_zero()
+        self.x_normed = MatrixBF16(config.hidden_size)
+        self.x_normed.alloc_zero()
+        self.x_buffer = MatrixBF16(config.hidden_size)
+        self.x_buffer.alloc_zero()
+        self.ffn_w1 = MatrixBF16(config.intermediate_size)
+        self.ffn_w1.alloc_zero()
+        self.ffn_w3 = MatrixBF16(config.intermediate_size)
+        self.ffn_w3.alloc_zero()
+        self.q = MatrixBF16(config.hidden_size)
+        self.q.alloc_zero()
+        self.k = MatrixBF16(0, 0)
+        self.v = MatrixBF16(0, 0)
+        self.attn_weights = MatrixBF16(
+            config.max_position_embeddings, config.num_attention_heads
+        )
+        self.attn_weights.alloc_zero()
+        self.logits = MatrixBF16(config.vocab_size)
+        self.logits.alloc_zero()
+        self.key_cache = MatrixBF16(
+            config.num_hidden_layers, config.kv_dims, config.max_position_embeddings
+        )
+        self.key_cache.alloc_zero()
+        self.value_cache = MatrixBF16(
+            config.num_hidden_layers, config.kv_dims, config.max_position_embeddings
+        )
+        self.value_cache.alloc_zero()
+        self.rt = Runtime(num_cores() // 2)
+
+
+struct LlamaWeightsF32:
+    var wte: MatrixF32
+    var fcr: MatrixF32
+    var fci: MatrixF32
+    var input_norm_attn_weigth: MatrixF32
+    var wq: MatrixF32
+    var wk: MatrixF32
+    var wv: MatrixF32
+    var wo: MatrixF32
+    var post_norm_weigth: MatrixF32
+    var w1: MatrixF32
+    var w3: MatrixF32
+    var w2: MatrixF32
+    var final_norm_weight: MatrixF32
+    var lm_head: MatrixF32
 
     fn __init__(
-        inout self, config: Config[T], shared_weights: Int, inout buf: FileBuffer
+        inout self, config: LlamaConfig, shared_weights: Bool, inout buf: FileBuffer
     ) raises:
-        let sla: Int = buf.offset
+        self.wte = MatrixF32(config.hidden_size, config.vocab_size)
+        self.wte.set_data_from_buffer(buf.read_value_float32(self.wte.size()))
 
-        self.wte = Matrix[T](config.vocab_size, config.hidden_size)
-        self.wte.set_data_from_buffer(buf.read_numerical_value_dynamic[T](self.wte.size()))
-
-        self.input_norm_attn_weigth = Matrix[T](
-            config.num_hidden_layers, config.hidden_size
+        self.input_norm_attn_weigth = MatrixF32(
+            config.hidden_size, config.num_hidden_layers
         )
         self.input_norm_attn_weigth.set_data_from_buffer(
-            buf.read_numerical_value_dynamic[T](self.input_norm_attn_weigth.size())
+            buf.read_value_float32(self.input_norm_attn_weigth.size())
         )
-        self.wq = Matrix[T](
+        self.wq = MatrixF32(
             config.num_hidden_layers, config.hidden_size, config.hidden_size
         )
-        self.wq.set_data_from_buffer(buf.read_numerical_value_dynamic[T](self.wq.size()))
-        self.wk = Matrix[T](
-            config.num_hidden_layers, config.hidden_size, config.kv_dims
+        self.wq.set_data_from_buffer(buf.read_value_float32(self.wq.size()))
+        self.wk = MatrixF32(
+            config.num_hidden_layers, config.kv_dims, config.hidden_size
         )
-        self.wk.set_data_from_buffer(buf.read_numerical_value_dynamic[T](self.wk.size()))
-        self.wv = Matrix[T](
-            config.num_hidden_layers, config.hidden_size, config.kv_dims
+        self.wk.set_data_from_buffer(buf.read_value_float32(self.wk.size()))
+        self.wv = MatrixF32(
+            config.num_hidden_layers, config.kv_dims, config.hidden_size
         )
-        self.wv.set_data_from_buffer(buf.read_numerical_value_dynamic[T](self.wv.size()))
-        self.wo = Matrix[T](
+        self.wv.set_data_from_buffer(buf.read_value_float32(self.wv.size()))
+        self.wo = MatrixF32(
             config.num_hidden_layers, config.hidden_size, config.hidden_size
         )
-        self.wo.set_data_from_buffer(buf.read_numerical_value_dynamic[T](self.wo.size()))
-        self.post_norm_weigth = Matrix[T](config.num_hidden_layers, config.hidden_size)
+        self.wo.set_data_from_buffer(buf.read_value_float32(self.wo.size()))
+        self.post_norm_weigth = MatrixF32(config.hidden_size, config.num_hidden_layers)
         self.post_norm_weigth.set_data_from_buffer(
-            buf.read_numerical_value_dynamic[T](self.post_norm_weigth.size())
+            buf.read_value_float32(self.post_norm_weigth.size())
         )
-        self.w1 = Matrix[T](
+        self.w1 = MatrixF32(
             config.num_hidden_layers, config.hidden_size, config.intermediate_size
         )
-        self.w1.set_data_from_buffer(buf.read_numerical_value_dynamic[T](self.w1.size()))
-        self.w2 = Matrix[T](
+        self.w1.set_data_from_buffer(buf.read_value_float32(self.w1.size()))
+        self.w2 = MatrixF32(
             config.num_hidden_layers, config.hidden_size, config.intermediate_size
         )
-        self.w2.set_data_from_buffer(buf.read_numerical_value_dynamic[T](self.w2.size()))
-        self.w3 = Matrix[T](
+        self.w2.set_data_from_buffer(buf.read_value_float32(self.w2.size()))
+        self.w3 = MatrixF32(
             config.num_hidden_layers, config.hidden_size, config.intermediate_size
         )
-        self.w3.set_data_from_buffer(buf.read_numerical_value_dynamic[T](self.w3.size()))
-        self.final_norm_weight = Matrix[T](config.hidden_size)
+        self.w3.set_data_from_buffer(buf.read_value_float32(self.w3.size()))
+        self.final_norm_weight = MatrixF32(config.hidden_size)
         self.final_norm_weight.set_data_from_buffer(
-            buf.read_numerical_value_dynamic[T](self.final_norm_weight.size())
+            buf.read_value_float32(self.final_norm_weight.size())
         )
-        self.fcr = Matrix[T](
+        self.fcr = MatrixF32(
             config.max_position_embeddings,
             (config.hidden_size // config.num_attention_heads) // 2,
         )
-        self.fcr.set_data_from_buffer(buf.read_numerical_value_dynamic[T](self.fcr.size()))
-        self.fci = Matrix[T](
+        self.fcr.set_data_from_buffer(buf.read_value_float32(self.fcr.size()))
+        self.fci = MatrixF32(
             config.max_position_embeddings,
             (config.hidden_size // config.num_attention_heads) // 2,
         )
-        self.fci.set_data_from_buffer(buf.read_numerical_value_dynamic[T](self.fci.size()))
-        self.lm_head = Matrix[T](config.vocab_size, config.hidden_size)
-        self.lm_head.set_data_from_buffer(self.wte.data)
+        self.fci.set_data_from_buffer(buf.read_value_float32(self.fci.size()))
+        self.lm_head = MatrixF32(config.vocab_size, config.hidden_size)
+        self.lm_head.set_data_from_buffer(
+            self.wte.data if shared_weights else buf.read_value_float32(
+                self.lm_head.size()
+            )
+        )
+
+
+struct LlamaWeightsBF16:
+    var wte: MatrixBF16
+    var fcr: MatrixBF16
+    var fci: MatrixBF16
+    var input_norm_attn_weigth: MatrixBF16
+    var wq: MatrixBF16
+    var wk: MatrixBF16
+    var wv: MatrixBF16
+    var wo: MatrixBF16
+    var post_norm_weigth: MatrixBF16
+    var w1: MatrixBF16
+    var w3: MatrixBF16
+    var w2: MatrixBF16
+    var final_norm_weight: MatrixBF16
+    var lm_head: MatrixBF16
+
+    fn __init__(
+        inout self, config: LlamaConfig, shared_weights: Bool, inout buf: FileBuffer
+    ) raises:
+        self.wte = MatrixBF16(config.hidden_size, config.vocab_size)
+        self.wte.set_data_from_buffer(buf.read_value_bfloat16(self.wte.size()))
+
+        self.input_norm_attn_weigth = MatrixBF16(
+            config.hidden_size, config.num_hidden_layers
+        )
+        self.input_norm_attn_weigth.set_data_from_buffer(
+            buf.read_value_bfloat16(self.input_norm_attn_weigth.size())
+        )
+        self.wq = MatrixBF16(
+            config.num_hidden_layers, config.hidden_size, config.hidden_size
+        )
+        self.wq.set_data_from_buffer(buf.read_value_bfloat16(self.wq.size()))
+        self.wk = MatrixBF16(
+            config.num_hidden_layers, config.kv_dims, config.hidden_size
+        )
+        self.wk.set_data_from_buffer(buf.read_value_bfloat16(self.wk.size()))
+        self.wv = MatrixBF16(
+            config.num_hidden_layers, config.kv_dims, config.hidden_size
+        )
+        self.wv.set_data_from_buffer(buf.read_value_bfloat16(self.wv.size()))
+        self.wo = MatrixBF16(
+            config.num_hidden_layers, config.hidden_size, config.hidden_size
+        )
+        self.wo.set_data_from_buffer(buf.read_value_bfloat16(self.wo.size()))
+        self.post_norm_weigth = MatrixBF16(config.hidden_size, config.num_hidden_layers)
+        self.post_norm_weigth.set_data_from_buffer(
+            buf.read_value_bfloat16(self.post_norm_weigth.size())
+        )
+        self.w1 = MatrixBF16(
+            config.num_hidden_layers, config.hidden_size, config.intermediate_size
+        )
+        self.w1.set_data_from_buffer(buf.read_value_bfloat16(self.w1.size()))
+        self.w2 = MatrixBF16(
+            config.num_hidden_layers, config.hidden_size, config.intermediate_size
+        )
+        self.w2.set_data_from_buffer(buf.read_value_bfloat16(self.w2.size()))
+        self.w3 = MatrixBF16(
+            config.num_hidden_layers, config.hidden_size, config.intermediate_size
+        )
+        self.w3.set_data_from_buffer(buf.read_value_bfloat16(self.w3.size()))
+        self.final_norm_weight = MatrixBF16(config.hidden_size)
+        self.final_norm_weight.set_data_from_buffer(
+            buf.read_value_bfloat16(self.final_norm_weight.size())
+        )
+        self.fcr = MatrixBF16(
+            config.max_position_embeddings,
+            (config.hidden_size // config.num_attention_heads) // 2,
+        )
+        self.fcr.set_data_from_buffer(buf.read_value_bfloat16(self.fcr.size()))
+        self.fci = MatrixBF16(
+            config.max_position_embeddings,
+            (config.hidden_size // config.num_attention_heads) // 2,
+        )
+        self.fci.set_data_from_buffer(buf.read_value_bfloat16(self.fci.size()))
+        self.lm_head = MatrixBF16(config.vocab_size, config.hidden_size)
+        self.lm_head.set_data_from_buffer(
+            self.wte.data if shared_weights else buf.read_value_bfloat16(
+                self.lm_head.size()
+            )
+        )
 
 
 fn read_file[T: DType](inout buffer: FileBuffer, filename: StringRef) raises -> None:
@@ -239,198 +368,3 @@ fn read_file[T: DType](inout buffer: FileBuffer, filename: StringRef) raises -> 
     buffer.data = state
     buffer.offset = 0
     return None
-
-
-fn llama_forward[
-    T: DType, nelts: Int
-](
-    input_id: Int,
-    position: Int,
-    weight: LlamaWeights[T],
-    inout state: RunState[T],
-    config: Config[T],
-) raises -> None:
-    let hidden_size: Int = config.hidden_size
-    let intermediate_size: Int = config.intermediate_size
-    let nl: Int = config.num_hidden_layers
-    let nh: Int = config.num_attention_heads
-    let hd: Int = config.head_dims
-    let nkvh: Int = config.num_key_value_heads
-    let kvd: Int = config.kv_dims
-    let kv_mul: Int = config.number_rep_kv
-
-    var x = state.x.data
-    let wte_data = weight.wte.data.offset(input_id * hidden_size)
-    memcpy[T](x, wte_data, hidden_size)
-
-    var mrt: Matrix[T] = Matrix[T](0, 0)
-    let fci = weight.fci.data.offset(position * hd // 2)
-    let fcr = weight.fcr.data.offset(position * hd // 2)
-    for layer_index in range(nl):
-        # Padding is calculated by multiplying curreny layer index , max number of position embedding ( max number of position embeddin in padding will be used in
-        # k v for seting offset and k and v values are like [max position embedding , kv_dims]), and kv_dims
-        let padding = layer_index * config.max_position_embeddings * kvd
-        rms_norm[T, nelts](
-            state.x_norm.data,
-            x,
-            weight.input_norm_attn_weigth.data,
-            1e-5,
-            config.hidden_size,
-            state.rt,
-        )
-        # ==================
-        # Calculating Query
-        mrt.set_data_from_buffer(
-            weight.wq.data.offset(layer_index * hidden_size * hidden_size),
-            hidden_size,
-            hidden_size,
-        )
-        matmul_parallelize_with_parallelism_level[T, nelts](
-            state.q, mrt, state.x_norm, state.rt
-        )
-        # ==================
-        # Calculating Key
-        mrt.set_data_from_buffer(
-            weight.wk.data.offset(layer_index * hidden_size * hidden_size),
-            hidden_size,
-            hidden_size,
-        )
-
-        matmul_parallelize_with_parallelism_level[T, nelts](
-            state.k, mrt, state.x_norm, state.rt
-        )
-        # ==================
-        # Calculating Values
-        mrt.set_data_from_buffer(
-            weight.wv.data.offset(layer_index * hidden_size * hidden_size),
-            hidden_size,
-            hidden_size,
-        )
-        matmul_parallelize_with_parallelism_level[T, nelts](
-            state.v, mrt, state.x_norm, state.rt
-        )
-        # ==================
-
-        let q: DTypePointer[T] = state.q.data
-        let k: DTypePointer[T] = state.k.data
-
-        for i in range(0, hd * nkvh, 2):
-            let half_dim: Int = i % hd // 2
-
-            let cu_fci = fci.offset(half_dim).load(0)
-            let cu_fcr = fcr.offset(half_dim).load(0)
-
-            let q_0 = q.offset(half_dim).load(0)
-            let q_1 = q.offset(half_dim + 1).load(0)
-
-            let k_0 = k.offset(half_dim).load(0)
-            let k_1 = k.offset(half_dim + 1).load(0)
-
-            q.offset(half_dim).store(0, q_0 * cu_fcr - q_0 * cu_fci)
-            q.offset(half_dim + 1).store(0, q_1 * cu_fci - q_1 * cu_fcr)
-
-            k.offset(half_dim).store(0, k_0 * cu_fcr - k_0 * cu_fci)
-            k.offset(half_dim + 1).store(0, k_1 * cu_fci - k_1 * cu_fcr)
-
-        for i in range(hd * nkvh, hidden_size, 2):
-            let half_dim: Int = i % hd // 2
-
-            let cu_fci = fci.offset(half_dim).load(0)
-            let cu_fcr = fcr.offset(half_dim).load(0)
-
-            let q_0 = q.offset(half_dim).load(0)
-            let q_1 = q.offset(half_dim + 1).load(0)
-
-            q.offset(half_dim).store(0, q_0 * cu_fcr - q_0 * cu_fci)
-            q.offset(half_dim + 1).store(0, q_1 * cu_fci - q_1 * cu_fcr)
-
-        for head_inedx in range(config.num_attention_heads):
-            let q = state.q.data.offset(head_inedx * hd)
-            var attn = state.attn_weights.data.offset(
-                head_inedx * config.max_position_embeddings
-            )
-            for cp in range(position + 1):
-                let k = state.k_cache.data.offset(
-                    padding + cp * kvd + (head_inedx // nkvh) * hd
-                )
-                var attn_w: SIMD[T, 1] = 0.0
-                for ii in range(hd):
-                    attn_w += q.offset(ii).load(0) * k.offset(ii).load(0)
-                attn_w /= math.sqrt[T, 1](hd)
-                attn.offset(cp).store(0, attn_w)
-            softmax[T, nelts](attn, position + 1)
-            var x_norm = state.x_norm.data.offset(head_inedx * hd)
-            memset_zero[T](x_norm, hd)
-            for cp in range(position + 1):
-                let v = state.v_cache.data.offset(
-                    padding + cp * kvd + (head_inedx // nkvh) * hd
-                )
-                var state_vw: SIMD[T, 1] = 0.0
-                let aa = attn.offset(cp).load(0)
-                for ii in range(hd):
-                    let st = v.offset(ii).load(0) * aa + x_norm.offset(ii).load(0)
-                    x_norm.offset(ii).store(0, st)
-
-        mrt.set_data_from_buffer(
-            weight.wo.data.offset(layer_index * hidden_size * hidden_size),
-            hidden_size,
-            hidden_size,
-        )
-
-        matmul_parallelize_with_parallelism_level[T, nelts](
-            state.o, state.x_norm, mrt, state.rt
-        )
-
-        add_pointers[T, nelts](x, state.o.data, hidden_size)
-
-        rms_norm[T, nelts](
-            state.x_norm.data,
-            x,
-            weight.input_norm_attn_weigth.data,
-            1e-5,
-            hidden_size,
-            state.rt,
-        )
-        mrt.set_data_from_buffer(
-            weight.w1.data.offset(layer_index * intermediate_size * hidden_size),
-            hidden_size,
-            intermediate_size,
-        )
-
-        matmul_parallelize_with_parallelism_level[T, nelts](
-            state.ffn_w1, mrt, state.x_norm, state.rt
-        )
-
-        mrt.set_data_from_buffer(
-            weight.w3.data.offset(layer_index * intermediate_size * hidden_size),
-            hidden_size,
-            intermediate_size,
-        )
-
-        matmul_parallelize_with_parallelism_level[T, nelts](
-            state.ffn_w3, mrt, state.x_norm, state.rt
-        )
-
-        for i in range(intermediate_size):
-            let __x = state.ffn_w1[i]
-            state.ffn_w1[i] = __x * (1.0 / (1.0 + math.exp[T, 1](-__x)))
-
-        for i in range(intermediate_size):
-            state.ffn_w1[i] = state.ffn_w1[i] * state.ffn_w3[i]
-        mrt.set_data_from_buffer(
-            weight.w2.data.offset(layer_index * intermediate_size * hidden_size),
-            intermediate_size,
-            hidden_size,
-        )
-        matmul_parallelize_with_parallelism_level[T, nelts](
-            state.x_norm, mrt, state.ffn_w1, state.rt
-        )
-        add_pointers[T, nelts](x, state.x_norm.data, hidden_size)
-
-    rms_norm[T, nelts](
-        state.x_norm.data, x, weight.final_norm_weight.data, 1e-5, hidden_size, state.rt
-    )
-    mrt.set_data_from_buffer(weight.lm_head.data, hidden_size, config.vocab_size)
-    matmul_parallelize_with_parallelism_level[T, nelts](
-        state.logits, mrt, state.x_norm, state.rt
-    )
