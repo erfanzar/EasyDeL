@@ -35,3 +35,102 @@ fn rms_norm[
         output.offset(idx).simd_store[_nelts](0, val)
 
     vectorize[nelts, _norm](size)
+
+
+fn rms_norm[
+    nelts: Int
+](
+    inout output: DTypePointer[DType.float32],
+    x: DTypePointer[DType.float32],
+    w: DTypePointer[DType.float32],
+    epsilon: SIMD[DType.float32, 1],
+    size: Int,
+    runtime: Runtime,
+):
+    var loop_val: SIMD[DType.float32, nelts] = SIMD[DType.float32, nelts](0.0)
+
+    @parameter
+    fn _sum_power_operation[_nelts: Int](i: Int):
+        if _nelts < nelts:
+            loop_val[0] += (x.offset(i).simd_load[_nelts](0) ** 2).reduce_add()
+        else:
+            loop_val += x.offset(i).simd_load[nelts](0) ** 2
+
+    vectorize[nelts, _sum_power_operation](size)
+
+    var normed: SIMD[DType.float32, 1] = loop_val.reduce_add()
+    normed = normed / size + epsilon
+    normed = 1.0 / math.sqrt(normed)
+
+    @parameter
+    fn _norm[_nelts: Int](idx: Int):
+        let val = w.simd_load[_nelts](idx) * normed * x.simd_load[_nelts](idx)
+        output.offset(idx).simd_store[_nelts](0, val)
+
+    vectorize[nelts, _norm](size)
+
+
+fn rms_norm[
+    nelts: Int
+](
+    inout output: DTypePointer[DType.float16],
+    x: DTypePointer[DType.float16],
+    w: DTypePointer[DType.float16],
+    epsilon: SIMD[DType.float16, 1],
+    size: Int,
+    runtime: Runtime,
+):
+    var loop_val: SIMD[DType.float16, nelts] = SIMD[DType.float16, nelts](0.0)
+
+    @parameter
+    fn _sum_power_operation[_nelts: Int](i: Int):
+        if _nelts < nelts:
+            loop_val[0] += (x.offset(i).simd_load[_nelts](0) ** 2).reduce_add()
+        else:
+            loop_val += x.offset(i).simd_load[nelts](0) ** 2
+
+    vectorize[nelts, _sum_power_operation](size)
+
+    var normed: SIMD[DType.float16, 1] = loop_val.reduce_add()
+    normed = normed / size + epsilon
+    normed = 1.0 / math.sqrt(normed)
+
+    @parameter
+    fn _norm[_nelts: Int](idx: Int):
+        let val = w.simd_load[_nelts](idx) * normed * x.simd_load[_nelts](idx)
+        output.offset(idx).simd_store[_nelts](0, val)
+
+    vectorize[nelts, _norm](size)
+
+
+fn rms_norm[
+    nelts: Int
+](
+    inout output: DTypePointer[DType.bfloat16],
+    x: DTypePointer[DType.bfloat16],
+    w: DTypePointer[DType.bfloat16],
+    epsilon: SIMD[DType.bfloat16, 1],
+    size: Int,
+    runtime: Runtime,
+):
+    var loop_val: SIMD[DType.bfloat16, nelts] = SIMD[DType.bfloat16, nelts](0.0)
+
+    @parameter
+    fn _sum_power_operation[_nelts: Int](i: Int):
+        if _nelts < nelts:
+            loop_val[0] += (x.offset(i).simd_load[_nelts](0) ** 2).reduce_add()
+        else:
+            loop_val += x.offset(i).simd_load[nelts](0) ** 2
+
+    vectorize[nelts, _sum_power_operation](size)
+
+    var normed: SIMD[DType.bfloat16, 1] = loop_val.reduce_add()
+    normed = normed / size + epsilon
+    normed = 1.0 / math.sqrt(normed)
+
+    @parameter
+    fn _norm[_nelts: Int](idx: Int):
+        let val = w.simd_load[_nelts](idx) * normed * x.simd_load[_nelts](idx)
+        output.offset(idx).simd_store[_nelts](0, val)
+
+    vectorize[nelts, _norm](size)
