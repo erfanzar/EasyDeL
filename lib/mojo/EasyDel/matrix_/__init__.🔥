@@ -4,7 +4,7 @@ Copyright (c) Erfan zare Chavoshi
 EasyDel Library [MOJO/Matrix]
 """
 
-from .matrix_struct import Matrix
+from .matrix_struct import Matrix,MatrixBF16,MatrixF32
 from .attention import rms_norm
 from .operations import (
     matmul,

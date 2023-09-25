@@ -2,6 +2,9 @@ from memory.memory import memset_zero
 
 
 struct Matrix[T: DType]:
+    r"""
+    EasyDel Matrix Class Static For Float32.
+    """
     var data: DTypePointer[T]
     var rows: Int
     var cols: Int
@@ -30,108 +33,338 @@ struct Matrix[T: DType]:
         if self.allocated == 1:
             self.data.free()
 
-    @always_inline
     fn alloc(inout self, fill: Int = 0):
         self.data = DTypePointer[T].alloc(self.size())
         self.allocated = 1
         if fill == 1:
             self.zero()
 
-    @always_inline
     fn alloc_zero(inout self):
         self.alloc(1)
 
-    @always_inline
     fn zero(inout self):
         memset_zero(self.data, self.size())
 
-    @always_inline
-    fn set_data_from_buffer(inout self, ptr: DTypePointer[T]) -> None:
+    fn set_data_from_buffer(inout self, ptr: DTypePointer[T]):
         self.data = ptr
-        return None
 
-    fn set_data_from_buffer(inout self, ptr: DTypePointer[T], rows: Int) -> None:
+    fn set_data_from_buffer(inout self, ptr: DTypePointer[T], cols: Int):
+        self.cols = cols
         self.data = ptr
-        self.rows = rows
-        return None
 
-    # set buf ptr with redefined rows, cols
-    fn set_data_from_buffer(
-        inout self, ptr: DTypePointer[T], cols: Int, rows: Int
-    ) -> None:
+    fn set_data_from_buffer(inout self, ptr: DTypePointer[T], cols: Int, rows: Int):
         self.data = ptr
         self.rows = rows
         self.cols = cols
-        return None
 
     fn set_data_from_buffer(
         inout self, ptr: DTypePointer[T], layers: Int, cols: Int, rows: Int
-    ) -> None:
+    ):
         self.data = ptr
         self.rows = rows
         self.cols = cols
         self.layers = layers
-        return None
 
-    @always_inline
     fn size(inout self) -> Int:
-        return self.cols * self.layers * self.rows  
+        return self.cols * self.rows * self.layers
 
-    # Get item with Layer , column , Row
-    @always_inline
-    fn __getitem__(self, z: Int, y: Int, x: Int) -> SIMD[T, 1]:
-        return self.load[1](z, y, x)
-
-    # Get item with  column , Row
-    @always_inline
-    fn __getitem__(self, y: Int, x: Int) -> SIMD[T, 1]:
-        return self.load[1](y, x)
-
-    # Get item with  Row
-    @always_inline
-    fn __getitem__(self, x: Int) -> SIMD[T, 1]:
-        return self.load[1](0, x)
-
-    # Set item with Layer , column , Row
-    @always_inline
-    fn __setitem__(self, z: Int, y: Int, x: Int, val: SIMD[T, 1]):
-        return self.store[1](z, y, x, val)
-
-    # Set item with column , Row
-    @always_inline
-    fn __setitem__(self, y: Int, x: Int, val: SIMD[T, 1]):
-        return self.store[1](y, x, val)
-
-    # Set item with  Row
-    @always_inline
-    fn __setitem__(self, x: Int, val: SIMD[T, 1]):
-        return self.store[1](0, x, val)
-
-    @always_inline
-    fn load[nelts: Int](self, z: Int, y: Int, x: Int) -> SIMD[T, nelts]:
-        return self.data.simd_load[nelts](z * self.layers + y * self.cols + x)
-
-    @always_inline
-    fn load[nelts: Int](self, x: Int) -> SIMD[T, nelts]:
-        return self.data.simd_load[nelts](x)
-
-    @always_inline
     fn load[nelts: Int](self, y: Int, x: Int) -> SIMD[T, nelts]:
         return self.data.simd_load[nelts](y * self.cols + x)
 
-    @always_inline
-    fn store[nelts: Int](self, z: Int, y: Int, x: Int, val: SIMD[T, nelts]):
-        self.data.simd_store[nelts](z * self.layers + y * self.cols + x, val)
+    fn load[nelts: Int](self, z: Int, y: Int, x: Int) -> SIMD[T, nelts]:
+        return self.data.simd_load[nelts](z * self.layers + y * self.cols + x)
 
-    @always_inline
-    fn store[nelts: Int](self, x: Int, val: SIMD[T, nelts]):
-        self.data.simd_store[nelts](x, val)
+    fn load[nelts: Int](self, x: Int) -> SIMD[T, nelts]:
+        return self.data.simd_load[nelts](x)
 
-    @always_inline
     fn store[nelts: Int](self, y: Int, x: Int, val: SIMD[T, nelts]):
         self.data.simd_store[nelts](y * self.cols + x, val)
 
-    @always_inline
+    fn store[nelts: Int](self, x: Int, val: SIMD[T, nelts]):
+        self.data.simd_store[nelts](x, val)
+
+    fn store[nelts: Int](self, z: Int, y: Int, x: Int, val: SIMD[T, nelts]):
+        self.data.simd_store[nelts](z * self.layers + y * self.cols + x, val)
+
+    fn __setitem__(self, y: Int, x: Int, val: SIMD[T, 1]):
+        return self.store[1](y, x, val)
+
+    fn __setitem__(self, x: Int, val: SIMD[T, 1]):
+        return self.store[1](0, x, val)
+
+    fn __setitem__(self, z: Int, y: Int, x: Int, val: SIMD[T, 1]):
+        return self.store[1](z, y, x, val)
+
+    fn __getitem__(self, y: Int, x: Int) -> SIMD[T, 1]:
+        return self.load[1](y, x)
+
+    fn __getitem__(self, x: Int) -> SIMD[T, 1]:
+        return self.load[1](0, x)
+
+    fn __getitem__(self, z: Int, y: Int, x: Int) -> SIMD[T, 1]:
+        return self.load[1](z, y, x)
+
     fn shape(self: Self) -> Tuple[Int, Int, Int]:
-        var shape_: Tuple[Int, Int, Int] = (self.layers, self.cols, self.cols)
-        return shape_
+        return (self.layers, self.cols, self.cols)
+
+    fn half(self: Self) -> DTypePointer[DType.float16]:
+        return self.data.bitcast[DType.float16]()
+
+    fn float(self: Self) -> DTypePointer[DType.float32]:
+        return self.data.bitcast[DType.float32]()
+
+    fn assertation(self: Self, z: Int, x: Int, y: Int) raises:
+        if x > self.cols:
+            raise Error("Index columns out of range [X > MatrixF32.cols]")
+        if y > self.rows:
+            raise Error("Index rows out of range [Y > MatrixF32.rows]")
+        if z > self.layers:
+            raise Error("Index layers out of range [Y > MatrixF32.layers]")
+
+
+struct MatrixF32:
+    r"""
+    EasyDel MatrixF32 Class Static For Float32.
+    """
+    var data: DTypePointer[DType.float32]
+    var rows: Int
+    var cols: Int
+    var layers: Int
+    var allocated: Int
+
+    fn __init__(inout self, cols: Int, rows: Int):
+        self.data = DTypePointer[DType.float32].alloc(0)
+        self.rows = rows
+        self.cols = cols
+        self.layers = 1
+        self.allocated = 0
+
+    fn __init__(inout self, cols: Int):
+        self.data = DTypePointer[DType.float32].alloc(0)
+        self.rows = 1
+        self.layers = 1
+        self.cols = cols
+        self.allocated = 0
+
+    fn __init__(inout self, layers: Int, cols: Int, rows: Int):
+        self.__init__(cols, rows)
+        self.layers = layers
+
+    fn __del__(owned self):
+        if self.allocated == 1:
+            self.data.free()
+
+    fn alloc(inout self, fill: Int = 0):
+        self.data = DTypePointer[DType.float32].alloc(self.size())
+        self.allocated = 1
+        if fill == 1:
+            self.zero()
+
+    fn alloc_zero(inout self):
+        self.alloc(1)
+
+    fn zero(inout self):
+        memset_zero(self.data, self.size())
+
+    fn set_data_from_buffer(inout self, ptr: DTypePointer[DType.float32]):
+        self.data = ptr
+
+    fn set_data_from_buffer(inout self, ptr: DTypePointer[DType.float32], cols: Int):
+        self.cols = cols
+        self.data = ptr
+
+    fn set_data_from_buffer(
+        inout self, ptr: DTypePointer[DType.float32], cols: Int, rows: Int
+    ):
+        self.data = ptr
+        self.rows = rows
+        self.cols = cols
+
+    fn set_data_from_buffer(
+        inout self, ptr: DTypePointer[DType.float32], layers: Int, cols: Int, rows: Int
+    ):
+        self.data = ptr
+        self.rows = rows
+        self.cols = cols
+        self.layers = layers
+
+    fn size(inout self) -> Int:
+        return self.cols * self.rows * self.layers
+
+    fn load[nelts: Int](self, y: Int, x: Int) -> SIMD[DType.float32, nelts]:
+        return self.data.simd_load[nelts](y * self.cols + x)
+
+    fn load[nelts: Int](self, z: Int, y: Int, x: Int) -> SIMD[DType.float32, nelts]:
+        return self.data.simd_load[nelts](z * self.layers + y * self.cols + x)
+
+    fn load[nelts: Int](self, x: Int) -> SIMD[DType.float32, nelts]:
+        return self.data.simd_load[nelts](x)
+
+    fn store[nelts: Int](self, y: Int, x: Int, val: SIMD[DType.float32, nelts]):
+        self.data.simd_store[nelts](y * self.cols + x, val)
+
+    fn store[nelts: Int](self, x: Int, val: SIMD[DType.float32, nelts]):
+        self.data.simd_store[nelts](x, val)
+
+    fn store[nelts: Int](self, z: Int, y: Int, x: Int, val: SIMD[DType.float32, nelts]):
+        self.data.simd_store[nelts](z * self.layers + y * self.cols + x, val)
+
+    fn __setitem__(self, y: Int, x: Int, val: Float32):
+        return self.store[1](y, x, val)
+
+    fn __setitem__(self, x: Int, val: Float32):
+        return self.store[1](0, x, val)
+
+    fn __setitem__(self, z: Int, y: Int, x: Int, val: Float32):
+        return self.store[1](z, y, x, val)
+
+    fn __getitem__(self, y: Int, x: Int) -> Float32:
+        return self.load[1](y, x)
+
+    fn __getitem__(self, x: Int) -> Float32:
+        return self.load[1](0, x)
+
+    fn __getitem__(self, z: Int, y: Int, x: Int) -> Float32:
+        return self.load[1](z, y, x)
+
+    fn shape(self: Self) -> Tuple[Int, Int, Int]:
+        return (self.layers, self.cols, self.cols)
+
+    fn half(self: Self) -> DTypePointer[DType.float16]:
+        return self.data.bitcast[DType.float16]()
+
+    fn float(self: Self) -> DTypePointer[DType.float32]:
+        return self.data.bitcast[DType.float32]()
+
+    fn assertation(self: Self, z: Int, x: Int, y: Int) raises:
+        if x > self.cols:
+            raise Error("Index columns out of range [X > MatrixF32.cols]")
+        if y > self.rows:
+            raise Error("Index rows out of range [Y > MatrixF32.rows]")
+        if z > self.layers:
+            raise Error("Index layers out of range [Y > MatrixF32.layers]")
+
+
+struct MatrixBF16:
+    r"""
+    EasyDel MatrixBF16 Class Static For Float32.
+    """
+    var data: DTypePointer[DType.bfloat16]
+    var rows: Int
+    var cols: Int
+    var layers: Int
+    var allocated: Int
+
+    fn __init__(inout self, cols: Int, rows: Int):
+        self.data = DTypePointer[DType.bfloat16].alloc(0)
+        self.rows = rows
+        self.cols = cols
+        self.layers = 1
+        self.allocated = 0
+
+    fn __init__(inout self, cols: Int):
+        self.data = DTypePointer[DType.bfloat16].alloc(0)
+        self.rows = 1
+        self.layers = 1
+        self.cols = cols
+        self.allocated = 0
+
+    fn __init__(inout self, layers: Int, cols: Int, rows: Int):
+        self.__init__(cols, rows)
+        self.layers = layers
+
+    fn __del__(owned self):
+        if self.allocated == 1:
+            self.data.free()
+
+    fn alloc(inout self, fill: Int = 0):
+        self.data = DTypePointer[DType.bfloat16].alloc(self.size())
+        self.allocated = 1
+        if fill == 1:
+            self.zero()
+
+    fn alloc_zero(inout self):
+        self.alloc(1)
+
+    fn zero(inout self):
+        memset_zero(self.data, self.size())
+
+    fn set_data_from_buffer(inout self, ptr: DTypePointer[DType.bfloat16]):
+        self.data = ptr
+
+    fn set_data_from_buffer(inout self, ptr: DTypePointer[DType.bfloat16], cols: Int):
+        self.cols = cols
+        self.data = ptr
+
+    fn set_data_from_buffer(
+        inout self, ptr: DTypePointer[DType.bfloat16], cols: Int, rows: Int
+    ):
+        self.data = ptr
+        self.rows = rows
+        self.cols = cols
+
+    fn set_data_from_buffer(
+        inout self, ptr: DTypePointer[DType.bfloat16], layers: Int, cols: Int, rows: Int
+    ):
+        self.data = ptr
+        self.rows = rows
+        self.cols = cols
+        self.layers = layers
+
+    fn size(inout self) -> Int:
+        return self.cols * self.rows * self.layers
+
+    fn load[nelts: Int](self, y: Int, x: Int) -> SIMD[DType.bfloat16, nelts]:
+        return self.data.simd_load[nelts](y * self.cols + x)
+
+    fn load[nelts: Int](self, z: Int, y: Int, x: Int) -> SIMD[DType.bfloat16, nelts]:
+        return self.data.simd_load[nelts](z * self.layers + y * self.cols + x)
+
+    fn load[nelts: Int](self, x: Int) -> SIMD[DType.bfloat16, nelts]:
+        return self.data.simd_load[nelts](x)
+
+    fn store[nelts: Int](self, y: Int, x: Int, val: SIMD[DType.bfloat16, nelts]):
+        self.data.simd_store[nelts](y * self.cols + x, val)
+
+    fn store[nelts: Int](self, x: Int, val: SIMD[DType.bfloat16, nelts]):
+        self.data.simd_store[nelts](x, val)
+
+    fn store[
+        nelts: Int
+    ](self, z: Int, y: Int, x: Int, val: SIMD[DType.bfloat16, nelts]):
+        self.data.simd_store[nelts](z * self.layers + y * self.cols + x, val)
+
+    fn __setitem__(self, y: Int, x: Int, val: SIMD[DType.bfloat16, 1]):
+        return self.store[1](y, x, val)
+
+    fn __setitem__(self, x: Int, val: SIMD[DType.bfloat16, 1]):
+        return self.store[1](0, x, val)
+
+    fn __setitem__(self, z: Int, y: Int, x: Int, val: SIMD[DType.bfloat16, 1]):
+        return self.store[1](z, y, x, val)
+
+    fn __getitem__(self, y: Int, x: Int) -> SIMD[DType.bfloat16, 1]:
+        return self.load[1](y, x)
+
+    fn __getitem__(self, x: Int) -> SIMD[DType.bfloat16, 1]:
+        return self.load[1](0, x)
+
+    fn __getitem__(self, z: Int, y: Int, x: Int) -> SIMD[DType.bfloat16, 1]:
+        return self.load[1](z, y, x)
+
+    fn shape(self: Self) -> Tuple[Int, Int, Int]:
+        return (self.layers, self.cols, self.cols)
+
+    fn half(self: Self) -> DTypePointer[DType.float16]:
+        return self.data.bitcast[DType.float16]()
+
+    fn float(self: Self) -> DTypePointer[DType.float32]:
+        return self.data.bitcast[DType.float32]()
+
+    fn assertation(self: Self, z: Int, x: Int, y: Int) raises:
+        if x > self.cols:
+            raise Error("Index columns out of range [X > MatrixF32.cols]")
+        if y > self.rows:
+            raise Error("Index rows out of range [Y > MatrixF32.rows]")
+        if z > self.layers:
+            raise Error("Index layers out of range [Y > MatrixF32.layers]")
