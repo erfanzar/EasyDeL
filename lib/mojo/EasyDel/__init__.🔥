@@ -22,6 +22,8 @@ from .utilities import (
 
 from .matrix_ import (
     Matrix,
+    MatrixF32,
+    MatrixBF16,
     rms_norm,
     matmul,
     argmax,
