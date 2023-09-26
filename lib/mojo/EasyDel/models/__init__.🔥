@@ -4,4 +4,6 @@ from .llama import (
     LlamaWeightsBF16,
     LlamaWeightsF32,
     LlamaConfig,
+    llama_forward_fp32,
+    llama_forward_bf16,
 )

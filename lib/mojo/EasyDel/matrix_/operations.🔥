@@ -4,6 +4,7 @@ from tensor import Tensor, TensorSpec
 from utils.index import Index
 from math import math
 from algorithm import Static2DTileUnitFunc as Tile2DFunc
+from random.random import rand
 from .matrix_struct import Matrix
 
 
@@ -242,7 +243,7 @@ fn matmul_tiled_parallelized[
 
 fn matmul_parallelize_with_parallelism_level[
     nelts: Int
-](inout r: MatrixBF16, a: MatrixBF16, b: MatrixBF16, runtime: Runtime):
+](r: MatrixBF16, a: MatrixBF16, b: MatrixBF16, runtime: Runtime):
     @parameter
     fn calc_row(m: Int):
         for k in range(a.cols):
@@ -260,7 +261,7 @@ fn matmul_parallelize_with_parallelism_level[
 
 fn matmul_parallelize_with_parallelism_level[
     nelts: Int
-](inout r: MatrixF32, a: MatrixF32, b: MatrixF32, runtime: Runtime):
+](r: MatrixF32, a: MatrixF32, b: MatrixF32, runtime: Runtime):
     @parameter
     fn calc_row(m: Int):
         for k in range(a.cols):
@@ -278,7 +279,7 @@ fn matmul_parallelize_with_parallelism_level[
 
 fn matmul_parallelize_with_parallelism_level[
     T: DType, nelts: Int
-](inout r: Matrix[T], a: Matrix[T], b: Matrix[T], runtime: Runtime):
+](r: Matrix[T], a: Matrix[T], b: Matrix[T], runtime: Runtime):
     @parameter
     fn calc_row(m: Int):
         for k in range(a.cols):
@@ -482,57 +483,51 @@ fn silu(matrix: MatrixF32, size: Int, runtime: Runtime):
     parallelize[si](runtime, size, runtime.parallelism_level())
 
 
+fn add_pointers[
+    T: DType, nelts: Int
+](inout a: DTypePointer[T], b: DTypePointer[T], size: Int) -> None:
+    @parameter
+    fn _add[_nelts: Int](Size: Int):
+        a.offset(Size).simd_store[_nelts](
+            0, a.offset(Size).simd_load[_nelts](0) + b.offset(Size).simd_load[_nelts](0)
+        )
+
+    vectorize[nelts, _add](size)
+
+
+fn add_pointers[
+    nelts: Int
+](
+    inout a: DTypePointer[DType.float32], b: DTypePointer[DType.float32], size: Int
+) -> None:
+    @parameter
+    fn _add[_nelts: Int](j: Int):
+        a.offset(j).simd_store[_nelts](
+            0, a.offset(j).simd_load[_nelts](0) + b.offset(j).simd_load[_nelts](0)
+        )
+
+    vectorize[nelts, _add](size)
+
+
+fn add_pointers[
+    nelts: Int
+](
+    inout a: DTypePointer[DType.bfloat16], b: DTypePointer[DType.bfloat16], size: Int
+) -> None:
+    @parameter
+    fn _add[_nelts: Int](Size: Int):
+        a.offset(Size).simd_store[_nelts](
+            0, a.offset(Size).simd_load[_nelts](0) + b.offset(Size).simd_load[_nelts](0)
+        )
+
+    vectorize[nelts, _add](size)
+
+
 fn add_matrix[T: DType, nelts: Int](inout a: Matrix[T], b: Matrix[T], size: Int):
     @parameter
     fn _add[_nelts: Int](Size: Int):
         a.data.offset(Size).simd_store[_nelts](
-            0, a.data.offset(Size).load(0) + b.data.offset(Size).load(0)
-        )
-
-    vectorize[nelts, _add](size)
-
-
-fn add_pointers[
-    T: DType, nelts: Int
-](inout a: DTypePointer[T], b: DTypePointer[T], size: Int):
-    @parameter
-    fn _add[_nelts: Int](Size: Int):
-        a.offset(Size).simd_store[_nelts](
-            0, a.offset(Size).load(0) + b.offset(Size).load(0)
-        )
-
-    vectorize[nelts, _add](size)
-
-
-fn add_pointers[
-    nelts: Int
-](inout a: DTypePointer[DType.bfloat16], b: DTypePointer[DType.bfloat16], size: Int):
-    @parameter
-    fn _add[_nelts: Int](Size: Int):
-        a.offset(Size).simd_store[_nelts](
-            0, a.offset(Size).load(0) + b.offset(Size).load(0)
-        )
-
-    vectorize[nelts, _add](size)
-
-
-fn add_pointers[
-    nelts: Int
-](inout a: DTypePointer[DType.float32], b: DTypePointer[DType.float32], size: Int):
-    @parameter
-    fn _add[_nelts: Int](Size: Int):
-        a.offset(Size).simd_store[_nelts](
-            0, a.offset(Size).load(0) + b.offset(Size).load(0)
-        )
-
-    vectorize[nelts, _add](size)
-
-
-fn add_matrix[nelts: Int](inout a: MatrixBF16, b: MatrixBF16, size: Int):
-    @parameter
-    fn _add[_nelts: Int](Size: Int):
-        a.data.offset(Size).simd_store[_nelts](
-            0, a.data.offset(Size).load(0) + b.data.offset(Size).load(0)
+            0, a.data.offset(Size).simd_load[_nelts](0) + b.data.offset(Size).simd_load[_nelts](0)
         )
 
     vectorize[nelts, _add](size)
@@ -542,7 +537,17 @@ fn add_matrix[nelts: Int](inout a: MatrixF32, b: MatrixF32, size: Int):
     @parameter
     fn _add[_nelts: Int](Size: Int):
         a.data.offset(Size).simd_store[_nelts](
-            0, a.data.offset(Size).load(0) + b.data.offset(Size).load(0)
+            0, a.data.offset(Size).simd_load[_nelts](0) + b.data.offset(Size).simd_load[_nelts](0)
+        )
+
+    vectorize[nelts, _add](size)
+
+
+fn add_matrix[nelts: Int](inout a: MatrixBF16, b: MatrixBF16, size: Int):
+    @parameter
+    fn _add[_nelts: Int](Size: Int):
+        a.data.offset(Size).simd_store[_nelts](
+            0, a.data.offset(Size).simd_load[_nelts](0) + b.data.offset(Size).simd_load[_nelts](0)
         )
 
     vectorize[nelts, _add](size)
@@ -576,11 +581,32 @@ fn softmax[T: DType, nelts: Int](inout x: DTypePointer[T], size: Int) -> None:
     vectorize[nelts, _norm](size)
 
 
-fn matmul[
-    T: DType, nelts: Int
-](inout C: Matrix[T], A: Matrix[T], B: Matrix[T], rt: Runtime) -> None:
-    # matmul_parallelized[T](C, A, B, rt)
-    matmul_parallelized[T, nelts](C, A, B, rt)
+fn softmax[nelts: Int](inout x: DTypePointer[DType.float32], size: Int) -> None:
+    var max_val: SIMD[DType.float32, 1] = -1e9
+
+    @parameter
+    fn _max[_nelts: Int](j: Int):
+        let val = x.simd_load[_nelts](j).reduce_max()
+        if val > max_val:
+            max_val = val
+
+    vectorize[nelts, _max](size)
+
+    # Exp and sum
+    var ssum: SIMD[DType.float32, 1] = 0.0
+
+    @parameter
+    fn _sum_exp[_nelts: Int](j: Int):
+        x.simd_store[_nelts](j, math.exp(x.simd_load[_nelts](j) - max_val))
+        ssum += x.simd_load[_nelts](j).reduce_add()
+
+    vectorize[nelts, _sum_exp](size)
+
+    @parameter
+    fn _norm[_nelts: Int](j: Int):
+        x.simd_store[_nelts](j, x.simd_load[_nelts](j) / ssum)
+
+    vectorize[nelts, _norm](size)
 
 
 fn softmax[nelts: Int](inout x: DTypePointer[DType.bfloat16], size: Int) -> None:
@@ -612,38 +638,10 @@ fn softmax[nelts: Int](inout x: DTypePointer[DType.bfloat16], size: Int) -> None
 
 
 fn matmul[
-    nelts: Int
-](inout C: MatrixBF16, A: MatrixBF16, B: MatrixBF16, rt: Runtime) -> None:
-    # matmul_parallelized[ DType.bfloat16](C, A, B, rt)
-    matmul_parallelized[nelts](C, A, B, rt)
-
-
-fn softmax[nelts: Int](inout x: DTypePointer[DType.float32], size: Int) -> None:
-    var max_val: SIMD[DType.float32, 1] = -1e9
-
-    @parameter
-    fn _max[_nelts: Int](j: Int):
-        let val = x.simd_load[_nelts](j).reduce_max()
-        if val > max_val:
-            max_val = val
-
-    vectorize[nelts, _max](size)
-
-    # Exp and sum
-    var ssum: SIMD[DType.float32, 1] = 0.0
-
-    @parameter
-    fn _sum_exp[_nelts: Int](j: Int):
-        x.simd_store[_nelts](j, math.exp(x.simd_load[_nelts](j) - max_val))
-        ssum += x.simd_load[_nelts](j).reduce_add()
-
-    vectorize[nelts, _sum_exp](size)
-
-    @parameter
-    fn _norm[_nelts: Int](j: Int):
-        x.simd_store[_nelts](j, x.simd_load[_nelts](j) / ssum)
-
-    vectorize[nelts, _norm](size)
+    T: DType, nelts: Int
+](inout C: Matrix[T], A: Matrix[T], B: Matrix[T], rt: Runtime) -> None:
+    # matmul_parallelized[T](C, A, B, rt)
+    matmul_parallelized[T, nelts](C, A, B, rt)
 
 
 fn matmul[
@@ -651,3 +649,46 @@ fn matmul[
 ](inout C: MatrixF32, A: MatrixF32, B: MatrixF32, rt: Runtime) -> None:
     # matmul_parallelized[ DType.float32](C, A, B, rt)
     matmul_parallelized[nelts](C, A, B, rt)
+
+
+fn matmul[
+    nelts: Int
+](inout C: MatrixBF16, A: MatrixBF16, B: MatrixBF16, rt: Runtime) -> None:
+    # matmul_parallelized[ DType.bfloat16](C, A, B, rt)
+    matmul_parallelized[nelts](C, A, B, rt)
+
+
+fn sample_probabilities[T: DType](matrix: Matrix[T]) -> Int:
+    let cols = matrix.cols
+    let random_data = DTypePointer[T].alloc(1)
+    rand[T](random_data, 1)
+    var l_number = SIMD[T, 1](0.0)
+    for i in range(cols):
+        l_number += matrix[i]
+        if random_data.load(0) < l_number:
+            return i
+    return cols - 1
+
+
+fn sample_probabilities(matrix: MatrixF32) -> Int:
+    let cols = matrix.cols
+    let random_data = DTypePointer[DType.float32].alloc(1)
+    rand[DType.float32](random_data, 1)
+    var l_number = Float32(0.0)
+    for i in range(cols):
+        l_number += matrix[i]
+        if random_data.load(0) < l_number:
+            return i
+    return cols - 1
+
+
+fn sample_probabilities(matrix: MatrixBF16) -> Int:
+    let cols = matrix.cols
+    let random_data = DTypePointer[DType.bfloat16].alloc(1)
+    rand[DType.bfloat16](random_data, 1)
+    var l_number = SIMD[DType.bfloat16, 1](0.0)
+    for i in range(cols):
+        l_number += matrix[i]
+        if random_data.load(0) < l_number:
+            return i
+    return cols - 1

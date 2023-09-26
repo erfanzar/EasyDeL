@@ -18,6 +18,7 @@ from .utilities import (
     string_num_to_int,
     read_file,
     system_information,
+    print_pointer,
 )
 
 from .matrix_ import (
@@ -47,6 +48,7 @@ from .matrix_ import (
     rope_rotation_multi_head,
     rope_rotation_multi_query,
     rope_rotation,
+    sample_probabilities,
 )
 
 from .models import (
@@ -55,4 +57,6 @@ from .models import (
     LlamaWeightsBF16,
     LlamaWeightsF32,
     LlamaConfig,
+    llama_forward_fp32,
+    llama_forward_bf16,
 )

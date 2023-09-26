@@ -12,5 +12,6 @@ from .string import (
     string_ref_to_uint8,
     uint8_to_string_ref,
     string_num_to_int,
+    print_pointer,
 )
 from .info import system_information
