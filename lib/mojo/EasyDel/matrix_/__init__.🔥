@@ -31,4 +31,5 @@ from .operations import (
     add_matrix,
     softmax,
     add_pointers,
+    sample_probabilities,
 )

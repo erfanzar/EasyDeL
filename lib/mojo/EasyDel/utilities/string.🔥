@@ -1,4 +1,3 @@
-
 fn string_to_pointer(string: String) -> Pointer[UInt8]:
     let _len = len(string)
     let res = Pointer[UInt8]().alloc(_len + 1)
@@ -33,7 +32,6 @@ fn concatenate_string(
     while string_2[size_2] != 0:
         size_2 += 1
     let new_str = Pointer[UInt8].alloc(size_1 + size_2 + 1)
-    
 
     memcpy[UInt8](new_str, string_1, size_1)
     memcpy[UInt8](new_str.offset(size_1), string_2, size_2)
@@ -61,3 +59,17 @@ fn string_num_to_int(string_int: Int) -> Int:
     if string_int >= ord("A"):
         return string_int - ord("A") + 10
     return string_int - ord("0")
+
+
+fn print_pointer(s: Pointer[UInt8]):
+    if (s[1].to_int() == ord("0")) and (s[2].to_int() == ord("x")):
+        print_no_newline(
+            chr(
+                string_num_to_int(s[3].to_int()) * 16 + string_num_to_int(s[4].to_int())
+            )
+        )
+        return
+    var index: Int = 0
+    while s[index].to_int() != 0:
+        print_no_newline(chr(s[index].to_int()))
+        index += 1
