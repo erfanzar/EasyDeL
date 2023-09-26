@@ -410,7 +410,7 @@ fn read_file[T: DType](inout buffer: FileBuffer, filename: StringRef) raises -> 
     return None
 
 @always_inline
-fn transformer[
+fn llama_forward_fp32[
     rope_rotation: fn ( 
         inout q: DTypePointer[DType.float32],
         inout k: DTypePointer[DType.float32],
@@ -428,8 +428,8 @@ fn transformer[
     )->None,
     nelts:Int
 ](
-    token: Int,
-    pos: Int,
+    input_id: Int,
+    position: Int,
     config: LlamaConfig,
     inout state: LlamaRunStateF32,
     weights: LlamaWeightsF32,
@@ -441,29 +441,29 @@ fn transformer[
     let number_rep_kv = config.number_rep_kv
     let head_dims = config.head_dims
 
-    var tmpw = MatrixF32(0, 0)
-    let content_row = weights.wte.data.offset(token * hidden_size)
+    var matrix_state = MatrixF32(0, 0)
+    let content_row = weights.wte.data.offset(input_id * hidden_size)
     memcpy[DType.float32](x, content_row, config.hidden_size)
 
-    let freq_cis_real_row = weights.fcr.data.offset(pos * head_dims // 2)
-    let freq_cis_imag_row = weights.fci.data.offset(pos * head_dims // 2)
+    let freq_cis_real_row = weights.fcr.data.offset(position * head_dims // 2)
+    let freq_cis_imag_row = weights.fci.data.offset(position * head_dims // 2)
 
     for l in range(config.num_hidden_layers):
-        rms_norm[nelts](state.x_normed.data, x, weights.input_norm_attn_weigth.data.offset(l * hidden_size), 1e-5,hidden_size,state.rt)
+        rms_norm[nelts](state.x_normed.data, x, weights.input_norm_attn_weigth.data.offset(l * hidden_size), config.rms_norm_eps ,hidden_size,state.rt)
 
-        tmpw.set_data_from_buffer(weights.wq.data.offset(l * hidden_size * hidden_size), hidden_size, hidden_size)
-        matmul(state.q, state.x_normed, tmpw, state.rt)
+        matrix_state.set_data_from_buffer(weights.wq.data.offset(l * hidden_size * hidden_size), rows=hidden_size, cols=hidden_size)
+        matmul(state.q, state.x_normed, matrix_state, state.rt)
 
         let loff = l * config.max_position_embeddings * kv_dims
-        state.k.set_data_from_buffer(state.key_cache.data.offset(loff + pos * kv_dims), 1, kv_dims)
-        tmpw.set_data_from_buffer(weights.wk.data.offset(l * hidden_size * kv_dims), kv_dims, hidden_size)
-        matmul(state.k, state.x_normed, tmpw, state.rt)
+        state.k.set_data_from_buffer(state.key_cache.data.offset(loff + position * kv_dims), rows=1, cols=kv_dims)
+        matrix_state.set_data_from_buffer(weights.wk.data.offset(l * hidden_size * kv_dims), rows=kv_dims, cols=hidden_size)
+        matmul(state.k, state.x_normed, matrix_state, state.rt)
 
         state.v.set_data_from_buffer(
-            state.value_cache.data.offset(loff + pos * kv_dims), 1, kv_dims
+            state.value_cache.data.offset(loff + position * kv_dims), rows=1, cols=kv_dims
         )
-        tmpw.set_data_from_buffer(weights.wv.data.offset(l * hidden_size * kv_dims), kv_dims, hidden_size)
-        matmul(state.v, state.x_normed, tmpw, state.rt)
+        matrix_state.set_data_from_buffer(weights.wv.data.offset(l * hidden_size * kv_dims), rows=kv_dims, cols=hidden_size)
+        matmul(state.v, state.x_normed, matrix_state, state.rt)
 
         rope_rotation(state.q.data,state.k.data, freq_cis_real_row, freq_cis_imag_row, config.num_attention_heads,config.num_key_value_heads,config.head_dims)
 
@@ -472,7 +472,7 @@ fn transformer[
 
             var attn_weights = state.attn_weights.data.offset(h * config.max_position_embeddings)
 
-            for t in range(pos + 1):
+            for t in range(position + 1):
                 let k = state.key_cache.data.offset(
                     loff + t * kv_dims + (h // number_rep_kv) * head_dims
                 )
@@ -483,11 +483,11 @@ fn transformer[
 
                 attn_weights.offset(t).store(0, score)
 
-            softmax[nelts](attn_weights, pos + 1)
+            softmax[nelts](attn_weights, position + 1)
 
             let x_normed = state.x_normed.data.offset(h * head_dims)
             memset_zero(x_normed, head_dims)
-            for t in range(pos + 1):
+            for t in range(position + 1):
                 let v = state.value_cache.data.offset(
                     loff + t * kv_dims + (h // number_rep_kv) * head_dims
                 )
@@ -495,18 +495,18 @@ fn transformer[
                 for i in range(head_dims):
                     let xbi = x_normed.offset(i).load(0) + a * v.offset(i).load(0)
                     x_normed.offset(i).store(0, xbi)
-        tmpw.set_data_from_buffer(weights.wo.data.offset(l * hidden_size * hidden_size), hidden_size, hidden_size)
-        matmul(state.x_buffer, state.x_normed, tmpw, state.rt)
+        matrix_state.set_data_from_buffer(weights.wo.data.offset(l * hidden_size * hidden_size), rows=hidden_size,cols=hidden_size)
+        matmul(state.x_buffer, state.x_normed, matrix_state, state.rt)
 
         add_pointers[nelts](x, state.x_buffer.data, hidden_size)
 
-        rms_norm[nelts](state.x_normed.data, x, weights.post_norm_weigth.data.offset(l * hidden_size),1e-5, hidden_size,state.rt)
+        rms_norm[nelts](state.x_normed.data, x, weights.post_norm_weigth.data.offset(l * hidden_size),config.rms_norm_eps, hidden_size,state.rt)
 
-        tmpw.set_data_from_buffer(weights.w1.data.offset(l * hidden_size * intermediate_size), intermediate_size, hidden_size)
-        matmul(state.ffn_w1, state.x_normed, tmpw, state.rt)
+        matrix_state.set_data_from_buffer(weights.w1.data.offset(l * hidden_size * intermediate_size), rows=intermediate_size, cols=hidden_size)
+        matmul(state.ffn_w1, state.x_normed, matrix_state, state.rt)
 
-        tmpw.set_data_from_buffer(weights.w3.data.offset(l * hidden_size * intermediate_size), intermediate_size, hidden_size)
-        matmul(state.ffn_w3, state.x_normed, tmpw, state.rt)
+        matrix_state.set_data_from_buffer(weights.w3.data.offset(l * hidden_size * intermediate_size), rows=intermediate_size, cols=hidden_size)
+        matmul(state.ffn_w3, state.x_normed, matrix_state, state.rt)
 
         for i in range(intermediate_size):
             let hbi = state.ffn_w1[i]
@@ -515,13 +515,13 @@ fn transformer[
         for i in range(intermediate_size):
             state.ffn_w1[i] = state.ffn_w1[i] * state.ffn_w3[i]
 
-        tmpw.set_data_from_buffer(weights.w2.data.offset(l * hidden_size * intermediate_size), hidden_size, intermediate_size)
-        matmul(state.x_normed, state.ffn_w1, tmpw, state.rt)
+        matrix_state.set_data_from_buffer(weights.w2.data.offset(l * hidden_size * intermediate_size), rows=hidden_size, cols=intermediate_size)
+        matmul(state.x_normed, state.ffn_w1, matrix_state, state.rt)
 
         add_pointers[nelts](x, state.x_normed.data, hidden_size)
 
-    rms_norm[nelts](x, x, weights.final_norm_weight.data,1e-5, hidden_size,state.rt)
+    rms_norm[nelts](x, x, weights.final_norm_weight.data,config.rms_norm_eps, hidden_size,state.rt)
 
-    tmpw.set_data_from_buffer(weights.lm_head.data, config.vocab_size, hidden_size)
-    matmul(state.logits, state.x, tmpw, state.rt)
+    matrix_state.set_data_from_buffer(weights.lm_head.data, rows=config.vocab_size,cols= hidden_size)
+    matmul(state.logits, state.x, matrix_state, state.rt)
 
