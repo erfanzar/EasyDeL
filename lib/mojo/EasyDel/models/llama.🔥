@@ -58,33 +58,34 @@ struct LlamaConfig:
 
     fn __init__(inout self: Self, inout buffer: FileBuffer) raises -> None:
         self.hidden_size = (
-            buffer.data.offset(buffer.offset).bitcast[DType.uint32]().load(0).to_int()
+            buffer.data.offset(buffer.offset).bitcast[DType.int32]().load(0).to_int()
         )
-        buffer.move_offset(sizeof[DType.uint32]())
+        buffer.move_offset(4)
         self.intermediate_size = (
-            buffer.data.offset(buffer.offset).bitcast[DType.uint32]().load(0).to_int()
+            buffer.data.offset(buffer.offset).bitcast[DType.int32]().load(0).to_int()
         )
-        buffer.move_offset(sizeof[DType.uint32]())
+        buffer.move_offset(4)
         self.num_hidden_layers = (
-            buffer.data.offset(buffer.offset).bitcast[DType.uint32]().load(0).to_int()
+            buffer.data.offset(buffer.offset).bitcast[DType.int32]().load(0).to_int()
         )
-        buffer.move_offset(sizeof[DType.uint32]())
+        buffer.move_offset(4)
         self.num_attention_heads = (
-            buffer.data.offset(buffer.offset).bitcast[DType.uint32]().load(0).to_int()
+            buffer.data.offset(buffer.offset).bitcast[DType.int32]().load(0).to_int()
         )
-        buffer.move_offset(sizeof[DType.uint32]())
+        buffer.move_offset(4)
         self.num_key_value_heads = (
-            buffer.data.offset(buffer.offset).bitcast[DType.uint32]().load(0).to_int()
+            buffer.data.offset(buffer.offset).bitcast[DType.int32]().load(0).to_int()
         )
-        buffer.move_offset(sizeof[DType.uint32]())
+        buffer.move_offset(4)
+        
         self.vocab_size = (
-            buffer.data.offset(buffer.offset).bitcast[DType.uint32]().load(0).to_int()
+            buffer.data.offset(buffer.offset).bitcast[DType.int32]().load(0).to_int()
         )
-        buffer.move_offset(sizeof[DType.uint32]())
+        buffer.move_offset(4)
         self.max_position_embeddings = (
-            buffer.data.offset(buffer.offset).bitcast[DType.uint32]().load(0).to_int()
+            buffer.data.offset(buffer.offset).bitcast[DType.int32]().load(0).to_int()
         )
-        buffer.move_offset(sizeof[DType.uint32]())
+        buffer.move_offset(4)
         self.head_dims = self.hidden_size // self.num_attention_heads
         self.kv_dims = (
             self.num_key_value_heads * self.hidden_size

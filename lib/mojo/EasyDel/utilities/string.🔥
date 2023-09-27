@@ -21,6 +21,16 @@ fn dif_string(string_1: Pointer[UInt8], string_2: Pointer[UInt8]) -> Int:
         return -1
     return 0
 
+fn wrap(token: Pointer[UInt8]) -> Pointer[UInt8]:
+    if dif_string(token, string_to_pointer('\\n')) == 0:
+        return string_to_pointer('<0x0A>')
+    if dif_string(token, string_to_pointer('\\t')) == 0:
+        return string_to_pointer('<0x09>')
+    if dif_string(token, string_to_pointer('\'')) == 0:
+        return string_to_pointer('<0x27>')
+    elif dif_string(token, string_to_pointer('\"')) == 0:
+        return string_to_pointer('<0x22>')
+    return token
 
 fn concatenate_string(
     string_1: Pointer[UInt8], string_2: Pointer[UInt8]
