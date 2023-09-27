@@ -24,8 +24,14 @@ struct FileBuffer:
         inout self: Self, size: Int
     ) raises -> DTypePointer[DType.float32]:
         let res = self.data.offset(self.offset).bitcast[DType.float32]()
+        self.move_offset(4 * size)
+        return res
 
-        self.move_offset(sizeof[DType.float32]() * size)
+    fn read_value_int(
+        inout self: Self
+    ) raises -> Int:
+        let res = self.data.offset(self.offset).bitcast[DType.int32]().load(0).to_int()
+        self.move_offset(4)
         return res
 
     fn read_value_float16(

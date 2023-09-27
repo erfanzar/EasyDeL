@@ -1,4 +1,4 @@
-from ..utilities import FileBuffer, read_numerical_value
+from ..utilities import FileBuffer, read_numerical_value,wrap
 
 
 fn loop_sort(
@@ -43,12 +43,9 @@ struct Tokenizer:
     var sorted_vocab: Pointer[Pointer[UInt8]]
     var sorted_indices: DynamicVector[Int]
 
-    fn __init__(inout self, vocab_size: Int, inout buffer: FileBuffer) raises:
+    fn __init__(inout self, vocab_size: Int, inout buffer: FileBuffer) raises -> None:
         self.vocab_size = vocab_size
-        self.max_token_length = (
-            buffer.data.offset(buffer.offset).bitcast[DType.uint32]().load(0).to_int()
-        )
-        buffer.move_offset(sizeof[DType.uint32]())
+        self.max_token_length = buffer.read_value_int()
         self.vocab_scores = DTypePointer[DType.float32].alloc(self.vocab_size)
         self.vocab = Pointer[Pointer[UInt8]].alloc(self.vocab_size)
 
@@ -56,31 +53,26 @@ struct Tokenizer:
         self.sorted_indices = DynamicVector[Int](0)
 
         for i in range(0, self.vocab_size):
-            self.vocab_scores.simd_store[1](
-                i, buffer.read_numerical_value_dynamic[DType.float32](1).load(0)
-            )
-            let string_length = (
-                buffer.data.offset(buffer.offset)
-                .bitcast[DType.uint32]()
-                .load(0)
-                .to_int()
-            )
-
-            buffer.move_offset(sizeof[DType.uint32]())
+            
+            self.vocab_scores.store(i, buffer.read_value_float32(1).load(0))
+            let string_length = buffer.read_value_int()
+           
             self.vocab.store(i, read_string_value(buffer, string_length))
+        return None
 
     fn sort(inout self) -> None:
         if len(self.sorted_indices) < self.vocab_size:
             self.sorted_indices = DynamicVector[Int](self.vocab_size)
             self.sorted_vocab = Pointer[Pointer[UInt8]].alloc(self.vocab_size)
-            for ii in range(self.vocab_size):
-                self.sorted_vocab.store(ii, self.vocab[ii])
-                self.sorted_indices.push_back(ii)
+            for i in range(self.vocab_size):
+                self.sorted_vocab.store(i, self.vocab[i])
+                self.sorted_indices.push_back(i)
 
         let n = self.vocab_size
         loop_sort(self.sorted_vocab, self.sorted_indices, 0, n - 1)
 
-    fn find(inout self, token: Pointer[UInt8]) -> Int:
+    fn find(inout self, t: Pointer[UInt8]) -> Int:
+        let token = wrap(t)
         let n = self.vocab_size
         if len(self.sorted_indices) < n:
             self.sort()
@@ -89,7 +81,6 @@ struct Tokenizer:
         while left <= right:
             let mid = left + (right - left) // 2
             let comparison = dif_string(self.sorted_vocab[mid], token)
-
             if comparison == 0:
                 return self.sorted_indices[mid]
             if comparison < 0:
@@ -136,15 +127,16 @@ fn load_tokenizer[
 fn byte_pr_tokenizer_encoder(
     inout input_ids: DynamicVector[Int], string: String, inout tokenizer: Tokenizer
 ) raises:
+
     for position in range(len(string)):
         let char = string_to_pointer(string[position])
-
         let _id = tokenizer.find(char)
         if _id == -1:
+            print('You will recive an Error  !')
             return
         input_ids.push_back(_id)
     while True:
-        var h_score: SIMD[DType.float32, 1] = -1e10
+        var h_score: SIMD[DType.float32, 1] = SIMD[DType.float32, 1](-1e10)
         var b_i: Int = -1
         var b_x: Int = -1
 
@@ -168,3 +160,4 @@ fn byte_pr_tokenizer_encoder(
         for i in range(b_x + 2, len(input_ids)):
             new_input_ids.push_back(input_ids[i])
         input_ids = new_input_ids
+

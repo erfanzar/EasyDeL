@@ -150,7 +150,7 @@ fn rope_rotation_multi_head(
 ) -> None:
     let off_rot = head_dims // 2
     for i in range(num_attention_heads):
-        for j in range(head_dims // 2):
+        for j in range(off_rot):
             let cu_fcr = fcr_row.offset(j).load(0)
             let cu_fci = fci_row.offset(j).load(0)
             let q0 = q.offset(i * head_dims + j).load(0)
@@ -177,7 +177,7 @@ fn rope_rotation_multi_head(
 ) -> None:
     let off_rot = head_dims // 2
     for i in range(num_attention_heads):
-        for j in range(head_dims // 2):
+        for j in range(off_rot):
             let cu_fcr = fcr_row.offset(j).load(0)
             let cu_fci = fci_row.offset(j).load(0)
             let q0 = q.offset(i * head_dims + j).load(0)
