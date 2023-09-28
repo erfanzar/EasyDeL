@@ -1,0 +1,124 @@
+from utils.vector import InlinedFixedVector
+
+
+struct ArrayShape:
+    var _shape: Pointer[Int]
+    var _length: Int
+    var _size: Int
+    var _allocated: Bool
+
+    fn __init__(inout self, shape: VariadicList[Int]) -> None:
+        self._length = len(shape)
+        self._shape = Pointer[Int]().alloc(self._length)
+        self._size = 1
+        self._allocated = True
+        self._size = self.product_dims()
+        for i in range(self._length):
+            self._shape.store(i, shape[i])
+
+    fn __init__(inout self, *elms: Int) -> None:
+        let shape: VariadicList[Int] = VariadicList[Int](elms)
+        self._length = len(shape)
+        self._shape = Pointer[Int]().alloc(self._length)
+        self._size = 1
+        self._allocated = True
+        self._size = self.product_dims()
+        for i in range(self._length):
+            self._shape.store(i, shape[i])
+
+    fn __copyinit__(inout self: Self, ext: Self):
+        self._size = ext._size
+        self._shape = ext._shape
+        self._length = ext._length
+        self._allocated = ext._allocated
+
+    fn __moveinit__(inout self: Self, owned ext: Self):
+        self._shape = ext._shape ^
+        self._length = ext._length
+        self._size = ext._size
+        self._allocated = ext._allocated
+
+    fn __len__(self) -> Int:
+        return self._size
+
+    fn __eq__(self, other: ArrayShape) -> Bool:
+        let mr = self.rank()
+        for i in range(mr):
+            if self._shape[i] != self._shape[i]:
+                return False
+
+        if mr != other.rank():
+            return False
+        return True
+
+    fn __is__(self, other: ArrayShape) -> Bool:
+        let mr = self.rank()
+        for i in range(mr):
+            if self._shape[i] != self._shape[i]:
+                return False
+
+        if mr != other.rank():
+            return False
+        return True
+
+    fn __eq_matmul__(self, other: ArrayShape) -> Bool:
+        let mr = self.rank()
+        let tr = other.rank()
+        if mr != tr:
+            return False
+        if mr == 1:
+            return self == other
+        for i in range(mr - 2):
+            if self.dim(i) != other.dim(i):
+                return False
+        if self.dim(mr - 2) != other.dim(mr - 1):
+            return False
+        if self._allocated == False or other._allocated == False:
+            return False
+        return True
+
+    fn __getitem__(self, idx: Int) -> Int:
+        return self._shape[self.__ntp__(idx, self._length)]
+
+    @staticmethod
+    fn __ntp__(i: Int, m: Int) -> Int:
+        if i < 0:
+            return i + m
+        return i
+
+    fn rank(self: Self) -> Int:
+        return self._length
+
+    fn product_dims(self) -> Int:
+        var res = 1
+        for i in range(self.rank()):
+            res *= self._shape[i]
+        return res
+
+    fn num_elements(self: Self) -> Int:
+        return self._size
+
+    fn dim(self, index: Int) -> Int:
+        return self.__ntp__(index, self._length)
+
+    fn shape(self: Self) -> Pointer[Int]:
+        return self._shape
+
+    fn get_1d_pos[off: Int](self, index: DynamicVector[Int]) -> Int:
+        var product: Int = 1
+        var position: Int = 0
+        for i in range(self.rank() - 1, 0, -1):
+            product *= self._shape[i]
+            position += self.__ntp__(index[i - 1], self._shape[i - 1]) * product
+
+        position += self.__ntp__(index[self.rank() - 1], self._shape[self.rank() - 1])
+        return position
+
+    fn shape_str(self: Self):
+        print_no_newline("[")
+        for i in range(self.rank()):
+            if i == self.rank() - 1:
+                print_no_newline(self[i])
+            else:
+                print_no_newline(self[i], ",")
+        print("]")
