@@ -642,6 +642,7 @@ struct Array[T: DType]:
             vectorize[nelts, _lp](last_dim)
 
         parallelize[_ol](rt, res_size)
+        return res ^
 
     fn pow[nelts: Int](self: Self, other: Self) -> Self:
         debug_assert(
@@ -667,6 +668,7 @@ struct Array[T: DType]:
 
         for i in range(res_size):
             _ol(i)
+        return res ^
 
     fn dot[nelts: Int](self: Self, other: Self) -> Self:
         debug_assert(
