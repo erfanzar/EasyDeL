@@ -1,4 +1,12 @@
-from ..utilities import FileBuffer, read_numerical_value,wrap
+from ..utilities import (
+    FileBuffer,
+    read_numerical_value,
+    wrap,
+    dif_string,
+    read_string_value,
+    string_to_pointer,
+    concatenate_string,
+)
 
 
 fn loop_sort(
@@ -53,10 +61,9 @@ struct Tokenizer:
         self.sorted_indices = DynamicVector[Int](0)
 
         for i in range(0, self.vocab_size):
-            
             self.vocab_scores.store(i, buffer.read_value_float32(1).load(0))
             let string_length = buffer.read_value_int()
-           
+
             self.vocab.store(i, read_string_value(buffer, string_length))
         return None
 
@@ -127,12 +134,11 @@ fn load_tokenizer[
 fn byte_pr_tokenizer_encoder(
     inout input_ids: DynamicVector[Int], string: String, inout tokenizer: Tokenizer
 ) raises:
-
     for position in range(len(string)):
         let char = string_to_pointer(string[position])
         let _id = tokenizer.find(char)
         if _id == -1:
-            print('You will recive an Error  !')
+            print("You will recive an Error  !")
             return
         input_ids.push_back(_id)
     while True:
@@ -160,4 +166,3 @@ fn byte_pr_tokenizer_encoder(
         for i in range(b_x + 2, len(input_ids)):
             new_input_ids.push_back(input_ids[i])
         input_ids = new_input_ids
-

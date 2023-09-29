@@ -212,18 +212,18 @@ struct Array[T: DType]:
     fn set_data_from_buffer(inout self: Self, pointer: DTypePointer[T]) -> None:
         self.data = pointer
 
-    fn set_data_from_buffer(
-        inout self: Self, pointer: DTypePointer[T], *dims: Int
-    ) -> None:
-        self.data = pointer
-        var shape = VariadicList[Int](dims)
-        debug_assert(
-            len(shape) == self._array_shape.rank(), "Ranking Assertation Failed!"
-        )
-        for i in range(len(shape)):
-            debug_assert(
-                shape[i] == self._array_shape.dim(i), "Ranking Assertation Failed!"
-            )
+    # fn set_data_from_buffer(
+    #     inout self: Self, pointer: DTypePointer[T], *dims: Int
+    # ) -> None:
+    #     self.data = pointer
+    #     var shape = VariadicList[Int](dims)
+    #     debug_assert(
+    #         len(shape) == self._array_shape.rank(), "Ranking Assertation Failed!"
+    #     )
+    #     for i in range(len(shape)):
+    #         debug_assert(
+    #             shape[i] == self._array_shape.dim(i), "Ranking Assertation Failed!"
+    #         )
 
     fn set_data_from_buffer(
         inout self: Self, pointer: DTypePointer[T], shape: VariadicList[Int]
