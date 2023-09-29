@@ -22,6 +22,7 @@ from math.math import (
     asinh,
     acosh,
 )
+import math
 from algorithm.functional import (
     vectorize,
     vectorize_unroll,
@@ -33,8 +34,6 @@ from runtime.llcl import Runtime, num_cores
 alias dims_average_size = 5
 
 # parts of this code is inspiered from https://github.com/andresnowak/Micro-Mojograd
-
-alias local_nelts: Int = simdwidthof[DType.float32]()
 
 
 struct ArrayShape:
@@ -193,6 +192,7 @@ struct ArrayShape:
 struct Array[T: DType]:
     var data: DTypePointer[T]
     var _array_shape: ArrayShape
+    alias nelts: Int = simdwidthof[T]()
 
     fn __init__(inout self: Self, array_shape: ArrayShape):
         self._array_shape = array_shape
@@ -218,7 +218,7 @@ struct Array[T: DType]:
             let dt = ext.data.simd_load[_nelts](0)
             self.data.simd_store[_nelts](0, dt)
 
-        vectorize[local_nelts, _do](ext._array_shape.num_elements())
+        vectorize[Array[T].nelts, _do](ext._array_shape.num_elements())
 
     fn __copyinit__(inout self, ext: Array[T]):
         self.data = DTypePointer[T].alloc(ext._array_shape.num_elements())
@@ -229,7 +229,7 @@ struct Array[T: DType]:
             let dt = ext.data.simd_load[_nelts](0)
             self.data.simd_store[_nelts](0, dt)
 
-        vectorize[local_nelts, _do](ext._array_shape.num_elements())
+        vectorize[Array[T].nelts, _do](ext._array_shape.num_elements())
 
     fn __del__(owned self):
         self.data.free()
@@ -307,28 +307,366 @@ struct Array[T: DType]:
     fn __getitem__(self, index: Int) -> SIMD[T, 1]:
         return self.load[1](index)
 
+    fn __element_wise_tensor_operation__[
+        nelts: Int,
+        outer_loop_func: fn[func: fn (Int) capturing -> None] (Int) capturing -> None,
+        op_func: fn[T: DType, simd_width: Int] (
+            x: SIMD[T, simd_width], y: SIMD[T, simd_width]
+        ) -> SIMD[T, simd_width],
+    ](self, other: Self) -> Self:
+        debug_assert(
+            self._array_shape == other._array_shape,
+            "dimension aren't equal, can't do operation element wise.",
+        )
+
+        let res = Self(self._array_shape)
+        let size = self._array_shape.num_elements()
+
+        let last_dim = self._array_shape[-1]
+        var dims_rest = size // last_dim
+
+        @parameter
+        fn _ol(i: Int):
+            @parameter
+            fn _iv[nelts: Int](j: Int):
+                let index = i * last_dim + j
+
+                res.store[nelts](
+                    index,
+                    op_func[T, nelts](
+                        self.load[nelts](index), other.load[nelts](index)
+                    ),
+                )
+
+            vectorize[nelts, _iv](last_dim)
+
+        outer_loop_func[_ol](dims_rest)
+
+        return res ^
+
+    fn __element_wise_tensor_operation__[
+        nelts: Int,
+        outer_loop_func: fn[func: fn (Int) capturing -> None] (Int) capturing -> None,
+        op_func: fn[T: DType, simd_width: Int] (x: SIMD[T, simd_width]) -> SIMD[
+            T, simd_width
+        ],
+    ](self) -> Self:
+        let res = Self(self._array_shape)
+        let size = self._array_shape.num_elements()
+
+        let last_dim = self._array_shape[-1]
+        var dims_rest = size // last_dim
+
+        @parameter
+        fn _ol(i: Int):
+            @parameter
+            fn _iv[nelts: Int](j: Int):
+                let index = i * last_dim + j
+
+                res.store[nelts](
+                    index,
+                    op_func[T, nelts](self.load[nelts](index)),
+                )
+
+            vectorize[nelts, _iv](last_dim)
+
+        outer_loop_func[_ol](dims_rest)
+
+        return res ^
+
+    fn __apply_math__[
+        func: fn[type: DType, simd_width: Int] (arg: SIMD[type, simd_width]) -> SIMD[
+            type, simd_width
+        ],
+    ](self: Self) -> Self:
+        var res: Array[T] = self
+
+        @parameter
+        fn _do(size: Int):
+            let ra = self.data.offset(size).simd_load[Array[T].nelts](0)
+            let rs: SIMD[T, Array[T].nelts] = func[T, Array[T].nelts](ra)
+            res.data.offset(size).simd_store[Array[T].nelts](0, rs)
+
+        parallelize[_do](self._array_shape.num_elements())
+        return res ^
+
+    fn __apply_math__[
+        nelts: Int,
+        func: fn[TP: DType, simd_width: Int] (arg: SIMD[TP, simd_width]) -> SIMD[
+            TP, simd_width
+        ],
+    ](self: Self) -> Self:
+        var res: Array[T] = self
+
+        @parameter
+        fn _do[_nelts: Int](size: Int):
+            let rs: SIMD[T, _nelts] = func[T, _nelts](
+                self.data.offset(size).simd_load[_nelts](0)
+            )
+            res.data.offset(size).simd_store[_nelts](0, rs)
+
+        vectorize[nelts, _do](self._array_shape.num_elements())
+        return res ^
+
+    fn __apply_math__[
+        func: fn[TP: DType, simd_width: Int] (arg: SIMD[TP, simd_width]) -> SIMD[
+            TP, simd_width
+        ],
+    ](self: Self, rt: Runtime) -> Self:
+        var res: Array[T] = self
+
+        @parameter
+        fn _do(size: Int):
+            let rs: SIMD[T, 1] = func[T, 1](
+                self.data.offset(size).simd_load[1](0)
+            ).reduce_add()
+            res.data.offset(size).simd_store[1](0, rs)
+
+        parallelize[_do](rt, self._array_shape.num_elements(), rt.parallelism_level())
+        return res ^
+
+    fn __add__(self: Self, other: Self) -> Self:
+        return self.add[Array[T].nelts](other)
+
+    fn __mul__(self: Self, other: Self) -> Self:
+        return self.mul[Array[T].nelts](other)
+
+    fn __matmul__(self: Self, other: Self) -> Self:
+        return self.matmul[Array[T].nelts](other)
+
+    fn __sub__(self: Self, other: Self) -> Self:
+        return self.sub[Array[T].nelts](other)
+
+    fn __truediv__(self: Self, other: Self) -> Self:
+        return self.true_div[Array[T].nelts](other)
+
+    fn __mod__(self: Self, other: Self) -> Self:
+        return self.mod[Array[T].nelts](other)
+
+    fn __len__(self: Self) -> Int:
+        return self._array_shape.num_elements()
+
+    fn __eq__(self, other: Self) -> Bool:
+        return self.eq[Array[T].nelts](other)
+
+    fn __ne__(self, other: Self) -> Bool:
+        return not self.eq[Array[T].nelts](other)
+
+    fn __floordiv__(self: Self, other: Self) -> Self:
+        ...
+
+    fn __pow__(self: Self, other: Self) -> Self:
+        return self.pow[Array[T].nelts](other)
+
+    fn __iadd__(inout self: Self, other: Self) -> None:
+        self = self.add[Array[T].nelts](other)
+
+    fn __isub__(inout self: Self, other: Self) -> None:
+        self = self.sub[Array[T].nelts](other)
+
+    fn __ipow__(inout self: Self, other: Self) -> None:
+        self = self.pow[Array[T].nelts](other)
+
+    fn __imod__(inout self: Self, other: Self) -> None:
+        self = self.mod[Array[T].nelts](other)
+
+    fn __idiv__(inout self: Self, other: Self) -> None:
+        self = self.true_div[Array[T].nelts](other)
+
+    fn __itruediv__(inout self: Self, other: Self) -> None:
+        self = self.true_div[Array[T].nelts](other)
+
+    fn __ifloordiv__(inout self: Self, other: Self) -> None:
+        ...
+
+    fn add[nelts: Int](self: Self, other: Self) -> Self:
+        @parameter
+        fn outer_loop[func: fn (Int) capturing -> None](size: Int):
+            for i in range(size):
+                func(i)
+
+        return self.__element_wise_tensor_operation__[nelts, outer_loop, math.add](
+            other
+        )
+
+    fn add[nelts: Int](self: Self, other: Self, runtime: Runtime) -> Self:
+        @parameter
+        fn outer_loop[func: fn (Int) capturing -> None](size: Int) -> None:
+            parallelize[func](runtime, size, runtime.parallelism_level())
+
+        return self.__element_wise_tensor_operation__[nelts, outer_loop, math.add](
+            other
+        )
+
+    fn mod[nelts: Int](self: Self, other: Self) -> Self:
+        @parameter
+        fn outer_loop[func: fn (Int) capturing -> None](size: Int):
+            for i in range(size):
+                func(i)
+
+        return self.__element_wise_tensor_operation__[nelts, outer_loop, math.mod](
+            other
+        )
+
+    fn mod[nelts: Int](self: Self, other: Self, runtime: Runtime) -> Self:
+        @parameter
+        fn outer_loop[func: fn (Int) capturing -> None](size: Int) -> None:
+            parallelize[func](runtime, size, runtime.parallelism_level())
+
+        return self.__element_wise_tensor_operation__[nelts, outer_loop, math.mod](
+            other
+        )
+
+    fn mul[nelts: Int](self: Self, other: Self) -> Self:
+        @parameter
+        fn outer_loop[func: fn (Int) capturing -> None](size: Int):
+            for i in range(size):
+                func(i)
+
+        return self.__element_wise_tensor_operation__[nelts, outer_loop, math.mul](
+            other
+        )
+
+    fn mul[nelts: Int](self: Self, other: Self, runtime: Runtime) -> Self:
+        @parameter
+        fn outer_loop[func: fn (Int) capturing -> None](size: Int) -> None:
+            parallelize[func](runtime, size, runtime.parallelism_level())
+
+        return self.__element_wise_tensor_operation__[nelts, outer_loop, math.mul](
+            other
+        )
+
+    fn sub[nelts: Int](self: Self, other: Self) -> Self:
+        @parameter
+        fn outer_loop[func: fn (Int) capturing -> None](size: Int):
+            for i in range(size):
+                func(i)
+
+        return self.__element_wise_tensor_operation__[nelts, outer_loop, math.sub](
+            other
+        )
+
+    fn sub[nelts: Int](self: Self, other: Self, runtime: Runtime) -> Self:
+        @parameter
+        fn outer_loop[func: fn (Int) capturing -> None](size: Int) -> None:
+            parallelize[func](runtime, size, runtime.parallelism_level())
+
+        return self.__element_wise_tensor_operation__[nelts, outer_loop, math.sub](
+            other
+        )
+
+    fn true_div[nelts: Int](self: Self, other: Self) -> Self:
+        @parameter
+        fn outer_loop[func: fn (Int) capturing -> None](size: Int):
+            for i in range(size):
+                func(i)
+
+        return self.__element_wise_tensor_operation__[nelts, outer_loop, math.div](
+            other
+        )
+
+    fn true_div[nelts: Int](self: Self, other: Self, runtime: Runtime) -> Self:
+        @parameter
+        fn outer_loop[func: fn (Int) capturing -> None](size: Int) -> None:
+            parallelize[func](runtime, size, runtime.parallelism_level())
+
+        return self.__element_wise_tensor_operation__[nelts, outer_loop, math.div](
+            other
+        )
+
+    fn eq[nelts: Int](self, other: Self) -> Bool:
+        debug_assert(
+            self._array_shape == other._array_shape,
+            "dimension aren't equal can't performe eq operation.",
+        )
+
+        var flag = True
+        let size = self._array_shape.num_elements()
+
+        @parameter
+        fn iterate_vectorize[nelts: Int](i: Int):
+            if self.load[nelts](i) != other.load[nelts](i):
+                flag = False
+
+        vectorize[nelts, iterate_vectorize](size)
+
+        return flag
+
+    fn eq[nelts: Int](self, other: Self, rt: Runtime, n_cores: Int) -> Bool:
+        debug_assert(
+            self._array_shape == other._array_shape,
+            "dimension aren't equal can't performe eq operation.",
+        )
+
+        var flag = True
+        let size = self._array_shape.num_elements()
+
+        let first_dim = self._array_shape[0]
+        let dims_rest = size // first_dim  # the rest of the dimensions
+
+        @parameter
+        fn iterate_parallel(i: Int):
+            @parameter
+            fn iterate_vectorize[nelts: Int](j: Int):
+                let index = i * dims_rest + j
+
+                if self.load[nelts](index) != other.load[nelts](index):
+                    flag = False
+
+            vectorize[nelts, iterate_vectorize](dims_rest)
+
+        parallelize[iterate_parallel](rt, first_dim, n_cores)
+
+        return flag
+
+    fn pow[nelts: Int](self: Self, other: Self, rt: Runtime) -> Self:
+        debug_assert(
+            self._array_shape.num_elements() == other._array_shape.num_elements(),
+            "Arrays Don't have same size",
+        )
+        var res = Array[T](self._array_shape)
+        let last_dim: Int = res._array_shape.dim(-1)
+        let res_size: Int = res._array_shape._size // last_dim
+
+        @parameter
+        fn _ol(i: Int):
+            @parameter
+            fn _lp[_nelts: Int](j: Int):
+                let index: Int = i * last_dim + j
+                res.data.simd_store[_nelts](
+                    index,
+                    self.data.simd_load[_nelts](index)
+                    ** res.data.simd_load[_nelts](index),
+                )
+
+            vectorize[nelts, _lp](last_dim)
+
+        parallelize[_ol](rt, res_size)
+
     fn pow[nelts: Int](self: Self, other: Self) -> Self:
         debug_assert(
             self._array_shape.num_elements() == other._array_shape.num_elements(),
             "Arrays Don't have same size",
         )
-        var shp = DynamicVector[Int]()
-        for s in range(self._array_shape._length):
-            shp.push_back(self._array_shape._shape[s])
-        var res = Self(ArrayShape(shp))
+        var res = Array[T](self._array_shape)
+        let last_dim: Int = res._array_shape.dim(-1)
+        let res_size: Int = res._array_shape._size // last_dim
 
         @parameter
-        fn _do[_nelts: Int](size: Int):
-            res.data.simd_store[_nelts](
-                size,
-                (
-                    self.data.simd_load[_nelts](size)
-                    * other.data.simd_load[_nelts](size)
-                ).reduce_add(),
-            )
+        fn _ol(i: Int):
+            @parameter
+            fn _lp[_nelts: Int](j: Int):
+                let index: Int = i * last_dim + j
+                res.data.simd_store[_nelts](
+                    index,
+                    self.data.simd_load[_nelts](index)
+                    ** res.data.simd_load[_nelts](index),
+                )
 
-        vectorize[nelts, _do](self._array_shape.num_elements())
-        return res ^
+            vectorize[nelts, _lp](last_dim)
+
+        for i in range(res_size):
+            _ol(i)
 
     fn dot[nelts: Int](self: Self, other: Self) -> Self:
         debug_assert(
@@ -440,57 +778,6 @@ struct Array[T: DType]:
 
         let res = self.__matmul[nelts, matmul_v](other)
 
-        return res ^
-
-    fn __apply_math__[
-        func: fn[type: DType, simd_width: Int] (arg: SIMD[type, simd_width]) -> SIMD[
-            type, simd_width
-        ],
-    ](self: Self) -> Self:
-        var res: Array[T] = self
-
-        @parameter
-        fn _do(size: Int):
-            let ra = self.data.offset(size).simd_load[local_nelts](0)
-            let rs: SIMD[T, local_nelts] = func[T, local_nelts](ra)
-            res.data.offset(size).simd_store[local_nelts](0, rs)
-
-        parallelize[_do](self._array_shape.num_elements())
-        return res ^
-
-    fn __apply_math__[
-        nelts: Int,
-        func: fn[TP: DType, simd_width: Int] (arg: SIMD[TP, simd_width]) -> SIMD[
-            TP, simd_width
-        ],
-    ](self: Self) -> Self:
-        var res: Array[T] = self
-
-        @parameter
-        fn _do[_nelts: Int](size: Int):
-            let rs: SIMD[T, _nelts] = func[T, _nelts](
-                self.data.offset(size).simd_load[_nelts](0)
-            )
-            res.data.offset(size).simd_store[_nelts](0, rs)
-
-        vectorize[nelts, _do](self._array_shape.num_elements())
-        return res ^
-
-    fn __apply_math__[
-        func: fn[TP: DType, simd_width: Int] (arg: SIMD[TP, simd_width]) -> SIMD[
-            TP, simd_width
-        ],
-    ](self: Self, rt: Runtime) -> Self:
-        var res: Array[T] = self
-
-        @parameter
-        fn _do(size: Int):
-            let rs: SIMD[T, 1] = func[T, 1](
-                self.data.offset(size).simd_load[1](0)
-            ).reduce_add()
-            res.data.offset(size).simd_store[1](0, rs)
-
-        parallelize[_do](rt, self._array_shape.num_elements(), rt.parallelism_level())
         return res ^
 
     # cos
