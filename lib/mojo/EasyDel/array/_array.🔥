@@ -209,6 +209,35 @@ struct Array[T: DType]:
         self.data = DTypePointer[T]().alloc(self._array_shape.num_elements())
         rand[T](self.data, self._array_shape.num_elements())
 
+    fn set_data_from_buffer(inout self: Self, pointer: DTypePointer[T]) -> None:
+        self.data = pointer
+
+    fn set_data_from_buffer(
+        inout self: Self, pointer: DTypePointer[T], *dims: Int
+    ) -> None:
+        self.data = pointer
+        var shape = VariadicList[Int](dims)
+        debug_assert(
+            len(shape) == self._array_shape.rank(), "Ranking Assertation Failed!"
+        )
+        for i in range(len(shape)):
+            debug_assert(
+                shape[i] == self._array_shape.dim(i), "Ranking Assertation Failed!"
+            )
+
+    fn set_data_from_buffer(
+        inout self: Self, pointer: DTypePointer[T], shape: VariadicList[Int]
+    ) -> None:
+        self.data = pointer
+
+        debug_assert(
+            len(shape) == self._array_shape.rank(), "Ranking Assertation Failed!"
+        )
+        for i in range(len(shape)):
+            debug_assert(
+                shape[i] == self._array_shape.dim(i), "Ranking Assertation Failed!"
+            )
+
     fn __moveinit__(inout self, owned ext: Array[T]):
         self.data = DTypePointer[T].alloc(ext._array_shape.num_elements())
         self._array_shape = ext._array_shape
@@ -233,6 +262,12 @@ struct Array[T: DType]:
 
     fn __del__(owned self):
         self.data.free()
+
+    fn dim(self: Self, i: Int) -> Int:
+        return self._array_shape.dim(i)
+
+    fn rank(self: Self) -> Int:
+        return self._array_shape.rank()
 
     @always_inline
     fn load[
@@ -967,3 +1002,38 @@ struct Array[T: DType]:
 
     fn acosh(inout self: Self, rt: Runtime) -> Self:
         return self.__apply_math__[acosh](rt)
+
+    fn print_array(self):
+        let size = self._array_shape.num_elements()
+
+        var product = InlinedFixedVector[dims_average_size, Int](
+            self._array_shape.rank() + 1
+        )
+        product.append(1)
+        for index in range(self._array_shape.rank()):
+            product.append(
+                product[index] * self._array_shape[self._array_shape.rank() - 1 - index]
+            )
+
+        var count = 0
+        for i in range(size + 1):
+            count = 0
+            for j in range(self._array_shape.rank()):
+                if i % product[j + 1] == 0 and i != 0:
+                    print_no_newline("]")
+                    count += 1
+
+            if i > 0 and i < size:
+                print_no_newline(",")
+            if i < size:
+                for i in range(count):
+                    print()
+
+            for j in range(self._array_shape.rank()):
+                if i % product[j + 1] == 0 and i != size:
+                    print_no_newline("[")
+
+            if i < size:
+                print_no_newline(self[i])
+
+        print()
