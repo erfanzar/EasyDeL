@@ -269,6 +269,9 @@ struct Array[T: DType]:
     fn rank(self: Self) -> Int:
         return self._array_shape.rank()
 
+    fn num_elements(self: Self) -> Int:
+        return self._array_shape.num_elements()
+
     @always_inline
     fn load[
         nelts: Int, off: Int
