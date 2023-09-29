@@ -1,98 +1,93 @@
-# from math import math
-# from ..matrix_ import *
-# from runtime.llcl import Runtime, num_cores
-# from python import Python as Py
-# from memory.memory import memset_zero
-# from algorithm.functional import parallelize
 
-# struct LlamaConfig:
-#     var hidden_size: Int
-#     var num_attention_heads: Int
-#     var num_hidden_layers: Int
-#     var vocab_size: Int
-#     var rms_norm_eps: Float32
-#     var number_rep_kv: Int
-#     var max_position_embeddings: Int
-#     var num_key_value_heads: Int
-#     var head_dims: Int
-#     var kv_dims: Int
-#     var intermediate_size: Int
+from ..utilities import FileBuffer
+struct LlamaConfig:
+    var hidden_size: Int
+    var num_attention_heads: Int
+    var num_hidden_layers: Int
+    var vocab_size: Int
+    var rms_norm_eps: Float32
+    var number_rep_kv: Int
+    var max_position_embeddings: Int
+    var num_key_value_heads: Int
+    var head_dims: Int
+    var kv_dims: Int
+    var intermediate_size: Int
 
-#     fn __init__(
-#         inout self: Self,
-#         hidden_size: Int,
-#         num_attention_heads: Int,
-#         num_hidden_layers: Int,
-#         vocab_size: Int,
-#         rms_norm_eps: Float32,
-#         number_rep_kv: Int,
-#         max_position_embeddings: Int,
-#         num_key_value_heads: Int,
-#         intermediate_size: Int,
-#     ) -> None:
-#         self.hidden_size = hidden_size
-#         self.max_position_embeddings = max_position_embeddings
-#         self.num_attention_heads = num_attention_heads
-#         self.num_hidden_layers = num_hidden_layers
-#         self.vocab_size = vocab_size
-#         self.rms_norm_eps = rms_norm_eps
-#         self.number_rep_kv = number_rep_kv
-#         self.num_key_value_heads = num_key_value_heads
-#         self.intermediate_size = intermediate_size
-#         self.head_dims = hidden_size // num_attention_heads
-#         self.kv_dims = hidden_size // num_key_value_heads
+    fn __init__(
+        inout self: Self,
+        hidden_size: Int,
+        num_attention_heads: Int,
+        num_hidden_layers: Int,
+        vocab_size: Int,
+        rms_norm_eps: Float32,
+        number_rep_kv: Int,
+        max_position_embeddings: Int,
+        num_key_value_heads: Int,
+        intermediate_size: Int,
+    ) -> None:
+        self.hidden_size = hidden_size
+        self.max_position_embeddings = max_position_embeddings
+        self.num_attention_heads = num_attention_heads
+        self.num_hidden_layers = num_hidden_layers
+        self.vocab_size = vocab_size
+        self.rms_norm_eps = rms_norm_eps
+        self.number_rep_kv = number_rep_kv
+        self.num_key_value_heads = num_key_value_heads
+        self.intermediate_size = intermediate_size
+        self.head_dims = hidden_size // num_attention_heads
+        self.kv_dims = hidden_size // num_key_value_heads
 
-#     fn __init__(inout self: Self) -> None:
-#         self.hidden_size = 512
-#         self.intermediate_size = self.hidden_size * 4
-#         self.max_position_embeddings = 2048
-#         self.num_attention_heads = 8
-#         self.num_hidden_layers = 8
-#         self.vocab_size = 32000
-#         self.rms_norm_eps = 1e-5
-#         self.number_rep_kv = 1
-#         self.num_key_value_heads = 1
-#         self.intermediate_size = self.hidden_size * 4
-#         self.head_dims = self.hidden_size // self.num_attention_heads
-#         self.kv_dims = self.hidden_size // self.num_key_value_heads
+    fn __init__(inout self: Self) -> None:
+        self.hidden_size = 512
+        self.intermediate_size = self.hidden_size * 4
+        self.max_position_embeddings = 2048
+        self.num_attention_heads = 8
+        self.num_hidden_layers = 8
+        self.vocab_size = 32000
+        self.rms_norm_eps = 1e-5
+        self.number_rep_kv = 1
+        self.num_key_value_heads = 1
+        self.intermediate_size = self.hidden_size * 4
+        self.head_dims = self.hidden_size // self.num_attention_heads
+        self.kv_dims = self.hidden_size // self.num_key_value_heads
 
-#     fn __init__(inout self: Self, inout buffer: FileBuffer) raises -> None:
-#         self.hidden_size = (
-#             buffer.data.offset(buffer.offset).bitcast[DType.int32]().load(0).to_int()
-#         )
-#         buffer.move_offset(4)
-#         self.intermediate_size = (
-#             buffer.data.offset(buffer.offset).bitcast[DType.int32]().load(0).to_int()
-#         )
-#         buffer.move_offset(4)
-#         self.num_hidden_layers = (
-#             buffer.data.offset(buffer.offset).bitcast[DType.int32]().load(0).to_int()
-#         )
-#         buffer.move_offset(4)
-#         self.num_attention_heads = (
-#             buffer.data.offset(buffer.offset).bitcast[DType.int32]().load(0).to_int()
-#         )
-#         buffer.move_offset(4)
-#         self.num_key_value_heads = (
-#             buffer.data.offset(buffer.offset).bitcast[DType.int32]().load(0).to_int()
-#         )
-#         buffer.move_offset(4)
+    fn __init__(inout self: Self, inout buffer: FileBuffer) raises -> None:
+        self.hidden_size = (
+            buffer.data.offset(buffer.offset).bitcast[DType.int32]().load(0).to_int()
+        )
+        buffer.move_offset(4)
+        self.intermediate_size = (
+            buffer.data.offset(buffer.offset).bitcast[DType.int32]().load(0).to_int()
+        )
+        buffer.move_offset(4)
+        self.num_hidden_layers = (
+            buffer.data.offset(buffer.offset).bitcast[DType.int32]().load(0).to_int()
+        )
+        buffer.move_offset(4)
+        self.num_attention_heads = (
+            buffer.data.offset(buffer.offset).bitcast[DType.int32]().load(0).to_int()
+        )
+        buffer.move_offset(4)
+        self.num_key_value_heads = (
+            buffer.data.offset(buffer.offset).bitcast[DType.int32]().load(0).to_int()
+        )
+        buffer.move_offset(4)
         
-#         self.vocab_size = (
-#             buffer.data.offset(buffer.offset).bitcast[DType.int32]().load(0).to_int()
-#         )
-#         buffer.move_offset(4)
-#         self.max_position_embeddings = (
-#             buffer.data.offset(buffer.offset).bitcast[DType.int32]().load(0).to_int()
-#         )
-#         buffer.move_offset(4)
-#         self.head_dims = self.hidden_size // self.num_attention_heads
-#         self.kv_dims = (
-#             self.num_key_value_heads * self.hidden_size
-#         ) // self.num_attention_heads
-#         self.number_rep_kv = self.num_attention_heads // self.num_attention_heads
-#         self.rms_norm_eps = 1e-5
-#         return None
+        self.vocab_size = (
+            buffer.data.offset(buffer.offset).bitcast[DType.int32]().load(0).to_int()
+        )
+        buffer.move_offset(4)
+        self.max_position_embeddings = (
+            buffer.data.offset(buffer.offset).bitcast[DType.int32]().load(0).to_int()
+        )
+        buffer.move_offset(4)
+        self.head_dims = self.hidden_size // self.num_attention_heads
+        self.kv_dims = (
+            self.num_key_value_heads * self.hidden_size
+        ) // self.num_attention_heads
+        self.number_rep_kv = self.num_attention_heads // self.num_attention_heads
+        self.rms_norm_eps = 1e-5
+        return None
 
 
 # struct LlamaRunStateF32:

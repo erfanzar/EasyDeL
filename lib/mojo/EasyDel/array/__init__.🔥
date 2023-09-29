@@ -4,4 +4,4 @@ Copyright (c) Erfan zare Chavoshi
 EasyDel Library [MOJO/Matrix]
 """
 
-from ._array import *
+from .array_module import Array, ArrayShape
