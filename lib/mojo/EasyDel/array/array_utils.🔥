@@ -1,0 +1,20 @@
+from python import PythonObject
+from .array_module import ArrayShape, Array
+
+
+fn convert_numpy_to_easydel_array[
+    T: DType
+](np_array: PythonObject, array_spec: ArrayShape) raises -> Array[T]:
+    let size: Int = array_spec.num_elements()
+    var dynamic_vector = DynamicVector[FloatLiteral](size)
+    dynamic_vector.reserve(size)
+    try:
+        for i in range(size):
+            if size == 1:
+                dynamic_vector.push_back(np_array.__index__())
+            else:
+                dynamic_vector.push_back(np_array.reshape(-1)[i].__index__())
+    except:
+        print("couldn't make it")
+        return Array[T](array_spec)
+    return Array[T](dynamic_vector, array_spec)
