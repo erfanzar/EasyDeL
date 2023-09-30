@@ -191,23 +191,44 @@ struct ArrayShape:
 
 struct Array[T: DType]:
     var data: DTypePointer[T]
-    var _array_shape: ArrayShape
+    var array_shape: ArrayShape
     alias nelts: Int = simdwidthof[T]()
 
     fn __init__(inout self: Self, array_shape: ArrayShape):
-        self._array_shape = array_shape
-        self.data = DTypePointer[T]().alloc(self._array_shape.num_elements())
-        rand[T](self.data, self._array_shape.num_elements())
+        self.array_shape = array_shape
+        self.data = DTypePointer[T]().alloc(self.array_shape.num_elements())
+        rand[T](self.data, self.array_shape.num_elements())
 
     fn __init__(inout self: Self, *dim: Int):
-        self._array_shape = ArrayShape(VariadicList(dim))
-        self.data = DTypePointer[T]().alloc(self._array_shape.num_elements())
-        rand[T](self.data, self._array_shape.num_elements())
+        self.array_shape = ArrayShape(VariadicList(dim))
+        self.data = DTypePointer[T]().alloc(self.array_shape.num_elements())
+        rand[T](self.data, self.array_shape.num_elements())
 
     fn __init__(inout self: Self, vl: VariadicList[Int]):
-        self._array_shape = ArrayShape(vl)
-        self.data = DTypePointer[T]().alloc(self._array_shape.num_elements())
-        rand[T](self.data, self._array_shape.num_elements())
+        self.array_shape = ArrayShape(vl)
+        self.data = DTypePointer[T]().alloc(self.array_shape.num_elements())
+        rand[T](self.data, self.array_shape.num_elements())
+
+    fn __init__(
+        inout self: Self, value: DynamicVector[FloatLiteral], shape: ArrayShape
+    ):
+        self.array_shape = shape
+        debug_assert(
+            len(value) == self.array_shape.num_elements(), "Data Size miss match"
+        )
+        self.data = DTypePointer[T]().alloc(self.array_shape.num_elements())
+
+        for i in range(self.array_shape.num_elements()):
+            self.data.simd_store[1](i, value[i])
+
+    fn __init__(inout self: Self, value: VariadicList[FloatLiteral], shape: ArrayShape):
+        self.array_shape = shape
+        debug_assert(
+            len(value) == self.array_shape.num_elements(), "Data Size miss match"
+        )
+        self.data = DTypePointer[T]().alloc(self.array_shape.num_elements())
+        for i in range(self.array_shape.num_elements()):
+            self.data.simd_store[1](i, value[i])
 
     fn set_data_from_buffer(inout self: Self, pointer: DTypePointer[T]) -> None:
         self.data = pointer
@@ -218,11 +239,11 @@ struct Array[T: DType]:
     #     self.data = pointer
     #     var shape = VariadicList[Int](dims)
     #     debug_assert(
-    #         len(shape) == self._array_shape.rank(), "Ranking Assertation Failed!"
+    #         len(shape) == self.array_shape.rank(), "Ranking Assertation Failed!"
     #     )
     #     for i in range(len(shape)):
     #         debug_assert(
-    #             shape[i] == self._array_shape.dim(i), "Ranking Assertation Failed!"
+    #             shape[i] == self.array_shape.dim(i), "Ranking Assertation Failed!"
     #         )
 
     fn set_data_from_buffer(
@@ -231,89 +252,88 @@ struct Array[T: DType]:
         self.data = pointer
 
         debug_assert(
-            len(shape) == self._array_shape.rank(), "Ranking Assertation Failed!"
+            len(shape) == self.array_shape.rank(), "Ranking Assertation Failed!"
         )
         for i in range(len(shape)):
             debug_assert(
-                shape[i] == self._array_shape.dim(i), "Ranking Assertation Failed!"
+                shape[i] == self.array_shape.dim(i), "Ranking Assertation Failed!"
             )
 
     fn __moveinit__(inout self, owned ext: Array[T]):
-        self.data = DTypePointer[T].alloc(ext._array_shape.num_elements())
-        self._array_shape = ext._array_shape
+        self.data = DTypePointer[T].alloc(ext.array_shape.num_elements())
+        self.array_shape = ext.array_shape
 
         @parameter
         fn _do[_nelts: Int](f: Int):
             let dt = ext.data.simd_load[_nelts](0)
             self.data.simd_store[_nelts](0, dt)
 
-        vectorize[Array[T].nelts, _do](ext._array_shape.num_elements())
+        vectorize[Array[T].nelts, _do](ext.array_shape.num_elements())
 
     fn __copyinit__(inout self, ext: Array[T]):
-        self.data = DTypePointer[T].alloc(ext._array_shape.num_elements())
-        self._array_shape = ext._array_shape
+        self.data = DTypePointer[T].alloc(ext.array_shape.num_elements())
+        self.array_shape = ext.array_shape
 
         @parameter
         fn _do[_nelts: Int](f: Int):
             let dt = ext.data.simd_load[_nelts](0)
             self.data.simd_store[_nelts](0, dt)
 
-        vectorize[Array[T].nelts, _do](ext._array_shape.num_elements())
+        vectorize[Array[T].nelts, _do](ext.array_shape.num_elements())
 
     fn __del__(owned self):
         self.data.free()
 
     fn dim(self: Self, i: Int) -> Int:
-        return self._array_shape.dim(i)
+        return self.array_shape.dim(i)
 
     fn rank(self: Self) -> Int:
-        return self._array_shape.rank()
+        return self.array_shape.rank()
 
     fn num_elements(self: Self) -> Int:
-        return self._array_shape.num_elements()
+        return self.array_shape.num_elements()
 
     @always_inline
     fn load[
         nelts: Int, off: Int
     ](self, index: InlinedFixedVector[off, Int]) -> SIMD[T, nelts]:
-        let position = self._array_shape.get_1d_pos(index)
-        self.assertation(position, self._array_shape._size)
+        let position = self.array_shape.get_1d_pos(index)
+        self.assertation(position, self.array_shape._size)
         return self.data.simd_load[nelts](position)
 
     @always_inline
     fn load[nelts: Int, off: Int](self, index: StaticIntTuple[off]) -> SIMD[T, nelts]:
-        let position = self._array_shape.get_1d_pos(index)
-        self.assertation(position, self._array_shape._size)
+        let position = self.array_shape.get_1d_pos(index)
+        self.assertation(position, self.array_shape._size)
         return self.data.simd_load[nelts](position)
 
     @always_inline
     fn load[nelts: Int](self, index: Int) -> SIMD[T, nelts]:
-        """Access the data as a 1D array."""
-        let position = self._array_shape.__ntp__(index, self._array_shape._size)
-        self.assertation(position, self._array_shape._size)
+        let position = self.array_shape.__ntp__(index, self.array_shape._size)
+        self.assertation(position, self.array_shape._size)
         return self.data.simd_load[nelts](position)
 
     @always_inline
     fn store[
         nelts: Int, off: Int
     ](self, index: InlinedFixedVector[off, Int], val: SIMD[T, nelts]):
-        let position = self._array_shape.get_1d_pos(index)
-        self.assertation(position, self._array_shape._size)
+        let position = self.array_shape.get_1d_pos(index)
+        self.assertation(position, self.array_shape._size)
         self.data.simd_store[nelts](position, val)
 
     @always_inline
     fn store[
         nelts: Int, off: Int
     ](self, index: StaticIntTuple[off], val: SIMD[T, nelts]):
-        let position = self._array_shape.get_1d_pos(index)
-        self.assertation(position, self._array_shape._size)
+        let position = self.array_shape.get_1d_pos(index)
+        self.assertation(position, self.array_shape._size)
         self.data.simd_store[nelts](position, val)
 
     @always_inline
     fn store[nelts: Int](self, index: Int, val: SIMD[T, nelts]):
         """Access the data as a 1D array."""
-        let position = self._array_shape.__ntp__(index, self._array_shape._size)
-        self.assertation(position, self._array_shape._size)
+        let position = self.array_shape.__ntp__(index, self.array_shape._size)
+        self.assertation(position, self.array_shape._size)
         self.data.simd_store[nelts](position, val)
 
     fn assertation(self: Self, i: Int, j: Int):
@@ -353,14 +373,14 @@ struct Array[T: DType]:
         ) -> SIMD[T, simd_width],
     ](self, other: Self) -> Self:
         debug_assert(
-            self._array_shape == other._array_shape,
+            self.array_shape == other.array_shape,
             "dimension aren't equal, can't do operation element wise.",
         )
 
-        let res = Self(self._array_shape)
-        let size = self._array_shape.num_elements()
+        let res = Self(self.array_shape)
+        let size = self.array_shape.num_elements()
 
-        let last_dim = self._array_shape[-1]
+        let last_dim = self.array_shape[-1]
         var dims_rest = size // last_dim
 
         @parameter
@@ -389,10 +409,10 @@ struct Array[T: DType]:
             T, simd_width
         ],
     ](self) -> Self:
-        let res = Self(self._array_shape)
-        let size = self._array_shape.num_elements()
+        let res = Self(self.array_shape)
+        let size = self.array_shape.num_elements()
 
-        let last_dim = self._array_shape[-1]
+        let last_dim = self.array_shape[-1]
         var dims_rest = size // last_dim
 
         @parameter
@@ -425,7 +445,7 @@ struct Array[T: DType]:
             let rs: SIMD[T, Array[T].nelts] = func[T, Array[T].nelts](ra)
             res.data.offset(size).simd_store[Array[T].nelts](0, rs)
 
-        parallelize[_do](self._array_shape.num_elements())
+        parallelize[_do](self.array_shape.num_elements())
         return res ^
 
     fn __apply_math__[
@@ -443,7 +463,7 @@ struct Array[T: DType]:
             )
             res.data.offset(size).simd_store[_nelts](0, rs)
 
-        vectorize[nelts, _do](self._array_shape.num_elements())
+        vectorize[nelts, _do](self.array_shape.num_elements())
         return res ^
 
     fn __apply_math__[
@@ -460,7 +480,7 @@ struct Array[T: DType]:
             ).reduce_add()
             res.data.offset(size).simd_store[1](0, rs)
 
-        parallelize[_do](rt, self._array_shape.num_elements(), rt.parallelism_level())
+        parallelize[_do](rt, self.array_shape.num_elements(), rt.parallelism_level())
         return res ^
 
     fn __add__(self: Self, other: Self) -> Self:
@@ -482,7 +502,7 @@ struct Array[T: DType]:
         return self.mod[Array[T].nelts](other)
 
     fn __len__(self: Self) -> Int:
-        return self._array_shape.num_elements()
+        return self.array_shape.num_elements()
 
     fn __eq__(self, other: Self) -> Bool:
         return self.eq[Array[T].nelts](other)
@@ -614,12 +634,12 @@ struct Array[T: DType]:
 
     fn eq[nelts: Int](self, other: Self) -> Bool:
         debug_assert(
-            self._array_shape == other._array_shape,
+            self.array_shape == other.array_shape,
             "dimension aren't equal can't performe eq operation.",
         )
 
         var flag = True
-        let size = self._array_shape.num_elements()
+        let size = self.array_shape.num_elements()
 
         @parameter
         fn iterate_vectorize[nelts: Int](i: Int):
@@ -632,14 +652,14 @@ struct Array[T: DType]:
 
     fn eq[nelts: Int](self, other: Self, rt: Runtime, n_cores: Int) -> Bool:
         debug_assert(
-            self._array_shape == other._array_shape,
+            self.array_shape == other.array_shape,
             "dimension aren't equal can't performe eq operation.",
         )
 
         var flag = True
-        let size = self._array_shape.num_elements()
+        let size = self.array_shape.num_elements()
 
-        let first_dim = self._array_shape[0]
+        let first_dim = self.array_shape[0]
         let dims_rest = size // first_dim  # the rest of the dimensions
 
         @parameter
@@ -659,12 +679,12 @@ struct Array[T: DType]:
 
     fn pow[nelts: Int](self: Self, other: Self, rt: Runtime) -> Self:
         debug_assert(
-            self._array_shape.num_elements() == other._array_shape.num_elements(),
+            self.array_shape.num_elements() == other.array_shape.num_elements(),
             "Arrays Don't have same size",
         )
-        var res = Array[T](self._array_shape)
-        let last_dim: Int = res._array_shape.dim(-1)
-        let res_size: Int = res._array_shape._size // last_dim
+        var res = Array[T](self.array_shape)
+        let last_dim: Int = res.array_shape.dim(-1)
+        let res_size: Int = res.array_shape._size // last_dim
 
         @parameter
         fn _ol(i: Int):
@@ -684,12 +704,12 @@ struct Array[T: DType]:
 
     fn pow[nelts: Int](self: Self, other: Self) -> Self:
         debug_assert(
-            self._array_shape.num_elements() == other._array_shape.num_elements(),
+            self.array_shape.num_elements() == other.array_shape.num_elements(),
             "Arrays Don't have same size",
         )
-        var res = Array[T](self._array_shape)
-        let last_dim: Int = res._array_shape.dim(-1)
-        let res_size: Int = res._array_shape._size // last_dim
+        var res = Array[T](self.array_shape)
+        let last_dim: Int = res.array_shape.dim(-1)
+        let res_size: Int = res.array_shape._size // last_dim
 
         @parameter
         fn _ol(i: Int):
@@ -710,16 +730,16 @@ struct Array[T: DType]:
 
     fn dot[nelts: Int](self: Self, other: Self) -> Self:
         debug_assert(
-            self._array_shape == other._array_shape,
+            self.array_shape == other.array_shape,
             "dimensions aren't the same",
         )
         debug_assert(
-            self._array_shape.rank() == 1 and other._array_shape.rank() == 1,
+            self.array_shape.rank() == 1 and other.array_shape.rank() == 1,
             "only 1D arrays are accepted",
         )
         var shp = DynamicVector[Int]()
-        for s in range(self._array_shape._length):
-            shp.push_back(self._array_shape._shape[s])
+        for s in range(self.array_shape._length):
+            shp.push_back(self.array_shape._shape[s])
         var res = Self(ArrayShape(shp))
 
         @parameter
@@ -733,7 +753,7 @@ struct Array[T: DType]:
                 ).reduce_add(),
             )
 
-        vectorize[nelts, _do](self._array_shape.num_elements())
+        vectorize[nelts, _do](self.array_shape.num_elements())
         return res ^
 
     @staticmethod
@@ -744,59 +764,53 @@ struct Array[T: DType]:
             for x in range(0, end_x, tile_x):
                 tiled_fn[tile_x, tile_y](x, y)
 
+    # TODO: Rebuild Matmul (Won't work)
     fn __matmul[
         nelts: Int,
         outer_loop_func: fn[func: fn (Int) capturing -> None] (Int) capturing -> None,
     ](self, other: Self) -> Self:
-        if self._array_shape.rank() == 1 and other._array_shape.rank() == 1:
+        if self.array_shape.rank() == 1 and other.array_shape.rank() == 1:
             return self.dot[nelts](other)
 
-        let dims_eq = self._array_shape.__eq_matmul__(other._array_shape)
+        let dims_eq = self.array_shape.__eq_matmul__(other.array_shape)
         debug_assert(dims_eq, "dimensions don't conform for matmul operation")
 
         var res_dims = InlinedFixedVector[dims_average_size, Int](
-            self._array_shape.rank()
+            self.array_shape.rank()
         )
-        for i in range(self._array_shape.rank() - 1):
-            res_dims.append(self._array_shape[i])
-        res_dims.append(other._array_shape[other._array_shape.rank() - 1])
+        for i in range(self.array_shape.rank() - 1):
+            res_dims.append(self.array_shape[i])
+        res_dims.append(other.array_shape[other.array_shape.rank() - 1])
 
         let res = Self(ArrayShape(res_dims))
 
-        let rld = res._array_shape[res._array_shape.rank() - 1]
-        let sld = self._array_shape[self._array_shape.rank() - 1]
-        let rcd = res._array_shape[res._array_shape.rank() - 2]
+        let C_C = res.array_shape[res.array_shape.rank() - 1]  # K
+        let B_C = other.array_shape[other.array_shape.rank() - 2]  # J
+        let C_R = res.array_shape[res.array_shape.rank() - 2]  # I
 
-        let size = self._array_shape._size * rld
+        var rest = res.num_elements() // (C_C * C_R)
+        rest = 1 if rest == 0 else rest
+    
+        print("RST : ", rest)
+        print("C_C : ", C_C)
+        print("B_C : ", B_C)
+        print("C_R : ", C_R)
+        print_no_newline('SELF > ')
+        self.array_shape.shape_str()
+        print_no_newline('OTHER > ')
+        other.array_shape.shape_str()
+        print_no_newline('RES > ')
+        res.array_shape.shape_str()
 
-        @parameter
-        fn outer_loop(i: Int):
-            @parameter
-            fn calc_tile[tile_x: Int, tile_y: Int](x: Int, y: Int):
-                let j_range = min(sld, y + tile_y)
-                for j in range(y, j_range):
-
-                    @parameter
-                    fn matmul_v[nelts: Int](k: Int):
-                        let index_res = i * rld + k + x
-                        let index_self = i * sld + j
-                        let index_other = (i // rcd) * sld * rld + j * rld + k + x
-
-                        res.store[nelts](
-                            index_res,
-                            res.load[nelts](index_res)
-                            + self.load[1](index_self) * other.load[nelts](index_other),
-                        )
-
-                    vectorize_unroll[nelts, tile_x // nelts, matmul_v](
-                        min(rld - x, tile_x)
-                    )
-
-            alias tile_size = 4
-            self.tile[calc_tile, nelts * tile_size, tile_size](rld, sld)
-
-        outer_loop_func[outer_loop](size // (rld * sld))
-
+        for idx in range(1, rest + 1):
+            for i in range(C_R):
+                for j in range(B_C):
+                    for k in range(C_C):
+                        let C_Index = idx * (i * C_R + k)
+                        let A_Index = idx * (i * C_R + j)
+                        let B_Index = idx * (j * B_C + k)
+                        # print("C : ",C_Index ,' += A ',A_Index,' * B ',B_Index)
+                        res[C_Index] += self[A_Index] * other[B_Index]
         return res ^
 
     @always_inline
@@ -1007,21 +1021,21 @@ struct Array[T: DType]:
         return self.__apply_math__[acosh](rt)
 
     fn print_array(self):
-        let size = self._array_shape.num_elements()
+        let size = self.array_shape.num_elements()
 
         var product = InlinedFixedVector[dims_average_size, Int](
-            self._array_shape.rank() + 1
+            self.array_shape.rank() + 1
         )
         product.append(1)
-        for index in range(self._array_shape.rank()):
+        for index in range(self.array_shape.rank()):
             product.append(
-                product[index] * self._array_shape[self._array_shape.rank() - 1 - index]
+                product[index] * self.array_shape[self.array_shape.rank() - 1 - index]
             )
 
         var count = 0
         for i in range(size + 1):
             count = 0
-            for j in range(self._array_shape.rank()):
+            for j in range(self.array_shape.rank()):
                 if i % product[j + 1] == 0 and i != 0:
                     print_no_newline("]")
                     count += 1
@@ -1032,11 +1046,11 @@ struct Array[T: DType]:
                 for i in range(count):
                     print()
 
-            for j in range(self._array_shape.rank()):
+            for j in range(self.array_shape.rank()):
                 if i % product[j + 1] == 0 and i != size:
                     print_no_newline("[")
 
             if i < size:
-                print_no_newline(self[i])
+                print_no_newline(self[i].cast[DType.int32]())
 
         print()

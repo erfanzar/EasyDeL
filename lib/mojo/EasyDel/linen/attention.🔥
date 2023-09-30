@@ -4,7 +4,7 @@ from math import math
 
 
 fn rms_norm[T: DType](x: Array[T], w: Array[T], epsilon: SIMD[T, 1]) -> Array[T]:
-    var result_array = Array[T](x._array_shape)
+    var result_array = Array[T](x.array_shape)
     alias nelts: Int = Array[T].nelts
     var sp: SIMD[T, nelts] = SIMD[T, nelts](0.0)
 
