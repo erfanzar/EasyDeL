@@ -6,5 +6,5 @@ and also give you a Gradio Chat and Instruct Pre-build and ready to use page
 
 and yes EasyDel supports Pytorch and jax Both for Serving LLMs 🧬
 
-1. [JAXServer](https://erfanzar.github.io/EasyDeL/docs/JAXServer) For Jax 🤖
-2. [PyTorchServer](https://erfanzar.github.io/EasyDeL/docs/PyTorchServer) For PyTorch 🌪
+1. [JAXServer](https://erfanzar.github.io/EasyDeL/docs/Python/JAXServer) For Jax 🤖
+2. [PyTorchServer](https://erfanzar.github.io/EasyDeL/docs/Python/PyTorchServer) For PyTorch 🌪
