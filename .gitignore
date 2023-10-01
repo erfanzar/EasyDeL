@@ -17,7 +17,11 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
+mojo_module/
+test.mojo
+run.mojo
+llama.bin
+llama-tokenizer.bin
 lib64/
 parts/
 sdist/

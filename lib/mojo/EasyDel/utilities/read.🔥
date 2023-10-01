@@ -1,0 +1,127 @@
+from python import Python as Py
+
+
+struct FileBuffer:
+    var data: DTypePointer[DType.uint8]
+    var offset: Int
+    var size: Int
+
+    fn __init__(inout self):
+        self.data = DTypePointer[DType.uint8].alloc(0)
+        self.offset = 0
+        self.size = 0
+
+    fn move_offset(inout self: Self, size: Int) raises:
+        let dmf: Int = self.offset + size
+        if dmf > self.size:
+            raise Error(
+                "Out of bounderies you can not move offset [Out of Range Data!]"
+            )
+        else:
+            self.offset += size
+
+    fn read_value_float32(
+        inout self: Self, size: Int
+    ) raises -> DTypePointer[DType.float32]:
+        let res = self.data.offset(self.offset).bitcast[DType.float32]()
+        self.move_offset(4 * size)
+        return res
+
+    fn read_value_int(
+        inout self: Self
+    ) raises -> Int:
+        let res = self.data.offset(self.offset).bitcast[DType.int32]().load(0).to_int()
+        self.move_offset(4)
+        return res
+
+    fn read_value_float16(
+        inout self: Self, size: Int
+    ) raises -> DTypePointer[DType.float16]:
+        let res = self.data.offset(self.offset).bitcast[DType.float16]()
+
+        self.move_offset(sizeof[DType.float16]() * size)
+        return res
+
+    fn read_value_bfloat16(
+        inout self: Self, size: Int
+    ) raises -> DTypePointer[DType.bfloat16]:
+        let res = self.data.offset(self.offset).bitcast[DType.bfloat16]()
+
+        self.move_offset(sizeof[DType.bfloat16]() * size)
+        return res
+
+    fn read_value_uint8(
+        inout self: Self, size: Int
+    ) raises -> DTypePointer[DType.uint8]:
+        let res = self.data.offset(self.offset).bitcast[DType.uint8]()
+
+        self.move_offset(sizeof[DType.uint8]() * size)
+        return res
+
+    fn read_value_uint16(
+        inout self: Self, size: Int
+    ) raises -> DTypePointer[DType.uint16]:
+        let res = self.data.offset(self.offset).bitcast[DType.uint16]()
+
+        self.move_offset(sizeof[DType.uint16]() * size)
+        return res
+
+    fn read_value_uint32(
+        inout self: Self, size: Int
+    ) raises -> DTypePointer[DType.uint32]:
+        let res = self.data.offset(self.offset).bitcast[DType.uint32]()
+
+        self.move_offset(sizeof[DType.uint32]() * size)
+        return res
+
+    fn read_numerical_value_dynamic[
+        T: DType
+    ](inout self: Self, size: Int) raises -> DTypePointer[T]:
+        let res = self.data.offset(self.offset).bitcast[T]()
+
+        self.move_offset(sizeof[T]() * size)
+        return res
+
+    fn get_offset(self: Self) -> Int:
+        return self.offset if self.offset < self.size else self.size
+
+
+fn read_numerical_value[T: DType](inout buffer: FileBuffer) raises -> SIMD[T, 1]:
+    let res: SIMD[T, 1] = buffer.data.offset(buffer.offset).bitcast[T]().load(0)
+    buffer.move_offset(sizeof[T]())
+    return res
+
+
+fn read_string_value(
+    inout buffer: FileBuffer, string_length: Int
+) raises -> Pointer[UInt8]:
+
+    let str = Pointer[UInt8].alloc(string_length + 1)
+
+    for i in range(string_length):
+        str.store(i, buffer.data.offset(buffer.offset).load(0))
+        buffer.move_offset(1)
+
+    str.store(string_length, 0)
+    return str
+
+
+fn read_file(inout buffer: FileBuffer, filename: StringRef) raises -> None:
+    let _os = Py.import_module("os")
+    let size: Int = atol(_os.path.getsize(filename).to_string())
+    let state_buffer: DTypePointer[DType.uint8] = DTypePointer[DType.uint8]().alloc(
+        size
+    )
+    let f = File(filename)
+    var reader = BufReader[4096](f ^)
+    var bytes_read: Int = 1
+    var offset: Int = 0
+    while bytes_read > 0:
+        let _bu_s = Buffer[4096, DType.uint8](state_buffer.offset(offset))
+        bytes_read = reader.read(_bu_s)
+        offset += bytes_read
+    reader.do_nothing()
+    buffer.data = state_buffer
+    buffer.offset = 0
+    buffer.size = size
+    return None

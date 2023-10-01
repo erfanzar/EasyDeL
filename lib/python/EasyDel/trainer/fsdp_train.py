@@ -9,15 +9,13 @@ from fjutils.easylm import blockwise_cross_entropy, cross_entropy_loss_and_accur
 import wandb
 from datasets import Dataset
 
-from EasyDel.trainer.config import TrainArguments
+from src.EasyDel.trainer.config import TrainArguments
 
 import jax
 import flax
-import optax
 from transformers import FlaxAutoModelForCausalLM, AutoConfig
-from IPython.display import clear_output
 from tqdm import tqdm
-from EasyDel.utils.utils import Timers
+from src.EasyDel.utils import Timers
 from EasyDel.smi import initialise_tracking, get_mem
 from jax.experimental.pjit import pjit, with_sharding_constraint
 from jax.sharding import PartitionSpec
@@ -25,7 +23,7 @@ from flax.training import train_state
 from jax import numpy as jnp
 from torch.utils.data import DataLoader
 from fjutils import match_partition_rules, make_shard_and_gather_fns, StreamingCheckpointer, count_params
-from EasyDel.utils.utils import prefix_print
+from src.EasyDel.utils import prefix_print
 
 
 def calculate_accuracy(predictions: jax.Array, targets: jax.Array):

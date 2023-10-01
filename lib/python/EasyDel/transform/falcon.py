@@ -1,9 +1,8 @@
 import jax
 from jax import numpy as jnp
-import torch
 from tqdm import tqdm
 from transformers import FalconForCausalLM
-from EasyDel.modules.falcon import FalconConfig
+from src.EasyDel.modules.falcon import FalconConfig
 
 
 def falcon_from_pretrained(model_id, device=jax.devices('cpu')[0]):
