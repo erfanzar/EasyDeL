@@ -57,10 +57,43 @@ fn matmul_2d[nelts: Int, T: DType](inout C: Array[T], A: Array[T], B: Array[T]) 
     parallelize[loop_](C.dim(-2))
 
 
-fn matmul[nelts: Int, T: DType](inout C: Array[T], A: Array[T], B: Array[T]) -> None:
+fn matmul_single_row[nelts: Int, T: DType](inout C: Array[T], A: Array[T], B: Array[T]):
+    if not (A.rank() == 2 and B.rank() == 1 and C.rank() == 1):
+        print("Report Matmul Bug in matmul_single_row")
+    C.fill(0.0)
     let C_C: Int = C.dim(-1)
     let A_C: Int = A.dim(-1)
     let C_R: Int = C.dim(-2)
+
+    @parameter
+    fn _loop(i: Int):
+        var ar: SIMD[T, nelts] = SIMD[T, nelts](0.0)
+
+        @parameter
+        fn element_wise[_nelts: Int](j: Int):
+            let a_i = i * A_C + j
+            if _nelts < nelts:
+                ar[0] += (A.load[_nelts](a_i) * B.load[_nelts](j)).reduce_add()
+            else:
+                ar += A.load[nelts](a_i) * B.load[nelts](j)
+
+        vectorize[nelts, element_wise](A_C)
+        C[i] = ar.reduce_add()
+
+    parallelize[_loop](A.dim(-2))
+
+
+fn matmul[nelts: Int, T: DType](inout C: Array[T], A: Array[T], B: Array[T]) -> None:
+    if A.rank() == 2 and B.rank() == 1 and C.rank() == 1:
+        matmul_single_row[nelts, T](C, A, B)
+        return
+    C.fill(0.0)
+    let C_C: Int = C.dim(-1)
+    let A_C: Int = A.dim(-1)
+    let C_R: Int = C.dim(-2)
+    let C_P: Int = C.dim(-2) * C.dim(-1)
+    let B_P: Int = B.dim(-2) * B.dim(-1)
+    let A_P: Int = A.dim(-2) * A.dim(-1)
 
     @parameter
     fn CI(y: Int, x: Int) -> Int:
@@ -74,28 +107,46 @@ fn matmul[nelts: Int, T: DType](inout C: Array[T], A: Array[T], B: Array[T]) -> 
     fn BI(y: Int, x: Int) -> Int:
         return y * B.dim(-1) + x
 
-    for s in range(1, (C.num_elements() // (C_C * C_R)) + 1):
-
+    # let ci_p = C.num_elements()
+    for s in range((C.num_elements() // (C_C * C_R))):
+        let pad_ci = s * C_P
+        let pad_ai = s * A_P
+        let pad_bi = s * B_P
         @parameter
         fn loop_(i: Int) -> None:
             for j in range(A_C):
 
                 @parameter
                 fn _mul[_nelts: Int](k: Int) -> None:
-                    let ci: Int = CI(i, k) * s
-                    let ai: Int = AI(i, j) * s
-                    let bi: Int = BI(j, k) * s
+                    let ci: Int = CI(i, k) + pad_ci
+                    let ai: Int = AI(i, j) + pad_ai
+                    let bi: Int = BI(j, k) + pad_bi
                     C.store[_nelts](ci, C.load[_nelts](ci) + A[ai] * B.load[_nelts](bi))
 
                 vectorize[nelts, _mul](C_C)
 
         parallelize[loop_](C_R)
 
+    # for i in range(1, (C.num_elements() // (C_C * C_R)) + 1):
+    #     for j in range(C_R):
+    #         for k in range(C_C):
+    #             @parameter
+    #             fn _mul[_nelts: Int](l: Int) -> None:
+    #                 let ci: Int = CI(j, k) * i
+    #                 let ai: Int = AI(j, l) * i
+    #                 let bi: Int = BI(l, k) * i
+    #                 C.store[_nelts](ci, C.load[_nelts](ci) + A[ai] * B.load[_nelts](bi))
+
+    #             vectorize[nelts, _mul](A_C)
+
 
 fn matmul_shape[T: DType](A: Array[T], B: Array[T]) -> ArrayShape:
-    var res_dims = InlinedFixedVector[dims_average_size, Int](A.rank())
-    for i in range(A.rank() - 1):
-        res_dims.append(A.dim(i))
-    res_dims.append(B.dim(-1))
+    if A.rank() == 2 and B.rank() == 1:
+        return ArrayShape(A.dim(0))
+    else:
+        var res_dims = InlinedFixedVector[dims_average_size, Int](A.rank())
+        for i in range(A.rank() - 1):
+            res_dims.append(A.dim(i))
+        res_dims.append(B.dim(-1))
 
-    return ArrayShape(res_dims)
+        return ArrayShape(res_dims)
