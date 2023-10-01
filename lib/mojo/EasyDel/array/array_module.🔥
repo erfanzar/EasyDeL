@@ -33,13 +33,15 @@ from runtime.llcl import Runtime, num_cores
 from memory.memory import memset_zero
 
 alias dims_average_size = 5
+alias debuging = True
 
 # parts of this code is inspiered from https://github.com/andresnowak/Micro-Mojograd
 
 
 fn do_check(res: Bool, string: StringRef):
     if not res:
-        print(string)
+        # print(string)
+        ...
 
 
 struct ArrayShape:
@@ -198,7 +200,7 @@ struct ArrayShape:
 struct Array[T: DType]:
     var data: DTypePointer[T]
     var array_shape: ArrayShape
-    alias nelts: Int = simdwidthof[T]()
+    alias nelts: Int = simdwidthof[T]() * 2
 
     fn __init__(inout self: Self, array_shape: ArrayShape):
         self.array_shape = array_shape
@@ -259,7 +261,7 @@ struct Array[T: DType]:
         for i in range(len(shape)):
             do_check(shape[i] == self.array_shape.dim(i), "Ranking Assertation Failed!")
 
-    fn __moveinit__(inout self, owned ext: Array[T]):
+    fn __moveinit__(inout self, owned ext: Self):
         self.data = DTypePointer[T].alloc(ext.array_shape.num_elements())
         self.array_shape = ext.array_shape
 
@@ -268,9 +270,9 @@ struct Array[T: DType]:
             let dt = ext.data.simd_load[_nelts](0)
             self.data.simd_store[_nelts](0, dt)
 
-        vectorize[Array[T].nelts, _do](ext.array_shape.num_elements())
+        vectorize[Self.nelts, _do](ext.array_shape.num_elements())
 
-    fn __copyinit__(inout self, ext: Array[T]):
+    fn __copyinit__(inout self, ext: Self):
         self.data = DTypePointer[T].alloc(ext.array_shape.num_elements())
         self.array_shape = ext.array_shape
 
@@ -279,7 +281,7 @@ struct Array[T: DType]:
             let dt = ext.data.simd_load[_nelts](0)
             self.data.simd_store[_nelts](0, dt)
 
-        vectorize[Array[T].nelts, _do](ext.array_shape.num_elements())
+        vectorize[Self.nelts, _do](ext.array_shape.num_elements())
 
     fn __del__(owned self):
         self.data.free()
@@ -437,13 +439,13 @@ struct Array[T: DType]:
             type, simd_width
         ],
     ](self: Self) -> Self:
-        var res: Array[T] = self
+        var res: Self = self
 
         @parameter
         fn _do(size: Int):
-            let ra = self.data.offset(size).simd_load[Array[T].nelts](0)
-            let rs: SIMD[T, Array[T].nelts] = func[T, Array[T].nelts](ra)
-            res.data.offset(size).simd_store[Array[T].nelts](0, rs)
+            let ra = self.data.offset(size).simd_load[Self.nelts](0)
+            let rs: SIMD[T, Self.nelts] = func[T, Self.nelts](ra)
+            res.data.offset(size).simd_store[Self.nelts](0, rs)
 
         parallelize[_do](self.array_shape.num_elements())
         return res ^
@@ -454,7 +456,7 @@ struct Array[T: DType]:
             TP, simd_width
         ],
     ](self: Self) -> Self:
-        var res: Array[T] = self
+        var res: Self = self
 
         @parameter
         fn _do[_nelts: Int](size: Int):
@@ -471,7 +473,7 @@ struct Array[T: DType]:
             TP, simd_width
         ],
     ](self: Self, rt: Runtime) -> Self:
-        var res: Array[T] = self
+        var res: Self = self
 
         @parameter
         fn _do(size: Int):
@@ -484,55 +486,59 @@ struct Array[T: DType]:
         return res ^
 
     fn __add__(self: Self, other: Self) -> Self:
-        return self.add[Array[T].nelts](other)
+        return self.add[Self.nelts](other)
 
     fn __mul__(self: Self, other: Self) -> Self:
-        return self.mul[Array[T].nelts](other)
+        return self.mul[Self.nelts](other)
 
     fn __matmul__(self: Self, other: Self) -> Self:
-        return self.matmul[Array[T].nelts](other)
+        let res = self.matmul[Self.nelts](other)
+        if debuging:
+            for i in range(res.num_elements()):
+                print("TRIGGERING RES OUT : ", i, " AS ", res[i])
+        return res
 
     fn __sub__(self: Self, other: Self) -> Self:
-        return self.sub[Array[T].nelts](other)
+        return self.sub[Self.nelts](other)
 
     fn __truediv__(self: Self, other: Self) -> Self:
-        return self.true_div[Array[T].nelts](other)
+        return self.true_div[Self.nelts](other)
 
     fn __mod__(self: Self, other: Self) -> Self:
-        return self.mod[Array[T].nelts](other)
+        return self.mod[Self.nelts](other)
 
     fn __len__(self: Self) -> Int:
         return self.array_shape.num_elements()
 
     fn __eq__(self, other: Self) -> Bool:
-        return self.eq[Array[T].nelts](other)
+        return self.eq[Self.nelts](other)
 
     fn __ne__(self, other: Self) -> Bool:
-        return not self.eq[Array[T].nelts](other)
+        return not self.eq[Self.nelts](other)
 
     fn __floordiv__(self: Self, other: Self) -> Self:
         ...
 
     fn __pow__(self: Self, other: Self) -> Self:
-        return self.pow[Array[T].nelts](other)
+        return self.pow[Self.nelts](other)
 
     fn __iadd__(inout self: Self, other: Self) -> None:
-        self = self.add[Array[T].nelts](other)
+        self = self.add[Self.nelts](other)
 
     fn __isub__(inout self: Self, other: Self) -> None:
-        self = self.sub[Array[T].nelts](other)
+        self = self.sub[Self.nelts](other)
 
     fn __ipow__(inout self: Self, other: Self) -> None:
-        self = self.pow[Array[T].nelts](other)
+        self = self.pow[Self.nelts](other)
 
     fn __imod__(inout self: Self, other: Self) -> None:
-        self = self.mod[Array[T].nelts](other)
+        self = self.mod[Self.nelts](other)
 
     fn __idiv__(inout self: Self, other: Self) -> None:
-        self = self.true_div[Array[T].nelts](other)
+        self = self.true_div[Self.nelts](other)
 
     fn __itruediv__(inout self: Self, other: Self) -> None:
-        self = self.true_div[Array[T].nelts](other)
+        self = self.true_div[Self.nelts](other)
 
     fn __ifloordiv__(inout self: Self, other: Self) -> None:
         ...
@@ -682,7 +688,7 @@ struct Array[T: DType]:
             self.array_shape.num_elements() == other.array_shape.num_elements(),
             "Arrays Don't have same size",
         )
-        var res = Array[T](self.array_shape)
+        var res = Self(self.array_shape)
         let last_dim: Int = res.array_shape.dim(-1)
         let res_size: Int = res.array_shape._size // last_dim
 
@@ -707,7 +713,7 @@ struct Array[T: DType]:
             self.array_shape.num_elements() == other.array_shape.num_elements(),
             "Arrays Don't have same size",
         )
-        var res = Array[T](self.array_shape)
+        var res = Self(self.array_shape)
         let last_dim: Int = res.array_shape.dim(-1)
         let res_size: Int = res.array_shape._size // last_dim
 
@@ -764,30 +770,93 @@ struct Array[T: DType]:
             for x in range(0, end_x, tile_x):
                 tiled_fn[tile_x, tile_y](x, y)
 
-    # TODO: Rebuild Matmul (Won't work)
+    fn __matmul_ot[
+        nelts: Int,
+        outer_loop_func: fn[func: fn (Int) capturing -> None] (Int) capturing -> None,
+    ](self, other: Self) -> Self:
+        if not (self.rank() == 2 and other.rank() == 1):
+            print("Report Matmul Bug")
+
+        var res = Self(self.dim(0))
+        res.fill(0.0)
+
+        @parameter
+        fn _loop(i: Int):
+            var ar: SIMD[T, nelts] = SIMD[T, nelts](0.0)
+
+            @parameter
+            fn element_wise[_nelts: Int](j: Int):
+                let a_i = i * self.dim(-1) + j
+                if _nelts < nelts:
+                    ar[0] += (
+                        self.load[_nelts](a_i) * other.load[_nelts](j)
+                    ).reduce_add()
+                else:
+                    ar += self.load[nelts](a_i) * other.load[nelts](j)
+
+            vectorize[nelts, element_wise](self.dim(-1))
+            res[i] = ar.reduce_add()
+
+        outer_loop_func[_loop](self.dim(-2))
+        return res ^
+
     fn __matmul[
         nelts: Int,
         outer_loop_func: fn[func: fn (Int) capturing -> None] (Int) capturing -> None,
     ](self, other: Self) -> Self:
         if self.array_shape.rank() == 1 and other.array_shape.rank() == 1:
             return self.dot[nelts](other)
-
-        let dims_eq = self.array_shape.__eq_matmul__(other.array_shape)
-        do_check(dims_eq, "dimensions don't conform for matmul operation")
-
-        var res_dims = InlinedFixedVector[dims_average_size, Int](
-            self.array_shape.rank()
+        if self.rank() == 2 and other.rank() == 1:
+            return self.__matmul_ot[nelts, outer_loop_func](other)
+        do_check(
+            not self.array_shape.__eq_matmul__(other.array_shape),
+            "dimensions don't conform for matmul operation",
         )
-        for i in range(self.array_shape.rank() - 1):
-            res_dims.append(self.array_shape[i])
-        res_dims.append(other.array_shape[other.array_shape.rank() - 1])
 
-        var res = Array[T](ArrayShape(res_dims))
-        res.fill(0.0)
+        var res_dims = InlinedFixedVector[dims_average_size, Int](self.rank())
+        for i in range(self.rank() - 1):
+            res_dims.append(self.dim(i))
+        res_dims.append(other.dim(-1))
 
-        do_check(True, "Matmul Not built Yet")
+        var result_array = Self(ArrayShape(res_dims))
+        result_array.fill(0.0)
 
-        return res ^
+        @parameter
+        fn C_I(y: Int, x: Int) -> Int:
+            return y * result_array.dim(-1) + x
+
+        @parameter
+        fn A_I(y: Int, x: Int) -> Int:
+            return y * self.dim(-1) + x
+
+        @parameter
+        fn B_I(y: Int, x: Int) -> Int:
+            return y * other.dim(-1) + x
+
+        @parameter
+        fn loop_(i: Int) -> None:
+            for j in range(self.dim(-1)):
+
+                @parameter
+                fn _mul[_nelts: Int](k: Int) -> None:
+                    let c_i = C_I(i, k)
+                    let a_i = A_I(i, j)
+                    let b_i = B_I(j, k)
+
+                    result_array.store[_nelts](
+                        c_i, result_array.load[_nelts](c_i) + self[a_i] * other.load[_nelts](b_i)
+                    )
+
+                    # if debuging:
+                    #     print("TRIGGERING : ", c_i, " AS ", result_array[c_i])
+
+                vectorize[nelts, _mul](result_array.dim(-1))
+
+        outer_loop_func[loop_](result_array.dim(-2))
+        # if debuging:
+        #     for i in range(result_array.num_elements()):
+        #         print("TRIGGERING RES : ", i, " AS ", result_array[i])
+        return result_array ^
 
     @always_inline
     fn matmul[nelts: Int](self, other: Self, rt: Runtime, n_cores: Int) -> Self:
@@ -795,9 +864,9 @@ struct Array[T: DType]:
         fn matmul_p[outer_loop: fn (Int) capturing -> None](range_size: Int):
             parallelize[outer_loop](rt, range_size, n_cores)
 
-        let res = self.__matmul[nelts, matmul_p](other)
+        let result_array = self.__matmul[nelts, matmul_p](other)
 
-        return res ^
+        return result_array
 
     @always_inline
     fn matmul[nelts: Int](self, other: Self) -> Self:
@@ -806,9 +875,11 @@ struct Array[T: DType]:
             for i in range(range_size):
                 outer_loop(i)
 
-        let res = self.__matmul[nelts, matmul_v](other)
-
-        return res ^
+        let result_array: Self = self.__matmul[nelts, matmul_v](other)
+        if debuging:
+            for i in range(result_array.num_elements()):
+                print("TRIGGERING RES MTML : ", i, " AS ", result_array[i])
+        return result_array
 
     # cos
 
@@ -1023,12 +1094,7 @@ struct Array[T: DType]:
 
             if i > 0 and i < size:
                 print_no_newline(",")
-                # if r_dt > 100:
-                #     print_no_newline(",")
-                # elif r_dt > 10 and r_dt < 100:
-                #     print_no_newline(" ,")
-                # elif r_dt < 10:
-                #     print_no_newline("  ,")
+
             if i < size:
                 for i in range(count):
                     print()
