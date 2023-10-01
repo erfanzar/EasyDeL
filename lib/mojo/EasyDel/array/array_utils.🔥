@@ -74,8 +74,7 @@ fn matmul[nelts: Int, T: DType](inout C: Array[T], A: Array[T], B: Array[T]) -> 
     fn BI(y: Int, x: Int) -> Int:
         return y * B.dim(-1) + x
 
-    let rest_size = (C.num_elements() // (C_C * C_R)) - 1
-    for s in range(1, rest_size + 1):
+    for s in range(1, (C.num_elements() // (C_C * C_R)) + 1):
 
         @parameter
         fn loop_(i: Int) -> None:
@@ -93,7 +92,7 @@ fn matmul[nelts: Int, T: DType](inout C: Array[T], A: Array[T], B: Array[T]) -> 
         parallelize[loop_](C_R)
 
 
-fn make_matmul_res[T: DType](A: Array[T], B: Array[T]) -> ArrayShape:
+fn matmul_shape[T: DType](A: Array[T], B: Array[T]) -> ArrayShape:
     var res_dims = InlinedFixedVector[dims_average_size, Int](A.rank())
     for i in range(A.rank() - 1):
         res_dims.append(A.dim(i))

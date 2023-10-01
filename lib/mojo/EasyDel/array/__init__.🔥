@@ -7,7 +7,7 @@ EasyDel Library [MOJO/Matrix]
 from .array_module import Array, ArrayShape
 from .array_utils import (
     convert_numpy_to_easydel_array,
-    make_matmul_res,
+    matmul_shape,
     matmul_2d,
     matmul,
 )
