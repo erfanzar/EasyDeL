@@ -2,7 +2,7 @@
 
 ## Available Models Are
 
-1. **_[Llama](https://erfanzar.github.io/EasyDeL/docs/Llama)_**:
+1. **_[Llama](https://erfanzar.github.io/EasyDeL/docs/Python/Llama)_**:
 
     * Supports:
         * Fully Sharded Data Parallel `(FSDP)`
@@ -13,23 +13,10 @@
         * Flash Attention
         * BlockWise Attention
         * Usage and Import from EasyDel Library
-        * [Usage](https://erfanzar.github.io/EasyDeL/docs/Llama)
+        * [Usage](https://erfanzar.github.io/EasyDeL/docs/Python/Llama)
 
 
-2. **_[Llama2](https://erfanzar.github.io/EasyDeL/docs/Llama2)_**:
-
-    * Supports:
-        * Fully Sharded Data Parallel `(FSDP)`
-        * MultiProcessing `(MP)`
-        * Data Parallel `(DP)`
-        * Distributed Data Parallel  (DDP) `(DP)`
-        * Gradient CheckPointing
-        * Flash Attention
-        * BlockWise Attention
-        * [Usage](https://erfanzar.github.io/EasyDeL/docs/Llama2)
-
-
-3. **_[Falcon](https://erfanzar.github.io/EasyDeL/docs/Falcon)_**:
+2. **_[Llama2](https://erfanzar.github.io/EasyDeL/docs/Python/Llama2)_**:
 
     * Supports:
         * Fully Sharded Data Parallel `(FSDP)`
@@ -39,10 +26,10 @@
         * Gradient CheckPointing
         * Flash Attention
         * BlockWise Attention
-        * [Usage](https://erfanzar.github.io/EasyDeL/docs/Falcon)
+        * [Usage](https://erfanzar.github.io/EasyDeL/docs/Python/Llama2)
 
 
-4. **_[MosaicMPT](https://erfanzar.github.io/EasyDeL/docs/MosaicMPT)_**:
+3. **_[Falcon](https://erfanzar.github.io/EasyDeL/docs/Python/Falcon)_**:
 
     * Supports:
         * Fully Sharded Data Parallel `(FSDP)`
@@ -52,7 +39,20 @@
         * Gradient CheckPointing
         * Flash Attention
         * BlockWise Attention
-        * [Usage](https://erfanzar.github.io/EasyDeL/docs/MosaicMPT)
+        * [Usage](https://erfanzar.github.io/EasyDeL/docs/Python/Falcon)
+
+
+4. **_[MosaicMPT](https://erfanzar.github.io/EasyDeL/docs/Python/MosaicMPT)_**:
+
+    * Supports:
+        * Fully Sharded Data Parallel `(FSDP)`
+        * MultiProcessing `(MP)`
+        * Data Parallel `(DP)`
+        * Distributed Data Parallel  (DDP) `(DP)`
+        * Gradient CheckPointing
+        * Flash Attention
+        * BlockWise Attention
+        * [Usage](https://erfanzar.github.io/EasyDeL/docs/Python/MosaicMPT)
 
 
 5. **_GPTNeoX_**  :
