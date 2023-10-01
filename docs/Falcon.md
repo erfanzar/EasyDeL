@@ -61,11 +61,11 @@ available for free, making them a valuable resource for researchers and develope
 
 ```python
 import jax
-from EasyDel.transform import falcon_from_pretrained
+from EasyDel import falcon_from_pretrained
 
 params, config = falcon_from_pretrained(
-    'tiiuae/falcon-7b',
-    device=jax.devices('cpu')[0]  # Offload on CPU
+  'tiiuae/falcon-7b',
+  device=jax.devices('cpu')[0]  # Offload on CPU
 )
 ```
 
@@ -76,51 +76,51 @@ also keep that in mind that returned `config` includes `.get_partition_rules(fsd
 ```python
 from EasyDel import JAXServer, FlaxFalconForCausalLM
 import jax
-from EasyDel.transform import falcon_from_pretrained
+from EasyDel import falcon_from_pretrained
 from transformers import AutoTokenizer
 
 params, config = falcon_from_pretrained(
-    'tiiuae/falcon-7b',
-    device=jax.devices('cpu')[0]  # Offload on CPU
+  'tiiuae/falcon-7b',
+  device=jax.devices('cpu')[0]  # Offload on CPU
 )
 
 
 class FalconJaxServer(JAXServer):
-    ...
-    # You have to Custom this one yourself as you 
-    # need read JaxServer Documents inorder to learn how
+  ...
+  # You have to Custom this one yourself as you 
+  # need read JaxServer Documents inorder to learn how
 
 
 server = FalconJaxServer.load_from_params(
-    params=params,
-    model=FlaxFalconForCausalLM(
-        config=config,
-        dtype=jax.numpy.bfloat16,  # Im on TPUs
-        param_dtype=jax.numpy.bfloat16,  # Im on TPUs
-        precision=jax.lax.Precision('fastest'),
-        _do_init=False,
-        input_shape=(1, 1024)
-    ),
-    config_model=config,
-    add_params_field=True,
-    tokenizer=AutoTokenizer.from_pretrained('tiiuae/falcon-7b'),
-    verbose=False,
-    do_memory_log=True,
-    config={
-        "max_length": 2048,
-        "max_new_tokens": 2048,
-        "max_stream_tokens": 64,
-        "dtype": 'bf16',
-        "use_prefix_tokenizer": True,
-        'pre_compile': True
-    }
+  params=params,
+  model=FlaxFalconForCausalLM(
+    config=config,
+    dtype=jax.numpy.bfloat16,  # Im on TPUs
+    param_dtype=jax.numpy.bfloat16,  # Im on TPUs
+    precision=jax.lax.Precision('fastest'),
+    _do_init=False,
+    input_shape=(1, 1024)
+  ),
+  config_model=config,
+  add_params_field=True,
+  tokenizer=AutoTokenizer.from_pretrained('tiiuae/falcon-7b'),
+  verbose=False,
+  do_memory_log=True,
+  config={
+    "max_length": 2048,
+    "max_new_tokens": 2048,
+    "max_stream_tokens": 64,
+    "dtype": 'bf16',
+    "use_prefix_tokenizer": True,
+    'pre_compile': True
+  }
 )
 
 server.fire()  # Launch FastAPI functions
 
 shared_urls = server.launch(
-    share_chat=True,
-    share_inst=True
+  share_chat=True,
+  share_inst=True
 )
 ```
 

@@ -1,0 +1,101 @@
+from python import PythonObject
+from .array_module import ArrayShape, Array, dims_average_size
+from algorithm.functional import (
+    vectorize,
+    parallelize,
+    vectorize_unroll,
+    Static2DTileUnitFunc as Tile2D,
+)
+from math import min
+
+
+fn convert_numpy_to_easydel_array[
+    T: DType
+](np_array: PythonObject, array_spec: ArrayShape) raises -> Array[T]:
+    let size: Int = array_spec.num_elements()
+    var dynamic_vector = DynamicVector[FloatLiteral](size)
+    dynamic_vector.reserve(size)
+    try:
+        for i in range(size):
+            if size == 1:
+                dynamic_vector.push_back(np_array.__index__())
+            else:
+                dynamic_vector.push_back(np_array.reshape(-1)[i].__index__())
+    except:
+        print("couldn't make it")
+        return Array[T](array_spec)
+    return Array[T](dynamic_vector, array_spec)
+
+
+fn matmul_2d[nelts: Int, T: DType](inout C: Array[T], A: Array[T], B: Array[T]) -> None:
+    @parameter
+    fn CI(y: Int, x: Int) -> Int:
+        return y * C.dim(-1) + x
+
+    @parameter
+    fn AI(y: Int, x: Int) -> Int:
+        return y * A.dim(-1) + x
+
+    @parameter
+    fn BI(y: Int, x: Int) -> Int:
+        return y * B.dim(-1) + x
+
+    @parameter
+    fn loop_(i: Int) -> None:
+        for j in range(A.dim(-1)):
+
+            @parameter
+            fn _mul[_nelts: Int](k: Int) -> None:
+                let ci: Int = CI(i, k)
+                let ai: Int = AI(i, j)
+                let bi: Int = BI(j, k)
+
+                C.store[_nelts](ci, C.load[_nelts](ci) + A[ai] * B.load[_nelts](bi))
+
+            vectorize[nelts, _mul](C.dim(-1))
+
+    parallelize[loop_](C.dim(-2))
+
+
+fn matmul[nelts: Int, T: DType](inout C: Array[T], A: Array[T], B: Array[T]) -> None:
+    let C_C: Int = C.dim(-1)
+    let A_C: Int = A.dim(-1)
+    let C_R: Int = C.dim(-2)
+
+    @parameter
+    fn CI(y: Int, x: Int) -> Int:
+        return y * C.dim(-1) + x
+
+    @parameter
+    fn AI(y: Int, x: Int) -> Int:
+        return y * A.dim(-1) + x
+
+    @parameter
+    fn BI(y: Int, x: Int) -> Int:
+        return y * B.dim(-1) + x
+
+    for s in range(1, (C.num_elements() // (C_C * C_R)) + 1):
+
+        @parameter
+        fn loop_(i: Int) -> None:
+            for j in range(A_C):
+
+                @parameter
+                fn _mul[_nelts: Int](k: Int) -> None:
+                    let ci: Int = CI(i, k) * s
+                    let ai: Int = AI(i, j) * s
+                    let bi: Int = BI(j, k) * s
+                    C.store[_nelts](ci, C.load[_nelts](ci) + A[ai] * B.load[_nelts](bi))
+
+                vectorize[nelts, _mul](C_C)
+
+        parallelize[loop_](C_R)
+
+
+fn matmul_shape[T: DType](A: Array[T], B: Array[T]) -> ArrayShape:
+    var res_dims = InlinedFixedVector[dims_average_size, Int](A.rank())
+    for i in range(A.rank() - 1):
+        res_dims.append(A.dim(i))
+    res_dims.append(B.dim(-1))
+
+    return ArrayShape(res_dims)

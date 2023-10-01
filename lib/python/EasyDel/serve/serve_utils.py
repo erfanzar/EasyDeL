@@ -13,25 +13,24 @@ import transformers
 import uvicorn
 from fastapi import FastAPI
 from fjutils import make_shard_and_gather_fns, match_partition_rules, with_sharding_constraint
-from dataclasses import dataclass, field, is_dataclass
 from typing import Optional, List, Union, Tuple
 from EasyDel.smi import get_mem, initialise_tracking
 from flax.core import freeze
 from flax.traverse_util import unflatten_dict
 from jax import numpy as jnp
 from jax.experimental import mesh_utils, pjit
-from flax.serialization import to_bytes, from_bytes, to_state_dict, from_state_dict
+from flax.serialization import from_bytes
 from ml_collections import ConfigDict
 from pydantic import BaseModel
 from fjutils import get_float_dtype_by_name
 from jax.sharding import Mesh, PartitionSpec as Ps
 from transformers import GenerationConfig, TextIteratorStreamer
-from EasyDel.serve.theme import seafoam
+from src.EasyDel.serve import seafoam
 import logging
-from EasyDel.utils.utils import RNG
+from src.EasyDel.utils import RNG
 import multiprocessing as mp
 import torch
-from EasyDel.utils.utils import prefix_str
+from src.EasyDel.utils import prefix_str
 
 pjit = pjit.pjit
 
