@@ -439,13 +439,13 @@ struct Array[T: DType]:
             type, simd_width
         ],
     ](self: Self) -> Self:
-        var res: Self = self
+        var res: Self = Self(self.array_shape)
 
         @parameter
         fn _do(size: Int):
-            let ra = self.data.offset(size).simd_load[Self.nelts](0)
-            let rs: SIMD[T, Self.nelts] = func[T, Self.nelts](ra)
-            res.data.offset(size).simd_store[Self.nelts](0, rs)
+            let ra = self.data.offset(size).simd_load[1](0)
+            let rs: SIMD[T, 1] = func[T, 1](ra)
+            res.data.offset(size).simd_store[1](0, rs)
 
         parallelize[_do](self.array_shape.num_elements())
         return res ^
@@ -493,9 +493,9 @@ struct Array[T: DType]:
 
     fn __matmul__(self: Self, other: Self) -> Self:
         let res = self.matmul[Self.nelts](other)
-        if debuging:
-            for i in range(res.num_elements()):
-                print("TRIGGERING RES OUT : ", i, " AS ", res[i])
+        # if debuging:
+        #     for i in range(res.num_elements()):
+        #         print("TRIGGERING RES OUT : ", i, " AS ", res[i])
         return res
 
     fn __sub__(self: Self, other: Self) -> Self:
@@ -844,7 +844,9 @@ struct Array[T: DType]:
                     let b_i = B_I(j, k)
 
                     result_array.store[_nelts](
-                        c_i, result_array.load[_nelts](c_i) + self[a_i] * other.load[_nelts](b_i)
+                        c_i,
+                        result_array.load[_nelts](c_i)
+                        + self[a_i] * other.load[_nelts](b_i),
                     )
 
                     # if debuging:
@@ -876,9 +878,9 @@ struct Array[T: DType]:
                 outer_loop(i)
 
         let result_array: Self = self.__matmul[nelts, matmul_v](other)
-        if debuging:
-            for i in range(result_array.num_elements()):
-                print("TRIGGERING RES MTML : ", i, " AS ", result_array[i])
+        # if debuging:
+        #     for i in range(result_array.num_elements()):
+        #         print("TRIGGERING RES MTML : ", i, " AS ", result_array[i])
         return result_array
 
     # cos
