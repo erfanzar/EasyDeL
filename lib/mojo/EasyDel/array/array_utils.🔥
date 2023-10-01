@@ -83,11 +83,13 @@ fn matmul_single_row[nelts: Int, T: DType](inout C: Array[T], A: Array[T], B: Ar
     parallelize[_loop](A.dim(-2))
 
 
-fn matmul[nelts: Int, T: DType](inout C: Array[T], A: Array[T], B: Array[T]) -> None:
+fn matmul[nelts: Int, T: DType](inout C: Array[T], A: Array[T], B: Array[T]) raises -> None:
     if A.rank() == 2 and B.rank() == 1 and C.rank() == 1:
         matmul_single_row[nelts, T](C, A, B)
         return
     C.fill(0.0)
+    if A.rank() != B.rank():
+        raise Error("Can not performe operation Dimensions won't match")
     let C_C: Int = C.dim(-1)
     let A_C: Int = A.dim(-1)
     let C_R: Int = C.dim(-2)
@@ -107,11 +109,11 @@ fn matmul[nelts: Int, T: DType](inout C: Array[T], A: Array[T], B: Array[T]) -> 
     fn BI(y: Int, x: Int) -> Int:
         return y * B.dim(-1) + x
 
-    # let ci_p = C.num_elements()
     for s in range((C.num_elements() // (C_C * C_R))):
         let pad_ci = s * C_P
         let pad_ai = s * A_P
         let pad_bi = s * B_P
+
         @parameter
         fn loop_(i: Int) -> None:
             for j in range(A_C):
@@ -126,18 +128,6 @@ fn matmul[nelts: Int, T: DType](inout C: Array[T], A: Array[T], B: Array[T]) -> 
                 vectorize[nelts, _mul](C_C)
 
         parallelize[loop_](C_R)
-
-    # for i in range(1, (C.num_elements() // (C_C * C_R)) + 1):
-    #     for j in range(C_R):
-    #         for k in range(C_C):
-    #             @parameter
-    #             fn _mul[_nelts: Int](l: Int) -> None:
-    #                 let ci: Int = CI(j, k) * i
-    #                 let ai: Int = AI(j, l) * i
-    #                 let bi: Int = BI(l, k) * i
-    #                 C.store[_nelts](ci, C.load[_nelts](ci) + A[ai] * B.load[_nelts](bi))
-
-    #             vectorize[nelts, _mul](A_C)
 
 
 fn matmul_shape[T: DType](A: Array[T], B: Array[T]) -> ArrayShape:
