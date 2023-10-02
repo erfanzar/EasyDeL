@@ -159,7 +159,7 @@ def main(argv):
         config.use_flash_attention = FLAGS.use_flash_attention
         config.use_sacn_mlp = FLAGS.use_sacn_mlp
     else:
-        conf = src.EasyDel.configs.configs.gptj_configs[FLAGS.model_type]
+        conf = EasyDel.configs.configs.gptj_configs[FLAGS.model_type]
         config = EasyDel.GPTJConfig(**conf, rotary_type=FLAGS.rotary_type)
         config.use_flash_attention = FLAGS.use_flash_attention
         config.use_sacn_mlp = FLAGS.use_sacn_mlp

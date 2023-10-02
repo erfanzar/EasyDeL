@@ -4,7 +4,7 @@ from jax import numpy as jnp
 import jax
 import torch
 from transformers import LlamaForCausalLM
-from src.EasyDel.modules.llama import LlamaConfig
+from EasyDel.modules.llama import LlamaConfig
 
 
 def llama_convert_hf_to_flax_load(checkpoints_dir, num_hidden_layers=32, num_attention_heads=32, hidden_size=4096,

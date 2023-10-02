@@ -1,6 +1,6 @@
 import absl.app
 from transformers import AutoTokenizer
-from src.EasyDel.serve import JAXServer
+from EasyDel.serve import JAXServer
 import EasyDel
 from absl import flags
 
@@ -108,7 +108,7 @@ flags.DEFINE_float(
 
 
 def main(argv):
-    conf = src.EasyDel.configs.configs.llama_configs[FLAGS.model_type]
+    conf = EasyDel.configs.configs.llama_configs[FLAGS.model_type]
     config = EasyDel.LlamaConfig(**conf, rotary_type=FLAGS.rotary_type)
     config.use_flash_attention = FLAGS.use_flash_attention
     config.use_sacn_mlp = FLAGS.use_sacn_mlp
