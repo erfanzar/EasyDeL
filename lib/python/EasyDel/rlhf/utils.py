@@ -4,7 +4,7 @@ from jax import lax, random
 from einops import rearrange
 from typing import Union, Optional, List
 
-from src.EasyDel import FlaxMptForCausalLM, FlaxLlamaForCausalLM, MptConfig, LlamaConfig
+from EasyDel import FlaxMptForCausalLM, FlaxLlamaForCausalLM, MptConfig, LlamaConfig
 
 
 # Converted from Pytorch To jax from LudicRrain Guy :)

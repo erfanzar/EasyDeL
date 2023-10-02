@@ -25,12 +25,12 @@ from pydantic import BaseModel
 from fjutils import get_float_dtype_by_name
 from jax.sharding import Mesh, PartitionSpec as Ps
 from transformers import GenerationConfig, TextIteratorStreamer
-from src.EasyDel.serve import seafoam
+from EasyDel.serve import seafoam
 import logging
-from src.EasyDel.utils import RNG
+from EasyDel.utils import RNG
 import multiprocessing as mp
 import torch
-from src.EasyDel.utils import prefix_str
+from EasyDel.utils import prefix_str
 
 pjit = pjit.pjit
 

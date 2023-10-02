@@ -1,4 +1,4 @@
-from src.EasyDel import MptConfig, FlaxMptForCausalLM
+from EasyDel import MptConfig, FlaxMptForCausalLM
 from jax import numpy as jnp
 import jax
 import torch
