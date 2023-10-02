@@ -7,6 +7,7 @@ from .gpt_neo_x import FlaxGPTNeoXForCausalLM, GPTNeoXConfig, FlaxGPTNeoXModel
 from .palm import PalmConfig, PalmModel, FlaxPalmForCausalLM
 from .t5 import FlaxT5ForConditionalGeneration, FlaxT5Model, T5Config
 from .opt import FlaxOPTForCausalLM, FlaxOPTModel, OPTConfig
+from .mistral import FlaxMistralModule, FlaxMistralForCausalLM, MistralConfig
 
 __all__ = ['FlaxLlamaForCausalLM', 'FlaxLlamaModel',
            'FlaxGPTJModule', 'FlaxGPTJForCausalLMModule', 'FlaxGPTJModel', 'FlaxGPTJForCausalLM', 'GPTJConfig',
@@ -16,5 +17,6 @@ __all__ = ['FlaxLlamaForCausalLM', 'FlaxLlamaModel',
            "FlaxGPTNeoXForCausalLM", "GPTNeoXConfig", "FlaxGPTNeoXModel",
            "FlaxT5ForConditionalGeneration", "FlaxT5Model",
            "PalmConfig", "PalmModel", "FlaxPalmForCausalLM", 'T5Config',
-           "FlaxOPTForCausalLM", "FlaxOPTModel", "OPTConfig", "LlamaConfig"
+           "FlaxOPTForCausalLM", "FlaxOPTModel", "OPTConfig", "LlamaConfig",
+           "FlaxMistralModule", "FlaxMistralForCausalLM", "MistralConfig"
            ]
