@@ -1,8 +1,8 @@
 import flax.core
 
-from src.EasyDel import llama_from_pretrained
+from EasyDel import llama_from_pretrained
 
-from src.EasyDel import TrainArguments, CausalLMTrainer
+from EasyDel import TrainArguments, CausalLMTrainer
 from datasets import load_dataset
 from huggingface_hub import HfApi
 from src import EasyDel

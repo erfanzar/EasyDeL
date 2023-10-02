@@ -1,4 +1,4 @@
-from src.EasyDel import TrainArguments, CausalLMTrainer
+from EasyDel import TrainArguments, CausalLMTrainer
 from datasets import load_dataset
 from huggingface_hub import HfApi
 from src import EasyDel
@@ -159,7 +159,7 @@ def main(argv):
         config.use_flash_attention = FLAGS.use_flash_attention
         config.use_sacn_mlp = FLAGS.use_sacn_mlp
     else:
-        conf = src.EasyDel.configs.configs.mpt_configs[FLAGS.model_type]
+        conf = EasyDel.configs.configs.mpt_configs[FLAGS.model_type]
         config = EasyDel.MptConfig(**conf, rotary_type=FLAGS.rotary_type)
         config.use_flash_attention = FLAGS.use_flash_attention
         config.use_sacn_mlp = FLAGS.use_sacn_mlp

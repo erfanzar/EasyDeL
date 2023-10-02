@@ -2,7 +2,7 @@ import EasyDel
 import jax.lax
 from EasyDel import JAXServer
 from fjutils import get_float_dtype_by_name
-from src.EasyDel.transform import llama_from_pretrained
+from EasyDel.transform import llama_from_pretrained
 from transformers import AutoTokenizer
 import gradio as gr
 
