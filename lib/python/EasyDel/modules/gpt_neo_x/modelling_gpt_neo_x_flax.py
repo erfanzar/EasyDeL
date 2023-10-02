@@ -13,40 +13,8 @@ from transformers.modeling_flax_outputs import FlaxCausalLMOutput, FlaxBaseModel
 from jax.random import split, PRNGKey
 from functools import partial
 from einops import rearrange
-
-ACT2FN = {
-    "gelu": partial(nn.gelu, approximate=False),
-    "relu": nn.relu,
-    "silu": nn.swish,
-    "swish": nn.swish,
-    "gelu_new": partial(nn.gelu, approximate=True),
-
-}
-
-
-def get_names_from_parition_spec(partition_specs):
-    names = set()
-    if isinstance(partition_specs, dict):
-        partition_specs = partition_specs.values()
-    for item in partition_specs:
-        if item is None:
-            continue
-        elif isinstance(item, str):
-            names.add(item)
-        else:
-            names.update(get_names_from_parition_spec(item))
-
-    return list(names)
-
-
-def with_sharding_constraint(x, partition_specs):
-    def names_in_mesh(*names):
-        return set(names) <= set(pxla.thread_resources.env.physical_mesh.axis_names)
-
-    axis_names = get_names_from_parition_spec(partition_specs)
-    if names_in_mesh(*axis_names):
-        x = wsc(x, partition_specs)
-    return x
+from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
+    with_sharding_constraint, ACT2FN
 
 
 class GPTNeoXConfig(PretrainedConfig):
@@ -128,9 +96,11 @@ class GPTNeoXConfig(PretrainedConfig):
     @staticmethod
     def get_mesh_names():
         return 'dp', 'fsdp', 'mp'
+
     def add_jax_args(self):
         self.from_pt = False
         ...
+
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0,
                          dtype: jnp.dtype = jnp.bfloat16) -> jnp.ndarray:

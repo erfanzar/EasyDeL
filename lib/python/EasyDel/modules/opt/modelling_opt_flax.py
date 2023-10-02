@@ -29,46 +29,12 @@ from jax import lax
 from jax.random import PRNGKey
 from transformers import PretrainedConfig
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxMaskedLMOutput
-from transformers.modeling_flax_utils import ACT2FN, FlaxPreTrainedModel, append_call_sample_docstring
-from jax.experimental.pjit import with_sharding_constraint as wsc
+from transformers.modeling_flax_utils import ACT2FN, FlaxPreTrainedModel
 from jax.sharding import PartitionSpec
-from jax.interpreters import pxla
 from transformers import logging
 
-
-def get_gradient_checkpoint_policy(name):
-    return {
-        'everything_saveable': jax.checkpoint_policies.everything_saveable,
-        'nothing_saveable': jax.checkpoint_policies.nothing_saveable,
-        'checkpoint_dots': jax.checkpoint_policies.checkpoint_dots,
-        'checkpoint_dots_with_no_batch_dims': jax.checkpoint_policies.checkpoint_dots_with_no_batch_dims,
-    }[name]
-
-
-def get_names_from_parition_spec(partition_specs):
-    names = set()
-    if isinstance(partition_specs, dict):
-        partition_specs = partition_specs.values()
-    for item in partition_specs:
-        if item is None:
-            continue
-        elif isinstance(item, str):
-            names.add(item)
-        else:
-            names.update(get_names_from_parition_spec(item))
-
-    return list(names)
-
-
-def names_in_mesh(*names):
-    return set(names) <= set(pxla.thread_resources.env.physical_mesh.axis_names)
-
-
-def with_sharding_constraint(x, partition_specs):
-    axis_names = get_names_from_parition_spec(partition_specs)
-    if names_in_mesh(*axis_names):
-        x = wsc(x, partition_specs)
-    return x
+from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
+    with_sharding_constraint
 
 
 class OPTConfig(PretrainedConfig):

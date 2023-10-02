@@ -45,31 +45,8 @@ from transformers import PretrainedConfig
 from jax.experimental.pjit import with_sharding_constraint as wsc
 from jax.sharding import PartitionSpec
 
-
-def get_names_from_parition_spec(partition_specs):
-    names = set()
-    if isinstance(partition_specs, dict):
-        partition_specs = partition_specs.values()
-    for item in partition_specs:
-        if item is None:
-            continue
-        elif isinstance(item, str):
-            names.add(item)
-        else:
-            names.update(get_names_from_parition_spec(item))
-
-    return list(names)
-
-
-def names_in_mesh(*names):
-    return set(names) <= set(pxla.thread_resources.env.physical_mesh.axis_names)
-
-
-def with_sharding_constraint(x, partition_specs):
-    axis_names = get_names_from_parition_spec(partition_specs)
-    if names_in_mesh(*axis_names):
-        x = wsc(x, partition_specs)
-    return x
+from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
+    with_sharding_constraint
 
 
 class T5Config(PretrainedConfig):
