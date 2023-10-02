@@ -4,7 +4,7 @@ from .modules import FlaxLlamaModel, FlaxLlamaForCausalLM, LlamaConfig, \
     FlaxGPTJForCausalLMModule, FlaxGPTJModel, FlaxGPTJForCausalLM, FlaxMptForCausalLM, MptConfig, FlaxMptModel, \
     FlaxFalconForCausalLM, FlaxFalconModel, FalconConfig, FlaxGPTNeoXForCausalLM, GPTNeoXConfig, FlaxGPTNeoXModel, \
     FlaxT5ForConditionalGeneration, FlaxT5Model, FlaxPalmForCausalLM, PalmModel, PalmConfig, T5Config, \
-    FlaxOPTForCausalLM, FlaxOPTModel, OPTConfig
+    FlaxOPTForCausalLM, FlaxOPTModel, OPTConfig, FlaxMistralModule, FlaxMistralForCausalLM, MistralConfig
 from .trainer import TrainArguments, fsdp_train_step, get_training_modules, CausalLMTrainer
 
 try:
@@ -29,4 +29,4 @@ __all__ = "TrainArguments", "fsdp_train_step", "get_training_modules", \
     "FlaxT5ForConditionalGeneration", "FlaxT5Model", \
     "FlaxPalmForCausalLM", "PalmModel", "PalmConfig", "T5Config", \
     "FlaxOPTForCausalLM", "FlaxOPTModel", "OPTConfig", "CausalLMTrainer", "LlamaConfig", "__version__", "JAXServer", \
-    "get_mesh", "PyTorchServer", "JaxServerConfig"
+    "get_mesh", "PyTorchServer", "JaxServerConfig", "FlaxMistralModule", "FlaxMistralForCausalLM", "MistralConfig"

@@ -34,49 +34,23 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
-from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
+from flax.core.frozen_dict import FrozenDict, unfreeze
 from flax.linen import combine_masks, make_causal_mask
 from flax.linen.attention import dot_product_attention_weights
-from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
-from transformers.modeling_flax_utils import ACT2FN, FlaxPreTrainedModel, append_call_sample_docstring
-from transformers.utils import add_start_docstrings, add_start_docstrings_to_model_forward, logging
+from transformers.modeling_flax_utils import ACT2FN, FlaxPreTrainedModel
+from transformers.utils import logging
 
 from transformers import PreTrainedTokenizer, TensorType, is_torch_available
 from transformers.configuration_utils import PretrainedConfig
 from transformers.onnx import OnnxConfigWithPast, PatchingSpec
 from jax.interpreters import pxla
 from fjutils.flash_attention import dot_product_attention_multihead
+from ..flax_modelling_utils import with_sharding_constraint
 
 logger = logging.get_logger(__name__)
-
-
-def get_names_from_parition_spec(partition_specs):
-    names = set()
-    if isinstance(partition_specs, dict):
-        partition_specs = partition_specs.values()
-    for item in partition_specs:
-        if item is None:
-            continue
-        elif isinstance(item, str):
-            names.add(item)
-        else:
-            names.update(get_names_from_parition_spec(item))
-
-    return list(names)
-
-
-def names_in_mesh(*names):
-    return set(names) <= set(pxla.thread_resources.env.physical_mesh.axis_names)
-
-
-def with_sharding_constraint_(x, partition_specs):
-    axis_names = get_names_from_parition_spec(partition_specs)
-    if names_in_mesh(*axis_names):
-        x = wsc(x, partition_specs)
-    return x
 
 
 class GPTJConfig(PretrainedConfig):
@@ -450,9 +424,9 @@ class FlaxGPTJAttention(nn.Module):
 
         # Force A local Sharding
         if self.config.use_pjit_attention_force:
-            query = with_sharding_constraint_(query, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
-            key = with_sharding_constraint_(key, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
-            value = with_sharding_constraint_(value, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
+            query = with_sharding_constraint(query, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
+            key = with_sharding_constraint(key, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
+            value = with_sharding_constraint(value, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
 
         query = self._split_heads(query)
         key = self._split_heads(key)
