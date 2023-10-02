@@ -48,7 +48,8 @@ pip install --upgrade pip
 # Note: wheels only available on linux.
 pip install --upgrade "jax[cuda11_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
 ```
-
+## TODO
+#### Mistral Model will be supported as soon as possible
 ## Documentation
 
 Tadadad (Magic Sound) 💫 finally documents are ready at [EasyDel/Docs](https://erfanzar.github.io/EasyDeL/docs)

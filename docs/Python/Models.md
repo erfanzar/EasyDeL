@@ -2,6 +2,19 @@
 
 ## Available Models Are
 
+0. **_Mistral_**:
+
+    * Supports:
+        * Fully Sharded Data Parallel `(FSDP)`
+        * MultiProcessing `(MP)`
+        * Data Parallel `(DP)`
+        * Distributed Data Parallel  (DDP) `(DP)`
+        * Gradient CheckPointing
+        * Flash Attention
+        * BlockWise Attention
+        * Usage and Import from EasyDel Library
+     
+
 1. **_[Llama](https://erfanzar.github.io/EasyDeL/docs/Python/Llama)_**:
 
     * Supports:
