@@ -2,13 +2,22 @@
 
 EasyDeL (Easy Deep Learning) is an open-source library designed to accelerate and optimize the training process of
 machine learning models. This library is primarily focused on Jax/Flax and plans to offer easy and fine solutions to
-train Flax/Jax Models on the `TPU/GPU` both for Serving and Training (EasyDel will support mojo and be rewriten for mojo too)
+train Flax/Jax Models on the `TPU/GPU` both for Serving and Training (EasyDel will support mojo and be rewriten for mojo
+too)
 
 ### EasyDel Mojo
 
-EasyDel Mojo differs from EasyDel in Python in significant ways. In Python, you can leverage a vast array of packages to create a mid or high-level API in no time. However, when working with Mojo, it's a different story. Here, you have to build some of the features that other Python libraries provide, such as Jax for arrays and computations. But why not import numpy, Jax, and other similar packages to Mojo and use them?
+EasyDel Mojo differs from EasyDel in Python in significant ways. In Python, you can leverage a vast array of packages to
+create a mid or high-level API in no time. However, when working with Mojo, it's a different story. Here, you have to
+build some of the features that other Python libraries provide, such as Jax for arrays and computations. But why not
+import numpy, Jax, and other similar packages to Mojo and use them?
 
-There are several reasons why building packages in Mojo is more efficient than importing them from Python. Firstly, when you import packages from Python, you incur the overhead of translating and processing the Python code into Mojo code, which takes time. Secondly, the Python code may not be optimized for the Mojo runtime environment, leading to slower performance. Lastly, building packages directly in Mojo allows you to design and optimize them explicitly for the Mojo runtime environment, resulting in faster and more efficient code. With Mojo's built-in array capabilities that are 35000x faster than Python, it's time to take your coding to the next level.
+There are several reasons why building packages in Mojo is more efficient than importing them from Python. Firstly, when
+you import packages from Python, you incur the overhead of translating and processing the Python code into Mojo code,
+which takes time. Secondly, the Python code may not be optimized for the Mojo runtime environment, leading to slower
+performance. Lastly, building packages directly in Mojo allows you to design and optimize them explicitly for the Mojo
+runtime environment, resulting in faster and more efficient code. With Mojo's built-in array capabilities that are
+35000x faster than Python, it's time to take your coding to the next level.
 
 [Read More ...](https://github.com/erfanzar/EasyDeL/blob/main/lib/mojo/README.md)
 
@@ -48,8 +57,7 @@ pip install --upgrade pip
 # Note: wheels only available on linux.
 pip install --upgrade "jax[cuda11_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
 ```
-## TODO
-#### Mistral Model will be supported as soon as possible
+
 ## Documentation
 
 Tadadad (Magic Sound) 💫 finally documents are ready at [EasyDel/Docs](https://erfanzar.github.io/EasyDeL/docs)
@@ -76,6 +84,7 @@ _Tutorials on how to use and train or serve your models with EasyDel is availabl
 
 ## Available Models Are
 
+- **_Mistral_**     (Support `FSDP`, `MP`,` DP`)(_Supports gradient checkpointing_)
 - **_Llama_**     (Support `FSDP`, `MP`,` DP`)(_Supports gradient checkpointing_)
 - **_Llama2_**    (Support `FSDP`, `MP`,` DP`)(_Supports gradient checkpointing_)
 - **_GPT-J_**     (Support `FSDP`, `MP`,` DP`)(_Supports gradient checkpointing_)

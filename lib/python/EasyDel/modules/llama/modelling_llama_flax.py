@@ -1,10 +1,6 @@
-import math
 from typing import Dict, Optional, Tuple, Union
-
-import fjutils.easylm
 from einops import einops
 from flax.linen import remat
-from einops import einsum
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -13,54 +9,14 @@ import flax.linen as nn
 from flax.linen.attention import dot_product_attention_weights
 from flax.traverse_util import flatten_dict, unflatten_dict
 from flax.linen import partitioning as nn_partitioning
-
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks, make_causal_mask
-
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_flax_utils import FlaxPreTrainedModel
-
-from jax.interpreters import pxla
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput, FlaxSequenceClassifierOutput
-
-from jax.experimental.pjit import with_sharding_constraint as wsc
-from fjutils import dot_product_attention_multihead
 from fjutils.easylm import blockwise_dot_product_attention
-
-
-def get_names_from_partition_spec(partition_specs):
-    names = set()
-    if isinstance(partition_specs, dict):
-        partition_specs = partition_specs.values()
-    for item in partition_specs:
-        if item is None:
-            continue
-        elif isinstance(item, str):
-            names.add(item)
-        else:
-            names.update(get_names_from_partition_spec(item))
-
-    return list(names)
-
-
-def names_in_mesh(*names):
-    return set(names) <= set(pxla.thread_resources.env.physical_mesh.axis_names)
-
-
-def with_sharding_constraint(x, partition_specs):
-    axis_names = get_names_from_partition_spec(partition_specs)
-    if names_in_mesh(*axis_names):
-        x = wsc(x, partition_specs)
-    return x
-
-
-def get_gradient_checkpoint_policy(name):
-    return {
-        'everything_saveable': jax.checkpoint_policies.everything_saveable,
-        'nothing_saveable': jax.checkpoint_policies.nothing_saveable,
-        'checkpoint_dots': jax.checkpoint_policies.checkpoint_dots,
-        'checkpoint_dots_with_no_batch_dims': jax.checkpoint_policies.checkpoint_dots_with_no_batch_dims,
-    }[name]
+from ..flax_modelling_utils import with_sharding_constraint, \
+    get_gradient_checkpoint_policy
 
 
 class LlamaConfig(PretrainedConfig):
