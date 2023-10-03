@@ -28,6 +28,8 @@ fn convert_numpy_to_easydel_array[
 
 
 fn matmul_2d[nelts: Int, T: DType](inout C: Array[T], A: Array[T], B: Array[T]) -> None:
+    if C.allocated == 0:
+        C.alloc()
     @parameter
     fn CI(y: Int, x: Int) -> Int:
         return y * C.dim(-1) + x
@@ -60,6 +62,8 @@ fn matmul_2d[nelts: Int, T: DType](inout C: Array[T], A: Array[T], B: Array[T]) 
 fn matmul_single_row[nelts: Int, T: DType](inout C: Array[T], A: Array[T], B: Array[T]):
     if not (A.rank() == 2 and B.rank() == 1 and C.rank() == 1):
         print("Report Matmul Bug in matmul_single_row")
+    if C.allocated == 0:
+        C.alloc()
     C.fill(0.0)
     let C_C: Int = C.dim(-1)
     let A_C: Int = A.dim(-1)
@@ -83,7 +87,11 @@ fn matmul_single_row[nelts: Int, T: DType](inout C: Array[T], A: Array[T], B: Ar
     parallelize[_loop](A.dim(-2))
 
 
-fn matmul[nelts: Int, T: DType](inout C: Array[T], A: Array[T], B: Array[T]) raises -> None:
+fn matmul[
+    nelts: Int, T: DType
+](inout C: Array[T], A: Array[T], B: Array[T]) raises -> None:
+    if C.allocated == 0:
+        C.alloc()
     if A.rank() == 2 and B.rank() == 1 and C.rank() == 1:
         matmul_single_row[nelts, T](C, A, B)
         return
