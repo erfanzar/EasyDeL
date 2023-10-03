@@ -1,4 +1,5 @@
 from python import Python as Py
+from ..in_out import File, BufReader
 
 
 struct FileBuffer:
@@ -23,21 +24,21 @@ struct FileBuffer:
     fn read_value_float32(
         inout self: Self, size: Int
     ) raises -> DTypePointer[DType.float32]:
-        let res = self.data.offset(self.offset).bitcast[DType.float32]()
+        let res = self.data.offset(self.get_offset()).bitcast[DType.float32]()
         self.move_offset(4 * size)
         return res
 
-    fn read_value_int(
-        inout self: Self
-    ) raises -> Int:
-        let res = self.data.offset(self.offset).bitcast[DType.int32]().load(0).to_int()
+    fn read_value_int(inout self: Self) raises -> Int:
+        let res = self.data.offset(self.get_offset()).bitcast[DType.int32]().load(
+            0
+        ).to_int()
         self.move_offset(4)
         return res
 
     fn read_value_float16(
         inout self: Self, size: Int
     ) raises -> DTypePointer[DType.float16]:
-        let res = self.data.offset(self.offset).bitcast[DType.float16]()
+        let res = self.data.offset(self.get_offset()).bitcast[DType.float16]()
 
         self.move_offset(sizeof[DType.float16]() * size)
         return res
@@ -45,7 +46,7 @@ struct FileBuffer:
     fn read_value_bfloat16(
         inout self: Self, size: Int
     ) raises -> DTypePointer[DType.bfloat16]:
-        let res = self.data.offset(self.offset).bitcast[DType.bfloat16]()
+        let res = self.data.offset(self.get_offset()).bitcast[DType.bfloat16]()
 
         self.move_offset(sizeof[DType.bfloat16]() * size)
         return res
@@ -53,7 +54,7 @@ struct FileBuffer:
     fn read_value_uint8(
         inout self: Self, size: Int
     ) raises -> DTypePointer[DType.uint8]:
-        let res = self.data.offset(self.offset).bitcast[DType.uint8]()
+        let res = self.data.offset(self.get_offset()).bitcast[DType.uint8]()
 
         self.move_offset(sizeof[DType.uint8]() * size)
         return res
@@ -61,7 +62,7 @@ struct FileBuffer:
     fn read_value_uint16(
         inout self: Self, size: Int
     ) raises -> DTypePointer[DType.uint16]:
-        let res = self.data.offset(self.offset).bitcast[DType.uint16]()
+        let res = self.data.offset(self.get_offset()).bitcast[DType.uint16]()
 
         self.move_offset(sizeof[DType.uint16]() * size)
         return res
@@ -69,7 +70,7 @@ struct FileBuffer:
     fn read_value_uint32(
         inout self: Self, size: Int
     ) raises -> DTypePointer[DType.uint32]:
-        let res = self.data.offset(self.offset).bitcast[DType.uint32]()
+        let res = self.data.offset(self.get_offset()).bitcast[DType.uint32]()
 
         self.move_offset(sizeof[DType.uint32]() * size)
         return res
@@ -77,9 +78,17 @@ struct FileBuffer:
     fn read_numerical_value_dynamic[
         T: DType
     ](inout self: Self, size: Int) raises -> DTypePointer[T]:
-        let res = self.data.offset(self.offset).bitcast[T]()
+        let res = self.data.offset(self.get_offset()).bitcast[T]()
 
         self.move_offset(sizeof[T]() * size)
+        return res
+
+    fn read_numerical_value_dynamic[
+        T: DType
+    ](inout self: Self, size: Int, fs: Int) raises -> DTypePointer[T]:
+        let res = self.data.offset(self.get_offset()).bitcast[T]()
+
+        self.move_offset(fs * size)
         return res
 
     fn get_offset(self: Self) -> Int:
@@ -95,7 +104,6 @@ fn read_numerical_value[T: DType](inout buffer: FileBuffer) raises -> SIMD[T, 1]
 fn read_string_value(
     inout buffer: FileBuffer, string_length: Int
 ) raises -> Pointer[UInt8]:
-
     let str = Pointer[UInt8].alloc(string_length + 1)
 
     for i in range(string_length):
