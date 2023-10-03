@@ -368,6 +368,54 @@ struct Array[T: DType]:
         return self.data.simd_load[nelts](position)
 
     @always_inline
+    fn load[nelts: Int](self, *dims: Int) raises -> SIMD[T, nelts]:
+        let variadic: VariadicList[Int] = VariadicList[Int](dims)
+        let slice_dv: DynamicVector[Int] = DynamicVector[Int]()
+        if len(variadic) > self.rank():
+            raise Error("Index out Of the Range (len(variadic) > self.rank())")
+        var pad: Int = 0
+        for i in range(len(variadic)):
+            var product: Int = 1
+            for f in range(i + 1, self.rank()):
+                product *= self.array_shape._shape[f]
+            pad += variadic[i] * product
+        if pad > self.num_elements():
+            raise Error("Index out Of the Range (pad > self.num_elements)")
+        return self.data.simd_load[nelts](pad)
+
+    @always_inline
+    fn load[nelts: Int](self, variadic: VariadicList[Int]) raises -> SIMD[T, nelts]:
+        let slice_dv: DynamicVector[Int] = DynamicVector[Int]()
+        if len(variadic) > self.rank():
+            raise Error("Index out Of the Range (len(variadic) > self.rank())")
+        var pad: Int = 0
+        for i in range(len(variadic)):
+            var product: Int = 1
+            for f in range(i + 1, self.rank()):
+                product *= self.array_shape._shape[f]
+            pad += variadic[i] * product
+        if pad > self.num_elements():
+            raise Error("Index out Of the Range (pad > self.num_elements)")
+        return self.data.simd_load[nelts](pad)
+
+    @always_inline
+    fn store[
+        nelts: Int
+    ](self, variadic: VariadicList[Int], val: SIMD[T, nelts]) raises -> None:
+        let slice_dv: DynamicVector[Int] = DynamicVector[Int]()
+        if len(variadic) > self.rank():
+            raise Error("Index out Of the Range (len(variadic) > self.rank())")
+        var pad: Int = 0
+        for i in range(len(variadic)):
+            var product: Int = 1
+            for f in range(i + 1, self.rank()):
+                product *= self.array_shape._shape[f]
+            pad += variadic[i] * product
+        if pad > self.num_elements():
+            raise Error("Index out Of the Range (pad > self.num_elements)")
+        self.data.simd_store[nelts](pad, val)
+
+    @always_inline
     fn store[
         nelts: Int, off: Int
     ](self, index: InlinedFixedVector[off, Int], val: SIMD[T, nelts]) -> None:
@@ -408,6 +456,13 @@ struct Array[T: DType]:
         return self.store[1](index, val)
 
     @always_inline
+    fn __setitem__(
+        self, vrd: VariadicList[Int], val: SIMD[T, 1]
+    ) raises:
+        r"""Dynamic Array SetItem."""
+        return self.store[1](vrd, val)
+
+    @always_inline
     fn __getitem__[off: Int](self, index: InlinedFixedVector[off, Int]) -> SIMD[T, 1]:
         return self.load[1, off](index)
 
@@ -418,6 +473,11 @@ struct Array[T: DType]:
     @always_inline
     fn __getitem__(self, index: Int) -> SIMD[T, 1]:
         return self.load[1](index)
+
+    @always_inline
+    fn __getitem__(self, *dims: Int) raises -> SIMD[T, 1]:
+        r"""Dynamic Array GetItem."""
+        return self.load[1](VariadicList[Int](dims))
 
     fn __element_wise_tensor_operation__[
         nelts: Int,
