@@ -264,16 +264,6 @@ struct Array[T: DType]:
         self.array_shape = ArrayShape(dim)
         self.allocated = 1
 
-    fn alloc(inout self: Self) -> None:
-        r"""Allocate or Init The Array."""
-        self.data = self.ArrayPointer.alloc(self.array_shape.num_elements())
-        self.allocated = 1
-
-    fn random(inout self: Self) -> None:
-        r"""Randomize The Data if the Array is Allocated."""
-        if self.allocated == 1:
-            rand[T](self.data, self.array_shape.num_elements())
-
     fn __moveinit__(inout self, owned ext: Self):
         self.data = ext.data
         self.array_shape = ext.array_shape
@@ -299,6 +289,20 @@ struct Array[T: DType]:
         if self.allocated == 1:
             self.data.free()
 
+    fn set_data_from_buffer(inout self: Self, buffer: DTypePointer[T]) -> None:
+        self.data = buffer
+        # self.allocated = 1
+
+    fn alloc(inout self: Self) -> None:
+        r"""Allocate or Init The Array."""
+        self.data = self.ArrayPointer.alloc(self.array_shape.num_elements())
+        self.allocated = 1
+
+    fn random(inout self: Self) -> None:
+        r"""Randomize The Data if the Array is Allocated."""
+        if self.allocated == 1:
+            rand[T](self.data, self.array_shape.num_elements())
+
     fn dim(self: Self, i: Int) -> Int:
         return self.array_shape.dim(i)
 
@@ -307,6 +311,41 @@ struct Array[T: DType]:
 
     fn num_elements(self: Self) -> Int:
         return self.array_shape.num_elements()
+
+    fn reshape(inout self, *dims: Int) raises:
+        let current_nelm = self.num_elements()
+        let vs: VariadicList[Int] = VariadicList[Int](dims)
+        var dynamic_index: Bool = False
+        for i in range(len(vs)):
+            if vs[i] == -1:
+                dynamic_index = True
+        if dynamic_index:
+            var vvs: DynamicVector[Int] = DynamicVector[Int]()
+            var num_elms: Int = 1
+            for i in range(len(vs)):
+                if vs[i] != -1:
+                    num_elms *= vs[i]
+
+            for i in range(len(vs)):
+                if vs[i] == -1:
+                    vvs.push_back(current_nelm // num_elms)
+                else:
+                    vvs.push_back(vs[i])
+            let array_shape = ArrayShape(vvs)
+            if array_shape.num_elements() != current_nelm:
+                raise Error(
+                    "Given new shape and number of elements in array won't Match"
+                )
+            self.array_shape = array_shape
+        else:
+            var num_elms: Int = 1
+            for i in range(len(vs)):
+                num_elms *= vs[i]
+            if num_elms != current_nelm:
+                raise Error(
+                    "Given new shape and number of elements in array won't Match"
+                )
+            self.array_shape = ArrayShape(vs)
 
     @always_inline
     fn load[
