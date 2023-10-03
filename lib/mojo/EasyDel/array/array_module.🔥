@@ -31,6 +31,7 @@ from algorithm.functional import (
 )
 from runtime.llcl import Runtime, num_cores
 from memory.memory import memset_zero
+from .array_utils import matmul_shape
 
 alias dims_average_size = 5
 alias debuging = True
@@ -200,91 +201,103 @@ struct ArrayShape:
 struct Array[T: DType]:
     var data: DTypePointer[T]
     var array_shape: ArrayShape
+    var allocated: Int
     alias nelts: Int = simdwidthof[T]() * 2
+    alias ArrayPointer: AnyType = DTypePointer[T]
 
-    fn __init__(inout self: Self, array_shape: ArrayShape):
+    fn __init__(inout self: Self, array_shape: ArrayShape) -> None:
+        r"""Init Array From ArrayShape(Alloc Zero)."""
         self.array_shape = array_shape
-        self.data = DTypePointer[T]().alloc(self.array_shape.num_elements())
-        rand[T](self.data, self.array_shape.num_elements())
+        self.data = self.ArrayPointer.alloc(0)
+        self.allocated = 0
+
+    fn __init__(inout self: Self, A: Self, B: Self) -> None:
+        r"""Init Array From Two other Arrays A and B For Matmul(Alloc One)."""
+        self.__init__(matmul_shape[T](A, B))
+        self.alloc()
 
     fn __init__(inout self: Self, *dim: Int):
+        r"""Init Array from Int Args(Alloc Zero)."""
         self.array_shape = ArrayShape(VariadicList(dim))
-        self.data = DTypePointer[T]().alloc(self.array_shape.num_elements())
-        rand[T](self.data, self.array_shape.num_elements())
+        self.data = self.ArrayPointer.alloc(0)
+        self.allocated = 0
 
-    fn __init__(inout self: Self, vl: VariadicList[Int]):
+    fn __init__(inout self: Self, init: Bool, *dim: Int) -> None:
+        r"""Init Array from Int Args(Depends on Passed Bool)."""
+        self.__init__(dim)
+        if init:
+            self.alloc()
+            self.random()
+
+    fn __init__(inout self: Self, vl: VariadicList[Int]) -> None:
+        r"""Init Array from VariadicList[Int](Alloc Zero)."""
         self.array_shape = ArrayShape(vl)
-        self.data = DTypePointer[T]().alloc(self.array_shape.num_elements())
-        rand[T](self.data, self.array_shape.num_elements())
+        self.data = self.ArrayPointer.alloc(0)
+        self.allocated = 0
 
     fn __init__(
         inout self: Self, value: DynamicVector[FloatLiteral], shape: ArrayShape
     ) -> None:
+        r"""Init Array from ArrayShape and load data from DynamicVector[FloatLiteral](Alloc One).
+        """
         self.array_shape = shape
         do_check(len(value) == self.array_shape.num_elements(), "Data Size miss match")
-        self.data = DTypePointer[T]().alloc(self.array_shape.num_elements())
-
+        self.data = self.ArrayPointer.alloc(self.array_shape.num_elements())
+        self.allocated = 1
         for i in range(self.array_shape.num_elements()):
             self.data.simd_store[1](i, value[i])
 
     fn __init__(
         inout self: Self, value: VariadicList[FloatLiteral], shape: ArrayShape
     ) -> None:
+        r"""Init Array from ArrayShape and load data from VariadicList[FloatLiteral](Alloc One).
+        """
         self.array_shape = shape
         do_check(len(value) == self.array_shape.num_elements(), "Data Size miss match")
-        self.data = DTypePointer[T]().alloc(self.array_shape.num_elements())
+        self.allocated = 1
+        self.data = self.ArrayPointer.alloc(self.array_shape.num_elements())
         for i in range(self.array_shape.num_elements()):
             self.data.simd_store[1](i, value[i])
 
-    fn set_data_from_buffer(inout self: Self, pointer: DTypePointer[T]) -> None:
+    fn __init__(inout self: Self, pointer: DTypePointer[T], *dim: Int) -> None:
         self.data = pointer
+        self.array_shape = ArrayShape(dim)
+        self.allocated = 1
 
-    # fn set_data_from_buffer(
-    #     inout self: Self, pointer: DTypePointer[T], *dims: Int
-    # ) -> None:
-    #     self.data = pointer
-    #     var shape = VariadicList[Int](dims)
-    #     do_check(
-    #         len(shape) == self.array_shape.rank(), "Ranking Assertation Failed!"
-    #     )
-    #     for i in range(len(shape)):
-    #         do_check(
-    #             shape[i] == self.array_shape.dim(i), "Ranking Assertation Failed!"
-    #         )
+    fn alloc(inout self: Self) -> None:
+        r"""Allocate or Init The Array."""
+        self.data = self.ArrayPointer.alloc(self.array_shape.num_elements())
+        self.allocated = 1
 
-    fn set_data_from_buffer(
-        inout self: Self, pointer: DTypePointer[T], shape: VariadicList[Int]
-    ) -> None:
-        self.data = pointer
-
-        do_check(len(shape) == self.array_shape.rank(), "Ranking Assertation Failed!")
-        for i in range(len(shape)):
-            do_check(shape[i] == self.array_shape.dim(i), "Ranking Assertation Failed!")
+    fn random(inout self: Self) -> None:
+        r"""Randomize The Data if the Array is Allocated."""
+        if self.allocated == 1:
+            rand[T](self.data, self.array_shape.num_elements())
 
     fn __moveinit__(inout self, owned ext: Self):
-        self.data = DTypePointer[T].alloc(ext.array_shape.num_elements())
+        self.data = ext.data
         self.array_shape = ext.array_shape
-
-        @parameter
-        fn _do[_nelts: Int](f: Int):
-            let dt = ext.data.simd_load[_nelts](0)
-            self.data.simd_store[_nelts](0, dt)
-
-        vectorize[Self.nelts, _do](ext.array_shape.num_elements())
+        self.allocated = ext.allocated
 
     fn __copyinit__(inout self, ext: Self):
-        self.data = DTypePointer[T].alloc(ext.array_shape.num_elements())
-        self.array_shape = ext.array_shape
+        self.allocated = ext.allocated
+        if self.allocated == 1:
+            self.data = self.ArrayPointer.alloc(ext.array_shape.num_elements())
+            self.array_shape = ext.array_shape
 
-        @parameter
-        fn _do[_nelts: Int](f: Int):
-            let dt = ext.data.simd_load[_nelts](0)
-            self.data.simd_store[_nelts](0, dt)
+            @parameter
+            fn _do[_nelts: Int](f: Int):
+                let dt = ext.data.simd_load[_nelts](0)
+                self.data.simd_store[_nelts](0, dt)
 
-        vectorize[Self.nelts, _do](ext.array_shape.num_elements())
+            vectorize[Self.nelts, _do](ext.array_shape.num_elements())
+        else:
+            self.data = self.ArrayPointer.alloc(0)
+            self.array_shape = ext.array_shape
 
     fn __del__(owned self):
-        self.data.free()
+        if self.allocated == 1:
+            self.data.free()
 
     fn dim(self: Self, i: Int) -> Int:
         return self.array_shape.dim(i)
@@ -380,6 +393,7 @@ struct Array[T: DType]:
         )
 
         let res = Self(self.array_shape)
+        res.alloc()
         let size = self.array_shape.num_elements()
 
         let last_dim = self.array_shape[-1]
@@ -413,7 +427,7 @@ struct Array[T: DType]:
     ](self) -> Self:
         let res = Self(self.array_shape)
         let size = self.array_shape.num_elements()
-
+        res.alloc()
         let last_dim = self.array_shape[-1]
         var dims_rest = size // last_dim
 
@@ -440,6 +454,7 @@ struct Array[T: DType]:
         ],
     ](self: Self) -> Self:
         var res: Self = Self(self.array_shape)
+        res.alloc()
 
         @parameter
         fn _do(size: Int):
@@ -689,6 +704,7 @@ struct Array[T: DType]:
             "Arrays Don't have same size",
         )
         var res = Self(self.array_shape)
+        res.alloc()
         let last_dim: Int = res.array_shape.dim(-1)
         let res_size: Int = res.array_shape._size // last_dim
 
@@ -714,6 +730,7 @@ struct Array[T: DType]:
             "Arrays Don't have same size",
         )
         var res = Self(self.array_shape)
+        res.alloc()
         let last_dim: Int = res.array_shape.dim(-1)
         let res_size: Int = res.array_shape._size // last_dim
 
@@ -788,9 +805,7 @@ struct Array[T: DType]:
             fn element_wise[_nelts: Int](j: Int):
                 let a_i = i * self.dim(-1) + j
                 if _nelts < nelts:
-                    ar[0] += (
-                        self.load[_nelts](a_i) * other.load[_nelts](j)
-                    ).reduce_add()
+                    ar[0] += (self.load[1](a_i) * other.load[_nelts](j)).reduce_add()
                 else:
                     ar += self.load[nelts](a_i) * other.load[nelts](j)
 
@@ -818,47 +833,54 @@ struct Array[T: DType]:
             res_dims.append(self.dim(i))
         res_dims.append(other.dim(-1))
 
-        var result_array = Self(ArrayShape(res_dims))
-        result_array.fill(0.0)
+        var C = Self(ArrayShape(res_dims))
+        C.fill(0.0)
+
+        C.fill(0.0)
+        if self.rank() != other.rank():
+            print("Can not performe operation Dimensions won't match")
+            return C ^
+        let C_C: Int = C.dim(-1)
+        let A_C: Int = self.dim(-1)
+        let C_R: Int = C.dim(-2)
+        let C_P: Int = C.dim(-2) * C.dim(-1)
+        let B_P: Int = other.dim(-2) * other.dim(-1)
+        let A_P: Int = self.dim(-2) * self.dim(-1)
 
         @parameter
-        fn C_I(y: Int, x: Int) -> Int:
-            return y * result_array.dim(-1) + x
+        fn CI(y: Int, x: Int) -> Int:
+            return y * C.dim(-1) + x
 
         @parameter
-        fn A_I(y: Int, x: Int) -> Int:
+        fn AI(y: Int, x: Int) -> Int:
             return y * self.dim(-1) + x
 
         @parameter
-        fn B_I(y: Int, x: Int) -> Int:
+        fn BI(y: Int, x: Int) -> Int:
             return y * other.dim(-1) + x
 
-        @parameter
-        fn loop_(i: Int) -> None:
-            for j in range(self.dim(-1)):
+        for s in range((C.num_elements() // (C_C * C_R))):
+            let pad_ci = s * C_P
+            let pad_ai = s * A_P
+            let pad_bi = s * B_P
 
-                @parameter
-                fn _mul[_nelts: Int](k: Int) -> None:
-                    let c_i = C_I(i, k)
-                    let a_i = A_I(i, j)
-                    let b_i = B_I(j, k)
+            @parameter
+            fn loop_(i: Int) -> None:
+                for j in range(A_C):
 
-                    result_array.store[_nelts](
-                        c_i,
-                        result_array.load[_nelts](c_i)
-                        + self[a_i] * other.load[_nelts](b_i),
-                    )
+                    @parameter
+                    fn _mul[_nelts: Int](k: Int) -> None:
+                        let ci: Int = CI(i, k) + pad_ci
+                        let ai: Int = AI(i, j) + pad_ai
+                        let bi: Int = BI(j, k) + pad_bi
+                        C.store[_nelts](
+                            ci, C.load[_nelts](ci) + self[ai] * other.load[_nelts](bi)
+                        )
 
-                    # if debuging:
-                    #     print("TRIGGERING : ", c_i, " AS ", result_array[c_i])
+                    vectorize[nelts, _mul](C_C)
 
-                vectorize[nelts, _mul](result_array.dim(-1))
-
-        outer_loop_func[loop_](result_array.dim(-2))
-        # if debuging:
-        #     for i in range(result_array.num_elements()):
-        #         print("TRIGGERING RES : ", i, " AS ", result_array[i])
-        return result_array ^
+            outer_loop_func[loop_](C_R)
+        return C ^
 
     @always_inline
     fn matmul[nelts: Int](self, other: Self, rt: Runtime, n_cores: Int) -> Self:

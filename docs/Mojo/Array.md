@@ -27,14 +27,19 @@ Apply the Matrix Mul for two Arrays
 a simple matmul with two arrays
 
 ```mojo
-import EasyDel as ed
+from EasyDel import Array, matmul, matmul_shape
 
-let E1: ed.Array[T] = ed.Array[T](1,2,18)
-let E2: ed.Array[T] = ed.Array[T](1,18,64)
-let C_Shape: ed.ArrayShape = ed.matmul_shape[T](E1, E2)
-var C: ed.Array[T] = ed.Array[T](C_Shape)
-C.fill(0.0) # Fill it with zeros
-ed.matmul[ed.Array[T].nelts, T](C, E1, E2) # parallelized and accurate
+
+fn run[nelts: Int, T: DType]() raises:
+    # You can change this But Remember Cols of A must match Rows of B
+    let A: Array[T] = Array[T](True, 1, 3, 1024, 512)  # True Passed to init Array
+    let B: Array[T] = Array[T](True, 1, 3, 512, 1024)
+    var C: Array[T] = Array[T](A, B)
+    matmul[nelts, T](C, A, B)  # You Get the same result As Numpy
+
+
+fn main() raises:
+    run[Array[DType.float32].nelts, DType.float32]()
 ```
 
 in this code we convert 2 numpy array into easydel array and apply matmul on them then do the same in easydel and check
@@ -59,9 +64,7 @@ fn run[T: DType]() raises:
     let E2: ed.Array[T] = ed.convert_numpy_to_easydel_array[T](A2, shape_2)
 
     let matmul_np = np.matmul(A1, A2)
-
-    let C_Shape: ed.ArrayShape = ed.matmul_shape[T](E1, E2)
-    var C: ed.Array[T] = ed.Array[T](C_Shape) # Prepare Result Array for Matmul
+    var C: ed.Array[T] = ed.Array[T](E1, E2) # Prepare Result Array for Matmul
     C.fill(0.0) # Fill it with zeros
     ed.matmul[ed.Array[T].nelts, T](C, E1, E2)
     print(matmul_np)
@@ -127,27 +130,46 @@ Takes DType as dynamic Input like `Array[DType.float32]`
 
 `fn __init__(inout self: Self, array_shape: ArrayShape):`
 
+ - Description: Init Array From ArrayShape(Alloc Zero).
+
+`fn __init__(inout self: Self, A: Self, B: Self) -> None:`
+
+ - Description: Init Array From Two other Arrays A and B For Matmul(Alloc One).
+
 `fn __init__(inout self: Self, vl: VariadicList[Int]):`
+
+ - Description: Init Array from VariadicList[Int](Alloc Zero).
+
+`fn __init__(inout self: Self, init: Bool, *dim: Int) -> None:`
+
+ - Description: Init Array from Int Args(Depends on Passed Bool).
 
 `fn __init__(inout self: Self, *dim: Int):`
 
+ - Description: Init Array from Int Args(Alloc Zero).
+
 `fn __init__(inout self: Self, value: DynamicVector[FloatLiteral], shape: ArrayShape) -> None:`
+
+ - Description: Init Array from ArrayShape and load data from DynamicVector[FloatLiteral](Alloc One).
 
 `fn __init__(inout self: Self, value: VariadicList[FloatLiteral], shape: ArrayShape) -> None:`
 
-### Set Data from buffer
+ - Description: Init Array from ArrayShape and load data from VariadicList[FloatLiteral](Alloc One).
 
-`fn set_data_from_buffer(inout self: Self, pointer: DTypePointer[T]) -> None:`
+`fn __init__(inout self: Self, pointer: DTypePointer[T], *dim: Int) -> None:`
 
-sets data from the given buffer
+ - Description: Init Array from IntArgs and load data from DTypePointer[T](Alloc One).
 
-```
-fn set_data_from_buffer(
-    inout self: Self, pointer: DTypePointer[T], shape: VariadicList[Int]
-) -> None:
-```
+### Alloc
 
-sets data from the given buffer and change shape
+`fn alloc(inout self: Self) -> None:`
+ - Description: Allocate or Init The Array.
+
+### Random
+
+`fn random(inout self: Self) -> None:`
+
+ - Description: Randomize The Data if the Array is Allocated.
 
 ### Dim
 
