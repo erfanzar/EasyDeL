@@ -195,6 +195,15 @@ class JaxServerConfig:
             'max_new_tokens should be divisible by  max_new_tokens' \
             f'{max_new_tokens % max_stream_tokens}'
 
+    def __getitem__(self, item):
+        if hasattr(self, item):
+            return getattr(self, item)
+        else:
+            raise KeyError(f'{item} not found !')
+
+    def __setitem__(self, key, value):
+        setattr(self, key, value)
+
 
 class JAXServer(object):
 
