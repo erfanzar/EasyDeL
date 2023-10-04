@@ -1,4 +1,5 @@
 import functools
+import typing
 
 import flax.core
 from jax import jit, random, grad, numpy as jnp, Array
@@ -648,7 +649,7 @@ class FlaxMistralModule(nn.Module):
             output_hidden_states: bool = False,
             return_dict: bool = True,
 
-    ) -> Tuple[Array, ...] | FlaxBaseModelOutput:
+    ) -> typing.Union[Tuple[Array, ...], FlaxBaseModelOutput]:
         if input_embeds is None:
             input_embeds = self.embed_tokens(input_ids.astype("i4"))
 
