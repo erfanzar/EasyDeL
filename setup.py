@@ -23,7 +23,7 @@ setup(
     ],
     keywords='machine learning, deep learning, pytorch, jax, flax',
     install_requires=[
-        'jax>=0.4.9',
+        'jax>=0.4.10',
         # add any other required dependencies here
     ],
     python_requires='>=3.8',
