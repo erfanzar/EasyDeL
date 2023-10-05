@@ -1,0 +1,17 @@
+from ..array import Array
+
+
+fn apply_dense[T: DType](x: Array[T], w: Array[T]) -> Array[T]:
+    let result = x @ w
+    return result
+
+
+fn apply_attn_pf[
+    T: DType
+](x_one: Array[T], x_two: Array[T], wq: Array[T], wk: Array[T], wv: Array[T]) -> Tuple[
+    Array[T], Array[T], Array[T]
+]:
+    let q = x_one @ wq
+    let k = x_two @ wk
+    let v = x_two @ wv
+    return q, k, v

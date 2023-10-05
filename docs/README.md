@@ -2,7 +2,14 @@
 
 EasyDeL (Easy Deep Learning) is an open-source library designed to accelerate and optimize the training process of
 machine learning models. This library is primarily focused on Jax/Flax and plans to offer easy and fine solutions to
-train Flax/Jax Models on the `TPU/GPU` both for Serving and Training
+train Flax/Jax Models on the `TPU/GPU` both for Serving and Training For both Python And Mojo🔥
+
+# EasyDel Mojo 🔥
+
+EasyDel Mojo differs from EasyDel in Python in significant ways. In Python, you can leverage a vast array of packages to
+create a mid or high-level API in no time. However, when working with Mojo, it's a different story. Here, you have to
+build some of the features that other Python libraries provide, such as Jax for arrays and computations. But why not
+import numpy, Jax, and other similar packages to Mojo and use them?
 
 #### Note this Library needs golang to run (for some tracking stuff on TPU/GPU/CPU)
 
@@ -45,12 +52,21 @@ pip install --upgrade "jax[cuda11_pip]" -f \
 
 ## Documentations 🧭
 
-* _EasyDel_:
+* _EasyDel Python_:
     * Configs
-    * [Modules](https://erfanzar.github.io/EasyDeL/docs/Models)
+    * [Modules](https://erfanzar.github.io/EasyDeL/docs/Python/Models)
     * RLHF
-    * [Serve](https://erfanzar.github.io/EasyDeL/docs/Serve)
+    * [Serve](https://erfanzar.github.io/EasyDeL/docs/Python/Serve)
     * SMI
     * Trainer
     * Transform
     * Utils
+
+* _EasyDel Mojo🔥_ (Docs are on the way...):
+    * [README 🔥](https://erfanzar.github.io/EasyDeL/lib/mojo)
+    * [Array 🔥](https://erfanzar.github.io/EasyDeL/docs/Mojo/Array)
+    * IO
+    * Linen
+    * Utilities
+    * Tokenizer
+    * Models
