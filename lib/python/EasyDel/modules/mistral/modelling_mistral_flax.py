@@ -157,9 +157,14 @@ def repeat_kv(x: jax.Array, n_rep: int) -> jax.Array:
     bs, s, n_kv_heads, head_dim = x.shape
     if n_rep == 1:
         return x
-
-    return jnp.expand_dims(x[:, :, :, None, :], (bs, s, n_kv_heads, n_rep, head_dim)).reshape(bs, s, n_kv_heads * n_rep,
-                                                                                              head_dim)
+    x = x[:, :, :, jnp.newaxis, :]
+    x = jnp.repeat(x, n_rep, axis=3)
+    # x = jnp.expand_dims(
+    #     x, (bs, s, n_kv_heads, n_rep, head_dim)
+    # )
+    return x.reshape(bs, s,
+                     n_kv_heads * n_rep,
+                     head_dim)
 
 
 class MistralRMSNorm(nn.Module):
@@ -335,7 +340,7 @@ class FlaxMistralAttention(nn.Module):
         freq_cis = jnp.take(freq_cis, position_ids, axis=0)
         q, k = apply_rotary_emb(q, k, freq_cis=freq_cis, dtype=self.dtype)
         k = repeat_kv(k, self.num_key_value_groups)
-        v = repeat_kv(v, self.num_key_value_groups)
+        v = repeat_kv(v, self.num_key_value_heads)
         if self.has_variable('cache', 'key') or init_cache:
             q, k, v, attention_mask = self.concatenate_to_cache_(q, k, v, attention_mask)
 
@@ -627,15 +632,23 @@ class FlaxMistralDecoratorCollection(nn.Module):
         for layer in self.layers:
             if output_hidden_states:
                 all_hidden_states += (hidden_state,)
+            # hidden_state: jax.Array,
+            # freq_cis: jax.Array,
+            # attention_mask: jax.Array,
+            # causal_mask: jax.Array,
+            # position_ids: jax.Array,
+            # deterministic: bool = True,
+            # init_cache: bool = False,
+            # output_attentions: bool = True
             output = layer(
-                hidden_state=hidden_state,
-                freq_cis=freq_cis,
-                attention_mask=attention_mask,
-                causal_mask=causal_mask,
-                position_ids=position_ids,
-                deterministic=deterministic,
-                init_cache=init_cache,
-                output_attentions=output_attentions
+                hidden_state,
+                freq_cis,
+                attention_mask,
+                causal_mask,
+                position_ids,
+                deterministic,
+                init_cache,
+                output_attentions
             )
             hidden_state = output[0]
 
@@ -679,7 +692,7 @@ class FlaxMistralModule(nn.Module):
             dim=self.config.hidden_size // self.config.num_attention_heads,
             end=self.config.max_position_embeddings * 2
         )
-        self.causal_mask = nn.make_causal_mask(jnp.ones(1, self.config.max_position_embeddings))
+        self.causal_mask = nn.make_causal_mask(jnp.ones((1, self.config.max_position_embeddings), dtype='i4'))
 
     def __call__(
             self,
