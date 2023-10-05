@@ -13,7 +13,7 @@ from transformers import PretrainedConfig, FlaxPreTrainedModel
 from flax.linen import partitioning as nn_partitioning
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 
-from ..flax_modelling_utils import ACT2FN, with_sharding_constraint
+from ..flax_modelling_utils import ACT2FN, with_sharding_constraint, get_gradient_checkpoint_policy
 
 
 class MistralConfig(PretrainedConfig):
@@ -82,8 +82,43 @@ class MistralConfig(PretrainedConfig):
             **kwargs,
         )
 
-    def get_partition_rules(self, fully_fsdp: bool = True):
-        ...
+    @staticmethod
+    def get_partition_rules(fully_fsdp: bool = True):
+        return (
+
+            ("model/embed_tokens/embedding", PS("dp", "fsdp")),
+
+            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PS("fsdp", "dp")),
+            ("self_attn/o_proj/kernel", PS("dp", "fsdp")),
+
+            ("mlp/gate_proj/kernel", PS("fsdp", "dp")),
+            ("mlp/down_proj/kernel", PS("dp", "fsdp")),
+            ("mlp/up_proj/kernel", PS("fsdp", "dp")),
+
+            ("input_layernorm/kernel", PS(None)),
+            ("post_attention_layernorm/kernel", PS(None)),
+
+            ("model/norm/kernel", PS(None)),
+            ("lm_head/kernel", PS("fsdp", "dp")),
+            ('.*', PS(None)),
+        ) if not fully_fsdp else (
+
+            ("model/embed_tokens/embedding", PS("fsdp")),
+
+            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PS("fsdp")),
+            ("self_attn/o_proj/kernel", PS("fsdp")),
+
+            ("mlp/gate_proj/kernel", PS("fsdp")),
+            ("mlp/down_proj/kernel", PS("fsdp")),
+            ("mlp/up_proj/kernel", PS("fsdp")),
+
+            ("input_layernorm/kernel", PS(None)),
+            ("post_attention_layernorm/kernel", PS(None)),
+
+            ("model/norm/kernel", PS(None)),
+            ("lm_head/kernel", PS("fsdp")),
+            ('.*', PS('fsdp')),
+        )
 
     def add_jax_args(self,
                      gradient_checkpointing: str = 'nothing_saveable',
@@ -556,8 +591,17 @@ class FlaxMistralDecoratorCollection(nn.Module):
     precision: Optional[Union[None, jax.lax.Precision]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
+        block = FlaxMistralDecoderLayer
+        if self.config.gradient_checkpointing != '':
+            block = remat(
+                block,
+                static_argnums=(5, 6, 7),
+                policy=get_gradient_checkpoint_policy(
+                    self.config.gradient_checkpointing
+                )
+            )
         self.layers = [
-            FlaxMistralDecoderLayer(
+            block(
                 config=self.config,
                 dtype=self.dtype,
                 param_dtype=self.param_dtype,
