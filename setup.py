@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='EasyDeL',
-    version='0.0.30',
+    version='0.0.31',
     author='Erfan Zare Chavoshi',
     author_email='erfanzare82@eyahoo.com',
     description='An open-source library to make training faster and more optimized in Jax/Flax',
@@ -27,4 +27,5 @@ setup(
         # add any other required dependencies here
     ],
     python_requires='>=3.8',
+    package_dir={'': 'lib/python'}
 )
