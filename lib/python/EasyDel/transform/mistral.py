@@ -7,10 +7,18 @@ from transformers import MistralForCausalLM
 from ..modules.mistral import MistralConfig
 
 
-def mistral_convert_hf_to_flax_load(checkpoints_dir, num_hidden_layers=32, num_attention_heads=32,
-                                    num_kv_heads: int = 32, hidden_size=4096,
+def inverse_permute(tensor, head, dim_in, dim_out):
+    return tensor.reshape(head, 2, dim_in // head // 2, dim_out).transpose(0, 2, 1, 3).reshape(
+        dim_in, dim_out)
+
+
+def permute(tensor, head, dim_in, dim_out):
+    return tensor.view(head, dim_in // head // 2, 2, dim_out).transpose(1, 2).reshape(dim_in, dim_out)
+
+
+def mistral_convert_hf_to_flax_load(checkpoints_dir, config: MistralConfig,
                                     device=jax.devices('cpu')[0]):
-    # Edited From EasyLM
+    kv_dim = config.num_key_value_heads * (config.hidden_size // config.num_attention_heads)
     ckpt_paths = sorted(Path(checkpoints_dir).glob("*.bin"))
     state_dict = {}
     with jax.default_device(device):
@@ -20,13 +28,6 @@ def mistral_convert_hf_to_flax_load(checkpoints_dir, num_hidden_layers=32, num_a
                 if k.startswith("model."):
                     k = k[6:]
                 state_dict[k] = v
-
-        def inverse_permute(w, head):
-
-            reshaped_w = w.reshape(head, 2, hidden_size // head // 2, hidden_size)
-            transposed_w = reshaped_w.transpose(0, 2, 1, 3)
-            inverted_w = transposed_w.reshape(hidden_size, hidden_size)
-            return inverted_w
 
         jax_weights = {
             "model": {
@@ -39,13 +40,16 @@ def mistral_convert_hf_to_flax_load(checkpoints_dir, num_hidden_layers=32, num_a
                             "q_proj": {
                                 "kernel": inverse_permute(
 
-                                    state_dict[f"layers.{layer}.self_attn.q_proj.weight"].numpy(), num_attention_heads
+                                    state_dict[f"layers.{layer}.self_attn.q_proj.weight"].numpy(),
+                                    config.num_attention_heads,
+                                    config.hidden_size, config.hidden_size
                                 ).transpose()
                             },
                             "k_proj": {
                                 "kernel": inverse_permute(
                                     state_dict[f"layers.{layer}.self_attn.k_proj.weight"].numpy(),
-                                    num_kv_heads
+                                    config.num_key_value_heads,
+                                    config.hidden_size, kv_dim
                                 ).transpose()
                             },
                             "v_proj": {
@@ -85,7 +89,7 @@ def mistral_convert_hf_to_flax_load(checkpoints_dir, num_hidden_layers=32, num_a
                             ].numpy()
                         },
                     }
-                    for layer in range(num_hidden_layers)
+                    for layer in range(config.num_hidden_layers)
                 },
             },
             "lm_head": {"kernel": state_dict["lm_head.weight"].numpy().transpose()},
@@ -94,16 +98,10 @@ def mistral_convert_hf_to_flax_load(checkpoints_dir, num_hidden_layers=32, num_a
         return jax_weights
 
 
-def mistral_convert_hf_to_flax(state_dict, num_hidden_layers=32, num_attention_heads=32, num_kv_heads: int = 32,
-                               hidden_size=4096,
+def mistral_convert_hf_to_flax(state_dict, config: MistralConfig,
                                device=jax.devices('cpu')[0]):
+    kv_dim = config.num_key_value_heads * (config.hidden_size // config.num_attention_heads)
     with jax.default_device(device):
-        def inverse_permute(w, head):
-            reshaped_w = w.reshape(head, 2, hidden_size // head // 2, hidden_size)
-            transposed_w = reshaped_w.transpose(0, 2, 1, 3)
-            inverted_w = transposed_w.reshape(hidden_size, hidden_size)
-            return inverted_w
-
         jax_weights = {
             "model": {
                 "embed_tokens": {"embedding": state_dict["model.embed_tokens.weight"].numpy()},
@@ -116,13 +114,16 @@ def mistral_convert_hf_to_flax(state_dict, num_hidden_layers=32, num_attention_h
                                 "kernel": inverse_permute(
 
                                     state_dict[f"model.layers.{layer}.self_attn.q_proj.weight"].numpy(),
-                                    num_attention_heads
+                                    config.num_attention_heads,
+                                    config.hidden_size, config.hidden_size
                                 ).transpose()
                             },
                             "k_proj": {
                                 "kernel": inverse_permute(
 
-                                    state_dict[f"model.layers.{layer}.self_attn.k_proj.weight"].numpy(), num_kv_heads
+                                    state_dict[f"model.layers.{layer}.self_attn.k_proj.weight"].numpy(),
+                                    config.num_key_value_heads,
+                                    config.hidden_size, kv_dim
                                 ).transpose()
                             },
                             "v_proj": {
@@ -162,7 +163,7 @@ def mistral_convert_hf_to_flax(state_dict, num_hidden_layers=32, num_attention_h
                             ].numpy()
                         },
                     }
-                    for layer in range(num_hidden_layers)
+                    for layer in range(config.num_hidden_layers)
                 },
             },
             "lm_head": {"kernel": state_dict["lm_head.weight"].numpy().transpose()},
@@ -171,12 +172,13 @@ def mistral_convert_hf_to_flax(state_dict, num_hidden_layers=32, num_attention_h
         return jax_weights
 
 
-def mistral_convert_pt_to_flax(state_dict_pt, n_layers: int, device=jax.devices('cpu')[0]):
+def mistral_convert_pt_to_flax(state_dict_pt, config: MistralConfig, device=jax.devices('cpu')[0]):
+    kv_dim = config.num_key_value_heads * (config.hidden_size // config.num_attention_heads)
     with jax.default_device(device):
         state_dict_flax = {}
         state_dict_flax[('model', 'embed_tokens', 'embedding')] = state_dict_pt[
             'model.embed_tokens.weight'].cpu().detach().numpy()
-        for i in range(n_layers):
+        for i in range(config.num_hidden_layers):
             state_dict_flax[('model', 'layers', f'{i}', 'input_layernorm', 'kernel')] = state_dict_pt[
                 f'model.layers.{i}.input_layernorm.weight'].cpu().detach().numpy()
             state_dict_flax[('model', 'layers', f'{i}', 'post_attention_layernorm', 'kernel')] = state_dict_pt[
@@ -203,7 +205,9 @@ def mistral_convert_pt_to_flax(state_dict_pt, n_layers: int, device=jax.devices(
     return state_dict_flax
 
 
-def mistral_convert_flax_to_pt(flax_params, n_layers, dim, num_attention_heads, num_kv_heads: int, dtype=jnp.float16):
+def mistral_convert_flax_to_pt(flax_params, config: MistralConfig, dtype=jnp.float16):
+    kv_dim = config.num_key_value_heads * (config.hidden_size // config.num_attention_heads)
+
     def match_keywords(string, ts, ns):
         for t in ts:
             if t not in string:
@@ -219,19 +223,19 @@ def mistral_convert_flax_to_pt(flax_params, n_layers, dim, num_attention_heads, 
             tensor = tensor.T
         torch_params[key] = torch.from_numpy(tensor.astype(dtype=dtype))
 
-    def permute(w, head):
-        return w.view(head, dim // head // 2, 2, dim).transpose(1, 2).reshape(dim, dim)
-
     state_dict = {}
     inv_freq = 1.0 / (
-            10000.0 ** (torch.arange(0, dim // num_attention_heads, 2).float() / (dim // num_attention_heads)))
-    for layer_i in range(n_layers):
+            10000.0 ** (torch.arange(0, config.hidden_size // config.num_attention_heads, 2).float() / (
+            config.hidden_size // config.num_attention_heads)))
+    for layer_i in range(config.num_hidden_layers):
         state_dict.update({
             f"model.layers.{layer_i}.self_attn.q_proj.weight": permute(
-                torch_params[f"model.layers.{layer_i}.attention.q_proj.kernel"], num_attention_heads
+                torch_params[f"model.layers.{layer_i}.attention.q_proj.kernel"], config.num_attention_heads,
+                config.hidden_size, config.hidden_size
             ),
             f"model.layers.{layer_i}.self_attn.k_proj.weight": permute(
-                torch_params[f"model.layers.{layer_i}.attention.k_proj.kernel"], num_kv_heads
+                torch_params[f"model.layers.{layer_i}.attention.k_proj.kernel"], config.num_key_value_heads,
+                config.hidden_size, kv_dim
             ),
             f"model.layers.{layer_i}.self_attn.v_proj.weight": torch_params[
                 f"model.layers.{layer_i}.attention.v_proj.kernel"],
@@ -269,10 +273,7 @@ def mistral_from_pretrained(model_id, device=jax.devices('cpu')[0]):
     model = MistralForCausalLM.from_pretrained(model_id)
     easydel_wights = mistral_convert_hf_to_flax(
         state_dict=model.state_dict(),
-        num_hidden_layers=config.num_hidden_layers,
-        hidden_size=config.hidden_size,
-        num_attention_heads=config.num_attention_heads,
-        num_kv_heads=config.num_key_value_heads,
+        config=config,
         device=device
     )
     config.add_jax_args()
