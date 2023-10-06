@@ -312,6 +312,45 @@ struct Array[T: DType]:
     fn num_elements(self: Self) -> Int:
         return self.array_shape.num_elements()
 
+    fn get_dynamic_axis(self: Self, *dims: Int) raises -> Int:
+        let variadic: VariadicList[Int] = VariadicList[Int](dims)
+        let slice_dv: DynamicVector[Int] = DynamicVector[Int]()
+        if len(variadic) > self.rank():
+            raise Error("Index out Of the Range (len(variadic) > self.rank())")
+        var pad: Int = 0
+        for i in range(len(variadic)):
+            var product: Int = 1
+            for f in range(i + 1, self.rank()):
+                product *= self.array_shape._shape[f]
+            pad += variadic[i] * product
+        if pad > self.num_elements():
+            raise Error("Index out Of the Range (pad > self.num_elements)")
+        return pad
+
+    fn transpose(self: Self, *dims: Int) raises -> Self:
+        var res_shape: DynamicVector[Int] = DynamicVector[Int]()
+        let _dims = VariadicList[Int](dims)
+        if len(_dims) != self.rank():
+            raise Error(
+                "The Passed input dims to swap are not accept able for function"
+            )
+        if len(_dims) > 3:
+            raise Error("Only 3D or 2D arrays are accepted for transpose right now")
+        for f in range(len(_dims)):
+            res_shape.push_back(self.dim(_dims[f]))
+        let res = Self(res_shape)
+        res.alloc()
+        res.fill(0.0)
+
+        for i in range(res.dim(0)):
+            var s = 0
+            var d = 0
+            var e = 0
+            for j in range(res.dim(-2)):
+                for k in range(res.dim(-1)):
+                    res[self.get_dynamic_axis(i, j, k)] = self[s, d, e]
+        return res
+
     fn reshape(inout self, *dims: Int) raises:
         let current_nelm = self.num_elements()
         let vs: VariadicList[Int] = VariadicList[Int](dims)
@@ -604,11 +643,7 @@ struct Array[T: DType]:
         return self.mul[Self.nelts](other)
 
     fn __matmul__(self: Self, other: Self) -> Self:
-        let res = self.matmul[Self.nelts](other)
-        # if debuging:
-        #     for i in range(res.num_elements()):
-        #         print("TRIGGERING RES OUT : ", i, " AS ", res[i])
-        return res
+        return self.matmul[Self.nelts](other)
 
     fn __sub__(self: Self, other: Self) -> Self:
         return self.sub[Self.nelts](other)
