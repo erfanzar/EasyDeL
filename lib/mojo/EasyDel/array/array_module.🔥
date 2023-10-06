@@ -29,7 +29,7 @@ from algorithm.functional import (
     Static2DTileUnitFunc,
     parallelize,
 )
-from runtime.llcl import Runtime, num_cores
+from runtime.llcl import num_cores
 from memory.memory import memset_zero
 from .array_utils import matmul_shape
 
@@ -456,9 +456,7 @@ struct Array[T: DType]:
         return self.store[1](index, val)
 
     @always_inline
-    fn __setitem__(
-        self, vrd: VariadicList[Int], val: SIMD[T, 1]
-    ) raises:
+    fn __setitem__(self, vrd: VariadicList[Int], val: SIMD[T, 1]) raises:
         r"""Dynamic Array SetItem."""
         return self.store[1](vrd, val)
 
@@ -586,7 +584,7 @@ struct Array[T: DType]:
         func: fn[TP: DType, simd_width: Int] (arg: SIMD[TP, simd_width]) -> SIMD[
             TP, simd_width
         ],
-    ](self: Self, rt: Runtime) -> Self:
+    ](self: Self, num_cores: Int) -> Self:
         var res: Self = self
 
         @parameter
@@ -596,7 +594,7 @@ struct Array[T: DType]:
             ).reduce_add()
             res.data.offset(size).simd_store[1](0, rs)
 
-        parallelize[_do](rt, self.array_shape.num_elements(), rt.parallelism_level())
+        parallelize[_do](self.array_shape.num_elements(), num_cores)
         return res ^
 
     fn __add__(self: Self, other: Self) -> Self:
@@ -667,10 +665,10 @@ struct Array[T: DType]:
             other
         )
 
-    fn add[nelts: Int](self: Self, other: Self, runtime: Runtime) -> Self:
+    fn add[nelts: Int](self: Self, other: Self, num_cores: Int) -> Self:
         @parameter
         fn outer_loop[func: fn (Int) capturing -> None](size: Int) -> None:
-            parallelize[func](runtime, size, runtime.parallelism_level())
+            parallelize[func](size, num_cores)
 
         return self.__element_wise_tensor_operation__[nelts, outer_loop, math.add](
             other
@@ -686,10 +684,10 @@ struct Array[T: DType]:
             other
         )
 
-    fn mod[nelts: Int](self: Self, other: Self, runtime: Runtime) -> Self:
+    fn mod[nelts: Int](self: Self, other: Self, num_cores: Int) -> Self:
         @parameter
         fn outer_loop[func: fn (Int) capturing -> None](size: Int) -> None:
-            parallelize[func](runtime, size, runtime.parallelism_level())
+            parallelize[func](size, num_cores)
 
         return self.__element_wise_tensor_operation__[nelts, outer_loop, math.mod](
             other
@@ -705,10 +703,10 @@ struct Array[T: DType]:
             other
         )
 
-    fn mul[nelts: Int](self: Self, other: Self, runtime: Runtime) -> Self:
+    fn mul[nelts: Int](self: Self, other: Self, num_cores: Int) -> Self:
         @parameter
         fn outer_loop[func: fn (Int) capturing -> None](size: Int) -> None:
-            parallelize[func](runtime, size, runtime.parallelism_level())
+            parallelize[func](size, num_cores)
 
         return self.__element_wise_tensor_operation__[nelts, outer_loop, math.mul](
             other
@@ -724,10 +722,10 @@ struct Array[T: DType]:
             other
         )
 
-    fn sub[nelts: Int](self: Self, other: Self, runtime: Runtime) -> Self:
+    fn sub[nelts: Int](self: Self, other: Self, num_cores: Int) -> Self:
         @parameter
         fn outer_loop[func: fn (Int) capturing -> None](size: Int) -> None:
-            parallelize[func](runtime, size, runtime.parallelism_level())
+            parallelize[func](size, num_cores)
 
         return self.__element_wise_tensor_operation__[nelts, outer_loop, math.sub](
             other
@@ -743,10 +741,10 @@ struct Array[T: DType]:
             other
         )
 
-    fn true_div[nelts: Int](self: Self, other: Self, runtime: Runtime) -> Self:
+    fn true_div[nelts: Int](self: Self, other: Self, num_cores: Int) -> Self:
         @parameter
         fn outer_loop[func: fn (Int) capturing -> None](size: Int) -> None:
-            parallelize[func](runtime, size, runtime.parallelism_level())
+            parallelize[func](size, num_cores)
 
         return self.__element_wise_tensor_operation__[nelts, outer_loop, math.div](
             other
@@ -770,7 +768,7 @@ struct Array[T: DType]:
 
         return flag
 
-    fn eq[nelts: Int](self, other: Self, rt: Runtime, n_cores: Int) -> Bool:
+    fn eq[nelts: Int](self, other: Self, num_cores: Int, n_cores: Int) -> Bool:
         do_check(
             self.array_shape == other.array_shape,
             "dimension aren't equal can't performe eq operation.",
@@ -793,11 +791,11 @@ struct Array[T: DType]:
 
             vectorize[nelts, iterate_vectorize](dims_rest)
 
-        parallelize[iterate_parallel](rt, first_dim, n_cores)
+        parallelize[iterate_parallel](first_dim, n_cores)
 
         return flag
 
-    fn pow[nelts: Int](self: Self, other: Self, rt: Runtime) -> Self:
+    fn pow[nelts: Int](self: Self, other: Self, num_cores: Int) -> Self:
         do_check(
             self.array_shape.num_elements() == other.array_shape.num_elements(),
             "Arrays Don't have same size",
@@ -820,7 +818,7 @@ struct Array[T: DType]:
 
             vectorize[nelts, _lp](last_dim)
 
-        parallelize[_ol](rt, res_size)
+        parallelize[_ol](res_size, num_cores)
         return res ^
 
     fn pow[nelts: Int](self: Self, other: Self) -> Self:
@@ -982,10 +980,10 @@ struct Array[T: DType]:
         return C ^
 
     @always_inline
-    fn matmul[nelts: Int](self, other: Self, rt: Runtime, n_cores: Int) -> Self:
+    fn matmul[nelts: Int](self, other: Self, num_cores: Int, n_cores: Int) -> Self:
         @parameter
         fn matmul_p[outer_loop: fn (Int) capturing -> None](range_size: Int):
-            parallelize[outer_loop](rt, range_size, n_cores)
+            parallelize[outer_loop](range_size, n_cores)
 
         let result_array = self.__matmul[nelts, matmul_p](other)
 
@@ -1012,8 +1010,8 @@ struct Array[T: DType]:
     fn cos[nelts: Int](inout self: Self) -> Self:
         return self.__apply_math__[nelts, cos]()
 
-    fn cos(inout self: Self, rt: Runtime) -> Self:
-        return self.__apply_math__[cos](rt)
+    fn cos(inout self: Self, num_cores: Int) -> Self:
+        return self.__apply_math__[cos](num_cores)
 
     # sin
 
@@ -1023,8 +1021,8 @@ struct Array[T: DType]:
     fn sin[nelts: Int](inout self: Self) -> Self:
         return self.__apply_math__[nelts, sin]()
 
-    fn sin(inout self: Self, rt: Runtime) -> Self:
-        return self.__apply_math__[sin](rt)
+    fn sin(inout self: Self, num_cores: Int) -> Self:
+        return self.__apply_math__[sin](num_cores)
 
     # log
 
@@ -1034,8 +1032,8 @@ struct Array[T: DType]:
     fn log[nelts: Int](inout self: Self) -> Self:
         return self.__apply_math__[nelts, log]()
 
-    fn log(inout self: Self, rt: Runtime) -> Self:
-        return self.__apply_math__[log](rt)
+    fn log(inout self: Self, num_cores: Int) -> Self:
+        return self.__apply_math__[log](num_cores)
 
     # log2
 
@@ -1045,8 +1043,8 @@ struct Array[T: DType]:
     fn log2[nelts: Int](inout self: Self) -> Self:
         return self.__apply_math__[nelts, log2]()
 
-    fn log2(inout self: Self, rt: Runtime) -> Self:
-        return self.__apply_math__[log2](rt)
+    fn log2(inout self: Self, num_cores: Int) -> Self:
+        return self.__apply_math__[log2](num_cores)
 
     # tan
 
@@ -1056,8 +1054,8 @@ struct Array[T: DType]:
     fn tan[nelts: Int](inout self: Self) -> Self:
         return self.__apply_math__[nelts, tan]()
 
-    fn tan(inout self: Self, rt: Runtime) -> Self:
-        return self.__apply_math__[tan](rt)
+    fn tan(inout self: Self, num_cores: Int) -> Self:
+        return self.__apply_math__[tan](num_cores)
 
     # tanh
 
@@ -1067,19 +1065,19 @@ struct Array[T: DType]:
     fn tanh[nelts: Int](inout self: Self) -> Self:
         return self.__apply_math__[nelts, tanh]()
 
-    fn tanh(inout self: Self, rt: Runtime) -> Self:
-        return self.__apply_math__[tanh](rt)
+    fn tanh(inout self: Self, num_cores: Int) -> Self:
+        return self.__apply_math__[tanh](num_cores)
 
     # sqrt
 
-    fn sqrt(inout self: Self) -> Self:
-        return self.__apply_math__[sqrt]()
+    # fn sqrt(inout self: Self) -> Self:
+    #     return self.__apply_math__[sqrt]()
 
-    fn sqrt[nelts: Int](inout self: Self) -> Self:
-        return self.__apply_math__[nelts, sqrt]()
+    # fn sqrt[nelts: Int](inout self: Self) -> Self:
+    #     return self.__apply_math__[nelts, sqrt]()
 
-    fn sqrt(inout self: Self, rt: Runtime) -> Self:
-        return self.__apply_math__[sqrt](rt)
+    # fn sqrt(inout self: Self, num_cores: Int) -> Self:
+    #     return self.__apply_math__[sqrt](num_cores)
 
     # atan
 
@@ -1089,8 +1087,8 @@ struct Array[T: DType]:
     fn atan[nelts: Int](inout self: Self) -> Self:
         return self.__apply_math__[nelts, atan]()
 
-    fn atan(inout self: Self, rt: Runtime) -> Self:
-        return self.__apply_math__[atan](rt)
+    fn atan(inout self: Self, num_cores: Int) -> Self:
+        return self.__apply_math__[atan](num_cores)
 
     # exp
 
@@ -1100,8 +1098,8 @@ struct Array[T: DType]:
     fn exp[nelts: Int](inout self: Self) -> Self:
         return self.__apply_math__[nelts, exp]()
 
-    fn exp(inout self: Self, rt: Runtime) -> Self:
-        return self.__apply_math__[exp](rt)
+    fn exp(inout self: Self, num_cores: Int) -> Self:
+        return self.__apply_math__[exp](num_cores)
 
     # exp2
 
@@ -1111,8 +1109,8 @@ struct Array[T: DType]:
     fn exp2[nelts: Int](inout self: Self) -> Self:
         return self.__apply_math__[nelts, exp2]()
 
-    fn exp2(inout self: Self, rt: Runtime) -> Self:
-        return self.__apply_math__[exp2](rt)
+    fn exp2(inout self: Self, num_cores: Int) -> Self:
+        return self.__apply_math__[exp2](num_cores)
 
     # log10
     fn log10(inout self: Self) -> Self:
@@ -1121,8 +1119,8 @@ struct Array[T: DType]:
     fn log10[nelts: Int](inout self: Self) -> Self:
         return self.__apply_math__[nelts, log10]()
 
-    fn log10(inout self: Self, rt: Runtime) -> Self:
-        return self.__apply_math__[log10](rt)
+    fn log10(inout self: Self, num_cores: Int) -> Self:
+        return self.__apply_math__[log10](num_cores)
 
     # log1p
 
@@ -1132,8 +1130,8 @@ struct Array[T: DType]:
     fn log1p[nelts: Int](inout self: Self) -> Self:
         return self.__apply_math__[nelts, log1p]()
 
-    fn log1p(inout self: Self, rt: Runtime) -> Self:
-        return self.__apply_math__[log1p](rt)
+    fn log1p(inout self: Self, num_cores: Int) -> Self:
+        return self.__apply_math__[log1p](num_cores)
 
     # logb
 
@@ -1143,8 +1141,8 @@ struct Array[T: DType]:
     fn logb[nelts: Int](inout self: Self) -> Self:
         return self.__apply_math__[nelts, logb]()
 
-    fn logb(inout self: Self, rt: Runtime) -> Self:
-        return self.__apply_math__[logb](rt)
+    fn logb(inout self: Self, num_cores: Int) -> Self:
+        return self.__apply_math__[logb](num_cores)
 
     # asin
 
@@ -1154,8 +1152,8 @@ struct Array[T: DType]:
     fn asin[nelts: Int](inout self: Self) -> Self:
         return self.__apply_math__[nelts, asin]()
 
-    fn asin(inout self: Self, rt: Runtime) -> Self:
-        return self.__apply_math__[asin](rt)
+    fn asin(inout self: Self, num_cores: Int) -> Self:
+        return self.__apply_math__[asin](num_cores)
 
     # acos
 
@@ -1165,8 +1163,8 @@ struct Array[T: DType]:
     fn acos[nelts: Int](inout self: Self) -> Self:
         return self.__apply_math__[nelts, acos]()
 
-    fn acos(inout self: Self, rt: Runtime) -> Self:
-        return self.__apply_math__[acos](rt)
+    fn acos(inout self: Self, num_cores: Int) -> Self:
+        return self.__apply_math__[acos](num_cores)
 
     # asinh
 
@@ -1176,8 +1174,8 @@ struct Array[T: DType]:
     fn asinh[nelts: Int](inout self: Self) -> Self:
         return self.__apply_math__[nelts, asinh]()
 
-    fn asinh(inout self: Self, rt: Runtime) -> Self:
-        return self.__apply_math__[asinh](rt)
+    fn asinh(inout self: Self, num_cores: Int) -> Self:
+        return self.__apply_math__[asinh](num_cores)
 
     # acosh
 
@@ -1187,8 +1185,8 @@ struct Array[T: DType]:
     fn acosh[nelts: Int](inout self: Self) -> Self:
         return self.__apply_math__[nelts, acosh]()
 
-    fn acosh(inout self: Self, rt: Runtime) -> Self:
-        return self.__apply_math__[acosh](rt)
+    fn acosh(inout self: Self, num_cores: Int) -> Self:
+        return self.__apply_math__[acosh](num_cores)
 
     fn fill(inout self: Self, val: SIMD[T, 1]) -> None:
         for i in range(self.num_elements()):
