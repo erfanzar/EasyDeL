@@ -159,9 +159,7 @@ def repeat_kv(x: jax.Array, n_rep: int) -> jax.Array:
         return x
     x = x[:, :, :, jnp.newaxis, :]
     x = jnp.repeat(x, n_rep, axis=3)
-    # x = jnp.expand_dims(
-    #     x, (bs, s, n_kv_heads, n_rep, head_dim)
-    # )
+
     return x.reshape(bs, s,
                      n_kv_heads * n_rep,
                      head_dim)
@@ -340,7 +338,7 @@ class FlaxMistralAttention(nn.Module):
         freq_cis = jnp.take(freq_cis, position_ids, axis=0)
         q, k = apply_rotary_emb(q, k, freq_cis=freq_cis, dtype=self.dtype)
         k = repeat_kv(k, self.num_key_value_groups)
-        v = repeat_kv(v, self.num_key_value_heads)
+        v = repeat_kv(v, self.num_key_value_groups)
         if self.has_variable('cache', 'key') or init_cache:
             q, k, v, attention_mask = self.concatenate_to_cache_(q, k, v, attention_mask)
 
@@ -373,6 +371,7 @@ class FlaxMistralAttention(nn.Module):
             dropout_rate=self.config.attn_pdrop,
             precision=self.precision
         )
+
         if self.config.use_pjit_attention_force:
             attn_weight = with_sharding_constraint(attn_weight, PS(("dp", "fsdp"), "mp", None, None))
         attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weight, v)
