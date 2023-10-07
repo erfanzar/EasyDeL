@@ -45,6 +45,7 @@ class MistralConfig(PretrainedConfig):
             scan_mlp_chunk_size: int = 1024,
             number_rep_kv: int = 1,
             attn_pdrop: float = 0.0,
+            c_max_position_embeddings: int = 4096,
             **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -74,6 +75,7 @@ class MistralConfig(PretrainedConfig):
         self.flash_attn_key_chunk_size = flash_attn_key_chunk_size
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.attn_pdrop = attn_pdrop
+        self.c_max_position_embeddings = c_max_position_embeddings
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -130,6 +132,7 @@ class MistralConfig(PretrainedConfig):
                      scan_mlp_chunk_size: int = 1024,
                      number_rep_kv: int = 1,
                      attn_pdrop: float = 0.0,
+                     c_max_position_embeddings: int = 4096
                      ):
         self.use_flash_attention = use_flash_attention
         self.number_rep_kv = number_rep_kv
@@ -140,6 +143,7 @@ class MistralConfig(PretrainedConfig):
         self.flash_attn_key_chunk_size = flash_attn_key_chunk_size
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.attn_pdrop = attn_pdrop
+        self.c_max_position_embeddings = c_max_position_embeddings
 
     @staticmethod
     def get_weight_decay_exclusions():
@@ -683,7 +687,7 @@ class FlaxMistralModule(nn.Module):
             dim=self.config.hidden_size // self.config.num_attention_heads,
             end=self.config.max_position_embeddings * 2
         )
-        self.causal_mask = nn.make_causal_mask(jnp.ones((1, self.config.max_position_embeddings), dtype='i4'))
+        self.causal_mask = nn.make_causal_mask(jnp.ones((1, self.config.c_max_position_embeddings), dtype='i4'))
 
     def __call__(
             self,
