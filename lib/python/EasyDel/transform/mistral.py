@@ -9,7 +9,7 @@ from ..modules.mistral import MistralConfig
 
 def inverse_permute(tensor, head, dim_in, dim_out):
     return tensor.reshape(head, 2, dim_in // head // 2, dim_out).transpose(0, 2, 1, 3).reshape(
-        dim_in, dim_out)
+        dim_out, dim_in)
 
 
 def permute(tensor, head, dim_in, dim_out):
