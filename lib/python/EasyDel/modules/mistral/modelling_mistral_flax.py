@@ -554,15 +554,6 @@ class FlaxMistralPretrainedModel(FlaxPreTrainedModel):
         else:
             mutable = False
 
-        # input_ids: jax.Array
-        # attention_mask: jax.Array
-        # position_ids: jax.Array
-        # deterministic: bool = True
-        # input_embeds: jax.Array = None
-        # init_cache: bool = False
-        # output_attentions: bool = False
-        # output_hidden_states: bool = False
-        # return_dict: bool = True
         outputs = self.module.apply(
             inputs,
             jnp.array(input_ids, dtype="i4"),
@@ -769,9 +760,10 @@ class FlaxMistralForCausalLMModule(nn.Module):
     def __call__(
             self,
             input_ids: jax.Array,
-            attention_mask: jax.Array = None,
-            position_ids: jax.Array = None,
+            attention_mask: jax.Array,
+            position_ids: jax.Array,
             deterministic: bool = True,
+            input_embeds: jax.Array = None,
             init_cache: bool = False,
             output_attentions: bool = False,
             output_hidden_states: bool = False,
@@ -790,6 +782,7 @@ class FlaxMistralForCausalLMModule(nn.Module):
             attention_mask=attention_mask,
             position_ids=position_ids,
             deterministic=deterministic,
+            input_embeds=input_embeds,
             init_cache=init_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
