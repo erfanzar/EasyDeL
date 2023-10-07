@@ -168,8 +168,8 @@ def repeat_kv(x: jax.Array, n_rep: int) -> jax.Array:
 class MistralRMSNorm(nn.Module):
     dim: int
     eps: float = 1e-6
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
+    dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.bfloat16
 
     def setup(self) -> None:
         self.weight = self.param(
@@ -217,10 +217,10 @@ def apply_rotary_emb(
         xq: jnp.ndarray,
         xk: jnp.ndarray,
         freq_cis: jnp.ndarray,
-        dtype: jnp.dtype = jnp.float32,
+        dtype: jnp.dtype = jnp.bfloat16,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    reshape_xq = xq.astype(jnp.float32).reshape(*xq.shape[:-1], -1, 2)
-    reshape_xk = xk.astype(jnp.float32).reshape(*xk.shape[:-1], -1, 2)
+    reshape_xq = xq.astype(jnp.bfloat16).reshape(*xq.shape[:-1], -1, 2)
+    reshape_xk = xk.astype(jnp.bfloat16).reshape(*xk.shape[:-1], -1, 2)
 
     xq_ = jax.lax.complex(reshape_xq[..., 0], reshape_xq[..., 1])
     xk_ = jax.lax.complex(reshape_xk[..., 0], reshape_xk[..., 1])
@@ -239,8 +239,8 @@ def apply_rotary_emb(
 
 class FlaxMistralMLP(nn.Module):
     config: MistralConfig
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
+    dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[None, jax.lax.Precision]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
@@ -263,8 +263,8 @@ class FlaxMistralMLP(nn.Module):
 
 class FlaxMistralAttention(nn.Module):
     config: MistralConfig
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
+    dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[None, jax.lax.Precision]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
@@ -383,8 +383,8 @@ class FlaxMistralAttention(nn.Module):
 
 class FlaxMistralDecoderLayer(nn.Module):
     config: MistralConfig
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
+    dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[None, jax.lax.Precision]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
@@ -453,7 +453,7 @@ class FlaxMistralPretrainedModel(FlaxPreTrainedModel):
                  config: MistralConfig,
                  input_shape: Tuple = (1, 1),
                  seed: int = 0,
-                 dtype: jnp.dtype = jnp.float32,
+                 dtype: jnp.dtype = jnp.bfloat16,
                  _do_init: bool = True,
                  **kwargs
                  ):
@@ -582,8 +582,8 @@ class FlaxMistralPretrainedModel(FlaxPreTrainedModel):
 
 class FlaxMistralDecoratorCollection(nn.Module):
     config: MistralConfig
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
+    dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[None, jax.lax.Precision]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
@@ -651,8 +651,8 @@ class FlaxMistralDecoratorCollection(nn.Module):
 
 class FlaxMistralModule(nn.Module):
     config: MistralConfig
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
+    dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self):
@@ -737,8 +737,8 @@ class FlaxMistralModel(FlaxMistralPretrainedModel):
 
 class FlaxMistralForCausalLMModule(nn.Module):
     config: MistralConfig
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
+    dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self):
