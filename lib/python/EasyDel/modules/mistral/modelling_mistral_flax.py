@@ -207,8 +207,8 @@ def precompute_freq_cis(
         else:
             raise ValueError(f'unknown {method} method for precompute_freq_cis')
 
-    freq = jnp.outer(t, freq).astype(jnp.float32)
-    sin, cos = jnp.sin(freq).astype(jnp.float32), jnp.cos(freq).astype(jnp.float32)
+    freq = jnp.outer(t, freq).astype(jnp.bfloat16)
+    sin, cos = jnp.sin(freq).astype(jnp.bfloat16), jnp.cos(freq).astype(jnp.bfloat16)
     freq_cis = jnp.complex64(cos + 1j * sin)
     return jnp.asarray(freq_cis)
 
@@ -219,8 +219,8 @@ def apply_rotary_emb(
         freq_cis: jnp.ndarray,
         dtype: jnp.dtype = jnp.bfloat16,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    reshape_xq = xq.astype(jnp.bfloat16).reshape(*xq.shape[:-1], -1, 2)
-    reshape_xk = xk.astype(jnp.bfloat16).reshape(*xk.shape[:-1], -1, 2)
+    reshape_xq = xq.astype(jnp.float32).reshape(*xq.shape[:-1], -1, 2)
+    reshape_xk = xk.astype(jnp.float32).reshape(*xk.shape[:-1], -1, 2)
 
     xq_ = jax.lax.complex(reshape_xq[..., 0], reshape_xq[..., 1])
     xk_ = jax.lax.complex(reshape_xk[..., 0], reshape_xk[..., 1])
@@ -797,7 +797,7 @@ class FlaxMistralForCausalLMModule(nn.Module):
         else:
             lm_logits = self.lm_head(hidden_states)
 
-        lm_logits = lm_logits.astype(jnp.float32)
+        # lm_logits = lm_logits.astype(jnp.float32)
 
         if not return_dict:
             return (lm_logits,) + outputs[1:]
