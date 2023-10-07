@@ -376,7 +376,8 @@ class FlaxMistralAttention(nn.Module):
             attn_weight = with_sharding_constraint(attn_weight, PS(("dp", "fsdp"), "mp", None, None))
         attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weight, v)
         attn_output = attn_output.reshape(attn_output.shape[:2] + (self.hidden_size,))
-        outputs = (attn_output, attn_weight) if output_attentions else (attn_output,)
+        out = self.o_proj(attn_output)
+        outputs = (out, attn_output) if output_attentions else (out,)
         return outputs
 
 
