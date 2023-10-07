@@ -8,12 +8,12 @@ from ..modules.mistral import MistralConfig
 
 
 def inverse_permute(tensor, head, dim_in, dim_out):
-    return tensor.reshape(head, 2, dim_in // head // 2, dim_out).transpose(0, 2, 1, 3).reshape(
+    return tensor.reshape(head, 2, dim_out // head // 2, dim_in).transpose(0, 2, 1, 3).reshape(
         dim_out, dim_in)
 
 
 def permute(tensor, head, dim_in, dim_out):
-    return tensor.view(head, dim_in // head // 2, 2, dim_out).transpose(1, 2).reshape(dim_in, dim_out)
+    return tensor.view(head, dim_out // head // 2, 2, dim_in).transpose(1, 2).reshape(dim_out, dim_in)
 
 
 def mistral_convert_hf_to_flax_load(checkpoints_dir, config: MistralConfig,
