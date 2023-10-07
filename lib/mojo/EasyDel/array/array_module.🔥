@@ -334,13 +334,34 @@ struct Array[T: DType]:
             raise Error(
                 "The Passed input dims to swap are not accept able for function"
             )
-        if len(_dims) > 3:
-            raise Error("Only 3D or 2D arrays are accepted for transpose right now")
+        if len(_dims) != 3:
+            raise Error("Only 3D arrays are accepted for transpose right now")
         for f in range(len(_dims)):
             res_shape.push_back(self.dim(_dims[f]))
-        let res = Self(res_shape)
+        var res = Self(res_shape)
         res.alloc()
         res.fill(0.0)
+        # let SL :Int= self.dim(0)
+        let RL: Int = self.dim(1)
+        let CL: Int = self.dim(2)
+        let RR: Int = res.dim(1)
+        let CR: Int = res.dim(2)
+
+        @parameter
+        fn self_index(layer: Int, row: Int, cols: Int) -> Int:
+            return layer * RL * CL + row * CL + cols
+
+        fn res_index(layer: Int, row: Int, cols: Int) -> Int:
+            return layer * RR * CR + row * CR + cols
+
+        @parameter
+        fn index_s(inout C: Int, i: Int, j: Int, k: Int, s: Int):
+            if _dims[s] == 0:
+                C = i
+            elif _dims[s] == 1:
+                C = j
+            elif _dims[s] == 2:
+                C = k
 
         for i in range(res.dim(0)):
             var s = 0
@@ -348,7 +369,10 @@ struct Array[T: DType]:
             var e = 0
             for j in range(res.dim(-2)):
                 for k in range(res.dim(-1)):
-                    res[self.get_dynamic_axis(i, j, k)] = self[s, d, e]
+                    index_s(s, i, j, k, 0)
+                    index_s(d, i, j, k, 1)
+                    index_s(e, i, j, k, 2)
+                    res[res_index(i, j, k)] = self[self_index(s, d, e)]
         return res
 
     fn reshape(inout self, *dims: Int) raises:
