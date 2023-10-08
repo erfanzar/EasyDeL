@@ -11,6 +11,10 @@ from .array import (
     matmul_2d,
     matmul,
     softmax,
+    silu,
+    relu,
+    leaky_relu,
+    sigmoid,
 )
 from .in_out import File, BufReader
 from .tokenizer import Tokenizer, load_tokenizer, byte_pr_tokenizer_encoder

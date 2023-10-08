@@ -11,4 +11,4 @@ from .array_utils import (
     matmul_2d,
     matmul,
 )
-from .funcs import softmax
+from .funcs import softmax, silu, relu, leaky_relu, sigmoid
