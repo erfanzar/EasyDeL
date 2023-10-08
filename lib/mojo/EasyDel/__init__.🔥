@@ -10,6 +10,7 @@ from .array import (
     matmul_shape,
     matmul_2d,
     matmul,
+    softmax,
 )
 from .in_out import File, BufReader
 from .tokenizer import Tokenizer, load_tokenizer, byte_pr_tokenizer_encoder

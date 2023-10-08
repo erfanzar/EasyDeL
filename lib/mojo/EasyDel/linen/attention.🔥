@@ -26,6 +26,8 @@ fn rms_norm[
     fn _do_element_wise[_nelts: Int](size: Int):
         C.store[_nelts](size, x.load[_nelts](size) * normed * w.load[_nelts](size))
 
+    vectorize[nelts, _do_element_wise](x.num_elements())
+
 
 fn rope_rotation_multi_query[
     T: DType

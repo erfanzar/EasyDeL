@@ -1,0 +1,29 @@
+from .array_module import Array, ArrayShape
+from algorithm.functional import vectorize
+import math.math
+
+
+fn softmax[nelts: Int, T: DType](inout x: Array[T]) -> None:
+    var max_val: SIMD[T, 1] = SIMD[T, 1](-1e9)
+
+    @parameter
+    fn _max[_nelts: Int](j: Int):
+        let val = x.load[_nelts](j).reduce_max()
+        if val > max_val:
+            max_val = val
+
+    vectorize[nelts, _max](x.num_elements())
+    var sum_val: SIMD[T, 1] = 0.0
+
+    @parameter
+    fn _sum_exp[_nelts: Int](j: Int):
+        x.store[_nelts](j, math.exp(x.load[_nelts](j) - max_val))
+        sum_val += x.load[_nelts](j).reduce_add()
+
+    vectorize[nelts, _sum_exp](x.num_elements())
+
+    @parameter
+    fn _norm[_nelts: Int](j: Int):
+        x.store[_nelts](j, x.load[_nelts](j) / sum_val)
+
+    vectorize[nelts, _norm](x.num_elements())
