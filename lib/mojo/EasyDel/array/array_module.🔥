@@ -550,7 +550,7 @@ struct Array[T: DType]:
             "dimension aren't equal, can't do operation element wise.",
         )
 
-        let res = Self(self.array_shape)
+        var res = Self(self.array_shape)
         res.alloc()
         let size = self.array_shape.num_elements()
 
