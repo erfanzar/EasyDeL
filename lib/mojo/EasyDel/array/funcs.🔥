@@ -4,7 +4,7 @@ import math.math
 from algorithm.functional import parallelize, vectorize
 
 
-fn softmax[nelts: Int, T: DType](inout x: Array[T]) -> None:
+fn softmax[T: DType, nelts: Int = 1](inout x: Array[T]) -> None:
     var max_val: SIMD[T, 1] = SIMD[T, 1](-1e9)
 
     @parameter

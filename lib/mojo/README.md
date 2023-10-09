@@ -17,7 +17,7 @@ Array API can be used just like Numpy Arrays For example
 import EasyDel as ed
 
 
-fn run[nelts: Int, T: DType]() raises:
+fn run[T: DType, nelts: Int = 1]() raises:
     # Let Create Two 4D Array
     var A: ed.Array[T] = ed.Array[T](1, 1, 128, 80)
     var B: ed.Array[T] = ed.Array[T](1, 1, 80, 128)
@@ -43,7 +43,7 @@ fn run[nelts: Int, T: DType]() raises:
     # Array by default is randomized so we fill array with zeros
     C_result_matmul_Array.fill(0.0)
 
-    ed.matmul[nelts, T](C_result_matmul_Array, A, B)
+    ed.matmul[T ,nelts](C_result_matmul_Array, A, B)
     # Method Number Two (Not recommended at all)
     # Due to Mojo language Bugs this feature apply the same code as above but you get wierd result
     var C = A @ B
