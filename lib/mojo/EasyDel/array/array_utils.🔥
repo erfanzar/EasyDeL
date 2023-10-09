@@ -28,7 +28,7 @@ fn convert_numpy_to_easydel_array[
 
 
 fn matmul_2d[
-    nelts: Int, T: DType
+    T: DType, nelts: Int = 1
 ](inout C: Array[T], A: Array[T], B: Array[T], num_workers: Int = 1) -> None:
     if C.allocated == 0:
         C.alloc()
@@ -63,12 +63,12 @@ fn matmul_2d[
 
 
 fn matmul[
-    nelts: Int, T: DType
+    T: DType, nelts: Int = 1
 ](inout C: Array[T], A: Array[T], B: Array[T], num_workers: Int = 1) raises -> None:
     if C.allocated == 0:
         C.alloc()
     if A.rank() == 2 and B.rank() == 1 and C.rank() == 1:
-        matmul_single_row[nelts, T](C, A, B, num_workers)
+        matmul_single_row[T ,nelts](C, A, B, num_workers)
         return
     C.fill(0.0)
     if A.rank() != B.rank():
@@ -126,7 +126,7 @@ fn matmul_shape[T: DType](A: Array[T], B: Array[T]) -> ArrayShape:
 
 
 fn matmul_single_row[
-    nelts: Int, T: DType
+    T: DType, nelts: Int = 1
 ](inout C: Array[T], A: Array[T], B: Array[T], num_workers: Int = 1):
     if not (A.rank() == 2 and B.rank() == 1 and C.rank() == 1):
         print("Report Matmul Bug in matmul_single_row")
