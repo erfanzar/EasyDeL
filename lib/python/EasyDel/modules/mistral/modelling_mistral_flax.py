@@ -704,7 +704,9 @@ class FlaxMistralModule(nn.Module):
     ) -> typing.Union[Tuple[Array, ...], FlaxBaseModelOutput]:
         if input_embeds is None:
             input_embeds = self.embed_tokens(input_ids.astype("i4"))
-
+        if attention_mask.ndim == 2:
+            b, s = attention_mask.shape
+            attention_mask = attention_mask.reshape(b, 1, 1, s)
         outputs = self.layers(
             hidden_state=input_embeds,
             attention_mask=attention_mask,
