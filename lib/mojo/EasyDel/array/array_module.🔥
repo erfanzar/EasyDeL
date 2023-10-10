@@ -433,41 +433,31 @@ struct Array[T: DType]:
     # i * r * Te.dim(2) + k * r + j
 
     @always_inline
-    fn store[
-        nelts: Int
-    ](self, d1: Int, d2: Int, d3: Int, val: SIMD[T, nelts]) raises -> None:
-        if self.rank() != 3:
-            raise Error("Miss match os requested shape (3D Store)")
+    fn store[nelts: Int](self, d1: Int, d2: Int, d3: Int, val: SIMD[T, nelts]) -> None:
+        debug_assert(self.rank() != 3, "Miss match os requested shape (3D Store)")
         let index = d1 * self.dim(-2) * self.dim(-1) + d2 * self.dim(-1) + d3
-        if index > self.num_elements():
-            raise Error("Out OF range in Store 3D")
+        debug_assert(index > self.num_elements(), "Out OF range in Store 3D")
         self.data.simd_store[nelts](index, val)
 
     @always_inline
-    fn store[nelts: Int](self, d1: Int, d2: Int, val: SIMD[T, nelts]) raises -> None:
-        if self.rank() != 2:
-            raise Error("Miss match os requested shape (2D Store)")
+    fn store[nelts: Int](self, d1: Int, d2: Int, val: SIMD[T, nelts]) -> None:
+        debug_assert(self.rank() != 2, "Miss match os requested shape (2D Store)")
         let index = d1 * self.dim(-1) + d2
-        if index > self.num_elements():
-            raise Error("Out OF range in Store 2D")
+        debug_assert(index > self.num_elements(), "Out OF range in Store 2D")
         self.data.simd_store[nelts](index, val)
 
     @always_inline
-    fn load[nelts: Int](self, d1: Int, d2: Int, d3: Int) raises -> SIMD[T, nelts]:
-        if self.rank() != 3:
-            raise Error("Miss match os requested shape (3D Load)")
+    fn load[nelts: Int](self, d1: Int, d2: Int, d3: Int) -> SIMD[T, nelts]:
+        debug_assert(self.rank() != 3, "Miss match os requested shape (3D Load)")
         let index = d1 * self.dim(-2) * self.dim(-1) + d2 * self.dim(-1) + d3
-        if index > self.num_elements():
-            raise Error("Out OF range in Load 3D")
+        debug_assert(index > self.num_elements(), "Out OF range in Load 3D")
         return self.data.simd_load[nelts](index)
 
     @always_inline
-    fn load[nelts: Int](self, d1: Int, d2: Int) raises -> SIMD[T, nelts]:
-        if self.rank() != 2:
-            raise Error("Miss match os requested shape (2D Load)")
+    fn load[nelts: Int](self, d1: Int, d2: Int) -> SIMD[T, nelts]:
+        debug_assert(self.rank() != 2, "Miss match os requested shape (2D Load)")
         let index = d1 * self.dim(-1) + d2
-        if index > self.num_elements():
-            raise Error("Out OF range in Load 2D")
+        debug_assert(index > self.num_elements(), "Out OF range in Load 2D")
         return self.data.simd_load[nelts](index)
 
     @always_inline

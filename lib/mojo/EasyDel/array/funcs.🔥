@@ -82,7 +82,7 @@ fn leaky_relu[
 
 # POINTER FUNC #
 
-
+@always_inline
 fn softmax[T: DType, nelts: Int](inout x: DTypePointer[T], num_elements: Int) -> None:
     var max_val: SIMD[T, 1] = SIMD[T, 1](-1e9)
 
@@ -108,7 +108,7 @@ fn softmax[T: DType, nelts: Int](inout x: DTypePointer[T], num_elements: Int) ->
 
     vectorize[nelts, _norm](num_elements)
 
-
+@always_inline
 fn sigmoid[
     T: DType
 ](inout x: DTypePointer[T], num_elements: Int, number_of_cores: Int = 1) -> None:
@@ -118,7 +118,7 @@ fn sigmoid[
 
     parallelize[_row](num_elements, number_of_cores)
 
-
+@always_inline
 fn silu[
     T: DType
 ](inout x: DTypePointer[T], num_elements: Int, number_of_cores: Int = 1) -> None:
@@ -129,7 +129,7 @@ fn silu[
 
     parallelize[_row](num_elements, number_of_cores)
 
-
+@always_inline
 fn relu[
     T: DType
 ](inout x: DTypePointer[T], num_elements: Int, number_of_cores: Int = 1) -> None:
@@ -140,7 +140,7 @@ fn relu[
 
     parallelize[_row](num_elements, number_of_cores)
 
-
+@always_inline
 fn leaky_relu[
     T: DType
 ](
