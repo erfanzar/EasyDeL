@@ -4,7 +4,8 @@ import math.math
 from algorithm.functional import parallelize, vectorize
 
 
-fn softmax[ T: DType, nelts: Int](inout x: Array[T]) -> None:
+fn softmax[T: DType, nelts: Int](inout x: Array[T], size: Int = 0) -> None:
+    let num_elements: Int = x.num_elements() if size == 0 else size
     var max_val: SIMD[T, 1] = SIMD[T, 1](-1e9)
 
     @parameter
@@ -13,7 +14,7 @@ fn softmax[ T: DType, nelts: Int](inout x: Array[T]) -> None:
         if val > max_val:
             max_val = val
 
-    vectorize[nelts, _max](x.num_elements())
+    vectorize[nelts, _max](num_elements)
     var sum_val: SIMD[T, 1] = 0.0
 
     @parameter
@@ -21,47 +22,136 @@ fn softmax[ T: DType, nelts: Int](inout x: Array[T]) -> None:
         x.store[_nelts](j, math.exp(x.load[_nelts](j) - max_val))
         sum_val += x.load[_nelts](j).reduce_add()
 
-    vectorize[nelts, _sum_exp](x.num_elements())
+    vectorize[nelts, _sum_exp](num_elements)
 
     @parameter
     fn _norm[_nelts: Int](j: Int):
         x.store[_nelts](j, x.load[_nelts](j) / sum_val)
 
-    vectorize[nelts, _norm](x.num_elements())
+    vectorize[nelts, _norm](num_elements)
 
 
-fn sigmoid[T: DType](inout x: Array[T], number_of_cores: Int = 1) -> None:
+fn sigmoid[
+    T: DType
+](inout x: Array[T], number_of_cores: Int = 1, size: Int = 0) -> None:
+    let num_elements: Int = x.num_elements() if size == 0 else size
+
     @parameter
     fn _row(size: Int):
         x[size] = 1.0 / (1.0 + math.exp(-x[size]))
 
-    parallelize[_row](x.num_elements(), number_of_cores)
+    parallelize[_row](num_elements, number_of_cores)
 
 
-fn silu[T: DType](inout x: Array[T], number_of_cores: Int = 1) -> None:
+fn silu[T: DType](inout x: Array[T], number_of_cores: Int = 1, size: Int = 0) -> None:
+    let num_elements: Int = x.num_elements() if size == 0 else size
+
     @parameter
     fn _row(size: Int):
         let dt: SIMD[T, 1] = x[size]
         x[size] = dt * (1.0 / (1.0 + math.exp(-dt)))
 
-    parallelize[_row](x.num_elements(), number_of_cores)
+    parallelize[_row](num_elements, number_of_cores)
 
 
-fn relu[T: DType](inout x: Array[T], number_of_cores: Int = 1) -> None:
+fn relu[T: DType](inout x: Array[T], number_of_cores: Int = 1, size: Int = 0) -> None:
+    let num_elements: Int = x.num_elements() if size == 0 else size
+
     @parameter
     fn _row(size: Int):
         let dt: SIMD[T, 1] = x[size]
         x[size] = dt if dt > 0 else 0.0
 
-    parallelize[_row](x.num_elements(), number_of_cores)
+    parallelize[_row](num_elements, number_of_cores)
 
 
 fn leaky_relu[
     T: DType
-](inout x: Array[T], drop: SIMD[T, 1] = 0.1, number_of_cores: Int = 1) -> None:
+](
+    inout x: Array[T], drop: SIMD[T, 1] = 0.1, number_of_cores: Int = 1, size: Int = 0
+) -> None:
+    let num_elements: Int = x.num_elements() if size == 0 else size
+
     @parameter
     fn _row(size: Int):
         let dt: SIMD[T, 1] = x[size]
         x[size] = dt if dt > drop else drop
 
-    parallelize[_row](x.num_elements(), number_of_cores)
+    parallelize[_row](num_elements, number_of_cores)
+
+
+# POINTER FUNC #
+
+
+fn softmax[T: DType, nelts: Int](inout x: DTypePointer[T], num_elements: Int) -> None:
+    var max_val: SIMD[T, 1] = SIMD[T, 1](-1e9)
+
+    @parameter
+    fn _max[_nelts: Int](j: Int):
+        let val = x.simd_load[_nelts](j).reduce_max()
+        if val > max_val:
+            max_val = val
+
+    vectorize[nelts, _max](num_elements)
+    var sum_val: SIMD[T, 1] = 0.0
+
+    @parameter
+    fn _sum_exp[_nelts: Int](j: Int):
+        x.simd_store[_nelts](j, math.exp(x.simd_load[_nelts](j) - max_val))
+        sum_val += x.simd_load[_nelts](j).reduce_add()
+
+    vectorize[nelts, _sum_exp](num_elements)
+
+    @parameter
+    fn _norm[_nelts: Int](j: Int):
+        x.simd_store[_nelts](j, x.simd_load[_nelts](j) / sum_val)
+
+    vectorize[nelts, _norm](num_elements)
+
+
+fn sigmoid[
+    T: DType
+](inout x: DTypePointer[T], num_elements: Int, number_of_cores: Int = 1) -> None:
+    @parameter
+    fn _row(size: Int):
+        x.store(size, 1.0 / (1.0 + math.exp(-x.load(size))))
+
+    parallelize[_row](num_elements, number_of_cores)
+
+
+fn silu[
+    T: DType
+](inout x: DTypePointer[T], num_elements: Int, number_of_cores: Int = 1) -> None:
+    @parameter
+    fn _row(size: Int):
+        let dt: SIMD[T, 1] = x.load(size)
+        x.store(size, dt * (1.0 / (1.0 + math.exp(-dt))))
+
+    parallelize[_row](num_elements, number_of_cores)
+
+
+fn relu[
+    T: DType
+](inout x: DTypePointer[T], num_elements: Int, number_of_cores: Int = 1) -> None:
+    @parameter
+    fn _row(size: Int):
+        let dt: SIMD[T, 1] = x.load(size)
+        x.store(size, dt if dt > 0 else 0.0)
+
+    parallelize[_row](num_elements, number_of_cores)
+
+
+fn leaky_relu[
+    T: DType
+](
+    inout x: DTypePointer[T],
+    num_elements: Int,
+    drop: SIMD[T, 1] = 0.1,
+    number_of_cores: Int = 1,
+) -> None:
+    @parameter
+    fn _row(size: Int):
+        let dt: SIMD[T, 1] = x.load(size)
+        x.store(size, dt if dt > drop else drop)
+
+    parallelize[_row](num_elements, number_of_cores)
