@@ -68,7 +68,7 @@ fn matmul[
     if C.allocated == 0:
         C.alloc()
         C.fill(0.0)
-    if A.rank() == 2 and B.rank() == 1 and C.rank() == 1:
+    if A.rank() == 2 and B.rank() == 1 and (C.rank() == 1 or C.rank() == 2):
         matmul_single_row[T, nelts](C, A, B, num_cores)
         return
     if A.rank() != B.rank():
@@ -128,7 +128,7 @@ fn matmul_shape[T: DType](A: Array[T], B: Array[T]) -> ArrayShape:
 fn matmul_single_row[
     T: DType, nelts: Int
 ](inout C: Array[T], A: Array[T], B: Array[T], num_cores: Int = 1):
-    if not (A.rank() == 2 and B.rank() == 1 and C.rank() == 1):
+    if not (A.rank() == 2 and B.rank() == 1 and (C.rank() == 1 or C.rank() == 2)):
         print("Report Matmul Bug in matmul_single_row")
     if C.allocated == 0:
         C.alloc()
@@ -137,14 +137,19 @@ fn matmul_single_row[
 
     @parameter
     fn _loop(i: Int):
-        @parameter
-        fn element_wise[_nelts: Int](j: Int):
-            let tensor: SIMD[T, _nelts] = C.data.simd_load[_nelts](
-                i
-            ) + A.data.simd_load[_nelts](i * A_C + j) * B.data.simd_load[_nelts](j)
-            C.data.simd_store[1](i, tensor.reduce_add())
+        var tensor = SIMD[T, nelts](0)
 
-        vectorize[nelts, element_wise](A_C)
+        @parameter
+        fn dot[_nelts: Int](j: Int):
+            if _nelts < nelts:
+                tensor[0] += (
+                    A.load[_nelts](i * A_C + j) * B.load[_nelts](j)
+                ).reduce_add()
+            else:
+                tensor += A.load[nelts](i * A_C + j) * B.load[nelts](j)
+
+        vectorize[nelts, dot](A_C)
+        C[i] = tensor.reduce_add()
 
     parallelize[_loop](A.dim(-2), num_cores)
 
@@ -161,19 +166,18 @@ fn matmul_single_row[
 ):
     @parameter
     fn _loop(i: Int):
-        var tensor = SIMD[T, nelts](0.0)
+        var tensor = SIMD[T, nelts](0)
 
         @parameter
-        fn element_wise[_nelts: Int](j: Int):
-            let idx = i * AC + j
+        fn dot[_nelts: Int](j: Int):
             if _nelts < nelts:
                 tensor[0] += (
-                    A.simd_load[_nelts](idx) * B.simd_load[_nelts](j)
+                    A.simd_load[_nelts](i * AC + j) * B.simd_load[_nelts](j)
                 ).reduce_add()
             else:
-                tensor += A.simd_load[nelts](idx) * B.simd_load[nelts](j)
+                tensor += A.simd_load[nelts](i * AC + j) * B.simd_load[nelts](j)
 
-        vectorize[nelts, element_wise](AC)
-        C.simd_store[1](i, tensor.reduce_add())
+        vectorize[nelts, dot](AC)
+        C.store(i, tensor.reduce_add())
 
     parallelize[_loop](AR, num_cores)
