@@ -8,6 +8,7 @@ from .array_module import Array, ArrayShape
 from .array_utils import (
     convert_numpy_to_easydel_array,
     matmul_shape,
+    matmul_single_row,
     matmul_2d,
     matmul,
 )

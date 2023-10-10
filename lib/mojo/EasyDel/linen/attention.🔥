@@ -1,5 +1,5 @@
 from ..array import Array, ArrayShape
-from algorithm.functional import vectorize
+from algorithm.functional import vectorize, parallelize
 from math import math
 
 
@@ -39,18 +39,21 @@ fn rope_rotation_multi_query[
     num_attention_heads: Int,
     num_key_value_heads: Int,
     head_dims: Int,
+    num_cores: Int = 1,
 ) -> None:
-    let off_rot = 1
-    for i in range(num_attention_heads):
+    @parameter
+    fn head_loop(i: Int):
         for j in range(0, head_dims, 2):
-            let cu_fcr = fcr_row.offset(j // 2).load(0)
-            let cu_fci = fci_row.offset(j // 2).load(0)
-            let q0 = q.load[1](i * head_dims + j)
-            let q1 = q.load[1](i * head_dims + j + off_rot)
-            q.store[1](i * head_dims + j, q0 * cu_fcr - q1 * cu_fci)
-            q.store[1](i * head_dims + j + off_rot, q0 * cu_fci + q1 * cu_fcr)
+            let fcr = fcr_row.load(j // 2)
+            let fci = fci_row.load(j // 2)
+            let q0 = q[i * head_dims + j]
+            let q1 = q[i * head_dims + j + 1]
+            q[i * head_dims + j] = q0 * fcr - q1 * fci
+            q[i * head_dims + j + 1] = q0 * fci + q1 * fcr
             if i < num_key_value_heads:
-                let k0 = k.load[1](i * head_dims + j)
-                let k1 = k.load[1](i * head_dims + j + off_rot)
-                k.store[1](i * head_dims + j, k0 * cu_fcr - k1 * cu_fci)
-                k.store[1](i * head_dims + j + off_rot, k0 * cu_fci + k1 * cu_fcr)
+                let k0 = k[i * head_dims + j]
+                let k1 = k[i * head_dims + j + 1]
+                k[i * head_dims + j] = k0 * fcr - k1 * fci
+                k[i * head_dims + j + 1] = k0 * fci + k1 * fcr
+
+    parallelize[head_loop](num_attention_heads, num_cores)
