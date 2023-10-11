@@ -3,11 +3,18 @@ from algorithm.functional import vectorize, parallelize
 from math import math
 
 
+@always_inline
 fn rms_norm[
-    T: DType
-](inout C: Array[T], x: Array[T], w: Array[T], epsilon: SIMD[T, 1]) -> None:
-    alias nelts: Int = Array[T].nelts
+    T: DType, nelts: Int
+](
+    inout C: Array[T],
+    x: Array[T],
+    w: Array[T],
+    epsilon: SIMD[T, 1],
+    num_elements: Int = 0,
+) -> None:
     var sp: SIMD[T, nelts] = SIMD[T, nelts](0.0)
+    let nml: Int = num_elements if num_elements > 0 else x.num_elements()
 
     @parameter
     fn _do_sum_pow[_nelts: Int](size: Int):
@@ -16,24 +23,24 @@ fn rms_norm[
         else:
             sp += x.load[nelts](size) ** 2
 
-    vectorize[nelts, _do_sum_pow](x.num_elements())
+    vectorize[nelts, _do_sum_pow](nml)
     var normed: SIMD[T, 1] = sp.reduce_add()
-    normed /= x.num_elements()
-    normed += epsilon
+    normed = normed / nml + epsilon
     normed = 1.0 / math.sqrt(normed)
 
     @parameter
-    fn _do_element_wise[_nelts: Int](size: Int):
-        C.store[_nelts](size, x.load[_nelts](size) * normed * w.load[_nelts](size))
+    fn _do_element_wise[_nelts: Int](j: Int):
+        let val = w.data.simd_load[_nelts](j) * normed * x.data.simd_load[_nelts](j)
+        C.data.offset(j).simd_store[_nelts](0, val)
 
-    vectorize[nelts, _do_element_wise](x.num_elements())
+    vectorize[nelts, _do_element_wise](nml)
 
 
-fn rope_rotation_multi_query[
+fn rope[
     T: DType
 ](
-    inout q: Array[T],
-    inout k: Array[T],
+    inout q_array: Array[T],
+    inout k_array: Array[T],
     fcr_row: DTypePointer[T],
     fci_row: DTypePointer[T],
     num_attention_heads: Int,
@@ -42,18 +49,18 @@ fn rope_rotation_multi_query[
     num_cores: Int = 1,
 ) -> None:
     @parameter
-    fn head_loop(i: Int):
+    fn _row(i: Int):
         for j in range(0, head_dims, 2):
-            let fcr = fcr_row.load(j // 2)
-            let fci = fci_row.load(j // 2)
-            let q0 = q[i * head_dims + j]
-            let q1 = q[i * head_dims + j + 1]
-            q[i * head_dims + j] = q0 * fcr - q1 * fci
-            q[i * head_dims + j + 1] = q0 * fci + q1 * fcr
+            let fcr = fcr_row.offset(j // 2).load(0)
+            let fci = fci_row.offset(j // 2).load(0)
+            let q0 = q_array.data.offset(i * head_dims + j).load(0)
+            let q1 = q_array.data.offset(i * head_dims + j + 1).load(0)
+            q_array.data.offset(i * head_dims + j).store(0, q0 * fcr - q1 * fci)
+            q_array.data.offset(i * head_dims + j + 1).store(0, q0 * fci + q1 * fcr)
             if i < num_key_value_heads:
-                let k0 = k[i * head_dims + j]
-                let k1 = k[i * head_dims + j + 1]
-                k[i * head_dims + j] = k0 * fcr - k1 * fci
-                k[i * head_dims + j + 1] = k0 * fci + k1 * fcr
+                let k0 = k_array.data.offset(i * head_dims + j).load(0)
+                let k1 = k_array.data.offset(i * head_dims + j + 1).load(0)
+                k_array.data.offset(i * head_dims + j).store(0, k0 * fcr - k1 * fci)
+                k_array.data.offset(i * head_dims + j + 1).store(0, k0 * fci + k1 * fcr)
 
-    parallelize[head_loop](num_attention_heads, num_cores)
+    parallelize[_row](num_attention_heads, num_cores)

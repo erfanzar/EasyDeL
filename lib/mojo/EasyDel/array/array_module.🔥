@@ -289,29 +289,36 @@ struct Array[T: DType]:
         if self.allocated == 1:
             self.data.free()
 
+    @always_inline
     fn set_data_from_buffer(inout self: Self, buffer: DTypePointer[T]) -> None:
         self.data = buffer
         # self.allocated = 1
 
+    @always_inline
     fn alloc(inout self: Self) -> None:
         r"""Allocate or Init The Array."""
         self.data = self.ArrayPointer.alloc(self.array_shape.num_elements())
         self.allocated = 1
 
+    @always_inline
     fn random(inout self: Self) -> None:
         r"""Randomize The Data if the Array is Allocated."""
         if self.allocated == 1:
             rand[T](self.data, self.array_shape.num_elements())
 
+    @always_inline
     fn dim(self: Self, i: Int) -> Int:
         return self.array_shape.dim(i)
 
+    @always_inline
     fn rank(self: Self) -> Int:
         return self.array_shape.rank()
 
+    @always_inline
     fn num_elements(self: Self) -> Int:
         return self.array_shape.num_elements()
 
+    @always_inline
     fn get_dynamic_axis(self: Self, *dims: Int) raises -> Int:
         let variadic: VariadicList[Int] = VariadicList[Int](dims)
         let slice_dv: DynamicVector[Int] = DynamicVector[Int]()
@@ -327,6 +334,7 @@ struct Array[T: DType]:
             raise Error("Index out Of the Range (pad > self.num_elements)")
         return pad
 
+    @always_inline
     fn transpose(self: Self, *dims: Int) raises -> Self:
         var res_shape: DynamicVector[Int] = DynamicVector[Int]()
         let _dims = VariadicList[Int](dims)
@@ -528,6 +536,7 @@ struct Array[T: DType]:
     fn __getitem__(self, d1: Int, d2: Int) raises -> SIMD[T, 1]:
         return self.load[1](d1, d2)
 
+    @always_inline
     fn __element_wise_tensor_operation__[
         nelts: Int,
         outer_loop_func: fn[func: fn (Int) capturing -> None] (Int) capturing -> None,
