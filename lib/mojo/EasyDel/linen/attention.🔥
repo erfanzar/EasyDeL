@@ -73,9 +73,9 @@ fn attention_weight[
 ](
     C: Array[T],
     attn: Array[T],
-    q: Array[T],
-    k_cache: Array[T],
-    v_cache: Array[T],
+    query: Array[T],
+    key_cache: Array[T],
+    value_cache: Array[T],
     pad: Int,
     head_dims: Int,
     number_rep_kv: Int,
@@ -87,18 +87,26 @@ fn attention_weight[
 ):
     @parameter
     fn _calculate_each_head(head_index: Int):
+        let q_offset = head_index * head_dims
+        let attn_offset = head_index * max_position_embeddings
         let kv_dims: Int = num_key_value_heads * head_dims
-        let q_ = q.data.offset(head_index * head_dims)
-        var C_AT = attn.data.offset(head_index * max_position_embeddings)
+        let q_ = query.data.offset(q_offset)
+        var C_AT = attn.data.offset(attn_offset)
         for position_index in range(position + 1):
             let k_offset = pad + position_index * kv_dims + (
                 head_index // number_rep_kv
             ) * head_dims
-            let k = k_cache.data.offset(k_offset)
+            let k = key_cache.data.offset(k_offset)
 
             var score: SIMD[T, 1] = SIMD[T, 1](0.0)
-            for dim_index in range(head_dims):
-                score += k.offset(dim_index).load(0) * q_.offset(dim_index).load(0)
+
+            @parameter
+            fn _qk[_nelts: Int](idx: Int):
+                score += (
+                    q_.simd_load[_nelts](q_offset + idx) * k.simd_load[_nelts](idx)
+                ).reduce_add()
+
+            vectorize[nelts,_qk](head_dims)
 
             score /= math.sqrt[T, 1](head_dims)
 
@@ -111,10 +119,15 @@ fn attention_weight[
             let v_offset: Int = pad + position_index * kv_dims + (
                 head_index // number_rep_kv
             ) * head_dims
-            let v = v_cache.data.offset(v_offset)
+            let v = value_cache.data.offset(v_offset)
             let A = C_AT.offset(position_index).load(0)
-            for ii in range(head_dims):
-                let x_ = H_S.offset(ii).load(0) + A * v.offset(ii).load(0)
-                H_S.offset(ii).store(0, x_)
+            @parameter
+            fn _wv[_nelts: Int](i: Int):
+                let xbi = H_S.simd_load[_nelts](
+                    i
+                ) + A * v.simd_load[_nelts](i)
+                H_S.simd_store[_nelts](i,xbi)
+
+            vectorize[nelts, _wv](head_dims)
 
     parallelize[_calculate_each_head](num_attention_heads, num_cores)
