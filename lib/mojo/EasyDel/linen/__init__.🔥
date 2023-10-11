@@ -1,1 +1,1 @@
-from .attention import rms_norm, rope_rotation_multi_query as rope
+from .attention import rms_norm, rope
