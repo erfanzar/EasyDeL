@@ -251,10 +251,10 @@ struct State[T: DType]:
 
     fn __init__(inout self: Self, config: LlamaConfig):
         self.k_cache = Array[T](
-            config.num_hidden_layers, config.max_position_embeddings, config.head_dims
+            config.num_hidden_layers, config.max_position_embeddings, config.kv_dims
         )
         self.v_cache = Array[T](
-            config.num_hidden_layers, config.max_position_embeddings, config.head_dims
+            config.num_hidden_layers, config.max_position_embeddings, config.kv_dims
         )
 
         self.input_layernorm = Array[T](config.hidden_size)
@@ -347,6 +347,8 @@ fn llama_forward[
             state.hidden_state,
             state.number_of_cores,
         )
+        # print("PASS Query Calculation")
+
         state.k.set_data_from_buffer(
             state.k_cache.data.offset(pad + position * config.kv_dims)
         )
@@ -361,7 +363,7 @@ fn llama_forward[
             state.hidden_state,
             state.number_of_cores,
         )
-
+        # print("PASS Key Calculation")
         state.v.set_data_from_buffer(
             state.v_cache.data.offset(pad + position * config.kv_dims)
         )
@@ -376,6 +378,7 @@ fn llama_forward[
             state.hidden_state,
             state.number_of_cores,
         )
+        # print("PASS Value Calculation")
 
         rope[T](
             q_array=state.q,
