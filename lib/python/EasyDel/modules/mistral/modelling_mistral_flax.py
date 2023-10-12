@@ -1,4 +1,5 @@
 import functools
+import typing
 
 import flax.core
 from jax import jit, random, grad, numpy as jnp, Array
@@ -12,7 +13,7 @@ from transformers import PretrainedConfig, FlaxPreTrainedModel
 from flax.linen import partitioning as nn_partitioning
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 
-from ..flax_modelling_utils import ACT2FN, with_sharding_constraint
+from ..flax_modelling_utils import ACT2FN, with_sharding_constraint, get_gradient_checkpoint_policy
 
 
 class MistralConfig(PretrainedConfig):
@@ -44,6 +45,7 @@ class MistralConfig(PretrainedConfig):
             scan_mlp_chunk_size: int = 1024,
             number_rep_kv: int = 1,
             attn_pdrop: float = 0.0,
+            c_max_position_embeddings: int = 4096,
             **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -73,6 +75,7 @@ class MistralConfig(PretrainedConfig):
         self.flash_attn_key_chunk_size = flash_attn_key_chunk_size
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.attn_pdrop = attn_pdrop
+        self.c_max_position_embeddings = c_max_position_embeddings
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -81,8 +84,43 @@ class MistralConfig(PretrainedConfig):
             **kwargs,
         )
 
-    def get_partition_rules(self, fully_fsdp: bool = True):
-        ...
+    @staticmethod
+    def get_partition_rules(fully_fsdp: bool = True):
+        return (
+
+            ("model/embed_tokens/embedding", PS("dp", "fsdp")),
+
+            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PS("fsdp", "dp")),
+            ("self_attn/o_proj/kernel", PS("dp", "fsdp")),
+
+            ("mlp/gate_proj/kernel", PS("fsdp", "dp")),
+            ("mlp/down_proj/kernel", PS("dp", "fsdp")),
+            ("mlp/up_proj/kernel", PS("fsdp", "dp")),
+
+            ("input_layernorm/kernel", PS(None)),
+            ("post_attention_layernorm/kernel", PS(None)),
+
+            ("model/norm/kernel", PS(None)),
+            ("lm_head/kernel", PS("fsdp", "dp")),
+            ('.*', PS(None)),
+        ) if not fully_fsdp else (
+
+            ("model/embed_tokens/embedding", PS("fsdp")),
+
+            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PS("fsdp")),
+            ("self_attn/o_proj/kernel", PS("fsdp")),
+
+            ("mlp/gate_proj/kernel", PS("fsdp")),
+            ("mlp/down_proj/kernel", PS("fsdp")),
+            ("mlp/up_proj/kernel", PS("fsdp")),
+
+            ("input_layernorm/kernel", PS(None)),
+            ("post_attention_layernorm/kernel", PS(None)),
+
+            ("model/norm/kernel", PS(None)),
+            ("lm_head/kernel", PS("fsdp")),
+            ('.*', PS('fsdp')),
+        )
 
     def add_jax_args(self,
                      gradient_checkpointing: str = 'nothing_saveable',
@@ -94,6 +132,7 @@ class MistralConfig(PretrainedConfig):
                      scan_mlp_chunk_size: int = 1024,
                      number_rep_kv: int = 1,
                      attn_pdrop: float = 0.0,
+                     c_max_position_embeddings: int = 4096
                      ):
         self.use_flash_attention = use_flash_attention
         self.number_rep_kv = number_rep_kv
@@ -104,6 +143,7 @@ class MistralConfig(PretrainedConfig):
         self.flash_attn_key_chunk_size = flash_attn_key_chunk_size
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.attn_pdrop = attn_pdrop
+        self.c_max_position_embeddings = c_max_position_embeddings
 
     @staticmethod
     def get_weight_decay_exclusions():
@@ -121,16 +161,19 @@ def repeat_kv(x: jax.Array, n_rep: int) -> jax.Array:
     bs, s, n_kv_heads, head_dim = x.shape
     if n_rep == 1:
         return x
+    x = x[:, :, :, jnp.newaxis, :]
+    x = jnp.repeat(x, n_rep, axis=3)
 
-    return jnp.expand_dims(x[:, :, :, None, :], (bs, s, n_kv_heads, n_rep, head_dim)).reshape(bs, s, n_kv_heads * n_rep,
-                                                                                              head_dim)
+    return x.reshape(bs, s,
+                     n_kv_heads * n_rep,
+                     head_dim)
 
 
 class MistralRMSNorm(nn.Module):
     dim: int
     eps: float = 1e-6
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
+    dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.bfloat16
 
     def setup(self) -> None:
         self.weight = self.param(
@@ -168,8 +211,8 @@ def precompute_freq_cis(
         else:
             raise ValueError(f'unknown {method} method for precompute_freq_cis')
 
-    freq = jnp.outer(t, freq).astype(jnp.float32)
-    sin, cos = jnp.sin(freq).astype(jnp.float32), jnp.cos(freq).astype(jnp.float32)
+    freq = jnp.outer(t, freq).astype(jnp.bfloat16)
+    sin, cos = jnp.sin(freq).astype(jnp.bfloat16), jnp.cos(freq).astype(jnp.bfloat16)
     freq_cis = jnp.complex64(cos + 1j * sin)
     return jnp.asarray(freq_cis)
 
@@ -178,7 +221,7 @@ def apply_rotary_emb(
         xq: jnp.ndarray,
         xk: jnp.ndarray,
         freq_cis: jnp.ndarray,
-        dtype: jnp.dtype = jnp.float32,
+        dtype: jnp.dtype = jnp.bfloat16,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     reshape_xq = xq.astype(jnp.float32).reshape(*xq.shape[:-1], -1, 2)
     reshape_xk = xk.astype(jnp.float32).reshape(*xk.shape[:-1], -1, 2)
@@ -200,8 +243,8 @@ def apply_rotary_emb(
 
 class FlaxMistralMLP(nn.Module):
     config: MistralConfig
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
+    dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[None, jax.lax.Precision]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
@@ -224,8 +267,8 @@ class FlaxMistralMLP(nn.Module):
 
 class FlaxMistralAttention(nn.Module):
     config: MistralConfig
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
+    dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[None, jax.lax.Precision]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
@@ -332,18 +375,20 @@ class FlaxMistralAttention(nn.Module):
             dropout_rate=self.config.attn_pdrop,
             precision=self.precision
         )
+
         if self.config.use_pjit_attention_force:
             attn_weight = with_sharding_constraint(attn_weight, PS(("dp", "fsdp"), "mp", None, None))
         attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weight, v)
         attn_output = attn_output.reshape(attn_output.shape[:2] + (self.hidden_size,))
-        outputs = (attn_output, attn_weight) if output_attentions else (attn_output,)
+        out = self.o_proj(attn_output)
+        outputs = (out, attn_output) if output_attentions else (out,)
         return outputs
 
 
 class FlaxMistralDecoderLayer(nn.Module):
     config: MistralConfig
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
+    dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[None, jax.lax.Precision]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
@@ -412,7 +457,7 @@ class FlaxMistralPretrainedModel(FlaxPreTrainedModel):
                  config: MistralConfig,
                  input_shape: Tuple = (1, 1),
                  seed: int = 0,
-                 dtype: jnp.dtype = jnp.float32,
+                 dtype: jnp.dtype = jnp.bfloat16,
                  _do_init: bool = True,
                  **kwargs
                  ):
@@ -513,15 +558,6 @@ class FlaxMistralPretrainedModel(FlaxPreTrainedModel):
         else:
             mutable = False
 
-        # input_ids: jax.Array
-        # attention_mask: jax.Array
-        # position_ids: jax.Array
-        # deterministic: bool = True
-        # input_embeds: jax.Array = None
-        # init_cache: bool = False
-        # output_attentions: bool = False
-        # output_hidden_states: bool = False
-        # return_dict: bool = True
         outputs = self.module.apply(
             inputs,
             jnp.array(input_ids, dtype="i4"),
@@ -550,13 +586,22 @@ class FlaxMistralPretrainedModel(FlaxPreTrainedModel):
 
 class FlaxMistralDecoratorCollection(nn.Module):
     config: MistralConfig
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
+    dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[None, jax.lax.Precision]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
+        block = FlaxMistralDecoderLayer
+        if self.config.gradient_checkpointing != '':
+            block = remat(
+                block,
+                static_argnums=(5, 6, 7),
+                policy=get_gradient_checkpoint_policy(
+                    self.config.gradient_checkpointing
+                )
+            )
         self.layers = [
-            FlaxMistralDecoderLayer(
+            block(
                 config=self.config,
                 dtype=self.dtype,
                 param_dtype=self.param_dtype,
@@ -582,15 +627,23 @@ class FlaxMistralDecoratorCollection(nn.Module):
         for layer in self.layers:
             if output_hidden_states:
                 all_hidden_states += (hidden_state,)
+            # hidden_state: jax.Array,
+            # freq_cis: jax.Array,
+            # attention_mask: jax.Array,
+            # causal_mask: jax.Array,
+            # position_ids: jax.Array,
+            # deterministic: bool = True,
+            # init_cache: bool = False,
+            # output_attentions: bool = True
             output = layer(
-                hidden_state=hidden_state,
-                freq_cis=freq_cis,
-                attention_mask=attention_mask,
-                causal_mask=causal_mask,
-                position_ids=position_ids,
-                deterministic=deterministic,
-                init_cache=init_cache,
-                output_attentions=output_attentions
+                hidden_state,
+                freq_cis,
+                attention_mask,
+                causal_mask,
+                position_ids,
+                deterministic,
+                init_cache,
+                output_attentions
             )
             hidden_state = output[0]
 
@@ -602,8 +655,8 @@ class FlaxMistralDecoratorCollection(nn.Module):
 
 class FlaxMistralModule(nn.Module):
     config: MistralConfig
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
+    dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self):
@@ -634,7 +687,7 @@ class FlaxMistralModule(nn.Module):
             dim=self.config.hidden_size // self.config.num_attention_heads,
             end=self.config.max_position_embeddings * 2
         )
-        self.causal_mask = nn.make_causal_mask(jnp.ones(1, self.config.max_position_embeddings))
+        self.causal_mask = nn.make_causal_mask(jnp.ones((1, self.config.c_max_position_embeddings), dtype='i4'))
 
     def __call__(
             self,
@@ -648,10 +701,12 @@ class FlaxMistralModule(nn.Module):
             output_hidden_states: bool = False,
             return_dict: bool = True,
 
-    ) -> Tuple[Array, ...] | FlaxBaseModelOutput:
+    ) -> typing.Union[Tuple[Array, ...], FlaxBaseModelOutput]:
         if input_embeds is None:
             input_embeds = self.embed_tokens(input_ids.astype("i4"))
-
+        if attention_mask.ndim == 2:
+            b, s = attention_mask.shape
+            attention_mask = attention_mask.reshape(b, 1, 1, s)
         outputs = self.layers(
             hidden_state=input_embeds,
             attention_mask=attention_mask,
@@ -688,8 +743,8 @@ class FlaxMistralModel(FlaxMistralPretrainedModel):
 
 class FlaxMistralForCausalLMModule(nn.Module):
     config: MistralConfig
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
+    dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self):
@@ -711,9 +766,10 @@ class FlaxMistralForCausalLMModule(nn.Module):
     def __call__(
             self,
             input_ids: jax.Array,
-            attention_mask: jax.Array = None,
-            position_ids: jax.Array = None,
+            attention_mask: jax.Array,
+            position_ids: jax.Array,
             deterministic: bool = True,
+            input_embeds: jax.Array = None,
             init_cache: bool = False,
             output_attentions: bool = False,
             output_hidden_states: bool = False,
@@ -732,6 +788,7 @@ class FlaxMistralForCausalLMModule(nn.Module):
             attention_mask=attention_mask,
             position_ids=position_ids,
             deterministic=deterministic,
+            input_embeds=input_embeds,
             init_cache=init_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -746,7 +803,7 @@ class FlaxMistralForCausalLMModule(nn.Module):
         else:
             lm_logits = self.lm_head(hidden_states)
 
-        lm_logits = lm_logits.astype(jnp.float32)
+        # lm_logits = lm_logits.astype(jnp.float32)
 
         if not return_dict:
             return (lm_logits,) + outputs[1:]

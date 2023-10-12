@@ -13,8 +13,8 @@ import transformers
 import uvicorn
 from fastapi import FastAPI
 from fjutils import make_shard_and_gather_fns, match_partition_rules, with_sharding_constraint
-from typing import Optional, List, Union, Tuple
-from EasyDel.smi import get_mem, initialise_tracking
+from typing import Optional, List, Tuple
+from ..smi import get_mem, initialise_tracking
 from flax.core import freeze
 from flax.traverse_util import unflatten_dict
 from jax import numpy as jnp
@@ -25,12 +25,68 @@ from pydantic import BaseModel
 from fjutils import get_float_dtype_by_name
 from jax.sharding import Mesh, PartitionSpec as Ps
 from transformers import GenerationConfig, TextIteratorStreamer
-from EasyDel.serve import seafoam
 import logging
-from EasyDel.utils import RNG
+from ..utils import RNG
 import multiprocessing as mp
 import torch
-from EasyDel.utils import prefix_str
+from ..utils import prefix_str
+from gradio.themes.base import Base
+from gradio.themes.utils import colors, fonts, sizes
+from typing import Union
+
+
+class Seafoam(Base):
+    def __init__(
+            self,
+            *,
+            primary_hue: Union[colors.Color, str] = colors.emerald,
+            secondary_hue: Union[colors.Color, str] = colors.blue,
+            neutral_hue: Union[colors.Color, str] = colors.gray,
+            spacing_size: Union[sizes.Size, str] = sizes.spacing_md,
+            radius_size: Union[sizes.Size, str] = sizes.radius_md,
+            text_size: Union[sizes.Size, str] = sizes.text_lg,
+            font: Union[fonts.Font, str]
+            = (
+                    fonts.GoogleFont("Quicksand"),
+                    "ui-sans-serif",
+                    "sans-serif",
+            ),
+            font_mono: Union[fonts.Font, str]
+            = (
+                    fonts.GoogleFont("IBM Plex Mono"),
+                    "ui-monospace",
+                    "monospace",
+            ),
+    ):
+        super().__init__(
+            primary_hue=primary_hue,
+            secondary_hue=secondary_hue,
+            neutral_hue=neutral_hue,
+            spacing_size=spacing_size,
+            radius_size=radius_size,
+            text_size=text_size,
+            font=font,
+            font_mono=font_mono,
+
+        )
+        super().set(
+            body_background_fill="linear-gradient(90deg, *secondary_800, *neutral_900)",
+            body_background_fill_dark="linear-gradient(90deg, *secondary_800, *neutral_900)",
+            button_primary_background_fill="linear-gradient(90deg, *primary_300, *secondary_400)",
+            button_primary_background_fill_hover="linear-gradient(90deg, *primary_200, *secondary_300)",
+            button_primary_text_color="white",
+            button_primary_background_fill_dark="linear-gradient(90deg, *primary_600, *secondary_800)",
+            slider_color="*secondary_300",
+            slider_color_dark="*secondary_400",
+            block_title_text_weight="600",
+            block_border_width="0px",
+            block_shadow="*shadow_drop_lg",
+            button_shadow="*shadow_drop_lg",
+            button_large_padding="4px",
+        )
+
+
+seafoam = Seafoam()
 
 pjit = pjit.pjit
 
@@ -138,6 +194,15 @@ class JaxServerConfig:
         assert max_new_tokens % max_stream_tokens == 0, \
             'max_new_tokens should be divisible by  max_new_tokens' \
             f'{max_new_tokens % max_stream_tokens}'
+
+    def __getitem__(self, item):
+        if hasattr(self, item):
+            return getattr(self, item)
+        else:
+            raise KeyError(f'{item} not found !')
+
+    def __setitem__(self, key, value):
+        setattr(self, key, value)
 
 
 class JAXServer(object):
