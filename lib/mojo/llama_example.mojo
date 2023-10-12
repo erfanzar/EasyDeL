@@ -60,7 +60,7 @@ fn run[
         byte_pr_tokenizer_encoder(prompt_tokens, prompt, tokenizer)
 
     while position < steps:
-        llama_forward[T, nelts](input_id, position, llama, state, config)
+        llama_forward[T, nelts](input_id, position, llama, state, config, True)
         if position < len(prompt_tokens):
             next_input_id = prompt_tokens[position]
         else:
@@ -97,9 +97,10 @@ fn main() raises:
     var steps: Int = 512
     var start: Int = -1
     var prompt: StringRef = ""
-    var checkpoint_path: StringRef = StringRef("stories.bin")
+    var checkpoint_path: StringRef = StringRef("weights.bin")
     var tokenizer_path: StringRef = StringRef("tokenizer.bin")
     var rng_seed: Int = time.now()
+    var verbose: Bool = True
 
     @parameter
     fn argparse() raises -> Int:
@@ -113,6 +114,9 @@ fn main() raises:
                 steps = atol(args[i + 1])
             if args[i] == "--tokenizer-path":
                 tokenizer_path = args[i + 1]
+            if args[i] == "-v":
+                let eva = atol(args[i + 1])
+                verbose = True if eva == 1 else False
             if args[i] == "--seed" or args[i] == "-s":
                 rng_seed = atol(args[i + 1])
             if args[i] == "--prompt" or args[i] == "-p":
@@ -133,6 +137,8 @@ fn main() raises:
         return 1
 
     let res = argparse()
+    if res == 0:
+        return
     random.seed(rng_seed)
     run[DTYPE, Array[DTYPE].nelts](
         checkpoint_path,
@@ -144,4 +150,5 @@ fn main() raises:
         steps,
         start,
         prompt,
+        verbose,
     )
