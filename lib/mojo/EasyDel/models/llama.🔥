@@ -302,6 +302,7 @@ fn llama_forward[
     weights: LlamaWeights[T],
     inout state: LlamaState[T],
     config: LlamaConfig,
+    fp32_attn: Bool = True,
 ) raises:
     let PO = PointerOperation[T]()
     let q_size: Int = config.hidden_size * (
@@ -322,7 +323,6 @@ fn llama_forward[
 
     let fci_row = weights.fci.data.offset(position * config.head_dims // 2)
     let fcr_row = weights.fcr.data.offset(position * config.head_dims // 2)
-
 
     for layer_index in range(config.num_hidden_layers):
         let pad: Int = layer_index * config.max_position_embeddings * config.kv_dims
@@ -418,7 +418,7 @@ fn llama_forward[
         )
 
         # APPLY RESIDUAL FOR ATTN(NORM(X)) + X
-        PO.add(x.data, state.o.data, config.hidden_size)
+        PO.add(x.data, state.o.data, config.hidden_size, state.number_of_cores)
         # FeedForward or MLP Layer
 
         rms_norm[T, nelts](
@@ -472,7 +472,7 @@ fn llama_forward[
         )
         # APPLY RESIDUAL FOR MLP(NORM(X)) + X
 
-        PO.add(x.data, state.ffd_out.data, config.hidden_size)
+        PO.add(x.data, state.ffd_out.data, config.hidden_size, state.number_of_cores)
 
     rms_norm[T, nelts](x, x, Array[T](weights.norm.data, config.hidden_size), 1e-5)
     matmul[T, nelts](
