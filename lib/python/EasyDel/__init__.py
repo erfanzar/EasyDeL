@@ -12,7 +12,7 @@ try:
 except ValueError as vr:
     print(f"\033[1;31mWarning\033[1;0m : JAXServer Wont be Imported Be Cause {vr}")
     JAXServer = None
-__version__ = "0.0.30"
+__version__ = "0.0.31"
 
 # import os
 #

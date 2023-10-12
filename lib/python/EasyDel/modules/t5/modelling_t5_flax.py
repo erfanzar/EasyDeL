@@ -42,7 +42,6 @@ from transformers.modeling_flax_utils import (
 )
 
 from transformers import PretrainedConfig
-from jax.experimental.pjit import with_sharding_constraint as wsc
 from jax.sharding import PartitionSpec
 
 from ..flax_modelling_utils import get_gradient_checkpoint_policy, \

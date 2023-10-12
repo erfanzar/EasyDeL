@@ -94,7 +94,7 @@ you can use this function outside the class like this
 
 ```python
 for string, num_used_tokens in server.process(
-        'im an string',
+        'im a string',
         greedy=False,
         max_new_tokens=256  # or None to use Maximum numbers passed in Config
 ):

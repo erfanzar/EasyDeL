@@ -52,7 +52,7 @@ class LlamaConfig(PretrainedConfig):
             flash_attn_key_chunk_size: int = 1024,
             scan_mlp_chunk_size: int = 1024,
             from_pt: bool = False,
-            attn_type='llama2',
+            attn_type='llama',
             **kwargs,
     ):
 
@@ -222,9 +222,12 @@ def repeat_kv(x: jax.Array, n_rep: int) -> jax.Array:
     bs, s, n_kv_heads, head_dim = x.shape
     if n_rep == 1:
         return x
+    x = x[:, :, :, jnp.newaxis, :]
+    x = jnp.repeat(x, n_rep, axis=3)
 
-    return jnp.expand_dims(x[:, :, :, None, :], (bs, s, n_kv_heads, n_rep, head_dim)).reshape(bs, s, n_kv_heads * n_rep,
-                                                                                              head_dim)
+    return x.reshape(bs, s,
+                     n_kv_heads * n_rep,
+                     head_dim)
 
 
 class RMSNorm(nn.Module):
@@ -524,7 +527,8 @@ class FlaxLlamaAttention(nn.Module):
                     attn_output = with_sharding_constraint(attn_output, PS(("dp", "fsdp"), None, "mp", None))
                 attn_output = self._merge_heads(attn_output)
             else:
-
+                print(f"Q : {xq.shape}")
+                print(f"K : {xk.shape}")
                 attn_weights = dot_product_attention_weights(
                     query=xq,
                     key=xk,
@@ -534,6 +538,7 @@ class FlaxLlamaAttention(nn.Module):
                     dropout_rate=self.config.attn_pdrop,
                     precision=self.precision,
                 )
+                print(f"A : {attn_weights.shape}")
                 if self.config.use_pjit_attention_force:
                     attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "mp", None, None))
 
