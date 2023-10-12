@@ -12,5 +12,5 @@ from .array_utils import (
     matmul_2d,
     matmul,
 )
-from .funcs import softmax, silu, relu, leaky_relu, sigmoid
+from .funcs import softmax, silu, relu, leaky_relu, sigmoid, sample_array
 from .ed_struct import PointerOperation
