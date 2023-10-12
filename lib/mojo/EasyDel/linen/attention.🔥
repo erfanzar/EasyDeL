@@ -68,15 +68,13 @@ fn rope[
 
 
 @always_inline
-fn attention_weight[
+fn dot_product_attention_weights[
     T: DType, nelts: Int
 ](
-    C: Array[T],
-    attn: Array[T],
+    attention: Array[T],
     query: Array[T],
     key_cache: Array[T],
-    value_cache: Array[T],
-    pad: Int,
+    padding: Int,
     head_dims: Int,
     number_rep_kv: Int,
     max_position_embeddings: Int,
@@ -85,48 +83,108 @@ fn attention_weight[
     num_attention_heads: Int,
     num_cores: Int = 1,
 ):
+    r"""
+    Calculates Q@K/Sqrt(HeadDims).
+    """
+
     @parameter
     fn _calculate_each_head(head_index: Int):
         let q_offset = head_index * head_dims
         let attn_offset = head_index * max_position_embeddings
         let kv_dims: Int = num_key_value_heads * head_dims
-        let q_ = query.data.offset(q_offset)
-        var C_AT = attn.data.offset(attn_offset)
+        var C_AT = attention.data.offset(attn_offset)
         for position_index in range(position + 1):
-            let k_offset = pad + position_index * kv_dims + (
+           let k_offset = padding + position_index * kv_dims + (
                 head_index // number_rep_kv
             ) * head_dims
-            let k = key_cache.data.offset(k_offset)
-
-            var score: SIMD[T, 1] = SIMD[T, 1](0.0)
-
+            var score: SIMD[T, nelts] = SIMD[T, nelts](0.0)
             @parameter
             fn _qk[_nelts: Int](idx: Int):
-                score += (
-                    q_.simd_load[_nelts](q_offset + idx) * k.simd_load[_nelts](idx)
-                ).reduce_add()
+                if _nelts < nelts:
+                    score[0] += (
+                        query.data.simd_load[_nelts](q_offset + idx)
+                        * key_cache.data.simd_load[_nelts](k_offset + idx)
+                    ).reduce_add()
+                else:
+                    score += query.data.simd_load[nelts](
+                        q_offset + idx
+                    ) * key_cache.data.simd_load[nelts](k_offset + idx)
+              
 
-            vectorize[nelts,_qk](head_dims)
+            vectorize[nelts, _qk](head_dims)
+            score /= math.sqrt[T, nelts](head_dims)
 
-            score /= math.sqrt[T, 1](head_dims)
+            C_AT.offset(position_index).store(0, score.reduce_add())
+        softmax[T, nelts](C_AT, position + 1)
 
-            C_AT.offset(position_index).store(0, score)
+    parallelize[_calculate_each_head](num_attention_heads, num_cores)
+
+
+@always_inline
+fn dot_product_attention[
+    T: DType, nelts: Int
+](
+    inout C: Array[T],
+    inout attention: Array[T],
+    query: Array[T],
+    key_cache: Array[T],
+    value_cache: Array[T],
+    padding: Int,
+    head_dims: Int,
+    number_rep_kv: Int,
+    max_position_embeddings: Int,
+    position: Int,
+    num_key_value_heads: Int,
+    num_attention_heads: Int,
+    num_cores: Int = 1,
+) -> NoneType:
+    r"""
+    Calculates (Q@K/Sqrt(HeadDims))@V.
+    """
+
+    @parameter
+    fn _calculate_each_head(head_index: Int):
+        let q_offset = head_index * head_dims
+        let attn_offset = head_index * max_position_embeddings
+        let kv_dims: Int = num_key_value_heads * head_dims
+        var C_AT = attention.data.offset(attn_offset)
+        for position_index in range(position + 1):
+            let k_offset = padding + position_index * kv_dims + (
+                head_index // number_rep_kv
+            ) * head_dims
+            var score: SIMD[T, nelts] = SIMD[T, nelts](0.0)
+            @parameter
+            fn _qk[_nelts: Int](idx: Int):
+                if _nelts < nelts:
+                    score[0] += (
+                        query.data.simd_load[_nelts](q_offset + idx)
+                        * key_cache.data.simd_load[_nelts](k_offset + idx)
+                    ).reduce_add()
+                else:
+                    score += query.data.simd_load[nelts](
+                        q_offset + idx
+                    ) * key_cache.data.simd_load[nelts](k_offset + idx)
+              
+
+            vectorize[nelts, _qk](head_dims)
+            score /= math.sqrt[T, nelts](head_dims)
+
+            C_AT.offset(position_index).store(0, score.reduce_add())
         softmax[T, nelts](C_AT, position + 1)
 
         let H_S = C.data.offset(head_index * head_dims)
         memset_zero(H_S, head_dims)
         for position_index in range(position + 1):
-            let v_offset: Int = pad + position_index * kv_dims + (
+            let v_offset: Int = padding + position_index * kv_dims + (
                 head_index // number_rep_kv
             ) * head_dims
             let v = value_cache.data.offset(v_offset)
             let A = C_AT.offset(position_index).load(0)
+
             @parameter
             fn _wv[_nelts: Int](i: Int):
-                let xbi = H_S.simd_load[_nelts](
-                    i
-                ) + A * v.simd_load[_nelts](i)
-                H_S.simd_store[_nelts](i,xbi)
+                let xbi = H_S.simd_load[_nelts](i) + A * v.simd_load[_nelts](i)
+                H_S.simd_store[_nelts](i, xbi)
 
             vectorize[nelts, _wv](head_dims)
 
