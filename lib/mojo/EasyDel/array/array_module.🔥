@@ -1286,6 +1286,15 @@ struct Array[T: DType]:
     fn acosh(inout self: Self, num_cores: Int) -> Self:
         return self.__apply_math__[acosh](num_cores)
 
+    fn argmax(self: Self, axis: Int = -1) -> Int:
+        var max_index: Int = 0
+        var max_value: SIMD[T, 1] = self[0]
+        for i in range(self.dim(axis)):
+            if self[i] > max_value:
+                max_index = i
+                max_value = self[i]
+        return max_index
+
     fn fill(inout self: Self, val: SIMD[T, 1]) -> None:
         for i in range(self.num_elements()):
             self.data.store(i, val)
