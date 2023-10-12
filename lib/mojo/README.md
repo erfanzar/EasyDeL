@@ -7,7 +7,7 @@ There are several reasons why building packages in Mojo is more efficient than i
 ## Docs
 
 * _EasyDel Mojo🔥_ :
-    * [README Tree🔥](https://erfanzar.github.io/EasyDeL/lib/mojo)
+  * [README Tree🔥](https://erfanzar.github.io/EasyDeL/lib/mojo)
 
 ## Array API
 
@@ -80,50 +80,63 @@ fn main() raises:
 
 #### Math Supported Operation For Arrays
 
-| Operation | Array[DT.F64]                                 | Array[DT.F32]                                 | Array[DT.F16]                                 | Array[DT.BF16]                                |
-| --------- | --------------------------------------------- | --------------------------------------------- | --------------------------------------------- | --------------------------------------------- |
-| `Sqrt`    | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) |
-| `Sin`     | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) |
-| `Cos`     | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) |
-| `Tanh`    | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) |
-| `Tan`     | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) |
-| `Log`     | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) |
-| `Log2`    | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) |
-| `Atan`    | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) |
-| `Exp`     | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) |
-| `Exp2`    | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) |
-| `Pow`     | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) |
-| `Log10`   | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) |
-| `Log1p`   | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) |
-| `Logb`    | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) |
-| `Asin`    | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) |
-| `Acos`    | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) |
-| `Acosh`   | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) |
+| Operation | Array[DT.F64]                               | Array[DT.F32]                               | Array[DT.F16]                               | Array[DT.BF16]                              |
+| --------- | ------------------------------------------- | ------------------------------------------- | ------------------------------------------- | ------------------------------------------- |
+| `Sqrt`  | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) |
+| `Sin`   | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) |
+| `Cos`   | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) |
+| `Tanh`  | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) |
+| `Tan`   | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) |
+| `Log`   | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) |
+| `Log2`  | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) |
+| `Atan`  | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) |
+| `Exp`   | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) |
+| `Exp2`  | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) |
+| `Pow`   | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) |
+| `Log10` | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) |
+| `Log1p` | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) |
+| `Logb`  | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) |
+| `Asin`  | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) |
+| `Acos`  | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) |
+| `Acosh` | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) | [✅](https://emojipedia.org/check-mark-button) |
 
 #### Supported Operations Between Arrays
 
-| Operation Sign | Func              | Supported Array TO Array                      | Supported Array TO SIMD |
-| -------------- | ----------------- | --------------------------------------------- | ----------------------- |
-| `+`            | `__add__()`       | [✅](https://emojipedia.org/check-mark-button) | ❌ Not Yet               |
-| `-`            | `__sub__()`       | [✅](https://emojipedia.org/check-mark-button) | ❌ Not Yet               |
-| `*`            | `__mul__()`       | [✅](https://emojipedia.org/check-mark-button) | ❌ Not Yet               |
-| `/`            | `__truediv__()`   | [✅](https://emojipedia.org/check-mark-button) | ❌ Not Yet               |
-| `//`           | `__floordiv__()`  | ❌ Not Yet                                     | ❌ Not Yet               |
-| `@`            | `__matmul__()`    | [✅](https://emojipedia.org/check-mark-button) | ❌ Not Yet               |
-| `%`            | `__mod__()`       | [✅](https://emojipedia.org/check-mark-button) | ❌ Not Yet               |
-| `**`           | `__pow__()`       | [✅](https://emojipedia.org/check-mark-button) | ❌ Not Yet               |
-| `+=`           | `__iadd__()`      | [✅](https://emojipedia.org/check-mark-button) | ❌ Not Yet               |
-| `-=`           | `__isub__()`      | [✅](https://emojipedia.org/check-mark-button) | ❌ Not Yet               |
-| `*=`           | `__imul__()`      | [✅](https://emojipedia.org/check-mark-button) | ❌ Not Yet               |
-| `/=`           | `__itruediv__()`  | [✅](https://emojipedia.org/check-mark-button) | ❌ Not Yet               |
-| `//=`          | `__ifloordiv__()` | ❌ Not Yet                                     | ❌ Not Yet               |
-| `**=`          | `__ipow__()`      | [✅](https://emojipedia.org/check-mark-button) | ❌ Not Yet               |
-| `==`           | `__eq__()`        | [✅](https://emojipedia.org/check-mark-button) | ❌ Not Yet               |
-| `!=`           | `__ne__()`        | [✅](https://emojipedia.org/check-mark-button) | ❌ Not Yet               |
-| `<`            | `__lt__()`        | [✅](https://emojipedia.org/check-mark-button) | ❌ Not Yet               |
-| `>`            | `__gt__()`        | [✅](https://emojipedia.org/check-mark-button) | ❌ Not Yet               |
-| `[]`           | `__getitem__()`   | [✅](https://emojipedia.org/check-mark-button) | ❌ Not Yet               |
-| `[]`           | `__setitem__()`   | [✅](https://emojipedia.org/check-mark-button) | ❌ Not Yet               |
+| Operation Sign | Func                | Supported Array TO Array                    | Supported Array TO SIMD |
+| -------------- | ------------------- | ------------------------------------------- | ----------------------- |
+| `+`          | `__add__()`       | [✅](https://emojipedia.org/check-mark-button) | ❌ Not Yet              |
+| `-`          | `__sub__()`       | [✅](https://emojipedia.org/check-mark-button) | ❌ Not Yet              |
+| `*`          | `__mul__()`       | [✅](https://emojipedia.org/check-mark-button) | ❌ Not Yet              |
+| `/`          | `__truediv__()`   | [✅](https://emojipedia.org/check-mark-button) | ❌ Not Yet             |
+| `//`         | `__floordiv__()`  | ❌ Not Yet                                 | ❌ Not Yet             |
+| `@`          | `__matmul__()`    | [✅](https://emojipedia.org/check-mark-button) | ❌ Not Yet             |
+| `%`          | `__mod__()`       | [✅](https://emojipedia.org/check-mark-button) | ❌ Not Yet             |
+| `**`         | `__pow__()`       | [✅](https://emojipedia.org/check-mark-button) | ❌ Not Yet             |
+| `+=`         | `__iadd__()`      | [✅](https://emojipedia.org/check-mark-button) | ❌ Not Yet             |
+| `-=`         | `__isub__()`      | [✅](https://emojipedia.org/check-mark-button) | ❌ Not Yet             |
+| `*=`         | `__imul__()`      | [✅](https://emojipedia.org/check-mark-button) | ❌ Not Yet             |
+| `/=`         | `__itruediv__()`  | [✅](https://emojipedia.org/check-mark-button) | ❌ Not Yet             |
+| `//=`        | `__ifloordiv__()` | ❌ Not Yet                                 | ❌ Not Yet             |
+| `**=`        | `__ipow__()`      | [✅](https://emojipedia.org/check-mark-button) | ❌ Not Yet             |
+| `==`         | `__eq__()`        | [✅](https://emojipedia.org/check-mark-button) | ❌ Not Yet             |
+| `!=`         | `__ne__()`        | [✅](https://emojipedia.org/check-mark-button) | ❌ Not Yet             |
+| `<`          | `__lt__()`        | [✅](https://emojipedia.org/check-mark-button) | ❌ Not Yet             |
+| `>`          | `__gt__()`        | [✅](https://emojipedia.org/check-mark-button) | ❌ Not Yet             |
+| `[]`         | `__getitem__()`   | [✅](https://emojipedia.org/check-mark-button) | ❌ Not Yet             |
+| `[]`         | `__setitem__()`   | [✅](https://emojipedia.org/check-mark-button) | ❌ Not Yet             |
+
+
+
+### Supported Operations For PointerOperation
+
+| Func  | Suppots                                     |
+| ----- | ------------------------------------------- |
+| ADD   | [✅](https://emojipedia.org/check-mark-button) |
+| MUL   | [✅](https://emojipedia.org/check-mark-button) |
+| MOD   | [✅](https://emojipedia.org/check-mark-button) |
+| DIV   | [✅](https://emojipedia.org/check-mark-button) |
+| T-DIV | [✅](https://emojipedia.org/check-mark-button) |
+| SUB   | [✅](https://emojipedia.org/check-mark-button) |
 
 ### Road Map
 
@@ -131,7 +144,7 @@ fn main() raises:
 * [X] Build Utils
 * [X] Build StreamReader To Read Data from Buffer
 * [X] Build Array API
-* [ ] Add Examples to use Library
-* [ ] Build Attention Library
+* [X] Add Examples to use Library
+* [X] Build Attention Library
 * [ ] Build Linen API
 * [ ] Gradient Support
