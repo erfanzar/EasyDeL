@@ -289,10 +289,14 @@ struct Array[T: DType]:
         if self.allocated == 1:
             self.data.free()
 
+    fn init_from_buffer(inout self: Self, buffer: DTypePointer[T], *dim: Int) -> None:
+        self.array_shape = ArrayShape(VariadicList(dim))
+        self.data = buffer
+        self.allocated = 0
+
     @always_inline
     fn set_data_from_buffer(inout self: Self, buffer: DTypePointer[T]) -> None:
         self.data = buffer
-        # self.allocated = 1
 
     @always_inline
     fn alloc(inout self: Self) -> None:
@@ -383,6 +387,7 @@ struct Array[T: DType]:
                     res[res_index(i, j, k)] = self[self_index(s, d, e)]
         return res
 
+    @always_inline
     fn reshape(inout self, *dims: Int) raises:
         let current_nelm = self.num_elements()
         let vs: VariadicList[Int] = VariadicList[Int](dims)
@@ -419,6 +424,38 @@ struct Array[T: DType]:
             self.array_shape = ArrayShape(vs)
 
     @always_inline
+    fn view(inout self, *dims: Int):
+        r"""
+        View Change Shape totaly and don't care if the new shape fits or doesn't.
+        """
+        let current_nelm = self.num_elements()
+        let vs: VariadicList[Int] = VariadicList[Int](dims)
+        var dynamic_index: Bool = False
+        for i in range(len(vs)):
+            if vs[i] == -1:
+                dynamic_index = True
+        if dynamic_index:
+            var vvs: DynamicVector[Int] = DynamicVector[Int]()
+            var num_elms: Int = 1
+            for i in range(len(vs)):
+                if vs[i] != -1:
+                    num_elms *= vs[i]
+
+            for i in range(len(vs)):
+                if vs[i] == -1:
+                    vvs.push_back(current_nelm // num_elms)
+                else:
+                    vvs.push_back(vs[i])
+            let array_shape = ArrayShape(vvs)
+
+            self.array_shape = array_shape
+        else:
+            var num_elms: Int = 1
+            for i in range(len(vs)):
+                num_elms *= vs[i]
+            self.array_shape = ArrayShape(vs)
+
+    @always_inline
     fn load[
         nelts: Int, off: Int
     ](self, index: InlinedFixedVector[off, Int]) -> SIMD[T, nelts]:
@@ -437,8 +474,6 @@ struct Array[T: DType]:
         let position = self.array_shape.__ntp__(index, self.array_shape._size)
         self.assertation(position, self.array_shape._size)
         return self.data.simd_load[nelts](position)
-
-    # i * r * Te.dim(2) + k * r + j
 
     @always_inline
     fn store[nelts: Int](self, d1: Int, d2: Int, d3: Int, val: SIMD[T, nelts]) -> None:
@@ -1248,7 +1283,10 @@ struct Array[T: DType]:
         for i in range(self.num_elements()):
             self.data.store(i, val)
 
-    fn print_array(self):
+    fn print_shape(self) -> None:
+        self.array_shape.shape_str()
+
+    fn print_array(self) -> None:
         let size = self.array_shape.num_elements()
 
         var product = InlinedFixedVector[dims_average_size, Int](
