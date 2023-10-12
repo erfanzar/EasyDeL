@@ -262,7 +262,7 @@ struct Array[T: DType]:
     fn __init__(inout self: Self, pointer: DTypePointer[T], *dim: Int) -> None:
         self.data = pointer
         self.array_shape = ArrayShape(dim)
-        self.allocated = 1
+        self.allocated = 0
 
     fn __moveinit__(inout self, owned ext: Self):
         self.data = ext.data
@@ -303,6 +303,13 @@ struct Array[T: DType]:
         r"""Allocate or Init The Array."""
         self.data = self.ArrayPointer.alloc(self.array_shape.num_elements())
         self.allocated = 1
+
+    @always_inline
+    fn alloc(inout self: Self, fill: SIMD[T, 1]) -> None:
+        r"""Allocate or Init The Array and fill that with given fill number."""
+        self.data = self.ArrayPointer.alloc(self.array_shape.num_elements())
+        self.allocated = 1
+        self.fill(fill)
 
     @always_inline
     fn random(inout self: Self) -> None:

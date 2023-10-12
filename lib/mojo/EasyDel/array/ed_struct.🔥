@@ -2,17 +2,23 @@ from .array_module import Array
 from runtime.llcl import num_cores
 from algorithm.functional import parallelize
 
-alias nmc: Int = num_cores()
-
 
 struct PointerOperation[T: DType]:
+    var TS: DType
+
+    fn __init__(inout self: Self):
+        self.TS = T
+
+    fn get_dtype(self) -> DType:
+        return self.TS
+
     @staticmethod
     @always_inline
     fn add(
         inout a: DTypePointer[T],
         b: DTypePointer[T],
         num_elements: Int,
-        num_cores: Int = nmc,
+        num_cores: Int = 2,
     ) -> None:
         @parameter
         fn row(size: Int):
@@ -27,7 +33,7 @@ struct PointerOperation[T: DType]:
         inout a: DTypePointer[T],
         b: DTypePointer[T],
         num_elements: Int,
-        num_cores: Int = nmc,
+        num_cores: Int = 2,
     ) -> None:
         @parameter
         fn row(size: Int):
@@ -42,7 +48,7 @@ struct PointerOperation[T: DType]:
         inout a: DTypePointer[T],
         b: DTypePointer[T],
         num_elements: Int,
-        num_cores: Int = nmc,
+        num_cores: Int = 2,
     ) -> None:
         @parameter
         fn row(size: Int):
@@ -57,7 +63,7 @@ struct PointerOperation[T: DType]:
         inout a: DTypePointer[T],
         b: DTypePointer[T],
         num_elements: Int,
-        num_cores: Int = nmc,
+        num_cores: Int = 2,
     ) -> None:
         @parameter
         fn row(size: Int):
@@ -72,7 +78,7 @@ struct PointerOperation[T: DType]:
         inout a: DTypePointer[T],
         b: DTypePointer[T],
         num_elements: Int,
-        num_cores: Int = nmc,
+        num_cores: Int = 2,
     ) -> None:
         @parameter
         fn row(size: Int):
@@ -87,7 +93,7 @@ struct PointerOperation[T: DType]:
         inout a: DTypePointer[T],
         b: DTypePointer[T],
         num_elements: Int,
-        num_cores: Int = nmc,
+        num_cores: Int = 2,
     ) -> None:
         @parameter
         fn row(size: Int):
@@ -102,7 +108,7 @@ struct PointerOperation[T: DType]:
         inout a: DTypePointer[T],
         b: DTypePointer[T],
         num_elements: Int,
-        num_cores: Int = nmc,
+        num_cores: Int = 2,
     ) -> None:
         @parameter
         fn row(size: Int):
@@ -117,7 +123,7 @@ struct PointerOperation[T: DType]:
         inout a: DTypePointer[T],
         b: SIMD[T, 1],
         num_elements: Int,
-        num_cores: Int = nmc,
+        num_cores: Int = 2,
     ) -> None:
         @parameter
         fn row(size: Int):
@@ -132,7 +138,7 @@ struct PointerOperation[T: DType]:
         inout a: DTypePointer[T],
         b: SIMD[T, 1],
         num_elements: Int,
-        num_cores: Int = nmc,
+        num_cores: Int = 2,
     ) -> None:
         @parameter
         fn row(size: Int):
@@ -147,7 +153,7 @@ struct PointerOperation[T: DType]:
         inout a: DTypePointer[T],
         b: SIMD[T, 1],
         num_elements: Int,
-        num_cores: Int = nmc,
+        num_cores: Int = 2,
     ) -> None:
         @parameter
         fn row(size: Int):
@@ -162,7 +168,7 @@ struct PointerOperation[T: DType]:
         inout a: DTypePointer[T],
         b: SIMD[T, 1],
         num_elements: Int,
-        num_cores: Int = nmc,
+        num_cores: Int = 2,
     ) -> None:
         @parameter
         fn row(size: Int):
@@ -177,7 +183,7 @@ struct PointerOperation[T: DType]:
         inout a: DTypePointer[T],
         b: SIMD[T, 1],
         num_elements: Int,
-        num_cores: Int = nmc,
+        num_cores: Int = 2,
     ) -> None:
         @parameter
         fn row(size: Int):
@@ -192,7 +198,7 @@ struct PointerOperation[T: DType]:
         inout a: DTypePointer[T],
         b: SIMD[T, 1],
         num_elements: Int,
-        num_cores: Int = nmc,
+        num_cores: Int = 2,
     ) -> None:
         @parameter
         fn row(size: Int):
@@ -207,7 +213,7 @@ struct PointerOperation[T: DType]:
         inout a: DTypePointer[T],
         b: SIMD[T, 1],
         num_elements: Int,
-        num_cores: Int = nmc,
+        num_cores: Int = 2,
     ) -> None:
         @parameter
         fn row(size: Int):
