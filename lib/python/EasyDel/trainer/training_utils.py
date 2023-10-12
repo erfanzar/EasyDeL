@@ -2,14 +2,14 @@ import dataclasses
 import os
 import typing
 
-from EasyDel.trainer.config import TrainArguments
+from ..trainer.config import TrainArguments
 
 import jax
 import flax
 import optax
 from transformers import FlaxAutoModelForCausalLM, AutoConfig
 from jax.sharding import PartitionSpec
-from EasyDel.utils import Timers
+from ..utils import Timers
 
 from jax.experimental.pjit import pjit, with_sharding_constraint
 from flax.training import train_state
