@@ -13,3 +13,4 @@ from .array_utils import (
     matmul,
 )
 from .funcs import softmax, silu, relu, leaky_relu, sigmoid
+from .ed_struct import PointerOperation

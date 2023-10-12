@@ -74,13 +74,13 @@ fn dot_product_attention_weights[
     attention: Array[T],
     query: Array[T],
     key_cache: Array[T],
-    padding: Int,
     head_dims: Int,
     number_rep_kv: Int,
     max_position_embeddings: Int,
     position: Int,
     num_key_value_heads: Int,
     num_attention_heads: Int,
+    padding: Int = 0,
     num_cores: Int = 1,
 ):
     r"""
@@ -129,13 +129,13 @@ fn dot_product_attention[
     query: Array[T],
     key_cache: Array[T],
     value_cache: Array[T],
-    padding: Int,
     head_dims: Int,
     number_rep_kv: Int,
     max_position_embeddings: Int,
     position: Int,
     num_key_value_heads: Int,
     num_attention_heads: Int,
+    padding: Int = 0,
     num_cores: Int = 1,
 ) -> NoneType:
     r"""

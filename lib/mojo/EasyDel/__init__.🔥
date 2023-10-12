@@ -16,6 +16,7 @@ from .array import (
     relu,
     leaky_relu,
     sigmoid,
+    PointerOperation,
 )
 from .in_out import File, BufReader
 from .tokenizer import Tokenizer, load_tokenizer, byte_pr_tokenizer_encoder
