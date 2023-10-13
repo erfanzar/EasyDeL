@@ -9,6 +9,7 @@ from EasyDel import (
     byte_pr_tokenizer_encoder,
     print_pointer,
     sample_array,
+    loop_sort,
 )
 from math import math
 from python import Python, PythonObject
@@ -40,13 +41,20 @@ fn run[
     read_file(tokenizer_bufferr, tokenizer_path)
 
     var config = LlamaConfig(weights_buffer)
-    var tokenizer: Tokenizer = Tokenizer(config.vocab_size, tokenizer_bufferr)
+    let sz = weights_buffer.size // 1024 / 1024
+    print(
+        "\033[1;32mLoaded Model Weights Are ",
+        sz if sz < 1000 else weights_buffer.size // 1024 / 1024 / 1024,
+        " MB" if sz < 1000 else " GB",
+        "\n",
+    )
 
     let is_tied: Bool = True if config.vocab_size > 0 else False
     if not is_tied:
         config.vocab_size = -config.vocab_size
     if verbose:
         config.print_config()
+    var tokenizer: Tokenizer = Tokenizer(config.vocab_size, tokenizer_bufferr)
 
     let llama: LlamaWeights[T] = LlamaWeights[T](config, is_tied, weights_buffer)
     var state: LlamaState[T] = LlamaState[T](config)
@@ -54,15 +62,15 @@ fn run[
         print("\033[1;32m\nModel Loaded Successfully And Mojo is on 🔥.\033[1;0m\n")
 
     let now: Int = time.now()
-    var prompt_tokens = DynamicVector[Int]()
+    var input_ids = DynamicVector[Int]()
 
     if prompt:
-        byte_pr_tokenizer_encoder(prompt_tokens, prompt, tokenizer)
+        byte_pr_tokenizer_encoder(input_ids, prompt, tokenizer)
 
     while position < steps:
         llama_forward[T, nelts](input_id, position, llama, state, config, True)
-        if position < len(prompt_tokens):
-            next_input_id = prompt_tokens[position]
+        if position < len(input_ids):
+            next_input_id = input_ids[position]
         else:
             if temperature == 0.0:
                 next_input_id = state.logits.argmax(-1)
@@ -74,7 +82,9 @@ fn run[
 
             if next_input_id == 1 or next_input_id == 2:
                 break
+
         var token_str: Pointer[UInt8] = tokenizer.vocab[next_input_id]
+
         if input_id == 1 and token_str[0] == ord(" "):
             token_str = token_str.offset(1)
         print_pointer(token_str)
@@ -96,7 +106,7 @@ fn main() raises:
     var temperature: SIMD[DTYPE, 1] = 0.4
     var steps: Int = 512
     var start: Int = -1
-    var prompt: StringRef = ""
+    var prompt: String = String("")
     var checkpoint_path: StringRef = StringRef("weights.bin")
     var tokenizer_path: StringRef = StringRef("tokenizer.bin")
     var rng_seed: Int = time.now()

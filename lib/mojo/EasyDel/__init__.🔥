@@ -24,7 +24,7 @@ from .array import (
     # ED Struct
 )
 from .in_out import File, BufReader
-from .tokenizer import Tokenizer, load_tokenizer, byte_pr_tokenizer_encoder
+from .tokenizer import Tokenizer, load_tokenizer, byte_pr_tokenizer_encoder, loop_sort
 from .utilities import (
     read_numerical_value,
     read_string_value,
