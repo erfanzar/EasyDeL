@@ -132,84 +132,112 @@ struct LlamaWeights[T: DType]:
         inout buf: FileBuffer,
     ) raises:
         let size: Int = sizeof[T]()
-        self.wte = Array[T](config.hidden_size, config.vocab_size)
-
-        self.wte.set_data_from_buffer(
-            buf.read_numerical_value_dynamic[T](self.wte.num_elements())
+        self.wte = Array[T](
+            buf.read_numerical_value_dynamic[T](config.hidden_size * config.vocab_size),
+            config.hidden_size,
+            config.vocab_size,
         )
 
-        self.input_layernorm = Array[T](config.hidden_size, config.num_hidden_layers)
-        self.input_layernorm.set_data_from_buffer(
-            buf.read_numerical_value_dynamic[T](self.input_layernorm.num_elements())
+        self.input_layernorm = Array[T](
+            buf.read_numerical_value_dynamic[T](
+                config.hidden_size * config.num_hidden_layers
+            ),
+            config.hidden_size,
+            config.num_hidden_layers,
         )
+
         self.q_proj = Array[T](
-            config.num_hidden_layers, config.hidden_size, config.hidden_size
-        )
-        self.q_proj.set_data_from_buffer(
-            buf.read_numerical_value_dynamic[T](self.q_proj.num_elements())
-        )
-        self.k_proj = Array[T](
-            config.num_hidden_layers, config.kv_dims, config.hidden_size
-        )
-        self.k_proj.set_data_from_buffer(
-            buf.read_numerical_value_dynamic[T](self.k_proj.num_elements())
-        )
-        self.v_proj = Array[T](
-            config.num_hidden_layers, config.kv_dims, config.hidden_size
+            buf.read_numerical_value_dynamic[T](
+                config.num_hidden_layers * config.hidden_size * config.hidden_size
+            ),
+            config.num_hidden_layers,
+            config.hidden_size,
+            config.hidden_size,
         )
 
-        self.v_proj.set_data_from_buffer(
-            buf.read_numerical_value_dynamic[T](self.v_proj.num_elements())
+        self.k_proj = Array[T](
+            buf.read_numerical_value_dynamic[T](
+                config.num_hidden_layers * config.kv_dims * config.hidden_size
+            ),
+            config.num_hidden_layers,
+            config.kv_dims,
+            config.hidden_size,
+        )
+
+        self.v_proj = Array[T](
+            buf.read_numerical_value_dynamic[T](
+                config.num_hidden_layers * config.kv_dims * config.hidden_size
+            ),
+            config.num_hidden_layers,
+            config.kv_dims,
+            config.hidden_size,
         )
 
         self.o_proj = Array[T](
-            config.num_hidden_layers, config.hidden_size, config.hidden_size
+            buf.read_numerical_value_dynamic[T](
+                config.num_hidden_layers * config.hidden_size * config.hidden_size
+            ),
+            config.num_hidden_layers,
+            config.hidden_size,
+            config.hidden_size,
         )
 
-        self.o_proj.set_data_from_buffer(
-            buf.read_numerical_value_dynamic[T](self.o_proj.num_elements())
-        )
-
-        self.post_layernorm = Array[T](config.hidden_size, config.num_hidden_layers)
-        self.post_layernorm.set_data_from_buffer(
-            buf.read_numerical_value_dynamic[T](self.post_layernorm.num_elements())
+        self.post_layernorm = Array[T](
+            buf.read_numerical_value_dynamic[T](
+                config.hidden_size * config.num_hidden_layers
+            ),
+            config.hidden_size,
+            config.num_hidden_layers,
         )
 
         self.w1 = Array[T](
-            config.num_hidden_layers, config.hidden_size, config.intermediate_size
-        )
-        self.w1.set_data_from_buffer(
-            buf.read_numerical_value_dynamic[T](self.w1.num_elements())
+            buf.read_numerical_value_dynamic[T](
+                config.num_hidden_layers * config.hidden_size * config.intermediate_size
+            ),
+            config.num_hidden_layers,
+            config.hidden_size,
+            config.intermediate_size,
         )
 
         self.w2 = Array[T](
-            config.num_hidden_layers, config.hidden_size, config.intermediate_size
-        )
-        self.w2.set_data_from_buffer(
-            buf.read_numerical_value_dynamic[T](self.w2.num_elements())
+            buf.read_numerical_value_dynamic[T](
+                config.num_hidden_layers * config.hidden_size * config.intermediate_size
+            ),
+            config.num_hidden_layers,
+            config.hidden_size,
+            config.intermediate_size,
         )
 
         self.w3 = Array[T](
-            config.num_hidden_layers, config.hidden_size, config.intermediate_size
-        )
-        self.w3.set_data_from_buffer(
-            buf.read_numerical_value_dynamic[T](self.w3.num_elements())
-        )
-
-        self.norm = Array[T](config.hidden_size)
-        self.norm.set_data_from_buffer(
-            buf.read_numerical_value_dynamic[T](self.norm.num_elements())
+            buf.read_numerical_value_dynamic[T](
+                config.num_hidden_layers * config.hidden_size * config.intermediate_size
+            ),
+            config.num_hidden_layers,
+            config.hidden_size,
+            config.intermediate_size,
         )
 
-        self.fcr = Array[T](config.max_position_embeddings, config.head_dims // 2)
-        self.fcr.set_data_from_buffer(
-            buf.read_numerical_value_dynamic[T](self.fcr.num_elements())
+        self.norm = Array[T](
+            buf.read_numerical_value_dynamic[T](config.hidden_size),
+            config.hidden_size,
         )
 
-        self.fci = Array[T](config.max_position_embeddings, config.head_dims // 2)
-        self.fci.set_data_from_buffer(
-            buf.read_numerical_value_dynamic[T](self.fci.num_elements())
+        self.fcr = Array[T](
+            buf.read_numerical_value_dynamic[T](
+                config.max_position_embeddings * (config.head_dims // 2)
+            ),
+            config.max_position_embeddings,
+            config.head_dims // 2,
         )
+
+        self.fci = Array[T](
+            buf.read_numerical_value_dynamic[T](
+                config.max_position_embeddings * (config.head_dims // 2)
+            ),
+            config.max_position_embeddings,
+            config.head_dims // 2,
+        )
+
         self.lm_head = Array[T](config.vocab_size, config.hidden_size)
         if shared_weights:
             self.lm_head.set_data_from_buffer(self.wte.data)
