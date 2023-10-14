@@ -348,9 +348,9 @@ fn llama_forward[
     )
 
     memcpy[T](x.data, context_row, config.hidden_size)
-
-    let fci_row = weights.fci.data.offset(position * config.head_dims // 2)
-    let fcr_row = weights.fcr.data.offset(position * config.head_dims // 2)
+    let row_offset = (weights.fci.num_elements() // weights.fci.dim(0)) * position
+    let fci_row = weights.fci.data.offset(row_offset)
+    let fcr_row = weights.fcr.data.offset(row_offset)
 
     for layer_index in range(config.num_hidden_layers):
         let pad: Int = layer_index * config.max_position_embeddings * config.kv_dims
@@ -363,7 +363,7 @@ fn llama_forward[
             ),
             1e-5,
         )
-
+        state.q.fill(0.0)
         matmul[T, nelts](
             state.q,
             Array[T](
@@ -417,6 +417,8 @@ fn llama_forward[
             head_dims=config.head_dims,
             num_cores=state.number_of_cores,
         )
+
+        state.hidden_state.fill(0.0)
 
         dot_product_attention[T, nelts](
             C=state.hidden_state,
