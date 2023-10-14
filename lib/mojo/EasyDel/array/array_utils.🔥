@@ -176,3 +176,118 @@ fn matmul_single_row[
         C.store(i, tensor.reduce_add())
 
     parallelize[_loop](AR, num_cores)
+
+
+fn T_AXIS_1_0_2[T: DType, nelts: Int](array: Array[T], num_workers: Int) -> Array[T]:
+    """
+    Transposes a 3D array in axis 0 and 1.
+    """
+
+    var transposed_array = Array[T](array.dim(1), array.dim(0), array.dim(2))
+    transposed_array.alloc(0.0)
+    for i in range(array.dim(0)):
+
+        @parameter
+        fn _row(j: Int):
+            @parameter
+            fn _cols[_nelts: Int](k: Int):
+                let dt: SIMD[T, _nelts] = array.load[_nelts](i, j, k)
+                transposed_array.store[_nelts](j, i, k, dt)
+
+            vectorize[nelts, _cols](array.dim(2))
+
+        parallelize[_row](array.dim(1), num_workers)
+    return transposed_array
+
+
+fn T_AXIS_0_2_1[T: DType, nelts: Int](array: Array[T], num_workers: Int) -> Array[T]:
+    """
+    Transposes an array in axis 2 and 1.
+    """
+
+    var transposed_array = Array[T](array.dim(2), array.dim(1), array.dim(0))
+    transposed_array.alloc(0.0)
+    for i in range(array.dim(0)):
+
+        @parameter
+        fn _row(j: Int):
+            @parameter
+            fn _cols[_nelts: Int](k: Int):
+                let dt: SIMD[T, _nelts] = array.load[_nelts](i, j, k)
+                transposed_array.store[_nelts](k, j, i, dt)
+
+            vectorize[nelts, _cols](array.dim(2))
+
+        parallelize[_row](array.dim(1), num_workers)
+    return transposed_array
+
+
+fn T_AXIS_2_1_0[T: DType, nelts: Int](array: Array[T], num_workers: Int) -> Array[T]:
+    """
+    Transposes an array in axis 0 and 2.
+    """
+
+    var transposed_array = Array[T](array.dim(2), array.dim(0), array.dim(1))
+    transposed_array.alloc(0.0)
+    for i in range(array.dim(0)):
+
+        @parameter
+        fn _row(j: Int):
+            @parameter
+            fn _cols[_nelts: Int](k: Int):
+                let dt: SIMD[T, _nelts] = array.load[_nelts](i, j, k)
+                transposed_array.store[_nelts](k, i, j, dt)
+
+            vectorize[nelts, _cols](array.dim(2))
+
+        parallelize[_row](array.dim(1), num_workers)
+    return transposed_array
+
+
+fn T_2D[T: DType, nelts: Int](array: Array[T], num_workers: Int) -> Array[T]:
+    """
+    Transposes an array.
+    """
+
+    var transposed_array = Array[T](array.dim(1), array.dim(0))
+    transposed_array.alloc(0.0)
+
+    @parameter
+    fn _row(i: Int):
+        @parameter
+        fn _cols[_nelts: Int](j: Int):
+            let dt: SIMD[T, _nelts] = array.load[_nelts](i, j)
+            transposed_array.store[_nelts](j, i, dt)
+
+        vectorize[nelts, _cols](array.dim(1))
+
+    parallelize[_row](array.dim(0), num_workers)
+    return transposed_array
+
+
+fn concatenate[
+    T: DType
+](A: Array[T], B: Array[T], inout axis: Int = 0, stragedy: String = "ord") -> Array[T]:
+    debug_assert(A.rank() == B.rank(), "A,B Shapes Wont Match for concatenate")
+    if axis < 0:
+        axis = A.rank() - axis
+    var cat_shape: DynamicVector[Int] = DynamicVector[Int]()
+    for i in range(A.rank()):
+        if i != axis:
+            debug_assert(A.dim(i) == B.dim(i), "A,B Shapes Wont Match for concatenate")
+            cat_shape.push_back(A.dim(i))
+        else:
+            cat_shape.push_back(A.dim(i) + B.dim(i))
+    var cat_array: Array[T] = Array[T](cat_shape)
+    cat_array.alloc(0.0)
+    if stragedy == "ord":
+
+        @parameter
+        fn _r[nelts: Int](I: Int):
+            if I < A.num_elements():
+                cat_array.store[nelts](I, A.load[nelts](I))
+            else:
+                cat_array.store[nelts](I, B.load[nelts](I))
+
+        vectorize[Array[T].nelts, _r](cat_array.num_elements())
+    return cat_array

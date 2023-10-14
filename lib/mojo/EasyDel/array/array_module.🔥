@@ -31,7 +31,7 @@ from algorithm.functional import (
 )
 from runtime.llcl import num_cores
 from memory.memory import memset_zero
-from .array_utils import matmul_shape
+from .array_utils import matmul_shape, T_2D, T_AXIS_0_2_1, T_AXIS_1_0_2, T_AXIS_2_1_0
 
 alias dims_average_size = 5
 alias debuging = True
@@ -346,53 +346,28 @@ struct Array[T: DType]:
         return pad
 
     @always_inline
-    fn transpose(self: Self, *dims: Int) raises -> Self:
-        var res_shape: DynamicVector[Int] = DynamicVector[Int]()
-        let _dims = VariadicList[Int](dims)
-        if len(_dims) != self.rank():
+    fn transpose[workers: Int = 2](self: Self, *dims: Int) raises -> Array[T]:
+        # var res_shape: DynamicVector[Int] = DynamicVector[Int]()
+        let dim = VariadicList[Int](dims)
+        if len(dim) != self.rank():
             raise Error(
                 "The Passed input dims to swap are not accept able for function"
             )
-        if len(_dims) != 3:
-            raise Error("Only 3D arrays are accepted for transpose right now")
-        for f in range(len(_dims)):
-            res_shape.push_back(self.dim(_dims[f]))
-        var res = Self(res_shape)
-        res.alloc()
-        res.fill(0.0)
-        # let SL :Int= self.dim(0)
-        let RL: Int = self.dim(1)
-        let CL: Int = self.dim(2)
-        let RR: Int = res.dim(1)
-        let CR: Int = res.dim(2)
+        if len(dim) != 3:
+            raise Error("Only 3D,2D arrays are accepted for transpose right now")
+        if dim[0] == 0 and dim[1] == 2 and dim[2] == 1:
+            return T_AXIS_0_2_1[T, Array[T].nelts](self, workers)
+        if dim[0] == 1 and dim[1] == 0 and dim[2] == 2:
+            return T_AXIS_1_0_2[T, Array[T].nelts](self, workers)
+        if dim[0] != 2 and dim[1] != 1 and dim[2] != 0:
+            raise Error("Open A Bug Form")
+        return T_AXIS_2_1_0[T, Array[T].nelts](self, workers)
 
-        @parameter
-        fn self_index(layer: Int, row: Int, cols: Int) -> Int:
-            return layer * RL * CL + row * CL + cols
-
-        fn res_index(layer: Int, row: Int, cols: Int) -> Int:
-            return layer * RR * CR + row * CR + cols
-
-        @parameter
-        fn index_s(inout C: Int, i: Int, j: Int, k: Int, s: Int):
-            if _dims[s] == 0:
-                C = i
-            elif _dims[s] == 1:
-                C = j
-            elif _dims[s] == 2:
-                C = k
-
-        for i in range(res.dim(0)):
-            var s = 0
-            var d = 0
-            var e = 0
-            for j in range(res.dim(-2)):
-                for k in range(res.dim(-1)):
-                    index_s(s, i, j, k, 0)
-                    index_s(d, i, j, k, 1)
-                    index_s(e, i, j, k, 2)
-                    res[res_index(i, j, k)] = self[self_index(s, d, e)]
-        return res
+    @always_inline
+    fn transpose[workers: Int = 2](self: Self) raises -> Array[T]:
+        if 2 != self.rank():
+            raise Error("Transpose with empty input only support 2D Arrays")
+        return T_2D[T, Array[T].nelts](self, workers)
 
     @always_inline
     fn reshape(inout self, *dims: Int) raises:
