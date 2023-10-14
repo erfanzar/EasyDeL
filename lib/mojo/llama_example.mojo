@@ -106,7 +106,7 @@ fn main() raises:
     var temperature: SIMD[DTYPE, 1] = 0.4
     var steps: Int = 512
     var start: Int = -1
-    var prompt: String = String("")
+    var prompt: String = String(r"<|im_start|>user\nHI<|im_end|>\n<|im_start|>assistant\n")
     var checkpoint_path: StringRef = StringRef("weights.bin")
     var tokenizer_path: StringRef = StringRef("tokenizer.bin")
     var rng_seed: Int = time.now()
