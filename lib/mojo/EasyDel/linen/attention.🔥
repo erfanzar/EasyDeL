@@ -66,6 +66,21 @@ fn rope[
 
     parallelize[_row](num_attention_heads, num_cores)
 
+fn rope[
+    T: DType
+](
+    inout q_array: Array[T],
+    inout k_array: Array[T],
+    fcr_row: DTypePointer[T],
+    fci_row: DTypePointer[T],
+    num_cores: Int = 1,
+) -> None:
+    if k_array.rank() != 3 or q_array.rank() != 3:
+        print('Wrong input Shape for Q,K')
+    let kv_heads = k_array.dim(0)
+    let n_heads  = q_array.dim(0)
+    let head_dim = q_array.dim(-1)
+
 
 @always_inline
 fn dot_product_attention_weights[
@@ -189,3 +204,5 @@ fn dot_product_attention[
             vectorize[nelts, _wv](head_dims)
 
     parallelize[_calculate_each_head](num_attention_heads, num_cores)
+
+
