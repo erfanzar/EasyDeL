@@ -1,6 +1,8 @@
 from .attention import (
     rms_norm,
     rope,
+    q_rope,
+    k_rope,
     dot_product_attention,
     dot_product_attention_weights,
 )
