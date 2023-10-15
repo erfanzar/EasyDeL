@@ -5,4 +5,5 @@ from .attention import (
     k_rope,
     dot_product_attention,
     dot_product_attention_weights,
+    repeat_kv,
 )
