@@ -11,10 +11,12 @@ from .array_utils import (
     matmul_single_row,
     matmul_2d,
     matmul,
-    T_AXIS_0_2_1, # LOW LEVEL AND PARALLELIZED , VECTORIZED
-    T_AXIS_2_1_0, # LOW LEVEL AND PARALLELIZED , VECTORIZED
-    T_AXIS_1_0_2, # LOW LEVEL AND PARALLELIZED , VECTORIZED
-    T_2D,         # LOW LEVEL AND PARALLELIZED , VECTORIZED
+    T_AXIS_0_2_1,  # LOW LEVEL AND PARALLELIZED , VECTORIZED
+    T_AXIS_2_1_0,  # LOW LEVEL AND PARALLELIZED , VECTORIZED
+    T_AXIS_1_0_2,  # LOW LEVEL AND PARALLELIZED , VECTORIZED
+    T_2D,  # LOW LEVEL AND PARALLELIZED , VECTORIZED
+    CAT_3D_AXIS_2,  # LOW LEVEL AND PARALLELIZED , VECTORIZED
+    rotate_half,  # LOW LEVEL AND PARALLELIZED , VECTORIZED
 )
 from .funcs import softmax, silu, relu, leaky_relu, sigmoid, sample_array
 from .ed_struct import PointerOperation

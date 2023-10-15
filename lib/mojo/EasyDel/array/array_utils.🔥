@@ -291,3 +291,67 @@ fn concatenate[
 
         vectorize[Array[T].nelts, _r](cat_array.num_elements())
     return cat_array
+
+
+fn CAT_3D_AXIS_2[T: DType, cores: Int](A: Array[T], B: Array[T]) -> Array[T]:
+    """
+    Return Concatenated Array At axis -1.
+    """
+    var x: Array[T] = Array[T](A.dim(0), A.dim(1), A.dim(-1) + B.dim(-1))
+    let A_A: Int = A.dim(-1)
+    x.alloc(0.0)
+    for i in range(A.dim(0)):
+
+        @parameter
+        fn _row(j: Int):
+            @parameter
+            fn _cols[nelts: Int](k: Int):
+                if k < A_A:
+                    x.store[nelts](i, j, k, A.load[nelts](i, j, k))
+                else:
+                    x.store[nelts](i, j, k, B.load[nelts](i, j, k - A_A))
+
+            vectorize[Array[T].nelts, _cols](x.dim(-1))
+
+        parallelize[_row](A.dim(1), cores)
+    return x
+
+
+fn rotate_half[T: DType, cores: Int](A: Array[T]) -> Array[T]:
+    """
+    Let make it More Pythonic.
+    """
+    debug_assert(A.rank() == 3, "Only 3D Arrays Are accepted")
+    let half: Int = A.dim(-1) // 2
+    let rest: Int = A.dim(-1) - half
+
+    var x1: Array[T] = Array[T](A.dim(0), A.dim(1), half)
+    var x2: Array[T] = Array[T](A.dim(0), A.dim(1), rest)
+
+    x1.alloc(0.0)
+    x2.alloc(0.0)
+    for i in range(A.dim(0)):
+        # X1 Rotation
+        @parameter
+        fn x1_row(j: Int):
+            @parameter
+            fn x1_cols[nelts: Int](k: Int):
+                x1.store[nelts](i, j, k, A.load[nelts](i, j, k))
+
+            vectorize[Array[T].nelts, x1_cols](half)
+
+        parallelize[x1_row](A.dim(1), cores)
+
+        # X2 Rotation
+        @parameter
+        fn x2_row(j: Int):
+            @parameter
+            fn x2_cols[nelts: Int](k: Int):
+                x2.store[nelts](i, j, k, -A.load[nelts](i, j, half + k))
+
+            vectorize[Array[T].nelts, x2_cols](rest)
+
+        parallelize[x2_row](A.dim(1), cores)
+
+    var cated: Array[T] = CAT_3D_AXIS_2[T, cores](x2, x1)
+    return cated
