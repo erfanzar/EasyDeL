@@ -318,6 +318,10 @@ struct Array[T: DType]:
             rand[T](self.data, self.array_shape.num_elements())
 
     @always_inline
+    fn zero(inout self):
+        self.fill(0.0)
+
+    @always_inline
     fn dim(self: Self, i: Int) -> Int:
         return self.array_shape.dim(i)
 
@@ -1295,6 +1299,7 @@ struct Array[T: DType]:
     fn acosh(inout self: Self, num_cores: Int) -> Self:
         return self.__apply_math__[acosh](num_cores)
 
+    @always_inline
     fn argmax(self: Self, axis: Int = -1) -> Int:
         var max_index: Int = 0
         var max_value: SIMD[T, 1] = self[0]
@@ -1304,9 +1309,13 @@ struct Array[T: DType]:
                 max_value = self[i]
         return max_index
 
+    @always_inline
     fn fill(inout self: Self, val: SIMD[T, 1]) -> None:
-        for i in range(self.num_elements()):
+        @parameter
+        fn set_[nelts: Int](i: Int):
             self.data.store(i, val)
+
+        vectorize[Array[T].nelts, set_](self.num_elements())
 
     fn print_shape(self) -> None:
         self.array_shape.shape_str()
