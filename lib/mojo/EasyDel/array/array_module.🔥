@@ -322,6 +322,10 @@ struct Array[T: DType]:
         self.fill(0.0)
 
     @always_inline
+    fn ones(inout self):
+        self.fill(1.0)
+
+    @always_inline
     fn dim(self: Self, i: Int) -> Int:
         return self.array_shape.dim(i)
 
@@ -1313,7 +1317,7 @@ struct Array[T: DType]:
     fn fill(inout self: Self, val: SIMD[T, 1]) -> None:
         @parameter
         fn set_[nelts: Int](i: Int):
-            self.data.store(i, val)
+            self.data.simd_store[nelts](i, val)
 
         vectorize[Array[T].nelts, set_](self.num_elements())
 
