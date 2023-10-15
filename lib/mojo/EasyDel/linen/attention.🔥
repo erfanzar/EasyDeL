@@ -73,9 +73,11 @@ fn q_rope[
     let head_dim = q.dim(-1)
     let chunk_cos: Array[T] = Array[T](cos.data.offset(position * head_dim), head_dim)
     let chunk_sin: Array[T] = Array[T](sin.data.offset(position * head_dim), head_dim)
+
     let q_r: Array[T] = rotate_half[T, num_cores](q)
     var q_embed: Array[T] = Array[T](q.array_shape)
     let q_row_size: Int = q.num_elements() // head_dim
+
     q_embed.alloc(0.0)
 
     @parameter
@@ -83,9 +85,9 @@ fn q_rope[
         @parameter
         fn _cols_q[nelts: Int](j: Int):
             let xbi: SIMD[T, nelts] = (
-                q.load[nelts](i, 1, j) * chunk_cos.load[nelts](j)
-            ) + (q_r.load[nelts](i, 1, j) * chunk_sin.load[nelts](j))
-            q_embed.store[nelts](i, 1, j, xbi)
+                q.load[nelts](i, 0, j) * chunk_cos.load[nelts](j)
+            ) + (q_r.load[nelts](i, 0, j) * chunk_sin.load[nelts](j))
+            q_embed.store[nelts](i, 0, j, xbi)
 
         vectorize[Array[T].nelts, _cols_q](head_dim)
 
@@ -95,13 +97,15 @@ fn q_rope[
 
 fn k_rope[
     T: DType, num_cores: Int
-](k: Array[T], cos: Array[T], sin: Array[T], position: Int,) -> Array[T]:
+](k: Array[T], cos: Array[T], sin: Array[T], position: Int) -> Array[T]:
     let head_dim = k.dim(-1)
     let chunk_cos: Array[T] = Array[T](cos.data.offset(position * head_dim), head_dim)
     let chunk_sin: Array[T] = Array[T](sin.data.offset(position * head_dim), head_dim)
+
     let k_r: Array[T] = rotate_half[T, num_cores](k)
     let k_row_size: Int = k.num_elements() // head_dim
     var k_embed: Array[T] = Array[T](k.array_shape)
+
     k_embed.alloc(0.0)
 
     @parameter
@@ -109,9 +113,9 @@ fn k_rope[
         @parameter
         fn _cols_k[nelts: Int](j: Int):
             let xbi: SIMD[T, nelts] = (
-                k.load[nelts](i, 1, j) * chunk_cos.load[nelts](j)
-            ) + (k_r.load[nelts](i, 1, j) * chunk_sin.load[nelts](j))
-            k_embed.store[nelts](i, 1, j, xbi)
+                k.load[nelts](i, 0, j) * chunk_cos.load[nelts](j)
+            ) + (k_r.load[nelts](i, 0, j) * chunk_sin.load[nelts](j))
+            k_embed.store[nelts](i, 0, j, xbi)
 
         vectorize[Array[T].nelts, _cols_k](head_dim)
 
@@ -298,3 +302,26 @@ fn dot_product_attention[
             vectorize[nelts, _wv](head_dims)
 
     parallelize[_calculate_each_head](num_attention_heads, num_cores)
+
+
+fn repeat_kv[T: DType, cores: Int](A: Array[T], times: Int) -> Array[T]:
+    var B: Array[T] = Array[T](A.dim(-3), times, A.dim(-2), A.dim(-1))
+    B.alloc(0.0)
+    let A1: Int = A.dim(0)
+    let A2: Int = A.dim(1)
+    let A3: Int = A.dim(2)
+
+    @parameter
+    fn _row(i: Int):
+        for j in range(times):
+            for k in range(A2):
+
+                @parameter
+                fn _cols[nelts: Int](l: Int):
+                    B.store[nelts](i, j, k, l, A.load[nelts](i, k, l))
+
+                vectorize[Array[T].nelts, _cols](A3)
+
+    parallelize[_row](A1, cores)
+    B.view(-1, A.dim(-2), A.dim(-1))
+    return B ^

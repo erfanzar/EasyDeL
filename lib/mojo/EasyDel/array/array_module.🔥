@@ -214,7 +214,7 @@ struct Array[T: DType]:
     fn __init__(inout self: Self, A: Self, B: Self) -> None:
         r"""Init Array From Two other Arrays A and B For Matmul(Alloc One)."""
         self.__init__(matmul_shape[T](A, B))
-        self.alloc()
+        self.alloc(0.0)
 
     fn __init__(inout self: Self, *dim: Int):
         r"""Init Array from Int Args(Alloc Zero)."""
@@ -330,11 +330,14 @@ struct Array[T: DType]:
         return self.array_shape.num_elements()
 
     @always_inline
-    fn get_dynamic_axis(self: Self, *dims: Int) raises -> Int:
+    fn get_dynamic_axis(self: Self, *dims: Int) -> Int:
         let variadic: VariadicList[Int] = VariadicList[Int](dims)
         let slice_dv: DynamicVector[Int] = DynamicVector[Int]()
         if len(variadic) > self.rank():
-            raise Error("Index out Of the Range (len(variadic) > self.rank())")
+            print(
+                "DynamicAxis Errors -> Index out Of the Range (len(variadic) >"
+                " self.rank())"
+            )
         var pad: Int = 0
         for i in range(len(variadic)):
             var product: Int = 1
@@ -342,7 +345,10 @@ struct Array[T: DType]:
                 product *= self.array_shape._shape[f]
             pad += variadic[i] * product
         if pad > self.num_elements():
-            raise Error("Index out Of the Range (pad > self.num_elements)")
+            print(
+                " DynamicAxis Errors -> Index out Of the Range (pad >"
+                " self.num_elements)"
+            )
         return pad
 
     @always_inline
@@ -458,6 +464,17 @@ struct Array[T: DType]:
         return self.data.simd_load[nelts](position)
 
     @always_inline
+    fn store[
+        nelts: Int
+    ](self, d1: Int, d2: Int, d3: Int, d4: Int, val: SIMD[T, nelts]) -> None:
+        debug_assert(self.rank() != 4, "Miss match os requested shape (4D Store)")
+        let index = (d1 * self.dim(-3) * self.dim(-2) * self.dim(-1)) + (
+            d2 * self.dim(-2) * self.dim(-1)
+        ) + (d3 * self.dim(-1)) + d4
+        debug_assert(index > self.num_elements(), "Out OF range in Store 4D")
+        self.data.simd_store[nelts](index, val)
+
+    @always_inline
     fn store[nelts: Int](self, d1: Int, d2: Int, d3: Int, val: SIMD[T, nelts]) -> None:
         debug_assert(self.rank() != 3, "Miss match os requested shape (3D Store)")
         let index = d1 * self.dim(-2) * self.dim(-1) + d2 * self.dim(-1) + d3
@@ -470,6 +487,15 @@ struct Array[T: DType]:
         let index = d1 * self.dim(-1) + d2
         debug_assert(index > self.num_elements(), "Out OF range in Store 2D")
         self.data.simd_store[nelts](index, val)
+
+    @always_inline
+    fn load[nelts: Int](self, d1: Int, d2: Int, d3: Int, d4: Int) -> SIMD[T, nelts]:
+        debug_assert(self.rank() != 3, "Miss match os requested shape (4D Load)")
+        let index = (d1 * self.dim(-3) * self.dim(-2) * self.dim(-1)) + (
+            d2 * self.dim(-2) * self.dim(-1)
+        ) + (d3 * self.dim(-1)) + d4
+        debug_assert(index > self.num_elements(), "Out OF range in Load 4D")
+        return self.data.simd_load[nelts](index)
 
     @always_inline
     fn load[nelts: Int](self, d1: Int, d2: Int, d3: Int) -> SIMD[T, nelts]:
@@ -526,11 +552,15 @@ struct Array[T: DType]:
         return self.store[1](index, val)
 
     @always_inline
-    fn __setitem__(self, d1: Int, d2: Int, d3: Int, val: SIMD[T, 1]) raises -> None:
+    fn __setitem__(self, d1: Int, d2: Int, d3: Int, d4: Int, val: SIMD[T, 1]) -> None:
+        return self.store[1](d1, d2, d3, d4, val)
+
+    @always_inline
+    fn __setitem__(self, d1: Int, d2: Int, d3: Int, val: SIMD[T, 1]) -> None:
         return self.store[1](d1, d2, d3, val)
 
     @always_inline
-    fn __setitem__(self, d1: Int, d2: Int, val: SIMD[T, 1]) raises -> None:
+    fn __setitem__(self, d1: Int, d2: Int, val: SIMD[T, 1]) -> None:
         return self.store[1](d1, d2, val)
 
     @always_inline
@@ -542,16 +572,20 @@ struct Array[T: DType]:
         return self.load[1, off](index)
 
     @always_inline
-    fn __getitem__(self, index: Int) -> SIMD[T, 1]:
-        return self.load[1](index)
+    fn __getitem__(self, d1: Int, d2: Int, d3: Int, d4: Int) -> SIMD[T, 1]:
+        return self.load[1](d1, d2, d3, d4)
 
     @always_inline
-    fn __getitem__(self, d1: Int, d2: Int, d3: Int) raises -> SIMD[T, 1]:
+    fn __getitem__(self, d1: Int, d2: Int, d3: Int) -> SIMD[T, 1]:
         return self.load[1](d1, d2, d3)
 
     @always_inline
-    fn __getitem__(self, d1: Int, d2: Int) raises -> SIMD[T, 1]:
+    fn __getitem__(self, d1: Int, d2: Int) -> SIMD[T, 1]:
         return self.load[1](d1, d2)
+
+    @always_inline
+    fn __getitem__(self, index: Int) -> SIMD[T, 1]:
+        return self.load[1](index)
 
     @always_inline
     fn __element_wise_tensor_operation__[
