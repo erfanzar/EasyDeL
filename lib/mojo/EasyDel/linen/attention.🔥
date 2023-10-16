@@ -234,6 +234,40 @@ fn dot_product_attention_weights[
 
 
 @always_inline
+fn dot_product_attention_weights[
+    T: DType, workers: Int
+](
+    inout q: Array[T],
+    inout k: Array[T],
+    num_attention_heads: Int,
+    num_key_value_heads: Int,
+    head_dims: Int,
+) -> Array[T]:
+    r"""
+    Calculates Q@K/Sqrt(HeadDims).
+    """
+    alias nelts: Int = q.nelts
+    k = T_AXIS_0_2_1[T, nelts](k, workers)
+
+    var A: Array[T] = Array[T](q, k)
+    matmul[T, nelts](A, q, k, workers)
+    let SH: SIMD[T, nelts] = SIMD[T, nelts](math.sqrt(head_dims))
+
+    @parameter
+    fn _row[_nelts: Int](i: Int):
+        if _nelts < nelts:
+            let res = A.load[nelts](i).reduce_add() / SH.reduce_add()
+            A.store[1](i, res)
+        else:
+            let res = A.load[nelts](i) / SH
+            A.store[nelts](i, res)
+
+    vectorize[nelts, _row](A.num_elements())
+    softmax[T, nelts](A)
+    return A
+
+
+@always_inline
 fn dot_product_attention[
     T: DType, nelts: Int
 ](
