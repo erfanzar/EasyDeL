@@ -360,21 +360,22 @@ struct Array[T: DType]:
         return pad
 
     @always_inline
-    fn transpose[workers: Int = 2](self: Self, *dims: Int) raises -> Array[T]:
+    fn transpose[workers: Int = 2](self: Self, *dims: Int) -> Array[T]:
         # var res_shape: DynamicVector[Int] = DynamicVector[Int]()
         let dim = VariadicList[Int](dims)
         if len(dim) != self.rank():
-            raise Error(
-                "The Passed input dims to swap are not accept able for function"
-            )
+            print("The Passed input dims to swap are not accept able for function")
+            return Array[T]()
         if len(dim) != 3:
-            raise Error("Only 3D,2D arrays are accepted for transpose right now")
+            print("Only 3D,2D arrays are accepted for transpose right now")
+            return Array[T]()
         if dim[0] == 0 and dim[1] == 2 and dim[2] == 1:
             return T_AXIS_0_2_1[T, Array[T].nelts](self, workers)
         if dim[0] == 1 and dim[1] == 0 and dim[2] == 2:
             return T_AXIS_1_0_2[T, Array[T].nelts](self, workers)
         if dim[0] != 2 and dim[1] != 1 and dim[2] != 0:
-            raise Error("Open A Bug Form")
+            print("Open A Bug Form")
+            return Array[T]()
         return T_AXIS_2_1_0[T, Array[T].nelts](self, workers)
 
     @always_inline

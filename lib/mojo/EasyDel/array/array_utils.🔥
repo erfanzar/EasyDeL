@@ -64,12 +64,13 @@ fn matmul_2d[
 @always_inline
 fn matmul[
     T: DType, nelts: Int
-](C: Array[T], A: Array[T], B: Array[T], num_cores: Int = 1) raises -> None:
+](C: Array[T], A: Array[T], B: Array[T], num_cores: Int = 1) -> None:
     if A.rank() == 2 and B.rank() == 1 and (C.rank() == 1 or C.rank() == 2):
         matmul_single_row[T, nelts](C, A, B, num_cores)
         return
     if A.rank() != B.rank():
-        raise Error("Can not performe operation Dimensions won't match")
+        print("Can not performe operation Dimensions won't match")
+        return
     let C_C: Int = C.dim(-1)
     let A_C: Int = A.dim(-1)
     let C_R: Int = C.dim(-2)
