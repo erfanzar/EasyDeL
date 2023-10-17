@@ -8,4 +8,4 @@ from .attention import (
     repeat_kv,
 )
 
-from .nn import linear, embedding
+from .nn import linear, embedding, rms_layernorm
