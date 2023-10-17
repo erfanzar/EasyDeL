@@ -356,3 +356,17 @@ fn rotate_half[T: DType, cores: Int](A: Array[T]) -> Array[T]:
 
     var cated: Array[T] = CAT_3D_AXIS_2[T, cores](x2, x1)
     return cated
+
+
+@always_inline
+fn arange[T: DType, cores: Int](start: Int, end: Int) -> Array[T]:
+    let rng = end - start
+    var array: Array[T] = Array[T](rng)
+    array.alloc()
+
+    @parameter
+    fn _row(i: Int):
+        array.store[1](i, start + i)
+
+    parallelize[_row](rng, cores)
+    return array

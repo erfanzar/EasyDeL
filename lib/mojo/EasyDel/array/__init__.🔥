@@ -17,6 +17,7 @@ from .array_utils import (
     T_2D,  # LOW LEVEL AND PARALLELIZED , VECTORIZED
     CAT_3D_AXIS_2,  # LOW LEVEL AND PARALLELIZED , VECTORIZED
     rotate_half,  # LOW LEVEL AND PARALLELIZED , VECTORIZED
+    arange,
 )
 from .funcs import softmax, silu, relu, leaky_relu, sigmoid, sample_array
 from .ed_struct import PointerOperation

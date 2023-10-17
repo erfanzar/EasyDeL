@@ -86,27 +86,34 @@ fn embedding[
 
 @always_inline
 fn rms_layernorm[
-    T: DType, nelts: Int
+    T: DType, nelts: Int, cores: Int
 ](x: Array[T], w: Array[T], epsilon: SIMD[T, 1]) -> Array[T]:
     var res: Array[T] = Array[T](x.array_shape)
-    var sp: SIMD[T, nelts] = SIMD[T, nelts](0.0)
+    res.alloc(0.0)
+    let num_elements: Int = x.dim(-1)
 
     @parameter
-    fn _do_sum_pow[_nelts: Int](size: Int):
-        if _nelts < nelts:
-            sp[0] += (x.load[_nelts](size) ** 2).reduce_add()
-        else:
-            sp += x.load[nelts](size) ** 2
+    fn _parallelizer(i: Int):
+        var sp: SIMD[T, nelts] = SIMD[T, nelts](0.0)
 
-    vectorize[nelts, _do_sum_pow](x.num_elements())
-    var normed: SIMD[T, 1] = sp.reduce_add()
-    normed = normed / x.num_elements() + epsilon
-    normed = 1.0 / math.sqrt(normed)
+        @parameter
+        fn _do_sum_pow[_nelts: Int](j: Int):
+            if _nelts < nelts:
+                sp[0] += (x.load[_nelts](i, j) ** 2).reduce_add()
+            else:
+                sp += x.load[nelts](i, j) ** 2
 
-    @parameter
-    fn _do_element_wise[_nelts: Int](j: Int):
-        let val = w.data.simd_load[_nelts](j) * normed * x.data.simd_load[_nelts](j)
-        res.data.offset(j).simd_store[_nelts](0, val)
+        vectorize[nelts, _do_sum_pow](num_elements)
+        var normed: SIMD[T, 1] = sp.reduce_add()
+        normed = normed / num_elements + epsilon
+        normed = 1.0 / math.sqrt(normed)
 
-    vectorize[nelts, _do_element_wise](x.num_elements())
+        @parameter
+        fn _do_element_wise[_nelts: Int](j: Int):
+            let val = w.load[_nelts](j) * normed * x.load[_nelts](i, j)
+            res.store[_nelts](i, j, val)
+
+        vectorize[nelts, _do_element_wise](num_elements)
+
+    parallelize[_parallelizer](x.dim(-2), cores)
     return res ^
