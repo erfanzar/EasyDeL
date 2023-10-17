@@ -771,6 +771,9 @@ struct Array[T: DType]:
     fn __ifloordiv__(inout self: Self, other: Self) -> None:
         ...
 
+    fn __len__(inout self) -> Int:
+        return self.num_elements()
+
     fn add[nelts: Int](self: Self, other: Self) -> Self:
         @parameter
         fn outer_loop[func: fn (Int) capturing -> None](size: Int):
