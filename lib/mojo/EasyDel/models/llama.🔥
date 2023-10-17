@@ -135,8 +135,8 @@ struct LlamaWeights[T: DType]:
         let size: Int = sizeof[T]()
         self.wte = Array[T](
             buf.read_numerical_value_dynamic[T](config.hidden_size * config.vocab_size),
-            config.hidden_size,
             config.vocab_size,
+            config.hidden_size,
         )
 
         self.input_layernorm = Array[T](
