@@ -46,6 +46,7 @@ class MistralConfig(PretrainedConfig):
             number_rep_kv: int = 1,
             attn_pdrop: float = 0.0,
             c_max_position_embeddings: int = 4096,
+            freq_max_position_embeddings: int = 4096,
             **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -76,6 +77,7 @@ class MistralConfig(PretrainedConfig):
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.attn_pdrop = attn_pdrop
         self.c_max_position_embeddings = c_max_position_embeddings
+        self.freq_max_position_embeddings = freq_max_position_embeddings
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -132,7 +134,8 @@ class MistralConfig(PretrainedConfig):
                      scan_mlp_chunk_size: int = 1024,
                      number_rep_kv: int = 1,
                      attn_pdrop: float = 0.0,
-                     c_max_position_embeddings: int = 4096
+                     c_max_position_embeddings: int = 4096,
+                     freq_max_position_embeddings: int = None
                      ):
         self.use_flash_attention = use_flash_attention
         self.number_rep_kv = number_rep_kv
@@ -144,6 +147,7 @@ class MistralConfig(PretrainedConfig):
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.attn_pdrop = attn_pdrop
         self.c_max_position_embeddings = c_max_position_embeddings
+        self.freq_max_position_embeddings = freq_max_position_embeddings
 
     @staticmethod
     def get_weight_decay_exclusions():
@@ -687,7 +691,8 @@ class FlaxMistralModule(nn.Module):
             method=None,
             scaling_factor=1.0,
             dim=self.config.hidden_size // self.config.num_attention_heads,
-            end=self.config.max_position_embeddings * 2
+            end=(
+                self.config.freq_max_position_embeddings * 2 if self.config.freq_max_position_embeddings is not None else self.config.max_position_embeddings * 2)
         )
         self.causal_mask = nn.make_causal_mask(jnp.ones((1, self.config.c_max_position_embeddings), dtype='i4'))
 
