@@ -9,6 +9,7 @@ from algorithm.functional import (
 from math import min
 
 
+@always_inline
 fn convert_numpy_to_easydel_array[
     T: DType
 ](np_array: PythonObject, array_spec: ArrayShape) raises -> Array[T]:
@@ -27,9 +28,10 @@ fn convert_numpy_to_easydel_array[
     return Array[T](dynamic_vector, array_spec)
 
 
-fn matmul_2d[nelts: Int, T: DType](inout C: Array[T], A: Array[T], B: Array[T]) -> None:
-    if C.allocated == 0:
-        C.alloc()
+@always_inline
+fn matmul_2d[
+    T: DType, nelts: Int
+](C: Array[T], A: Array[T], B: Array[T], num_cores: Int = 1) -> None:
     @parameter
     fn CI(y: Int, x: Int) -> Int:
         return y * C.dim(-1) + x
@@ -56,48 +58,19 @@ fn matmul_2d[nelts: Int, T: DType](inout C: Array[T], A: Array[T], B: Array[T]) 
 
             vectorize[nelts, _mul](C.dim(-1))
 
-    parallelize[loop_](C.dim(-2))
+    parallelize[loop_](C.dim(-2), num_cores)
 
 
-fn matmul_single_row[nelts: Int, T: DType](inout C: Array[T], A: Array[T], B: Array[T]):
-    if not (A.rank() == 2 and B.rank() == 1 and C.rank() == 1):
-        print("Report Matmul Bug in matmul_single_row")
-    if C.allocated == 0:
-        C.alloc()
-    C.fill(0.0)
-    let C_C: Int = C.dim(-1)
-    let A_C: Int = A.dim(-1)
-    let C_R: Int = C.dim(-2)
-
-    @parameter
-    fn _loop(i: Int):
-        var ar: SIMD[T, nelts] = SIMD[T, nelts](0.0)
-
-        @parameter
-        fn element_wise[_nelts: Int](j: Int):
-            let a_i = i * A_C + j
-            if _nelts < nelts:
-                ar[0] += (A.load[_nelts](a_i) * B.load[_nelts](j)).reduce_add()
-            else:
-                ar += A.load[nelts](a_i) * B.load[nelts](j)
-
-        vectorize[nelts, element_wise](A_C)
-        C[i] = ar.reduce_add()
-
-    parallelize[_loop](A.dim(-2))
-
-
+@always_inline
 fn matmul[
-    nelts: Int, T: DType
-](inout C: Array[T], A: Array[T], B: Array[T]) raises -> None:
-    if C.allocated == 0:
-        C.alloc()
-    if A.rank() == 2 and B.rank() == 1 and C.rank() == 1:
-        matmul_single_row[nelts, T](C, A, B)
+    T: DType, nelts: Int
+](C: Array[T], A: Array[T], B: Array[T], num_cores: Int = 1) -> None:
+    if A.rank() == 2 and B.rank() == 1 and (C.rank() == 1 or C.rank() == 2):
+        matmul_single_row[T, nelts](C, A, B, num_cores)
         return
-    C.fill(0.0)
     if A.rank() != B.rank():
-        raise Error("Can not performe operation Dimensions won't match")
+        print("Can not performe operation Dimensions won't match")
+        return
     let C_C: Int = C.dim(-1)
     let A_C: Int = A.dim(-1)
     let C_R: Int = C.dim(-2)
@@ -135,9 +108,10 @@ fn matmul[
 
                 vectorize[nelts, _mul](C_C)
 
-        parallelize[loop_](C_R)
+        parallelize[loop_](C_R, num_cores)
 
 
+@always_inline
 fn matmul_shape[T: DType](A: Array[T], B: Array[T]) -> ArrayShape:
     if A.rank() == 2 and B.rank() == 1:
         return ArrayShape(A.dim(0))
@@ -148,3 +122,251 @@ fn matmul_shape[T: DType](A: Array[T], B: Array[T]) -> ArrayShape:
         res_dims.append(B.dim(-1))
 
         return ArrayShape(res_dims)
+
+
+@always_inline
+fn matmul_single_row[
+    T: DType, nelts: Int
+](C: Array[T], A: Array[T], B: Array[T], num_cores: Int = 1):
+    if not (A.rank() == 2 and B.rank() == 1 and (C.rank() == 1 or C.rank() == 2)):
+        print("Report Matmul Bug in matmul_single_row")
+    let A_C: Int = A.dim(-1)
+
+    @parameter
+    fn _loop(i: Int):
+        var tensor = SIMD[T, nelts](0.0)
+
+        @parameter
+        fn dot[_nelts: Int](j: Int):
+            if _nelts < nelts:
+                tensor[0] += (A.load[_nelts](i, j) * B.load[_nelts](j)).reduce_add()
+            else:
+                tensor += A.load[nelts](i, j) * B.load[nelts](j)
+
+        vectorize[nelts, dot](A_C)
+        C[i] = tensor.reduce_add()
+
+    parallelize[_loop](A.dim(-2), num_cores)
+
+
+@always_inline
+fn matmul_single_row[
+    T: DType, nelts: Int
+](
+    C: DTypePointer[T],
+    A: DTypePointer[T],
+    B: DTypePointer[T],
+    AC: Int,
+    AR: Int,
+    num_cores: Int = 1,
+):
+    @parameter
+    fn _loop(i: Int):
+        var tensor = SIMD[T, nelts](0)
+
+        @parameter
+        fn dot[_nelts: Int](j: Int):
+            if _nelts < nelts:
+                tensor[0] += (
+                    A.simd_load[_nelts](i * AC + j) * B.simd_load[_nelts](j)
+                ).reduce_add()
+            else:
+                tensor += A.simd_load[nelts](i * AC + j) * B.simd_load[nelts](j)
+
+        vectorize[nelts, dot](AC)
+        C.store(i, tensor.reduce_add())
+
+    parallelize[_loop](AR, num_cores)
+
+
+fn T_AXIS_1_0_2[T: DType, nelts: Int](array: Array[T], num_workers: Int) -> Array[T]:
+    """
+    Transposes a 3D array in axis 0 and 1.
+    """
+
+    var transposed_array = Array[T](array.dim(1), array.dim(0), array.dim(2))
+    transposed_array.alloc(0.0)
+    for i in range(array.dim(0)):
+
+        @parameter
+        fn _row(j: Int):
+            @parameter
+            fn _cols[_nelts: Int](k: Int):
+                let dt: SIMD[T, _nelts] = array.load[_nelts](i, j, k)
+                transposed_array.store[_nelts](j, i, k, dt)
+
+            vectorize[nelts, _cols](array.dim(2))
+
+        parallelize[_row](array.dim(1), num_workers)
+    return transposed_array
+
+
+fn T_AXIS_0_2_1[T: DType, nelts: Int](array: Array[T], num_workers: Int) -> Array[T]:
+    """
+    Transposes an array in axis 2 and 1.
+    """
+
+    var transposed_array = Array[T](array.dim(0), array.dim(2), array.dim(1))
+    transposed_array.alloc(0.0)
+    for i in range(array.dim(0)):
+
+        @parameter
+        fn _row(j: Int):
+            @parameter
+            fn _cols[_nelts: Int](k: Int):
+                let dt: SIMD[T, _nelts] = array.load[_nelts](i, j, k)
+                transposed_array.store[_nelts](i, k, j, dt)
+
+            vectorize[nelts, _cols](array.dim(2))
+
+        parallelize[_row](array.dim(1), num_workers)
+    return transposed_array
+
+
+fn T_AXIS_2_1_0[T: DType, nelts: Int](array: Array[T], num_workers: Int) -> Array[T]:
+    """
+    Transposes an array in axis 0 and 2.
+    """
+
+    var transposed_array = Array[T](array.dim(2), array.dim(1), array.dim(0))
+    transposed_array.alloc(0.0)
+    for i in range(array.dim(0)):
+
+        @parameter
+        fn _row(j: Int):
+            @parameter
+            fn _cols[_nelts: Int](k: Int):
+                let dt: SIMD[T, _nelts] = array.load[_nelts](i, j, k)
+                transposed_array.store[_nelts](k, j, i, dt)
+
+            vectorize[nelts, _cols](array.dim(2))
+
+        parallelize[_row](array.dim(1), num_workers)
+    return transposed_array
+
+
+fn T_2D[T: DType, nelts: Int](array: Array[T], num_workers: Int) -> Array[T]:
+    """
+    Transposes an array.
+    """
+
+    var transposed_array = Array[T](array.dim(1), array.dim(0))
+    transposed_array.alloc(0.0)
+
+    @parameter
+    fn _row(i: Int):
+        @parameter
+        fn _cols[_nelts: Int](j: Int):
+            let dt: SIMD[T, _nelts] = array.load[_nelts](i, j)
+            transposed_array.store[_nelts](j, i, dt)
+
+        vectorize[nelts, _cols](array.dim(1))
+
+    parallelize[_row](array.dim(0), num_workers)
+    return transposed_array
+
+
+fn concatenate[
+    T: DType
+](A: Array[T], B: Array[T], inout axis: Int = 0, stragedy: String = "ord") -> Array[T]:
+    debug_assert(A.rank() == B.rank(), "A,B Shapes Wont Match for concatenate")
+    if axis < 0:
+        axis = A.rank() - axis
+    var cat_shape: DynamicVector[Int] = DynamicVector[Int]()
+    for i in range(A.rank()):
+        if i != axis:
+            debug_assert(A.dim(i) == B.dim(i), "A,B Shapes Wont Match for concatenate")
+            cat_shape.push_back(A.dim(i))
+        else:
+            cat_shape.push_back(A.dim(i) + B.dim(i))
+    var cat_array: Array[T] = Array[T](cat_shape)
+    cat_array.alloc(0.0)
+    if stragedy == "ord":
+
+        @parameter
+        fn _r[nelts: Int](I: Int):
+            if I < A.num_elements():
+                cat_array.store[nelts](I, A.load[nelts](I))
+            else:
+                cat_array.store[nelts](I, B.load[nelts](I))
+
+        vectorize[Array[T].nelts, _r](cat_array.num_elements())
+    return cat_array
+
+
+fn CAT_3D_AXIS_2[T: DType, cores: Int](A: Array[T], B: Array[T]) -> Array[T]:
+    """
+    Return Concatenated Array At axis -1.
+    """
+    var x: Array[T] = Array[T](A.dim(0), A.dim(1), A.dim(-1) + B.dim(-1))
+    let A_A: Int = A.dim(-1)
+    x.alloc(0.0)
+    for i in range(A.dim(0)):
+
+        @parameter
+        fn _row(j: Int):
+            @parameter
+            fn _cols[nelts: Int](k: Int):
+                if k < A_A:
+                    x.store[nelts](i, j, k, A.load[nelts](i, j, k))
+                else:
+                    x.store[nelts](i, j, k, B.load[nelts](i, j, k - A_A))
+
+            vectorize[Array[T].nelts, _cols](x.dim(-1))
+
+        parallelize[_row](A.dim(1), cores)
+    return x
+
+
+fn rotate_half[T: DType, cores: Int](A: Array[T]) -> Array[T]:
+    """
+    Let make it More Pythonic.
+    """
+    debug_assert(A.rank() == 3, "Only 3D Arrays Are accepted")
+    let half: Int = A.dim(-1) // 2
+    let rest: Int = A.dim(-1) - half
+
+    var x1: Array[T] = Array[T](A.dim(0), A.dim(1), half)
+    var x2: Array[T] = Array[T](A.dim(0), A.dim(1), rest)
+
+    x1.alloc(0.0)
+    x2.alloc(0.0)
+    for i in range(A.dim(0)):
+        # X1 Rotation
+        @parameter
+        fn x1_row(j: Int):
+            @parameter
+            fn x1_cols[nelts: Int](k: Int):
+                x1.store[nelts](i, j, k, A.load[nelts](i, j, k))
+
+            vectorize[Array[T].nelts, x1_cols](half)
+
+        parallelize[x1_row](A.dim(1), cores)
+
+        # X2 Rotation
+        @parameter
+        fn x2_row(j: Int):
+            @parameter
+            fn x2_cols[nelts: Int](k: Int):
+                x2.store[nelts](i, j, k, -A.load[nelts](i, j, half + k))
+
+            vectorize[Array[T].nelts, x2_cols](rest)
+
+        parallelize[x2_row](A.dim(1), cores)
+
+    var cated: Array[T] = CAT_3D_AXIS_2[T, cores](x2, x1)
+    return cated
+
+
+@always_inline
+fn arange[T: DType, cores: Int](start: Int, end: Int) -> Array[T]:
+    let rng = end - start
+    var array: Array[T] = Array[T](rng)
+    array.alloc()
+
+    @parameter
+    fn _row(i: Int):
+        array.store[1](i, start + i)
+
+    parallelize[_row](rng, cores)
+    return array

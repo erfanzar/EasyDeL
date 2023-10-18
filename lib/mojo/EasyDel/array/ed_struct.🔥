@@ -1,0 +1,223 @@
+from .array_module import Array
+from runtime.llcl import num_cores
+from algorithm.functional import parallelize
+
+
+struct PointerOperation[T: DType]:
+    var TS: DType
+
+    fn __init__(inout self: Self):
+        self.TS = T
+
+    fn get_dtype(self) -> DType:
+        return self.TS
+
+    @staticmethod
+    @always_inline
+    fn add(
+        inout a: DTypePointer[T],
+        b: DTypePointer[T],
+        num_elements: Int,
+        num_cores: Int = 2,
+    ) -> None:
+        @parameter
+        fn row(size: Int):
+            let cal: SIMD[T, 1] = a.offset(size).load(0) + b.offset(size).load(0)
+            a.offset(size).store(0, cal)
+
+        parallelize[row](num_elements, num_cores)
+
+    @staticmethod
+    @always_inline
+    fn mul(
+        inout a: DTypePointer[T],
+        b: DTypePointer[T],
+        num_elements: Int,
+        num_cores: Int = 2,
+    ) -> None:
+        @parameter
+        fn row(size: Int):
+            let cal: SIMD[T, 1] = a.offset(size).load(0) * b.offset(size).load(0)
+            a.offset(size).store(0, cal)
+
+        parallelize[row](num_elements, num_cores)
+
+    @staticmethod
+    @always_inline
+    fn sub(
+        inout a: DTypePointer[T],
+        b: DTypePointer[T],
+        num_elements: Int,
+        num_cores: Int = 2,
+    ) -> None:
+        @parameter
+        fn row(size: Int):
+            let cal: SIMD[T, 1] = a.offset(size).load(0) - b.offset(size).load(0)
+            a.offset(size).store(0, cal)
+
+        parallelize[row](num_elements, num_cores)
+
+    @staticmethod
+    @always_inline
+    fn div(
+        inout a: DTypePointer[T],
+        b: DTypePointer[T],
+        num_elements: Int,
+        num_cores: Int = 2,
+    ) -> None:
+        @parameter
+        fn row(size: Int):
+            let cal: SIMD[T, 1] = a.offset(size).load(0) / b.offset(size).load(0)
+            a.offset(size).store(0, cal)
+
+        parallelize[row](num_elements, num_cores)
+
+    @staticmethod
+    @always_inline
+    fn floor_div(
+        inout a: DTypePointer[T],
+        b: DTypePointer[T],
+        num_elements: Int,
+        num_cores: Int = 2,
+    ) -> None:
+        @parameter
+        fn row(size: Int):
+            let cal: SIMD[T, 1] = a.offset(size).load(0) // b.offset(size).load(0)
+            a.offset(size).store(0, cal)
+
+        parallelize[row](num_elements, num_cores)
+
+    @staticmethod
+    @always_inline
+    fn pow(
+        inout a: DTypePointer[T],
+        b: DTypePointer[T],
+        num_elements: Int,
+        num_cores: Int = 2,
+    ) -> None:
+        @parameter
+        fn row(size: Int):
+            let cal: SIMD[T, 1] = a.offset(size).load(0) ** b.offset(size).load(0)
+            a.offset(size).store(0, cal)
+
+        parallelize[row](num_elements, num_cores)
+
+    @staticmethod
+    @always_inline
+    fn mod(
+        inout a: DTypePointer[T],
+        b: DTypePointer[T],
+        num_elements: Int,
+        num_cores: Int = 2,
+    ) -> None:
+        @parameter
+        fn row(size: Int):
+            let cal: SIMD[T, 1] = a.offset(size).load(0) % b.offset(size).load(0)
+            a.offset(size).store(0, cal)
+
+        parallelize[row](num_elements, num_cores)
+
+    @staticmethod
+    @always_inline
+    fn add(
+        inout a: DTypePointer[T],
+        b: SIMD[T, 1],
+        num_elements: Int,
+        num_cores: Int = 2,
+    ) -> None:
+        @parameter
+        fn row(size: Int):
+            let cal: SIMD[T, 1] = a.offset(size).load(0) + b
+            a.offset(size).store(0, cal)
+
+        parallelize[row](num_elements, num_cores)
+
+    @staticmethod
+    @always_inline
+    fn mul(
+        inout a: DTypePointer[T],
+        b: SIMD[T, 1],
+        num_elements: Int,
+        num_cores: Int = 2,
+    ) -> None:
+        @parameter
+        fn row(size: Int):
+            let cal: SIMD[T, 1] = a.offset(size).load(0) * b
+            a.offset(size).store(0, cal)
+
+        parallelize[row](num_elements, num_cores)
+
+    @staticmethod
+    @always_inline
+    fn sub(
+        inout a: DTypePointer[T],
+        b: SIMD[T, 1],
+        num_elements: Int,
+        num_cores: Int = 2,
+    ) -> None:
+        @parameter
+        fn row(size: Int):
+            let cal: SIMD[T, 1] = a.offset(size).load(0) - b
+            a.offset(size).store(0, cal)
+
+        parallelize[row](num_elements, num_cores)
+
+    @staticmethod
+    @always_inline
+    fn div(
+        inout a: DTypePointer[T],
+        b: SIMD[T, 1],
+        num_elements: Int,
+        num_cores: Int = 2,
+    ) -> None:
+        @parameter
+        fn row(size: Int):
+            let cal: SIMD[T, 1] = a.offset(size).load(0) / b
+            a.offset(size).store(0, cal)
+
+        parallelize[row](num_elements, num_cores)
+
+    @staticmethod
+    @always_inline
+    fn floor_div(
+        inout a: DTypePointer[T],
+        b: SIMD[T, 1],
+        num_elements: Int,
+        num_cores: Int = 2,
+    ) -> None:
+        @parameter
+        fn row(size: Int):
+            let cal: SIMD[T, 1] = a.offset(size).load(0) // b
+            a.offset(size).store(0, cal)
+
+        parallelize[row](num_elements, num_cores)
+
+    @staticmethod
+    @always_inline
+    fn pow(
+        inout a: DTypePointer[T],
+        b: SIMD[T, 1],
+        num_elements: Int,
+        num_cores: Int = 2,
+    ) -> None:
+        @parameter
+        fn row(size: Int):
+            let cal: SIMD[T, 1] = a.offset(size).load(0) ** b
+            a.offset(size).store(0, cal)
+
+        parallelize[row](num_elements, num_cores)
+
+    @staticmethod
+    @always_inline
+    fn mod(
+        inout a: DTypePointer[T],
+        b: SIMD[T, 1],
+        num_elements: Int,
+        num_cores: Int = 2,
+    ) -> None:
+        @parameter
+        fn row(size: Int):
+            let cal: SIMD[T, 1] = a.offset(size).load(0) % b
+            a.offset(size).store(0, cal)
+
+        parallelize[row](num_elements, num_cores)
