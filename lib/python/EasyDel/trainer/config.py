@@ -4,6 +4,7 @@ import typing
 from typing import OrderedDict, List, Union
 
 import fjutils.optimizers
+
 import torch.utils.tensorboard
 import wandb
 from fjutils import StreamingCheckpointer
@@ -14,7 +15,7 @@ from jax import numpy as jnp
 import jax
 
 AVAILABLE_OPTIMIZERS: List[str] = ['adafactor', 'lion', 'adamw']
-AVAILABLE_SCHEDULERS: List[str] = ['linear', 'cosine', 'none', 'warm_up_cosine']
+AVAILABLE_SCHEDULERS: List[str] = ['linear', 'cosine', 'none', 'warm_up_cosine', "warm_up_linear"]
 AVAILABLE_GRADIENT_CHECK_POINTING: List[str] = ['everything_saveable',
                                                 'nothing_saveable',
                                                 'checkpoint_dots',
@@ -69,6 +70,7 @@ class TrainArguments(
             loss_remat: str = '',
             loss_chunk: int = 1024,
             is_left_padded: bool = False,
+            warmup_steps: int = 500,
             **kwargs
     ):
         super().__init__()
@@ -116,6 +118,7 @@ class TrainArguments(
         self.save_dir = save_dir
         self.use_pjit_attention_force = use_pjit_attention_force
         self.dtype = dtype
+        self.warmup_steps = warmup_steps
         self.param_dtype = param_dtype
         self.fully_fsdp = fully_fsdp
         self.use_wandb = use_wandb
@@ -216,7 +219,6 @@ class TrainArguments(
                     learning_rate=self.learning_rate,
                     steps=steps,
                     gradient_accumulation_steps=self.gradient_accumulation_steps,
-                    weight_decay=self.weight_decay,
                     **self.extra_optimizer_kwargs
                 )
             elif self.scheduler == 'none':
@@ -235,6 +237,17 @@ class TrainArguments(
                     gradient_accumulation_steps=self.gradient_accumulation_steps,
                     **self.extra_optimizer_kwargs
                 )
+            elif self.scheduler == 'warm_up_linear':
+                tx, sc = fjutils.optimizers.get_adafactor_with_warmup_linear_scheduler(
+                    learning_rate_start=self.learning_rate,
+                    steps=steps,
+                    learning_rate_end=self.learning_rate_end,
+                    gradient_accumulation_steps=self.gradient_accumulation_steps,
+                    warmup_steps=self.warmup_steps,
+                    **self.extra_optimizer_kwargs
+
+                )
+
             else:
                 raise ValueError('seems like you have choose wrong type or unavailable scheduler')
         elif self.optimizer == 'lion':
@@ -266,6 +279,16 @@ class TrainArguments(
                     learning_rate=self.learning_rate,
                     steps=steps,
                     gradient_accumulation_steps=self.gradient_accumulation_steps,
+                    **self.extra_optimizer_kwargs
+                )
+
+            elif self.scheduler == 'warm_up_linear':
+                tx, sc = fjutils.optimizers.get_lion_with_with_warmup_linear_scheduler(
+                    learning_rate_start=self.learning_rate,
+                    steps=steps,
+                    learning_rate_end=self.learning_rate_end,
+                    gradient_accumulation_steps=self.gradient_accumulation_steps,
+                    warmup_steps=self.warmup_steps,
                     **self.extra_optimizer_kwargs
                 )
             else:
@@ -301,6 +324,16 @@ class TrainArguments(
                     steps=steps,
                     weight_decay=self.weight_decay,
                     gradient_accumulation_steps=self.gradient_accumulation_steps,
+                    **self.extra_optimizer_kwargs
+                )
+            elif self.scheduler == 'warm_up_linear':
+                tx, sc = fjutils.optimizers.get_adamw_with_warmup_linear_scheduler(
+                    learning_rate_start=self.learning_rate,
+                    steps=steps,
+                    weight_decay=self.weight_decay,
+                    learning_rate_end=self.learning_rate_end,
+                    gradient_accumulation_steps=self.gradient_accumulation_steps,
+                    warmup_steps=self.warmup_steps,
                     **self.extra_optimizer_kwargs
                 )
             else:

@@ -130,46 +130,67 @@ Takes DType as dynamic Input like `Array[DType.float32]`
 
 `fn __init__(inout self: Self, array_shape: ArrayShape):`
 
- - Description: Init Array From ArrayShape(Alloc Zero).
+- Description: Init Array From ArrayShape(Alloc Zero).
 
 `fn __init__(inout self: Self, A: Self, B: Self) -> None:`
 
- - Description: Init Array From Two other Arrays A and B For Matmul(Alloc One).
+- Description: Init Array From Two other Arrays A and B For Matmul(Alloc One).
 
 `fn __init__(inout self: Self, vl: VariadicList[Int]):`
 
- - Description: Init Array from VariadicList[Int](Alloc Zero).
+- Description: Init Array from VariadicList[Int](Alloc Zero).
 
 `fn __init__(inout self: Self, init: Bool, *dim: Int) -> None:`
 
- - Description: Init Array from Int Args(Depends on Passed Bool).
+- Description: Init Array from Int Args(Depends on Passed Bool).
 
 `fn __init__(inout self: Self, *dim: Int):`
 
- - Description: Init Array from Int Args(Alloc Zero).
+- Description: Init Array from Int Args(Alloc Zero).
 
 `fn __init__(inout self: Self, value: DynamicVector[FloatLiteral], shape: ArrayShape) -> None:`
 
- - Description: Init Array from ArrayShape and load data from DynamicVector[FloatLiteral](Alloc One).
+- Description: Init Array from ArrayShape and load data from DynamicVector[FloatLiteral](Alloc One).
 
 `fn __init__(inout self: Self, value: VariadicList[FloatLiteral], shape: ArrayShape) -> None:`
 
- - Description: Init Array from ArrayShape and load data from VariadicList[FloatLiteral](Alloc One).
+- Description: Init Array from ArrayShape and load data from VariadicList[FloatLiteral](Alloc One).
 
 `fn __init__(inout self: Self, pointer: DTypePointer[T], *dim: Int) -> None:`
 
- - Description: Init Array from IntArgs and load data from DTypePointer[T](Alloc One).
+- Description: Init Array from IntArgs and load data from DTypePointer[T](Alloc One).
+  
+`fn __init__(inout self: Self, pointer: DTypePointer[T], *dim: Int) -> None:`
+
+- Description: Init Array from given data from DTypePointer[T](Alloc Zero).
 
 ### Alloc
 
 `fn alloc(inout self: Self) -> None:`
- - Description: Allocate or Init The Array.
+
+- Description: Allocate or Init The Array.
+
+`fn alloc(inout self: Self, fill:SIMD[T, 1]) -> None:`
+
+- Allocate or Init The Array and fill that with given fill number.
 
 ### Random
 
 `fn random(inout self: Self) -> None:`
 
- - Description: Randomize The Data if the Array is Allocated.
+- Description: Randomize The Data if the Array is Allocated.
+
+### Reshape and View
+
+View:
+
+* INOUT  `fn view(inout self, *dims: Int):`
+* View Change Shape totaly and don't care if the new shape fits or doesn't.
+
+Reshape:
+
+* INOUT  `fn reshape(inout self, *dims: Int):`
+* Reshape Change Shape totaly and check if the new shape fits or doesn't.
 
 ### Dim
 
@@ -203,7 +224,7 @@ fn load[
 
 ### Store Functions
 
-``` 
+```
 fn store[
     nelts: Int, off: Int
 ](self, index: InlinedFixedVector[off, Int], val: SIMD[T, nelts]) -> None:
@@ -225,6 +246,10 @@ fn store[
 
 `fn __getitem__(self, index: Int) -> SIMD[T, 1]:`
 
+`fn __getitem__(self, d1: Int, d2: Int, val:SIMD[T, 1]) raises->None:`
+
+`fn __getitem__(self, d1: Int, d2: Int, d3: Int, val:SIMD[T, 1]) raises->None:`
+
 ### `__setitem__` Functions
 
 `fn __setitem__(self, index: Int, val: SIMD[T, 1]) -> None:`
@@ -233,9 +258,16 @@ fn store[
 
 `fn __setitem__[off: Int](self, index: StaticIntTuple[off], val: SIMD[T, 1]):`
 
+`fn __setitem__(self, d1: Int, d2: Int, val:SIMD[T, 1]) raises->None:`
+
+`fn __setitem__(self, d1: Int, d2: Int, d3: Int, val:SIMD[T, 1]) raises->None:`
+
 ### Math Functions
 
 ```mojo
+
+fn argmax(self: Self, axis: Int = -1) -> Int:
+
 # cos
 
 fn cos(inout self: Self) -> Self:
