@@ -102,7 +102,7 @@ flags.DEFINE_string(
 flags.DEFINE_string(
     name="scheduler",
     default='cosine',
-    help='which scheduler to use (available schedulers are cosine linear none warm_up_cosine)'
+    help='which scheduler to use (available schedulers are cosine linear none warm_up_cosine , warm_up_linear)'
 )
 
 flags.DEFINE_string(
