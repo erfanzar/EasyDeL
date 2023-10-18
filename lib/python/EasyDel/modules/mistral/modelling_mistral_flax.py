@@ -161,8 +161,8 @@ def repeat_kv(x: jax.Array, n_rep: int) -> jax.Array:
     bs, s, n_kv_heads, head_dim = x.shape
     if n_rep == 1:
         return x
-    x = x[:, :, :, jnp.newaxis, :]
-    x = jnp.repeat(x, n_rep, axis=3)
+    x = x[:, :, jnp.newaxis, :, :]
+    x = jnp.repeat(x, n_rep, axis=2)
 
     return x.reshape(bs, s,
                      n_kv_heads * n_rep,
@@ -211,8 +211,8 @@ def precompute_freq_cis(
         else:
             raise ValueError(f'unknown {method} method for precompute_freq_cis')
 
-    freq = jnp.outer(t, freq).astype(jnp.bfloat16)
-    sin, cos = jnp.sin(freq).astype(jnp.bfloat16), jnp.cos(freq).astype(jnp.bfloat16)
+    freq = jnp.outer(t, freq).astype(jnp.float32)
+    sin, cos = jnp.sin(freq).astype(jnp.float32), jnp.cos(freq).astype(jnp.float32)
     freq_cis = jnp.complex64(cos + 1j * sin)
     return jnp.asarray(freq_cis)
 
