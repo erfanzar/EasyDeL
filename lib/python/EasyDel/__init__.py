@@ -10,7 +10,7 @@ from .trainer import TrainArguments, fsdp_train_step, get_training_modules, Caus
 try:
     from .serve import JAXServer, PyTorchServer, JaxServerConfig
 except ValueError as vr:
-    print(f"\033[1;31mWarning\033[1;0m : JAXServer Wont be Imported Be Cause {vr}")
+    print(f"\033[1;31mWarning\033[1;0m : JAXServer Will not be Imported Be Cause of {vr}")
     JAXServer = None
 __version__ = "0.0.31"
 
