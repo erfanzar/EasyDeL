@@ -390,7 +390,7 @@ class FlaxMistralAttention(nn.Module):
         attention_bias = jax.lax.select(
             attention_mask > 0,
             jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-            jnp.full(attention_mask.shape, -jnp.inf),
+            jnp.full(attention_mask.shape, jnp.finfo(q).min),
         )
 
         tk = k.transpose(0, 1, 3, 2)
