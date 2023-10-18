@@ -358,7 +358,9 @@ class FlaxMistralAttention(nn.Module):
             causal_mask = causal_mask[:, :, :q_l, :k_l]
 
         causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
-        attention_mask = jnp.broadcast_to(jnp.expand_dims(attention_mask, axis=(-3, -2)), causal_mask.shape)
+        if attention_mask.ndim == 2:
+            attention_mask = jnp.broadcast_to(jnp.expand_dims(attention_mask, axis=(-3, -2)), causal_mask.shape)
+
         attention_mask = nn.combine_masks(attention_mask, causal_mask)
         attention_bias = jax.lax.select(
             attention_mask > 0,
