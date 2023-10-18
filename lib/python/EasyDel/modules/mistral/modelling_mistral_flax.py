@@ -392,14 +392,16 @@ class FlaxMistralAttention(nn.Module):
             jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
             jnp.full(attention_mask.shape, jnp.finfo(q).min),
         )
+        org_dtype = k.dtype
 
-        tk = k.transpose(0, 1, 3, 2)
-        attn_weight = jax.lax.batch_matmul(q, tk) / math.sqrt(self.head_dim)
+        attention_bias, q, k, v = map(lambda x: x.astype(jnp.float32), [attention_bias, q, k, v])
+        attn_weight = jax.lax.batch_matmul(q, k.transpose(0, 1, 3, 2)) / math.sqrt(self.head_dim)
         attn_weight = attn_weight + attention_bias
         attn_weight = jax.nn.softmax(attn_weight.astype(jnp.float32), axis=-1).astype(attn_weight.dtype)
         if self.config.use_pjit_attention_force:
             attn_weight = with_sharding_constraint(attn_weight, PS(("dp", "fsdp"), "mp", None, None))
         attn_output = jax.lax.batch_matmul(attn_weight, v).transpose(0, 2, 1, 3)
+        attn_output = attn_output.astype(org_dtype)
         out = self.o_proj(attn_output.reshape(batch_size, sequence_length, self.hidden_size))
         outputs = (out, attn_output) if output_attentions else (out,)
         return outputs
