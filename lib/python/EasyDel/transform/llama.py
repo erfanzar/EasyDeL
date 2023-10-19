@@ -7,8 +7,25 @@ from transformers import LlamaForCausalLM
 from ..modules.llama import LlamaConfig
 
 
+def inverse_permute(w, num_attention_heads, in_dim, out_dim):
+    reshaped_w = w.reshape(num_attention_heads, 2, in_dim // num_attention_heads // 2, out_dim)
+    transposed_w = reshaped_w.transpose(0, 2, 1, 3)
+    inverted_w = transposed_w.reshape(in_dim, out_dim)
+    return inverted_w
+
+
+def match_keywords(string, ts, ns):
+    for t in ts:
+        if t not in string:
+            return False
+    for n in ns:
+        if n in string:
+            return False
+    return True
+
+
 def llama_convert_hf_to_flax_load(checkpoints_dir, num_hidden_layers=32, num_attention_heads=32, hidden_size=4096,
-                            device=jax.devices('cpu')[0]):
+                                  device=jax.devices('cpu')[0]):
     # Edited From EasyLM
     ckpt_paths = sorted(Path(checkpoints_dir).glob("*.bin"))
     state_dict = {}
@@ -93,15 +110,10 @@ def llama_convert_hf_to_flax_load(checkpoints_dir, num_hidden_layers=32, num_att
         return jax_weights
 
 
-def llama_convert_hf_to_flax(state_dict, num_hidden_layers=32, num_attention_heads=32, hidden_size=4096,
-                       device=jax.devices('cpu')[0]):
+def llama_convert_hf_to_flax(state_dict, config: LlamaConfig,
+                             device=jax.devices('cpu')[0]):
+    kv_dims = (config.hidden_size // config.num_attention_heads) * config.num_key_value_heads
     with jax.default_device(device):
-        def inverse_permute(w):
-            reshaped_w = w.reshape(num_attention_heads, 2, hidden_size // num_attention_heads // 2, hidden_size)
-            transposed_w = reshaped_w.transpose(0, 2, 1, 3)
-            inverted_w = transposed_w.reshape(hidden_size, hidden_size)
-            return inverted_w
-
         jax_weights = {
             "transformer": {
                 "wte": {"embedding": state_dict["model.embed_tokens.weight"].numpy()},
@@ -114,12 +126,15 @@ def llama_convert_hf_to_flax(state_dict, num_hidden_layers=32, num_attention_hea
                                 "kernel": inverse_permute(
 
                                     state_dict[f"model.layers.{layer}.self_attn.q_proj.weight"].numpy(),
+                                    num_attention_heads=config.num_attention_heads,
+                                    in_dim=config.hidden_size, out_dim=config.hidden_size
                                 ).transpose()
                             },
                             "wk": {
                                 "kernel": inverse_permute(
-
                                     state_dict[f"model.layers.{layer}.self_attn.k_proj.weight"].numpy(),
+                                    num_attention_heads=config.num_attention_heads,
+                                    in_dim=config.hidden_size, out_dim=kv_dims
                                 ).transpose()
                             },
                             "wv": {
@@ -159,7 +174,7 @@ def llama_convert_hf_to_flax(state_dict, num_hidden_layers=32, num_attention_hea
                             ].numpy()
                         },
                     }
-                    for layer in range(num_hidden_layers)
+                    for layer in range(config.num_hidden_layers)
                 },
             },
             "lm_head": {"kernel": state_dict["lm_head.weight"].numpy().transpose()},
@@ -201,15 +216,6 @@ def llama_convert_pt_to_flax(state_dict_pt, n_layers: int, device=jax.devices('c
 
 
 def llama_convert_flax_to_pt(flax_params, n_layers, dim, num_attention_heads, dtype=jnp.float16):
-    def match_keywords(string, ts, ns):
-        for t in ts:
-            if t not in string:
-                return False
-        for n in ns:
-            if n in string:
-                return False
-        return True
-
     torch_params = {}
     for key, tensor in flax_params.items():
         if match_keywords(key, ['kernel'], ['none']):
@@ -266,9 +272,7 @@ def llama_from_pretrained(model_id, device=jax.devices('cpu')[0]):
     model = LlamaForCausalLM.from_pretrained(model_id)
     easydel_wights = llama_convert_hf_to_flax(
         state_dict=model.state_dict(),
-        num_hidden_layers=config.num_hidden_layers,
-        hidden_size=config.hidden_size,
-        num_attention_heads=config.num_attention_heads,
+        config=config,
         device=device
     )
     config.add_jax_args()
