@@ -222,8 +222,8 @@ def repeat_kv(x: jax.Array, n_rep: int) -> jax.Array:
     bs, s, n_kv_heads, head_dim = x.shape
     if n_rep == 1:
         return x
-    x = x[:, :, :, jnp.newaxis, :]
-    x = jnp.repeat(x, n_rep, axis=3)
+    x = x[:, :, jnp.newaxis, :, :]
+    x = jnp.repeat(x, n_rep, axis=2)
 
     return x.reshape(bs, s,
                      n_kv_heads * n_rep,
@@ -527,8 +527,6 @@ class FlaxLlamaAttention(nn.Module):
                     attn_output = with_sharding_constraint(attn_output, PS(("dp", "fsdp"), None, "mp", None))
                 attn_output = self._merge_heads(attn_output)
             else:
-                print(f"Q : {xq.shape}")
-                print(f"K : {xk.shape}")
                 attn_weights = dot_product_attention_weights(
                     query=xq,
                     key=xk,
@@ -538,7 +536,6 @@ class FlaxLlamaAttention(nn.Module):
                     dropout_rate=self.config.attn_pdrop,
                     precision=self.precision,
                 )
-                print(f"A : {attn_weights.shape}")
                 if self.config.use_pjit_attention_force:
                     attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "mp", None, None))
 

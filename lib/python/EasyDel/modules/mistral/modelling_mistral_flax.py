@@ -421,10 +421,10 @@ class FlaxMistralAttention(nn.Module):
         )
         org_dtype = key.dtype
         attn_weight = nn.dot_product_attention(query=query, key=key, value=value, bias=attention_bias,
-                                               dtype=jnp.float32)
-        attn_output = attn_weight.astype(org_dtype)
-        out = self.o_proj(attn_output.reshape(batch_size, sequence_length, self.hidden_size))
-        outputs = (out, attn_output) if output_attentions else (out,)
+                                               dtype=jnp.promote_types(self.dtype, jnp.float32))
+        attn_weight = attn_weight.astype(org_dtype)
+        out = self.o_proj(attn_weight.reshape(batch_size, sequence_length, self.hidden_size))
+        outputs = (out, attn_weight) if output_attentions else (out,)
         return outputs
 
 
