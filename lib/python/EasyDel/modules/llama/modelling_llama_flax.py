@@ -17,7 +17,7 @@ from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLM
 from fjutils.easylm import blockwise_dot_product_attention
 from ..flax_modelling_utils import with_sharding_constraint, \
     get_gradient_checkpoint_policy
-
+import chex
 
 class LlamaConfig(PretrainedConfig):
     model_type = "Llama.md"
@@ -218,7 +218,7 @@ class LlamaConfig(PretrainedConfig):
 remat = nn_partitioning.remat
 
 
-def repeat_kv(x: jax.Array, n_rep: int) -> jax.Array:
+def repeat_kv(x: chex.Array, n_rep: int) -> chex.Array:
     bs, s, n_kv_heads, head_dim = x.shape
     if n_rep == 1:
         return x
@@ -1062,7 +1062,7 @@ class FlaxLlamaForCausalLMModule(nn.Module):
 class FlaxLlamaForCausalLM(FlaxLlamaPreTrainedModel):
     module_class = FlaxLlamaForCausalLMModule
 
-    def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[jax.Array] = None):
+    def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[chex.Array] = None):
         batch_size, seq_length = input_ids.shape
 
         past_key_values = self.init_cache(batch_size, max_length)

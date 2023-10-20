@@ -15,7 +15,7 @@ from functools import partial
 from einops import rearrange
 from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
     with_sharding_constraint, ACT2FN
-
+import chex
 
 class GPTNeoXConfig(PretrainedConfig):
     model_type = "gpt_neox"
@@ -159,8 +159,8 @@ class FlaxGPTNeoXAttention(nn.Module):
         self.bias = nn.make_causal_mask(jnp.ones((1, self.config.max_position_embeddings)))
 
     def __call__(self,
-                 hidden_states: jax.Array,
-                 attention_mask: jax.Array = None,
+                 hidden_states: chex.Array,
+                 attention_mask: chex.Array = None,
                  ):
         b, s, d = hidden_states.shape
         q, k, v = jnp.split(self.w_qkv(hidden_states), indices_or_sections=3, axis=-1)
@@ -236,8 +236,8 @@ class FlaxGPTNeoXBlock(nn.Module):
         )
 
     def __call__(self,
-                 hidden_states: jax.Array,
-                 attention_mask: jax.Array,
+                 hidden_states: chex.Array,
+                 attention_mask: chex.Array,
                  ):
         attn = self.attention(
             self.input_layernorm(hidden_states),
@@ -296,8 +296,8 @@ class FlaxGPTNeoXCollection(nn.Module):
         ]
 
     def __call__(self,
-                 hidden_states: jax.Array,
-                 attention_mask: jax.Array,
+                 hidden_states: chex.Array,
+                 attention_mask: chex.Array,
 
                  ):
         for block in self.blocks:
@@ -329,7 +329,7 @@ class FlaxGPTNeoXModule(nn.Module):
 
     def __call__(self,
                  input_ids: jnp.int32 = None,
-                 attention_mask: Optional[jax.Array] = None,
+                 attention_mask: Optional[chex.Array] = None,
                  return_dict: Optional[bool] = None,
                  ):
         b, s = input_ids.shape
@@ -381,7 +381,7 @@ class FlaxGPTNeoXPretrainedModel(FlaxPreTrainedModel):
         )
         return predict
 
-    def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[jax.Array] = None):
+    def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[chex.Array] = None):
         return {
             "attention_mask": attention_mask,
         }

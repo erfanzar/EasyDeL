@@ -47,7 +47,7 @@ from jax.sharding import PartitionSpec
 from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
     with_sharding_constraint
 
-
+import chex
 class T5Config(PretrainedConfig):
     model_type = "t5"
     keys_to_ignore_at_inference = ["past_key_values"]
@@ -1509,8 +1509,8 @@ class FlaxT5ForConditionalGeneration(FlaxT5PreTrainedModel):
             self,
             decoder_input_ids,
             max_length,
-            attention_mask: Optional[jax.Array] = None,
-            decoder_attention_mask: Optional[jax.Array] = None,
+            attention_mask: Optional[chex.Array] = None,
+            decoder_attention_mask: Optional[chex.Array] = None,
             encoder_outputs=None,
             **kwargs,
     ):

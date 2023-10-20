@@ -15,7 +15,7 @@ from flax.linen import partitioning as nn_partitioning
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 
 from ..flax_modelling_utils import ACT2FN, with_sharding_constraint, get_gradient_checkpoint_policy
-
+import chex
 
 class MistralConfig(PretrainedConfig):
     def __init__(
@@ -173,7 +173,7 @@ def matmul_4d_loop(x, y):
     return result
 
 
-def repeat_kv_bnsh(x: jax.Array, n_rep: int) -> jax.Array:
+def repeat_kv_bnsh(x: chex.Array, n_rep: int) -> chex.Array:
     bs, n_kv_heads, s, head_dim = x.shape
     if n_rep == 1:
         return x
@@ -183,7 +183,7 @@ def repeat_kv_bnsh(x: jax.Array, n_rep: int) -> jax.Array:
     return x.reshape(bs, n_kv_heads * n_rep, s, head_dim)
 
 
-def repeat_kv_bsnh(x: jax.Array, n_rep: int) -> jax.Array:
+def repeat_kv_bsnh(x: chex.Array, n_rep: int) -> chex.Array:
     bs, s, n_kv_heads, head_dim = x.shape
     x = x.transpose(0, 2, 1, 3)
     if n_rep == 1:
@@ -297,7 +297,7 @@ class FlaxMistralMLP(nn.Module):
         self.down_proj = dense(self.config.hidden_size)
         self.act_fn = ACT2FN[self.config.hidden_act]
 
-    def __call__(self, x: jax.Array):
+    def __call__(self, x: chex.Array):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
@@ -332,7 +332,7 @@ class FlaxMistralAttention(nn.Module):
         self.rotary = FlaxMistralRotaryEmbedding(self.dtype)
 
     @nn.compact
-    def concatenate_to_cache_(self, query: jax.Array, key: jax.Array, value: jax.Array, attention_mask: jax.Array):
+    def concatenate_to_cache_(self, query: chex.Array, key: chex.Array, value: chex.Array, attention_mask: chex.Array):
         is_cache_available = self.has_variable('cache', 'key')
         key_cache = self.variable('cache', 'key', jnp.zeros, key.shape, key.dtype)
         value_cache = self.variable('cache', 'value', jnp.zeros, key.shape, value.dtype)
@@ -370,11 +370,11 @@ class FlaxMistralAttention(nn.Module):
 
     def __call__(
             self,
-            hidden_state: jax.Array,
-            freq_cis: jax.Array,
-            attention_mask: jax.Array,
-            causal_mask: jax.Array,
-            position_ids: jax.Array,
+            hidden_state: chex.Array,
+            freq_cis: chex.Array,
+            attention_mask: chex.Array,
+            causal_mask: chex.Array,
+            position_ids: chex.Array,
             deterministic: bool = True,
             init_cache: bool = False,
             output_attentions: bool = True
@@ -462,11 +462,11 @@ class FlaxMistralDecoderLayer(nn.Module):
 
     def __call__(
             self,
-            hidden_state: jax.Array,
-            freq_cis: jax.Array,
-            attention_mask: jax.Array,
-            causal_mask: jax.Array,
-            position_ids: jax.Array,
+            hidden_state: chex.Array,
+            freq_cis: chex.Array,
+            attention_mask: chex.Array,
+            causal_mask: chex.Array,
+            position_ids: chex.Array,
             deterministic: bool = True,
             init_cache: bool = False,
             output_attentions: bool = True
@@ -656,11 +656,11 @@ class FlaxMistralDecoratorCollection(nn.Module):
 
     def __call__(
             self,
-            hidden_state: jax.Array,
-            freq_cis: jax.Array,
-            attention_mask: jax.Array,
-            causal_mask: jax.Array,
-            position_ids: jax.Array,
+            hidden_state: chex.Array,
+            freq_cis: chex.Array,
+            attention_mask: chex.Array,
+            causal_mask: chex.Array,
+            position_ids: chex.Array,
             deterministic: bool = True,
             init_cache: bool = False,
             output_attentions: bool = False,
@@ -726,11 +726,11 @@ class FlaxMistralModule(nn.Module):
 
     def __call__(
             self,
-            input_ids: jax.Array,
-            attention_mask: jax.Array,
-            position_ids: jax.Array,
+            input_ids: chex.Array,
+            attention_mask: chex.Array,
+            position_ids: chex.Array,
             deterministic: bool = True,
-            input_embeds: jax.Array = None,
+            input_embeds: chex.Array = None,
             init_cache: bool = False,
             output_attentions: bool = False,
             output_hidden_states: bool = False,
@@ -801,11 +801,11 @@ class FlaxMistralForCausalLMModule(nn.Module):
 
     def __call__(
             self,
-            input_ids: jax.Array,
-            attention_mask: jax.Array,
-            position_ids: jax.Array,
+            input_ids: chex.Array,
+            attention_mask: chex.Array,
+            position_ids: chex.Array,
             deterministic: bool = True,
-            input_embeds: jax.Array = None,
+            input_embeds: chex.Array = None,
             init_cache: bool = False,
             output_attentions: bool = False,
             output_hidden_states: bool = False,
@@ -850,7 +850,7 @@ class FlaxMistralForCausalLMModule(nn.Module):
 class FlaxMistralForCausalLM(FlaxMistralPretrainedModel):
     module_class = FlaxMistralForCausalLMModule
 
-    def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[jax.Array] = None):
+    def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[chex.Array] = None):
         batch_size, seq_length = input_ids.shape
 
         past_key_values = self.init_cache(batch_size, max_length)
