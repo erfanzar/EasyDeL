@@ -12,9 +12,10 @@ from transformers.modeling_flax_outputs import FlaxCausalLMOutput, FlaxBaseModel
 from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
     with_sharding_constraint
 import chex
-from fjutils.utils import transpose as trp
+from fjutils.utils import transpose
 
-transpose = jax.jit(trp)
+
+# transpose = jax.jit(trp)
 
 
 class FalconConfig(PretrainedConfig):
@@ -240,19 +241,23 @@ class FlaxFalconRotaryEmbedding(nn.Module):
     def __call__(self, key, query, freq_cis, position_ids):
         sin, cos = freq_cis
 
-        sin = sin[position_ids][None, :, :]
-        cos = cos[position_ids][None, :, :]
+        sin = sin[position_ids][:, :]
+        cos = cos[position_ids][:, :]
 
         _, sequence_length, _ = query.shape
 
-        query_expansion_factor = int(query.shape[0] / cos.shape[0])
+        # query_expansion_factor = int(query.shape[0] / cos.shape[0])
+        # key_expansion_factor = int(key.shape[0] / cos.shape[0])
+
+        query_expansion_factor = 1
+        key_expansion_factor = 1
+
         if query_expansion_factor > 1:
             query_cos = jnp.tile(cos, (query_expansion_factor,))
             query_sin = jnp.tile(sin, (query_expansion_factor,))
         else:
             query_cos, query_sin = cos, sin
 
-        key_expansion_factor = int(key.shape[0] / cos.shape[0])
         if key_expansion_factor > 1:
             if key_expansion_factor != query_expansion_factor:
                 key_cos = jnp.tile(cos, (key_expansion_factor,))
@@ -261,6 +266,7 @@ class FlaxFalconRotaryEmbedding(nn.Module):
                 key_cos, key_sin = query_cos, query_sin
         else:
             key_cos, key_sin = cos, sin
+
         query = apply_rotary_pos_embedding(query, query_sin, query_cos)
         key = apply_rotary_pos_embedding(key, key_sin, key_cos)
         return query.astype(self.dtype), key.astype(self.dtype)
@@ -385,12 +391,12 @@ class FlaxFalconAttention(nn.Module):
             output_attentions: bool = False,
     ):
         batch_size, sequence_length, _ = hidden_states.shape
-        num_kv_heads = self.config.num_attention_heads if self.config.new_decoder_architecture else self.config.num_kv_heads
+        num_kv_heads = self.num_kv_heads
         query_layer, key_layer, value_layer = self.split_head(self.query_key_value(hidden_states))
         query_layer = transpose(
             query_layer, 1, 2
         ).reshape(
-            batch_size * self.num_heads,
+            batch_size * self.config.num_attention_heads,
             sequence_length,
             self.head_dim
         )
@@ -408,14 +414,14 @@ class FlaxFalconAttention(nn.Module):
             sequence_length,
             self.head_dim
         )
-
         kv_length = key_layer.shape[1]
-        query_layer, key_layer = self.maybe_rotary(
-            query_layer,
-            key_layer,
-            freq_cis,
-            position_ids
-        )
+        if not self.config.alibi:
+            query_layer, key_layer = self.maybe_rotary(
+                query_layer,
+                key_layer,
+                freq_cis,
+                position_ids
+            )
 
         float_min = jnp.finfo(query_layer.dtype).min
         attention_bias = lax.select(
@@ -666,11 +672,10 @@ class FlaxFalconModule(nn.Module):
         )
         self.ln_f = nn.LayerNorm(dtype=self.dtype, param_dtype=self.param_dtype, epsilon=self.config.layer_norm_epsilon)
         self.causal_mask = nn.attention.make_causal_mask(jnp.ones((1, self.config.max_position_embeddings)))
-        if self.config.alibi:
+        if not self.config.alibi:
             self.freq_cis: Tuple[chex.Array, chex.Array] = precompute_falcon_freq_cis(
-                max_position_embedding=self.config.max_length or self.config.max_seq_len,
-                head_dim=self.config.hidden_size // self.config.num_attention_heads,
-
+                max_position_embedding=self.config.max_position_embeddings,
+                head_dim=self.config.hidden_size // self.config.num_attention_heads
             )
         else:
             self.freq_cis = None

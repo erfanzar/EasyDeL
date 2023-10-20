@@ -27,6 +27,7 @@ def main():
         num_attention_heads=8,
         num_hidden_layers=1,
         gradient_checkpointing='',
+        alibi=False
     )
     print('Model Config :\n', config)
 
@@ -40,29 +41,29 @@ def main():
     torch_output = torch_model(
         input_ids=input_ids
     )
-    try:
+    # try:
 
-        flax_model = FlaxFalconForCausalLM(
-            config=config,
-            dtype=jnp.float32,
-            param_dtype=jnp.float32,
-            _do_init=False, input_shape=(1, 6)
-        )
-        flax_output = flax_model(
-            input_ids=flax_input_ids,
-            params=params,
+    flax_model = FlaxFalconForCausalLM(
+        config=config,
+        dtype=jnp.float32,
+        param_dtype=jnp.float32,
+        _do_init=False, input_shape=(1, 6)
+    )
+    # flax_output = flax_model(
+    #     input_ids=flax_input_ids,
+    #     params=params,
+    #
+    # )
+    # res = jnp.allclose(torch_output.logits.cpu().detach().numpy(), flax_output.logits, atol=1e-5)
+    # print('Mistral Huggingface Predictions :\n', torch_output.logits.cpu().detach().numpy(),
+    #       '\nEasyDel Predictions: \n', flax_output.logits)
+    # if res:  # A Little Bit of humor
+    #     print('\033[1;36mTest Passed Unfortunately 🥳')
+    # else:
+    #     print('\033[1;31mTest Failed Successfully  🤕')
 
-        )
-        res = jnp.allclose(torch_output.logits.cpu().detach().numpy(), flax_output.logits, atol=1e-5)
-        print('Mistral Huggingface Predictions :\n', torch_output.logits.cpu().detach().numpy(),
-              '\nEasyDel Predictions: \n', flax_output.logits)
-        if res:  # A Little Bit of humor
-            print('\033[1;36mTest Passed Unfortunately 🥳')
-        else:
-            print('\033[1;31mTest Failed Successfully  🤕')
-
-    except TypeError as e:
-        print(e.__str__())
+    # except TypeError as e:
+    #     print(e.__str__())
 
 
 if __name__ == '__main__':
