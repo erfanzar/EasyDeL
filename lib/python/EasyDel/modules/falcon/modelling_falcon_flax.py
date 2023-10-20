@@ -271,12 +271,6 @@ class FlaxFalconAttention(nn.Module):
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]] = None
-    query_key_value: Optional[nn.Dense] = None
-    dense: Optional[nn.Dense] = None
-    maybe_rotary: Optional[Union[nn.Module, Callable]] = None
-    inv_norm_factor: Optional[float] = None
-    head_dim: Optional[int] = None
-    num_kv_heads: Optional[int] = None
 
     def setup(self) -> None:
         head_dim = self.config.hidden_size // self.config.num_attention_heads
@@ -340,7 +334,7 @@ class FlaxFalconAttention(nn.Module):
 
     def split_head(self, qkv: chex.Array):
         batch_size, sequence_length, _ = qkv.shape
-        if self.new_decoder_architecture:
+        if self.config.new_decoder_architecture:
             batch, sequence_length, _ = qkv.shape
             qkv = qkv.reshape(batch, sequence_length, -1, self.num_heads // self.num_kv_heads + 2, self.head_dim)
             query_state = qkv[:, :, :, :-2]
@@ -391,7 +385,7 @@ class FlaxFalconAttention(nn.Module):
             output_attentions: bool = False,
     ):
         batch_size, sequence_length, _ = hidden_states.shape
-        num_kv_heads = self.config.num_attention_heads if self.config.new_decoder_architecture else self.config.num
+        num_kv_heads = self.config.num_attention_heads if self.config.new_decoder_architecture else self.config.num_kv_heads
         query_layer, key_layer, value_layer = self.split_head(self.query_key_value(hidden_states))
         query_layer = transpose(
             query_layer, 1, 2
@@ -487,8 +481,6 @@ class FlaxFalconMlp(nn.Module):
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]] = None
-    dense_4h_to_h: Optional[nn.Module] = None
-    dense_h_to_4h: Optional[nn.Module] = None
 
     def setup(self) -> None:
         self.dense_h_to_4h = nn.Dense(
@@ -513,12 +505,6 @@ class FlaxFalconBlock(nn.Module):
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]] = None
-    mlp: Optional[nn.Module] = None
-    post_attention_layernorm: Optional[nn.Module] = None
-    input_layernorm: Optional[nn.Module] = None
-    ln_attn: Optional[nn.Module] = None
-    ln_mlp: Optional[nn.Module] = None
-    self_attention: Optional[nn.Module] = None
 
     def setup(self) -> None:
         config = self.config
@@ -613,7 +599,6 @@ class FlaxFalconCollection(nn.Module):
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]] = None
-    layers: Optional[List[FlaxFalconBlock]] = None
 
     def setup(self) -> None:
         block = FlaxFalconBlock
@@ -665,11 +650,6 @@ class FlaxFalconModule(nn.Module):
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]] = None
-    freq_cis: Optional[Union[Tuple[chex.Array, chex.Array], None]] = None
-    word_embeddings: Optional[nn.Module] = None
-    h: Optional[nn.Module] = None
-    ln_f: Optional[nn.Module] = None
-    causal_mask: Optional[chex.Array] = None
 
     def setup(self) -> None:
         self.word_embeddings = nn.Embed(
@@ -685,7 +665,7 @@ class FlaxFalconModule(nn.Module):
             precision=self.precision
         )
         self.ln_f = nn.LayerNorm(dtype=self.dtype, param_dtype=self.param_dtype, epsilon=self.config.layer_norm_epsilon)
-        self.causal_mask = nn.attention.make_causal_mask(jnp.one(1, self.config.max_position_embeddings))
+        self.causal_mask = nn.attention.make_causal_mask(jnp.ones((1, self.config.max_position_embeddings)))
         if self.config.alibi:
             self.freq_cis: Tuple[chex.Array, chex.Array] = precompute_falcon_freq_cis(
                 max_position_embedding=self.config.max_length or self.config.max_seq_len,
@@ -875,8 +855,6 @@ class FlaxFalconForCausalLMModule(nn.Module):
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]] = None
-    transformer: Optional[nn.Module] = None
-    lm_head: Optional[nn.Module] = None
 
     def setup(self) -> None:
         self.transformer = FlaxFalconModule(
