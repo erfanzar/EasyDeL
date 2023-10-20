@@ -3,7 +3,7 @@ import jax
 
 try:
     from lib.python.EasyDel import FalconConfig, FlaxFalconForCausalLM
-    from lib.python.EasyDel.transform import falcon_convert_pt_to_flax_7b
+    from lib.python.EasyDel.transform import falcon_convert_pt_to_flax
 except ModuleNotFoundError:
     import sys
     from pathlib import Path
@@ -11,7 +11,7 @@ except ModuleNotFoundError:
     cp = Path.cwd().__str__()
     sys.path.append(cp)
     from lib.python.EasyDel import FalconConfig, FlaxFalconForCausalLM
-    from lib.python.EasyDel.transform import falcon_convert_pt_to_flax_7b
+    from lib.python.EasyDel.transform import falcon_convert_pt_to_flax
 from jax import numpy as jnp
 from transformers import FalconForCausalLM
 import torch
@@ -21,21 +21,19 @@ import numpy as np
 def main():
     torch.manual_seed(42)
 
-    config = MistralConfig(
-        hidden_size=1024,
-        num_attention_heads=16,
-        num_key_value_heads=8,
-        num_hidden_layers=4,
-        intermediate_size=768,
-        gradient_checkpointing=''
+    config = FalconConfig(
+        vocab_size=1200,
+        hidden_size=256,
+        num_attention_heads=8,
+        num_hidden_layers=1,
+        gradient_checkpointing='',
     )
     print('Model Config :\n', config)
 
-    torch_model = MistralForCausalLM(
+    torch_model = FalconForCausalLM(
         config=copy.deepcopy(config)
     )
-    params = {"params": mistral_convert_hf_to_flax(torch_model.state_dict(), config)}
-
+    params = {"params": falcon_convert_pt_to_flax(torch_model.state_dict(), config)}
     np_random_input_ids = np.random.randint(0, config.vocab_size, (1, 128))
     input_ids = torch.from_numpy(np_random_input_ids).reshape(1, -1).to(torch.long)
     flax_input_ids = jnp.asarray(np_random_input_ids, dtype=jnp.int32).reshape(1, -1)
@@ -44,7 +42,7 @@ def main():
     )
     try:
 
-        flax_model = FlaxMistralForCausalLM(
+        flax_model = FlaxFalconForCausalLM(
             config=config,
             dtype=jnp.float32,
             param_dtype=jnp.float32,
