@@ -219,14 +219,10 @@ def mistral_convert_flax_to_pt(flax_params, config: MistralConfig, dtype=jnp.flo
             config.hidden_size // config.num_attention_heads)))
     for layer_i in range(config.num_hidden_layers):
         state_dict.update({
-            f"model.layers.{layer_i}.self_attn.q_proj.weight": permute(
-                torch_params[f"model.layers.{layer_i}.self_attn.q_proj.kernel"], config.num_attention_heads,
-                config.hidden_size, config.hidden_size
-            ),
-            f"model.layers.{layer_i}.self_attn.k_proj.weight": permute(
-                torch_params[f"model.layers.{layer_i}.self_attn.k_proj.kernel"], config.num_key_value_heads,
-                config.hidden_size, kv_dim
-            ),
+            f"model.layers.{layer_i}.self_attn.q_proj.weight": torch_params[
+                f"model.layers.{layer_i}.self_attn.q_proj.kernel"],
+            f"model.layers.{layer_i}.self_attn.k_proj.weight": torch_params[
+                f"model.layers.{layer_i}.self_attn.k_proj.kernel"],
             f"model.layers.{layer_i}.self_attn.v_proj.weight": torch_params[
                 f"model.layers.{layer_i}.self_attn.v_proj.kernel"],
             f"model.layers.{layer_i}.self_attn.o_proj.weight": torch_params[
