@@ -204,27 +204,32 @@ struct Array[T: DType]:
     var allocated: Int
     alias nelts: Int = simdwidthof[T]() * 2
     alias ArrayPointer: AnyType = DTypePointer[T]
+    var shape: Pointer[Int]
 
     fn __init__(inout self: Self, array_shape: ArrayShape) -> None:
         r"""Init Array From ArrayShape(Alloc Zero)."""
         self.array_shape = array_shape
         self.data = self.ArrayPointer.alloc(0)
         self.allocated = 0
+        self.shape = self.array_shape.shape()
 
     fn __init__(inout self: Self, A: Self, B: Self) -> None:
         r"""Init Array From Two other Arrays A and B For Matmul(Alloc One)."""
         self.__init__(matmul_shape[T](A, B))
+        self.shape = self.array_shape.shape()
         self.alloc(0.0)
 
     fn __init__(inout self: Self, *dim: Int):
         r"""Init Array from Int Args(Alloc Zero)."""
         self.array_shape = ArrayShape(VariadicList(dim))
         self.data = self.ArrayPointer.alloc(0)
+        self.shape = self.array_shape.shape()
         self.allocated = 0
 
     fn __init__(inout self: Self, init: Bool, *dim: Int) -> None:
         r"""Init Array from Int Args(Depends on Passed Bool)."""
         self.__init__(dim)
+        self.shape = self.array_shape.shape()
         if init:
             self.alloc()
             self.random()
@@ -233,6 +238,7 @@ struct Array[T: DType]:
         r"""Init Array from VariadicList[Int](Alloc Zero)."""
         self.array_shape = ArrayShape(vl)
         self.data = self.ArrayPointer.alloc(0)
+        self.shape = self.array_shape.shape()
         self.allocated = 0
 
     fn __init__(
@@ -244,6 +250,7 @@ struct Array[T: DType]:
         do_check(len(value) == self.array_shape.num_elements(), "Data Size miss match")
         self.data = self.ArrayPointer.alloc(self.array_shape.num_elements())
         self.allocated = 1
+        self.shape = self.array_shape.shape()
         for i in range(self.array_shape.num_elements()):
             self.data.simd_store[1](i, value[i])
 
@@ -256,6 +263,7 @@ struct Array[T: DType]:
         do_check(len(value) == self.array_shape.num_elements(), "Data Size miss match")
         self.allocated = 1
         self.data = self.ArrayPointer.alloc(self.array_shape.num_elements())
+        self.shape = self.array_shape.shape()
         for i in range(self.array_shape.num_elements()):
             self.data.simd_store[1](i, value[i])
 
@@ -263,14 +271,17 @@ struct Array[T: DType]:
         self.data = pointer
         self.array_shape = ArrayShape(dim)
         self.allocated = 0
+        self.shape = self.array_shape.shape()
 
     fn __moveinit__(inout self, owned ext: Self):
         self.data = ext.data
         self.array_shape = ext.array_shape
         self.allocated = ext.allocated
+        self.shape = ext.array_shape.shape()
 
     fn __copyinit__(inout self, ext: Self):
         self.allocated = ext.allocated
+        self.shape = ext.array_shape.shape()
         if self.allocated == 1:
             self.data = self.ArrayPointer.alloc(ext.array_shape.num_elements())
             self.array_shape = ext.array_shape
