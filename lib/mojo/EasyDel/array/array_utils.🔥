@@ -62,7 +62,7 @@ fn matmul_2d[
 
 
 @always_inline
-fn matmul[
+fn matmul_EA[
     T: DType, nelts: Int
 ](C: Array[T], A: Array[T], B: Array[T], num_cores: Int = 1) -> None:
     if A.rank() == 2 and B.rank() == 1 and (C.rank() == 1 or C.rank() == 2):
@@ -466,3 +466,35 @@ fn kernel_matmul[T:DType,nelts:Int,cores:Int](inout c: Array[T], a: Array[T], b:
 @always_inline
 fn matmul[T:DType,nelts:Int,cores:Int](inout C: Array[T], A: Array[T], B: Array[T]):
     recursive_broadcast[T,nelts,cores,kernel_matmul, base_case_matmul](C,A,B)
+
+@always_inline
+fn matmul[T:DType,cores:Int](inout C: Array[T], A: Array[T], B: Array[T]):
+    recursive_broadcast[T,Array[T].nelts,cores,kernel_matmul, base_case_matmul](C,A,B)
+
+@always_inline
+fn matmul[T:DType](inout C: Array[T], A: Array[T], B: Array[T]):
+    recursive_broadcast[T,Array[T].nelts,1,kernel_matmul, base_case_matmul](C,A,B)
+
+@always_inline
+fn matmul(inout C: Array[DType.float32], A: Array[DType.float32], B: Array[DType.float32]):
+    recursive_broadcast[DType.float32,Array[DType.float32].nelts,1,kernel_matmul, base_case_matmul](C,A,B)
+
+@always_inline
+fn matmul(inout C: Array[DType.float16], A: Array[DType.float16], B: Array[DType.float16]):
+    recursive_broadcast[DType.float16,Array[DType.float16].nelts,1,kernel_matmul, base_case_matmul](C,A,B)
+
+@always_inline
+fn matmul(inout C: Array[DType.bfloat16], A: Array[DType.bfloat16], B: Array[DType.bfloat16]):
+    recursive_broadcast[DType.bfloat16,Array[DType.bfloat16].nelts,1,kernel_matmul, base_case_matmul](C,A,B)
+
+@always_inline
+fn matmul[cores:Int](inout C: Array[DType.float32], A: Array[DType.float32], B: Array[DType.float32]):
+    recursive_broadcast[DType.float32,Array[DType.float32].nelts,cores,kernel_matmul, base_case_matmul](C,A,B)
+    
+@always_inline
+fn matmul[cores:Int](inout C: Array[DType.float16], A: Array[DType.float16], B: Array[DType.float16]):
+    recursive_broadcast[DType.float16,Array[DType.float16].nelts,cores,kernel_matmul, base_case_matmul](C,A,B)
+
+@always_inline
+fn matmul[cores:Int](inout C: Array[DType.bfloat16], A: Array[DType.bfloat16], B: Array[DType.bfloat16]):
+    recursive_broadcast[DType.bfloat16,Array[DType.bfloat16].nelts,cores,kernel_matmul, base_case_matmul](C,A,B)
