@@ -324,7 +324,7 @@ struct LlamaState[T: DType]:
 
 
 fn llama_forward[
-    T: DType, nelts: Int = 1
+    T: DType, nelts: Int, cores: Int
 ](
     input_id: Int,
     position: Int,
@@ -365,7 +365,7 @@ fn llama_forward[
             1e-5,
         )
         state.q.fill(0.0)
-        matmul[T, nelts](
+        matmul[T, nelts, cores](
             state.q,
             Array[T](
                 weights.q_proj.data.offset(layer_index * q_size),
@@ -373,7 +373,6 @@ fn llama_forward[
                 config.num_attention_heads * config.head_dims,
             ),
             state.hidden_state,
-            state.number_of_cores,
         )
         # print("PASS Query Calculation")
 
@@ -381,7 +380,7 @@ fn llama_forward[
             state.k_cache.data.offset(pad + position * config.kv_dims)
         )
 
-        matmul[T, nelts](
+        matmul[T, nelts, cores](
             state.k,
             Array[T](
                 weights.k_proj.data.offset(layer_index * kv_size),
@@ -389,14 +388,13 @@ fn llama_forward[
                 config.hidden_size,
             ),
             state.hidden_state,
-            state.number_of_cores,
         )
         # print("PASS Key Calculation")
         state.v.set_data_from_buffer(
             state.v_cache.data.offset(pad + position * config.kv_dims)
         )
 
-        matmul[T, nelts](
+        matmul[T, nelts, cores](
             state.v,
             Array[T](
                 weights.v_proj.data.offset(layer_index * kv_size),
@@ -404,7 +402,6 @@ fn llama_forward[
                 config.hidden_size,
             ),
             state.hidden_state,
-            state.number_of_cores,
         )
         # print("PASS Value Calculation")
 
@@ -437,7 +434,7 @@ fn llama_forward[
             num_cores=state.number_of_cores,
         )
 
-        matmul[T, nelts](
+        matmul[T, nelts, cores](
             state.o,
             Array[T](
                 weights.o_proj.data.offset(layer_index * o_size),
@@ -445,7 +442,6 @@ fn llama_forward[
                 config.hidden_size,
             ),
             state.hidden_state,
-            state.number_of_cores,
         )
 
         # APPLY RESIDUAL FOR ATTN(NORM(X)) + X
@@ -461,7 +457,7 @@ fn llama_forward[
             1e-5,
         )
 
-        matmul[T, nelts](
+        matmul[T, nelts, cores](
             state.w1_C,
             Array[T](
                 weights.w1.data.offset(layer_index * ffd_size),
@@ -469,10 +465,9 @@ fn llama_forward[
                 config.hidden_size,
             ),
             state.hidden_state,
-            state.number_of_cores,
         )
 
-        matmul[T, nelts](
+        matmul[T, nelts, cores](
             state.w3_C,
             Array[T](
                 weights.w3.data.offset(layer_index * ffd_size),
@@ -480,7 +475,6 @@ fn llama_forward[
                 config.hidden_size,
             ),
             state.hidden_state,
-            state.number_of_cores,
         )
 
         @parameter
@@ -491,7 +485,7 @@ fn llama_forward[
 
         parallelize[_element_wise_](config.intermediate_size, state.number_of_cores)
 
-        matmul[T, nelts](
+        matmul[T, nelts, cores](
             state.ffd_out,
             Array[T](
                 weights.w2.data.offset(layer_index * ffd_size),
@@ -499,18 +493,16 @@ fn llama_forward[
                 config.intermediate_size,
             ),
             state.w1_C,
-            state.number_of_cores,
         )
         # APPLY RESIDUAL FOR MLP(NORM(X)) + X
 
         PO.add(x.data, state.ffd_out.data, config.hidden_size, state.number_of_cores)
 
     rms_norm[T, nelts](x, x, Array[T](weights.norm.data, config.hidden_size), 1e-5)
-    matmul[T, nelts](
+    matmul[T, nelts, cores](
         state.logits,
         Array[T](weights.lm_head.data, config.vocab_size, config.hidden_size),
         x,
-        state.number_of_cores,
     )
 
 

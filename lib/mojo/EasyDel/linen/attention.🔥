@@ -271,7 +271,7 @@ fn dot_product_attention_weights[
     key = T_AXIS_0_2_1[T, nelts](key, cores)
 
     var A: Array[T] = Array[T](query, key)
-    matmul[T, nelts](A, query, key, cores)
+    matmul[T, nelts, cores](A, query, key)
     let SH: SIMD[T, nelts] = SIMD[T, nelts](math.sqrt(head_dims))
 
     @parameter
@@ -304,7 +304,7 @@ fn dot_product_attention[
         query, key
     )
     var attention: Array[T] = Array[T](value, attention_weight)
-    matmul[T, nelts](attention, value, attention_weight, cores)
+    matmul[T, nelts, cores](attention, value, attention_weight)
     return attention ^
 
 
