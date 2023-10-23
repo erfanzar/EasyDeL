@@ -6,7 +6,7 @@ import math
 fn linear[
     T: DType, nelts: Int, cores: Int
 ](inout o: Array[T], x: Array[T], w: Array[T]):
-    matmul[T, nelts](o, x, w, cores)
+    matmul[T, nelts, cores](o, x, w)
 
 
 fn linear[T: DType, cores: Int](x: Array[T], w: Array[T]) -> Array[T]:

@@ -336,6 +336,9 @@ struct Array[T: DType]:
     fn ones(inout self):
         self.fill(1.0)
 
+    fn dtype(self) -> DType:
+        return T
+
     @always_inline
     fn dim(self: Self, i: Int) -> Int:
         return self.array_shape.dim(i)
