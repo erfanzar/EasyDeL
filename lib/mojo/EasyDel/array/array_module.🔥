@@ -31,7 +31,7 @@ from algorithm.functional import (
 )
 from runtime.llcl import num_cores
 from memory.memory import memset_zero
-from .array_utils import matmul_shape, T_2D, T_AXIS_0_2_1, T_AXIS_1_0_2, T_AXIS_2_1_0
+from .array_forward import matmul_shape, T_2D, T_AXIS_0_2_1, T_AXIS_1_0_2, T_AXIS_2_1_0
 
 alias dims_average_size = 5
 alias debuging = True
@@ -205,6 +205,8 @@ struct Array[T: DType]:
     alias nelts: Int = simdwidthof[T]() * 2
     alias ArrayPointer: AnyType = DTypePointer[T]
     var shape: Pointer[Int]
+    var strides: Pointer[Int]
+    var extra_parameters: Pointer[Int]
 
     fn __init__(inout self: Self, array_shape: ArrayShape) -> None:
         r"""Init Array From ArrayShape(Alloc Zero)."""
@@ -212,11 +214,21 @@ struct Array[T: DType]:
         self.data = self.ArrayPointer.alloc(0)
         self.allocated = 0
         self.shape = self.array_shape.shape()
+        self.strides = Pointer[Int].alloc(self.array_shape.rank())
+        memset_zero(self.strides, self.array_shape.rank())
+        self.strides.store(self.array_shape.rank() - 1, 1)
+        for i in range(self.array_shape.rank() - 1):
+            self.strides.store(
+                self.array_shape.rank() - i - 2,
+                self.strides.load(self.array_shape.rank() - i - 1)
+                * self.shape[self.array_shape.rank() - i - 1],
+            )
+        self.extra_parameters = Pointer[Int].alloc(64)
+        memset_zero(self.extra_parameters, 64)
 
     fn __init__(inout self: Self, A: Self, B: Self) -> None:
         r"""Init Array From Two other Arrays A and B For Matmul(Alloc One)."""
         self.__init__(matmul_shape[T](A, B))
-        self.shape = self.array_shape.shape()
         self.alloc(0.0)
 
     fn __init__(inout self: Self, *dim: Int):
@@ -224,22 +236,56 @@ struct Array[T: DType]:
         self.array_shape = ArrayShape(VariadicList(dim))
         self.data = self.ArrayPointer.alloc(0)
         self.shape = self.array_shape.shape()
+        self.strides = Pointer[Int].alloc(self.array_shape.rank())
+        memset_zero(self.strides, self.array_shape.rank())
+        self.strides.store(self.array_shape.rank() - 1, 1)
+        for i in range(self.array_shape.rank() - 1):
+            self.strides.store(
+                self.array_shape.rank() - i - 2,
+                self.strides.load(self.array_shape.rank() - i - 1)
+                * self.shape[self.array_shape.rank() - i - 1],
+            )
         self.allocated = 0
+        self.extra_parameters = Pointer[Int].alloc(64)
+        memset_zero(self.extra_parameters, 64)
 
     fn __init__(inout self: Self, init: Bool, *dim: Int) -> None:
         r"""Init Array from Int Args(Depends on Passed Bool)."""
         self.__init__(dim)
         self.shape = self.array_shape.shape()
+        self.strides = Pointer[Int].alloc(self.array_shape.rank())
+        memset_zero(self.strides, self.array_shape.rank())
+        self.strides.store(self.array_shape.rank() - 1, 1)
+        self.extra_parameters = Pointer[Int].alloc(64)
+        memset_zero(self.extra_parameters, 64)
+        for i in range(self.array_shape.rank() - 1):
+            self.strides.store(
+                self.array_shape.rank() - i - 2,
+                self.strides.load(self.array_shape.rank() - i - 1)
+                * self.shape[self.array_shape.rank() - i - 1],
+            )
         if init:
             self.alloc()
             self.random()
+
 
     fn __init__(inout self: Self, vl: VariadicList[Int]) -> None:
         r"""Init Array from VariadicList[Int](Alloc Zero)."""
         self.array_shape = ArrayShape(vl)
         self.data = self.ArrayPointer.alloc(0)
         self.shape = self.array_shape.shape()
+        self.strides = Pointer[Int].alloc(self.array_shape.rank())
+        memset_zero(self.strides, self.array_shape.rank())
+        self.strides.store(self.array_shape.rank() - 1, 1)
+        for i in range(self.array_shape.rank() - 1):
+            self.strides.store(
+                self.array_shape.rank() - i - 2,
+                self.strides.load(self.array_shape.rank() - i - 1)
+                * self.shape[self.array_shape.rank() - i - 1],
+            )
         self.allocated = 0
+        self.extra_parameters = Pointer[Int].alloc(64)
+        memset_zero(self.extra_parameters, 64)
 
     fn __init__(
         inout self: Self, value: DynamicVector[FloatLiteral], shape: ArrayShape
@@ -251,8 +297,19 @@ struct Array[T: DType]:
         self.data = self.ArrayPointer.alloc(self.array_shape.num_elements())
         self.allocated = 1
         self.shape = self.array_shape.shape()
+        self.strides = Pointer[Int].alloc(self.array_shape.rank())
+        memset_zero(self.strides, self.array_shape.rank())
+        self.strides.store(self.array_shape.rank() - 1, 1)
+        for i in range(self.array_shape.rank() - 1):
+            self.strides.store(
+                self.array_shape.rank() - i - 2,
+                self.strides.load(self.array_shape.rank() - i - 1)
+                * self.shape[self.array_shape.rank() - i - 1],
+            )
         for i in range(self.array_shape.num_elements()):
             self.data.simd_store[1](i, value[i])
+        self.extra_parameters = Pointer[Int].alloc(64)
+        memset_zero(self.extra_parameters, 64)
 
     fn __init__(
         inout self: Self, value: VariadicList[FloatLiteral], shape: ArrayShape
@@ -264,24 +321,48 @@ struct Array[T: DType]:
         self.allocated = 1
         self.data = self.ArrayPointer.alloc(self.array_shape.num_elements())
         self.shape = self.array_shape.shape()
+        self.strides = Pointer[Int].alloc(self.array_shape.rank())
+        memset_zero(self.strides, self.array_shape.rank())
+        self.strides.store(self.array_shape.rank() - 1, 1)
+        for i in range(self.array_shape.rank() - 1):
+            self.strides.store(
+                self.array_shape.rank() - i - 2,
+                self.strides.load(self.array_shape.rank() - i - 1)
+                * self.shape[self.array_shape.rank() - i - 1],
+            )
         for i in range(self.array_shape.num_elements()):
             self.data.simd_store[1](i, value[i])
+        self.extra_parameters = Pointer[Int].alloc(64)
+        memset_zero(self.extra_parameters, 64)
 
     fn __init__(inout self: Self, pointer: DTypePointer[T], *dim: Int) -> None:
         self.data = pointer
         self.array_shape = ArrayShape(dim)
         self.allocated = 0
         self.shape = self.array_shape.shape()
+        self.strides = Pointer[Int].alloc(self.array_shape.rank())
+        memset_zero(self.strides, self.array_shape.rank())
+        self.strides.store(self.array_shape.rank() - 1, 1)
+        for i in range(self.array_shape.rank() - 1):
+            self.strides.store(
+                self.array_shape.rank() - i - 2,
+                self.strides.load(self.array_shape.rank() - i - 1)
+                * self.shape[self.array_shape.rank() - i - 1],
+            )
+        self.extra_parameters = Pointer[Int].alloc(64)
+        memset_zero(self.extra_parameters, 64)
 
     fn __moveinit__(inout self, owned ext: Self):
         self.data = ext.data
         self.array_shape = ext.array_shape
         self.allocated = ext.allocated
         self.shape = ext.array_shape.shape()
+        self.strides = ext.strides
 
     fn __copyinit__(inout self, ext: Self):
         self.allocated = ext.allocated
         self.shape = ext.array_shape.shape()
+        self.strides = ext.strides
         if self.allocated == 1:
             self.data = self.ArrayPointer.alloc(ext.array_shape.num_elements())
             self.array_shape = ext.array_shape
