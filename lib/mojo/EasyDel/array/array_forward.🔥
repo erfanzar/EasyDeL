@@ -6,10 +6,30 @@ from algorithm.functional import (
     vectorize_unroll,
     Static2DTileUnitFunc as Tile2D,
 )
-from math import max, min, sqrt, abs, pow, exp2, exp, log2, log, cos, sin, tan, asin, acos, atan, cosh, sinh, tanh
+from math import (
+    max,
+    min,
+    sqrt,
+    abs,
+    pow,
+    exp2,
+    exp,
+    log2,
+    log,
+    cos,
+    sin,
+    tan,
+    asin,
+    acos,
+    atan,
+    cosh,
+    sinh,
+    tanh,
+)
 import math
 from memory import memset_zero, memcpy
 from random import rand
+
 
 @always_inline
 fn convert_numpy_to_easydel_array[
@@ -111,20 +131,6 @@ fn matmul_EA[
                 vectorize[nelts, _mul](C_C)
 
         parallelize[loop_](C_R, num_cores)
-
-
-@always_inline
-fn matmul_shape[T: DType](A: Array[T], B: Array[T]) -> ArrayShape:
-    if A.rank() == Int(2) and B.rank() == 1:
-        return ArrayShape(A.dim(0))
-    else:
-        var res_dims = InlinedFixedVector[dims_average_size, Int](A.rank())
-        for i in range(A.rank() - 1):
-            res_dims.append(A.dim(i))
-        res_dims.append(B.dim(-1))
-
-        return ArrayShape(res_dims)
-
 
 @always_inline
 fn matmul_single_row[
@@ -246,28 +252,6 @@ fn T_AXIS_2_1_0[T: DType, nelts: Int](array: Array[T], num_workers: Int) -> Arra
         parallelize[_row](array.dim(1), num_workers)
     return transposed_array
 
-
-fn T_2D[T: DType, nelts: Int](array: Array[T], num_workers: Int) -> Array[T]:
-    """
-    Transposes an array.
-    """
-
-    var transposed_array = Array[T](array.dim(1), array.dim(0))
-    transposed_array.alloc(0.0)
-
-    @parameter
-    fn _row(i: Int):
-        @parameter
-        fn _cols[_nelts: Int](j: Int):
-            let dt: SIMD[T, _nelts] = array.load[_nelts](i, j)
-            transposed_array.store[_nelts](j, i, dt)
-
-        vectorize[nelts, _cols](array.dim(1))
-
-    parallelize[_row](array.dim(0), num_workers)
-    return transposed_array
-
-
 fn concatenate[
     T: DType
 ](A: Array[T], B: Array[T], inout axis: Int = 0, stragedy: String = "ord") -> Array[T]:
@@ -373,203 +357,316 @@ fn arange[T: DType, cores: Int](start: Int, end: Int) -> Array[T]:
     parallelize[_row](rng, cores)
     return array
 
+
 ## I Used https://github.com/TilliFe/Infermo/blob/main/infermo/operators/ to learn this Algorithms
 
-fn a_over_shape[T:DType](depth: Int, A: Array[T], B: Array[T]) -> Int:
-    let _df = max(B.rank() - A.rank(),0)
-    if(depth < _df):
+
+fn a_over_shape[T: DType](depth: Int, A: Array[T], B: Array[T]) -> Int:
+    let _df = max(B.rank() - A.rank(), 0)
+    if depth < _df:
         return 1
     return A.shape[depth - _df]
 
-fn b_over_shape[T:DType](depth: Int, A: Array[T], B: Array[T]) -> Int:
-    let _df = max(A.rank() - B.rank(),0)
-    if(depth < _df):
+
+fn b_over_shape[T: DType](depth: Int, A: Array[T], B: Array[T]) -> Int:
+    let _df = max(A.rank() - B.rank(), 0)
+    if depth < _df:
         return 1
     return B.shape[depth - _df]
-fn a_over_strides[T:DType](depth: Int, A: Array[T], B: Array[T]) -> Int:
-    let _df = max(B.rank() - A.rank(),0)
-    if(depth < _df):
+
+
+fn a_over_strides[T: DType](depth: Int, A: Array[T], B: Array[T]) -> Int:
+    let _df = max(B.rank() - A.rank(), 0)
+    if depth < _df:
         return A.strides[0]
     return A.strides[depth - _df]
 
-fn b_over_strides[T:DType](depth: Int, A: Array[T], B: Array[T]) -> Int:
-    let _df = max(A.rank() - B.rank(),0)
-    if(depth < _df):
+
+fn b_over_strides[T: DType](depth: Int, A: Array[T], B: Array[T]) -> Int:
+    let _df = max(A.rank() - B.rank(), 0)
+    if depth < _df:
         return B.strides[0]
     return B.strides[depth - _df]
+
+
 fn recursive_broadcast[
-    T:DType,
-    nelts:Int,
-    cores:Int,
+    T: DType,
+    nelts: Int,
+    cores: Int,
     kernel: fn[T:DType,nelts:Int,cores:Int](
         inout C: Array[T],
         A: Array[T],
         B: Array[T],
         a_index: Int,
-        b_index: Int, 
-        c_index: Int, 
-        depth: Int 
+        b_index: Int,
+        c_index: Int,
+        depth: Int
         ) -> None,
-    base_case: fn[T:DType](depth: Int, A: Array[T], B: Array[T]) -> Bool 
+    base_case: fn[T:DType](depth: Int, A: Array[T], B: Array[T]) -> Bool
 ](
-    inout C: Array[T], 
-    A: Array[T], 
-    B: Array[T], 
-    a_index: Int=0, 
-    b_index: Int=0, 
-    c_index: Int=0, 
-    depth: Int=0
+    inout C: Array[T],
+    A: Array[T],
+    B: Array[T],
+    a_index: Int = 0,
+    b_index: Int = 0,
+    c_index: Int = 0,
+    depth: Int = 0,
 ):
-
-    if(base_case[T](depth,A,B)):
-        kernel[T,nelts,cores](C,A,B,a_index,b_index,c_index,depth)
+    if base_case[T](depth, A, B):
+        kernel[T, nelts, cores](C, A, B, a_index, b_index, c_index, depth)
         return
 
-    let a_shape = a_over_shape[T](depth,A,B)
-    let b_shape = b_over_shape[T](depth,A,B)
+    let a_shape = a_over_shape[T](depth, A, B)
+    let b_shape = b_over_shape[T](depth, A, B)
     let c_shape = C.shape[depth]
-    if(a_shape != 1 and b_shape == 1):
-        for s in range(a_shape):
-            recursive_broadcast[T,nelts,cores,kernel,base_case](
-                C,A,B,
-                a_shape*a_index + s, 
-                b_shape*b_index,
-                c_shape*c_index + s, 
-                depth+1
+    if a_shape != 1 and b_shape == 1:
+
+        @parameter
+        fn _cols_a(s: Int):
+            recursive_broadcast[T, nelts, cores, kernel, base_case](
+                C,
+                A,
+                B,
+                a_shape * a_index + s,
+                b_shape * b_index,
+                c_shape * c_index + s,
+                depth + 1,
             )
-    elif(a_shape == 1 and b_shape != 1):
-        for s in range(b_shape):
-            recursive_broadcast[T,nelts,cores,kernel,base_case](
-                C,A,B,
-                a_shape*a_index, 
-                b_shape*b_index + s, 
-                c_shape*c_index + s,
-                depth+1
+
+        parallelize[_cols_a](a_shape, cores)
+    elif a_shape == 1 and b_shape != 1:
+
+        @parameter
+        fn _cols_b(s: Int):
+            recursive_broadcast[T, nelts, cores, kernel, base_case](
+                C,
+                A,
+                B,
+                a_shape * a_index,
+                b_shape * b_index + s,
+                c_shape * c_index + s,
+                depth + 1,
             )
+
+        parallelize[_cols_b](b_shape, cores)
     else:
-        for s in range(a_shape):
-            recursive_broadcast[T,nelts,cores,kernel,base_case](
-                C,A,B,
-                a_shape*a_index + s, 
-                b_shape*b_index + s, 
-                c_shape*c_index + s,
-                depth+1
+
+        @parameter
+        fn _cols_a_s(s: Int):
+            recursive_broadcast[T, nelts, cores, kernel, base_case](
+                C,
+                A,
+                B,
+                a_shape * a_index + s,
+                b_shape * b_index + s,
+                c_shape * c_index + s,
+                depth + 1,
             )
 
+        parallelize[_cols_a_s](a_shape, cores)
+
 
 @parameter
-fn base_case_matmul[T:DType](depth: Int, A: Array[T], B: Array[T]) -> Bool:
-    return depth == max(A.rank(),B.rank())-Int(2)
+fn base_case_matmul[T: DType](depth: Int, A: Array[T], B: Array[T]) -> Bool:
+    return depth == max(A.rank(), B.rank()) - Int(2)
+
 
 @parameter
-fn kernel_matmul[T:DType,nelts:Int,cores:Int](inout C: Array[T], A: Array[T], B: Array[T], a_index: Int, b_index: Int, c_index: Int, depth: Int) -> None:
- 
-    let offset_a = a_index * A.shape[A.rank()-2] * A.shape[A.rank()-1]
-    let offset_b = b_index * B.shape[B.rank()-2] * B.shape[B.rank()-1]
-    let offset_c = c_index * C.shape[C.rank()-2] * C.shape[C.rank()-1] 
+fn kernel_matmul[
+    T: DType, nelts: Int, cores: Int
+](
+    inout C: Array[T],
+    A: Array[T],
+    B: Array[T],
+    a_index: Int,
+    b_index: Int,
+    c_index: Int,
+    depth: Int,
+) -> None:
+    let offset_a = a_index * A.shape[A.rank() - 2] * A.shape[A.rank() - 1]
+    let offset_b = b_index * B.shape[B.rank() - 2] * B.shape[B.rank() - 1]
+    let offset_c = c_index * C.shape[C.rank() - 2] * C.shape[C.rank() - 1]
 
-    let M = A.shape[A.rank()-2]
-    let K = B.shape[B.rank()-2]
-    let N = B.shape[B.rank()-1]
+    let M = A.shape[A.rank() - 2]
+    let K = B.shape[B.rank() - 2]
+    let N = B.shape[B.rank() - 1]
 
     @parameter
-    fn calc_row (m: Int):
+    fn calc_row(m: Int):
         for k in range(K):
+
             @parameter
-            fn dot [nelts: Int](n: Int):
+            fn dot[nelts: Int](n: Int):
                 C.data.simd_store[nelts](
-                    offset_c + m*N+n, 
-                    C.data.simd_load[nelts](offset_c + m*N+n) + A.data.load(offset_a + m*K+k) * B.data.simd_load[nelts](offset_b + k*N+n))
-            vectorize[nelts, dot ](N)
-    parallelize[calc_row ](M, cores if cores > 0 else M) 
+                    offset_c + m * N + n,
+                    C.data.simd_load[nelts](offset_c + m * N + n)
+                    + A.data.load(offset_a + m * K + k)
+                    * B.data.simd_load[nelts](offset_b + k * N + n),
+                )
+
+            vectorize[nelts, dot](N)
+
+    parallelize[calc_row](M, cores if cores > 0 else M)
+
 
 @always_inline
-fn matmul[T:DType,nelts:Int,cores:Int](inout C: Array[T], A: Array[T], B: Array[T]):
-    recursive_broadcast[T,nelts,cores,kernel_matmul, base_case_matmul](C,A,B)
+fn matmul[
+    T: DType, nelts: Int = Array[T].nelts, cores: Int = 1
+](inout C: Array[T], A: Array[T], B: Array[T]):
+    recursive_broadcast[T, nelts, cores, kernel_matmul, base_case_matmul](C, A, B)
+
 
 @always_inline
-fn matmul[T:DType,cores:Int](inout C: Array[T], A: Array[T], B: Array[T]):
-    recursive_broadcast[T,Array[T].nelts,cores,kernel_matmul, base_case_matmul](C,A,B)
+fn matmul(
+    inout C: Array[DType.float32], A: Array[DType.float32], B: Array[DType.float32]
+):
+    recursive_broadcast[
+        DType.float32, Array[DType.float32].nelts, 1, kernel_matmul, base_case_matmul
+    ](C, A, B)
+
 
 @always_inline
-fn matmul[T:DType](inout C: Array[T], A: Array[T], B: Array[T]):
-    recursive_broadcast[T,Array[T].nelts,1,kernel_matmul, base_case_matmul](C,A,B)
+fn matmul(
+    inout C: Array[DType.float16], A: Array[DType.float16], B: Array[DType.float16]
+):
+    recursive_broadcast[
+        DType.float16, Array[DType.float16].nelts, 1, kernel_matmul, base_case_matmul
+    ](C, A, B)
+
 
 @always_inline
-fn matmul(inout C: Array[DType.float32], A: Array[DType.float32], B: Array[DType.float32]):
-    recursive_broadcast[DType.float32,Array[DType.float32].nelts,1,kernel_matmul, base_case_matmul](C,A,B)
+fn matmul(
+    inout C: Array[DType.bfloat16], A: Array[DType.bfloat16], B: Array[DType.bfloat16]
+):
+    recursive_broadcast[
+        DType.bfloat16, Array[DType.bfloat16].nelts, 1, kernel_matmul, base_case_matmul
+    ](C, A, B)
+
 
 @always_inline
-fn matmul(inout C: Array[DType.float16], A: Array[DType.float16], B: Array[DType.float16]):
-    recursive_broadcast[DType.float16,Array[DType.float16].nelts,1,kernel_matmul, base_case_matmul](C,A,B)
+fn matmul[
+    cores: Int
+](inout C: Array[DType.float32], A: Array[DType.float32], B: Array[DType.float32]):
+    recursive_broadcast[
+        DType.float32,
+        Array[DType.float32].nelts,
+        cores,
+        kernel_matmul,
+        base_case_matmul,
+    ](C, A, B)
+
 
 @always_inline
-fn matmul(inout C: Array[DType.bfloat16], A: Array[DType.bfloat16], B: Array[DType.bfloat16]):
-    recursive_broadcast[DType.bfloat16,Array[DType.bfloat16].nelts,1,kernel_matmul, base_case_matmul](C,A,B)
+fn matmul[
+    cores: Int
+](inout C: Array[DType.float16], A: Array[DType.float16], B: Array[DType.float16]):
+    recursive_broadcast[
+        DType.float16,
+        Array[DType.float16].nelts,
+        cores,
+        kernel_matmul,
+        base_case_matmul,
+    ](C, A, B)
+
 
 @always_inline
-fn matmul[cores:Int](inout C: Array[DType.float32], A: Array[DType.float32], B: Array[DType.float32]):
-    recursive_broadcast[DType.float32,Array[DType.float32].nelts,cores,kernel_matmul, base_case_matmul](C,A,B)
-    
-@always_inline
-fn matmul[cores:Int](inout C: Array[DType.float16], A: Array[DType.float16], B: Array[DType.float16]):
-    recursive_broadcast[DType.float16,Array[DType.float16].nelts,cores,kernel_matmul, base_case_matmul](C,A,B)
+fn matmul[
+    cores: Int
+](inout C: Array[DType.bfloat16], A: Array[DType.bfloat16], B: Array[DType.bfloat16]):
+    recursive_broadcast[
+        DType.bfloat16,
+        Array[DType.bfloat16].nelts,
+        cores,
+        kernel_matmul,
+        base_case_matmul,
+    ](C, A, B)
+
 
 @always_inline
-fn matmul[cores:Int](inout C: Array[DType.bfloat16], A: Array[DType.bfloat16], B: Array[DType.bfloat16]):
-    recursive_broadcast[DType.bfloat16,Array[DType.bfloat16].nelts,cores,kernel_matmul, base_case_matmul](C,A,B)
-
-@always_inline
-fn matmul[T:DType,nelts:Int,cores:Int]( A: Array[T], B: Array[T]) -> Array[T]:
-    var C :Array[T]= Array[T](A,B)
-    recursive_broadcast[T,nelts,cores,kernel_matmul, base_case_matmul](C,A,B)
+fn matmul[T: DType, nelts: Int, cores: Int](A: Array[T], B: Array[T]) -> Array[T]:
+    var C: Array[T] = Array[T](A, B)
+    recursive_broadcast[T, nelts, cores, kernel_matmul, base_case_matmul](C, A, B)
     return C
-@always_inline
-fn matmul[T:DType,cores:Int]( A: Array[T], B: Array[T])-> Array[T]:
-    var C :Array[T]= Array[T](A,B)
-    recursive_broadcast[T,Array[T].nelts,cores,kernel_matmul, base_case_matmul](C,A,B)
-    return C
+
 
 @always_inline
-fn matmul[T:DType](A: Array[T], B: Array[T])-> Array[T]:
-    var C :Array[T]= Array[T](A,B)
-    recursive_broadcast[T,Array[T].nelts,1,kernel_matmul, base_case_matmul](C,A,B)
+fn matmul[T: DType, cores: Int = 1](A: Array[T], B: Array[T]) -> Array[T]:
+    var C: Array[T] = Array[T](A, B)
+    recursive_broadcast[T, Array[T].nelts, cores, kernel_matmul, base_case_matmul](
+        C, A, B
+    )
     return C
 
-@always_inline
-fn matmul( A: Array[DType.float32], B: Array[DType.float32])-> Array[DType.float32]:
-    var C :Array[DType.float32]= Array[DType.float32](A,B)
-    recursive_broadcast[DType.float32,Array[DType.float32].nelts,1,kernel_matmul, base_case_matmul](C,A,B)
-    return C
 
 @always_inline
-fn matmul( A: Array[DType.float16], B: Array[DType.float16])-> Array[DType.float16]:
-    var C :Array[DType.float16]= Array[DType.float16](A,B)
-    recursive_broadcast[DType.float16,Array[DType.float16].nelts,1,kernel_matmul, base_case_matmul](C,A,B)
+fn matmul(A: Array[DType.float32], B: Array[DType.float32]) -> Array[DType.float32]:
+    var C: Array[DType.float32] = Array[DType.float32](A, B)
+    recursive_broadcast[
+        DType.float32, Array[DType.float32].nelts, 1, kernel_matmul, base_case_matmul
+    ](C, A, B)
     return C
 
-@always_inline
-fn matmul( A: Array[DType.bfloat16], B: Array[DType.bfloat16])-> Array[DType.bfloat16]:
-    var C :Array[DType.bfloat16]= Array[DType.bfloat16](A,B)
-    recursive_broadcast[DType.bfloat16,Array[DType.bfloat16].nelts,1,kernel_matmul, base_case_matmul](C,A,B)
-    return C
 
 @always_inline
-fn matmul[cores:Int]( A: Array[DType.float32], B: Array[DType.float32])-> Array[DType.float32]:
-    var C :Array[DType.float32]= Array[DType.float32](A,B)
-    recursive_broadcast[DType.float32,Array[DType.float32].nelts,cores,kernel_matmul, base_case_matmul](C,A,B)
+fn matmul(A: Array[DType.float16], B: Array[DType.float16]) -> Array[DType.float16]:
+    var C: Array[DType.float16] = Array[DType.float16](A, B)
+    recursive_broadcast[
+        DType.float16, Array[DType.float16].nelts, 1, kernel_matmul, base_case_matmul
+    ](C, A, B)
     return C
 
+
 @always_inline
-fn matmul[cores:Int]( A: Array[DType.float16], B: Array[DType.float16])-> Array[DType.float16]:
-    var C :Array[DType.float16]= Array[DType.float16](A,B)
-    recursive_broadcast[DType.float16,Array[DType.float16].nelts,cores,kernel_matmul, base_case_matmul](C,A,B)
+fn matmul(A: Array[DType.bfloat16], B: Array[DType.bfloat16]) -> Array[DType.bfloat16]:
+    var C: Array[DType.bfloat16] = Array[DType.bfloat16](A, B)
+    recursive_broadcast[
+        DType.bfloat16, Array[DType.bfloat16].nelts, 1, kernel_matmul, base_case_matmul
+    ](C, A, B)
     return C
-    
+
+
 @always_inline
-fn matmul[cores:Int](A: Array[DType.bfloat16], B: Array[DType.bfloat16])-> Array[DType.bfloat16]:
-    var C :Array[DType.bfloat16]= Array[DType.bfloat16](A,B)
-    recursive_broadcast[DType.bfloat16,Array[DType.bfloat16].nelts,cores,kernel_matmul, base_case_matmul](C,A,B)
+fn matmul[
+    cores: Int
+](A: Array[DType.float32], B: Array[DType.float32]) -> Array[DType.float32]:
+    var C: Array[DType.float32] = Array[DType.float32](A, B)
+    recursive_broadcast[
+        DType.float32,
+        Array[DType.float32].nelts,
+        cores,
+        kernel_matmul,
+        base_case_matmul,
+    ](C, A, B)
+    return C
+
+
+@always_inline
+fn matmul[
+    cores: Int
+](A: Array[DType.float16], B: Array[DType.float16]) -> Array[DType.float16]:
+    var C: Array[DType.float16] = Array[DType.float16](A, B)
+    recursive_broadcast[
+        DType.float16,
+        Array[DType.float16].nelts,
+        cores,
+        kernel_matmul,
+        base_case_matmul,
+    ](C, A, B)
+    return C
+
+
+@always_inline
+fn matmul[
+    cores: Int
+](A: Array[DType.bfloat16], B: Array[DType.bfloat16]) -> Array[DType.bfloat16]:
+    var C: Array[DType.bfloat16] = Array[DType.bfloat16](A, B)
+    recursive_broadcast[
+        DType.bfloat16,
+        Array[DType.bfloat16].nelts,
+        cores,
+        kernel_matmul,
+        base_case_matmul,
+    ](C, A, B)
     return C
 
 
@@ -721,16 +818,15 @@ fn sample[T: DType](array: Array[T]) -> Int:
     return number_of_cols - 1
 
 
-
 @always_inline
-fn softmax[T:DType,nelts:Int](A: Array[T],axis:Int=-1) -> Array[T]:
-    var B :Array[T]= Array[T](A.array_shape)
+fn softmax[T: DType, nelts: Int](A: Array[T], axis: Int = -1) -> Array[T]:
+    var B: Array[T] = Array[T](A.array_shape)
     B.alloc(0.0)
 
     let N = A.dim(axis)
 
     for s in range(B.num_elements() // N):
-        var max_element: SIMD[T,1] = 0.0
+        var max_element: SIMD[T, 1] = 0.0
 
         @parameter
         fn v_max[nelts: Int](i: Int):
@@ -738,7 +834,8 @@ fn softmax[T:DType,nelts:Int](A: Array[T],axis:Int=-1) -> Array[T]:
             max_element = max(max_element, _x)
 
         vectorize[nelts, v_max](N)
-        var sum_loop: SIMD[T,1]  = 0.0
+        var sum_loop: SIMD[T, 1] = 0.0
+
         @parameter
         fn v_exp[nelts: Int](i: Int):
             let _x = math.exp(A.data.simd_load[nelts](s * N + i) - max_element)
@@ -746,6 +843,7 @@ fn softmax[T:DType,nelts:Int](A: Array[T],axis:Int=-1) -> Array[T]:
             sum_loop += _x.reduce_add()
 
         vectorize[nelts, v_exp](N)
+
         @parameter
         fn v_div[nelts: Int](i: Int):
             B.data.simd_store[nelts](
@@ -755,13 +853,15 @@ fn softmax[T:DType,nelts:Int](A: Array[T],axis:Int=-1) -> Array[T]:
         vectorize[nelts, v_div](N)
     return B
 
-@always_inline
-fn softmax[T:DType](A: Array[T],axis:Int=-1) -> Array[T]:
-    var B = softmax[T,A.nelts](A,axis)
-    return B
 
 @always_inline
-fn mse[T:DType,nelts:Int](inout C: Array[T], A: Array[T], B: Array[T]):
+fn softmax[T: DType](A: Array[T], axis: Int = -1) -> Array[T]:
+    var B = softmax[T, A.nelts](A, axis)
+    return B
+
+
+@always_inline
+fn mse[T: DType, nelts: Int](inout C: Array[T], A: Array[T], B: Array[T]):
     @parameter
     fn v_mse[nelts: Int](index: Int):
         let error = (
@@ -770,14 +870,13 @@ fn mse[T:DType,nelts:Int](inout C: Array[T], A: Array[T], B: Array[T]):
         C.store[1](0, C.data.load(0) + error.reduce_add())
 
     vectorize[nelts, v_mse](A.num_elements())
-    C.store[1](0, C.data.load(0) / SIMD[T,1](A.num_elements()))
+    C.store[1](0, C.data.load(0) / SIMD[T, 1](A.num_elements()))
 
 
 @always_inline
-fn ce[T:DType,nelts:Int](inout C: Array[T], A: Array[T], B: Array[T]):
-
+fn ce[T: DType, nelts: Int](inout C: Array[T], A: Array[T], B: Array[T]):
     let N = A.dim(-1)
-    let epsilon = SIMD[T,1](1e-8)
+    let epsilon = SIMD[T, 1](1e-8)
 
     @parameter
     fn v_ce[nelts: Int](index: Int):
@@ -787,36 +886,36 @@ fn ce[T:DType,nelts:Int](inout C: Array[T], A: Array[T], B: Array[T]):
         C.store[1](0, C.data.load(0) + error.reduce_add())
 
     vectorize[nelts, v_ce](A.num_elements())
-    C.store[1](0, C.data.load(0) / (SIMD[T,1](A.num_elements()) / SIMD[T,1](N)))
+    C.store[1](0, C.data.load(0) / (SIMD[T, 1](A.num_elements()) / SIMD[T, 1](N)))
 
 
 @always_inline
-fn reshape[T:DType,nelts:Int](inout B: Array[T], A: Array[T]):
+fn reshape[T: DType, nelts: Int](inout B: Array[T], A: Array[T]):
     for s in range(B.num_elements() // A.num_elements()):
         let offset = s * A.num_elements()
+
         @parameter
         fn v_reshape[nelts: Int](i: Int):
-            B.data.simd_store[nelts](
-                offset + i, A.data.simd_load[nelts](i)
-            )
+            B.data.simd_store[nelts](offset + i, A.data.simd_load[nelts](i))
+
         vectorize[nelts, v_reshape](A.num_elements())
 
 
 @always_inline
-fn mean[T:DType,nelts:Int](inout B: Array[T], A: Array[T]): 
+fn mean[T: DType, nelts: Int](inout B: Array[T], A: Array[T]):
     let dim_len: Int = B.extra_parameters.load(0)
-    
+
     # Calculate total number of elements in dims
     var total_elements_in_dims: Int = 1
     for d in range(dim_len):
-        let dim: Int = B.extra_parameters.load(d+1)
+        let dim: Int = B.extra_parameters.load(d + 1)
         total_elements_in_dims *= A.shape[dim]
 
     var in_dims = DynamicVector[Bool](B.rank())
     for d in range(B.rank()):
         in_dims[d] = False
     for d in range(dim_len):
-        in_dims[B.extra_parameters.load(d+1)] = True
+        in_dims[B.extra_parameters.load(d + 1)] = True
 
     # Iterate over all elements in the Array[T]
     for i in range(A.num_elements()):
@@ -827,33 +926,32 @@ fn mean[T:DType,nelts:Int](inout B: Array[T], A: Array[T]):
         for dim in range(B.rank()):
             if not in_dims[dim]:
                 output_index += indeces[dim] * B.strides[dim]
-            
+
         B.data.store(output_index, B.data.load(output_index) + A.data.load(i))
 
     # Divide each element in output Array[T] by total number of elements in dims
     for i in range(B.num_elements()):
-        let value: SIMD[T,1] = B.data.load(i) / SIMD[T,1](total_elements_in_dims)
+        let value: SIMD[T, 1] = B.data.load(i) / SIMD[T, 1](total_elements_in_dims)
         B.data.store(i, value)
 
 
 @always_inline
-fn variance[T:DType,nelts:Int](inout B: Array[T], A: Array[T]): 
-
+fn variance[T: DType, nelts: Int](inout B: Array[T], A: Array[T]):
     let dim_len: Int = B.extra_parameters.load(0)
     let mean_output = DTypePointer[T].alloc(B.num_elements())
     memset_zero(mean_output, B.num_elements())
-    
+
     # Calculate total number of elements in dims
     var total_elements_in_dims: Int = 1
     for d in range(dim_len):
-        let dim: Int = B.extra_parameters.load(d+1)
+        let dim: Int = B.extra_parameters.load(d + 1)
         total_elements_in_dims *= A.shape[dim]
 
     var in_dims = DynamicVector[Bool](B.rank())
     for d in range(B.rank()):
         in_dims[d] = False
     for d in range(dim_len):
-        in_dims[B.extra_parameters.load(d+1)] = True
+        in_dims[B.extra_parameters.load(d + 1)] = True
 
     # Iterate over all elements in the Array[T]
     for i in range(A.num_elements()):
@@ -865,14 +963,14 @@ fn variance[T:DType,nelts:Int](inout B: Array[T], A: Array[T]):
         for dim in range(B.rank()):
             if not in_dims[dim]:
                 output_index += indeces[dim] * B.strides[dim]
-        
+
         mean_output.store(output_index, mean_output.load(output_index) + A.data.load(i))
 
     # Divide each element in output Array[T] by total number of elements in dims
     for i in range(B.num_elements()):
-        let value: SIMD[T,1] = mean_output.load(i) / SIMD[T,1](total_elements_in_dims)
+        let value: SIMD[T, 1] = mean_output.load(i) / SIMD[T, 1](total_elements_in_dims)
         mean_output.store(i, value)
-    
+
     # Iterate over all elements in the Array[T] again to calculate squared _dferences from the mean
     for i in range(A.num_elements()):
         var indeces = DynamicVector[Int]()
@@ -883,35 +981,33 @@ fn variance[T:DType,nelts:Int](inout B: Array[T], A: Array[T]):
         for dim in range(B.rank()):
             if not in_dims[dim]:
                 output_index += indeces[dim] * B.strides[dim]
-        
+
         let _df = A.data.load(i) - mean_output.load(output_index)
         B.data.store(output_index, B.data.load(output_index) + _df * _df)
 
     # Divide each element in squared__df_output Array[T] by total number of elements in dims to get the variance
     for i in range(B.num_elements()):
-        let value: SIMD[T,1] = B.data.load(i) / SIMD[T,1](total_elements_in_dims - 1)
-        B.data.store(i, value) 
-
+        let value: SIMD[T, 1] = B.data.load(i) / SIMD[T, 1](total_elements_in_dims - 1)
+        B.data.store(i, value)
 
 
 @always_inline
-fn std[T:DType,nelts:Int](inout B: Array[T], A: Array[T]): 
-
+fn std[T: DType, nelts: Int](inout B: Array[T], A: Array[T]):
     let dim_len: Int = B.extra_parameters.load(0)
     let mean_output = DTypePointer[T].alloc(B.num_elements())
     memset_zero(mean_output, B.num_elements())
-    
+
     # Calculate total number of elements in dims
     var total_elements_in_dims: Int = 1
     for d in range(dim_len):
-        let dim: Int = B.extra_parameters.load(d+1)
+        let dim: Int = B.extra_parameters.load(d + 1)
         total_elements_in_dims *= A.shape[dim]
 
     var in_dims = DynamicVector[Bool](B.rank())
     for d in range(B.rank()):
         in_dims[d] = False
     for d in range(dim_len):
-        in_dims[B.extra_parameters.load(d+1)] = True
+        in_dims[B.extra_parameters.load(d + 1)] = True
 
     # Iterate over all elements in the Array[T]
     for i in range(A.num_elements()):
@@ -923,13 +1019,13 @@ fn std[T:DType,nelts:Int](inout B: Array[T], A: Array[T]):
         for dim in range(B.rank()):
             if not in_dims[dim]:
                 output_index += indeces[dim] * B.strides[dim]
-        
+
         mean_output.store(output_index, mean_output.load(output_index) + A.data.load(i))
 
     for i in range(B.num_elements()):
-        let value: SIMD[T,1] = mean_output.load(i) / SIMD[T,1](total_elements_in_dims)
+        let value: SIMD[T, 1] = mean_output.load(i) / SIMD[T, 1](total_elements_in_dims)
         mean_output.store(i, value)
-    
+
     for i in range(A.num_elements()):
         var indeces = DynamicVector[Int]()
         for dim in range(A.rank()):
@@ -939,465 +1035,602 @@ fn std[T:DType,nelts:Int](inout B: Array[T], A: Array[T]):
         for dim in range(B.rank()):
             if not in_dims[dim]:
                 output_index += indeces[dim] * B.strides[dim]
-        
+
         let _df = A.data.load(i) - mean_output.load(output_index)
         B.data.store(output_index, B.data.load(output_index) + _df * _df)
 
     for i in range(B.num_elements()):
-        let value: SIMD[T,1] = sqrt(B.data.load(i) / SIMD[T,1](total_elements_in_dims - 1))
-        B.data.store(i, value) 
+        let value: SIMD[T, 1] = sqrt(
+            B.data.load(i) / SIMD[T, 1](total_elements_in_dims - 1)
+        )
+        B.data.store(i, value)
 
 
 @parameter
-fn base_case_mul [T:DType](depth: Int, A: Array[T], B: Array[T]) -> Bool:
-    return a_over_strides(depth,A,B)*a_over_shape[T](depth,A,B) == b_over_strides[T](depth,A,B)*b_over_shape[T](depth,A,B)
+fn base_case_mul[T: DType](depth: Int, A: Array[T], B: Array[T]) -> Bool:
+    return a_over_strides(depth, A, B) * a_over_shape[T](depth, A, B) == b_over_strides[
+        T
+    ](depth, A, B) * b_over_shape[T](depth, A, B)
+
 
 @parameter
-fn kernel_mul [T:DType,nelts:Int,cores:Int](inout C: Array[T], A: Array[T], B: Array[T], a_index: Int, b_index: Int, c_index: Int, depth: Int) -> None:
-
-    let offset_a = a_index*a_over_shape[T](depth,A,B)*a_over_strides[T](depth,A,B)
-    let offset_b = b_index*b_over_shape[T](depth,A,B)*b_over_strides[T](depth,A,B)
-    let c_rest = C.shape[depth]*C.strides[depth]
-    let offset_c = c_index*c_rest
+fn kernel_mul[
+    T: DType, nelts: Int, cores: Int
+](
+    inout C: Array[T],
+    A: Array[T],
+    B: Array[T],
+    a_index: Int,
+    b_index: Int,
+    c_index: Int,
+    depth: Int,
+) -> None:
+    let offset_a = a_index * a_over_shape[T](depth, A, B) * a_over_strides[T](
+        depth, A, B
+    )
+    let offset_b = b_index * b_over_shape[T](depth, A, B) * b_over_strides[T](
+        depth, A, B
+    )
+    let c_rest = C.shape[depth] * C.strides[depth]
+    let offset_c = c_index * c_rest
 
     @parameter
     fn v_mul[nelts: Int](i: Int):
         C.data.simd_store[nelts](
-            offset_c + i, A.data.simd_load[nelts](offset_a + i) * B.data.simd_load[nelts](offset_b + i)
+            offset_c + i,
+            A.data.simd_load[nelts](offset_a + i)
+            * B.data.simd_load[nelts](offset_b + i),
         )
+
     vectorize[nelts, v_mul](c_rest)
 
-@parameter
-fn base_case_add [T:DType](depth: Int, A: Array[T], B: Array[T]) -> Bool:
-    return a_over_strides[T](depth,A,B)*a_over_shape[T](depth,A,B) == b_over_strides[T](depth,A,B)*b_over_shape[T](depth,A,B)
 
 @parameter
-fn kernel_add [T:DType,nelts:Int,cores:Int](inout C: Array[T], A: Array[T], B: Array[T], a_index: Int, b_index: Int, c_index: Int, depth: Int) -> None:
-    
-    let offset_a = a_index*a_over_shape[T](depth,A,B)*a_over_strides[T](depth,A,B)
-    let offset_b = b_index*b_over_shape[T](depth,A,B)*b_over_strides[T](depth,A,B)
-    let c_rest = C.shape[depth]*C.strides[depth]
-    let offset_c = c_index*c_rest
+fn base_case_add[T: DType](depth: Int, A: Array[T], B: Array[T]) -> Bool:
+    return a_over_strides[T](depth, A, B) * a_over_shape[T](
+        depth, A, B
+    ) == b_over_strides[T](depth, A, B) * b_over_shape[T](depth, A, B)
+
+
+@parameter
+fn kernel_add[
+    T: DType, nelts: Int, cores: Int
+](
+    inout C: Array[T],
+    A: Array[T],
+    B: Array[T],
+    a_index: Int,
+    b_index: Int,
+    c_index: Int,
+    depth: Int,
+) -> None:
+    let offset_a = a_index * a_over_shape[T](depth, A, B) * a_over_strides[T](
+        depth, A, B
+    )
+    let offset_b = b_index * b_over_shape[T](depth, A, B) * b_over_strides[T](
+        depth, A, B
+    )
+    let c_rest = C.shape[depth] * C.strides[depth]
+    let offset_c = c_index * c_rest
 
     @parameter
     fn v_add[nelts: Int](i: Int):
         C.data.simd_store[nelts](
-            offset_c + i, A.data.simd_load[nelts](offset_a + i) + B.data.simd_load[nelts](offset_b + i)
+            offset_c + i,
+            A.data.simd_load[nelts](offset_a + i)
+            + B.data.simd_load[nelts](offset_b + i),
         )
+
     vectorize[nelts, v_add](c_rest)
 
 
 @parameter
-fn base_case_sub [T:DType](depth: Int, A: Array[T], B: Array[T]) -> Bool:
-    return a_over_strides[T](depth,A,B)*a_over_shape[T](depth,A,B) == b_over_strides[T](depth,A,B)*b_over_shape[T](depth,A,B)
+fn base_case_sub[T: DType](depth: Int, A: Array[T], B: Array[T]) -> Bool:
+    return a_over_strides[T](depth, A, B) * a_over_shape[T](
+        depth, A, B
+    ) == b_over_strides[T](depth, A, B) * b_over_shape[T](depth, A, B)
+
 
 @parameter
-fn kernel_sub [T:DType,nelts:Int,cores:Int](inout C: Array[T], A: Array[T], B: Array[T], a_index: Int, b_index: Int, c_index: Int, depth: Int) -> None:
-    
-    let offset_a = a_index*a_over_shape[T](depth,A,B)*a_over_strides[T](depth,A,B)
-    let offset_b = b_index*b_over_shape[T](depth,A,B)*b_over_strides[T](depth,A,B)
-    let c_rest = C.shape[depth]*C.strides[depth]
-    let offset_c = c_index*c_rest
+fn kernel_sub[
+    T: DType, nelts: Int, cores: Int
+](
+    inout C: Array[T],
+    A: Array[T],
+    B: Array[T],
+    a_index: Int,
+    b_index: Int,
+    c_index: Int,
+    depth: Int,
+) -> None:
+    let offset_a = a_index * a_over_shape[T](depth, A, B) * a_over_strides[T](
+        depth, A, B
+    )
+    let offset_b = b_index * b_over_shape[T](depth, A, B) * b_over_strides[T](
+        depth, A, B
+    )
+    let c_rest = C.shape[depth] * C.strides[depth]
+    let offset_c = c_index * c_rest
 
     @parameter
     fn v_sub[nelts: Int](i: Int):
         C.data.simd_store[nelts](
-            offset_c + i, A.data.simd_load[nelts](offset_a + i) - B.data.simd_load[nelts](offset_b + i)
+            offset_c + i,
+            A.data.simd_load[nelts](offset_a + i)
+            - B.data.simd_load[nelts](offset_b + i),
         )
+
     vectorize[nelts, v_sub](c_rest)
 
 
+@parameter
+fn base_case_div[T: DType](depth: Int, A: Array[T], B: Array[T]) -> Bool:
+    return a_over_strides[T](depth, A, B) * a_over_shape[T](
+        depth, A, B
+    ) == b_over_strides[T](depth, A, B) * b_over_shape[T](depth, A, B)
 
 
 @parameter
-fn base_case_div [T:DType](depth: Int, A: Array[T], B: Array[T]) -> Bool:
-    return a_over_strides[T](depth,A,B)*a_over_shape[T](depth,A,B) == b_over_strides[T](depth,A,B)*b_over_shape[T](depth,A,B)
-
-@parameter
-fn kernel_div [T:DType,nelts:Int,cores:Int](inout C: Array[T], A: Array[T], B: Array[T], a_index: Int, b_index: Int, c_index: Int, depth: Int) -> None:
-    
-    let offset_a = a_index*a_over_shape[T](depth,A,B)*a_over_strides[T](depth,A,B)
-    let offset_b = b_index*b_over_shape[T](depth,A,B)*b_over_strides[T](depth,A,B)
-    let c_rest = C.shape[depth]*C.strides[depth]
-    let offset_c = c_index*c_rest
+fn kernel_div[
+    T: DType, nelts: Int, cores: Int
+](
+    inout C: Array[T],
+    A: Array[T],
+    B: Array[T],
+    a_index: Int,
+    b_index: Int,
+    c_index: Int,
+    depth: Int,
+) -> None:
+    let offset_a = a_index * a_over_shape[T](depth, A, B) * a_over_strides[T](
+        depth, A, B
+    )
+    let offset_b = b_index * b_over_shape[T](depth, A, B) * b_over_strides[T](
+        depth, A, B
+    )
+    let c_rest = C.shape[depth] * C.strides[depth]
+    let offset_c = c_index * c_rest
 
     @parameter
     fn v_div[nelts: Int](i: Int):
         C.data.simd_store[nelts](
-            offset_c + i, A.data.simd_load[nelts](offset_a + i) / B.data.simd_load[nelts](offset_b + i)
+            offset_c + i,
+            A.data.simd_load[nelts](offset_a + i)
+            / B.data.simd_load[nelts](offset_b + i),
         )
+
     vectorize[nelts, v_div](c_rest)
-
-
 
 
 # pow(A,B)
 @parameter
-fn base_case_pow [T:DType](depth: Int, A: Array[T], B: Array[T]) -> Bool:
-    return a_over_strides[T](depth,A,B)*a_over_shape[T](depth,A,B) == b_over_strides[T](depth,A,B)*b_over_shape[T](depth,A,B)
+fn base_case_pow[T: DType](depth: Int, A: Array[T], B: Array[T]) -> Bool:
+    return a_over_strides[T](depth, A, B) * a_over_shape[T](
+        depth, A, B
+    ) == b_over_strides[T](depth, A, B) * b_over_shape[T](depth, A, B)
+
 
 @parameter
-fn kernel_pow [T:DType,nelts:Int,cores:Int](inout C: Array[T], A: Array[T], B: Array[T], a_index: Int, b_index: Int, c_index: Int, depth: Int) -> None:
-
-    let offset_a = a_index*a_over_shape[T](depth,A,B)*a_over_strides[T](depth,A,B)
-    let offset_b = b_index*b_over_shape[T](depth,A,B)*b_over_strides[T](depth,A,B)
-    let c_rest = C.shape[depth]*C.strides[depth]
-    let offset_c = c_index*c_rest
+fn kernel_pow[
+    T: DType, nelts: Int, cores: Int
+](
+    inout C: Array[T],
+    A: Array[T],
+    B: Array[T],
+    a_index: Int,
+    b_index: Int,
+    c_index: Int,
+    depth: Int,
+) -> None:
+    let offset_a = a_index * a_over_shape[T](depth, A, B) * a_over_strides[T](
+        depth, A, B
+    )
+    let offset_b = b_index * b_over_shape[T](depth, A, B) * b_over_strides[T](
+        depth, A, B
+    )
+    let c_rest = C.shape[depth] * C.strides[depth]
+    let offset_c = c_index * c_rest
 
     @parameter
     fn v_pow[nelts: Int](i: Int):
         C.data.simd_store[nelts](
-            offset_c + i, pow(A.data.simd_load[nelts](offset_a + i), B.data.simd_load[nelts](offset_b + i))
+            offset_c + i,
+            pow(
+                A.data.simd_load[nelts](offset_a + i),
+                B.data.simd_load[nelts](offset_b + i),
+            ),
         )
+
     vectorize[nelts, v_pow](c_rest)
 
+
 @always_inline
-fn e_pow[T:DType,nelts:Int](inout C: Array[T], A: Array[T], B: Array[T]):
-    recursive_broadcast[T,nelts,1,kernel_pow , base_case_pow ](C,A,B)
+fn array_pow[
+    T: DType, nelts: Int, cores: Int
+](inout C: Array[T], A: Array[T], B: Array[T]):
+    recursive_broadcast[T, nelts, cores, kernel_pow, base_case_pow](C, A, B)
 
 
- 
-fn e_pow_all[T:DType,nelts:Int](inout B: Array[T], A: Array[T]): 
+fn array_pow_all[T: DType, nelts: Int](inout B: Array[T], A: Array[T]):
     let e = B.extra_parameters.load(0)
+
     @parameter
     fn v_pow_all[nelts: Int](i: Int):
-        let temp = pow(A.data.simd_load[nelts](i),e)
+        let temp = pow(A.data.simd_load[nelts](i), e)
         B.data.simd_store[nelts](i, temp)
+
     vectorize[nelts, v_pow_all](A.num_elements())
 
 
 @always_inline
-fn e_exp2[T:DType,nelts:Int](inout B: Array[T], A: Array[T]): 
+fn array_exp2[T: DType, nelts: Int](inout B: Array[T], A: Array[T]):
     @parameter
     fn v_exp2[nelts: Int](i: Int):
         let temp = exp2(A.data.simd_load[nelts](i))
         B.data.simd_store[nelts](i, temp)
+
     vectorize[nelts, v_exp2](A.num_elements())
 
 
 @always_inline
-fn e_exp[T:DType,nelts:Int](inout B: Array[T], A: Array[T]): 
+fn array_exp[T: DType, nelts: Int](inout B: Array[T], A: Array[T]):
     @parameter
     fn v_exp[nelts: Int](i: Int):
         let temp = exp(A.data.simd_load[nelts](i))
         B.data.simd_store[nelts](i, temp)
+
     vectorize[nelts, v_exp](A.num_elements())
 
 
 @always_inline
-fn e_log2[T:DType,nelts:Int](inout B: Array[T], A: Array[T]): 
+fn array_log2[T: DType, nelts: Int](inout B: Array[T], A: Array[T]):
     @parameter
     fn v_log2[nelts: Int](i: Int):
         let temp = log2(A.data.simd_load[nelts](i))
         B.data.simd_store[nelts](i, temp)
+
     vectorize[nelts, v_log2](A.num_elements())
 
 
 @always_inline
-fn e_log[T:DType,nelts:Int](inout B: Array[T], A: Array[T]): 
+fn array_log[T: DType, nelts: Int](inout B: Array[T], A: Array[T]):
     @parameter
     fn v_log[nelts: Int](i: Int):
         let temp = log(A.data.simd_load[nelts](i))
         B.data.simd_store[nelts](i, temp)
+
     vectorize[nelts, v_log](A.num_elements())
 
 
 @always_inline
-fn e_sin[T:DType,nelts:Int](inout B: Array[T], A: Array[T]): 
+fn array_sin[T: DType, nelts: Int](inout B: Array[T], A: Array[T]):
     @parameter
     fn v_sin[nelts: Int](i: Int):
         let temp = sin(A.data.simd_load[nelts](i))
         B.data.simd_store[nelts](i, temp)
+
     vectorize[nelts, v_sin](A.num_elements())
 
 
 @always_inline
-fn e_cos[T:DType,nelts:Int](inout B: Array[T], A: Array[T]): 
+fn array_cos[T: DType, nelts: Int](inout B: Array[T], A: Array[T]):
     @parameter
     fn v_cos[nelts: Int](i: Int):
         let temp = cos(A.data.simd_load[nelts](i))
         B.data.simd_store[nelts](i, temp)
+
     vectorize[nelts, v_cos](A.num_elements())
 
 
 @always_inline
-fn e_tan[T:DType,nelts:Int](inout B: Array[T], A: Array[T]): 
+fn array_tan[T: DType, nelts: Int](inout B: Array[T], A: Array[T]):
     @parameter
     fn v_tan[nelts: Int](i: Int):
         let temp = tan(A.data.simd_load[nelts](i))
         B.data.simd_store[nelts](i, temp)
+
     vectorize[nelts, v_tan](A.num_elements())
 
 
 @always_inline
-fn e_asin[T:DType,nelts:Int](inout B: Array[T], A: Array[T]): 
+fn array_asin[T: DType, nelts: Int](inout B: Array[T], A: Array[T]):
     @parameter
     fn v_asin[nelts: Int](i: Int):
         let temp = asin(A.data.simd_load[nelts](i))
         B.data.simd_store[nelts](i, temp)
+
     vectorize[nelts, v_asin](A.num_elements())
 
 
 @always_inline
-fn e_acos[T:DType,nelts:Int](inout B: Array[T], A: Array[T]): 
+fn array_acos[T: DType, nelts: Int](inout B: Array[T], A: Array[T]):
     @parameter
     fn v_acos[nelts: Int](i: Int):
         let temp = acos(A.data.simd_load[nelts](i))
         B.data.simd_store[nelts](i, temp)
+
     vectorize[nelts, v_acos](A.num_elements())
 
 
 @always_inline
-fn e_atan[T:DType,nelts:Int](inout B: Array[T], A: Array[T]): 
+fn array_atan[T: DType, nelts: Int](inout B: Array[T], A: Array[T]):
     @parameter
     fn v_atan[nelts: Int](i: Int):
         let temp = atan(A.data.simd_load[nelts](i))
         B.data.simd_store[nelts](i, temp)
+
     vectorize[nelts, v_atan](A.num_elements())
 
 
 @always_inline
-fn e_sinh[T:DType,nelts:Int](inout B: Array[T], A: Array[T]): 
+fn array_sinh[T: DType, nelts: Int](inout B: Array[T], A: Array[T]):
     @parameter
     fn v_sinh[nelts: Int](i: Int):
         let temp = sinh(A.data.simd_load[nelts](i))
         B.data.simd_store[nelts](i, temp)
+
     vectorize[nelts, v_sinh](A.num_elements())
 
 
 @always_inline
-fn e_cosh[T:DType,nelts:Int](inout B: Array[T], A: Array[T]): 
+fn array_cosh[T: DType, nelts: Int](inout B: Array[T], A: Array[T]):
     @parameter
     fn v_cosh[nelts: Int](i: Int):
         let temp = cosh(A.data.simd_load[nelts](i))
         B.data.simd_store[nelts](i, temp)
+
     vectorize[nelts, v_cosh](A.num_elements())
 
 
 @always_inline
-fn e_tanh[T:DType,nelts:Int](inout B: Array[T], A: Array[T]): 
+fn array_tanh[T: DType, nelts: Int](inout B: Array[T], A: Array[T]):
     @parameter
     fn v_tanh[nelts: Int](i: Int):
         let temp = tanh(A.data.simd_load[nelts](i))
         B.data.simd_store[nelts](i, temp)
+
     vectorize[nelts, v_tanh](A.num_elements())
 
 
 @always_inline
-fn e_relu[T:DType,nelts:Int](inout B: Array[T], A: Array[T]): 
+fn array_relu[T: DType, nelts: Int](inout B: Array[T], A: Array[T]):
     @parameter
     fn v_relu[nelts: Int](i: Int):
-        let zeros = SIMD[T,nelts]()
+        let zeros = SIMD[T, nelts]()
         B.data.simd_store[nelts](
-            i, (A.data.simd_load[nelts](i) > zeros).cast[T]() * A.data.simd_load[nelts](i)
+            i,
+            (A.data.simd_load[nelts](i) > zeros).cast[T]() * A.data.simd_load[nelts](i),
         )
+
     vectorize[nelts, v_relu](B.num_elements())
 
 
 @always_inline
-fn e_copy[T:DType,nelts:Int](inout B: Array[T], A: Array[T]): 
-    memcpy(B.data,A.data,A.num_elements())
-    
-@always_inline
-fn e_div[T:DType,nelts:Int](inout C: Array[T], A: Array[T], B: Array[T]):
-    recursive_broadcast[T,nelts,1,kernel_div , base_case_div ](C,A,B)
+fn array_copy[T: DType, nelts: Int](inout B: Array[T], A: Array[T]):
+    memcpy(B.data, A.data, A.num_elements())
 
 
 @always_inline
-fn e_sqrt[T:DType,nelts:Int](inout B: Array[T], A: Array[T]): 
+fn array_div[
+    T: DType, nelts: Int, cores: Int
+](inout C: Array[T], A: Array[T], B: Array[T]):
+    recursive_broadcast[T, nelts, cores, kernel_div, base_case_div](C, A, B)
+
+
+@always_inline
+fn array_sqrt[T: DType, nelts: Int](inout B: Array[T], A: Array[T]):
     @parameter
     fn v_sqrt[nelts: Int](i: Int):
         let temp = sqrt(A.data.simd_load[nelts](i))
         B.data.simd_store[nelts](i, temp)
+
     vectorize[nelts, v_sqrt](A.num_elements())
 
 
 @always_inline
-fn e_abs[T:DType,nelts:Int](inout B: Array[T], A: Array[T]): 
+fn array_abs[T: DType, nelts: Int](inout B: Array[T], A: Array[T]):
     @parameter
     fn v_abs[nelts: Int](i: Int):
         let temp = abs(A.data.simd_load[nelts](i))
         B.data.simd_store[nelts](i, temp)
+
     vectorize[nelts, v_abs](A.num_elements())
 
 
 @always_inline
-fn e_mul[T:DType,nelts:Int](inout C:Array[T], A: Array[T], B: Array[T]):
-    recursive_broadcast[T,nelts,1,kernel_mul , base_case_mul ](C,A,B)
+fn array_mul[
+    T: DType, nelts: Int, cores: Int
+](inout C: Array[T], A: Array[T], B: Array[T]):
+    recursive_broadcast[T, nelts, cores, kernel_mul, base_case_mul](C, A, B)
+
 
 @always_inline
-fn e_add[T:DType,nelts:Int](inout C:Array[T],  A: Array[T], B: Array[T]):
-    recursive_broadcast[T,nelts,1,kernel_add , base_case_add ](C,A,B)
+fn array_add[
+    T: DType, nelts: Int, cores: Int
+](inout C: Array[T], A: Array[T], B: Array[T]):
+    recursive_broadcast[T, nelts, cores, kernel_add, base_case_add](C, A, B)
+
 
 @always_inline
-fn e_sub[T:DType,nelts:Int](inout C:Array[T],  A: Array[T], B: Array[T]):
-    recursive_broadcast[T,nelts,1,kernel_sub , base_case_sub ](C,A,B)
+fn array_sub[
+    T: DType, nelts: Int, cores: Int
+](inout C: Array[T], A: Array[T], B: Array[T]):
+    recursive_broadcast[T, nelts, cores, kernel_sub, base_case_sub](C, A, B)
+
 
 # More Automated Functions
 
+
 @always_inline
-fn e_pow[T:DType,nelts:Int](A: Array[T], B: Array[T]) ->Array[T]:
-    var C :Array[T]= Array[T](B.array_shape) 
+fn array_pow[T: DType, nelts: Int, cores: Int](A: Array[T], B: Array[T]) -> Array[T]:
+    var C: Array[T] = Array[T](B.array_shape)
     C.alloc(0.0)
-    e_pow[T,nelts](C,A,B)
+    array_pow[T, nelts, cores](C, A, B)
     return C
 
- 
-fn e_pow_all[T:DType,nelts:Int]( A: Array[T]) -> Array[T]:
-    var B :Array[T]= Array[T](A.array_shape)
-    B.alloc(0.0) 
-    e_pow_all[T,nelts](B,A)
+
+fn array_pow_all[T: DType, nelts: Int](A: Array[T]) -> Array[T]:
+    var B: Array[T] = Array[T](A.array_shape)
+    B.alloc(0.0)
+    array_pow_all[T, nelts](B, A)
     return B
 
 
 @always_inline
-fn e_exp2[T:DType,nelts:Int]( A: Array[T]) -> Array[T]:
-    var B :Array[T]= Array[T](A.array_shape)
-    B.alloc(0.0) 
-    e_exp2[T,nelts](B,A)
+fn array_exp2[T: DType, nelts: Int](A: Array[T]) -> Array[T]:
+    var B: Array[T] = Array[T](A.array_shape)
+    B.alloc(0.0)
+    array_exp2[T, nelts](B, A)
     return B
 
 
 @always_inline
-fn e_exp[T:DType,nelts:Int]( A: Array[T]) -> Array[T]:
-    var B :Array[T]= Array[T](A.array_shape)
-    B.alloc(0.0) 
-    e_exp[T,nelts](B,A)
+fn array_exp[T: DType, nelts: Int](A: Array[T]) -> Array[T]:
+    var B: Array[T] = Array[T](A.array_shape)
+    B.alloc(0.0)
+    array_exp[T, nelts](B, A)
     return B
 
 
 @always_inline
-fn e_log2[T:DType,nelts:Int]( A: Array[T]) -> Array[T]:
-    var B :Array[T]= Array[T](A.array_shape)
-    B.alloc(0.0) 
-    e_log2[T,nelts](B,A)
-    return B
-
-@always_inline
-fn e_log[T:DType,nelts:Int]( A: Array[T]) -> Array[T]:
-    var B :Array[T]= Array[T](A.array_shape)
-    B.alloc(0.0) 
-    e_log[T,nelts](B,A)
+fn array_log2[T: DType, nelts: Int](A: Array[T]) -> Array[T]:
+    var B: Array[T] = Array[T](A.array_shape)
+    B.alloc(0.0)
+    array_log2[T, nelts](B, A)
     return B
 
 
 @always_inline
-fn e_sin[T:DType,nelts:Int]( A: Array[T]) -> Array[T]:
-    var B :Array[T]= Array[T](A.array_shape)
-    B.alloc(0.0) 
-    e_sin[T,nelts](B,A)
+fn array_log[T: DType, nelts: Int](A: Array[T]) -> Array[T]:
+    var B: Array[T] = Array[T](A.array_shape)
+    B.alloc(0.0)
+    array_log[T, nelts](B, A)
     return B
 
 
 @always_inline
-fn e_cos[T:DType,nelts:Int]( A: Array[T]) -> Array[T]:
-    var B :Array[T]= Array[T](A.array_shape)
-    B.alloc(0.0) 
-    e_cos[T,nelts](B,A)
+fn array_sin[T: DType, nelts: Int](A: Array[T]) -> Array[T]:
+    var B: Array[T] = Array[T](A.array_shape)
+    B.alloc(0.0)
+    array_sin[T, nelts](B, A)
     return B
 
 
 @always_inline
-fn e_tan[T:DType,nelts:Int]( A: Array[T]) -> Array[T]:
-    var B :Array[T]= Array[T](A.array_shape)
-    B.alloc(0.0) 
-    e_tan[T,nelts](B,A)
+fn array_cos[T: DType, nelts: Int](A: Array[T]) -> Array[T]:
+    var B: Array[T] = Array[T](A.array_shape)
+    B.alloc(0.0)
+    array_cos[T, nelts](B, A)
     return B
 
 
 @always_inline
-fn e_asin[T:DType,nelts:Int]( A: Array[T]) -> Array[T]:
-    var B :Array[T]= Array[T](A.array_shape)
-    B.alloc(0.0) 
-    e_asin[T,nelts](B,A)
+fn array_tan[T: DType, nelts: Int](A: Array[T]) -> Array[T]:
+    var B: Array[T] = Array[T](A.array_shape)
+    B.alloc(0.0)
+    array_tan[T, nelts](B, A)
     return B
 
 
 @always_inline
-fn e_acos[T:DType,nelts:Int]( A: Array[T]) -> Array[T]:
-    var B :Array[T]= Array[T](A.array_shape)
-    B.alloc(0.0) 
-    e_acos[T,nelts](B,A)
-    return B
-
-@always_inline
-fn e_atan[T:DType,nelts:Int]( A: Array[T]) -> Array[T]:
-    var B :Array[T]= Array[T](A.array_shape)
-    B.alloc(0.0) 
-    e_atan[T,nelts](B,A)
+fn array_asin[T: DType, nelts: Int](A: Array[T]) -> Array[T]:
+    var B: Array[T] = Array[T](A.array_shape)
+    B.alloc(0.0)
+    array_asin[T, nelts](B, A)
     return B
 
 
 @always_inline
-fn e_sinh[T:DType,nelts:Int]( A: Array[T]) -> Array[T]:
-    var B :Array[T]= Array[T](A.array_shape)
-    B.alloc(0.0) 
-    e_sinh[T,nelts](B,A)
+fn array_acos[T: DType, nelts: Int](A: Array[T]) -> Array[T]:
+    var B: Array[T] = Array[T](A.array_shape)
+    B.alloc(0.0)
+    array_acos[T, nelts](B, A)
     return B
 
 
 @always_inline
-fn e_cosh[T:DType,nelts:Int]( A: Array[T]) -> Array[T]:
-    var B :Array[T]= Array[T](A.array_shape)
-    B.alloc(0.0) 
-    e_cosh[T,nelts](B,A)
+fn array_atan[T: DType, nelts: Int](A: Array[T]) -> Array[T]:
+    var B: Array[T] = Array[T](A.array_shape)
+    B.alloc(0.0)
+    array_atan[T, nelts](B, A)
     return B
 
 
 @always_inline
-fn e_tanh[T:DType,nelts:Int]( A: Array[T]) -> Array[T]:
-    var B :Array[T]= Array[T](A.array_shape)
-    B.alloc(0.0) 
-    e_tanh[T,nelts](B,A)
-    return B
-@always_inline
-fn e_relu[T:DType,nelts:Int]( A: Array[T]) -> Array[T]:
-    var B :Array[T]= Array[T](A.array_shape)
-    B.alloc(0.0) 
-    e_relu[T,nelts](B,A)
-    return B
-
-
-
-@always_inline
-fn e_sqrt[T:DType,nelts:Int]( A: Array[T]) -> Array[T]:
-    var B :Array[T]= Array[T](A.array_shape)
-    B.alloc(0.0) 
-    e_sqrt[T,nelts](B,A)
+fn array_sinh[T: DType, nelts: Int](A: Array[T]) -> Array[T]:
+    var B: Array[T] = Array[T](A.array_shape)
+    B.alloc(0.0)
+    array_sinh[T, nelts](B, A)
     return B
 
 
 @always_inline
-fn e_abs[T:DType,nelts:Int]( A: Array[T]) -> Array[T]:
-    var B :Array[T]= Array[T](A.array_shape)
-    B.alloc(0.0) 
-    e_abs[T,nelts](B,A)
+fn array_cosh[T: DType, nelts: Int](A: Array[T]) -> Array[T]:
+    var B: Array[T] = Array[T](A.array_shape)
+    B.alloc(0.0)
+    array_cosh[T, nelts](B, A)
     return B
 
+
 @always_inline
-fn e_mul[T:DType,nelts:Int]( A: Array[T], B: Array[T]) ->Array[T]:
-    var C:Array[T] = Array[T](B.array_shape)
+fn array_tanh[T: DType, nelts: Int](A: Array[T]) -> Array[T]:
+    var B: Array[T] = Array[T](A.array_shape)
+    B.alloc(0.0)
+    array_tanh[T, nelts](B, A)
+    return B
+
+
+@always_inline
+fn array_relu[T: DType, nelts: Int](A: Array[T]) -> Array[T]:
+    var B: Array[T] = Array[T](A.array_shape)
+    B.alloc(0.0)
+    array_relu[T, nelts](B, A)
+    return B
+
+
+@always_inline
+fn array_sqrt[T: DType, nelts: Int](A: Array[T]) -> Array[T]:
+    var B: Array[T] = Array[T](A.array_shape)
+    B.alloc(0.0)
+    array_sqrt[T, nelts](B, A)
+    return B
+
+
+@always_inline
+fn array_abs[T: DType, nelts: Int](A: Array[T]) -> Array[T]:
+    var B: Array[T] = Array[T](A.array_shape)
+    B.alloc(0.0)
+    array_abs[T, nelts](B, A)
+    return B
+
+
+@always_inline
+fn array_mul[T: DType, nelts: Int, cores: Int](A: Array[T], B: Array[T]) -> Array[T]:
+    var C: Array[T] = Array[T](B.array_shape)
     C.alloc(0.0)
-    e_mul[T,nelts](C,A,B)
+    array_mul[T, nelts, cores](C, A, B)
     return C
 
-@always_inline
-fn e_add[T:DType,nelts:Int]( A: Array[T], B: Array[T])->Array[T]:
-    var C:Array[T] = Array[T](B.array_shape)
-    C.alloc(0.0)
-    e_add[T,nelts](C,A,B)
-    return C
 
 @always_inline
-fn e_sub[T:DType,nelts:Int]( A: Array[T], B: Array[T])->Array[T]:
-    var C:Array[T] = Array[T](B.array_shape)
+fn array_add[T: DType, nelts: Int, cores: Int](A: Array[T], B: Array[T]) -> Array[T]:
+    var C: Array[T] = Array[T](B.array_shape)
     C.alloc(0.0)
-    e_sub[T,nelts](C,A,B)
+    array_add[T, nelts, cores](C, A, B)
     return C
 
+
 @always_inline
-fn e_div[T:DType,nelts:Int]( A: Array[T], B: Array[T])->Array[T]:
-    var C:Array[T] = Array[T](B.array_shape)
+fn array_sub[T: DType, nelts: Int, cores: Int](A: Array[T], B: Array[T]) -> Array[T]:
+    var C: Array[T] = Array[T](B.array_shape)
     C.alloc(0.0)
-    e_div[T,nelts](C,A,B)
+    array_sub[T, nelts, cores](C, A, B)
+    return C
+
+
+@always_inline
+fn array_div[T: DType, nelts: Int, cores: Int](A: Array[T], B: Array[T]) -> Array[T]:
+    var C: Array[T] = Array[T](B.array_shape)
+    C.alloc(0.0)
+    array_div[T, nelts, cores](C, A, B)
     return C
