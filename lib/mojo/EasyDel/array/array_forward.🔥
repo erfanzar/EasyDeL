@@ -1236,7 +1236,7 @@ fn e_sub[T:DType,nelts:Int](inout C:Array[T],  A: Array[T], B: Array[T]):
 # More Automated Functions
 
 @always_inline
-fn e_pow[T:DType,nelts:Int](inout C:Array[T],  A: Array[T], B: Array[T]) ->Array[T]:
+fn e_pow[T:DType,nelts:Int](A: Array[T], B: Array[T]) ->Array[T]:
     var C :Array[T]= Array[T](B.array_shape) 
     C.alloc(0.0)
     e_pow[T,nelts](C,A,B)
