@@ -1,9 +1,5 @@
 from python import PythonObject
-from .array_module import (
-    ArrayShape, 
-    Array,
-    dims_average_size
-)
+from .array_module import ArrayShape, Array, dims_average_size
 from algorithm.functional import (
     vectorize,
     parallelize,
@@ -34,6 +30,7 @@ import math
 from memory import memset_zero, memcpy
 from random import rand
 
+
 fn a_over_shape[T: DType](depth: Int, A: Array[T], B: Array[T]) -> Int:
     let _df = max(B.rank() - A.rank(), 0)
     if depth < _df:
@@ -60,6 +57,7 @@ fn b_over_strides[T: DType](depth: Int, A: Array[T], B: Array[T]) -> Int:
     if depth < _df:
         return B.strides[0]
     return B.strides[depth - _df]
+
 
 @always_inline
 fn convert_numpy_to_easydel_array[
@@ -162,6 +160,7 @@ fn matmul_EA[
 
         parallelize[loop_](C_R, num_cores)
 
+
 @always_inline
 fn matmul_single_row[
     T: DType, nelts: Int
@@ -216,6 +215,7 @@ fn matmul_single_row[
 
     parallelize[_loop](AR, num_cores)
 
+
 @always_inline
 fn T_AXIS_1_0_2[T: DType, nelts: Int](array: Array[T], num_workers: Int) -> Array[T]:
     """
@@ -237,6 +237,7 @@ fn T_AXIS_1_0_2[T: DType, nelts: Int](array: Array[T], num_workers: Int) -> Arra
 
         parallelize[_row](array.dim(1), num_workers)
     return transposed_array
+
 
 @always_inline
 fn T_AXIS_0_2_1[T: DType, nelts: Int](array: Array[T], num_workers: Int) -> Array[T]:
@@ -260,6 +261,7 @@ fn T_AXIS_0_2_1[T: DType, nelts: Int](array: Array[T], num_workers: Int) -> Arra
         parallelize[_row](array.dim(1), num_workers)
     return transposed_array
 
+
 @always_inline
 fn T_AXIS_2_1_0[T: DType, nelts: Int](array: Array[T], num_workers: Int) -> Array[T]:
     """
@@ -281,6 +283,7 @@ fn T_AXIS_2_1_0[T: DType, nelts: Int](array: Array[T], num_workers: Int) -> Arra
 
         parallelize[_row](array.dim(1), num_workers)
     return transposed_array
+
 
 @always_inline
 fn concatenate[
@@ -310,6 +313,7 @@ fn concatenate[
         vectorize[Array[T].nelts, _r](cat_array.num_elements())
     return cat_array
 
+
 @always_inline
 fn CAT_3D_AXIS_2[T: DType, cores: Int](A: Array[T], B: Array[T]) -> Array[T]:
     """
@@ -333,6 +337,7 @@ fn CAT_3D_AXIS_2[T: DType, cores: Int](A: Array[T], B: Array[T]) -> Array[T]:
 
         parallelize[_row](A.dim(1), cores)
     return x
+
 
 @always_inline
 fn rotate_half[T: DType, cores: Int](A: Array[T]) -> Array[T]:
@@ -391,6 +396,7 @@ fn arange[T: DType, cores: Int](start: Int, end: Int) -> Array[T]:
 
 ## I Used https://github.com/TilliFe/Infermo/blob/main/infermo/operators/ to learn this Algorithms
 
+
 fn recursive_broadcast[
     T: DType,
     nelts: Int,
@@ -404,7 +410,8 @@ fn recursive_broadcast[
         c_index: Int,
         depth: Int
         ) -> None,
-    base_case: fn[T:DType](depth: Int, A: Array[T], B: Array[T]) -> Bool
+    base_case: fn[T:DType](depth: Int, A: Array[T], B: Array[T]) -> Bool,
+    parallelized: Bool,
 ](
     inout C: Array[T],
     A: Array[T],
@@ -422,10 +429,26 @@ fn recursive_broadcast[
     let b_shape = b_over_shape[T](depth, A, B)
     let c_shape = C.shape[depth]
     if a_shape != 1 and b_shape == 1:
+        if parallelized:
 
-        @parameter
-        fn _cols_a(s: Int):
-            recursive_broadcast[T, nelts, cores, kernel, base_case](
+            @parameter
+            fn _cols_a(s: Int):
+                recursive_broadcast[
+                    T, nelts, cores, kernel, base_case, parallelized
+                ](
+                    C,
+                    A,
+                    B,
+                    a_shape * a_index + s,
+                    b_shape * b_index,
+                    c_shape * c_index + s,
+                    depth + 1,
+                )
+
+            parallelize[_cols_a](a_shape, cores)
+
+        for s in range(a_shape):
+            recursive_broadcast[T, nelts, cores, kernel, base_case, parallelized](
                 C,
                 A,
                 B,
@@ -434,40 +457,68 @@ fn recursive_broadcast[
                 c_shape * c_index + s,
                 depth + 1,
             )
-
-        parallelize[_cols_a](a_shape, cores)
     elif a_shape == 1 and b_shape != 1:
+        if parallelized:
 
-        @parameter
-        fn _cols_b(s: Int):
-            recursive_broadcast[T, nelts, cores, kernel, base_case](
-                C,
-                A,
-                B,
-                a_shape * a_index,
-                b_shape * b_index + s,
-                c_shape * c_index + s,
-                depth + 1,
-            )
+            @parameter
+            fn _cols_b(s: Int):
+                recursive_broadcast[
+                    T, nelts, cores, kernel, base_case, parallelized
+                ](
+                    C,
+                    A,
+                    B,
+                    a_shape * a_index,
+                    b_shape * b_index + s,
+                    c_shape * c_index + s,
+                    depth + 1,
+                )
 
-        parallelize[_cols_b](b_shape, cores)
+            parallelize[_cols_b](b_shape, cores)
+        else:
+            for s in range(b_shape):
+                recursive_broadcast[
+                    T, nelts, cores, kernel, base_case, parallelized
+                ](
+                    C,
+                    A,
+                    B,
+                    a_shape * a_index,
+                    b_shape * b_index + s,
+                    c_shape * c_index + s,
+                    depth + 1,
+                )
     else:
+        if parallelized:
 
-        @parameter
-        fn _cols_a_s(s: Int):
-            recursive_broadcast[T, nelts, cores, kernel, base_case](
-                C,
-                A,
-                B,
-                a_shape * a_index + s,
-                b_shape * b_index + s,
-                c_shape * c_index + s,
-                depth + 1,
-            )
+            @parameter
+            fn _cols_a_s(s: Int):
+                recursive_broadcast[
+                    T, nelts, cores, kernel, base_case, parallelized
+                ](
+                    C,
+                    A,
+                    B,
+                    a_shape * a_index + s,
+                    b_shape * b_index + s,
+                    c_shape * c_index + s,
+                    depth + 1,
+                )
 
-        parallelize[_cols_a_s](a_shape, cores)
-
-
+            parallelize[_cols_a_s](a_shape, cores)
+        else:
+            for s in range(a_shape):
+                recursive_broadcast[
+                    T, nelts, cores, kernel, base_case, parallelized
+                ](
+                    C,
+                    A,
+                    B,
+                    a_shape * a_index + s,
+                    b_shape * b_index + s,
+                    c_shape * c_index + s,
+                    depth + 1,
+                )
 
 
 @always_inline
@@ -510,9 +561,9 @@ fn kernel_matmul[
 
 @always_inline
 fn matmul[
-    T: DType, nelts: Int = Array[T].nelts, cores: Int = 1
+    T: DType, nelts: Int = Array[T].nelts, cores: Int = 1,parallelized:Bool=True
 ](inout C: Array[T], A: Array[T], B: Array[T]):
-    recursive_broadcast[T, nelts, cores, kernel_matmul, base_case_matmul](C, A, B)
+    recursive_broadcast[T, nelts, cores, kernel_matmul, base_case_matmul,parallelized](C, A, B)
 
 
 @always_inline
@@ -520,7 +571,7 @@ fn matmul(
     inout C: Array[DType.float32], A: Array[DType.float32], B: Array[DType.float32]
 ):
     recursive_broadcast[
-        DType.float32, Array[DType.float32].nelts, 1, kernel_matmul, base_case_matmul
+        DType.float32, Array[DType.float32].nelts, 1, kernel_matmul, base_case_matmul,True
     ](C, A, B)
 
 
@@ -529,7 +580,7 @@ fn matmul(
     inout C: Array[DType.float16], A: Array[DType.float16], B: Array[DType.float16]
 ):
     recursive_broadcast[
-        DType.float16, Array[DType.float16].nelts, 1, kernel_matmul, base_case_matmul
+        DType.float16, Array[DType.float16].nelts, 1, kernel_matmul, base_case_matmul,True
     ](C, A, B)
 
 
@@ -538,13 +589,13 @@ fn matmul(
     inout C: Array[DType.bfloat16], A: Array[DType.bfloat16], B: Array[DType.bfloat16]
 ):
     recursive_broadcast[
-        DType.bfloat16, Array[DType.bfloat16].nelts, 1, kernel_matmul, base_case_matmul
+        DType.bfloat16, Array[DType.bfloat16].nelts, 1, kernel_matmul, base_case_matmul,True
     ](C, A, B)
 
 
 @always_inline
 fn matmul[
-    cores: Int
+    cores: Int,parallelized:Bool=True
 ](inout C: Array[DType.float32], A: Array[DType.float32], B: Array[DType.float32]):
     recursive_broadcast[
         DType.float32,
@@ -552,12 +603,13 @@ fn matmul[
         cores,
         kernel_matmul,
         base_case_matmul,
+        parallelized
     ](C, A, B)
 
 
 @always_inline
 fn matmul[
-    cores: Int
+    cores: Int,parallelized:Bool=True
 ](inout C: Array[DType.float16], A: Array[DType.float16], B: Array[DType.float16]):
     recursive_broadcast[
         DType.float16,
@@ -565,12 +617,13 @@ fn matmul[
         cores,
         kernel_matmul,
         base_case_matmul,
+        parallelized
     ](C, A, B)
 
 
 @always_inline
 fn matmul[
-    cores: Int
+    cores: Int,parallelized:Bool=True
 ](inout C: Array[DType.bfloat16], A: Array[DType.bfloat16], B: Array[DType.bfloat16]):
     recursive_broadcast[
         DType.bfloat16,
@@ -578,20 +631,21 @@ fn matmul[
         cores,
         kernel_matmul,
         base_case_matmul,
+        parallelized
     ](C, A, B)
 
 
 @always_inline
-fn matmul[T: DType, nelts: Int, cores: Int](A: Array[T], B: Array[T]) -> Array[T]:
+fn matmul[T: DType, nelts: Int, cores: Int,parallelized:Bool=True](A: Array[T], B: Array[T]) -> Array[T]:
     var C: Array[T] = Array[T](A, B)
-    recursive_broadcast[T, nelts, cores, kernel_matmul, base_case_matmul](C, A, B)
+    recursive_broadcast[T, nelts, cores, kernel_matmul, base_case_matmul,parallelized](C, A, B)
     return C
 
 
 @always_inline
-fn matmul[T: DType, cores: Int = 1](A: Array[T], B: Array[T]) -> Array[T]:
+fn matmul[T: DType, cores: Int = 1,parallelized:Bool=True](A: Array[T], B: Array[T]) -> Array[T]:
     var C: Array[T] = Array[T](A, B)
-    recursive_broadcast[T, Array[T].nelts, cores, kernel_matmul, base_case_matmul](
+    recursive_broadcast[T, Array[T].nelts, cores, kernel_matmul, base_case_matmul,parallelized](
         C, A, B
     )
     return C
@@ -601,7 +655,7 @@ fn matmul[T: DType, cores: Int = 1](A: Array[T], B: Array[T]) -> Array[T]:
 fn matmul(A: Array[DType.float32], B: Array[DType.float32]) -> Array[DType.float32]:
     var C: Array[DType.float32] = Array[DType.float32](A, B)
     recursive_broadcast[
-        DType.float32, Array[DType.float32].nelts, 1, kernel_matmul, base_case_matmul
+        DType.float32, Array[DType.float32].nelts, 1, kernel_matmul, base_case_matmul,True
     ](C, A, B)
     return C
 
@@ -610,7 +664,7 @@ fn matmul(A: Array[DType.float32], B: Array[DType.float32]) -> Array[DType.float
 fn matmul(A: Array[DType.float16], B: Array[DType.float16]) -> Array[DType.float16]:
     var C: Array[DType.float16] = Array[DType.float16](A, B)
     recursive_broadcast[
-        DType.float16, Array[DType.float16].nelts, 1, kernel_matmul, base_case_matmul
+        DType.float16, Array[DType.float16].nelts, 1, kernel_matmul, base_case_matmul,True
     ](C, A, B)
     return C
 
@@ -619,14 +673,14 @@ fn matmul(A: Array[DType.float16], B: Array[DType.float16]) -> Array[DType.float
 fn matmul(A: Array[DType.bfloat16], B: Array[DType.bfloat16]) -> Array[DType.bfloat16]:
     var C: Array[DType.bfloat16] = Array[DType.bfloat16](A, B)
     recursive_broadcast[
-        DType.bfloat16, Array[DType.bfloat16].nelts, 1, kernel_matmul, base_case_matmul
+        DType.bfloat16, Array[DType.bfloat16].nelts, 1, kernel_matmul, base_case_matmul,True
     ](C, A, B)
     return C
 
 
 @always_inline
 fn matmul[
-    cores: Int
+    cores: Int,parallelized:Bool=True
 ](A: Array[DType.float32], B: Array[DType.float32]) -> Array[DType.float32]:
     var C: Array[DType.float32] = Array[DType.float32](A, B)
     recursive_broadcast[
@@ -635,13 +689,14 @@ fn matmul[
         cores,
         kernel_matmul,
         base_case_matmul,
+        parallelized
     ](C, A, B)
     return C
 
 
 @always_inline
 fn matmul[
-    cores: Int
+    cores: Int,parallelized:Bool=True
 ](A: Array[DType.float16], B: Array[DType.float16]) -> Array[DType.float16]:
     var C: Array[DType.float16] = Array[DType.float16](A, B)
     recursive_broadcast[
@@ -650,13 +705,14 @@ fn matmul[
         cores,
         kernel_matmul,
         base_case_matmul,
+        parallelized
     ](C, A, B)
     return C
 
 
 @always_inline
 fn matmul[
-    cores: Int
+    cores: Int,parallelized:Bool=True
 ](A: Array[DType.bfloat16], B: Array[DType.bfloat16]) -> Array[DType.bfloat16]:
     var C: Array[DType.bfloat16] = Array[DType.bfloat16](A, B)
     recursive_broadcast[
@@ -665,6 +721,7 @@ fn matmul[
         cores,
         kernel_matmul,
         base_case_matmul,
+        parallelized
     ](C, A, B)
     return C
 
@@ -1033,8 +1090,6 @@ fn std[T: DType, nelts: Int](inout B: Array[T], A: Array[T]):
         B.data.store(i, value)
 
 
-
-
 @always_inline
 fn kernel_mul[
     T: DType, nelts: Int, cores: Int
@@ -1065,6 +1120,7 @@ fn kernel_mul[
         )
 
     vectorize[nelts, v_mul](c_rest)
+
 
 @always_inline
 fn kernel_add[
@@ -1098,7 +1154,6 @@ fn kernel_add[
     vectorize[nelts, v_add](c_rest)
 
 
-
 @always_inline
 fn kernel_sub[
     T: DType, nelts: Int, cores: Int
@@ -1129,6 +1184,7 @@ fn kernel_sub[
         )
 
     vectorize[nelts, v_sub](c_rest)
+
 
 @always_inline
 fn kernel_div[
@@ -1166,11 +1222,14 @@ fn kernel_div[
 fn base_case_matmul[T: DType](depth: Int, A: Array[T], B: Array[T]) -> Bool:
     return depth == max(A.rank(), B.rank()) - Int(2)
 
+
 @always_inline
 fn base_case_mul[T: DType](depth: Int, A: Array[T], B: Array[T]) -> Bool:
     return a_over_strides(depth, A, B) * a_over_shape[T](depth, A, B) == b_over_strides[
         T
     ](depth, A, B) * b_over_shape[T](depth, A, B)
+
+
 @always_inline
 fn base_case_add[T: DType](depth: Int, A: Array[T], B: Array[T]) -> Bool:
     return a_over_strides[T](depth, A, B) * a_over_shape[T](
@@ -1178,13 +1237,11 @@ fn base_case_add[T: DType](depth: Int, A: Array[T], B: Array[T]) -> Bool:
     ) == b_over_strides[T](depth, A, B) * b_over_shape[T](depth, A, B)
 
 
-
 @always_inline
 fn base_case_sub[T: DType](depth: Int, A: Array[T], B: Array[T]) -> Bool:
     return a_over_strides[T](depth, A, B) * a_over_shape[T](
         depth, A, B
     ) == b_over_strides[T](depth, A, B) * b_over_shape[T](depth, A, B)
-
 
 
 @always_inline
@@ -1237,9 +1294,9 @@ fn kernel_pow[
 
 @always_inline
 fn array_pow[
-    T: DType, nelts: Int, cores: Int
+    T: DType, nelts: Int, cores: Int,parallelized:Bool=True
 ](inout C: Array[T], A: Array[T], B: Array[T]):
-    recursive_broadcast[T, nelts, cores, kernel_pow, base_case_pow](C, A, B)
+    recursive_broadcast[T, nelts, cores, kernel_pow, base_case_pow,parallelized](C, A, B)
 
 
 fn array_pow_all[T: DType, nelts: Int](inout B: Array[T], A: Array[T]):
@@ -1403,9 +1460,9 @@ fn array_copy[T: DType, nelts: Int](inout B: Array[T], A: Array[T]):
 
 @always_inline
 fn array_div[
-    T: DType, nelts: Int, cores: Int
+    T: DType, nelts: Int, cores: Int,parallelized:Bool=True
 ](inout C: Array[T], A: Array[T], B: Array[T]):
-    recursive_broadcast[T, nelts, cores, kernel_div, base_case_div](C, A, B)
+    recursive_broadcast[T, nelts, cores, kernel_div, base_case_div,parallelized](C, A, B)
 
 
 @always_inline
@@ -1430,23 +1487,23 @@ fn array_abs[T: DType, nelts: Int](inout B: Array[T], A: Array[T]):
 
 @always_inline
 fn array_mul[
-    T: DType, nelts: Int, cores: Int
+    T: DType, nelts: Int, cores: Int,parallelized:Bool=True
 ](inout C: Array[T], A: Array[T], B: Array[T]):
-    recursive_broadcast[T, nelts, cores, kernel_mul, base_case_mul](C, A, B)
+    recursive_broadcast[T, nelts, cores, kernel_mul, base_case_mul,parallelized](C, A, B)
 
 
 @always_inline
 fn array_add[
-    T: DType, nelts: Int, cores: Int
+    T: DType, nelts: Int, cores: Int,parallelized:Bool=True
 ](inout C: Array[T], A: Array[T], B: Array[T]):
-    recursive_broadcast[T, nelts, cores, kernel_add, base_case_add](C, A, B)
+    recursive_broadcast[T, nelts, cores, kernel_add, base_case_add,parallelized](C, A, B)
 
 
 @always_inline
 fn array_sub[
-    T: DType, nelts: Int, cores: Int
+    T: DType, nelts: Int, cores: Int,parallelized:Bool=True
 ](inout C: Array[T], A: Array[T], B: Array[T]):
-    recursive_broadcast[T, nelts, cores, kernel_sub, base_case_sub](C, A, B)
+    recursive_broadcast[T, nelts, cores, kernel_sub, base_case_sub,parallelized](C, A, B)
 
 
 # More Automated Functions
