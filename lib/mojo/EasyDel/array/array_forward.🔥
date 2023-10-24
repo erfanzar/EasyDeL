@@ -1,5 +1,9 @@
 from python import PythonObject
-from .array_module import ArrayShape, Array, dims_average_size
+from .array_module import (
+    ArrayShape, 
+    Array,
+    dims_average_size
+)
 from algorithm.functional import (
     vectorize,
     parallelize,
@@ -30,6 +34,32 @@ import math
 from memory import memset_zero, memcpy
 from random import rand
 
+fn a_over_shape[T: DType](depth: Int, A: Array[T], B: Array[T]) -> Int:
+    let _df = max(B.rank() - A.rank(), 0)
+    if depth < _df:
+        return 1
+    return A.shape[depth - _df]
+
+
+fn b_over_shape[T: DType](depth: Int, A: Array[T], B: Array[T]) -> Int:
+    let _df = max(A.rank() - B.rank(), 0)
+    if depth < _df:
+        return 1
+    return B.shape[depth - _df]
+
+
+fn a_over_strides[T: DType](depth: Int, A: Array[T], B: Array[T]) -> Int:
+    let _df = max(B.rank() - A.rank(), 0)
+    if depth < _df:
+        return A.strides[0]
+    return A.strides[depth - _df]
+
+
+fn b_over_strides[T: DType](depth: Int, A: Array[T], B: Array[T]) -> Int:
+    let _df = max(A.rank() - B.rank(), 0)
+    if depth < _df:
+        return B.strides[0]
+    return B.strides[depth - _df]
 
 @always_inline
 fn convert_numpy_to_easydel_array[
@@ -186,7 +216,7 @@ fn matmul_single_row[
 
     parallelize[_loop](AR, num_cores)
 
-
+@always_inline
 fn T_AXIS_1_0_2[T: DType, nelts: Int](array: Array[T], num_workers: Int) -> Array[T]:
     """
     Transposes A 3D array in axis 0 and 1.
@@ -208,7 +238,7 @@ fn T_AXIS_1_0_2[T: DType, nelts: Int](array: Array[T], num_workers: Int) -> Arra
         parallelize[_row](array.dim(1), num_workers)
     return transposed_array
 
-
+@always_inline
 fn T_AXIS_0_2_1[T: DType, nelts: Int](array: Array[T], num_workers: Int) -> Array[T]:
     """
     Transposes an array in axis 2 and 1.
@@ -230,7 +260,7 @@ fn T_AXIS_0_2_1[T: DType, nelts: Int](array: Array[T], num_workers: Int) -> Arra
         parallelize[_row](array.dim(1), num_workers)
     return transposed_array
 
-
+@always_inline
 fn T_AXIS_2_1_0[T: DType, nelts: Int](array: Array[T], num_workers: Int) -> Array[T]:
     """
     Transposes an array in axis 0 and 2.
@@ -252,6 +282,7 @@ fn T_AXIS_2_1_0[T: DType, nelts: Int](array: Array[T], num_workers: Int) -> Arra
         parallelize[_row](array.dim(1), num_workers)
     return transposed_array
 
+@always_inline
 fn concatenate[
     T: DType
 ](A: Array[T], B: Array[T], inout axis: Int = 0, stragedy: String = "ord") -> Array[T]:
@@ -279,7 +310,7 @@ fn concatenate[
         vectorize[Array[T].nelts, _r](cat_array.num_elements())
     return cat_array
 
-
+@always_inline
 fn CAT_3D_AXIS_2[T: DType, cores: Int](A: Array[T], B: Array[T]) -> Array[T]:
     """
     Return Concatenated Array At axis -1.
@@ -303,7 +334,7 @@ fn CAT_3D_AXIS_2[T: DType, cores: Int](A: Array[T], B: Array[T]) -> Array[T]:
         parallelize[_row](A.dim(1), cores)
     return x
 
-
+@always_inline
 fn rotate_half[T: DType, cores: Int](A: Array[T]) -> Array[T]:
     """
     Let make it More Pythonic.
@@ -359,35 +390,6 @@ fn arange[T: DType, cores: Int](start: Int, end: Int) -> Array[T]:
 
 
 ## I Used https://github.com/TilliFe/Infermo/blob/main/infermo/operators/ to learn this Algorithms
-
-
-fn a_over_shape[T: DType](depth: Int, A: Array[T], B: Array[T]) -> Int:
-    let _df = max(B.rank() - A.rank(), 0)
-    if depth < _df:
-        return 1
-    return A.shape[depth - _df]
-
-
-fn b_over_shape[T: DType](depth: Int, A: Array[T], B: Array[T]) -> Int:
-    let _df = max(A.rank() - B.rank(), 0)
-    if depth < _df:
-        return 1
-    return B.shape[depth - _df]
-
-
-fn a_over_strides[T: DType](depth: Int, A: Array[T], B: Array[T]) -> Int:
-    let _df = max(B.rank() - A.rank(), 0)
-    if depth < _df:
-        return A.strides[0]
-    return A.strides[depth - _df]
-
-
-fn b_over_strides[T: DType](depth: Int, A: Array[T], B: Array[T]) -> Int:
-    let _df = max(A.rank() - B.rank(), 0)
-    if depth < _df:
-        return B.strides[0]
-    return B.strides[depth - _df]
-
 
 fn recursive_broadcast[
     T: DType,
@@ -466,12 +468,9 @@ fn recursive_broadcast[
         parallelize[_cols_a_s](a_shape, cores)
 
 
-@parameter
-fn base_case_matmul[T: DType](depth: Int, A: Array[T], B: Array[T]) -> Bool:
-    return depth == max(A.rank(), B.rank()) - Int(2)
 
 
-@parameter
+@always_inline
 fn kernel_matmul[
     T: DType, nelts: Int, cores: Int
 ](
@@ -890,18 +889,6 @@ fn ce[T: DType, nelts: Int](inout C: Array[T], A: Array[T], B: Array[T]):
 
 
 @always_inline
-fn reshape[T: DType, nelts: Int](inout B: Array[T], A: Array[T]):
-    for s in range(B.num_elements() // A.num_elements()):
-        let offset = s * A.num_elements()
-
-        @parameter
-        fn v_reshape[nelts: Int](i: Int):
-            B.data.simd_store[nelts](offset + i, A.data.simd_load[nelts](i))
-
-        vectorize[nelts, v_reshape](A.num_elements())
-
-
-@always_inline
 fn mean[T: DType, nelts: Int](inout B: Array[T], A: Array[T]):
     let dim_len: Int = B.extra_parameters.load(0)
 
@@ -1046,14 +1033,9 @@ fn std[T: DType, nelts: Int](inout B: Array[T], A: Array[T]):
         B.data.store(i, value)
 
 
-@parameter
-fn base_case_mul[T: DType](depth: Int, A: Array[T], B: Array[T]) -> Bool:
-    return a_over_strides(depth, A, B) * a_over_shape[T](depth, A, B) == b_over_strides[
-        T
-    ](depth, A, B) * b_over_shape[T](depth, A, B)
 
 
-@parameter
+@always_inline
 fn kernel_mul[
     T: DType, nelts: Int, cores: Int
 ](
@@ -1084,15 +1066,7 @@ fn kernel_mul[
 
     vectorize[nelts, v_mul](c_rest)
 
-
-@parameter
-fn base_case_add[T: DType](depth: Int, A: Array[T], B: Array[T]) -> Bool:
-    return a_over_strides[T](depth, A, B) * a_over_shape[T](
-        depth, A, B
-    ) == b_over_strides[T](depth, A, B) * b_over_shape[T](depth, A, B)
-
-
-@parameter
+@always_inline
 fn kernel_add[
     T: DType, nelts: Int, cores: Int
 ](
@@ -1124,14 +1098,8 @@ fn kernel_add[
     vectorize[nelts, v_add](c_rest)
 
 
-@parameter
-fn base_case_sub[T: DType](depth: Int, A: Array[T], B: Array[T]) -> Bool:
-    return a_over_strides[T](depth, A, B) * a_over_shape[T](
-        depth, A, B
-    ) == b_over_strides[T](depth, A, B) * b_over_shape[T](depth, A, B)
 
-
-@parameter
+@always_inline
 fn kernel_sub[
     T: DType, nelts: Int, cores: Int
 ](
@@ -1162,15 +1130,7 @@ fn kernel_sub[
 
     vectorize[nelts, v_sub](c_rest)
 
-
-@parameter
-fn base_case_div[T: DType](depth: Int, A: Array[T], B: Array[T]) -> Bool:
-    return a_over_strides[T](depth, A, B) * a_over_shape[T](
-        depth, A, B
-    ) == b_over_strides[T](depth, A, B) * b_over_shape[T](depth, A, B)
-
-
-@parameter
+@always_inline
 fn kernel_div[
     T: DType, nelts: Int, cores: Int
 ](
@@ -1202,15 +1162,46 @@ fn kernel_div[
     vectorize[nelts, v_div](c_rest)
 
 
-# pow(A,B)
-@parameter
+@always_inline
+fn base_case_matmul[T: DType](depth: Int, A: Array[T], B: Array[T]) -> Bool:
+    return depth == max(A.rank(), B.rank()) - Int(2)
+
+@always_inline
+fn base_case_mul[T: DType](depth: Int, A: Array[T], B: Array[T]) -> Bool:
+    return a_over_strides(depth, A, B) * a_over_shape[T](depth, A, B) == b_over_strides[
+        T
+    ](depth, A, B) * b_over_shape[T](depth, A, B)
+@always_inline
+fn base_case_add[T: DType](depth: Int, A: Array[T], B: Array[T]) -> Bool:
+    return a_over_strides[T](depth, A, B) * a_over_shape[T](
+        depth, A, B
+    ) == b_over_strides[T](depth, A, B) * b_over_shape[T](depth, A, B)
+
+
+
+@always_inline
+fn base_case_sub[T: DType](depth: Int, A: Array[T], B: Array[T]) -> Bool:
+    return a_over_strides[T](depth, A, B) * a_over_shape[T](
+        depth, A, B
+    ) == b_over_strides[T](depth, A, B) * b_over_shape[T](depth, A, B)
+
+
+
+@always_inline
+fn base_case_div[T: DType](depth: Int, A: Array[T], B: Array[T]) -> Bool:
+    return a_over_strides[T](depth, A, B) * a_over_shape[T](
+        depth, A, B
+    ) == b_over_strides[T](depth, A, B) * b_over_shape[T](depth, A, B)
+
+
+@always_inline
 fn base_case_pow[T: DType](depth: Int, A: Array[T], B: Array[T]) -> Bool:
     return a_over_strides[T](depth, A, B) * a_over_shape[T](
         depth, A, B
     ) == b_over_strides[T](depth, A, B) * b_over_shape[T](depth, A, B)
 
 
-@parameter
+@always_inline
 fn kernel_pow[
     T: DType, nelts: Int, cores: Int
 ](

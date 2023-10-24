@@ -1,10 +1,8 @@
 from ..utilities import FileBuffer
 from ..array import Array, ArrayShape, PointerOperation
-from ..linen import rms_norm, rope, dot_product_attention
 from runtime.llcl import num_cores
 import math
 from algorithm.functional import parallelize
-from ..linen import linear
 
 
 struct LlamaConfig:

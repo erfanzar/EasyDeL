@@ -21,6 +21,8 @@ from math.math import (
     acos,
     asinh,
     acosh,
+    min,
+    max,
 )
 import math
 from algorithm.functional import (
@@ -67,9 +69,21 @@ from .array_forward import (
     array_sqrt,
     array_pow,
     array_sub,
+    relu,
+    leaky_relu,
+    softmax,
+    silu,
+    sigmoid,
+    mean,
+    ce,
+    mse,
+    sample,
     T_AXIS_0_2_1,
     T_AXIS_1_0_2,
     T_AXIS_2_1_0,
+    CAT_3D_AXIS_2,
+    rotate_half,
+    convert_numpy_to_easydel_array,
 )
 
 alias dims_average_size = 5
@@ -495,24 +509,24 @@ struct Array[T: DType]:
             )
         return pad
 
-    @always_inline
-    fn transpose[workers: Int = 2](self: Self, *dims: Int) -> Array[T]:
-        # var res_shape: DynamicVector[Int] = DynamicVector[Int]()
-        let dim = VariadicList[Int](dims)
-        if len(dim) != self.rank():
-            print("The Passed input dims to swap are not accept able for function")
-            return Array[T]()
-        if len(dim) != 3:
-            print("Only 3D,2D arrays are accepted for transpose right now")
-            return Array[T]()
-        if dim[0] == 0 and dim[1] == 2 and dim[2] == 1:
-            return T_AXIS_0_2_1[T, Array[T].nelts](self, workers)
-        if dim[0] == 1 and dim[1] == 0 and dim[2] == 2:
-            return T_AXIS_1_0_2[T, Array[T].nelts](self, workers)
-        if dim[0] != 2 and dim[1] != 1 and dim[2] != 0:
-            print("Open A Bug Form")
-            return Array[T]()
-        return T_AXIS_2_1_0[T, Array[T].nelts](self, workers)
+    # @always_inline
+    # fn transpose[workers: Int = 2](self: Self, *dims: Int) -> Array[T]:
+    #     # var res_shape: DynamicVector[Int] = DynamicVector[Int]()
+    #     let dim = VariadicList[Int](dims)
+    #     if len(dim) != self.rank():
+    #         print("The Passed input dims to swap are not accept able for function")
+    #         return Array[T]()
+    #     if len(dim) != 3:
+    #         print("Only 3D,2D arrays are accepted for transpose right now")
+    #         return Array[T]()
+    #     if dim[0] == 0 and dim[1] == 2 and dim[2] == 1:
+    #         return T_AXIS_0_2_1[T, Array[T].nelts](self, workers)
+    #     if dim[0] == 1 and dim[1] == 0 and dim[2] == 2:
+    #         return T_AXIS_1_0_2[T, Array[T].nelts](self, workers)
+    #     if dim[0] != 2 and dim[1] != 1 and dim[2] != 0:
+    #         print("Open A Bug Form")
+    #         return Array[T]()
+    #     return T_AXIS_2_1_0[T, Array[T].nelts](self, workers)
 
     @always_inline
     fn T_[nelts: Int = Self.nelts, cores: Int = 2](self: Self) -> Array[T]:
@@ -879,70 +893,6 @@ struct Array[T: DType]:
         return res ^
 
     @always_inline
-    fn __add__(self: Self, other: Self) -> Self:
-        return self.add[Self.nelts](other)
-
-    @always_inline
-    fn __mul__(self: Self, other: Self) -> Self:
-        return self.mul[Self.nelts](other)
-
-    @always_inline
-    fn __matmul__(self: Self, other: Self) -> Self:
-        return self.matmul[Self.nelts](other)
-
-    @always_inline
-    fn __sub__(self: Self, other: Self) -> Self:
-        return self.sub[Self.nelts](other)
-
-    @always_inline
-    fn __truediv__(self: Self, other: Self) -> Self:
-        return self.div[Self.nelts](other)
-
-    @always_inline
-    fn __mod__(self: Self, other: Self) -> Self:
-        return self.mod[Self.nelts](other)
-
-    @always_inline
-    fn __len__(self: Self) -> Int:
-        return self.array_shape.num_elements()
-
-    @always_inline
-    fn __eq__(self, other: Self) -> Bool:
-        return self.eq[Self.nelts](other)
-
-    @always_inline
-    fn __ne__(self, other: Self) -> Bool:
-        return not self.eq[Self.nelts](other)
-
-    @always_inline
-    fn __pow__(self: Self, other: Self) -> Self:
-        return self.pow[Self.nelts](other)
-
-    @always_inline
-    fn __iadd__(inout self: Self, other: Self) -> None:
-        self = self.add[Self.nelts](other)
-
-    @always_inline
-    fn __isub__(inout self: Self, other: Self) -> None:
-        self = self.sub[Self.nelts](other)
-
-    @always_inline
-    fn __ipow__(inout self: Self, other: Self) -> None:
-        self = self.pow[Self.nelts](other)
-
-    @always_inline
-    fn __imod__(inout self: Self, other: Self) -> None:
-        self = self.mod[Self.nelts](other)
-
-    @always_inline
-    fn __idiv__(inout self: Self, other: Self) -> None:
-        self = self.div[Self.nelts](other)
-
-    @always_inline
-    fn __itruediv__(inout self: Self, other: Self) -> None:
-        self = self.div[Self.nelts](other)
-
-    @always_inline
     fn __len__(inout self) -> Int:
         return self.num_elements()
 
@@ -1020,10 +970,6 @@ struct Array[T: DType]:
                 tiled_fn[tile_x, tile_y](x, y)
 
     @always_inline
-    fn matmul[nelts: Int = Self.nelts, cores: Int = 2](self, other: Self) -> Self:
-        return matmul[T, nelts, cores](self, other)
-
-    @always_inline
     fn argmax(self: Self, axis: Int = -1) -> Int:
         var max_index: Int = 0
         var max_value: SIMD[T, 1] = self[0]
@@ -1085,6 +1031,10 @@ struct Array[T: DType]:
                 print_no_newline(r_dt)
 
         print()
+
+    @always_inline
+    fn matmul[nelts: Int = Self.nelts, cores: Int = 2](self, other: Self) -> Self:
+        return matmul[T, nelts, cores](self, other)
 
     @always_inline
     fn cosh[nelts: Int = Array[T].nelts, cores: Int = 2](self) -> Array[T]:
@@ -1169,3 +1119,67 @@ struct Array[T: DType]:
     @always_inline
     fn pow[nelts: Int = Array[T].nelts, cores: Int = 2](self, other: Self) -> Array[T]:
         return array_pow[T, nelts, cores](self, other)
+
+    @always_inline
+    fn __add__(self: Self, other: Self) -> Self:
+        return self.add[Self.nelts](other)
+
+    @always_inline
+    fn __mul__(self: Self, other: Self) -> Self:
+        return self.mul[Self.nelts](other)
+
+    @always_inline
+    fn __matmul__(self: Self, other: Self) -> Self:
+        return self.matmul[Self.nelts](other)
+
+    @always_inline
+    fn __sub__(self: Self, other: Self) -> Self:
+        return self.sub[Self.nelts](other)
+
+    @always_inline
+    fn __truediv__(self: Self, other: Self) -> Self:
+        return self.div[Self.nelts](other)
+
+    @always_inline
+    fn __mod__(self: Self, other: Self) -> Self:
+        return self.mod[Self.nelts](other)
+
+    @always_inline
+    fn __len__(self: Self) -> Int:
+        return self.array_shape.num_elements()
+
+    @always_inline
+    fn __eq__(self, other: Self) -> Bool:
+        return self.eq[Self.nelts](other)
+
+    @always_inline
+    fn __ne__(self, other: Self) -> Bool:
+        return not self.eq[Self.nelts](other)
+
+    @always_inline
+    fn __pow__(self: Self, other: Self) -> Self:
+        return self.pow[Self.nelts](other)
+
+    @always_inline
+    fn __iadd__(inout self: Self, other: Self) -> None:
+        self = self.add[Self.nelts](other)
+
+    @always_inline
+    fn __isub__(inout self: Self, other: Self) -> None:
+        self = self.sub[Self.nelts](other)
+
+    @always_inline
+    fn __ipow__(inout self: Self, other: Self) -> None:
+        self = self.pow[Self.nelts](other)
+
+    @always_inline
+    fn __imod__(inout self: Self, other: Self) -> None:
+        self = self.mod[Self.nelts](other)
+
+    @always_inline
+    fn __idiv__(inout self: Self, other: Self) -> None:
+        self = self.div[Self.nelts](other)
+
+    @always_inline
+    fn __itruediv__(inout self: Self, other: Self) -> None:
+        self = self.div[Self.nelts](other)

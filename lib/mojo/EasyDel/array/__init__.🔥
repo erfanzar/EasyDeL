@@ -4,8 +4,10 @@ Copyright (c) Erfan zare Chavoshi
 EasyDel Library [MOJO/Matrix]
 """
 
-from .array_module import Array, ArrayShape, matmul_shape
-from .array_forward import (
+from .array_module import (
+    Array,
+    ArrayShape,
+    matmul_shape,
     matmul,
     matmul_2d,
     matmul_EA,
