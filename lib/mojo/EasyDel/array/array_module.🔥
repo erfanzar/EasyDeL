@@ -31,12 +31,63 @@ from algorithm.functional import (
 )
 from runtime.llcl import num_cores
 from memory.memory import memset_zero
-from .array_forward import matmul_shape, T_2D, T_AXIS_0_2_1, T_AXIS_1_0_2, T_AXIS_2_1_0
+
+from .array_forward import (
+    matmul,
+    matmul_2d,
+    matmul_EA,
+    matmul_single_row,
+    base_case_matmul,
+    kernel_add,
+    kernel_div,
+    kernel_matmul,
+    kernel_mul,
+    kernel_pow,
+    kernel_sub,
+    array_abs,
+    array_acos,
+    array_add,
+    array_asin,
+    array_atan,
+    array_copy,
+    array_tanh,
+    array_tan,
+    array_cos,
+    array_cosh,
+    array_div,
+    array_exp,
+    array_exp2,
+    array_relu,
+    array_log,
+    array_log2,
+    array_mul,
+    array_pow_all,
+    array_sin,
+    array_sinh,
+    array_sqrt,
+    array_pow,
+    array_sub,
+    T_AXIS_0_2_1,
+    T_AXIS_1_0_2,
+    T_AXIS_2_1_0,
+)
 
 alias dims_average_size = 5
 alias debuging = True
 
+
 # parts of this code is inspiered from https://github.com/andresnowak/Micro-Mojograd
+@always_inline
+fn matmul_shape[T: DType](A: Array[T], B: Array[T]) -> ArrayShape:
+    if A.rank() == Int(2) and B.rank() == 1:
+        return ArrayShape(A.dim(0))
+    else:
+        var res_dims = InlinedFixedVector[dims_average_size, Int](A.rank())
+        for i in range(A.rank() - 1):
+            res_dims.append(A.dim(i))
+        res_dims.append(B.dim(-1))
+
+        return ArrayShape(res_dims)
 
 
 fn do_check(res: Bool, string: StringRef):
@@ -47,6 +98,7 @@ fn do_check(res: Bool, string: StringRef):
 
 struct ArrayShape:
     var _shape: Pointer[Int]
+    var _strides: Pointer[Int]
     var _length: Int
     var _size: Int
     var _allocated: Bool
@@ -54,48 +106,88 @@ struct ArrayShape:
     fn __init__(inout self, shape: VariadicList[Int]) -> None:
         self._length = len(shape)
         self._shape = Pointer[Int]().alloc(self._length)
+        self._strides = Pointer[Int]().alloc(self._length)
+        memset_zero(self._strides, self._length)
         for i in range(self._length):
             self._shape.store(i, shape[i])
         self._size = 1
         self._allocated = True
         self._size = self.product_dims()
+
+        self._strides.store(self._length - 1, 1)
+        for i in range(self._length - 1):
+            self._strides.store(
+                self._length - i - 2,
+                self._strides.load(self._length - i - 1)
+                * self._shape[self._length - i - 1],
+            )
 
     fn __init__(inout self, shape: DynamicVector[Int]) -> None:
         self._length = len(shape)
         self._shape = Pointer[Int]().alloc(self._length)
+        self._strides = Pointer[Int]().alloc(self._length)
+        memset_zero(self._strides, self._length)
+        for i in range(self._length):
+            self._shape.store(i, shape[i])
+        self._size = 1
+        self._allocated = True
+        self._size = self.product_dims()
+        self._strides.store(self._length - 1, 1)
+        for i in range(self._length - 1):
+            self._strides.store(
+                self._length - i - 2,
+                self._strides.load(self._length - i - 1)
+                * self._shape[self._length - i - 1],
+            )
+
+    fn __init__[off: Int](inout self, shape: InlinedFixedVector[off, Int]) -> None:
+        self._length = len(shape)
+        self._shape = Pointer[Int]().alloc(self._length)
+        self._strides = Pointer[Int]().alloc(self._length)
+        memset_zero(self._strides, self._length)
         for i in range(self._length):
             self._shape.store(i, shape[i])
         self._size = 1
         self._allocated = True
         self._size = self.product_dims()
 
-    fn __init__[off: Int](inout self, shape: InlinedFixedVector[off, Int]) -> None:
-        self._length = len(shape)
-        self._shape = Pointer[Int]().alloc(self._length)
-        for i in range(self._length):
-            self._shape.store(i, shape[i])
-        self._size = 1
-        self._allocated = True
-        self._size = self.product_dims()
+        self._strides.store(self._length - 1, 1)
+        for i in range(self._length - 1):
+            self._strides.store(
+                self._length - i - 2,
+                self._strides.load(self._length - i - 1)
+                * self._shape[self._length - i - 1],
+            )
 
     fn __init__(inout self, *elms: Int) -> None:
         let shape: VariadicList[Int] = VariadicList[Int](elms)
         self._length = len(shape)
         self._shape = Pointer[Int]().alloc(self._length)
+        self._strides = Pointer[Int]().alloc(self._length)
+        memset_zero(self._strides, self._length)
         for i in range(self._length):
             self._shape.store(i, shape[i])
         self._size = 1
         self._allocated = True
         self._size = self.product_dims()
+        self._strides.store(self._length - 1, 1)
+        for i in range(self._length - 1):
+            self._strides.store(
+                self._length - i - 2,
+                self._strides.load(self._length - i - 1)
+                * self._shape[self._length - i - 1],
+            )
 
     fn __copyinit__(inout self: Self, ext: Self):
         self._size = ext._size
         self._shape = ext._shape
         self._length = ext._length
         self._allocated = ext._allocated
+        self._strides = ext._strides
 
     fn __moveinit__(inout self: Self, owned ext: Self):
         self._shape = ext._shape ^
+        self._strides = ext._strides ^
         self._length = ext._length
         self._size = ext._size
         self._allocated = ext._allocated
@@ -166,6 +258,9 @@ struct ArrayShape:
     fn shape(self: Self) -> Pointer[Int]:
         return self._shape
 
+    fn strides(self: Self) -> Pointer[Int]:
+        return self._strides
+
     @always_inline
     fn get_1d_pos[off: Int](self, index: InlinedFixedVector[off, Int]) -> Int:
         var product: Int = 1
@@ -197,16 +292,25 @@ struct ArrayShape:
                 print_no_newline(self[i], ",")
         print("]")
 
+    fn strides_str(self: Self):
+        print_no_newline("[")
+        for i in range(self.rank()):
+            if i == self.rank() - 1:
+                print_no_newline(self._strides[i])
+            else:
+                print_no_newline(self._strides[i], ",")
+        print("]")
+
 
 struct Array[T: DType]:
     var data: DTypePointer[T]
     var array_shape: ArrayShape
     var allocated: Int
-    alias nelts: Int = simdwidthof[T]() * 2
-    alias ArrayPointer: AnyType = DTypePointer[T]
     var shape: Pointer[Int]
     var strides: Pointer[Int]
     var extra_parameters: Pointer[Int]
+    alias nelts: Int = simdwidthof[T]() * 2
+    alias ArrayPointer: AnyType = DTypePointer[T]
 
     fn __init__(inout self: Self, array_shape: ArrayShape) -> None:
         r"""Init Array From ArrayShape(Alloc Zero)."""
@@ -214,15 +318,7 @@ struct Array[T: DType]:
         self.data = self.ArrayPointer.alloc(0)
         self.allocated = 0
         self.shape = self.array_shape.shape()
-        self.strides = Pointer[Int].alloc(self.array_shape.rank())
-        memset_zero(self.strides, self.array_shape.rank())
-        self.strides.store(self.array_shape.rank() - 1, 1)
-        for i in range(self.array_shape.rank() - 1):
-            self.strides.store(
-                self.array_shape.rank() - i - 2,
-                self.strides.load(self.array_shape.rank() - i - 1)
-                * self.shape[self.array_shape.rank() - i - 1],
-            )
+        self.strides = self.array_shape.strides()
         self.extra_parameters = Pointer[Int].alloc(64)
         memset_zero(self.extra_parameters, 64)
 
@@ -236,53 +332,17 @@ struct Array[T: DType]:
         self.array_shape = ArrayShape(VariadicList(dim))
         self.data = self.ArrayPointer.alloc(0)
         self.shape = self.array_shape.shape()
-        self.strides = Pointer[Int].alloc(self.array_shape.rank())
-        memset_zero(self.strides, self.array_shape.rank())
-        self.strides.store(self.array_shape.rank() - 1, 1)
-        for i in range(self.array_shape.rank() - 1):
-            self.strides.store(
-                self.array_shape.rank() - i - 2,
-                self.strides.load(self.array_shape.rank() - i - 1)
-                * self.shape[self.array_shape.rank() - i - 1],
-            )
+        self.strides = self.array_shape.strides()
         self.allocated = 0
         self.extra_parameters = Pointer[Int].alloc(64)
         memset_zero(self.extra_parameters, 64)
-
-    fn __init__(inout self: Self, init: Bool, *dim: Int) -> None:
-        r"""Init Array from Int Args(Depends on Passed Bool)."""
-        self.__init__(dim)
-        self.shape = self.array_shape.shape()
-        self.strides = Pointer[Int].alloc(self.array_shape.rank())
-        memset_zero(self.strides, self.array_shape.rank())
-        self.strides.store(self.array_shape.rank() - 1, 1)
-        self.extra_parameters = Pointer[Int].alloc(64)
-        memset_zero(self.extra_parameters, 64)
-        for i in range(self.array_shape.rank() - 1):
-            self.strides.store(
-                self.array_shape.rank() - i - 2,
-                self.strides.load(self.array_shape.rank() - i - 1)
-                * self.shape[self.array_shape.rank() - i - 1],
-            )
-        if init:
-            self.alloc()
-            self.random()
-
 
     fn __init__(inout self: Self, vl: VariadicList[Int]) -> None:
         r"""Init Array from VariadicList[Int](Alloc Zero)."""
         self.array_shape = ArrayShape(vl)
         self.data = self.ArrayPointer.alloc(0)
         self.shape = self.array_shape.shape()
-        self.strides = Pointer[Int].alloc(self.array_shape.rank())
-        memset_zero(self.strides, self.array_shape.rank())
-        self.strides.store(self.array_shape.rank() - 1, 1)
-        for i in range(self.array_shape.rank() - 1):
-            self.strides.store(
-                self.array_shape.rank() - i - 2,
-                self.strides.load(self.array_shape.rank() - i - 1)
-                * self.shape[self.array_shape.rank() - i - 1],
-            )
+        self.strides = self.array_shape.strides()
         self.allocated = 0
         self.extra_parameters = Pointer[Int].alloc(64)
         memset_zero(self.extra_parameters, 64)
@@ -297,15 +357,7 @@ struct Array[T: DType]:
         self.data = self.ArrayPointer.alloc(self.array_shape.num_elements())
         self.allocated = 1
         self.shape = self.array_shape.shape()
-        self.strides = Pointer[Int].alloc(self.array_shape.rank())
-        memset_zero(self.strides, self.array_shape.rank())
-        self.strides.store(self.array_shape.rank() - 1, 1)
-        for i in range(self.array_shape.rank() - 1):
-            self.strides.store(
-                self.array_shape.rank() - i - 2,
-                self.strides.load(self.array_shape.rank() - i - 1)
-                * self.shape[self.array_shape.rank() - i - 1],
-            )
+        self.strides = self.array_shape.strides()
         for i in range(self.array_shape.num_elements()):
             self.data.simd_store[1](i, value[i])
         self.extra_parameters = Pointer[Int].alloc(64)
@@ -321,34 +373,18 @@ struct Array[T: DType]:
         self.allocated = 1
         self.data = self.ArrayPointer.alloc(self.array_shape.num_elements())
         self.shape = self.array_shape.shape()
-        self.strides = Pointer[Int].alloc(self.array_shape.rank())
-        memset_zero(self.strides, self.array_shape.rank())
-        self.strides.store(self.array_shape.rank() - 1, 1)
-        for i in range(self.array_shape.rank() - 1):
-            self.strides.store(
-                self.array_shape.rank() - i - 2,
-                self.strides.load(self.array_shape.rank() - i - 1)
-                * self.shape[self.array_shape.rank() - i - 1],
-            )
-        for i in range(self.array_shape.num_elements()):
-            self.data.simd_store[1](i, value[i])
+        self.strides = self.array_shape.strides()
         self.extra_parameters = Pointer[Int].alloc(64)
         memset_zero(self.extra_parameters, 64)
+        for i in range(self.array_shape.num_elements()):
+            self.data.simd_store[1](i, value[i])
 
     fn __init__(inout self: Self, pointer: DTypePointer[T], *dim: Int) -> None:
         self.data = pointer
         self.array_shape = ArrayShape(dim)
         self.allocated = 0
         self.shape = self.array_shape.shape()
-        self.strides = Pointer[Int].alloc(self.array_shape.rank())
-        memset_zero(self.strides, self.array_shape.rank())
-        self.strides.store(self.array_shape.rank() - 1, 1)
-        for i in range(self.array_shape.rank() - 1):
-            self.strides.store(
-                self.array_shape.rank() - i - 2,
-                self.strides.load(self.array_shape.rank() - i - 1)
-                * self.shape[self.array_shape.rank() - i - 1],
-            )
+        self.strides = self.array_shape.strides()
         self.extra_parameters = Pointer[Int].alloc(64)
         memset_zero(self.extra_parameters, 64)
 
@@ -357,12 +393,15 @@ struct Array[T: DType]:
         self.array_shape = ext.array_shape
         self.allocated = ext.allocated
         self.shape = ext.array_shape.shape()
-        self.strides = ext.strides
+        self.strides = ext.array_shape.strides()
+        self.extra_parameters = ext.extra_parameters
 
     fn __copyinit__(inout self, ext: Self):
         self.allocated = ext.allocated
         self.shape = ext.array_shape.shape()
-        self.strides = ext.strides
+        self.strides = ext.array_shape.strides()
+        self.extra_parameters = ext.extra_parameters
+
         if self.allocated == 1:
             self.data = self.ArrayPointer.alloc(ext.array_shape.num_elements())
             self.array_shape = ext.array_shape
@@ -383,6 +422,8 @@ struct Array[T: DType]:
 
     fn init_from_buffer(inout self: Self, buffer: DTypePointer[T], *dim: Int) -> None:
         self.array_shape = ArrayShape(VariadicList(dim))
+        self.shape = self.array_shape.shape()
+        self.strides = self.array_shape.strides()
         self.data = buffer
         self.allocated = 0
 
@@ -474,10 +515,35 @@ struct Array[T: DType]:
         return T_AXIS_2_1_0[T, Array[T].nelts](self, workers)
 
     @always_inline
-    fn transpose[workers: Int = 2](self: Self) raises -> Array[T]:
-        if 2 != self.rank():
-            raise Error("Transpose with empty input only support 2D Arrays")
-        return T_2D[T, Array[T].nelts](self, workers)
+    fn T_[nelts: Int = Self.nelts, cores: Int = 2](self: Self) -> Array[T]:
+        """
+        Transpose the two last dims.
+        """
+        var dynamic_vector: DynamicVector[Int] = DynamicVector[Int]()
+        for i in range(0, self.rank() - 2):
+            if i >= 0 and self.rank() > 2:
+                dynamic_vector.push_back(self.dim(i))
+
+        dynamic_vector.push_back(self.dim(-1))
+        dynamic_vector.push_back(self.dim(-2))
+        var B: Array[T] = Array[T](dynamic_vector)
+        B.alloc(0.00)
+        let M = self.dim(-2)
+        let N = self.dim(-1)
+
+        for s in range(B.num_elements() // (M * N)):
+            let offset = s * M * N
+            for i in range(M):
+
+                @parameter
+                fn v_transpose[nelts: Int](j: Int):
+                    B.data.simd_store[nelts](
+                        offset + j * M + i,
+                        self.data.simd_load[nelts](offset + i * N + j),
+                    )
+
+                vectorize[nelts, v_transpose](N)
+        return B
 
     @always_inline
     fn reshape(inout self, *dims: Int) raises:
@@ -812,82 +878,75 @@ struct Array[T: DType]:
         parallelize[_do](self.array_shape.num_elements(), num_cores)
         return res ^
 
+    @always_inline
     fn __add__(self: Self, other: Self) -> Self:
         return self.add[Self.nelts](other)
 
+    @always_inline
     fn __mul__(self: Self, other: Self) -> Self:
         return self.mul[Self.nelts](other)
 
+    @always_inline
     fn __matmul__(self: Self, other: Self) -> Self:
         return self.matmul[Self.nelts](other)
 
+    @always_inline
     fn __sub__(self: Self, other: Self) -> Self:
         return self.sub[Self.nelts](other)
 
+    @always_inline
     fn __truediv__(self: Self, other: Self) -> Self:
-        return self.true_div[Self.nelts](other)
+        return self.div[Self.nelts](other)
 
+    @always_inline
     fn __mod__(self: Self, other: Self) -> Self:
         return self.mod[Self.nelts](other)
 
+    @always_inline
     fn __len__(self: Self) -> Int:
         return self.array_shape.num_elements()
 
+    @always_inline
     fn __eq__(self, other: Self) -> Bool:
         return self.eq[Self.nelts](other)
 
+    @always_inline
     fn __ne__(self, other: Self) -> Bool:
         return not self.eq[Self.nelts](other)
 
-    fn __floordiv__(self: Self, other: Self) -> Self:
-        ...
-
+    @always_inline
     fn __pow__(self: Self, other: Self) -> Self:
         return self.pow[Self.nelts](other)
 
+    @always_inline
     fn __iadd__(inout self: Self, other: Self) -> None:
         self = self.add[Self.nelts](other)
 
+    @always_inline
     fn __isub__(inout self: Self, other: Self) -> None:
         self = self.sub[Self.nelts](other)
 
+    @always_inline
     fn __ipow__(inout self: Self, other: Self) -> None:
         self = self.pow[Self.nelts](other)
 
+    @always_inline
     fn __imod__(inout self: Self, other: Self) -> None:
         self = self.mod[Self.nelts](other)
 
+    @always_inline
     fn __idiv__(inout self: Self, other: Self) -> None:
-        self = self.true_div[Self.nelts](other)
+        self = self.div[Self.nelts](other)
 
+    @always_inline
     fn __itruediv__(inout self: Self, other: Self) -> None:
-        self = self.true_div[Self.nelts](other)
+        self = self.div[Self.nelts](other)
 
-    fn __ifloordiv__(inout self: Self, other: Self) -> None:
-        ...
-
+    @always_inline
     fn __len__(inout self) -> Int:
         return self.num_elements()
 
-    fn add[nelts: Int](self: Self, other: Self) -> Self:
-        @parameter
-        fn outer_loop[func: fn (Int) capturing -> None](size: Int):
-            for i in range(size):
-                func(i)
-
-        return self.__element_wise_tensor_operation__[nelts, outer_loop, math.add](
-            other
-        )
-
-    fn add[nelts: Int](self: Self, other: Self, num_cores: Int) -> Self:
-        @parameter
-        fn outer_loop[func: fn (Int) capturing -> None](size: Int) -> None:
-            parallelize[func](size, num_cores)
-
-        return self.__element_wise_tensor_operation__[nelts, outer_loop, math.add](
-            other
-        )
-
+    @always_inline
     fn mod[nelts: Int](self: Self, other: Self) -> Self:
         @parameter
         fn outer_loop[func: fn (Int) capturing -> None](size: Int):
@@ -904,63 +963,6 @@ struct Array[T: DType]:
             parallelize[func](size, num_cores)
 
         return self.__element_wise_tensor_operation__[nelts, outer_loop, math.mod](
-            other
-        )
-
-    fn mul[nelts: Int](self: Self, other: Self) -> Self:
-        @parameter
-        fn outer_loop[func: fn (Int) capturing -> None](size: Int):
-            for i in range(size):
-                func(i)
-
-        return self.__element_wise_tensor_operation__[nelts, outer_loop, math.mul](
-            other
-        )
-
-    fn mul[nelts: Int](self: Self, other: Self, num_cores: Int) -> Self:
-        @parameter
-        fn outer_loop[func: fn (Int) capturing -> None](size: Int) -> None:
-            parallelize[func](size, num_cores)
-
-        return self.__element_wise_tensor_operation__[nelts, outer_loop, math.mul](
-            other
-        )
-
-    fn sub[nelts: Int](self: Self, other: Self) -> Self:
-        @parameter
-        fn outer_loop[func: fn (Int) capturing -> None](size: Int):
-            for i in range(size):
-                func(i)
-
-        return self.__element_wise_tensor_operation__[nelts, outer_loop, math.sub](
-            other
-        )
-
-    fn sub[nelts: Int](self: Self, other: Self, num_cores: Int) -> Self:
-        @parameter
-        fn outer_loop[func: fn (Int) capturing -> None](size: Int) -> None:
-            parallelize[func](size, num_cores)
-
-        return self.__element_wise_tensor_operation__[nelts, outer_loop, math.sub](
-            other
-        )
-
-    fn true_div[nelts: Int](self: Self, other: Self) -> Self:
-        @parameter
-        fn outer_loop[func: fn (Int) capturing -> None](size: Int):
-            for i in range(size):
-                func(i)
-
-        return self.__element_wise_tensor_operation__[nelts, outer_loop, math.div](
-            other
-        )
-
-    fn true_div[nelts: Int](self: Self, other: Self, num_cores: Int) -> Self:
-        @parameter
-        fn outer_loop[func: fn (Int) capturing -> None](size: Int) -> None:
-            parallelize[func](size, num_cores)
-
-        return self.__element_wise_tensor_operation__[nelts, outer_loop, math.div](
             other
         )
 
@@ -1009,87 +1011,6 @@ struct Array[T: DType]:
 
         return flag
 
-    fn pow[nelts: Int](self: Self, other: Self, num_cores: Int) -> Self:
-        do_check(
-            self.array_shape.num_elements() == other.array_shape.num_elements(),
-            "Arrays Don't have same size",
-        )
-        var res = Self(self.array_shape)
-        res.alloc()
-        let last_dim: Int = res.array_shape.dim(-1)
-        let res_size: Int = res.array_shape._size // last_dim
-
-        @parameter
-        fn _ol(i: Int):
-            @parameter
-            fn _lp[_nelts: Int](j: Int):
-                let index: Int = i * last_dim + j
-                res.data.simd_store[_nelts](
-                    index,
-                    self.data.simd_load[_nelts](index)
-                    ** res.data.simd_load[_nelts](index),
-                )
-
-            vectorize[nelts, _lp](last_dim)
-
-        parallelize[_ol](res_size, num_cores)
-        return res ^
-
-    fn pow[nelts: Int](self: Self, other: Self) -> Self:
-        do_check(
-            self.array_shape.num_elements() == other.array_shape.num_elements(),
-            "Arrays Don't have same size",
-        )
-        var res = Self(self.array_shape)
-        res.alloc()
-        let last_dim: Int = res.array_shape.dim(-1)
-        let res_size: Int = res.array_shape._size // last_dim
-
-        @parameter
-        fn _ol(i: Int):
-            @parameter
-            fn _lp[_nelts: Int](j: Int):
-                let index: Int = i * last_dim + j
-                res.data.simd_store[_nelts](
-                    index,
-                    self.data.simd_load[_nelts](index)
-                    ** res.data.simd_load[_nelts](index),
-                )
-
-            vectorize[nelts, _lp](last_dim)
-
-        for i in range(res_size):
-            _ol(i)
-        return res ^
-
-    fn dot[nelts: Int](self: Self, other: Self) -> Self:
-        do_check(
-            self.array_shape == other.array_shape,
-            "dimensions aren't the same",
-        )
-        do_check(
-            self.array_shape.rank() == 1 and other.array_shape.rank() == 1,
-            "only 1D arrays are accepted",
-        )
-        var shp = DynamicVector[Int]()
-        for s in range(self.array_shape._length):
-            shp.push_back(self.array_shape._shape[s])
-        var res = Self(ArrayShape(shp))
-
-        @parameter
-        fn _do[_nelts: Int](size: Int):
-            res.data.simd_store[_nelts](
-                size,
-                res[size]
-                + (
-                    self.data.simd_load[_nelts](size)
-                    * other.data.simd_load[_nelts](size)
-                ).reduce_add(),
-            )
-
-        vectorize[nelts, _do](self.array_shape.num_elements())
-        return res ^
-
     @staticmethod
     fn tile[
         tiled_fn: Static2DTileUnitFunc, tile_x: Int, tile_y: Int
@@ -1098,309 +1019,9 @@ struct Array[T: DType]:
             for x in range(0, end_x, tile_x):
                 tiled_fn[tile_x, tile_y](x, y)
 
-    fn __matmul_ot[
-        nelts: Int,
-        outer_loop_func: fn[func: fn (Int) capturing -> None] (Int) capturing -> None,
-    ](self, other: Self) -> Self:
-        if not (self.rank() == 2 and other.rank() == 1):
-            print("Report Matmul Bug")
-
-        var res = Self(self.dim(0))
-        res.fill(0.0)
-
-        @parameter
-        fn _loop(i: Int):
-            var ar: SIMD[T, nelts] = SIMD[T, nelts](0.0)
-
-            @parameter
-            fn element_wise[_nelts: Int](j: Int):
-                let a_i = i * self.dim(-1) + j
-                if _nelts < nelts:
-                    ar[0] += (self.load[1](a_i) * other.load[_nelts](j)).reduce_add()
-                else:
-                    ar += self.load[nelts](a_i) * other.load[nelts](j)
-
-            vectorize[nelts, element_wise](self.dim(-1))
-            res[i] = ar.reduce_add()
-
-        outer_loop_func[_loop](self.dim(-2))
-        return res ^
-
-    fn __matmul[
-        nelts: Int,
-        outer_loop_func: fn[func: fn (Int) capturing -> None] (Int) capturing -> None,
-    ](self, other: Self) -> Self:
-        if self.array_shape.rank() == 1 and other.array_shape.rank() == 1:
-            return self.dot[nelts](other)
-        if self.rank() == 2 and other.rank() == 1:
-            return self.__matmul_ot[nelts, outer_loop_func](other)
-        do_check(
-            not self.array_shape.__eq_matmul__(other.array_shape),
-            "dimensions don't conform for matmul operation",
-        )
-
-        var res_dims = InlinedFixedVector[dims_average_size, Int](self.rank())
-        for i in range(self.rank() - 1):
-            res_dims.append(self.dim(i))
-        res_dims.append(other.dim(-1))
-
-        var C = Self(ArrayShape(res_dims))
-        C.fill(0.0)
-
-        C.fill(0.0)
-        if self.rank() != other.rank():
-            print("Can not performe operation Dimensions won't match")
-            return C ^
-        let C_C: Int = C.dim(-1)
-        let A_C: Int = self.dim(-1)
-        let C_R: Int = C.dim(-2)
-        let C_P: Int = C.dim(-2) * C.dim(-1)
-        let B_P: Int = other.dim(-2) * other.dim(-1)
-        let A_P: Int = self.dim(-2) * self.dim(-1)
-
-        @parameter
-        fn CI(y: Int, x: Int) -> Int:
-            return y * C.dim(-1) + x
-
-        @parameter
-        fn AI(y: Int, x: Int) -> Int:
-            return y * self.dim(-1) + x
-
-        @parameter
-        fn BI(y: Int, x: Int) -> Int:
-            return y * other.dim(-1) + x
-
-        for s in range((C.num_elements() // (C_C * C_R))):
-            let pad_ci = s * C_P
-            let pad_ai = s * A_P
-            let pad_bi = s * B_P
-
-            @parameter
-            fn loop_(i: Int) -> None:
-                for j in range(A_C):
-
-                    @parameter
-                    fn _mul[_nelts: Int](k: Int) -> None:
-                        let ci: Int = CI(i, k) + pad_ci
-                        let ai: Int = AI(i, j) + pad_ai
-                        let bi: Int = BI(j, k) + pad_bi
-                        C.store[_nelts](
-                            ci, C.load[_nelts](ci) + self[ai] * other.load[_nelts](bi)
-                        )
-
-                    vectorize[nelts, _mul](C_C)
-
-            outer_loop_func[loop_](C_R)
-        return C ^
-
     @always_inline
-    fn matmul[nelts: Int](self, other: Self, num_cores: Int, n_cores: Int) -> Self:
-        @parameter
-        fn matmul_p[outer_loop: fn (Int) capturing -> None](range_size: Int):
-            parallelize[outer_loop](range_size, n_cores)
-
-        let result_array = self.__matmul[nelts, matmul_p](other)
-
-        return result_array
-
-    @always_inline
-    fn matmul[nelts: Int](self, other: Self) -> Self:
-        @parameter
-        fn matmul_v[outer_loop: fn (Int) capturing -> None](range_size: Int):
-            for i in range(range_size):
-                outer_loop(i)
-
-        let result_array: Self = self.__matmul[nelts, matmul_v](other)
-        # if debuging:
-        #     for i in range(result_array.num_elements()):
-        #         print("TRIGGERING RES MTML : ", i, " AS ", result_array[i])
-        return result_array
-
-    # cos
-
-    fn cos(inout self: Self) -> Self:
-        return self.__apply_math__[cos]()
-
-    fn cos[nelts: Int](inout self: Self) -> Self:
-        return self.__apply_math__[nelts, cos]()
-
-    fn cos(inout self: Self, num_cores: Int) -> Self:
-        return self.__apply_math__[cos](num_cores)
-
-    # sin
-
-    fn sin(inout self: Self) -> Self:
-        return self.__apply_math__[sin]()
-
-    fn sin[nelts: Int](inout self: Self) -> Self:
-        return self.__apply_math__[nelts, sin]()
-
-    fn sin(inout self: Self, num_cores: Int) -> Self:
-        return self.__apply_math__[sin](num_cores)
-
-    # log
-
-    fn log(inout self: Self) -> Self:
-        return self.__apply_math__[log]()
-
-    fn log[nelts: Int](inout self: Self) -> Self:
-        return self.__apply_math__[nelts, log]()
-
-    fn log(inout self: Self, num_cores: Int) -> Self:
-        return self.__apply_math__[log](num_cores)
-
-    # log2
-
-    fn log2(inout self: Self) -> Self:
-        return self.__apply_math__[log2]()
-
-    fn log2[nelts: Int](inout self: Self) -> Self:
-        return self.__apply_math__[nelts, log2]()
-
-    fn log2(inout self: Self, num_cores: Int) -> Self:
-        return self.__apply_math__[log2](num_cores)
-
-    # tan
-
-    fn tan(inout self: Self) -> Self:
-        return self.__apply_math__[tan]()
-
-    fn tan[nelts: Int](inout self: Self) -> Self:
-        return self.__apply_math__[nelts, tan]()
-
-    fn tan(inout self: Self, num_cores: Int) -> Self:
-        return self.__apply_math__[tan](num_cores)
-
-    # tanh
-
-    fn tanh(inout self: Self) -> Self:
-        return self.__apply_math__[tanh]()
-
-    fn tanh[nelts: Int](inout self: Self) -> Self:
-        return self.__apply_math__[nelts, tanh]()
-
-    fn tanh(inout self: Self, num_cores: Int) -> Self:
-        return self.__apply_math__[tanh](num_cores)
-
-    # sqrt
-
-    # fn sqrt(inout self: Self) -> Self:
-    #     return self.__apply_math__[sqrt]()
-
-    # fn sqrt[nelts: Int](inout self: Self) -> Self:
-    #     return self.__apply_math__[nelts, sqrt]()
-
-    # fn sqrt(inout self: Self, num_cores: Int) -> Self:
-    #     return self.__apply_math__[sqrt](num_cores)
-
-    # atan
-
-    fn atan(inout self: Self) -> Self:
-        return self.__apply_math__[atan]()
-
-    fn atan[nelts: Int](inout self: Self) -> Self:
-        return self.__apply_math__[nelts, atan]()
-
-    fn atan(inout self: Self, num_cores: Int) -> Self:
-        return self.__apply_math__[atan](num_cores)
-
-    # exp
-
-    fn exp(inout self: Self) -> Self:
-        return self.__apply_math__[exp]()
-
-    fn exp[nelts: Int](inout self: Self) -> Self:
-        return self.__apply_math__[nelts, exp]()
-
-    fn exp(inout self: Self, num_cores: Int) -> Self:
-        return self.__apply_math__[exp](num_cores)
-
-    # exp2
-
-    fn exp2(inout self: Self) -> Self:
-        return self.__apply_math__[exp2]()
-
-    fn exp2[nelts: Int](inout self: Self) -> Self:
-        return self.__apply_math__[nelts, exp2]()
-
-    fn exp2(inout self: Self, num_cores: Int) -> Self:
-        return self.__apply_math__[exp2](num_cores)
-
-    # log10
-    fn log10(inout self: Self) -> Self:
-        return self.__apply_math__[log10]()
-
-    fn log10[nelts: Int](inout self: Self) -> Self:
-        return self.__apply_math__[nelts, log10]()
-
-    fn log10(inout self: Self, num_cores: Int) -> Self:
-        return self.__apply_math__[log10](num_cores)
-
-    # log1p
-
-    fn log1p(inout self: Self) -> Self:
-        return self.__apply_math__[log1p]()
-
-    fn log1p[nelts: Int](inout self: Self) -> Self:
-        return self.__apply_math__[nelts, log1p]()
-
-    fn log1p(inout self: Self, num_cores: Int) -> Self:
-        return self.__apply_math__[log1p](num_cores)
-
-    # logb
-
-    fn logb(inout self: Self) -> Self:
-        return self.__apply_math__[logb]()
-
-    fn logb[nelts: Int](inout self: Self) -> Self:
-        return self.__apply_math__[nelts, logb]()
-
-    fn logb(inout self: Self, num_cores: Int) -> Self:
-        return self.__apply_math__[logb](num_cores)
-
-    # asin
-
-    fn asin(inout self: Self) -> Self:
-        return self.__apply_math__[asin]()
-
-    fn asin[nelts: Int](inout self: Self) -> Self:
-        return self.__apply_math__[nelts, asin]()
-
-    fn asin(inout self: Self, num_cores: Int) -> Self:
-        return self.__apply_math__[asin](num_cores)
-
-    # acos
-
-    fn acos(inout self: Self) -> Self:
-        return self.__apply_math__[acos]()
-
-    fn acos[nelts: Int](inout self: Self) -> Self:
-        return self.__apply_math__[nelts, acos]()
-
-    fn acos(inout self: Self, num_cores: Int) -> Self:
-        return self.__apply_math__[acos](num_cores)
-
-    # asinh
-
-    fn asinh(inout self: Self) -> Self:
-        return self.__apply_math__[asinh]()
-
-    fn asinh[nelts: Int](inout self: Self) -> Self:
-        return self.__apply_math__[nelts, asinh]()
-
-    fn asinh(inout self: Self, num_cores: Int) -> Self:
-        return self.__apply_math__[asinh](num_cores)
-
-    # acosh
-
-    fn acosh(inout self: Self) -> Self:
-        return self.__apply_math__[acosh]()
-
-    fn acosh[nelts: Int](inout self: Self) -> Self:
-        return self.__apply_math__[nelts, acosh]()
-
-    fn acosh(inout self: Self, num_cores: Int) -> Self:
-        return self.__apply_math__[acosh](num_cores)
+    fn matmul[nelts: Int = Self.nelts, cores: Int = 2](self, other: Self) -> Self:
+        return matmul[T, nelts, cores](self, other)
 
     @always_inline
     fn argmax(self: Self, axis: Int = -1) -> Int:
@@ -1422,6 +1043,9 @@ struct Array[T: DType]:
 
     fn print_shape(self) -> None:
         self.array_shape.shape_str()
+
+    fn print_strides(self) -> None:
+        self.array_shape.strides_str()
 
     fn print_array(self) -> None:
         let size = self.array_shape.num_elements()
@@ -1461,3 +1085,87 @@ struct Array[T: DType]:
                 print_no_newline(r_dt)
 
         print()
+
+    @always_inline
+    fn cosh[nelts: Int = Array[T].nelts, cores: Int = 2](self) -> Array[T]:
+        return array_cosh[T, nelts](self)
+
+    @always_inline
+    fn cos[nelts: Int = Array[T].nelts, cores: Int = 2](self) -> Array[T]:
+        return array_cos[T, nelts](self)
+
+    @always_inline
+    fn tan[nelts: Int = Array[T].nelts, cores: Int = 2](self) -> Array[T]:
+        return array_tan[T, nelts](self)
+
+    @always_inline
+    fn tanh[nelts: Int = Array[T].nelts, cores: Int = 2](self) -> Array[T]:
+        return array_tanh[T, nelts](self)
+
+    @always_inline
+    fn atan[nelts: Int = Array[T].nelts, cores: Int = 2](self) -> Array[T]:
+        return array_atan[T, nelts](self)
+
+    @always_inline
+    fn asin[nelts: Int = Array[T].nelts, cores: Int = 2](self) -> Array[T]:
+        return array_asin[T, nelts](self)
+
+    @always_inline
+    fn acos[nelts: Int = Array[T].nelts, cores: Int = 2](self) -> Array[T]:
+        return array_acos[T, nelts](self)
+
+    @always_inline
+    fn add[nelts: Int = Array[T].nelts, cores: Int = 2](self, other: Self) -> Array[T]:
+        return array_add[T, nelts, cores](self, other)
+
+    @always_inline
+    fn abs[nelts: Int = Array[T].nelts, cores: Int = 2](self) -> Array[T]:
+        return array_abs[T, nelts](self)
+
+    @always_inline
+    fn sqrt[nelts: Int = Array[T].nelts, cores: Int = 2](self) -> Array[T]:
+        return array_sqrt[T, nelts](self)
+
+    @always_inline
+    fn sinh[nelts: Int = Array[T].nelts, cores: Int = 2](self) -> Array[T]:
+        return array_sinh[T, nelts](self)
+
+    @always_inline
+    fn sin[nelts: Int = Array[T].nelts, cores: Int = 2](self) -> Array[T]:
+        return array_sin[T, nelts](self)
+
+    @always_inline
+    fn pow_all[nelts: Int = Array[T].nelts, cores: Int = 2](self) -> Array[T]:
+        return array_pow_all[T, nelts](self)
+
+    @always_inline
+    fn log[nelts: Int = Array[T].nelts, cores: Int = 2](self) -> Array[T]:
+        return array_log[T, nelts](self)
+
+    @always_inline
+    fn log2[nelts: Int = Array[T].nelts, cores: Int = 2](self) -> Array[T]:
+        return array_log2[T, nelts](self)
+
+    @always_inline
+    fn exp[nelts: Int = Array[T].nelts, cores: Int = 2](self) -> Array[T]:
+        return array_exp[T, nelts](self)
+
+    @always_inline
+    fn exp2[nelts: Int = Array[T].nelts, cores: Int = 2](self) -> Array[T]:
+        return array_exp2[T, nelts](self)
+
+    @always_inline
+    fn div[nelts: Int = Array[T].nelts, cores: Int = 2](self, other: Self) -> Array[T]:
+        return array_div[T, nelts, cores](self, other)
+
+    @always_inline
+    fn mul[nelts: Int = Array[T].nelts, cores: Int = 2](self, other: Self) -> Array[T]:
+        return array_mul[T, nelts, cores](self, other)
+
+    @always_inline
+    fn sub[nelts: Int = Array[T].nelts, cores: Int = 2](self, other: Self) -> Array[T]:
+        return array_sub[T, nelts, cores](self, other)
+
+    @always_inline
+    fn pow[nelts: Int = Array[T].nelts, cores: Int = 2](self, other: Self) -> Array[T]:
+        return array_pow[T, nelts, cores](self, other)

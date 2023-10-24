@@ -1,4 +1,4 @@
-from ..array import Array, ArrayShape, rotate_half, CAT_3D_AXIS_2
+from ..array import Array, ArrayShape, rotate_half, CAT_3D_AXIS_2, matmul, softmax
 from algorithm.functional import vectorize, parallelize
 from math import math
 from memory import memset_zero
@@ -268,7 +268,7 @@ fn dot_product_attention_weights[
     Calculates Q@K/Sqrt(HeadDims).
     """
     let head_dims: Int = key.dim(-1)
-    key = T_AXIS_0_2_1[T, nelts](key, cores)
+    key = key.T_[nelts, cores]()
 
     var A: Array[T] = Array[T](query, key)
     matmul[T, nelts, cores](A, query, key)
@@ -284,7 +284,7 @@ fn dot_product_attention_weights[
             A.store[nelts](i, res)
 
     vectorize[nelts, _row](A.num_elements())
-    softmax[T, nelts](A)
+    A = softmax[T](A, -1)
     return A ^
 
 
@@ -306,77 +306,6 @@ fn dot_product_attention[
     var attention: Array[T] = Array[T](value, attention_weight)
     matmul[T, nelts, cores](attention, value, attention_weight)
     return attention ^
-
-
-@always_inline
-fn dot_product_attention[
-    T: DType, nelts: Int
-](
-    inout C: Array[T],
-    inout attention: Array[T],
-    query: Array[T],
-    key_cache: Array[T],
-    value_cache: Array[T],
-    head_dims: Int,
-    number_rep_kv: Int,
-    max_position_embeddings: Int,
-    position: Int,
-    num_key_value_heads: Int,
-    num_attention_heads: Int,
-    padding: Int = 0,
-    num_cores: Int = 1,
-) -> NoneType:
-    r"""
-    Calculates (Q@K/Sqrt(HeadDims))@V.
-    """
-
-    @parameter
-    fn _calculate_each_head(head_index: Int):
-        let q_offset = head_index * head_dims
-        let attn_offset = head_index * max_position_embeddings
-        let kv_dims: Int = num_key_value_heads * head_dims
-        var C_AT = attention.data.offset(attn_offset)
-        for position_index in range(position + 1):
-            let k_offset = padding + position_index * kv_dims + (
-                head_index // number_rep_kv
-            ) * head_dims
-            var score: SIMD[T, nelts] = SIMD[T, nelts](0.0)
-
-            @parameter
-            fn _qk[_nelts: Int](idx: Int):
-                if _nelts < nelts:
-                    score[0] += (
-                        query.data.simd_load[_nelts](q_offset + idx)
-                        * key_cache.data.simd_load[_nelts](k_offset + idx)
-                    ).reduce_add()
-                else:
-                    score += query.data.simd_load[nelts](
-                        q_offset + idx
-                    ) * key_cache.data.simd_load[nelts](k_offset + idx)
-
-            vectorize[nelts, _qk](head_dims)
-            score /= math.sqrt[T, nelts](head_dims)
-
-            C_AT.offset(position_index).store(0, score.reduce_add())
-        softmax[T, nelts](C_AT, position + 1)
-
-        let H_S = C.data.offset(head_index * head_dims)
-        memset_zero(H_S, head_dims)
-        for position_index in range(position + 1):
-            let v_offset: Int = padding + position_index * kv_dims + (
-                head_index // number_rep_kv
-            ) * head_dims
-            let v = value_cache.data.offset(v_offset)
-            let A = C_AT.offset(position_index).load(0)
-
-            @parameter
-            fn _wv[_nelts: Int](i: Int):
-                let xbi = H_S.simd_load[_nelts](i) + A * v.simd_load[_nelts](i)
-                H_S.simd_store[_nelts](i, xbi)
-
-            vectorize[nelts, _wv](head_dims)
-
-    parallelize[_calculate_each_head](num_attention_heads, num_cores)
 
 
 fn repeat_kv[T: DType, cores: Int](A: Array[T], times: Int) -> Array[T]:
