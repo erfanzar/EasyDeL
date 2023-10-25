@@ -10,7 +10,7 @@ from .array_module import (
     matmul_shape,
     matmul,
     matmul_2d,
-    matmul_EA,
+    matmul_3D,
     matmul_single_row,
     base_case_matmul,
     kernel_add,

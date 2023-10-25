@@ -37,7 +37,7 @@ from memory.memory import memset_zero
 from .array_forward import (
     matmul,
     matmul_2d,
-    matmul_EA,
+    matmul_3D,
     matmul_single_row,
     base_case_matmul,
     kernel_add,
@@ -323,7 +323,7 @@ struct Array[T: DType]:
     var shape: Pointer[Int]
     var strides: Pointer[Int]
     var extra_parameters: Pointer[Int]
-    alias nelts: Int = simdwidthof[T]() * 2
+    alias nelts: Int = simdwidthof[T]()
     alias ArrayPointer: AnyType = DTypePointer[T]
 
     fn __init__(inout self: Self, array_shape: ArrayShape) -> None:
@@ -460,8 +460,12 @@ struct Array[T: DType]:
 
     @always_inline
     fn random(inout self: Self) -> None:
-        r"""Randomize The Data if the Array is Allocated."""
+        r"""Randomize Data."""
         if self.allocated == 1:
+            rand[T](self.data, self.array_shape.num_elements())
+        else:
+            self.data = DTypePointer[T]().alloc(self.array_shape.num_elements())
+            self.allocated = 1
             rand[T](self.data, self.array_shape.num_elements())
 
     @always_inline
@@ -993,44 +997,60 @@ struct Array[T: DType]:
     fn print_strides(self) -> None:
         self.array_shape.strides_str()
 
-    fn print_array(self) -> None:
-        let size = self.array_shape.num_elements()
+    fn print_array(self,number_detail:Int=5) -> None:
+        let row: Int = self.dim(-2)
+        let cols: Int = self.dim(-1)
+        let col_strides: Int = (self.strides[0] * self.shape[0]) // cols
+        print_no_newline("<Array: ")
+        for i in range(col_strides):
+            if col_strides > 10 and i > 4 and i < col_strides - 5:
+                if i == 5:
+                    print("                 ... ")
+                continue
+            else:
+                if i > 0:
+                    print_no_newline("           ")
+                else:
+                    print_no_newline("[ ")
 
-        var product = InlinedFixedVector[dims_average_size, Int](
-            self.array_shape.rank() + 1
-        )
-        product.append(1)
-        for index in range(self.array_shape.rank()):
-            product.append(
-                product[index] * self.array_shape[self.array_shape.rank() - 1 - index]
-            )
+                var indent = 0
+                for d in range(self.rank() - 1):
+                    if cols * i % self.strides[d] == 0:
+                        print_no_newline("[ ")
+                        indent += 1
+                    else:
+                        print_no_newline("  ")
 
-        var count = 0
-        for i in range(size + 1):
-            let r_dt = self[i]
-            count = 0
-            for j in range(self.array_shape.rank()):
-                if i % product[j + 1] == 0 and i != 0:
-                    print_no_newline("]")
-                    count += 1
+                for j in range(cols):
+                    if cols > 10 and j >= 3 and j < cols - 3:
+                        if j == 3:
+                            print_no_newline("... , ")
+                        continue
+                    else:
+                        let idx = cols * i + j
+                        let str_dt = String(self.data.load(idx))
+                        let len_str = len(str_dt)
+                        if len_str > number_detail:
+                            print_no_newline(str_dt[:number_detail])
+                        else:
+                            print_no_newline(str_dt)
+                        if j != cols - 1:
+                            print_no_newline(", ")
 
-            if i > 0 and i < size:
-                print_no_newline(",")
+                for d in range(self.rank() - 2, -1, -1):
+                    if cols * (i + 1) % self.strides[d] == 0:
+                        print_no_newline(" ]")
 
-            if i < size:
-                for i in range(count):
-                    print()
-                    for i in range(self.array_shape.rank() - 1):
-                        print_no_newline(" ")
-
-            for j in range(self.array_shape.rank()):
-                if i % product[j + 1] == 0 and i != size:
-                    print_no_newline("[")
-
-            if i < size:
-                print_no_newline(r_dt)
-
-        print()
+                if i < col_strides - 1:
+                    print_no_newline(", ")
+                    put_new_line()
+                else:
+                    print_no_newline(" ], shape: [")
+                    for i in range(self.rank()):
+                        print_no_newline(self.shape[i])
+                        if i < self.rank() - 1:
+                            print_no_newline(",")
+                    print_no_newline("], Data>\n\n")
 
     @always_inline
     fn matmul[nelts: Int = Self.nelts, cores: Int = 2](self, other: Self) -> Self:
