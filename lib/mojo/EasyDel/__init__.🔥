@@ -9,7 +9,7 @@ from .array import (
     # Array Module
     matmul,
     matmul_2d,
-    matmul_EA,
+    matmul_3D,
     matmul_shape,
     matmul_single_row,
     base_case_matmul,

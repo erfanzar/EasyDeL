@@ -112,7 +112,7 @@ fn matmul_2d[
 
 
 @always_inline
-fn matmul_EA[
+fn matmul_3D[
     T: DType, nelts: Int
 ](C: Array[T], A: Array[T], B: Array[T], num_cores: Int = 1) -> None:
     if A.rank() == Int(2) and B.rank() == 1 and (C.rank() == 1 or C.rank() == 2):
