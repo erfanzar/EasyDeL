@@ -6,15 +6,15 @@ from memory import memset_zero
 
 @always_inline
 fn rms_norm[
-    T: DType, nelts: Int
+    DT: DType, nelts: Int
 ](
-    inout C: Array[T],
-    x: Array[T],
-    w: Array[T],
-    epsilon: SIMD[T, 1],
+    inout C: Array[DT],
+    x: Array[DT],
+    w: Array[DT],
+    epsilon: SIMD[DT, 1],
     num_elements: Int = 0,
 ) -> None:
-    var sp: SIMD[T, nelts] = SIMD[T, nelts](0.0)
+    var sp: SIMD[DT, nelts] = SIMD[DT, nelts](0.0)
     let nml: Int = num_elements if num_elements > 0 else x.num_elements()
 
     @parameter
@@ -25,7 +25,7 @@ fn rms_norm[
             sp += x.load[nelts](size) ** 2
 
     vectorize[nelts, _do_sum_pow](nml)
-    var normed: SIMD[T, 1] = sp.reduce_add()
+    var normed: SIMD[DT, 1] = sp.reduce_add()
     normed = normed / nml + epsilon
     normed = 1.0 / math.sqrt(normed)
 
@@ -38,12 +38,12 @@ fn rms_norm[
 
 
 fn rope[
-    T: DType
+    DT: DType
 ](
-    inout q_array: Array[T],
-    inout k_array: Array[T],
-    fcr_row: DTypePointer[T],
-    fci_row: DTypePointer[T],
+    inout q_array: Array[DT],
+    inout k_array: Array[DT],
+    fcr_row: DTypePointer[DT],
+    fci_row: DTypePointer[DT],
     num_attention_heads: Int,
     num_key_value_heads: Int,
     head_dims: Int,
@@ -68,14 +68,14 @@ fn rope[
 
 
 fn rope[
-    T: DType, num_cores: Int
-](array: Array[T], cos: Array[T], sin: Array[T], position: Int,) -> Array[T]:
+    DT: DType, num_cores: Int
+](array: Array[DT], cos: Array[DT], sin: Array[DT], position: Int,) -> Array[DT]:
     let head_dim = array.dim(-1)
-    let chunk_cos: Array[T] = Array[T](cos.data.offset(position * head_dim), head_dim)
-    let chunk_sin: Array[T] = Array[T](sin.data.offset(position * head_dim), head_dim)
+    let chunk_cos: Array[DT] = Array[DT](cos.data.offset(position * head_dim), head_dim)
+    let chunk_sin: Array[DT] = Array[DT](sin.data.offset(position * head_dim), head_dim)
 
-    let _r: Array[T] = rotate_half[T, num_cores](array)
-    var _embed: Array[T] = Array[T](array.array_shape)
+    let _r: Array[DT] = rotate_half[DT, num_cores](array)
+    var _embed: Array[DT] = Array[DT](array.array_shape)
     let _row_size: Int = array.num_elements() // head_dim
 
     _embed.alloc(0.0)
@@ -84,20 +84,20 @@ fn rope[
     fn _row(i: Int):
         @parameter
         fn _cols[nelts: Int](j: Int):
-            let xbi: SIMD[T, nelts] = (
+            let xbi: SIMD[DT, nelts] = (
                 array.load[nelts](i, 0, j) * chunk_cos.load[nelts](j)
             ) + (_r.load[nelts](i, 0, j) * chunk_sin.load[nelts](j))
             _embed.store[nelts](i, 0, j, xbi)
 
-        vectorize[Array[T].nelts, _cols](head_dim)
+        vectorize[Array[DT].nelts, _cols](head_dim)
 
     parallelize[_row](_row_size)
     return _embed
 
 
 fn rope[
-    T: DType, num_cores: Int
-](array: Array[T], cos: Array[T], sin: Array[T], position_ids: Array[T]) -> Array[T]:
+    DT: DType, num_cores: Int
+](array: Array[DT], cos: Array[DT], sin: Array[DT], position_ids: Array[DT]) -> Array[DT]:
     """
     Takes Array Like
     Shape(number attention heads, sequence length, head dim).
@@ -109,8 +109,8 @@ fn rope[
     if seq_len != position_ids.__len__():
         print("K/Q Seq Length don't match with Position IDS.")
 
-    var chunk_cos: Array[T] = Array[T](seq_len, head_dim)
-    var chunk_sin: Array[T] = Array[T](seq_len, head_dim)
+    var chunk_cos: Array[DT] = Array[DT](seq_len, head_dim)
+    var chunk_sin: Array[DT] = Array[DT](seq_len, head_dim)
     chunk_cos.alloc(0.0)
     chunk_sin.alloc(0.0)
 
@@ -127,8 +127,8 @@ fn rope[
 
     parallelize[_rows](position_ids.__len__())
 
-    let _r: Array[T] = rotate_half[T, num_cores](array)
-    var _embed: Array[T] = Array[T](array.array_shape)
+    let _r: Array[DT] = rotate_half[DT, num_cores](array)
+    var _embed: Array[DT] = Array[DT](array.array_shape)
 
     _embed.alloc(0.0)
     for seq_id in range(position_ids.__len__()):
@@ -137,42 +137,42 @@ fn rope[
         fn _row(i: Int):
             @parameter
             fn _cols[nelts: Int](j: Int):
-                let xbi: SIMD[T, nelts] = (
+                let xbi: SIMD[DT, nelts] = (
                     array.load[nelts](i, seq_id, j) * chunk_cos.load[nelts](seq_id, j)
                 ) + (_r.load[nelts](i, seq_id, j) * chunk_sin.load[nelts](seq_id, j))
                 _embed.store[nelts](i, seq_id, j, xbi)
 
-            vectorize[Array[T].nelts, _cols](head_dim)
+            vectorize[Array[DT].nelts, _cols](head_dim)
 
         parallelize[_row](num_heads)
     return _embed ^
 
 
 fn torch_rope[
-    T: DType, num_cores: Int
+    DT: DType, num_cores: Int
 ](
-    q: Array[T],
-    k: Array[T],
-    cos: Array[T],
-    sin: Array[T],
+    q: Array[DT],
+    k: Array[DT],
+    cos: Array[DT],
+    sin: Array[DT],
     position: Int,
 ) -> Tuple[
-    Array[T], Array[T]
+    Array[DT], Array[DT]
 ]:
     debug_assert(k.rank() != 3 or q.rank() != 3, "Wrong input Shape for Q,K")
     let head_dim = q.dim(-1)
 
-    let chunk_cos: Array[T] = Array[T](cos.data.offset(position * head_dim), head_dim)
-    let chunk_sin: Array[T] = Array[T](sin.data.offset(position * head_dim), head_dim)
+    let chunk_cos: Array[DT] = Array[DT](cos.data.offset(position * head_dim), head_dim)
+    let chunk_sin: Array[DT] = Array[DT](sin.data.offset(position * head_dim), head_dim)
 
-    var q_embed: Array[T] = Array[T](q.array_shape)
-    var k_embed: Array[T] = Array[T](k.array_shape)
+    var q_embed: Array[DT] = Array[DT](q.array_shape)
+    var k_embed: Array[DT] = Array[DT](k.array_shape)
 
     k_embed.alloc(0.0)
     q_embed.alloc(0.0)
 
-    let q_r: Array[T] = rotate_half[T, num_cores](q)
-    let k_r: Array[T] = rotate_half[T, num_cores](k)
+    let q_r: Array[DT] = rotate_half[DT, num_cores](q)
+    let k_r: Array[DT] = rotate_half[DT, num_cores](k)
 
     let q_row_size: Int = q.num_elements() // head_dim
     let k_row_size: Int = k.num_elements() // head_dim
@@ -181,23 +181,23 @@ fn torch_rope[
     fn _row_q(i: Int):
         @parameter
         fn _cols_q[nelts: Int](j: Int):
-            let xbi: SIMD[T, nelts] = (
+            let xbi: SIMD[DT, nelts] = (
                 q.load[nelts](i, 1, j) * chunk_cos.load[nelts](j)
             ) + (q_r.load[nelts](i, 1, j) * chunk_sin.load[nelts](j))
             q_embed.store[nelts](i, 1, j, xbi)
 
-        vectorize[Array[T].nelts, _cols_q](head_dim)
+        vectorize[Array[DT].nelts, _cols_q](head_dim)
 
     @parameter
     fn _row_k(i: Int):
         @parameter
         fn _cols_k[nelts: Int](j: Int):
-            let xbi: SIMD[T, nelts] = (
+            let xbi: SIMD[DT, nelts] = (
                 k.load[nelts](i, 1, j) * chunk_cos.load[nelts](j)
             ) + (k_r.load[nelts](i, 1, j) * chunk_sin.load[nelts](j))
             k_embed.store[nelts](i, 1, j, xbi)
 
-        vectorize[Array[T].nelts, _cols_k](head_dim)
+        vectorize[Array[DT].nelts, _cols_k](head_dim)
 
     parallelize[_row_q](q_row_size)
     parallelize[_row_k](k_row_size)
@@ -206,11 +206,11 @@ fn torch_rope[
 
 @always_inline
 fn dot_product_attention_weights[
-    T: DType, nelts: Int
+    DT: DType, nelts: Int
 ](
-    attention: Array[T],
-    query: Array[T],
-    key_cache: Array[T],
+    attention: Array[DT],
+    query: Array[DT],
+    key_cache: Array[DT],
     head_dims: Int,
     number_rep_kv: Int,
     max_position_embeddings: Int,
@@ -234,7 +234,7 @@ fn dot_product_attention_weights[
             let k_offset = padding + position_index * kv_dims + (
                 head_index // number_rep_kv
             ) * head_dims
-            var score: SIMD[T, nelts] = SIMD[T, nelts](0.0)
+            var score: SIMD[DT, nelts] = SIMD[DT, nelts](0.0)
 
             @parameter
             fn _qk[_nelts: Int](idx: Int):
@@ -249,18 +249,18 @@ fn dot_product_attention_weights[
                     ) * key_cache.data.simd_load[nelts](k_offset + idx)
 
             vectorize[nelts, _qk](head_dims)
-            score /= math.sqrt[T, nelts](head_dims)
+            score /= math.sqrt[DT, nelts](head_dims)
 
             C_AT.offset(position_index).store(0, score.reduce_add())
-        softmax[T, nelts](C_AT, position + 1)
+        softmax[DT, nelts](C_AT, position + 1)
 
     parallelize[_calculate_each_head](num_attention_heads, num_cores)
 
 
 @always_inline
 fn dot_product_attention_weights[
-    T: DType, nelts: Int, cores: Int
-](inout query: Array[T], inout key: Array[T]) -> Array[T]:
+    DT: DType, nelts: Int, cores: Int
+](inout query: Array[DT], inout key: Array[DT]) -> Array[DT]:
     r"""
     Takes in
     q Shape(sequence length, num_attention_heads, head_dims)
@@ -270,9 +270,9 @@ fn dot_product_attention_weights[
     let head_dims: Int = key.dim(-1)
     key = key.T_[nelts, cores]()
 
-    var A: Array[T] = Array[T](query, key)
-    matmul[T, nelts, cores](A, query, key)
-    let SH: SIMD[T, nelts] = SIMD[T, nelts](math.sqrt(head_dims))
+    var A: Array[DT] = Array[DT](query, key)
+    matmul[DT, nelts, cores](A, query, key)
+    let SH: SIMD[DT, nelts] = SIMD[DT, nelts](math.sqrt(head_dims))
 
     @parameter
     fn _row[_nelts: Int](i: Int):
@@ -284,14 +284,14 @@ fn dot_product_attention_weights[
             A.store[nelts](i, res)
 
     vectorize[nelts, _row](A.num_elements())
-    A = softmax[T](A, -1)
+    A = softmax[DT](A, -1)
     return A ^
 
 
 @always_inline
 fn dot_product_attention[
-    T: DType, nelts: Int, cores: Int
-](inout query: Array[T], inout key: Array[T], inout value: Array[T],) -> Array[T]:
+    DT: DType, nelts: Int, cores: Int
+](inout query: Array[DT], inout key: Array[DT], inout value: Array[DT],) -> Array[DT]:
     r"""
     Takes In
     q Shape(sequence length, num_attention_heads, head_dims)
@@ -300,16 +300,16 @@ fn dot_product_attention[
     Calculates (Q@K/Sqrt(HeadDims))@V.
     """
     ...
-    var attention_weight: Array[T] = dot_product_attention_weights[T, nelts, cores](
+    var attention_weight: Array[DT] = dot_product_attention_weights[DT, nelts, cores](
         query, key
     )
-    var attention: Array[T] = Array[T](value, attention_weight)
-    matmul[T, nelts, cores](attention, value, attention_weight)
+    var attention: Array[DT] = Array[DT](value, attention_weight)
+    matmul[DT, nelts, cores](attention, value, attention_weight)
     return attention ^
 
 
-fn repeat_kv[T: DType, cores: Int](A: Array[T], times: Int) -> Array[T]:
-    var B: Array[T] = Array[T](A.dim(-3), times, A.dim(-2), A.dim(-1))
+fn repeat_kv[DT: DType, cores: Int](A: Array[DT], times: Int) -> Array[DT]:
+    var B: Array[DT] = Array[DT](A.dim(-3), times, A.dim(-2), A.dim(-1))
     B.alloc(0.0)
     let A1: Int = A.dim(0)
     let A2: Int = A.dim(1)
@@ -324,7 +324,7 @@ fn repeat_kv[T: DType, cores: Int](A: Array[T], times: Int) -> Array[T]:
                 fn _cols[nelts: Int](l: Int):
                     B.store[nelts](i, j, k, l, A.load[nelts](i, k, l))
 
-                vectorize[Array[T].nelts, _cols](A3)
+                vectorize[Array[DT].nelts, _cols](A3)
 
     parallelize[_row](A1, cores)
     B.view(-1, A.dim(-2), A.dim(-1))
