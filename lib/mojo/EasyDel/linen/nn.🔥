@@ -30,7 +30,7 @@ fn embedding[
 
         @parameter
         fn _set_cols[nelts: Int](j: Int):
-            embed.store[nelts](i, j, w.load[nelts](axis, j))
+            embed.store[nelts](VariadicList[Int](i, j), w.load[nelts](axis, j))
 
         vectorize[embed.nelts, _set_cols](hidden)
 
@@ -53,7 +53,7 @@ fn embedding[
 
         @parameter
         fn _set_cols[nelts: Int](j: Int):
-            embed.store[nelts](i, j, w.load[nelts](axis, j))
+            embed.store[nelts](VariadicList[Int](i, j), w.load[nelts](axis, j))
 
         vectorize[embed.nelts, _set_cols](hidden)
 
@@ -76,7 +76,7 @@ fn embedding[
 
         @parameter
         fn _set_cols[nelts: Int](j: Int):
-            embed.store[nelts](i, j, w.load[nelts](axis, j))
+            embed.store[nelts](VariadicList[Int](i, j), w.load[nelts](axis, j))
 
         vectorize[embed.nelts, _set_cols](hidden)
 
@@ -111,7 +111,7 @@ fn rms_layernorm[
         @parameter
         fn _do_element_wise[_nelts: Int](j: Int):
             let val = w.load[_nelts](j) * normed * x.load[_nelts](i, j)
-            res.store[_nelts](i, j, val)
+            res.store[_nelts](VariadicList[Int](i, j), val)
 
         vectorize[nelts, _do_element_wise](num_elements)
 
