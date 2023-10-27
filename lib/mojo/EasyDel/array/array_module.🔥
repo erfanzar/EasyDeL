@@ -104,12 +104,6 @@ fn matmul_shape[DT: DType](A: Array[DT], B: Array[DT]) -> ArrayShape:
         return ArrayShape(res_dims)
 
 
-fn do_check(res: Bool, string: StringRef):
-    if not res:
-        # print(string)
-        ...
-
-
 struct ArrayShape:
     var _shape: Pointer[Int]
     var _strides: Pointer[Int]
@@ -343,64 +337,44 @@ struct Array[DT: DType]:
 
     fn __init__(inout self: Self, *dim: Int):
         r"""Init Array from Int Args(Alloc Zero)."""
-        self.array_shape = ArrayShape(VariadicList(dim))
-        self.data = self.ArrayPointer.alloc(0)
-        self.shape = self.array_shape.shape()
-        self.strides = self.array_shape.strides()
-        self.allocated = 0
-        self.extra_parameters = Pointer[Int].alloc(64)
-        memset_zero(self.extra_parameters, 64)
+        let array_shape = ArrayShape(VariadicList(dim))
+        self.__init__(array_shape)
 
     fn __init__(inout self: Self, vl: VariadicList[Int]) -> None:
         r"""Init Array from VariadicList[Int](Alloc Zero)."""
-        self.array_shape = ArrayShape(vl)
-        self.data = self.ArrayPointer.alloc(0)
-        self.shape = self.array_shape.shape()
-        self.strides = self.array_shape.strides()
-        self.allocated = 0
-        self.extra_parameters = Pointer[Int].alloc(64)
-        memset_zero(self.extra_parameters, 64)
+        let array_shape = ArrayShape(vl)
+        self.__init__(array_shape)
 
     fn __init__(
         inout self: Self, value: DynamicVector[FloatLiteral], shape: ArrayShape
     ) -> None:
         r"""Init Array from ArrayShape and load data from DynamicVector[FloatLiteral](Alloc One).
         """
-        self.array_shape = shape
-        do_check(len(value) == self.array_shape.num_elements(), "Data Size miss match")
-        self.data = self.ArrayPointer.alloc(self.array_shape.num_elements())
-        self.allocated = 1
-        self.shape = self.array_shape.shape()
-        self.strides = self.array_shape.strides()
-        for i in range(self.array_shape.num_elements()):
+        if not len(value) == shape.num_elements():
+            print("Data Size miss match")
+        self.__init__(shape)
+        self.alloc(0.0)
+        for i in range(shape.num_elements()):
             self.data.simd_store[1](i, value[i])
-        self.extra_parameters = Pointer[Int].alloc(64)
-        memset_zero(self.extra_parameters, 64)
 
     fn __init__(
         inout self: Self, value: VariadicList[FloatLiteral], shape: ArrayShape
     ) -> None:
         r"""Init Array from ArrayShape and load data from VariadicList[FloatLiteral](Alloc One).
         """
-        self.array_shape = shape
-        do_check(len(value) == self.array_shape.num_elements(), "Data Size miss match")
-        self.allocated = 1
-        self.data = self.ArrayPointer.alloc(self.array_shape.num_elements())
-        self.shape = self.array_shape.shape()
-        self.strides = self.array_shape.strides()
-        self.extra_parameters = Pointer[Int].alloc(64)
-        memset_zero(self.extra_parameters, 64)
-        for i in range(self.array_shape.num_elements()):
+        if not len(value) == shape.num_elements():
+            print("Data Size miss match")
+        self.__init__(shape)
+        self.alloc(0.0)
+        for i in range(shape.num_elements()):
             self.data.simd_store[1](i, value[i])
 
     fn __init__(inout self: Self, pointer: DTypePointer[DT], *dim: Int) -> None:
-        self.data = pointer
-        self.array_shape = ArrayShape(dim)
+        r"""Uses given pointer and cover that as an Array."""
+        let shape = ArrayShape(dim)
+        self.__init__(shape)
         self.allocated = 0
-        self.shape = self.array_shape.shape()
-        self.strides = self.array_shape.strides()
-        self.extra_parameters = Pointer[Int].alloc(64)
-        memset_zero(self.extra_parameters, 64)
+        self.data = pointer
 
     fn __moveinit__(inout self, owned ext: Self):
         self.data = ext.data
@@ -622,6 +596,8 @@ struct Array[DT: DType]:
                 num_elms *= vs[i]
             self.array_shape = ArrayShape(vs)
 
+    # LOAD
+
     @always_inline
     fn load[
         nelts: Int, off: Int
@@ -643,52 +619,18 @@ struct Array[DT: DType]:
         return self.data.simd_load[nelts](position)
 
     @always_inline
-    fn store[
-        nelts: Int
-    ](self, d1: Int, d2: Int, d3: Int, d4: Int, val: SIMD[DT, nelts]) -> None:
-        debug_assert(self.rank() != 4, "Miss match os requested shape (4D Store)")
-        let index = (d1 * self.dim(-3) * self.dim(-2) * self.dim(-1)) + (
-            d2 * self.dim(-2) * self.dim(-1)
-        ) + (d3 * self.dim(-1)) + d4
-        debug_assert(index > self.num_elements(), "Out OF range in Store 4D")
-        self.data.simd_store[nelts](index, val)
-
-    @always_inline
-    fn store[nelts: Int](self, d1: Int, d2: Int, d3: Int, val: SIMD[DT, nelts]) -> None:
-        debug_assert(self.rank() != 3, "Miss match os requested shape (3D Store)")
-        let index = d1 * self.dim(-2) * self.dim(-1) + d2 * self.dim(-1) + d3
-        debug_assert(index > self.num_elements(), "Out OF range in Store 3D")
-        self.data.simd_store[nelts](index, val)
-
-    @always_inline
-    fn store[nelts: Int](self, d1: Int, d2: Int, val: SIMD[DT, nelts]) -> None:
-        debug_assert(self.rank() != 2, "Miss match os requested shape (2D Store)")
-        let index = d1 * self.dim(-1) + d2
-        debug_assert(index > self.num_elements(), "Out OF range in Store 2D")
-        self.data.simd_store[nelts](index, val)
-
-    @always_inline
-    fn load[nelts: Int](self, d1: Int, d2: Int, d3: Int, d4: Int) -> SIMD[DT, nelts]:
-        debug_assert(self.rank() != 3, "Miss match os requested shape (4D Load)")
-        let index = (d1 * self.dim(-3) * self.dim(-2) * self.dim(-1)) + (
-            d2 * self.dim(-2) * self.dim(-1)
-        ) + (d3 * self.dim(-1)) + d4
-        debug_assert(index > self.num_elements(), "Out OF range in Load 4D")
+    fn load[nelts: Int](self, dims: VariadicList[Int]) -> SIMD[DT, nelts]:
+        """ND Array Access."""
+        let index = self.get_index(dims)
         return self.data.simd_load[nelts](index)
 
     @always_inline
-    fn load[nelts: Int](self, d1: Int, d2: Int, d3: Int) -> SIMD[DT, nelts]:
-        debug_assert(self.rank() != 3, "Miss match os requested shape (3D Load)")
-        let index = d1 * self.dim(-2) * self.dim(-1) + d2 * self.dim(-1) + d3
-        debug_assert(index > self.num_elements(), "Out OF range in Load 3D")
+    fn load[nelts: Int](self, *dims: Int) -> SIMD[DT, nelts]:
+        """ND Array Access."""
+        let index = self.get_index(dims)
         return self.data.simd_load[nelts](index)
 
-    @always_inline
-    fn load[nelts: Int](self, d1: Int, d2: Int) -> SIMD[DT, nelts]:
-        debug_assert(self.rank() != 2, "Miss match os requested shape (2D Load)")
-        let index = d1 * self.dim(-1) + d2
-        debug_assert(index > self.num_elements(), "Out OF range in Load 2D")
-        return self.data.simd_load[nelts](index)
+    # STORE
 
     @always_inline
     fn store[
@@ -713,8 +655,18 @@ struct Array[DT: DType]:
         self.assertation(position, self.array_shape._size)
         self.data.simd_store[nelts](position, val)
 
+    @always_inline
+    fn store[nelts: Int](self, dims: VariadicList[Int], val: SIMD[DT, nelts]) -> None:
+        """ND Array Access."""
+        let index = self.get_index(dims)
+        self.assertation(index, self.array_shape._size)
+        self.data.simd_store[nelts](index, val)
+
     fn assertation(self: Self, i: Int, j: Int) -> None:
-        do_check(True if i > j else False, "Index out of range")
+        if not i >= j:
+            print("Index out of range")
+
+    # __SETITEM__
 
     @always_inline
     fn __setitem__(self, index: Int, val: SIMD[DT, 1]) -> None:
@@ -731,16 +683,11 @@ struct Array[DT: DType]:
         return self.store[1](index, val)
 
     @always_inline
-    fn __setitem__(self, d1: Int, d2: Int, d3: Int, d4: Int, val: SIMD[DT, 1]) -> None:
-        return self.store[1](d1, d2, d3, d4, val)
+    fn __setitem__(self, dims: VariadicList[Int], val: SIMD[DT, 1]):
+        let index: Int = self.get_index(dims)
+        return self.store[1](index, val)
 
-    @always_inline
-    fn __setitem__(self, d1: Int, d2: Int, d3: Int, val: SIMD[DT, 1]) -> None:
-        return self.store[1](d1, d2, d3, val)
-
-    @always_inline
-    fn __setitem__(self, d1: Int, d2: Int, val: SIMD[DT, 1]) -> None:
-        return self.store[1](d1, d2, val)
+    # __GETITEM__
 
     @always_inline
     fn __getitem__[off: Int](self, index: InlinedFixedVector[off, Int]) -> SIMD[DT, 1]:
@@ -749,18 +696,6 @@ struct Array[DT: DType]:
     @always_inline
     fn __getitem__[off: Int](self, index: StaticIntTuple[off]) -> SIMD[DT, 1]:
         return self.load[1, off](index)
-
-    @always_inline
-    fn __getitem__(self, d1: Int, d2: Int, d3: Int, d4: Int) -> SIMD[DT, 1]:
-        return self.load[1](d1, d2, d3, d4)
-
-    @always_inline
-    fn __getitem__(self, d1: Int, d2: Int, d3: Int) -> SIMD[DT, 1]:
-        return self.load[1](d1, d2, d3)
-
-    @always_inline
-    fn __getitem__(self, d1: Int, d2: Int) -> SIMD[DT, 1]:
-        return self.load[1](d1, d2)
 
     @always_inline
     fn __getitem__(self, index: Int) -> SIMD[DT, 1]:
@@ -779,10 +714,8 @@ struct Array[DT: DType]:
             x: SIMD[DT, simd_width], y: SIMD[DT, simd_width]
         ) -> SIMD[DT, simd_width],
     ](self, other: Self) -> Self:
-        do_check(
-            self.array_shape == other.array_shape,
-            "dimension aren't equal, can't do operation element wise.",
-        )
+        if not self.array_shape == other.array_shape:
+            print("dimension aren't equal, can't do operation element wise.")
 
         var res = Self(self.array_shape)
         res.alloc()
@@ -917,10 +850,8 @@ struct Array[DT: DType]:
         )
 
     fn eq[nelts: Int](self, other: Self) -> Bool:
-        do_check(
-            self.array_shape == other.array_shape,
-            "dimension aren't equal can't performe eq operation.",
-        )
+        if not self.array_shape == other.array_shape:
+            print("dimension aren't equal can't performe eq operation.")
 
         var flag = True
         let size = self.array_shape.num_elements()
@@ -935,10 +866,8 @@ struct Array[DT: DType]:
         return flag
 
     fn eq[nelts: Int](self, other: Self, num_cores: Int, n_cores: Int) -> Bool:
-        do_check(
-            self.array_shape == other.array_shape,
-            "dimension aren't equal can't performe eq operation.",
-        )
+        if not self.array_shape == other.array_shape:
+            print("dimension aren't equal can't performe eq operation.")
 
         var flag = True
         let size = self.array_shape.num_elements()
@@ -1081,7 +1010,9 @@ struct Array[DT: DType]:
         return array_acos[DT, nelts](self)
 
     @always_inline
-    fn add[nelts: Int = Array[DT].nelts, cores: Int = 2](self, other: Self) -> Array[DT]:
+    fn add[
+        nelts: Int = Array[DT].nelts, cores: Int = 2
+    ](self, other: Self) -> Array[DT]:
         return array_add[DT, nelts, cores](self, other)
 
     @always_inline
@@ -1121,19 +1052,27 @@ struct Array[DT: DType]:
         return array_exp2[DT, nelts](self)
 
     @always_inline
-    fn div[nelts: Int = Array[DT].nelts, cores: Int = 2](self, other: Self) -> Array[DT]:
+    fn div[
+        nelts: Int = Array[DT].nelts, cores: Int = 2
+    ](self, other: Self) -> Array[DT]:
         return array_div[DT, nelts, cores](self, other)
 
     @always_inline
-    fn mul[nelts: Int = Array[DT].nelts, cores: Int = 2](self, other: Self) -> Array[DT]:
+    fn mul[
+        nelts: Int = Array[DT].nelts, cores: Int = 2
+    ](self, other: Self) -> Array[DT]:
         return array_mul[DT, nelts, cores](self, other)
 
     @always_inline
-    fn sub[nelts: Int = Array[DT].nelts, cores: Int = 2](self, other: Self) -> Array[DT]:
+    fn sub[
+        nelts: Int = Array[DT].nelts, cores: Int = 2
+    ](self, other: Self) -> Array[DT]:
         return array_sub[DT, nelts, cores](self, other)
 
     @always_inline
-    fn pow[nelts: Int = Array[DT].nelts, cores: Int = 2](self, other: Self) -> Array[DT]:
+    fn pow[
+        nelts: Int = Array[DT].nelts, cores: Int = 2
+    ](self, other: Self) -> Array[DT]:
         return array_pow[DT, nelts, cores](self, other)
 
     @always_inline
