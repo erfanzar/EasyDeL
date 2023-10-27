@@ -87,7 +87,7 @@ fn rope[
             let xbi: SIMD[DT, nelts] = (
                 array.load[nelts](i, 0, j) * chunk_cos.load[nelts](j)
             ) + (_r.load[nelts](i, 0, j) * chunk_sin.load[nelts](j))
-            _embed.store[nelts](i, 0, j, xbi)
+            _embed.store[nelts](VariadicList[Int](i, 0, j), xbi)
 
         vectorize[Array[DT].nelts, _cols](head_dim)
 
@@ -97,7 +97,9 @@ fn rope[
 
 fn rope[
     DT: DType, num_cores: Int
-](array: Array[DT], cos: Array[DT], sin: Array[DT], position_ids: Array[DT]) -> Array[DT]:
+](array: Array[DT], cos: Array[DT], sin: Array[DT], position_ids: Array[DT]) -> Array[
+    DT
+]:
     """
     Takes Array Like
     Shape(number attention heads, sequence length, head dim).
@@ -120,8 +122,12 @@ fn rope[
 
         @parameter
         fn _cols[_nelts: Int](i: Int):
-            chunk_cos.store[_nelts](position, i, cos.load[_nelts](position_id, i))
-            chunk_sin.store[_nelts](position, i, sin.load[_nelts](position_id, i))
+            chunk_cos.store[_nelts](
+                VariadicList[Int](position, i), cos.load[_nelts](position_id, i)
+            )
+            chunk_sin.store[_nelts](
+                VariadicList[Int](position, i), sin.load[_nelts](position_id, i)
+            )
 
         vectorize[array.nelts, _cols](head_dim)
 
@@ -140,7 +146,7 @@ fn rope[
                 let xbi: SIMD[DT, nelts] = (
                     array.load[nelts](i, seq_id, j) * chunk_cos.load[nelts](seq_id, j)
                 ) + (_r.load[nelts](i, seq_id, j) * chunk_sin.load[nelts](seq_id, j))
-                _embed.store[nelts](i, seq_id, j, xbi)
+                _embed.store[nelts](VariadicList[Int](i, seq_id, j), xbi)
 
             vectorize[Array[DT].nelts, _cols](head_dim)
 
@@ -184,7 +190,7 @@ fn torch_rope[
             let xbi: SIMD[DT, nelts] = (
                 q.load[nelts](i, 1, j) * chunk_cos.load[nelts](j)
             ) + (q_r.load[nelts](i, 1, j) * chunk_sin.load[nelts](j))
-            q_embed.store[nelts](i, 1, j, xbi)
+            q_embed.store[nelts](VariadicList[Int](i, 1, j), xbi)
 
         vectorize[Array[DT].nelts, _cols_q](head_dim)
 
@@ -195,7 +201,7 @@ fn torch_rope[
             let xbi: SIMD[DT, nelts] = (
                 k.load[nelts](i, 1, j) * chunk_cos.load[nelts](j)
             ) + (k_r.load[nelts](i, 1, j) * chunk_sin.load[nelts](j))
-            k_embed.store[nelts](i, 1, j, xbi)
+            k_embed.store[nelts](VariadicList[Int](i, 1, j), xbi)
 
         vectorize[Array[DT].nelts, _cols_k](head_dim)
 
@@ -268,7 +274,7 @@ fn dot_product_attention_weights[
     Calculates Q@K/Sqrt(HeadDims).
     """
     let head_dims: Int = key.dim(-1)
-    key = key.T_[nelts, cores]()
+    key = key.T[nelts, cores]()
 
     var A: Array[DT] = Array[DT](query, key)
     matmul[DT, nelts, cores](A, query, key)
@@ -322,7 +328,9 @@ fn repeat_kv[DT: DType, cores: Int](A: Array[DT], times: Int) -> Array[DT]:
 
                 @parameter
                 fn _cols[nelts: Int](l: Int):
-                    B.store[nelts](i, j, k, l, A.load[nelts](i, k, l))
+                    B.store[nelts](
+                        VariadicList[Int](i, j, k, l), A.load[nelts](i, k, l)
+                    )
 
                 vectorize[Array[DT].nelts, _cols](A3)
 

@@ -231,7 +231,7 @@ fn T_AXIS_1_0_2[DT: DType, nelts: Int](array: Array[DT], num_workers: Int) -> Ar
             @parameter
             fn _cols[_nelts: Int](k: Int):
                 let dt: SIMD[DT, _nelts] = array.load[_nelts](i, j, k)
-                transposed_array.store[_nelts](j, i, k, dt)
+                transposed_array.store[_nelts](VariadicList[Int](j, i, k), dt)
 
             vectorize[nelts, _cols](array.dim(2))
 
@@ -254,7 +254,7 @@ fn T_AXIS_0_2_1[DT: DType, nelts: Int](array: Array[DT], num_workers: Int) -> Ar
             @parameter
             fn _cols[_nelts: Int](k: Int):
                 let dt: SIMD[DT, _nelts] = array.load[_nelts](i, j, k)
-                transposed_array.store[_nelts](i, k, j, dt)
+                transposed_array.store[_nelts](VariadicList[Int](i, k, j), dt)
 
             vectorize[nelts, _cols](array.dim(2))
 
@@ -277,7 +277,7 @@ fn T_AXIS_2_1_0[DT: DType, nelts: Int](array: Array[DT], num_workers: Int) -> Ar
             @parameter
             fn _cols[_nelts: Int](k: Int):
                 let dt: SIMD[DT, _nelts] = array.load[_nelts](i, j, k)
-                transposed_array.store[_nelts](k, j, i, dt)
+                transposed_array.store[_nelts](VariadicList[Int](k, j, i), dt)
 
             vectorize[nelts, _cols](array.dim(2))
 
@@ -329,9 +329,9 @@ fn CAT_3D_AXIS_2[DT: DType, cores: Int](A: Array[DT], B: Array[DT]) -> Array[DT]
             @parameter
             fn _cols[nelts: Int](k: Int):
                 if k < A_A:
-                    x.store[nelts](i, j, k, A.load[nelts](i, j, k))
+                    x.store[nelts](VariadicList[Int](i, j, k), A.load[nelts](i, j, k))
                 else:
-                    x.store[nelts](i, j, k, B.load[nelts](i, j, k - A_A))
+                    x.store[nelts](VariadicList[Int](i, j, k), B.load[nelts](i, j, k - A_A))
 
             vectorize[Array[DT].nelts, _cols](x.dim(-1))
 
@@ -359,7 +359,7 @@ fn rotate_half[DT: DType, cores: Int](A: Array[DT]) -> Array[DT]:
         fn x1_row(j: Int):
             @parameter
             fn x1_cols[nelts: Int](k: Int):
-                x1.store[nelts](i, j, k, A.load[nelts](i, j, k))
+                x1.store[nelts](VariadicList[Int](i, j, k), A.load[nelts](i, j, k))
 
             vectorize[Array[DT].nelts, x1_cols](half)
 
@@ -370,7 +370,7 @@ fn rotate_half[DT: DType, cores: Int](A: Array[DT]) -> Array[DT]:
         fn x2_row(j: Int):
             @parameter
             fn x2_cols[nelts: Int](k: Int):
-                x2.store[nelts](i, j, k, -A.load[nelts](i, j, half + k))
+                x2.store[nelts](VariadicList[Int](i, j, k), -A.load[nelts](i, j, half + k))
 
             vectorize[Array[DT].nelts, x2_cols](rest)
 

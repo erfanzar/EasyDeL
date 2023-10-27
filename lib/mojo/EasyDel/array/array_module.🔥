@@ -312,108 +312,221 @@ struct ArrayShape:
 
 struct Array[DT: DType]:
     var data: DTypePointer[DT]
+    var grad: DTypePointer[DT]
+
     var array_shape: ArrayShape
-    var allocated: Int
+
     var shape: Pointer[Int]
     var strides: Pointer[Int]
+    var parents: Pointer[Int]
     var extra_parameters: Pointer[Int]
+
+    var parents_dynamic: Pointer[Bool]
+
+    var number_of_parents: Int
+    var identifier: Int
+
+    var name: StringRef
+
+    var in_nodes: Bool
+    var is_dynamic: Bool
+    var visited: Bool
+    var requires_grad: Bool
+    var allocated: Bool
+
     alias nelts: Int = simdwidthof[DT]()
     alias ArrayPointer: AnyType = DTypePointer[DT]
+    alias nodes_depth: Int = 64
+    alias pi: SIMD[DT, 1] = SIMD[DT, 1](
+        3.1415926535897932384626433832795028841971693993751058
+    )
 
-    fn __init__(inout self: Self, array_shape: ArrayShape) -> None:
+    fn __init__(
+        inout self: Self, array_shape: ArrayShape, requires_grad: Bool = False
+    ) -> None:
         r"""Init Array From ArrayShape(Alloc Zero)."""
+
         self.array_shape = array_shape
+
         self.data = self.ArrayPointer.alloc(0)
-        self.allocated = 0
+        self.grad = self.ArrayPointer.alloc(0)
+        self.extra_parameters = Pointer[Int].alloc(self.nodes_depth)
+        self.parents = Pointer[Int].alloc(self.nodes_depth)
+
+        self.number_of_parents = 0
+        self.identifier = 1
+
+        self.allocated = False
+        self.in_nodes = False
+        self.is_dynamic = False
+        self.visited = False
+        self.requires_grad = requires_grad
+
         self.shape = self.array_shape.shape()
         self.strides = self.array_shape.strides()
-        self.extra_parameters = Pointer[Int].alloc(64)
-        memset_zero(self.extra_parameters, 64)
 
-    fn __init__(inout self: Self, A: Self, B: Self) -> None:
+        self.name = StringRef("None")
+
+        self.parents_dynamic = Pointer[Bool].alloc(self.nodes_depth)
+
+        for i in range(self.nodes_depth):
+            self.parents_dynamic.store(i, False)
+
+        memset_zero(self.parents, self.nodes_depth)
+        memset_zero(self.extra_parameters, self.nodes_depth)
+
+    fn __init__(
+        inout self: Self, A: Self, B: Self, requires_grad: Bool = False
+    ) -> None:
         r"""Init Array From Two other Arrays A and B For Matmul(Alloc One)."""
-        self.__init__(matmul_shape[DT](A, B))
+        self.__init__(matmul_shape[DT](A, B), requires_grad)
         self.alloc(0.0)
 
     fn __init__(inout self: Self, *dim: Int):
+        r"""Init Array from Int Args(Alloc Zero , Do Not Store Gradinet too)."""
+        let array_shape = ArrayShape(VariadicList(dim))
+        self.__init__(array_shape, False)
+
+    fn __init__(inout self: Self, requires_grad: Bool, *dim: Int):
         r"""Init Array from Int Args(Alloc Zero)."""
         let array_shape = ArrayShape(VariadicList(dim))
-        self.__init__(array_shape)
-
-    fn __init__(inout self: Self, vl: VariadicList[Int]) -> None:
-        r"""Init Array from VariadicList[Int](Alloc Zero)."""
-        let array_shape = ArrayShape(vl)
-        self.__init__(array_shape)
+        self.__init__(array_shape, requires_grad)
 
     fn __init__(
-        inout self: Self, value: DynamicVector[FloatLiteral], shape: ArrayShape
+        inout self: Self, vl: VariadicList[Int], requires_grad: Bool = False
+    ) -> None:
+        r"""Init Array from VariadicList[Int](Alloc Zero)."""
+        let array_shape = ArrayShape(vl)
+        self.__init__(array_shape, requires_grad)
+
+    fn __init__(
+        inout self: Self,
+        value: DynamicVector[FloatLiteral],
+        shape: ArrayShape,
+        requires_grad: Bool = False,
     ) -> None:
         r"""Init Array from ArrayShape and load data from DynamicVector[FloatLiteral](Alloc One).
         """
         if not len(value) == shape.num_elements():
             print("Data Size miss match")
-        self.__init__(shape)
+        self.__init__(shape, requires_grad)
         self.alloc(0.0)
         for i in range(shape.num_elements()):
             self.data.simd_store[1](i, value[i])
 
     fn __init__(
-        inout self: Self, value: VariadicList[FloatLiteral], shape: ArrayShape
+        inout self: Self,
+        value: VariadicList[FloatLiteral],
+        shape: ArrayShape,
+        requires_grad: Bool = False,
     ) -> None:
         r"""Init Array from ArrayShape and load data from VariadicList[FloatLiteral](Alloc One).
         """
         if not len(value) == shape.num_elements():
             print("Data Size miss match")
-        self.__init__(shape)
+        self.__init__(shape, requires_grad)
         self.alloc(0.0)
         for i in range(shape.num_elements()):
             self.data.simd_store[1](i, value[i])
 
+    fn __init__(
+        inout self: Self, requires_grad: Bool, pointer: DTypePointer[DT], *dim: Int
+    ) -> None:
+        r"""Uses given pointer and cover that as an Array."""
+        let shape = ArrayShape(dim)
+        self.__init__(shape, requires_grad)
+        self.allocated = False
+        self.data = pointer
+
     fn __init__(inout self: Self, pointer: DTypePointer[DT], *dim: Int) -> None:
         r"""Uses given pointer and cover that as an Array."""
         let shape = ArrayShape(dim)
-        self.__init__(shape)
-        self.allocated = 0
+        self.__init__(shape, False)
+        self.allocated = False
         self.data = pointer
 
     fn __moveinit__(inout self, owned ext: Self):
         self.data = ext.data
+        self.grad = ext.grad
+
         self.array_shape = ext.array_shape
-        self.allocated = ext.allocated
+
         self.shape = ext.array_shape.shape()
         self.strides = ext.array_shape.strides()
+        self.parents = ext.parents
         self.extra_parameters = ext.extra_parameters
+        self.parents_dynamic = ext.parents_dynamic
+
+        self.number_of_parents = ext.number_of_parents
+        self.identifier = ext.identifier
+
+        self.name = ext.name
+
+        self.in_nodes = ext.in_nodes
+        self.is_dynamic = ext.is_dynamic
+        self.visited = ext.visited
+        self.requires_grad = ext.requires_grad
+        self.allocated = ext.allocated
 
     fn __copyinit__(inout self, ext: Self):
-        self.allocated = ext.allocated
+        self.array_shape = ext.array_shape
+
         self.shape = ext.array_shape.shape()
         self.strides = ext.array_shape.strides()
+        self.parents = ext.parents
         self.extra_parameters = ext.extra_parameters
+        self.parents_dynamic = ext.parents_dynamic
 
-        if self.allocated == 1:
+        self.number_of_parents = ext.number_of_parents
+        self.identifier = ext.identifier
+
+        self.name = ext.name
+
+        self.in_nodes = ext.in_nodes
+        self.is_dynamic = ext.is_dynamic
+        self.visited = ext.visited
+        self.requires_grad = ext.requires_grad
+        self.allocated = ext.allocated
+
+        if self.allocated:
             self.data = self.ArrayPointer.alloc(ext.array_shape.num_elements())
-            self.array_shape = ext.array_shape
+
+            if self.requires_grad:
+                self.grad = self.ArrayPointer.alloc(ext.array_shape.num_elements())
+            else:
+                self.grad = self.ArrayPointer.alloc(0)
 
             @parameter
             fn _do[_nelts: Int](f: Int):
-                let dt = ext.data.simd_load[_nelts](0)
-                self.data.simd_store[_nelts](0, dt)
+                let dt = ext.data.simd_load[_nelts](f)
+                self.data.simd_store[_nelts](f, dt)
+                if self.requires_grad:
+                    let gt = ext.grad.simd_load[_nelts](f)
+                    self.grad.simd_store[_nelts](f, gt)
 
             vectorize[Self.nelts, _do](ext.array_shape.num_elements())
+
         else:
             self.data = self.ArrayPointer.alloc(0)
-            self.array_shape = ext.array_shape
+            self.grad = self.ArrayPointer.alloc(0)
 
     fn __del__(owned self):
-        if self.allocated == 1:
+        if self.allocated:
             self.data.free()
+            self.grad.free()
+
+        self.shape.free()
+        self.strides.free()
+        self.parents.free()
+        self.extra_parameters.free()
+        self.parents_dynamic.free()
 
     fn init_from_buffer(inout self: Self, buffer: DTypePointer[DT], *dim: Int) -> None:
         self.array_shape = ArrayShape(VariadicList(dim))
         self.shape = self.array_shape.shape()
         self.strides = self.array_shape.strides()
         self.data = buffer
-        self.allocated = 0
+        self.allocated = False
 
     @always_inline
     fn set_data_from_buffer(inout self: Self, buffer: DTypePointer[DT]) -> None:
@@ -422,24 +535,26 @@ struct Array[DT: DType]:
     @always_inline
     fn alloc(inout self: Self) -> None:
         r"""Allocate or Init The Array."""
-        self.data = self.ArrayPointer.alloc(self.array_shape.num_elements())
-        self.allocated = 1
+        self.data = self.ArrayPointer.alloc(self.num_elements())
+        if self.requires_grad:
+            self.grad = self.ArrayPointer.alloc(self.num_elements())
+        self.allocated = True
+        # self.random()
+        rand[DT](self.data, self.array_shape.num_elements())
 
     @always_inline
     fn alloc(inout self: Self, fill: SIMD[DT, 1]) -> None:
         r"""Allocate or Init The Array and fill that with given fill number."""
-        self.data = self.ArrayPointer.alloc(self.array_shape.num_elements())
-        self.allocated = 1
+        self.alloc()
         self.fill(fill)
 
     @always_inline
     fn random(inout self: Self) -> None:
         r"""Randomize Data."""
-        if self.allocated == 1:
+        if self.allocated:
             rand[DT](self.data, self.array_shape.num_elements())
         else:
-            self.data = DTypePointer[DT]().alloc(self.array_shape.num_elements())
-            self.allocated = 1
+            self.alloc()
             rand[DT](self.data, self.array_shape.num_elements())
 
     @always_inline
@@ -466,6 +581,18 @@ struct Array[DT: DType]:
         return self.array_shape.num_elements()
 
     @always_inline
+    fn set_name(inout self: Self, new_name: StringRef):
+        self.name = new_name
+
+    @always_inline
+    fn set_identifier(inout self: Self, new_identifier: Int):
+        self.identifier = new_identifier
+
+    @always_inline
+    fn set_visited(inout self: Self, visited: Bool):
+        self.visited = visited
+
+    @always_inline
     fn get_index(self: Self, variadic_index: VariadicList[Int]) -> Int:
         if self.rank() != len(variadic_index):
             print("Error at (fn get_index(self, *dims:Int)) dimensions won't match")
@@ -480,7 +607,6 @@ struct Array[DT: DType]:
 
     @always_inline
     fn transpose[workers: Int = 2](self: Self, *dims: Int) -> Array[DT]:
-        # var res_shape: DynamicVector[Int] = DynamicVector[Int]()
         let dim = VariadicList[Int](dims)
         if len(dim) != self.rank():
             print("The Passed input dims to swap are not accept able for function")
@@ -910,11 +1036,15 @@ struct Array[DT: DType]:
 
     @always_inline
     fn fill(inout self: Self, val: SIMD[DT, 1]) -> None:
-        @parameter
-        fn set_[nelts: Int](i: Int):
-            self.data.simd_store[nelts](i, val)
+        if val == 0:
+            memset_zero[DT](self.data, self.num_elements())
+        else:
 
-        vectorize[Array[DT].nelts, set_](self.num_elements())
+            @parameter
+            fn set_[nelts: Int](i: Int):
+                self.data.simd_store[nelts](i, val)
+
+            vectorize[Array[DT].nelts, set_](self.num_elements())
 
     fn print_shape(self) -> None:
         self.array_shape.shape_str()
@@ -922,7 +1052,7 @@ struct Array[DT: DType]:
     fn print_strides(self) -> None:
         self.array_shape.strides_str()
 
-    fn print_array(self, number_detail: Int = 5) -> None:
+    fn print_array(self, number_detail: Int = 6) -> None:
         let row: Int = self.dim(-2)
         let cols: Int = self.dim(-1)
         let col_strides: Int = (self.strides[0] * self.shape[0]) // cols
@@ -1138,3 +1268,49 @@ struct Array[DT: DType]:
     @always_inline
     fn __itruediv__(inout self: Self, other: Self) -> None:
         self = self.div[Self.nelts](other)
+
+    fn randu(self, min_val: SIMD[DT, 1], max_val: SIMD[DT, 1]):
+        rand(self.data, self.num_elements())
+
+        @parameter
+        fn _cols(i: Int):
+            self.store[1](i, self.load[1](i) * (max_val - min_val) + min_val)
+
+        parallelize[_cols](self.num_elements())
+
+    fn randHe(self):
+        let u1 = DTypePointer[DT].alloc(self.num_elements())
+        let u2 = DTypePointer[DT].alloc(self.num_elements())
+        rand(u1, self.num_elements())
+        rand(u2, self.num_elements())
+
+        @parameter
+        fn _cols(i: Int):
+            let z = sqrt(-SIMD[DT, 1](2.0) * log(u1.simd_load[1](i))) * cos(
+                SIMD[DT, 1](2.0) * self.pi * u2.simd_load[1](i)
+            )
+            let sigma = sqrt(SIMD[DT, 1](2.0) / self.dim(-1))
+            self.store[1](i, z * sigma)
+
+        parallelize[_cols](self.num_elements())
+        u1.free()
+        u2.free()
+
+    fn randn(
+        self, std: SIMD[DT, 1] = SIMD[DT, 1](1.0), mu: SIMD[DT, 1] = SIMD[DT, 1](0.0)
+    ):
+        let u1 = DTypePointer[DT].alloc(self.num_elements())
+        let u2 = DTypePointer[DT].alloc(self.num_elements())
+        rand(u1, self.num_elements())
+        rand(u2, self.num_elements())
+
+        @parameter
+        fn _cols(i: Int):
+            let z = sqrt(-SIMD[DT, 1](2.0) * log(u1.simd_load[1](i))) * cos(
+                SIMD[DT, 1](2.0) * self.pi * u2.simd_load[1](i)
+            )
+            self.store[1](i, z * std + mu)
+
+        parallelize[_cols](self.num_elements())
+        u1.free()
+        u2.free()
