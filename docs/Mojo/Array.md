@@ -4,21 +4,21 @@
 
 ```mojo
 fn convert_numpy_to_easydel_array[
-    T: DType
-](np_array: PythonObject, array_spec: ArrayShape) raises -> Array[T]:
+    DT: DType
+](np_array: PythonObject, array_spec: ArrayShape) raises -> Array[DT]:
 ```
 
 Converts a Numpy Array To Mojo Array
 
 ### matmul_shape 🌪
 
-`fn matmul_shape[T: DType](A: Array[T], B: Array[T]) -> ArrayShape:`
+`fn matmul_shape[DT: DType](A: Array[DT], B: Array[DT]) -> ArrayShape:`
 
 give you the shape of new Array for C in Matmul
 
 ### matmul 🪓
 
-`fn matmul[nelts: Int, T: DType](inout C: Array[T], A: Array[T], B: Array[T]) -> None:->`
+`fn matmul[nelts: Int, DT: DType](inout C: Array[DT], A: Array[DT], B: Array[DT]) -> None:->`
 
 Apply the Matrix Mul for two Arrays
 
@@ -30,12 +30,12 @@ a simple matmul with two arrays
 from EasyDel import Array, matmul, matmul_shape
 
 
-fn run[nelts: Int, T: DType]() raises:
+fn run[nelts: Int, DT: DType]() raises:
     # You can change this But Remember Cols of A must match Rows of B
-    let A: Array[T] = Array[T](True, 1, 3, 1024, 512)  # True Passed to init Array
-    let B: Array[T] = Array[T](True, 1, 3, 512, 1024)
-    var C: Array[T] = Array[T](A, B)
-    matmul[nelts, T](C, A, B)  # You Get the same result As Numpy
+    let A: Array[DT] = Array[DT](True, 1, 3, 1024, 512)  # True Passed to init Array
+    let B: Array[DT] = Array[DT](True, 1, 3, 512, 1024)
+    var C: Array[DT] = Array[DT](A, B)
+    matmul[nelts, DT](C, A, B)  # You Get the same result As Numpy
 
 
 fn main() raises:
@@ -50,7 +50,7 @@ from python import Python as Py
 import EasyDel as ed
 
 
-fn run[T: DType]() raises:
+fn run[DT: DType]() raises:
     let np_shape_1 = (2, 20)
     let shape_1 = ed.ArrayShape(2, 20)
     let np_shape_2 = (20, 18)
@@ -60,13 +60,13 @@ fn run[T: DType]() raises:
 
     let A1 = np.random.randint(0, 20, np_shape_1)
     let A2 = np.random.randint(0, 20, np_shape_2)
-    let E1: ed.Array[T] = ed.convert_numpy_to_easydel_array[T](A1, shape_1)
-    let E2: ed.Array[T] = ed.convert_numpy_to_easydel_array[T](A2, shape_2)
+    let E1: ed.Array[DT] = ed.convert_numpy_to_easydel_array[DT](A1, shape_1)
+    let E2: ed.Array[DT] = ed.convert_numpy_to_easydel_array[DT](A2, shape_2)
 
     let matmul_np = np.matmul(A1, A2)
-    var C: ed.Array[T] = ed.Array[T](E1, E2) # Prepare Result Array for Matmul
+    var C: ed.Array[DT] = ed.Array[DT](E1, E2) # Prepare Result Array for Matmul
     C.fill(0.0) # Fill it with zeros
-    ed.matmul[ed.Array[T].nelts, T](C, E1, E2)
+    ed.matmul[ed.Array[DT].nelts, DT](C, E1, E2)
     print(matmul_np)
     C.print_array()
 
@@ -156,13 +156,13 @@ Takes DType as dynamic Input like `Array[DType.float32]`
 
 - Description: Init Array from ArrayShape and load data from VariadicList[FloatLiteral](Alloc One).
 
-`fn __init__(inout self: Self, pointer: DTypePointer[T], *dim: Int) -> None:`
+`fn __init__(inout self: Self, pointer: DTypePointer[DT], *dim: Int) -> None:`
 
-- Description: Init Array from IntArgs and load data from DTypePointer[T](Alloc One).
+- Description: Init Array from IntArgs and load data from DTypePointer[DT](Alloc One).
   
-`fn __init__(inout self: Self, pointer: DTypePointer[T], *dim: Int) -> None:`
+`fn __init__(inout self: Self, pointer: DTypePointer[DT], *dim: Int) -> None:`
 
-- Description: Init Array from given data from DTypePointer[T](Alloc Zero).
+- Description: Init Array from given data from DTypePointer[DT](Alloc Zero).
 
 ### Alloc
 
@@ -170,7 +170,7 @@ Takes DType as dynamic Input like `Array[DType.float32]`
 
 - Description: Allocate or Init The Array.
 
-`fn alloc(inout self: Self, fill:SIMD[T, 1]) -> None:`
+`fn alloc(inout self: Self, fill:SIMD[DT, 1]) -> None:`
 
 - Allocate or Init The Array and fill that with given fill number.
 
@@ -215,52 +215,52 @@ Reshape:
 ```
 fn load[
     nelts: Int, off: Int
-](self, index: InlinedFixedVector[off, Int]) -> SIMD[T, nelts]:
+](self, index: InlinedFixedVector[off, Int]) -> SIMD[DT, nelts]:
 ```
 
-`fn load[nelts: Int, off: Int](self, index: StaticIntTuple[off]) -> SIMD[T, nelts]:`
+`fn load[nelts: Int, off: Int](self, index: StaticIntTuple[off]) -> SIMD[DT, nelts]:`
 
-`fn load[nelts: Int](self, index: Int) -> SIMD[T, nelts]:`
+`fn load[nelts: Int](self, index: Int) -> SIMD[DT, nelts]:`
 
 ### Store Functions
 
 ```
 fn store[
     nelts: Int, off: Int
-](self, index: InlinedFixedVector[off, Int], val: SIMD[T, nelts]) -> None:
+](self, index: InlinedFixedVector[off, Int], val: SIMD[DT, nelts]) -> None:
 ```
 
 ```
 fn store[
     nelts: Int, off: Int
-](self, index: StaticIntTuple[off], val: SIMD[T, nelts]) -> None:
+](self, index: StaticIntTuple[off], val: SIMD[DT, nelts]) -> None:
 ```
 
-`fn store[nelts: Int](self, index: Int, val: SIMD[T, nelts]) -> None:`
+`fn store[nelts: Int](self, index: Int, val: SIMD[DT, nelts]) -> None:`
 
 ### `__getitem__` Functions
 
-`fn __getitem__[off: Int](self, index: InlinedFixedVector[off, Int]) -> SIMD[T, 1]:`
+`fn __getitem__[off: Int](self, index: InlinedFixedVector[off, Int]) -> SIMD[DT, 1]:`
 
-`fn __getitem__[off: Int](self, index: StaticIntTuple[off]) -> SIMD[T, 1]:`
+`fn __getitem__[off: Int](self, index: StaticIntTuple[off]) -> SIMD[DT, 1]:`
 
-`fn __getitem__(self, index: Int) -> SIMD[T, 1]:`
+`fn __getitem__(self, index: Int) -> SIMD[DT, 1]:`
 
-`fn __getitem__(self, d1: Int, d2: Int, val:SIMD[T, 1]) raises->None:`
+`fn __getitem__(self, d1: Int, d2: Int, val:SIMD[DT, 1]) raises->None:`
 
-`fn __getitem__(self, d1: Int, d2: Int, d3: Int, val:SIMD[T, 1]) raises->None:`
+`fn __getitem__(self, d1: Int, d2: Int, d3: Int, val:SIMD[DT, 1]) raises->None:`
 
 ### `__setitem__` Functions
 
-`fn __setitem__(self, index: Int, val: SIMD[T, 1]) -> None:`
+`fn __setitem__(self, index: Int, val: SIMD[DT, 1]) -> None:`
 
-`fn __setitem__[off: Int](self, index: InlinedFixedVector[off, Int], val: SIMD[T, 1]):`
+`fn __setitem__[off: Int](self, index: InlinedFixedVector[off, Int], val: SIMD[DT, 1]):`
 
-`fn __setitem__[off: Int](self, index: StaticIntTuple[off], val: SIMD[T, 1]):`
+`fn __setitem__[off: Int](self, index: StaticIntTuple[off], val: SIMD[DT, 1]):`
 
-`fn __setitem__(self, d1: Int, d2: Int, val:SIMD[T, 1]) raises->None:`
+`fn __setitem__(self, d1: Int, d2: Int, val:SIMD[DT, 1]) raises->None:`
 
-`fn __setitem__(self, d1: Int, d2: Int, d3: Int, val:SIMD[T, 1]) raises->None:`
+`fn __setitem__(self, d1: Int, d2: Int, d3: Int, val:SIMD[DT, 1]) raises->None:`
 
 ### Math Functions
 
@@ -410,5 +410,5 @@ fn acosh(inout self: Self, rt: Runtime) -> Self:
 
 # Fill the whole array with the val 
 
-fn fill(inout self: Self, val: SIMD[T, 1]) -> None:
+fn fill(inout self: Self, val: SIMD[DT, 1]) -> None:
 ```

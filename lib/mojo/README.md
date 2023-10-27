@@ -17,10 +17,10 @@ Array API can be used just like Numpy Arrays For example
 import EasyDel as ed
 
 
-fn run[T: DType, nelts: Int = 1]() raises:
+fn run[DT: DType, nelts: Int = 1]() raises:
     # Let Create Two 4D Array
-    var A: ed.Array[T] = ed.Array[T](1, 1, 128, 80)
-    var B: ed.Array[T] = ed.Array[T](1, 1, 128, 80)
+    var A: ed.Array[DT] = ed.Array[DT](1, 1, 128, 80)
+    var B: ed.Array[DT] = ed.Array[DT](1, 1, 128, 80)
 
     # What can we do?
     # These are the operations
@@ -131,7 +131,7 @@ fn main() raises:
 | MUL   | [✅](https://emojipedia.org/check-mark-button) |
 | MOD   | [✅](https://emojipedia.org/check-mark-button) |
 | DIV   | [✅](https://emojipedia.org/check-mark-button) |
-| T-DIV | [✅](https://emojipedia.org/check-mark-button) |
+| DT-DIV | [✅](https://emojipedia.org/check-mark-button) |
 | SUB   | [✅](https://emojipedia.org/check-mark-button) |
 
 ### Road Map

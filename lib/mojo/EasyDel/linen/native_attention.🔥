@@ -4,16 +4,16 @@ from algorithm.functional import vectorize
 
 
 fn native_rms_norm[
-    T: DType, nelts: Int
+    DT: DType, nelts: Int
 ](
-    inout output: DTypePointer[T],
-    x: DTypePointer[T],
-    w: DTypePointer[T],
-    epsilon: SIMD[T, 1],
+    inout output: DTypePointer[DT],
+    x: DTypePointer[DT],
+    w: DTypePointer[DT],
+    epsilon: SIMD[DT, 1],
     size: Int,
     runtime: Runtime,
 ) -> None:
-    var loop_val: SIMD[T, nelts] = SIMD[T, nelts](0.0)
+    var loop_val: SIMD[DT, nelts] = SIMD[DT, nelts](0.0)
 
     @parameter
     fn _sum_power_operation[_nelts: Int](i: Int):
@@ -24,7 +24,7 @@ fn native_rms_norm[
 
     vectorize[nelts, _sum_power_operation](size)
 
-    var normed: SIMD[T, 1] = loop_val.reduce_add()
+    var normed: SIMD[DT, 1] = loop_val.reduce_add()
     normed = normed / size + epsilon
     normed = 1.0 / math.sqrt(normed)
 
@@ -37,12 +37,12 @@ fn native_rms_norm[
 
 
 fn native_rope_rotation_multi_head[
-    T: DType
+    DT: DType
 ](
-    inout q: DTypePointer[T],
-    inout k: DTypePointer[T],
-    fcr_row: DTypePointer[T],
-    fci_row: DTypePointer[T],
+    inout q: DTypePointer[DT],
+    inout k: DTypePointer[DT],
+    fcr_row: DTypePointer[DT],
+    fci_row: DTypePointer[DT],
     num_attention_heads: Int,
     num_key_values_head: Int,
     head_dims: Int,
@@ -66,12 +66,12 @@ fn native_rope_rotation_multi_head[
 
 
 fn native_rope_rotation_multi_query[
-    T: DType
+    DT: DType
 ](
-    inout q: DTypePointer[T],
-    inout k: DTypePointer[T],
-    fcr_row: DTypePointer[T],
-    fci_row: DTypePointer[T],
+    inout q: DTypePointer[DT],
+    inout k: DTypePointer[DT],
+    fcr_row: DTypePointer[DT],
+    fci_row: DTypePointer[DT],
     num_attention_heads: Int,
     num_key_values_head: Int,
     head_dims: Int,
@@ -95,12 +95,12 @@ fn native_rope_rotation_multi_query[
 
 
 fn native_rope_rotation[
-    T: DType
+    DT: DType
 ](
-    inout q: DTypePointer[T],
-    inout k: DTypePointer[T],
-    fcr_row: DTypePointer[T],
-    fci_row: DTypePointer[T],
+    inout q: DTypePointer[DT],
+    inout k: DTypePointer[DT],
+    fcr_row: DTypePointer[DT],
+    fci_row: DTypePointer[DT],
     hidden_size: Int,
     num_key_values_head: Int,
     head_dims: Int,

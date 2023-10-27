@@ -4,24 +4,24 @@ import math
 
 
 fn linear[
-    T: DType, nelts: Int, cores: Int
-](inout o: Array[T], x: Array[T], w: Array[T]):
-    matmul[T, nelts, cores](o, x, w)
+    DT: DType, nelts: Int, cores: Int
+](inout o: Array[DT], x: Array[DT], w: Array[DT]):
+    matmul[DT, nelts, cores](o, x, w)
 
 
-fn linear[T: DType, cores: Int](x: Array[T], w: Array[T]) -> Array[T]:
-    var o: Array[T] = Array[T](x, w)
-    linear[T, o.nelts, cores](o, x, w)
+fn linear[DT: DType, cores: Int](x: Array[DT], w: Array[DT]) -> Array[DT]:
+    var o: Array[DT] = Array[DT](x, w)
+    linear[DT, o.nelts, cores](o, x, w)
     return o ^
 
 
 fn embedding[
-    T: DType, cores: Int
-](input_ids: DynamicVector[Int], w: Array[T]) -> Array[T]:
+    DT: DType, cores: Int
+](input_ids: DynamicVector[Int], w: Array[DT]) -> Array[DT]:
     let hidden: Int = w.dim(-1)
     let size: Int = w.dim(-2)
 
-    var embed: Array[T] = Array[T](len(input_ids), hidden)
+    var embed: Array[DT] = Array[DT](len(input_ids), hidden)
     embed.alloc(0.0)
 
     @parameter
@@ -39,12 +39,12 @@ fn embedding[
 
 
 fn embedding[
-    T: DType, cores: Int, off: Int
-](input_ids: InlinedFixedVector[off, Int], w: Array[T]) -> Array[T]:
+    DT: DType, cores: Int, off: Int
+](input_ids: InlinedFixedVector[off, Int], w: Array[DT]) -> Array[DT]:
     let hidden: Int = w.dim(-1)
     let size: Int = w.dim(-2)
 
-    var embed: Array[T] = Array[T](len(input_ids), hidden)
+    var embed: Array[DT] = Array[DT](len(input_ids), hidden)
     embed.alloc(0.0)
 
     @parameter
@@ -62,12 +62,12 @@ fn embedding[
 
 
 fn embedding[
-    T: DType, cores: Int
-](input_ids: VariadicList[Int], w: Array[T]) -> Array[T]:
+    DT: DType, cores: Int
+](input_ids: VariadicList[Int], w: Array[DT]) -> Array[DT]:
     let hidden: Int = w.dim(-1)
     let size: Int = w.dim(-2)
 
-    var embed: Array[T] = Array[T](len(input_ids), hidden)
+    var embed: Array[DT] = Array[DT](len(input_ids), hidden)
     embed.alloc(0.0)
 
     @parameter
@@ -86,15 +86,15 @@ fn embedding[
 
 @always_inline
 fn rms_layernorm[
-    T: DType, nelts: Int, cores: Int
-](x: Array[T], w: Array[T], epsilon: SIMD[T, 1]) -> Array[T]:
-    var res: Array[T] = Array[T](x.array_shape)
+    DT: DType, nelts: Int, cores: Int
+](x: Array[DT], w: Array[DT], epsilon: SIMD[DT, 1]) -> Array[DT]:
+    var res: Array[DT] = Array[DT](x.array_shape)
     res.alloc(0.0)
     let num_elements: Int = x.dim(-1)
 
     @parameter
     fn _parallelizer(i: Int):
-        var sp: SIMD[T, nelts] = SIMD[T, nelts](0.0)
+        var sp: SIMD[DT, nelts] = SIMD[DT, nelts](0.0)
 
         @parameter
         fn _do_sum_pow[_nelts: Int](j: Int):
@@ -104,7 +104,7 @@ fn rms_layernorm[
                 sp += x.load[nelts](i, j) ** 2
 
         vectorize[nelts, _do_sum_pow](num_elements)
-        var normed: SIMD[T, 1] = sp.reduce_add()
+        var normed: SIMD[DT, 1] = sp.reduce_add()
         normed = normed / num_elements + epsilon
         normed = 1.0 / math.sqrt(normed)
 
