@@ -8,7 +8,7 @@ from ..modules.mistral import MistralConfig
 
 
 def inverse_permute(tensor, head, dim_in, dim_out):
-    return tensor.reshape(head, 2, dim_out // head // 2, dim_in).transpose(0, 2, 1, 3).reshape(
+    return tensor.reshape(head, 2, dim_in // head // 2, dim_out).transpose(0, 2, 1, 3).reshape(
         dim_out, dim_in)
 
 
@@ -111,30 +111,20 @@ def mistral_convert_hf_to_flax(state_dict, config: MistralConfig,
                     % (layer): {
                         "self_attn": {
                             "q_proj": {
-                                "kernel": inverse_permute(
-
-                                    state_dict[f"model.layers.{layer}.self_attn.q_proj.weight"].numpy(),
-                                    config.num_attention_heads,
-                                    config.hidden_size, config.hidden_size
-                                ).transpose()
+                                "kernel": state_dict[
+                                    f"model.layers.{layer}.self_attn.q_proj.weight"].numpy().transpose()
                             },
                             "k_proj": {
-                                "kernel": inverse_permute(
-
-                                    state_dict[f"model.layers.{layer}.self_attn.k_proj.weight"].numpy(),
-                                    config.num_key_value_heads,
-                                    config.hidden_size, kv_dim
-                                ).transpose()
+                                "kernel": state_dict[
+                                    f"model.layers.{layer}.self_attn.k_proj.weight"].numpy().transpose()
                             },
                             "v_proj": {
-                                "kernel": state_dict[f"model.layers.{layer}.self_attn.v_proj.weight"]
-                                .numpy()
-                                .transpose()
+                                "kernel": state_dict[
+                                    f"model.layers.{layer}.self_attn.v_proj.weight"].numpy().transpose()
                             },
                             "o_proj": {
-                                "kernel": state_dict[f"model.layers.{layer}.self_attn.o_proj.weight"]
-                                .numpy()
-                                .transpose()
+                                "kernel": state_dict[
+                                    f"model.layers.{layer}.self_attn.o_proj.weight"].numpy().transpose()
                             },
                         },
                         "mlp": {
@@ -229,14 +219,10 @@ def mistral_convert_flax_to_pt(flax_params, config: MistralConfig, dtype=jnp.flo
             config.hidden_size // config.num_attention_heads)))
     for layer_i in range(config.num_hidden_layers):
         state_dict.update({
-            f"model.layers.{layer_i}.self_attn.q_proj.weight": permute(
-                torch_params[f"model.layers.{layer_i}.self_attn.q_proj.kernel"], config.num_attention_heads,
-                config.hidden_size, config.hidden_size
-            ),
-            f"model.layers.{layer_i}.self_attn.k_proj.weight": permute(
-                torch_params[f"model.layers.{layer_i}.self_attn.k_proj.kernel"], config.num_key_value_heads,
-                config.hidden_size, kv_dim
-            ),
+            f"model.layers.{layer_i}.self_attn.q_proj.weight": torch_params[
+                f"model.layers.{layer_i}.self_attn.q_proj.kernel"],
+            f"model.layers.{layer_i}.self_attn.k_proj.weight": torch_params[
+                f"model.layers.{layer_i}.self_attn.k_proj.kernel"],
             f"model.layers.{layer_i}.self_attn.v_proj.weight": torch_params[
                 f"model.layers.{layer_i}.self_attn.v_proj.kernel"],
             f"model.layers.{layer_i}.self_attn.o_proj.weight": torch_params[

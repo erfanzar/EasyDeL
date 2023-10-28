@@ -1,4 +1,5 @@
 import functools
+import math
 import typing
 
 import flax.core
@@ -14,7 +15,7 @@ from flax.linen import partitioning as nn_partitioning
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 
 from ..flax_modelling_utils import ACT2FN, with_sharding_constraint, get_gradient_checkpoint_policy
-
+import chex
 
 class MistralConfig(PretrainedConfig):
     def __init__(
@@ -46,6 +47,7 @@ class MistralConfig(PretrainedConfig):
             number_rep_kv: int = 1,
             attn_pdrop: float = 0.0,
             c_max_position_embeddings: int = 4096,
+            freq_max_position_embeddings: int = 4096,
             **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -76,6 +78,7 @@ class MistralConfig(PretrainedConfig):
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.attn_pdrop = attn_pdrop
         self.c_max_position_embeddings = c_max_position_embeddings
+        self.freq_max_position_embeddings = freq_max_position_embeddings
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -132,7 +135,8 @@ class MistralConfig(PretrainedConfig):
                      scan_mlp_chunk_size: int = 1024,
                      number_rep_kv: int = 1,
                      attn_pdrop: float = 0.0,
-                     c_max_position_embeddings: int = 4096
+                     c_max_position_embeddings: int = 4096,
+                     freq_max_position_embeddings: int = None
                      ):
         self.use_flash_attention = use_flash_attention
         self.number_rep_kv = number_rep_kv
@@ -144,6 +148,7 @@ class MistralConfig(PretrainedConfig):
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.attn_pdrop = attn_pdrop
         self.c_max_position_embeddings = c_max_position_embeddings
+        self.freq_max_position_embeddings = freq_max_position_embeddings
 
     @staticmethod
     def get_weight_decay_exclusions():
@@ -157,16 +162,62 @@ class MistralConfig(PretrainedConfig):
 remat = nn_partitioning.remat
 
 
-def repeat_kv(x: jax.Array, n_rep: int) -> jax.Array:
-    bs, s, n_kv_heads, head_dim = x.shape
+def matmul_4d_loop(x, y):
+    """Computes the matrix product of two 4D arrays x and y using a loop."""
+    result = jnp.zeros(*x.shape[:-2] + x.shape[-2] + y.shape[-1])
+    for i in range(x.shape[0]):
+        for j in range(y.shape[1]):
+            for key in range(x.shape[2]):
+                for l in range(y.shape[3]):
+                    result[i, j, key, l] += x[i, j, key, :] * y[key, l, :, :]
+    return result
+
+
+def repeat_kv_bnsh(x: chex.Array, n_rep: int) -> chex.Array:
+    bs, n_kv_heads, s, head_dim = x.shape
     if n_rep == 1:
         return x
-    x = x[:, :, :, jnp.newaxis, :]
-    x = jnp.repeat(x, n_rep, axis=3)
+    x = x[:, :, jnp.newaxis, :, :]
+    x = jnp.repeat(x, n_rep, axis=2)
 
-    return x.reshape(bs, s,
-                     n_kv_heads * n_rep,
-                     head_dim)
+    return x.reshape(bs, n_kv_heads * n_rep, s, head_dim)
+
+
+def repeat_kv_bsnh(x: chex.Array, n_rep: int) -> chex.Array:
+    bs, s, n_kv_heads, head_dim = x.shape
+    x = x.transpose(0, 2, 1, 3)
+    if n_rep == 1:
+        return x
+    x = x[:, :, jnp.newaxis, :, :]
+    x = jnp.repeat(x, n_rep, axis=2)
+
+    x = x.transpose(0, 2, 1, 3)
+
+    return x.reshape(bs, s, n_kv_heads * n_rep, head_dim)
+
+
+def _make_sliding_window_causal_mask(
+        input_ids_shape,
+        dtype: jnp.dtype,
+        past_key_values_length: int = 0,
+        sliding_window: int = 4096,
+):
+    """
+    Make causal mask used for sliding window attention
+    """
+    bsz, tgt_len = input_ids_shape
+
+    tensor = jnp.full(
+        (tgt_len, tgt_len),
+        fill_value=1,
+    )
+    mask = jnp.tril(tensor, 0)
+    mask = jnp.triu(mask, -sliding_window)
+    mask = jnp.log(mask).astype(dtype)
+
+    if past_key_values_length > 0:
+        mask = jnp.concatenate([jnp.zeros(tgt_len, past_key_values_length, dtype=dtype), mask], dim=-1)
+    return mask[None, None, :, :].repeat(bsz, 0)
 
 
 class MistralRMSNorm(nn.Module):
@@ -193,52 +244,37 @@ class MistralRMSNorm(nn.Module):
         return output * weight
 
 
-def precompute_freq_cis(
-        method: Union[str, None],
-        dim: int, end: int, theta: float = 10000.0,
-        scaling_factor: float = 8., **kwargs) -> jnp.ndarray:
-    freq = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(jnp.float32) / dim))
-    t = jnp.arange(end)
+def precompute_freq_cis(max_position_embedding, head_dim):
+    inv_freq = 1.0 / (10000 ** (jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim))
+    freq = jnp.einsum("i , j -> i j", jnp.arange(max_position_embedding), inv_freq).astype("float32")
 
-    if method is not None:
-        if method == 'linear':
-            t = t / scaling_factor
-        elif method == 'dynamic':
-            base = theta * (
-                    (scaling_factor * end / end) - (scaling_factor - 1)
-            ) ** (dim / (dim - 2))
-            freq = 1.0 / (base ** (jnp.arange(0, dim, 2) / dim))
-        else:
-            raise ValueError(f'unknown {method} method for precompute_freq_cis')
-
-    freq = jnp.outer(t, freq).astype(jnp.bfloat16)
-    sin, cos = jnp.sin(freq).astype(jnp.bfloat16), jnp.cos(freq).astype(jnp.bfloat16)
-    freq_cis = jnp.complex64(cos + 1j * sin)
-    return jnp.asarray(freq_cis)
+    embed = jnp.concatenate((freq, freq), axis=-1)
+    return jnp.sin(embed)[:, :], jnp.cos(embed)[:, :]
 
 
-def apply_rotary_emb(
-        xq: jnp.ndarray,
-        xk: jnp.ndarray,
-        freq_cis: jnp.ndarray,
-        dtype: jnp.dtype = jnp.bfloat16,
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    reshape_xq = xq.astype(jnp.float32).reshape(*xq.shape[:-1], -1, 2)
-    reshape_xk = xk.astype(jnp.float32).reshape(*xk.shape[:-1], -1, 2)
+def rotate_half(x):
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2:]
+    return jnp.concatenate((-x2, x1), axis=-1)
 
-    xq_ = jax.lax.complex(reshape_xq[..., 0], reshape_xq[..., 1])
-    xk_ = jax.lax.complex(reshape_xk[..., 0], reshape_xk[..., 1])
 
-    # add head dim
-    freq_cis = jnp.reshape(freq_cis, (*freq_cis.shape[:2], 1, *freq_cis.shape[2:]))
+def apply_rotary_pos_emb(tensor, sin_, cos_):
+    return (tensor * cos_) + (rotate_half(tensor) * sin_)
 
-    xq_out = xq_ * freq_cis
-    xq_out = jnp.stack((jnp.real(xq_out), jnp.imag(xq_out)), axis=-1).reshape(*xq_out.shape[:-1], -1)
 
-    xk_out = xk_ * freq_cis
-    xk_out = jnp.stack((jnp.real(xk_out), jnp.imag(xk_out)), axis=-1).reshape(*xk_out.shape[:-1], -1)
+class FlaxMistralRotaryEmbedding(nn.Module):
+    dtype: jnp.dtype = jnp.float32
 
-    return xq_out.astype(dtype), xk_out.astype(dtype)
+    def __call__(self, key, query, freq_cis, position_ids):
+        sin, cos = freq_cis
+
+        sin = sin[position_ids][:, None, :, :]
+        cos = cos[position_ids][:, None, :, :]
+
+        key = apply_rotary_pos_emb(key, sin, cos)
+        query = apply_rotary_pos_emb(query, sin, cos)
+
+        return query.astype(self.dtype), key.astype(self.dtype)
 
 
 class FlaxMistralMLP(nn.Module):
@@ -261,7 +297,7 @@ class FlaxMistralMLP(nn.Module):
         self.down_proj = dense(self.config.hidden_size)
         self.act_fn = ACT2FN[self.config.hidden_act]
 
-    def __call__(self, x: jax.Array):
+    def __call__(self, x: chex.Array):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
@@ -293,61 +329,76 @@ class FlaxMistralAttention(nn.Module):
         self.k_proj = dense(self.num_key_value_heads * self.head_dim)
         self.v_proj = dense(self.num_key_value_heads * self.head_dim)
         self.o_proj = dense(self.hidden_size)
+        self.rotary = FlaxMistralRotaryEmbedding(self.dtype)
 
     @nn.compact
-    def concatenate_to_cache_(self, q: jax.Array, k: jax.Array, v: jax.Array, attention_mask: jax.Array):
+    def concatenate_to_cache_(self, query: chex.Array, key: chex.Array, value: chex.Array, attention_mask: chex.Array):
         is_cache_available = self.has_variable('cache', 'key')
-        key_cache = self.variable('cache', 'key', jnp.zeros, k.shape, k.dtype)
-        value_cache = self.variable('cache', 'value', jnp.zeros, k.shape, v.dtype)
+        key_cache = self.variable('cache', 'key', jnp.zeros, key.shape, key.dtype)
+        value_cache = self.variable('cache', 'value', jnp.zeros, key.shape, value.dtype)
         index_cache = self.variable('cache', 'index', lambda: jnp.array(0, dtype=jnp.int32))
         if is_cache_available:
             *bd, ml, nh, dph = key_cache.value.shape
             indices = (0,) * len(bd) + (index_cache.value, 0, 0)
-            k = jax.lax.dynamic_update_slice(key_cache.value, k, indices)
-            v = jax.lax.dynamic_update_slice(value_cache.value, v, indices)
-            key_cache.value = k
-            value_cache.value = v
-            num_updated_cache_vector = q.shape[1]
+            key = jax.lax.dynamic_update_slice(key_cache.value, key, indices)
+            value = jax.lax.dynamic_update_slice(value_cache.value, value, indices)
+            key_cache.value = key
+            value_cache.value = value
+            num_updated_cache_vector = query.shape[1]
             index_cache.value = index_cache.value + num_updated_cache_vector
             pad_mask = jnp.broadcast_to(
                 jnp.arange(ml) < index_cache.value,
                 tuple(bd) + (1, num_updated_cache_vector, ml)
             )
             attention_mask = nn.combine_masks(pad_mask, attention_mask)
-        return q, k, v, attention_mask
+        return query, key, value, attention_mask
+
+    @staticmethod
+    def _t(query, key, value):
+        return jnp.transpose(query, (0, 2, 1, 3)), jnp.transpose(key, (0, 2, 1, 3)), jnp.transpose(value, (0, 2, 1, 3))
+
+    def t_rotary(self, batch_size, sequence_length, query, key, value, freq_cis, position_ids):
+        query = query.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
+        key = key.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
+        value = value.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
+
+        query, key, value = self._t(query, key, value)
+        query, key = self.rotary(position_ids=position_ids, query=query, key=key, freq_cis=freq_cis)
+        key = repeat_kv_bnsh(key, self.num_key_value_groups)
+        value = repeat_kv_bnsh(value, self.num_key_value_groups)
+        return self._t(query, key, value)
 
     def __call__(
             self,
-            hidden_state: jax.Array,
-            freq_cis: jax.Array,
-            attention_mask: jax.Array,
-            causal_mask: jax.Array,
-            position_ids: jax.Array,
+            hidden_state: chex.Array,
+            freq_cis: chex.Array,
+            attention_mask: chex.Array,
+            causal_mask: chex.Array,
+            position_ids: chex.Array,
             deterministic: bool = True,
             init_cache: bool = False,
             output_attentions: bool = True
     ):
-        batch_size, max_sequence_length = hidden_state.shape[:2]
-        q, k, v = self.q_proj(hidden_state), self.k_proj(hidden_state), self.v_proj(hidden_state)
+        batch_size, sequence_length = hidden_state.shape[:2]
+        query, key, value = self.q_proj(hidden_state), self.k_proj(hidden_state), self.v_proj(hidden_state)
 
         if self.config.use_pjit_attention_force:
-            q = with_sharding_constraint(q, PS('fsdp', 'mp', None))
-            k = with_sharding_constraint(k, PS('fsdp', 'mp', None))
-            v = with_sharding_constraint(v, PS('fsdp', 'mp', None))
-
-        q = q.reshape(batch_size, max_sequence_length, -1, self.head_dim)
-        k = k.reshape(batch_size, max_sequence_length, -1, self.head_dim)
-        v = v.reshape(batch_size, max_sequence_length, -1, self.head_dim)
-
-        freq_cis = jnp.take(freq_cis, position_ids, axis=0)
-        q, k = apply_rotary_emb(q, k, freq_cis=freq_cis, dtype=self.dtype)
-        k = repeat_kv(k, self.num_key_value_groups)
-        v = repeat_kv(v, self.num_key_value_groups)
+            query = with_sharding_constraint(query, PS('fsdp', 'mp', None))
+            key = with_sharding_constraint(key, PS('fsdp', 'mp', None))
+            value = with_sharding_constraint(value, PS('fsdp', 'mp', None))
+        query, key, value = self.t_rotary(
+            batch_size=batch_size,
+            sequence_length=sequence_length,
+            query=query,
+            key=key,
+            value=value,
+            freq_cis=freq_cis,
+            position_ids=position_ids
+        )
         if self.has_variable('cache', 'key') or init_cache:
-            q, k, v, attention_mask = self.concatenate_to_cache_(q, k, v, attention_mask)
+            query, key, value, attention_mask = self.concatenate_to_cache_(query, key, value, attention_mask)
 
-        q_l, k_l = q.shape[1], k.shape[1]
-
+        q_l, k_l = query.shape[1], key.shape[1]
         if self.has_variable('cache', 'key'):
             mask_shift: int = self.variables['cache']['index']
             dl = self.variables['cache']['key'].shape[1]
@@ -358,30 +409,22 @@ class FlaxMistralAttention(nn.Module):
             causal_mask = causal_mask[:, :, :q_l, :k_l]
 
         causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
-        attention_mask = jnp.broadcast_to(jnp.expand_dims(attention_mask, axis=(-3, -2)), causal_mask.shape)
+        if attention_mask.ndim == 2:
+            attention_mask = jnp.broadcast_to(jnp.expand_dims(attention_mask, axis=(-3, -2)), causal_mask.shape)
+
         attention_mask = nn.combine_masks(attention_mask, causal_mask)
+
         attention_bias = jax.lax.select(
             attention_mask > 0,
             jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-            jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
+            jnp.full(attention_mask.shape, jnp.finfo(query).min),
         )
-
-        attn_weight = nn.dot_product_attention_weights(
-            query=q,
-            key=k,
-            bias=attention_bias,
-            dtype=jnp.promote_types(self.dtype, jnp.float32),
-            deterministic=deterministic,
-            dropout_rate=self.config.attn_pdrop,
-            precision=self.precision
-        )
-
-        if self.config.use_pjit_attention_force:
-            attn_weight = with_sharding_constraint(attn_weight, PS(("dp", "fsdp"), "mp", None, None))
-        attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weight, v)
-        attn_output = attn_output.reshape(attn_output.shape[:2] + (self.hidden_size,))
-        out = self.o_proj(attn_output)
-        outputs = (out, attn_output) if output_attentions else (out,)
+        org_dtype = key.dtype
+        attn_weight = nn.dot_product_attention(query=query, key=key, value=value, bias=attention_bias,
+                                               dtype=jnp.promote_types(self.dtype, jnp.float32))
+        attn_weight = attn_weight.astype(org_dtype)
+        out = self.o_proj(attn_weight.reshape(batch_size, sequence_length, self.hidden_size))
+        outputs = (out, attn_weight) if output_attentions else (out,)
         return outputs
 
 
@@ -419,11 +462,11 @@ class FlaxMistralDecoderLayer(nn.Module):
 
     def __call__(
             self,
-            hidden_state: jax.Array,
-            freq_cis: jax.Array,
-            attention_mask: jax.Array,
-            causal_mask: jax.Array,
-            position_ids: jax.Array,
+            hidden_state: chex.Array,
+            freq_cis: chex.Array,
+            attention_mask: chex.Array,
+            causal_mask: chex.Array,
+            position_ids: chex.Array,
             deterministic: bool = True,
             init_cache: bool = False,
             output_attentions: bool = True
@@ -439,6 +482,7 @@ class FlaxMistralDecoderLayer(nn.Module):
             init_cache=init_cache,
             output_attentions=output_attentions
         )
+
         hidden_state = attention_output[0] + residual
 
         hidden_state = self.mlp(self.post_attention_layernorm(hidden_state)) + hidden_state
@@ -612,11 +656,11 @@ class FlaxMistralDecoratorCollection(nn.Module):
 
     def __call__(
             self,
-            hidden_state: jax.Array,
-            freq_cis: jax.Array,
-            attention_mask: jax.Array,
-            causal_mask: jax.Array,
-            position_ids: jax.Array,
+            hidden_state: chex.Array,
+            freq_cis: chex.Array,
+            attention_mask: chex.Array,
+            causal_mask: chex.Array,
+            position_ids: chex.Array,
             deterministic: bool = True,
             init_cache: bool = False,
             output_attentions: bool = False,
@@ -627,14 +671,6 @@ class FlaxMistralDecoratorCollection(nn.Module):
         for layer in self.layers:
             if output_hidden_states:
                 all_hidden_states += (hidden_state,)
-            # hidden_state: jax.Array,
-            # freq_cis: jax.Array,
-            # attention_mask: jax.Array,
-            # causal_mask: jax.Array,
-            # position_ids: jax.Array,
-            # deterministic: bool = True,
-            # init_cache: bool = False,
-            # output_attentions: bool = True
             output = layer(
                 hidden_state,
                 freq_cis,
@@ -681,21 +717,20 @@ class FlaxMistralModule(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype
         )
+
         self.freq_cis = precompute_freq_cis(
-            method=None,
-            scaling_factor=1.0,
-            dim=self.config.hidden_size // self.config.num_attention_heads,
-            end=self.config.max_position_embeddings * 2
+            max_position_embedding=self.config.freq_max_position_embeddings if self.config.freq_max_position_embeddings is not None else self.config.max_position_embeddings,
+            head_dim=self.config.hidden_size // self.config.num_attention_heads
         )
         self.causal_mask = nn.make_causal_mask(jnp.ones((1, self.config.c_max_position_embeddings), dtype='i4'))
 
     def __call__(
             self,
-            input_ids: jax.Array,
-            attention_mask: jax.Array,
-            position_ids: jax.Array,
+            input_ids: chex.Array,
+            attention_mask: chex.Array,
+            position_ids: chex.Array,
             deterministic: bool = True,
-            input_embeds: jax.Array = None,
+            input_embeds: chex.Array = None,
             init_cache: bool = False,
             output_attentions: bool = False,
             output_hidden_states: bool = False,
@@ -707,6 +742,7 @@ class FlaxMistralModule(nn.Module):
         if attention_mask.ndim == 2:
             b, s = attention_mask.shape
             attention_mask = attention_mask.reshape(b, 1, 1, s)
+
         outputs = self.layers(
             hidden_state=input_embeds,
             attention_mask=attention_mask,
@@ -728,7 +764,7 @@ class FlaxMistralModule(nn.Module):
             outputs = (hidden_states,) + outputs[1:]
 
         if not return_dict:
-            return tuple(v for v in outputs if v is not None)
+            return tuple(value for value in outputs if value is not None)
 
         return FlaxBaseModelOutput(
             last_hidden_state=hidden_states,
@@ -765,11 +801,11 @@ class FlaxMistralForCausalLMModule(nn.Module):
 
     def __call__(
             self,
-            input_ids: jax.Array,
-            attention_mask: jax.Array,
-            position_ids: jax.Array,
+            input_ids: chex.Array,
+            attention_mask: chex.Array,
+            position_ids: chex.Array,
             deterministic: bool = True,
-            input_embeds: jax.Array = None,
+            input_embeds: chex.Array = None,
             init_cache: bool = False,
             output_attentions: bool = False,
             output_hidden_states: bool = False,
@@ -814,7 +850,7 @@ class FlaxMistralForCausalLMModule(nn.Module):
 class FlaxMistralForCausalLM(FlaxMistralPretrainedModel):
     module_class = FlaxMistralForCausalLMModule
 
-    def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[jax.Array] = None):
+    def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[chex.Array] = None):
         batch_size, seq_length = input_ids.shape
 
         past_key_values = self.init_cache(batch_size, max_length)

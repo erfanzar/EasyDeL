@@ -11,14 +11,14 @@ def pt2np(array: torch.Tensor) -> np.array:
     return array.detach().cpu().numpy()
 
 
-def np2jax(array: np.array) -> jax.Array:
+def np2jax(array: np.array) -> chex.Array:
     """
         Convert Numpy Array to JAX Array
         """
     return jnp.asarray(array)
 
 
-def pt2jax(array: torch.Tensor) -> jax.Array:
+def pt2jax(array: torch.Tensor) -> chex.Array:
     """
     Convert Pytorch Array to JAX Array
     """
