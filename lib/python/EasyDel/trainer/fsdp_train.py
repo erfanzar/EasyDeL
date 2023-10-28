@@ -24,9 +24,9 @@ from jax import numpy as jnp
 from torch.utils.data import DataLoader
 from fjutils import match_partition_rules, make_shard_and_gather_fns, StreamingCheckpointer, count_params
 from ..utils import prefix_print
+import chex
 
-
-def calculate_accuracy(predictions: jax.Array, targets: jax.Array):
+def calculate_accuracy(predictions: chex.Array, targets: chex.Array):
     predicted_classes = jnp.argmax(predictions, axis=-1)
     correct_predictions = (predicted_classes == targets).sum()
     total_predictions = targets.shape[0]
@@ -418,18 +418,21 @@ class CausalLMTrainer:
                             pbar.update(1)
 
                             if self.arguments.use_wandb:
-                                self.wandb_runtime.log(
-                                    {
-                                        'loss': loss.tolist(),
-                                        'learning_rate': self.scheduler(sharded_train_state_.step.tolist()).tolist(),
-                                        'step': sharded_train_state_.step.tolist(),
-                                        'step time': ttl_time,
-                                        'perplexity': jnp.exp(loss).tolist(),
-                                        'accuracy': accuracy.tolist(),
-                                        'avg_accuracy': (sum(accuracies) / len(accuracies)).tolist(),
-                                        'mem_res': mem_res
-                                    }
-                                )
+                                with jax.spmd_mode("allow_all"):
+                                    self.wandb_runtime.log(
+                                        {
+                                            "loss": loss.tolist(),
+                                            "learning_rate": self.scheduler(
+                                                sharded_train_state_.step.tolist()
+                                            ).tolist(),
+                                            "step": sharded_train_state_.step.tolist(),
+                                            "step time": ttl_time,
+                                            "perplexity": jnp.exp(loss).tolist(),
+                                            "accuracy": accuracy.tolist(),
+                                            "avg_accuracy": (sum(accuracies) / len(accuracies)).tolist(),
+                                            "mem_res": mem_res,
+                                        }
+                                    )
                             if self.arguments.track_memory:
                                 IPython.display.clear_output(True)
                                 pbar.display(mem_res)

@@ -2,7 +2,19 @@ import jax
 from jax import numpy as jnp
 from tqdm import tqdm
 from transformers import FalconForCausalLM
-from EasyDel.modules.falcon import FalconConfig
+from ..modules.falcon import FalconConfig
+import torch
+from typing import Dict
+
+
+def match_keywords(string, ts, ns):
+    for t in ts:
+        if t not in string:
+            return False
+    for n in ns:
+        if n in string:
+            return False
+    return True
 
 
 def falcon_from_pretrained(model_id, device=jax.devices('cpu')[0]):
@@ -129,3 +141,22 @@ def falcon_convert_flax_to_pt_7b(state_dict_flax, num_hidden_layers: int, device
         jnp.transpose(state_dict_flax[('lm_head', 'kernel')], (1, 0))).to(device)
 
     return state_dict
+
+
+def falcon_convert_pt_to_flax(state_dict: Dict[str, torch.Tensor], config: FalconConfig, device=jax.devices('cpu')[0]):
+    lw = len('.weight')
+    with jax.default_device(device):
+        flax_dict = {}
+        for key, tensor in state_dict.items():
+            if match_keywords(key, ['kernel'], ['none']):
+                if len(tensor.shape) == 2:
+                    tensor = tensor.transpose(0, 1)
+            if key.endswith('.weight'):
+                key = key[:-lw] + '.kernel'
+            key_tuple = key.split('.')
+            key_names = ()
+            tensor = tensor.detach().cpu().numpy()
+            for k in key_tuple:
+                key_names += k,
+            flax_dict[key_names] = tensor
+    return flax_dict

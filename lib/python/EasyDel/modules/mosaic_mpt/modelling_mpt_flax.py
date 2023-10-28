@@ -16,7 +16,7 @@ from einops import rearrange
 from fjutils.flash_attention import dot_product_attention_multihead
 from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
     with_sharding_constraint
-
+import chex
 
 class MptConfig(PretrainedConfig):
     model_type = 'mpt'
@@ -249,7 +249,7 @@ class FlaxMptMLP(nn.Module):
                              dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision)
         self.act = ACT2FN[self.config.act_fn]
 
-    def __call__(self, hidden_states: jax.Array):
+    def __call__(self, hidden_states: chex.Array):
         return self.down(self.act(self.up(hidden_states)))
 
 
@@ -295,10 +295,10 @@ class FlaxMptAttention(nn.Module):
         return key, value, attention_mask
 
     def __call__(self,
-                 hidden_states: jax.Array,
-                 attention_mask: jax.Array,
-                 position_ids: jax.Array,
-                 attn_bias: jax.Array = None,
+                 hidden_states: chex.Array,
+                 attention_mask: chex.Array,
+                 position_ids: chex.Array,
+                 attn_bias: chex.Array = None,
                  init_cache: bool = False
                  ):
         inp_shape = hidden_states.shape
@@ -395,10 +395,10 @@ class FlaxMptBlock(nn.Module):
                               precision=self.precision)
 
     def __call__(self,
-                 hidden_states: jax.Array,
-                 attention_mask: jax.Array,
-                 position_ids: jax.Array,
-                 attn_bias: jax.Array = None,
+                 hidden_states: chex.Array,
+                 attention_mask: chex.Array,
+                 position_ids: chex.Array,
+                 attn_bias: chex.Array = None,
                  init_cache: bool = False
                  ):
         hidden_states = (
@@ -453,10 +453,10 @@ class FlaxMptCollection(nn.Module):
         ]
 
     def __call__(self,
-                 hidden_states: jax.Array,
-                 attention_mask: jax.Array,
-                 position_ids: jax.Array,
-                 attn_bias: jax.Array = None,
+                 hidden_states: chex.Array,
+                 attention_mask: chex.Array,
+                 position_ids: chex.Array,
+                 attn_bias: chex.Array = None,
                  init_cache: bool = False
                  ):
         for block in self.blocks:
@@ -504,9 +504,9 @@ class FlaxMptModule(nn.Module):
 
     def __call__(self,
 
-                 input_ids: jax.Array,
-                 attention_mask: jax.Array = None,
-                 position_ids: jax.Array = None,
+                 input_ids: chex.Array,
+                 attention_mask: chex.Array = None,
+                 position_ids: chex.Array = None,
                  init_cache: bool = False,
                  return_dict: bool = True,
                  extra_embedding: Optional[Union[jnp.ndarray, None]] = None
@@ -654,10 +654,10 @@ class FlaxFlaxMptForCausalLMModule(nn.Module):
                                     dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision)
 
     def __call__(self,
-                 input_ids: jax.Array,
-                 attention_mask: jax.Array = None,
+                 input_ids: chex.Array,
+                 attention_mask: chex.Array = None,
                  init_cache: bool = False,
-                 position_ids: jax.Array = None,
+                 position_ids: chex.Array = None,
                  return_dict: bool = True,
                  extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
 
@@ -687,7 +687,7 @@ class FlaxFlaxMptForCausalLMModule(nn.Module):
 class FlaxMptForCausalLM(FlaxMptPretrainedModel):
     module_class = FlaxFlaxMptForCausalLMModule
 
-    def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[jax.Array] = None):
+    def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[chex.Array] = None):
 
         batch_size, seq_length = input_ids.shape
 

@@ -12,7 +12,7 @@ from transformers import PretrainedConfig
 from jax.sharding import PartitionSpec
 from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
     with_sharding_constraint
-
+import chex
 
 class PalmConfig(PretrainedConfig):
     def __init__(self,
@@ -293,7 +293,7 @@ class PalmPretrainedModel(transformers.FlaxPreTrainedModel):
         )
         return predict
 
-    def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[jax.Array] = None):
+    def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[chex.Array] = None):
         return {
             "attention_mask": attention_mask,
         }
@@ -350,8 +350,8 @@ class PalmModule(nn.Module):
         return mask.reshape(b, 1, 1, s)
 
     def __call__(self,
-                 input_ids: jax.Array,
-                 attention_mask: jax.Array = None,
+                 input_ids: chex.Array,
+                 attention_mask: chex.Array = None,
                  return_dict: bool = True,
                  output_attention: bool = False):
         batch, seq_len = input_ids.shape
@@ -412,8 +412,8 @@ class FlaxPalmForCausalLMModule(nn.Module):
             )
 
     def __call__(self,
-                 input_ids: jax.Array,
-                 attention_mask: jax.Array = None,
+                 input_ids: chex.Array,
+                 attention_mask: chex.Array = None,
                  return_dict: bool = True,
                  output_attention: bool = False):
         out = self.path_way(
