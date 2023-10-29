@@ -57,5 +57,6 @@ from .array_module import (
     CAT_3D_AXIS_2,
     rotate_half,
     convert_numpy_to_easydel_array,
+    arange,
 )
 from .ed_struct import PointerOperation
