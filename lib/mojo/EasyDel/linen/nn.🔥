@@ -1,4 +1,81 @@
-from .nn_funcs import Array, matmul, linear, embedding, rms_layernorm
+from ..array import Array, matmul
+from algorithm.functional import parallelize, vectorize
+import math
+
+
+@always_inline
+fn linear[
+    DT: DType, nelts: Int, cores: Int, parallelized: Bool
+](inout output: Array[DT], input: Array[DT], weight: Array[DT]):
+    matmul[DT, nelts, cores, parallelized](output, input, weight)
+
+
+@always_inline
+fn linear[DT: DType, cores: Int](input: Array[DT], weight: Array[DT]) -> Array[DT]:
+    var output: Array[DT] = Array[DT](input, weight)
+    linear[DT, output.nelts, cores, True](output, input, weight)
+    return output
+
+
+@always_inline
+fn embedding[
+    DT: DType, nelts: Int, cores: Int
+](input_ids: VariadicList[Int], weight: Array[DT]) -> Array[DT]:
+    let last_dim: Int = weight.dim(-1)
+    let batch: Int = len(input_ids)
+
+    var embed: Array[DT] = Array[DT](batch, last_dim)
+    embed.alloc(0.0)
+
+    @parameter
+    fn _row(i: Int):
+        let axis: Int = input_ids[i]
+
+        @parameter
+        fn _cols[_nelts: Int](j: Int):
+            embed.store[_nelts](VariadicList[Int](i, j), weight.load[_nelts](axis, j))
+
+        vectorize[nelts, _cols](last_dim)
+
+    parallelize[_row](batch, cores)
+    return embed
+
+
+@always_inline
+fn rms_layernorm[
+    DT: DType, nelts: Int, cores: Int
+](input: Array[DT], weight: Array[DT], epsilon: SIMD[DT, 1]) -> Array[DT]:
+    var res: Array[DT] = Array[DT](input.array_shape)
+    res.alloc(0.0)
+    let num_elements: Int = input.dim(-1)
+    let batch: Int = input.num_elements() // (input.dim(-1) * input.dim(-2))
+    for b in range(batch):
+
+        @parameter
+        fn _parallelizer(i: Int):
+            var sp: SIMD[DT, nelts] = SIMD[DT, nelts](0.0)
+
+            @parameter
+            fn _do_sum_pow[_nelts: Int](j: Int):
+                if _nelts < nelts:
+                    sp[0] += (input.load[_nelts](b, i, j) ** 2).reduce_add()
+                else:
+                    sp += input.load[nelts](b, i, j) ** 2
+
+            vectorize[nelts, _do_sum_pow](num_elements)
+            var normed: SIMD[DT, 1] = sp.reduce_add()
+            normed = normed / num_elements + epsilon
+            normed = 1.0 / math.sqrt(normed)
+
+            @parameter
+            fn _do_element_wise[_nelts: Int](j: Int):
+                let val = weight.load[_nelts](j) * normed * input.load[_nelts](b, i, j)
+                res.store[_nelts](VariadicList[Int](b, i, j), val)
+
+            vectorize[nelts, _do_element_wise](num_elements)
+
+        parallelize[_parallelizer](input.dim(-2), cores)
+    return res
 
 
 struct Linear[DT: DType, nelts: Int, cores: Int, parallelized: Bool]:

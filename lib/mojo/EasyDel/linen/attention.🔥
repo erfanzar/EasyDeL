@@ -4,68 +4,6 @@ from math import math
 from memory import memset_zero
 
 
-@always_inline
-fn rms_norm[
-    DT: DType, nelts: Int
-](
-    inout C: Array[DT],
-    x: Array[DT],
-    w: Array[DT],
-    epsilon: SIMD[DT, 1],
-    num_elements: Int = 0,
-) -> None:
-    var sp: SIMD[DT, nelts] = SIMD[DT, nelts](0.0)
-    let nml: Int = num_elements if num_elements > 0 else x.num_elements()
-
-    @parameter
-    fn _do_sum_pow[_nelts: Int](size: Int):
-        if _nelts < nelts:
-            sp[0] += (x.load[_nelts](size) ** 2).reduce_add()
-        else:
-            sp += x.load[nelts](size) ** 2
-
-    vectorize[nelts, _do_sum_pow](nml)
-    var normed: SIMD[DT, 1] = sp.reduce_add()
-    normed = normed / nml + epsilon
-    normed = 1.0 / math.sqrt(normed)
-
-    @parameter
-    fn _do_element_wise[_nelts: Int](j: Int):
-        let val = w.data.simd_load[_nelts](j) * normed * x.data.simd_load[_nelts](j)
-        C.data.offset(j).simd_store[_nelts](0, val)
-
-    vectorize[nelts, _do_element_wise](nml)
-
-
-fn rope[
-    DT: DType
-](
-    inout q_array: Array[DT],
-    inout k_array: Array[DT],
-    fcr_row: DTypePointer[DT],
-    fci_row: DTypePointer[DT],
-    num_attention_heads: Int,
-    num_key_value_heads: Int,
-    head_dims: Int,
-    num_cores: Int = 1,
-) -> None:
-    @parameter
-    fn _row(i: Int):
-        for j in range(0, head_dims, 2):
-            let fcr = fcr_row.offset(j // 2).load(0)
-            let fci = fci_row.offset(j // 2).load(0)
-            let q0 = q_array.data.offset(i * head_dims + j).load(0)
-            let q1 = q_array.data.offset(i * head_dims + j + 1).load(0)
-            q_array.data.offset(i * head_dims + j).store(0, q0 * fcr - q1 * fci)
-            q_array.data.offset(i * head_dims + j + 1).store(0, q0 * fci + q1 * fcr)
-            if i < num_key_value_heads:
-                let k0 = k_array.data.offset(i * head_dims + j).load(0)
-                let k1 = k_array.data.offset(i * head_dims + j + 1).load(0)
-                k_array.data.offset(i * head_dims + j).store(0, k0 * fcr - k1 * fci)
-                k_array.data.offset(i * head_dims + j + 1).store(0, k0 * fci + k1 * fcr)
-
-    parallelize[_row](num_attention_heads, num_cores)
-
 
 fn rope[
     DT: DType, num_cores: Int
@@ -153,61 +91,6 @@ fn rope[
         parallelize[_row](num_heads)
     return _embed ^
 
-
-fn torch_rope[
-    DT: DType, num_cores: Int
-](
-    q: Array[DT],
-    k: Array[DT],
-    cos: Array[DT],
-    sin: Array[DT],
-    position: Int,
-) -> Tuple[
-    Array[DT], Array[DT]
-]:
-    debug_assert(k.rank() != 3 or q.rank() != 3, "Wrong input Shape for Q,K")
-    let head_dim = q.dim(-1)
-
-    let chunk_cos: Array[DT] = Array[DT](cos.data.offset(position * head_dim), head_dim)
-    let chunk_sin: Array[DT] = Array[DT](sin.data.offset(position * head_dim), head_dim)
-
-    var q_embed: Array[DT] = Array[DT](q.array_shape)
-    var k_embed: Array[DT] = Array[DT](k.array_shape)
-
-    k_embed.alloc(0.0)
-    q_embed.alloc(0.0)
-
-    let q_r: Array[DT] = rotate_half[DT, num_cores](q)
-    let k_r: Array[DT] = rotate_half[DT, num_cores](k)
-
-    let q_row_size: Int = q.num_elements() // head_dim
-    let k_row_size: Int = k.num_elements() // head_dim
-
-    @parameter
-    fn _row_q(i: Int):
-        @parameter
-        fn _cols_q[nelts: Int](j: Int):
-            let xbi: SIMD[DT, nelts] = (
-                q.load[nelts](i, 1, j) * chunk_cos.load[nelts](j)
-            ) + (q_r.load[nelts](i, 1, j) * chunk_sin.load[nelts](j))
-            q_embed.store[nelts](VariadicList[Int](i, 1, j), xbi)
-
-        vectorize[Array[DT].nelts, _cols_q](head_dim)
-
-    @parameter
-    fn _row_k(i: Int):
-        @parameter
-        fn _cols_k[nelts: Int](j: Int):
-            let xbi: SIMD[DT, nelts] = (
-                k.load[nelts](i, 1, j) * chunk_cos.load[nelts](j)
-            ) + (k_r.load[nelts](i, 1, j) * chunk_sin.load[nelts](j))
-            k_embed.store[nelts](VariadicList[Int](i, 1, j), xbi)
-
-        vectorize[Array[DT].nelts, _cols_k](head_dim)
-
-    parallelize[_row_q](q_row_size)
-    parallelize[_row_k](k_row_size)
-    return q_embed, k_embed
 
 
 @always_inline
