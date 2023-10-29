@@ -448,9 +448,12 @@ struct Array[DT: DType]:
 
     fn __init__(inout self: Self, A: Array[DT]) -> None:
         r"""Copy the given array without copying gradients."""
-        self.__init__(A.array_shape)
+        var dynamic_vector: DynamicVector[Int] = DynamicVector[Int]()
+        for i in range(A.rank()):
+            dynamic_vector.push_back(A.dim(i))
+        self.__init__(ArrayShape(dynamic_vector))
         self.alloc(0.0)
-        array_copy[DT, Self.nelts](self, A)
+        memcpy[DT](self.data, A.data, self.num_elements())
 
     fn __moveinit__(inout self, owned ext: Self):
         self.data = ext.data
