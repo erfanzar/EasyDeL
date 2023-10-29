@@ -132,7 +132,9 @@ struct LlamaWeights[DT: DType]:
     ) raises:
         let size: Int = sizeof[DT]()
         self.wte = Array[DT](
-            buf.read_numerical_value_dynamic[DT](config.hidden_size * config.vocab_size),
+            buf.read_numerical_value_dynamic[DT](
+                config.hidden_size * config.vocab_size
+            ),
             config.vocab_size,
             config.hidden_size,
         )
@@ -247,36 +249,15 @@ struct LlamaWeights[DT: DType]:
 
 
 struct LlamaState[DT: DType]:
-    # State
-    var hidden_state: Array[DT]
-    var ffd_out: Array[DT]
-    var x: Array[DT]
 
-    # Norms
-    var input_layernorm: Array[DT]
-    var post_layernorm: Array[DT]
-    var norm: Array[DT]
-
-    # Attention Layer
     var k_cache: Array[DT]
     var v_cache: Array[DT]
-    var q: Array[DT]
-    var k: Array[DT]
-    var v: Array[DT]
-    var o: Array[DT]
-    var attention: Array[DT]
 
-    # FeedForward
-    var w1_C: Array[DT]
-    var w3_C: Array[DT]
-
-    # LM Head
-    var logits: Array[DT]
-
-    # Number of cores
+    var position_index: Int
     var number_of_cores: Int
 
     fn __init__(inout self: Self, config: LlamaConfig):
+        
         self.k_cache = Array[DT](
             config.num_hidden_layers, config.max_position_embeddings, config.kv_dims
         )
@@ -284,38 +265,8 @@ struct LlamaState[DT: DType]:
             config.num_hidden_layers, config.max_position_embeddings, config.kv_dims
         )
 
-        self.input_layernorm = Array[DT](config.hidden_size)
-        self.post_layernorm = Array[DT](config.hidden_size)
-        self.norm = Array[DT](config.hidden_size)
-        self.q = Array[DT](1, config.num_attention_heads * config.head_dims)
-        self.k = Array[DT](1, config.num_key_value_heads * config.head_dims)
-        self.v = Array[DT](1, config.num_key_value_heads * config.head_dims)
-        self.o = Array[DT](1, config.hidden_size)
-        self.attention = Array[DT](
-            config.num_attention_heads, config.max_position_embeddings
-        )
-        self.w1_C = Array[DT](config.intermediate_size)
-        self.w3_C = Array[DT](config.intermediate_size)
-        self.ffd_out = Array[DT](config.hidden_size)
-        self.hidden_state = Array[DT](config.hidden_size)
-        self.logits = Array[DT](config.hidden_size, config.vocab_size)
-        self.x = Array[DT](config.hidden_size)
-
-        self.x.alloc(0.0)
-
         self.v_cache.alloc(0.0)
         self.k_cache.alloc(0.0)
 
-        self.attention.alloc(0.0)
-
-        self.w1_C.alloc(0.0)
-        self.w3_C.alloc(0.0)
-        self.ffd_out.alloc(0.0)
-
-        self.hidden_state.alloc(0.0)
-        self.logits.alloc(0.0)
-
-        self.q.alloc(0.0)
-        self.o.alloc(0.0)
-
+        self.position_index = 0
         self.number_of_cores = num_cores()

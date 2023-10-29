@@ -84,6 +84,7 @@ from .array_forward import (
     CAT_3D_AXIS_2,
     rotate_half,
     convert_numpy_to_easydel_array,
+    arange,
 )
 
 alias dims_average_size = 5
@@ -445,6 +446,12 @@ struct Array[DT: DType]:
         self.allocated = False
         self.data = pointer
 
+    fn __init__(inout self: Self, A: Array[DT]) -> None:
+        r"""Copy the given array without copying gradients."""
+        self.__init__(A.array_shape)
+        self.alloc(0.0)
+        array_copy[DT, Self.nelts](self, A)
+
     fn __moveinit__(inout self, owned ext: Self):
         self.data = ext.data
         self.grad = ext.grad
@@ -789,8 +796,8 @@ struct Array[DT: DType]:
         self.data.simd_store[nelts](index, val)
 
     fn assertation(self: Self, i: Int, j: Int) -> None:
-        if not i >= j:
-            print("Index out of range")
+        if not i <= j:
+            print("Index out of range : ", i, " !>", j)
 
     # __SETITEM__
 

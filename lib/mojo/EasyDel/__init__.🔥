@@ -53,6 +53,7 @@ from .array import (
     T_AXIS_1_0_2,
     T_AXIS_2_1_0,
     convert_numpy_to_easydel_array,
+    arange,
     # Funcs
     PointerOperation,
     # ED Struct
