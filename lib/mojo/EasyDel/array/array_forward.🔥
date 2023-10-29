@@ -315,32 +315,32 @@ fn concatenate[
 
 
 @always_inline
-fn CAT_3D_AXIS_2[DT: DType, cores: Int](A: Array[DT], B: Array[DT]) -> Array[DT]:
+fn CAT_4D_AXIS_3[DT: DType, nelts:Int,cores: Int](A: Array[DT], B: Array[DT]) -> Array[DT]:
     """
     Return Concatenated Array At axis -1.
     """
-    var x: Array[DT] = Array[DT](A.dim(0), A.dim(1), A.dim(-1) + B.dim(-1))
+    var x: Array[DT] = Array[DT](A.dim(0), A.dim(1), A.dim(2), A.dim(-1) + B.dim(-1))
     let A_A: Int = A.dim(-1)
     x.alloc(0.0)
-    for i in range(A.dim(0)):
-
-        @parameter
-        fn _row(j: Int):
+    for b in range(A.dim(0)):
+        for i in range(A.dim(1)):
             @parameter
-            fn _cols[nelts: Int](k: Int):
-                if k < A_A:
-                    x.store[nelts](VariadicList[Int](i, j, k), A.load[nelts](i, j, k))
-                else:
-                    x.store[nelts](VariadicList[Int](i, j, k), B.load[nelts](i, j, k - A_A))
+            fn _row(j: Int):
+                @parameter
+                fn _cols[_nelts: Int](k: Int):
+                    if k < A_A:
+                        x.store[_nelts](VariadicList[Int](b,i, j, k), A.load[_nelts](b,i, j, k))
+                    else:
+                        x.store[_nelts](VariadicList[Int](b,i, j, k), B.load[_nelts](b,i, j, k - A_A))
 
-            vectorize[Array[DT].nelts, _cols](x.dim(-1))
+                vectorize[nelts, _cols](x.dim(-1))
 
-        parallelize[_row](A.dim(1), cores)
+            parallelize[_row](A.dim(2), cores)
     return x
 
 
 @always_inline
-fn rotate_half[DT: DType, cores: Int](A: Array[DT]) -> Array[DT]:
+fn rotate_half[DT: DType, nelts:Int,cores: Int](A: Array[DT]) -> Array[DT]:
     """
     Let make it More Pythonic.
     """
@@ -348,35 +348,36 @@ fn rotate_half[DT: DType, cores: Int](A: Array[DT]) -> Array[DT]:
     let half: Int = A.dim(-1) // 2
     let rest: Int = A.dim(-1) - half
 
-    var x1: Array[DT] = Array[DT](A.dim(0), A.dim(1), half)
-    var x2: Array[DT] = Array[DT](A.dim(0), A.dim(1), rest)
+    var x1: Array[DT] = Array[DT](A.dim(0),A.dim(1), A.dim(2), half)
+    var x2: Array[DT] = Array[DT](A.dim(0),A.dim(1), A.dim(2), rest)
 
     x1.alloc(0.0)
     x2.alloc(0.0)
-    for i in range(A.dim(0)):
-        # X1 Rotation
-        @parameter
-        fn x1_row(j: Int):
+    for b in range(A.dim(0)):
+        for i in range(A.dim(1)):
+            # X1 Rotation
             @parameter
-            fn x1_cols[nelts: Int](k: Int):
-                x1.store[nelts](VariadicList[Int](i, j, k), A.load[nelts](i, j, k))
+            fn x1_row(j: Int):
+                @parameter
+                fn x1_cols[nelts: Int](k: Int):
+                    x1.store[nelts](VariadicList[Int](b,i, j, k), A.load[nelts](b,i, j, k))
 
-            vectorize[Array[DT].nelts, x1_cols](half)
+                vectorize[Array[DT].nelts, x1_cols](half)
 
-        parallelize[x1_row](A.dim(1), cores)
+            parallelize[x1_row](A.dim(2), cores)
 
-        # X2 Rotation
-        @parameter
-        fn x2_row(j: Int):
+            # X2 Rotation
             @parameter
-            fn x2_cols[nelts: Int](k: Int):
-                x2.store[nelts](VariadicList[Int](i, j, k), -A.load[nelts](i, j, half + k))
+            fn x2_row(j: Int):
+                @parameter
+                fn x2_cols[nelts: Int](k: Int):
+                    x2.store[nelts](VariadicList[Int](b,i, j, k), -A.load[nelts](b,i, j, half + k))
 
-            vectorize[Array[DT].nelts, x2_cols](rest)
+                vectorize[Array[DT].nelts, x2_cols](rest)
 
-        parallelize[x2_row](A.dim(1), cores)
+            parallelize[x2_row](A.dim(2), cores)
 
-    var cated: Array[DT] = CAT_3D_AXIS_2[DT, cores](x2, x1)
+    var cated: Array[DT] = CAT_4D_AXIS_3[DT, nelts,cores](x2, x1)
     return cated
 
 

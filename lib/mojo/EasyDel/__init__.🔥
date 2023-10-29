@@ -52,6 +52,7 @@ from .array import (
     T_AXIS_0_2_1,
     T_AXIS_1_0_2,
     T_AXIS_2_1_0,
+    CAT_4D_AXIS_3,
     convert_numpy_to_easydel_array,
     arange,
     # Funcs
