@@ -4,7 +4,6 @@ from math import math
 from memory import memset_zero
 
 
-
 fn rope[
     DT: DType, num_cores: Int
 ](array: Array[DT], cos: Array[DT], sin: Array[DT], position: Int,) -> Array[DT]:
@@ -90,7 +89,6 @@ fn rope[
 
         parallelize[_row](num_heads)
     return _embed ^
-
 
 
 @always_inline
@@ -220,3 +218,26 @@ fn repeat_kv[DT: DType, cores: Int](A: Array[DT], times: Int) -> Array[DT]:
     parallelize[_row](A1, cores)
     B.view(-1, A.dim(-2), A.dim(-1))
     return B ^
+
+
+fn qkv_tranpose[DT: DType, nelts: Int, cores: Int](owned array: Array[DT]) -> Array[DT]:
+    var transposed_array: Array[DT] = Array[DT](
+        array.dim(0), array.dim(2), array.dim(1), array.dim(3)
+    )
+    transposed_array.alloc()
+    for i in range(array.dim(0)):
+
+        @parameter
+        fn _rows(j: Int):
+            for k in range(array.dim(1)):
+
+                @parameter
+                fn _cols[_nelts: Int](l: Int):
+                    transposed_array.store[_nelts](
+                        VariadicList[Int](i, j, k, l), array.load[_nelts](i, k, j, l)
+                    )
+
+                vectorize[nelts, _cols](array.dim(3))
+
+        parallelize[_rows](array.dim(2))
+    return transposed_array
