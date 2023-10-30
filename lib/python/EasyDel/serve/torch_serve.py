@@ -149,7 +149,7 @@ class PyTorchServer(object):
         return ''
 
     @staticmethod
-    def format_chat(history: List[List[str, str]], prompt: str, system: str = None) -> str:
+    def format_chat(history: List[List[str]], prompt: str, system: str = None) -> str:
         NotImplementedError()
         return ''
 
@@ -238,7 +238,7 @@ class PyTorchServer(object):
 
     def process_gradio_chat(self,
                             prompt: str,
-                            history: List[List[str, str]],
+                            history: List[List[str]],
                             max_new_tokens: int,
                             temperature: float,
                             max_length: int,
