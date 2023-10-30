@@ -24,9 +24,9 @@ from jax import numpy as jnp
 from torch.utils.data import DataLoader
 from fjutils import match_partition_rules, make_shard_and_gather_fns, StreamingCheckpointer, count_params
 from ..utils import prefix_print
+import chex
 
-
-def calculate_accuracy(predictions: jax.Array, targets: jax.Array):
+def calculate_accuracy(predictions: chex.Array, targets: chex.Array):
     predicted_classes = jnp.argmax(predictions, axis=-1)
     correct_predictions = (predicted_classes == targets).sum()
     total_predictions = targets.shape[0]

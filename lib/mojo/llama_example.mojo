@@ -8,7 +8,6 @@ from EasyDel import (
     Tokenizer,
     byte_pr_tokenizer_encoder,
     print_pointer,
-    sample_array,
     loop_sort,
 )
 from math import math
@@ -16,19 +15,19 @@ from python import Python, PythonObject
 import time
 import random
 from random import rand
-from EasyDel.models.llama import LlamaConfig, LlamaWeights, llama_forward, LlamaState
+from EasyDel.models.llama import LlamaConfig, LlamaWeights, LlamaState
 from sys import argv
 
 
 fn run[
-    T: DType, nelts: Int = 1
+    DT: DType, nelts: Int = 1
 ](
     weights_path: StringRef,
     tokenizer_path: StringRef,
     inout next_input_id: Int = -1,
     inout input_id: Int = 1,
     inout position: Int = 0,
-    temperature: SIMD[T, 1] = 0.4,
+    temperature: SIMD[DT, 1] = 0.4,
     steps: Int = 512,
     inout start: Int = -1,
     prompt: String = "",
@@ -56,8 +55,8 @@ fn run[
         config.print_config()
     var tokenizer: Tokenizer = Tokenizer(config.vocab_size, tokenizer_bufferr)
 
-    let llama: LlamaWeights[T] = LlamaWeights[T](config, is_tied, weights_buffer)
-    var state: LlamaState[T] = LlamaState[T](config)
+    let llama: LlamaWeights[DT] = LlamaWeights[DT](config, is_tied, weights_buffer)
+    var state: LlamaState[DT] = LlamaState[DT](config)
     if verbose:
         print("\033[1;32m\nModel Loaded Successfully And Mojo is on 🔥.\033[1;0m\n")
 
@@ -66,36 +65,7 @@ fn run[
 
     if prompt:
         byte_pr_tokenizer_encoder(input_ids, prompt, tokenizer)
-
-    while position < steps:
-        llama_forward[T, nelts](input_id, position, llama, state, config, True)
-        if position < len(input_ids):
-            next_input_id = input_ids[position]
-        else:
-            if temperature == 0.0:
-                next_input_id = state.logits.argmax(-1)
-            else:
-                for q in range(config.vocab_size):
-                    state.logits[q] = state.logits[q] / temperature
-                softmax[T, nelts](state.logits, config.vocab_size)
-                next_input_id = sample_array[T](state.logits)
-
-            if next_input_id == 1 or next_input_id == 2:
-                break
-
-        var token_str: Pointer[UInt8] = tokenizer.vocab[next_input_id]
-
-        if input_id == 1 and token_str[0] == ord(" "):
-            token_str = token_str.offset(1)
-        print_pointer(token_str)
-        input_id = next_input_id
-        position += 1
-        if start == -1:
-            start = time.now() // 1_000_000
-    print()
-    if verbose:
-        let tps = (position - 1) / ((time.now() // 1_000_000) - start) * 1000
-        print("\nAchieved Tokens ", tps, " Pre Second")
+    print("Working in Progress ...")
 
 
 fn main() raises:
@@ -106,7 +76,9 @@ fn main() raises:
     var temperature: SIMD[DTYPE, 1] = 0.4
     var steps: Int = 512
     var start: Int = -1
-    var prompt: String = String(r"<|im_start|>user\nHI<|im_end|>\n<|im_start|>assistant\n")
+    var prompt: String = String(
+        r"<|im_start|>user\nHI<|im_end|>\n<|im_start|>assistant\n"
+    )
     var checkpoint_path: StringRef = StringRef("weights.bin")
     var tokenizer_path: StringRef = StringRef("tokenizer.bin")
     var rng_seed: Int = time.now()
