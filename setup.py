@@ -2,12 +2,12 @@ from setuptools import setup, find_packages
 
 setup(
     name='EasyDeL',
-    version='0.0.31',
+    version='0.0.33',
     author='Erfan Zare Chavoshi',
     author_email='erfanzare82@eyahoo.com',
     description='An open-source library to make training faster and more optimized in Jax/Flax',
     url='https://github.com/erfanzar/EasyDeL',
-    packages=find_packages('EasyDel'),
+    packages=find_packages('lib/python/'),
     long_description=open('README.md').read(),
     long_description_content_type='text/markdown',
     classifiers=[
