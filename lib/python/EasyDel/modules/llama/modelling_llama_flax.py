@@ -89,7 +89,8 @@ class LlamaConfig(PretrainedConfig):
             **kwargs,
         )
 
-    def get_partition_rules(self, fully_fsdp: bool = True):
+    @staticmethod
+    def get_partition_rules(fully_fsdp: bool = True):
         return (
 
             ("model/embed_tokens/embedding", PS("dp", "fsdp")),
