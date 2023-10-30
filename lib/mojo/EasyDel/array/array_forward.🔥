@@ -876,13 +876,12 @@ fn sample[DT: DType](array: Array[DT]) -> Int:
 
 
 @always_inline
-fn softmax[DT: DType, nelts: Int](A: Array[DT], axis: Int = -1) -> Array[DT]:
-    var B: Array[DT] = Array[DT](A.array_shape)
-    B.alloc(0.0)
+fn softmax[DT: DType, nelts: Int,cores:Int](inout B:Array[DT],A: Array[DT], axis: Int = -1):
+    
 
     let N = A.dim(axis)
-
-    for s in range(B.num_elements() // N):
+    @parameter
+    fn rows(s:Int):
         var max_element: SIMD[DT, 1] = 0.0
 
         @parameter
@@ -908,12 +907,15 @@ fn softmax[DT: DType, nelts: Int](A: Array[DT], axis: Int = -1) -> Array[DT]:
             )
 
         vectorize[nelts, v_div](N)
-    return B
+    parallelize[rows](B.num_elements() // N,cores)
+
 
 
 @always_inline
-fn softmax[DT: DType](A: Array[DT], axis: Int = -1) -> Array[DT]:
-    var B = softmax[DT, A.nelts](A, axis)
+fn softmax[DT: DType,nelts:Int,cores:Int](A: Array[DT], axis: Int = -1) -> Array[DT]:
+    var B: Array[DT] = Array[DT](A)
+    B.alloc(0.0)
+    softmax[DT,nelts,cores ](B,A, axis)
     return B
 
 
