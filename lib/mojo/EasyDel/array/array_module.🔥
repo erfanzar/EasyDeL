@@ -21,6 +21,8 @@ from math.math import (
     acos,
     asinh,
     acosh,
+    min,
+    max,
 )
 import math
 from algorithm.functional import (
@@ -31,22 +33,81 @@ from algorithm.functional import (
 )
 from runtime.llcl import num_cores
 from memory.memory import memset_zero
-from .array_utils import matmul_shape, T_2D, T_AXIS_0_2_1, T_AXIS_1_0_2, T_AXIS_2_1_0
+
+from .array_forward import (
+    matmul,
+    matmul_2d,
+    matmul_3D,
+    matmul_single_row,
+    base_case_matmul,
+    kernel_add,
+    kernel_div,
+    kernel_matmul,
+    kernel_mul,
+    kernel_pow,
+    kernel_sub,
+    array_abs,
+    array_acos,
+    array_add,
+    array_asin,
+    array_atan,
+    array_copy,
+    array_tanh,
+    array_tan,
+    array_cos,
+    array_cosh,
+    array_div,
+    array_exp,
+    array_exp2,
+    array_relu,
+    array_log,
+    array_log2,
+    array_mul,
+    array_pow_all,
+    array_sin,
+    array_sinh,
+    array_sqrt,
+    array_pow,
+    array_sub,
+    relu,
+    leaky_relu,
+    softmax,
+    silu,
+    sigmoid,
+    mean,
+    ce,
+    mse,
+    sample,
+    T_AXIS_0_2_1,
+    T_AXIS_1_0_2,
+    T_AXIS_2_1_0,
+    CAT_4D_AXIS_3,
+    rotate_half,
+    convert_numpy_to_easydel_array,
+    arange,
+)
 
 alias dims_average_size = 5
 alias debuging = True
 
+
 # parts of this code is inspiered from https://github.com/andresnowak/Micro-Mojograd
+@always_inline
+fn matmul_shape[DT: DType](A: Array[DT], B: Array[DT]) -> ArrayShape:
+    if A.rank() == Int(2) and B.rank() == 1:
+        return ArrayShape(A.dim(0))
+    else:
+        var res_dims = InlinedFixedVector[dims_average_size, Int](A.rank())
+        for i in range(A.rank() - 1):
+            res_dims.append(A.dim(i))
+        res_dims.append(B.dim(-1))
 
-
-fn do_check(res: Bool, string: StringRef):
-    if not res:
-        # print(string)
-        ...
+        return ArrayShape(res_dims)
 
 
 struct ArrayShape:
     var _shape: Pointer[Int]
+    var _strides: Pointer[Int]
     var _length: Int
     var _size: Int
     var _allocated: Bool
@@ -54,48 +115,88 @@ struct ArrayShape:
     fn __init__(inout self, shape: VariadicList[Int]) -> None:
         self._length = len(shape)
         self._shape = Pointer[Int]().alloc(self._length)
+        self._strides = Pointer[Int]().alloc(self._length)
+        memset_zero(self._strides, self._length)
         for i in range(self._length):
             self._shape.store(i, shape[i])
         self._size = 1
         self._allocated = True
         self._size = self.product_dims()
+
+        self._strides.store(self._length - 1, 1)
+        for i in range(self._length - 1):
+            self._strides.store(
+                self._length - i - 2,
+                self._strides.load(self._length - i - 1)
+                * self._shape[self._length - i - 1],
+            )
 
     fn __init__(inout self, shape: DynamicVector[Int]) -> None:
         self._length = len(shape)
         self._shape = Pointer[Int]().alloc(self._length)
+        self._strides = Pointer[Int]().alloc(self._length)
+        memset_zero(self._strides, self._length)
+        for i in range(self._length):
+            self._shape.store(i, shape[i])
+        self._size = 1
+        self._allocated = True
+        self._size = self.product_dims()
+        self._strides.store(self._length - 1, 1)
+        for i in range(self._length - 1):
+            self._strides.store(
+                self._length - i - 2,
+                self._strides.load(self._length - i - 1)
+                * self._shape[self._length - i - 1],
+            )
+
+    fn __init__[off: Int](inout self, shape: InlinedFixedVector[off, Int]) -> None:
+        self._length = len(shape)
+        self._shape = Pointer[Int]().alloc(self._length)
+        self._strides = Pointer[Int]().alloc(self._length)
+        memset_zero(self._strides, self._length)
         for i in range(self._length):
             self._shape.store(i, shape[i])
         self._size = 1
         self._allocated = True
         self._size = self.product_dims()
 
-    fn __init__[off: Int](inout self, shape: InlinedFixedVector[off, Int]) -> None:
-        self._length = len(shape)
-        self._shape = Pointer[Int]().alloc(self._length)
-        for i in range(self._length):
-            self._shape.store(i, shape[i])
-        self._size = 1
-        self._allocated = True
-        self._size = self.product_dims()
+        self._strides.store(self._length - 1, 1)
+        for i in range(self._length - 1):
+            self._strides.store(
+                self._length - i - 2,
+                self._strides.load(self._length - i - 1)
+                * self._shape[self._length - i - 1],
+            )
 
     fn __init__(inout self, *elms: Int) -> None:
         let shape: VariadicList[Int] = VariadicList[Int](elms)
         self._length = len(shape)
         self._shape = Pointer[Int]().alloc(self._length)
+        self._strides = Pointer[Int]().alloc(self._length)
+        memset_zero(self._strides, self._length)
         for i in range(self._length):
             self._shape.store(i, shape[i])
         self._size = 1
         self._allocated = True
         self._size = self.product_dims()
+        self._strides.store(self._length - 1, 1)
+        for i in range(self._length - 1):
+            self._strides.store(
+                self._length - i - 2,
+                self._strides.load(self._length - i - 1)
+                * self._shape[self._length - i - 1],
+            )
 
     fn __copyinit__(inout self: Self, ext: Self):
         self._size = ext._size
         self._shape = ext._shape
         self._length = ext._length
         self._allocated = ext._allocated
+        self._strides = ext._strides
 
     fn __moveinit__(inout self: Self, owned ext: Self):
         self._shape = ext._shape ^
+        self._strides = ext._strides ^
         self._length = ext._length
         self._size = ext._size
         self._allocated = ext._allocated
@@ -166,6 +267,9 @@ struct ArrayShape:
     fn shape(self: Self) -> Pointer[Int]:
         return self._shape
 
+    fn strides(self: Self) -> Pointer[Int]:
+        return self._strides
+
     @always_inline
     fn get_1d_pos[off: Int](self, index: InlinedFixedVector[off, Int]) -> Int:
         var product: Int = 1
@@ -197,125 +301,271 @@ struct ArrayShape:
                 print_no_newline(self[i], ",")
         print("]")
 
+    fn strides_str(self: Self):
+        print_no_newline("[")
+        for i in range(self.rank()):
+            if i == self.rank() - 1:
+                print_no_newline(self._strides[i])
+            else:
+                print_no_newline(self._strides[i], ",")
+        print("]")
 
-struct Array[T: DType]:
-    var data: DTypePointer[T]
+
+struct Array[DT: DType]:
+    var data: DTypePointer[DT]
+    var grad: DTypePointer[DT]
+
     var array_shape: ArrayShape
-    var allocated: Int
-    alias nelts: Int = simdwidthof[T]() * 2
-    alias ArrayPointer: AnyType = DTypePointer[T]
 
-    fn __init__(inout self: Self, array_shape: ArrayShape) -> None:
+    var shape: Pointer[Int]
+    var strides: Pointer[Int]
+    var parents: Pointer[Int]
+    var extra_parameters: Pointer[Int]
+
+    var parents_dynamic: Pointer[Bool]
+
+    var number_of_parents: Int
+    var identifier: Int
+
+    var name: StringRef
+
+    var in_nodes: Bool
+    var is_dynamic: Bool
+    var visited: Bool
+    var requires_grad: Bool
+    var allocated: Bool
+
+    alias nelts: Int = simdwidthof[DT]()
+    alias ArrayPointer: AnyType = DTypePointer[DT]
+    alias nodes_depth: Int = 64
+    alias pi: SIMD[DT, 1] = SIMD[DT, 1](
+        3.1415926535897932384626433832795028841971693993751058
+    )
+
+    fn __init__(
+        inout self: Self, array_shape: ArrayShape, requires_grad: Bool = False
+    ) -> None:
         r"""Init Array From ArrayShape(Alloc Zero)."""
-        self.array_shape = array_shape
-        self.data = self.ArrayPointer.alloc(0)
-        self.allocated = 0
 
-    fn __init__(inout self: Self, A: Self, B: Self) -> None:
+        self.array_shape = array_shape
+
+        self.data = self.ArrayPointer.alloc(0)
+        self.grad = self.ArrayPointer.alloc(0)
+        self.extra_parameters = Pointer[Int].alloc(self.nodes_depth)
+        self.parents = Pointer[Int].alloc(self.nodes_depth)
+
+        self.number_of_parents = 0
+        self.identifier = 1
+
+        self.allocated = False
+        self.in_nodes = False
+        self.is_dynamic = False
+        self.visited = False
+        self.requires_grad = requires_grad
+
+        self.shape = self.array_shape.shape()
+        self.strides = self.array_shape.strides()
+
+        self.name = StringRef("None")
+
+        self.parents_dynamic = Pointer[Bool].alloc(self.nodes_depth)
+
+        for i in range(self.nodes_depth):
+            self.parents_dynamic.store(i, False)
+
+        memset_zero(self.parents, self.nodes_depth)
+        memset_zero(self.extra_parameters, self.nodes_depth)
+
+    fn __init__(
+        inout self: Self, A: Self, B: Self, requires_grad: Bool = False
+    ) -> None:
         r"""Init Array From Two other Arrays A and B For Matmul(Alloc One)."""
-        self.__init__(matmul_shape[T](A, B))
+        self.__init__(matmul_shape[DT](A, B), requires_grad)
         self.alloc(0.0)
 
     fn __init__(inout self: Self, *dim: Int):
+        r"""Init Array from Int Args(Alloc Zero , Do Not Store Gradinet too)."""
+        let array_shape = ArrayShape(VariadicList(dim))
+        self.__init__(array_shape, False)
+
+    fn __init__(inout self: Self, requires_grad: Bool, *dim: Int):
         r"""Init Array from Int Args(Alloc Zero)."""
-        self.array_shape = ArrayShape(VariadicList(dim))
-        self.data = self.ArrayPointer.alloc(0)
-        self.allocated = 0
-
-    fn __init__(inout self: Self, init: Bool, *dim: Int) -> None:
-        r"""Init Array from Int Args(Depends on Passed Bool)."""
-        self.__init__(dim)
-        if init:
-            self.alloc()
-            self.random()
-
-    fn __init__(inout self: Self, vl: VariadicList[Int]) -> None:
-        r"""Init Array from VariadicList[Int](Alloc Zero)."""
-        self.array_shape = ArrayShape(vl)
-        self.data = self.ArrayPointer.alloc(0)
-        self.allocated = 0
+        let array_shape = ArrayShape(VariadicList(dim))
+        self.__init__(array_shape, requires_grad)
 
     fn __init__(
-        inout self: Self, value: DynamicVector[FloatLiteral], shape: ArrayShape
+        inout self: Self, vl: VariadicList[Int], requires_grad: Bool = False
+    ) -> None:
+        r"""Init Array from VariadicList[Int](Alloc Zero)."""
+        let array_shape = ArrayShape(vl)
+        self.__init__(array_shape, requires_grad)
+
+    fn __init__(
+        inout self: Self,
+        value: DynamicVector[FloatLiteral],
+        shape: ArrayShape,
+        requires_grad: Bool = False,
     ) -> None:
         r"""Init Array from ArrayShape and load data from DynamicVector[FloatLiteral](Alloc One).
         """
-        self.array_shape = shape
-        do_check(len(value) == self.array_shape.num_elements(), "Data Size miss match")
-        self.data = self.ArrayPointer.alloc(self.array_shape.num_elements())
-        self.allocated = 1
-        for i in range(self.array_shape.num_elements()):
+        if not len(value) == shape.num_elements():
+            print("Data Size miss match")
+        self.__init__(shape, requires_grad)
+        self.alloc(0.0)
+        for i in range(shape.num_elements()):
             self.data.simd_store[1](i, value[i])
 
     fn __init__(
-        inout self: Self, value: VariadicList[FloatLiteral], shape: ArrayShape
+        inout self: Self,
+        value: VariadicList[FloatLiteral],
+        shape: ArrayShape,
+        requires_grad: Bool = False,
     ) -> None:
         r"""Init Array from ArrayShape and load data from VariadicList[FloatLiteral](Alloc One).
         """
-        self.array_shape = shape
-        do_check(len(value) == self.array_shape.num_elements(), "Data Size miss match")
-        self.allocated = 1
-        self.data = self.ArrayPointer.alloc(self.array_shape.num_elements())
-        for i in range(self.array_shape.num_elements()):
+        if not len(value) == shape.num_elements():
+            print("Data Size miss match")
+        self.__init__(shape, requires_grad)
+        self.alloc(0.0)
+        for i in range(shape.num_elements()):
             self.data.simd_store[1](i, value[i])
 
-    fn __init__(inout self: Self, pointer: DTypePointer[T], *dim: Int) -> None:
+    fn __init__(
+        inout self: Self, requires_grad: Bool, pointer: DTypePointer[DT], *dim: Int
+    ) -> None:
+        r"""Uses given pointer and cover that as an Array."""
+        let shape = ArrayShape(dim)
+        self.__init__(shape, requires_grad)
+        self.allocated = False
         self.data = pointer
-        self.array_shape = ArrayShape(dim)
-        self.allocated = 0
+
+    fn __init__(inout self: Self, pointer: DTypePointer[DT], *dim: Int) -> None:
+        r"""Uses given pointer and cover that as an Array."""
+        let shape = ArrayShape(dim)
+        self.__init__(shape, False)
+        self.allocated = False
+        self.data = pointer
+
+    fn __init__(inout self: Self, A: Array[DT]) -> None:
+        r"""Copy the given array without copying gradients."""
+        var dynamic_vector: DynamicVector[Int] = DynamicVector[Int]()
+        for i in range(A.rank()):
+            dynamic_vector.push_back(A.dim(i))
+        self.__init__(ArrayShape(dynamic_vector))
+        self.alloc(0.0)
+        memcpy[DT](self.data, A.data, self.num_elements())
 
     fn __moveinit__(inout self, owned ext: Self):
         self.data = ext.data
+        self.grad = ext.grad
+
         self.array_shape = ext.array_shape
+
+        self.shape = ext.array_shape.shape()
+        self.strides = ext.array_shape.strides()
+        self.parents = ext.parents
+        self.extra_parameters = ext.extra_parameters
+        self.parents_dynamic = ext.parents_dynamic
+
+        self.number_of_parents = ext.number_of_parents
+        self.identifier = ext.identifier
+
+        self.name = ext.name
+
+        self.in_nodes = ext.in_nodes
+        self.is_dynamic = ext.is_dynamic
+        self.visited = ext.visited
+        self.requires_grad = ext.requires_grad
         self.allocated = ext.allocated
 
     fn __copyinit__(inout self, ext: Self):
+        self.array_shape = ext.array_shape
+
+        self.shape = ext.array_shape.shape()
+        self.strides = ext.array_shape.strides()
+        self.parents = ext.parents
+        self.extra_parameters = ext.extra_parameters
+        self.parents_dynamic = ext.parents_dynamic
+
+        self.number_of_parents = ext.number_of_parents
+        self.identifier = ext.identifier
+
+        self.name = ext.name
+
+        self.in_nodes = ext.in_nodes
+        self.is_dynamic = ext.is_dynamic
+        self.visited = ext.visited
+        self.requires_grad = ext.requires_grad
         self.allocated = ext.allocated
-        if self.allocated == 1:
+
+        if self.allocated:
             self.data = self.ArrayPointer.alloc(ext.array_shape.num_elements())
-            self.array_shape = ext.array_shape
+
+            if self.requires_grad:
+                self.grad = self.ArrayPointer.alloc(ext.array_shape.num_elements())
+            else:
+                self.grad = self.ArrayPointer.alloc(0)
 
             @parameter
             fn _do[_nelts: Int](f: Int):
-                let dt = ext.data.simd_load[_nelts](0)
-                self.data.simd_store[_nelts](0, dt)
+                let dt = ext.data.simd_load[_nelts](f)
+                self.data.simd_store[_nelts](f, dt)
+                if self.requires_grad:
+                    let gt = ext.grad.simd_load[_nelts](f)
+                    self.grad.simd_store[_nelts](f, gt)
 
             vectorize[Self.nelts, _do](ext.array_shape.num_elements())
+
         else:
             self.data = self.ArrayPointer.alloc(0)
-            self.array_shape = ext.array_shape
+            self.grad = self.ArrayPointer.alloc(0)
 
     fn __del__(owned self):
-        if self.allocated == 1:
+        if self.allocated:
             self.data.free()
+            self.grad.free()
 
-    fn init_from_buffer(inout self: Self, buffer: DTypePointer[T], *dim: Int) -> None:
+        self.shape.free()
+        self.strides.free()
+        self.parents.free()
+        self.extra_parameters.free()
+        self.parents_dynamic.free()
+
+    fn init_from_buffer(inout self: Self, buffer: DTypePointer[DT], *dim: Int) -> None:
         self.array_shape = ArrayShape(VariadicList(dim))
+        self.shape = self.array_shape.shape()
+        self.strides = self.array_shape.strides()
         self.data = buffer
-        self.allocated = 0
+        self.allocated = False
 
     @always_inline
-    fn set_data_from_buffer(inout self: Self, buffer: DTypePointer[T]) -> None:
+    fn set_data_from_buffer(inout self: Self, buffer: DTypePointer[DT]) -> None:
         self.data = buffer
 
     @always_inline
     fn alloc(inout self: Self) -> None:
         r"""Allocate or Init The Array."""
-        self.data = self.ArrayPointer.alloc(self.array_shape.num_elements())
-        self.allocated = 1
+        self.data = self.ArrayPointer.alloc(self.num_elements())
+        if self.requires_grad:
+            self.grad = self.ArrayPointer.alloc(self.num_elements())
+        self.allocated = True
+        # self.random()
+        rand[DT](self.data, self.array_shape.num_elements())
 
     @always_inline
-    fn alloc(inout self: Self, fill: SIMD[T, 1]) -> None:
+    fn alloc(inout self: Self, fill: SIMD[DT, 1]) -> None:
         r"""Allocate or Init The Array and fill that with given fill number."""
-        self.data = self.ArrayPointer.alloc(self.array_shape.num_elements())
-        self.allocated = 1
+        self.alloc()
         self.fill(fill)
 
     @always_inline
     fn random(inout self: Self) -> None:
-        r"""Randomize The Data if the Array is Allocated."""
-        if self.allocated == 1:
-            rand[T](self.data, self.array_shape.num_elements())
+        r"""Randomize Data."""
+        if self.allocated:
+            rand[DT](self.data, self.array_shape.num_elements())
+        else:
+            self.alloc()
+            rand[DT](self.data, self.array_shape.num_elements())
 
     @always_inline
     fn zero(inout self):
@@ -324,6 +574,9 @@ struct Array[T: DType]:
     @always_inline
     fn ones(inout self):
         self.fill(1.0)
+
+    fn dtype(self) -> DType:
+        return DT
 
     @always_inline
     fn dim(self: Self, i: Int) -> Int:
@@ -338,51 +591,78 @@ struct Array[T: DType]:
         return self.array_shape.num_elements()
 
     @always_inline
-    fn get_dynamic_axis(self: Self, *dims: Int) -> Int:
-        let variadic: VariadicList[Int] = VariadicList[Int](dims)
-        let slice_dv: DynamicVector[Int] = DynamicVector[Int]()
-        if len(variadic) > self.rank():
-            print(
-                "DynamicAxis Errors -> Index out Of the Range (len(variadic) >"
-                " self.rank())"
-            )
-        var pad: Int = 0
-        for i in range(len(variadic)):
-            var product: Int = 1
-            for f in range(i + 1, self.rank()):
-                product *= self.array_shape._shape[f]
-            pad += variadic[i] * product
-        if pad > self.num_elements():
-            print(
-                " DynamicAxis Errors -> Index out Of the Range (pad >"
-                " self.num_elements)"
-            )
-        return pad
+    fn set_name(inout self: Self, new_name: StringRef):
+        self.name = new_name
 
     @always_inline
-    fn transpose[workers: Int = 2](self: Self, *dims: Int) -> Array[T]:
-        # var res_shape: DynamicVector[Int] = DynamicVector[Int]()
+    fn set_identifier(inout self: Self, new_identifier: Int):
+        self.identifier = new_identifier
+
+    @always_inline
+    fn set_visited(inout self: Self, visited: Bool):
+        self.visited = visited
+
+    @always_inline
+    fn get_index(self: Self, variadic_index: VariadicList[Int]) -> Int:
+        if self.rank() != len(variadic_index):
+            print("Error at (fn get_index(self, *dims:Int)) dimensions won't match")
+        var index: Int = 0
+        for i in range(len(variadic_index)):
+            index += self.strides[i] * variadic_index[i]
+        return index
+
+    @always_inline
+    fn get_index(self: Self, *dims: Int) -> Int:
+        return self.get_index(VariadicList[Int](dims))
+
+    @always_inline
+    fn transpose[workers: Int = 2](self: Self, *dims: Int) -> Array[DT]:
         let dim = VariadicList[Int](dims)
         if len(dim) != self.rank():
             print("The Passed input dims to swap are not accept able for function")
-            return Array[T]()
+            return Array[DT]()
         if len(dim) != 3:
             print("Only 3D,2D arrays are accepted for transpose right now")
-            return Array[T]()
+            return Array[DT]()
         if dim[0] == 0 and dim[1] == 2 and dim[2] == 1:
-            return T_AXIS_0_2_1[T, Array[T].nelts](self, workers)
+            return T_AXIS_0_2_1[DT, Array[DT].nelts](self, workers)
         if dim[0] == 1 and dim[1] == 0 and dim[2] == 2:
-            return T_AXIS_1_0_2[T, Array[T].nelts](self, workers)
+            return T_AXIS_1_0_2[DT, Array[DT].nelts](self, workers)
         if dim[0] != 2 and dim[1] != 1 and dim[2] != 0:
             print("Open A Bug Form")
-            return Array[T]()
-        return T_AXIS_2_1_0[T, Array[T].nelts](self, workers)
+            return Array[DT]()
+        return T_AXIS_2_1_0[DT, Array[DT].nelts](self, workers)
 
     @always_inline
-    fn transpose[workers: Int = 2](self: Self) raises -> Array[T]:
-        if 2 != self.rank():
-            raise Error("Transpose with empty input only support 2D Arrays")
-        return T_2D[T, Array[T].nelts](self, workers)
+    fn T[nelts: Int = Self.nelts, cores: Int = 2](self: Self) -> Array[DT]:
+        """
+        Transpose the two last dims.
+        """
+        var dynamic_vector: DynamicVector[Int] = DynamicVector[Int]()
+        for i in range(0, self.rank() - 2):
+            if i >= 0 and self.rank() > 2:
+                dynamic_vector.push_back(self.dim(i))
+
+        dynamic_vector.push_back(self.dim(-1))
+        dynamic_vector.push_back(self.dim(-2))
+        var B: Array[DT] = Array[DT](dynamic_vector)
+        B.alloc(0.00)
+        let M = self.dim(-2)
+        let N = self.dim(-1)
+
+        for s in range(B.num_elements() // (M * N)):
+            let offset = s * M * N
+            for i in range(M):
+
+                @parameter
+                fn v_transpose[nelts: Int](j: Int):
+                    B.data.simd_store[nelts](
+                        offset + j * M + i,
+                        self.data.simd_load[nelts](offset + i * N + j),
+                    )
+
+                vectorize[nelts, v_transpose](N)
+        return B
 
     @always_inline
     fn reshape(inout self, *dims: Int) raises:
@@ -452,78 +732,46 @@ struct Array[T: DType]:
                 num_elms *= vs[i]
             self.array_shape = ArrayShape(vs)
 
+    # LOAD
+
     @always_inline
     fn load[
         nelts: Int, off: Int
-    ](self, index: InlinedFixedVector[off, Int]) -> SIMD[T, nelts]:
+    ](self, index: InlinedFixedVector[off, Int]) -> SIMD[DT, nelts]:
         let position = self.array_shape.get_1d_pos(index)
         self.assertation(position, self.array_shape._size)
         return self.data.simd_load[nelts](position)
 
     @always_inline
-    fn load[nelts: Int, off: Int](self, index: StaticIntTuple[off]) -> SIMD[T, nelts]:
+    fn load[nelts: Int, off: Int](self, index: StaticIntTuple[off]) -> SIMD[DT, nelts]:
         let position = self.array_shape.get_1d_pos(index)
         self.assertation(position, self.array_shape._size)
         return self.data.simd_load[nelts](position)
 
     @always_inline
-    fn load[nelts: Int](self, index: Int) -> SIMD[T, nelts]:
+    fn load[nelts: Int](self, index: Int) -> SIMD[DT, nelts]:
         let position = self.array_shape.__ntp__(index, self.array_shape._size)
         self.assertation(position, self.array_shape._size)
         return self.data.simd_load[nelts](position)
 
     @always_inline
-    fn store[
-        nelts: Int
-    ](self, d1: Int, d2: Int, d3: Int, d4: Int, val: SIMD[T, nelts]) -> None:
-        debug_assert(self.rank() != 4, "Miss match os requested shape (4D Store)")
-        let index = (d1 * self.dim(-3) * self.dim(-2) * self.dim(-1)) + (
-            d2 * self.dim(-2) * self.dim(-1)
-        ) + (d3 * self.dim(-1)) + d4
-        debug_assert(index > self.num_elements(), "Out OF range in Store 4D")
-        self.data.simd_store[nelts](index, val)
-
-    @always_inline
-    fn store[nelts: Int](self, d1: Int, d2: Int, d3: Int, val: SIMD[T, nelts]) -> None:
-        debug_assert(self.rank() != 3, "Miss match os requested shape (3D Store)")
-        let index = d1 * self.dim(-2) * self.dim(-1) + d2 * self.dim(-1) + d3
-        debug_assert(index > self.num_elements(), "Out OF range in Store 3D")
-        self.data.simd_store[nelts](index, val)
-
-    @always_inline
-    fn store[nelts: Int](self, d1: Int, d2: Int, val: SIMD[T, nelts]) -> None:
-        debug_assert(self.rank() != 2, "Miss match os requested shape (2D Store)")
-        let index = d1 * self.dim(-1) + d2
-        debug_assert(index > self.num_elements(), "Out OF range in Store 2D")
-        self.data.simd_store[nelts](index, val)
-
-    @always_inline
-    fn load[nelts: Int](self, d1: Int, d2: Int, d3: Int, d4: Int) -> SIMD[T, nelts]:
-        debug_assert(self.rank() != 3, "Miss match os requested shape (4D Load)")
-        let index = (d1 * self.dim(-3) * self.dim(-2) * self.dim(-1)) + (
-            d2 * self.dim(-2) * self.dim(-1)
-        ) + (d3 * self.dim(-1)) + d4
-        debug_assert(index > self.num_elements(), "Out OF range in Load 4D")
+    fn load[nelts: Int](self, dims: VariadicList[Int]) -> SIMD[DT, nelts]:
+        """ND Array Access."""
+        let index = self.get_index(dims)
         return self.data.simd_load[nelts](index)
 
     @always_inline
-    fn load[nelts: Int](self, d1: Int, d2: Int, d3: Int) -> SIMD[T, nelts]:
-        debug_assert(self.rank() != 3, "Miss match os requested shape (3D Load)")
-        let index = d1 * self.dim(-2) * self.dim(-1) + d2 * self.dim(-1) + d3
-        debug_assert(index > self.num_elements(), "Out OF range in Load 3D")
+    fn load[nelts: Int](self, *dims: Int) -> SIMD[DT, nelts]:
+        """ND Array Access."""
+        let index = self.get_index(dims)
         return self.data.simd_load[nelts](index)
 
-    @always_inline
-    fn load[nelts: Int](self, d1: Int, d2: Int) -> SIMD[T, nelts]:
-        debug_assert(self.rank() != 2, "Miss match os requested shape (2D Load)")
-        let index = d1 * self.dim(-1) + d2
-        debug_assert(index > self.num_elements(), "Out OF range in Load 2D")
-        return self.data.simd_load[nelts](index)
+    # STORE
 
     @always_inline
     fn store[
         nelts: Int, off: Int
-    ](self, index: InlinedFixedVector[off, Int], val: SIMD[T, nelts]) -> None:
+    ](self, index: InlinedFixedVector[off, Int], val: SIMD[DT, nelts]) -> None:
         let position = self.array_shape.get_1d_pos(index)
         self.assertation(position, self.array_shape._size)
         self.data.simd_store[nelts](position, val)
@@ -531,83 +779,79 @@ struct Array[T: DType]:
     @always_inline
     fn store[
         nelts: Int, off: Int
-    ](self, index: StaticIntTuple[off], val: SIMD[T, nelts]) -> None:
+    ](self, index: StaticIntTuple[off], val: SIMD[DT, nelts]) -> None:
         let position = self.array_shape.get_1d_pos(index)
         self.assertation(position, self.array_shape._size)
         self.data.simd_store[nelts](position, val)
 
     @always_inline
-    fn store[nelts: Int](self, index: Int, val: SIMD[T, nelts]) -> None:
+    fn store[nelts: Int](self, index: Int, val: SIMD[DT, nelts]) -> None:
         """Access the data as a 1D array."""
         let position = self.array_shape.__ntp__(index, self.array_shape._size)
         self.assertation(position, self.array_shape._size)
         self.data.simd_store[nelts](position, val)
 
+    @always_inline
+    fn store[nelts: Int](self, dims: VariadicList[Int], val: SIMD[DT, nelts]) -> None:
+        """ND Array Access."""
+        let index = self.get_index(dims)
+        self.assertation(index, self.array_shape._size)
+        self.data.simd_store[nelts](index, val)
+
     fn assertation(self: Self, i: Int, j: Int) -> None:
-        do_check(True if i > j else False, "Index out of range")
+        if not i <= j:
+            print("Index out of range : ", i, " !>", j)
+
+    # __SETITEM__
 
     @always_inline
-    fn __setitem__(self, index: Int, val: SIMD[T, 1]) -> None:
+    fn __setitem__(self, index: Int, val: SIMD[DT, 1]) -> None:
         return self.store[1](index, val)
 
     @always_inline
     fn __setitem__[
         off: Int
-    ](self, index: InlinedFixedVector[off, Int], val: SIMD[T, 1]):
+    ](self, index: InlinedFixedVector[off, Int], val: SIMD[DT, 1]):
         return self.store[1](index, val)
 
     @always_inline
-    fn __setitem__[off: Int](self, index: StaticIntTuple[off], val: SIMD[T, 1]):
+    fn __setitem__[off: Int](self, index: StaticIntTuple[off], val: SIMD[DT, 1]):
         return self.store[1](index, val)
 
     @always_inline
-    fn __setitem__(self, d1: Int, d2: Int, d3: Int, d4: Int, val: SIMD[T, 1]) -> None:
-        return self.store[1](d1, d2, d3, d4, val)
+    fn __setitem__(self, dims: VariadicList[Int], val: SIMD[DT, 1]):
+        let index: Int = self.get_index(dims)
+        return self.store[1](index, val)
+
+    # __GETITEM__
 
     @always_inline
-    fn __setitem__(self, d1: Int, d2: Int, d3: Int, val: SIMD[T, 1]) -> None:
-        return self.store[1](d1, d2, d3, val)
-
-    @always_inline
-    fn __setitem__(self, d1: Int, d2: Int, val: SIMD[T, 1]) -> None:
-        return self.store[1](d1, d2, val)
-
-    @always_inline
-    fn __getitem__[off: Int](self, index: InlinedFixedVector[off, Int]) -> SIMD[T, 1]:
+    fn __getitem__[off: Int](self, index: InlinedFixedVector[off, Int]) -> SIMD[DT, 1]:
         return self.load[1, off](index)
 
     @always_inline
-    fn __getitem__[off: Int](self, index: StaticIntTuple[off]) -> SIMD[T, 1]:
+    fn __getitem__[off: Int](self, index: StaticIntTuple[off]) -> SIMD[DT, 1]:
         return self.load[1, off](index)
 
     @always_inline
-    fn __getitem__(self, d1: Int, d2: Int, d3: Int, d4: Int) -> SIMD[T, 1]:
-        return self.load[1](d1, d2, d3, d4)
+    fn __getitem__(self, index: Int) -> SIMD[DT, 1]:
+        return self.load[1](index)
 
     @always_inline
-    fn __getitem__(self, d1: Int, d2: Int, d3: Int) -> SIMD[T, 1]:
-        return self.load[1](d1, d2, d3)
-
-    @always_inline
-    fn __getitem__(self, d1: Int, d2: Int) -> SIMD[T, 1]:
-        return self.load[1](d1, d2)
-
-    @always_inline
-    fn __getitem__(self, index: Int) -> SIMD[T, 1]:
+    fn __getitem__(self, *dims: Int) -> SIMD[DT, 1]:
+        let index: Int = self.get_index(dims)
         return self.load[1](index)
 
     @always_inline
     fn __element_wise_tensor_operation__[
         nelts: Int,
         outer_loop_func: fn[func: fn (Int) capturing -> None] (Int) capturing -> None,
-        op_func: fn[T: DType, simd_width: Int] (
-            x: SIMD[T, simd_width], y: SIMD[T, simd_width]
-        ) -> SIMD[T, simd_width],
+        op_func: fn[DT: DType, simd_width: Int] (
+            x: SIMD[DT, simd_width], y: SIMD[DT, simd_width]
+        ) -> SIMD[DT, simd_width],
     ](self, other: Self) -> Self:
-        do_check(
-            self.array_shape == other.array_shape,
-            "dimension aren't equal, can't do operation element wise.",
-        )
+        if not self.array_shape == other.array_shape:
+            print("dimension aren't equal, can't do operation element wise.")
 
         var res = Self(self.array_shape)
         res.alloc()
@@ -624,7 +868,7 @@ struct Array[T: DType]:
 
                 res.store[nelts](
                     index,
-                    op_func[T, nelts](
+                    op_func[DT, nelts](
                         self.load[nelts](index), other.load[nelts](index)
                     ),
                 )
@@ -638,8 +882,8 @@ struct Array[T: DType]:
     fn __element_wise_tensor_operation__[
         nelts: Int,
         outer_loop_func: fn[func: fn (Int) capturing -> None] (Int) capturing -> None,
-        op_func: fn[T: DType, simd_width: Int] (x: SIMD[T, simd_width]) -> SIMD[
-            T, simd_width
+        op_func: fn[DT: DType, simd_width: Int] (x: SIMD[DT, simd_width]) -> SIMD[
+            DT, simd_width
         ],
     ](self) -> Self:
         let res = Self(self.array_shape)
@@ -656,7 +900,7 @@ struct Array[T: DType]:
 
                 res.store[nelts](
                     index,
-                    op_func[T, nelts](self.load[nelts](index)),
+                    op_func[DT, nelts](self.load[nelts](index)),
                 )
 
             vectorize[nelts, _iv](last_dim)
@@ -676,7 +920,7 @@ struct Array[T: DType]:
         @parameter
         fn _do(size: Int):
             let ra = self.data.offset(size).simd_load[1](0)
-            let rs: SIMD[T, 1] = func[T, 1](ra)
+            let rs: SIMD[DT, 1] = func[DT, 1](ra)
             res.data.offset(size).simd_store[1](0, rs)
 
         parallelize[_do](self.array_shape.num_elements())
@@ -692,7 +936,7 @@ struct Array[T: DType]:
 
         @parameter
         fn _do[_nelts: Int](size: Int):
-            let rs: SIMD[T, _nelts] = func[T, _nelts](
+            let rs: SIMD[DT, _nelts] = func[DT, _nelts](
                 self.data.offset(size).simd_load[_nelts](0)
             )
             res.data.offset(size).simd_store[_nelts](0, rs)
@@ -709,7 +953,7 @@ struct Array[T: DType]:
 
         @parameter
         fn _do(size: Int):
-            let rs: SIMD[T, 1] = func[T, 1](
+            let rs: SIMD[DT, 1] = func[DT, 1](
                 self.data.offset(size).simd_load[1](0)
             ).reduce_add()
             res.data.offset(size).simd_store[1](0, rs)
@@ -717,82 +961,11 @@ struct Array[T: DType]:
         parallelize[_do](self.array_shape.num_elements(), num_cores)
         return res ^
 
-    fn __add__(self: Self, other: Self) -> Self:
-        return self.add[Self.nelts](other)
-
-    fn __mul__(self: Self, other: Self) -> Self:
-        return self.mul[Self.nelts](other)
-
-    fn __matmul__(self: Self, other: Self) -> Self:
-        return self.matmul[Self.nelts](other)
-
-    fn __sub__(self: Self, other: Self) -> Self:
-        return self.sub[Self.nelts](other)
-
-    fn __truediv__(self: Self, other: Self) -> Self:
-        return self.true_div[Self.nelts](other)
-
-    fn __mod__(self: Self, other: Self) -> Self:
-        return self.mod[Self.nelts](other)
-
-    fn __len__(self: Self) -> Int:
-        return self.array_shape.num_elements()
-
-    fn __eq__(self, other: Self) -> Bool:
-        return self.eq[Self.nelts](other)
-
-    fn __ne__(self, other: Self) -> Bool:
-        return not self.eq[Self.nelts](other)
-
-    fn __floordiv__(self: Self, other: Self) -> Self:
-        ...
-
-    fn __pow__(self: Self, other: Self) -> Self:
-        return self.pow[Self.nelts](other)
-
-    fn __iadd__(inout self: Self, other: Self) -> None:
-        self = self.add[Self.nelts](other)
-
-    fn __isub__(inout self: Self, other: Self) -> None:
-        self = self.sub[Self.nelts](other)
-
-    fn __ipow__(inout self: Self, other: Self) -> None:
-        self = self.pow[Self.nelts](other)
-
-    fn __imod__(inout self: Self, other: Self) -> None:
-        self = self.mod[Self.nelts](other)
-
-    fn __idiv__(inout self: Self, other: Self) -> None:
-        self = self.true_div[Self.nelts](other)
-
-    fn __itruediv__(inout self: Self, other: Self) -> None:
-        self = self.true_div[Self.nelts](other)
-
-    fn __ifloordiv__(inout self: Self, other: Self) -> None:
-        ...
-
+    @always_inline
     fn __len__(inout self) -> Int:
         return self.num_elements()
 
-    fn add[nelts: Int](self: Self, other: Self) -> Self:
-        @parameter
-        fn outer_loop[func: fn (Int) capturing -> None](size: Int):
-            for i in range(size):
-                func(i)
-
-        return self.__element_wise_tensor_operation__[nelts, outer_loop, math.add](
-            other
-        )
-
-    fn add[nelts: Int](self: Self, other: Self, num_cores: Int) -> Self:
-        @parameter
-        fn outer_loop[func: fn (Int) capturing -> None](size: Int) -> None:
-            parallelize[func](size, num_cores)
-
-        return self.__element_wise_tensor_operation__[nelts, outer_loop, math.add](
-            other
-        )
-
+    @always_inline
     fn mod[nelts: Int](self: Self, other: Self) -> Self:
         @parameter
         fn outer_loop[func: fn (Int) capturing -> None](size: Int):
@@ -812,68 +985,9 @@ struct Array[T: DType]:
             other
         )
 
-    fn mul[nelts: Int](self: Self, other: Self) -> Self:
-        @parameter
-        fn outer_loop[func: fn (Int) capturing -> None](size: Int):
-            for i in range(size):
-                func(i)
-
-        return self.__element_wise_tensor_operation__[nelts, outer_loop, math.mul](
-            other
-        )
-
-    fn mul[nelts: Int](self: Self, other: Self, num_cores: Int) -> Self:
-        @parameter
-        fn outer_loop[func: fn (Int) capturing -> None](size: Int) -> None:
-            parallelize[func](size, num_cores)
-
-        return self.__element_wise_tensor_operation__[nelts, outer_loop, math.mul](
-            other
-        )
-
-    fn sub[nelts: Int](self: Self, other: Self) -> Self:
-        @parameter
-        fn outer_loop[func: fn (Int) capturing -> None](size: Int):
-            for i in range(size):
-                func(i)
-
-        return self.__element_wise_tensor_operation__[nelts, outer_loop, math.sub](
-            other
-        )
-
-    fn sub[nelts: Int](self: Self, other: Self, num_cores: Int) -> Self:
-        @parameter
-        fn outer_loop[func: fn (Int) capturing -> None](size: Int) -> None:
-            parallelize[func](size, num_cores)
-
-        return self.__element_wise_tensor_operation__[nelts, outer_loop, math.sub](
-            other
-        )
-
-    fn true_div[nelts: Int](self: Self, other: Self) -> Self:
-        @parameter
-        fn outer_loop[func: fn (Int) capturing -> None](size: Int):
-            for i in range(size):
-                func(i)
-
-        return self.__element_wise_tensor_operation__[nelts, outer_loop, math.div](
-            other
-        )
-
-    fn true_div[nelts: Int](self: Self, other: Self, num_cores: Int) -> Self:
-        @parameter
-        fn outer_loop[func: fn (Int) capturing -> None](size: Int) -> None:
-            parallelize[func](size, num_cores)
-
-        return self.__element_wise_tensor_operation__[nelts, outer_loop, math.div](
-            other
-        )
-
     fn eq[nelts: Int](self, other: Self) -> Bool:
-        do_check(
-            self.array_shape == other.array_shape,
-            "dimension aren't equal can't performe eq operation.",
-        )
+        if not self.array_shape == other.array_shape:
+            print("dimension aren't equal can't performe eq operation.")
 
         var flag = True
         let size = self.array_shape.num_elements()
@@ -888,10 +1002,8 @@ struct Array[T: DType]:
         return flag
 
     fn eq[nelts: Int](self, other: Self, num_cores: Int, n_cores: Int) -> Bool:
-        do_check(
-            self.array_shape == other.array_shape,
-            "dimension aren't equal can't performe eq operation.",
-        )
+        if not self.array_shape == other.array_shape:
+            print("dimension aren't equal can't performe eq operation.")
 
         var flag = True
         let size = self.array_shape.num_elements()
@@ -914,87 +1026,6 @@ struct Array[T: DType]:
 
         return flag
 
-    fn pow[nelts: Int](self: Self, other: Self, num_cores: Int) -> Self:
-        do_check(
-            self.array_shape.num_elements() == other.array_shape.num_elements(),
-            "Arrays Don't have same size",
-        )
-        var res = Self(self.array_shape)
-        res.alloc()
-        let last_dim: Int = res.array_shape.dim(-1)
-        let res_size: Int = res.array_shape._size // last_dim
-
-        @parameter
-        fn _ol(i: Int):
-            @parameter
-            fn _lp[_nelts: Int](j: Int):
-                let index: Int = i * last_dim + j
-                res.data.simd_store[_nelts](
-                    index,
-                    self.data.simd_load[_nelts](index)
-                    ** res.data.simd_load[_nelts](index),
-                )
-
-            vectorize[nelts, _lp](last_dim)
-
-        parallelize[_ol](res_size, num_cores)
-        return res ^
-
-    fn pow[nelts: Int](self: Self, other: Self) -> Self:
-        do_check(
-            self.array_shape.num_elements() == other.array_shape.num_elements(),
-            "Arrays Don't have same size",
-        )
-        var res = Self(self.array_shape)
-        res.alloc()
-        let last_dim: Int = res.array_shape.dim(-1)
-        let res_size: Int = res.array_shape._size // last_dim
-
-        @parameter
-        fn _ol(i: Int):
-            @parameter
-            fn _lp[_nelts: Int](j: Int):
-                let index: Int = i * last_dim + j
-                res.data.simd_store[_nelts](
-                    index,
-                    self.data.simd_load[_nelts](index)
-                    ** res.data.simd_load[_nelts](index),
-                )
-
-            vectorize[nelts, _lp](last_dim)
-
-        for i in range(res_size):
-            _ol(i)
-        return res ^
-
-    fn dot[nelts: Int](self: Self, other: Self) -> Self:
-        do_check(
-            self.array_shape == other.array_shape,
-            "dimensions aren't the same",
-        )
-        do_check(
-            self.array_shape.rank() == 1 and other.array_shape.rank() == 1,
-            "only 1D arrays are accepted",
-        )
-        var shp = DynamicVector[Int]()
-        for s in range(self.array_shape._length):
-            shp.push_back(self.array_shape._shape[s])
-        var res = Self(ArrayShape(shp))
-
-        @parameter
-        fn _do[_nelts: Int](size: Int):
-            res.data.simd_store[_nelts](
-                size,
-                res[size]
-                + (
-                    self.data.simd_load[_nelts](size)
-                    * other.data.simd_load[_nelts](size)
-                ).reduce_add(),
-            )
-
-        vectorize[nelts, _do](self.array_shape.num_elements())
-        return res ^
-
     @staticmethod
     fn tile[
         tiled_fn: Static2DTileUnitFunc, tile_x: Int, tile_y: Int
@@ -1003,314 +1034,10 @@ struct Array[T: DType]:
             for x in range(0, end_x, tile_x):
                 tiled_fn[tile_x, tile_y](x, y)
 
-    fn __matmul_ot[
-        nelts: Int,
-        outer_loop_func: fn[func: fn (Int) capturing -> None] (Int) capturing -> None,
-    ](self, other: Self) -> Self:
-        if not (self.rank() == 2 and other.rank() == 1):
-            print("Report Matmul Bug")
-
-        var res = Self(self.dim(0))
-        res.fill(0.0)
-
-        @parameter
-        fn _loop(i: Int):
-            var ar: SIMD[T, nelts] = SIMD[T, nelts](0.0)
-
-            @parameter
-            fn element_wise[_nelts: Int](j: Int):
-                let a_i = i * self.dim(-1) + j
-                if _nelts < nelts:
-                    ar[0] += (self.load[1](a_i) * other.load[_nelts](j)).reduce_add()
-                else:
-                    ar += self.load[nelts](a_i) * other.load[nelts](j)
-
-            vectorize[nelts, element_wise](self.dim(-1))
-            res[i] = ar.reduce_add()
-
-        outer_loop_func[_loop](self.dim(-2))
-        return res ^
-
-    fn __matmul[
-        nelts: Int,
-        outer_loop_func: fn[func: fn (Int) capturing -> None] (Int) capturing -> None,
-    ](self, other: Self) -> Self:
-        if self.array_shape.rank() == 1 and other.array_shape.rank() == 1:
-            return self.dot[nelts](other)
-        if self.rank() == 2 and other.rank() == 1:
-            return self.__matmul_ot[nelts, outer_loop_func](other)
-        do_check(
-            not self.array_shape.__eq_matmul__(other.array_shape),
-            "dimensions don't conform for matmul operation",
-        )
-
-        var res_dims = InlinedFixedVector[dims_average_size, Int](self.rank())
-        for i in range(self.rank() - 1):
-            res_dims.append(self.dim(i))
-        res_dims.append(other.dim(-1))
-
-        var C = Self(ArrayShape(res_dims))
-        C.fill(0.0)
-
-        C.fill(0.0)
-        if self.rank() != other.rank():
-            print("Can not performe operation Dimensions won't match")
-            return C ^
-        let C_C: Int = C.dim(-1)
-        let A_C: Int = self.dim(-1)
-        let C_R: Int = C.dim(-2)
-        let C_P: Int = C.dim(-2) * C.dim(-1)
-        let B_P: Int = other.dim(-2) * other.dim(-1)
-        let A_P: Int = self.dim(-2) * self.dim(-1)
-
-        @parameter
-        fn CI(y: Int, x: Int) -> Int:
-            return y * C.dim(-1) + x
-
-        @parameter
-        fn AI(y: Int, x: Int) -> Int:
-            return y * self.dim(-1) + x
-
-        @parameter
-        fn BI(y: Int, x: Int) -> Int:
-            return y * other.dim(-1) + x
-
-        for s in range((C.num_elements() // (C_C * C_R))):
-            let pad_ci = s * C_P
-            let pad_ai = s * A_P
-            let pad_bi = s * B_P
-
-            @parameter
-            fn loop_(i: Int) -> None:
-                for j in range(A_C):
-
-                    @parameter
-                    fn _mul[_nelts: Int](k: Int) -> None:
-                        let ci: Int = CI(i, k) + pad_ci
-                        let ai: Int = AI(i, j) + pad_ai
-                        let bi: Int = BI(j, k) + pad_bi
-                        C.store[_nelts](
-                            ci, C.load[_nelts](ci) + self[ai] * other.load[_nelts](bi)
-                        )
-
-                    vectorize[nelts, _mul](C_C)
-
-            outer_loop_func[loop_](C_R)
-        return C ^
-
-    @always_inline
-    fn matmul[nelts: Int](self, other: Self, num_cores: Int, n_cores: Int) -> Self:
-        @parameter
-        fn matmul_p[outer_loop: fn (Int) capturing -> None](range_size: Int):
-            parallelize[outer_loop](range_size, n_cores)
-
-        let result_array = self.__matmul[nelts, matmul_p](other)
-
-        return result_array
-
-    @always_inline
-    fn matmul[nelts: Int](self, other: Self) -> Self:
-        @parameter
-        fn matmul_v[outer_loop: fn (Int) capturing -> None](range_size: Int):
-            for i in range(range_size):
-                outer_loop(i)
-
-        let result_array: Self = self.__matmul[nelts, matmul_v](other)
-        # if debuging:
-        #     for i in range(result_array.num_elements()):
-        #         print("TRIGGERING RES MTML : ", i, " AS ", result_array[i])
-        return result_array
-
-    # cos
-
-    fn cos(inout self: Self) -> Self:
-        return self.__apply_math__[cos]()
-
-    fn cos[nelts: Int](inout self: Self) -> Self:
-        return self.__apply_math__[nelts, cos]()
-
-    fn cos(inout self: Self, num_cores: Int) -> Self:
-        return self.__apply_math__[cos](num_cores)
-
-    # sin
-
-    fn sin(inout self: Self) -> Self:
-        return self.__apply_math__[sin]()
-
-    fn sin[nelts: Int](inout self: Self) -> Self:
-        return self.__apply_math__[nelts, sin]()
-
-    fn sin(inout self: Self, num_cores: Int) -> Self:
-        return self.__apply_math__[sin](num_cores)
-
-    # log
-
-    fn log(inout self: Self) -> Self:
-        return self.__apply_math__[log]()
-
-    fn log[nelts: Int](inout self: Self) -> Self:
-        return self.__apply_math__[nelts, log]()
-
-    fn log(inout self: Self, num_cores: Int) -> Self:
-        return self.__apply_math__[log](num_cores)
-
-    # log2
-
-    fn log2(inout self: Self) -> Self:
-        return self.__apply_math__[log2]()
-
-    fn log2[nelts: Int](inout self: Self) -> Self:
-        return self.__apply_math__[nelts, log2]()
-
-    fn log2(inout self: Self, num_cores: Int) -> Self:
-        return self.__apply_math__[log2](num_cores)
-
-    # tan
-
-    fn tan(inout self: Self) -> Self:
-        return self.__apply_math__[tan]()
-
-    fn tan[nelts: Int](inout self: Self) -> Self:
-        return self.__apply_math__[nelts, tan]()
-
-    fn tan(inout self: Self, num_cores: Int) -> Self:
-        return self.__apply_math__[tan](num_cores)
-
-    # tanh
-
-    fn tanh(inout self: Self) -> Self:
-        return self.__apply_math__[tanh]()
-
-    fn tanh[nelts: Int](inout self: Self) -> Self:
-        return self.__apply_math__[nelts, tanh]()
-
-    fn tanh(inout self: Self, num_cores: Int) -> Self:
-        return self.__apply_math__[tanh](num_cores)
-
-    # sqrt
-
-    # fn sqrt(inout self: Self) -> Self:
-    #     return self.__apply_math__[sqrt]()
-
-    # fn sqrt[nelts: Int](inout self: Self) -> Self:
-    #     return self.__apply_math__[nelts, sqrt]()
-
-    # fn sqrt(inout self: Self, num_cores: Int) -> Self:
-    #     return self.__apply_math__[sqrt](num_cores)
-
-    # atan
-
-    fn atan(inout self: Self) -> Self:
-        return self.__apply_math__[atan]()
-
-    fn atan[nelts: Int](inout self: Self) -> Self:
-        return self.__apply_math__[nelts, atan]()
-
-    fn atan(inout self: Self, num_cores: Int) -> Self:
-        return self.__apply_math__[atan](num_cores)
-
-    # exp
-
-    fn exp(inout self: Self) -> Self:
-        return self.__apply_math__[exp]()
-
-    fn exp[nelts: Int](inout self: Self) -> Self:
-        return self.__apply_math__[nelts, exp]()
-
-    fn exp(inout self: Self, num_cores: Int) -> Self:
-        return self.__apply_math__[exp](num_cores)
-
-    # exp2
-
-    fn exp2(inout self: Self) -> Self:
-        return self.__apply_math__[exp2]()
-
-    fn exp2[nelts: Int](inout self: Self) -> Self:
-        return self.__apply_math__[nelts, exp2]()
-
-    fn exp2(inout self: Self, num_cores: Int) -> Self:
-        return self.__apply_math__[exp2](num_cores)
-
-    # log10
-    fn log10(inout self: Self) -> Self:
-        return self.__apply_math__[log10]()
-
-    fn log10[nelts: Int](inout self: Self) -> Self:
-        return self.__apply_math__[nelts, log10]()
-
-    fn log10(inout self: Self, num_cores: Int) -> Self:
-        return self.__apply_math__[log10](num_cores)
-
-    # log1p
-
-    fn log1p(inout self: Self) -> Self:
-        return self.__apply_math__[log1p]()
-
-    fn log1p[nelts: Int](inout self: Self) -> Self:
-        return self.__apply_math__[nelts, log1p]()
-
-    fn log1p(inout self: Self, num_cores: Int) -> Self:
-        return self.__apply_math__[log1p](num_cores)
-
-    # logb
-
-    fn logb(inout self: Self) -> Self:
-        return self.__apply_math__[logb]()
-
-    fn logb[nelts: Int](inout self: Self) -> Self:
-        return self.__apply_math__[nelts, logb]()
-
-    fn logb(inout self: Self, num_cores: Int) -> Self:
-        return self.__apply_math__[logb](num_cores)
-
-    # asin
-
-    fn asin(inout self: Self) -> Self:
-        return self.__apply_math__[asin]()
-
-    fn asin[nelts: Int](inout self: Self) -> Self:
-        return self.__apply_math__[nelts, asin]()
-
-    fn asin(inout self: Self, num_cores: Int) -> Self:
-        return self.__apply_math__[asin](num_cores)
-
-    # acos
-
-    fn acos(inout self: Self) -> Self:
-        return self.__apply_math__[acos]()
-
-    fn acos[nelts: Int](inout self: Self) -> Self:
-        return self.__apply_math__[nelts, acos]()
-
-    fn acos(inout self: Self, num_cores: Int) -> Self:
-        return self.__apply_math__[acos](num_cores)
-
-    # asinh
-
-    fn asinh(inout self: Self) -> Self:
-        return self.__apply_math__[asinh]()
-
-    fn asinh[nelts: Int](inout self: Self) -> Self:
-        return self.__apply_math__[nelts, asinh]()
-
-    fn asinh(inout self: Self, num_cores: Int) -> Self:
-        return self.__apply_math__[asinh](num_cores)
-
-    # acosh
-
-    fn acosh(inout self: Self) -> Self:
-        return self.__apply_math__[acosh]()
-
-    fn acosh[nelts: Int](inout self: Self) -> Self:
-        return self.__apply_math__[nelts, acosh]()
-
-    fn acosh(inout self: Self, num_cores: Int) -> Self:
-        return self.__apply_math__[acosh](num_cores)
-
     @always_inline
     fn argmax(self: Self, axis: Int = -1) -> Int:
         var max_index: Int = 0
-        var max_value: SIMD[T, 1] = self[0]
+        var max_value: SIMD[DT, 1] = self[0]
         for i in range(self.dim(axis)):
             if self[i] > max_value:
                 max_index = i
@@ -1318,51 +1045,282 @@ struct Array[T: DType]:
         return max_index
 
     @always_inline
-    fn fill(inout self: Self, val: SIMD[T, 1]) -> None:
-        @parameter
-        fn set_[nelts: Int](i: Int):
-            self.data.simd_store[nelts](i, val)
+    fn fill(inout self: Self, val: SIMD[DT, 1]) -> None:
+        if val == 0:
+            memset_zero[DT](self.data, self.num_elements())
+        else:
 
-        vectorize[Array[T].nelts, set_](self.num_elements())
+            @parameter
+            fn set_[nelts: Int](i: Int):
+                self.data.simd_store[nelts](i, val)
+
+            vectorize[Array[DT].nelts, set_](self.num_elements())
 
     fn print_shape(self) -> None:
         self.array_shape.shape_str()
 
-    fn print_array(self) -> None:
-        let size = self.array_shape.num_elements()
+    fn print_strides(self) -> None:
+        self.array_shape.strides_str()
 
-        var product = InlinedFixedVector[dims_average_size, Int](
-            self.array_shape.rank() + 1
-        )
-        product.append(1)
-        for index in range(self.array_shape.rank()):
-            product.append(
-                product[index] * self.array_shape[self.array_shape.rank() - 1 - index]
+    fn print_array(self, number_detail: Int = 6) -> None:
+        let row: Int = self.dim(-2)
+        let cols: Int = self.dim(-1)
+        let col_strides: Int = (self.strides[0] * self.shape[0]) // cols
+        print_no_newline("<Array: ")
+        for i in range(col_strides):
+            if col_strides > 10 and i > 4 and i < col_strides - 5:
+                if i == 5:
+                    print("                 ... ")
+                continue
+            else:
+                if i > 0:
+                    print_no_newline("           ")
+                else:
+                    print_no_newline("[ ")
+
+                var indent = 0
+                for d in range(self.rank() - 1):
+                    if cols * i % self.strides[d] == 0:
+                        print_no_newline("[ ")
+                        indent += 1
+                    else:
+                        print_no_newline("  ")
+
+                for j in range(cols):
+                    if cols > 10 and j >= 3 and j < cols - 3:
+                        if j == 3:
+                            print_no_newline("... , ")
+                        continue
+                    else:
+                        let idx = cols * i + j
+                        let str_dt = String(self.data.load(idx))
+                        let len_str = len(str_dt)
+                        if len_str > number_detail:
+                            print_no_newline(str_dt[:number_detail])
+                        else:
+                            print_no_newline(str_dt)
+                        if j != cols - 1:
+                            print_no_newline(", ")
+
+                for d in range(self.rank() - 2, -1, -1):
+                    if cols * (i + 1) % self.strides[d] == 0:
+                        print_no_newline(" ]")
+
+                if i < col_strides - 1:
+                    print_no_newline(", ")
+                    put_new_line()
+                else:
+                    print_no_newline(" ], shape: [")
+                    for i in range(self.rank()):
+                        print_no_newline(self.shape[i])
+                        if i < self.rank() - 1:
+                            print_no_newline(",")
+                    print_no_newline("], Data>\n\n")
+
+    @always_inline
+    fn matmul[nelts: Int = Self.nelts, cores: Int = 2](self, other: Self) -> Self:
+        return matmul[DT, nelts, cores](self, other)
+
+    @always_inline
+    fn cosh[nelts: Int = Array[DT].nelts, cores: Int = 2](self) -> Array[DT]:
+        return array_cosh[DT, nelts](self)
+
+    @always_inline
+    fn cos[nelts: Int = Array[DT].nelts, cores: Int = 2](self) -> Array[DT]:
+        return array_cos[DT, nelts](self)
+
+    @always_inline
+    fn tan[nelts: Int = Array[DT].nelts, cores: Int = 2](self) -> Array[DT]:
+        return array_tan[DT, nelts](self)
+
+    @always_inline
+    fn tanh[nelts: Int = Array[DT].nelts, cores: Int = 2](self) -> Array[DT]:
+        return array_tanh[DT, nelts](self)
+
+    @always_inline
+    fn atan[nelts: Int = Array[DT].nelts, cores: Int = 2](self) -> Array[DT]:
+        return array_atan[DT, nelts](self)
+
+    @always_inline
+    fn asin[nelts: Int = Array[DT].nelts, cores: Int = 2](self) -> Array[DT]:
+        return array_asin[DT, nelts](self)
+
+    @always_inline
+    fn acos[nelts: Int = Array[DT].nelts, cores: Int = 2](self) -> Array[DT]:
+        return array_acos[DT, nelts](self)
+
+    @always_inline
+    fn add[
+        nelts: Int = Array[DT].nelts, cores: Int = 2
+    ](self, other: Self) -> Array[DT]:
+        return array_add[DT, nelts, cores](self, other)
+
+    @always_inline
+    fn abs[nelts: Int = Array[DT].nelts, cores: Int = 2](self) -> Array[DT]:
+        return array_abs[DT, nelts](self)
+
+    @always_inline
+    fn sqrt[nelts: Int = Array[DT].nelts, cores: Int = 2](self) -> Array[DT]:
+        return array_sqrt[DT, nelts](self)
+
+    @always_inline
+    fn sinh[nelts: Int = Array[DT].nelts, cores: Int = 2](self) -> Array[DT]:
+        return array_sinh[DT, nelts](self)
+
+    @always_inline
+    fn sin[nelts: Int = Array[DT].nelts, cores: Int = 2](self) -> Array[DT]:
+        return array_sin[DT, nelts](self)
+
+    @always_inline
+    fn pow_all[nelts: Int = Array[DT].nelts, cores: Int = 2](self) -> Array[DT]:
+        return array_pow_all[DT, nelts](self)
+
+    @always_inline
+    fn log[nelts: Int = Array[DT].nelts, cores: Int = 2](self) -> Array[DT]:
+        return array_log[DT, nelts](self)
+
+    @always_inline
+    fn log2[nelts: Int = Array[DT].nelts, cores: Int = 2](self) -> Array[DT]:
+        return array_log2[DT, nelts](self)
+
+    @always_inline
+    fn exp[nelts: Int = Array[DT].nelts, cores: Int = 2](self) -> Array[DT]:
+        return array_exp[DT, nelts](self)
+
+    @always_inline
+    fn exp2[nelts: Int = Array[DT].nelts, cores: Int = 2](self) -> Array[DT]:
+        return array_exp2[DT, nelts](self)
+
+    @always_inline
+    fn div[
+        nelts: Int = Array[DT].nelts, cores: Int = 2
+    ](self, other: Self) -> Array[DT]:
+        return array_div[DT, nelts, cores](self, other)
+
+    @always_inline
+    fn mul[
+        nelts: Int = Array[DT].nelts, cores: Int = 2
+    ](self, other: Self) -> Array[DT]:
+        return array_mul[DT, nelts, cores](self, other)
+
+    @always_inline
+    fn sub[
+        nelts: Int = Array[DT].nelts, cores: Int = 2
+    ](self, other: Self) -> Array[DT]:
+        return array_sub[DT, nelts, cores](self, other)
+
+    @always_inline
+    fn pow[
+        nelts: Int = Array[DT].nelts, cores: Int = 2
+    ](self, other: Self) -> Array[DT]:
+        return array_pow[DT, nelts, cores](self, other)
+
+    @always_inline
+    fn __add__(self: Self, other: Self) -> Self:
+        return self.add[Self.nelts](other)
+
+    @always_inline
+    fn __mul__(self: Self, other: Self) -> Self:
+        return self.mul[Self.nelts](other)
+
+    @always_inline
+    fn __matmul__(self: Self, other: Self) -> Self:
+        return self.matmul[Self.nelts](other)
+
+    @always_inline
+    fn __sub__(self: Self, other: Self) -> Self:
+        return self.sub[Self.nelts](other)
+
+    @always_inline
+    fn __truediv__(self: Self, other: Self) -> Self:
+        return self.div[Self.nelts](other)
+
+    @always_inline
+    fn __mod__(self: Self, other: Self) -> Self:
+        return self.mod[Self.nelts](other)
+
+    @always_inline
+    fn __len__(self: Self) -> Int:
+        return self.array_shape.num_elements()
+
+    @always_inline
+    fn __eq__(self, other: Self) -> Bool:
+        return self.eq[Self.nelts](other)
+
+    @always_inline
+    fn __ne__(self, other: Self) -> Bool:
+        return not self.eq[Self.nelts](other)
+
+    @always_inline
+    fn __pow__(self: Self, other: Self) -> Self:
+        return self.pow[Self.nelts](other)
+
+    @always_inline
+    fn __iadd__(inout self: Self, other: Self) -> None:
+        self = self.add[Self.nelts](other)
+
+    @always_inline
+    fn __isub__(inout self: Self, other: Self) -> None:
+        self = self.sub[Self.nelts](other)
+
+    @always_inline
+    fn __ipow__(inout self: Self, other: Self) -> None:
+        self = self.pow[Self.nelts](other)
+
+    @always_inline
+    fn __imod__(inout self: Self, other: Self) -> None:
+        self = self.mod[Self.nelts](other)
+
+    @always_inline
+    fn __idiv__(inout self: Self, other: Self) -> None:
+        self = self.div[Self.nelts](other)
+
+    @always_inline
+    fn __itruediv__(inout self: Self, other: Self) -> None:
+        self = self.div[Self.nelts](other)
+
+    fn randu(self, min_val: SIMD[DT, 1], max_val: SIMD[DT, 1]):
+        rand(self.data, self.num_elements())
+
+        @parameter
+        fn _cols(i: Int):
+            self.store[1](i, self.load[1](i) * (max_val - min_val) + min_val)
+
+        parallelize[_cols](self.num_elements())
+
+    fn randHe(self):
+        let u1 = DTypePointer[DT].alloc(self.num_elements())
+        let u2 = DTypePointer[DT].alloc(self.num_elements())
+        rand(u1, self.num_elements())
+        rand(u2, self.num_elements())
+
+        @parameter
+        fn _cols(i: Int):
+            let z = sqrt(-SIMD[DT, 1](2.0) * log(u1.simd_load[1](i))) * cos(
+                SIMD[DT, 1](2.0) * self.pi * u2.simd_load[1](i)
             )
+            let sigma = sqrt(SIMD[DT, 1](2.0) / self.dim(-1))
+            self.store[1](i, z * sigma)
 
-        var count = 0
-        for i in range(size + 1):
-            let r_dt = self[i]
-            count = 0
-            for j in range(self.array_shape.rank()):
-                if i % product[j + 1] == 0 and i != 0:
-                    print_no_newline("]")
-                    count += 1
+        parallelize[_cols](self.num_elements())
+        u1.free()
+        u2.free()
 
-            if i > 0 and i < size:
-                print_no_newline(",")
+    fn randn(
+        self, std: SIMD[DT, 1] = SIMD[DT, 1](1.0), mu: SIMD[DT, 1] = SIMD[DT, 1](0.0)
+    ):
+        let u1 = DTypePointer[DT].alloc(self.num_elements())
+        let u2 = DTypePointer[DT].alloc(self.num_elements())
+        rand(u1, self.num_elements())
+        rand(u2, self.num_elements())
 
-            if i < size:
-                for i in range(count):
-                    print()
-                    for i in range(self.array_shape.rank() - 1):
-                        print_no_newline(" ")
+        @parameter
+        fn _cols(i: Int):
+            let z = sqrt(-SIMD[DT, 1](2.0) * log(u1.simd_load[1](i))) * cos(
+                SIMD[DT, 1](2.0) * self.pi * u2.simd_load[1](i)
+            )
+            self.store[1](i, z * std + mu)
 
-            for j in range(self.array_shape.rank()):
-                if i % product[j + 1] == 0 and i != size:
-                    print_no_newline("[")
-
-            if i < size:
-                print_no_newline(r_dt)
-
-        print()
+        parallelize[_cols](self.num_elements())
+        u1.free()
+        u2.free()
