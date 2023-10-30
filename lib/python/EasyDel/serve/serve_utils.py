@@ -33,6 +33,7 @@ from ..utils import prefix_str
 from gradio.themes.base import Base
 from gradio.themes.utils import colors, fonts, sizes
 from typing import Union
+import chex
 
 
 class Seafoam(Base):
@@ -338,8 +339,8 @@ class JAXServer(object):
 
     def generate(self,
                  params: Union[flax.core.FrozenDict, dict],
-                 input_ids: jax.Array,
-                 attention_mask: jax.Array,
+                 input_ids: chex.Array,
+                 attention_mask: chex.Array,
                  ):
         if not self._funcs_generated:
             raise NotImplementedError(
@@ -494,8 +495,8 @@ class JAXServer(object):
 
     def greedy_generate(self,
                         params: Union[flax.core.FrozenDict, dict],
-                        input_ids: jax.Array,
-                        attention_mask: jax.Array,
+                        input_ids: chex.Array,
+                        attention_mask: chex.Array,
                         ):
         if not self._funcs_generated:
             raise NotImplementedError(

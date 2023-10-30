@@ -4,20 +4,59 @@ Copyright (c) Erfan zare Chavoshi
 EasyDel Library [MOJO/Matrix]
 """
 
-from .array_module import Array, ArrayShape
-from .array_utils import (
-    convert_numpy_to_easydel_array,
+from .array_module import (
+    Array,
+    ArrayShape,
     matmul_shape,
-    matmul_single_row,
-    matmul_2d,
     matmul,
-    T_AXIS_0_2_1,  # LOW LEVEL AND PARALLELIZED , VECTORIZED
-    T_AXIS_2_1_0,  # LOW LEVEL AND PARALLELIZED , VECTORIZED
-    T_AXIS_1_0_2,  # LOW LEVEL AND PARALLELIZED , VECTORIZED
-    T_2D,  # LOW LEVEL AND PARALLELIZED , VECTORIZED
-    CAT_3D_AXIS_2,  # LOW LEVEL AND PARALLELIZED , VECTORIZED
-    rotate_half,  # LOW LEVEL AND PARALLELIZED , VECTORIZED
+    matmul_2d,
+    matmul_3D,
+    matmul_single_row,
+    base_case_matmul,
+    kernel_add,
+    kernel_div,
+    kernel_matmul,
+    kernel_mul,
+    kernel_pow,
+    kernel_sub,
+    array_abs,
+    array_acos,
+    array_add,
+    array_asin,
+    array_atan,
+    array_copy,
+    array_tanh,
+    array_tan,
+    array_cos,
+    array_cosh,
+    array_div,
+    array_exp,
+    array_exp2,
+    array_relu,
+    array_log,
+    array_log2,
+    array_mul,
+    array_pow_all,
+    array_sin,
+    array_sinh,
+    array_sqrt,
+    array_pow,
+    array_sub,
+    relu,
+    leaky_relu,
+    softmax,
+    silu,
+    sigmoid,
+    mean,
+    ce,
+    mse,
+    sample,
+    T_AXIS_0_2_1,
+    T_AXIS_1_0_2,
+    T_AXIS_2_1_0,
+    CAT_4D_AXIS_3,
+    rotate_half,
+    convert_numpy_to_easydel_array,
     arange,
 )
-from .funcs import softmax, silu, relu, leaky_relu, sigmoid, sample_array
 from .ed_struct import PointerOperation

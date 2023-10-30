@@ -2,7 +2,7 @@
 
 ## Available Models Are
 
-1. **_Mistral_**:
+1. **_[Mistral](https://erfanzar.github.io/EasyDeL/docs/Python/Mistral)_**:
 
     * Supports:
         * Fully Sharded Data Parallel `(FSDP)`
@@ -11,6 +11,7 @@
         * Distributed Data Parallel  (DDP) `(DP)`
         * Gradient CheckPointing
         * Usage and Import from EasyDel Library
+        * [Usage](https://erfanzar.github.io/EasyDeL/docs/Python/Mistral)
 
 [//]: # (        * Flash Attention)
 
