@@ -14,7 +14,7 @@ from flax.linen import partitioning as nn_partitioning
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 
 from ..flax_modelling_utils import ACT2FN, with_sharding_constraint, get_gradient_checkpoint_policy, repeat_kv_bnsh, \
-    apply_rotary_pos_emb
+    apply_rotary_pos_emb, precompute_freq_cis
 import chex
 
 
