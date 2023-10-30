@@ -16,6 +16,16 @@ def permute(tensor, head, dim_in, dim_out):
     return tensor.view(head, dim_out // head // 2, 2, dim_in).transpose(1, 2).reshape(dim_out, dim_in)
 
 
+def match_keywords(string, ts, ns):
+    for t in ts:
+        if t not in string:
+            return False
+    for n in ns:
+        if n in string:
+            return False
+    return True
+
+
 def mistral_convert_hf_to_flax_load(checkpoints_dir, config: MistralConfig,
                                     device=jax.devices('cpu')[0]):
     kv_dim = config.num_key_value_heads * (config.hidden_size // config.num_attention_heads)
@@ -100,15 +110,13 @@ def mistral_convert_hf_to_flax_load(checkpoints_dir, config: MistralConfig,
 
 def mistral_convert_hf_to_flax(state_dict, config: MistralConfig,
                                device=jax.devices('cpu')[0]):
-    kv_dim = config.num_key_value_heads * (config.hidden_size // config.num_attention_heads)
     with jax.default_device(device):
         jax_weights = {
             "model": {
                 "embed_tokens": {"embedding": state_dict["model.embed_tokens.weight"].numpy()},
                 "norm": {"kernel": state_dict["model.norm.weight"].numpy()},
                 "layers": {
-                    "%d"
-                    % (layer): {
+                    f"{layer}": {
                         "self_attn": {
                             "q_proj": {
                                 "kernel": state_dict[
@@ -163,11 +171,9 @@ def mistral_convert_hf_to_flax(state_dict, config: MistralConfig,
 
 
 def mistral_convert_pt_to_flax(state_dict_pt, config: MistralConfig, device=jax.devices('cpu')[0]):
-    kv_dim = config.num_key_value_heads * (config.hidden_size // config.num_attention_heads)
     with jax.default_device(device):
-        state_dict_flax = {}
-        state_dict_flax[('model', 'embed_tokens', 'embedding')] = state_dict_pt[
-            'model.embed_tokens.weight'].cpu().detach().numpy()
+        state_dict_flax = {('model', 'embed_tokens', 'embedding'): state_dict_pt[
+            'model.embed_tokens.weight'].cpu().detach().numpy()}
         for i in range(config.num_hidden_layers):
             state_dict_flax[('model', 'layers', f'{i}', 'input_layernorm', 'kernel')] = state_dict_pt[
                 f'model.layers.{i}.input_layernorm.weight'].cpu().detach().numpy()
@@ -196,17 +202,6 @@ def mistral_convert_pt_to_flax(state_dict_pt, config: MistralConfig, device=jax.
 
 
 def mistral_convert_flax_to_pt(flax_params, config: MistralConfig, dtype=jnp.float16):
-    kv_dim = config.num_key_value_heads * (config.hidden_size // config.num_attention_heads)
-
-    def match_keywords(string, ts, ns):
-        for t in ts:
-            if t not in string:
-                return False
-        for n in ns:
-            if n in string:
-                return False
-        return True
-
     torch_params = {}
     for key, tensor in flax_params.items():
         if match_keywords(key, ['kernel'], ['none']):
@@ -214,8 +209,7 @@ def mistral_convert_flax_to_pt(flax_params, config: MistralConfig, dtype=jnp.flo
         torch_params[key] = torch.from_numpy(tensor.astype(dtype=dtype))
 
     state_dict = {}
-    inv_freq = 1.0 / (
-            10000.0 ** (torch.arange(0, config.hidden_size // config.num_attention_heads, 2).float() / (
+    inv_freq = 1.0 / (10000.0 ** (torch.arange(0, config.hidden_size // config.num_attention_heads, 2).float() / (
             config.hidden_size // config.num_attention_heads)))
     for layer_i in range(config.num_hidden_layers):
         state_dict.update({
