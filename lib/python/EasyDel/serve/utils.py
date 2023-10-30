@@ -22,7 +22,7 @@ class InstructRequest(BaseModel):
 class ChatRequest(BaseModel):
     prompt: str
     system: Optional[str] = None
-    history: Union[List[List[str, str]], None] = None
+    history: Union[List[List], None] = None
     temperature: Optional[float] = None
     greedy: Optional[bool] = False
 
