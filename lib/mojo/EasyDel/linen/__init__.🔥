@@ -4,6 +4,7 @@ from .attention import (
     dot_product_attention_weights,
     repeat_kv,
     qkv_tranpose,
+    collect_index,
 )
 
 from .nn import (

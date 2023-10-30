@@ -173,7 +173,7 @@ fn dot_product_attention_weights[
             A.store[nelts](i, res)
 
     vectorize[nelts, _row](A.num_elements())
-    A = softmax[DT](A, -1)
+    A = softmax[DT, nelts, cores](A, -1)
     return A ^
 
 
@@ -245,3 +245,16 @@ fn qkv_tranpose[DT: DType, nelts: Int, cores: Int](owned array: Array[DT]) -> Ar
 
         parallelize[_rows](array.dim(2))
     return transposed_array
+
+
+fn collect_index[DT: DType, nelts: Int](A: Array[DT], axis: Int) -> Array[DT]:
+    var B: Array[DT] = Array[DT](1, A.dim(-1))
+
+    B.alloc()
+
+    @parameter
+    fn cols[_nelts: Int](i: Int):
+        B.store[_nelts](i, A.load[_nelts](axis, i))
+
+    vectorize[nelts, cols](B.num_elements())
+    return B
