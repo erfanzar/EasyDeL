@@ -9,9 +9,6 @@ from .array_module import (
     ArrayShape,
     matmul_shape,
     matmul,
-    matmul_2d,
-    matmul_3D,
-    matmul_single_row,
     base_case_matmul,
     kernel_add,
     kernel_div,
@@ -58,5 +55,7 @@ from .array_module import (
     rotate_half,
     convert_numpy_to_easydel_array,
     arange,
+    matmul_row,
+    over_all_softmax,
 )
 from .ed_struct import PointerOperation

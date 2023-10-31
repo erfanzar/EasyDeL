@@ -8,10 +8,7 @@ from .array import (
     ArrayShape,
     # Array Module
     matmul,
-    matmul_2d,
-    matmul_3D,
     matmul_shape,
-    matmul_single_row,
     base_case_matmul,
     kernel_add,
     kernel_div,
@@ -55,6 +52,8 @@ from .array import (
     CAT_4D_AXIS_3,
     convert_numpy_to_easydel_array,
     arange,
+    matmul_row,
+    over_all_softmax,
     # Funcs
     PointerOperation,
     # ED Struct
