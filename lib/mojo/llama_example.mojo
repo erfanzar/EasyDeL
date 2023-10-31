@@ -68,10 +68,9 @@ fn run[
     let loading_time: SIMD[DT, 1] = (
         SIMD[DT, 1](time.now()) - start_loading
     ) / 1_000_000_000
-
+    var start_time = Float64(0)
     print("MODEL LOADED AND STATE CREATED IN ", loading_time, " SEC/s")
 
-    let now: Int = time.now()
     var input_ids = DynamicVector[Int]()
 
     if prompt:
@@ -99,13 +98,17 @@ fn run[
         var token_string: Pointer[UInt8] = tokenizer.vocab[next_input_id]
         if input_id == 0 and token_string[0] == ord(" "):
             token_string = token_string.offset(1)
-
+        if start_time == 0:
+            start_time = time.now() / 1_000_000
         position_id += 1
         input_id = next_input_id
 
         print_pointer(token_string)
 
-    print("\n\nWATCHOUT FOR 🔥")
+    print(
+        "\n\nWATCHOUT FOR 🔥 , AVG Tokens M/s : ",
+        (position_id - 1) / ((time.now() / 1_000_000) - start_time) * 1000,
+    )
 
 
 fn main() raises:
@@ -113,8 +116,8 @@ fn main() raises:
     var input_id: Int = 1
     var position_id: Int = 0
 
-    var temperature: SIMD[RUNTIME_DTYPE, 1] = 0.4
-    var steps: Int = 512
+    var temperature: SIMD[RUNTIME_DTYPE, 1] = 0.7
+    var steps: Int = 1024
     var start: Int = -1
 
     var prompt: String = String(r"")
