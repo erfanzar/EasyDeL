@@ -362,13 +362,13 @@ fn llama_forward_call[
 
         llama_state.k.set_data_from_buffer(
             llama_state.key_cache.data.offset(
-                layer_index * position_id * config.kv_dims
+                layer_index * config.max_position_embeddings * config.kv_dims
             )
         )
 
         llama_state.v.set_data_from_buffer(
             llama_state.value_cache.data.offset(
-                layer_index * position_id * config.kv_dims
+                layer_index * config.max_position_embeddings * config.kv_dims
             )
         )
         let q_proj: Array[DT] = Array[DT](
@@ -427,14 +427,15 @@ fn llama_forward_call[
 
                 vectorize[nelts, score_fn](config.head_dims)
                 score /= math.sqrt[DT, 1](config.head_dims)
-                llama_state.attention.store[1](attention_offset + pos, score)
+                # print("score : ", score, " Save at : ", attention_offset + pos)
+                llama_state.attention[attention_offset + pos] = score
 
             over_all_softmax[DT, nelts, cores](
                 llama_state.attention,
                 attention_offset,
                 attention_offset + position_id + 1,
             )
-
+   
             for pos in range(position_id + 1):
                 let v_offset = (
                     cache_stride
@@ -442,13 +443,15 @@ fn llama_forward_call[
                     + (h // config.number_rep_kv) * config.head_dims
                 )
 
-                let attn = llama_state.attention.load[1](attention_offset + pos)
+                let attn = llama_state.attention[attention_offset + pos]
 
                 @parameter
                 fn attn_value_mul[_nelts: Int](i: Int):
                     let av = llama_state.residual.data.simd_load[_nelts](
                         hidden_size_offset + i
-                    ) + attn * llama_state.v.data.simd_load[_nelts](v_offset + i)
+                    ) + attn * llama_state.value_cache.data.simd_load[_nelts](
+                        v_offset + i
+                    )
                     llama_state.residual.data.simd_store[_nelts](
                         hidden_size_offset + i, av
                     )
@@ -536,7 +539,7 @@ fn llama_forward_call[
             llama_state.hidden_state,
             llama_state.residual,
         )
-
+        
     rms_layernorm_1d[DT, nelts, cores](
         llama_state.hidden_state,
         llama_state.hidden_state,

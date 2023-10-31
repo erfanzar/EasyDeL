@@ -4,7 +4,8 @@ from EasyDel import (
     FileBuffer,
     read_file,
     BufReader,
-    softmax,
+    over_all_softmax,
+    sample,
     Tokenizer,
     byte_pr_tokenizer_encoder,
     print_pointer,
@@ -15,18 +16,28 @@ from python import Python, PythonObject
 import time
 import random
 from random import rand
-from EasyDel.models.llama import LlamaConfig, LlamaWeights, LlamaState
+from EasyDel.models.llama import (
+    LlamaConfig,
+    LlamaWeights,
+    LlamaState,
+    llama_forward_call,
+)
 from sys import argv
+from runtime.llcl import num_cores
+
+alias RUNTIME_DTYPE: DType = DType.float32
+alias RUNTIME_NELTS: Int = Array[RUNTIME_DTYPE].nelts * 4
+alias RUNTIME_CORES: Int = 6
 
 
 fn run[
-    DT: DType, nelts: Int = 1
+    DT: DType, nelts: Int, cores: Int
 ](
     weights_path: StringRef,
     tokenizer_path: StringRef,
     inout next_input_id: Int = -1,
     inout input_id: Int = 1,
-    inout position: Int = 0,
+    inout position_id: Int = 0,
     temperature: SIMD[DT, 1] = 0.4,
     steps: Int = 512,
     inout start: Int = -1,
@@ -40,13 +51,9 @@ fn run[
     read_file(tokenizer_bufferr, tokenizer_path)
 
     var config = LlamaConfig(weights_buffer)
-    let sz = weights_buffer.size // 1024 / 1024
-    print(
-        "\033[1;32mLoaded Model Weights Are ",
-        sz if sz < 1000 else weights_buffer.size // 1024 / 1024 / 1024,
-        " MB" if sz < 1000 else " GB",
-        "\n",
-    )
+
+    print("LOADED WEIGHT SIZE [MB] : ", weights_buffer.size // 1024 / 1024)
+    print("LOADED TOKENS SIZE [MB] : ", tokenizer_bufferr.size // 1024 / 1024)
 
     let is_tied: Bool = True if config.vocab_size > 0 else False
     if not is_tied:
@@ -55,32 +62,68 @@ fn run[
         config.print_config()
     var tokenizer: Tokenizer = Tokenizer(config.vocab_size, tokenizer_bufferr)
 
+    let start_loading: SIMD[DT, 1] = SIMD[DT, 1](time.now())
     let llama: LlamaWeights[DT] = LlamaWeights[DT](config, is_tied, weights_buffer)
-    var state: LlamaState[DT] = LlamaState[DT](config)
-    if verbose:
-        print("\033[1;32m\nModel Loaded Successfully And Mojo is on 🔥.\033[1;0m\n")
+    var llama_state: LlamaState[DT] = LlamaState[DT](config)
+    let loading_time: SIMD[DT, 1] = (
+        SIMD[DT, 1](time.now()) - start_loading
+    ) / 1_000_000_000
+
+    print("MODEL LOADED AND STATE CREATED IN ", loading_time, " SEC/s")
 
     let now: Int = time.now()
     var input_ids = DynamicVector[Int]()
 
     if prompt:
-        byte_pr_tokenizer_encoder(input_ids, prompt, tokenizer)
-    print("Working in Progress ...")
+        tokenizer.encode(input_ids, prompt)
+
+    for i in range(steps):
+        llama_forward_call[DT, nelts, cores, True](
+            input_id, position_id, llama_state, llama, config
+        )
+        if position_id < len(input_ids):
+            next_input_id = input_ids[position_id]
+        else:
+            if temperature == 0.0:
+                over_all_softmax[DT, nelts, cores](llama_state.logits)
+                next_input_id = llama_state.logits.argmax()
+            else:
+                for j in range(config.vocab_size):
+                    llama_state.logits[j] = llama_state.logits[j] / temperature
+
+                over_all_softmax[DT, nelts, cores](llama_state.logits)
+                next_input_id = sample[DT](llama_state.logits)
+
+            if next_input_id == 1 or next_input_id == 2:
+                break
+        var token_string: Pointer[UInt8] = tokenizer.vocab[next_input_id]
+        if input_id == 0 and token_string[0] == ord(" "):
+            token_string = token_string.offset(1)
+
+        position_id += 1
+        input_id = next_input_id
+
+        print_pointer(token_string)
+
+    print("\n\nWATCHOUT FOR 🔥")
 
 
 fn main() raises:
-    alias DTYPE = DType.float32
     var next_input_id: Int = -1
     var input_id: Int = 1
-    var position: Int = 0
-    var temperature: SIMD[DTYPE, 1] = 0.4
+    var position_id: Int = 0
+
+    var temperature: SIMD[RUNTIME_DTYPE, 1] = 0.4
     var steps: Int = 512
     var start: Int = -1
-    var prompt: String = String(
-        r"<|im_start|>user\nHI<|im_end|>\n<|im_start|>assistant\n"
-    )
+
+    var prompt: String = String(r"")
+
+    # Prompt Example for TinyLlama <|im_start|>user\nHI<|im_end|>\n<|im_start|>assistant\n
+
     var checkpoint_path: StringRef = StringRef("weights.bin")
     var tokenizer_path: StringRef = StringRef("tokenizer.bin")
+
     var rng_seed: Int = time.now()
     var verbose: Bool = True
 
@@ -119,15 +162,19 @@ fn main() raises:
         return 1
 
     let res = argparse()
-    if res == 0:
-        return
+    # if res == 0:
+    #     return
+
+    print("RUNTIME DTYPE   : ", RUNTIME_DTYPE)
+    print("NUMBER OF CORES : ", num_cores())
+    print("NUMBER OF NELTS : ", RUNTIME_NELTS)
     random.seed(rng_seed)
-    run[DTYPE, Array[DTYPE].nelts](
+    run[RUNTIME_DTYPE, RUNTIME_NELTS, RUNTIME_CORES](
         checkpoint_path,
         tokenizer_path,
         next_input_id,
         input_id,
-        position,
+        position_id,
         temperature,
         steps,
         start,
