@@ -188,7 +188,7 @@ class JAXServer(object):
                     pad_token_id=tokenizer.pad_token_id,
                     bos_token_id=tokenizer.bos_token_id,
 
-                    temperature=self.config.temperature,
+                    temperature=0,
                     do_sample=False,
                     num_beams=1,
                 )
@@ -383,7 +383,7 @@ class JAXServer(object):
 
         else:
             print(
-                '\033[1;41mSkip Compiling the compiling process is useless '
+                '\033[1;91mSkip Compiling the compiling process is useless '
                 'when you are not using prefix tokenizer\033[1;0m')
         return True
 
@@ -635,7 +635,7 @@ class JAXServer(object):
                 theme=seafoam) as block:
             gr.Markdown("# <h1> <center>Powered by [EasyDeL](https://github.com/erfanzar/EasyDel) </center> </h1>")
             with gr.Row():
-                pred = gr.TextArea(elem_id="EasyDel", label="EasyDel", container=True, height=600)
+                pred = gr.TextArea(elem_id="EasyDel", label="EasyDel", container=True)
 
             with gr.Row():
                 submit = gr.Button(variant="primary")
