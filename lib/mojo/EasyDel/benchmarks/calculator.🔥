@@ -4,6 +4,4 @@ fn calculate_gflops(time_in_secons: Float64, *dims: Int) -> Float64:
     var product = 1.0
     for i in range(len(vls)):
         product *= vls[i]
-
-    product *= 2
     return product / (time_in_secons * 1e9)

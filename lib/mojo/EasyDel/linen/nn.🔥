@@ -42,11 +42,33 @@ fn embedding[
 
 
 @always_inline
+fn embedding[
+    DT: DType, nelts: Int, cores: Int
+](input_ids: DynamicVector[Int], weight: Array[DT]) -> Array[DT]:
+    let last_dim: Int = weight.dim(-1)
+    let batch: Int = len(input_ids)
+
+    var embed: Array[DT] = Array[DT](batch, last_dim)
+    embed.alloc(0.0)
+
+    @parameter
+    fn _row(i: Int):
+        let axis: Int = input_ids[i]
+
+        @parameter
+        fn _cols[_nelts: Int](j: Int):
+            embed.store[_nelts](VariadicList[Int](i, j), weight.load[_nelts](axis, j))
+
+        vectorize[nelts, _cols](last_dim)
+
+    parallelize[_row](batch, cores)
+    return embed
+
+
+@always_inline
 fn rms_layernorm_3d[
     DT: DType, nelts: Int, cores: Int
-](input: Array[DT], weight: Array[DT], epsilon: SIMD[DT, 1]) -> Array[DT]:
-    var res: Array[DT] = Array[DT](input)
-    res.alloc(0.0)
+](inout res: Array[DT], input: Array[DT], weight: Array[DT], epsilon: SIMD[DT, 1]):
     let num_elements: Int = input.dim(-1)
     let batch: Int = input.num_elements() // (input.dim(-1) * input.dim(-2))
     for b in range(batch):
@@ -75,17 +97,23 @@ fn rms_layernorm_3d[
             vectorize[nelts, _do_element_wise](num_elements)
 
         parallelize[_parallelizer](input.dim(-2), cores)
+
+
+@always_inline
+fn rms_layernorm_3d[
+    DT: DType, nelts: Int, cores: Int
+](input: Array[DT], weight: Array[DT], epsilon: SIMD[DT, 1]) -> Array[DT]:
+    var res: Array[DT] = Array[DT](input)
+    res.alloc(0.0)
+    rms_layernorm_3d[DT, nelts, cores](res, input, weight, epsilon)
     return res
 
 
 @always_inline
 fn rms_layernorm_2d[
     DT: DType, nelts: Int, cores: Int
-](input: Array[DT], weight: Array[DT], epsilon: SIMD[DT, 1]) -> Array[DT]:
-    var res: Array[DT] = Array[DT](input)
-    res.alloc(0.0)
+](inout res: Array[DT], input: Array[DT], weight: Array[DT], epsilon: SIMD[DT, 1]):
     let num_elements: Int = input.dim(-1)
-    let batch: Int = input.num_elements() // (input.dim(-1) * input.dim(-2))
 
     @parameter
     fn _parallelizer(i: Int):
@@ -111,6 +139,54 @@ fn rms_layernorm_2d[
         vectorize[nelts, _do_element_wise](num_elements)
 
     parallelize[_parallelizer](input.dim(-2), cores)
+
+
+@always_inline
+fn rms_layernorm_2d[
+    DT: DType, nelts: Int, cores: Int
+](input: Array[DT], weight: Array[DT], epsilon: SIMD[DT, 1]) -> Array[DT]:
+    var res: Array[DT] = Array[DT](input)
+    res.alloc(0.0)
+    rms_layernorm_2d[DT, nelts, cores](res, input, weight, epsilon)
+    return res
+
+
+@always_inline
+fn rms_layernorm_1d[
+    DT: DType, nelts: Int, cores: Int
+](inout res: Array[DT], input: Array[DT], weight: Array[DT], epsilon: SIMD[DT, 1]):
+    let num_elements: Int = input.dim(-1)
+
+    var sp: SIMD[DT, nelts] = SIMD[DT, nelts](0.0)
+
+    @parameter
+    fn _do_sum_pow[_nelts: Int](j: Int):
+        if _nelts < nelts:
+            sp[0] += (input.load[_nelts]( j) ** 2).reduce_add()
+        else:
+            sp += input.load[nelts](j) ** 2
+
+    vectorize[nelts, _do_sum_pow](num_elements)
+    var normed: SIMD[DT, 1] = sp.reduce_add()
+    normed = normed / num_elements + epsilon
+    normed = 1.0 / math.sqrt(normed)
+
+    @parameter
+    fn _do_element_wise[_nelts: Int](j: Int):
+        let val = weight.load[_nelts](j) * normed * input.load[_nelts](j)
+        res.store[_nelts](VariadicList[Int](j), val)
+
+    vectorize[nelts, _do_element_wise](num_elements)
+
+
+
+@always_inline
+fn rms_layernorm_1d[
+    DT: DType, nelts: Int, cores: Int
+](input: Array[DT], weight: Array[DT], epsilon: SIMD[DT, 1]) -> Array[DT]:
+    var res: Array[DT] = Array[DT](input.dim(-1))
+    res.alloc(0.0)
+    rms_layernorm_2d[DT, nelts, cores](res, input, weight, epsilon)
     return res
 
 
