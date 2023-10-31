@@ -26,7 +26,7 @@ class PytorchServerConfig:
                  logging=True,
                  dtype='fp16',
                  max_number_of_gpus=None,
-                 max_gpu_perc_to_use=None,
+                 max_gpu_perc_to_use=0.95,
                  max_stream_tokens: int = 1
                  ):
         self.host = host
@@ -167,14 +167,15 @@ class PyTorchServer(object):
             string,
             return_tensors='pt'
         )
-        input_ids = tokens.input_ids
-        attention_mask = tokens.attention_mask
+        input_ids = tokens.input_ids.to(self.model.device)
+        attention_mask = tokens.attention_mask.to(self.model.device)
 
         iterator_streamer = TextIteratorStreamer(
             tokenizer=self.tokenizer,
             skip_prompt=True,
             skip_special_tokens=True
         )
+
         if stream:
             kwargs = dict(
                 input_ids=input_ids,
@@ -247,6 +248,7 @@ class PyTorchServer(object):
                             ):
         string = self.format_chat(prompt=prompt, history=history, system=None)
         history.append([prompt, ''])
+        responses = ''
         for response in self.process(
                 string=string,
                 max_new_tokens=max_new_tokens,
@@ -256,7 +258,8 @@ class PyTorchServer(object):
                 top_k=top_k,
                 stream=True
         ):
-            history[-1][-1] = response
+            responses += response
+            history[-1][-1] = responses
             yield '', history
 
     def process_gradio_instruct(self,
@@ -269,6 +272,7 @@ class PyTorchServer(object):
                                 top_k: int
                                 ):
         string = self.format_instruct(system=system, instruction=instruction)
+        responses = ''
         for response in self.process(
                 string=string,
                 max_new_tokens=max_new_tokens,
@@ -278,6 +282,7 @@ class PyTorchServer(object):
                 top_k=top_k,
                 stream=True
         ):
+            responses += response
             yield '', response
 
     def create_gradio_ui_chat(self):
