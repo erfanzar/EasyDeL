@@ -7,7 +7,7 @@ setup(
     author_email='erfanzare82@eyahoo.com',
     description='An open-source library to make training faster and more optimized in Jax/Flax',
     url='https://github.com/erfanzar/EasyDeL',
-    packages=find_packages('lib/python/'),
+    packages=find_packages('lib/python'),
     long_description=open('README.md').read(),
     long_description_content_type='text/markdown',
     classifiers=[
