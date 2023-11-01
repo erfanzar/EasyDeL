@@ -5,11 +5,13 @@ from .attention import (
     repeat_kv,
     qkv_tranpose,
     collect_index,
+    rope_rotation,
 )
 
 from .nn import (
     linear,
     embedding,
+    rms_layernorm_1d,
     rms_layernorm_2d,
     rms_layernorm_3d,
     Linear,

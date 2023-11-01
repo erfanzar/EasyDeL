@@ -247,6 +247,35 @@ fn qkv_tranpose[DT: DType, nelts: Int, cores: Int](owned array: Array[DT]) -> Ar
     return transposed_array
 
 
+fn rope_rotation[
+    DT: DType, cores: Int
+](
+    q: Array[DT],
+    k: Array[DT],
+    freq_cis_real_row: Array[DT],
+    freq_cis_imag_row: Array[DT],
+    head_dim: Int,
+    num_attention_heads: Int,
+    num_key_value_heads: Int,
+) -> None:
+    @parameter
+    fn loop_over_heads(i: Int):
+        for j in range(0, head_dim, 2):
+            let fcr = freq_cis_real_row[j // 2]
+            let fci = freq_cis_imag_row[j // 2]
+            let q0 = q[i * head_dim + j]
+            let q1 = q[i * head_dim + j + 1]
+            q[i * head_dim + j] = q0 * fcr - q1 * fci
+            q[i * head_dim + j + 1] = q0 * fci + q1 * fcr
+            if i < num_key_value_heads:
+                let k0 = k[i * head_dim + j]
+                let k1 = k[i * head_dim + j + 1]
+                k[i * head_dim + j] = k0 * fcr - k1 * fci
+                k[i * head_dim + j + 1] = k0 * fci + k1 * fcr
+
+    parallelize[loop_over_heads](num_attention_heads, cores)
+
+
 fn collect_index[DT: DType, nelts: Int](A: Array[DT], axis: Int) -> Array[DT]:
     var B: Array[DT] = Array[DT](1, A.dim(-1))
 
