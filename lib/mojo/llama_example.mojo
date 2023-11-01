@@ -106,7 +106,7 @@ fn run[
         print_pointer(token_string)
 
     print(
-        "\n\nWATCHOUT FOR 🔥 , AVG Tokens M/s : ",
+        "\n\nWATCHOUT FOR 🔥 , AVG Tokens P/s : ",
         (position_id - 1) / ((time.now() / 1_000_000) - start_time) * 1000,
     )
 
