@@ -35,16 +35,8 @@ class JaxServerConfig:
             self,
             host: str = "0.0.0.0",
             port: int = 2059,
-            instruct_format: str = '### SYSTEM:\n{system}\n### INSTRUCT:\n{instruct}\n### ASSISTANT:\n',
-            chat_format: str = '<|prompter|>{prompt}</s><|assistant|>{assistant}</s>',
+
             batch_size: int = 1,
-            system_prefix: str = '',
-            system: str = '',
-            prompt_prefix_instruct: str = '',
-            prompt_postfix_instruct: str = '',
-            prompt_prefix_chat: str = '<|prompter|>',
-            prompt_postfix_chat: str = '</s><|assistant|>',
-            chat_prefix: str = '',
             contains_auto_format: bool = True,
             max_length: int = 4096,
             max_new_tokens: int = 4096,
@@ -62,16 +54,6 @@ class JaxServerConfig:
     ):
         self.host = host
         self.port = port
-        self.instruct_format = instruct_format
-        self.chat_format = chat_format
-        self.batch_size = batch_size
-        self.system_prefix = system_prefix
-        self.system = system
-        self.prompt_prefix_instruct = prompt_prefix_instruct
-        self.prompt_postfix_instruct = prompt_postfix_instruct
-        self.prompt_prefix_chat = prompt_prefix_chat
-        self.prompt_postfix_chat = prompt_postfix_chat
-        self.chat_prefix = chat_prefix
         self.contains_auto_format = contains_auto_format
         self.max_length = max_length
         self.max_new_tokens = max_new_tokens
@@ -425,7 +407,7 @@ class JAXServer(object):
                 'status': "down"
             }
 
-        string = self.chat_format(
+        string = self.format_chat(
             prompt=data.prompt,
             system=None,
             history=data.history
@@ -445,14 +427,31 @@ class JAXServer(object):
             'tokens_used': used_tokens,
         }
 
+    @staticmethod
+    def format_instruct(system: str, instruction: str) -> str:
+        """
+        Here you will get the system and instruction from user, and you can apply your prompting style
+        """
+        raise NotImplementedError()
+
+    @staticmethod
+    def format_chat(history: typing.List[str], prompt: str, system: typing.Union[str, None]) -> str:
+        """
+        Here you will get the system, prompt and history from user, and you can apply your prompting style
+        """
+        raise NotImplementedError()
+
     def forward_instruct(self, data: InstructRequest):
         if not self._funcs_generated:
             return {
                 'status': "down"
             }
 
-        string = self.config.instruct_format.format(instruct=data.prompt, system=data.system)
         response, used_tokens = [None] * 2
+        string = self.format_instruct(
+            system=data.system,
+            instruction=data.instruction
+        )
         for response, used_tokens in self.process(
                 string=string,
                 greedy=data.greedy,
@@ -533,21 +532,8 @@ class JAXServer(object):
                 -1] == self.prefix_tokenizer.eos_token_id:
                 break
 
-    def chat_format(self, history, prompt, system=None) -> str:
-        if len(history) == 0:
-            message_ = ''
-        else:
-            message_ = ''
-            for message in history:
-                message_ += self.config.chat_format.format(prompt=message[0], assistant=message[1])
-        message_ += self.config.prompt_prefix_chat + prompt + self.config.prompt_postfix_chat
-        return message_
-
-    def instruct_format(self, prompt, system) -> str:
-        return self.config.instruct_format.format(system=system, instruct=prompt)
-
     def process_gradio_chat(self, prompt, history, max_new_tokens, system, greedy):
-        string = self.chat_format(history=history, prompt=prompt, system=system)
+        string = self.format_chat(history=history, prompt=prompt, system=system)
 
         if not self.config.stream_tokens_for_gradio:
             response = ''
@@ -569,8 +555,8 @@ class JAXServer(object):
                 yield '', history
         return '', history
 
-    def process_gradio_instruct(self, prompt, system, max_new_tokens, greedy):
-        string = self.instruct_format(prompt=prompt, system=system)
+    def process_gradio_instruct(self, instruction, system, max_new_tokens, greedy):
+        string = self.format_instruct(instruction=instruction, system=system)
         if not self.config.stream_tokens_for_gradio:
             response = ''
             for response, _ in self.process(
