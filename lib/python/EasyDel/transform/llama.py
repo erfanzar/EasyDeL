@@ -5,6 +5,7 @@ import jax
 import torch
 from transformers import LlamaForCausalLM
 from ..modules.llama import LlamaConfig
+from fjutils.utils import load_and_convert_checkpoint
 
 
 def inverse_permute(w, num_attention_heads, in_dim, out_dim):
@@ -143,6 +144,19 @@ def llama_convert_flax_to_pt(flax_params, config: LlamaConfig, dtype=jnp.float16
         "lm_head.weight": torch_params["lm_head.kernel"],
     })
     return state_dict
+
+
+def llama_easydel_to_hf(path, config: LlamaConfig):
+    """
+        Takes path to easydel saved ckpt and return the model in pytorch (Transformers Huggingface)
+    """
+    torch_params = load_and_convert_checkpoint(path)
+    edited_params = {}
+    for k, v in torch_params.items():
+        edited_params[k.replace('.kernel', '.weight').replace('.embedding', '.weight')] = v
+    model = LlamaForCausalLM(config=config)
+    model.load_state_dict(edited_params)
+    return model
 
 
 def llama_from_pretrained(model_id, device=jax.devices('cpu')[0]):
