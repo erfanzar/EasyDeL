@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from fjutils.utils import load_and_convert_checkpoint
 from jax import numpy as jnp
 import jax
 import torch
@@ -243,6 +244,19 @@ def mistral_convert_flax_to_pt(flax_params, config: MistralConfig, dtype=jnp.flo
         "lm_head.weight": torch_params["lm_head.kernel"],
     })
     return state_dict
+
+
+def mistral_easydel_to_hf(path, config: MistralConfig):
+    """
+    Takes path to easydel saved ckpt and return the model in pytorch (Transformers Huggingface)
+    """
+    torch_params = load_and_convert_checkpoint(path)
+    edited_params = {}
+    for k, v in torch_params.items():
+        edited_params[k.replace('.kernel', '.weight').replace('.embedding', '.weight')] = v
+    model = MistralForCausalLM(config=config)
+    model.load_state_dict(edited_params)
+    return model
 
 
 def mistral_from_pretrained(model_id, device=jax.devices('cpu')[0]):
