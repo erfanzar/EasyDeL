@@ -389,6 +389,8 @@ fn llama_forward_call[
             config.kv_dims,
         )
 
+        llama_state.q.fill(0.0)
+            
         matmul_row[DT, nelts, cores](llama_state.q, llama_state.residual, q_proj)
         matmul_row[DT, nelts, cores](llama_state.k, llama_state.residual, k_proj)
         matmul_row[DT, nelts, cores](llama_state.v, llama_state.residual, v_proj)
@@ -435,7 +437,7 @@ fn llama_forward_call[
                 attention_offset,
                 attention_offset + position_id + 1,
             )
-   
+
             for pos in range(position_id + 1):
                 let v_offset = (
                     cache_stride
@@ -539,7 +541,7 @@ fn llama_forward_call[
             llama_state.hidden_state,
             llama_state.residual,
         )
-        
+
     rms_layernorm_1d[DT, nelts, cores](
         llama_state.hidden_state,
         llama_state.hidden_state,
