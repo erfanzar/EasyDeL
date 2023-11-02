@@ -11,13 +11,13 @@ import tqdm
 import transformers
 import uvicorn
 from fastapi import FastAPI
-from fjutils import make_shard_and_gather_fns, match_partition_rules, with_sharding_constraint
+from fjformer import make_shard_and_gather_fns, match_partition_rules, with_sharding_constraint
 from typing import Tuple
 from ..smi import get_mem, initialise_tracking
 from jax import numpy as jnp
 from jax.experimental import mesh_utils
 from flax.serialization import from_bytes
-from fjutils import get_float_dtype_by_name
+from fjformer.load._load import get_float_dtype_by_name
 from jax.sharding import Mesh, PartitionSpec as Ps
 from transformers import GenerationConfig
 import logging
@@ -35,7 +35,6 @@ class JaxServerConfig:
             self,
             host: str = "0.0.0.0",
             port: int = 2059,
-
             batch_size: int = 1,
             contains_auto_format: bool = True,
             max_length: int = 4096,

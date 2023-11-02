@@ -145,7 +145,7 @@ transform in the library example
 ```python
 import jax
 from EasyDel import mpt_convert_pt_to_flax_7b
-from fjutils.utils import save_ckpt
+from fjformer.utils import save_ckpt
 
 number_of_layers = 32  # its 32 hidden layers for Mpt 7B
 device = jax.devices('cpu')[0]  # offload on CPU

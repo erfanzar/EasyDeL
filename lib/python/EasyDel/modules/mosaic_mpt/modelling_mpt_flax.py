@@ -13,10 +13,11 @@ from jax.sharding import PartitionSpec
 from transformers.modeling_flax_outputs import FlaxCausalLMOutput, FlaxBaseModelOutput
 import flax
 from einops import rearrange
-from fjutils.flash_attention import dot_product_attention_multihead
+from fjformer.attention import dot_product_attention_multihead
 from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
     with_sharding_constraint
 import chex
+
 
 class MptConfig(PretrainedConfig):
     model_type = 'mpt'
