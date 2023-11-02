@@ -5,7 +5,7 @@ import time
 import typing
 
 import IPython.display
-from fjutils.easylm import blockwise_cross_entropy, cross_entropy_loss_and_accuracy
+from fjformer.func.loss_func import fused_cross_entropy_loss_and_accuracy, cross_entropy_loss_and_accuracy
 import wandb
 from datasets import Dataset
 
@@ -22,9 +22,10 @@ from jax.sharding import PartitionSpec
 from flax.training import train_state
 from jax import numpy as jnp
 from torch.utils.data import DataLoader
-from fjutils import match_partition_rules, make_shard_and_gather_fns, StreamingCheckpointer, count_params
+from fjformer import match_partition_rules, make_shard_and_gather_fns, StreamingCheckpointer
 from ..utils import prefix_print
 import chex
+
 
 def calculate_accuracy(predictions: chex.Array, targets: chex.Array):
     predicted_classes = jnp.argmax(predictions, axis=-1)
@@ -284,14 +285,9 @@ class CausalLMTrainer:
             )
 
         if self.arguments.loss_remat != '':
-            blockwise_cross = functools.partial(
-                blockwise_cross_entropy,
-                chunk_size=self.arguments.loss_chunk,
-                policy=self.arguments.loss_remat
-            )
-            loss_fn = blockwise_cross
-        else:
             loss_fn = cross_entropy_loss_and_accuracy
+        else:
+            loss_fn = fused_cross_entropy_loss_and_accuracy
 
         def fsdp_train_step_(state, batch):
             batch = with_sharding_constraint(batch, PartitionSpec(('dp', 'fsdp')))
@@ -338,6 +334,11 @@ class CausalLMTrainer:
         return sharded_create_from_params_fn, sharded_train_step_fn, sharded_predict, mesh, ckpt_streamer, init_fn
 
     def train(self, model_parameters: flax.core.FrozenDict = None) -> OutputFineTuner:
+        def count_params(_p):
+            print('\033[1;31mModel Contain : ',
+                  sum(i.size for i in jax.tree_util.tree_flatten(flax.core.unfreeze(_p))[0]) / 1e9,
+                  ' Billion Parameters')
+
         dir_prefix: str = '/dev/shm'
         if self.arguments.track_memory:
             initialise_tracking(dir_prefix=dir_prefix)

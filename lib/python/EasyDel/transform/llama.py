@@ -5,7 +5,7 @@ import jax
 import torch
 from transformers import LlamaForCausalLM
 from ..modules.llama import LlamaConfig
-from fjutils.utils import load_and_convert_checkpoint
+from fjformer.utils import load_and_convert_checkpoint
 
 
 def inverse_permute(w, num_attention_heads, in_dim, out_dim):

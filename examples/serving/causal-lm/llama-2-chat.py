@@ -3,7 +3,7 @@ import typing
 import EasyDel
 import jax.lax
 from EasyDel import JAXServer, JaxServerConfig
-from fjutils import get_float_dtype_by_name
+from fjformer.load._load import get_float_dtype_by_name
 from EasyDel.transform import llama_from_pretrained
 from transformers import AutoTokenizer
 import gradio as gr

@@ -3,7 +3,7 @@ from datasets import load_dataset
 from huggingface_hub import HfApi
 import EasyDel
 from absl import flags, app
-from fjutils import get_float_dtype_by_name
+from fjformer.load._load import get_float_dtype_by_name
 
 FLAGS = flags.FLAGS
 
