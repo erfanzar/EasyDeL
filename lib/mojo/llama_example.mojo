@@ -39,7 +39,7 @@ fn run[
     inout input_id: Int = 1,
     inout position_id: Int = 0,
     temperature: SIMD[DT, 1] = 0.4,
-    steps: Int = 512,
+    inout steps: Int = 512,
     inout start: Int = -1,
     prompt: String = "",
     verbose: Bool = True,
@@ -61,7 +61,10 @@ fn run[
     if verbose:
         config.print_config()
     var tokenizer: Tokenizer = Tokenizer(config.vocab_size, tokenizer_bufferr)
-
+    steps = (
+        steps if config.max_position_embeddings
+        > steps else config.max_position_embeddings
+    )
     let start_loading: SIMD[DT, 1] = SIMD[DT, 1](time.now())
     let llama: LlamaWeights[DT] = LlamaWeights[DT](config, is_tied, weights_buffer)
     var llama_state: LlamaState[DT] = LlamaState[DT](config)
