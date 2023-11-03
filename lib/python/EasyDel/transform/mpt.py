@@ -1,5 +1,3 @@
-from fjformer.utils import load_and_convert_checkpoint
-
 from .. import MptConfig
 from jax import numpy as jnp
 import jax
