@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from fjformer.utils import load_and_convert_checkpoint
+from fjformer import load_and_convert_checkpoint_to_torch
 from jax import numpy as jnp
 import jax
 import torch
@@ -250,7 +250,7 @@ def mistral_easydel_to_hf(path, config: MistralConfig):
     """
     Takes path to easydel saved ckpt and return the model in pytorch (Transformers Huggingface)
     """
-    torch_params = load_and_convert_checkpoint(path)
+    torch_params = load_and_convert_checkpoint_to_torch(path)
     edited_params = {}
     for k, v in torch_params.items():
         edited_params[k.replace('.kernel', '.weight').replace('.embedding', '.weight')] = v
