@@ -285,9 +285,9 @@ class CausalLMTrainer:
             )
 
         if self.arguments.loss_remat != '':
-            loss_fn = cross_entropy_loss_and_accuracy
-        else:
             loss_fn = fused_cross_entropy_loss_and_accuracy
+        else:
+            loss_fn = cross_entropy_loss_and_accuracy
 
         def fsdp_train_step_(state, batch):
             batch = with_sharding_constraint(batch, PartitionSpec(('dp', 'fsdp')))
