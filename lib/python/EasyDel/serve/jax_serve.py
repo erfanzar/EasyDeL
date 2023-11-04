@@ -23,7 +23,7 @@ import logging
 from ..utils import RNG
 import multiprocessing as mp
 from ..utils import prefix_str
-from typing import Union,Sequence
+from typing import Union, Sequence
 import chex
 from .utils import InstructRequest, ChatRequest, seafoam
 from jax.experimental.pjit import pjit
@@ -52,7 +52,7 @@ class JaxServerConfig:
     ):
         self.host = host
         self.port = port
-        self.batch_size=batch_size
+        self.batch_size = batch_size
         self.contains_auto_format = contains_auto_format
         self.max_length = max_length
         self.max_new_tokens = max_new_tokens
