@@ -4,7 +4,6 @@ jax>=0.4.10
 jaxlib>=0.4.10
 flax
 fjformer>=0.0.1
-numpy
 transformers>=4.33.0
 einops
 optax
@@ -14,11 +13,8 @@ tqdm==4.65.0
 datasets==2.14.3
 setuptools
 torch>=2.0.1
-fastapi
 gradio~=3.41.2
 distrax
 rlax
 wandb>=0.15.9
-uvicorn~=0.23.2
-pydantic~=2.3.0
 tensorboard
