@@ -36,7 +36,7 @@ setup(
         "ipython",
         "tqdm",
         "datasets==2.14.3",
-        'torch>=2.0.1',
+        "pydantic==2.4.2",
         "gradio~=3.41.2",
         "distrax",
         "rlax",
