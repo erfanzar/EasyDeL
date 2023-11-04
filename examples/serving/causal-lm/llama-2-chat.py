@@ -94,31 +94,6 @@ class Llama2Host(JAXServer):
             do_memory_log=False
         )
 
-    def process_gradio_chat(self, prompt, history, max_new_tokens, greedy, pbar=gr.Progress()):
-        string = get_prompt_llama2_format(
-            message=prompt,
-            chat_history=history,
-            system_prompt=DEFAULT_SYSTEM_PROMPT
-        )
-        response, _ = self.process(
-            string=string,
-            greedy=greedy,
-            max_new_tokens=max_new_tokens,
-            pbar=pbar
-        )
-        history.append([prompt, response])
-        return '', history
-
-    def process_gradio_instruct(self, prompt, system, max_new_tokens, greedy, pbar=gr.Progress()):
-        string = get_prompt_llama2_format(system_prompt=DEFAULT_SYSTEM_PROMPT, message=prompt, chat_history=[])
-        response, _ = self.process(
-            string=string,
-            greedy=greedy,
-            max_new_tokens=max_new_tokens,
-            pbar=pbar
-        )
-        return '', response
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Argument parser for Llama2.")
