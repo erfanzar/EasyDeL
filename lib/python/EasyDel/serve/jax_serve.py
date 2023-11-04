@@ -12,7 +12,6 @@ import transformers
 import uvicorn
 from fastapi import FastAPI
 from fjutils import make_shard_and_gather_fns, match_partition_rules, with_sharding_constraint
-from typing import Tuple
 from ..smi import get_mem, initialise_tracking
 from jax import numpy as jnp
 from jax.experimental import mesh_utils
@@ -24,7 +23,7 @@ import logging
 from ..utils import RNG
 import multiprocessing as mp
 from ..utils import prefix_str
-from typing import Union
+from typing import Union,Sequence
 import chex
 from .utils import InstructRequest, ChatRequest, seafoam
 from jax.experimental.pjit import pjit
@@ -35,7 +34,6 @@ class JaxServerConfig:
             self,
             host: str = "0.0.0.0",
             port: int = 2059,
-
             batch_size: int = 1,
             contains_auto_format: bool = True,
             max_length: int = 4096,
@@ -45,13 +43,14 @@ class JaxServerConfig:
             top_p: float = 0.95,
             top_k: int = 50,
             logging: bool = True,
-            mesh_axes_names: Tuple[str] = ('dp', 'fsdp', 'mp'),
-            mesh_axes_shape: Tuple[int] = (1, -1, 1),
+            mesh_axes_names: Sequence[str] = ('dp', 'fsdp', 'mp'),
+            mesh_axes_shape: Sequence[int] = (1, -1, 1),
             dtype: str = 'fp16',
             stream_tokens_for_gradio: bool = True,
             use_prefix_tokenizer: bool = True,
             pre_compile: bool = True,
     ):
+        self.batch_size = batch_size
         self.host = host
         self.port = port
         self.contains_auto_format = contains_auto_format
