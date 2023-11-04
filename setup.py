@@ -46,7 +46,7 @@ setup(
         "uvicorn~=0.23.2",
         "pydantic~=2.3.0",
         "tensorboard",
-        "chex>=0.1.84",
+        "chex>=0.1.82",
         # add any other required dependencies here
     ],
     python_requires='>=3.8',
