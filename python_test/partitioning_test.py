@@ -100,26 +100,13 @@ def get_mesh(model_parallel_submesh: HardwareMesh,
             'dimension of the per-host submesh')
 
         def dh_dd_mh_md(g: int, m: int, l: int) -> Tuple[int, int, int, int]:
-            """Split a global mesh dimension into four tiling components.
-
-            Args:
-              g: global mesh bounds dimension size
-              m: model-parallel submesh bounds dimension size
-              l: local submesh bounds dimension size
-
-            Returns:
-              The resulting tuple divides the dimension into the hosts component of
-              the data-parallel submesh, the devices component of the data-parallel
-              submesh, the hosts component of the model-parallel submesh, and the
-              devices component of the model-parallel submesh.
-            """
             d = g // m
             if m >= l:
                 assert not m % l, tile_err
-                return (d, 1, m // l, l)
+                return d, 1, m // l, l
             else:
                 assert not l % m, tile_err
-                return (d // (l // m), l // m, 1, m)
+                return d // (l // m), l // m, 1, m
 
         dh_dd_mh_md_tups = map(dh_dd_mh_md, global_hardware_mesh,
                                model_parallel_submesh, local_hardware_mesh)
@@ -129,15 +116,11 @@ def get_mesh(model_parallel_submesh: HardwareMesh,
                                     *(4 * i + 2 for i in range(mesh_ndim)),
                                     *(4 * i + 3 for i in range(mesh_ndim)))
     else:
-        # e.g. [(x_data, x_model), (y_data, y_model), ...]
         model_data_tups = [
             (g // m, m)
             for g, m in zip(global_hardware_mesh, model_parallel_submesh)
         ]
-        # reshape to e.g. (x_data, x_model, y_data, y_model...)
-        devices = devices.reshape(*(s for t in model_data_tups for s in t))  # pylint: disable=g-complex-comprehension
-        # TODO(jekbradbury): reorder small subgroups for ring locality
-        # transpose to e.g. (x_data, y_data, ..., x_model, ...)
+        devices = devices.reshape(*(s for t in model_data_tups for s in t))
         devices = devices.transpose(*(2 * i for i in range(mesh_ndim)),
                                     *(2 * i + 1 for i in range(mesh_ndim)))
     # reshape to (data, model)
@@ -149,6 +132,15 @@ def get_mesh(model_parallel_submesh: HardwareMesh,
     return global_mesh
 
 
+def get_cpu_mesh() -> Mesh:
+    devices = np.empty(
+        (jax.process_count(), jax.local_device_count()), dtype=object
+    )
+    for device in jax.devices():
+        devices[device.process_index, device.id % jax.local_device_count()] = device
+    return Mesh(devices, ['data', 'model'])
+
+
 def main():
     mesh = get_jax_mesh('1,-1,1', ('dp', "fsdp", 'mp'))
     config = LlamaConfig(
@@ -158,7 +150,8 @@ def main():
         num_attention_heads=8
     )
 
-    model = FlaxLlamaForCausalLM(config=config, _do_init=True)
+    # model = FlaxLlamaForCausalLM(config=config, _do_init=True)
+    print(get_cpu_mesh())
 
 
 if __name__ == "__main__":
