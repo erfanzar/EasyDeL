@@ -13,7 +13,7 @@ from flax.linen import combine_masks, make_causal_mask
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_flax_utils import FlaxPreTrainedModel
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput, FlaxSequenceClassifierOutput
-from fjutils.easylm import blockwise_dot_product_attention
+from fjformer.attention import efficient_attention
 from ..flax_modelling_utils import with_sharding_constraint, \
     get_gradient_checkpoint_policy, repeat_kv_bnsh, apply_rotary_pos_emb, precompute_freq_cis
 import chex
@@ -389,19 +389,18 @@ class FlaxLlamaAttention(nn.Module):
                 jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
             )
             attn_weights = None
-            attn_output = blockwise_dot_product_attention(
+            attn_output = efficient_attention(
                 query_state,
                 key_state,
                 value_state,
                 bias=attention_bias,
                 deterministic=deterministic,
                 dropout_rng=dropout_rng,
-                attn_pdrop=self.config.attn_pdrop,
+                attention_drop_rate=self.config.attn_pdrop,
                 causal=True,
                 query_chunk_size=self.config.scan_query_chunk_size,
                 key_chunk_size=self.config.scan_key_chunk_size,
                 dtype=self.dtype,
-                policy=get_gradient_checkpoint_policy('nothing_saveable'),
                 precision=self.precision,
                 float32_logits=True,
             )

@@ -27,7 +27,7 @@ from functools import partial
 from typing import Optional, Tuple
 
 from einops import einops
-from fjutils import with_sharding_constraint
+from fjformer import with_sharding_constraint
 from jax.experimental.pjit import with_sharding_constraint as wsc
 from jax.sharding import PartitionSpec
 import flax.linen as nn
@@ -47,9 +47,10 @@ from transformers import PreTrainedTokenizer, TensorType, is_torch_available
 from transformers.configuration_utils import PretrainedConfig
 from transformers.onnx import OnnxConfigWithPast, PatchingSpec
 from jax.interpreters import pxla
-from fjutils.flash_attention import dot_product_attention_multihead
+from fjformer.attention import efficient_attention
 from ..flax_modelling_utils import with_sharding_constraint
 import chex
+
 logger = logging.get_logger(__name__)
 
 
@@ -490,17 +491,16 @@ class FlaxGPTJAttention(nn.Module):
                 attention_bias,
                 '... s q k -> ... s 1 q k'
             )
-            attn_output = dot_product_attention_multihead(
+            attn_output = efficient_attention(
                 query,
                 key,
                 value,
                 bias=attention_mask,
                 dropout_rng=dropout_rng,
-                dropout_rate=self.config.attn_pdrop,
-                enable_dropout=not deterministic and self.config.attn_pdrop > 0.0,
-                rescale_logits=True,
+                attention_drop_rate=self.config.attn_pdrop,
+                deterministic=not deterministic and self.config.attn_pdrop > 0.0,
                 float32_logits=True,
-                causal_mask=True,
+                causal=True,
                 dtype=self.dtype,
                 precision=self.precision,
                 query_chunk_size=self.config.flash_attn_query_chunk_size,

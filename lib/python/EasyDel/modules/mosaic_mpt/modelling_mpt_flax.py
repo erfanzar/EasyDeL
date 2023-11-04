@@ -13,10 +13,11 @@ from jax.sharding import PartitionSpec
 from transformers.modeling_flax_outputs import FlaxCausalLMOutput, FlaxBaseModelOutput
 import flax
 from einops import rearrange
-from fjutils.flash_attention import dot_product_attention_multihead
+from fjformer.attention import efficient_attention
 from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
-    with_sharding_constraint
+    with_sharding_constraint, ACT2FN
 import chex
+
 
 class MptConfig(PretrainedConfig):
     model_type = 'mpt'
@@ -343,18 +344,17 @@ class FlaxMptAttention(nn.Module):
                 ),
                 '...s q k->... s 1 q k'
             )
-            atw = dot_product_attention_multihead(
+            atw = efficient_attention(
                 query=q,
                 key=k,
                 value=v,
                 dtype=self.dtype,
                 precision=self.precision,
-                dropout_rate=0.0,
-                enable_dropout=False,
+                attention_drop_rate=0.0,
+                deterministic=False,
                 float32_logits=True,
-                rescale_logits=True,
                 bias=attn_mask,
-                causal_mask=False,
+                causal=False,
                 key_chunk_size=self.config.flash_attn_key_chunk_size,
                 query_chunk_size=self.config.flash_attn_query_chunk_size
             )
