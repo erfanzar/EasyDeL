@@ -24,12 +24,12 @@ setup(
     keywords='machine learning, deep learning, pytorch, jax, flax',
     install_requires=[
         "chex~=0.1.7",
+        "typing>=3.10.0.0",
         "jax>=0.4.10",
         "jaxlib>=0.4.10",
         "flax>=0.7.1",
         "fjformer>=0.0.1",
         "numpy~=1.24.2",
-        "typing>=3.7.4.3",
         "transformers>=4.33.0",
         "einops>=0.6.1",
         "optax~=0.1.7",
