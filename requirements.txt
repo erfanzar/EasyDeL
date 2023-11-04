@@ -9,10 +9,10 @@ einops
 optax
 msgpack
 ipython
-tqdm==4.65.0
+tqdm
+pydantic==2.4.2
 datasets==2.14.3
 setuptools
-torch>=2.0.1
 gradio~=3.41.2
 distrax
 rlax
