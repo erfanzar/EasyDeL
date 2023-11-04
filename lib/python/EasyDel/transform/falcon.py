@@ -1,5 +1,5 @@
 import jax
-from fjutils.utils import load_and_convert_checkpoint
+from fjformer import load_and_convert_checkpoint_to_torch
 from jax import numpy as jnp
 from tqdm import tqdm
 from transformers import FalconForCausalLM
@@ -148,7 +148,7 @@ def falcon_easydel_to_hf(path, config: FalconConfig):
     """
         Takes path to easydel saved ckpt and return the model in pytorch (Transformers Huggingface)
     """
-    torch_params = load_and_convert_checkpoint(path)
+    torch_params = load_and_convert_checkpoint_to_torch(path)
     edited_params = {}
     for k, v in torch_params.items():
         edited_params[k.replace('.kernel', '.weight').replace('.embedding', '.weight')] = v

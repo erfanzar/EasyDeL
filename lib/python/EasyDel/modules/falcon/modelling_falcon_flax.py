@@ -12,10 +12,7 @@ from transformers.modeling_flax_outputs import FlaxCausalLMOutput, FlaxBaseModel
 from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
     with_sharding_constraint
 import chex
-from fjutils.utils import transpose
-
-
-# transpose = jax.jit(trp)
+from fjformer.func import transpose
 
 
 class FalconConfig(PretrainedConfig):

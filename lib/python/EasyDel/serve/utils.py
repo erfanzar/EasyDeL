@@ -1,12 +1,12 @@
 import jax
-from fjutils import make_shard_and_gather_fns, match_partition_rules
+from fjformer import make_shard_and_gather_fns, match_partition_rules
 from typing import Optional, List
 from flax.core import freeze
 from flax.traverse_util import unflatten_dict
 from jax import numpy as jnp
 from jax.experimental import mesh_utils
 from pydantic import BaseModel
-from fjutils import get_float_dtype_by_name
+from fjformer.load._load import get_float_dtype_by_name
 from gradio.themes.base import Base
 from gradio.themes.utils import colors, fonts, sizes
 from typing import Union
