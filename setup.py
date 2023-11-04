@@ -23,6 +23,7 @@ setup(
     ],
     keywords='machine learning, deep learning, pytorch, jax, flax',
     install_requires=[
+        "chex~=0.1.7",
         "jax>=0.4.10",
         "jaxlib>=0.4.10",
         "flax>=0.7.1",
@@ -46,7 +47,6 @@ setup(
         "uvicorn~=0.23.2",
         "pydantic~=2.3.0",
         "tensorboard",
-        "chex~=0.1.7",
         # add any other required dependencies here
     ],
     python_requires='>=3.8',
