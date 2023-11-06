@@ -169,7 +169,6 @@ class JAXServer(object):
                     pad_token_id=tokenizer.pad_token_id,
                     bos_token_id=tokenizer.bos_token_id,
 
-                    temperature=0,
                     do_sample=False,
                     num_beams=1,
                 )
