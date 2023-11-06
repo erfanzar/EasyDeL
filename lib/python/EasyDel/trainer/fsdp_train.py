@@ -1,10 +1,10 @@
 import dataclasses
-import functools
 import os
 import time
 import typing
 
 import IPython.display
+import fjformer.func.loss_func
 from fjformer.func.loss_func import fused_cross_entropy_loss_and_accuracy, cross_entropy_loss_and_accuracy
 import wandb
 from datasets import Dataset
@@ -284,7 +284,9 @@ class CausalLMTrainer:
                 params=params_
             )
 
-        if self.arguments.loss_remat != '':
+        if self.arguments.loss_remat == 'OHA':
+            loss_fn = fjformer.func.loss_func.cross_entropy_with_logits
+        elif self.arguments.loss_remat != '':
             loss_fn = fused_cross_entropy_loss_and_accuracy
         else:
             loss_fn = cross_entropy_loss_and_accuracy
