@@ -340,7 +340,7 @@ class PyTorchServer(object):
                 theme=seafoam) as block:
             gr.Markdown("# <h1> <center>Powered by [EasyDeL](https://github.com/erfanzar/EasyDel) </center> </h1>")
             with gr.Row():
-                pred = gr.TextArea(elem_id="EasyDel", label="EasyDel", container=True, height=600)
+                pred = gr.TextArea(elem_id="EasyDel", label="EasyDel", container=True)
 
             with gr.Row():
                 submit = gr.Button(variant="primary")
