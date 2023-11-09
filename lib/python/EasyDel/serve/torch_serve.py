@@ -158,7 +158,9 @@ class PyTorchServer(object):
                 temperature: float = 0.6,
                 top_k=50,
                 top_p=0.9,
-                stream: bool = True
+                stream: bool = True,
+                sample: bool = True
+
                 ):
         assert self.model is not None, 'you should first load model with ``load`` method'
         tokens = self.tokenizer(
@@ -188,7 +190,8 @@ class PyTorchServer(object):
                     top_k=top_k,
                     top_p=top_p,
                     max_new_tokens=max_new_tokens or self.config.max_new_tokens,
-                    num_beams=1
+                    num_beams=1,
+                    do_sample=sample
                 )
             )
             thread_ = threading.Thread(
