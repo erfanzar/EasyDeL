@@ -1,7 +1,0 @@
-fn calculate_gflops(time_in_secons: Float64, *dims: Int) -> Float64:
-    # GFLOPs/s = 2 * m * k * n / (time in seconds * 1e9)
-    let vls = VariadicList[Int](dims)
-    var product = 1.0
-    for i in range(len(vls)):
-        product *= vls[i]
-    return product / (time_in_secons * 1e9)
