@@ -1,4 +1,3 @@
-from python import Python as Py
 from ..in_out import File, BufReader
 
 
@@ -114,22 +113,17 @@ fn read_string_value(
     return str
 
 
-fn read_file(inout buffer: FileBuffer, filename: StringRef) raises -> None:
-    let _os = Py.import_module("os")
-    let size: Int = atol(_os.path.getsize(filename).to_string())
-    let state_buffer: DTypePointer[DType.uint8] = DTypePointer[DType.uint8]().alloc(
-        size
-    )
-    let f = File(filename)
-    var reader = BufReader[4096](f ^)
-    var bytes_read: Int = 1
-    var offset: Int = 0
-    while bytes_read > 0:
-        let _bu_s = Buffer[4096, DType.uint8](state_buffer.offset(offset))
-        bytes_read = reader.read(_bu_s)
-        offset += bytes_read
-    reader.do_nothing()
-    buffer.data = state_buffer
-    buffer.offset = 0
-    buffer.size = size
+fn read_file(file_name: String, inout buf: FileBuffer) raises:
+    var fd = open(file_name, "r")
+    let data = fd.read()
+    fd.close()
+    let cp_size = data._buffer.size
+    let cp_buf: DTypePointer[DType.uint8] = DTypePointer[DType.uint8].alloc(cp_size)
+    let data_ptr = data._as_ptr().bitcast[DType.uint8]()
+    for i in range(cp_size):
+        cp_buf.store(i, data_ptr.load(i))
+    _ = data
+    buf.data = cp_buf
+    buf.size = cp_size
+    buf.offset = 0
     return None
