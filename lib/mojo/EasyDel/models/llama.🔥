@@ -2,7 +2,8 @@ from ..utilities import FileBuffer
 from runtime.llcl import num_cores
 import math
 from algorithm.functional import vectorize, parallelize, parallelize
-from tensor import Tensor, TensorSpec
+from tensor import Tensor, TensorSpec, TensorShape
+from ..tensor_utils import TensorSlice
 
 
 struct LlamaConfig:
@@ -106,3 +107,114 @@ struct LlamaConfig:
         print("HEAD DIMS               : ", self.head_dims)
         print("KV DIMS                 : ", self.kv_dims)
         print_no_newline("\033[1;0m")
+
+
+struct RunState[T: DType]:
+    var x: Tensor[T]  # activation at current time stamp (hidden_size,)
+    var residual: Tensor[T]  # same, but inside a residual branch (hidden_size,)
+    var residual2: Tensor[T]  # an additional buffer just for convenience (hidden_size,)
+    var w1: Tensor[T]  # buffer for hidden dimension in the ffn (intermediate_size,)
+    var w3: Tensor[T]  # buffer for hidden dimension in the ffn (intermediate_size,)
+    var q: Tensor[T]  # query (hidden_size,)
+    var k: TensorSlice[T]  # key (kv_dim,)
+    var v: TensorSlice[T]  # value (kv_dim,)
+    var att: Tensor[
+        T
+    ]  # buffer for scores/attention values (n_heads, max_position_embeddings)
+    var logits: Tensor[T]  # output logits
+    var key_cache: Tensor[T]  # (layer, max_position_embeddings, hidden_size)
+    var value_cache: Tensor[T]  # (layer, max_position_embeddings, hidden_size)
+
+    fn __init__(inout self, config: LlamaConfig) raises:
+        self.x = Tensor[T](config.hidden_size)
+        self.residual = Tensor[T](config.hidden_size)
+        self.residual2 = Tensor[T](config.hidden_size)
+        self.w1 = Tensor[T](config.intermediate_size)
+        self.w3 = Tensor[T](config.intermediate_size)
+        self.q = Tensor[T](config.hidden_size)
+        self.att = Tensor[T](config.num_attention_heads, config.max_position_embeddings)
+        self.logits = Tensor[T](config.vocab_size)
+        self.key_cache = Tensor[T](
+            config.num_hidden_layers, config.max_position_embeddings, config.kv_dims
+        )
+        self.value_cache = Tensor[T](
+            config.num_hidden_layers, config.max_position_embeddings, config.kv_dims
+        )
+        # So their updates flow to the caches, k and v are slices with shared memory.
+        # Initialize with placeholders. The real tensors reference layer and position during forward pass.
+        self.k = TensorSlice[T](Tensor[T](TensorShape(1, config.kv_dims)), 1)
+        self.v = TensorSlice[T](Tensor[T](TensorShape(1, config.kv_dims)), 1)
+
+
+fn load_weights[T: DType](inout buf: FileBuffer, *dims: Int) raises -> Tensor[T]:
+    # Ensure returned Tensor doesn't share a pointer with FileBuf
+    let shape = TensorShape(dims)
+    let result_data = DTypePointer[T].alloc(shape.num_elements())
+    memcpy(
+        result_data,
+        buf.read_numerical_value_dynamic[T](shape.num_elements()),
+        shape.num_elements(),
+    )
+    return Tensor[T](result_data, shape)
+
+
+struct TransformerWeights[T: DType]:
+    var wte: Tensor[T]
+    var fcr: Tensor[T]
+    var fci: Tensor[T]
+    var input_layernorm_weight: Tensor[T]
+    var q_proj: Tensor[T]
+    var k_proj: Tensor[T]
+    var v_proj: Tensor[T]
+    var o_proj: Tensor[T]
+    var post_layernorm_weight: Tensor[T]
+    var w1: Tensor[T]
+    var w3: Tensor[T]
+    var w2: Tensor[T]
+    var norm: Tensor[T]
+    var wcls: Tensor[T]
+
+    fn __init__(
+        inout self, config: LlamaConfig, shared_weights: Int, inout buf: FileBuffer
+    ) raises:
+        self.wte = load_weights[T](
+            buf, config.vocab_size, config.hidden_size
+        )
+        self.input_layernorm_weight = load_weights[T](
+            buf, config.num_hidden_layers, config.hidden_size
+        )
+        self.q_proj = load_weights[T](
+            buf, config.num_hidden_layers, config.hidden_size, config.hidden_size
+        )
+        self.k_proj = load_weights[T](
+            buf, config.num_hidden_layers, config.kv_dims, config.hidden_size
+        )
+        self.v_proj = load_weights[T](
+            buf, config.num_hidden_layers, config.kv_dims, config.hidden_size
+        )
+        self.o_proj = load_weights[T](
+            buf, config.num_hidden_layers, config.hidden_size, config.hidden_size
+        )
+        self.post_layernorm_weight = load_weights[T](
+            buf, config.num_hidden_layers, config.hidden_size
+        )
+        self.w1 = load_weights[T](
+            buf, config.num_hidden_layers, config.intermediate_size, config.hidden_size
+        )
+        self.w2 = load_weights[T](
+            buf, config.num_hidden_layers, config.hidden_size, config.intermediate_size
+        )
+        self.w3 = load_weights[T](
+            buf, config.num_hidden_layers, config.intermediate_size, config.hidden_size
+        )
+        self.norm = load_weights[T](buf, config.hidden_size)
+        self.fcr = load_weights[T](
+            buf, config.max_position_embeddings, config.head_dims // 2
+        )
+        self.fci = load_weights[T](
+            buf, config.max_position_embeddings, config.head_dims // 2
+        )
+        if shared_weights:
+            self.wcls = self.wte
+        else:
+            self.wcls = load_weights[T](buf, config.vocab_size, config.hidden_size)
