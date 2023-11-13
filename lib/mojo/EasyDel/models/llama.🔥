@@ -328,7 +328,7 @@ fn llama_forward_call[
     DT: DType, nelts: Int, cores: Int, parallelized: Bool
 ](
     input_id: Int,
-    position_id: Int,
+    inout position_id: Int,
     inout llama_state: LlamaState[DT],
     llama: LlamaWeights[DT],
     config: LlamaConfig,
@@ -338,6 +338,41 @@ fn llama_forward_call[
         llama.wte.data.offset(input_id * config.hidden_size),
         config.hidden_size,
     )
+
+    if config.max_position_embeddings < position_id:
+        var k_c: Array[DT] = Array[DT](
+            config.num_hidden_layers, config.max_position_embeddings, config.kv_dims
+        )
+        var v_c: Array[DT] = Array[DT](
+            config.num_hidden_layers, config.max_position_embeddings, config.kv_dims
+        )
+
+        k_c.alloc(0.0)
+        v_c.alloc(0.0)
+
+        for i in range(config.num_hidden_layers):
+
+            @parameter
+            fn _rows(j: Int):
+                @parameter
+                fn _cols[_nelts: Int](k: Int):
+                    let c_o_idx = llama_state.key_cache.get_index(i, j + 1, k)
+                    let c_n_idx = llama_state.key_cache.get_index(i, j, k)
+
+                    k_c.store[_nelts](
+                        c_n_idx, llama_state.key_cache.load[_nelts](c_o_idx)
+                    )
+                    v_c.store[_nelts](
+                        c_n_idx, llama_state.value_cache.load[_nelts](c_o_idx)
+                    )
+
+                vectorize[nelts, _cols](config.kv_dims)
+
+            parallelize[_rows](config.max_position_embeddings - 1, cores)
+
+        llama_state.key_cache = k_c
+        llama_state.value_cache = v_c
+        position_id = config.max_position_embeddings
 
     let freqs_cis_imag_row: Array[DT] = Array[DT](
         llama.fci.data.offset(position_id * config.head_dims), config.head_dims
@@ -390,7 +425,7 @@ fn llama_forward_call[
         )
 
         llama_state.q.fill(0.0)
-            
+
         matmul_row[DT, nelts, cores](llama_state.q, llama_state.residual, q_proj)
         matmul_row[DT, nelts, cores](llama_state.k, llama_state.residual, k_proj)
         matmul_row[DT, nelts, cores](llama_state.v, llama_state.residual, v_proj)
