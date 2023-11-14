@@ -78,13 +78,48 @@ fn b_over_strides[T: DType](depth: Int, A: Tensor[T], B: Tensor[T]) -> Int:
     return stride[T](B, depth - _df)
 
 
+@always_inline
+fn scope_softmax[T: DType, nelts: Int](inout x: Tensor[T]) -> None:
+    scope_softmax[T, nelts](x, 0, x.dim(0))
+
+
+@always_inline
+fn scope_softmax[T: DType, nelts: Int](inout x: Tensor[T], start: Int, end: Int):
+    var max_val: SIMD[T, 1] = SIMD[T, 1](-1e9)
+
+    @parameter
+    fn _max[_nelts: Int](ii: Int):
+        let val = x.simd_load[_nelts](start + ii).reduce_max()
+        if val > max_val:
+            max_val = val
+
+    vectorize[nelts, _max](end - start)
+
+    var ssum: SIMD[T, 1] = 0.0
+
+    @parameter
+    fn _exp[_nelts: Int](ii: Int):
+        x.simd_store[_nelts](
+            start + ii, math.exp(x.simd_load[_nelts](start + ii) - max_val)
+        )
+        ssum += x.simd_load[_nelts](start + ii).reduce_add()
+
+    vectorize[nelts, _exp](end - start)
+
+    @parameter
+    fn _norm[_nelts: Int](ii: Int):
+        x.simd_store[_nelts](start + ii, x.simd_load[_nelts](start + ii) / ssum)
+
+    vectorize[nelts, _norm](end - start)
+
+
 struct TensorSlice[T: DType]:
     # Provides a view into a tensor representing a 1D slice on its first or first 2 dimensions.
     # Same function signatures as Tensor but without owning the data.
     var _data: DTypePointer[T]
     var _shape: TensorShape
 
-    fn __init__(inout self, t: Tensor[T], layer: Int) raises:
+    fn __init__(inout self, t: Tensor[T], layer: Int):
         let elements_per_layer = t.num_elements() // t.dim(0)
         self._data = t.data().offset(layer * elements_per_layer)
         if t.rank() == 2:
@@ -94,9 +129,9 @@ struct TensorSlice[T: DType]:
         else:
             # Compiler complains if _shape not defined
             self._shape = TensorShape(1)
-            raise Error("TensorSlice: rank greater than 3 not implemented.")
+            print("TensorSlice: rank greater than 3 not implemented.")
 
-    fn __init__(inout self, t: Tensor[T], layer: Int, row: Int) raises:
+    fn __init__(inout self, t: Tensor[T], layer: Int, row: Int):
         let elements_per_layer = t.num_elements() // t.dim(0)
         let elements_per_row = elements_per_layer // t.dim(1)
         self._data = t.data().offset(
@@ -107,14 +142,14 @@ struct TensorSlice[T: DType]:
         elif t.rank() == 1:
             # Compiler complains if _shape not defined
             self._shape = TensorShape(1)
-            raise Error(
+            print(
                 "Trying to slice a 1D Tensor by layer and row.  This requires a 3D"
                 " Tensor."
             )
         else:
             # Compiler complains if _shape not defined
             self._shape = TensorShape(1)
-            raise Error("TensorSlice: rank greater than 3 not implemented.")
+            print("TensorSlice: rank greater than 3 not implemented.")
 
     fn data(self) -> DTypePointer[T]:
         return self._data
@@ -191,41 +226,6 @@ fn rmsnorm[
 
 
 @always_inline
-fn softmax[T: DType, nelts: Int](inout x: Tensor[T]) -> None:
-    softmax[T, nelts](x, 0, x.dim(0))
-
-
-@always_inline
-fn softmax[T: DType, nelts: Int](inout x: Tensor[T], start: Int, end: Int):
-    var max_val: SIMD[T, 1] = -1e9
-
-    @parameter
-    fn _max[_nelts: Int](ii: Int):
-        let val = x.simd_load[_nelts](start + ii).reduce_max()
-        if val > max_val:
-            max_val = val
-
-    vectorize[nelts, _max](end - start)
-
-    var ssum: SIMD[T, 1] = 0.0
-
-    @parameter
-    fn _exp[_nelts: Int](ii: Int):
-        x.simd_store[_nelts](
-            start + ii, math.exp(x.simd_load[_nelts](start + ii) - max_val)
-        )
-        ssum += x.simd_load[_nelts](start + ii).reduce_add()
-
-    vectorize[nelts, _exp](end - start)
-
-    @parameter
-    fn _norm[_nelts: Int](ii: Int):
-        x.simd_store[_nelts](start + ii, x.simd_load[_nelts](start + ii) / ssum)
-
-    vectorize[nelts, _norm](end - start)
-
-
-@always_inline
 fn batch_matmul_row[
     T: DType, nelts: Int, cores: Int, n: Int
 ](
@@ -281,7 +281,7 @@ fn batch_matmul_row[
 @always_inline
 fn matmul_row[
     T: DType, nelts: Int, cores: Int
-](C: Tensor[T], A: Tensor[T], B: Tensor[T]) raises:
+](C: Tensor[T], A: Tensor[T], B: Tensor[T]):
     # B (d,n) @ A (n,) -> C (d,)
     matmul_dimension_checks(A.shape(), B.shape())
     batch_matmul_row[T, nelts, cores, 1](
@@ -296,7 +296,7 @@ fn matmul_row[
 @always_inline
 fn matmul_row[
     T: DType, nelts: Int, cores: Int
-](C: Tensor[T], A: Tensor[T], B: TensorSlice[T]) raises:
+](C: Tensor[T], A: Tensor[T], B: TensorSlice[T]):
     # B (d,n) @ A (n,) -> C (d,)
     matmul_dimension_checks(A.shape(), B.shape())
     batch_matmul_row[T, nelts, cores, 1](
@@ -311,7 +311,7 @@ fn matmul_row[
 @always_inline
 fn matmul_row[
     T: DType, nelts: Int, cores: Int
-](C: TensorSlice[T], A: Tensor[T], B: TensorSlice[T]) raises:
+](C: TensorSlice[T], A: Tensor[T], B: TensorSlice[T]):
     # B (d,n) @ A (n,) -> C (d,)
     matmul_dimension_checks(A.shape(), B.shape())
     batch_matmul_row[T, nelts, cores, 1](
@@ -325,13 +325,13 @@ fn matmul_row[
     )
 
 
-fn matmul_dimension_checks(a: TensorShape, b: TensorShape) raises:
+fn matmul_dimension_checks(a: TensorShape, b: TensorShape):
     if a[0] != b[1]:
-        raise Error(
+        print(
             "matmul dimension mismatch. A rows (dim 0) not equal to B columns (dim 1)"
         )
     if b.rank() != 2:
-        raise Error("matmul expects B to be a 2D matrix")
+        print("matmul expects B to be a 2D matrix")
 
 
 fn argmax[T: DType](v: Tensor[T]) -> Int:
@@ -619,11 +619,48 @@ fn kernel_matmul[
 
 @always_inline
 fn matmul[
-    T: DType, nelts: Int, cores: Int = 1, parallelized: Bool = True
+    T: DType, nelts: Int, cores: Int, parallelized: Bool
 ](inout C: Tensor[T], A: Tensor[T], B: Tensor[T]):
     recursive_broadcast[T, nelts, cores, kernel_matmul, base_case_matmul, parallelized](
         C, A, B
     )
+
+
+@always_inline
+fn matmul[
+    T: DType, nelts: Int, cores: Int
+](inout C: Tensor[T], A: Tensor[T], B: Tensor[T]):
+    recursive_broadcast[T, nelts, cores, kernel_matmul, base_case_matmul, True](C, A, B)
+
+
+@always_inline
+fn matmul[T: DType, nelts: Int](inout C: Tensor[T], A: Tensor[T], B: Tensor[T]):
+    recursive_broadcast[T, nelts, 1, kernel_matmul, base_case_matmul, True](C, A, B)
+
+
+@always_inline
+fn matmul[
+    T: DType, nelts: Int, cores: Int, parallelized: Bool
+](A: Tensor[T], B: Tensor[T]) -> Tensor[T]:
+    var C: Tensor[T] = Tensor[T](matmul_shape[T](A, B))
+    recursive_broadcast[T, nelts, cores, kernel_matmul, base_case_matmul, parallelized](
+        C, A, B
+    )
+    return C
+
+
+@always_inline
+fn matmul[T: DType, nelts: Int, cores: Int](A: Tensor[T], B: Tensor[T]) -> Tensor[T]:
+    var C: Tensor[T] = Tensor[T](matmul_shape[T](A, B))
+    recursive_broadcast[T, nelts, cores, kernel_matmul, base_case_matmul, True](C, A, B)
+    return C
+
+
+@always_inline
+fn matmul[T: DType, nelts: Int](A: Tensor[T], B: Tensor[T]) -> Tensor[T]:
+    var C: Tensor[T] = Tensor[T](matmul_shape[T](A, B))
+    recursive_broadcast[T, nelts, 1, kernel_matmul, base_case_matmul, True](C, A, B)
+    return C
 
 
 @always_inline
@@ -1425,3 +1462,7 @@ fn tensor_div[
 
     tensor_div[T, nelts, cores](C, A, B)
     return C
+
+
+fn randf[T: DType](A: Tensor[T]):
+    rand[T](A.data(), A.num_elements())

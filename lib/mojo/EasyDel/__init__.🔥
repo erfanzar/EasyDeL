@@ -62,4 +62,7 @@ from .tensor_utils import (
     mse,
     sample,
     arange,
+    randf,
+    argmax,
+    scope_softmax,
 )

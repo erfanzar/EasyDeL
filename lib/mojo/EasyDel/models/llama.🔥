@@ -3,7 +3,15 @@ from runtime.llcl import num_cores
 import math
 from algorithm.functional import vectorize, parallelize, parallelize
 from tensor import Tensor, TensorSpec, TensorShape
-from ..tensor_utils import TensorSlice
+from ..tensor_utils import (
+    TensorSlice,
+    batch_matmul_row,
+    rmsnorm,
+    matmul_row,
+    tensor_add,
+    scope_softmax,
+)
+from memory import memset_zero
 
 
 struct LlamaConfig:
@@ -109,21 +117,19 @@ struct LlamaConfig:
         print_no_newline("\033[1;0m")
 
 
-struct RunState[T: DType]:
-    var x: Tensor[T]  # activation at current time stamp (hidden_size,)
-    var residual: Tensor[T]  # same, but inside a residual branch (hidden_size,)
-    var residual2: Tensor[T]  # an additional buffer just for convenience (hidden_size,)
-    var w1: Tensor[T]  # buffer for hidden dimension in the ffn (intermediate_size,)
-    var w3: Tensor[T]  # buffer for hidden dimension in the ffn (intermediate_size,)
-    var q: Tensor[T]  # query (hidden_size,)
-    var k: TensorSlice[T]  # key (kv_dim,)
-    var v: TensorSlice[T]  # value (kv_dim,)
-    var att: Tensor[
-        T
-    ]  # buffer for scores/attention values (n_heads, max_position_embeddings)
-    var logits: Tensor[T]  # output logits
-    var key_cache: Tensor[T]  # (layer, max_position_embeddings, hidden_size)
-    var value_cache: Tensor[T]  # (layer, max_position_embeddings, hidden_size)
+struct LlamaRunState[T: DType]:
+    var x: Tensor[T]
+    var residual: Tensor[T]
+    var residual2: Tensor[T]
+    var w1: Tensor[T]
+    var w3: Tensor[T]
+    var q: Tensor[T]
+    var k: TensorSlice[T]
+    var v: TensorSlice[T]
+    var att: Tensor[T]
+    var logits: Tensor[T]
+    var key_cache: Tensor[T]
+    var value_cache: Tensor[T]
 
     fn __init__(inout self, config: LlamaConfig) raises:
         self.x = Tensor[T](config.hidden_size)
@@ -140,14 +146,11 @@ struct RunState[T: DType]:
         self.value_cache = Tensor[T](
             config.num_hidden_layers, config.max_position_embeddings, config.kv_dims
         )
-        # So their updates flow to the caches, k and v are slices with shared memory.
-        # Initialize with placeholders. The real tensors reference layer and position during forward pass.
         self.k = TensorSlice[T](Tensor[T](TensorShape(1, config.kv_dims)), 1)
         self.v = TensorSlice[T](Tensor[T](TensorShape(1, config.kv_dims)), 1)
 
 
 fn load_weights[T: DType](inout buf: FileBuffer, *dims: Int) raises -> Tensor[T]:
-    # Ensure returned Tensor doesn't share a pointer with FileBuf
     let shape = TensorShape(dims)
     let result_data = DTypePointer[T].alloc(shape.num_elements())
     memcpy(
@@ -158,7 +161,7 @@ fn load_weights[T: DType](inout buf: FileBuffer, *dims: Int) raises -> Tensor[T]
     return Tensor[T](result_data, shape)
 
 
-struct TransformerWeights[T: DType]:
+struct LlamaWeights[T: DType]:
     var wte: Tensor[T]
     var fcr: Tensor[T]
     var fci: Tensor[T]
@@ -177,9 +180,7 @@ struct TransformerWeights[T: DType]:
     fn __init__(
         inout self, config: LlamaConfig, shared_weights: Int, inout buf: FileBuffer
     ) raises:
-        self.wte = load_weights[T](
-            buf, config.vocab_size, config.hidden_size
-        )
+        self.wte = load_weights[T](buf, config.vocab_size, config.hidden_size)
         self.input_layernorm_weight = load_weights[T](
             buf, config.num_hidden_layers, config.hidden_size
         )
@@ -218,3 +219,184 @@ struct TransformerWeights[T: DType]:
             self.wcls = self.wte
         else:
             self.wcls = load_weights[T](buf, config.vocab_size, config.hidden_size)
+
+
+fn rope_rotation_llama[
+    T: DType, cores: Int
+](
+    inout q: Tensor[T],
+    inout k: TensorSlice[T],
+    freq_cis_real_row: TensorSlice[T],
+    freq_cis_imag_row: TensorSlice[T],
+    config: LlamaConfig,
+) -> None:
+    # stories model, llama2
+    let head_dims = config.head_dims
+
+    @parameter
+    fn head_loop(i: Int):
+        for j in range(0, config.head_dims, 2):
+            let fcr = freq_cis_real_row[j // 2]
+            let fci = freq_cis_imag_row[j // 2]
+            let q0 = q[i * head_dims + j]
+            let q1 = q[i * head_dims + j + 1]
+            q[i * head_dims + j] = q0 * fcr - q1 * fci
+            q[i * head_dims + j + 1] = q0 * fci + q1 * fcr
+            if i < config.num_key_value_heads:
+                let k0 = k[i * head_dims + j]
+                let k1 = k[i * head_dims + j + 1]
+                k[i * head_dims + j] = k0 * fcr - k1 * fci
+                k[i * head_dims + j + 1] = k0 * fci + k1 * fcr
+
+    parallelize[head_loop](config.num_attention_heads, cores)
+
+
+@always_inline
+fn llama_forward[
+    T: DType, nelts: Int, cores: Int
+](
+    input_id: Int,
+    position_id: Int,
+    config: LlamaConfig,
+    inout state: LlamaRunState[T],
+    weights: LlamaWeights[T],
+) -> None:
+    let hidden_size = config.hidden_size
+    let intermediate_size = config.intermediate_size
+    let head_dims = config.head_dims
+    let kv_dims = config.kv_dims
+    let number_rep_kv = config.number_rep_kv
+
+    let content_row = weights.wte.data().offset(input_id * hidden_size)
+    memcpy[T](state.x.data(), content_row, hidden_size)
+
+    let freq_cis_real_row = TensorSlice[T](weights.fcr, position_id)
+    let freq_cis_imag_row = TensorSlice[T](weights.fci, position_id)
+
+    for layer_inedx in range(config.num_hidden_layers):
+        rmsnorm[T, nelts](
+            state.residual,
+            state.x,
+            TensorSlice[T](weights.input_layernorm_weight, layer_inedx),
+        )
+
+        let cache_padding = layer_inedx * config.max_position_embeddings * config.kv_dims
+
+        state.k = TensorSlice[T](state.key_cache, layer_inedx, position_id)
+        state.v = TensorSlice[T](state.value_cache, layer_inedx, position_id)
+
+        if kv_dims == hidden_size:
+            batch_matmul_row[T, nelts, cores, 3](
+                StaticTuple[3, DTypePointer[T]](
+                    state.q.data(), state.k.data(), state.v.data()
+                ),
+                state.residual.data(),
+                StaticTuple[3, DTypePointer[T]](
+                    TensorSlice[T](weights.q_proj, layer_inedx).data(),
+                    TensorSlice[T](weights.k_proj, layer_inedx).data(),
+                    TensorSlice[T](weights.v_proj, layer_inedx).data(),
+                ),
+                hidden_size,
+                hidden_size,
+            )
+        else:
+            matmul_row[T, nelts, cores](
+                state.q, state.residual, TensorSlice[T](weights.q_proj, layer_inedx)
+            )
+            batch_matmul_row[T, nelts, cores, 2](
+                StaticTuple[2, DTypePointer[T]](state.k.data(), state.v.data()),
+                state.residual.data(),
+                StaticTuple[2, DTypePointer[T]](
+                    TensorSlice[T](weights.k_proj, layer_inedx).data(),
+                    TensorSlice[T](weights.v_proj, layer_inedx).data(),
+                ),
+                kv_dims,
+                hidden_size,
+            )
+
+        rope_rotation_llama[T, cores](
+            state.q, state.k, freq_cis_real_row, freq_cis_imag_row, config
+        )
+
+        memset_zero[T](state.residual.data(), state.residual.num_elements())
+
+        @parameter
+        fn loop_over_heads(h: Int):
+            let q_offset = h * head_dims
+            let att_offset = h * config.max_position_embeddings
+            for t in range(position_id + 1):
+                let k_offset = cache_padding + t * kv_dims + (
+                    h // number_rep_kv
+                ) * head_dims
+                var score: SIMD[T, 1] = 0.0
+
+                @parameter
+                fn score_fn[_nelts: Int](i: Int):
+                    score += (
+                        state.q.simd_load[_nelts](q_offset + i)
+                        * state.key_cache.simd_load[_nelts](k_offset + i)
+                    ).reduce_add()
+
+                vectorize[nelts, score_fn](head_dims)
+                score /= math.sqrt[T, 1](head_dims)
+                state.att[att_offset + t] = score
+            scope_softmax[T, nelts](state.att, att_offset, att_offset + position_id + 1)
+
+            let residual_offset = h * head_dims
+            for t in range(position_id + 1):
+                let v_offset = cache_padding + t * kv_dims + (
+                    h // number_rep_kv
+                ) * head_dims
+
+                let a = state.att[att_offset + t]
+
+                @parameter
+                fn xb_accumulate[_nelts: Int](i: Int):
+                    let xbi = state.residual.simd_load[_nelts](
+                        residual_offset + i
+                    ) + a * state.value_cache.simd_load[_nelts](v_offset + i)
+                    state.residual.simd_store[_nelts](residual_offset + i, xbi)
+
+                vectorize[nelts, xb_accumulate](head_dims)
+
+        parallelize[loop_over_heads](config.num_attention_heads, cores)
+
+        matmul_row[T, nelts, cores](
+            state.residual2, state.residual, TensorSlice[T](weights.o_proj, layer_inedx)
+        )
+
+        tensor_add[T, nelts](state.x, state.residual2)
+
+        rmsnorm[T, nelts](
+            state.residual,
+            state.x,
+            TensorSlice[T](weights.post_layernorm_weight, layer_inedx),
+        )
+
+        batch_matmul_row[T, nelts, cores, 2](
+            StaticTuple[2, DTypePointer[T]](state.w1.data(), state.w3.data()),
+            state.residual.data(),
+            StaticTuple[2, DTypePointer[T]](
+                TensorSlice[T](weights.w1, layer_inedx).data(),
+                TensorSlice[T](weights.w3, layer_inedx).data(),
+            ),
+            intermediate_size,
+            hidden_size,
+        )
+
+        @parameter
+        fn silu[_nelts: Int](i: Int):
+            let initial_hb = state.w1.simd_load[_nelts](i)
+            let hbi = initial_hb * (1.0 / (1.0 + math.exp(-initial_hb)))
+            state.w1.simd_store[_nelts](i, hbi * state.w3.simd_load[_nelts](i))
+
+        vectorize[nelts, silu](intermediate_size)
+        matmul_row[T, nelts, cores](
+            state.residual, state.w1, TensorSlice[T](weights.w2, layer_inedx)
+        )
+
+        tensor_add[T, nelts](state.x, state.residual)
+
+    rmsnorm[T, nelts](state.x, state.x, weights.norm)
+
+    matmul_row[T, nelts, cores](state.logits, state.x, weights.wcls)

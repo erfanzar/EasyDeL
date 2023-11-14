@@ -46,4 +46,10 @@ from .forward import (
     mse,
     sample,
     arange,
+    randf,
+    batch_matmul_row,
+    rmsnorm,
+    matmul_row,
+    argmax,
+    scope_softmax,
 )
