@@ -1,4 +1,4 @@
-from .tensor_utils import (
+from .forward import (
     tensor_add,
     tensor_sub,
     tensor_div,
