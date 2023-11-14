@@ -2,8 +2,41 @@
 
 from tensor import Tensor, TensorShape
 from algorithm.functional import vectorize, parallelize, unroll
+from math import (
+    max,
+    min,
+    sqrt,
+    abs,
+    pow,
+    exp2,
+    exp,
+    log2,
+    log,
+    cos,
+    sin,
+    tan,
+    asin,
+    acos,
+    atan,
+    cosh,
+    sinh,
+    tanh,
+)
 import math
+from memory import memset_zero, memcpy
 from random import rand
+
+
+fn matmul_shape[DT: DType](A: Tensor[DT], B: Tensor[DT]) -> TensorShape:
+    if A.rank() == Int(2) and B.rank() == 1:
+        return TensorShape(A.dim(0))
+
+    var res_dims = DynamicVector[Int]()
+    for i in range(A.rank() - 1):
+        res_dims.push_back(A.dim(i))
+    res_dims.push_back(B.dim(-1))
+
+    return TensorShape(res_dims)
 
 
 fn stride[T: DType](tensor: Tensor[T], axis: Int) -> Int:
@@ -193,7 +226,7 @@ fn softmax[T: DType, nelts: Int](inout x: Tensor[T], start: Int, end: Int):
 
 
 @always_inline
-fn batch_matmul[
+fn batch_matmul_row[
     T: DType, nelts: Int, cores: Int, n: Int
 ](
     C: StaticTuple[n, DTypePointer[T]],
@@ -238,7 +271,7 @@ fn batch_matmul[
 
         @parameter
         fn _reduce[k: Int]():
-            C[k].store(i, tmp[k].reduce_add())
+            C[k].simd_store(i, tmp[k].reduce_add())
 
         unroll[n, _reduce]()
 
@@ -246,12 +279,12 @@ fn batch_matmul[
 
 
 @always_inline
-fn matmul[
+fn matmul_row[
     T: DType, nelts: Int, cores: Int
 ](C: Tensor[T], A: Tensor[T], B: Tensor[T]) raises:
     # B (d,n) @ A (n,) -> C (d,)
     matmul_dimension_checks(A.shape(), B.shape())
-    batch_matmul[T, nelts, cores, 1](
+    batch_matmul_row[T, nelts, cores, 1](
         StaticTuple[1, DTypePointer[T]](C.data()),
         A.data(),
         StaticTuple[1, DTypePointer[T]](B.data()),
@@ -261,12 +294,12 @@ fn matmul[
 
 
 @always_inline
-fn matmul[
+fn matmul_row[
     T: DType, nelts: Int, cores: Int
 ](C: Tensor[T], A: Tensor[T], B: TensorSlice[T]) raises:
     # B (d,n) @ A (n,) -> C (d,)
     matmul_dimension_checks(A.shape(), B.shape())
-    batch_matmul[T, nelts, cores, 1](
+    batch_matmul_row[T, nelts, cores, 1](
         StaticTuple[1, DTypePointer[T]](C.data()),
         A.data(),
         StaticTuple[1, DTypePointer[T]](B.data()),
@@ -276,12 +309,12 @@ fn matmul[
 
 
 @always_inline
-fn matmul[
+fn matmul_row[
     T: DType, nelts: Int, cores: Int
 ](C: TensorSlice[T], A: Tensor[T], B: TensorSlice[T]) raises:
     # B (d,n) @ A (n,) -> C (d,)
     matmul_dimension_checks(A.shape(), B.shape())
-    batch_matmul[T, nelts, cores, 1](
+    batch_matmul_row[T, nelts, cores, 1](
         StaticTuple[1, DTypePointer[T]](
             C.data(),
         ),
@@ -391,7 +424,7 @@ fn tensor_pow[T: DType, nelts: Int](inout a: Tensor[T], b: SIMD[T, 1]) -> None:
 
 @always_inline
 fn concatenate[
-    T: DType
+    T: DType, nelts: Int
 ](A: Tensor[T], B: Tensor[T], inout axis: Int = 0, stragedy: String = "ord") -> Tensor[
     T
 ]:
@@ -405,32 +438,28 @@ fn concatenate[
             cat_shape.push_back(A.dim(i))
         else:
             cat_shape.push_back(A.dim(i) + B.dim(i))
-    var cat_tensor: Tensor[T] = Tensor[T](cat_shape)
-    cat_tensor.alloc(0.0)
+    let cat_tensor: Tensor[T] = Tensor[T](cat_shape)
     if stragedy == "ord":
 
         @parameter
-        fn _r[nelts: Int](I: Int):
+        fn _r[_nelts: Int](I: Int):
             if I < A.num_elements():
-                cat_tensor.store[nelts](I, A.load[nelts](I))
+                cat_tensor.simd_store[_nelts](I, A.simd_load[_nelts](I))
             else:
-                cat_tensor.store[nelts](I, B.load[nelts](I))
+                cat_tensor.simd_store[_nelts](I, B.simd_load[_nelts](I))
 
-        vectorize[Tensor[T].nelts, _r](cat_tensor.num_elements())
+        vectorize[nelts, _r](cat_tensor.num_elements())
     return cat_tensor
-
-
 
 
 @always_inline
 fn arange[T: DType, cores: Int](start: Int, end: Int) -> Tensor[T]:
     let rng = end - start
     var tensor: Tensor[T] = Tensor[T](rng)
-    tensor.alloc()
 
     @parameter
     fn _row(i: Int):
-        tensor.store[1](i, start + i)
+        tensor.simd_store[1](i, start + i)
 
     parallelize[_row](rng, cores)
     return tensor
@@ -440,7 +469,15 @@ fn recursive_broadcast[
     T: DType,
     nelts: Int,
     cores: Int,
-    kernel: fn[T:DType,nelts:Int,cores:Int](inout C: Tensor[T], A: Tensor[T], B: Tensor[T], a_index: Int, b_index: Int,c_index: Int, depth: Int) -> None,
+    kernel: fn[T: DType, nelts: Int, cores: Int] (
+        inout C: Tensor[T],
+        A: Tensor[T],
+        B: Tensor[T],
+        a_index: Int,
+        b_index: Int,
+        c_index: Int,
+        depth: Int,
+    ) -> None,
     base_case: fn[T: DType] (depth: Int, A: Tensor[T], B: Tensor[T]) -> Bool,
     parallelized: Bool,
 ](
@@ -568,7 +605,7 @@ fn kernel_matmul[
 
             @parameter
             fn dot[nelts: Int](n: Int):
-                C.data.simd_store[nelts](
+                C.simd_store[nelts](
                     offset_c + m * N + n,
                     C.simd_load[nelts](offset_c + m * N + n)
                     + A.simd_load[1](offset_a + m * K + k)
@@ -582,11 +619,11 @@ fn kernel_matmul[
 
 @always_inline
 fn matmul[
-    T: DType, nelts: Int = Tensor[T].nelts, cores: Int = 1, parallelized: Bool = True
+    T: DType, nelts: Int, cores: Int = 1, parallelized: Bool = True
 ](inout C: Tensor[T], A: Tensor[T], B: Tensor[T]):
-    recursive_broadcast[
-        T, nelts, cores, kernel_matmul, base_case_matmul, parallelized
-    ](C, A, B)
+    recursive_broadcast[T, nelts, cores, kernel_matmul, base_case_matmul, parallelized](
+        C, A, B
+    )
 
 
 @always_inline
@@ -678,7 +715,7 @@ fn sigmoid[
 ](inout x: DTypePointer[T], num_elements: Int, number_of_cores: Int = 1) -> None:
     @parameter
     fn _row(size: Int):
-        x.store(size, 1.0 / (1.0 + math.exp(-x.load(size))))
+        x.simd_store[1](size, 1.0 / (1.0 + math.exp(-x.load(size))))
 
     parallelize[_row](num_elements, number_of_cores)
 
@@ -690,7 +727,7 @@ fn silu[
     @parameter
     fn _row(size: Int):
         let dt: SIMD[T, 1] = x.load(size)
-        x.store(size, dt * (1.0 / (1.0 + math.exp(-dt))))
+        x.simd_store[1](size, dt * (1.0 / (1.0 + math.exp(-dt))))
 
     parallelize[_row](num_elements, number_of_cores)
 
@@ -702,7 +739,7 @@ fn relu[
     @parameter
     fn _row(size: Int):
         let dt: SIMD[T, 1] = x.load(size)
-        x.store(size, dt if dt > 0 else 0.0)
+        x.simd_store(size, dt if dt > 0 else 0.0)
 
     parallelize[_row](num_elements, number_of_cores)
 
@@ -719,22 +756,9 @@ fn leaky_relu[
     @parameter
     fn _row(size: Int):
         let dt: SIMD[T, 1] = x.load(size)
-        x.store(size, dt if dt > drop else drop)
+        x.simd_store(size, dt if dt > drop else drop)
 
     parallelize[_row](num_elements, number_of_cores)
-
-
-@always_inline
-fn sample[T: DType](tensor: Tensor[T]) -> Int:
-    let number_of_cols = tensor.dim(-1)
-    let random_value = DTypePointer[T].alloc(1)
-    rand[T](random_value, 1)
-    var cdf: SIMD[T, 1] = 0.0
-    for i in range(number_of_cols):
-        cdf += tensor[i]
-        if random_value.load(0) < cdf:
-            return i
-    return number_of_cols - 1
 
 
 @always_inline
@@ -758,16 +782,14 @@ fn softmax[
         @parameter
         fn v_exp[nelts: Int](i: Int):
             let _x = math.exp(A.simd_load[nelts](s * N + i) - max_element)
-            B.data.simd_store[nelts](s * N + i, _x)
+            B.simd_store[nelts](s * N + i, _x)
             sum_loop += _x.reduce_add()
 
         vectorize[nelts, v_exp](N)
 
         @parameter
         fn v_div[nelts: Int](i: Int):
-            B.data.simd_store[nelts](
-                s * N + i, B.simd_load[nelts](s * N + i) / sum_loop
-            )
+            B.simd_store[nelts](s * N + i, B.simd_load[nelts](s * N + i) / sum_loop)
 
         vectorize[nelts, v_div](N)
 
@@ -775,11 +797,9 @@ fn softmax[
 
 
 @always_inline
-fn softmax[
-    T: DType, nelts: Int, cores: Int
-](A: Tensor[T], axis: Int = -1) -> Tensor[T]:
-    var B: Tensor[T] = Tensor[T](A)
-    
+fn softmax[T: DType, nelts: Int, cores: Int](A: Tensor[T], axis: Int = -1) -> Tensor[T]:
+    var B: Tensor[T] = Tensor[T](A.shape())
+
     softmax[T, nelts, cores](B, A, axis)
     return B
 
@@ -788,13 +808,13 @@ fn softmax[
 fn mse[T: DType, nelts: Int](inout C: Tensor[T], A: Tensor[T], B: Tensor[T]):
     @parameter
     fn v_mse[nelts: Int](index: Int):
-        let error = (
+        let error = (A.simd_load[nelts](index) - B.simd_load[nelts](index)) * (
             A.simd_load[nelts](index) - B.simd_load[nelts](index)
-        ) * (A.simd_load[nelts](index) - B.simd_load[nelts](index))
-        C.store[1](0, C.simd_load[1](0) + error.reduce_add())
+        )
+        C.simd_store[1](0, C.simd_load[1](0) + error.reduce_add())
 
     vectorize[nelts, v_mse](A.num_elements())
-    C.store[1](0, C.simd_load[1](0) / SIMD[T, 1](A.num_elements()))
+    C.simd_store[1](0, C.simd_load[1](0) / SIMD[T, 1](A.num_elements()))
 
 
 @always_inline
@@ -807,104 +827,13 @@ fn ce[T: DType, nelts: Int](inout C: Tensor[T], A: Tensor[T], B: Tensor[T]):
         let error = -A.simd_load[nelts](index) * log(
             B.simd_load[nelts](index) + epsilon
         )
-        C.store[1](0, C.simd_load[1](0) + error.reduce_add())
+        C.simd_store[1](0, C.simd_load[1](0) + error.reduce_add())
 
     vectorize[nelts, v_ce](A.num_elements())
-    C.store[1](0, C.simd_load[1](0) / (SIMD[T, 1](A.num_elements()) / SIMD[T, 1](N)))
+    C.simd_store[1](
+        0, C.simd_load[1](0) / (SIMD[T, 1](A.num_elements()) / SIMD[T, 1](N))
+    )
 
-
-@always_inline
-fn mean[T: DType, nelts: Int](inout B: Tensor[T], A: Tensor[T]):
-    let dim_len: Int = B.extra_parameters.load(0)
-
-    # Calculate total number of elements in dims
-    var total_elements_in_dims: Int = 1
-    for d in range(dim_len):
-        let dim: Int = B.extra_parameters.load(d + 1)
-        total_elements_in_dims *= A.shape()[dim]
-
-    var in_dims = DynamicVector[Bool](B.rank())
-    for d in range(B.rank()):
-        in_dims[d] = False
-    for d in range(dim_len):
-        in_dims[B.extra_parameters.load(d + 1)] = True
-
-    # Iterate over all elements in the Tensor[T]
-    for i in range(A.num_elements()):
-        var indeces = DynamicVector[Int]()
-        for dim in range(A.rank()):
-            indeces.push_back((i // stride[T](A,dim)) % A.shape()[dim])
-        var output_index = 0
-        for dim in range(B.rank()):
-            if not in_dims[dim]:
-                output_index += indeces[dim] * stride[T](V,dim)
-
-        B.data.store(output_index, B.simd_load[1](output_index) + A.simd_load[1](i))
-
-    # Divide each element in output Tensor[T] by total number of elements in dims
-    for i in range(B.num_elements()):
-        let value: SIMD[T, 1] = B.simd_load[1](i) / SIMD[T, 1](total_elements_in_dims)
-        B.data.store(i, value)
-
-
-@always_inline
-fn variance[T: DType, nelts: Int](inout B: Tensor[T], A: Tensor[T]):
-    let dim_len: Int = B.extra_parameters.load(0)
-    let mean_output = DTypePointer[T].alloc(B.num_elements())
-    memset_zero(mean_output, B.num_elements())
-
-    # Calculate total number of elements in dims
-    var total_elements_in_dims: Int = 1
-    for d in range(dim_len):
-        let dim: Int = B.extra_parameters.load(d + 1)
-        total_elements_in_dims *= A.shape()[dim]
-
-    var in_dims = DynamicVector[Bool](B.rank())
-    for d in range(B.rank()):
-        in_dims[d] = False
-    for d in range(dim_len):
-        in_dims[B.extra_parameters.load(d + 1)] = True
-
-    # Iterate over all elements in the Tensor[T]
-    for i in range(A.num_elements()):
-        var indeces = DynamicVector[Int]()
-        for dim in range(A.rank()):
-            indeces.push_back((i // stride[T](A,dim)) % A.shape()[dim])
-
-        var output_index = 0
-        for dim in range(B.rank()):
-            if not in_dims[dim]:
-                output_index += indeces[dim] *stride[T](B,dim)
-
-        mean_output.store(output_index, mean_output.load(output_index) + A.simd_load[1](i))
-
-    # Divide each element in output Tensor[T] by total number of elements in dims
-    for i in range(B.num_elements()):
-        let value: SIMD[T, 1] = mean_output.load(i) / SIMD[T, 1](
-            total_elements_in_dims
-        )
-        mean_output.store(i, value)
-
-    # Iterate over all elements in the Tensor[T] again to calculate squared _dferences from the mean
-    for i in range(A.num_elements()):
-        var indeces = DynamicVector[Int]()
-        for dim in range(A.rank()):
-            indeces.push_back((i // stride[T](A,dim)) % A.shape()[dim])
-
-        var output_index = 0
-        for dim in range(B.rank()):
-            if not in_dims[dim]:
-                output_index += indeces[dim] *stride[T](B,dim)
-
-        let _df = A.simd_load[1](i) - mean_output.load(output_index)
-        B.data.store(output_index, B.simd_load[1](output_index) + _df * _df)
-
-    # Divide each element in squared__df_output Tensor[T] by total number of elements in dims to get the variance
-    for i in range(B.num_elements()):
-        let value: SIMD[T, 1] = B.simd_load[1](i) / SIMD[T, 1](
-            total_elements_in_dims - 1
-        )
-        B.data.store(i, value)
 
 @always_inline
 fn kernel_mul[
@@ -924,15 +853,14 @@ fn kernel_mul[
     let offset_b = b_index * b_over_shape[T](depth, A, B) * b_over_strides[T](
         depth, A, B
     )
-    let c_rest = C.shape()[depth] * stride[T](C,depth)
+    let c_rest = C.shape()[depth] * stride[T](C, depth)
     let offset_c = c_index * c_rest
 
     @parameter
     fn v_mul[nelts: Int](i: Int):
-        C.data.simd_store[nelts](
+        C.simd_store[nelts](
             offset_c + i,
-            A.simd_load[nelts](offset_a + i)
-            * B.simd_load[nelts](offset_b + i),
+            A.simd_load[nelts](offset_a + i) * B.simd_load[nelts](offset_b + i),
         )
 
     vectorize[nelts, v_mul](c_rest)
@@ -956,15 +884,14 @@ fn kernel_add[
     let offset_b = b_index * b_over_shape[T](depth, A, B) * b_over_strides[T](
         depth, A, B
     )
-    let c_rest = C.shape()[depth] * stride[T](C,depth)
+    let c_rest = C.shape()[depth] * stride[T](C, depth)
     let offset_c = c_index * c_rest
 
     @parameter
     fn v_add[nelts: Int](i: Int):
-        C.data.simd_store[nelts](
+        C.simd_store[nelts](
             offset_c + i,
-            A.simd_load[nelts](offset_a + i)
-            + B.simd_load[nelts](offset_b + i),
+            A.simd_load[nelts](offset_a + i) + B.simd_load[nelts](offset_b + i),
         )
 
     vectorize[nelts, v_add](c_rest)
@@ -988,15 +915,14 @@ fn kernel_sub[
     let offset_b = b_index * b_over_shape[T](depth, A, B) * b_over_strides[T](
         depth, A, B
     )
-    let c_rest = C.shape()[depth] * stride[T](C,depth)
+    let c_rest = C.shape()[depth] * stride[T](C, depth)
     let offset_c = c_index * c_rest
 
     @parameter
     fn v_sub[nelts: Int](i: Int):
-        C.data.simd_store[nelts](
+        C.simd_store[nelts](
             offset_c + i,
-            A.simd_load[nelts](offset_a + i)
-            - B.simd_load[nelts](offset_b + i),
+            A.simd_load[nelts](offset_a + i) - B.simd_load[nelts](offset_b + i),
         )
 
     vectorize[nelts, v_sub](c_rest)
@@ -1020,15 +946,14 @@ fn kernel_div[
     let offset_b = b_index * b_over_shape[T](depth, A, B) * b_over_strides[T](
         depth, A, B
     )
-    let c_rest = C.shape()[depth] * stride[T](C,depth)
+    let c_rest = C.shape()[depth] * stride[T](C, depth)
     let offset_c = c_index * c_rest
 
     @parameter
     fn v_div[nelts: Int](i: Int):
-        C.data.simd_store[nelts](
+        C.simd_store[nelts](
             offset_c + i,
-            A.simd_load[nelts](offset_a + i)
-            / B.simd_load[nelts](offset_b + i),
+            A.simd_load[nelts](offset_a + i) / B.simd_load[nelts](offset_b + i),
         )
 
     vectorize[nelts, v_div](c_rest)
@@ -1041,9 +966,9 @@ fn base_case_matmul[T: DType](depth: Int, A: Tensor[T], B: Tensor[T]) -> Bool:
 
 @always_inline
 fn base_case_mul[T: DType](depth: Int, A: Tensor[T], B: Tensor[T]) -> Bool:
-    return a_over_strides(depth, A, B) * a_over_shape[T](
-        depth, A, B
-    ) == b_over_strides[T](depth, A, B) * b_over_shape[T](depth, A, B)
+    return a_over_strides(depth, A, B) * a_over_shape[T](depth, A, B) == b_over_strides[
+        T
+    ](depth, A, B) * b_over_shape[T](depth, A, B)
 
 
 @always_inline
@@ -1092,12 +1017,12 @@ fn kernel_pow[
     let offset_b = b_index * b_over_shape[T](depth, A, B) * b_over_strides[T](
         depth, A, B
     )
-    let c_rest = C.shape()[depth] * stride[T](C,depth)
+    let c_rest = C.shape()[depth] * stride[T](C, depth)
     let offset_c = c_index * c_rest
 
     @parameter
     fn v_pow[nelts: Int](i: Int):
-        C.data.simd_store[nelts](
+        C.simd_store[nelts](
             offset_c + i,
             pow(
                 A.simd_load[nelts](offset_a + i),
@@ -1117,23 +1042,12 @@ fn tensor_pow[
     )
 
 
-fn tensor_pow_all[T: DType, nelts: Int](inout B: Tensor[T], A: Tensor[T]):
-    let e = B.extra_parameters.load(0)
-
-    @parameter
-    fn v_pow_all[nelts: Int](i: Int):
-        let temp = pow(A.simd_load[nelts](i), e)
-        B.data.simd_store[nelts](i, temp)
-
-    vectorize[nelts, v_pow_all](A.num_elements())
-
-
 @always_inline
 fn tensor_exp2[T: DType, nelts: Int](inout B: Tensor[T], A: Tensor[T]):
     @parameter
     fn v_exp2[nelts: Int](i: Int):
         let temp = exp2(A.simd_load[nelts](i))
-        B.data.simd_store[nelts](i, temp)
+        B.simd_store[nelts](i, temp)
 
     vectorize[nelts, v_exp2](A.num_elements())
 
@@ -1143,7 +1057,7 @@ fn tensor_exp[T: DType, nelts: Int](inout B: Tensor[T], A: Tensor[T]):
     @parameter
     fn v_exp[nelts: Int](i: Int):
         let temp = exp(A.simd_load[nelts](i))
-        B.data.simd_store[nelts](i, temp)
+        B.simd_store[nelts](i, temp)
 
     vectorize[nelts, v_exp](A.num_elements())
 
@@ -1153,7 +1067,7 @@ fn tensor_log2[T: DType, nelts: Int](inout B: Tensor[T], A: Tensor[T]):
     @parameter
     fn v_log2[nelts: Int](i: Int):
         let temp = log2(A.simd_load[nelts](i))
-        B.data.simd_store[nelts](i, temp)
+        B.simd_store[nelts](i, temp)
 
     vectorize[nelts, v_log2](A.num_elements())
 
@@ -1163,7 +1077,7 @@ fn tensor_log[T: DType, nelts: Int](inout B: Tensor[T], A: Tensor[T]):
     @parameter
     fn v_log[nelts: Int](i: Int):
         let temp = log(A.simd_load[nelts](i))
-        B.data.simd_store[nelts](i, temp)
+        B.simd_store[nelts](i, temp)
 
     vectorize[nelts, v_log](A.num_elements())
 
@@ -1173,7 +1087,7 @@ fn tensor_sin[T: DType, nelts: Int](inout B: Tensor[T], A: Tensor[T]):
     @parameter
     fn v_sin[nelts: Int](i: Int):
         let temp = sin(A.simd_load[nelts](i))
-        B.data.simd_store[nelts](i, temp)
+        B.simd_store[nelts](i, temp)
 
     vectorize[nelts, v_sin](A.num_elements())
 
@@ -1183,7 +1097,7 @@ fn tensor_cos[T: DType, nelts: Int](inout B: Tensor[T], A: Tensor[T]):
     @parameter
     fn v_cos[nelts: Int](i: Int):
         let temp = cos(A.simd_load[nelts](i))
-        B.data.simd_store[nelts](i, temp)
+        B.simd_store[nelts](i, temp)
 
     vectorize[nelts, v_cos](A.num_elements())
 
@@ -1193,7 +1107,7 @@ fn tensor_tan[T: DType, nelts: Int](inout B: Tensor[T], A: Tensor[T]):
     @parameter
     fn v_tan[nelts: Int](i: Int):
         let temp = tan(A.simd_load[nelts](i))
-        B.data.simd_store[nelts](i, temp)
+        B.simd_store[nelts](i, temp)
 
     vectorize[nelts, v_tan](A.num_elements())
 
@@ -1203,7 +1117,7 @@ fn tensor_asin[T: DType, nelts: Int](inout B: Tensor[T], A: Tensor[T]):
     @parameter
     fn v_asin[nelts: Int](i: Int):
         let temp = asin(A.simd_load[nelts](i))
-        B.data.simd_store[nelts](i, temp)
+        B.simd_store[nelts](i, temp)
 
     vectorize[nelts, v_asin](A.num_elements())
 
@@ -1213,7 +1127,7 @@ fn tensor_acos[T: DType, nelts: Int](inout B: Tensor[T], A: Tensor[T]):
     @parameter
     fn v_acos[nelts: Int](i: Int):
         let temp = acos(A.simd_load[nelts](i))
-        B.data.simd_store[nelts](i, temp)
+        B.simd_store[nelts](i, temp)
 
     vectorize[nelts, v_acos](A.num_elements())
 
@@ -1223,7 +1137,7 @@ fn tensor_atan[T: DType, nelts: Int](inout B: Tensor[T], A: Tensor[T]):
     @parameter
     fn v_atan[nelts: Int](i: Int):
         let temp = atan(A.simd_load[nelts](i))
-        B.data.simd_store[nelts](i, temp)
+        B.simd_store[nelts](i, temp)
 
     vectorize[nelts, v_atan](A.num_elements())
 
@@ -1233,7 +1147,7 @@ fn tensor_sinh[T: DType, nelts: Int](inout B: Tensor[T], A: Tensor[T]):
     @parameter
     fn v_sinh[nelts: Int](i: Int):
         let temp = sinh(A.simd_load[nelts](i))
-        B.data.simd_store[nelts](i, temp)
+        B.simd_store[nelts](i, temp)
 
     vectorize[nelts, v_sinh](A.num_elements())
 
@@ -1243,7 +1157,7 @@ fn tensor_cosh[T: DType, nelts: Int](inout B: Tensor[T], A: Tensor[T]):
     @parameter
     fn v_cosh[nelts: Int](i: Int):
         let temp = cosh(A.simd_load[nelts](i))
-        B.data.simd_store[nelts](i, temp)
+        B.simd_store[nelts](i, temp)
 
     vectorize[nelts, v_cosh](A.num_elements())
 
@@ -1253,7 +1167,7 @@ fn tensor_tanh[T: DType, nelts: Int](inout B: Tensor[T], A: Tensor[T]):
     @parameter
     fn v_tanh[nelts: Int](i: Int):
         let temp = tanh(A.simd_load[nelts](i))
-        B.data.simd_store[nelts](i, temp)
+        B.simd_store[nelts](i, temp)
 
     vectorize[nelts, v_tanh](A.num_elements())
 
@@ -1263,10 +1177,9 @@ fn tensor_relu[T: DType, nelts: Int](inout B: Tensor[T], A: Tensor[T]):
     @parameter
     fn v_relu[nelts: Int](i: Int):
         let zeros = SIMD[T, nelts]()
-        B.data.simd_store[nelts](
+        B.simd_store[nelts](
             i,
-            (A.simd_load[nelts](i) > zeros).cast[T]()
-            * A.simd_load[nelts](i),
+            (A.simd_load[nelts](i) > zeros).cast[T]() * A.simd_load[nelts](i),
         )
 
     vectorize[nelts, v_relu](B.num_elements())
@@ -1274,7 +1187,7 @@ fn tensor_relu[T: DType, nelts: Int](inout B: Tensor[T], A: Tensor[T]):
 
 @always_inline
 fn tensor_copy[T: DType, nelts: Int](inout B: Tensor[T], A: Tensor[T]):
-    memcpy(B.data, A.data, A.num_elements())
+    memcpy(B.data(), A.data(), A.num_elements())
 
 
 @always_inline
@@ -1291,7 +1204,7 @@ fn tensor_sqrt[T: DType, nelts: Int](inout B: Tensor[T], A: Tensor[T]):
     @parameter
     fn v_sqrt[nelts: Int](i: Int):
         let temp = sqrt(A.simd_load[nelts](i))
-        B.data.simd_store[nelts](i, temp)
+        B.simd_store[nelts](i, temp)
 
     vectorize[nelts, v_sqrt](A.num_elements())
 
@@ -1301,7 +1214,7 @@ fn tensor_abs[T: DType, nelts: Int](inout B: Tensor[T], A: Tensor[T]):
     @parameter
     fn v_abs[nelts: Int](i: Int):
         let temp = abs(A.simd_load[nelts](i))
-        B.data.simd_store[nelts](i, temp)
+        B.simd_store[nelts](i, temp)
 
     vectorize[nelts, v_abs](A.num_elements())
 
@@ -1340,143 +1253,136 @@ fn tensor_sub[
 fn tensor_pow[
     T: DType, nelts: Int, cores: Int
 ](A: Tensor[T], B: Tensor[T]) -> Tensor[T]:
-    var C: Tensor[T] = Tensor[T](B.tensor_shape)
-    
+    var C: Tensor[T] = Tensor[T](B.shape())
+
     tensor_pow[T, nelts, cores](C, A, B)
     return C
 
 
-fn tensor_pow_all[T: DType, nelts: Int](A: Tensor[T]) -> Tensor[T]:
-    var B: Tensor[T] = Tensor[T](A.tensor_shape)
-    
-    tensor_pow_all[T, nelts](B, A)
-    return B
-
-
 @always_inline
 fn tensor_exp2[T: DType, nelts: Int](A: Tensor[T]) -> Tensor[T]:
-    var B: Tensor[T] = Tensor[T](A.tensor_shape)
-    
+    var B: Tensor[T] = Tensor[T](A.shape())
+
     tensor_exp2[T, nelts](B, A)
     return B
 
 
 @always_inline
 fn tensor_exp[T: DType, nelts: Int](A: Tensor[T]) -> Tensor[T]:
-    var B: Tensor[T] = Tensor[T](A.tensor_shape)
-    
+    var B: Tensor[T] = Tensor[T](A.shape())
+
     tensor_exp[T, nelts](B, A)
     return B
 
 
 @always_inline
 fn tensor_log2[T: DType, nelts: Int](A: Tensor[T]) -> Tensor[T]:
-    var B: Tensor[T] = Tensor[T](A.tensor_shape)
-    
+    var B: Tensor[T] = Tensor[T](A.shape())
+
     tensor_log2[T, nelts](B, A)
     return B
 
 
 @always_inline
 fn tensor_log[T: DType, nelts: Int](A: Tensor[T]) -> Tensor[T]:
-    var B: Tensor[T] = Tensor[T](A.tensor_shape)
-    
+    var B: Tensor[T] = Tensor[T](A.shape())
+
     tensor_log[T, nelts](B, A)
     return B
 
 
 @always_inline
 fn tensor_sin[T: DType, nelts: Int](A: Tensor[T]) -> Tensor[T]:
-    var B: Tensor[T] = Tensor[T](A.tensor_shape)
-    
+    var B: Tensor[T] = Tensor[T](A.shape())
+
     tensor_sin[T, nelts](B, A)
     return B
 
 
 @always_inline
 fn tensor_cos[T: DType, nelts: Int](A: Tensor[T]) -> Tensor[T]:
-    var B: Tensor[T] = Tensor[T](A.tensor_shape)
-    
+    var B: Tensor[T] = Tensor[T](A.shape())
+
     tensor_cos[T, nelts](B, A)
     return B
 
 
 @always_inline
 fn tensor_tan[T: DType, nelts: Int](A: Tensor[T]) -> Tensor[T]:
-    var B: Tensor[T] = Tensor[T](A.tensor_shape)
-    
+    var B: Tensor[T] = Tensor[T](A.shape())
+
     tensor_tan[T, nelts](B, A)
     return B
 
 
 @always_inline
 fn tensor_asin[T: DType, nelts: Int](A: Tensor[T]) -> Tensor[T]:
-    var B: Tensor[T] = Tensor[T](A.tensor_shape)
-    
+    var B: Tensor[T] = Tensor[T](A.shape())
+
     tensor_asin[T, nelts](B, A)
     return B
 
 
 @always_inline
 fn tensor_acos[T: DType, nelts: Int](A: Tensor[T]) -> Tensor[T]:
-    var B: Tensor[T] = Tensor[T](A.tensor_shape)
-    
+    var B: Tensor[T] = Tensor[T](A.shape())
+
     tensor_acos[T, nelts](B, A)
     return B
 
 
 @always_inline
 fn tensor_atan[T: DType, nelts: Int](A: Tensor[T]) -> Tensor[T]:
-    var B: Tensor[T] = Tensor[T](A.tensor_shape)
-    
+    var B: Tensor[T] = Tensor[T](A.shape())
+
     tensor_atan[T, nelts](B, A)
     return B
 
 
 @always_inline
 fn tensor_sinh[T: DType, nelts: Int](A: Tensor[T]) -> Tensor[T]:
-    var B: Tensor[T] = Tensor[T](A.tensor_shape)
-    
+    var B: Tensor[T] = Tensor[T](A.shape())
+
     tensor_sinh[T, nelts](B, A)
     return B
 
 
 @always_inline
 fn tensor_cosh[T: DType, nelts: Int](A: Tensor[T]) -> Tensor[T]:
-    var B: Tensor[T] = Tensor[T](A.tensor_shape)
-    
+    var B: Tensor[T] = Tensor[T](A.shape())
+
     tensor_cosh[T, nelts](B, A)
     return B
 
 
 @always_inline
 fn tensor_tanh[T: DType, nelts: Int](A: Tensor[T]) -> Tensor[T]:
-    var B: Tensor[T] = Tensor[T](A.tensor_shape)
-    
+    var B: Tensor[T] = Tensor[T](A.shape())
+
     tensor_tanh[T, nelts](B, A)
     return B
 
 
 @always_inline
 fn tensor_relu[T: DType, nelts: Int](A: Tensor[T]) -> Tensor[T]:
-    var B: Tensor[T] = Tensor[T](A.tensor_shape)
-    
+    var B: Tensor[T] = Tensor[T](A.shape())
+
     tensor_relu[T, nelts](B, A)
     return B
 
 
 @always_inline
 fn tensor_sqrt[T: DType, nelts: Int](A: Tensor[T]) -> Tensor[T]:
-    var B: Tensor[T] = Tensor[T](A.tensor_shape)
-    
+    var B: Tensor[T] = Tensor[T](A.shape())
+
     tensor_sqrt[T, nelts](B, A)
     return B
 
 
 @always_inline
 fn tensor_abs[T: DType, nelts: Int](A: Tensor[T]) -> Tensor[T]:
-    var B: Tensor[T] = Tensor[T](A.tensor_shape)
-    
+    var B: Tensor[T] = Tensor[T](A.shape())
+
     tensor_abs[T, nelts](B, A)
     return B
 
@@ -1485,8 +1391,8 @@ fn tensor_abs[T: DType, nelts: Int](A: Tensor[T]) -> Tensor[T]:
 fn tensor_mul[
     T: DType, nelts: Int, cores: Int
 ](A: Tensor[T], B: Tensor[T]) -> Tensor[T]:
-    var C: Tensor[T] = Tensor[T](B.tensor_shape)
-    
+    var C: Tensor[T] = Tensor[T](B.shape())
+
     tensor_mul[T, nelts, cores](C, A, B)
     return C
 
@@ -1495,8 +1401,8 @@ fn tensor_mul[
 fn tensor_add[
     T: DType, nelts: Int, cores: Int
 ](A: Tensor[T], B: Tensor[T]) -> Tensor[T]:
-    var C: Tensor[T] = Tensor[T](B.tensor_shape)
-    
+    var C: Tensor[T] = Tensor[T](B.shape())
+
     tensor_add[T, nelts, cores](C, A, B)
     return C
 
@@ -1505,8 +1411,8 @@ fn tensor_add[
 fn tensor_sub[
     T: DType, nelts: Int, cores: Int
 ](A: Tensor[T], B: Tensor[T]) -> Tensor[T]:
-    var C: Tensor[T] = Tensor[T](B.tensor_shape)
-    
+    var C: Tensor[T] = Tensor[T](B.shape())
+
     tensor_sub[T, nelts, cores](C, A, B)
     return C
 
@@ -1515,7 +1421,7 @@ fn tensor_sub[
 fn tensor_div[
     T: DType, nelts: Int, cores: Int
 ](A: Tensor[T], B: Tensor[T]) -> Tensor[T]:
-    var C: Tensor[T] = Tensor[T](B.tensor_shape)
-    
+    var C: Tensor[T] = Tensor[T](B.shape())
+
     tensor_div[T, nelts, cores](C, A, B)
     return C
