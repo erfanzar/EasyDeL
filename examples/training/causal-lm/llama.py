@@ -1,11 +1,11 @@
 import flax.core
 
-from EasyDel import llama_from_pretrained
+from EasyDel.transform import llama_from_pretrained
 
 from EasyDel import TrainArguments, CausalLMTrainer
 from datasets import load_dataset
 from huggingface_hub import HfApi
-from src import EasyDel
+import EasyDel
 from absl import flags, app
 from fjformer.load._load import get_float_dtype_by_name
 
@@ -179,7 +179,7 @@ def main(argv):
     params, config = llama_from_pretrained(FLAGS.repo_id)
 
     train_args = TrainArguments(
-        model_class=EasyDel.FlaxLlamaForCausalLM,
+        model_class=EasyDel.modules.FlaxLlamaForCausalLM,
         configs_to_init_model_class={
             'config': config,
             'dtype': get_float_dtype_by_name(FLAGS.dtype),

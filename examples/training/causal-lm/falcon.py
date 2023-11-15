@@ -1,7 +1,7 @@
 from EasyDel import TrainArguments, CausalLMTrainer
 from datasets import load_dataset
 from huggingface_hub import HfApi
-from src import EasyDel
+import EasyDel
 from absl import flags, app
 from fjformer.load._load import get_float_dtype_by_name
 
@@ -155,12 +155,12 @@ def main(argv):
 
     if FLAGS.config_repo is not None:
         conf = None
-        config = EasyDel.FalconConfig.from_pretrained(FLAGS.config_repo, trust_remote_code=True)
+        config = EasyDel.modules.FalconConfig.from_pretrained(FLAGS.config_repo, trust_remote_code=True)
         config.use_flash_attention = FLAGS.use_flash_attention
         config.use_sacn_mlp = FLAGS.use_sacn_mlp
     else:
         conf = EasyDel.configs.configs.falcon_configs[FLAGS.model_type]
-        config = EasyDel.FalconConfig(**conf, rotary_type=FLAGS.rotary_type)
+        config = EasyDel.modules.FalconConfig(**conf, rotary_type=FLAGS.rotary_type)
         config.use_flash_attention = FLAGS.use_flash_attention
         config.use_sacn_mlp = FLAGS.use_sacn_mlp
         config.max_sequence_length = FLAGS.max_sequence_length
@@ -169,7 +169,7 @@ def main(argv):
         config.rope_scaling = None
 
     train_args = TrainArguments(
-        model_class=EasyDel.FlaxFalconForCausalLM,
+        model_class=EasyDel.modules.FlaxFalconForCausalLM,
         configs_to_init_model_class={'config': config, 'dtype': get_float_dtype_by_name(FLAGS.dtype),
                                      'param_dtype': get_float_dtype_by_name(FLAGS.dtype)},
         custom_rule=config.get_partition_rules(True),
