@@ -18,7 +18,7 @@ def match_keywords(string, ts, ns):
     return True
 
 
-def falcon_from_pretrained(model_id, device=jax.devices('cpu')[0]):
+def falcon_from_pretrained(model_id, device):
     """
     return: Weight or Params for EasyDel Model , Config
     """
@@ -36,7 +36,7 @@ def falcon_from_pretrained(model_id, device=jax.devices('cpu')[0]):
 
 def falcon_convert_pt_to_flax_7b(
         state_dict, num_hidden_layers: int,
-        device=jax.devices('cpu')[0],
+        device,
         bias=False,
         is_pb: bool = False
 ):
@@ -157,7 +157,7 @@ def falcon_easydel_to_hf(path, config: FalconConfig):
     return model
 
 
-def falcon_convert_pt_to_flax(state_dict: Dict[str, torch.Tensor], config: FalconConfig, device=jax.devices('cpu')[0]):
+def falcon_convert_pt_to_flax(state_dict: Dict[str, torch.Tensor], config: FalconConfig, device):
     lw = len('.weight')
     with jax.default_device(device):
         flax_dict = {}

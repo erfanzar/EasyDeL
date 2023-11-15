@@ -73,7 +73,7 @@ from EasyDel.transform import llama_from_pretrained
 
 params, config = llama_from_pretrained(
     'meta-llama/Llama-2-7b',
-    device=jax.devices('cpu')[0]  # Offload on CPU
+    device  # Offload on CPU
 )
 ```
 
@@ -90,7 +90,7 @@ from transformers import AutoTokenizer
 
 params, config = llama_from_pretrained(
     'meta-llama/Llama-2-7b',
-    device=jax.devices('cpu')[0]  # Offload on CPU
+    device  # Offload on CPU
 )
 
 DEFAULT_SYSTEM_PROMPT = "You are a helpful, respectful and honest assistant and act as wanted"
