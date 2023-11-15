@@ -26,7 +26,7 @@ def match_keywords(string, ts, ns):
 
 
 def llama_convert_hf_to_flax_load(checkpoints_dir, config: LlamaConfig,
-                                  device=jax.devices('cpu')[0]):
+                                  device):
     ckpt_paths = sorted(Path(checkpoints_dir).glob("*.bin"))
     state_dict = {}
     with jax.default_device(device):
@@ -41,7 +41,7 @@ def llama_convert_hf_to_flax_load(checkpoints_dir, config: LlamaConfig,
 
 
 def llama_convert_hf_to_flax(state_dict, config: LlamaConfig,
-                             device=jax.devices('cpu')[0]):
+                             device):
     with jax.default_device(device):
         jax_weights = {
             "model": {
@@ -159,7 +159,7 @@ def llama_easydel_to_hf(path, config: LlamaConfig):
     return model
 
 
-def llama_from_pretrained(model_id, device=jax.devices('cpu')[0]):
+def llama_from_pretrained(model_id, device):
     """
     return: Weight or Params for EasyDel Model , Config
     """

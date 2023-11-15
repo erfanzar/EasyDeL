@@ -65,7 +65,7 @@ from EasyDel.transform import falcon_from_pretrained
 
 params, config = falcon_from_pretrained(
     'tiiuae/falcon-7b',
-    device=jax.devices('cpu')[0]  # Offload on CPU
+    device  # Offload on CPU
 )
 ```
 
@@ -82,7 +82,7 @@ from transformers import AutoTokenizer
 
 params, config = falcon_from_pretrained(
     'tiiuae/falcon-7b',
-    device=jax.devices('cpu')[0]  # Offload on CPU
+    device  # Offload on CPU
 )
 
 

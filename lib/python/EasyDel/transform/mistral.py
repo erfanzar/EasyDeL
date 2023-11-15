@@ -28,7 +28,7 @@ def match_keywords(string, ts, ns):
 
 
 def mistral_convert_hf_to_flax_load(checkpoints_dir, config: MistralConfig,
-                                    device=jax.devices('cpu')[0]):
+                                    device):
     kv_dim = config.num_key_value_heads * (config.hidden_size // config.num_attention_heads)
     ckpt_paths = sorted(Path(checkpoints_dir).glob("*.bin"))
     state_dict = {}
@@ -110,7 +110,7 @@ def mistral_convert_hf_to_flax_load(checkpoints_dir, config: MistralConfig,
 
 
 def mistral_convert_hf_to_flax(state_dict, config: MistralConfig,
-                               device=jax.devices('cpu')[0]):
+                               device):
     with jax.default_device(device):
         jax_weights = {
             "model": {
@@ -171,7 +171,7 @@ def mistral_convert_hf_to_flax(state_dict, config: MistralConfig,
         return jax_weights
 
 
-def mistral_convert_pt_to_flax(state_dict_pt, config: MistralConfig, device=jax.devices('cpu')[0]):
+def mistral_convert_pt_to_flax(state_dict_pt, config: MistralConfig, device):
     with jax.default_device(device):
         state_dict_flax = {('model', 'embed_tokens', 'embedding'): state_dict_pt[
             'model.embed_tokens.weight'].cpu().detach().numpy()}
@@ -259,7 +259,7 @@ def mistral_easydel_to_hf(path, config: MistralConfig):
     return model
 
 
-def mistral_from_pretrained(model_id, device=jax.devices('cpu')[0]):
+def mistral_from_pretrained(model_id, device):
     """
     return: Weight or Params for EasyDel Model , Config
     """
