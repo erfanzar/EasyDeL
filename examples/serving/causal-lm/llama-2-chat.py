@@ -2,7 +2,7 @@ import typing
 
 import EasyDel
 import jax.lax
-from EasyDel import JAXServer, JaxServerConfig
+from EasyDel.serve import JAXServer, JaxServerConfig
 from fjformer.load._load import get_float_dtype_by_name
 from EasyDel.transform import llama_from_pretrained
 from transformers import AutoTokenizer
@@ -54,7 +54,7 @@ class Llama2Host(JAXServer):
                 repo_id
             )
         tokenizer = AutoTokenizer.from_pretrained(repo_id)
-        model = EasyDel.FlaxLlamaForCausalLM(
+        model = EasyDel.modules.FlaxLlamaForCausalLM(
             config=config_model,
             dtype=get_float_dtype_by_name(config['dtype'] if config is not None else 'fp16'),
             param_dtype=get_float_dtype_by_name(config['dtype'] if config is not None else 'fp16'),
