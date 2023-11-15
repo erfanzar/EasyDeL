@@ -1,4 +1,5 @@
-from typing import Dict, Optional, Tuple, Union
+import typing
+from typing import Dict, Optional, Tuple, Union, Type
 from einops import einops
 import jax
 import jax.numpy as jnp
@@ -7,7 +8,7 @@ from jax.sharding import PartitionSpec as PS
 import flax.linen as nn
 from flax.linen.attention import dot_product_attention_weights
 from flax.traverse_util import flatten_dict, unflatten_dict
-from flax.linen import partitioning as nn_partitioning
+from flax.linen import partitioning as nn_partitioning, Dense
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks, make_causal_mask
 from transformers.configuration_utils import PretrainedConfig
@@ -17,6 +18,7 @@ from fjformer.attention import efficient_attention
 from ..flax_modelling_utils import with_sharding_constraint, \
     get_gradient_checkpoint_policy, repeat_kv_bnsh, apply_rotary_pos_emb, precompute_freq_cis
 import chex
+from ...linen import array_from_8bit, Dense8Bit, array_to_bit8, to_8bit, from_8bit
 
 
 class LlamaConfig(PretrainedConfig):
@@ -51,6 +53,7 @@ class LlamaConfig(PretrainedConfig):
             flash_attn_query_chunk_size: int = 1024,
             flash_attn_key_chunk_size: int = 1024,
             scan_mlp_chunk_size: int = 1024,
+            load_in_8bit: bool = False,
             **kwargs,
     ):
         num_key_value_heads = num_key_value_heads or number_rep_kv * num_attention_heads
@@ -80,7 +83,7 @@ class LlamaConfig(PretrainedConfig):
         self.flash_attn_key_chunk_size = flash_attn_key_chunk_size
         self.flash_attn_query_chunk_size = flash_attn_query_chunk_size
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
-
+        self.load_in_8bit = load_in_8bit
         super().__init__(
             # pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -142,6 +145,7 @@ class LlamaConfig(PretrainedConfig):
                      flash_attn_key_chunk_size: int = 1024,
                      scan_mlp_chunk_size: int = 1024,
                      number_rep_kv: int = 1,
+                     load_in_8bit: bool = False,
                      ):
         self.use_flash_attention = use_flash_attention
         self.embd_pdrop = embd_pdrop
@@ -159,6 +163,7 @@ class LlamaConfig(PretrainedConfig):
         self.flash_attn_query_chunk_size = flash_attn_query_chunk_size
         self.flash_attn_key_chunk_size = flash_attn_key_chunk_size
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
+        self.load_in_8bit = load_in_8bit
 
     @staticmethod
     def get_weight_decay_exclusions():
@@ -167,6 +172,9 @@ class LlamaConfig(PretrainedConfig):
     @staticmethod
     def rng_keys():
         return ('params', 'dropout', 'fcm')
+
+    def get_linear_class(self) -> Type[Union[Dense8Bit, Dense]]:
+        return Dense8Bit if self.load_in_8bit else nn.Dense
 
 
 re_mat = nn_partitioning.remat
@@ -204,6 +212,7 @@ class RMSNorm(nn.Module):
     eps: float = 1e-6
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
+    bit8: bool = False
 
     def setup(self) -> None:
         self.weight = self.param(
@@ -217,10 +226,16 @@ class RMSNorm(nn.Module):
         return x * jax.lax.rsqrt(jnp.square(x).mean(-1, keepdims=True) + self.eps)
 
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
-        output = self._norm(x).astype(self.dtype)
-        weight = jnp.asarray(self.weight, self.dtype)
-        return output * weight
+        if self.bit8:
+            x = array_from_8bit(x, self.dtype).astype(jnp.promote_types(self.dtype, jnp.float32))
+            output = self._norm(x).astype(self.dtype)
+            weight = jnp.asarray(array_from_8bit(self.weight, self.dtype), self.dtype)
+            return array_to_bit8(output * weight)
+        else:
+            x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
+            output = self._norm(x).astype(self.dtype)
+            weight = jnp.asarray(self.weight, self.dtype)
+            return output * weight
 
 
 class FlaxLlamaAttention(nn.Module):
@@ -237,7 +252,9 @@ class FlaxLlamaAttention(nn.Module):
 
         if self.number_of_reps == 1:
             assert self.config.num_attention_heads == self.config.num_key_value_heads
-        self.q_proj = nn.Dense(
+
+        dense_class = self.config.get_linear_class()
+        self.q_proj = dense_class(
             config.num_attention_heads * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -245,7 +262,7 @@ class FlaxLlamaAttention(nn.Module):
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision
         )
-        self.k_proj = nn.Dense(
+        self.k_proj = dense_class(
             config.num_key_value_heads * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -253,7 +270,7 @@ class FlaxLlamaAttention(nn.Module):
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision
         )
-        self.v_proj = nn.Dense(
+        self.v_proj = dense_class(
             config.num_key_value_heads * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -261,7 +278,7 @@ class FlaxLlamaAttention(nn.Module):
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision
         )
-        self.o_proj = nn.Dense(
+        self.o_proj = dense_class(
             config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -307,6 +324,8 @@ class FlaxLlamaAttention(nn.Module):
         return jnp.transpose(query, (0, 2, 1, 3)), jnp.transpose(key, (0, 2, 1, 3)), jnp.transpose(value, (0, 2, 1, 3))
 
     def apply_rotary(self, batch_size, sequence_length, query, key, value, freq_cis, position_ids):
+        if self.config.load_in_8bit:
+            query, key, value = map(lambda x: array_from_8bit(x), [query, key, value])
         query = query.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
         key = key.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
         value = value.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
@@ -342,6 +361,7 @@ class FlaxLlamaAttention(nn.Module):
         key_state = key_state.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
         value_state = value_state.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
 
+        # Loaded in fp32/fp16/bf16
         query_state, key_state, value_state = self.apply_rotary(
             query=query_state,
             key=key_state,
@@ -437,8 +457,8 @@ class FlaxLlamaMLP(nn.Module):
 
     def setup(self) -> None:
         config = self.config
-
-        self.gate_proj = nn.Dense(
+        dense_class = self.config.get_linear_class()
+        self.gate_proj = dense_class(
             config.intermediate_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -446,7 +466,7 @@ class FlaxLlamaMLP(nn.Module):
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
         )
-        self.down_proj = nn.Dense(
+        self.down_proj = dense_class(
             config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -454,7 +474,7 @@ class FlaxLlamaMLP(nn.Module):
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
         )
-        self.up_proj = nn.Dense(
+        self.up_proj = dense_class(
             config.intermediate_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -465,9 +485,14 @@ class FlaxLlamaMLP(nn.Module):
         self.dropout = nn.Dropout(rate=self.config.resid_pdrop)
 
     def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
-        x = self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
-        x = self.dropout(x, deterministic=deterministic)
-        return x
+        gate = array_from_8bit(self.gate_proj(x), self.dtype) if self.config.load_in_8bit else self.gate_proj(x)
+        gate = nn.silu(gate)  # Dtype non-int8
+        up = array_to_bit8(self.up_proj(x)) if self.config.load_in_8bit else self.up_proj(x)
+        down = array_from_8bit(gate, self.dtype) * array_from_8bit(up,
+                                                                   self.dtype) if self.config.load_in_8bit else gate * up
+        down = self.down_proj(down)
+        down = self.dropout(down, deterministic=deterministic)
+        return down
 
 
 class FlaxLlamaBlock(nn.Module):
@@ -509,12 +534,14 @@ class FlaxLlamaBlock(nn.Module):
             eps=self.config.rms_norm_eps,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
+            bit8=self.config.load_in_8bit
         )
         self.post_attention_layernorm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
+            bit8=self.config.load_in_8bit
 
         )
 
@@ -542,11 +569,16 @@ class FlaxLlamaBlock(nn.Module):
             fcm_mask,
         )
         attn_output = attn_outputs[0]
-        hidden_states = hidden_states + attn_output
+        if self.config.load_in_8bit:
+            hidden_states = array_from_8bit(hidden_states) + array_from_8bit(attn_output)
+        else:
+            hidden_states = hidden_states + attn_output
 
         feed_forward_input = self.post_attention_layernorm(hidden_states)
 
         if self.config.use_sacn_mlp:
+            if self.config.use_sacn_mlp and self.config.load_in_8bit:
+                raise ValueError("use_sacn_mlp and load_in_8bit can not be used at same time")
             feed_forward_input = einops.rearrange(
                 feed_forward_input,
                 '... (b s) d -> ... b s d',
@@ -628,9 +660,10 @@ class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
             for missing_key in self._missing_keys:
                 params[missing_key] = random_params[missing_key]
             self._missing_keys = set()
-            return freeze(unflatten_dict(params))
+            return freeze(to_8bit(unflatten_dict(params))) if self.config.load_in_8bit else freeze(
+                unflatten_dict(params))
         else:
-            return random_params
+            return to_8bit(random_params) if self.config.load_in_8bit else random_params
 
     def init_cache(self, batch_size, max_length):
 
@@ -808,8 +841,11 @@ class FlaxLlamaModule(nn.Module):
         self.dropout = nn.Dropout(rate=self.config.embd_pdrop)
         self.layers = FlaxLlamaBlockCollection(self.config, dtype=self.dtype, param_dtype=self.param_dtype,
                                                precision=self.precision)
-        self.norm = RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps, dtype=self.dtype,
-                            param_dtype=self.param_dtype)
+        self.norm = RMSNorm(self.config.hidden_size,
+                            eps=self.config.rms_norm_eps,
+                            dtype=self.dtype,
+                            param_dtype=self.param_dtype,
+                            bit8=self.config.load_in_8bit)
         config = self.config
         self.causal_mask = make_causal_mask(jnp.ones((1, config.max_position_embeddings)))
         self.freq_cis = precompute_freq_cis(
@@ -938,7 +974,8 @@ class FlaxLlamaForCausalLMModule(nn.Module):
         else:
             lm_logits = self.lm_head(hidden_states)
 
-        lm_logits = lm_logits.astype(jnp.float32)
+        lm_logits = array_from_8bit(lm_logits).astype(jnp.float32) if self.config.load_in_8bit else lm_logits.astype(
+            jnp.float32)
 
         if not return_dict:
             return (lm_logits,) + outputs[1:]
