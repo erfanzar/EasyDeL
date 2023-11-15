@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='EasyDeL',
-    version='0.0.36',
+    version='0.0.37',
     author='Erfan Zare Chavoshi',
     author_email='erfanzare82@eyahoo.com',
     description='An open-source library to make training faster and more optimized in Jax/Flax',
@@ -20,6 +20,7 @@ setup(
         'Programming Language :: Python :: 3.9',
         'Programming Language :: Python :: 3.10',
         'Programming Language :: Python :: 3.11',
+        'Programming Language :: Python :: 3.12',
     ],
     keywords='machine learning, deep learning, pytorch, jax, flax',
     install_requires=[
