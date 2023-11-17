@@ -16,6 +16,25 @@ Some of the models supported by EasyDel will support Int8 or 8bit interface thes
 * [ ] T5
 * [ ] MosaicGPT / MPT
 
+## Available Models Are
+
+| Models          | FP16/FP32/BF16 | DP | FSDP | MP | FlashAttn | Gradient Checkpointing |
+|-----------------|:---------------|:---|------|----|-----------|------------------------|
+| **_Llama_**     | ✅              | ✅  | ✅    | ✅  | ✅         | ✅                      | 
+| **_Mistral_**   | ✅              | ✅  | ✅    | ✅  | ❌         | ✅                      | 
+| **_Llama2_**    | ✅              | ✅  | ✅    | ✅  | ❌         | ✅                      | 
+| **_GPT-J_**     | ✅              | ✅  | ✅    | ✅  | ✅         | ✅                      | 
+| **_LT_**        | ✅              | ✅  | ✅    | ✅  | ❌         | ✅                      | 
+| **_MosaicMPT_** | ✅              | ✅  | ✅    | ✅  | ✅         | ✅                      |
+| **_GPTNeoX-J_** | ✅              | ✅  | ✅    | ✅  | ✅         | ✅                      | 
+| **_Falcon_**    | ✅              | ✅  | ✅    | ✅  | ✅         | ✅                      | 
+| **_Palm_**      | ✅              | ✅  | ✅    | ✅  | ✅         | ✅                      | 
+| **_T5_**        | ✅              | ✅  | ✅    | ✅  | ❌         | ✅                      | 
+| **_OPT_**       | ✅              | ✅  | ✅    | ✅  | ❌         | ✅                      |
+
+you can also tell me the model you want in Flax/Jax version and ill try my best to build it ;)
+
+
 ### EasyDel Mojo
 
 EasyDel Mojo differs from EasyDel in Python in significant ways. In Python, you can leverage a vast array of packages to
@@ -93,25 +112,6 @@ _Tutorials on how to use and train or serve your models with EasyDel is availabl
 
 3. [_Use Llama 2 Models_](https://github.com/erfanzar/EasyDeL/blob/main/LLAMA.md)
 
-## Available Models Are
-
-- **_Mistral_**     (Support `FSDP`, `MP`,` DP`)(_Supports gradient checkpointing_)
-- **_Llama_**     (Support `FSDP`, `MP`,` DP`)(_Supports gradient checkpointing_)
-- **_Llama2_**    (Support `FSDP`, `MP`,` DP`)(_Supports gradient checkpointing_)
-- **_GPT-J_**     (Support `FSDP`, `MP`,` DP`)(_Supports gradient checkpointing_)
-- **_LT_**        (Support `FSDP`, `MP`, `DP`)(_Supports gradient checkpointing_)
-- **_MosaicMPT_** (Support `FSDP`, `MP`,` DP`)(_Supports gradient checkpointing_)
-- **_GPTNeoX_**   (Support `FSDP`, `MP`, `DP`)(_Supports gradient checkpointing_)
-- **_Falcon_**    (Support `FSDP`, `MP`, `DP`)(_Supports gradient checkpointing_)
-- **_Palm_**      (Support `FSDP`, `MP`, `DP`)(_Supports gradient checkpointing_)
-- **_T5_**        (Support `FSDP`, `MP`, `DP`)(_Supports gradient checkpointing_)
-- **_OPT_**       (Support `FSDP`, `MP`, `DP`)(_Supports gradient checkpointing_)
-
-[//]: # (- **_XGen_**      _Soon_)
-
-- _LLama GPT-J MosaicMPT Falcon supports Flash Attention_
-
-you can also tell me the model you want in Flax/Jax version and ill try my best to build it ;)
 
 ## Serving
 
@@ -176,7 +176,6 @@ from EasyDel import TrainArguments, CausalLMTrainer
 from datasets import load_dataset
 # Removed !
 from EasyDel import configs
-
 
 max_length = 4096
 conf = configs.mpt_configs['7b']
