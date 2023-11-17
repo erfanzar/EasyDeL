@@ -5,17 +5,6 @@ machine learning models. This library is primarily focused on Jax/Flax and plans
 train Flax/Jax Models on the `TPU/GPU` both for Serving and Training (EasyDel will support mojo and be rewriten for mojo
 too)
 
-## Current Update
-
-Some of the models supported by EasyDel will support Int8 or 8bit interface these following models will be supported
-
-* [X] Llama (Supported via `LlamaConfig(load_in_8bit=True)`)
-* [ ] Falcon
-* [ ] Mistral
-* [ ] Palm
-* [ ] T5
-* [ ] MosaicGPT / MPT
-
 ## Available Models Are
 
 | Models          | FP16/FP32/BF16 | DP | FSDP | MP | FlashAttn | Gradient Checkpointing | 8Bit Interface |
@@ -33,6 +22,17 @@ Some of the models supported by EasyDel will support Int8 or 8bit interface thes
 | **_OPT_**       | ✅              | ✅  | ✅    | ✅  | ❌         | ✅                      | ❌              |
 
 you can also tell me the model you want in Flax/Jax version and ill try my best to build it ;)
+
+## Current Update
+
+Some of the models supported by EasyDel will support Int8 or 8bit interface these following models will be supported
+
+* [X] Llama (Supported via `LlamaConfig(load_in_8bit=True)`)
+* [ ] Falcon
+* [ ] Mistral
+* [ ] Palm
+* [ ] T5
+* [ ] MosaicGPT / MPT
 
 ### EasyDel Mojo
 
