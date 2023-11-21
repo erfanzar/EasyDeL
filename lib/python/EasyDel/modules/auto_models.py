@@ -1,6 +1,9 @@
 import functools
+import gc
 
 import jax.numpy
+import torch.cuda
+from flax.traverse_util import unflatten_dict
 from transformers import AutoConfig, PretrainedConfig, AutoModelForCausalLM
 from . import MptConfig as _MptConfig
 from . import LlamaConfig as _LlamaConfig
@@ -77,6 +80,11 @@ TYPE_TO_CFG_MODEL = {
 }
 
 
+def is_flatten(pytree: dict):
+    mpl = [k for k in pytree.keys()][0]
+    return True if isinstance(mpl, tuple) else False
+
+
 class AutoEasyDelModelForCausalLM:
     @classmethod
     def from_pretrained(
@@ -88,12 +96,16 @@ class AutoEasyDelModelForCausalLM:
             device=jax.devices('cpu')[0],
             **kwargs
     ):
+        """
+        returns Model and Parameters for the Model
+        """
         config = AutoConfig.from_pretrained(repo_id)
         model_type = config.model_type
         if model_type not in TYPE_TO_CFG_MODEL:
             raise EasyDelRunTimeError(f'Model Type ({model_type}) is not supported or is not found')
         cfg, module, trf = TYPE_TO_CFG_MODEL[model_type]
         model = AutoModelForCausalLM.from_pretrained(repo_id, **kwargs)
+        cfg = cfg.from_pretrained(repo_id)
         if hasattr(cfg, 'add_jax_args'):
             cfg.add_jax_args()
 
@@ -105,6 +117,12 @@ class AutoEasyDelModelForCausalLM:
             precision=precision
         )
 
-        outs = trf(repo_id,device=device)
+        params = trf(model.state_dict(), config=config, device=device)
+        del model,
+        gc.collect()
+        torch.cuda.empty_cache()
 
-        return ed_model
+        if is_flatten(params):
+            params = unflatten_dict(params)
+        ed_model.config = cfg
+        return ed_model, params
