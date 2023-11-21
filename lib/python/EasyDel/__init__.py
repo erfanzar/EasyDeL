@@ -108,7 +108,7 @@ from .transform.falcon import (
     falcon_convert_pt_to_flax_7b as falcon_convert_pt_to_flax_7b,
     falcon_convert_flax_to_pt_7b as falcon_convert_flax_to_pt_7b,
     falcon_from_pretrained as falcon_from_pretrained,
-    falcon_convert_pt_to_flax as falcon_convert_pt_to_flax,
+    falcon_convert_hf_to_flax as falcon_convert_hf_to_flax,
     falcon_easydel_to_hf as falcon_easydel_to_hf
 )
 from .transform.mistral import (
