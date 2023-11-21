@@ -6,6 +6,7 @@ from transformers import FalconForCausalLM
 from ..modules.falcon import FalconConfig
 import torch
 from typing import Dict
+import gc
 
 
 def match_keywords(string, ts, ns):
@@ -30,6 +31,8 @@ def falcon_from_pretrained(model_id, device):
         num_hidden_layers=config.num_hidden_layers,
         device=device
     )
+    del model
+    gc.collect()
     config.add_jax_args()
     return easydel_wights, config
 

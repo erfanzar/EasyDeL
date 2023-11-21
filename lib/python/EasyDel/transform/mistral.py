@@ -1,3 +1,4 @@
+import gc
 from pathlib import Path
 
 from fjformer import load_and_convert_checkpoint_to_torch
@@ -271,4 +272,7 @@ def mistral_from_pretrained(model_id, device):
         device=device
     )
     config.add_jax_args()
+
+    del model
+    gc.collect()
     return easydel_wights, config

@@ -1,3 +1,5 @@
+import gc
+
 from .. import MptConfig
 from jax import numpy as jnp
 import jax
@@ -154,4 +156,7 @@ def mpt_from_pretrained(model_id, device, **kwargs):
         device=device
     )
     config.add_jax_args()
+
+    del model
+    gc.collect()
     return easydel_wights, config
