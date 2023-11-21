@@ -28,7 +28,7 @@ def falcon_from_pretrained(model_id, device):
     model = FalconForCausalLM.from_pretrained(model_id)
     easydel_wights = falcon_convert_pt_to_flax_7b(
         state_dict=model.state_dict(),
-        num_hidden_layers=config.num_hidden_layers,
+        config=config,
         device=device
     )
     del model
@@ -38,15 +38,15 @@ def falcon_from_pretrained(model_id, device):
 
 
 def falcon_convert_pt_to_flax_7b(
-        state_dict, num_hidden_layers: int,
+        state_dict,
+        config: FalconConfig,
         device,
-        bias=False,
         is_pb: bool = False
 ):
     with jax.default_device(device):
         state_dict_flax = {('transformer', 'wte', 'embedding'): state_dict[
             'transformer.word_embeddings.weight'].cpu().detach().numpy()}
-        pbar = tqdm(iterable=range(num_hidden_layers))
+        pbar = tqdm(iterable=range(config.num_hidden_layers))
         for i in pbar:
             pbar.set_description('Converting Layers')
             state_dict_flax[('transformer', 'h', f'{i}', 'input_layernorm', 'scale')] = state_dict[
@@ -73,7 +73,7 @@ def falcon_convert_pt_to_flax_7b(
                         'tried to access some of model weight but they were unavailable please open a bug or '
                         'check model config'
                     )
-            if bias:
+            if config.bias:
                 state_dict_flax[
                     ('transformer', 'h', f'{i}', 'self_attention', 'w_qkv', 'bias')] = state_dict[
                     f'transformer.h.{i}.self_attention.query_key_value.bias'].cpu().detach().numpy()
@@ -160,7 +160,7 @@ def falcon_easydel_to_hf(path, config: FalconConfig):
     return model
 
 
-def falcon_convert_pt_to_flax(state_dict: Dict[str, torch.Tensor], config: FalconConfig, device):
+def falcon_convert_hf_to_flax(state_dict: Dict[str, torch.Tensor], config: FalconConfig, device):
     lw = len('.weight')
     with jax.default_device(device):
         flax_dict = {}
