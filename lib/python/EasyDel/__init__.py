@@ -63,6 +63,8 @@ from .modules.lucid_transformer.modelling_lt_flax import (
     FlaxLTForCausalLM as FlaxLTForCausalLM
 )
 
+from .modules.auto_models import AutoEasyDelModelForCausalLM as AutoEasyDelModelForCausalLM
+
 from .utils.utils import (
     get_mesh as get_mesh,
     names_in_mesh as names_in_mesh,

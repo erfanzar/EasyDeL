@@ -43,8 +43,8 @@ def mistral_convert_hf_to_flax_load(checkpoints_dir, config: MistralConfig,
 
         jax_weights = {
             "model": {
-                "embed_tokens": {"embedding": state_dict["embed_tokens.weight"].numpy()},
-                "norm": {"kernel": state_dict["norm.weight"].numpy()},
+                "embed_tokens": {"embedding": state_dict["embed_tokens.weight"].cpu().numpy()},
+                "norm": {"kernel": state_dict["norm.weight"].cpu().numpy()},
                 "layers": {
                     "%d"
                     % (layer): {
@@ -52,59 +52,59 @@ def mistral_convert_hf_to_flax_load(checkpoints_dir, config: MistralConfig,
                             "q_proj": {
                                 "kernel": inverse_permute(
 
-                                    state_dict[f"layers.{layer}.self_attn.q_proj.weight"].numpy(),
+                                    state_dict[f"layers.{layer}.self_attn.q_proj.weight"].cpu().numpy(),
                                     config.num_attention_heads,
                                     config.hidden_size, config.hidden_size
                                 ).transpose()
                             },
                             "k_proj": {
                                 "kernel": inverse_permute(
-                                    state_dict[f"layers.{layer}.self_attn.k_proj.weight"].numpy(),
+                                    state_dict[f"layers.{layer}.self_attn.k_proj.weight"].cpu().numpy(),
                                     config.num_key_value_heads,
                                     config.hidden_size, kv_dim
                                 ).transpose()
                             },
                             "v_proj": {
                                 "kernel": state_dict[f"layers.{layer}.self_attn.v_proj.weight"]
-                                .numpy()
+                                .cpu().numpy()
                                 .transpose()
                             },
                             "o_proj": {
                                 "kernel": state_dict[f"layers.{layer}.self_attn.o_proj.weight"]
-                                .numpy()
+                                .cpu().numpy()
                                 .transpose()
                             },
                         },
                         "mlp": {
                             "gate_proj": {
                                 "kernel": state_dict[f"layers.{layer}.mlp.gate_proj.weight"]
-                                .numpy()
+                                .cpu().numpy()
                                 .transpose()
                             },
                             "down_proj": {
                                 "kernel": state_dict[f"layers.{layer}.mlp.down_proj.weight"]
-                                .numpy()
+                                .cpu().numpy()
                                 .transpose()
                             },
                             "up_proj": {
                                 "kernel": state_dict[f"layers.{layer}.mlp.up_proj.weight"]
-                                .numpy()
+                                .cpu().numpy()
                                 .transpose()
                             },
                         },
                         "input_layernorm": {
-                            "kernel": state_dict[f"layers.{layer}.input_layernorm.weight"].numpy()
+                            "kernel": state_dict[f"layers.{layer}.input_layernorm.weight"].cpu().numpy()
                         },
                         "post_attention_layernorm": {
                             "kernel": state_dict[
                                 f"layers.{layer}.post_attention_layernorm.weight"
-                            ].numpy()
+                            ].cpu().numpy()
                         },
                     }
                     for layer in range(config.num_hidden_layers)
                 },
             },
-            "lm_head": {"kernel": state_dict["lm_head.weight"].numpy().transpose()},
+            "lm_head": {"kernel": state_dict["lm_head.weight"].cpu().numpy().transpose()},
         }
 
         return jax_weights
@@ -115,58 +115,58 @@ def mistral_convert_hf_to_flax(state_dict, config: MistralConfig,
     with jax.default_device(device):
         jax_weights = {
             "model": {
-                "embed_tokens": {"embedding": state_dict["model.embed_tokens.weight"].numpy()},
-                "norm": {"kernel": state_dict["model.norm.weight"].numpy()},
+                "embed_tokens": {"embedding": state_dict["model.embed_tokens.weight"].cpu().numpy()},
+                "norm": {"kernel": state_dict["model.norm.weight"].cpu().numpy()},
                 "layers": {
                     f"{layer}": {
                         "self_attn": {
                             "q_proj": {
                                 "kernel": state_dict[
-                                    f"model.layers.{layer}.self_attn.q_proj.weight"].numpy().transpose()
+                                    f"model.layers.{layer}.self_attn.q_proj.weight"].cpu().numpy().transpose()
                             },
                             "k_proj": {
                                 "kernel": state_dict[
-                                    f"model.layers.{layer}.self_attn.k_proj.weight"].numpy().transpose()
+                                    f"model.layers.{layer}.self_attn.k_proj.weight"].cpu().numpy().transpose()
                             },
                             "v_proj": {
                                 "kernel": state_dict[
-                                    f"model.layers.{layer}.self_attn.v_proj.weight"].numpy().transpose()
+                                    f"model.layers.{layer}.self_attn.v_proj.weight"].cpu().numpy().transpose()
                             },
                             "o_proj": {
                                 "kernel": state_dict[
-                                    f"model.layers.{layer}.self_attn.o_proj.weight"].numpy().transpose()
+                                    f"model.layers.{layer}.self_attn.o_proj.weight"].cpu().numpy().transpose()
                             },
                         },
                         "mlp": {
                             "gate_proj": {
                                 "kernel": state_dict[f"model.layers.{layer}.mlp.gate_proj.weight"]
-                                .numpy()
+                                .cpu().numpy()
                                 .transpose()
                             },
                             "down_proj": {
                                 "kernel": state_dict[f"model.layers.{layer}.mlp.down_proj.weight"]
-                                .numpy()
+                                .cpu().numpy()
                                 .transpose()
                             },
                             "up_proj": {
                                 "kernel": state_dict[f"model.layers.{layer}.mlp.up_proj.weight"]
-                                .numpy()
+                                .cpu().numpy()
                                 .transpose()
                             },
                         },
                         "input_layernorm": {
-                            "kernel": state_dict[f"model.layers.{layer}.input_layernorm.weight"].numpy()
+                            "kernel": state_dict[f"model.layers.{layer}.input_layernorm.weight"].cpu().numpy()
                         },
                         "post_attention_layernorm": {
                             "kernel": state_dict[
                                 f"model.layers.{layer}.post_attention_layernorm.weight"
-                            ].numpy()
+                            ].cpu().numpy()
                         },
                     }
                     for layer in range(config.num_hidden_layers)
                 },
             },
-            "lm_head": {"kernel": state_dict["lm_head.weight"].numpy().transpose()},
+            "lm_head": {"kernel": state_dict["lm_head.weight"].cpu().numpy().transpose()},
         }
 
         return jax_weights
