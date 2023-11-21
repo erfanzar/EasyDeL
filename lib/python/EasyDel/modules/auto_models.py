@@ -1,5 +1,6 @@
 import functools
 import gc
+import typing
 
 import jax.numpy
 import torch.cuda
@@ -28,6 +29,8 @@ from ..transform import falcon_convert_hf_to_flax as _falcon_convert_pt_to_flax
 from ..transform import llama_convert_hf_to_flax as _llama_convert_hf_to_flax
 from ..transform import mistral_convert_hf_to_flax as _mistral_convert_hf_to_flax
 from ..transform.easydel_transform import huggingface_to_easydel
+
+from transformers import FlaxPreTrainedModel
 
 
 class EasyDelRunTimeError(Exception):
@@ -95,7 +98,7 @@ class AutoEasyDelModelForCausalLM:
             precision: jax.lax.Precision = jax.lax.Precision('fastest'),
             device=jax.devices('cpu')[0],
             **kwargs
-    ):
+    ) -> typing.Union[FlaxPreTrainedModel, dict]:
         """
         returns Model and Parameters for the Model
         """
