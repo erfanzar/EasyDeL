@@ -1,3 +1,4 @@
+import gc
 from pathlib import Path
 
 from jax import numpy as jnp
@@ -171,4 +172,7 @@ def llama_from_pretrained(model_id, device):
         device=device
     )
     config.add_jax_args()
+
+    del model
+    gc.collect()
     return easydel_wights, config
