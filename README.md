@@ -143,76 +143,70 @@ in beta version but it's works and ill soon release a Tutorial For that
 ## FineTuning
 
 with using EasyDel FineTuning LLM (CausalLanguageModels) are easy as much as possible with using Jax and Flax
-and having the benefit of TPUs for the best speed here's a simple code to use in order to finetune your own MPT / LLama
+and having the benefit of TPUs for the best speed here's a simple code to use in order to finetune your
+own *_MPT / LLama / Falcon / OPT / GPT-J / GPT-Neox / Palm / T5_*
 or any other models supported by EasyDel
 
 #### Step One
 
-download converted model weights in order to finetune or convert the weights of the model you want to use
-transform in the library example
-
-```python
-import jax
-from EasyDel.transform import mpt_convert_pt_to_flax_7b
-from fjformer.utils import save_ckpt
-
-number_of_layers = 32  # its 32 hidden layers for Mpt 7B
-device = jax.devices('cpu')[0]  # offload on CPU
-
-pytorch_model_state_dict = None  # StateDict of the model should be this one
-flax_params = mpt_convert_pt_to_flax_7b(pytorch_model_state_dict, number_of_layers, device)
-save_ckpt(flax_params, 'flax_param_easydel')
-```
-
-#### Step Two
-
-now it's time to finetune or model
+Days Has Been Passed and now using easydel in Jax is way more similar to HF/PyTorch Style
+now it's time to finetune our model
 
 ```python
 import jax.numpy
-from EasyDel import TrainArguments, CausalLMTrainer
+from EasyDel import TrainArguments, CausalLMTrainer, AutoEasyDelModelForCausalLM, FlaxLlamaForCausalLM
 from datasets import load_dataset
-# Removed !
-from EasyDel import configs
+import flax
+from jax import numpy as jnp
+
+llama, params = AutoEasyDelModelForCausalLM.from_pretrained("", )
+# Llama 2 Max Sequence Length is 4096
 
 max_length = 4096
-conf = configs.mpt_configs['7b']
-conf['max_sequence_length'] = max_length
-conf['max_seq_len'] = max_length
+
+configs_to_init_model_class = {
+    'config': llama.config,
+    'dtype': jnp.bfloat16,
+    'param_dtype': jnp.bfloat16,
+    'input_shape': (1, 1)
+}
 
 train_args = TrainArguments(
-    model_id='erfanzar/FlaxMpt-7B',
-    # right now you should use model supported with remote code from huggingface all model are supported and uploaded
+    model_class=FlaxLlamaForCausalLM,
     model_name='my_first_model_to_train_using_easydel',
     num_train_epochs=3,
-    learning_rate=1e-5,
+    learning_rate=5e-5,
     learning_rate_end=1e-6,
-    optimizer='lion',  # 'adamw', 'lion', 'adafactor' are supported
+    optimizer='adamw',  # 'adamw', 'lion', 'adafactor' are supported
     scheduler='linear',  # 'linear','cosine', 'none' ,'warm_up_cosine' and 'warm_up_linear'  are supported
     weight_decay=0.01,
-    total_batch_size=16,
+    total_batch_size=64,
     max_steps=None,  # None to let trainer Decide
     do_train=True,
     do_eval=False,  # it's optional but supported 
-    backend='tpu',  # default backed is set to cpu so you must define you want to use tpu cpu or gpu
+    backend='tpu',  # default backed is set to cpu, so you must define you want to use tpu cpu or gpu
     max_length=max_length,  # Note that you have to change this in the model config too
     gradient_checkpointing='nothing_saveable',
     sharding_array=(1, -1, 1),  # the way to shard model across gpu,cpu or TPUs using sharding array (1, -1, 1)
-    # everything training will be in fully fsdp automatic and share data between devices
+    # everything training will be in fully FSDP automatic and share data between devices
     use_pjit_attention_force=False,
-    extra_configs=conf,
     remove_ckpt_after_load=True,
-    gradient_accumulation_steps=8
+    gradient_accumulation_steps=8,
+    loss_remat='',
+    dtype=jnp.bfloat16
 )
 dataset = load_dataset('TRAIN_DATASET')
 dataset_train = dataset['train']
 dataset_eval = dataset['eval']
 
-trainer = CausalLMTrainer(train_args,
-                          dataset_train,
-                          ckpt_path='flax_param_easydel')
-model_and_extra_outputs = trainer.train()
-print(f'Hey ! , here\'s where your model saved {model_and_extra_outputs.last_save_file_name}')
+trainer = CausalLMTrainer(
+    train_args,
+    dataset_train,
+    ckpt_path=None
+)
+
+output = trainer.train(flax.core.FrozenDict({'params': params}))
+print(f'Hey ! , here\'s where your model saved {output.last_save_file_name}')
 
 
 ```
@@ -252,10 +246,13 @@ server = JAXServer.load_from_params(
     add_params_field=True
 )
 
-predictions = server.process(
-    'String To The Model'
-)
-```
+response_printed = 0
+for response, tokens_used in server.process(
+        'String To The Model', stream=True
+):
+    print(response[response_printed:], end='')
+    response_printed = len(response)
+``` 
 
 ## Contributing
 
