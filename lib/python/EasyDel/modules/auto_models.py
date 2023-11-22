@@ -111,7 +111,6 @@ class AutoEasyDelModelForCausalLM:
         cfg = cfg.from_pretrained(repo_id)
         if hasattr(cfg, 'add_jax_args'):
             cfg.add_jax_args()
-
         ed_model = module(
             config=cfg,
             _do_init=False,
@@ -127,5 +126,5 @@ class AutoEasyDelModelForCausalLM:
 
         if is_flatten(params):
             params = unflatten_dict(params)
-        ed_model.config = cfg
+
         return ed_model, params

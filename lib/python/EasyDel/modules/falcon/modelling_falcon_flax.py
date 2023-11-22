@@ -45,7 +45,7 @@ class FalconConfig(PretrainedConfig):
             bos_token_id: int = 11,
             eos_token_id: int = 11,
             use_pjit_attention_force: bool = False,
-            gradient_checkpointing: str = 'nothing_saveable',
+            gradient_checkpointing: str = '',
             **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -137,7 +137,7 @@ class FalconConfig(PretrainedConfig):
                      bos_token_id: int = 11,
                      eos_token_id: int = 11,
                      use_pjit_attention_force: bool = False,
-                     gradient_checkpointing: str = 'nothing_saveable',
+                     gradient_checkpointing: str = '',
                      **kwargs,
                      ):
         basics = dict(
@@ -209,25 +209,21 @@ def apply_rotary_pos_embedding(tensor, sin_, cos_):
     return (tensor * cos_) + (_rotate_half(tensor) * sin_)
 
 
-@nn.compact
-def dropout_add(self, x: chex.Array, residual: chex.Array, prob: float, deterministic: bool) -> chex.Array:
+def dropout_add(linen_drop: nn.Dropout, x: chex.Array, residual: chex.Array, deterministic: bool) -> chex.Array:
     """
     Dropout add function
 
     Args:
-        self (Self)
-            self must be passed to the func
+        linen_drop (Self)
+            linen_drop must be passed to the func
         x (`torch.tensor`, *required*):
             input tensor
         residual (`torch.tensor`, *required*):
             residual tensor
-        prob (`float`, *required*):
-            dropout probability
         deterministic (`bool`, *required*):
             training mode
     """
-    nn_ = nn.Dropout(prob)
-    out = nn_(inputs=x, deterministic=deterministic)
+    out = linen_drop(inputs=x, deterministic=deterministic)
     out = residual + out
     return out
 
@@ -295,8 +291,13 @@ class FlaxFalconAttention(nn.Module):
         self.maybe_rotary = FlaxFalconRotaryEmbedding(self.dtype) if not self.config.alibi else lambda q, k, a, s: (
             q, k)
         assert self.head_dim * self.config.num_attention_heads == self.config.hidden_size
-        self.num_kv_heads = self.config.num_kv_heads if (
-                self.config.new_decoder_architecture or not self.config.multi_query) else 1
+        if self.config.num_kv_heads is not None:
+
+            self.num_kv_heads = self.config.num_kv_heads if (
+                    self.config.new_decoder_architecture or not self.config.multi_query) else 1
+        else:
+            self.num_kv_heads = self.config.num_attention_heads
+        self.num_heads = self.config.num_attention_heads
 
     @nn.compact
     def _concatenate_to_cache(self, key: chex.Array, value: chex.Array, query: chex.Array, attention_mask: chex.Array):
@@ -372,7 +373,7 @@ class FlaxFalconAttention(nn.Module):
 
         batch_size_and_num_heads, seq_length, _ = x.shape
         batch_size = batch_size_and_num_heads // self.num_heads
-        x = x.view(batch_size, self.config.num_attention_heads, seq_length, self.head_dim)
+        x = x.reshape(batch_size, self.config.num_attention_heads, seq_length, self.head_dim)
 
         x = x.transpose(0, 2, 1, 3)
         return x.reshape(batch_size, seq_length, self.config.num_attention_heads * self.head_dim)
@@ -436,7 +437,8 @@ class FlaxFalconAttention(nn.Module):
         query_layer_, key_layer_, value_layer_, attention_bias = map(lambda x: x.astype(dtype=dtype), (
             query_layer_, key_layer_, value_layer_, attention_bias))
 
-        attention_scores = jax.lax.batch_matmul(query_layer_, transpose(key_layer_, -2, -1))
+        attention_scores = jax.lax.batch_matmul(query_layer_, transpose(key_layer_, len(key_layer_.shape) - 2,
+                                                                        len(key_layer_.shape) - 1))
         if alibi is None:
 
             attention_scores /= math.sqrt(self.head_dim)
@@ -534,6 +536,9 @@ class FlaxFalconBlock(nn.Module):
             precision=self.precision
         )
 
+        self.dropout = nn.Dropout(self.config.attention_dropout)
+        self.dropout_mlp = nn.Dropout(self.config.hidden_dropout)
+
     def __call__(
             self,
             hidden_states: chex.Array,
@@ -542,7 +547,7 @@ class FlaxFalconBlock(nn.Module):
             freq_cis: Tuple[chex.Array, chex.Array],
             position_ids: chex.Array,
             causal_mask: chex.Array,
-            output_attentions: bool = True,
+            output_attentions: bool = False,
             deterministic: bool = True
     ):
         residual = hidden_states
@@ -571,11 +576,10 @@ class FlaxFalconBlock(nn.Module):
                 mlp_layernorm_out = attention_layernorm_out
             else:
                 residual = dropout_add(
-                    self=self,
+                    linen_drop=self.dropout,
                     x=attention_output,
                     residual=residual,
-                    prob=self.config.attention_dropout,
-                    deterministic=self.training
+                    deterministic=deterministic
                 )
                 mlp_layernorm_out = self.post_attention_layernorm(residual)
 
@@ -587,11 +591,11 @@ class FlaxFalconBlock(nn.Module):
             mlp_output += attention_output
 
         output = dropout_add(
-            self=self,
+            linen_drop=self.dropout_mlp,
             x=mlp_output,
             residual=residual,
-            prob=self.config.hidden_dropout,
-            deterministic=self.training
+            deterministic=deterministic
+
         )
 
         return output, outputs
@@ -604,11 +608,21 @@ class FlaxFalconCollection(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
+        # hidden_states: chex.Array,
+        # alibi: chex.Array,
+        # attention_mask: chex.Array,
+        # freq_cis: Tuple[chex.Array, chex.Array],
+        # position_ids: chex.Array,
+        # causal_mask: chex.Array,
+        # output_attentions: bool = False,
+        # deterministic: bool = True
+
         block = FlaxFalconBlock
         if self.config.gradient_checkpointing != '':
             block = nn.remat(
                 block,
-                policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing)
+                policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
+                static_argnums=(-2, -1)
             )
         self.layers = [
             block(
@@ -630,7 +644,7 @@ class FlaxFalconCollection(nn.Module):
                  freq_cis: Tuple[chex.Array, chex.Array],
                  position_ids: chex.Array,
                  causal_mask: chex.Array,
-                 output_attentions: bool = True,
+                 output_attentions: bool = False,
                  deterministic: bool = True
                  ):
         for layer in self.layers:
@@ -681,7 +695,7 @@ class FlaxFalconModule(nn.Module):
                  input_ids: chex.Array,
                  attention_mask: Optional[chex.Array] = None,
                  position_ids: Optional[chex.Array] = None,
-                 output_attentions: bool = True,
+                 output_attentions: bool = False,
                  deterministic: bool = True,
                  use_cache: Optional[bool] = None,
                  return_dict: Optional[bool] = False
@@ -759,7 +773,7 @@ class FlaxFalconPretrainedModel(FlaxPreTrainedModel):
                  attention_mask: Optional[chex.Array] = None,
                  position_ids: Optional[chex.Array] = None,
                  past_key_values: Optional[nn.Module] = None,
-                 output_attentions: bool = True,
+                 output_attentions: bool = False,
                  deterministic: bool = True,
                  use_cache: Optional[bool] = None,
                  return_dict: Optional[bool] = False,
@@ -787,7 +801,7 @@ class FlaxFalconPretrainedModel(FlaxPreTrainedModel):
         # input_ids: chex.Array,
         # attention_mask: Optional[chex.Array] = None
         # position_ids: Optional[chex.Array] = None
-        # output_attentions: bool = True
+        # output_attentions: bool = False
         # deterministic: bool = True
         # use_cache: Optional[bool] = None
         # return_dict: Optional[bool] = False
@@ -874,7 +888,7 @@ class FlaxFalconForCausalLMModule(nn.Module):
                  input_ids: chex.Array,
                  attention_mask: Optional[chex.Array] = None,
                  position_ids: Optional[chex.Array] = None,
-                 output_attentions: bool = True,
+                 output_attentions: bool = False,
                  deterministic: bool = True,
                  use_cache: Optional[bool] = None,
                  return_dict: Optional[bool] = False
