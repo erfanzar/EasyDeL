@@ -29,7 +29,7 @@ setup(
         "jax>=0.4.10",
         "jaxlib>=0.4.10",
         "flax",
-        "fjformer>=0.0.8",
+        "fjformer>=0.0.10",
         "transformers>=4.33.0",
         "einops>=0.6.1",
         "optax",
