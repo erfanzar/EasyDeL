@@ -7,32 +7,44 @@ too)
 
 ## Available Models Are
 
-| Models          | FP16/FP32/BF16 | DP | FSDP | MP | FlashAttn | Gradient Checkpointing | 8Bit Interface |
-|-----------------|:---------------|:---|------|----|-----------|------------------------|----------------|
-| **_Llama_**     | ✅              | ✅  | ✅    | ✅  | ✅         | ✅                      | ✅              |
-| **_Mistral_**   | ✅              | ✅  | ✅    | ✅  | ❌         | ✅                      | 🌪             |
-| **_Llama2_**    | ✅              | ✅  | ✅    | ✅  | ❌         | ✅                      | ✅              |
-| **_GPT-J_**     | ✅              | ✅  | ✅    | ✅  | ✅         | ✅                      | ❌              |
-| **_LT_**        | ✅              | ✅  | ✅    | ✅  | ❌         | ✅                      | ❌              |
-| **_MosaicMPT_** | ✅              | ✅  | ✅    | ✅  | ✅         | ✅                      | 🌪             |
-| **_GPTNeoX-J_** | ✅              | ✅  | ✅    | ✅  | ✅         | ✅                      | ❌              |
-| **_Falcon_**    | ✅              | ✅  | ✅    | ✅  | ✅         | ✅                      | 🌪             |
-| **_Palm_**      | ✅              | ✅  | ✅    | ✅  | ✅         | ✅                      | ❌              |
-| **_T5_**        | ✅              | ✅  | ✅    | ✅  | ❌         | ✅                      | ❌              |
-| **_OPT_**       | ✅              | ✅  | ✅    | ✅  | ❌         | ✅                      | ❌              |
+| Models          | FP16/FP32/BF16 | DP | FSDP | MP | FlashAttn | Gradient Checkpointing | 8/6/4Bit Interface and Training |
+|-----------------|:---------------|:---|------|----|-----------|------------------------|---------------------------------|
+| **_Llama_**     | ✅              | ✅  | ✅    | ✅  | ✅         | ✅                      | ✅                               |
+| **_Mistral_**   | ✅              | ✅  | ✅    | ✅  | ❌         | ✅                      | ✅                               |
+| **_Llama2_**    | ✅              | ✅  | ✅    | ✅  | ❌         | ✅                      | ✅                               |
+| **_GPT-J_**     | ✅              | ✅  | ✅    | ✅  | ✅         | ✅                      | ❌                               |
+| **_LT_**        | ✅              | ✅  | ✅    | ✅  | ❌         | ✅                      | ❌                               |
+| **_MosaicMPT_** | ✅              | ✅  | ✅    | ✅  | ✅         | ✅                      | 🌪                              |
+| **_GPTNeoX-J_** | ✅              | ✅  | ✅    | ✅  | ✅         | ✅                      | ❌                               |
+| **_Falcon_**    | ✅              | ✅  | ✅    | ✅  | ✅         | ✅                      | ✅                               |
+| **_Palm_**      | ✅              | ✅  | ✅    | ✅  | ✅         | ✅                      | ❌                               |
+| **_T5_**        | ✅              | ✅  | ✅    | ✅  | ❌         | ✅                      | ❌                               |
+| **_OPT_**       | ✅              | ✅  | ✅    | ✅  | ❌         | ✅                      | ❌                               |
 
 you can also tell me the model you want in Flax/Jax version and ill try my best to build it ;)
 
 ## Current Update
 
-Some of the models supported by EasyDel will support Int8 or 8bit interface these following models will be supported
+Some of the models supported by EasyDel will support 8,6,4 bit interface and Train these following models will be
+supported
 
-* [X] Llama (Supported via `LlamaConfig(load_in_8bit=True)`)
-* [ ] Falcon
-* [ ] Mistral
+* [X] Llama (Supported via `LlamaConfig(bits=8)` or `LlamaConfig(bits=4)`)
+* [X] Falcon (Supported via `FalconConfig(bits=8)` or `FalconConfig(bits=4)`)
+* [X] Mistral (Supported via `MistalConfig(bits=8)` or `MistalConfig(bits=4)`)
 * [ ] Palm
 * [ ] T5
 * [ ] MosaicGPT / MPT
+
+#### About Bits in EasyDel
+
+in easydel bits are totally different from huggingface and in EasyDel training model with 8 bit is supported too without
+needs to change the code just change the bit and that's all you have todo but by the way you still have to pass
+the dtype and param_dtype cause unlike the transformers and bitsandbytes which store parameters in int8 and do
+operations
+in float16,bfloat16,float32 we don't do that like this in Jax we still store parameters as float16,bfloat16 or float32
+and
+do operations in bits like 8 6 4, and you can still train your model in this way and make it much more accurate than bitsandbytes 
+or peft fine-tuning
 
 ### EasyDel Mojo
 
