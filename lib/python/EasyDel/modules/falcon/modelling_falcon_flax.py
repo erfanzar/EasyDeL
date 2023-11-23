@@ -13,6 +13,7 @@ from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
     with_sharding_constraint
 import chex
 from fjformer.func import transpose
+from fjformer.bits import config as q_config, q_flax
 
 
 class FalconConfig(PretrainedConfig):
@@ -46,6 +47,7 @@ class FalconConfig(PretrainedConfig):
             eos_token_id: int = 11,
             use_pjit_attention_force: bool = False,
             gradient_checkpointing: str = '',
+            bits: Optional[int] = None,
             **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -71,6 +73,7 @@ class FalconConfig(PretrainedConfig):
         self.parallel_attn = parallel_attn
         self.num_kv_heads = num_kv_heads
         self.new_decoder_architecture = new_decoder_architecture
+        self.bits = bits
         self.from_pt = False
 
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
@@ -138,9 +141,11 @@ class FalconConfig(PretrainedConfig):
                      eos_token_id: int = 11,
                      use_pjit_attention_force: bool = False,
                      gradient_checkpointing: str = '',
+                     bits: Optional[int] = None,
                      **kwargs,
                      ):
         basics = dict(
+            bits=bits,
             vocab_size=vocab_size,
             hidden_size=hidden_size,
             num_hidden_layers=num_hidden_layers,
@@ -273,19 +278,31 @@ class FlaxFalconAttention(nn.Module):
 
     def setup(self) -> None:
         head_dim = self.config.hidden_size // self.config.num_attention_heads
+
+        if self.config.bits is not None:
+            _dot_general_cls = q_config.fully_quantized(
+                fwd_bits=self.config.bits,
+                bwd_bits=self.config.bits
+            )
+        else:
+            _dot_general_cls = None
+
+        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
         self.query_key_value = nn.Dense(
             features=3 * self.config.hidden_size if not self.config.multi_query else (
                     self.config.hidden_size + 2 * head_dim),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            use_bias=self.config.bias
+            use_bias=self.config.bias,
+            dot_general=dot_general_cls
         )
         self.inv_norm_factor = 1 / math.sqrt(head_dim)
         self.dense = nn.Dense(
             features=self.config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            use_bias=self.config.bias
+            use_bias=self.config.bias,
+            dot_general=dot_general_cls
         )
         self.head_dim = head_dim
         self.maybe_rotary = FlaxFalconRotaryEmbedding(self.dtype) if not self.config.alibi else lambda q, k, a, s: (
@@ -488,17 +505,29 @@ class FlaxFalconMlp(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
+        if self.config.bits is not None:
+            _dot_general_cls = q_config.fully_quantized(
+                fwd_bits=self.config.bits,
+                bwd_bits=self.config.bits
+            )
+        else:
+            _dot_general_cls = None
+
+        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
+
         self.dense_h_to_4h = nn.Dense(
             features=self.config.hidden_size * 4,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            use_bias=self.config.bias
+            use_bias=self.config.bias,
+            dot_general=dot_general_cls
         )
         self.dense_4h_to_h = nn.Dense(
             features=self.config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            use_bias=self.config.bias
+            use_bias=self.config.bias,
+            dot_general=dot_general_cls
         )
 
     def __call__(self, x: chex.Array, deterministic: bool = True):
@@ -879,9 +908,19 @@ class FlaxFalconForCausalLMModule(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
+        if self.config.bits is not None:
+            _dot_general_cls = q_config.fully_quantized(
+                fwd_bits=self.config.bits,
+                bwd_bits=self.config.bits
+            )
+        else:
+            _dot_general_cls = None
+
+        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
         self.lm_head = nn.Dense(
             self.config.vocab_size,
-            use_bias=False
+            use_bias=False,
+            dot_general=dot_general_cls
         )
 
     def __call__(self,
