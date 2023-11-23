@@ -844,7 +844,8 @@ class FlaxFalconPretrainedModel(FlaxPreTrainedModel):
             deterministic,
             use_cache,
             return_dict,
-            mutable=mutable
+            mutable=mutable,
+            rngs={'params': jax.random.key(0)}
         )
 
         if past_key_values is not None and return_dict:
