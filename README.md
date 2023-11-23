@@ -17,8 +17,8 @@ too)
 | **_MosaicMPT_** | ✅              | ✅  | ✅    | ✅  | ✅         | ✅                      | ✅                               |
 | **_GPTNeoX-J_** | ✅              | ✅  | ✅    | ✅  | ✅         | ✅                      | ❌                               |
 | **_Falcon_**    | ✅              | ✅  | ✅    | ✅  | ✅         | ✅                      | ✅                               |
-| **_Palm_**      | ✅              | ✅  | ✅    | ✅  | ✅         | ✅                      | ❌                               |
-| **_T5_**        | ✅              | ✅  | ✅    | ✅  | ❌         | ✅                      | ❌                               |
+| **_Palm_**      | ✅              | ✅  | ✅    | ✅  | ✅         | ✅                      | 🌪️                             |
+| **_T5_**        | ✅              | ✅  | ✅    | ✅  | ❌         | ✅                      | 🌪️                             |
 | **_OPT_**       | ✅              | ✅  | ✅    | ✅  | ❌         | ✅                      | ❌                               |
 
 you can also tell me the model you want in Flax/Jax version and ill try my best to build it ;)
@@ -33,8 +33,8 @@ supported
 * [X] Mistral (Supported via `MistalConfig(bits=8)` or `MistalConfig(bits=4)`)
 * [ ] Palm
 * [ ] T5
-* [X] MosaicGPT / MPT
-* [X] GPT-J
+* [X] MosaicGPT / MPT (Supported via `MptConfig(bits=8)` or `MptConfig(bits=4)`)
+* [X] GPT-J (Supported via `GPTJConfig(bits=8)` or `GPTJConfig(bits=4)`)
 
 #### About Bits in EasyDel
 
@@ -117,7 +117,7 @@ chat model (70B model is supported too)
 
 ```shell
 python -m examples.serving.causal-lm.llama-2-chat \
-  --repo_id='meta-llama/Llama.md-2-7b-chat-hf' --max_length=4096 \
+  --repo_id='meta-llama/Llama-2-7b-chat-hf' --max_length=4096 \
   --max_new_tokens=2048 --max_stream_tokens=32 --temperature=0.6 \
   --top_p=0.95 --top_k=50 \
   --dtype='fp16' --use_prefix_tokenizer
