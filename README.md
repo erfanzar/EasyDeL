@@ -12,9 +12,9 @@ too)
 | **_Llama_**     | ✅              | ✅  | ✅    | ✅  | ✅         | ✅                      | ✅                               |
 | **_Mistral_**   | ✅              | ✅  | ✅    | ✅  | ❌         | ✅                      | ✅                               |
 | **_Llama2_**    | ✅              | ✅  | ✅    | ✅  | ❌         | ✅                      | ✅                               |
-| **_GPT-J_**     | ✅              | ✅  | ✅    | ✅  | ✅         | ✅                      | ❌                               |
+| **_GPT-J_**     | ✅              | ✅  | ✅    | ✅  | ✅         | ✅                      | ✅                               |
 | **_LT_**        | ✅              | ✅  | ✅    | ✅  | ❌         | ✅                      | ❌                               |
-| **_MosaicMPT_** | ✅              | ✅  | ✅    | ✅  | ✅         | ✅                      | 🌪                              |
+| **_MosaicMPT_** | ✅              | ✅  | ✅    | ✅  | ✅         | ✅                      | ✅                               |
 | **_GPTNeoX-J_** | ✅              | ✅  | ✅    | ✅  | ✅         | ✅                      | ❌                               |
 | **_Falcon_**    | ✅              | ✅  | ✅    | ✅  | ✅         | ✅                      | ✅                               |
 | **_Palm_**      | ✅              | ✅  | ✅    | ✅  | ✅         | ✅                      | ❌                               |
@@ -33,7 +33,8 @@ supported
 * [X] Mistral (Supported via `MistalConfig(bits=8)` or `MistalConfig(bits=4)`)
 * [ ] Palm
 * [ ] T5
-* [ ] MosaicGPT / MPT
+* [X] MosaicGPT / MPT
+* [X] GPT-J
 
 #### About Bits in EasyDel
 
@@ -43,24 +44,9 @@ the dtype and param_dtype cause unlike the transformers and bitsandbytes which s
 operations
 in float16,bfloat16,float32 we don't do that like this in Jax we still store parameters as float16,bfloat16 or float32
 and
-do operations in bits like 8 6 4, and you can still train your model in this way and make it much more accurate than bitsandbytes 
+do operations in bits like 8 6 4, and you can still train your model in this way and make it much more accurate than
+bitsandbytes
 or peft fine-tuning
-
-### EasyDel Mojo
-
-EasyDel Mojo differs from EasyDel in Python in significant ways. In Python, you can leverage a vast array of packages to
-create a mid or high-level API in no time. However, when working with Mojo, it's a different story. Here, you have to
-build some of the features that other Python libraries provide, such as Jax for arrays and computations. But why not
-import numpy, Jax, and other similar packages to Mojo and use them?
-
-There are several reasons why building packages in Mojo is more efficient than importing them from Python. Firstly, when
-you import packages from Python, you incur the overhead of translating and processing the Python code into Mojo code,
-which takes time. Secondly, the Python code may not be optimized for the Mojo runtime environment, leading to slower
-performance. Lastly, building packages directly in Mojo allows you to design and optimize them explicitly for the Mojo
-runtime environment, resulting in faster and more efficient code. With Mojo's built-in array capabilities that are
-35000x faster than Python, it's time to take your coding to the next level.
-
-[Read More ...](https://github.com/erfanzar/EasyDeL/blob/main/lib/mojo/README.md)
 
 #### Note this Library needs golang to run (for some tracking stuff on TPU/GPU/CPU)
 
@@ -265,6 +251,22 @@ for response, tokens_used in server.process(
     print(response[response_printed:], end='')
     response_printed = len(response)
 ``` 
+
+## EasyDel Mojo
+
+EasyDel Mojo differs from EasyDel in Python in significant ways. In Python, you can leverage a vast array of packages to
+create a mid or high-level API in no time. However, when working with Mojo, it's a different story. Here, you have to
+build some of the features that other Python libraries provide, such as Jax for arrays and computations. But why not
+import numpy, Jax, and other similar packages to Mojo and use them?
+
+There are several reasons why building packages in Mojo is more efficient than importing them from Python. Firstly, when
+you import packages from Python, you incur the overhead of translating and processing the Python code into Mojo code,
+which takes time. Secondly, the Python code may not be optimized for the Mojo runtime environment, leading to slower
+performance. Lastly, building packages directly in Mojo allows you to design and optimize them explicitly for the Mojo
+runtime environment, resulting in faster and more efficient code. With Mojo's built-in array capabilities that are
+35000x faster than Python, it's time to take your coding to the next level.
+
+[Read More ...](https://github.com/erfanzar/EasyDeL/blob/main/lib/mojo/README.md)
 
 ## Contributing
 
