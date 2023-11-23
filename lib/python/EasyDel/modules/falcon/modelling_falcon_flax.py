@@ -274,7 +274,7 @@ class FlaxFalconAttention(nn.Module):
     config: FalconConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         head_dim = self.config.hidden_size // self.config.num_attention_heads
@@ -502,7 +502,7 @@ class FlaxFalconMlp(nn.Module):
     config: FalconConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         if self.config.bits is not None:
@@ -538,7 +538,7 @@ class FlaxFalconBlock(nn.Module):
     config: FalconConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         config = self.config
@@ -634,7 +634,7 @@ class FlaxFalconCollection(nn.Module):
     config: FalconConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         # hidden_states: chex.Array,
@@ -695,7 +695,7 @@ class FlaxFalconModule(nn.Module):
     config: FalconConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         self.word_embeddings = nn.Embed(
@@ -900,7 +900,7 @@ class FlaxFalconForCausalLMModule(nn.Module):
     config: FalconConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         self.transformer = FlaxFalconModule(
