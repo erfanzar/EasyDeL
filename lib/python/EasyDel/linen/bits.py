@@ -119,3 +119,29 @@ class Dense8Bit(Dense):
         if bias is not None:
             y += jnp.reshape(bias, (1,) * (y.ndim - 1) + (-1,))
         return array_to_bit8(y)
+
+
+def matmul_true_int8(lhs, rhs):
+    assert lhs.dtype == jnp.int8
+    assert rhs.dtype == jnp.int8
+    result = jnp.matmul(lhs, rhs, preferred_element_type=jnp.int32)
+    assert result.dtype == jnp.int32
+    return result
+
+
+def aqt_matmul_int8(a, w):
+    max_int8 = 127
+
+    # This function is customizable and injectable, i.e:
+    # users can inject custom quant code into an AQT config.
+    def quant_int8(x):
+        return jnp.clip(jnp.round(x), -max_int8, max_int8).astype(jnp.int8)
+
+    # Calibration. Calibration function is also customizable and injectable.
+    a_s = max_int8 / jnp.max(jnp.abs(a), axis=1, keepdims=True)
+    w_s = max_int8 / jnp.max(jnp.abs(w), axis=0, keepdims=True)
+
+    # int8 matmul with int32 accumulator
+    result = matmul_true_int8(quant_int8(a * a_s), quant_int8(w * w_s)) / (a_s * w_s)
+
+    return result
