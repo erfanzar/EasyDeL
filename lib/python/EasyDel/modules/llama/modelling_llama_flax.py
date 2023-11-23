@@ -716,6 +716,7 @@ class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
         if dropout_rng is not None:
             rngs["dropout"] = dropout_rng
 
+        rngs['params'] = jax.random.key(0)
         inputs = {"params": params or self.params} if add_params_field else params or self.params
 
         if past_key_values:
