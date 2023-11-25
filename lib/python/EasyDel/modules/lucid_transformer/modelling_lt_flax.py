@@ -15,7 +15,6 @@ from einops import rearrange
 from typing import Dict, Any, Optional, Tuple, List
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 import chex
-
 ACT2CLS = {
     "gelu": nn.gelu,
     "relu": nn.relu,
@@ -62,7 +61,6 @@ class FlaxLTConfig(PretrainedConfig):
         self.softmax_scale = softmax_scale
         self.fsdp = fsdp
         self.hidden_act = hidden_act
-        self.mesh = None
         self.__dict__.update(**kwargs)
 
     @staticmethod
@@ -88,9 +86,6 @@ class FlaxLTConfig(PretrainedConfig):
     @staticmethod
     def rng_keys():
         return ('params', 'dropout', 'fcm')
-
-    def set_mesh(self, mesh):
-        self.mesh = mesh
 
 
 def is_name(*names):

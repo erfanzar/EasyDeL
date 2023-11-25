@@ -48,8 +48,6 @@ from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
     with_sharding_constraint
 
 import chex
-
-
 class T5Config(PretrainedConfig):
     model_type = "t5"
     keys_to_ignore_at_inference = ["past_key_values"]
@@ -96,7 +94,7 @@ class T5Config(PretrainedConfig):
         self.initializer_factor = initializer_factor
         self.feed_forward_proj = feed_forward_proj
         self.use_cache = use_cache
-        self.mesh = None
+
         act_info = self.feed_forward_proj.split("-")
         self.dense_act_fn = act_info[-1]
         self.is_gated_act = act_info[0] == "gated"
@@ -121,19 +119,16 @@ class T5Config(PretrainedConfig):
 
     def get_partition_rules(self, fully_fsdp: bool = True):
         return (
-            ("wi_0/kernel", PartitionSpec(('fsdp', 'mp'))),
-            ("wi_1/kernel", PartitionSpec(('fsdp', 'mp'))),
-            ("wi/kernel", PartitionSpec(('fsdp', 'mp'), 'tp')),
-            ("wo/kernel", PartitionSpec(('fsdp', 'mp'), 'tp')),
-            ("SelfAttention/(q|k|v|o)/kernel", PartitionSpec(('fsdp', 'mp'))),
-            ("EncDecAttention/(q|k|v|o)/kernel", PartitionSpec(('fsdp', 'mp'))),
+            ("wi_0/kernel", PartitionSpec('fsdp')),
+            ("wi_1/kernel", PartitionSpec('fsdp')),
+            ("wi/kernel", PartitionSpec('fsdp', 'mp')),
+            ("wo/kernel", PartitionSpec('fsdp', 'mp')),
+            ("SelfAttention/(q|k|v|o)/kernel", PartitionSpec('fsdp')),
+            ("EncDecAttention/(q|k|v|o)/kernel", PartitionSpec('fsdp')),
             ('.*', PartitionSpec(None))
         ) if not fully_fsdp else (
-            ('.*', PartitionSpec(('fsdp', 'mp')))
+            ('.*', PartitionSpec('fsdp'))
         )
-
-    def set_mesh(self, mesh):
-        self.mesh = mesh
 
 
 remat = nn_partitioning.remat

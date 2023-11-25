@@ -17,7 +17,6 @@ from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
     with_sharding_constraint, ACT2FN
 import chex
 
-
 class GPTNeoXConfig(PretrainedConfig):
     model_type = "gpt_neox"
 
@@ -59,53 +58,48 @@ class GPTNeoXConfig(PretrainedConfig):
         self.use_cache = use_cache
         self.tie_word_embeddings = tie_word_embeddings
         self.gradient_checkpointing = gradient_checkpointing
-        self.mesh = None
         self.use_parallel_residual = use_parallel_residual
         self.from_pt = False
 
     @staticmethod
     def get_partition_rules(fully_fsdp: bool = False):
         return (
-            ('wte/embedding', PartitionSpec(('fsdp', 'mp'), 'tp')),
-            ('attention/w_qkv/(kernel|bias)', PartitionSpec(('fsdp', 'mp'), 'tp')),
-            ('attention/wo/(kernel|bias)', PartitionSpec(('fsdp', 'mp'), 'tp')),
-            ('mlp/dense_h_to_4h/(kernel|bias)', PartitionSpec(('fsdp', 'mp'), 'tp')),
-            ('mlp/dense_4h_to_h/(kernel|bias)', PartitionSpec('tp', ('fsdp', 'mp'))),
+            ('wte/embedding', PartitionSpec('fsdp', 'mp')),
+            ('attention/w_qkv/(kernel|bias)', PartitionSpec('fsdp', 'mp')),
+            ('attention/wo/(kernel|bias)', PartitionSpec('fsdp', 'mp')),
+            ('mlp/dense_h_to_4h/(kernel|bias)', PartitionSpec('fsdp', 'mp')),
+            ('mlp/dense_4h_to_h/(kernel|bias)', PartitionSpec('mp', 'fsdp')),
 
-            ('post_attention_layernorm/(bias|scale)', PartitionSpec(('fsdp', 'mp'), 'tp')),
-            ('input_layernorm/(bias|scale)', PartitionSpec(('fsdp', 'mp'), 'tp')),
+            ('post_attention_layernorm/(bias|scale)', PartitionSpec('fsdp', 'mp')),
+            ('input_layernorm/(bias|scale)', PartitionSpec('fsdp', 'mp')),
 
-            ('transformer/final_layer_norm/(scale|bias)', PartitionSpec('tp', ('fsdp', 'mp'))),
-            ('lm_head/kernel', PartitionSpec('tp', ('fsdp', 'mp'))),
+            ('transformer/final_layer_norm/(scale|bias)', PartitionSpec('mp', 'fsdp')),
+            ('lm_head/kernel', PartitionSpec('mp', 'fsdp')),
             ('.*', PartitionSpec(None))
         ) if not fully_fsdp else (
 
-            ('embed_in/embedding', PartitionSpec(('fsdp', 'mp'))),
+            ('embed_in/embedding', PartitionSpec('fsdp')),
 
-            ('attention/w_qkv/(kernel|bias)', PartitionSpec(('fsdp', 'mp'))),
-            ('attention/wo/(kernel|bias)', PartitionSpec(('fsdp', 'mp'))),
-            ('mlp/dense_h_to_4h/(kernel|bias)', PartitionSpec(('fsdp', 'mp'))),
-            ('mlp/dense_4h_to_h/(kernel|bias)', PartitionSpec(('fsdp', 'mp'))),
+            ('attention/w_qkv/(kernel|bias)', PartitionSpec('fsdp')),
+            ('attention/wo/(kernel|bias)', PartitionSpec('fsdp')),
+            ('mlp/dense_h_to_4h/(kernel|bias)', PartitionSpec('fsdp')),
+            ('mlp/dense_4h_to_h/(kernel|bias)', PartitionSpec('fsdp')),
 
-            ('post_attention_layernorm/(bias|scale)', PartitionSpec(('fsdp', 'mp'))),
-            ('input_layernorm/(bias|scale)', PartitionSpec(('fsdp', 'mp'))),
+            ('post_attention_layernorm/(bias|scale)', PartitionSpec('fsdp')),
+            ('input_layernorm/(bias|scale)', PartitionSpec('fsdp')),
 
-            ('transformer/final_layer_norm/(scale|bias)', PartitionSpec(('fsdp', 'mp'))),
-            ('lm_head/kernel', PartitionSpec(('fsdp', 'mp'))),
+            ('transformer/final_layer_norm/(scale|bias)', PartitionSpec('fsdp')),
+            ('lm_head/kernel', PartitionSpec('fsdp')),
             ('.*', PartitionSpec(None))
         )
 
     @staticmethod
     def get_mesh_names():
-        return "dp", "fsdp", "tp", "mp"
+        return 'dp', 'fsdp', 'mp'
 
     def add_jax_args(self):
         self.from_pt = False
-        if not hasattr(self, 'mesh'):
-            self.mesh = None
-
-    def set_mesh(self, mesh):
-        self.mesh = mesh
+        ...
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0,

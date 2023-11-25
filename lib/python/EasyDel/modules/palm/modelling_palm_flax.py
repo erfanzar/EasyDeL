@@ -14,7 +14,6 @@ from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
     with_sharding_constraint
 import chex
 
-
 class PalmConfig(PretrainedConfig):
     def __init__(self,
                  vocab_size: Optional[int] = 32000,
@@ -47,10 +46,6 @@ class PalmConfig(PretrainedConfig):
         self.vocab_size = vocab_size
         self.eps = eps
         self.max_length = max_length
-        self.mesh = None
-
-    def set_mesh(self, mesh):
-        self.mesh = mesh
 
     @staticmethod
     def _set_config_defaults(config, config_defaults):
@@ -62,23 +57,23 @@ class PalmConfig(PretrainedConfig):
     @staticmethod
     def get_partition_rules(fully_fsdp: bool = False):
         return (
-            ('wi/kernel', PartitionSpec(('fsdp', 'mp'))),
-            ('attn_wo/kernel', PartitionSpec(('fsdp', 'mp'), 'tp')),
-            ('ff_wo/kernel', PartitionSpec(('fsdp', 'mp'), 'tp')),
-            ('wte/embedding', PartitionSpec(('fsdp', 'mp'), 'tp')),
-            ('lm_head/kernel', PartitionSpec(('fsdp', 'mp'))),
-            ('post_norm/kernel', PartitionSpec(('fsdp', 'mp'))),
-            ('norm/kernel', PartitionSpec(('fsdp', 'mp'), 'tp')),
+            ('wi/kernel', PartitionSpec('fsdp')),
+            ('attn_wo/kernel', PartitionSpec('fsdp', 'mp')),
+            ('ff_wo/kernel', PartitionSpec('fsdp', 'mp')),
+            ('wte/embedding', PartitionSpec('fsdp', 'mp')),
+            ('lm_head/kernel', PartitionSpec('fsdp')),
+            ('post_norm/kernel', PartitionSpec('fsdp')),
+            ('norm/kernel', PartitionSpec('fsdp', 'mp')),
             ('.*', PartitionSpec(None)),
         ) if not fully_fsdp else (
-            ('wi/kernel', PartitionSpec(('fsdp', 'mp'))),
-            ('attn_wo/kernel', PartitionSpec(('fsdp', 'mp'))),
-            ('ff_wo/kernel', PartitionSpec(('fsdp', 'mp'))),
-            ('wte/embedding', PartitionSpec(('fsdp', 'mp'))),
-            ('lm_head/kernel', PartitionSpec(('fsdp', 'mp'))),
-            ('post_norm/kernel', PartitionSpec(('fsdp', 'mp'))),
-            ('norm/kernel', PartitionSpec(('fsdp', 'mp'))),
-            ('.*', PartitionSpec(('fsdp', 'mp'))),
+            ('wi/kernel', PartitionSpec('fsdp')),
+            ('attn_wo/kernel', PartitionSpec('fsdp')),
+            ('ff_wo/kernel', PartitionSpec('fsdp')),
+            ('wte/embedding', PartitionSpec('fsdp')),
+            ('lm_head/kernel', PartitionSpec('fsdp')),
+            ('post_norm/kernel', PartitionSpec('fsdp')),
+            ('norm/kernel', PartitionSpec('fsdp')),
+            ('.*', PartitionSpec('fsdp')),
         )
 
 
