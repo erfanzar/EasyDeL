@@ -16,7 +16,6 @@ from flax.linen import combine_masks, make_causal_mask
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_flax_utils import FlaxPreTrainedModel
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput, FlaxSequenceClassifierOutput
-from fjformer.attention import efficient_attention
 from ..flax_modelling_utils import with_sharding_constraint, \
     get_gradient_checkpoint_policy, repeat_kv_bnsh, apply_rotary_pos_emb, precompute_freq_cis, get_flash_attention
 import chex
@@ -86,7 +85,7 @@ class LlamaConfig(PretrainedConfig):
         self.flash_attn_query_chunk_size = flash_attn_query_chunk_size
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.bits = bits
-        self.mesh = None
+
         super().__init__(
             # pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -167,11 +166,6 @@ class LlamaConfig(PretrainedConfig):
         self.flash_attn_key_chunk_size = flash_attn_key_chunk_size
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.bits = bits
-        if not hasattr(self, 'mesh'):
-            self.mesh = None
-
-    def set_mesh(self, mesh):
-        self.mesh = mesh
 
     @staticmethod
     def get_weight_decay_exclusions():
@@ -419,7 +413,7 @@ class FlaxLlamaAttention(nn.Module):
             else:
                 up_cast_float32 = True
                 ring_attention_fn = fjformer.attention.ring_attention
-            print("HERE")
+
             ring_attention_sharded = shard_map(
                 partial(
                     ring_attention_fn,
@@ -473,7 +467,6 @@ class FlaxLlamaAttention(nn.Module):
                                                                                     attention_mask)
 
             attn_weights = None
-
             ring_attention_sharded = shard_map(
                 partial(fjformer.attention.ring_attention_standard, axis_name="mp"),
                 mesh=self.config.mesh,

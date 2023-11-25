@@ -62,7 +62,7 @@ class FlaxLTConfig(PretrainedConfig):
         self.softmax_scale = softmax_scale
         self.fsdp = fsdp
         self.hidden_act = hidden_act
-        self.mesh = None
+
         self.__dict__.update(**kwargs)
 
     @staticmethod
@@ -89,8 +89,7 @@ class FlaxLTConfig(PretrainedConfig):
     def rng_keys():
         return ('params', 'dropout', 'fcm')
 
-    def set_mesh(self, mesh):
-        self.mesh = mesh
+
 
 
 def is_name(*names):

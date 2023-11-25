@@ -59,7 +59,7 @@ class GPTNeoXConfig(PretrainedConfig):
         self.use_cache = use_cache
         self.tie_word_embeddings = tie_word_embeddings
         self.gradient_checkpointing = gradient_checkpointing
-        self.mesh = None
+
         self.use_parallel_residual = use_parallel_residual
         self.from_pt = False
 
@@ -101,11 +101,9 @@ class GPTNeoXConfig(PretrainedConfig):
 
     def add_jax_args(self):
         self.from_pt = False
-        if not hasattr(self, 'mesh'):
-            self.mesh = None
 
-    def set_mesh(self, mesh):
-        self.mesh = mesh
+
+
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0,

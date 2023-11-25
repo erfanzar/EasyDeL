@@ -6,6 +6,7 @@ from flax import linen as nn
 from functools import partial
 import chex
 from typing import Sequence
+from jax.experimental.mesh_utils import create_device_mesh
 
 ACT2FN = {
     "gelu": partial(nn.gelu, approximate=False),
@@ -136,8 +137,8 @@ def create_mesh(
         axis_dims: Sequence[int] = (1, -1, 1, 1), axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"), backend=''
 ):
     array_devices = jax.numpy.ones((len(jax.devices() if backend == '' else jax.devices(backend)), 1))
-    resh: jax.numpy.ndarray = array_devices.reshape(axis_dims)
+    resh = array_devices.reshape(axis_dims).shape
 
     return jax.sharding.Mesh(
-        resh, axis_names
+        create_device_mesh(resh), axis_names
     )

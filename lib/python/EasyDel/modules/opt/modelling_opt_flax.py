@@ -96,7 +96,7 @@ class OPTConfig(PretrainedConfig):
         self.layer_norm_elementwise_affine = layer_norm_elementwise_affine
         self._remove_final_layer_norm = _remove_final_layer_norm
         self.from_pt = False
-        self.mesh = None
+
 
     def get_partition_rules(self, fully_fsdp: bool = True):
         if not fully_fsdp:
@@ -161,11 +161,9 @@ class OPTConfig(PretrainedConfig):
             if not hasattr(self, k):
                 setattr(self, k, v)
         self.from_pt = False
-        if not hasattr(self, 'mesh'):
-            self.mesh = None
 
-    def set_mesh(self, mesh):
-        self.mesh = mesh
+
+
 
 
 logger = logging.get_logger(__name__)

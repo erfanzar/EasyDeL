@@ -82,7 +82,7 @@ class MistralConfig(PretrainedConfig):
         self.attn_pdrop = attn_pdrop
         self.c_max_position_embeddings = c_max_position_embeddings
         self.freq_max_position_embeddings = freq_max_position_embeddings
-        self.mesh = None
+
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -155,11 +155,9 @@ class MistralConfig(PretrainedConfig):
         self.c_max_position_embeddings = c_max_position_embeddings
         self.freq_max_position_embeddings = freq_max_position_embeddings
         self.bits = bits
-        if not hasattr(self, 'mesh'):
-            self.mesh = None
 
-    def set_mesh(self, mesh):
-        self.mesh = mesh
+
+
 
     @staticmethod
     def get_weight_decay_exclusions():

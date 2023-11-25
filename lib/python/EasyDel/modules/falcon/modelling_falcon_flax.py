@@ -75,7 +75,7 @@ class FalconConfig(PretrainedConfig):
         self.new_decoder_architecture = new_decoder_architecture
         self.bits = bits
         self.from_pt = False
-        self.mesh = None
+
 
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
 
@@ -177,11 +177,9 @@ class FalconConfig(PretrainedConfig):
 
         self.from_pt = False
 
-        if not hasattr(self, 'mesh'):
-            self.mesh = None
 
-    def set_mesh(self, mesh):
-        self.mesh = mesh
+
+
 
 
 def built_bloom_alibi(attention_mask, num_attention_heads):
