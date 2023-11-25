@@ -139,7 +139,7 @@ class FlaxGPTNeoXAttention(nn.Module):
     config: GPTNeoXConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         self.head_size = self.config.hidden_size // self.config.num_attention_heads
@@ -195,7 +195,7 @@ class FlaxGPTNeoXMlp(nn.Module):
     config: GPTNeoXConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         self.dense_h_to_4h = nn.Dense(self.config.intermediate_size)
@@ -210,7 +210,7 @@ class FlaxGPTNeoXBlock(nn.Module):
     config: GPTNeoXConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         self.use_parallel_residual = self.config.use_parallel_residual
@@ -270,7 +270,7 @@ class FlaxGPTNeoXCollection(nn.Module):
     config: GPTNeoXConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         block = FlaxGPTNeoXBlock
@@ -312,7 +312,7 @@ class FlaxGPTNeoXModule(nn.Module):
     config: GPTNeoXConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         self.embed_in = nn.Embed(self.config.vocab_size, self.config.hidden_size)
@@ -398,7 +398,7 @@ class FlaxGPTNeoXForCausalLMModule(nn.Module):
     config: GPTNeoXConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         self.transformer = FlaxGPTNeoXModule(

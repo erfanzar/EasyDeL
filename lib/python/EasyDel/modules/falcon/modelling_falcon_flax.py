@@ -12,10 +12,8 @@ from transformers.modeling_flax_outputs import FlaxCausalLMOutput, FlaxBaseModel
 from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
     with_sharding_constraint
 import chex
-from fjutils.utils import transpose
-
-
-# transpose = jax.jit(trp)
+from fjformer.func import transpose
+from fjformer.bits import config as q_config, q_flax
 
 
 class FalconConfig(PretrainedConfig):
@@ -48,7 +46,8 @@ class FalconConfig(PretrainedConfig):
             bos_token_id: int = 11,
             eos_token_id: int = 11,
             use_pjit_attention_force: bool = False,
-            gradient_checkpointing: str = 'nothing_saveable',
+            gradient_checkpointing: str = '',
+            bits: Optional[int] = None,
             **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -74,6 +73,7 @@ class FalconConfig(PretrainedConfig):
         self.parallel_attn = parallel_attn
         self.num_kv_heads = num_kv_heads
         self.new_decoder_architecture = new_decoder_architecture
+        self.bits = bits
         self.from_pt = False
 
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
@@ -140,10 +140,12 @@ class FalconConfig(PretrainedConfig):
                      bos_token_id: int = 11,
                      eos_token_id: int = 11,
                      use_pjit_attention_force: bool = False,
-                     gradient_checkpointing: str = 'nothing_saveable',
+                     gradient_checkpointing: str = '',
+                     bits: Optional[int] = None,
                      **kwargs,
                      ):
         basics = dict(
+            bits=bits,
             vocab_size=vocab_size,
             hidden_size=hidden_size,
             num_hidden_layers=num_hidden_layers,
@@ -212,25 +214,21 @@ def apply_rotary_pos_embedding(tensor, sin_, cos_):
     return (tensor * cos_) + (_rotate_half(tensor) * sin_)
 
 
-@nn.compact
-def dropout_add(self, x: chex.Array, residual: chex.Array, prob: float, deterministic: bool) -> chex.Array:
+def dropout_add(linen_drop: nn.Dropout, x: chex.Array, residual: chex.Array, deterministic: bool) -> chex.Array:
     """
     Dropout add function
 
     Args:
-        self (Self)
-            self must be passed to the func
+        linen_drop (Self)
+            linen_drop must be passed to the func
         x (`torch.tensor`, *required*):
             input tensor
         residual (`torch.tensor`, *required*):
             residual tensor
-        prob (`float`, *required*):
-            dropout probability
         deterministic (`bool`, *required*):
             training mode
     """
-    nn_ = nn.Dropout(prob)
-    out = nn_(inputs=x, deterministic=deterministic)
+    out = linen_drop(inputs=x, deterministic=deterministic)
     out = residual + out
     return out
 
@@ -276,30 +274,47 @@ class FlaxFalconAttention(nn.Module):
     config: FalconConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         head_dim = self.config.hidden_size // self.config.num_attention_heads
+
+        if self.config.bits is not None:
+            _dot_general_cls = q_config.fully_quantized(
+                fwd_bits=self.config.bits,
+                bwd_bits=self.config.bits
+            )
+        else:
+            _dot_general_cls = None
+
+        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
         self.query_key_value = nn.Dense(
             features=3 * self.config.hidden_size if not self.config.multi_query else (
                     self.config.hidden_size + 2 * head_dim),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            use_bias=self.config.bias
+            use_bias=self.config.bias,
+            dot_general=dot_general_cls
         )
         self.inv_norm_factor = 1 / math.sqrt(head_dim)
         self.dense = nn.Dense(
             features=self.config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            use_bias=self.config.bias
+            use_bias=self.config.bias,
+            dot_general=dot_general_cls
         )
         self.head_dim = head_dim
         self.maybe_rotary = FlaxFalconRotaryEmbedding(self.dtype) if not self.config.alibi else lambda q, k, a, s: (
             q, k)
         assert self.head_dim * self.config.num_attention_heads == self.config.hidden_size
-        self.num_kv_heads = self.config.num_kv_heads if (
-                self.config.new_decoder_architecture or not self.config.multi_query) else 1
+        if self.config.num_kv_heads is not None:
+
+            self.num_kv_heads = self.config.num_kv_heads if (
+                    self.config.new_decoder_architecture or not self.config.multi_query) else 1
+        else:
+            self.num_kv_heads = self.config.num_attention_heads
+        self.num_heads = self.config.num_attention_heads
 
     @nn.compact
     def _concatenate_to_cache(self, key: chex.Array, value: chex.Array, query: chex.Array, attention_mask: chex.Array):
@@ -375,7 +390,7 @@ class FlaxFalconAttention(nn.Module):
 
         batch_size_and_num_heads, seq_length, _ = x.shape
         batch_size = batch_size_and_num_heads // self.num_heads
-        x = x.view(batch_size, self.config.num_attention_heads, seq_length, self.head_dim)
+        x = x.reshape(batch_size, self.config.num_attention_heads, seq_length, self.head_dim)
 
         x = x.transpose(0, 2, 1, 3)
         return x.reshape(batch_size, seq_length, self.config.num_attention_heads * self.head_dim)
@@ -439,7 +454,8 @@ class FlaxFalconAttention(nn.Module):
         query_layer_, key_layer_, value_layer_, attention_bias = map(lambda x: x.astype(dtype=dtype), (
             query_layer_, key_layer_, value_layer_, attention_bias))
 
-        attention_scores = jax.lax.batch_matmul(query_layer_, transpose(key_layer_, -2, -1))
+        attention_scores = jax.lax.batch_matmul(query_layer_, transpose(key_layer_, len(key_layer_.shape) - 2,
+                                                                        len(key_layer_.shape) - 1))
         if alibi is None:
 
             attention_scores /= math.sqrt(self.head_dim)
@@ -486,20 +502,32 @@ class FlaxFalconMlp(nn.Module):
     config: FalconConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
+        if self.config.bits is not None:
+            _dot_general_cls = q_config.fully_quantized(
+                fwd_bits=self.config.bits,
+                bwd_bits=self.config.bits
+            )
+        else:
+            _dot_general_cls = None
+
+        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
+
         self.dense_h_to_4h = nn.Dense(
             features=self.config.hidden_size * 4,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            use_bias=self.config.bias
+            use_bias=self.config.bias,
+            dot_general=dot_general_cls
         )
         self.dense_4h_to_h = nn.Dense(
             features=self.config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            use_bias=self.config.bias
+            use_bias=self.config.bias,
+            dot_general=dot_general_cls
         )
 
     def __call__(self, x: chex.Array, deterministic: bool = True):
@@ -510,7 +538,7 @@ class FlaxFalconBlock(nn.Module):
     config: FalconConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         config = self.config
@@ -537,6 +565,9 @@ class FlaxFalconBlock(nn.Module):
             precision=self.precision
         )
 
+        self.dropout = nn.Dropout(self.config.attention_dropout)
+        self.dropout_mlp = nn.Dropout(self.config.hidden_dropout)
+
     def __call__(
             self,
             hidden_states: chex.Array,
@@ -545,7 +576,7 @@ class FlaxFalconBlock(nn.Module):
             freq_cis: Tuple[chex.Array, chex.Array],
             position_ids: chex.Array,
             causal_mask: chex.Array,
-            output_attentions: bool = True,
+            output_attentions: bool = False,
             deterministic: bool = True
     ):
         residual = hidden_states
@@ -574,11 +605,10 @@ class FlaxFalconBlock(nn.Module):
                 mlp_layernorm_out = attention_layernorm_out
             else:
                 residual = dropout_add(
-                    self=self,
+                    linen_drop=self.dropout,
                     x=attention_output,
                     residual=residual,
-                    prob=self.config.attention_dropout,
-                    deterministic=self.training
+                    deterministic=deterministic
                 )
                 mlp_layernorm_out = self.post_attention_layernorm(residual)
 
@@ -590,11 +620,11 @@ class FlaxFalconBlock(nn.Module):
             mlp_output += attention_output
 
         output = dropout_add(
-            self=self,
+            linen_drop=self.dropout_mlp,
             x=mlp_output,
             residual=residual,
-            prob=self.config.hidden_dropout,
-            deterministic=self.training
+            deterministic=deterministic
+
         )
 
         return output, outputs
@@ -604,14 +634,24 @@ class FlaxFalconCollection(nn.Module):
     config: FalconConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
+        # hidden_states: chex.Array,
+        # alibi: chex.Array,
+        # attention_mask: chex.Array,
+        # freq_cis: Tuple[chex.Array, chex.Array],
+        # position_ids: chex.Array,
+        # causal_mask: chex.Array,
+        # output_attentions: bool = False,
+        # deterministic: bool = True
+
         block = FlaxFalconBlock
         if self.config.gradient_checkpointing != '':
             block = nn.remat(
                 block,
-                policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing)
+                policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
+                static_argnums=(-2, -1)
             )
         self.layers = [
             block(
@@ -633,7 +673,7 @@ class FlaxFalconCollection(nn.Module):
                  freq_cis: Tuple[chex.Array, chex.Array],
                  position_ids: chex.Array,
                  causal_mask: chex.Array,
-                 output_attentions: bool = True,
+                 output_attentions: bool = False,
                  deterministic: bool = True
                  ):
         for layer in self.layers:
@@ -655,7 +695,7 @@ class FlaxFalconModule(nn.Module):
     config: FalconConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         self.word_embeddings = nn.Embed(
@@ -684,7 +724,7 @@ class FlaxFalconModule(nn.Module):
                  input_ids: chex.Array,
                  attention_mask: Optional[chex.Array] = None,
                  position_ids: Optional[chex.Array] = None,
-                 output_attentions: bool = True,
+                 output_attentions: bool = False,
                  deterministic: bool = True,
                  use_cache: Optional[bool] = None,
                  return_dict: Optional[bool] = False
@@ -762,7 +802,7 @@ class FlaxFalconPretrainedModel(FlaxPreTrainedModel):
                  attention_mask: Optional[chex.Array] = None,
                  position_ids: Optional[chex.Array] = None,
                  past_key_values: Optional[nn.Module] = None,
-                 output_attentions: bool = True,
+                 output_attentions: bool = False,
                  deterministic: bool = True,
                  use_cache: Optional[bool] = None,
                  return_dict: Optional[bool] = False,
@@ -790,7 +830,7 @@ class FlaxFalconPretrainedModel(FlaxPreTrainedModel):
         # input_ids: chex.Array,
         # attention_mask: Optional[chex.Array] = None
         # position_ids: Optional[chex.Array] = None
-        # output_attentions: bool = True
+        # output_attentions: bool = False
         # deterministic: bool = True
         # use_cache: Optional[bool] = None
         # return_dict: Optional[bool] = False
@@ -804,7 +844,8 @@ class FlaxFalconPretrainedModel(FlaxPreTrainedModel):
             deterministic,
             use_cache,
             return_dict,
-            mutable=mutable
+            mutable=mutable,
+            rngs={'params': jax.random.key(0)}
         )
 
         if past_key_values is not None and return_dict:
@@ -859,7 +900,7 @@ class FlaxFalconForCausalLMModule(nn.Module):
     config: FalconConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         self.transformer = FlaxFalconModule(
@@ -868,16 +909,26 @@ class FlaxFalconForCausalLMModule(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
+        if self.config.bits is not None:
+            _dot_general_cls = q_config.fully_quantized(
+                fwd_bits=self.config.bits,
+                bwd_bits=self.config.bits
+            )
+        else:
+            _dot_general_cls = None
+
+        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
         self.lm_head = nn.Dense(
             self.config.vocab_size,
-            use_bias=False
+            use_bias=False,
+            dot_general=dot_general_cls
         )
 
     def __call__(self,
                  input_ids: chex.Array,
                  attention_mask: Optional[chex.Array] = None,
                  position_ids: Optional[chex.Array] = None,
-                 output_attentions: bool = True,
+                 output_attentions: bool = False,
                  deterministic: bool = True,
                  use_cache: Optional[bool] = None,
                  return_dict: Optional[bool] = False

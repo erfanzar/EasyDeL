@@ -42,12 +42,19 @@ def with_sharding_constraint(x, partition_specs):
 
 
 def get_gradient_checkpoint_policy(name):
-    return {
-        'everything_saveable': jax.checkpoint_policies.everything_saveable,
-        'nothing_saveable': jax.checkpoint_policies.nothing_saveable,
-        'checkpoint_dots': jax.checkpoint_policies.checkpoint_dots,
-        'checkpoint_dots_with_no_batch_dims': jax.checkpoint_policies.checkpoint_dots_with_no_batch_dims,
-    }[name]
+    gradients = dict(
+        everything_saveable=jax.checkpoint_policies.everything_saveable,
+        nothing_saveable=jax.checkpoint_policies.nothing_saveable,
+        dots_saveable=jax.checkpoint_policies.dots_saveable,
+        checkpoint_dots=jax.checkpoint_policies.checkpoint_dots,
+        dots_with_no_batch_dims_saveable=jax.checkpoint_policies.dots_with_no_batch_dims_saveable,
+        checkpoint_dots_with_no_batch_dims=jax.checkpoint_policies.checkpoint_dots_with_no_batch_dims,
+        save_anything_except_these_names=jax.checkpoint_policies.save_anything_except_these_names,
+        save_any_names_but_these=jax.checkpoint_policies.save_any_names_but_these,
+        save_only_these_names=jax.checkpoint_policies.save_only_these_names,
+        save_from_both_policies=jax.checkpoint_policies.save_from_both_policies
+    )
+    return gradients[name]
 
 
 def repeat_kv_bnsh(x: chex.Array, n_rep: int) -> chex.Array:

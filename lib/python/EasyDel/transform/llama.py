@@ -1,3 +1,4 @@
+import gc
 from pathlib import Path
 
 from jax import numpy as jnp
@@ -5,6 +6,7 @@ import jax
 import torch
 from transformers import LlamaForCausalLM
 from ..modules.llama import LlamaConfig
+from fjformer import load_and_convert_checkpoint_to_torch
 
 
 def inverse_permute(w, num_attention_heads, in_dim, out_dim):
@@ -25,7 +27,7 @@ def match_keywords(string, ts, ns):
 
 
 def llama_convert_hf_to_flax_load(checkpoints_dir, config: LlamaConfig,
-                                  device=jax.devices('cpu')[0]):
+                                  device):
     ckpt_paths = sorted(Path(checkpoints_dir).glob("*.bin"))
     state_dict = {}
     with jax.default_device(device):
@@ -40,62 +42,62 @@ def llama_convert_hf_to_flax_load(checkpoints_dir, config: LlamaConfig,
 
 
 def llama_convert_hf_to_flax(state_dict, config: LlamaConfig,
-                             device=jax.devices('cpu')[0]):
+                             device):
     with jax.default_device(device):
         jax_weights = {
             "model": {
-                "embed_tokens": {"embedding": state_dict["model.embed_tokens.weight"].numpy()},
-                "norm": {"kernel": state_dict["model.norm.weight"].numpy()},
+                "embed_tokens": {"embedding": state_dict["model.embed_tokens.weight"].cpu().numpy()},
+                "norm": {"kernel": state_dict["model.norm.weight"].cpu().numpy()},
                 "layers": {
                     f"{layer}": {
                         "self_attn": {
                             "q_proj": {
                                 "kernel": state_dict[
-                                    f"model.layers.{layer}.self_attn.q_proj.weight"].numpy().transpose()
+                                    f"model.layers.{layer}.self_attn.q_proj.weight"].cpu().numpy().transpose()
                             },
                             "k_proj": {
                                 "kernel": state_dict[
-                                    f"model.layers.{layer}.self_attn.k_proj.weight"].numpy().transpose()
+                                    f"model.layers.{layer}.self_attn.k_proj.weight"].cpu().numpy().transpose()
                             },
                             "v_proj": {
                                 "kernel": state_dict[
-                                    f"model.layers.{layer}.self_attn.v_proj.weight"].numpy().transpose()
+                                    f"model.layers.{layer}.self_attn.v_proj.weight"].cpu().numpy().transpose()
                             },
                             "o_proj": {
                                 "kernel": state_dict[
-                                    f"model.layers.{layer}.self_attn.o_proj.weight"].numpy().transpose()
+                                    f"model.layers.{layer}.self_attn.o_proj.weight"].cpu().numpy().transpose()
                             },
                         },
                         "mlp": {
                             "gate_proj": {
                                 "kernel": state_dict[f"model.layers.{layer}.mlp.gate_proj.weight"]
-                                .numpy()
+                                .cpu().numpy()
                                 .transpose()
                             },
                             "down_proj": {
                                 "kernel": state_dict[f"model.layers.{layer}.mlp.down_proj.weight"]
-                                .numpy()
+                                .cpu().numpy()
                                 .transpose()
                             },
                             "up_proj": {
                                 "kernel": state_dict[f"model.layers.{layer}.mlp.up_proj.weight"]
-                                .numpy()
+                                .cpu().numpy()
                                 .transpose()
                             },
                         },
                         "input_layernorm": {
-                            "kernel": state_dict[f"model.layers.{layer}.input_layernorm.weight"].numpy()
+                            "kernel": state_dict[f"model.layers.{layer}.input_layernorm.weight"].cpu().numpy()
                         },
                         "post_attention_layernorm": {
                             "kernel": state_dict[
                                 f"model.layers.{layer}.post_attention_layernorm.weight"
-                            ].numpy()
+                            ].cpu().numpy()
                         },
                     }
                     for layer in range(config.num_hidden_layers)
                 },
             },
-            "lm_head": {"kernel": state_dict["lm_head.weight"].numpy().transpose()},
+            "lm_head": {"kernel": state_dict["lm_head.weight"].cpu().numpy().transpose()},
         }
 
         return jax_weights
@@ -145,7 +147,20 @@ def llama_convert_flax_to_pt(flax_params, config: LlamaConfig, dtype=jnp.float16
     return state_dict
 
 
-def llama_from_pretrained(model_id, device=jax.devices('cpu')[0]):
+def llama_easydel_to_hf(path, config: LlamaConfig):
+    """
+        Takes path to easydel saved ckpt and return the model in pytorch (Transformers Huggingface)
+    """
+    torch_params = load_and_convert_checkpoint_to_torch(path)
+    edited_params = {}
+    for k, v in torch_params.items():
+        edited_params[k.replace('.kernel', '.weight').replace('.embedding', '.weight')] = v
+    model = LlamaForCausalLM(config=config)
+    model.load_state_dict(edited_params)
+    return model
+
+
+def llama_from_pretrained(model_id, device):
     """
     return: Weight or Params for EasyDel Model , Config
     """
@@ -157,4 +172,7 @@ def llama_from_pretrained(model_id, device=jax.devices('cpu')[0]):
         device=device
     )
     config.add_jax_args()
+
+    del model
+    gc.collect()
     return easydel_wights, config

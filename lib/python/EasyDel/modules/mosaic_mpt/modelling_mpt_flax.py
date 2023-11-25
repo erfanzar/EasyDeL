@@ -2,10 +2,8 @@ import math
 
 import einops
 from flax import linen as nn
-from flax.serialization import to_bytes, from_bytes, to_state_dict, from_state_dict
-from jax import grad, jit
 from flax.core import FrozenDict
-from typing import Optional, Dict, Union, Tuple
+from typing import Optional, Union, Tuple
 from transformers import FlaxPreTrainedModel, PretrainedConfig
 from jax import numpy as jnp
 import jax
@@ -13,10 +11,12 @@ from jax.sharding import PartitionSpec
 from transformers.modeling_flax_outputs import FlaxCausalLMOutput, FlaxBaseModelOutput
 import flax
 from einops import rearrange
-from fjutils.flash_attention import dot_product_attention_multihead
+from fjformer.attention import efficient_attention
 from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
-    with_sharding_constraint
+    with_sharding_constraint, ACT2FN
 import chex
+from fjformer.bits import config as q_config, q_flax
+
 
 class MptConfig(PretrainedConfig):
     model_type = 'mpt'
@@ -47,6 +47,7 @@ class MptConfig(PretrainedConfig):
                  use_flash_attention: bool = False,
                  flash_attn_query_chunk_size: int = 1024,
                  flash_attn_key_chunk_size: int = 2048,
+                 bits: Optional[int] = None,
                  **kwargs
                  ):
 
@@ -75,7 +76,7 @@ class MptConfig(PretrainedConfig):
         self.use_flash_attention = use_flash_attention
         self.flash_attn_key_chunk_size = flash_attn_key_chunk_size
         self.flash_attn_query_chunk_size = flash_attn_query_chunk_size
-
+        self.bits = bits
         self.from_pt = False
         if 'name' in kwargs:
             del kwargs['name']
@@ -168,12 +169,14 @@ class MptConfig(PretrainedConfig):
                      use_flash_attention: bool = False,
                      flash_attn_query_chunk_size: int = 1024,
                      flash_attn_key_chunk_size: int = 2048,
+                     bits: Optional[int] = None,
                      **kwargs
                      ):
         if hasattr(self, 'attn_config'):
             for k, v in self.attn_config.items():
                 setattr(self, k, v)
         basics = dict(
+            bits=bits,
             d_model=d_model,
             n_heads=n_heads,
             n_layers=n_layers,
@@ -238,15 +241,36 @@ class FlaxMptMLP(nn.Module):
     config: MptConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
-        self.up = nn.Dense(self.config.d_model * self.config.expansion_ratio, kernel_init=jax.nn.initializers.normal(),
-                           use_bias=self.config.use_bias,
-                           dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision)
-        self.down = nn.Dense(self.config.d_model, kernel_init=jax.nn.initializers.normal(),
-                             use_bias=self.config.use_bias,
-                             dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision)
+        if self.config.bits is not None:
+            _dot_general_cls = q_config.fully_quantized(
+                fwd_bits=self.config.bits,
+                bwd_bits=self.config.bits
+            )
+        else:
+            _dot_general_cls = None
+
+        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
+        self.up = nn.Dense(
+            self.config.d_model * self.config.expansion_ratio,
+            kernel_init=jax.nn.initializers.normal(),
+            use_bias=self.config.use_bias,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision,
+            dot_general=dot_general_cls
+        )
+        self.down = nn.Dense(
+            self.config.d_model,
+            kernel_init=jax.nn.initializers.normal(),
+            use_bias=self.config.use_bias,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision,
+            dot_general=dot_general_cls
+        )
         self.act = ACT2FN[self.config.act_fn]
 
     def __call__(self, hidden_states: chex.Array):
@@ -257,14 +281,36 @@ class FlaxMptAttention(nn.Module):
     config: MptConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
-        self.w_qkv = nn.Dense(self.config.d_model * 3, kernel_init=jax.nn.initializers.normal(),
-                              use_bias=self.config.use_bias,
-                              dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision)
-        self.wo = nn.Dense(self.config.d_model, kernel_init=jax.nn.initializers.normal(), use_bias=self.config.use_bias,
-                           dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision)
+
+        if self.config.bits is not None:
+            _dot_general_cls = q_config.fully_quantized(
+                fwd_bits=self.config.bits,
+                bwd_bits=self.config.bits
+            )
+        else:
+            _dot_general_cls = None
+
+        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
+        self.w_qkv = nn.Dense(
+            self.config.d_model * 3,
+            kernel_init=jax.nn.initializers.normal(),
+            use_bias=self.config.use_bias,
+            dot_general=dot_general_cls,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision)
+        self.wo = nn.Dense(
+            self.config.d_model,
+            kernel_init=jax.nn.initializers.normal(),
+            use_bias=self.config.use_bias,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision,
+            dot_general=dot_general_cls
+        )
         if self.config.qk_ln:
             self.q_ln = nn.LayerNorm(use_bias=self.config.use_norm_bias)
             self.k_ln = nn.LayerNorm(use_bias=self.config.use_norm_bias)
@@ -343,18 +389,17 @@ class FlaxMptAttention(nn.Module):
                 ),
                 '...s q k->... s 1 q k'
             )
-            atw = dot_product_attention_multihead(
+            atw = efficient_attention(
                 query=q,
                 key=k,
                 value=v,
                 dtype=self.dtype,
                 precision=self.precision,
-                dropout_rate=0.0,
-                enable_dropout=False,
+                attention_drop_rate=0.0,
+                deterministic=False,
                 float32_logits=True,
-                rescale_logits=True,
                 bias=attn_mask,
-                causal_mask=False,
+                causal=False,
                 key_chunk_size=self.config.flash_attn_key_chunk_size,
                 query_chunk_size=self.config.flash_attn_query_chunk_size
             )
@@ -384,7 +429,7 @@ class FlaxMptBlock(nn.Module):
     config: MptConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         self.norm_1 = nn.LayerNorm(use_bias=self.config.use_norm_bias)
@@ -427,7 +472,7 @@ class FlaxMptCollection(nn.Module):
     config: MptConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         block = FlaxMptBlock
@@ -487,7 +532,7 @@ class FlaxMptModule(nn.Module):
     config: MptConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         self.wte = nn.Embed(num_embeddings=self.config.vocab_size, features=self.config.d_model)
@@ -610,7 +655,7 @@ class FlaxMptPretrainedModel(FlaxPreTrainedModel):
         if past_key_values is not None:
             params['cache'] = past_key_values
             mutable = ['cache']
-
+        rngs = {'params': jax.random.key(0)}
         predict = self.module.apply(
             params,
             input_ids=input_ids,
@@ -619,7 +664,8 @@ class FlaxMptPretrainedModel(FlaxPreTrainedModel):
             extra_embedding=extra_embedding,
             position_ids=position_ids,
             init_cache=init_cache,
-            mutable=mutable
+            mutable=mutable,
+            rngs=rngs
         )
         if past_key_values is not None and return_dict:
             predict, past_key_values = predict
@@ -639,7 +685,7 @@ class FlaxFlaxMptForCausalLMModule(nn.Module):
     config: MptConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         self.transformer = FlaxMptModule(
@@ -648,10 +694,20 @@ class FlaxFlaxMptForCausalLMModule(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
+        if self.config.bits is not None:
+            _dot_general_cls = q_config.fully_quantized(
+                fwd_bits=self.config.bits,
+                bwd_bits=self.config.bits
+            )
+        else:
+            _dot_general_cls = None
+
+        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
         if self.config.use_lm_head:
             self.lm_head = nn.Dense(self.config.vocab_size, kernel_init=jax.nn.initializers.normal(),
                                     use_bias=self.config.use_bias,
-                                    dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision)
+                                    dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision,
+                                    dot_general=dot_general_cls)
 
     def __call__(self,
                  input_ids: chex.Array,

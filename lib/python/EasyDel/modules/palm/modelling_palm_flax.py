@@ -82,7 +82,7 @@ class RMSNorm(nn.Module):
     eps: float = 1e-6
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         self.weight = self.param(
@@ -131,7 +131,7 @@ class ParallelPalmBlock(nn.Module):
     config: PalmConfig
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         attn_inner_dim = self.config.dim_head * self.config.num_attention_heads
@@ -210,7 +210,7 @@ class ParallelCollection(nn.Module):
     config: PalmConfig
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         block = ParallelPalmBlock
@@ -250,7 +250,7 @@ class PalmPretrainedModel(transformers.FlaxPreTrainedModel):
     config_class = PalmConfig
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def __init__(self, config: PalmConfig, input_shape=(1, 1), _do_init=False):
         module = self.module_class(
@@ -306,7 +306,7 @@ class PalmModule(nn.Module):
     config: PalmConfig
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         self.wte = nn.Embed(
@@ -394,7 +394,7 @@ class FlaxPalmForCausalLMModule(nn.Module):
     config: PalmConfig
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         self.path_way = PalmModule(
