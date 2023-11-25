@@ -57,7 +57,7 @@ def make_shard_and_gather_fns(partition_specs, dtype_specs=None):
     return shard_fns, gather_fns
 
 
-def get_names_from_parition_spec(partition_specs):
+def get_names_from_partition_spec(partition_specs):
     names = set()
     if isinstance(partition_specs, dict):
         partition_specs = partition_specs.values()
@@ -67,7 +67,7 @@ def get_names_from_parition_spec(partition_specs):
         elif isinstance(item, str):
             names.add(item)
         else:
-            names.update(get_names_from_parition_spec(item))
+            names.update(get_names_from_partition_spec(item))
 
     return list(names)
 
@@ -77,7 +77,7 @@ def names_in_mesh(*names):
 
 
 def with_sharding_constraint(x, partition_specs):
-    axis_names = get_names_from_parition_spec(partition_specs)
+    axis_names = get_names_from_partition_spec(partition_specs)
     if names_in_mesh(*axis_names):
         x = wsc(x, partition_specs)
     return x
@@ -182,8 +182,8 @@ class RNG:
 
 
 def get_mesh(
-        shape: str = (1, -1, 1),
-        axis_names=('dp', 'fsdp', 'mp')
+        shape: str = (1, -1, 1, 1),
+        axis_names=("dp", "fsdp", "tp", "mp")
 ):
     from jax.sharding import Mesh
     from jax.experimental import mesh_utils

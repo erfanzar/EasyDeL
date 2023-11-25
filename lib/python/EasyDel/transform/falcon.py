@@ -1,10 +1,12 @@
 import jax
+from fjformer import load_and_convert_checkpoint_to_torch
 from jax import numpy as jnp
 from tqdm import tqdm
 from transformers import FalconForCausalLM
 from ..modules.falcon import FalconConfig
 import torch
 from typing import Dict
+import gc
 
 
 def match_keywords(string, ts, ns):
@@ -17,7 +19,7 @@ def match_keywords(string, ts, ns):
     return True
 
 
-def falcon_from_pretrained(model_id, device=jax.devices('cpu')[0]):
+def falcon_from_pretrained(model_id, device):
     """
     return: Weight or Params for EasyDel Model , Config
     """
@@ -26,23 +28,25 @@ def falcon_from_pretrained(model_id, device=jax.devices('cpu')[0]):
     model = FalconForCausalLM.from_pretrained(model_id)
     easydel_wights = falcon_convert_pt_to_flax_7b(
         state_dict=model.state_dict(),
-        num_hidden_layers=config.num_hidden_layers,
+        config=config,
         device=device
     )
+    del model
+    gc.collect()
     config.add_jax_args()
     return easydel_wights, config
 
 
 def falcon_convert_pt_to_flax_7b(
-        state_dict, num_hidden_layers: int,
-        device=jax.devices('cpu')[0],
-        bias=False,
+        state_dict,
+        config: FalconConfig,
+        device,
         is_pb: bool = False
 ):
     with jax.default_device(device):
         state_dict_flax = {('transformer', 'wte', 'embedding'): state_dict[
             'transformer.word_embeddings.weight'].cpu().detach().numpy()}
-        pbar = tqdm(iterable=range(num_hidden_layers))
+        pbar = tqdm(iterable=range(config.num_hidden_layers))
         for i in pbar:
             pbar.set_description('Converting Layers')
             state_dict_flax[('transformer', 'h', f'{i}', 'input_layernorm', 'scale')] = state_dict[
@@ -69,7 +73,7 @@ def falcon_convert_pt_to_flax_7b(
                         'tried to access some of model weight but they were unavailable please open a bug or '
                         'check model config'
                     )
-            if bias:
+            if config.bias:
                 state_dict_flax[
                     ('transformer', 'h', f'{i}', 'self_attention', 'w_qkv', 'bias')] = state_dict[
                     f'transformer.h.{i}.self_attention.query_key_value.bias'].cpu().detach().numpy()
@@ -143,7 +147,20 @@ def falcon_convert_flax_to_pt_7b(state_dict_flax, num_hidden_layers: int, device
     return state_dict
 
 
-def falcon_convert_pt_to_flax(state_dict: Dict[str, torch.Tensor], config: FalconConfig, device=jax.devices('cpu')[0]):
+def falcon_easydel_to_hf(path, config: FalconConfig):
+    """
+        Takes path to easydel saved ckpt and return the model in pytorch (Transformers Huggingface)
+    """
+    torch_params = load_and_convert_checkpoint_to_torch(path)
+    edited_params = {}
+    for k, v in torch_params.items():
+        edited_params[k.replace('.kernel', '.weight').replace('.embedding', '.weight')] = v
+    model = FalconForCausalLM(config=config)
+    model.load_state_dict(edited_params)
+    return model
+
+
+def falcon_convert_hf_to_flax(state_dict: Dict[str, torch.Tensor], config: FalconConfig, device):
     lw = len('.weight')
     with jax.default_device(device):
         flax_dict = {}

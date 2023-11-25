@@ -9,6 +9,7 @@ from utils.index import Index
 from utils.vector import DynamicVector
 import testing
 
+
 @value
 @register_passable("trivial")
 struct DIR:
@@ -152,7 +153,6 @@ fn fread(
 alias BUF_SIZE = 4096
 
 
-
 fn to_char_ptr(s: String) -> Pointer[UInt8]:
     """Only ASCII-based strings."""
     let ptr = Pointer[UInt8]().alloc(len(s) + 1)
@@ -182,9 +182,6 @@ struct File:
     fn __del__(owned self) raises:
         if self.handle:
             pass
-            # let c = fclose(self.handle)
-            # if c != 0:
-            #     raise Error("Failed to close file")
         if self.fname:
             self.fname.free()
         if self.mode:
@@ -203,7 +200,7 @@ struct File:
 
     fn read[D: Dim](self, buffer: Buffer[D, DType.uint8]) raises -> Int:
         return fread(
-            buffer.data.as_scalar_pointer(), sizeof[UInt8](), BUF_SIZE, self.handle
+            buffer.data._as_scalar_pointer(), sizeof[UInt8](), BUF_SIZE, self.handle
         ).to_int()
 
 

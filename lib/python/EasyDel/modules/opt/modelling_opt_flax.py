@@ -37,6 +37,8 @@ from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
     with_sharding_constraint
 
 import chex
+
+
 class OPTConfig(PretrainedConfig):
     model_type = "opt"
     keys_to_ignore_at_inference = ["past_key_values"]
@@ -94,13 +96,14 @@ class OPTConfig(PretrainedConfig):
         self.layer_norm_elementwise_affine = layer_norm_elementwise_affine
         self._remove_final_layer_norm = _remove_final_layer_norm
         self.from_pt = False
+        self.mesh = None
 
     def get_partition_rules(self, fully_fsdp: bool = True):
         if not fully_fsdp:
             raise NotImplementedError
         else:
             return (
-                ('.*', PartitionSpec('fsdp'))
+                ('.*', PartitionSpec(('fsdp', 'mp')))
             )
 
     def add_jax_args(
@@ -158,7 +161,11 @@ class OPTConfig(PretrainedConfig):
             if not hasattr(self, k):
                 setattr(self, k, v)
         self.from_pt = False
-        return self
+        if not hasattr(self, 'mesh'):
+            self.mesh = None
+
+    def set_mesh(self, mesh):
+        self.mesh = mesh
 
 
 logger = logging.get_logger(__name__)
