@@ -307,7 +307,7 @@ import jax.sharding
 import logging
 import copy
 import functools
-from fjutils import with_sharding_constraint
+from fjformer import with_sharding_constraint
 from jax.experimental.pjit import pjit
 from transformers import GenerationConfig
 

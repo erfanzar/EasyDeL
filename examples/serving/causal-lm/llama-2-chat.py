@@ -1,7 +1,9 @@
+import typing
+
 import EasyDel
 import jax.lax
-from EasyDel import JAXServer
-from fjutils import get_float_dtype_by_name
+from EasyDel.serve import JAXServer, JaxServerConfig
+from fjformer.load._load import get_float_dtype_by_name
 from EasyDel.transform import llama_from_pretrained
 from transformers import AutoTokenizer
 import gradio as gr
@@ -37,6 +39,14 @@ class Llama2Host(JAXServer):
     def __init__(self, config=None):
         super().__init__(config=config)
 
+    @staticmethod
+    def format_instruct(system: str, instruction: str) -> str:
+        return get_prompt_llama2_format(instruction, [], system)
+
+    @staticmethod
+    def format_chat(history: typing.List[str], prompt: str, system: typing.Union[str, None]) -> str:
+        return get_prompt_llama2_format(prompt, history, system)
+
     @classmethod
     def load_from_torch(cls, repo_id, config=None):
         with jax.default_device(jax.devices('cpu')[0]):
@@ -44,7 +54,7 @@ class Llama2Host(JAXServer):
                 repo_id
             )
         tokenizer = AutoTokenizer.from_pretrained(repo_id)
-        model = EasyDel.FlaxLlamaForCausalLM(
+        model = EasyDel.modules.FlaxLlamaForCausalLM(
             config=config_model,
             dtype=get_float_dtype_by_name(config['dtype'] if config is not None else 'fp16'),
             param_dtype=get_float_dtype_by_name(config['dtype'] if config is not None else 'fp16'),
@@ -83,31 +93,6 @@ class Llama2Host(JAXServer):
             add_params_field=True,
             do_memory_log=False
         )
-
-    def process_gradio_chat(self, prompt, history, max_new_tokens, greedy, pbar=gr.Progress()):
-        string = get_prompt_llama2_format(
-            message=prompt,
-            chat_history=history,
-            system_prompt=DEFAULT_SYSTEM_PROMPT
-        )
-        response, _ = self.process(
-            string=string,
-            greedy=greedy,
-            max_new_tokens=max_new_tokens,
-            pbar=pbar
-        )
-        history.append([prompt, response])
-        return '', history
-
-    def process_gradio_instruct(self, prompt, system, max_new_tokens, greedy, pbar=gr.Progress()):
-        string = get_prompt_llama2_format(system_prompt=DEFAULT_SYSTEM_PROMPT, message=prompt, chat_history=[])
-        response, _ = self.process(
-            string=string,
-            greedy=greedy,
-            max_new_tokens=max_new_tokens,
-            pbar=pbar
-        )
-        return '', response
 
 
 if __name__ == "__main__":
@@ -190,23 +175,21 @@ if __name__ == "__main__":
         help="Whether to use a prefix tokenizer.",
     )
     args = parser.parse_args()
-    configs = {
-        "repo_id": args.repo_id,
-        "contains_auto_format": args.contains_auto_format,
-        "max_length": args.max_length,
-        "max_new_tokens": args.max_new_tokens,
-        "max_stream_tokens": args.max_stream_tokens,
-        "temperature": args.temperature,
-        "top_p": args.top_p,
-        "top_k": args.top_k,
-        "logging": args.logging,
-        "mesh_axes_names": args.mesh_axes_names,
-        "mesh_axes_shape": args.mesh_axes_shape,
-        "dtype": args.dtype,
-        "use_prefix_tokenizer": args.use_prefix_tokenizer
-    }
-    for key, value in configs.items():
-        print('\033[1;36m{:<30}\033[1;0m : {:>30}'.format(key.replace('_', ' '), f"{value}"))
+    configs = JaxServerConfig(
+        contains_auto_format=args.contains_auto_format,
+        max_length=args.max_length,
+        max_new_tokens=args.max_new_tokens,
+        max_stream_tokens=args.max_stream_tokens,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
+        logging=args.logging,
+        mesh_axes_names=args.mesh_axes_names,
+        mesh_axes_shape=args.mesh_axes_shape,
+        dtype=args.dtype,
+        use_prefix_tokenizer=args.use_prefix_tokenizer
+    )
+
     server = Llama2Host.load_from_torch(
         repo_id=args.repo_id,
         config=configs
