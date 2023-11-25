@@ -8,16 +8,16 @@ if [[ "$device" == "tpu" ]]; then
   # Install the dependencies for TPU
   pip install jax[tpu]==0.4.10 -f https://storage.googleapis.com/jax-releases/libtpu_releases.html -q
   pip install datasets flax optax --upgrade -q
-  pip install einops ml_collections gradio sentencepiece fjutils==0.0.17 protobuf==3.20.0 -q
+  pip install einops ml_collections gradio sentencepiece fjformer>=0.0.0 protobuf==3.20.0 -q
   pip install transformers --upgrade
   echo "Done."
 elif [[ "$device" == "gpu" ]]; then
   pip install numpy==1.25.2 -q
-  pip install transformers einops ml_collections gradio sentencepiece fjutils==0.0.19 protobuf -q
+  pip install transformers einops ml_collections gradio sentencepiece fjformer>=0.0.0 protobuf -q
   pip install datasets flax optax --upgrade -q
 elif [[ "$device" == "cpu" ]]; then
   pip install numpy==1.25.2 -q
-  pip install transformers einops ml_collections gradio sentencepiece fjutils==0.0.19 protobuf -q
+  pip install transformers einops ml_collections gradio sentencepiece fjformer>=0.0.0 protobuf -q
   pip install datasets flax optax --upgrade -q
 else
   # Print an error message

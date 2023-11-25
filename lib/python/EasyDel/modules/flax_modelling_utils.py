@@ -1,9 +1,11 @@
+import fjformer.attention
 from jax.interpreters import pxla
 from jax.experimental.pjit import with_sharding_constraint as wsc
 import jax
 from flax import linen as nn
 from functools import partial
 import chex
+from typing import Sequence
 
 ACT2FN = {
     "gelu": partial(nn.gelu, approximate=False),
@@ -42,12 +44,19 @@ def with_sharding_constraint(x, partition_specs):
 
 
 def get_gradient_checkpoint_policy(name):
-    return {
-        'everything_saveable': jax.checkpoint_policies.everything_saveable,
-        'nothing_saveable': jax.checkpoint_policies.nothing_saveable,
-        'checkpoint_dots': jax.checkpoint_policies.checkpoint_dots,
-        'checkpoint_dots_with_no_batch_dims': jax.checkpoint_policies.checkpoint_dots_with_no_batch_dims,
-    }[name]
+    gradients = dict(
+        everything_saveable=jax.checkpoint_policies.everything_saveable,
+        nothing_saveable=jax.checkpoint_policies.nothing_saveable,
+        dots_saveable=jax.checkpoint_policies.dots_saveable,
+        checkpoint_dots=jax.checkpoint_policies.checkpoint_dots,
+        dots_with_no_batch_dims_saveable=jax.checkpoint_policies.dots_with_no_batch_dims_saveable,
+        checkpoint_dots_with_no_batch_dims=jax.checkpoint_policies.checkpoint_dots_with_no_batch_dims,
+        save_anything_except_these_names=jax.checkpoint_policies.save_anything_except_these_names,
+        save_any_names_but_these=jax.checkpoint_policies.save_any_names_but_these,
+        save_only_these_names=jax.checkpoint_policies.save_only_these_names,
+        save_from_both_policies=jax.checkpoint_policies.save_from_both_policies
+    )
+    return gradients[name]
 
 
 def repeat_kv_bnsh(x: chex.Array, n_rep: int) -> chex.Array:
@@ -89,3 +98,46 @@ def rotate_half(x):
 
 def apply_rotary_pos_emb(tensor, sin_, cos_):
     return (tensor * cos_) + (rotate_half(tensor) * sin_)
+
+
+def get_ranks_and_size(mesh):
+    out = dict(mesh=mesh)
+    mp_size = mesh.shape['tp'] * mesh.shape['mp']
+    mp_node_size = max(1, mp_size // jax.local_device_count())
+    dp_node_size = jax.process_count() // mp_node_size
+    out.update(mp_node_size=mp_node_size,
+               dp_node_size=dp_node_size)
+
+    dp_node_rank = jax.process_index() // mp_node_size
+    mp_node_rank = jax.process_index() % mp_node_size
+    out.update(dp_node_rank=dp_node_rank,
+               mp_node_rank=mp_node_rank)
+    return out
+
+
+def get_flash_attention():
+    """
+    return: FlashAttention FN, Upcast Needed to float32
+    """
+    platform = jax.lib.xla_bridge.get_backend().platform
+    if platform == "gpu":
+        float32_logits = False
+        ring_attention_fn = fjformer.attention.ring_flash_attention_gpu
+    elif platform == 'tpu':
+        float32_logits = True
+        ring_attention_fn = fjformer.attention.ring_flash_attention_tpu
+    else:
+        raise ValueError(f'Unsupported platform {platform}')
+
+    return ring_attention_fn, float32_logits
+
+
+def create_mesh(
+        axis_dims: Sequence[int] = (1, -1, 1, 1), axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"), backend=''
+):
+    array_devices = jax.numpy.ones((len(jax.devices() if backend == '' else jax.devices(backend)), 1))
+    resh: jax.numpy.ndarray = array_devices.reshape(axis_dims)
+
+    return jax.sharding.Mesh(
+        resh, axis_names
+    )
