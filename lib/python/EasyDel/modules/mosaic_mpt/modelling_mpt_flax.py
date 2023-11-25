@@ -77,7 +77,7 @@ class MptConfig(PretrainedConfig):
         self.flash_attn_key_chunk_size = flash_attn_key_chunk_size
         self.flash_attn_query_chunk_size = flash_attn_query_chunk_size
         self.bits = bits
-        self.mesh = None
+
         self.from_pt = False
         if 'name' in kwargs:
             del kwargs['name']
@@ -211,11 +211,9 @@ class MptConfig(PretrainedConfig):
                 setattr(self, k, v)
 
         self.from_pt = False
-        if not hasattr(self, 'mesh'):
-            self.mesh = None
 
-    def set_mesh(self, mesh):
-        self.mesh = mesh
+
+
 
 
 class RMSNorm(nn.Module):

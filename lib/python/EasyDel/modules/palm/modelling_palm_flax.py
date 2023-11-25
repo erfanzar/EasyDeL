@@ -47,10 +47,9 @@ class PalmConfig(PretrainedConfig):
         self.vocab_size = vocab_size
         self.eps = eps
         self.max_length = max_length
-        self.mesh = None
 
-    def set_mesh(self, mesh):
-        self.mesh = mesh
+
+
 
     @staticmethod
     def _set_config_defaults(config, config_defaults):

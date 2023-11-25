@@ -114,7 +114,7 @@ class GPTJConfig(PretrainedConfig):
         super().__init__(
             bos_token_id=bos_token_id, eos_token_id=eos_token_id, tie_word_embeddings=tie_word_embeddings, **kwargs
         )
-        self.mesh = None
+
 
     @staticmethod
     def set_custom_partition(embedding_partition: PartitionSpec,
@@ -239,11 +239,9 @@ class GPTJConfig(PretrainedConfig):
                 setattr(self, k, v)
         self.from_pt = False
         return self
-        if not hasattr(self, 'mesh'):
-            self.mesh = None
 
-    def set_mesh(self, mesh):
-        self.mesh = mesh
+
+
 
 
 class GPTJOnnxConfig(OnnxConfigWithPast):
