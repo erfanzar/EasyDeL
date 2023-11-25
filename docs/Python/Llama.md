@@ -69,11 +69,11 @@ Here is a table comparing the different sizes of Llama models:
 
 ```python
 import jax
-from EasyDel import llama_from_pretrained
+from EasyDel.transform import llama_from_pretrained
 
 params, config = llama_from_pretrained(
     'meta-llama/Llama-2-7b',
-    device=jax.devices('cpu')[0]  # Offload on CPU
+    device  # Offload on CPU
 )
 ```
 
@@ -82,14 +82,15 @@ also keep that in mind that returned `config` includes `.get_partition_rules(fsd
 #### Use With JaxServer
 
 ```python
-from EasyDel import JAXServer, FlaxLlamaForCausalLM
+from EasyDel.serve import JAXServer
+from EasyDel.modules.llama import FlaxLlamaForCausalLM
 import jax
 from EasyDel.transform import llama_from_pretrained
 from transformers import AutoTokenizer
 
 params, config = llama_from_pretrained(
     'meta-llama/Llama-2-7b',
-    device=jax.devices('cpu')[0]  # Offload on CPU
+    device  # Offload on CPU
 )
 
 DEFAULT_SYSTEM_PROMPT = "You are a helpful, respectful and honest assistant and act as wanted"

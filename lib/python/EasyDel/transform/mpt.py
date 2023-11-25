@@ -1,3 +1,5 @@
+import gc
+
 from .. import MptConfig
 from jax import numpy as jnp
 import jax
@@ -39,7 +41,7 @@ def mpt_convert_flax_to_pt_7b(state_dict_flax, n_layers: int, device=torch.devic
     return state_dict
 
 
-def mpt_convert_pt_to_flax_7b(state_dict, n_layers: int, device=jax.devices('cpu')[0], use_lm_head=False):
+def mpt_convert_pt_to_flax_7b(state_dict, n_layers: int, device, use_lm_head=False):
     # CONVERTER MPT-7B
     with jax.default_device(device):
         state_dict_flax = {('transformer', 'wte', 'embedding'): state_dict[
@@ -65,7 +67,7 @@ def mpt_convert_pt_to_flax_7b(state_dict, n_layers: int, device=jax.devices('cpu
     return state_dict_flax
 
 
-def mpt_convert_pt_to_flax_1b(state_dict, n_layers: int, device=jax.devices('cpu')[0], use_lm_head=False, ):
+def mpt_convert_pt_to_flax_1b(state_dict, n_layers: int, device, use_lm_head=False, ):
     # CONVERTER MPT-1B
     with jax.default_device(device):
         state_dict_flax = {(('transformer', 'wte', 'embedding')): state_dict[
@@ -141,7 +143,7 @@ def mpt_convert_flax_to_pt_1b(state_dict_flax, n_layers: int, device=torch.devic
     return state_dict
 
 
-def mpt_from_pretrained(model_id, device=jax.devices('cpu')[0], **kwargs):
+def mpt_from_pretrained(model_id, device, **kwargs):
     """
     return: Weight or Params for EasyDel Model , Config
     """
@@ -154,4 +156,7 @@ def mpt_from_pretrained(model_id, device=jax.devices('cpu')[0], **kwargs):
         device=device
     )
     config.add_jax_args()
+
+    del model
+    gc.collect()
     return easydel_wights, config

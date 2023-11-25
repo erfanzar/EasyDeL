@@ -1,5 +1,5 @@
-from fjutils import StreamingCheckpointer, float_tensor_to_dtype
-from flax.traverse_util import flatten_dict, unflatten_dict
+from fjformer import StreamingCheckpointer, float_tensor_to_dtype
+from flax.traverse_util import flatten_dict
 
 
 def match_keywords(string, positives, negatives):

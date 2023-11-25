@@ -16,6 +16,7 @@ from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLM
 from ..flax_modelling_utils import ACT2FN, with_sharding_constraint, get_gradient_checkpoint_policy, repeat_kv_bnsh, \
     apply_rotary_pos_emb, precompute_freq_cis
 import chex
+from fjformer.bits import config as q_config, q_flax
 
 
 class MistralConfig(PretrainedConfig):
@@ -49,6 +50,7 @@ class MistralConfig(PretrainedConfig):
             attn_pdrop: float = 0.0,
             c_max_position_embeddings: int = 4096,
             freq_max_position_embeddings: int = 4096,
+            bits: Optional[int] = None,
             **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -58,7 +60,7 @@ class MistralConfig(PretrainedConfig):
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
         self.sliding_window = sliding_window
-
+        self.bits = bits
         # for backward compatibility
         if num_key_value_heads is None:
             num_key_value_heads = num_attention_heads
@@ -137,7 +139,8 @@ class MistralConfig(PretrainedConfig):
                      number_rep_kv: int = 1,
                      attn_pdrop: float = 0.0,
                      c_max_position_embeddings: int = 4096,
-                     freq_max_position_embeddings: int = None
+                     freq_max_position_embeddings: int = None,
+                     bits: Optional[int] = None,
                      ):
         self.use_flash_attention = use_flash_attention
         self.number_rep_kv = number_rep_kv
@@ -150,6 +153,7 @@ class MistralConfig(PretrainedConfig):
         self.attn_pdrop = attn_pdrop
         self.c_max_position_embeddings = c_max_position_embeddings
         self.freq_max_position_embeddings = freq_max_position_embeddings
+        self.bits = bits
 
     @staticmethod
     def get_weight_decay_exclusions():
@@ -244,13 +248,23 @@ class FlaxMistralMLP(nn.Module):
     precision: Optional[Union[None, jax.lax.Precision]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
+        if self.config.bits is not None:
+            _dot_general_cls = q_config.fully_quantized(
+                fwd_bits=self.config.bits,
+                bwd_bits=self.config.bits
+            )
+        else:
+            _dot_general_cls = None
+
+        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
         dense = functools.partial(
             nn.Dense,
             use_bias=False,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
-            kernel_init=nn.initializers.normal()
+            kernel_init=nn.initializers.normal(),
+            dot_general=dot_general_cls
         )
         self.gate_proj = dense(self.config.intermediate_size)
         self.up_proj = dense(self.config.intermediate_size)
@@ -275,14 +289,23 @@ class FlaxMistralAttention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
+        if self.config.bits is not None:
+            _dot_general_cls = q_config.fully_quantized(
+                fwd_bits=self.config.bits,
+                bwd_bits=self.config.bits
+            )
+        else:
+            _dot_general_cls = None
 
+        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
         dense = functools.partial(
             nn.Dense,
             use_bias=False,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
-            kernel_init=nn.initializers.normal()
+            kernel_init=nn.initializers.normal(),
+            dot_general=dot_general_cls
         )
 
         self.q_proj = dense(self.num_heads * self.head_dim)
@@ -555,7 +578,7 @@ class FlaxMistralPretrainedModel(FlaxPreTrainedModel):
             rng_s["dropout"] = dropout_rng
 
         inputs = {"params": params or self.params} if add_params_field else params or self.params
-
+        rng_s['params'] = jax.random.key(0)
         if past_key_values:
             inputs["cache"] = past_key_values
             mutable = ["cache"]
@@ -653,7 +676,7 @@ class FlaxMistralModule(nn.Module):
     config: MistralConfig
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def setup(self):
 
@@ -741,7 +764,7 @@ class FlaxMistralForCausalLMModule(nn.Module):
     config: MistralConfig
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def setup(self):
         self.model: FlaxMistralModule = FlaxMistralModule(
@@ -750,6 +773,16 @@ class FlaxMistralForCausalLMModule(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision,
         )
+
+        if self.config.bits is not None:
+            _dot_general_cls = q_config.fully_quantized(
+                fwd_bits=self.config.bits,
+                bwd_bits=self.config.bits
+            )
+        else:
+            _dot_general_cls = None
+
+        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
         self.lm_head = nn.Dense(
             self.config.vocab_size,
             dtype=self.dtype,
@@ -757,6 +790,7 @@ class FlaxMistralForCausalLMModule(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
             precision=self.precision,
+            dot_general=dot_general_cls
         )
 
     def __call__(

@@ -3,11 +3,11 @@ import pathlib
 import typing
 from typing import OrderedDict, List, Union
 
-import fjutils.optimizers
+import fjformer.optimizers
 
 import torch.utils.tensorboard
 import wandb
-from fjutils import StreamingCheckpointer
+from fjformer import StreamingCheckpointer
 from jax.experimental.mesh_utils import create_device_mesh
 
 from jax.sharding import Mesh
@@ -207,7 +207,7 @@ class TrainArguments(
 
         if self.optimizer == 'adafactor':
             if self.scheduler == 'linear':
-                tx, sc = fjutils.optimizers.get_adafactor_with_linear_scheduler(
+                tx, sc = fjformer.optimizers.get_adafactor_with_linear_scheduler(
                     learning_rate_start=self.learning_rate,
                     learning_rate_end=self.learning_rate_end,
                     gradient_accumulation_steps=self.gradient_accumulation_steps,
@@ -215,14 +215,14 @@ class TrainArguments(
                     **self.extra_optimizer_kwargs
                 )
             elif self.scheduler == 'cosine':
-                tx, sc = fjutils.optimizers.get_adafactor_with_cosine_scheduler(
+                tx, sc = fjformer.optimizers.get_adafactor_with_cosine_scheduler(
                     learning_rate=self.learning_rate,
                     steps=steps,
                     gradient_accumulation_steps=self.gradient_accumulation_steps,
                     **self.extra_optimizer_kwargs
                 )
             elif self.scheduler == 'none':
-                tx, sc = fjutils.optimizers.get_adafactor_with_linear_scheduler(
+                tx, sc = fjformer.optimizers.get_adafactor_with_linear_scheduler(
                     learning_rate_start=self.learning_rate,
                     learning_rate_end=self.learning_rate,
                     steps=steps,
@@ -230,7 +230,7 @@ class TrainArguments(
                     **self.extra_optimizer_kwargs
                 )
             elif self.scheduler == 'warm_up_cosine':
-                tx, sc = fjutils.optimizers.get_adafactor_with_warm_up_cosine_scheduler(
+                tx, sc = fjformer.optimizers.get_adafactor_with_warm_up_cosine_scheduler(
                     learning_rate=self.learning_rate,
                     steps=steps,
                     weight_decay=self.weight_decay,
@@ -238,7 +238,7 @@ class TrainArguments(
                     **self.extra_optimizer_kwargs
                 )
             elif self.scheduler == 'warm_up_linear':
-                tx, sc = fjutils.optimizers.get_adafactor_with_warmup_linear_scheduler(
+                tx, sc = fjformer.optimizers.get_adafactor_with_warmup_linear_scheduler(
                     learning_rate_start=self.learning_rate,
                     steps=steps,
                     learning_rate_end=self.learning_rate_end,
@@ -252,7 +252,7 @@ class TrainArguments(
                 raise ValueError('seems like you have choose wrong type or unavailable scheduler')
         elif self.optimizer == 'lion':
             if self.scheduler == 'linear':
-                tx, sc = fjutils.optimizers.get_lion_with_linear_scheduler(
+                tx, sc = fjformer.optimizers.get_lion_with_linear_scheduler(
                     learning_rate_start=self.learning_rate,
                     learning_rate_end=self.learning_rate_end,
                     steps=steps,
@@ -260,14 +260,14 @@ class TrainArguments(
                     **self.extra_optimizer_kwargs
                 )
             elif self.scheduler == 'cosine':
-                tx, sc = fjutils.optimizers.get_lion_with_cosine_scheduler(
+                tx, sc = fjformer.optimizers.get_lion_with_cosine_scheduler(
                     learning_rate=self.learning_rate,
                     gradient_accumulation_steps=self.gradient_accumulation_steps,
                     steps=steps,
                     **self.extra_optimizer_kwargs
                 )
             elif self.scheduler == 'none':
-                tx, sc = fjutils.optimizers.get_lion_with_linear_scheduler(
+                tx, sc = fjformer.optimizers.get_lion_with_linear_scheduler(
                     learning_rate_start=self.learning_rate,
                     learning_rate_end=self.learning_rate,
                     steps=steps,
@@ -275,7 +275,7 @@ class TrainArguments(
                     **self.extra_optimizer_kwargs
                 )
             elif self.scheduler == 'warm_up_cosine':
-                tx, sc = fjutils.optimizers.get_lion_with_warm_up_cosine_scheduler(
+                tx, sc = fjformer.optimizers.get_lion_with_warm_up_cosine_scheduler(
                     learning_rate=self.learning_rate,
                     steps=steps,
                     gradient_accumulation_steps=self.gradient_accumulation_steps,
@@ -283,7 +283,7 @@ class TrainArguments(
                 )
 
             elif self.scheduler == 'warm_up_linear':
-                tx, sc = fjutils.optimizers.get_lion_with_with_warmup_linear_scheduler(
+                tx, sc = fjformer.optimizers.get_lion_with_with_warmup_linear_scheduler(
                     learning_rate_start=self.learning_rate,
                     steps=steps,
                     learning_rate_end=self.learning_rate_end,
@@ -295,7 +295,7 @@ class TrainArguments(
                 raise ValueError('seems like you have choose wrong type or unavailable scheduler')
         elif self.optimizer == 'adamw':
             if self.scheduler == 'linear':
-                tx, sc = fjutils.optimizers.get_adamw_with_linear_scheduler(
+                tx, sc = fjformer.optimizers.get_adamw_with_linear_scheduler(
                     learning_rate_start=self.learning_rate,
                     learning_rate_end=self.learning_rate_end,
                     steps=steps,
@@ -303,7 +303,7 @@ class TrainArguments(
                     **self.extra_optimizer_kwargs
                 )
             elif self.scheduler == 'cosine':
-                tx, sc = fjutils.optimizers.get_adamw_with_cosine_scheduler(
+                tx, sc = fjformer.optimizers.get_adamw_with_cosine_scheduler(
                     learning_rate=self.learning_rate,
                     gradient_accumulation_steps=self.gradient_accumulation_steps,
                     steps=steps,
@@ -311,7 +311,7 @@ class TrainArguments(
                     **self.extra_optimizer_kwargs
                 )
             elif self.scheduler == 'none':
-                tx, sc = fjutils.optimizers.get_adamw_with_linear_scheduler(
+                tx, sc = fjformer.optimizers.get_adamw_with_linear_scheduler(
                     learning_rate_start=self.learning_rate,
                     learning_rate_end=self.learning_rate,
                     gradient_accumulation_steps=self.gradient_accumulation_steps,
@@ -319,7 +319,7 @@ class TrainArguments(
                     **self.extra_optimizer_kwargs
                 )
             elif self.scheduler == 'warm_up_cosine':
-                tx, sc = fjutils.optimizers.get_adamw_with_warm_up_cosine_scheduler(
+                tx, sc = fjformer.optimizers.get_adamw_with_warm_up_cosine_scheduler(
                     learning_rate=self.learning_rate,
                     steps=steps,
                     weight_decay=self.weight_decay,
@@ -327,7 +327,7 @@ class TrainArguments(
                     **self.extra_optimizer_kwargs
                 )
             elif self.scheduler == 'warm_up_linear':
-                tx, sc = fjutils.optimizers.get_adamw_with_warmup_linear_scheduler(
+                tx, sc = fjformer.optimizers.get_adamw_with_warmup_linear_scheduler(
                     learning_rate_start=self.learning_rate,
                     steps=steps,
                     weight_decay=self.weight_decay,

@@ -13,10 +13,11 @@ from flax.linen import combine_masks, make_causal_mask
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_flax_utils import FlaxPreTrainedModel
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput, FlaxSequenceClassifierOutput
-from fjutils.easylm import blockwise_dot_product_attention
+from fjformer.attention import efficient_attention
 from ..flax_modelling_utils import with_sharding_constraint, \
     get_gradient_checkpoint_policy, repeat_kv_bnsh, apply_rotary_pos_emb, precompute_freq_cis
 import chex
+from fjformer.bits import config as q_config, q_flax
 
 
 class LlamaConfig(PretrainedConfig):
@@ -51,6 +52,7 @@ class LlamaConfig(PretrainedConfig):
             flash_attn_query_chunk_size: int = 1024,
             flash_attn_key_chunk_size: int = 1024,
             scan_mlp_chunk_size: int = 1024,
+            bits: Optional[int] = None,
             **kwargs,
     ):
         num_key_value_heads = num_key_value_heads or number_rep_kv * num_attention_heads
@@ -80,7 +82,7 @@ class LlamaConfig(PretrainedConfig):
         self.flash_attn_key_chunk_size = flash_attn_key_chunk_size
         self.flash_attn_query_chunk_size = flash_attn_query_chunk_size
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
-
+        self.bits = bits
         super().__init__(
             # pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -142,6 +144,7 @@ class LlamaConfig(PretrainedConfig):
                      flash_attn_key_chunk_size: int = 1024,
                      scan_mlp_chunk_size: int = 1024,
                      number_rep_kv: int = 1,
+                     bits: Optional[int] = None,
                      ):
         self.use_flash_attention = use_flash_attention
         self.embd_pdrop = embd_pdrop
@@ -159,6 +162,7 @@ class LlamaConfig(PretrainedConfig):
         self.flash_attn_query_chunk_size = flash_attn_query_chunk_size
         self.flash_attn_key_chunk_size = flash_attn_key_chunk_size
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
+        self.bits = bits
 
     @staticmethod
     def get_weight_decay_exclusions():
@@ -166,7 +170,7 @@ class LlamaConfig(PretrainedConfig):
 
     @staticmethod
     def rng_keys():
-        return ('params', 'dropout', 'fcm')
+        return 'params', 'dropout', 'fcm'
 
 
 re_mat = nn_partitioning.remat
@@ -227,13 +231,23 @@ class FlaxLlamaAttention(nn.Module):
     config: LlamaConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def setup(self):
         config = self.config
         self.hidden_size = config.hidden_size
         self.head_dim = self.config.hidden_size // self.config.num_attention_heads
         self.number_of_reps = self.config.num_attention_heads // self.config.num_key_value_heads
+
+        if self.config.bits is not None:
+            _dot_general_cls = q_config.fully_quantized(
+                fwd_bits=self.config.bits,
+                bwd_bits=self.config.bits
+            )
+        else:
+            _dot_general_cls = None
+
+        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
 
         if self.number_of_reps == 1:
             assert self.config.num_attention_heads == self.config.num_key_value_heads
@@ -243,7 +257,8 @@ class FlaxLlamaAttention(nn.Module):
             param_dtype=self.param_dtype,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-            precision=self.precision
+            precision=self.precision,
+            dot_general=dot_general_cls
         )
         self.k_proj = nn.Dense(
             config.num_key_value_heads * self.head_dim,
@@ -251,7 +266,8 @@ class FlaxLlamaAttention(nn.Module):
             param_dtype=self.param_dtype,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-            precision=self.precision
+            precision=self.precision,
+            dot_general=dot_general_cls
         )
         self.v_proj = nn.Dense(
             config.num_key_value_heads * self.head_dim,
@@ -259,7 +275,8 @@ class FlaxLlamaAttention(nn.Module):
             param_dtype=self.param_dtype,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-            precision=self.precision
+            precision=self.precision,
+            dot_general=dot_general_cls
         )
         self.o_proj = nn.Dense(
             config.hidden_size,
@@ -267,7 +284,8 @@ class FlaxLlamaAttention(nn.Module):
             param_dtype=self.param_dtype,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-            precision=self.precision
+            precision=self.precision,
+            dot_general=dot_general_cls
         )
 
         self.rotary = FlaxLlamaEmbedding(self.dtype)
@@ -389,19 +407,18 @@ class FlaxLlamaAttention(nn.Module):
                 jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
             )
             attn_weights = None
-            attn_output = blockwise_dot_product_attention(
+            attn_output = efficient_attention(
                 query_state,
                 key_state,
                 value_state,
                 bias=attention_bias,
                 deterministic=deterministic,
                 dropout_rng=dropout_rng,
-                attn_pdrop=self.config.attn_pdrop,
+                attention_drop_rate=self.config.attn_pdrop,
                 causal=True,
                 query_chunk_size=self.config.scan_query_chunk_size,
                 key_chunk_size=self.config.scan_key_chunk_size,
                 dtype=self.dtype,
-                policy=get_gradient_checkpoint_policy('nothing_saveable'),
                 precision=self.precision,
                 float32_logits=True,
             )
@@ -434,10 +451,20 @@ class FlaxLlamaMLP(nn.Module):
     config: LlamaConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         config = self.config
+
+        if self.config.bits is not None:
+            _dot_general_cls = q_config.fully_quantized(
+                fwd_bits=self.config.bits,
+                bwd_bits=self.config.bits
+            )
+        else:
+            _dot_general_cls = None
+
+        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
 
         self.gate_proj = nn.Dense(
             config.intermediate_size,
@@ -446,6 +473,7 @@ class FlaxLlamaMLP(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
+            dot_general=dot_general_cls
         )
         self.down_proj = nn.Dense(
             config.hidden_size,
@@ -454,6 +482,7 @@ class FlaxLlamaMLP(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
+            dot_general=dot_general_cls
         )
         self.up_proj = nn.Dense(
             config.intermediate_size,
@@ -462,6 +491,7 @@ class FlaxLlamaMLP(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
+            dot_general=dot_general_cls
         )
         self.dropout = nn.Dropout(rate=self.config.resid_pdrop)
 
@@ -475,7 +505,7 @@ class FlaxLlamaBlock(nn.Module):
     config: LlamaConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         attn_block = FlaxLlamaAttention
@@ -686,6 +716,7 @@ class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
         if dropout_rng is not None:
             rngs["dropout"] = dropout_rng
 
+        rngs['params'] = jax.random.key(0)
         inputs = {"params": params or self.params} if add_params_field else params or self.params
 
         if past_key_values:
@@ -724,7 +755,7 @@ class FlaxLlamaBlockCollection(nn.Module):
     config: LlamaConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def setup(self):
         self.blocks = [
@@ -795,7 +826,7 @@ class FlaxLlamaModule(nn.Module):
     config: LlamaConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def setup(self):
 
@@ -882,7 +913,7 @@ class FlaxLlamaForCausalLMModule(nn.Module):
     config: LlamaConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def setup(self):
         self.model = FlaxLlamaModule(self.config,
@@ -890,6 +921,17 @@ class FlaxLlamaForCausalLMModule(nn.Module):
                                      param_dtype=self.param_dtype,
                                      precision=self.precision,
                                      )
+
+        if self.config.bits is not None:
+            _dot_general_cls = q_config.fully_quantized(
+                fwd_bits=self.config.bits,
+                bwd_bits=self.config.bits
+            )
+        else:
+            _dot_general_cls = None
+
+        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
+
         self.lm_head = nn.Dense(
             self.config.vocab_size,
             dtype=self.dtype,
@@ -897,6 +939,7 @@ class FlaxLlamaForCausalLMModule(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
             precision=self.precision,
+            dot_general=dot_general_cls
         )
 
     def __call__(
@@ -978,7 +1021,7 @@ class FlaxLlamaForSequenceClassificationModule(nn.Module):
     config: LlamaConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
 
     def setup(self):
         self.model = FlaxLlamaModule(self.config, dtype=self.dtype)
