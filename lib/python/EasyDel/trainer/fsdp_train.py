@@ -1,11 +1,11 @@
 import dataclasses
-import functools
 import os
 import time
 import typing
 
 import IPython.display
-from fjutils.easylm import blockwise_cross_entropy, cross_entropy_loss_and_accuracy
+import fjformer.func.loss_func
+from fjformer.func.loss_func import fused_cross_entropy_loss_and_accuracy, cross_entropy_loss_and_accuracy
 import wandb
 from datasets import Dataset
 
@@ -22,9 +22,10 @@ from jax.sharding import PartitionSpec
 from flax.training import train_state
 from jax import numpy as jnp
 from torch.utils.data import DataLoader
-from fjutils import match_partition_rules, make_shard_and_gather_fns, StreamingCheckpointer, count_params
+from fjformer import match_partition_rules, make_shard_and_gather_fns, StreamingCheckpointer
 from ..utils import prefix_print
 import chex
+
 
 def calculate_accuracy(predictions: chex.Array, targets: chex.Array):
     predicted_classes = jnp.argmax(predictions, axis=-1)
@@ -35,7 +36,7 @@ def calculate_accuracy(predictions: chex.Array, targets: chex.Array):
 
 
 def fsdp_train_step(state, batch):
-    batch = with_sharding_constraint(batch, PartitionSpec(('dp', 'fsdp')))
+    batch = with_sharding_constraint(batch, PartitionSpec(('dp', 'fsdp'), 'mp'))
 
     def calculate_loss(params):
         labels = batch.pop('labels')
@@ -57,7 +58,7 @@ def fsdp_eval_step(state, batch_eval):
     batch_eval = with_sharding_constraint(
         batch_eval,
         PartitionSpec(
-            ('dp', 'fsdp'))
+            ('dp', 'fsdp'), 'mp')
     )
 
     def calculate_loss(params):
@@ -203,6 +204,10 @@ class CausalLMTrainer:
         self.sharded_train_step_fn = funcs[1]
         self.sharded_predict = funcs[2]
         self.mesh = funcs[3]
+        if hasattr(self.model.config, 'set_mesh'):
+            self.model.config.set_mesh(self.mesh)
+        else:
+            self.model.config.mesh = self.mesh
         self.ckpt_streamer = funcs[4]
         self.init_fn = funcs[5]
         self.timer(
@@ -258,6 +263,11 @@ class CausalLMTrainer:
                 **self.arguments.configs_to_init_model_class,
                 _do_init=False
             )
+            if self.mesh is not None:
+                if hasattr(model.config, 'set_mesh'):
+                    model.config.set_mesh(self.mesh)
+                else:
+                    model.config.mesh = self.mesh
             config = self.arguments.configs_to_init_model_class['config']
 
         tx, scheduler = self.arguments.get_optimizer_and_scheduler(self.max_steps_train)
@@ -283,13 +293,10 @@ class CausalLMTrainer:
                 params=params_
             )
 
-        if self.arguments.loss_remat != '':
-            blockwise_cross = functools.partial(
-                blockwise_cross_entropy,
-                chunk_size=self.arguments.loss_chunk,
-                policy=self.arguments.loss_remat
-            )
-            loss_fn = blockwise_cross
+        if self.arguments.loss_remat == 'OHA':
+            loss_fn = fjformer.func.loss_func.cross_entropy_with_logits
+        elif self.arguments.loss_remat != '':
+            loss_fn = fused_cross_entropy_loss_and_accuracy
         else:
             loss_fn = cross_entropy_loss_and_accuracy
 
@@ -338,9 +345,20 @@ class CausalLMTrainer:
         return sharded_create_from_params_fn, sharded_train_step_fn, sharded_predict, mesh, ckpt_streamer, init_fn
 
     def train(self, model_parameters: flax.core.FrozenDict = None) -> OutputFineTuner:
+        def count_params(_p):
+            print('\033[1;31mModel Contain : ',
+                  sum(i.size for i in jax.tree_util.tree_flatten(flax.core.unfreeze(_p))[0]) / 1e9,
+                  ' Billion Parameters')
+
         dir_prefix: str = '/dev/shm'
         if self.arguments.track_memory:
             initialise_tracking(dir_prefix=dir_prefix)
+
+        if self.model.config.mesh is None:
+            if hasattr(self.model.config, 'set_mesh'):
+                self.model.config.set_mesh(self.mesh)
+            else:
+                self.model.config.mesh = self.mesh
 
         with self.mesh:
             if self.finetune:
