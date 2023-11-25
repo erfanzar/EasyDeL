@@ -28,13 +28,34 @@ The config input is a dictionary that contains the following keys:
 * `top_k`: The top-k parameter for sampling from the model's output distribution.
     * _Default Value has been set to  `50`_
 * `mesh_axes_shape`: The shape of the mesh axes for distributed training.
-    * _Default Value has been set to  `(1, -1, 1, 1)`_
+    * _Default Value has been set to  `(1, -1, 1)`_
 * `host`: The host address for the server.
     * _Default Value has been set to  `'0.0.0.0'`_
 * `dtype`: The data type for the model's parameters.
     * _Default Value has been set to  `'fp16'`_
 * `mesh_axes_names`: The names of the mesh axes for distributed training.
-    * _Default Value has been set to  `("dp", "fsdp", "tp", "mp")`_
+    * _Default Value has been set to  `('dp', 'fsdp', 'mp')`_
+* `system_prefix`: The prefix that will be prepended to system messages.
+    * _Default Value has been set to  `''`_
+* `system`: The system message to be displayed.
+    * _Default Value has been set to  `''`_
+* `prompt_prefix_instruct`: The prefix that will be prepended to instruction prompts.
+    * _Default Value has been set to  `''`_
+* `prompt_postfix_instruct`: The postfix that will be appended to instruction prompts.
+    * _Default Value has been set to  `''`_
+* `prompt_prefix_chat`: The prefix that will be prepended to chat prompts.
+    * _Default Value has been set to  `<|prompter|>`_
+* `prompt_postfix_chat`: The postfix that will be appended to chat prompts.
+    * _Default Value has been set to  `</s><|assistant|>`_
+* `instruct_format`: The format string for instruction prompts.
+    * _Default Value has been set to  `### SYSTEM:\n{system}\n### INSTRUCT:
+      \n{instruct}\n### ASSISTANT:\n`_
+* `chat_format`: The format string for chat prompts.
+    * _Default Value has been set to  `'<|prompter|>{prompt}</s><|assistant|>{assistant}</s>'`_
+* `chat_prefix`: The prefix that will be prepended to chat responses.
+    * _Default Value has been set to  `''`_
+* `contains_auto_format`: Whether the model should automatically format instruction prompts.
+    * _Default Value has been set to  `True`_
 * `logging`: Whether the model should log its training progress.:
     * _Default Value has been set to  `True`_
 * `stream_tokens_for_gradio`: Whether the model should stream tokens to Gradio.
@@ -45,23 +66,6 @@ The config input is a dictionary that contains the following keys:
     * _Default Value has been set to  `True`_
 
 ## JAXServer Functions
-`JAXServer` has `format_chat` and `format_instruct` funcs that you have to implement them to prompt your model
-
-```python
-@staticmethod
-def format_instruct(system: str, instruction: str)->str:
-    """
-    Here you will get the system and instruction from user, and you can apply your prompting style
-    """
-    raise NotImplementedError()
-
-@staticmethod
-def format_chat(history: typing.List[str], prompt: str, system: typing.Union[str, None])->str:
-    """
-    Here you will get the system, prompt and history from user, and you can apply your prompting style
-    """
-    raise NotImplementedError()
-```
 
 `JAXServer` Contains a method named `.process` and with using `process` method you can generate text from text
 

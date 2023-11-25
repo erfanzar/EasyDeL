@@ -58,7 +58,7 @@ pip install --upgrade "jax[cuda11_pip]" -f \
     * RLHF
     * [Serve](https://erfanzar.github.io/EasyDeL/docs/Python/Serve)
     * SMI
-    * [Trainer](https://erfanzar.github.io/EasyDeL/docs/Python/TrainingExample)
+    * Trainer
     * Transform
     * Utils
 

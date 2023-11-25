@@ -99,11 +99,6 @@ struct Tokenizer:
                 right = mid - 1
         return -1
 
-    fn encode(
-        inout self: Self, inout input_ids: DynamicVector[Int], string: String
-    ) raises:
-        byte_pr_tokenizer_encoder(input_ids, string, self)
-
 
 @always_inline
 fn load_tokenizer[

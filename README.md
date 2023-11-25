@@ -5,48 +5,21 @@ machine learning models. This library is primarily focused on Jax/Flax and plans
 train Flax/Jax Models on the `TPU/GPU` both for Serving and Training (EasyDel will support mojo and be rewriten for mojo
 too)
 
-## Available Models Are
+### EasyDel Mojo
 
-| Models          | FP16/FP32/BF16 | DP | FSDP | MP | FlashAttn | Gradient Checkpointing | 8/6/4Bit Interface and Training |
-|-----------------|:---------------|:---|------|----|-----------|------------------------|---------------------------------|
-| **_Llama_**     | ✅              | ✅  | ✅    | ✅  | ✅         | ✅                      | ✅                               |
-| **_Mistral_**   | ✅              | ✅  | ✅    | ✅  | ❌         | ✅                      | ✅                               |
-| **_Llama2_**    | ✅              | ✅  | ✅    | ✅  | ❌         | ✅                      | ✅                               |
-| **_GPT-J_**     | ✅              | ✅  | ✅    | ✅  | ✅         | ✅                      | ✅                               |
-| **_LT_**        | ✅              | ✅  | ✅    | ✅  | ❌         | ✅                      | ❌                               |
-| **_MosaicMPT_** | ✅              | ✅  | ✅    | ✅  | ✅         | ✅                      | ✅                               |
-| **_GPTNeoX-J_** | ✅              | ✅  | ✅    | ✅  | ✅         | ✅                      | ❌                               |
-| **_Falcon_**    | ✅              | ✅  | ✅    | ✅  | ✅         | ✅                      | ✅                               |
-| **_Palm_**      | ✅              | ✅  | ✅    | ✅  | ✅         | ✅                      | 🌪️                             |
-| **_T5_**        | ✅              | ✅  | ✅    | ✅  | ❌         | ✅                      | 🌪️                             |
-| **_OPT_**       | ✅              | ✅  | ✅    | ✅  | ❌         | ✅                      | ❌                               |
+EasyDel Mojo differs from EasyDel in Python in significant ways. In Python, you can leverage a vast array of packages to
+create a mid or high-level API in no time. However, when working with Mojo, it's a different story. Here, you have to
+build some of the features that other Python libraries provide, such as Jax for arrays and computations. But why not
+import numpy, Jax, and other similar packages to Mojo and use them?
 
-you can also tell me the model you want in Flax/Jax version and ill try my best to build it ;)
+There are several reasons why building packages in Mojo is more efficient than importing them from Python. Firstly, when
+you import packages from Python, you incur the overhead of translating and processing the Python code into Mojo code,
+which takes time. Secondly, the Python code may not be optimized for the Mojo runtime environment, leading to slower
+performance. Lastly, building packages directly in Mojo allows you to design and optimize them explicitly for the Mojo
+runtime environment, resulting in faster and more efficient code. With Mojo's built-in array capabilities that are
+35000x faster than Python, it's time to take your coding to the next level.
 
-## Current Update
-
-Some of the models supported by EasyDel will support 8,6,4 bit interface and Train these following models will be
-supported
-
-* [X] Llama (Supported via `LlamaConfig(bits=8)` or `LlamaConfig(bits=4)`)
-* [X] Falcon (Supported via `FalconConfig(bits=8)` or `FalconConfig(bits=4)`)
-* [X] Mistral (Supported via `MistalConfig(bits=8)` or `MistalConfig(bits=4)`)
-* [ ] Palm
-* [ ] T5
-* [X] MosaicGPT / MPT (Supported via `MptConfig(bits=8)` or `MptConfig(bits=4)`)
-* [X] GPT-J (Supported via `GPTJConfig(bits=8)` or `GPTJConfig(bits=4)`)
-
-#### About Bits in EasyDel
-
-in easydel bits are totally different from huggingface and in EasyDel training model with 8 bit is supported too without
-needs to change the code just change the bit and that's all you have todo but by the way you still have to pass
-the dtype and param_dtype cause unlike the transformers and bitsandbytes which store parameters in int8 and do
-operations
-in float16,bfloat16,float32 we don't do that like this in Jax we still store parameters as float16,bfloat16 or float32
-and
-do operations in bits like 8 6 4, and you can still train your model in this way and make it much more accurate than
-bitsandbytes
-or peft fine-tuning
+[Read More ...](https://github.com/erfanzar/EasyDeL/blob/main/lib/mojo/README.md)
 
 #### Note this Library needs golang to run (for some tracking stuff on TPU/GPU/CPU)
 
@@ -109,6 +82,26 @@ _Tutorials on how to use and train or serve your models with EasyDel is availabl
 
 3. [_Use Llama 2 Models_](https://github.com/erfanzar/EasyDeL/blob/main/LLAMA.md)
 
+## Available Models Are
+
+- **_Mistral_**     (Support `FSDP`, `MP`,` DP`)(_Supports gradient checkpointing_)
+- **_Llama_**     (Support `FSDP`, `MP`,` DP`)(_Supports gradient checkpointing_)
+- **_Llama2_**    (Support `FSDP`, `MP`,` DP`)(_Supports gradient checkpointing_)
+- **_GPT-J_**     (Support `FSDP`, `MP`,` DP`)(_Supports gradient checkpointing_)
+- **_LT_**        (Support `FSDP`, `MP`, `DP`)(_Supports gradient checkpointing_)
+- **_MosaicMPT_** (Support `FSDP`, `MP`,` DP`)(_Supports gradient checkpointing_)
+- **_GPTNeoX_**   (Support `FSDP`, `MP`, `DP`)(_Supports gradient checkpointing_)
+- **_Falcon_**    (Support `FSDP`, `MP`, `DP`)(_Supports gradient checkpointing_)
+- **_Palm_**      (Support `FSDP`, `MP`, `DP`)(_Supports gradient checkpointing_)
+- **_T5_**        (Support `FSDP`, `MP`, `DP`)(_Supports gradient checkpointing_)
+- **_OPT_**       (Support `FSDP`, `MP`, `DP`)(_Supports gradient checkpointing_)
+
+[//]: # (- **_XGen_**      _Soon_)
+
+- _LLama GPT-J MosaicMPT Falcon supports Flash Attention_
+
+you can also tell me the model you want in Flax/Jax version and ill try my best to build it ;)
+
 ## Serving
 
 you can read docs or examples to see how `JAXServer` works but let me show you how you can simply host and serve a
@@ -117,7 +110,7 @@ chat model (70B model is supported too)
 
 ```shell
 python -m examples.serving.causal-lm.llama-2-chat \
-  --repo_id='meta-llama/Llama-2-7b-chat-hf' --max_length=4096 \
+  --repo_id='meta-llama/Llama.md-2-7b-chat-hf' --max_length=4096 \
   --max_new_tokens=2048 --max_stream_tokens=32 --temperature=0.6 \
   --top_p=0.95 --top_k=50 \
   --dtype='fp16' --use_prefix_tokenizer
@@ -141,70 +134,75 @@ in beta version but it's works and ill soon release a Tutorial For that
 ## FineTuning
 
 with using EasyDel FineTuning LLM (CausalLanguageModels) are easy as much as possible with using Jax and Flax
-and having the benefit of TPUs for the best speed here's a simple code to use in order to finetune your
-own *_MPT / LLama / Falcon / OPT / GPT-J / GPT-Neox / Palm / T5_*
+and having the benefit of TPUs for the best speed here's a simple code to use in order to finetune your own MPT / LLama
 or any other models supported by EasyDel
 
 #### Step One
 
-Days Has Been Passed and now using easydel in Jax is way more similar to HF/PyTorch Style
-now it's time to finetune our model
+download converted model weights in order to finetune or convert the weights of the model you want to use
+transform in the library example
+
+```python
+import jax
+from EasyDel import mpt_convert_pt_to_flax_7b
+from fjutils.utils import save_ckpt
+
+number_of_layers = 32  # its 32 hidden layers for Mpt 7B
+device = jax.devices('cpu')[0]  # offload on CPU
+
+pytorch_model_state_dict = None  # StateDict of the model should be this one
+flax_params = mpt_convert_pt_to_flax_7b(pytorch_model_state_dict, number_of_layers, device)
+save_ckpt(flax_params, 'flax_param_easydel')
+```
+
+#### Step Two
+
+now it's time to finetune or model
 
 ```python
 import jax.numpy
-from EasyDel import TrainArguments, CausalLMTrainer, AutoEasyDelModelForCausalLM, FlaxLlamaForCausalLM
+from EasyDel import TrainArguments, CausalLMTrainer
 from datasets import load_dataset
-import flax
-from jax import numpy as jnp
-
-llama, params = AutoEasyDelModelForCausalLM.from_pretrained("", )
-# Llama 2 Max Sequence Length is 4096
+from EasyDel import configs
 
 max_length = 4096
-
-configs_to_init_model_class = {
-    'config': llama.config,
-    'dtype': jnp.bfloat16,
-    'param_dtype': jnp.bfloat16,
-    'input_shape': (1, 1)
-}
+conf = configs.mpt_configs['7b']
+conf['max_sequence_length'] = max_length
+conf['max_seq_len'] = max_length
 
 train_args = TrainArguments(
-    model_class=FlaxLlamaForCausalLM,
+    model_id='erfanzar/FlaxMpt-7B',
+    # right now you should use model supported with remote code from huggingface all model are supported and uploaded
     model_name='my_first_model_to_train_using_easydel',
     num_train_epochs=3,
-    learning_rate=5e-5,
+    learning_rate=1e-5,
     learning_rate_end=1e-6,
-    optimizer='adamw',  # 'adamw', 'lion', 'adafactor' are supported
+    optimizer='lion',  # 'adamw', 'lion', 'adafactor' are supported
     scheduler='linear',  # 'linear','cosine', 'none' ,'warm_up_cosine' and 'warm_up_linear'  are supported
     weight_decay=0.01,
-    total_batch_size=64,
+    total_batch_size=16,
     max_steps=None,  # None to let trainer Decide
     do_train=True,
     do_eval=False,  # it's optional but supported 
-    backend='tpu',  # default backed is set to cpu, so you must define you want to use tpu cpu or gpu
+    backend='tpu',  # default backed is set to cpu so you must define you want to use tpu cpu or gpu
     max_length=max_length,  # Note that you have to change this in the model config too
     gradient_checkpointing='nothing_saveable',
-    sharding_array=(1, -1, 1, 1),  # the way to shard model across gpu,cpu or TPUs using sharding array (1, -1, 1, 1)
-    # everything training will be in fully FSDP automatic and share data between devices
+    sharding_array=(1, -1, 1),  # the way to shard model across gpu,cpu or TPUs using sharding array (1, -1, 1)
+    # everything training will be in fully fsdp automatic and share data between devices
     use_pjit_attention_force=False,
+    extra_configs=conf,
     remove_ckpt_after_load=True,
-    gradient_accumulation_steps=8,
-    loss_remat='',
-    dtype=jnp.bfloat16
+    gradient_accumulation_steps=8
 )
 dataset = load_dataset('TRAIN_DATASET')
 dataset_train = dataset['train']
 dataset_eval = dataset['eval']
 
-trainer = CausalLMTrainer(
-    train_args,
-    dataset_train,
-    ckpt_path=None
-)
-
-output = trainer.train(flax.core.FrozenDict({'params': params}))
-print(f'Hey ! , here\'s where your model saved {output.last_save_file_name}')
+trainer = CausalLMTrainer(train_args,
+                          dataset_train,
+                          ckpt_path='flax_param_easydel')
+model_and_extra_outputs = trainer.train()
+print(f'Hey ! , here\'s where your model saved {model_and_extra_outputs.last_save_file_name}')
 
 
 ```
@@ -218,9 +216,8 @@ To use EasyDeL in your project, you will need to import the library in your Pyth
 and classes. Here is an example of how to import EasyDeL and use its Model class:
 
 ```python
-from EasyDel.modules import FlaxLlamaForCausalLM, LlamaConfig
-from EasyDel.serve import JAXServer
-from EasyDel.transform import llama_from_pretrained
+from EasyDel import JAXServer, FlaxLlamaForCausalLM, LlamaConfig
+from EasyDel import llama_from_pretrained
 from transformers import AutoTokenizer
 
 import jax
@@ -244,29 +241,10 @@ server = JAXServer.load_from_params(
     add_params_field=True
 )
 
-response_printed = 0
-for response, tokens_used in server.process(
-        'String To The Model', stream=True
-):
-    print(response[response_printed:], end='')
-    response_printed = len(response)
-``` 
-
-## EasyDel Mojo
-
-EasyDel Mojo differs from EasyDel in Python in significant ways. In Python, you can leverage a vast array of packages to
-create a mid or high-level API in no time. However, when working with Mojo, it's a different story. Here, you have to
-build some of the features that other Python libraries provide, such as Jax for arrays and computations. But why not
-import numpy, Jax, and other similar packages to Mojo and use them?
-
-There are several reasons why building packages in Mojo is more efficient than importing them from Python. Firstly, when
-you import packages from Python, you incur the overhead of translating and processing the Python code into Mojo code,
-which takes time. Secondly, the Python code may not be optimized for the Mojo runtime environment, leading to slower
-performance. Lastly, building packages directly in Mojo allows you to design and optimize them explicitly for the Mojo
-runtime environment, resulting in faster and more efficient code. With Mojo's built-in array capabilities that are
-35000x faster than Python, it's time to take your coding to the next level.
-
-[Read More ...](https://github.com/erfanzar/EasyDeL/blob/main/lib/mojo/README.md)
+predictions = server.process(
+    'String To The Model'
+)
+```
 
 ## Contributing
 
