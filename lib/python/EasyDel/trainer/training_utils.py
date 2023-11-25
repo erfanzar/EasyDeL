@@ -15,7 +15,7 @@ from jax.experimental.pjit import pjit, with_sharding_constraint
 from flax.training import train_state
 from jax import numpy as jnp
 from torch.utils.data import DataLoader
-from fjformer import match_partition_rules, make_shard_and_gather_fns, StreamingCheckpointer
+from fjutils import match_partition_rules, make_shard_and_gather_fns, StreamingCheckpointer, count_params
 
 
 def fsdp_train_step(state, batch, label_in_the_field=False, scope_logits=True):
@@ -240,6 +240,7 @@ def get_training_modules(
             'loading parameters'
         ).stop()
         timer.log(['loading parameters'])
+        count_params(sharded_train_state_.params)
 
         timer.write(timer.timers.keys(), 0)
 

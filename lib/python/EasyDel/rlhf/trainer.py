@@ -8,16 +8,18 @@ import typing
 from typing import Union, Optional, Callable, List, Any
 
 import optax
-from fjformer.monitor import tracker
+from fjutils import tracker
 import IPython
 import einops
+import fjutils
 import flax.training.train_state
 import jax
 import torch
 import tqdm.autonotebook
 import wandb
 from datasets import DatasetDict, Dataset, IterableDatasetDict, IterableDataset
-from fjformer import StreamingCheckpointer, optimizers
+from fjutils import StreamingCheckpointer
+from fjutils import optimizers
 from flax import struct, core
 
 from jax import numpy as jnp
@@ -169,7 +171,7 @@ class RLHFConfig(PretrainedConfig):
                  dtype: Union[str, jnp.dtype] = 'bf16',
                  param_dtype: Union[str, jnp.dtype] = 'bf16',
                  precision: Optional[Union[str, jax.lax.Precision, None]] = 'fastest',
-                 sharding_array: tuple = (1, -1, 1, 1),
+                 sharding_array: tuple = (1, -1, 1),
                  extra_optimizer_kwargs: dict = None,
                  model_name: str = 'RLHF',
                  save_dir: str = 'easydel_ckpt',
@@ -253,7 +255,7 @@ class RLHFConfig(PretrainedConfig):
 
     @staticmethod
     def get_mesh_names():
-        return "dp", "fsdp", "tp", "mp"
+        return 'dp', 'fsdp', 'mp'
 
     @staticmethod
     def get_optimizer_and_scheduler(
@@ -570,8 +572,8 @@ class RLHFTrainer:
                 params_reward_=params_reward
             )
         )
-        partition_specs = fjformer.match_partition_rules(params=shape, rules=partition_rules)
-        shard_fns, _ = fjformer.make_shard_and_gather_fns(
+        partition_specs = fjutils.match_partition_rules(params=shape, rules=partition_rules)
+        shard_fns, _ = fjutils.make_shard_and_gather_fns(
             partition_specs=partition_specs,
             dtype_specs=self.config.dtype
         )
@@ -813,7 +815,7 @@ class RLHFTrainer:
             )
             rearrange_ = lambda t: einops.rearrange(t, '1 ... -> ...')
             pbar = tqdm.tqdm(iterable=range(num_episodes), desc='Episode')
-            for _ in pbar:
+            for _  in pbar:
                 for time_step in range(max_time_steps):
                     time += 1
                     index = get_rand()
