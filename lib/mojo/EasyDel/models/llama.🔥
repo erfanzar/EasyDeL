@@ -1,10 +1,17 @@
 from ..utilities import FileBuffer
-from ..array import Array, ArrayShape, PointerOperation
 from runtime.llcl import num_cores
 import math
-from algorithm.functional import parallelize
-from ..linen import embedding, rms_layernorm_2d, rope, qkv_tranpose, repeat_kv
-from algorithm.functional import vectorize, parallelize
+from algorithm.functional import vectorize, parallelize, parallelize
+from tensor import Tensor, TensorSpec, TensorShape
+from ..tensor_utils import (
+    TensorSlice,
+    batch_matmul_row,
+    rmsnorm,
+    matmul_row,
+    tensor_add,
+    scope_softmax,
+)
+from memory import memset_zero
 
 
 struct LlamaConfig:
@@ -110,381 +117,286 @@ struct LlamaConfig:
         print_no_newline("\033[1;0m")
 
 
-struct LlamaWeights[DT: DType]:
-    var wte: Array[DT]
-    var fcr: Array[DT]
-    var fci: Array[DT]
-    var input_layernorm: Array[DT]
-    var q_proj: Array[DT]
-    var k_proj: Array[DT]
-    var v_proj: Array[DT]
-    var o_proj: Array[DT]
-    var post_layernorm: Array[DT]
-    var w1: Array[DT]
-    var w3: Array[DT]
-    var w2: Array[DT]
-    var norm: Array[DT]
-    var lm_head: Array[DT]
+struct LlamaRunState[T: DType]:
+    var x: Tensor[T]
+    var residual: Tensor[T]
+    var residual2: Tensor[T]
+    var w1: Tensor[T]
+    var w3: Tensor[T]
+    var q: Tensor[T]
+    var k: TensorSlice[T]
+    var v: TensorSlice[T]
+    var att: Tensor[T]
+    var logits: Tensor[T]
+    var key_cache: Tensor[T]
+    var value_cache: Tensor[T]
+
+    fn __init__(inout self, config: LlamaConfig) raises:
+        self.x = Tensor[T](config.hidden_size)
+        self.residual = Tensor[T](config.hidden_size)
+        self.residual2 = Tensor[T](config.hidden_size)
+        self.w1 = Tensor[T](config.intermediate_size)
+        self.w3 = Tensor[T](config.intermediate_size)
+        self.q = Tensor[T](config.hidden_size)
+        self.att = Tensor[T](config.num_attention_heads, config.max_position_embeddings)
+        self.logits = Tensor[T](config.vocab_size)
+        self.key_cache = Tensor[T](
+            config.num_hidden_layers, config.max_position_embeddings, config.kv_dims
+        )
+        self.value_cache = Tensor[T](
+            config.num_hidden_layers, config.max_position_embeddings, config.kv_dims
+        )
+        self.k = TensorSlice[T](Tensor[T](TensorShape(1, config.kv_dims)), 1)
+        self.v = TensorSlice[T](Tensor[T](TensorShape(1, config.kv_dims)), 1)
+
+
+fn load_weights[T: DType](inout buf: FileBuffer, *dims: Int) raises -> Tensor[T]:
+    let shape = TensorShape(dims)
+    let result_data = DTypePointer[T].alloc(shape.num_elements())
+    memcpy(
+        result_data,
+        buf.read_numerical_value_dynamic[T](shape.num_elements()),
+        shape.num_elements(),
+    )
+    return Tensor[T](result_data, shape)
+
+
+struct LlamaWeights[T: DType]:
+    var wte: Tensor[T]
+    var fcr: Tensor[T]
+    var fci: Tensor[T]
+    var input_layernorm_weight: Tensor[T]
+    var q_proj: Tensor[T]
+    var k_proj: Tensor[T]
+    var v_proj: Tensor[T]
+    var o_proj: Tensor[T]
+    var post_layernorm_weight: Tensor[T]
+    var w1: Tensor[T]
+    var w3: Tensor[T]
+    var w2: Tensor[T]
+    var norm: Tensor[T]
+    var wcls: Tensor[T]
 
     fn __init__(
-        inout self,
-        config: LlamaConfig,
-        shared_weights: Bool,
-        inout buf: FileBuffer,
+        inout self, config: LlamaConfig, shared_weights: Int, inout buf: FileBuffer
     ) raises:
-        let size: Int = sizeof[DT]()
-        self.wte = Array[DT](
-            buf.read_numerical_value_dynamic[DT](
-                config.hidden_size * config.vocab_size
-            ),
-            config.vocab_size,
-            config.hidden_size,
+        self.wte = load_weights[T](buf, config.vocab_size, config.hidden_size)
+        self.input_layernorm_weight = load_weights[T](
+            buf, config.num_hidden_layers, config.hidden_size
         )
-
-        self.input_layernorm = Array[DT](
-            buf.read_numerical_value_dynamic[DT](
-                config.hidden_size * config.num_hidden_layers
-            ),
-            config.hidden_size,
-            config.num_hidden_layers,
+        self.q_proj = load_weights[T](
+            buf, config.num_hidden_layers, config.hidden_size, config.hidden_size
         )
-
-        self.q_proj = Array[DT](
-            buf.read_numerical_value_dynamic[DT](
-                config.num_hidden_layers * config.hidden_size * config.hidden_size
-            ),
-            config.num_hidden_layers,
-            config.hidden_size,
-            config.hidden_size,
+        self.k_proj = load_weights[T](
+            buf, config.num_hidden_layers, config.kv_dims, config.hidden_size
         )
-
-        self.k_proj = Array[DT](
-            buf.read_numerical_value_dynamic[DT](
-                config.num_hidden_layers * config.kv_dims * config.hidden_size
-            ),
-            config.num_hidden_layers,
-            config.kv_dims,
-            config.hidden_size,
+        self.v_proj = load_weights[T](
+            buf, config.num_hidden_layers, config.kv_dims, config.hidden_size
         )
-
-        self.v_proj = Array[DT](
-            buf.read_numerical_value_dynamic[DT](
-                config.num_hidden_layers * config.kv_dims * config.hidden_size
-            ),
-            config.num_hidden_layers,
-            config.kv_dims,
-            config.hidden_size,
+        self.o_proj = load_weights[T](
+            buf, config.num_hidden_layers, config.hidden_size, config.hidden_size
         )
-
-        self.o_proj = Array[DT](
-            buf.read_numerical_value_dynamic[DT](
-                config.num_hidden_layers * config.hidden_size * config.hidden_size
-            ),
-            config.num_hidden_layers,
-            config.hidden_size,
-            config.hidden_size,
+        self.post_layernorm_weight = load_weights[T](
+            buf, config.num_hidden_layers, config.hidden_size
         )
-
-        self.post_layernorm = Array[DT](
-            buf.read_numerical_value_dynamic[DT](
-                config.hidden_size * config.num_hidden_layers
-            ),
-            config.hidden_size,
-            config.num_hidden_layers,
+        self.w1 = load_weights[T](
+            buf, config.num_hidden_layers, config.intermediate_size, config.hidden_size
         )
-
-        self.w1 = Array[DT](
-            buf.read_numerical_value_dynamic[DT](
-                config.num_hidden_layers * config.hidden_size * config.intermediate_size
-            ),
-            config.num_hidden_layers,
-            config.hidden_size,
-            config.intermediate_size,
+        self.w2 = load_weights[T](
+            buf, config.num_hidden_layers, config.hidden_size, config.intermediate_size
         )
-
-        self.w2 = Array[DT](
-            buf.read_numerical_value_dynamic[DT](
-                config.num_hidden_layers * config.hidden_size * config.intermediate_size
-            ),
-            config.num_hidden_layers,
-            config.hidden_size,
-            config.intermediate_size,
+        self.w3 = load_weights[T](
+            buf, config.num_hidden_layers, config.intermediate_size, config.hidden_size
         )
-
-        self.w3 = Array[DT](
-            buf.read_numerical_value_dynamic[DT](
-                config.num_hidden_layers * config.hidden_size * config.intermediate_size
-            ),
-            config.num_hidden_layers,
-            config.hidden_size,
-            config.intermediate_size,
+        self.norm = load_weights[T](buf, config.hidden_size)
+        self.fcr = load_weights[T](
+            buf, config.max_position_embeddings, config.head_dims // 2
         )
-
-        self.norm = Array[DT](
-            buf.read_numerical_value_dynamic[DT](config.hidden_size),
-            1,
-            config.hidden_size,
+        self.fci = load_weights[T](
+            buf, config.max_position_embeddings, config.head_dims // 2
         )
-
-        self.fcr = Array[DT](
-            buf.read_numerical_value_dynamic[DT](
-                config.max_position_embeddings * (config.head_dims // 2)
-            ),
-            config.max_position_embeddings,
-            config.head_dims // 2,
-        )
-
-        self.fci = Array[DT](
-            buf.read_numerical_value_dynamic[DT](
-                config.max_position_embeddings * (config.head_dims // 2)
-            ),
-            config.max_position_embeddings,
-            config.head_dims // 2,
-        )
-
-        self.lm_head = Array[DT](config.hidden_size, config.vocab_size)
         if shared_weights:
-            self.lm_head.set_data_from_buffer(self.wte.data)
+            self.wcls = self.wte
         else:
-            self.lm_head.set_data_from_buffer(
-                buf.read_numerical_value_dynamic[DT](self.lm_head.num_elements())
-            )
+            self.wcls = load_weights[T](buf, config.vocab_size, config.hidden_size)
 
 
-struct LlamaState[DT: DType]:
-    var k_cache: Array[DT]
-    var v_cache: Array[DT]
-
-    var position_index: Int
-    var number_of_cores: Int
-
-    fn __init__(inout self: Self, config: LlamaConfig):
-        self.k_cache = Array[DT](
-            config.num_hidden_layers,
-            config.num_key_value_heads,
-            config.max_position_embeddings,
-            config.head_dims,
-        )
-        self.v_cache = Array[DT](
-            config.num_hidden_layers,
-            config.num_key_value_heads,
-            config.max_position_embeddings,
-            config.head_dims,
-        )
-
-        self.v_cache.alloc(0.0)
-        self.k_cache.alloc(0.0)
-
-        self.position_index = 0
-        self.number_of_cores = num_cores()
-
-
-fn llama_forward_call[
-    DT: DType, nelts: Int, cores: Int, parallelized: Bool
+fn rope_rotation_llama[
+    T: DType, cores: Int
 ](
-    input_ids: VariadicList[Int],
-    position_ids: Array[DT],
-    llama_state: LlamaState[DT],
-    llama: LlamaWeights[DT],
+    inout q: Tensor[T],
+    inout k: TensorSlice[T],
+    freq_cis_real_row: TensorSlice[T],
+    freq_cis_imag_row: TensorSlice[T],
     config: LlamaConfig,
-    position_int: Int,
-) raises -> Array[DT]:
-    @parameter
-    fn write_to_cahce(array: Array[DT], array_cache: Array[DT], layer_index: Int):
-        let start_seq = position_ids[0].to_int()
-        var end_seq = position_ids[position_ids.num_elements() - 1].to_int() + 1
-        for s in range(start_seq, end_seq):
-            for i in range(config.num_key_value_heads):
-
-                @parameter
-                fn rows(j: Int):
-                    let cache_index: Int = array_cache.get_index(layer_index, i, s, j)
-                    let array_index: Int = array.get_index(0, i, s - start_seq, j)
-                    array_cache.store[1](cache_index, array.load[1](array_index))
-
-                parallelize[rows](config.head_dims, cores)
+) -> None:
+    # stories model, llama2
+    let head_dims = config.head_dims
 
     @parameter
-    fn read_from_cache(array_cache: Array[DT], layer_index: Int) -> Array[DT]:
-        var end_seq = position_ids[position_ids.num_elements() - 1].to_int() + 1
-        var array: Array[DT] = Array[DT](
-            1, config.num_key_value_heads, end_seq, config.head_dims
-        )
-        array.alloc(0.0)
+    fn head_loop(i: Int):
+        for j in range(0, config.head_dims, 2):
+            let fcr = freq_cis_real_row[j // 2]
+            let fci = freq_cis_imag_row[j // 2]
+            let q0 = q[i * head_dims + j]
+            let q1 = q[i * head_dims + j + 1]
+            q[i * head_dims + j] = q0 * fcr - q1 * fci
+            q[i * head_dims + j + 1] = q0 * fci + q1 * fcr
+            if i < config.num_key_value_heads:
+                let k0 = k[i * head_dims + j]
+                let k1 = k[i * head_dims + j + 1]
+                k[i * head_dims + j] = k0 * fcr - k1 * fci
+                k[i * head_dims + j + 1] = k0 * fci + k1 * fcr
 
-        for s in range(0, end_seq):
-            for i in range(config.num_key_value_heads):
+    parallelize[head_loop](config.num_attention_heads, cores)
 
-                @parameter
-                fn rows(j: Int):
-                    let cache_index: Int = array_cache.get_index(layer_index, i, s, j)
-                    let array_index: Int = array.get_index(0, i, s, j)
-                    array.store[1](array_index, array_cache.load[1](cache_index))
 
-                parallelize[rows](config.head_dims, cores)
+@always_inline
+fn llama_forward[
+    T: DType, nelts: Int, cores: Int
+](
+    input_id: Int,
+    position_id: Int,
+    config: LlamaConfig,
+    inout state: LlamaRunState[T],
+    weights: LlamaWeights[T],
+) -> None:
+    let hidden_size = config.hidden_size
+    let intermediate_size = config.intermediate_size
+    let head_dims = config.head_dims
+    let kv_dims = config.kv_dims
+    let number_rep_kv = config.number_rep_kv
 
-        return array
+    let content_row = weights.wte.data().offset(input_id * hidden_size)
+    memcpy[T](state.x.data(), content_row, hidden_size)
 
-    # Attention Forward
+    let freq_cis_real_row = TensorSlice[T](weights.fcr, position_id)
+    let freq_cis_imag_row = TensorSlice[T](weights.fci, position_id)
 
-    @parameter
-    fn attention_forward(
-        hidden_state: Array[DT],
-        layer_index: Int,
-    ) raises -> Array[DT]:
-        let query_sequence_length = position_ids.num_elements()
-
-        let kv_sequence_length = position_ids[
-            position_ids.num_elements() - 1
-        ].to_int() + 1
-        let q_index = layer_index * config.hidden_size * config.hidden_size
-        let kv_index = layer_index * config.kv_dims * config.hidden_size
-
-        let wq = llama.q_proj.data.offset(q_index)
-        let wk = llama.k_proj.data.offset(kv_index)
-        let wv = llama.v_proj.data.offset(kv_index)
-        let wo = llama.o_proj.data.offset(q_index)
-
-        var q = matmul[DT, nelts, cores, parallelized](
-            hidden_state, Array[DT](wq, config.hidden_size, config.hidden_size)
-        )
-        var k = matmul[DT, nelts, cores, parallelized](
-            hidden_state, Array[DT](wk, config.hidden_size, config.kv_dims)
-        )
-        var v = matmul[DT, nelts, cores, parallelized](
-            hidden_state, Array[DT](wv, config.hidden_size, config.kv_dims)
+    for layer_inedx in range(config.num_hidden_layers):
+        rmsnorm[T, nelts](
+            state.residual,
+            state.x,
+            TensorSlice[T](weights.input_layernorm_weight, layer_inedx),
         )
 
-        q.reshape(
-            1, query_sequence_length, config.num_attention_heads, config.head_dims
-        )
-        k.reshape(
-            1, query_sequence_length, config.num_key_value_heads, config.head_dims
-        )
-        v.reshape(
-            1, query_sequence_length, config.num_key_value_heads, config.head_dims
-        )
+        let cache_padding = layer_inedx * config.max_position_embeddings * config.kv_dims
 
-        q = qkv_tranpose[DT, nelts, cores](q)
-        k = qkv_tranpose[DT, nelts, cores](k)
-        v = qkv_tranpose[DT, nelts, cores](v)
+        state.k = TensorSlice[T](state.key_cache, layer_inedx, position_id)
+        state.v = TensorSlice[T](state.value_cache, layer_inedx, position_id)
 
-        q = rope[DT, nelts, cores](q, llama.fcr, llama.fci, position_ids)
-        k = rope[DT, nelts, cores](k, llama.fcr, llama.fci, position_ids)
-
-        write_to_cahce(k, llama_state.k_cache, layer_index)
-        k = read_from_cache(llama_state.k_cache, layer_index)
-
-        write_to_cahce(v, llama_state.v_cache, layer_index)
-        v = read_from_cache(llama_state.v_cache, layer_index)
-
-        if config.number_rep_kv != 1:
-            k = repeat_kv[DT, nelts, cores](k, config.number_rep_kv)
-            v = repeat_kv[DT, nelts, cores](v, config.number_rep_kv)
-
-        k = k.T[nelts, cores]()
-
-        var attention = matmul[DT, nelts, cores, parallelized](q, k)
-
-        for i in range(attention.num_elements()):
-            let x_rep: SIMD[DT, 1] = (
-                attention.data.simd_load[1](i) / math.sqrt[DT, 1](config.head_dims)
+        if kv_dims == hidden_size:
+            batch_matmul_row[T, nelts, cores, 3](
+                StaticTuple[3, DTypePointer[T]](
+                    state.q.data(), state.k.data(), state.v.data()
+                ),
+                state.residual.data(),
+                StaticTuple[3, DTypePointer[T]](
+                    TensorSlice[T](weights.q_proj, layer_inedx).data(),
+                    TensorSlice[T](weights.k_proj, layer_inedx).data(),
+                    TensorSlice[T](weights.v_proj, layer_inedx).data(),
+                ),
+                hidden_size,
+                hidden_size,
             )
-            attention.data.simd_store[1](i, x_rep)
+        else:
+            matmul_row[T, nelts, cores](
+                state.q, state.residual, TensorSlice[T](weights.q_proj, layer_inedx)
+            )
+            batch_matmul_row[T, nelts, cores, 2](
+                StaticTuple[2, DTypePointer[T]](state.k.data(), state.v.data()),
+                state.residual.data(),
+                StaticTuple[2, DTypePointer[T]](
+                    TensorSlice[T](weights.k_proj, layer_inedx).data(),
+                    TensorSlice[T](weights.v_proj, layer_inedx).data(),
+                ),
+                kv_dims,
+                hidden_size,
+            )
 
-        attention = softmax[DT, nelts, cores](attention, -1)
-        var attention_weight = matmul[DT, nelts, cores, parallelized](attention, v)
-        attention_weight = qkv_tranpose[DT, nelts, cores](attention_weight)
-
-        attention_weight.reshape(1, query_sequence_length, config.hidden_size)
-        let output = matmul[DT, nelts, cores, parallelized](
-            attention_weight, Array[DT](wo, config.hidden_size, config.hidden_size)
-        )
-        return output
-
-    @parameter
-    fn mlp_forward(
-        hidden_state: Array[DT],
-        layer_index: Int,
-    ) -> Array[DT]:
-        let mlp_pad: Int = layer_index * config.hidden_size * config.intermediate_size
-
-        let w1: DTypePointer[DT] = llama.w1.data.offset(mlp_pad)
-        let w2: DTypePointer[DT] = llama.w2.data.offset(mlp_pad)
-        let w3: DTypePointer[DT] = llama.w3.data.offset(mlp_pad)
-
-        let w1_array: Array[DT] = Array[DT](
-            w1, config.hidden_size, config.intermediate_size
-        )
-        let w2_array: Array[DT] = Array[DT](
-            w2, config.intermediate_size, config.hidden_size
-        )
-        let w3_array: Array[DT] = Array[DT](
-            w3, config.hidden_size, config.intermediate_size
+        rope_rotation_llama[T, cores](
+            state.q, state.k, freq_cis_real_row, freq_cis_imag_row, config
         )
 
-        let w1_res: Array[DT] = matmul[DT, nelts, cores, parallelized](
-            hidden_state, w1_array
+        memset_zero[T](state.residual.data(), state.residual.num_elements())
+
+        @parameter
+        fn loop_over_heads(h: Int):
+            let q_offset = h * head_dims
+            let att_offset = h * config.max_position_embeddings
+            for t in range(position_id + 1):
+                let k_offset = cache_padding + t * kv_dims + (
+                    h // number_rep_kv
+                ) * head_dims
+                var score: SIMD[T, 1] = 0.0
+
+                @parameter
+                fn score_fn[_nelts: Int](i: Int):
+                    score += (
+                        state.q.simd_load[_nelts](q_offset + i)
+                        * state.key_cache.simd_load[_nelts](k_offset + i)
+                    ).reduce_add()
+
+                vectorize[nelts, score_fn](head_dims)
+                score /= math.sqrt[T, 1](head_dims)
+                state.att[att_offset + t] = score
+            scope_softmax[T, nelts](state.att, att_offset, att_offset + position_id + 1)
+
+            let residual_offset = h * head_dims
+            for t in range(position_id + 1):
+                let v_offset = cache_padding + t * kv_dims + (
+                    h // number_rep_kv
+                ) * head_dims
+
+                let a = state.att[att_offset + t]
+
+                @parameter
+                fn xb_accumulate[_nelts: Int](i: Int):
+                    let xbi = state.residual.simd_load[_nelts](
+                        residual_offset + i
+                    ) + a * state.value_cache.simd_load[_nelts](v_offset + i)
+                    state.residual.simd_store[_nelts](residual_offset + i, xbi)
+
+                vectorize[nelts, xb_accumulate](head_dims)
+
+        parallelize[loop_over_heads](config.num_attention_heads, cores)
+
+        matmul_row[T, nelts, cores](
+            state.residual2, state.residual, TensorSlice[T](weights.o_proj, layer_inedx)
         )
-        let w3_res: Array[DT] = matmul[DT, nelts, cores, parallelized](
-            hidden_state, w3_array
+
+        tensor_add[T, nelts](state.x, state.residual2)
+
+        rmsnorm[T, nelts](
+            state.residual,
+            state.x,
+            TensorSlice[T](weights.post_layernorm_weight, layer_inedx),
+        )
+
+        batch_matmul_row[T, nelts, cores, 2](
+            StaticTuple[2, DTypePointer[T]](state.w1.data(), state.w3.data()),
+            state.residual.data(),
+            StaticTuple[2, DTypePointer[T]](
+                TensorSlice[T](weights.w1, layer_inedx).data(),
+                TensorSlice[T](weights.w3, layer_inedx).data(),
+            ),
+            intermediate_size,
+            hidden_size,
         )
 
         @parameter
         fn silu[_nelts: Int](i: Int):
-            let inner_w1 = w1_res.load[_nelts](i)
-            let w1_silu = inner_w1 * (1.0 / (1.0 + math.exp(-inner_w1)))
-            w1_res.store[_nelts](i, w1_silu * w3_res.load[_nelts](i))
+            let initial_hb = state.w1.simd_load[_nelts](i)
+            let hbi = initial_hb * (1.0 / (1.0 + math.exp(-initial_hb)))
+            state.w1.simd_store[_nelts](i, hbi * state.w3.simd_load[_nelts](i))
 
-        vectorize[nelts, silu](w1_res.num_elements())
-        let output: Array[DT] = matmul[DT, nelts, cores, parallelized](w1_res, w2_array)
-        return output
-
-    var hidden_state = embedding[DT, nelts, cores](input_ids, llama.wte)
-    for layer_index in range(config.num_hidden_layers):
-        var residual: Array[DT] = Array[DT](hidden_state)
-
-        hidden_state = rms_layernorm_2d[DT, nelts, cores](
-            hidden_state,
-            Array[DT](
-                llama.input_layernorm.data.offset(layer_index * config.hidden_size),
-                config.hidden_size,
-            ),
-            1e-5,
+        vectorize[nelts, silu](intermediate_size)
+        matmul_row[T, nelts, cores](
+            state.residual, state.w1, TensorSlice[T](weights.w2, layer_inedx)
         )
 
-        let attention_out: Array[DT] = attention_forward(hidden_state, layer_index)
+        tensor_add[T, nelts](state.x, state.residual)
 
-        @parameter
-        fn cols_add_attn[_nelts: Int](i: Int):
-            hidden_state.store[_nelts](
-                i, attention_out.load[_nelts](i) + residual.load[_nelts](i)
-            )
+    rmsnorm[T, nelts](state.x, state.x, weights.norm)
 
-        vectorize[nelts, cols_add_attn](attention_out.num_elements())
-
-        residual = Array[DT](hidden_state)
-
-        hidden_state = rms_layernorm_2d[DT, nelts, cores](
-            hidden_state,
-            Array[DT](
-                llama.post_layernorm.data.offset(layer_index * config.hidden_size),
-                config.hidden_size,
-            ),
-            1e-5,
-        )
-        hidden_state = mlp_forward(hidden_state, layer_index)
-
-        @parameter
-        fn cols_add_mlp[_nelts: Int](i: Int):
-            let res: SIMD[DT, _nelts] = hidden_state.load[_nelts](i) + residual.load[
-                _nelts
-            ](i)
-            hidden_state.store[_nelts](i, res)
-
-        vectorize[nelts, cols_add_mlp](hidden_state.num_elements())
-
-    hidden_state = rms_layernorm_2d[DT, nelts, cores](hidden_state, llama.norm, 1e-5)
-
-    let logits = matmul[DT, nelts, cores, parallelized](hidden_state, llama.lm_head)
-    return logits
+    matmul_row[T, nelts, cores](state.logits, state.x, weights.wcls)

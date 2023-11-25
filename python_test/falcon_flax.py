@@ -3,7 +3,7 @@ import jax
 
 try:
     from lib.python.EasyDel import FalconConfig, FlaxFalconForCausalLM
-    from lib.python.EasyDel.transform import falcon_convert_pt_to_flax
+    from lib.python.EasyDel.transform import falcon_convert_hf_to_flax
 except ModuleNotFoundError:
     import sys
     from pathlib import Path
@@ -11,7 +11,7 @@ except ModuleNotFoundError:
     cp = Path.cwd().__str__()
     sys.path.append(cp)
     from lib.python.EasyDel import FalconConfig, FlaxFalconForCausalLM
-    from lib.python.EasyDel.transform import falcon_convert_pt_to_flax
+    from lib.python.EasyDel.transform import falcon_convert_hf_to_flax
 from jax import numpy as jnp
 from transformers import FalconForCausalLM
 import torch
@@ -34,7 +34,7 @@ def main():
     torch_model = FalconForCausalLM(
         config=copy.deepcopy(config)
     )
-    params = {"params": falcon_convert_pt_to_flax(torch_model.state_dict(), config)}
+    params = {"params": falcon_convert_hf_to_flax(torch_model.state_dict(), config)}
     np_random_input_ids = np.random.randint(0, config.vocab_size, (1, 128))
     input_ids = torch.from_numpy(np_random_input_ids).reshape(1, -1).to(torch.long)
     flax_input_ids = jnp.asarray(np_random_input_ids, dtype=jnp.int32).reshape(1, -1)
