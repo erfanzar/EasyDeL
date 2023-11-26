@@ -104,11 +104,13 @@ class AutoEasyDelModelForCausalLM:
     def from_pretrained(
             cls,
             repo_id: str,
-            device,
+            device=jax.devices('cpu')[0],
             dtype: jax.numpy.dtype = jax.numpy.float32,
             param_dtype: jax.numpy.dtype = jax.numpy.float32,
             precision: jax.lax.Precision = jax.lax.Precision('fastest'),
-            # =jax.devices('cpu')[0]
+            sharding_axis_dims: typing.Sequence[int] = (1, -1, 1, 1),
+            sharding_axis_names: typing.Sequence[str] = ('dp', 'fsdp', 'tp', 'mp'),
+            input_shape: typing.Sequence[int] = (1, 1),
             **kwargs
     ) -> typing.Union[FlaxPreTrainedModel, dict]:
         """
@@ -123,12 +125,15 @@ class AutoEasyDelModelForCausalLM:
         cfg = cfg.from_pretrained(repo_id)
         if hasattr(cfg, 'add_jax_args'):
             cfg.add_jax_args()
+        cfg.axis_dims = sharding_axis_dims
+        cfg.axis_names = sharding_axis_names
         ed_model = module(
             config=cfg,
             _do_init=False,
             dtype=dtype,
             param_dtype=param_dtype,
-            precision=precision
+            precision=precision,
+            input_shape=input_shape
         )
 
         params = trf(model.state_dict(), config=config, device=device)
