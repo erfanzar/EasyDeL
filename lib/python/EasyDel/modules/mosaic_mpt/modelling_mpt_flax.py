@@ -3,7 +3,7 @@ import math
 import einops
 from flax import linen as nn
 from flax.core import FrozenDict
-from typing import Optional, Union, Tuple
+from typing import Optional, Union, Tuple, Sequence
 from transformers import FlaxPreTrainedModel, PretrainedConfig
 from jax import numpy as jnp
 import jax
@@ -13,12 +13,12 @@ import flax
 from einops import rearrange
 from fjformer.attention import efficient_attention
 from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
-    with_sharding_constraint, ACT2FN
+    with_sharding_constraint, ACT2FN, JaxBaseClassModel
 import chex
 from fjformer.bits import config as q_config, q_flax
 
 
-class MptConfig(PretrainedConfig):
+class MptConfig(PretrainedConfig, JaxBaseClassModel):
     model_type = 'mpt'
 
     def __init__(self,
@@ -48,6 +48,8 @@ class MptConfig(PretrainedConfig):
                  flash_attn_query_chunk_size: int = 1024,
                  flash_attn_key_chunk_size: int = 2048,
                  bits: Optional[int] = None,
+                 axis_dims: Sequence[int] = (1, -1, 1, 1),
+                 axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
                  **kwargs
                  ):
 
@@ -83,7 +85,11 @@ class MptConfig(PretrainedConfig):
             del kwargs['name']
         if 'loss_fn' in kwargs:
             del kwargs['loss_fn']
-        super().__init__(**kwargs)
+        super().__init__(
+            axis_dims=axis_dims,
+            axis_names=axis_names,
+            **kwargs
+        )
 
     @staticmethod
     def _set_config_defaults(config, config_defaults):
@@ -171,8 +177,12 @@ class MptConfig(PretrainedConfig):
                      flash_attn_query_chunk_size: int = 1024,
                      flash_attn_key_chunk_size: int = 2048,
                      bits: Optional[int] = None,
+                     axis_dims: Sequence[int] = (1, -1, 1, 1),
+                     axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
                      **kwargs
                      ):
+        self.axis_names = axis_names
+        self.axis_dims = axis_dims
         if hasattr(self, 'attn_config'):
             for k, v in self.attn_config.items():
                 setattr(self, k, v)
@@ -211,9 +221,6 @@ class MptConfig(PretrainedConfig):
                 setattr(self, k, v)
 
         self.from_pt = False
-
-
-
 
 
 class RMSNorm(nn.Module):

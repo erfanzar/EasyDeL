@@ -48,9 +48,6 @@ class PalmConfig(PretrainedConfig):
         self.eps = eps
         self.max_length = max_length
 
-
-
-
     @staticmethod
     def _set_config_defaults(config, config_defaults):
         for (k, v) in config_defaults.items():

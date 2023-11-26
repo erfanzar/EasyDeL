@@ -1,8 +1,11 @@
 import functools
 import typing
+from typing import Sequence
 
+import fjformer.attention
 import flax.core
-from jax import numpy as jnp, Array
+from jax import numpy as jnp, Array, lax
+from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec as PS
 import jax
 from flax import linen as nn
@@ -10,16 +13,16 @@ from flax.traverse_util import unflatten_dict, flatten_dict
 from flax.core import freeze, unfreeze
 from typing import Union, Optional, Tuple
 from transformers import PretrainedConfig, FlaxPreTrainedModel
-from flax.linen import partitioning as nn_partitioning
+from flax.linen import partitioning as nn_partitioning, combine_masks
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 
 from ..flax_modelling_utils import ACT2FN, with_sharding_constraint, get_gradient_checkpoint_policy, repeat_kv_bnsh, \
-    apply_rotary_pos_emb, precompute_freq_cis
+    apply_rotary_pos_emb, precompute_freq_cis, JaxBaseClassModel, get_flash_attention
 import chex
 from fjformer.bits import config as q_config, q_flax
 
 
-class MistralConfig(PretrainedConfig):
+class MistralConfig(PretrainedConfig, JaxBaseClassModel):
     def __init__(
             self,
             vocab_size=32000,
@@ -51,6 +54,8 @@ class MistralConfig(PretrainedConfig):
             c_max_position_embeddings: int = 4096,
             freq_max_position_embeddings: int = 4096,
             bits: Optional[int] = None,
+            axis_dims: Sequence[int] = (1, -1, 1, 1),
+            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
             **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -84,6 +89,8 @@ class MistralConfig(PretrainedConfig):
         self.freq_max_position_embeddings = freq_max_position_embeddings
 
         super().__init__(
+            axis_names=axis_names,
+            axis_dims=axis_dims,
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
@@ -142,6 +149,8 @@ class MistralConfig(PretrainedConfig):
                      c_max_position_embeddings: int = 4096,
                      freq_max_position_embeddings: int = None,
                      bits: Optional[int] = None,
+                     axis_dims: Sequence[int] = (1, -1, 1, 1),
+                     axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
                      ):
         self.use_flash_attention = use_flash_attention
         self.number_rep_kv = number_rep_kv
@@ -155,9 +164,8 @@ class MistralConfig(PretrainedConfig):
         self.c_max_position_embeddings = c_max_position_embeddings
         self.freq_max_position_embeddings = freq_max_position_embeddings
         self.bits = bits
-
-
-
+        self.axis_dims = axis_dims
+        self.axis_names = axis_names
 
     @staticmethod
     def get_weight_decay_exclusions():
@@ -401,17 +409,96 @@ class FlaxMistralAttention(nn.Module):
 
         attention_mask = nn.combine_masks(attention_mask, causal_mask)
 
-        attention_bias = jax.lax.select(
-            attention_mask > 0,
-            jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-            jnp.full(attention_mask.shape, jnp.finfo(query).min),
-        )
-        org_dtype = key.dtype
-        attn_weight = nn.dot_product_attention(query=query, key=key, value=value, bias=attention_bias,
-                                               dtype=jnp.promote_types(self.dtype, jnp.float32))
-        attn_weight = attn_weight.astype(org_dtype)
-        out = self.o_proj(attn_weight.reshape(batch_size, sequence_length, self.hidden_size))
-        outputs = (out, attn_weight) if output_attentions else (out,)
+        if self.config.use_flash_attention and not (self.has_variable("cache", "cached_key") or init_cache):
+
+            if attention_mask.ndim == 2:
+                attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
+
+            attention_bias = lax.select(
+                attention_mask > 0,
+                jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
+                jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
+            )
+            attn_weights = None
+
+            if self.config.use_flash_attention:
+                ring_attention_fn, up_cast_float32 = get_flash_attention()
+            else:
+                up_cast_float32 = True
+                ring_attention_fn = fjformer.attention.ring_attention
+
+            ring_attention_sharded = shard_map(
+                functools.partial(
+                    ring_attention_fn,
+                    axis_name="mp",
+                    float32_logits=up_cast_float32,
+                    blockwise_kwargs=dict(
+                        deterministic=deterministic,
+                        dropout_rng=jax.random.key(0),
+                        attn_pdrop=self.config.attn_pdrop,
+                        causal=True,
+                        query_chunk_size=self.config.scan_query_chunk_size,
+                        key_chunk_size=self.config.scan_key_chunk_size,
+                        dtype=self.dtype,
+                        policy=get_gradient_checkpoint_policy('nothing_saveable'),
+                        precision=self.precision,
+                        prevent_cse=not self.config.scan_layers,
+                    )
+                ),
+                mesh=self.config.jax_mesh(),
+                in_specs=(
+                    PS(("dp", "fsdp"), "mp", "tp", None),
+                    PS(("dp", "fsdp"), "mp", "tp", None),
+                    PS(("dp", "fsdp"), "mp", "tp", None),
+                    PS(("dp", "fsdp"), None, None, None)
+                ),
+                out_specs=PS(("dp", "fsdp"), "mp", "tp", None),
+                check_rep=False
+            )
+            attn_output = ring_attention_sharded(query, key, value, attention_bias)
+            attn_output = with_sharding_constraint(attn_output, PS(("dp", "fsdp"), "mp", "tp", None))
+        else:
+            query_length, key_length = query.shape[1], key.shape[1]
+
+            if self.has_variable("cache", "cached_key"):
+                mask_shift = self.variables["cache"]["cache_index"]
+                max_decoder_length = self.variables["cache"]["cached_key"].shape[1]
+                causal_mask = lax.dynamic_slice(
+                    causal_mask, (0, 0, mask_shift, 0), (1, 1, query_length, max_decoder_length)
+                )
+            else:
+                causal_mask = causal_mask[:, :, :query_length, :key_length]
+
+            batch_size = hidden_state.shape[0]
+            causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
+            if attention_mask.ndim == 2:
+                attention_mask = jnp.broadcast_to(jnp.expand_dims(attention_mask, axis=(-3, -2)), causal_mask.shape)
+            attention_mask = combine_masks(attention_mask, causal_mask)
+
+            if self.has_variable("cache", "cached_key") or init_cache:
+                key, value, attention_mask = self._concatenate_to_cache(key, value, query,
+                                                                        attention_mask)
+
+            attn_weights = None
+            ring_attention_sharded = shard_map(
+                functools.partial(fjformer.attention.ring_attention_standard, axis_name="mp"),
+                mesh=self.config.jax_mesh(),
+                in_specs=(
+                    PS(("dp", "fsdp"), "mp", "tp", None),
+                    PS(("dp", "fsdp"), "mp", "tp", None),
+                    PS(("dp", "fsdp"), "mp", "tp", None),
+                    PS(("dp", "fsdp"), None, "mp", None)
+                ),
+                out_specs=PS(("dp", "fsdp"), "mp", "tp", None),
+                check_rep=False
+            )
+
+            attn_output = ring_attention_sharded(
+                query, key, value, attention_mask
+            )
+
+        out = self.o_proj(attn_output.reshape(batch_size, sequence_length, self.hidden_size))
+        outputs = (out, attn_output) if output_attentions else (out,)
         return outputs
 
 

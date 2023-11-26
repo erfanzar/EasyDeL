@@ -16,7 +16,7 @@
 """ Flax T5 model."""
 
 import copy
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Tuple, Sequence
 
 import flax.linen as nn
 import jax
@@ -27,7 +27,6 @@ from flax.linen import combine_masks, make_causal_mask
 from flax.linen import partitioning as nn_partitioning
 from flax.linen.attention import dot_product_attention_weights
 from flax.traverse_util import flatten_dict, unflatten_dict
-from jax.interpreters import pxla
 from jax.random import PRNGKey
 
 from transformers.modeling_flax_outputs import (
@@ -45,12 +44,12 @@ from transformers import PretrainedConfig
 from jax.sharding import PartitionSpec
 
 from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
-    with_sharding_constraint
+    with_sharding_constraint, JaxBaseClassModel
 
 import chex
 
 
-class T5Config(PretrainedConfig):
+class T5Config(PretrainedConfig, JaxBaseClassModel):
     model_type = "t5"
     keys_to_ignore_at_inference = ["past_key_values"]
     attribute_map = {"hidden_size": "d_model", "num_attention_heads": "num_heads", "num_hidden_layers": "num_layers"}
@@ -76,6 +75,8 @@ class T5Config(PretrainedConfig):
             eos_token_id=1,
             gradient_checkpointing: str = 'nothing_saveable',
             use_pjit_attention_force: bool = False,
+            axis_dims: Sequence[int] = (1, -1, 1, 1),
+            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
             **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -113,6 +114,8 @@ class T5Config(PretrainedConfig):
             self.dense_act_fn = "gelu_new"
 
         super().__init__(
+            axis_dims=axis_dims,
+            axis_names=axis_names,
             pad_token_id=pad_token_id,
             eos_token_id=eos_token_id,
             is_encoder_decoder=is_encoder_decoder,
@@ -131,8 +134,6 @@ class T5Config(PretrainedConfig):
         ) if not fully_fsdp else (
             ('.*', PartitionSpec(('fsdp', 'mp')))
         )
-
-
 
 
 remat = nn_partitioning.remat
