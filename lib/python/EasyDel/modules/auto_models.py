@@ -3,7 +3,7 @@ import gc
 import typing
 
 import jax.numpy
-import torch.cuda
+
 from flax.traverse_util import unflatten_dict
 from transformers import AutoConfig, PretrainedConfig, AutoModelForCausalLM
 
@@ -134,7 +134,6 @@ class AutoEasyDelModelForCausalLM:
         params = trf(model.state_dict(), config=config, device=device)
         del model,
         gc.collect()
-        torch.cuda.empty_cache()
 
         if is_flatten(params):
             params = unflatten_dict(params)
