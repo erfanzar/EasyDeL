@@ -93,10 +93,11 @@ class AutoEasyDelModelForCausalLM:
     def from_pretrained(
             cls,
             repo_id: str,
+            device,
             dtype: jax.numpy.dtype = jax.numpy.float32,
             param_dtype: jax.numpy.dtype = jax.numpy.float32,
             precision: jax.lax.Precision = jax.lax.Precision('fastest'),
-            device=jax.devices('cpu')[0],
+            # =jax.devices('cpu')[0]
             **kwargs
     ) -> typing.Union[FlaxPreTrainedModel, dict]:
         """
