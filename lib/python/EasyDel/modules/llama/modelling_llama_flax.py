@@ -16,7 +16,7 @@ from flax.linen import combine_masks, make_causal_mask
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_flax_utils import FlaxPreTrainedModel
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput, FlaxSequenceClassifierOutput
-from ..flax_modelling_utils import (
+from EasyDel.modules.flax_modelling_utils import (
     with_sharding_constraint,
     get_gradient_checkpoint_policy,
     repeat_kv_bnsh,

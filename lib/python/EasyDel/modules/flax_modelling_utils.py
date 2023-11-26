@@ -7,7 +7,7 @@ from functools import partial
 import chex
 from typing import Sequence, Optional
 from jax.experimental.mesh_utils import create_device_mesh
-from overrides import overrides
+
 
 ACT2FN = {
     "gelu": partial(nn.gelu, approximate=False),
