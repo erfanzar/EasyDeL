@@ -1,7 +1,7 @@
 import math
 from flax import linen as nn
 from flax.core import FrozenDict, unfreeze
-from typing import Optional, Dict, Union, Tuple, List, Callable
+from typing import Optional, Dict, Union, Tuple, Sequence
 
 from flax.linen import combine_masks
 from transformers import FlaxPreTrainedModel, PretrainedConfig
@@ -10,13 +10,13 @@ import jax
 from jax.sharding import PartitionSpec
 from transformers.modeling_flax_outputs import FlaxCausalLMOutput, FlaxBaseModelOutput
 from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
-    with_sharding_constraint
+    with_sharding_constraint, JaxBaseClassModel
 import chex
 from fjformer.func import transpose
 from fjformer.bits import config as q_config, q_flax
 
 
-class FalconConfig(PretrainedConfig):
+class FalconConfig(PretrainedConfig, JaxBaseClassModel):
     model_type = "falcon"
     attribute_map = {
         "num_hidden_layers": "num_hidden_layers",
@@ -48,6 +48,8 @@ class FalconConfig(PretrainedConfig):
             use_pjit_attention_force: bool = False,
             gradient_checkpointing: str = '',
             bits: Optional[int] = None,
+            axis_dims: Sequence[int] = (1, -1, 1, 1),
+            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
             **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -76,8 +78,13 @@ class FalconConfig(PretrainedConfig):
         self.bits = bits
         self.from_pt = False
 
-
-        super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
+        super().__init__(
+            axis_dims=axis_dims,
+            axis_names=axis_names,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            **kwargs
+        )
 
     @property
     def head_dim(self):
@@ -143,8 +150,12 @@ class FalconConfig(PretrainedConfig):
                      use_pjit_attention_force: bool = False,
                      gradient_checkpointing: str = '',
                      bits: Optional[int] = None,
+                     axis_dims: Sequence[int] = (1, -1, 1, 1),
+                     axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
                      **kwargs,
                      ):
+        self.axis_names = axis_names
+        self.axis_dims = axis_dims
         basics = dict(
             bits=bits,
             vocab_size=vocab_size,
@@ -176,10 +187,6 @@ class FalconConfig(PretrainedConfig):
                 setattr(self, key_state, value_state)
 
         self.from_pt = False
-
-
-
-
 
 
 def built_bloom_alibi(attention_mask, num_attention_heads):

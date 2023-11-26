@@ -1,5 +1,5 @@
 from functools import partial
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, Optional, Tuple, Union, Sequence
 
 import fjformer.attention
 from einops import einops
@@ -16,13 +16,20 @@ from flax.linen import combine_masks, make_causal_mask
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_flax_utils import FlaxPreTrainedModel
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput, FlaxSequenceClassifierOutput
-from ..flax_modelling_utils import with_sharding_constraint, \
-    get_gradient_checkpoint_policy, repeat_kv_bnsh, apply_rotary_pos_emb, precompute_freq_cis, get_flash_attention
+from ..flax_modelling_utils import (
+    with_sharding_constraint,
+    get_gradient_checkpoint_policy,
+    repeat_kv_bnsh,
+    apply_rotary_pos_emb,
+    precompute_freq_cis,
+    get_flash_attention,
+    JaxBaseClassModel
+)
 import chex
 from fjformer.bits import config as q_config, q_flax
 
 
-class LlamaConfig(PretrainedConfig):
+class LlamaConfig(PretrainedConfig, JaxBaseClassModel):
     model_type = "llama"
 
     def __init__(
@@ -55,6 +62,8 @@ class LlamaConfig(PretrainedConfig):
             flash_attn_key_chunk_size: int = 1024,
             scan_mlp_chunk_size: int = 1024,
             bits: Optional[int] = None,
+            axis_dims: Sequence[int] = (1, -1, 1, 1),
+            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
             **kwargs,
     ):
         num_key_value_heads = num_key_value_heads or number_rep_kv * num_attention_heads
@@ -87,7 +96,9 @@ class LlamaConfig(PretrainedConfig):
         self.bits = bits
 
         super().__init__(
-            # pad_token_id=pad_token_id,
+            axis_dims=axis_dims,
+            axis_names=axis_names,
+            backend=None,
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
             tie_word_embeddings=tie_word_embeddings,
@@ -148,7 +159,11 @@ class LlamaConfig(PretrainedConfig):
                      scan_mlp_chunk_size: int = 1024,
                      number_rep_kv: int = 1,
                      bits: Optional[int] = None,
+                     axis_dims: Sequence[int] = (1, -1, 1, 1),
+                     axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
                      ):
+        self.axis_names = axis_names
+        self.axis_dims = axis_dims
         self.use_flash_attention = use_flash_attention
         self.embd_pdrop = embd_pdrop
         self.number_rep_kv = number_rep_kv
@@ -354,6 +369,7 @@ class FlaxLlamaAttention(nn.Module):
         batch_size, sequence_length = hidden_states.shape[:2]
         query_state, key_state, value_state = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(
             hidden_states)
+
         if self.config.use_pjit_attention_force:
             query_state = with_sharding_constraint(query_state, PS(("dp", "fsdp"), "mp", "tp"))
             key_state = with_sharding_constraint(key_state, PS(("dp", "fsdp"), "mp", "tp"))
@@ -432,7 +448,7 @@ class FlaxLlamaAttention(nn.Module):
                         prevent_cse=not self.config.scan_layers,
                     )
                 ),
-                mesh=self.config.mesh,
+                mesh=self.config.jax_mesh(),
                 in_specs=(
                     PS(("dp", "fsdp"), "mp", "tp", None),
                     PS(("dp", "fsdp"), "mp", "tp", None),
@@ -469,7 +485,7 @@ class FlaxLlamaAttention(nn.Module):
             attn_weights = None
             ring_attention_sharded = shard_map(
                 partial(fjformer.attention.ring_attention_standard, axis_name="mp"),
-                mesh=self.config.mesh,
+                mesh=self.config.jax_mesh(),
                 in_specs=(
                     PS(("dp", "fsdp"), "mp", "tp", None),
                     PS(("dp", "fsdp"), "mp", "tp", None),
@@ -484,7 +500,9 @@ class FlaxLlamaAttention(nn.Module):
                 query_state, key_state, value_state, attention_mask
             )
 
+        attn_output = self._merge_heads(attn_output)
         attn_output = self.o_proj(attn_output)
+
         attn_output = self.resid_dropout(attn_output, deterministic=deterministic)
         outputs = (attn_output, attn_weights) if output_attentions else (attn_output,)
 

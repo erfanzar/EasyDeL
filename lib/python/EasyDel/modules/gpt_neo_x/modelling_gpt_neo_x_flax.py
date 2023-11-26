@@ -2,23 +2,19 @@ import math
 
 from flax import linen as nn
 from flax.core import FrozenDict
-from typing import Optional, Dict, Union, Tuple
-from transformers import FlaxPreTrainedModel, PretrainedConfig, GPTNeoXForCausalLM
+from typing import Optional, Dict, Union, Tuple, Sequence
+from transformers import FlaxPreTrainedModel, PretrainedConfig
 from jax import numpy as jnp
 import jax
-from jax.interpreters import pxla
-from jax.experimental.pjit import pjit, with_sharding_constraint as wsc
 from jax.sharding import PartitionSpec
-from transformers.modeling_flax_outputs import FlaxCausalLMOutput, FlaxBaseModelOutput
-from jax.random import split, PRNGKey
-from functools import partial
+from transformers.modeling_flax_outputs import FlaxBaseModelOutput
 from einops import rearrange
 from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
-    with_sharding_constraint, ACT2FN
+    with_sharding_constraint, ACT2FN, JaxBaseClassModel
 import chex
 
 
-class GPTNeoXConfig(PretrainedConfig):
+class GPTNeoXConfig(PretrainedConfig, JaxBaseClassModel):
     model_type = "gpt_neox"
 
     def __init__(
@@ -41,9 +37,17 @@ class GPTNeoXConfig(PretrainedConfig):
             tie_word_embeddings=False,
             gradient_checkpointing='everything_saveable',
             use_parallel_residual=True,
+            axis_dims: Sequence[int] = (1, -1, 1, 1),
+            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
             **kwargs,
     ):
-        super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
+        super().__init__(
+            axis_dims=axis_dims,
+            axis_names=axis_names,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            **kwargs
+        )
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
@@ -99,11 +103,14 @@ class GPTNeoXConfig(PretrainedConfig):
     def get_mesh_names():
         return "dp", "fsdp", "tp", "mp"
 
-    def add_jax_args(self):
+    def add_jax_args(
+            self,
+            axis_dims: Sequence[int] = (1, -1, 1, 1),
+            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
+    ):
         self.from_pt = False
-
-
-
+        self.axis_names = axis_names
+        self.axis_dims = axis_dims
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0,

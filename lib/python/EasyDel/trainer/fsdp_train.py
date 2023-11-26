@@ -204,10 +204,6 @@ class CausalLMTrainer:
         self.sharded_train_step_fn = funcs[1]
         self.sharded_predict = funcs[2]
         self.mesh = funcs[3]
-        if hasattr(self.model.config, 'set_mesh'):
-            self.model.config.set_mesh(self.mesh)
-        else:
-            self.model.config.mesh = self.mesh
         self.ckpt_streamer = funcs[4]
         self.init_fn = funcs[5]
         self.timer(
@@ -255,19 +251,21 @@ class CausalLMTrainer:
                                                          _do_init=False)
 
         else:
-            assert self.arguments.custom_rule is not None, 'if you are using custom model to init you must' \
-                                                           ' pass custom_rule for partition rules '
+            if not hasattr(self.arguments.configs_to_init_model_class['config'], 'get_partition_rules'):
+                assert self.arguments.custom_rule is not None, 'if you are using custom model to init you must' \
+                                                               ' pass custom_rule for partition rules '
+
             self.arguments.configs_to_init_model_class[
-                'config'].use_pjit_attention_force = self.arguments.use_pjit_attention_force
+                'config'
+            ].use_pjit_attention_force = self.arguments.use_pjit_attention_force
+
+            self.arguments.configs_to_init_model_class['config'].axis_dims = self.arguments.sharding_array
+
             model = self.arguments.model_class(
                 **self.arguments.configs_to_init_model_class,
                 _do_init=False
             )
-            if self.mesh is not None:
-                if hasattr(model.config, 'set_mesh'):
-                    model.config.set_mesh(self.mesh)
-                else:
-                    model.config.mesh = self.mesh
+
             config = self.arguments.configs_to_init_model_class['config']
 
         tx, scheduler = self.arguments.get_optimizer_and_scheduler(self.max_steps_train)

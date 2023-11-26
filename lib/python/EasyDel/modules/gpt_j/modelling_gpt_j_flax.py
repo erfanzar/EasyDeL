@@ -21,7 +21,7 @@
 # limitations under the License.
 """ GPT-J model configuration"""
 from collections import OrderedDict
-from typing import Any, List, Mapping
+from typing import Any, List, Mapping, Sequence
 
 from functools import partial
 from typing import Optional, Tuple
@@ -47,14 +47,14 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.onnx import OnnxConfigWithPast, PatchingSpec
 
 from fjformer.attention import efficient_attention
-from ..flax_modelling_utils import with_sharding_constraint
+from ..flax_modelling_utils import with_sharding_constraint, JaxBaseClassModel
 import chex
 from fjformer.bits import config as q_config, q_flax
 
 logger = logging.get_logger(__name__)
 
 
-class GPTJConfig(PretrainedConfig):
+class GPTJConfig(PretrainedConfig, JaxBaseClassModel):
     model_type = "gptj"
     attribute_map = {
         "max_position_embeddings": "n_positions",
@@ -87,6 +87,8 @@ class GPTJConfig(PretrainedConfig):
             flash_attn_query_chunk_size: int = 1024,
             flash_attn_key_chunk_size: int = 2048,
             bits: Optional[int] = None,
+            axis_dims: Sequence[int] = (1, -1, 1, 1),
+            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
             **kwargs,
     ):
         self.bits = bits
@@ -112,9 +114,13 @@ class GPTJConfig(PretrainedConfig):
         self.use_flash_attention = use_flash_attention
         self.from_pt = False
         super().__init__(
-            bos_token_id=bos_token_id, eos_token_id=eos_token_id, tie_word_embeddings=tie_word_embeddings, **kwargs
+            axis_names=axis_names,
+            axis_dims=axis_dims,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            tie_word_embeddings=tie_word_embeddings,
+            **kwargs
         )
-
 
     @staticmethod
     def set_custom_partition(embedding_partition: PartitionSpec,
@@ -208,7 +214,11 @@ class GPTJConfig(PretrainedConfig):
             flash_attn_query_chunk_size: int = 1024,
             flash_attn_key_chunk_size: int = 2048,
             bits: Optional[int] = None,
+            axis_dims: Sequence[int] = (1, -1, 1, 1),
+            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
     ):
+        self.axis_dims = axis_dims
+        self.axis_names = axis_names
         basics = dict(
             bits=bits,
             vocab_size=vocab_size,
@@ -239,9 +249,6 @@ class GPTJConfig(PretrainedConfig):
                 setattr(self, k, v)
         self.from_pt = False
         return self
-
-
-
 
 
 class GPTJOnnxConfig(OnnxConfigWithPast):

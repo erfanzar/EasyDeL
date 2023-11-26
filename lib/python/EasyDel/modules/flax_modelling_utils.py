@@ -5,8 +5,9 @@ import jax
 from flax import linen as nn
 from functools import partial
 import chex
-from typing import Sequence
+from typing import Sequence, Optional
 from jax.experimental.mesh_utils import create_device_mesh
+from overrides import overrides
 
 ACT2FN = {
     "gelu": partial(nn.gelu, approximate=False),
@@ -103,7 +104,7 @@ def apply_rotary_pos_emb(tensor, sin_, cos_):
 
 def get_ranks_and_size(mesh):
     out = dict(mesh=mesh)
-    mp_size = mesh.shape['tp'] * mesh.shape['mp']
+    mp_size = mesh.shape["tp"] * mesh.shape["mp"]
     mp_node_size = max(1, mp_size // jax.local_device_count())
     dp_node_size = jax.process_count() // mp_node_size
     out.update(mp_node_size=mp_node_size,
@@ -124,21 +125,53 @@ def get_flash_attention():
     if platform == "gpu":
         float32_logits = False
         ring_attention_fn = fjformer.attention.ring_flash_attention_gpu
-    elif platform == 'tpu':
+    elif platform == "tpu":
         float32_logits = True
         ring_attention_fn = fjformer.attention.ring_flash_attention_tpu
     else:
-        raise ValueError(f'Unsupported platform {platform}')
+        raise ValueError(f"Unsupported platform {platform}")
 
     return ring_attention_fn, float32_logits
 
 
 def create_mesh(
-        axis_dims: Sequence[int] = (1, -1, 1, 1), axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"), backend=''
+        axis_dims: Sequence[int] = (1, -1, 1, 1), axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"), backend=""
 ):
-    array_devices = jax.numpy.ones((len(jax.devices() if backend == '' else jax.devices(backend)), 1))
+    array_devices = jax.numpy.ones((len(jax.devices() if backend == "" else jax.devices(backend)), 1))
     resh = array_devices.reshape(axis_dims).shape
 
     return jax.sharding.Mesh(
         create_device_mesh(resh), axis_names
     )
+
+
+class JaxBaseClassModel:
+    def __init__(
+            self,
+            axis_dims: Sequence[int] = (1, -1, 1, 1),
+            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
+            backend: Optional[None] = None
+    ):
+        self.axis_dims = axis_dims
+        self.axis_names = axis_names
+        self.backend = backend if backend is not None else ""
+
+    def jax_mesh(self) -> jax.sharding.Mesh:
+        return create_mesh(
+            axis_dims=self.axis_dims,
+            axis_names=self.axis_names,
+            backend=(self.backend if self.backend is not None else "") if hasattr(self, 'backend') else ""
+        )
+
+    def get_axis_dims(self) -> Sequence[int]:
+        return self.axis_dims
+
+    def get_axis_names(self) -> Sequence[str]:
+        return self.axis_names
+
+    def get_backend(self) -> str:
+        return self.backend if not self.backend == "" else jax.lib.xla_bridge.get_backend().platform
+
+    @staticmethod
+    def get_flash_attention():
+        return get_flash_attention()
