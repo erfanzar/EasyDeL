@@ -12,7 +12,7 @@ from transformers.modeling_flax_outputs import FlaxCausalLMOutput, FlaxBaseModel
 import flax
 from einops import rearrange
 from fjformer.attention import efficient_attention
-from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
+from EasyDel.modules.flax_modelling_utils import get_gradient_checkpoint_policy, \
     with_sharding_constraint, ACT2FN, JaxBaseClassModel
 import chex
 from fjformer.bits import config as q_config, q_flax

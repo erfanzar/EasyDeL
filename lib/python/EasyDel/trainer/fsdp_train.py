@@ -9,21 +9,21 @@ from fjformer.func.loss_func import fused_cross_entropy_loss_and_accuracy, cross
 import wandb
 from datasets import Dataset
 
-from ..trainer.config import TrainArguments
+from EasyDel.trainer.config import TrainArguments
 
 import jax
 import flax
 from transformers import FlaxAutoModelForCausalLM, AutoConfig
 from tqdm import tqdm
-from ..utils import Timers
-from ..smi import initialise_tracking, get_mem
+from EasyDel.utils.utils import Timers, prefix_print
+from EasyDel.smi import initialise_tracking, get_mem
 from jax.experimental.pjit import pjit, with_sharding_constraint
 from jax.sharding import PartitionSpec
 from flax.training import train_state
 from jax import numpy as jnp
 from torch.utils.data import DataLoader
 from fjformer import match_partition_rules, make_shard_and_gather_fns, StreamingCheckpointer
-from ..utils import prefix_print
+
 import chex
 
 

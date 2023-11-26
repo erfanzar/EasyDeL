@@ -1,1 +1,1 @@
-from .modelling_palm_flax import FlaxPalmForCausalLM, PalmModel, PalmConfig
+from EasyDel.modules.palm.modelling_palm_flax import FlaxPalmForCausalLM, PalmModel, PalmConfig

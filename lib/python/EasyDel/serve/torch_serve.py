@@ -4,12 +4,11 @@ import transformers
 import uvicorn
 from fastapi import FastAPI
 from typing import List
-from ml_collections import ConfigDict
 from transformers import TextIteratorStreamer
 import logging
 import multiprocessing as mp
 import torch
-from .utils import ChatRequest, InstructRequest, seafoam
+from EasyDel.serve.utils import ChatRequest, InstructRequest, seafoam
 
 
 class PytorchServerConfig:

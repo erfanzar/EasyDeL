@@ -25,6 +25,7 @@ from EasyDel.modules.flax_modelling_utils import (
     get_flash_attention,
     JaxBaseClassModel
 )
+
 import chex
 from fjformer.bits import config as q_config, q_flax
 
@@ -189,9 +190,6 @@ class LlamaConfig(PretrainedConfig, JaxBaseClassModel):
     @staticmethod
     def rng_keys():
         return 'params', 'dropout', 'fcm'
-
-
-re_mat = nn_partitioning.remat
 
 
 class FlaxLlamaEmbedding(nn.Module):
@@ -572,7 +570,7 @@ class FlaxLlamaBlock(nn.Module):
     def setup(self) -> None:
         attn_block = FlaxLlamaAttention
         if self.config.gradient_checkpointing != '':
-            attn_block = re_mat(
+            attn_block = nn_partitioning.remat(
                 FlaxLlamaAttention, static_argnums=(5, 6, 7),
                 policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing)
             )
@@ -586,7 +584,7 @@ class FlaxLlamaBlock(nn.Module):
         mlp_block = FlaxLlamaMLP
 
         if self.config.gradient_checkpointing != '':
-            mlp_block = re_mat(
+            mlp_block = nn_partitioning.remat(
                 FlaxLlamaMLP, static_argnums=(1,),
                 policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing)
             )

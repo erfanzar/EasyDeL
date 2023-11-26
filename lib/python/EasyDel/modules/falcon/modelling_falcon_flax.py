@@ -9,7 +9,7 @@ from jax import numpy as jnp, lax
 import jax
 from jax.sharding import PartitionSpec
 from transformers.modeling_flax_outputs import FlaxCausalLMOutput, FlaxBaseModelOutput
-from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
+from EasyDel.modules.flax_modelling_utils import get_gradient_checkpoint_policy, \
     with_sharding_constraint, JaxBaseClassModel
 import chex
 from fjformer.func import transpose

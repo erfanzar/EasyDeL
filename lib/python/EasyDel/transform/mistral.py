@@ -6,7 +6,7 @@ from jax import numpy as jnp
 import jax
 import torch
 from transformers import MistralForCausalLM
-from ..modules.mistral import MistralConfig
+from EasyDel.modules.mistral import MistralConfig
 
 
 def inverse_permute(tensor, head, dim_in, dim_out):

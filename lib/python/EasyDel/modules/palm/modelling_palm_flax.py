@@ -10,7 +10,7 @@ from jax import numpy as np
 from transformers.modeling_flax_outputs import FlaxCausalLMOutput
 from transformers import PretrainedConfig
 from jax.sharding import PartitionSpec
-from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
+from EasyDel.modules.flax_modelling_utils import get_gradient_checkpoint_policy, \
     with_sharding_constraint
 import chex
 
