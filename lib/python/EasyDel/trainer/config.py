@@ -71,6 +71,7 @@ class TrainArguments(
             loss_chunk: int = 1024,
             is_left_padded: bool = False,
             warmup_steps: int = 500,
+            init_input_shape: typing.Tuple[int, int] = (1, 1),
             **kwargs
     ):
         super().__init__()
@@ -136,7 +137,7 @@ class TrainArguments(
 
         self.loss_chunk = loss_chunk
         self.loss_remat = loss_remat
-
+        self.init_input_shape = init_input_shape
         self.is_left_padded = is_left_padded
         torch.set_default_device('cpu')
         self.__dict__.update(**kwargs)

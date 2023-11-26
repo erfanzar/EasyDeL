@@ -273,7 +273,9 @@ class CausalLMTrainer:
 
     def configure_functions(self):
         def init_fn():
-            params__ = self.model.init_weights(jax.random.PRNGKey(0), (1, self.arguments.max_length))
+            params__ = self.model.init_weights(
+                jax.random.PRNGKey(0), self.config.init_input_shape
+            )
             if self.arguments.dtype == jnp.bfloat16:
                 params__ = self.model.to_bf16(params__)
             elif self.arguments.dtype == jnp.float16:
