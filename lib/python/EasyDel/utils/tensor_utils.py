@@ -1,7 +1,7 @@
-import jax
 import torch
 from jax import numpy as jnp
 import numpy as np
+import chex
 
 
 def pt2np(array: torch.Tensor) -> np.array:

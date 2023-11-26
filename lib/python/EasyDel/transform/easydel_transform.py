@@ -1,6 +1,6 @@
 import jax
 
-from flax.traverse_util import flatten_dict, unflatten_dict
+from flax.traverse_util import flatten_dict
 from flax.serialization import from_bytes, to_bytes, to_state_dict
 import msgpack
 import os

@@ -5,7 +5,7 @@ from jax import numpy as jnp
 import jax
 import torch
 from transformers import LlamaForCausalLM
-from ..modules.llama import LlamaConfig
+from EasyDel.modules.llama import LlamaConfig
 from fjformer import load_and_convert_checkpoint_to_torch
 
 
