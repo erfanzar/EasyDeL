@@ -354,12 +354,6 @@ class CausalLMTrainer:
         if self.arguments.track_memory:
             initialise_tracking(dir_prefix=dir_prefix)
 
-        if self.model.config.mesh is None:
-            if hasattr(self.model.config, 'set_mesh'):
-                self.model.config.set_mesh(self.mesh)
-            else:
-                self.model.config.mesh = self.mesh
-
         with self.mesh:
             if self.finetune:
                 shard_fns, gather_fns = make_shard_and_gather_fns(self.train_state_partition_spec,
