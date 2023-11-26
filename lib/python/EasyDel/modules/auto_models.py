@@ -6,28 +6,7 @@ import jax.numpy
 import torch.cuda
 from flax.traverse_util import unflatten_dict
 from transformers import AutoConfig, PretrainedConfig, AutoModelForCausalLM
-from . import MptConfig as _MptConfig
-from . import LlamaConfig as _LlamaConfig
-from . import FlaxLlamaForCausalLM as _FlaxLlamaForCausalLM
-from . import FlaxMptForCausalLM as _FlaxMptForCausalLM
-from . import FlaxMistralForCausalLM as _FlaxMistralForCausalLM
-from . import FlaxGPTNeoXForCausalLM as _FlaxGPTNeoXForCausalLM
-from . import FlaxFalconForCausalLM as _FlaxFalconForCausalLM
-from . import FlaxGPTJForCausalLM as _FlaxGPTJForCausalLM
-from . import FlaxLTForCausalLM as _FlaxLTForCausalLM
-from . import FalconConfig as _FalconConfig
-from . import MistralConfig as _MistralConfig
-from . import FlaxLTConfig as _FlaxLTConfig
-from . import PalmConfig as _PalmConfig
-from . import OPTConfig as _OPTConfig
-from . import GPTJConfig as _GPTJConfig
-from . import FlaxPalmForCausalLM as _FlaxPalmForCausalLM
-from . import FlaxOPTForCausalLM as _FlaxOPTForCausalLM
-from . import GPTNeoXConfig as _GPTNeoXConfig
 
-from ..transform import falcon_convert_hf_to_flax as _falcon_convert_pt_to_flax
-from ..transform import llama_convert_hf_to_flax as _llama_convert_hf_to_flax
-from ..transform import mistral_convert_hf_to_flax as _mistral_convert_hf_to_flax
 from ..transform.easydel_transform import huggingface_to_easydel
 
 from transformers import FlaxPreTrainedModel
@@ -37,50 +16,82 @@ class EasyDelRunTimeError(Exception):
     ...
 
 
-TYPE_TO_CFG_MODEL = {
-    "llama": (
-        _LlamaConfig,
-        _FlaxLlamaForCausalLM,
-        _llama_convert_hf_to_flax
-    ),
-    "falcon": (
-        _FalconConfig,
-        _FlaxFalconForCausalLM,
-        _falcon_convert_pt_to_flax
-    ),
-    "mpt": (
-        _MptConfig,
-        _FlaxMptForCausalLM,
-        functools.partial(huggingface_to_easydel, embedding_layer_name="wte")
-    ),
-    "mistral": (
-        _MistralConfig,
-        _FlaxMistralForCausalLM,
-        _mistral_convert_hf_to_flax
-    ),
-    "gptj": (
-        _GPTJConfig,
-        _FlaxGPTJForCausalLM,
-        functools.partial(huggingface_to_easydel, embedding_layer_name="wte")
-    ),
+def get_modules_by_type(model_type: str):
+    if model_type == "llama":
+        from . import LlamaConfig as _LlamaConfig
+        from . import FlaxLlamaForCausalLM as _FlaxLlamaForCausalLM
+        from ..transform import llama_convert_hf_to_flax as _llama_convert_hf_to_flax
+        return (
+            _LlamaConfig,
+            _FlaxLlamaForCausalLM,
+            _llama_convert_hf_to_flax
+        )
+    elif model_type == "falcon":
+        from . import FlaxFalconForCausalLM as _FlaxFalconForCausalLM
+        from . import FalconConfig as _FalconConfig
+        from ..transform import falcon_convert_hf_to_flax as _falcon_convert_pt_to_flax
 
-    "gpt_neox": (
-        _GPTNeoXConfig,
-        _FlaxGPTNeoXForCausalLM,
-        functools.partial(huggingface_to_easydel, embedding_layer_name="wte")
-    ),
-    "palm": (
-        _PalmConfig,
-        _FlaxPalmForCausalLM,
-        functools.partial(huggingface_to_easydel, embedding_layer_name="wte")
-    ),
-    "lt": (
-        _FlaxLTConfig,
-        _FlaxLTForCausalLM,
-        functools.partial(huggingface_to_easydel, embedding_layer_name="wte")
-    )
+        return (
+            _FalconConfig,
+            _FlaxFalconForCausalLM,
+            _falcon_convert_pt_to_flax
+        )
+    elif model_type == "mpt":
+        from . import FlaxMptForCausalLM as _FlaxMptForCausalLM
+        from . import MptConfig as _MptConfig
+        return (
+            _MptConfig,
+            _FlaxMptForCausalLM,
+            functools.partial(huggingface_to_easydel, embedding_layer_name="wte")
+        )
 
-}
+    elif model_type == "mistral":
+        from . import FlaxMistralForCausalLM as _FlaxMistralForCausalLM
+        from . import MistralConfig as _MistralConfig
+        from ..transform import mistral_convert_hf_to_flax as _mistral_convert_hf_to_flax
+        return (
+            _MistralConfig,
+            _FlaxMistralForCausalLM,
+            _mistral_convert_hf_to_flax
+        )
+    elif model_type == "gptj":
+        from . import FlaxGPTJForCausalLM as _FlaxGPTJForCausalLM
+        from . import GPTJConfig as _GPTJConfig
+        return (
+            _GPTJConfig,
+            _FlaxGPTJForCausalLM,
+            functools.partial(huggingface_to_easydel, embedding_layer_name="wte")
+        )
+
+    elif model_type == "gpt_neox":
+        from . import FlaxGPTNeoXForCausalLM as _FlaxGPTNeoXForCausalLM
+        from . import GPTNeoXConfig as _GPTNeoXConfig
+
+        return (
+            _GPTNeoXConfig,
+            _FlaxGPTNeoXForCausalLM,
+            functools.partial(huggingface_to_easydel, embedding_layer_name="wte")
+        )
+    elif model_type == "palm":
+        from . import FlaxPalmForCausalLM as _FlaxPalmForCausalLM
+        from . import PalmConfig as _PalmConfig
+        return (
+            _PalmConfig,
+            _FlaxPalmForCausalLM,
+            functools.partial(huggingface_to_easydel, embedding_layer_name="wte")
+        )
+    elif model_type == "lt":
+        from . import FlaxLTForCausalLM as _FlaxLTForCausalLM
+        from . import FlaxLTConfig as _FlaxLTConfig
+
+        return (
+            _FlaxLTConfig,
+            _FlaxLTForCausalLM,
+            functools.partial(huggingface_to_easydel, embedding_layer_name="wte")
+        )
+
+    else:
+        raise EasyDelRunTimeError(f'Model Type ({model_type}) is not supported or is not found')
 
 
 def is_flatten(pytree: dict):
@@ -105,9 +116,9 @@ class AutoEasyDelModelForCausalLM:
         """
         config = AutoConfig.from_pretrained(repo_id)
         model_type = config.model_type
-        if model_type not in TYPE_TO_CFG_MODEL:
-            raise EasyDelRunTimeError(f'Model Type ({model_type}) is not supported or is not found')
-        cfg, module, trf = TYPE_TO_CFG_MODEL[model_type]
+
+        cfg, module, trf = get_modules_by_type(model_type)
+
         model = AutoModelForCausalLM.from_pretrained(repo_id, **kwargs)
         cfg = cfg.from_pretrained(repo_id)
         if hasattr(cfg, 'add_jax_args'):
