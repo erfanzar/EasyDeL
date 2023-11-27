@@ -8,7 +8,6 @@ import chex
 from typing import Sequence, Optional
 from jax.experimental.mesh_utils import create_device_mesh
 
-
 ACT2FN = {
     "gelu": partial(nn.gelu, approximate=False),
     "relu": nn.relu,
@@ -175,3 +174,11 @@ class JaxBaseClassModel:
     @staticmethod
     def get_flash_attention():
         return get_flash_attention()
+
+
+def add_start_docstrings(*docstr):
+    def docstring_decorator(fn):
+        fn.__doc__ = "".join(docstr) + (fn.__doc__ if fn.__doc__ is not None else "")
+        return fn
+
+    return docstring_decorator

@@ -25,7 +25,7 @@ from EasyDel.modules.flax_modelling_utils import (
     get_flash_attention,
     JaxBaseClassModel
 )
-
+from transformers import LlamaForCausalLM
 import chex
 from fjformer.bits import config as q_config, q_flax
 
@@ -65,6 +65,7 @@ class LlamaConfig(PretrainedConfig, JaxBaseClassModel):
             bits: Optional[int] = None,
             axis_dims: Sequence[int] = (1, -1, 1, 1),
             axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
+            scan_layers: bool = True,
             **kwargs,
     ):
         num_key_value_heads = num_key_value_heads or number_rep_kv * num_attention_heads
@@ -95,7 +96,7 @@ class LlamaConfig(PretrainedConfig, JaxBaseClassModel):
         self.flash_attn_query_chunk_size = flash_attn_query_chunk_size
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.bits = bits
-
+        self.scan_layers = scan_layers
         super().__init__(
             axis_dims=axis_dims,
             axis_names=axis_names,
@@ -162,7 +163,9 @@ class LlamaConfig(PretrainedConfig, JaxBaseClassModel):
                      bits: Optional[int] = None,
                      axis_dims: Sequence[int] = (1, -1, 1, 1),
                      axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
+                     scan_layers: bool = True
                      ):
+        self.scan_layers = scan_layers
         self.axis_names = axis_names
         self.axis_dims = axis_dims
         self.use_flash_attention = use_flash_attention
@@ -438,8 +441,8 @@ class FlaxLlamaAttention(nn.Module):
                         dropout_rng=dropout_rng,
                         attn_pdrop=self.config.attn_pdrop,
                         causal=True,
-                        query_chunk_size=self.config.scan_query_chunk_size,
-                        key_chunk_size=self.config.scan_key_chunk_size,
+                        query_chunk_size=self.config.flash_attn_query_chunk_size,
+                        key_chunk_size=self.config.flash_attn_key_chunk_size,
                         dtype=self.dtype,
                         policy=get_gradient_checkpoint_policy('nothing_saveable'),
                         precision=self.precision,
