@@ -7,6 +7,8 @@ from functools import partial
 import chex
 from typing import Sequence, Optional
 from jax.experimental.mesh_utils import create_device_mesh
+from jax.sharding import PartitionSpec as PS
+from jax.experimental.shard_map import shard_map
 
 ACT2FN = {
     "gelu": partial(nn.gelu, approximate=False),
@@ -118,19 +120,148 @@ def get_ranks_and_size(mesh):
 
 def get_flash_attention():
     """
-    return: FlashAttention FN, Upcast Needed to float32
+    return: FlashAttention FN, Upcast Needed to float32,do_shard_map
     """
     platform = jax.lib.xla_bridge.get_backend().platform
     if platform == "gpu":
         float32_logits = False
         ring_attention_fn = fjformer.attention.ring_flash_attention_gpu
+        do_shard_map = True
     elif platform == "tpu":
         float32_logits = True
-        ring_attention_fn = fjformer.attention.ring_flash_attention_tpu
+        ring_attention_fn = fjformer.attention.tpu_flash_attention
+        do_shard_map = False
     else:
         raise ValueError(f"Unsupported platform {platform}")
 
-    return ring_attention_fn, float32_logits
+    return ring_attention_fn, float32_logits, do_shard_map
+
+
+def smart_flash_attention(
+        q: chex.Array,
+        k: chex.Array,
+        v: chex.Array,
+        bias: chex.Array,
+        block_k: int,
+        block_q: int,
+        block_b: int,
+        q_seq_len: int,
+        kv_seq_len: int,
+        num_attention_heads: int,
+        num_key_value_heads: int,
+        head_dims: int,
+        causal: bool,
+        attn_pdrop: float,
+        mesh: jax.sharding.Mesh = None,
+        dtype: jax.numpy.dtype = jax.numpy.float32,
+        precision: jax.lax.Precision = jax.lax.Precision('fastest'),
+        dropout_rng: jax.random.PRNGKey = None,
+        force_float32_tpu: bool = True,
+        deterministic: bool = False
+):
+    """
+    Smart Flash Attention mechanism for efficient attention computation.
+
+    Args:
+    - q: Query tensor with shape [batch_size, num_attention_heads, q_seq_len, head_dims].
+    - k: Key tensor with shape [batch_size, num_key_value_heads, kv_seq_len, head_dims].
+    - v: Value tensor with shape [batch_size, num_key_value_heads, kv_seq_len, head_dims].
+    - bias: Bias tensor with shape [batch_size, num_attention_heads, q_seq_len, kv_seq_len].
+    - block_k: Block size for key tensor reshaping.
+    - block_q: Block size for query tensor reshaping.
+    - block_b: Block size for bias tensor reshaping.
+    - q_seq_len: Length of the query sequence.
+    - kv_seq_len: Length of the key-value sequence.
+    - num_attention_heads: Number of attention heads.
+    - num_key_value_heads: Number of key-value heads.
+    - head_dims: Dimensionality of each attention head.
+    - causal: If True, applies causal masking to the attention scores.
+    - attn_pdrop: Dropout probability for attention weights.
+    - mesh: Mesh specifying the data distribution for parallel computation.
+    - dtype: Data type of the tensors.
+    - precision: Precision mode for computation (default is 'fastest').
+    - dropout_rng: Random number generator key for dropout.
+    - force_float32_tpu: If True, forces computation to use float32 on TPU.
+    - deterministic: If True, ensures deterministic computation.
+
+    Returns:
+    - Output tensor with the same shape as the input value tensor v.
+
+    Raises:
+    - ValueError: If the shapes of input tensors are not compatible for attention computation.
+
+    """
+    assertion_mkv_err = """
+    Q,K,V and bias shapes must be like
+    Q Shape : [batch_size, num_attention_heads, q_seq_len, head_dims]
+    K Shape : [batch_size, num_key_value_heads, kv_seq_len, head_dims]
+    V Shape : [batch_size, num_key_value_heads, kv_seq_len, head_dims]
+    bias Shape : [batch_size, num_attention_heads, q_seq_len, kv_seq_len]
+    """
+    batch_size = q.shape[0]
+    assert batch_size == k.shape[0] == v.shape[0], 'Batch Size for q,k,v wont match'
+
+    assert q.shape == (batch_size, num_attention_heads, q_seq_len, head_dims), assertion_mkv_err
+    assert k.shape == (batch_size, num_key_value_heads, kv_seq_len, head_dims), assertion_mkv_err
+    assert v.shape == (batch_size, num_key_value_heads, kv_seq_len, head_dims), assertion_mkv_err
+    assert bias.shape == (batch_size, num_attention_heads, q_seq_len, kv_seq_len), assertion_mkv_err
+
+    flash_attn_fn, f32_upcast, do_shard_map = get_flash_attention()
+
+    if do_shard_map:
+        q, k, v = map(lambda x: jax.numpy.transpose(x, (0, 2, 1, 3)), [q, k, v])
+        assert mesh is not None, 'For Using Shard Map on GPUs you have to pass Mesh'
+        ring_attention_sharded = shard_map(
+            partial(
+                flash_attn_fn,
+                axis_name="mp",
+                float32_logits=f32_upcast,
+                blockwise_kwargs=dict(
+                    deterministic=deterministic,
+                    dropout_rng=dropout_rng,
+                    attn_pdrop=attn_pdrop,
+                    causal=causal,
+                    query_chunk_size=block_q,
+                    key_chunk_size=block_k,
+                    dtype=dtype,
+                    policy=jax.checkpoint_policies.nothing_saveable,
+                    precision=precision,
+                    prevent_cse=False,
+                )
+            ),
+            mesh=mesh,
+            in_specs=(
+                PS(("dp", "fsdp"), "mp", "tp", None),
+                PS(("dp", "fsdp"), "mp", "tp", None),
+                PS(("dp", "fsdp"), "mp", "tp", None),
+                PS(("dp", "fsdp"), None, None, None)
+            ),
+            out_specs=PS(("dp", "fsdp"), "mp", "tp", None),
+            check_rep=False
+        )
+        attn_output = ring_attention_sharded(q, k, v, bias)
+        attn_output = with_sharding_constraint(attn_output, PS(("dp", "fsdp"), "mp", "tp", None))
+    else:
+        if force_float32_tpu or f32_upcast:
+            q, k, v = map(lambda x: x.astype(jax.numpy.float32), [q, k, v])
+        attn_output = fjformer.attention.jax_flash_attn_tpu.flash_attention(
+            q,
+            k,
+            v,
+            bias,
+            None,
+            causal=False,
+            sm_scale=1.0,
+            block_sizes=fjformer.attention.jax_flash_attn_tpu.BlockSizes(
+                block_b=block_b,
+                block_k=block_k,
+                block_q=block_q,
+                block_k_major=block_k
+            ),
+            debug=False,
+        )
+    attn_output = attn_output.astype(dtype)
+    return attn_output
 
 
 def create_mesh(
