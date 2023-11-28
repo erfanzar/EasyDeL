@@ -16,8 +16,17 @@ from transformers import PretrainedConfig, FlaxPreTrainedModel
 from flax.linen import partitioning as nn_partitioning, combine_masks
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 
-from EasyDel.modules.flax_modelling_utils import ACT2FN, with_sharding_constraint, get_gradient_checkpoint_policy, repeat_kv_bnsh, \
-    apply_rotary_pos_emb, precompute_freq_cis, JaxBaseClassModel, get_flash_attention
+from EasyDel.modules.flax_modelling_utils import (
+    ACT2FN,
+    with_sharding_constraint,
+    get_gradient_checkpoint_policy,
+    repeat_kv_bnsh,
+    apply_rotary_pos_emb,
+    precompute_freq_cis,
+    JaxBaseClassModel,
+    get_flash_attention,
+    smart_flash_attention
+)
 import chex
 from fjformer.bits import config as q_config, q_flax
 
@@ -402,7 +411,9 @@ class FlaxMistralAttention(nn.Module):
             )
         else:
             causal_mask = causal_mask[:, :, :q_l, :k_l]
-
+        dropout_rng = None
+        if not deterministic and self.config.attn_pdrop > 0.0:
+            dropout_rng = self.make_rng("dropout")
         causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
         if attention_mask.ndim == 2:
             attention_mask = jnp.broadcast_to(jnp.expand_dims(attention_mask, axis=(-3, -2)), causal_mask.shape)
@@ -414,49 +425,37 @@ class FlaxMistralAttention(nn.Module):
             if attention_mask.ndim == 2:
                 attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
 
+            if attention_mask.shape[1] != self.config.num_attention_heads:
+                attention_mask = attention_mask.repeat(self.config.num_attention_heads, 1, )
             attention_bias = lax.select(
                 attention_mask > 0,
                 jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
                 jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
             )
             attn_weights = None
-
-            if self.config.use_flash_attention:
-                ring_attention_fn, up_cast_float32 = get_flash_attention()
-            else:
-                up_cast_float32 = True
-                ring_attention_fn = fjformer.attention.ring_attention
-
-            ring_attention_sharded = shard_map(
-                functools.partial(
-                    ring_attention_fn,
-                    axis_name="mp",
-                    float32_logits=up_cast_float32,
-                    blockwise_kwargs=dict(
-                        deterministic=deterministic,
-                        dropout_rng=jax.random.key(0),
-                        attn_pdrop=self.config.attn_pdrop,
-                        causal=True,
-                        query_chunk_size=self.config.scan_query_chunk_size,
-                        key_chunk_size=self.config.scan_key_chunk_size,
-                        dtype=self.dtype,
-                        policy=get_gradient_checkpoint_policy('nothing_saveable'),
-                        precision=self.precision,
-                        prevent_cse=not self.config.scan_layers,
-                    )
-                ),
+            rtp_axis = (0, 2, 1, 3)
+            attn_output = smart_flash_attention(
+                q=jnp.transpose(query, rtp_axis),
+                k=jnp.transpose(key, rtp_axis),
+                v=jnp.transpose(value, rtp_axis),
+                bias=attention_bias,
+                block_q=self.config.flash_attn_query_chunk_size,
+                block_k=self.config.flash_attn_key_chunk_size,
+                block_b=1,
+                num_attention_heads=self.config.num_attention_heads,
+                precision=self.precision,
+                dtype=self.dtype,
+                causal=False,
                 mesh=self.config.jax_mesh(),
-                in_specs=(
-                    PS(("dp", "fsdp"), "mp", "tp", None),
-                    PS(("dp", "fsdp"), "mp", "tp", None),
-                    PS(("dp", "fsdp"), "mp", "tp", None),
-                    PS(("dp", "fsdp"), None, None, None)
-                ),
-                out_specs=PS(("dp", "fsdp"), "mp", "tp", None),
-                check_rep=False
+                dropout_rng=dropout_rng,
+                deterministic=deterministic,
+                q_seq_len=q_l,
+                kv_seq_len=k_l,
+                attn_pdrop=self.config.attn_pdrop,
+                head_dims=self.head_dim,
+                force_float32_tpu=True
             )
-            attn_output = ring_attention_sharded(query, key, value, attention_bias)
-            attn_output = with_sharding_constraint(attn_output, PS(("dp", "fsdp"), "mp", "tp", None))
+            attn_output = jnp.transpose(attn_output, rtp_axis)
         else:
             query_length, key_length = query.shape[1], key.shape[1]
 
