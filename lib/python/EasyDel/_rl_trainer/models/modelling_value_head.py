@@ -2,7 +2,6 @@ import typing
 
 import jax.lax
 from flax import linen as nn
-from overrides import overrides
 from transformers import FlaxPreTrainedModel
 from EasyDel.modules import FlaxLlamaForCausalLM
 from typing import Type
@@ -22,6 +21,16 @@ class ValueHead(nn.Module):
     precision: typing.Optional[jax.lax.Precision] = jax.lax.Precision('fastest')
 
     def setup(self):
+        """
+        The setup function is called by the model's constructor.
+        It initializes all of the layers in your model, and assigns them to member variables.
+        The setup function should be used for any initialization that needs to happen before running forward().
+        This includes things like loading weights from a file, or setting up an optimizer.
+
+        :param self: Represent the instance of the class
+        :return: A tuple of the following:
+        :doc-author: Trelent
+        """
         config = self.config
 
         self.dropout = nn.Dropout(self.summary_dropout_prob)
@@ -43,6 +52,17 @@ class ValueHead(nn.Module):
         )
 
     def __call__(self, hidden_states: chex.Array, deterministic: bool = True):
+        """
+        The __call__ function is the main function of a class.
+        It is called when an instance of the class (an object) is invoked as a function, e.g., x(arg).
+        The __call__ method enables instances of a class to be called like standard Python functions.
+
+        :param self: Represent the instance of the class
+        :param hidden_states: chex.Array: Pass the hidden states of the previous layer
+        :param deterministic: bool: Determine whether to use dropout
+        :return: A tensor of shape (batch_size, num_classes)
+        :doc-author: Trelent
+        """
         output = self.dropout(hidden_states, deterministic=deterministic)
         if output.dtype != self.summary.weight.dtype:
             output = output.to(self.summary.weight.dtype)
@@ -72,6 +92,20 @@ class FlaxAutoModelForCausalLMWithValueHead(FlaxPreTrainedModelWrapper):
             attention_mask=None,
             **kwargs,
     ):
+        """
+        The __call__ function is the main function of a Flax model.
+        It takes in input_ids, attention_mask, and past_key_values as arguments.
+        The output is a tuple containing lm logits and value.
+
+        :param self: Represent the instance of the class
+        :param input_ids: Pass the input to the model
+        :param past_key_values: Pass the past key values to the model
+        :param attention_mask: Mask out the padding tokens
+        :param **kwargs: Pass in the past_key_values parameter
+        :param : Pass the past key values to the model
+        :return: The logits and the value
+        :doc-author: Trelent
+        """
         kwargs["output_hidden_states"] = True
         kwargs["past_key_values"] = past_key_values
 
@@ -93,6 +127,15 @@ class FlaxAutoModelForCausalLMWithValueHead(FlaxPreTrainedModelWrapper):
         return self.pretrained_model.generate(*args, **kwargs)
 
     def push_to_hub(self, *args, **kwargs):
+        """
+        The push_to_hub function is used to push the model to a remote location.
+
+        :param self: Represent the instance of the class
+        :param *args: Send a non-keyworded variable length argument list to the function
+        :param **kwargs: Pass keyworded, variable-length argument list to a function
+        :return: The pretrained model
+        :doc-author: Trelent
+        """
         setattr(self.pretrained_model, "v_head", self.v_head)
 
         return self.pretrained_model.push_to_hub(*args, **kwargs)
