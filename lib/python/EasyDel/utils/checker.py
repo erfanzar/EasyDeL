@@ -2,6 +2,7 @@ from importlib.util import find_spec
 
 
 def package_checker(name: str):
+
     return True if find_spec(name) is not None else False
 
 

@@ -50,6 +50,24 @@ class Seafoam(Base):
                     "monospace",
             ),
     ):
+        """
+        The __init__ function is called when the class is instantiated.
+        It sets up the object with all of its instance variables and other things it needs to function properly.
+
+
+        :param self: Represent the instance of the object
+        :param *: Unpack the list of parameters into a tuple
+        :param primary_hue: Union[colors.Color,str]: Set the primary color of the theme
+        :param secondary_hue: Union[colors.Color,str]: Set the secondary color of the theme
+        :param neutral_hue: Union[colors.Color,str]: Set the neutral color of the theme
+        :param spacing_size: Union[sizes.Size,str]: Set the spacing size of the theme
+        :param radius_size: Union[sizes.Size,str]: Set the radius of the buttons and other elements
+        :param text_size: Union[sizes.Size,str]: Set the size of the text in the app
+
+        :return: The class object
+        :doc-author: Trelent
+        """
+
         super().__init__(
             primary_hue=primary_hue,
             secondary_hue=secondary_hue,

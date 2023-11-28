@@ -74,6 +74,60 @@ class TrainArguments(
             init_input_shape: typing.Tuple[int, int] = (1, 1),
             **kwargs
     ):
+        """
+        The __init__ function is called when the class is instantiated.
+        It sets up the instance of the class, and makes sure that it has all of
+        the attributes necessary for proper functioning. It also allows you to set
+        default values for those attributes if they are not provided as arguments by
+        the person creating an instance.
+
+        :param self: Refer to the class instance itself
+        :param model_name: str: Specify the model name
+        :param num_train_epochs: int: Set the number of epochs for training
+        :param model_id: str: Load a model from the save_dir
+        :param model_class: Initialize the model, and the configs_to_init_model_class parameter is used to
+        :param total_batch_size: int: Set the batch size of the model
+        :param max_steps: Union[int,None]: Determine the maximum number of steps to train for
+        :param optimizer: str: Specify which optimizer to use
+        :param scheduler: str: Set the learning rate scheduler
+        :param learning_rate: Union[int,float]: Set the learning rate , Set the dtype of the model parameters
+        :param learning_rate_end: Union[None,float]: Set the end learning rate, Set the dtype of the model parameters
+        :param gradient_accumulation_steps: int: Accumulate gradients over multiple batches
+        :param weight_decay: float: Control the weight decay
+        :param gradient_checkpointing: str: Control the gradient checkpointing method
+        :param max_length: Union[int, None]: Set the maximum length of a sequence, Pass the model_class to the trainer class
+        :param sharding_array: Union[tuple: Shard the model across multiple devices
+        :param is_fine_tuning: bool: Determine whether the model is being trained from scratch or not
+        :param do_train: bool: Determine whether the model should be trained or not
+        :param do_eval: bool: Determine whether to run the eval loop or not
+        :param do_test: Union[bool,None]: Determine whether to run the test or not, Pass the model_class to the trainer
+        :param backend: Union[str, None]:: Specify the device that will be used for training, Define the default value of a parameter
+        :param extra_optimizer_kwargs: dict: Pass extra arguments to the optimizer
+        :param save_steps: Union[int,None]: Save the model after a number of steps,  Set the default value of do_test to none
+        :param save_dir: str: Specify the directory where the model checkpoints will be saved
+        :param use_pjit_attention_force: bool: Determine whether to use the jax
+        :param dtype: Set the data type of the model parameters and inputs
+        :param param_dtype: Specify the data type of the model parameters
+        :param fully_fsdp: Control the use of fully fused sdp
+        :param use_wandb: bool: Determine whether to use wandb or not
+        :param custom_rule: Pass a custom rule to the optimizer,
+        :param extra_configs: Pass extra configurations to the model class
+        :param ids_to_pop_from_dataset: list: Pop some keys from the dataset,
+        :param remove_ckpt_after_load: bool: Remove the checkpoint after loading it
+        :param configs_to_init_model_class: Pass the configs to the model class
+        :param do_last_save: bool: Save the model at the end of training
+        :param model_parameters: Pass the model parameters to the trainer
+        :param do_shard_fns: bool: Shard the model across multiple devices
+        :param track_memory: bool: Track the memory usage of the model
+        :param loss_remat: str: Specify how to rematerialize the loss function
+        :param loss_chunk: int: Chunk the loss function
+        :param is_left_padded: bool: Indicate whether the input is left padded or not
+        :param warmup_steps: int: Warm up the learning rate
+        :param init_input_shape: typing.Tuple[int]: Initialize the input shape of the model
+        :param **kwargs: Pass a variable number of keyword arguments to a function
+        :return: Nothing
+        :doc-author: Trelent
+        """
         super().__init__()
         if ids_to_pop_from_dataset is None:
             ids_to_pop_from_dataset = []
@@ -146,10 +200,27 @@ class TrainArguments(
         return {k: v for k, v in self.__dict__.items()}
 
     def get_meter_dict(self):
+        """
+        The get_meter_dict function is used to return a dictionary of the hyperparameters.
+        The function iterates through all the attributes in the class and returns a dictionary with
+        the key as &quot;hyperparameters/{k}&quot; and value as v for each attribute k,v in self.__dict__ if it is an instance of int, float, str, bool or torch.Tensor.
+
+        :param self: Represent the instance of the class
+        :return: A dictionary of hyperparameters
+        :doc-author: Trelent
+        """
         return {f"hyperparameters/{k}": v for k, v in self.__dict__.items() if
                 isinstance(v, (int, float, str, bool, torch.Tensor))}
 
     def get_wandb_init(self):
+        """
+        The get_wandb_init function is a helper function that returns the wandb.init() call with
+        the project name, config object, and tags set to appropriate values for this model.
+
+        :param self: Pass the class instance to the function
+        :return: A wandb
+        :doc-author: Trelent
+        """
         return wandb.init(
             project=f'easydel-{self.model_name}',
             config=self(),
@@ -178,16 +249,48 @@ class TrainArguments(
         return string
 
     def get_path(self):
+        """
+        The get_path function returns a pathlib.Path object, which is a class that
+        represents file paths and provides methods for interacting with the files at
+        those paths. The get_path function takes no arguments and returns an instance of
+        the Path class initialized with two arguments: self.save_dir (a string) and
+        self.model_name (also a string). The save directory is the directory where we'll
+        store our model checkpoints, while the model name will be used to create unique
+        filenames for each checkpoint.
+
+        :param self: Represent the instance of the class
+        :return: A pathlib
+        :doc-author: Trelent
+        """
         return pathlib.Path(
             self.save_dir, self.model_name
         )
 
     def ckpt_path_exists(self):
+        """
+        The ckpt_path_exists function checks to see if the path exists. If it does not, then it creates a new directory.
+
+        :param self: Represent the instance of the class
+        :return: A path
+        :doc-author: Trelent
+        """
         path = self.get_path()
         if not path.exists():
             path.mkdir(parents=True)
 
     def get_mesh(self):
+        """
+        The get_mesh function is used to create a mesh object that can be used
+        to define the geometry of the device. The mesh object contains two arrays:
+        a list of vertices and a list of faces. Each face is defined by three indices,
+        which correspond to three vertices in the vertex array. The get_mesh function
+        is called when creating an instance of DeviceGeometry, which is then passed
+        into an instance of DeviceSimulation.
+
+        :param self: Refer to the object itself
+        :return: A mesh object with the device array shape and the mesh names
+        :doc-author: Trelent
+        """
         return Mesh(
             create_device_mesh(
                 self.array_devices_shape
@@ -203,6 +306,15 @@ class TrainArguments(
         return "dp", "fsdp", "tp", "mp"
 
     def get_optimizer_and_scheduler(self, steps=None):
+        """
+        The get_optimizer_and_scheduler function is a helper function that returns the optimizer and scheduler
+            based on the parameters passed to it.
+
+        :param self: Represent the instance of the class
+        :param steps: Calculate the number of steps to train
+        :return: A tuple of two objects:
+        :doc-author: Trelent
+        """
         steps = self.max_steps or steps
         assert steps is not None, 'if you haven\'t pass max steps to init you should pass init in func'
 
@@ -344,10 +456,30 @@ class TrainArguments(
         return tx, sc
 
     def get_streaming_checkpointer(self):
+        """
+        The get_streaming_checkpointer function is used to save the model's weights.
+        The streaming checkpointer saves the model's weights in a file called &quot;checkpoint&quot; and then
+        saves a copy of that file with an incrementing number appended to it (e.g., checkpoint_001,
+        checkpoint_002, etc.). This allows you to keep multiple versions of your trained models.
+
+        :param self: Represent the instance of the class
+        :return: A streamingcheckpointer object
+        :doc-author: Trelent
+        """
         return StreamingCheckpointer(StreamingCheckpointer.get_default_config(),
                                      os.path.join(self.save_dir, self.model_name))
 
     def get_board(self):
+        """
+        The get_board function is a helper function that returns a TensorBoard object.
+        The TensorBoard object is used to log the training and validation loss, as well as
+        the accuracy of the model during training. The get_board function takes no arguments,
+        and returns an instance of torch.utils.tensorboard SummaryWriter class.
+
+        :param self: Represent the instance of the class
+        :return: A summary-writer object
+        :doc-author: Trelent
+        """
         return torch.utils.tensorboard.SummaryWriter(
             log_dir=str(self.get_path()),
             comment=f'{self.model_name}',

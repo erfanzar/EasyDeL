@@ -17,6 +17,16 @@ class EasyDelRunTimeError(Exception):
 
 
 def get_modules_by_type(model_type: str):
+    """
+    The get_modules_by_type function is a helper function that returns the following:
+        1. The config class for the model type specified (e.g., LlamaConfig, FalconConfig)
+        2. The Flax Model class for the model type specified (e.g., FlaxLlamaForCausalLM, FlaxFalconForCausalLM)
+        3. A function to convert a HuggingFace pretrained checkpoint into an EasyDel checkpoint
+
+    :param model_type: str: Determine which model to use
+    :return: A tuple of three elements
+    :doc-author: Trelent
+    """
     if model_type == "llama":
         from EasyDel.modules.llama import LlamaConfig as _LlamaConfig
         from EasyDel.modules.llama import FlaxLlamaForCausalLM as _FlaxLlamaForCausalLM
@@ -95,6 +105,15 @@ def get_modules_by_type(model_type: str):
 
 
 def is_flatten(pytree: dict):
+    """
+    The is_flatten function checks if the pytree is flattened.
+        If it is, then the first key in the dictionary will be a tuple of (mpl, mpl_id).
+        Otherwise, it will be an integer representing mpl_id.
+
+    :param pytree: dict: Pass the pytree to the function
+    :return: True if the pytree is a flattened tree, and false otherwise
+    :doc-author: Trelent
+    """
     mpl = [k for k in pytree.keys()][0]
     return True if isinstance(mpl, tuple) else False
 
@@ -114,8 +133,24 @@ class AutoEasyDelModelForCausalLM:
             **kwargs
     ) -> typing.Union[FlaxPreTrainedModel, dict]:
         """
-        returns Model and Parameters for the Model
+        The from_pretrained function is a helper function that allows you to instantiate a model from the pretrained
+        model repository. It takes as input the name of the model (e.g., 'bert-base-uncased') and returns an instance of
+        the class corresponding to your model, with all weights loaded from disk.
+
+        :param cls: Create an instance of the class that called this function
+        :param repo_id: str: Identify the model in the huggingface model hub
+        :param device: Specify the device on which to run the model
+        :param dtype: jax.numpy.dtype: Specify the data type of the model
+        :param param_dtype: jax.numpy.dtype: Specify the dtype of the parameters
+        :param precision: jax.lax.Precision: Control the precision of the model
+        :param sharding_axis_dims: typing.Sequence[int]: Specify the dimension of each axis in the sharded model
+        :param sharding_axis_names: typing.Sequence[str]: Specify the order of sharding
+        :param input_shape: typing.Sequence[int]: Specify the shape of the input to the model
+        :param **kwargs: Pass additional arguments to the model and config classes
+        :return: A model and parameters
+        :doc-author: Trelent
         """
+
         config = AutoConfig.from_pretrained(repo_id)
         model_type = config.model_type
 

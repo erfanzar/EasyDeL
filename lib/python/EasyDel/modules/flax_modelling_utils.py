@@ -21,6 +21,18 @@ ACT2FN = {
 
 
 def get_names_from_partition_spec(partition_specs):
+    """
+    The get_names_from_partition_spec function takes a partition_specs argument, which is either a dictionary or list.
+    If it's a dictionary, the function converts it to a list of values. Then for each item in the partition_specs list:
+        If the item is None, continue (do nothing) and move on to next iteration of loop.
+        If the item is an instance of str (i.e., if it's just one string), add that string to names set and move
+        on to next iteration of loop.
+        Otherwise, (if not None or str), call get_names_from_partition_spec recurs
+
+    :param partition_specs: Define the partitioning of a table
+    :return: A list of the names of all partitions
+    :doc-author: Trelent
+    """
     names = set()
     if isinstance(partition_specs, dict):
         partition_specs = partition_specs.values()
@@ -36,10 +48,31 @@ def get_names_from_partition_spec(partition_specs):
 
 
 def names_in_mesh(*names):
+    """
+    The names_in_mesh function is a decorator that can be used to check whether
+    the names of the axes passed into a function are valid.  It will raise an
+    exception if any of the axis names are not in the physical mesh.  For example,
+    if you have a function that takes two axes as arguments, and you want to make sure they're both in your mesh:
+
+    :param *names: Collect all the names passed to the function into a tuple
+    :return: A boolean indicating whether all the given
+    :doc-author: Trelent
+    """
     return set(names) <= set(pxla.thread_resources.env.physical_mesh.axis_names)
 
 
 def with_sharding_constraint(x, partition_specs):
+    """
+    The with_sharding_constraint function is used to ensure that the sharding of a tensor
+    is consistent with the sharding of its inputs.  This function should be called on any
+    tensor which has been created by an operation which does not automatically handle this,
+    such as tf.concat or tf.split.
+
+    :param x: Define the tensor that will be sharded
+    :param partition_specs: Specify the partitioning of the data
+    :return: The same tensor with the
+    :doc-author: Trelent
+    """
     axis_names = get_names_from_partition_spec(partition_specs)
     if names_in_mesh(*axis_names):
         x = wsc(x, partition_specs)
@@ -47,6 +80,14 @@ def with_sharding_constraint(x, partition_specs):
 
 
 def get_gradient_checkpoint_policy(name):
+    """
+    The get_gradient_checkpoint_policy function is a helper function that returns the gradient checkpoint policy
+        specified by the name parameter.
+
+    :param name: Select the checkpoint policy from the dictionary
+    :return: A function that is used in the jax
+    :doc-author: Trelent
+    """
     gradients = dict(
         everything_saveable=jax.checkpoint_policies.everything_saveable,
         nothing_saveable=jax.checkpoint_policies.nothing_saveable,
@@ -63,6 +104,18 @@ def get_gradient_checkpoint_policy(name):
 
 
 def repeat_kv_bnsh(x: chex.Array, n_rep: int) -> chex.Array:
+    """
+    The repeat_kv_bnsh function is used to repeat the key and value vectors for each head in a multi-head attention
+    module. This function takes as input an array of shape (batch_size, n_heads, sequence_length, head_dim) and returns
+    an array of shape (batch_size, n_heads * nrep, sequence length, head dim). The reason this is necessary is because the
+    attention module expects keys/values/queries to be repeated across heads but not across batches. However we want our
+    keys/values/queries to be repeated both across heads AND batches so that we can use them
+
+    :param x: chex.Array: Pass in the input to the function
+    :param n_rep: int: Repeat the key and value heads
+    :return: A new array with the same shape as x, except for the second dimension which is n_kv_heads * n_rep
+    :doc-author: Trelent
+    """
     bs, n_kv_heads, s, head_dim = x.shape
     if n_rep == 1:
         return x
@@ -73,6 +126,14 @@ def repeat_kv_bnsh(x: chex.Array, n_rep: int) -> chex.Array:
 
 
 def repeat_kv_bsnh(x: chex.Array, n_rep: int) -> chex.Array:
+    """
+    The repeat_kv_bsnh function is used to repeat the key and value vectors for each head.
+
+    :param x: chex.Array: Specify the input array
+    :param n_rep: int: Repeat the key-value attention heads n_rep times
+    :return: A new array with the same batch size, sequence length, and head dimension as the input array
+    :doc-author: Trelent
+    """
     bs, s, n_kv_heads, head_dim = x.shape
     x = x.transpose(0, 2, 1, 3)
     if n_rep == 1:
@@ -86,6 +147,14 @@ def repeat_kv_bsnh(x: chex.Array, n_rep: int) -> chex.Array:
 
 
 def precompute_freq_cis(max_position_embedding, head_dim):
+    """
+    The precompute_freq_cis function is used to precompute the sinusoidal embeddings for positional encoding.
+
+    :param max_position_embedding: Define the maximum length of the sequence
+    :param head_dim: Determine the number of heads in the attention layer
+    :return: Two arrays:
+    :doc-author: Trelent
+    """
     inv_freq = 1.0 / (10000 ** (jax.numpy.arange(0, head_dim, 2, dtype=jax.numpy.float32) / head_dim))
     freq = jax.numpy.einsum("i , j -> i j", jax.numpy.arange(max_position_embedding), inv_freq).astype("float32")
 
@@ -94,16 +163,46 @@ def precompute_freq_cis(max_position_embedding, head_dim):
 
 
 def rotate_half(x):
+    """
+    The rotate_half function takes a complex-valued array and rotates the
+    phase of its second half by 180 degrees. This is equivalent to multiplying
+    the second half by -i, or equivalently rotating it 90 degrees counterclockwise.
+
+
+    :param x: Specify the input array
+    :return: A new array that is the same as the input
+    :doc-author: Trelent
+    """
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2:]
     return jax.numpy.concatenate((-x2, x1), axis=-1)
 
 
 def apply_rotary_pos_emb(tensor, sin_, cos_):
+    """
+    The apply_rotary_pos_emb function applies a rotary positional embedding to the input tensor.
+
+    :param tensor: Store the tensor that is passed into the function
+    :param sin_: Rotate the tensor by pi/2
+    :param cos_: Apply the cosine function to the tensor
+    :return: A tensor with the same shape as the input tensor
+    :doc-author: Trelent
+    """
     return (tensor * cos_) + (rotate_half(tensor) * sin_)
 
 
 def get_ranks_and_size(mesh):
+    """
+    The get_ranks_and_size function is used to determine the number of MPI processes
+    (``mp_node_size``) and the number of devices per process (``dp_node_size``).
+    The ``mesh.shape[&quot;tp&quot;] * mesh.shape[&quot;mp&quot;]`` determines how many MPI processes are needed,
+    and then we divide that by the local device count to get ``mp_node_size = max( 1, mp / jax.local )`.
+    This means that if there are more than enough devices for all MPI ranks on a node, each rank will only use one device; otherwise it will use
+
+    :param mesh: Get the shape of the mesh
+    :return: A dictionary with the following keys:
+    :doc-author: Trelent
+    """
     out = dict(mesh=mesh)
     mp_size = mesh.shape["tp"] * mesh.shape["mp"]
     mp_node_size = max(1, mp_size // jax.local_device_count())
@@ -265,6 +364,15 @@ def smart_flash_attention(
 def create_mesh(
         axis_dims: Sequence[int] = (1, -1, 1, 1), axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"), backend=""
 ):
+    """
+    The create_mesh function creates a mesh object that can be used to shard arrays.
+
+    :param axis_dims: Sequence[int]: Specify the dimensions of the mesh
+    :param axis_names: Sequence[str]: Name the axes of the mesh
+    :param backend: Specify the backend to use
+    :return: A mesh object
+    :doc-author: Trelent
+    """
     array_devices = jax.numpy.ones((len(jax.devices() if backend == "" else jax.devices(backend)), 1))
     resh = array_devices.reshape(axis_dims).shape
 
@@ -280,11 +388,31 @@ class JaxBaseClassModel:
             axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
             backend: Optional[None] = None
     ):
+        """
+        The __init__ function is called when the class is instantiated.
+        It sets up the object with all of its initial values.
+
+        :param self: Represent the instance of the class
+        :param axis_dims: Sequence[int]: Specify the dimensions of the mesh
+        :param axis_names: Sequence[str]: Name the axes of the mesh
+        :param backend: Specify the backend to use
+        :return: A new instance of the class
+        :doc-author: Trelent
+        """
         self.axis_dims = axis_dims
         self.axis_names = axis_names
         self.backend = backend if backend is not None else ""
 
     def jax_mesh(self) -> jax.sharding.Mesh:
+        """
+        The jax_mesh function is a helper function that creates a jax.sharding.Mesh object from the
+        axis_dims and axis_names attributes of an object, which are assumed to be lists of integers and strings, respectively.
+        The backend attribute is also used if it exists.
+
+        :param self: Refer to the object itself
+        :return: A jaxMesh
+        :doc-author: Trelent
+        """
         return create_mesh(
             axis_dims=self.axis_dims,
             axis_names=self.axis_names,
@@ -292,20 +420,60 @@ class JaxBaseClassModel:
         )
 
     def get_axis_dims(self) -> Sequence[int]:
+        """
+        The get_axis_dims function returns a sequence of integers representing the dimensions of each axis.
+
+        :param self: Represent the instance of the class
+        :return: The dimensions of the axes
+        :doc-author: Trelent
+        """
         return self.axis_dims
 
     def get_axis_names(self) -> Sequence[str]:
+        """
+        The get_axis_names function returns a list of the names of the axes.
+
+        :param self: Represent the instance of the class
+        :return: A list of the names of all axes
+        :doc-author: Trelent
+        """
         return self.axis_names
 
     def get_backend(self) -> str:
+        """
+        The get_backend function returns the backend that is currently being used.
+        If no backend has been set, it will return the default JAX backend.
+
+        :param self: Bind the method to an object
+        :return: The backend platform
+        :doc-author: Trelent
+        """
         return self.backend if not self.backend == "" else jax.lib.xla_bridge.get_backend().platform
 
     @staticmethod
     def get_flash_attention():
+        """
+        The get_flash_attention function is used to get the flash attention value from the database.
+            :returns: The flash attention value from the database.
+
+        :return: A function
+        :doc-author: Trelent
+        """
         return get_flash_attention()
 
 
 def add_start_docstrings(*docstr):
+    """
+    The add_start_docstrings function is a decorator that adds the docstrings to the beginning of a function.
+    The add_start_docstrings function takes in an arbitrary number of strings and returns a decorator.
+    The returned decorator takes in one argument, fn, which is assumed to be a function. The docstring for fn is set equal to
+    the concatenation of all the strings passed into add_start_docstrings plus (if it exists) the original docstring for fn.
+    
+    :param *docstr: Pass in a variable number of arguments to the function
+    :return: A decorator that adds the docstrings to the function
+    :doc-author: Trelent
+    """
+
     def docstring_decorator(fn):
         fn.__doc__ = "".join(docstr) + (fn.__doc__ if fn.__doc__ is not None else "")
         return fn
