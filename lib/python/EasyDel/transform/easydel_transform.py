@@ -15,7 +15,7 @@ def get_float_dtype_by_name(dtype):
 
     :param dtype: Specify the type of data that is being passed into the function
     :return: The float dtype of the input string
-    :doc-author: Trelent
+    
     """
     return {
         'bf16': jax.numpy.bfloat16,
@@ -36,7 +36,7 @@ def float_tensor_to_dtype(tensor, dtype):
     :param tensor: Convert the tensor to a float dtype
     :param dtype: Convert the tensor to a specific dtype
     :return: A tensor with the specified dtype
-    :doc-author: Trelent
+    
     """
     if dtype is None or dtype == '':
         return tensor
@@ -58,7 +58,7 @@ def match_keywords(string, ts, ns):
     :param ts: Specify the required keywords and ns is used to specify the non-required keywords
     :param ns: Specify a list of negative keywords
     :return: True if all the keywords in ts are present and none of the
-    :doc-author: Trelent
+    
     """
     for t in ts:
         if t not in string:
@@ -81,7 +81,7 @@ def huggingface_to_easydel(state_dict, embedding_layer_name: str, device, dtype:
     :param device: Determine which device the model will be loaded on
     :param dtype: jax.numpy.dtype: Specify the data type of the tensors
     :return: A dictionary of the weights and biases in a format that can be used by flax
-    :doc-author: Trelent
+    
     """
     _l = len('.weight')
     with jax.default_device(device):
@@ -113,7 +113,7 @@ def read_ckpt(path: [str, os.PathLike], shard_fns=None, add_extra_past_fix: list
     :param shard_fns: Shard the tensors
     :param add_extra_past_fix: list: Add an extra past to the key
     :return: A dictionary of tensors
-    :doc-author: Trelent
+    
     """
     tensors = {}
     with open(path, 'rb') as stream:
@@ -138,7 +138,7 @@ def save_ckpt(train_state, path, gather_fns=None, float_dtype=None):
     :param gather_fns: Specify a function that will be used to convert the tensor to bytes
     :param float_dtype: Convert the tensor to a specific dtype
     :return: Nothing
-    :doc-author: Trelent
+    
     """
 
     train_state = to_state_dict(train_state)

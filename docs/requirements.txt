@@ -1,0 +1,33 @@
+absl-py
+ipython>=8.8.0  # 8.7.0 has ipython3 lexer error
+sphinx>=6.0.0
+sphinx-autodoc-typehints
+sphinx-book-theme>=1.0.1  # Older versions fail to pin pydata-sphinx-theme
+sphinx-copybutton>=0.5.0
+sphinx-remove-toctrees
+jupyter-sphinx>=0.3.2
+sphinx-design
+myst-nb>=1.0.0
+
+# Packages used for CI tests.
+pytest
+pytest-xdist
+
+# Packages used for notebook execution
+matplotlib
+scikit-learn
+numpy
+chex~=0.1.7
+typing
+jax>=0.4.10
+transformers>=4.34.0
+flax>=0.7.1
+optax>=0.1.7
+einops
+msgpack
+ml_collections
+einops
+datasets
+IPython
+jax_extensions
+matplotlib

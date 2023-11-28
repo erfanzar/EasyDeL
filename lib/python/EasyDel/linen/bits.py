@@ -15,7 +15,7 @@ def get_tile_inds(format_):
 
     :param format_: Determine the shape of the tile_inds array
     :return: The indices of the tiles in a given format
-    :doc-author: Trelent
+    
     """
     transform = lambda x: lax.cond(
         jnp.bitwise_and(jnp.array(format_), 1),
@@ -76,7 +76,7 @@ class MatmulLtState:
 
         :param self: Represent the instance of the class
         :return: Nothing
-        :doc-author: Trelent
+        
         """
         self.CB = None
         self.CxB = None
@@ -153,7 +153,7 @@ def aqt_matmul_int8(a, w):
     :param a: Scale the input tensor
     :param w: Store the weights of the model
     :return: A result that is close to the original matrix multiplication
-    :doc-author: Trelent
+    
     """
     max_int8 = 127
 

@@ -65,7 +65,7 @@ class Seafoam(Base):
         :param text_size: Union[sizes.Size,str]: Set the size of the text in the app
 
         :return: The class object
-        :doc-author: Trelent
+        
         """
 
         super().__init__(

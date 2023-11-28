@@ -31,7 +31,7 @@ def get_names_from_partition_spec(partition_specs):
 
     :param partition_specs: Define the partitioning of a table
     :return: A list of the names of all partitions
-    :doc-author: Trelent
+    
     """
     names = set()
     if isinstance(partition_specs, dict):
@@ -56,7 +56,7 @@ def names_in_mesh(*names):
 
     :param *names: Collect all the names passed to the function into a tuple
     :return: A boolean indicating whether all the given
-    :doc-author: Trelent
+    
     """
     return set(names) <= set(pxla.thread_resources.env.physical_mesh.axis_names)
 
@@ -71,7 +71,7 @@ def with_sharding_constraint(x, partition_specs):
     :param x: Define the tensor that will be sharded
     :param partition_specs: Specify the partitioning of the data
     :return: The same tensor with the
-    :doc-author: Trelent
+    
     """
     axis_names = get_names_from_partition_spec(partition_specs)
     if names_in_mesh(*axis_names):
@@ -86,7 +86,7 @@ def get_gradient_checkpoint_policy(name):
 
     :param name: Select the checkpoint policy from the dictionary
     :return: A function that is used in the jax
-    :doc-author: Trelent
+    
     """
     gradients = dict(
         everything_saveable=jax.checkpoint_policies.everything_saveable,
@@ -114,7 +114,7 @@ def repeat_kv_bnsh(x: chex.Array, n_rep: int) -> chex.Array:
     :param x: chex.Array: Pass in the input to the function
     :param n_rep: int: Repeat the key and value heads
     :return: A new array with the same shape as x, except for the second dimension which is n_kv_heads * n_rep
-    :doc-author: Trelent
+    
     """
     bs, n_kv_heads, s, head_dim = x.shape
     if n_rep == 1:
@@ -132,7 +132,7 @@ def repeat_kv_bsnh(x: chex.Array, n_rep: int) -> chex.Array:
     :param x: chex.Array: Specify the input array
     :param n_rep: int: Repeat the key-value attention heads n_rep times
     :return: A new array with the same batch size, sequence length, and head dimension as the input array
-    :doc-author: Trelent
+    
     """
     bs, s, n_kv_heads, head_dim = x.shape
     x = x.transpose(0, 2, 1, 3)
@@ -153,7 +153,7 @@ def precompute_freq_cis(max_position_embedding, head_dim):
     :param max_position_embedding: Define the maximum length of the sequence
     :param head_dim: Determine the number of heads in the attention layer
     :return: Two arrays:
-    :doc-author: Trelent
+    
     """
     inv_freq = 1.0 / (10000 ** (jax.numpy.arange(0, head_dim, 2, dtype=jax.numpy.float32) / head_dim))
     freq = jax.numpy.einsum("i , j -> i j", jax.numpy.arange(max_position_embedding), inv_freq).astype("float32")
@@ -171,7 +171,7 @@ def rotate_half(x):
 
     :param x: Specify the input array
     :return: A new array that is the same as the input
-    :doc-author: Trelent
+    
     """
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2:]
@@ -186,7 +186,7 @@ def apply_rotary_pos_emb(tensor, sin_, cos_):
     :param sin_: Rotate the tensor by pi/2
     :param cos_: Apply the cosine function to the tensor
     :return: A tensor with the same shape as the input tensor
-    :doc-author: Trelent
+    
     """
     return (tensor * cos_) + (rotate_half(tensor) * sin_)
 
@@ -201,7 +201,7 @@ def get_ranks_and_size(mesh):
 
     :param mesh: Get the shape of the mesh
     :return: A dictionary with the following keys:
-    :doc-author: Trelent
+    
     """
     out = dict(mesh=mesh)
     mp_size = mesh.shape["tp"] * mesh.shape["mp"]
@@ -371,7 +371,7 @@ def create_mesh(
     :param axis_names: Sequence[str]: Name the axes of the mesh
     :param backend: Specify the backend to use
     :return: A mesh object
-    :doc-author: Trelent
+    
     """
     array_devices = jax.numpy.ones((len(jax.devices() if backend == "" else jax.devices(backend)), 1))
     resh = array_devices.reshape(axis_dims).shape
@@ -397,7 +397,7 @@ class JaxBaseClassModel:
         :param axis_names: Sequence[str]: Name the axes of the mesh
         :param backend: Specify the backend to use
         :return: A new instance of the class
-        :doc-author: Trelent
+        
         """
         self.axis_dims = axis_dims
         self.axis_names = axis_names
@@ -411,7 +411,7 @@ class JaxBaseClassModel:
 
         :param self: Refer to the object itself
         :return: A jaxMesh
-        :doc-author: Trelent
+        
         """
         return create_mesh(
             axis_dims=self.axis_dims,
@@ -425,7 +425,7 @@ class JaxBaseClassModel:
 
         :param self: Represent the instance of the class
         :return: The dimensions of the axes
-        :doc-author: Trelent
+        
         """
         return self.axis_dims
 
@@ -435,7 +435,7 @@ class JaxBaseClassModel:
 
         :param self: Represent the instance of the class
         :return: A list of the names of all axes
-        :doc-author: Trelent
+        
         """
         return self.axis_names
 
@@ -446,7 +446,7 @@ class JaxBaseClassModel:
 
         :param self: Bind the method to an object
         :return: The backend platform
-        :doc-author: Trelent
+        
         """
         return self.backend if not self.backend == "" else jax.lib.xla_bridge.get_backend().platform
 
@@ -457,7 +457,7 @@ class JaxBaseClassModel:
             :returns: The flash attention value from the database.
 
         :return: A function
-        :doc-author: Trelent
+        
         """
         return get_flash_attention()
 
@@ -471,7 +471,7 @@ def add_start_docstrings(*docstr):
     
     :param *docstr: Pass in a variable number of arguments to the function
     :return: A decorator that adds the docstrings to the function
-    :doc-author: Trelent
+    
     """
 
     def docstring_decorator(fn):

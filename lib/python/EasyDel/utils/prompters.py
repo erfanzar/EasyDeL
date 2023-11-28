@@ -16,7 +16,7 @@ def antitoxin_prompter(
     :param system: typing.Optional[str]: Pass the system's response to the prompt
     :param : Store the history of user and assistant interaction
     :return: A string that contains the user's prompt,
-    :doc-author: Trelent
+    
     """
     sys_str = f"<|im_start|>system\n{system}<|im_end|>\n" if system is not None else ""
     histories = ''
@@ -39,7 +39,7 @@ def antitoxin_prompter_chat_format(
     :param system: typing.Optional[str]: Pass in the system message
     :param : Store the history of the conversation
     :return: A string that contains the system message and
-    :doc-author: Trelent
+    
     """
     sys_str = f"<|im_start|>system\n{system}<|im_end|>\n" if system is not None else ""
     histories = ''
@@ -64,7 +64,7 @@ def llama2_prompter(
     :param system: typing.Optional[str]: Indicate that the system is optional
     :param : Specify the system's response
     :return: A string that is a concatenation of the
-    :doc-author: Trelent
+    
     """
     do_strip = False
     if system is not None:
@@ -95,7 +95,7 @@ def llama2_prompter_chat_format(
     :param messages: typing.List[str]: Pass in a list of strings
     :param : Add the system message to the beginning of the chat
     :return: A string that is the
-    :doc-author: Trelent
+    
     """
     if system is not None:
         string = [f'<s>[INST] <<SYS>>\n{system}\n<</SYS>>\n\n']

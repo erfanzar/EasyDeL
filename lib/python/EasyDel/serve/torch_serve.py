@@ -49,7 +49,7 @@ class PytorchServerConfig:
         :param max_gpu_perc_to_use: Specify the maximum percentage of gpu memory that can be used by the server
         :param max_stream_tokens: int: Limit the number of tokens that can be streamed to a single client
         :return: Nothing
-        :doc-author: Trelent
+        
         """
         self.host = host
         self.port = port
@@ -78,7 +78,7 @@ class PyTorchServer(object):
         :param self: Represent the instance of the class
         :param config: PytorchServerConfig: Pass the configuration parameters to the class
         :return: The app, which is a fastapi object
-        :doc-author: Trelent
+        
         """
         self.model, self.tokenizer = [None] * 2
 
@@ -103,7 +103,7 @@ class PyTorchServer(object):
 
         :param num_gpus_req: Specify the number of gpus to be used
         :return: The amount of free memory on each gpu
-        :doc-author: Trelent
+        
         """
         gpu_m = []
         dc = torch.cuda.device_count()
@@ -122,7 +122,7 @@ class PyTorchServer(object):
 
         :param self: Bind the method to an object
         :return: A dictionary with the following keys:
-        :doc-author: Trelent
+        
         """
         if self.config.dtype == 'fp16':
             dtype = torch.float16
@@ -153,7 +153,7 @@ class PyTorchServer(object):
 
         :param self: Represent the instance of the class
         :return: A dictionary with the following keys:
-        :doc-author: Trelent
+        
         """
         return {
             'config': {k: v for k, v in self.config.__dict__.items()},
@@ -175,7 +175,7 @@ class PyTorchServer(object):
         :param self: Refer to the object itself
         :param data: InstructRequest: Pass in the data that is used to generate the response
         :return: A dictionary with a single key, response
-        :doc-author: Trelent
+        
         """
         string = self.format_instruct(
             system=data.system,
@@ -201,7 +201,7 @@ class PyTorchServer(object):
         :param self: Refer to the object itself
         :param data: ChatRequest: Pass the data from the api to the function
         :return: A dictionary with a single key, response
-        :doc-author: Trelent
+        
         """
         string = self.format_chat(
             system=data.system,
@@ -230,7 +230,7 @@ class PyTorchServer(object):
         :param system: str: Determine which system the instruction is for
         :param instruction: str: Store the instruction that is being passed in
         :return: The instruction in the format of the system
-        :doc-author: Trelent
+        
         """
         raise NotImplementedError()
 
@@ -247,7 +247,7 @@ class PyTorchServer(object):
         :param prompt: str: Display the prompt to the user
         :param system: str: Add a system message to the chat history
         :return: A string that contains the history of a chat
-        :doc-author: Trelent
+        
         """
         raise NotImplementedError()
 
@@ -275,7 +275,7 @@ class PyTorchServer(object):
         :param stream: bool: Determine whether to stream the output or not
         :param sample: bool: Indicate whether to sample from the distribution or take the argmax
         :return: A generator
-        :doc-author: Trelent
+        
         """
         assert self.model is not None, 'you should first load model with ``load`` method'
         tokens = self.tokenizer(
@@ -347,7 +347,7 @@ class PyTorchServer(object):
         :param auto_config: bool: Determine whether the model should be loaded with a config file or not
         :param **kwargs: Pass a variable number of keyword arguments to the function
         :return: A tuple of model and tokenizer
-        :doc-author: Trelent
+        
         """
         load_kwargs = kwargs if not auto_config else self.get_model_load_kwargs()
         load_kwargs = load_kwargs | kwargs
@@ -388,7 +388,7 @@ class PyTorchServer(object):
         :param top_p: float: Control the randomness of the model
         :param top_k: int: Control the number of tokens that are filtered from the top-k filtering
         :return: A generator object, which is a type of iterator
-        :doc-author: Trelent
+        
         """
         string = self.format_chat(prompt=prompt, history=history, system=None)
         history.append([prompt, ''])
@@ -429,7 +429,7 @@ class PyTorchServer(object):
         :param top_p: float: Control the randomness of the model
         :param top_k: int: Limit the number of tokens that are considered for each position
         :return: A generator object
-        :doc-author: Trelent
+        
         """
         string = self.format_instruct(system=system, instruction=instruction)
         responses = ''
@@ -451,7 +451,7 @@ class PyTorchServer(object):
 
         :param self: Refer to the object itself
         :return: A block
-        :doc-author: Trelent
+        
         """
         with gr.Blocks(
                 theme=seafoam) as block:
@@ -509,7 +509,7 @@ class PyTorchServer(object):
 
         :param self: Represent the instance of the class
         :return: A block
-        :doc-author: Trelent
+        
         """
         with gr.Blocks(
                 theme=seafoam) as block:
@@ -565,7 +565,7 @@ class PyTorchServer(object):
 
         :param self: Represent the instance of the class
         :return: A process that runs the uvicorn server
-        :doc-author: Trelent
+        
         """
         def run():
             uvicorn.run(self.app, host=self.config.host, port=self.config.port)
@@ -580,7 +580,7 @@ class PyTorchServer(object):
 
         :param self: Represent the instance of the class
         :return: A boolean value
-        :doc-author: Trelent
+        
         """
         if self.process_uvicorn is not None:
             self.process_uvicorn.join()

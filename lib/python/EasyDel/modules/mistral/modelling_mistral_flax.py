@@ -110,7 +110,7 @@ class MistralConfig(PretrainedConfig, JaxBaseClassModel):
         :param **kwargs: Pass a variable number of keyword arguments to a function
         :param : Define the number of layers in the model
         :return: An instance of the class
-        :doc-author: Trelent
+        
         """
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
@@ -162,7 +162,7 @@ class MistralConfig(PretrainedConfig, JaxBaseClassModel):
 
         :param fully_fsdp: bool: Determine whether to use the fully_fsdp partitioning scheme or not
         :return: A list of tuples
-        :doc-author: Trelent
+        
         """
         return (
 
@@ -239,7 +239,7 @@ class MistralConfig(PretrainedConfig, JaxBaseClassModel):
         :param &quot;mp&quot;): Specify the number of heads in the multi-head attention
         :param : Enable gradient checkpointing
         :return: A tuple of the following:
-        :doc-author: Trelent
+        
         """
         self.use_flash_attention = use_flash_attention
         self.number_rep_kv = number_rep_kv
@@ -479,7 +479,7 @@ class FlaxMistralAttention(nn.Module):
         :param init_cache: bool: Initialize the cache
         :param output_attentions: bool: Determine whether to return the attention weights
         :return: A tuple of (out, attn_output)
-        :doc-author: Trelent
+        
         """
         batch_size, sequence_length = hidden_state.shape[:2]
         query, key, value = self.q_proj(hidden_state), self.k_proj(hidden_state), self.v_proj(hidden_state)
@@ -658,7 +658,7 @@ class FlaxMistralDecoderLayer(nn.Module):
         :param init_cache: bool: Initialize the cache for the self-attention layer
         :param output_attentions: bool: Determine whether to return the attention weights or not
         :return: A tuple of hidden_state and attention_output
-        :doc-author: Trelent
+        
         """
         residual = hidden_state
         attention_output = self.self_attn(
@@ -715,7 +715,7 @@ class FlaxMistralPretrainedModel(FlaxPreTrainedModel):
         :param input_shape: Tuple: Initialize the input_ids, attention_mask and position_ids
         :param params: flax.core.FrozenDict: Pass in the parameters of a pre-trained model
         :return: A frozendict of parameters
-        :doc-author: Trelent
+        
         """
         input_ids = jnp.zeros(input_shape, dtype="i4")
         attention_mask = jnp.ones_like(input_ids)
@@ -796,7 +796,7 @@ class FlaxMistralPretrainedModel(FlaxPreTrainedModel):
         :param return_dict: Optional[bool]: Return a dictionary of the outputs
         :param add_params_field: bool: Add a params field to the inputs dictionary
         :return: A tuple of (last_hidden_state, past_key_values)
-        :doc-author: Trelent
+        
         """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -980,7 +980,7 @@ class FlaxMistralModule(nn.Module):
         :param return_dict: bool: Return a dictionary of the outputs or not
         :param : Determine whether the model is in training mode or not
         :return: A tuple of the hidden states, all hidden states, and attentions
-        :doc-author: Trelent
+        
         """
         if input_embeds is None:
             input_embeds = self.embed_tokens(input_ids.astype("i4"))
@@ -1086,7 +1086,7 @@ class FlaxMistralForCausalLMModule(nn.Module):
             :param return_dict: bool: Return a dictionary of the outputs or just the logits
             :param : Determine whether to return the logits or not
             :return: A tuple of (lm_logits, hidden_states, attentions)
-            :doc-author: Trelent
+            
         """
         batch_size, seq_length = input_ids.shape
 

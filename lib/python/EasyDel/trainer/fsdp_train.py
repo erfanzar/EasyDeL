@@ -39,7 +39,7 @@ def calculate_accuracy(predictions: chex.Array, targets: chex.Array):
     :param predictions: chex.Array: Pass in the predictions from the model
     :param targets: chex.Array: Calculate the accuracy of the model
     :return: A single value, the accuracy
-    :doc-author: Trelent
+    
     """
     predicted_classes = jnp.argmax(predictions, axis=-1)
     correct_predictions = (predicted_classes == targets).sum()
@@ -57,7 +57,7 @@ def fsdp_train_step(state, batch):
     :param state: Store the model parameters
     :param batch: Pass the data to the model
     :return: A tuple of (state, loss, accuracy)
-    :doc-author: Trelent
+    
     """
     batch = with_sharding_constraint(batch, PartitionSpec(('dp', 'fsdp'), 'mp'))
 
@@ -86,7 +86,7 @@ def fsdp_eval_step(state, batch_eval):
     :param state: Store the model parameters and other information about the training process
     :param batch_eval: Pass the batch of data to the function
     :return: The loss and accuracy of the model
-    :doc-author: Trelent
+    
     """
     batch_eval = with_sharding_constraint(
         batch_eval,
@@ -102,7 +102,7 @@ def fsdp_eval_step(state, batch_eval):
 
         :param params: Pass the model parameters to the function
         :return: The loss and the accuracy
-        :doc-author: Trelent
+        
         """
         labels = batch_eval.pop('labels')
         logits = state.apply_fn(params=params, **batch_eval,
@@ -124,7 +124,7 @@ def predict(state, input_ids):
     :param state: Store the model parameters and the input_ids parameter is used to pass in a batch of token ids
     :param input_ids: Pass the input to the model
     :return: The next input_ids
-    :doc-author: Trelent
+    
     """
     input_ids = with_sharding_constraint(input_ids, PartitionSpec(('dp', 'fsdp')))
     pred = state.apply_fn(params=state.params, input_ids=input_ids, return_dict=True)
@@ -171,7 +171,7 @@ class CausalLMTrainer:
         :param ckpt_path: typing.Union[str,os.PathLike] : Load the checkpoint path
         :param _do_init_fns: bool: Initialize the functions
         :return: Nothing, it just initializes the class
-        :doc-author: Trelent
+        
         """
         self.timer = None
         self.dataloader_train = None
@@ -243,7 +243,7 @@ class CausalLMTrainer:
         It can be used to save data, upload files, or do any other cleanup tasks.
 
         :return: A dictionary of the run's metadata
-        :doc-author: Trelent
+        
         """
         wandb.finish()
 
@@ -257,7 +257,7 @@ class CausalLMTrainer:
 
         :param self: Represent the instance of the class
         :return: A tuple of functions
-        :doc-author: Trelent
+        
         """
         self.wandb_runtime = self.arguments.get_wandb_init() if self.arguments.use_wandb else None
         self.timer = Timers(
@@ -306,7 +306,7 @@ class CausalLMTrainer:
 
         :param self: Refer to the class instance itself
         :return: A dataloader_train, max_steps_train, dataloader_eval and max steps eval
-        :doc-author: Trelent
+        
         """
 
         def collate_fn(batch):
@@ -338,7 +338,7 @@ class CausalLMTrainer:
 
         :param self: Represent the instance of the class
         :return: A model, optimizer, scheduler and config
-        :doc-author: Trelent
+        
         """
         extra_configs = {} if self.arguments.extra_configs is None else self.arguments.extra_configs
         if self.arguments.model_class is None:
@@ -383,7 +383,7 @@ class CausalLMTrainer:
 
         :param self: Access the class attributes
         :return: A tuple of functions
-        :doc-author: Trelent
+        
         """
 
         def init_fn():
@@ -469,7 +469,7 @@ class CausalLMTrainer:
         :param self: Make the class methods aware of other methods and attributes within the class
         :param model_parameters: flax.core.FrozenDict: Load a pre-trained model
         :return: An object of type "OutputFineTuner"
-        :doc-author: Trelent
+        
         """
 
         def count_params(_p):

@@ -78,7 +78,7 @@ class JaxServerConfig:
         :param pre_compile: bool: Pre-compile the model
         :param : Set the host address
         :return: Nothing
-        :doc-author: Trelent
+        
         """
         self.host = host
         self.port = port
@@ -123,7 +123,7 @@ class JAXServer(object):
         :param self: Refer to the current instance of a class
         :param config: Pass the jaxserverconfig object
         :return: A fastapi object
-        :doc-author: Trelent
+        
         """
         self.process_uvicorn, self.prefix_tokenizer, self.params, self.tokenizer, self.model, \
             self.rules, self._generate, self._greedy_generate = [None] * 8
@@ -158,7 +158,7 @@ class JAXServer(object):
 
         :param self: Represent the instance of the class
         :return: A dictionary with the following keys:
-        :doc-author: Trelent
+        
         """
         return {
             'config': {k: v for k, v in self.config.__dict__.items()},
@@ -176,7 +176,7 @@ class JAXServer(object):
 
 
         :return: The amount of memory used by the program
-        :doc-author: Trelent
+        
         """
         return get_mem()
 
@@ -189,7 +189,7 @@ class JAXServer(object):
         :param model: Generate the model
         :param tokenizer: Get the eos_token_id, pad_token_id and bos token id
         :return: A function that takes in three parameters:
-        :doc-author: Trelent
+        
         """
         assert self.rules is not None, 'you should first shard params with using ``shard_params`` method'
 
@@ -286,7 +286,7 @@ class JAXServer(object):
         :param tokenizer: Tokenize the input text
         :param partition_rules: Specify how the parameters should be partitioned
         :return: A dictionary with the following keys:
-        :doc-author: Trelent
+        
         """
         self.shard_params(params=params, partition_rules=partition_rules)
         self.configure_generate_functions(model, tokenizer)
@@ -304,7 +304,7 @@ class JAXServer(object):
         :param input_ids: chex.Array: Pass the input to the model
         :param attention_mask: chex.Array: Mask the padding tokens
         :return: The logits of the model
-        :doc-author: Trelent
+        
         """
         if not self._funcs_generated:
             raise NotImplementedError(
@@ -343,7 +343,7 @@ class JAXServer(object):
         :param do_memory_log: bool: Log the memory usage of the server
         :param verbose: bool: Print the compilation process
         :return: A server
-        :doc-author: Trelent
+        
         """
         assert hasattr(model,
                        'init_weights'), 'model must contain init_weights func in order to init params for shard_fns'
@@ -424,7 +424,7 @@ class JAXServer(object):
         :param do_memory_log: bool: Log the memory usage of the server
         :param verbose: bool: Print out the status of the compilation
         :return: A server object
-        :doc-author: Trelent
+        
         """
         assert hasattr(model,
                        'init_weights'), 'model must contain init_weights func in order to init params for shard_fns'
@@ -474,7 +474,7 @@ class JAXServer(object):
         :param self: Represent the instance of the class
         :param verbose: bool: Print out the compiling process
         :return: True, but what does it do?
-        :doc-author: Trelent
+        
         """
         assert self._funcs_generated, 'funcs are not generated yet'
         assert self.rules is not None, 'rules should not be None'
@@ -520,7 +520,7 @@ class JAXServer(object):
         :param attention_mask: chex.Array: Mask the input tokens
         :param : Specify the parameters of the model
         :return:  generated_ids
-        :doc-author: Trelent
+        
         """
         if not self._funcs_generated:
             raise NotImplementedError(
@@ -545,7 +545,7 @@ class JAXServer(object):
         :param params: Pass the parameters of the model to be sharded
         :param partition_rules: Specify how the parameters should be partitioned
         :return: The sharded parameters
-        :doc-author: Trelent
+        
         """
         logging.log(
             logging.INFO,
@@ -574,7 +574,7 @@ class JAXServer(object):
         :param self: Access the attributes and methods of the class
         :param data: ChatRequest: Pass in the data from the request
         :return: A dictionary with the following keys:
-        :doc-author: Trelent
+        
         """
         if not self._funcs_generated:
             return {
@@ -626,7 +626,7 @@ class JAXServer(object):
         :param self: Bind the method to the object
         :param data: InstructRequest: Pass the system and instruction to the function
         :return: A dictionary with three keys:
-        :doc-author: Trelent
+        
         """
         if not self._funcs_generated:
             return {
@@ -663,7 +663,7 @@ class JAXServer(object):
         :param system: Specify which system to use for the instruction
         :param greedy: Determine whether the system should return
         :return: The response from the forward_instruct function
-        :doc-author: Trelent
+        
         """
         data = InstructRequest(
             prompt=prompt,
@@ -684,7 +684,7 @@ class JAXServer(object):
         :param history: Pass the history of the conversation to the model
         :param greedy: Determine whether the model should use a greedy search
         :return: A chat-response object
-        :doc-author: Trelent
+        
         """
         data = ChatRequest(
             prompt=prompt,
@@ -712,7 +712,7 @@ class JAXServer(object):
         :param max_new_tokens: int: Set the number of tokens to generate
         :param **kwargs: Pass any additional parameters to the process function
         :return: A generator that yields the predicted text and the number of tokens generated
-        :doc-author: Trelent
+        
         """
         tokens = self.prefix_tokenizer(
             string,
@@ -772,7 +772,7 @@ class JAXServer(object):
         :param system: Determine whether the message is from the user or system
         :param greedy: Determine if the model should generate a response token by token or all at once
         :return: A tuple of two values:
-        :doc-author: Trelent
+        
         """
         string = self.format_chat(history=history, prompt=prompt, system=system)
 
@@ -808,7 +808,7 @@ class JAXServer(object):
         :param max_new_tokens: Limit the number of new tokens that can be added to the vocabulary
         :param greedy: Determine whether the model should be greedy or not
         :return: A tuple of two strings:
-        :doc-author: Trelent
+        
         """
         string = self.format_instruct(instruction=instruction, system=system)
         if not self.config.stream_tokens_for_gradio:
@@ -837,7 +837,7 @@ class JAXServer(object):
 
         :param self: Represent the instance of the class
         :return: A block
-        :doc-author: Trelent
+        
         """
         with gr.Blocks(
                 theme=seafoam) as block:
@@ -885,7 +885,7 @@ class JAXServer(object):
 
         :param self: Represent the instance of the class
         :return: A block
-        :doc-author: Trelent
+        
         """
         with gr.Blocks(
                 theme=seafoam) as block:
@@ -932,7 +932,7 @@ class JAXServer(object):
 
         :param self: Refer to the instance of the class
         :return: A process, which is a child of the main process
-        :doc-author: Trelent
+        
         """
         assert self._funcs_generated, 'you have to first add your model and parameters into server before using fire ' \
                                       'with using ``configure_generate_functions``'
@@ -950,7 +950,7 @@ class JAXServer(object):
 
         :param self: Represent the instance of the class
         :return: The process_uvicorn
-        :doc-author: Trelent
+        
         """
         if self.process_uvicorn is not None:
             self.process_uvicorn.join()
@@ -973,7 +973,7 @@ class JAXServer(object):
         :param share_chat: bool: Determine if the chatbot should be shared
         :param share_inst: bool: Share the instructions for the app
         :return: A dictionary with the share urls for chat and instructions
-        :doc-author: Trelent
+        
         """
         share_kwargs = {}
         assert not share_chat or not share_inst, 'you have to pass at least one of sharing options True'
