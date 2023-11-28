@@ -437,7 +437,6 @@ class FlaxLlamaAttention(nn.Module):
                 block_k=self.config.flash_attn_key_chunk_size,
                 block_b=1,
                 num_attention_heads=self.config.num_attention_heads,
-                num_key_value_heads=self.config.num_key_value_heads,
                 precision=self.precision,
                 dtype=self.dtype,
                 causal=False,
@@ -450,7 +449,7 @@ class FlaxLlamaAttention(nn.Module):
                 head_dims=self.head_dim,
                 force_float32_tpu=True
             )
-
+            attn_output = jnp.transpose(attn_output, rtp_axis)
         else:
             query_length, key_length = query_state.shape[1], key_state.shape[1]
 
