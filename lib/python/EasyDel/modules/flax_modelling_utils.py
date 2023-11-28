@@ -148,7 +148,6 @@ def smart_flash_attention(
         q_seq_len: int,
         kv_seq_len: int,
         num_attention_heads: int,
-        num_key_value_heads: int,
         head_dims: int,
         causal: bool,
         attn_pdrop: float,
@@ -164,8 +163,8 @@ def smart_flash_attention(
 
     Args:
     - q: Query tensor with shape [batch_size, num_attention_heads, q_seq_len, head_dims].
-    - k: Key tensor with shape [batch_size, num_key_value_heads, kv_seq_len, head_dims].
-    - v: Value tensor with shape [batch_size, num_key_value_heads, kv_seq_len, head_dims].
+    - k: Key tensor with shape [batch_size, num_attention_heads, kv_seq_len, head_dims].
+    - v: Value tensor with shape [batch_size, num_attention_heads, kv_seq_len, head_dims].
     - bias: Bias tensor with shape [batch_size, num_attention_heads, q_seq_len, kv_seq_len].
     - block_k: Block size for key tensor reshaping.
     - block_q: Block size for query tensor reshaping.
@@ -173,7 +172,6 @@ def smart_flash_attention(
     - q_seq_len: Length of the query sequence.
     - kv_seq_len: Length of the key-value sequence.
     - num_attention_heads: Number of attention heads.
-    - num_key_value_heads: Number of key-value heads.
     - head_dims: Dimensionality of each attention head.
     - causal: If True, applies causal masking to the attention scores.
     - attn_pdrop: Dropout probability for attention weights.
@@ -194,16 +192,16 @@ def smart_flash_attention(
     assertion_mkv_err = """
     Q,K,V and bias shapes must be like
     Q Shape : [batch_size, num_attention_heads, q_seq_len, head_dims]
-    K Shape : [batch_size, num_key_value_heads, kv_seq_len, head_dims]
-    V Shape : [batch_size, num_key_value_heads, kv_seq_len, head_dims]
+    K Shape : [batch_size, num_attention_heads, kv_seq_len, head_dims]
+    V Shape : [batch_size, num_attention_heads, kv_seq_len, head_dims]
     bias Shape : [batch_size, num_attention_heads, q_seq_len, kv_seq_len]
     """
     batch_size = q.shape[0]
     assert batch_size == k.shape[0] == v.shape[0], 'Batch Size for q,k,v wont match'
 
     assert q.shape == (batch_size, num_attention_heads, q_seq_len, head_dims), assertion_mkv_err
-    assert k.shape == (batch_size, num_key_value_heads, kv_seq_len, head_dims), assertion_mkv_err
-    assert v.shape == (batch_size, num_key_value_heads, kv_seq_len, head_dims), assertion_mkv_err
+    assert k.shape == (batch_size, num_attention_heads, kv_seq_len, head_dims), assertion_mkv_err
+    assert v.shape == (batch_size, num_attention_heads, kv_seq_len, head_dims), assertion_mkv_err
     assert bias.shape == (batch_size, num_attention_heads, q_seq_len, kv_seq_len), assertion_mkv_err
 
     flash_attn_fn, f32_upcast, do_shard_map = get_flash_attention()
