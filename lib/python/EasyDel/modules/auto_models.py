@@ -25,7 +25,7 @@ def get_modules_by_type(model_type: str):
 
     :param model_type: str: Determine which model to use
     :return: A tuple of three elements
-    :doc-author: Trelent
+    
     """
     if model_type == "llama":
         from EasyDel.modules.llama import LlamaConfig as _LlamaConfig
@@ -112,7 +112,7 @@ def is_flatten(pytree: dict):
 
     :param pytree: dict: Pass the pytree to the function
     :return: True if the pytree is a flattened tree, and false otherwise
-    :doc-author: Trelent
+    
     """
     mpl = [k for k in pytree.keys()][0]
     return True if isinstance(mpl, tuple) else False
@@ -148,7 +148,7 @@ class AutoEasyDelModelForCausalLM:
         :param input_shape: typing.Sequence[int]: Specify the shape of the input to the model
         :param **kwargs: Pass additional arguments to the model and config classes
         :return: A model and parameters
-        :doc-author: Trelent
+        
         """
 
         config = AutoConfig.from_pretrained(repo_id)

@@ -126,7 +126,7 @@ class TrainArguments(
         :param init_input_shape: typing.Tuple[int]: Initialize the input shape of the model
         :param **kwargs: Pass a variable number of keyword arguments to a function
         :return: Nothing
-        :doc-author: Trelent
+        
         """
         super().__init__()
         if ids_to_pop_from_dataset is None:
@@ -207,7 +207,7 @@ class TrainArguments(
 
         :param self: Represent the instance of the class
         :return: A dictionary of hyperparameters
-        :doc-author: Trelent
+        
         """
         return {f"hyperparameters/{k}": v for k, v in self.__dict__.items() if
                 isinstance(v, (int, float, str, bool, torch.Tensor))}
@@ -219,7 +219,7 @@ class TrainArguments(
 
         :param self: Pass the class instance to the function
         :return: A wandb
-        :doc-author: Trelent
+        
         """
         return wandb.init(
             project=f'easydel-{self.model_name}',
@@ -260,7 +260,7 @@ class TrainArguments(
 
         :param self: Represent the instance of the class
         :return: A pathlib
-        :doc-author: Trelent
+        
         """
         return pathlib.Path(
             self.save_dir, self.model_name
@@ -272,7 +272,7 @@ class TrainArguments(
 
         :param self: Represent the instance of the class
         :return: A path
-        :doc-author: Trelent
+        
         """
         path = self.get_path()
         if not path.exists():
@@ -289,7 +289,7 @@ class TrainArguments(
 
         :param self: Refer to the object itself
         :return: A mesh object with the device array shape and the mesh names
-        :doc-author: Trelent
+        
         """
         return Mesh(
             create_device_mesh(
@@ -313,7 +313,7 @@ class TrainArguments(
         :param self: Represent the instance of the class
         :param steps: Calculate the number of steps to train
         :return: A tuple of two objects:
-        :doc-author: Trelent
+        
         """
         steps = self.max_steps or steps
         assert steps is not None, 'if you haven\'t pass max steps to init you should pass init in func'
@@ -464,7 +464,7 @@ class TrainArguments(
 
         :param self: Represent the instance of the class
         :return: A streamingcheckpointer object
-        :doc-author: Trelent
+        
         """
         return StreamingCheckpointer(StreamingCheckpointer.get_default_config(),
                                      os.path.join(self.save_dir, self.model_name))
@@ -478,7 +478,7 @@ class TrainArguments(
 
         :param self: Represent the instance of the class
         :return: A summary-writer object
-        :doc-author: Trelent
+        
         """
         return torch.utils.tensorboard.SummaryWriter(
             log_dir=str(self.get_path()),

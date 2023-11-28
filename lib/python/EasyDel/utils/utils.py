@@ -20,7 +20,7 @@ def make_shard_and_gather_fns(partition_specs, dtype_specs=None):
     :param partition_specs: Specify the partitioning of each tensor in the model
     :param dtype_specs: Specify the dtype of the tensor
     :return: A tuple of two functions:
-    :doc-author: Trelent
+    
     """
     float_dtypes = (jnp.bfloat16, jnp.float16, jnp.float32, jnp.float64)
 
@@ -82,7 +82,7 @@ def get_names_from_partition_spec(partition_specs):
     
     :param partition_specs: Specify the partitioning of a table
     :return: A list of names from a partition spec
-    :doc-author: Trelent
+    
     """
     names = set()
     if isinstance(partition_specs, dict):
@@ -107,7 +107,7 @@ def names_in_mesh(*names):
 
     :param *names: Pass in a variable number of arguments
     :return: A boolean indicating whether all of the given names are in the physical mesh
-    :doc-author: Trelent
+    
     """
     return set(names) <= set(pxla.thread_resources.env.physical_mesh.axis_names)
 
@@ -122,7 +122,7 @@ def with_sharding_constraint(x, partition_specs):
     :param x: Pass in the tensor that is to be sharded
     :param partition_specs: Specify the axis names and partition sizes
     :return: The same value as the original function
-    :doc-author: Trelent
+    
     """
     axis_names = get_names_from_partition_spec(partition_specs)
     if names_in_mesh(*axis_names):
@@ -140,7 +140,7 @@ class Timer:
         :param self: Represent the instance of the class
         :param name: Give the timer a name
         :return: An instance of the class
-        :doc-author: Trelent
+        
         """
         self.name_ = name
         self.elapsed_ = 0.0
@@ -155,7 +155,7 @@ class Timer:
 
         :param self: Access the attributes and methods of the class in python
         :return: Nothing
-        :doc-author: Trelent
+        
         """
         assert not self.started_, "timer has already been started"
         self.start_time = time.time()
@@ -168,7 +168,7 @@ class Timer:
 
         :param self: Represent the instance of the class
         :return: The time elapsed since the start function was called
-        :doc-author: Trelent
+        
         """
         assert self.started_, "timer is not started"
         self.elapsed_ += time.time() - self.start_time
@@ -180,7 +180,7 @@ class Timer:
 
         :param self: Represent the instance of the class
         :return: True if the timer was running, false otherwise
-        :doc-author: Trelent
+        
         """
         self.elapsed_ = 0.0
         self.started_ = False
@@ -194,7 +194,7 @@ class Timer:
         :param self: Represent the instance of the class
         :param reset: Reset the timer
         :return: The elapsed time in seconds
-        :doc-author: Trelent
+        
         """
         started_ = self.started_
         if self.started_:
@@ -239,7 +239,7 @@ class Timers:
         :param normalizer: Normalize the time elapsed by a certain value
         :param reset: Reset the timer after it has been written to tensorboard
         :return: Nothing
-        :doc-author: Trelent
+        
         """
         assert normalizer > 0.0
         for name in names:
@@ -260,7 +260,7 @@ class Timers:
         :param normalizer: Normalize the time taken to run a function
         :param reset: Reset the timer after logging
         :return: The time taken for the given name
-        :doc-author: Trelent
+        
         """
         assert normalizer > 0.0
 
@@ -302,7 +302,7 @@ def get_mesh(
     :param shape: typing.Sequence[int]: Specify the shape of the array that is used to create the mesh
     :param axis_names: typing.Sequence[int]: Specify the Axis Names in mesh
     :return: A mesh object
-    :doc-author: Trelent
+    
     """
     from jax.sharding import Mesh
     from jax.experimental import mesh_utils

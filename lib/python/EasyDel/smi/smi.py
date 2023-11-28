@@ -23,7 +23,7 @@ def run(note_book=None, interval: float = 1, dir_prefix: str = '/dev/shm', dpr=T
     :param dir_prefix: str: Specify the directory where the memory
     :param dpr: Control whether the output is displayed in a notebook or not
     :return: The output of the pprof command
-    :doc-author: Trelent
+    
     """
     if note_book is None:
         import os
@@ -68,7 +68,7 @@ def get_mem(dir_prefix: str = '/dev/shm'):
 
     :param dir_prefix: str: Specify the directory where
     :return: A string of the memory profile
-    :doc-author: Trelent
+    
     """
     return subprocess.run(
         args=['go', 'tool', 'pprof', '-tags', f'{dir_prefix}/memory.prof'],
@@ -84,7 +84,7 @@ def initialise_tracking(interval: float = 1., dir_prefix: str = '/dev/shm') -> N
     :param interval: float: Specify the time interval between each memory profile
     :param dir_prefix: str: Specify the directory where the memory profile will be saved
     :return: Nothing, but it starts a thread that
-    :doc-author: Trelent
+    
     """
 
     def inner():

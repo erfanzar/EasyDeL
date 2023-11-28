@@ -114,7 +114,7 @@ class LlamaConfig(PretrainedConfig, JaxBaseClassModel):
         :param **kwargs: Pass a variable number of keyword arguments to a function
         :param : Define the number of layers in the model
         :return: Nothing
-        :doc-author: Trelent
+        
         """
         num_key_value_heads = num_key_value_heads or number_rep_kv * num_attention_heads
         self.num_key_value_heads = num_key_value_heads
@@ -165,7 +165,7 @@ class LlamaConfig(PretrainedConfig, JaxBaseClassModel):
 
         :param fully_fsdp: bool: Determine whether to partition the model fully or not
         :return: A list of tuples
-        :doc-author: Trelent
+        
         """
         return (
 
@@ -249,7 +249,7 @@ class LlamaConfig(PretrainedConfig, JaxBaseClassModel):
         :param &quot;mp&quot;): Specify the number of multi-head attention layers
         :param scan_layers: bool: Determine whether to use scan layers or not
         :return: The following:
-        :doc-author: Trelent
+        
         """
         self.scan_layers = scan_layers
         self.axis_names = axis_names
@@ -415,7 +415,7 @@ class FlaxLlamaAttention(nn.Module):
         :param query: Determine the number of cache vectors to update
         :param attention_mask: Mask out the padded vectors in the cache
         :return: The key, value and attention_mask
-        :doc-author: Trelent
+        
         """
         is_initialized = self.has_variable("cache", "cached_key")
         cached_key = self.variable("cache", "cached_key", jnp.zeros, key.shape, key.dtype)
@@ -449,7 +449,7 @@ class FlaxLlamaAttention(nn.Module):
         :param key: Determine the number of heads
         :param value: Store the values of the input
         :return: The transpose of the query, key and value matrices
-        :doc-author: Trelent
+        
         """
         return jnp.transpose(query, (0, 2, 1, 3)), jnp.transpose(key, (0, 2, 1, 3)), jnp.transpose(value, (0, 2, 1, 3))
 
@@ -468,7 +468,7 @@ class FlaxLlamaAttention(nn.Module):
         :param freq_cis: Calculate the frequency of each word in the vocabulary
         :param position_ids: Identify the position of each token in the sequence
         :return: A tuple of 3 tensors: query, key and value
-        :doc-author: Trelent
+        
         """
         query = query.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
         key = key.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
@@ -510,7 +510,7 @@ class FlaxLlamaAttention(nn.Module):
         :param fcm_mask: Mask out the attention weights between the input and output tokens
         :param : Determine if the attention is causal or not
         :return: A tuple of two arrays
-        :doc-author: Trelent
+        
         """
         batch_size, sequence_length = hidden_states.shape[:2]
         query_state, key_state, value_state = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(
@@ -701,7 +701,7 @@ class FlaxLlamaMLP(nn.Module):
         :param x: jnp.ndarray: Pass in the input to the layer
         :param deterministic: bool: Determine whether to use dropout
         :return: A tensor that is the result of applying a dropout function to x
-        :doc-author: Trelent
+        
         """
         x = self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
         x = self.dropout(x, deterministic=deterministic)
@@ -787,7 +787,7 @@ class FlaxLlamaBlock(nn.Module):
         :param fcm_mask: Optional[jnp.ndarray]: Mask the self-attention
         :param : Control the dropout in the self attention layer
         :return: A tuple of two items
-        :doc-author: Trelent
+        
         """
         attn_outputs = self.self_attn(
             self.input_layernorm(hidden_states),
@@ -869,7 +869,7 @@ class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
         :param **kwargs: Pass in any additional parameters that the module_class might need
         :param : Specify the number of layers in the network
         :return: The super() of the class
-        :doc-author: Trelent
+        
         """
         module = self.module_class(config=config, dtype=dtype, **kwargs)
         super().__init__(config, module, input_shape=input_shape, seed=seed, dtype=dtype, _do_init=_do_init)
@@ -884,7 +884,7 @@ class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
         :param input_shape: Tuple: Specify the shape of the input tensor
         :param params: FrozenDict: Pass in the parameters of a pre-trained model
         :return: A frozendict of parameters
-        :doc-author: Trelent
+        
         """
         input_ids = jnp.zeros(input_shape, dtype="i4")
         attention_mask = jnp.ones_like(input_ids)
@@ -931,7 +931,7 @@ class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
         :param batch_size: Define the batch size of the input tensors
         :param max_length: Set the length of the input sequence
         :return: A dictionary with the following keys:
-        :doc-author: Trelent
+        
         """
         input_ids = jnp.ones((batch_size, max_length))
         attention_mask = jnp.ones_like(input_ids)
@@ -978,7 +978,7 @@ class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
         :param extra_embedding: Optional[Union[jnp.ndarray,None]]: Pass in the embedding for the input_ids
         :param add_params_field: bool: Add the params field to the inputs dictionary
         :return: A tuple of the following:
-        :doc-author: Trelent
+        
         """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1085,7 +1085,7 @@ class FlaxLlamaBlockCollection(nn.Module):
         :param return_dict: bool: Return a dictionary of the outputs
         :param : Determine whether to use the forgetful causal mask
         :return: A tuple of 3 values
-        :doc-author: Trelent
+        
         """
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
@@ -1191,7 +1191,7 @@ class FlaxLlamaModule(nn.Module):
         :param extra_embedding: Optional[Union[jnp.ndarray: Pass in the embedding of the
         :param None]]: Pass in the extra embedding
         :return: A tuple of:
-        :doc-author: Trelent
+        
         """
         if input_embeds is None:
             input_embeds = self.embed_tokens(input_ids.astype("i4"))
@@ -1300,7 +1300,7 @@ class FlaxLlamaForCausalLMModule(nn.Module):
         :param extra_embedding: Optional[Union[jnp.ndarray: Pass in the embedding of the word that we want to predict
         :param None]]: Pass in the extra embedding
         :return: The logits and the hidden states
-        :doc-author: Trelent
+        
         """
         batch_size, seq_length = input_ids.shape
         if attention_mask is None:
@@ -1350,7 +1350,7 @@ class FlaxLlamaForCausalLM(FlaxLlamaPreTrainedModel):
         :param max_length: Set the length of the sequence to be generated
         :param attention_mask: Optional[chex.Array]: Mask the attention weights
         :return: A dictionary of the past_key_values, attention_mask and position ids
-        :doc-author: Trelent
+        
         """
         batch_size, seq_length = input_ids.shape
 
@@ -1423,7 +1423,7 @@ class FlaxLlamaForSequenceClassificationModule(nn.Module):
         :param extra_embedding: Optional[Union[jnp.ndarray: Pass in the embedding of a new word
         :param None]]: Pass the extra embedding to the model
         :return: A tuple of logits and hidden_states
-        :doc-author: Trelent
+        
         """
         batch_size, seq_length = input_ids.shape
         if attention_mask is None:
