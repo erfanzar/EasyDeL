@@ -67,6 +67,51 @@ class MistralConfig(PretrainedConfig, JaxBaseClassModel):
             axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
             **kwargs,
     ):
+        """
+        The __init__ function is called when the class is instantiated.
+        It allows the class to initialize the attributes of a class.
+        The self parameter is a reference to the current instance of the class, and is used to access variables that belong to the class.
+
+        :param self: Represent the instance of the class
+        :param vocab_size: Define the size of the vocabulary
+        :param hidden_size: Determine the size of the embedding layers
+        :param intermediate_size: Define the size of the intermediate layer in each transformer block
+        :param num_hidden_layers: Determine the number of layers in the encoder and decoder
+        :param num_attention_heads: Determine the number of attention heads in each layer
+        :param num_key_value_heads: Specify the number of heads for key and value
+        :param hidden_act: Specify the activation function used in the hidden layers
+        :param max_position_embeddings: Set the maximum length of the sequence
+        :param initializer_range: Initialize the weights of the model
+        :param rms_norm_eps: Avoid division by zero in the rms normalization
+        :param use_cache: Determine whether to use the cache in the decoder
+        :param pad_token_id: Specify the token id of the padding token
+        :param bos_token_id: Specify the beginning of sentence token id
+        :param eos_token_id: Specify the end of sentence token
+        :param tie_word_embeddings: Tie the word embeddings and the output layer
+        :param rope_theta: Control the number of tokens in a rope
+        :param sliding_window: Control the number of tokens that are processed in parallel
+        :param gradient_checkpointing: str: Specify whether to use gradient checkpointing
+        :param use_pjit_attention_force: bool: Force the use of pjit attention
+        :param use_flash_attention: bool: Enable the flash attention mechanism
+        :param use_sacn_mlp: bool: Determine whether or not to use the scan_mlp function
+        :param flash_attn_query_chunk_size: int: Determine the number of rows in each chunk
+        :param flash_attn_key_chunk_size: int: Control the size of chunks that are used for the key matrix in flash attention
+        :param scan_mlp_chunk_size: int: Specify the chunk size of the scan mlp
+        :param number_rep_kv: int: Specify the number of times to repeat the key and value vectors
+        :param attn_pdrop: float: Set the dropout rate for the attention layer
+        :param c_max_position_embeddings: int: Set the maximum number of tokens in a sequence
+        :param freq_max_position_embeddings: int: Set the maximum number of frequency bins that can be used in the model
+        :param bits: Optional[int]: Specify the number of bits used for quantization
+        :param axis_dims: Sequence[int]: Specify the dimension of each axis
+        :param axis_names: Sequence[str]: Specify the names of each axis in the tensor
+        :param &quot;fsdp&quot;: Specify the frequency dimension of the input
+        :param &quot;tp&quot;: Determine the number of time-steps in the input sequence
+        :param &quot;mp&quot;): Define the maximum position embeddings
+        :param **kwargs: Pass a variable number of keyword arguments to a function
+        :param : Define the number of layers in the model
+        :return: An instance of the class
+        :doc-author: Trelent
+        """
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
@@ -109,6 +154,16 @@ class MistralConfig(PretrainedConfig, JaxBaseClassModel):
 
     @staticmethod
     def get_partition_rules(fully_fsdp: bool = True):
+        """
+        The get_partition_rules function is used to define the partitioning scheme for a model.
+        It returns a list of tuples, where each tuple contains two elements:
+          1) A regex string that matches the name of one or more parameters in the model.
+          2) A PartitionScheme object that defines how those parameters should be partitioned.
+
+        :param fully_fsdp: bool: Determine whether to use the fully_fsdp partitioning scheme or not
+        :return: A list of tuples
+        :doc-author: Trelent
+        """
         return (
 
             ("model/embed_tokens/embedding", PS("tp", ("fsdp", "mp"))),
@@ -161,6 +216,31 @@ class MistralConfig(PretrainedConfig, JaxBaseClassModel):
                      axis_dims: Sequence[int] = (1, -1, 1, 1),
                      axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
                      ):
+        """
+        The add_jax_args function adds the following arguments to the model:
+
+        :param self: Bind the attributes and methods of a class to an instance of that class
+        :param gradient_checkpointing: str: Determine whether or not to use gradient checkpointing
+        :param use_pjit_attention_force: bool: Determine whether to use the pjit_attention_force function
+        :param use_flash_attention: bool: Determine if the flash attention module is used or not
+        :param use_sacn_mlp: bool: Determine whether to use the scan_mlp function or not
+        :param flash_attn_query_chunk_size: int: Specify the number of tokens that will be processed at a time
+        :param flash_attn_key_chunk_size: int: Chunk the keys for flash attention
+        :param scan_mlp_chunk_size: int: Chunk the input to the mlp
+        :param number_rep_kv: int: Control the number of times that the key and value vectors are repeated
+        :param attn_pdrop: float: Set the dropout rate for the attention layer
+        :param c_max_position_embeddings: int: Set the maximum number of positional embeddings for the causal axis
+        :param freq_max_position_embeddings: int: Set the maximum length of the frequency axis
+        :param bits: Optional[int]: Specify the number of bits to use for quantization
+        :param axis_dims: Sequence[int]: Specify the dimensions of each axis in the tensor
+        :param axis_names: Sequence[str]: Name the axes of the tensors
+        :param &quot;fsdp&quot;: Control the number of frequency bins in the spectrogram
+        :param &quot;tp&quot;: Determine the number of time steps in a sequence
+        :param &quot;mp&quot;): Specify the number of heads in the multi-head attention
+        :param : Enable gradient checkpointing
+        :return: A tuple of the following:
+        :doc-author: Trelent
+        """
         self.use_flash_attention = use_flash_attention
         self.number_rep_kv = number_rep_kv
         self.gradient_checkpointing = gradient_checkpointing
@@ -383,6 +463,24 @@ class FlaxMistralAttention(nn.Module):
             init_cache: bool = False,
             output_attentions: bool = True
     ):
+        """
+        The __call__ function is the main function of a JAX module.
+        It defines how the module behaves when called as a function, and it's what you'll use to call your model in practice.
+        The __call__ method takes an input tensor (x) and returns an output tensor (y).
+        In this case, we're defining our model to be a simple linear layer with no activation: y = x @ w + b.
+
+        :param self: Refer to the object itself
+        :param hidden_state: chex.Array: Pass in the hidden state of the model
+        :param freq_cis: chex.Array: Create the t_rotary variable
+        :param attention_mask: chex.Array: Mask the attention weights
+        :param causal_mask: chex.Array: Mask the attention weights
+        :param position_ids: chex.Array: Specify the position of each token in a sequence
+        :param deterministic: bool: Determine whether to use dropout or not
+        :param init_cache: bool: Initialize the cache
+        :param output_attentions: bool: Determine whether to return the attention weights
+        :return: A tuple of (out, attn_output)
+        :doc-author: Trelent
+        """
         batch_size, sequence_length = hidden_state.shape[:2]
         query, key, value = self.q_proj(hidden_state), self.k_proj(hidden_state), self.v_proj(hidden_state)
 
@@ -544,6 +642,24 @@ class FlaxMistralDecoderLayer(nn.Module):
             init_cache: bool = False,
             output_attentions: bool = True
     ):
+        """
+        The __call__ function is the main function of a TransformerEncoderLayer.
+        It takes in the following arguments:
+            hidden_state (chex.Array): The input to the encoder layer, which is also its output after being processed by all sublayers.
+            freq_cis (chex.Array): A tensor containing frequency-domain representations of each token's context vector, used for computing self-attention weights and biases in a more efficient manner than using position embeddings or sinusoidal positional encoding vectors would allow for [2]. This tensor has shape `(batch_size, num
+
+        :param self: Represent the instance of the class
+        :param hidden_state: chex.Array: Represent the input to the encoder layer
+        :param freq_cis: chex.Array: Pass the frequency information to the attention layer
+        :param attention_mask: chex.Array: Mask out the attention weights for certain positions
+        :param causal_mask: chex.Array: Mask the future tokens
+        :param position_ids: chex.Array: Indicate the position of each token in the sequence
+        :param deterministic: bool: Determine whether to use dropout or not
+        :param init_cache: bool: Initialize the cache for the self-attention layer
+        :param output_attentions: bool: Determine whether to return the attention weights or not
+        :return: A tuple of hidden_state and attention_output
+        :doc-author: Trelent
+        """
         residual = hidden_state
         attention_output = self.self_attn(
             hidden_state=self.input_layernorm(hidden_state),
@@ -588,6 +704,19 @@ class FlaxMistralPretrainedModel(FlaxPreTrainedModel):
             params: flax.core.FrozenDict = None
     ) -> flax.core.FrozenDict:
 
+        """
+        The init_weights function is used to initialize the weights of a model.
+        It takes in an rng, which is a random number generator key that can be used to generate random numbers.
+        The input_shape parameter specifies the shape of the inputs that will be fed into this model.
+        The params parameter allows you to pass in pre-trained weights for your model, if you have them available.
+
+        :param self: Access variables that belong to the class
+        :param rng: jax.random.PRNGKey: Initialize the weights of the model
+        :param input_shape: Tuple: Initialize the input_ids, attention_mask and position_ids
+        :param params: flax.core.FrozenDict: Pass in the parameters of a pre-trained model
+        :return: A frozendict of parameters
+        :doc-author: Trelent
+        """
         input_ids = jnp.zeros(input_shape, dtype="i4")
         attention_mask = jnp.ones_like(input_ids)
         position_ids = jnp.broadcast_to(jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_shape)
@@ -646,6 +775,29 @@ class FlaxMistralPretrainedModel(FlaxPreTrainedModel):
             return_dict: Optional[bool] = None,
             add_params_field: bool = False
     ):
+        """
+        The __call__ function is the main function of a JAX module.
+        It takes as input:
+        - The parameters of the model (self.params)
+        - The inputs to the model (input_ids, attention_mask, position_ids)
+        - Whether we are training (train=True/False) and whether we want to return all hidden states and
+        attentions weights at each layer in addition to just the last layer output (output_hidden_states=True/False).
+
+        :param self: Represent the instance of the class
+        :param input_ids: Pass the input sequence to the model
+        :param attention_mask: Mask out the padding tokens
+        :param position_ids: Specify the position of each token in the sequence
+        :param params: dict: Pass in the parameters of the model
+        :param past_key_values: dict: Pass the past key values to the model
+        :param dropout_rng: jax.random.PRNGKey: Pass in a random number generator key to the model
+        :param train: bool: Determine whether to use dropout or not
+        :param output_attentions: Optional[bool]: Determine whether to return the attention weights
+        :param output_hidden_states: Optional[bool]: Determine whether to return the hidden states of all layers
+        :param return_dict: Optional[bool]: Return a dictionary of the outputs
+        :param add_params_field: bool: Add a params field to the inputs dictionary
+        :return: A tuple of (last_hidden_state, past_key_values)
+        :doc-author: Trelent
+        """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -810,6 +962,26 @@ class FlaxMistralModule(nn.Module):
             return_dict: bool = True,
 
     ) -> typing.Union[Tuple[Array, ...], FlaxBaseModelOutput]:
+        """
+        The __call__ function is the main function of a Flax model.
+        It takes in input_ids, attention_mask, and position_ids as inputs to the model.
+        The output is a tuple containing: last hidden state (hidden states), all hidden states (if output_hidden_states=True), attentions (if output attentions=True).
+
+
+        :param self: Represent the instance of the class
+        :param input_ids: chex.Array: Pass in the input ids
+        :param attention_mask: chex.Array: Mask out the attention weights for certain tokens
+        :param position_ids: chex.Array: Determine the position of each token in a sequence
+        :param deterministic: bool: Determine whether to use dropout or not
+        :param input_embeds: chex.Array: Pass in the embedding of the input_ids
+        :param init_cache: bool: Initialize the cache for the decoder
+        :param output_attentions: bool: Determine whether to return the attention weights or not
+        :param output_hidden_states: bool: Return all hidden states or just the last one
+        :param return_dict: bool: Return a dictionary of the outputs or not
+        :param : Determine whether the model is in training mode or not
+        :return: A tuple of the hidden states, all hidden states, and attentions
+        :doc-author: Trelent
+        """
         if input_embeds is None:
             input_embeds = self.embed_tokens(input_ids.astype("i4"))
         if attention_mask.ndim == 2:
@@ -895,9 +1067,30 @@ class FlaxMistralForCausalLMModule(nn.Module):
             output_hidden_states: bool = False,
             return_dict: bool = True,
     ):
+        """
+            The __call__ function is the main function of a Flax module. It defines how the model will be called,
+            and what it returns. In this case, we are calling our Transformer model with input_ids and attention_mask
+            as inputs (these are defined in __init__). We also have some optional arguments that can be passed to
+            the call function: deterministic (whether to use dropout), input_embeds (if you want to pass your own embeddings),
+            output_attentions and output_hidden states which return additional outputs from the transformer layers if set True. Finally,
+
+            :param self: Refer to the object itself
+            :param input_ids: chex.Array: Pass in the input tokens
+            :param attention_mask: chex.Array: Mask out the padding tokens
+            :param position_ids: chex.Array: Specify the position of each token in the sequence
+            :param deterministic: bool: Determine whether to use dropout in the model
+            :param input_embeds: chex.Array: Pass in the embeddings of the input tokens
+            :param init_cache: bool: Initialize the cache for the decoder
+            :param output_attentions: bool: Return the attention weights
+            :param output_hidden_states: bool: Return the hidden states of all layers
+            :param return_dict: bool: Return a dictionary of the outputs or just the logits
+            :param : Determine whether to return the logits or not
+            :return: A tuple of (lm_logits, hidden_states, attentions)
+            :doc-author: Trelent
+        """
         batch_size, seq_length = input_ids.shape
-        if attention_mask is None:
-            attention_mask = jnp.ones_like(input_ids)
+
+        if attention_mask is None: attention_mask = jnp.ones_like(input_ids)
         if position_ids is None:
             position_ids = jnp.broadcast_to(
                 jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),

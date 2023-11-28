@@ -28,6 +28,29 @@ class PytorchServerConfig:
                  max_gpu_perc_to_use=0.95,
                  max_stream_tokens: int = 1
                  ):
+        """
+        The __init__ function is called when the class is instantiated.
+        It sets up the instance of the class, and defines all its attributes.
+
+
+        :param self: Represent the instance of the class
+        :param host: Specify the ip address of the server
+        :param port: Specify the port number that will be used by the server
+        :param batch_size: Determine the number of samples to be generated in a single batch
+        :param contains_auto_format: Determine whether the input text contains auto_formatting
+        :param max_length: Set the maximum length of a sentence
+        :param max_new_tokens: Limit the number of new tokens that can be generated in a single batch
+        :param temperature: Control the randomness of the generated text
+        :param top_p: Control the probability of sampling from the top candidates
+        :param top_k: Limit the number of tokens that are considered for each token
+        :param logging: Control whether the server will print out
+        :param dtype: Specify the data type of the tensors
+        :param max_number_of_gpus: Limit the number of gpus used by the server
+        :param max_gpu_perc_to_use: Specify the maximum percentage of gpu memory that can be used by the server
+        :param max_stream_tokens: int: Limit the number of tokens that can be streamed to a single client
+        :return: Nothing
+        :doc-author: Trelent
+        """
         self.host = host
         self.port = port
         self.batch_size = batch_size
@@ -47,9 +70,17 @@ class PytorchServerConfig:
 class PyTorchServer(object):
 
     def __init__(self, config: PytorchServerConfig):
-        self.model, self.tokenizer = [None] * 2
+        """
+        The __init__ function is called when the class is instantiated.
+        It sets up the instance of the class, and defines all its attributes.
+        The __init__ function can accept arguments, which are passed at instantiation.
 
-        # logging.warning('PytorchServer is not built fully yet at this version')
+        :param self: Represent the instance of the class
+        :param config: PytorchServerConfig: Pass the configuration parameters to the class
+        :return: The app, which is a fastapi object
+        :doc-author: Trelent
+        """
+        self.model, self.tokenizer = [None] * 2
 
         self.config = config
         self.process_uvicorn = None
@@ -67,6 +98,13 @@ class PyTorchServer(object):
     @staticmethod
     def get_gpu_memory(num_gpus_req=None):
 
+        """
+        The get_gpu_memory function returns the amount of available GPU memory in GB.
+
+        :param num_gpus_req: Specify the number of gpus to be used
+        :return: The amount of free memory on each gpu
+        :doc-author: Trelent
+        """
         gpu_m = []
         dc = torch.cuda.device_count()
         num_gpus = torch.cuda.device_count() if num_gpus_req is None else min(num_gpus_req, dc)
@@ -79,6 +117,13 @@ class PyTorchServer(object):
         return gpu_m
 
     def get_model_load_kwargs(self):
+        """
+        The get_model_load_kwargs function is used to set the torch_dtype, device_map and max_memory parameters for loading a model.
+
+        :param self: Bind the method to an object
+        :return: A dictionary with the following keys:
+        :doc-author: Trelent
+        """
         if self.config.dtype == 'fp16':
             dtype = torch.float16
         elif self.config.dtype == 'fp32':
@@ -96,6 +141,20 @@ class PyTorchServer(object):
 
     def status(self):
 
+        """
+        The status function returns a dictionary with the following keys:
+            config: A dictionary of configuration parameters.
+            devices: The number of GPUs available to the server.
+            device_sharding: Whether device sharding is enabled. If True, then each request will be served by
+            a different GPU (if multiple GPUs are available). If False, then all requests will be served by
+            the same GPU (or CPU if no GPUs are available). This parameter can also be set in your client's
+            initialization function via torch-serve's DeviceShardingStrategy
+            class. See https://pytorch-lightning.readthedoc
+
+        :param self: Represent the instance of the class
+        :return: A dictionary with the following keys:
+        :doc-author: Trelent
+        """
         return {
             'config': {k: v for k, v in self.config.__dict__.items()},
             'devices': f"{torch.cuda.device_count()}",
@@ -106,6 +165,18 @@ class PyTorchServer(object):
         }
 
     def forward_instruct_fast_api(self, data: InstructRequest):
+        """
+        The forward_instruct_fast_api function is a ReST API endpoint that takes in an InstructRequest object and returns
+        a response. The InstructRequest object contains the following fields:
+            - system (str): A string representing the name of the system to be instructed. This should match one of the
+                systems defined in your config file, or else it will default to &quot;default&quot;. If you want to instruct multiple
+                systems at once, use forward_instruct_fast instead.
+
+        :param self: Refer to the object itself
+        :param data: InstructRequest: Pass in the data that is used to generate the response
+        :return: A dictionary with a single key, response
+        :doc-author: Trelent
+        """
         string = self.format_instruct(
             system=data.system,
             instruction=data.instruction
@@ -124,6 +195,14 @@ class PyTorchServer(object):
         }
 
     def forward_chat_fast_api(self, data: ChatRequest):
+        """
+        The forward_chat_fast_api function is a ReST API endpoint that takes in a ChatRequest object and returns the response from the model.
+
+        :param self: Refer to the object itself
+        :param data: ChatRequest: Pass the data from the api to the function
+        :return: A dictionary with a single key, response
+        :doc-author: Trelent
+        """
         string = self.format_chat(
             system=data.system,
             history=data.history,
@@ -144,10 +223,32 @@ class PyTorchServer(object):
 
     @staticmethod
     def format_instruct(system: str, instruction: str) -> str:
+        """
+        The format_instruct function is used to format the instruction string
+            for a particular system.  The function takes two arguments:
+
+        :param system: str: Determine which system the instruction is for
+        :param instruction: str: Store the instruction that is being passed in
+        :return: The instruction in the format of the system
+        :doc-author: Trelent
+        """
         raise NotImplementedError()
 
     @staticmethod
     def format_chat(history: List[str], prompt: str, system: str = None) -> str:
+        """
+        The format_chat function takes a list of strings, representing the chat history,
+        and returns a string that is formatted in such a way that it can be printed to the screen.
+        The prompt argument is used to indicate which user's turn it currently is. The system argument
+        is used for messages from the system (e.g., &quot;You are now connected!&quot;). If no value for system
+        is provided, then this function should return None.
+
+        :param history: List[str]: Store the chat history
+        :param prompt: str: Display the prompt to the user
+        :param system: str: Add a system message to the chat history
+        :return: A string that contains the history of a chat
+        :doc-author: Trelent
+        """
         raise NotImplementedError()
 
     def process(self,
@@ -161,6 +262,21 @@ class PyTorchServer(object):
                 sample: bool = True
 
                 ):
+        """
+        The process function is the main function of this class. It takes a string as input and returns a generator that yields strings.
+
+        :param self: Represent the instance of the class
+        :param string: str: Pass the string to be generated
+        :param max_new_tokens: int: Limit the number of new tokens that can be generated
+        :param max_length: int: Set the maximum length of the generated text
+        :param temperature: float: Control the randomness of the text generation
+        :param top_k: Filter out the top k tokens with the highest probability
+        :param top_p: Control the probability of sampling from the top n tokens
+        :param stream: bool: Determine whether to stream the output or not
+        :param sample: bool: Indicate whether to sample from the distribution or take the argmax
+        :return: A generator
+        :doc-author: Trelent
+        """
         assert self.model is not None, 'you should first load model with ``load`` method'
         tokens = self.tokenizer(
             string,
@@ -222,6 +338,17 @@ class PyTorchServer(object):
             return pred
 
     def load(self, repo_id: str, tokenizer_repo: str = None, auto_config: bool = True, **kwargs):
+        """
+        The load function is used to load a model from the HuggingFace Model Hub.
+
+        :param self: Represent the instance of the class
+        :param repo_id: str: Specify the name of the model to be loaded
+        :param tokenizer_repo: str: Specify the repo id of the tokenizer
+        :param auto_config: bool: Determine whether the model should be loaded with a config file or not
+        :param **kwargs: Pass a variable number of keyword arguments to the function
+        :return: A tuple of model and tokenizer
+        :doc-author: Trelent
+        """
         load_kwargs = kwargs if not auto_config else self.get_model_load_kwargs()
         load_kwargs = load_kwargs | kwargs
         model = transformers.AutoModelForCausalLM.from_pretrained(
@@ -246,6 +373,23 @@ class PyTorchServer(object):
                             top_p: float,
                             top_k: int
                             ):
+        """
+        The process_gradio_chat function is a wrapper for the process function.
+        It takes in the same arguments as process, but also takes in prompt and history.
+        The prompt is appended to the history list, which contains all of the previous messages sent by both parties.
+        The format_chat function formats this information into a string that can be fed into GPT-2's model.
+
+        :param self: Refer to the object itself
+        :param prompt: str: Set the prompt for the chatbot
+        :param history: List[str]: Store the history of the conversation
+        :param max_new_tokens: int: Limit the number of tokens that can be generated in a single response
+        :param temperature: float: Control the randomness of the text generation
+        :param max_length: int: Set the maximum length of the response
+        :param top_p: float: Control the randomness of the model
+        :param top_k: int: Control the number of tokens that are filtered from the top-k filtering
+        :return: A generator object, which is a type of iterator
+        :doc-author: Trelent
+        """
         string = self.format_chat(prompt=prompt, history=history, system=None)
         history.append([prompt, ''])
         responses = ''
@@ -271,6 +415,22 @@ class PyTorchServer(object):
                                 top_p: float,
                                 top_k: int
                                 ):
+        """
+        The process_gradio_instruct function is a wrapper for the process function.
+        It takes in an instruction and system, formats them into a string, then passes that string to the process function.
+        The output of this function is formatted so that it can be used with gradio's stream_func decorator.
+
+        :param self: Refer to the object itself
+        :param instruction: str: Pass the instruction to the model
+        :param system: str: Specify the system that is being used for the chatbot
+        :param max_new_tokens: int: Specify the maximum number of tokens that can be generated
+        :param temperature: float: Control the randomness of the output
+        :param max_length: int: Set the maximum length of the response
+        :param top_p: float: Control the randomness of the model
+        :param top_k: int: Limit the number of tokens that are considered for each position
+        :return: A generator object
+        :doc-author: Trelent
+        """
         string = self.format_instruct(system=system, instruction=instruction)
         responses = ''
         for response in self.process(
@@ -286,6 +446,13 @@ class PyTorchServer(object):
             yield '', response
 
     def create_gradio_ui_chat(self):
+        """
+        The create_gradio_ui_chat function creates a Gradio UI for the chatbot.
+
+        :param self: Refer to the object itself
+        :return: A block
+        :doc-author: Trelent
+        """
         with gr.Blocks(
                 theme=seafoam) as block:
             gr.Markdown("# <h1> <center>Powered by [EasyDeL](https://github.com/erfanzar/EasyDel) </center> </h1>")
@@ -335,6 +502,15 @@ class PyTorchServer(object):
         return block
 
     def create_gradio_ui_instruct(self):
+        """
+        The create_gradio_ui_instruct function creates a Gradio UI for the EasyDel model.
+        The function takes in no arguments and returns a block of code that is used to create the UI.
+
+
+        :param self: Represent the instance of the class
+        :return: A block
+        :doc-author: Trelent
+        """
         with gr.Blocks(
                 theme=seafoam) as block:
             gr.Markdown("# <h1> <center>Powered by [EasyDeL](https://github.com/erfanzar/EasyDel) </center> </h1>")
@@ -384,6 +560,13 @@ class PyTorchServer(object):
         return block
 
     def fire(self):
+        """
+        The fire function starts the uvicorn server in a separate process.
+
+        :param self: Represent the instance of the class
+        :return: A process that runs the uvicorn server
+        :doc-author: Trelent
+        """
         def run():
             uvicorn.run(self.app, host=self.config.host, port=self.config.port)
 
@@ -391,6 +574,14 @@ class PyTorchServer(object):
         self.process_uvicorn.start()
 
     def end(self):
+        """
+        The end function is used to stop the server.
+            It will wait for the process to end before returning.
+
+        :param self: Represent the instance of the class
+        :return: A boolean value
+        :doc-author: Trelent
+        """
         if self.process_uvicorn is not None:
             self.process_uvicorn.join()
         else:
