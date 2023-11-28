@@ -122,4 +122,4 @@ from EasyDel.transform.mistral import (
     mistral_easydel_to_hf as mistral_easydel_to_hf
 )
 
-__version__ = "0.0.39"
+__version__ = "0.0.40"
