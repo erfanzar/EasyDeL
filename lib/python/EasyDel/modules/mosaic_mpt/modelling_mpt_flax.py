@@ -3,7 +3,7 @@ import math
 import einops
 from flax import linen as nn
 from flax.core import FrozenDict
-from typing import Optional, Union, Tuple
+from typing import Optional, Union, Tuple, Sequence
 from transformers import FlaxPreTrainedModel, PretrainedConfig
 from jax import numpy as jnp
 import jax
@@ -12,13 +12,18 @@ from transformers.modeling_flax_outputs import FlaxCausalLMOutput, FlaxBaseModel
 import flax
 from einops import rearrange
 from fjformer.attention import efficient_attention
-from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
-    with_sharding_constraint, ACT2FN
+from EasyDel.modules.flax_modelling_utils import (
+    get_gradient_checkpoint_policy,
+    with_sharding_constraint,
+    ACT2FN,
+    JaxBaseClassModel,
+    smart_flash_attention
+)
 import chex
 from fjformer.bits import config as q_config, q_flax
 
 
-class MptConfig(PretrainedConfig):
+class MptConfig(PretrainedConfig, JaxBaseClassModel):
     model_type = 'mpt'
 
     def __init__(self,
@@ -48,6 +53,8 @@ class MptConfig(PretrainedConfig):
                  flash_attn_query_chunk_size: int = 1024,
                  flash_attn_key_chunk_size: int = 2048,
                  bits: Optional[int] = None,
+                 axis_dims: Sequence[int] = (1, -1, 1, 1),
+                 axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
                  **kwargs
                  ):
 
@@ -77,12 +84,17 @@ class MptConfig(PretrainedConfig):
         self.flash_attn_key_chunk_size = flash_attn_key_chunk_size
         self.flash_attn_query_chunk_size = flash_attn_query_chunk_size
         self.bits = bits
+
         self.from_pt = False
         if 'name' in kwargs:
             del kwargs['name']
         if 'loss_fn' in kwargs:
             del kwargs['loss_fn']
-        super().__init__(**kwargs)
+        super().__init__(
+            axis_dims=axis_dims,
+            axis_names=axis_names,
+            **kwargs
+        )
 
     @staticmethod
     def _set_config_defaults(config, config_defaults):
@@ -95,18 +107,18 @@ class MptConfig(PretrainedConfig):
     def get_partition_rules(fully_fsdp: bool = False):
         return (
 
-            ("transformer/wte/embedding", PartitionSpec("dp", "fsdp")),
-            ("transformer/wpe/embedding", PartitionSpec("dp", "fsdp")),
+            ("transformer/wte/embedding", PartitionSpec("tp", ("fsdp", "mp"))),
+            ("transformer/wpe/embedding", PartitionSpec("tp", ("fsdp", "mp"))),
 
-            ("attn/w_qkv/kernel", PartitionSpec("fsdp", "dp")),
-            ("attn/wo/kernel", PartitionSpec("dp", "fsdp")),
-            ("attn/w_qkv/bias", PartitionSpec("fsdp", "dp")),
-            ("attn/wo/bias", PartitionSpec("dp", "fsdp")),
+            ("attn/w_qkv/kernel", PartitionSpec(("fsdp", "mp"), "tp")),
+            ("attn/wo/kernel", PartitionSpec("tp", ("fsdp", "mp"))),
+            ("attn/w_qkv/bias", PartitionSpec(("fsdp", "mp"), "tp")),
+            ("attn/wo/bias", PartitionSpec("tp", ("fsdp", "mp"))),
 
-            ("ffn/down/kernel", PartitionSpec("fsdp", "dp")),
-            ("ffn/up/kernel", PartitionSpec("fsdp", "dp")),
-            ("ffn/down/kernel", PartitionSpec("fsdp", "dp")),
-            ("ffn/up/kernel", PartitionSpec("fsdp", "dp")),
+            ("ffn/down/kernel", PartitionSpec(("fsdp", "mp"), "tp")),
+            ("ffn/up/kernel", PartitionSpec(("fsdp", "mp"), "tp")),
+            ("ffn/down/kernel", PartitionSpec(("fsdp", "mp"), "tp")),
+            ("ffn/up/kernel", PartitionSpec(("fsdp", "mp"), "tp")),
 
             ("attention_norm/kernel", PartitionSpec(None)),
             ("norm_f/kernel", PartitionSpec(None)),
@@ -114,23 +126,23 @@ class MptConfig(PretrainedConfig):
 
             ("transformer/norm_f/kernel", PartitionSpec(None)),
             ("transformer/norm_f/bias", PartitionSpec(None)),
-            ("lm_head/kernel", PartitionSpec("fsdp", "dp")),
-            ("lm_head/bias", PartitionSpec("fsdp", "dp")),
+            ("lm_head/kernel", PartitionSpec(("fsdp", "mp"), "tp")),
+            ("lm_head/bias", PartitionSpec(("fsdp", "mp"), "tp")),
             ('.*', PartitionSpec(None)),
         ) if not fully_fsdp else (
 
-            ("transformer/wte/embedding", PartitionSpec("fsdp")),
-            ("transformer/wpe/embedding", PartitionSpec("fsdp")),
+            ("transformer/wte/embedding", PartitionSpec(("fsdp", "mp"))),
+            ("transformer/wpe/embedding", PartitionSpec(("fsdp", "mp"))),
 
-            ("attn/w_qkv/kernel", PartitionSpec("fsdp")),
-            ("attn/wo/kernel", PartitionSpec("fsdp")),
-            ("attn/w_qkv/bias", PartitionSpec("fsdp")),
-            ("attn/wo/bias", PartitionSpec("fsdp")),
+            ("attn/w_qkv/kernel", PartitionSpec(("fsdp", "mp"))),
+            ("attn/wo/kernel", PartitionSpec(("fsdp", "mp"))),
+            ("attn/w_qkv/bias", PartitionSpec(("fsdp", "mp"))),
+            ("attn/wo/bias", PartitionSpec(("fsdp", "mp"))),
 
-            ("ffn/down/kernel", PartitionSpec("fsdp")),
-            ("ffn/up/kernel", PartitionSpec("fsdp")),
-            ("ffn/down/kernel", PartitionSpec("fsdp")),
-            ("ffn/up/kernel", PartitionSpec("fsdp")),
+            ("ffn/down/kernel", PartitionSpec(("fsdp", "mp"))),
+            ("ffn/up/kernel", PartitionSpec(("fsdp", "mp"))),
+            ("ffn/down/kernel", PartitionSpec(("fsdp", "mp"))),
+            ("ffn/up/kernel", PartitionSpec(("fsdp", "mp"))),
 
             ("attention_norm/kernel", PartitionSpec(None)),
             ("norm_f/kernel", PartitionSpec(None)),
@@ -138,8 +150,8 @@ class MptConfig(PretrainedConfig):
 
             ("transformer/norm_f/kernel", PartitionSpec(None)),
             ("transformer/norm_f/bias", PartitionSpec(None)),
-            ("lm_head/kernel", PartitionSpec("fsdp")),
-            ("lm_head/bias", PartitionSpec("fsdp")),
+            ("lm_head/kernel", PartitionSpec(("fsdp", "mp"))),
+            ("lm_head/bias", PartitionSpec(("fsdp", "mp"))),
             ('.*', PartitionSpec(None)),
         )
 
@@ -170,8 +182,12 @@ class MptConfig(PretrainedConfig):
                      flash_attn_query_chunk_size: int = 1024,
                      flash_attn_key_chunk_size: int = 2048,
                      bits: Optional[int] = None,
+                     axis_dims: Sequence[int] = (1, -1, 1, 1),
+                     axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
                      **kwargs
                      ):
+        self.axis_names = axis_names
+        self.axis_dims = axis_dims
         if hasattr(self, 'attn_config'):
             for k, v in self.attn_config.items():
                 setattr(self, k, v)
@@ -210,7 +226,6 @@ class MptConfig(PretrainedConfig):
                 setattr(self, k, v)
 
         self.from_pt = False
-        return self
 
 
 class RMSNorm(nn.Module):
@@ -241,7 +256,7 @@ class FlaxMptMLP(nn.Module):
     config: MptConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
+    precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
         if self.config.bits is not None:
@@ -281,7 +296,7 @@ class FlaxMptAttention(nn.Module):
     config: MptConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
+    precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
 
@@ -349,13 +364,6 @@ class FlaxMptAttention(nn.Module):
                  ):
         inp_shape = hidden_states.shape
         b, s, ds = inp_shape
-
-        # if attention_mask is not None:
-        #     _, s = attention_mask.shape
-        #     assert inp_shape[
-        #                1] == s, (f'hidden_state_size on hidden_states shape'
-        #                          f' ({inp_shape[1]}) and attention_mask ({s}) miss match'
-        #                          f' attention Shape : {attention_mask.shape} | hidden Shape : {hidden_states.shape}')
         qkv = self.w_qkv(hidden_states)
         q, k, v = jnp.split(qkv, 3, -1)
         if self.config.qk_ln:
@@ -371,65 +379,77 @@ class FlaxMptAttention(nn.Module):
         attention_mask = attention_mask.reshape(b, 1, 1, -1)
         if self.has_variable('cache', 'key') or init_cache:
             k, v, attention_mask = self._concatenate_to_cache(key=k, value=v, query=q, attention_mask=attention_mask)
-        if self.config.use_flash_attention:
 
-            attn_mask = einops.rearrange(
-                nn.combine_masks(
-                    jnp.where(self.causal_mask == 1, 0, jnp.finfo(jnp.ones((1,), dtype=self.dtype)).min)[:, :, :s, :s],
-                    jnp.where(attention_mask == 1, 0,
-                              jnp.finfo(jnp.ones((1, 1), dtype=self.dtype)).min),
-                    attn_bias
-                ),
-                '...s q k->... s 1 q k'
-            ) if attn_bias is not None else einops.rearrange(
-                nn.combine_masks(
-                    jnp.where(self.causal_mask == 1, 0, jnp.finfo(jnp.ones((1,), dtype=self.dtype)).min)[:, :, :s, :s],
-                    jnp.where(attention_mask == 1, 0,
-                              jnp.finfo(jnp.ones((1, 1), dtype=self.dtype)).min)
-                ),
-                '...s q k->... s 1 q k'
+        q_l = q.shape[1]
+        k_l = k.shape[1]
+        dropout_rng = None
+        deterministic = False
+        if deterministic:
+            dropout_rng = self.make_rng("dropout")
+
+        if self.config.use_flash_attention and not (self.has_variable("cache", "cached_key") or init_cache):
+
+            if attention_mask.ndim == 2:
+                attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
+
+            if attention_mask.shape[1] != self.config.num_attention_heads:
+                attention_mask = attention_mask.repeat(self.config.num_attention_heads, 1, )
+            attention_bias = jax.lax.select(
+                attention_mask > 0,
+                jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
+                jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
             )
-            atw = efficient_attention(
-                query=q,
-                key=k,
-                value=v,
-                dtype=self.dtype,
+            attn_weights = None
+            rtp_axis = (0, 2, 1, 3)
+            attn_output = smart_flash_attention(
+                q=jnp.transpose(q, rtp_axis),
+                k=jnp.transpose(k, rtp_axis),
+                v=jnp.transpose(b, rtp_axis),
+                bias=attention_bias + attn_bias,
+                block_q=self.config.flash_attn_query_chunk_size,
+                block_k=self.config.flash_attn_key_chunk_size,
+                block_b=1,
+                num_attention_heads=self.config.num_attention_heads,
                 precision=self.precision,
-                attention_drop_rate=0.0,
-                deterministic=False,
-                float32_logits=True,
-                bias=attn_mask,
+                dtype=self.dtype,
                 causal=False,
-                key_chunk_size=self.config.flash_attn_key_chunk_size,
-                query_chunk_size=self.config.flash_attn_query_chunk_size
+                mesh=self.config.jax_mesh(),
+                dropout_rng=dropout_rng,
+                deterministic=deterministic,
+                q_seq_len=q_l,
+                kv_seq_len=k_l,
+                attn_pdrop=self.config.attn_pdrop,
+                head_dims=self.head_dim,
+                force_float32_tpu=True
             )
+            attn_output = jnp.transpose(attn_output, rtp_axis)
         else:
             d = q.shape[-1]
-            atw = jnp.einsum('...qhd,...khd->...hqk', q, k, precision=self.precision) * jax.lax.rsqrt(
+            attn_output = jnp.einsum('...qhd,...khd->...hqk', q, k, precision=self.precision) * jax.lax.rsqrt(
                 jnp.asarray(d).astype(v.dtype))
             if self.config.use_pjit_attention_force:
-                atw = with_sharding_constraint(atw, PartitionSpec(('dp', 'fsdp'), 'mp', None, None))
+                attn_output = with_sharding_constraint(attn_output, PartitionSpec(('dp', 'fsdp'), 'mp', None, None))
             if attn_bias is not None:
-                atw += attn_bias[:, :, :, :atw.shape[-1]]
-            mask = jnp.where(self.causal_mask == 1, 0, jnp.finfo(atw).min)
+                attn_output += attn_bias[:, :, :, :attn_output.shape[-1]]
+            mask = jnp.where(self.causal_mask == 1, 0, jnp.finfo(attn_output).min)
             if attention_mask is not None:
                 attention_mask = jnp.where(
                     attention_mask == 1,
                     0,
-                    jnp.finfo(atw).min
+                    jnp.finfo(attn_output).min
                 )
-                atw += attention_mask
-            atw += mask[:, :, :atw.shape[-2], :atw.shape[-1]]
-            atw = nn.softmax(atw, -1)
-            atw = jnp.einsum('...hqk,...khd->...qhd', atw, v)
-        return self.wo(atw.reshape(inp_shape))
+                attn_output += attention_mask
+            attn_output += mask[:, :, :attn_output.shape[-2], :attn_output.shape[-1]]
+            attn_output = nn.softmax(attn_output, -1)
+            attn_output = jnp.einsum('...hqk,...khd->...qhd', attn_output, v)
+        return self.wo(attn_output.reshape(inp_shape))
 
 
 class FlaxMptBlock(nn.Module):
     config: MptConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
+    precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
         self.norm_1 = nn.LayerNorm(use_bias=self.config.use_norm_bias)
@@ -472,7 +492,7 @@ class FlaxMptCollection(nn.Module):
     config: MptConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
+    precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
         block = FlaxMptBlock
@@ -532,7 +552,7 @@ class FlaxMptModule(nn.Module):
     config: MptConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
+    precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
         self.wte = nn.Embed(num_embeddings=self.config.vocab_size, features=self.config.d_model)
@@ -685,7 +705,7 @@ class FlaxFlaxMptForCausalLMModule(nn.Module):
     config: MptConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
+    precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
         self.transformer = FlaxMptModule(

@@ -1,3 +1,3 @@
-from .jax_serve import JAXServer, JaxServerConfig
-from .torch_serve import PyTorchServer, PytorchServerConfig
-from .utils import ChatRequest, InstructRequest
+from EasyDel.serve.jax_serve import JAXServer, JaxServerConfig
+from EasyDel.serve.torch_serve import PyTorchServer, PytorchServerConfig
+from EasyDel.serve.utils import ChatRequest, InstructRequest

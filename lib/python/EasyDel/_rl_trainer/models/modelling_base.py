@@ -41,6 +41,17 @@ class FlaxPreTrainedModelWrapper(nn.Module):
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, from_pt: bool = True, *model_args, **kwargs):
 
+        """
+        The from_pretrained function is used to instantiate a model from a pretrained checkpoint.
+
+        :param cls: Refer to the class that called this function
+        :param pretrained_model_name_or_path: Specify the path to the pretrained model
+        :param from_pt: bool: Determine whether to load the model from a pytorch checkpoint or not
+        :param *model_args: Pass the positional arguments of the model
+        :param **kwargs: Pass keyworded, variable-length argument list
+        :return: A model with the state_dict loaded from a file
+        :doc-author: Trelent
+        """
         if kwargs is not None:
             reward_adapter = kwargs.pop("reward_adapter", None)
             is_trainable = kwargs.pop("is_trainable", False)
@@ -177,6 +188,22 @@ class FlaxPreTrainedModelWrapper(nn.Module):
             model_name="pytorch_model.bin",
             model_index_name="pytorch_model.bin.index.json",
     ):
+        """
+        The _get_checkpoint_from_hub function is used to download a pretrained model from the Hugging Face Hub.
+        It will first attempt to download the entire model, and if that fails it will try downloading just the v_head weights.
+        If neither of those attempts succeed, it will return None for all outputs.
+
+        :param cls: Specify the class of the model
+        :param pretrained_model: Load the pretrained model
+        :param pretrained_model_name_or_path: Load the pretrained model from a checkpoint
+        :param index_filename: Load the index file for sharded models
+        :param token: Authenticate with the hugging face model hub
+        :param model_name: Specify the name of the model file to be downloaded
+        :param model_index_name: Specify the name of the index file
+        :param : Load the pretrained model
+        :return: A tuple of four elements:
+        :doc-author: Trelent
+        """
         files_to_download = None
         filename = None
         is_resuming_training = True
@@ -221,10 +248,28 @@ class FlaxPreTrainedModelWrapper(nn.Module):
 
     @classmethod
     def _get_current_device(cls):
+        """
+        The _get_current_device function is a class method that returns the current device.
+
+        :param cls: Indicate that the function is a method of the class
+        :return: The current device
+        :doc-author: Trelent
+        """
         return jax.devices()[0]
 
     @classmethod
     def _split_kwargs(cls, kwargs):
+        """
+        The _split_kwargs function is used to split the kwargs into three categories:
+            1. supported_kwargs - These are the arguments that are supported by this class and will be passed on to the parent class.
+            2. unsupported_kwargs - These are arguments that aren't supported by this class, but may be useful for other classes in a chain of inheritance (e.g., if you're using multiple mixins).
+            3. peft_kwargs - These are arguments specific to PEFT and will not be passed on to any other classes.
+
+        :param cls: Refer to the class itself
+        :param kwargs: Pass keyword arguments to the function
+        :return: A tuple of three dictionaries
+        :doc-author: Trelent
+        """
         supported_kwargs = {}
         unsupported_kwargs = {}
         peft_kwargs = {}
@@ -264,6 +309,19 @@ class FlaxPreTrainedModelWrapper(nn.Module):
 
     def compute_reward_score(self, input_ids, attention_mask=None, ppo_adapter_name="default", **kwargs):
 
+        """
+        The compute_reward_score function is used to compute the reward score for a given input.
+        The function takes in an input_ids tensor and returns a tensor of scores. The shape of the returned
+        tensor will be (batch_size, sequence_length). The higher the score, the more likely that token should be kept.
+
+        :param self: Represent the instance of the class
+        :param input_ids: Pass the input tokens to the model
+        :param attention_mask: Indicate which tokens are padding
+        :param ppo_adapter_name: Set the adapter back to its original state
+        :param **kwargs: Pass a variable number of arguments to a function
+        :return: The scores for the given input_ids
+        :doc-author: Trelent
+        """
         if not self.supports_rm_adapter:
             raise ValueError("This model does not support reward modeling adapter.")
 

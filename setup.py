@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='EasyDeL',
-    version='0.0.39',
+    version='0.0.40',
     author='Erfan Zare Chavoshi',
     author_email='erfanzare82@eyahoo.com',
     description='An open-source library to make training faster and more optimized in Jax/Flax',
@@ -36,7 +36,7 @@ setup(
         "msgpack",
         "ipython",
         "tqdm",
-        "datasets==2.14.3",
+        "datasets",
         "pydantic==2.4.2",
         "gradio",
         "distrax",

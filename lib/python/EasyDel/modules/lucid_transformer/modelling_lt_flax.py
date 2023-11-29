@@ -12,9 +12,11 @@ from transformers import FlaxPreTrainedModel, PretrainedConfig
 from jax.sharding import PartitionSpec
 import flax
 from einops import rearrange
-from typing import Dict, Any, Optional, Tuple, List
+from typing import Dict, Any, Optional, Sequence
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
+from EasyDel.modules.flax_modelling_utils import JaxBaseClassModel
 import chex
+
 ACT2CLS = {
     "gelu": nn.gelu,
     "relu": nn.relu,
@@ -26,7 +28,7 @@ ACT2CLS = {
 }
 
 
-class FlaxLTConfig(PretrainedConfig):
+class FlaxLTConfig(PretrainedConfig, JaxBaseClassModel):
     def __init__(self,
                  initializer_range: float = 0.02,
                  hidden_size: int = 4096,
@@ -43,9 +45,17 @@ class FlaxLTConfig(PretrainedConfig):
                  alibi_bias_max: int = 8,
                  fsdp=False,
                  hidden_act="silu",
+                 axis_dims: Sequence[int] = (1, -1, 1, 1),
+                 axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
                  **kwargs
                  ):
-        super().__init__(eos_token_id=eos_token_id, bos_token_id=bos_token_id, pad_token_id=pad_token_id)
+        super().__init__(
+            axis_dims=axis_dims,
+            axis_names=axis_names,
+            eos_token_id=eos_token_id,
+            bos_token_id=bos_token_id,
+            pad_token_id=pad_token_id
+        )
         self.max_sequence_length = max_sequence_length
         self.weight_decay = weight_decay
         self.alibi_bias_max = alibi_bias_max
@@ -60,8 +70,14 @@ class FlaxLTConfig(PretrainedConfig):
         self.initializer_range = initializer_range
         self.softmax_scale = softmax_scale
         self.fsdp = fsdp
+        self.axis_dims = axis_dims
+        self.axis_names = axis_names
         self.hidden_act = hidden_act
-        self.__dict__.update(**kwargs)
+
+        self.__dict__.update(
+
+            **kwargs
+        )
 
     @staticmethod
     def get_partition_rules():
@@ -85,7 +101,7 @@ class FlaxLTConfig(PretrainedConfig):
 
     @staticmethod
     def rng_keys():
-        return ('params', 'dropout', 'fcm')
+        return 'params', 'dropout', 'fcm'
 
 
 def is_name(*names):
