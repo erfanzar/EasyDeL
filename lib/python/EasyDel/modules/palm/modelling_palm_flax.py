@@ -10,9 +10,10 @@ from jax import numpy as np
 from transformers.modeling_flax_outputs import FlaxCausalLMOutput
 from transformers import PretrainedConfig
 from jax.sharding import PartitionSpec
-from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
+from EasyDel.modules.flax_modelling_utils import get_gradient_checkpoint_policy, \
     with_sharding_constraint
 import chex
+
 
 class PalmConfig(PretrainedConfig):
     def __init__(self,
@@ -57,23 +58,23 @@ class PalmConfig(PretrainedConfig):
     @staticmethod
     def get_partition_rules(fully_fsdp: bool = False):
         return (
-            ('wi/kernel', PartitionSpec('fsdp')),
-            ('attn_wo/kernel', PartitionSpec('fsdp', 'mp')),
-            ('ff_wo/kernel', PartitionSpec('fsdp', 'mp')),
-            ('wte/embedding', PartitionSpec('fsdp', 'mp')),
-            ('lm_head/kernel', PartitionSpec('fsdp')),
-            ('post_norm/kernel', PartitionSpec('fsdp')),
-            ('norm/kernel', PartitionSpec('fsdp', 'mp')),
+            ('wi/kernel', PartitionSpec(('fsdp', 'mp'))),
+            ('attn_wo/kernel', PartitionSpec(('fsdp', 'mp'), 'tp')),
+            ('ff_wo/kernel', PartitionSpec(('fsdp', 'mp'), 'tp')),
+            ('wte/embedding', PartitionSpec(('fsdp', 'mp'), 'tp')),
+            ('lm_head/kernel', PartitionSpec(('fsdp', 'mp'))),
+            ('post_norm/kernel', PartitionSpec(('fsdp', 'mp'))),
+            ('norm/kernel', PartitionSpec(('fsdp', 'mp'), 'tp')),
             ('.*', PartitionSpec(None)),
         ) if not fully_fsdp else (
-            ('wi/kernel', PartitionSpec('fsdp')),
-            ('attn_wo/kernel', PartitionSpec('fsdp')),
-            ('ff_wo/kernel', PartitionSpec('fsdp')),
-            ('wte/embedding', PartitionSpec('fsdp')),
-            ('lm_head/kernel', PartitionSpec('fsdp')),
-            ('post_norm/kernel', PartitionSpec('fsdp')),
-            ('norm/kernel', PartitionSpec('fsdp')),
-            ('.*', PartitionSpec('fsdp')),
+            ('wi/kernel', PartitionSpec(('fsdp', 'mp'))),
+            ('attn_wo/kernel', PartitionSpec(('fsdp', 'mp'))),
+            ('ff_wo/kernel', PartitionSpec(('fsdp', 'mp'))),
+            ('wte/embedding', PartitionSpec(('fsdp', 'mp'))),
+            ('lm_head/kernel', PartitionSpec(('fsdp', 'mp'))),
+            ('post_norm/kernel', PartitionSpec(('fsdp', 'mp'))),
+            ('norm/kernel', PartitionSpec(('fsdp', 'mp'))),
+            ('.*', PartitionSpec(('fsdp', 'mp'))),
         )
 
 
@@ -82,7 +83,7 @@ class RMSNorm(nn.Module):
     eps: float = 1e-6
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
+    precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
         self.weight = self.param(
@@ -131,7 +132,7 @@ class ParallelPalmBlock(nn.Module):
     config: PalmConfig
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
+    precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
         attn_inner_dim = self.config.dim_head * self.config.num_attention_heads
@@ -210,7 +211,7 @@ class ParallelCollection(nn.Module):
     config: PalmConfig
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
+    precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
         block = ParallelPalmBlock
@@ -250,7 +251,7 @@ class PalmPretrainedModel(transformers.FlaxPreTrainedModel):
     config_class = PalmConfig
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
+    precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def __init__(self, config: PalmConfig, input_shape=(1, 1), _do_init=False):
         module = self.module_class(
@@ -306,7 +307,7 @@ class PalmModule(nn.Module):
     config: PalmConfig
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
+    precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
         self.wte = nn.Embed(
@@ -394,7 +395,7 @@ class FlaxPalmForCausalLMModule(nn.Module):
     config: PalmConfig
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[jax.lax.Precision, str]] = jax.lax.Precision('fastest')
+    precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
         self.path_way = PalmModule(

@@ -21,7 +21,7 @@
 # limitations under the License.
 """ GPT-J model configuration"""
 from collections import OrderedDict
-from typing import Any, List, Mapping
+from typing import Any, List, Mapping, Sequence
 
 from functools import partial
 from typing import Optional, Tuple
@@ -47,14 +47,14 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.onnx import OnnxConfigWithPast, PatchingSpec
 
 from fjformer.attention import efficient_attention
-from ..flax_modelling_utils import with_sharding_constraint
+from EasyDel.modules.flax_modelling_utils import with_sharding_constraint, JaxBaseClassModel
 import chex
 from fjformer.bits import config as q_config, q_flax
 
 logger = logging.get_logger(__name__)
 
 
-class GPTJConfig(PretrainedConfig):
+class GPTJConfig(PretrainedConfig, JaxBaseClassModel):
     model_type = "gptj"
     attribute_map = {
         "max_position_embeddings": "n_positions",
@@ -87,6 +87,8 @@ class GPTJConfig(PretrainedConfig):
             flash_attn_query_chunk_size: int = 1024,
             flash_attn_key_chunk_size: int = 2048,
             bits: Optional[int] = None,
+            axis_dims: Sequence[int] = (1, -1, 1, 1),
+            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
             **kwargs,
     ):
         self.bits = bits
@@ -112,7 +114,12 @@ class GPTJConfig(PretrainedConfig):
         self.use_flash_attention = use_flash_attention
         self.from_pt = False
         super().__init__(
-            bos_token_id=bos_token_id, eos_token_id=eos_token_id, tie_word_embeddings=tie_word_embeddings, **kwargs
+            axis_names=axis_names,
+            axis_dims=axis_dims,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            tie_word_embeddings=tie_word_embeddings,
+            **kwargs
         )
 
     @staticmethod
@@ -145,43 +152,43 @@ class GPTJConfig(PretrainedConfig):
     def get_partition_rules(just_fsdp: bool = True):
         if just_fsdp:
             rules = (
-                ("model/wte/embedding", PartitionSpec("fsdp", )),
+                ("model/wte/embedding", PartitionSpec(("fsdp", "mp"), )),
 
-                ("attn/(k_proj|v_proj|q_proj)/kernel", PartitionSpec("fsdp", )),
-                ("attn/out_proj/kernel", PartitionSpec("fsdp", )),
+                ("attn/(k_proj|v_proj|q_proj)/kernel", PartitionSpec(("fsdp", "mp"), )),
+                ("attn/out_proj/kernel", PartitionSpec(("fsdp", "mp"), )),
 
-                ("mlp/fc_out/kernel", PartitionSpec("fsdp", )),
-                ("mlp/fc_out/bias", PartitionSpec("fsdp", )),
+                ("mlp/fc_out/kernel", PartitionSpec(("fsdp", "mp"), )),
+                ("mlp/fc_out/bias", PartitionSpec(("fsdp", "mp"), )),
 
-                ("mlp/fc_in/kernel", PartitionSpec("fsdp", )),
-                ("mlp/fc_in/bias", PartitionSpec("fsdp", )),
+                ("mlp/fc_in/kernel", PartitionSpec(("fsdp", "mp"), )),
+                ("mlp/fc_in/bias", PartitionSpec(("fsdp", "mp"), )),
 
-                ("lm_head/kernel", PartitionSpec("fsdp", )),
-                ("lm_head/bias", PartitionSpec("fsdp", )),
+                ("lm_head/kernel", PartitionSpec(("fsdp", "mp"), )),
+                ("lm_head/bias", PartitionSpec(("fsdp", "mp"), )),
                 ('.*', PartitionSpec(None)),
             )
         else:
             rules = (
-                ("model/wte/embedding", PartitionSpec('mp', "fsdp")),
+                ("model/wte/embedding", PartitionSpec('tp', ("fsdp", "mp"))),
 
-                ("attn/(k_proj|v_proj|q_proj)/kernel", PartitionSpec("fsdp", 'mp')),
-                ("attn/out_proj/kernel", PartitionSpec('mp', "fsdp", )),
+                ("attn/(k_proj|v_proj|q_proj)/kernel", PartitionSpec(("fsdp", "mp"), 'tp')),
+                ("attn/out_proj/kernel", PartitionSpec('tp', ("fsdp", "mp"), )),
 
-                ("mlp/fc_out/kernel", PartitionSpec("fsdp", 'mp')),
-                ("mlp/fc_out/bias", PartitionSpec("fsdp", 'mp')),
+                ("mlp/fc_out/kernel", PartitionSpec(("fsdp", "mp"), 'tp')),
+                ("mlp/fc_out/bias", PartitionSpec(("fsdp", "mp"), 'tp')),
 
-                ("mlp/fc_in/kernel", PartitionSpec('mp', "fsdp", )),
-                ("mlp/fc_in/bias", PartitionSpec('mp', "fsdp", )),
+                ("mlp/fc_in/kernel", PartitionSpec('tp', ("fsdp", "mp"), )),
+                ("mlp/fc_in/bias", PartitionSpec('tp', ("fsdp", "mp"), )),
 
-                ("lm_head/kernel", PartitionSpec('mp', "fsdp", )),
-                ("lm_head/bias", PartitionSpec('mp', "fsdp", )),
+                ("lm_head/kernel", PartitionSpec('tp', ("fsdp", "mp"), )),
+                ("lm_head/bias", PartitionSpec('tp', ("fsdp", "mp"), )),
                 ('.*', PartitionSpec(None)),
             )
         return rules
 
     @staticmethod
     def get_mesh_names():
-        return 'dp', 'fsdp', 'mp'
+        return "dp", "fsdp", "tp", "mp"
 
     def add_jax_args(
             self,
@@ -207,7 +214,11 @@ class GPTJConfig(PretrainedConfig):
             flash_attn_query_chunk_size: int = 1024,
             flash_attn_key_chunk_size: int = 2048,
             bits: Optional[int] = None,
+            axis_dims: Sequence[int] = (1, -1, 1, 1),
+            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
     ):
+        self.axis_dims = axis_dims
+        self.axis_names = axis_names
         basics = dict(
             bits=bits,
             vocab_size=vocab_size,

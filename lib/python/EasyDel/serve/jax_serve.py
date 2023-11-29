@@ -12,7 +12,7 @@ import transformers
 import uvicorn
 from fastapi import FastAPI
 from fjformer import make_shard_and_gather_fns, match_partition_rules, with_sharding_constraint
-from ..smi import get_mem, initialise_tracking
+from EasyDel.smi import get_mem, initialise_tracking
 from jax import numpy as jnp
 from jax.experimental import mesh_utils
 from flax.serialization import from_bytes
@@ -20,12 +20,11 @@ from fjformer.load._load import get_float_dtype_by_name
 from jax.sharding import Mesh, PartitionSpec as Ps
 from transformers import GenerationConfig
 import logging
-from ..utils import RNG
+from EasyDel.utils.utils import RNG, prefix_str
 import multiprocessing as mp
-from ..utils import prefix_str
 from typing import Union, Sequence
 import chex
-from .utils import InstructRequest, ChatRequest, seafoam
+from EasyDel.serve.utils import InstructRequest, ChatRequest, seafoam
 from jax.experimental.pjit import pjit
 
 
@@ -43,13 +42,44 @@ class JaxServerConfig:
             top_p: float = 0.95,
             top_k: int = 50,
             logging: bool = True,
-            mesh_axes_names: Sequence[str] = ('dp', 'fsdp', 'mp'),
-            mesh_axes_shape: Sequence[int] = (1, -1, 1),
+            mesh_axes_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
+            mesh_axes_shape: Sequence[int] = (1, -1, 1, 1),
             dtype: str = 'fp16',
             stream_tokens_for_gradio: bool = True,
             use_prefix_tokenizer: bool = True,
             pre_compile: bool = True,
     ):
+        """
+        The __init__ function is called when the class is instantiated.
+        It sets up the attributes of an instance of this class, which are:
+            host: str = &quot;0.0.0.0&quot;
+                The IP address to listen on for incoming requests from clients
+
+        :param self: Represent the instance of the class
+        :param host: str: Set the host address of the server
+        :param port: int: Specify the port number that the server will run on
+        :param batch_size: int: Set the batch size of the model
+        :param contains_auto_format: bool: Determine whether the input text contains auto-formatting
+        :param max_length: int: Set the maximum length of the text that can be generated
+        :param max_new_tokens: int: Determine how many tokens can be added to the vocabulary
+        :param max_stream_tokens: int: Set the maximum number of tokens that can be streamed at a time
+        :param temperature: float: Control the randomness of the output
+        :param top_p: float: Control the diversity of the text generated
+        :param top_k: int: Limit the number of tokens that can be generated
+        :param logging: bool: Print out the progress of the server
+        :param mesh_axes_names: Sequence[str]: Specify the names of the axes in the mesh tensor
+        :param &quot;fsdp&quot;: Set the number of tokens to be generated
+        :param &quot;tp&quot;: Set the top_p value
+        :param &quot;mp&quot;): Define the mesh_axes_names
+        :param mesh_axes_shape: Sequence[int]: Specify the shape of the mesh
+        :param dtype: str: Specify the data type of the model
+        :param stream_tokens_for_gradio: bool: Determine whether the stream tokens
+        :param use_prefix_tokenizer: bool: Determine if the tokenizer should be used to generate tokens
+        :param pre_compile: bool: Pre-compile the model
+        :param : Set the host address
+        :return: Nothing
+        
+        """
         self.host = host
         self.port = port
         self.batch_size = batch_size
@@ -85,6 +115,16 @@ class JAXServer(object):
 
     def __init__(self, config=None):
 
+        """
+        The __init__ function is called when the class is instantiated.
+        It sets up all the attributes that will be used by other methods in the class.
+
+
+        :param self: Refer to the current instance of a class
+        :param config: Pass the jaxserverconfig object
+        :return: A fastapi object
+        
+        """
         self.process_uvicorn, self.prefix_tokenizer, self.params, self.tokenizer, self.model, \
             self.rules, self._generate, self._greedy_generate = [None] * 8
         assert config is None or isinstance(config, JaxServerConfig), 'config can be None or JaxServerConfig Type'
@@ -110,6 +150,16 @@ class JAXServer(object):
         self.app = gr.mount_gradio_app(self.app, self.gradio_app_instruct, '/gradio_instruct')
 
     def status(self):
+        """
+        The status function returns a dictionary with the following keys:
+            config: A dictionary containing all of the configuration parameters for this server.
+            devices: A string describing which devices are available to JAX.
+            number_of_backends: The number of backends available to JAX.  This is usually equal to the number of GPUs on your machine, but can be less if you have not installed CUDA or if you have disabled some GPUs in your system BIOS settings (e.g., because they are defective).  It can also be more than one if you have multiple machines connected via MPI and running under Horov
+
+        :param self: Represent the instance of the class
+        :return: A dictionary with the following keys:
+        
+        """
         return {
             'config': {k: v for k, v in self.config.__dict__.items()},
             'devices': f"{jax.devices()}",
@@ -121,10 +171,26 @@ class JAXServer(object):
 
     @staticmethod
     def get_memory():
+        """
+        The get_memory function returns the total memory of the system in bytes.
+
+
+        :return: The amount of memory used by the program
+        
+        """
         return get_mem()
 
     def configure_generate_functions(self, model, tokenizer):
 
+        """
+        The configure_generate_functions function is used to configure the generation functions for a given model.
+
+        :param self: Access variables within the class
+        :param model: Generate the model
+        :param tokenizer: Get the eos_token_id, pad_token_id and bos token id
+        :return: A function that takes in three parameters:
+        
+        """
         assert self.rules is not None, 'you should first shard params with using ``shard_params`` method'
 
         if tokenizer.pad_token is None:
@@ -208,6 +274,20 @@ class JAXServer(object):
         self._funcs_generated = True
 
     def auto_configure(self, model, params, tokenizer, partition_rules):
+        """
+        The auto_configure function is a helper function that will automatically configure the model for distributed training.
+        It does this by:
+            1) sharding the parameters of the model based on partition_rules, and then
+            2) configuring generate functions to be used in distributed training.
+
+        :param self: Represent the instance of the class
+        :param model: Configure the model
+        :param params: Store the parameters that are used to configure the model
+        :param tokenizer: Tokenize the input text
+        :param partition_rules: Specify how the parameters should be partitioned
+        :return: A dictionary with the following keys:
+        
+        """
         self.shard_params(params=params, partition_rules=partition_rules)
         self.configure_generate_functions(model, tokenizer)
 
@@ -216,6 +296,16 @@ class JAXServer(object):
                  input_ids: chex.Array,
                  attention_mask: chex.Array,
                  ):
+        """
+        The generate function is used to generate a sequence of tokens from the model.
+
+        :param self: Access variables that belong to the class
+        :param params: Union[flax.core.FrozenDict, dict]: Pass the parameters of the model to be used in generating text
+        :param input_ids: chex.Array: Pass the input to the model
+        :param attention_mask: chex.Array: Mask the padding tokens
+        :return: The logits of the model
+        
+        """
         if not self._funcs_generated:
             raise NotImplementedError(
                 'this method will be implemented automatically after using ``configure_generate_functions`` function'
@@ -239,6 +329,22 @@ class JAXServer(object):
             do_memory_log: bool = False,
             verbose: bool = True
     ):
+        """
+        The load function is used to load a pretrained model from disk.
+
+        :param cls: Refer to the class itself
+        :param model: transformers.FlaxPreTrainedModel: Initialize the server
+        :param config_model: transformers.PretrainedConfig: Get the partition rules
+        :param tokenizer: transformers.PreTrainedTokenizer: Load the tokenizer from the model
+        :param path: typing.Union[str, os.PathLike]: Specify the path to the checkpoint file
+        :param config: Configure the server
+        :param add_params_field: bool: Add a params field to the server
+        :param init_shape: tuple: Specify the shape of the input to be used for generating shard_fns
+        :param do_memory_log: bool: Log the memory usage of the server
+        :param verbose: bool: Print the compilation process
+        :return: A server
+        
+        """
         assert hasattr(model,
                        'init_weights'), 'model must contain init_weights func in order to init params for shard_fns'
         assert hasattr(config_model,
@@ -301,6 +407,25 @@ class JAXServer(object):
             do_memory_log: bool = False,
             verbose: bool = True
     ):
+        """
+        The load_from_params function is used to load a model from the parameters of a pretrained model.
+        It takes in the following arguments:
+            - cls: The class of the server you are loading, this should be Server or TPU_Server depending on what backend you want to use.
+            - model: A FlaxPreTrainedModel object that contains all of your models functions and parameters. This can be found in transformers/flax_utils/models/*model*.py
+                where *model* is replaced with whatever transformer you are using (e.g., bert). You can also create your own custom
+
+        :param cls: Create a new instance of the class
+        :param model: transformers.FlaxPreTrainedModel: Load the model
+        :param config_model: transformers.PretrainedConfig: Get the partition rules
+        :param tokenizer: transformers.PreTrainedTokenizer: Tokenize the input text
+        :param params: typing.Dict: Pass in the parameters of the model
+        :param config: Pass in the config file for the server
+        :param add_params_field: bool: Add a params field to the server
+        :param do_memory_log: bool: Log the memory usage of the server
+        :param verbose: bool: Print out the status of the compilation
+        :return: A server object
+        
+        """
         assert hasattr(model,
                        'init_weights'), 'model must contain init_weights func in order to init params for shard_fns'
         assert hasattr(config_model,
@@ -339,6 +464,18 @@ class JAXServer(object):
         return server
 
     def compile(self, verbose: bool = True) -> bool:
+        """
+        The compile function is used to compile the model for use in inference.
+        It does this by running through all possible combinations of rules and actions,
+        and compiling them into functions that can be called later on during inference.
+        This allows us to avoid having to recompile the model every time we want to run it,
+        which would be very slow.
+
+        :param self: Represent the instance of the class
+        :param verbose: bool: Print out the compiling process
+        :return: True, but what does it do?
+        
+        """
         assert self._funcs_generated, 'funcs are not generated yet'
         assert self.rules is not None, 'rules should not be None'
         if self.config.use_prefix_tokenizer:
@@ -372,6 +509,19 @@ class JAXServer(object):
                         input_ids: chex.Array,
                         attention_mask: chex.Array,
                         ):
+        """
+        The greedy_generate function is a helper function that takes in the model parameters, input_ids and attention_mask
+        and returns the generated tokens. It uses greedy search to generate tokens one at a time.
+
+
+        :param self: Refer to the object itself
+        :param params: Union[flax.core.FrozenDict, dict]: Pass the parameters to the model
+        :param input_ids: chex.Array: Pass in the input sequence
+        :param attention_mask: chex.Array: Mask the input tokens
+        :param : Specify the parameters of the model
+        :return:  generated_ids
+        
+        """
         if not self._funcs_generated:
             raise NotImplementedError(
                 'this method will be implemented automatically after using ``configure_generate_functions`` function'
@@ -384,6 +534,19 @@ class JAXServer(object):
 
     def shard_params(self, params, partition_rules):
 
+        """
+        The shard_params function takes in a set of parameters and a partition rule.
+        The partition rule is used to determine how the parameters should be sharded across devices.
+        For example, if we have two devices, one with 4GB of memory and another with 8GB of memory,
+        we may want to shard our model such that the device with more memory has more parameters on it.
+        This function returns an updated version of params where each parameter is now stored on its own device.
+
+        :param self: Bind the instance of the class to a method
+        :param params: Pass the parameters of the model to be sharded
+        :param partition_rules: Specify how the parameters should be partitioned
+        :return: The sharded parameters
+        
+        """
         logging.log(
             logging.INFO,
             'the parameters will be sharded and ba saved inside server you can access them by ``JAXServer.params``')
@@ -400,6 +563,19 @@ class JAXServer(object):
 
     def forward_chat(self, data: ChatRequest):
 
+        """
+        The forward_chat function is the main function of this class.
+        It takes in a ChatRequest object, which contains a prompt and history.
+        The prompt is the user's input to be processed by the chatbot, while history
+        is an array of previous inputs and outputs from both sides (user and bot).
+        The forward_chat function then formats these inputs into one string that can be processed by our model.
+        This formatted string is then passed through our process() method, which returns an output response as well as how many tokens were used to generate it.
+
+        :param self: Access the attributes and methods of the class
+        :param data: ChatRequest: Pass in the data from the request
+        :return: A dictionary with the following keys:
+        
+        """
         if not self._funcs_generated:
             return {
                 'status': "down"
@@ -440,6 +616,18 @@ class JAXServer(object):
         raise NotImplementedError()
 
     def forward_instruct(self, data: InstructRequest):
+        """
+        The forward_instruct function is the main function of this class.
+        It takes in a InstructRequest object, which contains the system and instruction to be processed.
+        The function then formats the input string using format_instruct, and passes it into process().
+        process() returns a tuple containing (response, used_tokens). The response is returned as part of
+        the response dictionary. If no valid responses are found by process(), None will be returned instead.
+
+        :param self: Bind the method to the object
+        :param data: InstructRequest: Pass the system and instruction to the function
+        :return: A dictionary with three keys:
+        
+        """
         if not self._funcs_generated:
             return {
                 'status': "down"
@@ -464,6 +652,19 @@ class JAXServer(object):
         }
 
     def forward_instruct_non_api(self, prompt, system, greedy):
+        """
+        The forward_instruct_non_api function is a wrapper for the forward_instruct function.
+        It takes in a prompt, system, and greedy flag as arguments and returns the response from
+        the forward_instruct function. The purpose of this wrapper is to allow users to call
+        forward_instruct without having to create an InstructRequest object.
+
+        :param self: Represent the instance of the class
+        :param prompt: Pass the instruction to the system
+        :param system: Specify which system to use for the instruction
+        :param greedy: Determine whether the system should return
+        :return: The response from the forward_instruct function
+        
+        """
         data = InstructRequest(
             prompt=prompt,
             system=system,
@@ -472,6 +673,19 @@ class JAXServer(object):
         return self.forward_instruct(data)
 
     def forward_chat_non_api(self, prompt, history, greedy):
+        """
+        The forward_chat_non_api function is a wrapper for the forward_chat function.
+        It takes in a prompt, history, and greedy parameter and returns the response from
+        the forward_chat function. The purpose of this wrapper is to allow users to use
+        the chatbot without having to create ChatRequest objects.
+
+        :param self: Represent the instance of the class
+        :param prompt: Pass the user's input to the model
+        :param history: Pass the history of the conversation to the model
+        :param greedy: Determine whether the model should use a greedy search
+        :return: A chat-response object
+        
+        """
         data = ChatRequest(
             prompt=prompt,
             history=history,
@@ -486,6 +700,20 @@ class JAXServer(object):
                 max_new_tokens: int = None,
                 **kwargs
                 ):
+        """
+        The process function is the main function of a model. It takes in an input string and returns a list of strings
+        that are generated from that input string. The process function can be called multiple times with different inputs,
+        and each time it will return a new set of outputs based on those inputs.
+
+        :param self: Access the class attributes
+        :param string: str: Pass the string that we want to generate
+        :param *: Pass a variable number of arguments to a function
+        :param greedy: bool: Determine whether to use the greedy or non-greedy version of the generate function
+        :param max_new_tokens: int: Set the number of tokens to generate
+        :param **kwargs: Pass any additional parameters to the process function
+        :return: A generator that yields the predicted text and the number of tokens generated
+        
+        """
         tokens = self.prefix_tokenizer(
             string,
             max_length=self.config.max_length - self.config.max_stream_tokens,
@@ -531,6 +759,21 @@ class JAXServer(object):
                 break
 
     def process_gradio_chat(self, prompt, history, max_new_tokens, system, greedy):
+        """
+        The process_gradio_chat function is a wrapper for the process function.
+        It takes in a prompt, history, max_new_tokens and system as arguments.
+        The string variable is set to the output of format_chat with the given history and prompt.
+        If stream tokens are not enabled then it will append an empty response to history and iterate through all responses from process until there are no more left (the last one). It will then return an empty string along with this new updated version of history. If stream tokens are enabled it appends an empty response to the end of our current list of histories (history) and iterates through
+
+        :param self: Refer to the object itself
+        :param prompt: Add the user's input to the history
+        :param history: Keep track of the conversation
+        :param max_new_tokens: Limit the number of tokens that can be generated by the model
+        :param system: Determine whether the message is from the user or system
+        :param greedy: Determine if the model should generate a response token by token or all at once
+        :return: A tuple of two values:
+        
+        """
         string = self.format_chat(history=history, prompt=prompt, system=system)
 
         if not self.config.stream_tokens_for_gradio:
@@ -554,6 +797,19 @@ class JAXServer(object):
         return '', history
 
     def process_gradio_instruct(self, instruction, system, max_new_tokens, greedy):
+        """
+        The process_gradio_instruct function is a wrapper for the process function.
+        It takes in an instruction and system, formats them into a string, and then passes that string to the process function.
+        The response from this call to process is returned as output.
+
+        :param self: Refer to the instance of the class
+        :param instruction: Pass in the instruction from the user
+        :param system: Determine which system to use for the instruction
+        :param max_new_tokens: Limit the number of new tokens that can be added to the vocabulary
+        :param greedy: Determine whether the model should be greedy or not
+        :return: A tuple of two strings:
+        
+        """
         string = self.format_instruct(instruction=instruction, system=system)
         if not self.config.stream_tokens_for_gradio:
             response = ''
@@ -576,6 +832,13 @@ class JAXServer(object):
         return '', response
 
     def create_gradio_ui_chat(self):
+        """
+        The create_gradio_ui_chat function creates a Gradio UI for the chatbot.
+
+        :param self: Represent the instance of the class
+        :return: A block
+        
+        """
         with gr.Blocks(
                 theme=seafoam) as block:
             gr.Markdown("# <h1> <center>Powered by [EasyDeL](https://github.com/erfanzar/EasyDel) </center> </h1>")
@@ -615,6 +878,15 @@ class JAXServer(object):
         return block
 
     def create_gradio_ui_instruct(self):
+        """
+        The create_gradio_ui_instruct function creates a Gradio UI for the EasyDeL model.
+        The function takes in an instance of the EasyDeL class and returns a Gradio UI object.
+
+
+        :param self: Represent the instance of the class
+        :return: A block
+        
+        """
         with gr.Blocks(
                 theme=seafoam) as block:
             gr.Markdown("# <h1> <center>Powered by [EasyDeL](https://github.com/erfanzar/EasyDel) </center> </h1>")
@@ -653,6 +925,15 @@ class JAXServer(object):
         return block
 
     def fire(self):
+        """
+        The fire function is a wrapper around the uvicorn.run function that allows you to run your model in a separate process
+        from the main one. This is useful for running models on GPUs, as it prevents any other processes from using them while
+        the model is being served.
+
+        :param self: Refer to the instance of the class
+        :return: A process, which is a child of the main process
+        
+        """
         assert self._funcs_generated, 'you have to first add your model and parameters into server before using fire ' \
                                       'with using ``configure_generate_functions``'
 
@@ -663,6 +944,14 @@ class JAXServer(object):
         self.process_uvicorn.start()
 
     def end(self):
+        """
+        The end function is used to stop the server.
+            It will wait for the process to end before returning.
+
+        :param self: Represent the instance of the class
+        :return: The process_uvicorn
+        
+        """
         if self.process_uvicorn is not None:
             self.process_uvicorn.join()
         else:
@@ -672,6 +961,20 @@ class JAXServer(object):
                share_chat: bool = False,
                share_inst: bool = False
                ):
+        """
+        The launch function is a wrapper for the launch function of the gradio.Interface class.
+        It takes two boolean arguments: share_chat and share_inst, which are used to determine whether to
+        share the chatbot interface and/or instruction interface respectively. If both are set to False, then neither
+        interface will be shared (this is useful if you want to run your app locally). If one or both of them are True,
+        then they will be shared on Gradio's servers with a unique URL that can be accessed by anyone in order for them
+        to interact with your app.
+
+        :param self: Represent the instance of the class
+        :param share_chat: bool: Determine if the chatbot should be shared
+        :param share_inst: bool: Share the instructions for the app
+        :return: A dictionary with the share urls for chat and instructions
+        
+        """
         share_kwargs = {}
         assert not share_chat or not share_inst, 'you have to pass at least one of sharing options True'
         if share_chat:

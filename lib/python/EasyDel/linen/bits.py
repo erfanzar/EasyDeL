@@ -6,10 +6,17 @@ import jax.lax as lax
 from flax.linen.dtypes import promote_dtype
 from jax import vmap
 from flax.linen import Dense, compact
-from .utils import array_from_8bit, array_to_bit8
+from EasyDel.linen.utils import array_from_8bit, array_to_bit8
 
 
 def get_tile_inds(format_):
+    """
+    The get_tile_inds function is used to get the indices of a tile in a tensor.
+
+    :param format_: Determine the shape of the tile_inds array
+    :return: The indices of the tiles in a given format
+    
+    """
     transform = lambda x: lax.cond(
         jnp.bitwise_and(jnp.array(format_), 1),
         lambda _: lax.transpose(x),
@@ -61,6 +68,16 @@ class MatmulLtState:
     formatB = "col_turing"
 
     def reset_grads(self):
+        """
+        The reset_grads function is used to reset the gradients of all the parameters in our model.
+        This function is called after each iteration of training, and before we update our weights.
+        The reason for this is that if we don't reset these values, they will accumulate over time and
+        cause problems with our weight updates.
+
+        :param self: Represent the instance of the class
+        :return: Nothing
+        
+        """
         self.CB = None
         self.CxB = None
         self.SB = None
@@ -130,6 +147,14 @@ def matmul_true_int8(lhs, rhs):
 
 
 def aqt_matmul_int8(a, w):
+    """
+    The aqt_matmul_int8 function performs the following steps:
+
+    :param a: Scale the input tensor
+    :param w: Store the weights of the model
+    :return: A result that is close to the original matrix multiplication
+    
+    """
     max_int8 = 127
 
     # This function is customizable and injectable, i.e:

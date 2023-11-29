@@ -1,1 +1,1 @@
-from .modelling_mistral_flax import FlaxMistralModule, FlaxMistralForCausalLM, MistralConfig
+from EasyDel.modules.mistral.modelling_mistral_flax import FlaxMistralModule, FlaxMistralForCausalLM, MistralConfig

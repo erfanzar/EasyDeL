@@ -16,7 +16,7 @@
 """ Flax OPT model."""
 
 from functools import partial
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Sequence
 
 import flax.linen as nn
 import jax
@@ -33,11 +33,13 @@ from transformers.modeling_flax_utils import ACT2FN, FlaxPreTrainedModel
 from jax.sharding import PartitionSpec
 from transformers import logging
 
-from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
-    with_sharding_constraint
+from EasyDel.modules.flax_modelling_utils import get_gradient_checkpoint_policy, \
+    with_sharding_constraint, JaxBaseClassModel
 
 import chex
-class OPTConfig(PretrainedConfig):
+
+
+class OPTConfig(PretrainedConfig, JaxBaseClassModel):
     model_type = "opt"
     keys_to_ignore_at_inference = ["past_key_values"]
 
@@ -65,9 +67,13 @@ class OPTConfig(PretrainedConfig):
             layer_norm_elementwise_affine: bool = True,
             gradient_checkpointing: str = 'nothing_saveable',
             use_pjit_attention_force: bool = False,
+            axis_dims: Sequence[int] = (1, -1, 1, 1),
+            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
             **kwargs,
     ):
         super().__init__(
+            axis_names=axis_names,
+            axis_dims=axis_dims,
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
@@ -89,7 +95,6 @@ class OPTConfig(PretrainedConfig):
         self.layerdrop = layerdrop
         self.use_cache = use_cache
         self.do_layer_norm_before = do_layer_norm_before
-        # We keep these variables at `True` for backward compatibility.
         self.enable_bias = enable_bias
         self.layer_norm_elementwise_affine = layer_norm_elementwise_affine
         self._remove_final_layer_norm = _remove_final_layer_norm
@@ -100,7 +105,7 @@ class OPTConfig(PretrainedConfig):
             raise NotImplementedError
         else:
             return (
-                ('.*', PartitionSpec('fsdp'))
+                ('.*', PartitionSpec(('fsdp', 'mp')))
             )
 
     def add_jax_args(
@@ -127,6 +132,8 @@ class OPTConfig(PretrainedConfig):
             layer_norm_elementwise_affine: bool = True,
             gradient_checkpointing: str = 'nothing_saveable',
             use_pjit_attention_force: bool = False,
+            axis_dims: Sequence[int] = (1, -1, 1, 1),
+            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
             **kwargs
     ):
         basics = dict(
@@ -158,7 +165,6 @@ class OPTConfig(PretrainedConfig):
             if not hasattr(self, k):
                 setattr(self, k, v)
         self.from_pt = False
-        return self
 
 
 logger = logging.get_logger(__name__)

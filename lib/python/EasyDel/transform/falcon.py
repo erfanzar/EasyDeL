@@ -3,7 +3,7 @@ from fjformer import load_and_convert_checkpoint_to_torch
 from jax import numpy as jnp
 from tqdm import tqdm
 from transformers import FalconForCausalLM
-from ..modules.falcon import FalconConfig
+from EasyDel.modules.falcon import (FalconConfig)
 import torch
 from typing import Dict
 import gc

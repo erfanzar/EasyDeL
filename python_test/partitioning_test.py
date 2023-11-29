@@ -34,17 +34,17 @@ def main():
         ("model/embed_tokens/embedding", PartitionSpec("mp", 'fsdp')),
 
         ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec('mp', "fsdp")),
-        ("self_attn/o_proj/kernel", PartitionSpec("fsdp")),
+        ("self_attn/o_proj/kernel", PartitionSpec(("fsdp","mp"))),
 
         ("mlp/gate_proj/kernel", PartitionSpec('mp', "fsdp")),
         ("mlp/down_proj/kernel", PartitionSpec("fsdp", 'mp')),
         ("mlp/up_proj/kernel", PartitionSpec('mp', "fsdp")),
 
-        ("input_layernorm/kernel", PartitionSpec("fsdp")),
-        ("post_attention_layernorm/kernel", PartitionSpec("fsdp")),
+        ("input_layernorm/kernel", PartitionSpec(("fsdp","mp"))),
+        ("post_attention_layernorm/kernel", PartitionSpec(("fsdp","mp"))),
 
-        ("model/norm/kernel", PartitionSpec("fsdp")),
-        ("lm_head/kernel", PartitionSpec("fsdp")),
+        ("model/norm/kernel", PartitionSpec(("fsdp","mp"))),
+        ("lm_head/kernel", PartitionSpec(("fsdp","mp"))),
         ('.*', PartitionSpec(None)),
     )
     partition_specs = match_partition_rules(partition_rules, params=params)

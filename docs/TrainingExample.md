@@ -67,7 +67,7 @@ class TrainArguments(
             weight_decay: float = 0.01,
             gradient_checkpointing: str = 'nothing_saveable',
             max_length: Union[int, None] = 4096,
-            sharding_array: Union[tuple, int] = (1, -1, 1),
+            sharding_array: Union[tuple, int] = (1, -1, 1, 1),
             # PJIT Partition Sharding Mesh Size for (DP,FSDP,MP) 
             is_fine_tuning: bool = True,
             do_train: bool = True,
@@ -186,7 +186,7 @@ train_args = TrainArguments(
     backend='tpu',
     max_length=max_length,
     gradient_checkpointing='nothing_saveable',
-    sharding_array=(1, -1, 1),
+    sharding_array=(1, -1, 1, 1),
     use_pjit_attention_force=False,
     gradient_accumulation_steps=1,
     remove_ckpt_after_load=True,
