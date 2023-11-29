@@ -1,93 +1,93 @@
 llama_configs = {
-    '3b': {
-        'vocab_size': 32000,
-        'hidden_size': 3200,
-        'intermediate_size': 8640,
-        'num_hidden_layers': 26,
-        'num_attention_heads': 32,
-        'num_key_value_heads': None,
-        'max_position_embeddings': 2048,
-        'initializer_range': 0.02,
-        'rms_norm_eps': 1e-6,
-        'use_cache': True,
-        'tie_word_embeddings': False,
+    "3b": {
+        "vocab_size": 32000,
+        "hidden_size": 3200,
+        "intermediate_size": 8640,
+        "num_hidden_layers": 26,
+        "num_attention_heads": 32,
+        "num_key_value_heads": None,
+        "max_position_embeddings": 2048,
+        "initializer_range": 0.02,
+        "rms_norm_eps": 1e-6,
+        "use_cache": True,
+        "tie_word_embeddings": False,
         "rope_scaling": None
     },
-    '7b': {
-        'vocab_size': 32000,
-        'hidden_size': 4096,
-        'intermediate_size': 11008,
-        'num_hidden_layers': 32,
-        'num_attention_heads': 32,
-        'num_key_value_heads': None,
-        'max_position_embeddings': 2048,
-        'initializer_range': 0.02,
-        'rms_norm_eps': 1e-6,
-        'use_cache': True,
-        'tie_word_embeddings': False,
+    "7b": {
+        "vocab_size": 32000,
+        "hidden_size": 4096,
+        "intermediate_size": 11008,
+        "num_hidden_layers": 32,
+        "num_attention_heads": 32,
+        "num_key_value_heads": None,
+        "max_position_embeddings": 2048,
+        "initializer_range": 0.02,
+        "rms_norm_eps": 1e-6,
+        "use_cache": True,
+        "tie_word_embeddings": False,
         "rope_scaling": None
     },
-    '13b': {
-        'vocab_size': 32000,
-        'hidden_size': 5120,
-        'intermediate_size': 13824,
-        'num_hidden_layers': 40,
-        'num_attention_heads': 40,
-        'num_key_value_heads': None,
-        'max_position_embeddings': 2048,
-        'initializer_range': 0.02,
-        'rms_norm_eps': 1e-6,
-        'use_cache': True,
-        'tie_word_embeddings': False,
+    "13b": {
+        "vocab_size": 32000,
+        "hidden_size": 5120,
+        "intermediate_size": 13824,
+        "num_hidden_layers": 40,
+        "num_attention_heads": 40,
+        "num_key_value_heads": None,
+        "max_position_embeddings": 2048,
+        "initializer_range": 0.02,
+        "rms_norm_eps": 1e-6,
+        "use_cache": True,
+        "tie_word_embeddings": False,
         "rope_scaling": None
     },
-    '30b': {
-        'vocab_size': 32000,
-        'hidden_size': 6656,
-        'intermediate_size': 17920,
-        'num_hidden_layers': 60,
-        'num_attention_heads': 52,
-        'num_key_value_heads': None,
-        'max_position_embeddings': 2048,
-        'initializer_range': 0.02,
-        'rms_norm_eps': 1e-6,
-        'use_cache': True,
-        'tie_word_embeddings': False,
+    "30b": {
+        "vocab_size": 32000,
+        "hidden_size": 6656,
+        "intermediate_size": 17920,
+        "num_hidden_layers": 60,
+        "num_attention_heads": 52,
+        "num_key_value_heads": None,
+        "max_position_embeddings": 2048,
+        "initializer_range": 0.02,
+        "rms_norm_eps": 1e-6,
+        "use_cache": True,
+        "tie_word_embeddings": False,
         "rope_scaling": None
     },
-    '65b': {
-        'vocab_size': 32000,
-        'hidden_size': 8192,
-        'intermediate_size': 22016,
-        'num_hidden_layers': 80,
-        'num_attention_heads': 64,
-        'num_key_value_heads': None,
-        'max_position_embeddings': 2048,
-        'initializer_range': 0.02,
-        'rms_norm_eps': 1e-5,
-        'use_cache': True,
-        'tie_word_embeddings': False,
+    "65b": {
+        "vocab_size": 32000,
+        "hidden_size": 8192,
+        "intermediate_size": 22016,
+        "num_hidden_layers": 80,
+        "num_attention_heads": 64,
+        "num_key_value_heads": None,
+        "max_position_embeddings": 2048,
+        "initializer_range": 0.02,
+        "rms_norm_eps": 1e-5,
+        "use_cache": True,
+        "tie_word_embeddings": False,
         "rope_scaling": None
     }
 }
 
 llama_2_configs = {
 
-    '7b': {
-        'vocab_size': 32000,
-        'hidden_size': 4096,
-        'intermediate_size': 11008,
-        'num_hidden_layers': 32,
-        'num_attention_heads': 32,
-        'num_key_value_heads': None,
-        'max_position_embeddings': 2048,
-        'initializer_range': 0.02,
-        'rms_norm_eps': 1e-5,
-        'use_cache': True,
-        'tie_word_embeddings': False,
+    "7b": {
+        "vocab_size": 32000,
+        "hidden_size": 4096,
+        "intermediate_size": 11008,
+        "num_hidden_layers": 32,
+        "num_attention_heads": 32,
+        "num_key_value_heads": None,
+        "max_position_embeddings": 2048,
+        "initializer_range": 0.02,
+        "rms_norm_eps": 1e-5,
+        "use_cache": True,
+        "tie_word_embeddings": False,
         "rope_scaling": None
     },
-    '13b': {
+    "13b": {
         "bos_token_id": 1,
         "eos_token_id": 2,
         "hidden_act": "silu",
@@ -106,7 +106,7 @@ llama_2_configs = {
         "use_cache": True,
         "vocab_size": 32000
     },
-    '70b': {
+    "70b": {
         "bos_token_id": 1,
         "eos_token_id": 2,
         "hidden_act": "silu",
@@ -213,7 +213,7 @@ mpt_configs = {
 }
 
 gptj_configs = {
-    '6b': {
+    "6b": {
         "vocab_size": 50400,
         "n_positions": 2048,
         "n_embd": 4096,
@@ -234,7 +234,7 @@ gptj_configs = {
 }
 
 falcon_configs = {
-    '7b': {
+    "7b": {
         "alibi": False,
         "apply_residual_connection_post_layernorm": False,
         "attention_dropout": 0.0,
@@ -254,7 +254,7 @@ falcon_configs = {
         "use_cache": False,
         "vocab_size": 65024
     },
-    '40b': {
+    "40b": {
         "bias": False,
         "bos_token_id": 11,
         "eos_token_id": 11,
@@ -274,7 +274,7 @@ falcon_configs = {
 }
 
 opt_configs = {
-    '1.3b': {
+    "1.3b": {
 
         "activation_dropout": 0.0,
         "activation_function": "relu",
@@ -298,7 +298,7 @@ opt_configs = {
         "word_embed_proj_dim": 2048
 
     },
-    '6.7b': {
+    "6.7b": {
         "_remove_final_layer_norm": False,
         "activation_dropout": 0.0,
         "activation_function": "relu",
@@ -321,7 +321,7 @@ opt_configs = {
         "vocab_size": 50272,
         "word_embed_proj_dim": 4096
     },
-    '66b': {
+    "66b": {
         "_remove_final_layer_norm": False,
         "activation_dropout": 0.0,
         "activation_function": "relu",
@@ -344,7 +344,7 @@ opt_configs = {
         "vocab_size": 50272,
         "word_embed_proj_dim": 9216
     },
-    '13b': {
+    "13b": {
         "_name_or_path": "facebook/opt-13b",
         "_remove_final_layer_norm": False,
         "activation_dropout": 0.0,
@@ -369,7 +369,7 @@ opt_configs = {
         "vocab_size": 50272,
         "word_embed_proj_dim": 5120
     },
-    '350m': {
+    "350m": {
         "activation_dropout": 0.0,
         "activation_function": "relu",
         "attention_dropout": 0.0,
@@ -393,3 +393,28 @@ opt_configs = {
 
     }
 }
+
+
+def get_config(model_type: str, struct: str):
+    """
+    The get_config function takes in a model_type and struct, and returns the corresponding config.
+
+    :param model_type: str: Determine which model to use
+    :param struct: str: Specify the structure of the model
+    :return: A dictionary of hyperparameters
+    :doc-author: Trelent
+    """
+    if model_type == "llama":
+        return llama_configs[struct]
+    elif model_type == "llama2":
+        return llama_2_configs[struct]
+    elif model_type == "opt":
+        return opt_configs[struct]
+    elif model_type == "gptj":
+        return gptj_configs[struct]
+    elif model_type == "falcon":
+        return falcon_configs[struct]
+    elif model_type == "mpt":
+        return mpt_configs[struct]
+    else:
+        raise ValueError(f"Unknown ModelType : {model_type}")
