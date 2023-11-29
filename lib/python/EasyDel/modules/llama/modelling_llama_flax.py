@@ -1382,6 +1382,13 @@ class FlaxLlamaForSequenceClassificationModule(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self):
+        """
+        The setup function is called once at the beginning of training.
+        It initializes the model and optimizer, and sets up any other state that needs to be initialized.
+
+        :param self: Access variables that belong to the class
+        :return: A tuple of the model and the classifier
+        """
         self.model = FlaxLlamaModule(self.config, dtype=self.dtype)
         self.classifier = nn.Dense(
             self.num_classes,
