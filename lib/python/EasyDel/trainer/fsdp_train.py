@@ -597,7 +597,7 @@ class CausalLMTrainer:
                     pbar_eval = tqdm(total=self.max_steps_eval)
                     for i_eval, batch_eval in enumerate(self.dataloader_eval):
                         _ = batch_eval.pop('token_type_ids', None)
-                        batch['labels'] = batch['input_ids'][..., 1:]
+                        batch_eval['labels'] = batch_eval['input_ids'][..., 1:]
                         for i in self.arguments.ids_to_pop_from_dataset:
                             _ = batch_eval.pop(i, None)
                         loss_eval, accuracy = fsdp_eval_step(sharded_train_state_, batch_eval)
