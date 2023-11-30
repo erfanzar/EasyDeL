@@ -72,7 +72,11 @@ repo_url: "https://github.com/erfanzar/EasyDel"
 
 plugins:
   - search
-  - mkdocstrings
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            docstring_style: sphinx
 
 theme:
   name: material
