@@ -39,7 +39,7 @@ def calculate_accuracy(predictions: chex.Array, targets: chex.Array):
     :param predictions: chex.Array: Pass in the predictions from the model
     :param targets: chex.Array: Calculate the accuracy of the model
     :return: A single value, the accuracy
-    
+
     """
     predicted_classes = jnp.argmax(predictions, axis=-1)
     correct_predictions = (predicted_classes == targets).sum()
@@ -48,73 +48,97 @@ def calculate_accuracy(predictions: chex.Array, targets: chex.Array):
     return accuracy
 
 
-def fsdp_train_step(state, batch):
+def create_fsdp_train_step(partition_spec=PartitionSpec(('dp', 'fsdp'), 'mp')):
     """
-    The fsdp_train_step function is a training step function that takes in the current state of the model,
+    The create_fsdp_train_step function is a training step function that takes in the current state of the model,
     and a batch of data. It then calculates the loss and accuracy for this batch, and returns an updated state
     with new parameters based on these gradients.
 
-    :param state: Store the model parameters
-    :param batch: Pass the data to the model
-    :return: A tuple of (state, loss, accuracy)
-    
+    :param partition_spec: Specify which devices the model will be split across
+    :return: A fsdp_train_step function that takes in the current state of the model,
+
     """
-    batch = with_sharding_constraint(batch, PartitionSpec(('dp', 'fsdp'), 'mp'))
 
-    def calculate_loss(params):
-        labels = batch.pop('labels')
-        logits = state.apply_fn(params=params, **batch,
-                                return_dict=True).logits
+    def fsdp_train_step(state, batch):
+        """
+        The fsdp_train_step function is a training step function that takes in the current state of the model,
+        and a batch of data. It then calculates the loss and accuracy for this batch, and returns an updated state
+        with new parameters based on these gradients.
 
-        loss, accuracy = cross_entropy_loss_and_accuracy(
-            logits[:, :-1, :], labels, batch['attention_mask'].astype(jnp.float32)[:, 1:]
-        )
-        return loss, accuracy
+        :param state: Store the model parameters
+        :param batch: Pass the data to the model
+        :return: A tuple of (state, loss, accuracy)
 
-    grad_fn = jax.value_and_grad(calculate_loss, has_aux=True)
-    (loss__, accuracy__), grad = grad_fn(state.params)
-    state = state.apply_gradients(grads=grad)
-    return state, loss__, accuracy__
+        """
+        batch = with_sharding_constraint(batch, partition_spec)
+
+        def calculate_loss(params):
+            labels = batch.pop('labels')
+            logits = state.apply_fn(params=params, **batch,
+                                    return_dict=True).logits
+
+            loss, accuracy = cross_entropy_loss_and_accuracy(
+                logits[:, :-1, :], labels, batch['attention_mask'].astype(jnp.float32)[:, 1:]
+            )
+            return loss, accuracy
+
+        grad_fn = jax.value_and_grad(calculate_loss, has_aux=True)
+        (loss__, accuracy__), grad = grad_fn(state.params)
+        state = state.apply_gradients(grads=grad)
+        return state, loss__, accuracy__
+
+    return fsdp_train_step
 
 
-def fsdp_eval_step(state, batch_eval):
+def create_fsdp_eval_step(partition_spec=PartitionSpec(('dp', 'fsdp'), 'mp')):
     """
-    The fsdp_eval_step function is used to calculate the loss and accuracy of a model.
+    The create_fsdp_eval_step function is used to create a function that calculates the loss and accuracy of a model.
     It takes in a set of parameters, which are then passed into the state.apply_fn function
     to generate logits for each token in the batch. The cross entropy loss and accuracy are then calculated from these logits.
 
-    :param state: Store the model parameters and other information about the training process
-    :param batch_eval: Pass the batch of data to the function
-    :return: The loss and accuracy of the model
-    
-    """
-    batch_eval = with_sharding_constraint(
-        batch_eval,
-        PartitionSpec(
-            ('dp', 'fsdp'), 'mp')
-    )
+    :param partition_spec: Specify the partitioning of the model parameters
+    :return: A function that can be used to calculate the loss and accuracy of a model
 
-    def calculate_loss(params):
+    """
+
+    def fsdp_eval_step(state, batch_eval):
         """
-        The calculate_loss function is used to calculate the loss and accuracy of a model.
+        The fsdp_eval_step function is used to calculate the loss and accuracy of a model.
         It takes in a set of parameters, which are then passed into the state.apply_fn function
         to generate logits for each token in the batch. The cross entropy loss and accuracy are then calculated from these logits.
 
-        :param params: Pass the model parameters to the function
-        :return: The loss and the accuracy
-        
+        :param state: Store the model parameters and other information about the training process
+        :param batch_eval: Pass the batch of data to the function
+        :return: The loss and accuracy of the model
+
         """
-        labels = batch_eval.pop('labels')
-        logits = state.apply_fn(params=params, **batch_eval,
-                                return_dict=True).logits
-
-        loss, accuracy = cross_entropy_loss_and_accuracy(
-            logits[:, :-1, :], labels, batch_eval['attention_mask'].astype(jnp.float32)[:, 1:]
+        batch_eval = with_sharding_constraint(
+            batch_eval, partition_spec
         )
-        return loss, accuracy
 
-    loss__, accuracy__ = calculate_loss(state.params)
-    return loss__, accuracy__
+        def calculate_loss(params):
+            """
+            The calculate_loss function is used to calculate the loss and accuracy of a model.
+            It takes in a set of parameters, which are then passed into the state.apply_fn function
+            to generate logits for each token in the batch. The cross entropy loss and accuracy are then calculated from these logits.
+
+            :param params: Pass the model parameters to the function
+            :return: The loss and the accuracy
+
+            """
+            labels = batch_eval.pop('labels')
+            logits = state.apply_fn(params=params, **batch_eval,
+                                    return_dict=True).logits
+
+            loss, accuracy = cross_entropy_loss_and_accuracy(
+                logits[:, :-1, :], labels, batch_eval['attention_mask'].astype(jnp.float32)[:, 1:]
+            )
+            return loss, accuracy
+
+        loss__, accuracy__ = calculate_loss(state.params)
+        return loss__, accuracy__
+
+    return fsdp_eval_step
 
 
 def predict(state, input_ids):
@@ -124,7 +148,7 @@ def predict(state, input_ids):
     :param state: Store the model parameters and the input_ids parameter is used to pass in a batch of token ids
     :param input_ids: Pass the input to the model
     :return: The next input_ids
-    
+
     """
     input_ids = with_sharding_constraint(input_ids, PartitionSpec(('dp', 'fsdp')))
     pred = state.apply_fn(params=state.params, input_ids=input_ids, return_dict=True)
@@ -171,7 +195,7 @@ class CausalLMTrainer:
         :param ckpt_path: typing.Union[str,os.PathLike] : Load the checkpoint path
         :param _do_init_fns: bool: Initialize the functions
         :return: Nothing, it just initializes the class
-        
+
         """
         self.timer = None
         self.dataloader_train = None
@@ -243,21 +267,21 @@ class CausalLMTrainer:
         It can be used to save data, upload files, or do any other cleanup tasks.
 
         :return: A dictionary of the run's metadata
-        
+
         """
         wandb.finish()
 
     def init_functions(self):
         """
         The init_functions function is responsible for initializing the following:
-            - wandb_runtime (if use_wandb is True)
+            - wandb_runtime (if you use_wandb is True)
             - timer object (for logging time taken by various functions)
             - dataloader objects for training and evaluation data, along with max steps per epoch.
               The configure_dataloader function accomplishes this task.
 
         :param self: Represent the instance of the class
         :return: A tuple of functions
-        
+
         """
         self.wandb_runtime = self.arguments.get_wandb_init() if self.arguments.use_wandb else None
         self.timer = Timers(
@@ -306,7 +330,7 @@ class CausalLMTrainer:
 
         :param self: Refer to the class instance itself
         :return: A dataloader_train, max_steps_train, dataloader_eval and max steps eval
-        
+
         """
 
         def collate_fn(batch):
@@ -338,7 +362,7 @@ class CausalLMTrainer:
 
         :param self: Represent the instance of the class
         :return: A model, optimizer, scheduler and config
-        
+
         """
         extra_configs = {} if self.arguments.extra_configs is None else self.arguments.extra_configs
         if self.arguments.model_class is None:
@@ -383,7 +407,7 @@ class CausalLMTrainer:
 
         :param self: Access the class attributes
         :return: A tuple of functions
-        
+
         """
 
         def init_fn():
@@ -415,7 +439,7 @@ class CausalLMTrainer:
             loss_fn = cross_entropy_loss_and_accuracy
 
         def fsdp_train_step_(state, batch):
-            batch = with_sharding_constraint(batch, PartitionSpec(('dp', 'fsdp')))
+            batch = with_sharding_constraint(batch, self.arguments.step_partition_spec)
 
             def calculate_loss(params):
                 labels = batch.pop('labels')
@@ -435,8 +459,10 @@ class CausalLMTrainer:
         train_state_shape = jax.eval_shape(init_fn)
         train_state_partition_spec = match_partition_rules(
             self.config.get_partition_rules(
-                fully_fsdp=self.arguments.fully_fsdp) if self.arguments.custom_rule is None else self.arguments.custom_rule,
-            train_state_shape)
+                fully_fsdp=self.arguments.fully_fsdp
+            ) if self.arguments.custom_rule is None else self.arguments.custom_rule,
+            train_state_shape
+        )
         sharded_create_from_params_fn = pjit(
             create_train_state_from_params,
             in_shardings=(train_state_partition_spec.params,),
@@ -469,7 +495,7 @@ class CausalLMTrainer:
         :param self: Make the class methods aware of other methods and attributes within the class
         :param model_parameters: flax.core.FrozenDict: Load a pre-trained model
         :return: An object of type "OutputFineTuner"
-        
+
         """
 
         def count_params(_p):
@@ -597,10 +623,11 @@ class CausalLMTrainer:
                     pbar_eval = tqdm(total=self.max_steps_eval)
                     for i_eval, batch_eval in enumerate(self.dataloader_eval):
                         _ = batch_eval.pop('token_type_ids', None)
-                        batch['labels'] = batch['input_ids'][..., 1:]
+                        batch_eval['labels'] = batch_eval['input_ids'][..., 1:]
                         for i in self.arguments.ids_to_pop_from_dataset:
                             _ = batch_eval.pop(i, None)
-                        loss_eval, accuracy = fsdp_eval_step(sharded_train_state_, batch_eval)
+                        loss_eval, accuracy = create_fsdp_eval_step(self.arguments.step_partition_spec)(
+                            sharded_train_state_, batch_eval)
                         pbar_eval.update(1)
                         if self.arguments.use_wandb:
                             self.wandb_runtime.log(

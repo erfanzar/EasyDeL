@@ -1,13 +1,27 @@
-# EasyDeL
+# EasyDeL 🔮
 
-EasyDeL (Easy Deep Learning) is an open-source library designed to accelerate and optimize the training process of
-machine learning models. This library is primarily focused on Jax/Flax and plans to offer easy and fine solutions to
-train Flax/Jax Models on the `TPU/GPU` both for Serving and Training (EasyDel will support mojo and be rewriten for mojo
-too)
+EasyDeL, an open-source library, is specifically designed to enhance and streamline the training process of machine
+learning models. It focuses primarily on Jax/Flax and aims to provide convenient and effective solutions for training
+Flax/Jax Models on TPU/GPU for both Serving and Training purposes. Additionally, EasyDeL will support mojo and will be
+rewritten for mojo as well.
+
+Some of the key features provided by EasyDeL include:
+
+- Support for 8, 6, and 4 BIT inference and training in JAX
+- Integration of flashAttention in JAX for GPUs and TPUs
+- Automatic serving of LLMs with mid and high-level APIs in both JAX and PyTorch
+- LLM Trainer and fine-tuner in JAX
+- RLHF (presumably Reinforcement Learning with Hybrid Functions) in Jax
+- And various other features to enhance the training process and optimize performance.
+
+> These features collectively aim to simplify and accelerate the training of machine learning models, making it more
+> efficient and accessible for developers working with Jax/Flax.
 
 ## Documentation 💫
 
-Documents are ready at [Here](https://erfanzar.github.io/EasyDeL/docs)
+> Documents and Examples are ready at [Here](https://erfanzar.github.io/EasyDeL/docs)
+> Please have that in mind that EasyDel is in the loop of fast-development
+> so we might have API changes
 
 ## Serving
 
@@ -24,27 +38,23 @@ python -m examples.serving.causal-lm.llama-2-chat \
 
 ```
 
-you can use all of the llama models not just 'meta-llama/Llama-2-7b-chat-hf'
-
-'fp16' Or 'fp32' , 'bf16' are supported dtype
-
-make sure to use --use_prefix_tokenizer
-
-and you will get links or api to use model from gradio app chat/instruct or FastAPI apis
+> [!NOTE]
+> you can use all the llama models not just 'meta-llama/Llama-2-7b-chat-hf'
+> float16 or float32 , bfloat16 are supported dtype and make sure to use --use_prefix_tokenizer,
+> and you will get links or api to use model from gradio app chat/instruct or FastAPI apis
 
 ## RLHF(Reinforcement Learning From Human Feedback)
 
-`RLHF` or Reinforcement Learning From Human Feedback is Available At the moment, but it's still
-under heavy development , because i don't have enough experience with Reinforcement Learning at the moment so its still
-in beta version but it's works and ill soon release a Tutorial For that
+> RLHF or Reinforcement Learning From Human Feedback is Available At the moment, but it's still
+> under heavy development , because I don't have enough experience with Reinforcement Learning at the moment so its
+> still
+> in beta version but it's works and ill soon release a Tutorial For that
 
 ## FineTuning
 
 with using EasyDel FineTuning LLM (CausalLanguageModels) are easy as much as possible with using Jax and Flax
 and having the benefit of TPUs for the best speed here's a simple code to use in order to finetune your
-own *_MPT / LLama / Falcon / OPT / GPT-J / GPT-Neox / Palm / T5_*
-or any other models supported by EasyDel
-
+own Model
 
 Days Has Been Passed and now using easydel in Jax is way more similar to HF/PyTorch Style
 now it's time to finetune our model
@@ -131,7 +141,7 @@ model, params = AutoEasyDelModelForCausalLM.from_pretrained(
     jax.numpy.float16,
     jax.lax.Precision('fastest'),
     (1, -1, 1, 1),
-    device_map='auto'     
+    device_map='auto'
 )
 
 server = JAXServer.load_from_params(
@@ -149,7 +159,6 @@ for response, tokens_used in server.process(
     print(response[response_printed:], end='')
     response_printed = len(response)
 ``` 
-
 
 ## Contributing
 
