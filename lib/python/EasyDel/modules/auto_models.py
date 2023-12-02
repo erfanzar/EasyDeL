@@ -132,7 +132,7 @@ class AutoEasyDelModelForCausalLM:
             q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
             k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
             v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-            o_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, "mp", None),
+            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", None, ("dp", "fsdp"), None),
             a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
             input_shape: typing.Sequence[int] = (1, 1),
             backend: typing.Optional[str] = None,
@@ -154,7 +154,7 @@ class AutoEasyDelModelForCausalLM:
         :param q_ps: jax.sharding.PartitionSpec: Specify the partitioning of the query tensor
         :param k_ps: jax.sharding.PartitionSpec: Partition the key matrix
         :param v_ps: jax.sharding.PartitionSpec: Specify the partitioning of the value tensor
-        :param o_ps: jax.sharding.PartitionSpec: Specify the output partition spec
+        :param b_ps: jax.sharding.PartitionSpec: Specify the Attention Bias partition spec
         :param a_ps: jax.sharding.PartitionSpec: Specify the partitioning of the attention weights
         :param input_shape: typing.Sequence[int]: Specify the shape of the input to the model
         :param backend: typing.Optional[str]: backend to use for model
@@ -177,7 +177,7 @@ class AutoEasyDelModelForCausalLM:
         cfg.q_ps = q_ps
         cfg.k_ps = k_ps
         cfg.v_ps = v_ps
-        cfg.o_ps = o_ps
+        cfg.b_ps = b_ps
         cfg.a_ps = a_ps
         cfg.backend = backend
         ed_model = module(

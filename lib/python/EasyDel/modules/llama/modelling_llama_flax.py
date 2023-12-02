@@ -224,7 +224,7 @@ class LlamaConfig(PretrainedConfig, JaxBaseClassModel):
                      q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
                      k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
                      v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-                     o_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, "mp", None),
+                     b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", None, ("dp", "fsdp"), None),
                      a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
                      backend: Optional[str] = None,
                      scan_layers: bool = True,
@@ -254,7 +254,7 @@ class LlamaConfig(PretrainedConfig, JaxBaseClassModel):
         :param q_ps: jax.sharding.PartitionSpec: Specify the partitioning of the query tensor
         :param k_ps: jax.sharding.PartitionSpec: Partition the key matrix
         :param v_ps: jax.sharding.PartitionSpec: Specify the partitioning of the value tensor
-        :param o_ps: jax.sharding.PartitionSpec: Specify the output partition spec
+        :param b_ps: jax.sharding.PartitionSpec: Specify the Attention Bias partition spec
         :param a_ps: jax.sharding.PartitionSpec: Specify the partitioning of the attention weights
         :param backend: typing.Optional[str]: backend to use for model
         :param scan_layers: bool: Determine whether to use scan layers or not
@@ -266,7 +266,7 @@ class LlamaConfig(PretrainedConfig, JaxBaseClassModel):
         self.q_ps = q_ps
         self.k_ps = k_ps
         self.v_ps = v_ps
-        self.o_ps = o_ps
+        self.b_ps = b_ps
         self.a_ps = a_ps
         self.backend = backend
         self.scan_layers = scan_layers
@@ -597,7 +597,7 @@ class FlaxLlamaAttention(nn.Module):
                 q_ps=self.config.q_ps,
                 k_ps=self.config.k_ps,
                 v_ps=self.config.v_ps,
-                o_ps=self.config.o_ps,
+                b_ps=self.config.b_ps,
                 a_ps=self.config.a_ps,
                 bias=attention_bias,
                 block_q=self.config.flash_attn_query_chunk_size,
@@ -647,7 +647,7 @@ class FlaxLlamaAttention(nn.Module):
                     self.config.q_ps,
                     self.config.k_ps,
                     self.config.v_ps,
-                    self.config.o_ps
+                    self.config.b_ps
                 ),
                 out_specs=self.config.a_ps,
                 check_rep=False
