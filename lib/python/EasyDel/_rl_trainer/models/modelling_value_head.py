@@ -29,7 +29,7 @@ class ValueHead(nn.Module):
 
         :param self: Represent the instance of the class
         :return: A tuple of the following:
-        :doc-author: Trelent
+        
         """
         config = self.config
 
@@ -61,7 +61,7 @@ class ValueHead(nn.Module):
         :param hidden_states: chex.Array: Pass the hidden states of the previous layer
         :param deterministic: bool: Determine whether to use dropout
         :return: A tensor of shape (batch_size, num_classes)
-        :doc-author: Trelent
+        
         """
         output = self.dropout(hidden_states, deterministic=deterministic)
         if output.dtype != self.summary.weight.dtype:
@@ -104,7 +104,7 @@ class FlaxAutoModelForCausalLMWithValueHead(FlaxPreTrainedModelWrapper):
         :param **kwargs: Pass in the past_key_values parameter
         :param : Pass the past key values to the model
         :return: The logits and the value
-        :doc-author: Trelent
+        
         """
         kwargs["output_hidden_states"] = True
         kwargs["past_key_values"] = past_key_values
@@ -134,7 +134,7 @@ class FlaxAutoModelForCausalLMWithValueHead(FlaxPreTrainedModelWrapper):
         :param *args: Send a non-keyworded variable length argument list to the function
         :param **kwargs: Pass keyworded, variable-length argument list to a function
         :return: The pretrained model
-        :doc-author: Trelent
+        
         """
         setattr(self.pretrained_model, "v_head", self.v_head)
 
