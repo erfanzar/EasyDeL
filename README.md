@@ -13,11 +13,13 @@ Some of the key features provided by EasyDeL include:
 - LLM Trainer and fine-tuner in JAX
 - RLHF (presumably Reinforcement Learning with Hybrid Functions) in Jax
 - And various other features to enhance the training process and optimize performance.
+
 > [!NOTE]
 > These features collectively aim to simplify and accelerate the training of machine learning models, making it more
 > efficient and accessible for developers working with Jax/Flax.
 
 ## Documentation 💫
+
 > [!IMPORTANT]
 > Documents and Examples are ready at [Here](https://erfanzar.github.io/EasyDeL/docs)
 > Please have that in mind that EasyDel is in the loop of fast-development
@@ -166,7 +168,7 @@ EasyDeL is an open-source project, and contributions are welcome. If you would l
 fork the repository, make your changes, and submit a pull request. The team behind EasyDeL will review your changes and
 merge them if they are suitable.
 
-## License
+## License 📜
 
 EasyDeL is released under the Apache v2 license. Please see the LICENSE file in the root directory of this project for
 more information.
@@ -174,3 +176,18 @@ more information.
 ## Contact
 
 If you have any questions or comments about EasyDeL, you can reach out to me
+
+## Citing EasyDeL 🥶
+
+To cite this repository:
+
+```misc
+@misc{Zare Chavoshi_2023,
+    title={EasyDeL, an open-source library, is specifically designed to enhance and streamline the training process of machine learning models. It focuses primarily on Jax/Flax and aims to provide convenient and effective solutions for training Flax/Jax Models on TPU/GPU for both Serving and Training purposes.},
+    url={https://github.com/erfanzar/EasyDel},
+    journal={EasyDeL Easy and Fast DeepLearning with JAX},
+    publisher={Erfan Zare Chavoshi},
+    author={Zare Chavoshi, Erfan},
+    year={2023}
+} 
+```
