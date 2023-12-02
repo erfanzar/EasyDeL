@@ -50,7 +50,7 @@ class FlaxPreTrainedModelWrapper(nn.Module):
         :param *model_args: Pass the positional arguments of the model
         :param **kwargs: Pass keyworded, variable-length argument list
         :return: A model with the state_dict loaded from a file
-        :doc-author: Trelent
+        
         """
         if kwargs is not None:
             reward_adapter = kwargs.pop("reward_adapter", None)
@@ -202,7 +202,7 @@ class FlaxPreTrainedModelWrapper(nn.Module):
         :param model_index_name: Specify the name of the index file
         :param : Load the pretrained model
         :return: A tuple of four elements:
-        :doc-author: Trelent
+        
         """
         files_to_download = None
         filename = None
@@ -253,7 +253,7 @@ class FlaxPreTrainedModelWrapper(nn.Module):
 
         :param cls: Indicate that the function is a method of the class
         :return: The current device
-        :doc-author: Trelent
+        
         """
         return jax.devices()[0]
 
@@ -268,7 +268,7 @@ class FlaxPreTrainedModelWrapper(nn.Module):
         :param cls: Refer to the class itself
         :param kwargs: Pass keyword arguments to the function
         :return: A tuple of three dictionaries
-        :doc-author: Trelent
+        
         """
         supported_kwargs = {}
         unsupported_kwargs = {}
@@ -320,7 +320,7 @@ class FlaxPreTrainedModelWrapper(nn.Module):
         :param ppo_adapter_name: Set the adapter back to its original state
         :param **kwargs: Pass a variable number of arguments to a function
         :return: The scores for the given input_ids
-        :doc-author: Trelent
+        
         """
         if not self.supports_rm_adapter:
             raise ValueError("This model does not support reward modeling adapter.")

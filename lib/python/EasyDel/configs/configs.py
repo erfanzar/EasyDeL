@@ -402,7 +402,7 @@ def get_config(model_type: str, struct: str):
     :param model_type: str: Determine which model to use
     :param struct: str: Specify the structure of the model
     :return: A dictionary of hyperparameters
-    :doc-author: Trelent
+    
     """
     if model_type == "llama":
         return llama_configs[struct]

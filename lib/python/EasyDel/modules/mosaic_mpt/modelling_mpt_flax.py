@@ -388,7 +388,7 @@ class FlaxMptAttention(nn.Module):
         :param attn_bias: chex.Array: Add a bias to the attention scores
         :param init_cache: bool: Initialize the cache
         :return: The output of the attention layer
-        :doc-author: Trelent
+        
         """
         inp_shape = hidden_states.shape
         b, s, ds = inp_shape

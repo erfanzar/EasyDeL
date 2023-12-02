@@ -211,7 +211,7 @@ def built_bloom_alibi(attention_mask, num_attention_heads):
     :param attention_mask: Mask out the padding tokens in the input sequence
     :param num_attention_heads: Determine the number of attention heads in the model
     :return: A tensor of shape (batch_size, num_attention_heads, 1, sequence_length)
-    :doc-author: Trelent
+    
     """
     batch_size, sequence_length = attention_mask.shape
     cp2 = 2 ** math.floor(math.log2(num_attention_heads))
@@ -244,7 +244,7 @@ def precompute_falcon_freq_cis(max_position_embedding: int, head_dim: int, theta
     :param head_dim: int: Determine the size of the positional embedding
     :param theta: float: Adjust the frequency of the sinusoid
     :return: A tuple of two arrays
-    :doc-author: Trelent
+    
     """
     inv_freq_cis = 1.0 / (theta ** (jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim))
     freq = jnp.einsum("i , j -> i j", jnp.arange(max_position_embedding), inv_freq_cis).astype("float32")
@@ -262,7 +262,7 @@ def _rotate_half(x):
 
     :param x: Specify the input array
     :return: The negative of the second half of x concatenated with the first half
-    :doc-author: Trelent
+    
     """
     return jnp.concatenate((-x[..., x.shape[-1] // 2:], x[..., : x.shape[-1] // 2]), axis=-1)
 
@@ -275,7 +275,7 @@ def apply_rotary_pos_embedding(tensor, sin_, cos_):
     :param sin_: Rotate the tensor by half of its length
     :param cos_: Multiply the tensor and cosine of the angle
     :return: A tensor with the same shape as its input,
-    :doc-author: Trelent
+    
     """
     return (tensor * cos_) + (_rotate_half(tensor) * sin_)
 
@@ -293,7 +293,7 @@ def dropout_add(linen_drop: nn.Dropout, x: chex.Array, residual: chex.Array, det
     :param residual: chex.Array: Add the residual to the output of dropout_add
     :param deterministic: bool: Determine whether the dropout layer is active or not
     :return: A tensor that is the sum of the residual and a dropout layer
-    :doc-author: Trelent
+    
     """
     out = linen_drop(inputs=x, deterministic=deterministic)
     out = residual + out
