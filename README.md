@@ -58,8 +58,10 @@ with using EasyDel FineTuning LLM (CausalLanguageModels) are easy as much as pos
 and having the benefit of TPUs for the best speed here's a simple code to use in order to finetune your
 own Model
 
-Days Has Been Passed and now using easydel in Jax is way more similar to HF/PyTorch Style
-now it's time to finetune our model
+
+> [!TIP]
+> Days Has Been Passed and now using easydel in Jax is way more similar to HF/PyTorch Style
+> now it's time to finetune our model
 
 ```python
 import jax.numpy
