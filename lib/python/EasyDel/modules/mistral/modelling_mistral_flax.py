@@ -536,6 +536,11 @@ class FlaxMistralAttention(nn.Module):
                 q=jnp.transpose(query, rtp_axis),
                 k=jnp.transpose(key, rtp_axis),
                 v=jnp.transpose(value, rtp_axis),
+                q_ps=self.config.q_ps,
+                k_ps=self.config.k_ps,
+                v_ps=self.config.v_ps,
+                o_ps=self.config.o_ps,
+                a_ps=self.config.a_ps,
                 bias=attention_bias,
                 block_q=self.config.flash_attn_query_chunk_size,
                 block_k=self.config.flash_attn_key_chunk_size,
@@ -581,12 +586,12 @@ class FlaxMistralAttention(nn.Module):
                 functools.partial(fjformer.attention.ring_attention_standard, axis_name="mp"),
                 mesh=self.config.jax_mesh(),
                 in_specs=(
-                    PS(("dp", "fsdp"), "mp", "tp", None),
-                    PS(("dp", "fsdp"), "mp", "tp", None),
-                    PS(("dp", "fsdp"), "mp", "tp", None),
-                    PS(("dp", "fsdp"), None, "mp", None)
+                    self.config.q_ps,
+                    self.config.k_ps,
+                    self.config.v_ps,
+                    self.config.o_ps
                 ),
-                out_specs=PS(("dp", "fsdp"), "mp", "tp", None),
+                out_specs=self.config.a_ps,
                 check_rep=False
             )
 

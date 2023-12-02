@@ -494,9 +494,10 @@ class FlaxLlamaAttention(nn.Module):
     ):
 
         """
-        The __call__ function is the main function of a JAX module.
-        It defines how the module behaves when called with inputs.
-        The __call__ function can be thought of as a &quot;forward pass&quot; through the model, and it should return all outputs that are needed for training or inference.
+
+        The __call__ function is the main function of a JAX module. It defines how the module behaves when called
+        with inputs. The __call__ function can be thought of as a &quot;forward pass&quot; through the model,
+        and it should return all outputs that are needed for training or inference.
 
         :param self: Access variables that belong to the class
         :param hidden_states: chex.Array: Pass the hidden states of the previous layer
@@ -520,7 +521,6 @@ class FlaxLlamaAttention(nn.Module):
             query_state = with_sharding_constraint(query_state, PS(("dp", "fsdp"), "mp", "tp"))
             key_state = with_sharding_constraint(key_state, PS(("dp", "fsdp"), "mp", "tp"))
             value_state = with_sharding_constraint(value_state, PS(("dp", "fsdp"), "mp", "tp"))
-
         query_state = query_state.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
         key_state = key_state.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
         value_state = value_state.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
@@ -576,6 +576,11 @@ class FlaxLlamaAttention(nn.Module):
                 q=jnp.transpose(query_state, rtp_axis),
                 k=jnp.transpose(key_state, rtp_axis),
                 v=jnp.transpose(value_state, rtp_axis),
+                q_ps=self.config.q_ps,
+                k_ps=self.config.k_ps,
+                v_ps=self.config.v_ps,
+                o_ps=self.config.o_ps,
+                a_ps=self.config.a_ps,
                 bias=attention_bias,
                 block_q=self.config.flash_attn_query_chunk_size,
                 block_k=self.config.flash_attn_key_chunk_size,
@@ -621,12 +626,12 @@ class FlaxLlamaAttention(nn.Module):
                 partial(fjformer.attention.ring_attention_standard, axis_name="mp"),
                 mesh=self.config.jax_mesh(),
                 in_specs=(
-                    PS(("dp", "fsdp"), "mp", "tp", None),
-                    PS(("dp", "fsdp"), "mp", "tp", None),
-                    PS(("dp", "fsdp"), "mp", "tp", None),
-                    PS(("dp", "fsdp"), None, "mp", None)
+                    self.config.q_ps,
+                    self.config.k_ps,
+                    self.config.v_ps,
+                    self.config.o_ps
                 ),
-                out_specs=PS(("dp", "fsdp"), "mp", "tp", None),
+                out_specs=self.config.a_ps,
                 check_rep=False
             )
 
