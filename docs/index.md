@@ -17,41 +17,34 @@ Some of the key features provided by EasyDeL include:
 > These features collectively aim to simplify and accelerate the training of machine learning models, making it more
 > efficient and accessible for developers working with Jax/Flax.
 
-#### Note this Library needs golang to run (for some tracking stuff on TPU/GPU/CPU)
+## What Makes EasyDeL 🔮 Special
 
-#### Ubuntu GO installation
+EasyDeL is built up on JAX and Flax and that's why EasyDeL can perform as fast and as easy
+as possible
 
-```shell
-sudo apt-get update && apt-get upgrade -y
-sudo apt-get install golang -y 
-```
+When comparing JAX to PyTorch and TensorFlow, there are several benefits to using JAX that are worth considering.
 
-#### Manjaro/Arch GO installation
+1. **Performance**: JAX provides excellent performance through its XLA (Accelerated Linear Algebra) backend, which can
+   optimize and compile your code for various hardware accelerators such as GPUs and TPUs. This can lead to significant
+   speed improvements for certain types of computations.
 
-```shell
-sudo pacman -Syyuu go
-```
+2. **Automatic Differentiation**: JAX offers a powerful and flexible automatic differentiation system, which is
+   essential for training machine learning models. It allows for both forward-mode and reverse-mode automatic
+   differentiation, giving you more options for gradient computation.
 
-_you can install other version too but easydel required at least version of 0.4.10_
+3. **Functional Programming**: JAX is built around functional programming concepts, which can lead to more composable
+   and modular code. This can make it easier to reason about your code and to create abstractions that are reusable
+   across different parts of your project.
 
-```shell
-!pip install jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html -q
-```
+4. **Interoperability with NumPy**: JAX is designed to be compatible with NumPy, which means that you can often take
+   existing NumPy code and run it with minimal changes on JAX. This can be a significant advantage when transitioning
+   existing codebases to use JAX.
 
-on GPUs be like
+5. **Flexibility**: JAX provides a high degree of flexibility, allowing you to drop down to lower-level abstractions
+   when needed. This can be particularly useful when implementing custom operations or experimenting with new research
+   ideas.
 
-```shell
-pip install --upgrade pip
-# CUDA 12 installation
-# Note: wheels only available on linux.
-pip install --upgrade "jax[cuda12_pip]" -f \
-  https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
-```
-
-```shell
-pip install --upgrade pip
-# CUDA 11 installation
-# Note: wheels only available on linux.
-pip install --upgrade "jax[cuda11_pip]" -f \
-  https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
-```
+While JAX offers these benefits, it's important to note that PyTorch and TensorFlow have large and active communities,
+extensive libraries, and a wide range of pre-trained models, which can be advantageous in certain scenarios.
+Additionally, the choice of framework often depends on the specific requirements of the project and the familiarity of
+the team with a particular toolset.
