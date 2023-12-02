@@ -63,7 +63,10 @@ from EasyDel.modules.lucid_transformer.modelling_lt_flax import (
     FlaxLTForCausalLM as FlaxLTForCausalLM
 )
 
-from EasyDel.modules.auto_models import AutoEasyDelModelForCausalLM as AutoEasyDelModelForCausalLM
+from EasyDel.modules.auto_models import (
+    AutoEasyDelModelForCausalLM as AutoEasyDelModelForCausalLM,
+    get_modules_by_type as get_modules_by_type
+)
 
 from EasyDel.utils.utils import (
     get_mesh as get_mesh,

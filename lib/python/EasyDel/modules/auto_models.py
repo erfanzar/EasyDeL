@@ -24,7 +24,7 @@ def get_modules_by_type(model_type: str):
         3. A function to convert a HuggingFace pretrained checkpoint into an EasyDel checkpoint
 
     :param model_type: str: Determine which model to use
-    :return: A tuple of three elements
+    :return: A tuple of three elements (BaseConfig,BaseModel,Func To Transform Model from Torch to EasyDeL)
     
     """
     if model_type == "llama":
