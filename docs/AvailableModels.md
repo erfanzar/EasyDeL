@@ -1,4 +1,3 @@
-
 # Available Models
 
 | Models          | FP16/FP32/BF16 | DP | FSDP | MP | FlashAttn | Gradient Checkpointing | 8/6/4Bit Interface and Training |
@@ -29,3 +28,6 @@ supported
 * [ ] T5
 * [X] MosaicGPT / MPT (Supported via `MptConfig(bits=8)` or `MptConfig(bits=4)`)
 * [X] GPT-J (Supported via `GPTJConfig(bits=8)` or `GPTJConfig(bits=4)`)
+
+> [!NOTE]
+> all the models in future will have the 8,6 and 4 bit Inference and Training
