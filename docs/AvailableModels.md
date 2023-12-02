@@ -29,5 +29,4 @@ supported
 * [X] MosaicGPT / MPT (Supported via `MptConfig(bits=8)` or `MptConfig(bits=4)`)
 * [X] GPT-J (Supported via `GPTJConfig(bits=8)` or `GPTJConfig(bits=4)`)
 
-> [!NOTE]
 > all the models in future will have the 8,6 and 4 bit Inference and Training
