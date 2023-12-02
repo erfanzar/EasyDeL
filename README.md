@@ -21,7 +21,7 @@ Some of the key features provided by EasyDeL include:
 ## Documentation 💫
 
 > [!IMPORTANT]
-> Documents and Examples are ready at [Here](https://erfanzar.github.io/EasyDeL/docs)
+> Documents and Examples are ready at [Here](https://erfanzar.github.io/EasyDeL)
 > Please have that in mind that EasyDel is in the loop of fast-development
 > so we might have API changes
 
