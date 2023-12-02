@@ -221,7 +221,14 @@ class LlamaConfig(PretrainedConfig, JaxBaseClassModel):
                      bits: Optional[int] = None,
                      axis_dims: Sequence[int] = (1, -1, 1, 1),
                      axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
-                     scan_layers: bool = True
+                     q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
+                     k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
+                     v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
+                     o_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, "mp", None),
+                     a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
+                     backend: Optional[str] = None,
+                     scan_layers: bool = True,
+                     **kwargs,
                      ):
         """
         The add_jax_args function adds the following arguments to the Transformer class:
@@ -244,13 +251,24 @@ class LlamaConfig(PretrainedConfig, JaxBaseClassModel):
         :param bits: Optional[int]: Determine the number of bits used in the quantization
         :param axis_dims: Sequence[int]: Specify the dimension of each axis
         :param axis_names: Sequence[str]: Name the axes of the tensor
-        :param &quot;fsdp&quot;: Determine the number of layers in the model
-        :param &quot;tp&quot;: Determine the number of heads in the attention layer
-        :param &quot;mp&quot;): Specify the number of multi-head attention layers
+        :param q_ps: jax.sharding.PartitionSpec: Specify the partitioning of the query tensor
+        :param k_ps: jax.sharding.PartitionSpec: Partition the key matrix
+        :param v_ps: jax.sharding.PartitionSpec: Specify the partitioning of the value tensor
+        :param o_ps: jax.sharding.PartitionSpec: Specify the output partition spec
+        :param a_ps: jax.sharding.PartitionSpec: Specify the partitioning of the attention weights
+        :param backend: typing.Optional[str]: backend to use for model
         :param scan_layers: bool: Determine whether to use scan layers or not
         :return: The following:
         
         """
+        self.axis_names = axis_names
+        self.axis_dims = axis_dims
+        self.q_ps = q_ps
+        self.k_ps = k_ps
+        self.v_ps = v_ps
+        self.o_ps = o_ps
+        self.a_ps = a_ps
+        self.backend = backend
         self.scan_layers = scan_layers
         self.axis_names = axis_names
         self.axis_dims = axis_dims

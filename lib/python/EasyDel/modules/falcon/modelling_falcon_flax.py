@@ -152,10 +152,22 @@ class FalconConfig(PretrainedConfig, JaxBaseClassModel):
                      bits: Optional[int] = None,
                      axis_dims: Sequence[int] = (1, -1, 1, 1),
                      axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
+                     q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
+                     k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
+                     v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
+                     o_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, "mp", None),
+                     a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
+                     backend: Optional[str] = None,
                      **kwargs,
                      ):
         self.axis_names = axis_names
         self.axis_dims = axis_dims
+        self.q_ps = q_ps
+        self.k_ps = k_ps
+        self.v_ps = v_ps
+        self.o_ps = o_ps
+        self.a_ps = a_ps
+        self.backend = backend
         basics = dict(
             bits=bits,
             vocab_size=vocab_size,
@@ -190,7 +202,6 @@ class FalconConfig(PretrainedConfig, JaxBaseClassModel):
 
 
 def built_bloom_alibi(attention_mask, num_attention_heads):
-
     """
     The built_bloom_alibi function is used to create a bloom alibi for the attention mask.
     The bloom alibi is used in the Bloom Attention layer to ensure that each token has a unique
@@ -222,7 +233,6 @@ def built_bloom_alibi(attention_mask, num_attention_heads):
 
 
 def precompute_falcon_freq_cis(max_position_embedding: int, head_dim: int, theta: float = 10000):
-
     """
     The precompute_falcon_freq_cis function is used to precompute the sinusoidal frequencies for the FALCON model.
     The function takes in three arguments: max_position_embedding, head_dim, and theta. The first two are self-explanatory;
@@ -244,7 +254,6 @@ def precompute_falcon_freq_cis(max_position_embedding: int, head_dim: int, theta
 
 
 def _rotate_half(x):
-
     """
     The _rotate_half function takes a 1D array and rotates it by half its length.
     For example, if the input is [0, 1, 2, 3], then the output will be [-2,-3,-0,-4].
@@ -259,7 +268,6 @@ def _rotate_half(x):
 
 
 def apply_rotary_pos_embedding(tensor, sin_, cos_):
-
     """
     The apply_rotary_pos_embedding function applies a rotary positional embedding to the input tensor.
 
@@ -273,7 +281,6 @@ def apply_rotary_pos_embedding(tensor, sin_, cos_):
 
 
 def dropout_add(linen_drop: nn.Dropout, x: chex.Array, residual: chex.Array, deterministic: bool) -> chex.Array:
-
     """
     The dropout_add function is a helper function that adds the residual to the output of
     the dropout layer. This is necessary because we want to use deterministic=True when
