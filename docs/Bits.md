@@ -9,6 +9,5 @@ and
 do operations in bits like 8 6 4, and you can still train your model in this way and make it much more accurate than
 bitsandbytes or peft fine-tuning
 
-> [!NOTE]
 > Right now im looking to make EasyBITs in EasyDel work on TPU-v3 cause on low amp GPUs and old TPUs it
 > might now work as good as it does on TPU-v4/5
