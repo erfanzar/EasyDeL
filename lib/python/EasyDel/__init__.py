@@ -75,7 +75,11 @@ from EasyDel.utils.utils import (
 )
 
 from EasyDel.trainer import (
-    CausalLMTrainer, TrainArguments, fsdp_train_step, get_training_modules
+    CausalLMTrainer,
+    TrainArguments,
+    create_fsdp_eval_step,
+    create_fsdp_train_step,
+    get_training_modules
 )
 
 from EasyDel.linen import (

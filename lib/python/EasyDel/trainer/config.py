@@ -72,6 +72,7 @@ class TrainArguments(
             is_left_padded: bool = False,
             warmup_steps: int = 500,
             init_input_shape: typing.Tuple[int, int] = (1, 1),
+            step_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(('dp', 'fsdp'), 'mp'),
             **kwargs
     ):
         """
@@ -124,6 +125,7 @@ class TrainArguments(
         :param is_left_padded: bool: Indicate whether the input is left padded or not
         :param warmup_steps: int: Warm up the learning rate
         :param init_input_shape: typing.Tuple[int]: Initialize the input shape of the model
+        :param step_partition_spec: jax.sharding.PartitionSpec: PartitionSpec Custom to be used in training and eval or test loop
         :param **kwargs: Pass a variable number of keyword arguments to a function
         :return: Nothing
         
@@ -193,6 +195,7 @@ class TrainArguments(
         self.loss_remat = loss_remat
         self.init_input_shape = init_input_shape
         self.is_left_padded = is_left_padded
+        self.step_partition_spec = step_partition_spec
         torch.set_default_device('cpu')
         self.__dict__.update(**kwargs)
 
