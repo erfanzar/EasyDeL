@@ -84,7 +84,7 @@ class PalmConfig(PretrainedConfig):
             q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
             k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
             v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-            o_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, "mp", None),
+            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", None, ("dp", "fsdp"), None),
             a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
             backend: Optional[str] = None,
             **kwargs,
@@ -94,7 +94,7 @@ class PalmConfig(PretrainedConfig):
         self.q_ps = q_ps
         self.k_ps = k_ps
         self.v_ps = v_ps
-        self.o_ps = o_ps
+        self.b_ps = b_ps
         self.a_ps = a_ps
         self.backend = backend
 

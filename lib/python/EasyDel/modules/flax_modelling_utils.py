@@ -244,7 +244,7 @@ def smart_flash_attention(
         q_ps: jax.sharding.PartitionSpec,
         k_ps: jax.sharding.PartitionSpec,
         v_ps: jax.sharding.PartitionSpec,
-        o_ps: jax.sharding.PartitionSpec,
+        b_ps: jax.sharding.PartitionSpec,
         a_ps: jax.sharding.PartitionSpec,
         block_k: int,
         block_q: int,
@@ -283,7 +283,7 @@ def smart_flash_attention(
 
     :param v_ps: jax.sharding.PartitionSpec: Specify the partitioning of the value tensor
 
-    :param o_ps: jax.sharding.PartitionSpec: Specify the output partition spec
+    :param b_ps: jax.sharding.PartitionSpec: Specify the Attention Bias partition spec
 
     :param a_ps: jax.sharding.PartitionSpec: Specify the partitioning of the attention weights
 
@@ -380,7 +380,7 @@ def smart_flash_attention(
                 q_ps,
                 k_ps,
                 v_ps,
-                o_ps
+                b_ps
             ),
             out_specs=a_ps,
             check_rep=False
@@ -438,7 +438,7 @@ class JaxBaseClassModel:
     :param q_ps: jax.sharding.PartitionSpec: Specify the partitioning of the query tensor
     :param k_ps: jax.sharding.PartitionSpec: Partition the key matrix
     :param v_ps: jax.sharding.PartitionSpec: Specify the partitioning of the value tensor
-    :param o_ps: jax.sharding.PartitionSpec: Specify the output partition spec
+    :param b_ps: jax.sharding.PartitionSpec: Specify the Attention Bias partition spec
     :param a_ps: jax.sharding.PartitionSpec: Specify the partitioning of the attention weights
     :param backend: Optional[None]: Specify the backend to use
     """
@@ -450,7 +450,7 @@ class JaxBaseClassModel:
             q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
             k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
             v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-            o_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, "mp", None),
+            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", None, ("dp", "fsdp"), None),
             a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
             backend: Optional[None] = None
     ):
@@ -465,7 +465,7 @@ class JaxBaseClassModel:
         :param q_ps: jax.sharding.PartitionSpec: Specify the partitioning of the query tensor
         :param k_ps: jax.sharding.PartitionSpec: Partition the key matrix
         :param v_ps: jax.sharding.PartitionSpec: Specify the partitioning of the value tensor
-        :param o_ps: jax.sharding.PartitionSpec: Specify the output partition spec
+        :param b_ps: jax.sharding.PartitionSpec: Specify the Attention Bias partition spec
         :param a_ps: jax.sharding.PartitionSpec: Specify the partitioning of the attention weights
         :param backend: Optional[None]: Specify the backend to use
         :return: A new instance of the class
@@ -474,7 +474,7 @@ class JaxBaseClassModel:
         self.q_ps = q_ps
         self.k_ps = k_ps
         self.v_ps = v_ps
-        self.o_ps = o_ps
+        self.b_ps = b_ps
         self.a_ps = a_ps
         self.axis_dims = axis_dims
         self.axis_names = axis_names
