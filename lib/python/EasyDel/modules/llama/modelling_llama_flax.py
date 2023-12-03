@@ -26,7 +26,6 @@ from ..flax_modelling_utils import (
     JaxBaseClassModel,
     smart_flash_attention
 )
-from transformers import LlamaForCausalLM
 import chex
 from fjformer.bits import config as q_config, q_flax
 
