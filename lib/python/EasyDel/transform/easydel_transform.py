@@ -1,3 +1,4 @@
+import flax.traverse_util
 import jax
 
 from flax.traverse_util import flatten_dict
@@ -69,7 +70,12 @@ def match_keywords(string, ts, ns):
     return True
 
 
-def huggingface_to_easydel(state_dict, embedding_layer_name: str, device, dtype: jax.numpy.dtype = jax.numpy.float16):
+def huggingface_to_easydel(
+        state_dict,
+        embedding_layer_name: str,
+        device,
+        dtype: jax.numpy.dtype = jax.numpy.float16
+):
     """
     The huggingface_to_easydel function takes a huggingface model's state_dict and converts it to an easydel
     model's flax_dict. The function is designed to be used in conjunction with the load_huggingface function, which
@@ -80,7 +86,7 @@ def huggingface_to_easydel(state_dict, embedding_layer_name: str, device, dtype:
     :param embedding_layer_name: str: Identify the embedding layer in the huggingface model
     :param device: Determine which device the model will be loaded on
     :param dtype: jax.numpy.dtype: Specify the data type of the tensors
-    :return: A dictionary of the weights and biases in a format that can be used by flax
+    :return: A dictionary of the weights and biases in a format that can be used by flax (it's an UnFlattenDict)
     
     """
     _l = len('.weight')
@@ -88,7 +94,7 @@ def huggingface_to_easydel(state_dict, embedding_layer_name: str, device, dtype:
         flax_dict = {}
         for key, tensor in state_dict.items():
             if embedding_layer_name in key:
-                tensor = tensor.transpose(0, 1)
+                # tensor = tensor.transpose(0, 1)
                 key = key[:-_l] + '.embedding'
             elif match_keywords(key, ['kernel'], ['none']):
                 if len(tensor.shape) == 2:
@@ -101,7 +107,7 @@ def huggingface_to_easydel(state_dict, embedding_layer_name: str, device, dtype:
             for k in key_tuple:
                 key_names += k,
             flax_dict[key_names] = tensor.astype(dtype)
-        return flax_dict
+        return flax.traverse_util.unflatten_dict(flax_dict)
 
 
 def read_ckpt(path: [str, os.PathLike], shard_fns=None, add_extra_past_fix: list = None):
