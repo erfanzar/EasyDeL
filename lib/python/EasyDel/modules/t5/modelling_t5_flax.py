@@ -135,7 +135,6 @@ class T5Config(PretrainedConfig, JaxBaseClassModel):
             ('.*', PartitionSpec(('fsdp', 'mp')))
         )
 
-
 remat = nn_partitioning.remat
 
 

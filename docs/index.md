@@ -1,44 +1,50 @@
-# EasyDeL
+# EasyDeL 🔮
 
-EasyDeL (Easy Deep Learning) is an open-source library designed to accelerate and optimize the training process of
-machine learning models. This library is primarily focused on Jax/Flax and plans to offer easy and fine solutions to
-train Flax/Jax Models on the `TPU/GPU` both for Serving and Training For both Python And Mojo🔥
+EasyDeL, an open-source library, is specifically designed to enhance and streamline the training process of machine
+learning models. It focuses primarily on Jax/Flax and aims to provide convenient and effective solutions for training
+Flax/Jax Models on TPU/GPU for both Serving and Training purposes. Additionally, EasyDeL will support mojo and will be
+rewritten for mojo as well.
 
-#### Note this Library needs golang to run (for some tracking stuff on TPU/GPU/CPU)
+Some of the key features provided by EasyDeL include:
 
-#### Ubuntu GO installation
+- Support for 8, 6, and 4 BIT inference and training in JAX
+- Integration of flashAttention in JAX for GPUs and TPUs
+- Automatic serving of LLMs with mid and high-level APIs in both JAX and PyTorch
+- LLM Trainer and fine-tuner in JAX
+- RLHF (presumably Reinforcement Learning with Hybrid Functions) in Jax
+- And various other features to enhance the training process and optimize performance.
 
-```shell
-sudo apt-get update && apt-get upgrade -y
-sudo apt-get install golang -y 
-```
+> These features collectively aim to simplify and accelerate the training of machine learning models, making it more
+> efficient and accessible for developers working with Jax/Flax.
 
-#### Manjaro/Arch GO installation
+## What Makes EasyDeL 🔮 Special
 
-```shell
-sudo pacman -Syyuu go
-```
+EasyDeL is built up on JAX and Flax and that's why EasyDeL can perform as fast and as easy
+as possible
 
-_you can install other version too but easydel required at least version of 0.4.10_
+When comparing JAX to PyTorch and TensorFlow, there are several benefits to using JAX that are worth considering.
 
-```shell
-!pip install jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html -q
-```
+1. **Performance**: JAX provides excellent performance through its XLA (Accelerated Linear Algebra) backend, which can
+   optimize and compile your code for various hardware accelerators such as GPUs and TPUs. This can lead to significant
+   speed improvements for certain types of computations.
 
-on GPUs be like
+2. **Automatic Differentiation**: JAX offers a powerful and flexible automatic differentiation system, which is
+   essential for training machine learning models. It allows for both forward-mode and reverse-mode automatic
+   differentiation, giving you more options for gradient computation.
 
-```shell
-pip install --upgrade pip
-# CUDA 12 installation
-# Note: wheels only available on linux.
-pip install --upgrade "jax[cuda12_pip]" -f \
-  https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
-```
+3. **Functional Programming**: JAX is built around functional programming concepts, which can lead to more composable
+   and modular code. This can make it easier to reason about your code and to create abstractions that are reusable
+   across different parts of your project.
 
-```shell
-pip install --upgrade pip
-# CUDA 11 installation
-# Note: wheels only available on linux.
-pip install --upgrade "jax[cuda11_pip]" -f \
-  https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
-```
+4. **Interoperability with NumPy**: JAX is designed to be compatible with NumPy, which means that you can often take
+   existing NumPy code and run it with minimal changes on JAX. This can be a significant advantage when transitioning
+   existing codebases to use JAX.
+
+5. **Flexibility**: JAX provides a high degree of flexibility, allowing you to drop down to lower-level abstractions
+   when needed. This can be particularly useful when implementing custom operations or experimenting with new research
+   ideas.
+
+While JAX offers these benefits, it's important to note that PyTorch and TensorFlow have large and active communities,
+extensive libraries, and a wide range of pre-trained models, which can be advantageous in certain scenarios.
+Additionally, the choice of framework often depends on the specific requirements of the project and the familiarity of
+the team with a particular toolset.
