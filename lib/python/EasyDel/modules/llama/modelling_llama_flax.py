@@ -539,6 +539,7 @@ class FlaxLlamaAttention(nn.Module):
             query_state = with_sharding_constraint(query_state, PS(("dp", "fsdp"), "mp", "tp"))
             key_state = with_sharding_constraint(key_state, PS(("dp", "fsdp"), "mp", "tp"))
             value_state = with_sharding_constraint(value_state, PS(("dp", "fsdp"), "mp", "tp"))
+
         query_state = query_state.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
         key_state = key_state.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
         value_state = value_state.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
@@ -552,6 +553,16 @@ class FlaxLlamaAttention(nn.Module):
             batch_size=batch_size,
             sequence_length=sequence_length
         )
+
+        assert_msg = (
+            "num_attention_heads repeat wont work likely\n"
+            f"INFO :\n\trepeat_kv_bnsh Used with number_of_reps = {self.number_of_reps}\n\t"
+            f"NH : {self.config.num_attention_heads} KVH : {self.config.num_attention_heads}"
+        )
+
+        assert query_state.shape[-2] == self.config.num_attention_heads, assert_msg
+        assert key_state.shape[-2] == self.config.num_attention_heads, assert_msg
+        assert value_state.shape[-2] == self.config.num_attention_heads, assert_msg
 
         query_length, key_length = query_state.shape[1], key_state.shape[1]
 
