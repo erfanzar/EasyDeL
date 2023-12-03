@@ -3,16 +3,9 @@ site_name: EasyDel
 copyright: "Erfan Zare Chavoshi-EasyDel"
 nav:
   - Home: index.md
-  - Examples:
-      - PytorchServer: PyTorchServer.md
-      - JAXServer: JAXServer.md
-      - DataProcessing: DataProcessing.md
-      - TrainingExample: TrainingExample.md
-      - Falcon Models: Falcon.md
-      - Llama Models: Llama.md
-      - Llama2 Models: Llama2.md
-      - Mistral Models: Mistral.md
-      - MosaicMPT Models: MosaicMPT.md
+  - Install: Install.md
+  - AvailableModels: AvailableModels.md
+  - EasyBIT: Bits.md
   - Eval:
       - lm_eval: lib-python-EasyDel-eval-lm_eval.md
   - Transform:
@@ -65,14 +58,27 @@ nav:
       - core: lib-python-EasyDel-_rl_trainer-core.md
   - Data Preprocessing:
       - data_preprocessing/_processor: lib-python-EasyDel-data_preprocessing-_processor.md
-
+  - Examples:
+      - PytorchServer: PyTorchServer.md
+      - JAXServer: JAXServer.md
+      - DataProcessing: DataProcessing.md
+      - TrainingExample: TrainingExample.md
+      - Falcon Models: Falcon.md
+      - Llama Models: Llama.md
+      - Llama2 Models: Llama2.md
+      - Mistral Models: Mistral.md
+      - MosaicMPT Models: MosaicMPT.md
 
 site_author: "Erfan Zare Chavoshi"
 repo_url: "https://github.com/erfanzar/EasyDel"
 
 plugins:
   - search
-  - mkdocstrings
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            docstring_style: sphinx
 
 theme:
   name: material

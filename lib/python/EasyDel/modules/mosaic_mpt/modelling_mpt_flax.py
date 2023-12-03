@@ -184,10 +184,22 @@ class MptConfig(PretrainedConfig, JaxBaseClassModel):
                      bits: Optional[int] = None,
                      axis_dims: Sequence[int] = (1, -1, 1, 1),
                      axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
-                     **kwargs
+                     q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
+                     k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
+                     v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
+                     b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", None, ("dp", "fsdp"), None),
+                     a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
+                     backend: Optional[str] = None,
+                     **kwargs,
                      ):
         self.axis_names = axis_names
         self.axis_dims = axis_dims
+        self.q_ps = q_ps
+        self.k_ps = k_ps
+        self.v_ps = v_ps
+        self.b_ps = b_ps
+        self.a_ps = a_ps
+        self.backend = backend
         if hasattr(self, 'attn_config'):
             for k, v in self.attn_config.items():
                 setattr(self, k, v)
@@ -362,6 +374,22 @@ class FlaxMptAttention(nn.Module):
                  attn_bias: chex.Array = None,
                  init_cache: bool = False
                  ):
+
+        """
+        The __call__ function is the main function of a JAX module.
+        It takes in inputs and returns outputs, just like any other Python function.
+        The difference is that __call__ can also take in state (e.g., parameters) from the module itself,
+        and it can update that state as part of its computation.
+
+        :param self: Access variables that belong to the class
+        :param hidden_states: chex.Array: Pass the input to the attention layer
+        :param attention_mask: chex.Array: Mask out certain positions in the sequence
+        :param position_ids: chex.Array: Specify the position of each token in the sequence
+        :param attn_bias: chex.Array: Add a bias to the attention scores
+        :param init_cache: bool: Initialize the cache
+        :return: The output of the attention layer
+        
+        """
         inp_shape = hidden_states.shape
         b, s, ds = inp_shape
         qkv = self.w_qkv(hidden_states)

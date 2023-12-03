@@ -17,7 +17,7 @@ def evaluate(model, task_list: Optional[List[str]] = None, write_out: bool = Tru
     :param limit: int: Limit the number of examples that are evaluated
     :param shots: int: Specify how many times to run the model on a given task
     :return: A dictionary with the following keys
-    :doc-author: Trelent
+    
     """
     if task_list is None:
         task_list = ['wsc', "piqa"]

@@ -24,7 +24,7 @@ def get_modules_by_type(model_type: str):
         3. A function to convert a HuggingFace pretrained checkpoint into an EasyDel checkpoint
 
     :param model_type: str: Determine which model to use
-    :return: A tuple of three elements
+    :return: A tuple of three elements (BaseConfig,BaseModel,Func To Transform Model from Torch to EasyDeL)
     
     """
     if model_type == "llama":
@@ -129,7 +129,13 @@ class AutoEasyDelModelForCausalLM:
             precision: jax.lax.Precision = jax.lax.Precision('fastest'),
             sharding_axis_dims: typing.Sequence[int] = (1, -1, 1, 1),
             sharding_axis_names: typing.Sequence[str] = ('dp', 'fsdp', 'tp', 'mp'),
+            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
+            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
+            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
+            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", None, ("dp", "fsdp"), None),
+            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
             input_shape: typing.Sequence[int] = (1, 1),
+            backend: typing.Optional[str] = None,
             **kwargs
     ) -> typing.Union[FlaxPreTrainedModel, dict]:
         """
@@ -145,7 +151,13 @@ class AutoEasyDelModelForCausalLM:
         :param precision: jax.lax.Precision: Control the precision of the model
         :param sharding_axis_dims: typing.Sequence[int]: Specify the dimension of each axis in the sharded model
         :param sharding_axis_names: typing.Sequence[str]: Specify the order of sharding
+        :param q_ps: jax.sharding.PartitionSpec: Specify the partitioning of the query tensor
+        :param k_ps: jax.sharding.PartitionSpec: Partition the key matrix
+        :param v_ps: jax.sharding.PartitionSpec: Specify the partitioning of the value tensor
+        :param b_ps: jax.sharding.PartitionSpec: Specify the Attention Bias partition spec
+        :param a_ps: jax.sharding.PartitionSpec: Specify the partitioning of the attention weights
         :param input_shape: typing.Sequence[int]: Specify the shape of the input to the model
+        :param backend: typing.Optional[str]: backend to use for model
         :param **kwargs: Pass additional arguments to the model and config classes
         :return: A model and parameters
         
@@ -162,6 +174,12 @@ class AutoEasyDelModelForCausalLM:
             cfg.add_jax_args()
         cfg.axis_dims = sharding_axis_dims
         cfg.axis_names = sharding_axis_names
+        cfg.q_ps = q_ps
+        cfg.k_ps = k_ps
+        cfg.v_ps = v_ps
+        cfg.b_ps = b_ps
+        cfg.a_ps = a_ps
+        cfg.backend = backend
         ed_model = module(
             config=cfg,
             _do_init=False,

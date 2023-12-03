@@ -107,10 +107,23 @@ class GPTNeoXConfig(PretrainedConfig, JaxBaseClassModel):
             self,
             axis_dims: Sequence[int] = (1, -1, 1, 1),
             axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
+            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
+            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
+            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
+            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", None, ("dp", "fsdp"), None),
+            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
+            backend: Optional[str] = None,
+            **kwargs,
     ):
-        self.from_pt = False
         self.axis_names = axis_names
         self.axis_dims = axis_dims
+        self.q_ps = q_ps
+        self.k_ps = k_ps
+        self.v_ps = v_ps
+        self.b_ps = b_ps
+        self.a_ps = a_ps
+        self.backend = backend
+        self.from_pt = False
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0,

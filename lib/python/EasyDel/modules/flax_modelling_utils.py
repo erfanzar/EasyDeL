@@ -241,6 +241,11 @@ def smart_flash_attention(
         k: chex.Array,
         v: chex.Array,
         bias: chex.Array,
+        q_ps: jax.sharding.PartitionSpec,
+        k_ps: jax.sharding.PartitionSpec,
+        v_ps: jax.sharding.PartitionSpec,
+        b_ps: jax.sharding.PartitionSpec,
+        a_ps: jax.sharding.PartitionSpec,
         block_k: int,
         block_q: int,
         block_b: int,
@@ -256,37 +261,81 @@ def smart_flash_attention(
         dropout_rng: jax.random.PRNGKey = None,
         force_float32_tpu: bool = True,
         deterministic: bool = False
-):
+) -> chex.Array:
     """
     Smart Flash Attention mechanism for efficient attention computation.
 
-    Args:
-    - q: Query tensor with shape [batch_size, num_attention_heads, q_seq_len, head_dims].
-    - k: Key tensor with shape [batch_size, num_attention_heads, kv_seq_len, head_dims].
-    - v: Value tensor with shape [batch_size, num_attention_heads, kv_seq_len, head_dims].
-    - bias: Bias tensor with shape [batch_size, num_attention_heads, q_seq_len, kv_seq_len].
-    - block_k: Block size for key tensor reshaping.
-    - block_q: Block size for query tensor reshaping.
-    - block_b: Block size for bias tensor reshaping.
-    - q_seq_len: Length of the query sequence.
-    - kv_seq_len: Length of the key-value sequence.
-    - num_attention_heads: Number of attention heads.
-    - head_dims: Dimensionality of each attention head.
-    - causal: If True, applies causal masking to the attention scores.
-    - attn_pdrop: Dropout probability for attention weights.
-    - mesh: Mesh specifying the data distribution for parallel computation.
-    - dtype: Data type of the tensors.
-    - precision: Precision mode for computation (default is 'fastest').
-    - dropout_rng: Random number generator key for dropout.
-    - force_float32_tpu: If True, forces computation to use float32 on TPU.
-    - deterministic: If True, ensures deterministic computation.
+    :param q: Query tensor with shape [batch_size, num_attention_heads, q_seq_len, head_dims].
+    :type q: tensor
 
-    Returns:
-    - Output tensor with the same shape as the input value tensor v.
+    :param k: Key tensor with shape [batch_size, num_attention_heads, kv_seq_len, head_dims].
+    :type k: tensor
 
-    Raises:
-    - ValueError: If the shapes of input tensors are not compatible for attention computation.
+    :param v: Value tensor with shape [batch_size, num_attention_heads, kv_seq_len, head_dims].
+    :type v: tensor
 
+    :param bias: Bias tensor with shape [batch_size, num_attention_heads, q_seq_len, kv_seq_len].
+    :type bias: tensor
+
+    :param q_ps: jax.sharding.PartitionSpec: Specify the partitioning of the query tensor
+
+    :param k_ps: jax.sharding.PartitionSpec: Partition the key matrix
+
+    :param v_ps: jax.sharding.PartitionSpec: Specify the partitioning of the value tensor
+
+    :param b_ps: jax.sharding.PartitionSpec: Specify the Attention Bias partition spec
+
+    :param a_ps: jax.sharding.PartitionSpec: Specify the partitioning of the attention weights
+
+    :param block_k: Block size for key tensor reshaping.
+    :type block_k: int
+
+    :param block_q: Block size for query tensor reshaping.
+    :type block_q: int
+
+    :param block_b: Block size for bias tensor reshaping.
+    :type block_b: int
+
+    :param q_seq_len: Length of the query sequence.
+    :type q_seq_len: int
+
+    :param kv_seq_len: Length of the key-value sequence.
+    :type kv_seq_len: int
+
+    :param num_attention_heads: Number of attention heads.
+    :type num_attention_heads: int
+
+    :param head_dims: Dimensionality of each attention head.
+    :type head_dims: int
+
+    :param causal: If True, applies causal masking to the attention scores.
+    :type causal: bool
+
+    :param attn_pdrop: Dropout probability for attention weights.
+    :type attn_pdrop: float
+
+    :param mesh: Mesh specifying the data distribution for parallel computation.
+    :type mesh: mesh_type
+
+    :param dtype: Data type of the tensors.
+    :type dtype: data_type
+
+    :param precision: Precision mode for computation (default is 'fastest').
+    :type precision: str
+
+    :param dropout_rng: Random number generator key for dropout.
+    :type dropout_rng: rng_key
+
+    :param force_float32_tpu: If True, forces computation to use float32 on TPU.
+    :type force_float32_tpu: bool
+
+    :param deterministic: If True, ensures deterministic computation.
+    :type deterministic: bool
+
+    :return: chex.Array: Output tensor with the same shape as the input value tensor v.
+    :rtype: tensor
+
+    :raises ValueError: If the shapes of input tensors are not compatible for attention computation.
     """
     assertion_mkv_err = """
     Q,K,V and bias shapes must be like
@@ -328,16 +377,15 @@ def smart_flash_attention(
             ),
             mesh=mesh,
             in_specs=(
-                PS(("dp", "fsdp"), "mp", "tp", None),
-                PS(("dp", "fsdp"), "mp", "tp", None),
-                PS(("dp", "fsdp"), "mp", "tp", None),
-                PS(("dp", "fsdp"), None, None, None)
+                q_ps,
+                k_ps,
+                v_ps,
+                b_ps
             ),
-            out_specs=PS(("dp", "fsdp"), "mp", "tp", None),
+            out_specs=a_ps,
             check_rep=False
         )
         attn_output = ring_attention_sharded(q, k, v, bias)
-        attn_output = with_sharding_constraint(attn_output, PS(("dp", "fsdp"), "mp", "tp", None))
     else:
         if force_float32_tpu or f32_upcast:
             q, k, v = map(lambda x: x.astype(jax.numpy.float32), [q, k, v])
@@ -382,23 +430,52 @@ def create_mesh(
 
 
 class JaxBaseClassModel:
+    """
+    It initializes all the attributes of an object, and it's called when you create a new instance of that class.
+    :param self: Refer to the instance of the class
+    :param axis_dims: Sequence[int]: Specify the number of dimensions for each axis
+    :param axis_names: Sequence[str]: Set the names of the axes
+    :param q_ps: jax.sharding.PartitionSpec: Specify the partitioning of the query tensor
+    :param k_ps: jax.sharding.PartitionSpec: Partition the key matrix
+    :param v_ps: jax.sharding.PartitionSpec: Specify the partitioning of the value tensor
+    :param b_ps: jax.sharding.PartitionSpec: Specify the Attention Bias partition spec
+    :param a_ps: jax.sharding.PartitionSpec: Specify the partitioning of the attention weights
+    :param backend: Optional[None]: Specify the backend to use
+    """
+
     def __init__(
             self,
             axis_dims: Sequence[int] = (1, -1, 1, 1),
             axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
+            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
+            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
+            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
+            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", None, ("dp", "fsdp"), None),
+            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
             backend: Optional[None] = None
     ):
         """
-        The __init__ function is called when the class is instantiated.
-        It sets up the object with all of its initial values.
+        The __init__ function is the constructor for a class.
+        It initializes all the attributes of an object, and it's called when you create a new instance of that class.
 
-        :param self: Represent the instance of the class
-        :param axis_dims: Sequence[int]: Specify the dimensions of the mesh
-        :param axis_names: Sequence[str]: Name the axes of the mesh
-        :param backend: Specify the backend to use
+
+        :param self: Refer to the instance of the class
+        :param axis_dims: Sequence[int]: Specify the number of dimensions for each axis
+        :param axis_names: Sequence[str]: Set the names of the axes
+        :param q_ps: jax.sharding.PartitionSpec: Specify the partitioning of the query tensor
+        :param k_ps: jax.sharding.PartitionSpec: Partition the key matrix
+        :param v_ps: jax.sharding.PartitionSpec: Specify the partitioning of the value tensor
+        :param b_ps: jax.sharding.PartitionSpec: Specify the Attention Bias partition spec
+        :param a_ps: jax.sharding.PartitionSpec: Specify the partitioning of the attention weights
+        :param backend: Optional[None]: Specify the backend to use
         :return: A new instance of the class
-        
+
         """
+        self.q_ps = q_ps
+        self.k_ps = k_ps
+        self.v_ps = v_ps
+        self.b_ps = b_ps
+        self.a_ps = a_ps
         self.axis_dims = axis_dims
         self.axis_names = axis_names
         self.backend = backend if backend is not None else ""
@@ -411,7 +488,7 @@ class JaxBaseClassModel:
 
         :param self: Refer to the object itself
         :return: A jaxMesh
-        
+
         """
         return create_mesh(
             axis_dims=self.axis_dims,
@@ -425,7 +502,7 @@ class JaxBaseClassModel:
 
         :param self: Represent the instance of the class
         :return: The dimensions of the axes
-        
+
         """
         return self.axis_dims
 
@@ -435,7 +512,7 @@ class JaxBaseClassModel:
 
         :param self: Represent the instance of the class
         :return: A list of the names of all axes
-        
+
         """
         return self.axis_names
 
@@ -446,7 +523,7 @@ class JaxBaseClassModel:
 
         :param self: Bind the method to an object
         :return: The backend platform
-        
+
         """
         return self.backend if not self.backend == "" else jax.lib.xla_bridge.get_backend().platform
 
@@ -457,7 +534,7 @@ class JaxBaseClassModel:
             :returns: The flash attention value from the database.
 
         :return: A function
-        
+
         """
         return get_flash_attention()
 
