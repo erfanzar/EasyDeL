@@ -12,7 +12,7 @@ import transformers
 import uvicorn
 from fastapi import FastAPI
 from fjformer import make_shard_and_gather_fns, match_partition_rules, with_sharding_constraint
-from EasyDel.smi import get_mem, initialise_tracking
+from ..smi import get_mem, initialise_tracking
 from jax import numpy as jnp
 from jax.experimental import mesh_utils
 from flax.serialization import from_bytes
@@ -20,11 +20,11 @@ from fjformer.load._load import get_float_dtype_by_name
 from jax.sharding import Mesh, PartitionSpec as Ps
 from transformers import GenerationConfig
 import logging
-from EasyDel.utils.utils import RNG, prefix_str
+from ..utils.utils import RNG, prefix_str
 import multiprocessing as mp
 from typing import Union, Sequence
 import chex
-from EasyDel.serve.utils import InstructRequest, ChatRequest, seafoam
+from .utils import InstructRequest, ChatRequest, seafoam
 from jax.experimental.pjit import pjit
 
 

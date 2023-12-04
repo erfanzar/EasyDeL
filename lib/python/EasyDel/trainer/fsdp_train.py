@@ -9,14 +9,14 @@ from fjformer.func.loss_func import fused_cross_entropy_loss_and_accuracy, cross
 import wandb
 from datasets import Dataset
 
-from EasyDel.trainer.config import TrainArguments
+from .config import TrainArguments
 
 import jax
 import flax
 from transformers import FlaxAutoModelForCausalLM, AutoConfig
 from tqdm import tqdm
-from EasyDel.utils.utils import Timers, prefix_print
-from EasyDel.smi import initialise_tracking, get_mem
+from ..utils.utils import Timers, prefix_print
+from ..smi import initialise_tracking, get_mem
 from jax.experimental.pjit import pjit, with_sharding_constraint
 from jax.sharding import PartitionSpec
 from flax.training import train_state

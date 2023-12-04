@@ -6,7 +6,7 @@ import jax.lax as lax
 from flax.linen.dtypes import promote_dtype
 from jax import vmap
 from flax.linen import Dense, compact
-from EasyDel.linen.utils import array_from_8bit, array_to_bit8
+from .utils import array_from_8bit, array_to_bit8
 
 
 def get_tile_inds(format_):
