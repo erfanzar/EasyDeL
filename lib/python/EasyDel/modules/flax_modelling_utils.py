@@ -418,6 +418,7 @@ def smart_flash_attention(
             check_rep=False
         )
         attn_output = ring_attention_sharded(q, k, v, bias)
+        attn_output = with_sharding_constraint(attn_output, a_ps)
     else:
         if force_float32_tpu or f32_upcast:
             q, k, v = map(lambda x: x.astype(jax.numpy.float32), [q, k, v])
@@ -437,7 +438,7 @@ def smart_flash_attention(
             ),
             debug=False,
         )
-    attn_output = with_sharding_constraint(attn_output, a_ps)
+
     attn_output = attn_output.astype(dtype)
     return attn_output
 
