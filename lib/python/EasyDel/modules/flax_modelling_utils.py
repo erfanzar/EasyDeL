@@ -437,6 +437,7 @@ def smart_flash_attention(
             ),
             debug=False,
         )
+    attn_output = with_sharding_constraint(attn_output, a_ps)
     attn_output = attn_output.astype(dtype)
     return attn_output
 
