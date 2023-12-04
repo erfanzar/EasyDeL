@@ -20,6 +20,38 @@ ACT2FN = {
 }
 
 
+def canonicalize_dtype(
+        *args, dtype: Optional[chex.ArrayDType] = None, inexact: bool = True
+) -> chex.ArrayDType:
+    """Canonicalize an optional dtype to the definitive dtype.
+
+    If the ``dtype`` is None this function will infer the dtype. If it is not
+    None it will be returned unmodified or an exceptions is raised if the dtype
+    is invalid.
+    from the input arguments using ``jnp.result_type``.
+
+    Args:
+      *args: JAX array compatible values. None values
+        are ignored.
+      dtype: Optional dtype override. If specified the arguments are cast to
+        the specified dtype instead and dtype inference is disabled.
+      inexact: When True, the output dtype must be a subdtype
+      of `jnp.inexact`. Inexact dtypes are real or complex floating points. This
+      is useful when you want to apply operations that don't work directly on
+      integers like taking a mean for example.
+    Returns:
+      The dtype that *args should be cast to.
+    """
+    if dtype is None:
+        args_filtered = [jax.numpy.asarray(x) for x in args if x is not None]
+        dtype = jax.numpy.result_type(*args_filtered)
+        if inexact and not jax.numpy.issubdtype(dtype, jax.numpy.inexact):
+            dtype = jax.numpy.promote_types(jax.numpy.float32, dtype)
+    if inexact and not jax.numpy.issubdtype(dtype, jax.numpy.inexact):
+        raise ValueError(f'Dtype must be inexact: {dtype}')
+    return dtype
+
+
 def get_names_from_partition_spec(partition_specs):
     """
     The get_names_from_partition_spec function takes a partition_specs argument, which is either a dictionary or list.
@@ -386,6 +418,7 @@ def smart_flash_attention(
             check_rep=False
         )
         attn_output = ring_attention_sharded(q, k, v, bias)
+        attn_output = with_sharding_constraint(attn_output, a_ps)
     else:
         if force_float32_tpu or f32_upcast:
             q, k, v = map(lambda x: x.astype(jax.numpy.float32), [q, k, v])
@@ -405,6 +438,7 @@ def smart_flash_attention(
             ),
             debug=False,
         )
+
     attn_output = attn_output.astype(dtype)
     return attn_output
 
