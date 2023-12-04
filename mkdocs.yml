@@ -53,9 +53,9 @@ nav:
       - bits: lib-python-EasyDel-linen-bits.md
       - utils: lib-python-EasyDel-linen-utils.md
   - RL Trainer:
-      - models/modelling_base: lib-python-EasyDel-_rl_trainer-models-modelling_base.md
-      - models/modelling_value_head: lib-python-EasyDel-_rl_trainer-models-modelling_value_head.md
-      - core: lib-python-EasyDel-_rl_trainer-core.md
+      - models/modelling_base: lib-python-EasyDel-rl_trainer-models-modelling_base.md
+      - models/modelling_value_head: lib-python-EasyDel-rl_trainer-models-modelling_value_head.md
+      - core: lib-python-EasyDel-rl_trainer-core.md
   - Data Preprocessing:
       - data_preprocessing/_processor: lib-python-EasyDel-data_preprocessing-_processor.md
   - Examples:
