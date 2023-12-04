@@ -16,7 +16,7 @@ from transformers import PretrainedConfig, FlaxPreTrainedModel
 from flax.linen import partitioning as nn_partitioning, combine_masks
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 
-from EasyDel.modules.flax_modelling_utils import (
+from ..flax_modelling_utils import (
     ACT2FN,
     with_sharding_constraint,
     get_gradient_checkpoint_policy,
@@ -218,7 +218,7 @@ class MistralConfig(PretrainedConfig, JaxBaseClassModel):
                      q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
                      k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
                      v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-                     b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", None, ("dp", "fsdp"), None),
+                     b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, "tp", None),
                      a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
                      backend: Optional[str] = None,
                      **kwargs,

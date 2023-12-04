@@ -11,7 +11,7 @@ from flax.traverse_util import unflatten_dict, flatten_dict
 from jax import numpy as jnp
 from flax import linen as nn
 from chex import Array
-from EasyDel.modules.flax_modelling_utils import JaxBaseClassModel, ACT2FN, get_gradient_checkpoint_policy,canonicalize_dtype
+from ..flax_modelling_utils import JaxBaseClassModel, ACT2FN, get_gradient_checkpoint_policy,canonicalize_dtype
 from transformers import PretrainedConfig
 from einops import repeat, rearrange
 from transformers.modeling_flax_outputs import FlaxCausalLMOutput

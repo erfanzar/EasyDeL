@@ -8,7 +8,7 @@ from transformers import TextIteratorStreamer
 import logging
 import multiprocessing as mp
 import torch
-from EasyDel.serve.utils import ChatRequest, InstructRequest, seafoam
+from .utils import ChatRequest, InstructRequest, seafoam
 
 
 class PytorchServerConfig:

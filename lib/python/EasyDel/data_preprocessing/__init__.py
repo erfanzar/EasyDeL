@@ -1,1 +1,1 @@
-from EasyDel.data_preprocessing._processor import DataProcessorArguments, DataProcessor
+from ._processor import DataProcessorArguments, DataProcessor

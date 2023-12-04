@@ -33,7 +33,7 @@ from transformers.modeling_flax_utils import ACT2FN, FlaxPreTrainedModel
 from jax.sharding import PartitionSpec
 from transformers import logging
 
-from EasyDel.modules.flax_modelling_utils import get_gradient_checkpoint_policy, \
+from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
     with_sharding_constraint, JaxBaseClassModel
 
 import chex
