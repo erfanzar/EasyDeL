@@ -649,7 +649,11 @@ class FlaxLlamaAttention(nn.Module):
             if self.has_variable("cache", "cached_key") or init_cache:
                 key_state, value_state, attention_mask = self._concatenate_to_cache(key_state, value_state, query_state,
                                                                                     attention_mask)
-
+            attention_bias = lax.select(
+                attention_mask > 0,
+                jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
+                jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
+            )
             attn_weights = None
             ring_attention_sharded = shard_map(
                 partial(fjformer.attention.ring_attention_standard, axis_name="mp"),
@@ -665,7 +669,7 @@ class FlaxLlamaAttention(nn.Module):
             )
 
             attn_output = ring_attention_sharded(
-                query_state, key_state, value_state, attention_mask
+                query_state, key_state, value_state, attention_bias
             )
 
         attn_output = self._merge_heads(attn_output)
