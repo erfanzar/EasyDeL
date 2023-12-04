@@ -26,7 +26,6 @@ from ..flax_modelling_utils import (
     JaxBaseClassModel,
     smart_flash_attention
 )
-from transformers import LlamaForCausalLM
 import chex
 from fjformer.bits import config as q_config, q_flax
 
@@ -671,6 +670,7 @@ class FlaxLlamaAttention(nn.Module):
             attn_output = ring_attention_sharded(
                 query_state, key_state, value_state, attention_bias
             )
+            attn_output = with_sharding_constraint(attn_output, self.config.a_ps)
 
         attn_output = self._merge_heads(attn_output)
         attn_output = self.o_proj(attn_output)
@@ -1087,8 +1087,13 @@ class FlaxLlamaBlockCollection(nn.Module):
 
     def setup(self):
         self.blocks = [
-            FlaxLlamaBlock(self.config, name=str(i), dtype=self.dtype, param_dtype=self.param_dtype,
-                           precision=self.precision)
+            FlaxLlamaBlock(
+                self.config,
+                name=str(i),
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+                precision=self.precision
+            )
             for i in range(self.config.num_hidden_layers)
         ]
 
