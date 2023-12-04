@@ -654,24 +654,33 @@ class FlaxLlamaAttention(nn.Module):
                 jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
             )
             attn_weights = None
-            ring_attention_sharded = shard_map(
-                partial(fjformer.attention.ring_attention_standard, axis_name="mp"),
-                mesh=self.config.jax_mesh(),
-                in_specs=(
-                    self.config.q_ps,
-                    self.config.k_ps,
-                    self.config.v_ps,
-                    self.config.b_ps
-                ),
-                out_specs=self.config.a_ps,
-                check_rep=False
+            # ring_attention_sharded = shard_map(
+            #     partial(fjformer.attention.ring_attention_standard, axis_name="mp"),
+            #     mesh=self.config.jax_mesh(),
+            #     in_specs=(
+            #         self.config.q_ps,
+            #         self.config.k_ps,
+            #         self.config.v_ps,
+            #         self.config.b_ps
+            #     ),
+            #     out_specs=self.config.a_ps,
+            #     check_rep=False
+            # )
+            #
+            # attn_output = ring_attention_sharded(
+            #     query_state, key_state, value_state, attention_bias
+            # )
+            # attn_output = with_sharding_constraint(attn_output, self.config.a_ps)
+            attn_output = nn.attention.dot_product_attention(
+                query=query_state,
+                key=key_state,
+                value=value_state,
+                bias=attention_bias,
+                dtype=jnp.promote_types(self.dtype, jnp.float32),
+                deterministic=deterministic,
+                dropout_rng=dropout_rng,
+                precision=self.precision
             )
-
-            attn_output = ring_attention_sharded(
-                query_state, key_state, value_state, attention_bias
-            )
-            attn_output = with_sharding_constraint(attn_output, self.config.a_ps)
-
         attn_output = self._merge_heads(attn_output)
         attn_output = self.o_proj(attn_output)
 
