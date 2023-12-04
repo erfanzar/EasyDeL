@@ -616,6 +616,7 @@ class FlaxMistralAttention(nn.Module):
             attn_output = ring_attention_sharded(
                 query, key, value, attention_mask
             )
+            attn_output = with_sharding_constraint(attn_output, self.config.a_ps)
 
         out = self.o_proj(attn_output.reshape(batch_size, sequence_length, self.hidden_size))
         outputs = (out, attn_output) if output_attentions else (out,)
