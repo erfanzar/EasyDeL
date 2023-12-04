@@ -64,7 +64,7 @@ from .modules.lucid_transformer.modelling_lt_flax import (
 )
 
 from .modules.auto_models import (
-    AutoModelForCausalLM as AutoModelForCausalLM,
+    AutoEasyDelModelForCausalLM as AutoEasyDelModelForCausalLM,
     get_modules_by_type as get_modules_by_type
 )
 
