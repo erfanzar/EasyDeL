@@ -107,13 +107,13 @@ class MptConfig(PretrainedConfig, JaxBaseClassModel):
     def get_partition_rules(fully_fsdp: bool = False):
         return (
 
-            ("transformer/wte/embedding", PartitionSpec("tp", ("fsdp", "mp"))),
-            ("transformer/wpe/embedding", PartitionSpec("tp", ("fsdp", "mp"))),
+            ("transformer/wte/embedding", PartitionSpec("tp", "fsdp")),
+            ("transformer/wpe/embedding", PartitionSpec("tp", "fsdp")),
 
             ("attn/w_qkv/kernel", PartitionSpec("fsdp", "tp")),
-            ("attn/wo/kernel", PartitionSpec("tp", ("fsdp", "mp"))),
+            ("attn/wo/kernel", PartitionSpec("tp", "fsdp")),
             ("attn/w_qkv/bias", PartitionSpec("fsdp", "tp")),
-            ("attn/wo/bias", PartitionSpec("tp", ("fsdp", "mp"))),
+            ("attn/wo/bias", PartitionSpec("tp", "fsdp")),
 
             ("ffn/down/kernel", PartitionSpec("fsdp", "tp")),
             ("ffn/up/kernel", PartitionSpec("fsdp", "tp")),

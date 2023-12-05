@@ -124,15 +124,15 @@ class T5Config(PretrainedConfig, JaxBaseClassModel):
 
     def get_partition_rules(self, fully_fsdp: bool = True):
         return (
-            ("wi_0/kernel", PartitionSpec(('fsdp', 'mp'))),
-            ("wi_1/kernel", PartitionSpec(('fsdp', 'mp'))),
-            ("wi/kernel", PartitionSpec(('fsdp', 'mp'), 'tp')),
-            ("wo/kernel", PartitionSpec(('fsdp', 'mp'), 'tp')),
-            ("SelfAttention/(q|k|v|o)/kernel", PartitionSpec(('fsdp', 'mp'))),
-            ("EncDecAttention/(q|k|v|o)/kernel", PartitionSpec(('fsdp', 'mp'))),
+            ("wi_0/kernel", PartitionSpec("fsdp")),
+            ("wi_1/kernel", PartitionSpec("fsdp")),
+            ("wi/kernel", PartitionSpec("fsdp", 'tp')),
+            ("wo/kernel", PartitionSpec("fsdp", 'tp')),
+            ("SelfAttention/(q|k|v|o)/kernel", PartitionSpec("fsdp")),
+            ("EncDecAttention/(q|k|v|o)/kernel", PartitionSpec("fsdp")),
             ('.*', PartitionSpec(None))
         ) if not fully_fsdp else (
-            ('.*', PartitionSpec(('fsdp', 'mp')))
+            ('.*', PartitionSpec("fsdp"))
         )
 
 remat = nn_partitioning.remat

@@ -70,32 +70,32 @@ class GPTNeoXConfig(PretrainedConfig, JaxBaseClassModel):
     @staticmethod
     def get_partition_rules(fully_fsdp: bool = False):
         return (
-            ('wte/embedding', PartitionSpec(('fsdp', 'mp'), 'tp')),
-            ('attention/w_qkv/(kernel|bias)', PartitionSpec(('fsdp', 'mp'), 'tp')),
-            ('attention/wo/(kernel|bias)', PartitionSpec(('fsdp', 'mp'), 'tp')),
-            ('mlp/dense_h_to_4h/(kernel|bias)', PartitionSpec(('fsdp', 'mp'), 'tp')),
-            ('mlp/dense_4h_to_h/(kernel|bias)', PartitionSpec('tp', ('fsdp', 'mp'))),
+            ('wte/embedding', PartitionSpec("fsdp", 'tp')),
+            ('attention/w_qkv/(kernel|bias)', PartitionSpec("fsdp", 'tp')),
+            ('attention/wo/(kernel|bias)', PartitionSpec("fsdp", 'tp')),
+            ('mlp/dense_h_to_4h/(kernel|bias)', PartitionSpec("fsdp", 'tp')),
+            ('mlp/dense_4h_to_h/(kernel|bias)', PartitionSpec('tp', "fsdp")),
 
-            ('post_attention_layernorm/(bias|scale)', PartitionSpec(('fsdp', 'mp'), 'tp')),
-            ('input_layernorm/(bias|scale)', PartitionSpec(('fsdp', 'mp'), 'tp')),
+            ('post_attention_layernorm/(bias|scale)', PartitionSpec("fsdp", 'tp')),
+            ('input_layernorm/(bias|scale)', PartitionSpec("fsdp", 'tp')),
 
-            ('transformer/final_layer_norm/(scale|bias)', PartitionSpec('tp', ('fsdp', 'mp'))),
-            ('lm_head/kernel', PartitionSpec('tp', ('fsdp', 'mp'))),
+            ('transformer/final_layer_norm/(scale|bias)', PartitionSpec('tp', "fsdp")),
+            ('lm_head/kernel', PartitionSpec('tp', "fsdp")),
             ('.*', PartitionSpec(None))
         ) if not fully_fsdp else (
 
-            ('embed_in/embedding', PartitionSpec(('fsdp', 'mp'))),
+            ('embed_in/embedding', PartitionSpec("fsdp")),
 
-            ('attention/w_qkv/(kernel|bias)', PartitionSpec(('fsdp', 'mp'))),
-            ('attention/wo/(kernel|bias)', PartitionSpec(('fsdp', 'mp'))),
-            ('mlp/dense_h_to_4h/(kernel|bias)', PartitionSpec(('fsdp', 'mp'))),
-            ('mlp/dense_4h_to_h/(kernel|bias)', PartitionSpec(('fsdp', 'mp'))),
+            ('attention/w_qkv/(kernel|bias)', PartitionSpec("fsdp")),
+            ('attention/wo/(kernel|bias)', PartitionSpec("fsdp")),
+            ('mlp/dense_h_to_4h/(kernel|bias)', PartitionSpec("fsdp")),
+            ('mlp/dense_4h_to_h/(kernel|bias)', PartitionSpec("fsdp")),
 
-            ('post_attention_layernorm/(bias|scale)', PartitionSpec(('fsdp', 'mp'))),
-            ('input_layernorm/(bias|scale)', PartitionSpec(('fsdp', 'mp'))),
+            ('post_attention_layernorm/(bias|scale)', PartitionSpec("fsdp")),
+            ('input_layernorm/(bias|scale)', PartitionSpec("fsdp")),
 
-            ('transformer/final_layer_norm/(scale|bias)', PartitionSpec(('fsdp', 'mp'))),
-            ('lm_head/kernel', PartitionSpec(('fsdp', 'mp'))),
+            ('transformer/final_layer_norm/(scale|bias)', PartitionSpec("fsdp")),
+            ('lm_head/kernel', PartitionSpec("fsdp")),
             ('.*', PartitionSpec(None))
         )
 
