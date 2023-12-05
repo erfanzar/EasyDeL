@@ -306,7 +306,7 @@ class TrainArguments(
 
     @staticmethod
     def get_mesh_names():
-        return "dp", "fsdp", "tp", "mp"
+        return "dp", "fsdp",  "mp"
 
     def get_optimizer_and_scheduler(self, steps=None):
         """

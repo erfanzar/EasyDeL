@@ -42,7 +42,7 @@ class JaxServerConfig:
             top_p: float = 0.95,
             top_k: int = 50,
             logging: bool = True,
-            mesh_axes_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
+            mesh_axes_names: Sequence[str] = ("dp", "fsdp",  "mp"),
             mesh_axes_shape: Sequence[int] = (1, -1, 1, 1),
             dtype: str = 'fp16',
             stream_tokens_for_gradio: bool = True,
@@ -68,8 +68,6 @@ class JaxServerConfig:
         :param top_k: int: Limit the number of tokens that can be generated
         :param logging: bool: Print out the progress of the server
         :param mesh_axes_names: Sequence[str]: Specify the names of the axes in the mesh tensor
-        :param &quot;fsdp&quot;: Set the number of tokens to be generated
-        :param &quot;tp&quot;: Set the top_p value
         :param &quot;mp&quot;): Define the mesh_axes_names
         :param mesh_axes_shape: Sequence[int]: Specify the shape of the mesh
         :param dtype: str: Specify the data type of the model

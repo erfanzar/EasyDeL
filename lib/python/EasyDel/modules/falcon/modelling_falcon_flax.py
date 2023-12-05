@@ -49,7 +49,7 @@ class FalconConfig(PretrainedConfig, JaxBaseClassModel):
             gradient_checkpointing: str = '',
             bits: Optional[int] = None,
             axis_dims: Sequence[int] = (1, -1, 1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
+            axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
             **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -97,12 +97,12 @@ class FalconConfig(PretrainedConfig, JaxBaseClassModel):
     @staticmethod
     def get_partition_rules(fully_fsdp: bool = False):
         return (
-            ('word_embeddings/embedding', PartitionSpec('tp', "fsdp")),
-            ('self_attention/query_key_value/(kernel)', PartitionSpec('tp', "fsdp")),
-            ('self_attention/dense/(kernel)', PartitionSpec('tp', "fsdp")),
-            ('mlp/dense_4h_to_h/(kernel)', PartitionSpec('tp', "fsdp")),
-            ('mlp/dense_h_to_4h/(kernel)', PartitionSpec('tp', "fsdp")),
-            ('lm_head/kernel', PartitionSpec('tp', "fsdp")),
+            ('word_embeddings/embedding', PartitionSpec("dp", "fsdp")),
+            ('self_attention/query_key_value/(kernel)', PartitionSpec("dp", "fsdp")),
+            ('self_attention/dense/(kernel)', PartitionSpec("dp", "fsdp")),
+            ('mlp/dense_4h_to_h/(kernel)', PartitionSpec("dp", "fsdp")),
+            ('mlp/dense_h_to_4h/(kernel)', PartitionSpec("dp", "fsdp")),
+            ('lm_head/kernel', PartitionSpec("dp", "fsdp")),
             ('transformer/ln_f/bias', PartitionSpec("fsdp")),
             ('transformer/ln_f/scale', PartitionSpec("fsdp")),
             ('transformer/post_attention_layernorm/scale', PartitionSpec("fsdp")),
@@ -124,7 +124,7 @@ class FalconConfig(PretrainedConfig, JaxBaseClassModel):
 
     @staticmethod
     def get_mesh_names():
-        return "dp", "fsdp", "tp", "mp"
+        return "dp", "fsdp",  "mp"
 
     def add_jax_args(self,
                      vocab_size: int = 65024,
@@ -151,12 +151,12 @@ class FalconConfig(PretrainedConfig, JaxBaseClassModel):
                      gradient_checkpointing: str = '',
                      bits: Optional[int] = None,
                      axis_dims: Sequence[int] = (1, -1, 1, 1),
-                     axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
-                     q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
-                     k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
-                     v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
-                     b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", None, None, None),
-                     a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
+                     axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
+                     q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
+                     k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
+                     v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
+                     b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", None, "fsdp", None),
+                     a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
                      backend: Optional[str] = None,
                      **kwargs,
                      ):

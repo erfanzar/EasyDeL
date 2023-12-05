@@ -76,7 +76,7 @@ class T5Config(PretrainedConfig, JaxBaseClassModel):
             gradient_checkpointing: str = 'nothing_saveable',
             use_pjit_attention_force: bool = False,
             axis_dims: Sequence[int] = (1, -1, 1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
+            axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
             **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -126,8 +126,8 @@ class T5Config(PretrainedConfig, JaxBaseClassModel):
         return (
             ("wi_0/kernel", PartitionSpec("fsdp")),
             ("wi_1/kernel", PartitionSpec("fsdp")),
-            ("wi/kernel", PartitionSpec("fsdp", 'tp')),
-            ("wo/kernel", PartitionSpec("fsdp", 'tp')),
+            ("wi/kernel", PartitionSpec("fsdp", "dp")),
+            ("wo/kernel", PartitionSpec("fsdp", "dp")),
             ("SelfAttention/(q|k|v|o)/kernel", PartitionSpec("fsdp")),
             ("EncDecAttention/(q|k|v|o)/kernel", PartitionSpec("fsdp")),
             ('.*', PartitionSpec(None))

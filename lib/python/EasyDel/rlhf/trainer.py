@@ -253,7 +253,7 @@ class RLHFConfig(PretrainedConfig):
 
     @staticmethod
     def get_mesh_names():
-        return "dp", "fsdp", "tp", "mp"
+        return "dp", "fsdp", "mp"
 
     @staticmethod
     def get_optimizer_and_scheduler(
