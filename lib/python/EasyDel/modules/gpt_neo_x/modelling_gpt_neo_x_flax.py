@@ -9,7 +9,7 @@ import jax
 from jax.sharding import PartitionSpec
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput
 from einops import rearrange
-from EasyDel.modules.flax_modelling_utils import get_gradient_checkpoint_policy, \
+from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
     with_sharding_constraint, ACT2FN, JaxBaseClassModel
 import chex
 

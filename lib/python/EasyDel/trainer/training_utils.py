@@ -2,14 +2,14 @@ import dataclasses
 import os
 import typing
 
-from EasyDel.trainer.config import TrainArguments
+from .config import TrainArguments
 
 import jax
 import flax
 import optax
 from transformers import FlaxAutoModelForCausalLM, AutoConfig
 from jax.sharding import PartitionSpec
-from EasyDel.utils.utils import Timers
+from ..utils.utils import Timers
 
 from jax.experimental.pjit import pjit, with_sharding_constraint
 from flax.training import train_state
@@ -98,7 +98,7 @@ def get_training_modules(
         dataset_train,
         ckpt_path,
         training_arguments: TrainArguments,
-        use_pjit_attention_force: bool = True,
+        use_pjit_attention_force: bool = False,
         dataset_eval=None,
         dtype=jnp.bfloat16,
         param_dtype=jnp.bfloat16,

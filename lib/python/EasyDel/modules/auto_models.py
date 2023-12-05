@@ -7,7 +7,7 @@ import jax.numpy
 from flax.traverse_util import unflatten_dict
 from transformers import AutoConfig, PretrainedConfig, AutoModelForCausalLM
 
-from EasyDel.transform.easydel_transform import huggingface_to_easydel
+from ..transform.easydel_transform import huggingface_to_easydel
 
 from transformers import FlaxPreTrainedModel
 
@@ -28,18 +28,18 @@ def get_modules_by_type(model_type: str):
     
     """
     if model_type == "llama":
-        from EasyDel.modules.llama import LlamaConfig as _LlamaConfig
-        from EasyDel.modules.llama import FlaxLlamaForCausalLM as _FlaxLlamaForCausalLM
-        from EasyDel.transform import llama_convert_hf_to_flax as _llama_convert_hf_to_flax
+        from .llama import LlamaConfig as _LlamaConfig
+        from .llama import FlaxLlamaForCausalLM as _FlaxLlamaForCausalLM
+        from ..transform import llama_convert_hf_to_flax as _llama_convert_hf_to_flax
         return (
             _LlamaConfig,
             _FlaxLlamaForCausalLM,
             _llama_convert_hf_to_flax
         )
     elif model_type == "falcon":
-        from EasyDel.modules.falcon import FlaxFalconForCausalLM as _FlaxFalconForCausalLM
-        from EasyDel.modules.falcon import FalconConfig as _FalconConfig
-        from EasyDel.transform import falcon_convert_hf_to_flax as _falcon_convert_pt_to_flax
+        from .falcon import FlaxFalconForCausalLM as _FlaxFalconForCausalLM
+        from .falcon import FalconConfig as _FalconConfig
+        from ..transform import falcon_convert_hf_to_flax as _falcon_convert_pt_to_flax
 
         return (
             _FalconConfig,
@@ -47,8 +47,8 @@ def get_modules_by_type(model_type: str):
             _falcon_convert_pt_to_flax
         )
     elif model_type == "mpt":
-        from EasyDel.modules.mosaic_mpt import FlaxMptForCausalLM as _FlaxMptForCausalLM
-        from EasyDel.modules.mosaic_mpt import MptConfig as _MptConfig
+        from .mosaic_mpt import FlaxMptForCausalLM as _FlaxMptForCausalLM
+        from .mosaic_mpt import MptConfig as _MptConfig
         return (
             _MptConfig,
             _FlaxMptForCausalLM,
@@ -56,17 +56,17 @@ def get_modules_by_type(model_type: str):
         )
 
     elif model_type == "mistral":
-        from EasyDel.modules.mistral import FlaxMistralForCausalLM as _FlaxMistralForCausalLM
-        from EasyDel.modules.mistral import MistralConfig as _MistralConfig
-        from EasyDel.transform import mistral_convert_hf_to_flax as _mistral_convert_hf_to_flax
+        from .mistral import FlaxMistralForCausalLM as _FlaxMistralForCausalLM
+        from .mistral import MistralConfig as _MistralConfig
+        from ..transform import mistral_convert_hf_to_flax as _mistral_convert_hf_to_flax
         return (
             _MistralConfig,
             _FlaxMistralForCausalLM,
             _mistral_convert_hf_to_flax
         )
     elif model_type == "gptj":
-        from EasyDel.modules.gpt_j import FlaxGPTJForCausalLM as _FlaxGPTJForCausalLM
-        from EasyDel.modules.gpt_j import GPTJConfig as _GPTJConfig
+        from .gpt_j import FlaxGPTJForCausalLM as _FlaxGPTJForCausalLM
+        from .gpt_j import GPTJConfig as _GPTJConfig
         return (
             _GPTJConfig,
             _FlaxGPTJForCausalLM,
@@ -74,8 +74,8 @@ def get_modules_by_type(model_type: str):
         )
 
     elif model_type == "gpt_neox":
-        from EasyDel.modules.gpt_neo_x import FlaxGPTNeoXForCausalLM as _FlaxGPTNeoXForCausalLM
-        from EasyDel.modules.gpt_neo_x import GPTNeoXConfig as _GPTNeoXConfig
+        from .gpt_neo_x import FlaxGPTNeoXForCausalLM as _FlaxGPTNeoXForCausalLM
+        from .gpt_neo_x import GPTNeoXConfig as _GPTNeoXConfig
 
         return (
             _GPTNeoXConfig,
@@ -83,16 +83,16 @@ def get_modules_by_type(model_type: str):
             functools.partial(huggingface_to_easydel, embedding_layer_name="wte")
         )
     elif model_type == "palm":
-        from EasyDel.modules.palm import FlaxPalmForCausalLM as _FlaxPalmForCausalLM
-        from EasyDel.modules.palm import PalmConfig as _PalmConfig
+        from .palm import FlaxPalmForCausalLM as _FlaxPalmForCausalLM
+        from .palm import PalmConfig as _PalmConfig
         return (
             _PalmConfig,
             _FlaxPalmForCausalLM,
             functools.partial(huggingface_to_easydel, embedding_layer_name="wte")
         )
     elif model_type == "lt":
-        from EasyDel.modules.lucid_transformer import FlaxLTForCausalLM as _FlaxLTForCausalLM
-        from EasyDel.modules.lucid_transformer import FlaxLTConfig as _FlaxLTConfig
+        from .lucid_transformer import FlaxLTForCausalLM as _FlaxLTForCausalLM
+        from .lucid_transformer import FlaxLTConfig as _FlaxLTConfig
 
         return (
             _FlaxLTConfig,

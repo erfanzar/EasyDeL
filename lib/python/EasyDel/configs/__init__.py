@@ -1,4 +1,4 @@
-from EasyDel.configs.configs import (
+from .configs import (
     llama_configs,
     falcon_configs,
     mpt_configs,

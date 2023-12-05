@@ -14,7 +14,7 @@ import flax
 from einops import rearrange
 from typing import Dict, Any, Optional, Sequence
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
-from EasyDel.modules.flax_modelling_utils import JaxBaseClassModel
+from ..flax_modelling_utils import JaxBaseClassModel
 import chex
 
 ACT2CLS = {
