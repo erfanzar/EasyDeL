@@ -1,1 +1,1 @@
-from EasyDel.modules.falcon.modelling_falcon_flax import FlaxFalconForCausalLM, FlaxFalconModel, FalconConfig
+from .modelling_falcon_flax import FlaxFalconForCausalLM, FlaxFalconModel, FalconConfig

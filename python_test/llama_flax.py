@@ -1,23 +1,23 @@
-import copy
-
 import os
 
-os.environ["JAX_TRACEBACK_FILTERING"] = 'off'
+os.environ["XLA_FLAGS"] = '--xla_force_host_platform_device_count=8'
+
+import copy
 import jax
 
 try:
-    from lib.python.EasyDel import MistralConfig, FlaxMistralForCausalLM
-    from lib.python.EasyDel.transform import mistral_convert_hf_to_flax
+    from lib.python.EasyDel import LlamaConfig, FlaxLlamaForCausalLM
+    from lib.python.EasyDel.transform import llama_convert_hf_to_flax
 except ModuleNotFoundError:
     import sys
     from pathlib import Path
 
     cp = Path.cwd().__str__()
     sys.path.append(cp)
-    from lib.python.EasyDel import MistralConfig, FlaxMistralForCausalLM
-    from lib.python.EasyDel.transform import mistral_convert_hf_to_flax
+    from lib.python.EasyDel import LlamaConfig, FlaxLlamaForCausalLM
+    from lib.python.EasyDel.transform import llama_convert_hf_to_flax
 from jax import numpy as jnp
-from transformers import MistralForCausalLM
+from transformers import LlamaForCausalLM
 import torch
 import numpy as np
 
@@ -25,20 +25,21 @@ import numpy as np
 def main():
     torch.manual_seed(42)
 
-    config = MistralConfig(
+    config = LlamaConfig(
         hidden_size=128,
-        num_attention_heads=4,
-        num_key_value_heads=8,
+        num_attention_heads=8,
+        num_key_value_heads=4,
         num_hidden_layers=2,
         intermediate_size=128,
         gradient_checkpointing=''
     )
     print('Model Config :\n', config)
 
-    torch_model = MistralForCausalLM(
+    torch_model = LlamaForCausalLM(
         config=copy.deepcopy(config)
     )
-    params = {"params": mistral_convert_hf_to_flax(torch_model.state_dict(), config, jax.devices('cpu')[0])}
+    print(jax.devices('cpu'))
+    params = {"params": llama_convert_hf_to_flax(torch_model.state_dict(), config, device=jax.devices('cpu')[0])}
 
     np_random_input_ids = np.random.randint(0, config.vocab_size, (1, 128))
     input_ids = torch.from_numpy(np_random_input_ids).reshape(1, -1).to(torch.long)
@@ -47,9 +48,10 @@ def main():
         input_ids=input_ids
     )
     config.add_jax_args()
+    print(config)
     try:
 
-        flax_model = FlaxMistralForCausalLM(
+        flax_model = FlaxLlamaForCausalLM(
             config=config,
             dtype=jnp.float32,
             param_dtype=jnp.float32,

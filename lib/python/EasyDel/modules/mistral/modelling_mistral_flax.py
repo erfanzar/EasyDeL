@@ -16,7 +16,7 @@ from transformers import PretrainedConfig, FlaxPreTrainedModel
 from flax.linen import partitioning as nn_partitioning, combine_masks
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 
-from EasyDel.modules.flax_modelling_utils import (
+from ..flax_modelling_utils import (
     ACT2FN,
     with_sharding_constraint,
     get_gradient_checkpoint_policy,
@@ -52,7 +52,7 @@ class MistralConfig(PretrainedConfig, JaxBaseClassModel):
             rope_theta=10000.0,
             sliding_window=4096,
             gradient_checkpointing: str = 'nothing_saveable',
-            use_pjit_attention_force: bool = True,
+            use_pjit_attention_force: bool = False,
             use_flash_attention: bool = False,
             use_sacn_mlp: bool = False,
             flash_attn_query_chunk_size: int = 1024,
@@ -202,7 +202,7 @@ class MistralConfig(PretrainedConfig, JaxBaseClassModel):
 
     def add_jax_args(self,
                      gradient_checkpointing: str = 'nothing_saveable',
-                     use_pjit_attention_force: bool = True,
+                     use_pjit_attention_force: bool = False,
                      use_flash_attention: bool = False,
                      use_sacn_mlp: bool = False,
                      flash_attn_query_chunk_size: int = 1024,
@@ -218,7 +218,7 @@ class MistralConfig(PretrainedConfig, JaxBaseClassModel):
                      q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
                      k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
                      v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-                     b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", None, ("dp", "fsdp"), None),
+                     b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, "tp", None),
                      a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
                      backend: Optional[str] = None,
                      **kwargs,

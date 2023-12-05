@@ -47,7 +47,7 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.onnx import OnnxConfigWithPast, PatchingSpec
 
 from fjformer.attention import efficient_attention
-from EasyDel.modules.flax_modelling_utils import with_sharding_constraint, JaxBaseClassModel
+from ..flax_modelling_utils import with_sharding_constraint, JaxBaseClassModel
 import chex
 from fjformer.bits import config as q_config, q_flax
 

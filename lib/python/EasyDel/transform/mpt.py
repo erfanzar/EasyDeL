@@ -1,6 +1,6 @@
 import gc
 
-from EasyDel.modules.mosaic_mpt import MptConfig
+from ..modules.mosaic_mpt import MptConfig
 from jax import numpy as jnp
 import jax
 import torch

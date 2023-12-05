@@ -5,7 +5,7 @@ from fjformer.partition_utils.t5x_partitioning import (standard_logical_axis_rul
                                                        LocalChunker, HardwareMesh, PjitPartitioner,
                                                        host_local_array_to_global_array, global_mesh_defined)
 
-from EasyDel.partitioning.partitioner import get_partitions
+from .partitioner import get_partitions
 
 __all__ = ("standard_logical_axis_rules", "BasePartitioner", "DataLayout",
            "LogicalAxisRules", "BasePjitPartitioner", "cached_property",
