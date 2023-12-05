@@ -689,8 +689,20 @@ class FlaxLlamaAttention(nn.Module):
                     query_state, key_state, value_state, attention_mask
                 )
             else:
-                attn_output = partial(fjformer.attention.ring_attention_standard, axis_name="mp")(
-                    query_state, key_state, value_state, attention_mask
+                attention_bias = lax.select(
+                    attention_mask > 0,
+                    jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
+                    jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
+                )
+                attn_output = nn.attention.dot_product_attention(
+                    query=query_state,
+                    key=key_state,
+                    value=value_state,
+                    bias=attention_bias,
+                    dtype=jnp.promote_types(jnp.float32, self.dtype),
+                    precision=self.precision,
+                    deterministic=deterministic,
+                    dropout_rng=dropout_rng
                 )
         attn_output = self._merge_heads(attn_output)
         attn_output = self.o_proj(attn_output)

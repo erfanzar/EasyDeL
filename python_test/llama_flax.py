@@ -1,6 +1,6 @@
 import os
 
-os.environ["XLA_FLAGS"] = '--xla_force_host_platform_device_count=8'
+# os.environ["XLA_FLAGS"] = '--xla_force_host_platform_device_count=8'
 
 import copy
 import jax
@@ -20,6 +20,7 @@ from jax import numpy as jnp
 from transformers import LlamaForCausalLM
 import torch
 import numpy as np
+from fjformer.partition_utils import make_shard_and_gather_fns, match_partition_rules, create_mesh
 
 
 def main():
@@ -47,31 +48,45 @@ def main():
     torch_output = torch_model(
         input_ids=input_ids
     )
-    config.add_jax_args()
-    print(config)
-    try:
+    config.add_jax_args(
+        q_ps=jax.sharding.PartitionSpec("dp", None, "fsdp", None),
+        k_ps=jax.sharding.PartitionSpec("dp", None, "fsdp", None),
+        v_ps=jax.sharding.PartitionSpec("dp", None, "fsdp", None),
+        b_ps=jax.sharding.PartitionSpec("dp", None, None, None),
+        a_ps=jax.sharding.PartitionSpec("dp", None, "fsdp", None),
+    )
+    print("Config\n", config)
+    mesh = create_mesh()
+    print("Mesh:\n", mesh)
+    with mesh:
+        partition_specs = match_partition_rules(config.get_partition_rules(True), params)
+        shard, _ = make_shard_and_gather_fns(partition_specs, jnp.float32)
 
-        flax_model = FlaxLlamaForCausalLM(
-            config=config,
-            dtype=jnp.float32,
-            param_dtype=jnp.float32,
-            _do_init=False, input_shape=(1, 6)
-        )
-        flax_output = flax_model(
-            input_ids=flax_input_ids,
-            params=params,
+        params = jax.tree_map(lambda p, f: f(p), params, shard)
 
-        )
-        res = jnp.allclose(torch_output.logits.cpu().detach().numpy(), flax_output.logits, atol=1e-5)
-        print('Mistral Huggingface Predictions :\n', torch_output.logits.cpu().detach().numpy(),
-              '\nEasyDel Predictions: \n', flax_output.logits)
-        if res:  # A Little Bit of humor
-            print('\033[1;36mTest Passed Unfortunately 🥳')
-        else:
-            print('\033[1;31mTest Failed Successfully  🤕')
+        try:
 
-    except TypeError as e:
-        print(e.__str__())
+            flax_model = FlaxLlamaForCausalLM(
+                config=config,
+                dtype=jnp.float32,
+                param_dtype=jnp.float32,
+                _do_init=False, input_shape=(1, 6)
+            )
+            flax_output = flax_model(
+                input_ids=flax_input_ids,
+                params=params,
+
+            )
+            res = jnp.allclose(torch_output.logits.cpu().detach().numpy(), flax_output.logits, atol=1e-5)
+            print('LLama Huggingface Predictions :\n', torch_output.logits.cpu().detach().numpy(),
+                  '\nEasyDel Predictions: \n', flax_output.logits)
+            if res:  # A Little Bit of humor
+                print('\033[1;36mTest Passed Unfortunately 🥳')
+            else:
+                print('\033[1;31mTest Failed Successfully  🤕')
+
+        except TypeError as e:
+            print(e.__str__())
 
 
 if __name__ == '__main__':
