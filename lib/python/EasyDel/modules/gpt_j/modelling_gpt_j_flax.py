@@ -152,30 +152,30 @@ class GPTJConfig(PretrainedConfig, JaxBaseClassModel):
     def get_partition_rules(just_fsdp: bool = True):
         if just_fsdp:
             rules = (
-                ("model/wte/embedding", PartitionSpec(("fsdp", "mp"), )),
+                ("model/wte/embedding", PartitionSpec("fsdp", )),
 
-                ("attn/(k_proj|v_proj|q_proj)/kernel", PartitionSpec(("fsdp", "mp"), )),
-                ("attn/out_proj/kernel", PartitionSpec(("fsdp", "mp"), )),
+                ("attn/(k_proj|v_proj|q_proj)/kernel", PartitionSpec("fsdp", )),
+                ("attn/out_proj/kernel", PartitionSpec("fsdp", )),
 
-                ("mlp/fc_out/kernel", PartitionSpec(("fsdp", "mp"), )),
-                ("mlp/fc_out/bias", PartitionSpec(("fsdp", "mp"), )),
+                ("mlp/fc_out/kernel", PartitionSpec("fsdp", )),
+                ("mlp/fc_out/bias", PartitionSpec("fsdp", )),
 
-                ("mlp/fc_in/kernel", PartitionSpec(("fsdp", "mp"), )),
-                ("mlp/fc_in/bias", PartitionSpec(("fsdp", "mp"), )),
+                ("mlp/fc_in/kernel", PartitionSpec("fsdp", )),
+                ("mlp/fc_in/bias", PartitionSpec("fsdp", )),
 
-                ("lm_head/kernel", PartitionSpec(("fsdp", "mp"), )),
-                ("lm_head/bias", PartitionSpec(("fsdp", "mp"), )),
+                ("lm_head/kernel", PartitionSpec("fsdp", )),
+                ("lm_head/bias", PartitionSpec("fsdp", )),
                 ('.*', PartitionSpec(None)),
             )
         else:
             rules = (
                 ("model/wte/embedding", PartitionSpec('tp', ("fsdp", "mp"))),
 
-                ("attn/(k_proj|v_proj|q_proj)/kernel", PartitionSpec(("fsdp", "mp"), 'tp')),
+                ("attn/(k_proj|v_proj|q_proj)/kernel", PartitionSpec("fsdp", 'tp')),
                 ("attn/out_proj/kernel", PartitionSpec('tp', ("fsdp", "mp"), )),
 
-                ("mlp/fc_out/kernel", PartitionSpec(("fsdp", "mp"), 'tp')),
-                ("mlp/fc_out/bias", PartitionSpec(("fsdp", "mp"), 'tp')),
+                ("mlp/fc_out/kernel", PartitionSpec("fsdp", 'tp')),
+                ("mlp/fc_out/bias", PartitionSpec("fsdp", 'tp')),
 
                 ("mlp/fc_in/kernel", PartitionSpec('tp', ("fsdp", "mp"), )),
                 ("mlp/fc_in/bias", PartitionSpec('tp', ("fsdp", "mp"), )),
@@ -216,11 +216,11 @@ class GPTJConfig(PretrainedConfig, JaxBaseClassModel):
             bits: Optional[int] = None,
             axis_dims: Sequence[int] = (1, -1, 1, 1),
             axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
-            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", None, ("dp", "fsdp"), None),
-            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
+            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
+            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
+            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
+            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", None, None, None),
+            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
             backend: Optional[str] = None,
             **kwargs,
     ):
@@ -556,7 +556,7 @@ class FlaxGPTJAttention(nn.Module):
                 precision=self.precision,
             )
             if self.config.use_pjit_attention_force:
-                attn_weights = with_sharding_constraint(attn_weights, PartitionSpec(("dp", "fsdp"), "mp", None, None))
+                attn_weights = with_sharding_constraint(attn_weights, PartitionSpec("fsdp", "mp", None, None))
 
             attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value, precision=self.precision)
         attn_output = self._merge_heads(attn_output)

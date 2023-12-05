@@ -110,15 +110,15 @@ class MptConfig(PretrainedConfig, JaxBaseClassModel):
             ("transformer/wte/embedding", PartitionSpec("tp", ("fsdp", "mp"))),
             ("transformer/wpe/embedding", PartitionSpec("tp", ("fsdp", "mp"))),
 
-            ("attn/w_qkv/kernel", PartitionSpec(("fsdp", "mp"), "tp")),
+            ("attn/w_qkv/kernel", PartitionSpec("fsdp", "tp")),
             ("attn/wo/kernel", PartitionSpec("tp", ("fsdp", "mp"))),
-            ("attn/w_qkv/bias", PartitionSpec(("fsdp", "mp"), "tp")),
+            ("attn/w_qkv/bias", PartitionSpec("fsdp", "tp")),
             ("attn/wo/bias", PartitionSpec("tp", ("fsdp", "mp"))),
 
-            ("ffn/down/kernel", PartitionSpec(("fsdp", "mp"), "tp")),
-            ("ffn/up/kernel", PartitionSpec(("fsdp", "mp"), "tp")),
-            ("ffn/down/kernel", PartitionSpec(("fsdp", "mp"), "tp")),
-            ("ffn/up/kernel", PartitionSpec(("fsdp", "mp"), "tp")),
+            ("ffn/down/kernel", PartitionSpec("fsdp", "tp")),
+            ("ffn/up/kernel", PartitionSpec("fsdp", "tp")),
+            ("ffn/down/kernel", PartitionSpec("fsdp", "tp")),
+            ("ffn/up/kernel", PartitionSpec("fsdp", "tp")),
 
             ("attention_norm/kernel", PartitionSpec(None)),
             ("norm_f/kernel", PartitionSpec(None)),
@@ -126,23 +126,23 @@ class MptConfig(PretrainedConfig, JaxBaseClassModel):
 
             ("transformer/norm_f/kernel", PartitionSpec(None)),
             ("transformer/norm_f/bias", PartitionSpec(None)),
-            ("lm_head/kernel", PartitionSpec(("fsdp", "mp"), "tp")),
-            ("lm_head/bias", PartitionSpec(("fsdp", "mp"), "tp")),
+            ("lm_head/kernel", PartitionSpec("fsdp", "tp")),
+            ("lm_head/bias", PartitionSpec("fsdp", "tp")),
             ('.*', PartitionSpec(None)),
         ) if not fully_fsdp else (
 
-            ("transformer/wte/embedding", PartitionSpec(("fsdp", "mp"))),
-            ("transformer/wpe/embedding", PartitionSpec(("fsdp", "mp"))),
+            ("transformer/wte/embedding", PartitionSpec("fsdp")),
+            ("transformer/wpe/embedding", PartitionSpec("fsdp")),
 
-            ("attn/w_qkv/kernel", PartitionSpec(("fsdp", "mp"))),
-            ("attn/wo/kernel", PartitionSpec(("fsdp", "mp"))),
-            ("attn/w_qkv/bias", PartitionSpec(("fsdp", "mp"))),
-            ("attn/wo/bias", PartitionSpec(("fsdp", "mp"))),
+            ("attn/w_qkv/kernel", PartitionSpec("fsdp")),
+            ("attn/wo/kernel", PartitionSpec("fsdp")),
+            ("attn/w_qkv/bias", PartitionSpec("fsdp")),
+            ("attn/wo/bias", PartitionSpec("fsdp")),
 
-            ("ffn/down/kernel", PartitionSpec(("fsdp", "mp"))),
-            ("ffn/up/kernel", PartitionSpec(("fsdp", "mp"))),
-            ("ffn/down/kernel", PartitionSpec(("fsdp", "mp"))),
-            ("ffn/up/kernel", PartitionSpec(("fsdp", "mp"))),
+            ("ffn/down/kernel", PartitionSpec("fsdp")),
+            ("ffn/up/kernel", PartitionSpec("fsdp")),
+            ("ffn/down/kernel", PartitionSpec("fsdp")),
+            ("ffn/up/kernel", PartitionSpec("fsdp")),
 
             ("attention_norm/kernel", PartitionSpec(None)),
             ("norm_f/kernel", PartitionSpec(None)),
@@ -150,8 +150,8 @@ class MptConfig(PretrainedConfig, JaxBaseClassModel):
 
             ("transformer/norm_f/kernel", PartitionSpec(None)),
             ("transformer/norm_f/bias", PartitionSpec(None)),
-            ("lm_head/kernel", PartitionSpec(("fsdp", "mp"))),
-            ("lm_head/bias", PartitionSpec(("fsdp", "mp"))),
+            ("lm_head/kernel", PartitionSpec("fsdp")),
+            ("lm_head/bias", PartitionSpec("fsdp")),
             ('.*', PartitionSpec(None)),
         )
 
@@ -184,11 +184,11 @@ class MptConfig(PretrainedConfig, JaxBaseClassModel):
                      bits: Optional[int] = None,
                      axis_dims: Sequence[int] = (1, -1, 1, 1),
                      axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
-                     q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-                     k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-                     v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-                     b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", None, ("dp", "fsdp"), None),
-                     a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
+                     q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
+                     k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
+                     v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
+                     b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", None, None, None),
+                     a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
                      backend: Optional[str] = None,
                      **kwargs,
                      ):

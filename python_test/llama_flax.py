@@ -49,11 +49,11 @@ def main():
         input_ids=input_ids
     )
     config.add_jax_args(
-        q_ps=jax.sharding.PartitionSpec("dp", None, "fsdp", None),
-        k_ps=jax.sharding.PartitionSpec("dp", None, "fsdp", None),
-        v_ps=jax.sharding.PartitionSpec("dp", None, "fsdp", None),
+        q_ps=jax.sharding.PartitionSpec("fsdp", None, None, None),
+        k_ps=jax.sharding.PartitionSpec("fsdp", None, None, None),
+        v_ps=jax.sharding.PartitionSpec("fsdp", None, None, None),
         b_ps=jax.sharding.PartitionSpec("dp", None, None, None),
-        a_ps=jax.sharding.PartitionSpec("dp", None, "fsdp", None),
+        a_ps=jax.sharding.PartitionSpec("fsdp", None, None, None),
     )
     print("Config\n", config)
     mesh = create_mesh()
