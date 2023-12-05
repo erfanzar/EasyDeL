@@ -55,6 +55,7 @@ def main():
         b_ps=jax.sharding.PartitionSpec("dp", None, None, None),
         a_ps=jax.sharding.PartitionSpec("dp", None, None, None),
     )
+    config.use_shard_map = False
     print("Config\n", config)
     mesh = create_mesh()
     print("Mesh:\n", mesh)
