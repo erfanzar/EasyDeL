@@ -84,16 +84,16 @@ class FlaxLTConfig(PretrainedConfig, JaxBaseClassModel):
         return (
             # Emb
             ("model/wte/embedding", PartitionSpec("mp", "fsdp")),
-            ("attn/(k_proj|v_proj|q_proj)/kernel", PartitionSpec("fsdp", "mp")),
-            ("attn/o_proj/kernel", PartitionSpec("mp", "fsdp")),
-            ("mlp/down/kernel", PartitionSpec("mp", "fsdp")),
-            ("mlp/up/kernel", PartitionSpec("fsdp", "mp")),
-            ("lm_head/kernel", PartitionSpec("fsdp", "mp")),
-            ('.*', PartitionSpec(None)),
-            ('ln/kernel', PartitionSpec(None)),
-            ('ln1/kernel', PartitionSpec(None)),
-            ('ln2/kernel', PartitionSpec(None)),
-        )
+            ("attn/(k_proj|v_proj|q_proj)/kernel", PartitionSpec("fsdp"),
+             ("attn/o_proj/kernel", PartitionSpec("mp", "fsdp")),
+             ("mlp/down/kernel", PartitionSpec("mp", "fsdp")),
+             ("mlp/up/kernel", PartitionSpec("fsdp")),
+             ("lm_head/kernel", PartitionSpec("fsdp", "mp")),
+             ('.*', PartitionSpec(None)),
+             ('ln/kernel', PartitionSpec(None)),
+             ('ln1/kernel', PartitionSpec(None)),
+             ('ln2/kernel', PartitionSpec(None)),
+             ))
 
     @staticmethod
     def get_weight_decay_exclusions():
@@ -164,7 +164,7 @@ class LTSelfAttention(nn.Module):
             attn_weights = jnp.add(attention_mask, attn_weights)
 
         if self.config.fsdp:
-            attn_weights = with_sharding_constraint(attn_weights, PartitionSpec(("dp", "fsdp"), "mp", None, None))
+            attn_weights = with_sharding_constraint(attn_weights, PartitionSpec("fsdp", "mp", None, None))
 
         attn_weights = jax.nn.softmax(attn_weights, axis=-1)
         value = jnp.matmul(attn_weights, wv).reshape(b, t, c)

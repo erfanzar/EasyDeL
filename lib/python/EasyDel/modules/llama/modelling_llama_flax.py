@@ -180,35 +180,35 @@ class LlamaConfig(PretrainedConfig, JaxBaseClassModel):
 
             ("model/embed_tokens/embedding", PS("tp", ("fsdp", "mp"))),
 
-            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PS(("fsdp", "mp"), "tp")),
+            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PS("fsdp", "tp")),
             ("self_attn/o_proj/kernel", PS("tp", ("fsdp", "mp"))),
 
-            ("mlp/gate_proj/kernel", PS(("fsdp", "mp"), "tp")),
+            ("mlp/gate_proj/kernel", PS("fsdp", "tp")),
             ("mlp/down_proj/kernel", PS("tp", ("fsdp", "mp"))),
-            ("mlp/up_proj/kernel", PS(("fsdp", "mp"), "tp")),
+            ("mlp/up_proj/kernel", PS("fsdp", "tp")),
 
             ("input_layernorm/kernel", PS(None)),
             ("post_attention_layernorm/kernel", PS(None)),
 
             ("model/norm/kernel", PS(None)),
-            ("lm_head/kernel", PS(("fsdp", "mp"), "tp")),
+            ("lm_head/kernel", PS("fsdp", "tp")),
             ('.*', PS(None)),
         ) if not fully_fsdp else (
 
-            ("model/embed_tokens/embedding", PS(("fsdp", "mp"))),
+            ("model/embed_tokens/embedding", PS("fsdp", "mp")),
 
-            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PS(("fsdp", "mp"))),
-            ("self_attn/o_proj/kernel", PS(("fsdp", "mp"))),
+            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PS("fsdp")),
+            ("self_attn/o_proj/kernel", PS("fsdp")),
 
-            ("mlp/gate_proj/kernel", PS(("fsdp", "mp"))),
-            ("mlp/down_proj/kernel", PS(("fsdp", "mp"))),
-            ("mlp/up_proj/kernel", PS(("fsdp", "mp"))),
+            ("mlp/gate_proj/kernel", PS("fsdp")),
+            ("mlp/down_proj/kernel", PS("fsdp")),
+            ("mlp/up_proj/kernel", PS("fsdp")),
 
             ("input_layernorm/kernel", PS(None)),
             ("post_attention_layernorm/kernel", PS(None)),
 
             ("model/norm/kernel", PS(None)),
-            ("lm_head/kernel", PS(("fsdp", "mp"))),
+            ("lm_head/kernel", PS("fsdp")),
             ('.*', PS('fsdp')),
         )
 
@@ -234,11 +234,11 @@ class LlamaConfig(PretrainedConfig, JaxBaseClassModel):
                      hidden_act: str = 'silu',
                      axis_dims: Sequence[int] = (1, -1, 1, 1),
                      axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
-                     q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-                     k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-                     v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-                     b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, "mp", None),
-                     a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
+                     q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
+                     k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
+                     v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
+                     b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", None, "mp", None),
+                     a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
                      backend: Optional[str] = None,
                      scan_layers: bool = True,
                      **kwargs,
@@ -556,9 +556,9 @@ class FlaxLlamaAttention(nn.Module):
             hidden_states)
 
         if self.config.use_pjit_attention_force:
-            query_state = with_sharding_constraint(query_state, PS(("dp", "fsdp"), "mp", "tp"))
-            key_state = with_sharding_constraint(key_state, PS(("dp", "fsdp"), "mp", "tp"))
-            value_state = with_sharding_constraint(value_state, PS(("dp", "fsdp"), "mp", "tp"))
+            query_state = with_sharding_constraint(query_state, PS("fsdp", "mp", "tp"))
+            key_state = with_sharding_constraint(key_state, PS("fsdp", "mp", "tp"))
+            value_state = with_sharding_constraint(value_state, PS("fsdp", "mp", "tp"))
 
         query_state = query_state.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
         key_state = key_state.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
