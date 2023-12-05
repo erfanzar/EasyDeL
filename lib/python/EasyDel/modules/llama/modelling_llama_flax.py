@@ -10,7 +10,7 @@ from jax.sharding import PartitionSpec as PS
 import flax.linen as nn
 from jax.experimental.shard_map import shard_map
 from flax.traverse_util import flatten_dict, unflatten_dict
-from flax.linen import partitioning as nn_partitioning
+from flax.linen import partitioning as nn_partitioning, dot_product_attention_weights
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks, make_causal_mask
 from transformers.configuration_utils import PretrainedConfig
@@ -176,26 +176,26 @@ class LlamaConfig(PretrainedConfig, JaxBaseClassModel):
         :return: A list of tuples
 
         """
-        return (
+        (
 
-            ("model/embed_tokens/embedding", PS("tp", ("fsdp", "mp"))),
+            ("model/embed_tokens/embedding", PS("dp", "fsdp")),
 
-            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PS("fsdp", "tp")),
-            ("self_attn/o_proj/kernel", PS("tp", ("fsdp", "mp"))),
+            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PS("fsdp", "dp")),
+            ("self_attn/o_proj/kernel", PS("dp", "fsdp")),
 
-            ("mlp/gate_proj/kernel", PS("fsdp", "tp")),
-            ("mlp/down_proj/kernel", PS("tp", ("fsdp", "mp"))),
-            ("mlp/up_proj/kernel", PS("fsdp", "tp")),
+            ("mlp/gate_proj/kernel", PS("fsdp", "dp")),
+            ("mlp/down_proj/kernel", PS("dp", "fsdp")),
+            ("mlp/up_proj/kernel", PS("fsdp", "dp")),
 
             ("input_layernorm/kernel", PS(None)),
             ("post_attention_layernorm/kernel", PS(None)),
 
             ("model/norm/kernel", PS(None)),
-            ("lm_head/kernel", PS("fsdp", "tp")),
+            ("lm_head/kernel", PS("fsdp", "dp")),
             ('.*', PS(None)),
         ) if not fully_fsdp else (
 
-            ("model/embed_tokens/embedding", PS("fsdp", "mp")),
+            ("model/embed_tokens/embedding", PS("fsdp")),
 
             ("self_attn/(q_proj|k_proj|v_proj)/kernel", PS("fsdp")),
             ("self_attn/o_proj/kernel", PS("fsdp")),
@@ -694,16 +694,19 @@ class FlaxLlamaAttention(nn.Module):
                     jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
                     jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
                 )
-                attn_output = nn.attention.dot_product_attention(
+                attn_weights = dot_product_attention_weights(
                     query=query_state,
                     key=key_state,
-                    value=value_state,
                     bias=attention_bias,
-                    dtype=jnp.promote_types(jnp.float32, self.dtype),
-                    precision=self.precision,
+                    dtype=jnp.promote_types(self.dtype, jnp.float32),
                     deterministic=deterministic,
-                    dropout_rng=dropout_rng
+                    dropout_rate=self.config.attn_pdrop,
+                    precision=self.precision,
                 )
+                if self.config.use_pjit_attention_force:
+                    attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "mp", None, None))
+
+                attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value_state)
         attn_output = self._merge_heads(attn_output)
         attn_output = self.o_proj(attn_output)
 
