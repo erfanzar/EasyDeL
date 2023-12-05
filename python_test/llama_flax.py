@@ -49,11 +49,11 @@ def main():
         input_ids=input_ids
     )
     config.add_jax_args(
-        q_ps=jax.sharding.PartitionSpec("fsdp", None, None, None),
-        k_ps=jax.sharding.PartitionSpec("fsdp", None, None, None),
-        v_ps=jax.sharding.PartitionSpec("fsdp", None, None, None),
+        q_ps=jax.sharding.PartitionSpec("dp", None, None, None),
+        k_ps=jax.sharding.PartitionSpec("dp", None, None, None),
+        v_ps=jax.sharding.PartitionSpec("dp", None, None, None),
         b_ps=jax.sharding.PartitionSpec("dp", None, None, None),
-        a_ps=jax.sharding.PartitionSpec("fsdp", None, None, None),
+        a_ps=jax.sharding.PartitionSpec("dp", None, None, None),
     )
     print("Config\n", config)
     mesh = create_mesh()
@@ -70,7 +70,7 @@ def main():
                 config=config,
                 dtype=jnp.float32,
                 param_dtype=jnp.float32,
-                _do_init=False, input_shape=(1, 6)
+                _do_init=False, input_shape=(1, 128)
             )
             flax_output = flax_model(
                 input_ids=flax_input_ids,
