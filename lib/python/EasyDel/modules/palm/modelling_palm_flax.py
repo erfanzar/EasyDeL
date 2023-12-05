@@ -58,23 +58,23 @@ class PalmConfig(PretrainedConfig):
     @staticmethod
     def get_partition_rules(fully_fsdp: bool = False):
         return (
-            ('wi/kernel', PartitionSpec(('fsdp', 'mp'))),
-            ('attn_wo/kernel', PartitionSpec(('fsdp', 'mp'), 'tp')),
-            ('ff_wo/kernel', PartitionSpec(('fsdp', 'mp'), 'tp')),
-            ('wte/embedding', PartitionSpec(('fsdp', 'mp'), 'tp')),
-            ('lm_head/kernel', PartitionSpec(('fsdp', 'mp'))),
-            ('post_norm/kernel', PartitionSpec(('fsdp', 'mp'))),
-            ('norm/kernel', PartitionSpec(('fsdp', 'mp'), 'tp')),
+            ('wi/kernel', PartitionSpec("fsdp")),
+            ('attn_wo/kernel', PartitionSpec("fsdp", 'tp')),
+            ('ff_wo/kernel', PartitionSpec("fsdp", 'tp')),
+            ('wte/embedding', PartitionSpec("fsdp", 'tp')),
+            ('lm_head/kernel', PartitionSpec("fsdp")),
+            ('post_norm/kernel', PartitionSpec("fsdp")),
+            ('norm/kernel', PartitionSpec("fsdp", 'tp')),
             ('.*', PartitionSpec(None)),
         ) if not fully_fsdp else (
-            ('wi/kernel', PartitionSpec(('fsdp', 'mp'))),
-            ('attn_wo/kernel', PartitionSpec(('fsdp', 'mp'))),
-            ('ff_wo/kernel', PartitionSpec(('fsdp', 'mp'))),
-            ('wte/embedding', PartitionSpec(('fsdp', 'mp'))),
-            ('lm_head/kernel', PartitionSpec(('fsdp', 'mp'))),
-            ('post_norm/kernel', PartitionSpec(('fsdp', 'mp'))),
-            ('norm/kernel', PartitionSpec(('fsdp', 'mp'))),
-            ('.*', PartitionSpec(('fsdp', 'mp'))),
+            ('wi/kernel', PartitionSpec("fsdp")),
+            ('attn_wo/kernel', PartitionSpec("fsdp")),
+            ('ff_wo/kernel', PartitionSpec("fsdp")),
+            ('wte/embedding', PartitionSpec("fsdp")),
+            ('lm_head/kernel', PartitionSpec("fsdp")),
+            ('post_norm/kernel', PartitionSpec("fsdp")),
+            ('norm/kernel', PartitionSpec("fsdp")),
+            ('.*', PartitionSpec("fsdp")),
         )
 
     def add_jax_args(

@@ -97,29 +97,29 @@ class FalconConfig(PretrainedConfig, JaxBaseClassModel):
     @staticmethod
     def get_partition_rules(fully_fsdp: bool = False):
         return (
-            ('word_embeddings/embedding', PartitionSpec('tp', ('fsdp', 'mp'))),
-            ('self_attention/query_key_value/(kernel)', PartitionSpec('tp', ('fsdp', 'mp'))),
-            ('self_attention/dense/(kernel)', PartitionSpec('tp', ('fsdp', 'mp'))),
-            ('mlp/dense_4h_to_h/(kernel)', PartitionSpec('tp', ('fsdp', 'mp'))),
-            ('mlp/dense_h_to_4h/(kernel)', PartitionSpec('tp', ('fsdp', 'mp'))),
-            ('lm_head/kernel', PartitionSpec('tp', ('fsdp', 'mp'))),
-            ('transformer/ln_f/bias', PartitionSpec(('fsdp', 'mp'))),
-            ('transformer/ln_f/scale', PartitionSpec(('fsdp', 'mp'))),
-            ('transformer/post_attention_layernorm/scale', PartitionSpec(('fsdp', 'mp'))),
-            ('transformer/post_attention_layernorm/bias', PartitionSpec(('fsdp', 'mp'))),
-            ('.*', PartitionSpec('tp'))
+            ('word_embeddings/embedding', PartitionSpec('tp', "fsdp")),
+            ('self_attention/query_key_value/(kernel)', PartitionSpec('tp', "fsdp")),
+            ('self_attention/dense/(kernel)', PartitionSpec('tp', "fsdp")),
+            ('mlp/dense_4h_to_h/(kernel)', PartitionSpec('tp', "fsdp")),
+            ('mlp/dense_h_to_4h/(kernel)', PartitionSpec('tp', "fsdp")),
+            ('lm_head/kernel', PartitionSpec('tp', "fsdp")),
+            ('transformer/ln_f/bias', PartitionSpec("fsdp")),
+            ('transformer/ln_f/scale', PartitionSpec("fsdp")),
+            ('transformer/post_attention_layernorm/scale', PartitionSpec("fsdp")),
+            ('transformer/post_attention_layernorm/bias', PartitionSpec("fsdp")),
+            ('.*', PartitionSpec('fsdp'))
         ) if not fully_fsdp else (
-            ('word_embeddings/embedding', PartitionSpec(('fsdp', 'mp'))),
-            ('self_attention/query_key_value/(kernel|bias)', PartitionSpec(('fsdp', 'mp'))),
-            ('self_attention/dense/(kernel|bias)', PartitionSpec(('fsdp', 'mp'))),
-            ('mlp/dense_4h_to_h/(kernel|bias)', PartitionSpec(('fsdp', 'mp'))),
-            ('mlp/dense_h_to_4h/(kernel|bias)', PartitionSpec(('fsdp', 'mp'))),
-            ('lm_head/kernel', PartitionSpec(('fsdp', 'mp'))),
-            ('transformer/ln_f/bias', PartitionSpec(('fsdp', 'mp'))),
-            ('transformer/ln_f/scale', PartitionSpec(('fsdp', 'mp'))),
-            ('transformer/post_attention_layernorm/scale', PartitionSpec(('fsdp', 'mp'))),
-            ('transformer/post_attention_layernorm/bias', PartitionSpec(('fsdp', 'mp'))),
-            ('.*', PartitionSpec(('fsdp', 'mp')))
+            ('word_embeddings/embedding', PartitionSpec("fsdp")),
+            ('self_attention/query_key_value/(kernel|bias)', PartitionSpec("fsdp")),
+            ('self_attention/dense/(kernel|bias)', PartitionSpec("fsdp")),
+            ('mlp/dense_4h_to_h/(kernel|bias)', PartitionSpec("fsdp")),
+            ('mlp/dense_h_to_4h/(kernel|bias)', PartitionSpec("fsdp")),
+            ('lm_head/kernel', PartitionSpec("fsdp")),
+            ('transformer/ln_f/bias', PartitionSpec("fsdp")),
+            ('transformer/ln_f/scale', PartitionSpec("fsdp")),
+            ('transformer/post_attention_layernorm/scale', PartitionSpec("fsdp")),
+            ('transformer/post_attention_layernorm/bias', PartitionSpec("fsdp")),
+            ('.*', PartitionSpec("fsdp"))
         )
 
     @staticmethod

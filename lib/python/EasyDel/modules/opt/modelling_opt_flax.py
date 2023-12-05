@@ -105,7 +105,7 @@ class OPTConfig(PretrainedConfig, JaxBaseClassModel):
             raise NotImplementedError
         else:
             return (
-                ('.*', PartitionSpec(('fsdp', 'mp')))
+                ('.*', PartitionSpec("fsdp"))
             )
 
     def add_jax_args(
