@@ -59,12 +59,12 @@ class PalmConfig(PretrainedConfig):
     def get_partition_rules(fully_fsdp: bool = False):
         return (
             ('wi/kernel', PartitionSpec("fsdp")),
-            ('attn_wo/kernel', PartitionSpec("fsdp", 'tp')),
-            ('ff_wo/kernel', PartitionSpec("fsdp", 'tp')),
-            ('wte/embedding', PartitionSpec("fsdp", 'tp')),
+            ('attn_wo/kernel', PartitionSpec("fsdp", "dp")),
+            ('ff_wo/kernel', PartitionSpec("fsdp", "dp")),
+            ('wte/embedding', PartitionSpec("fsdp", "dp")),
             ('lm_head/kernel', PartitionSpec("fsdp")),
             ('post_norm/kernel', PartitionSpec("fsdp")),
-            ('norm/kernel', PartitionSpec("fsdp", 'tp')),
+            ('norm/kernel', PartitionSpec("fsdp", "dp")),
             ('.*', PartitionSpec(None)),
         ) if not fully_fsdp else (
             ('wi/kernel', PartitionSpec("fsdp")),
@@ -80,12 +80,12 @@ class PalmConfig(PretrainedConfig):
     def add_jax_args(
             self,
             axis_dims: Sequence[int] = (1, -1, 1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
-            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
-            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
-            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
-            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", None, None, None),
-            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
+            axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
+            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
+            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
+            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
+            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", None, "fsdp", None),
+            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
             backend: Optional[str] = None,
             **kwargs,
     ):

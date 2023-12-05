@@ -64,7 +64,7 @@ class MistralConfig(PretrainedConfig, JaxBaseClassModel):
             freq_max_position_embeddings: int = 4096,
             bits: Optional[int] = None,
             axis_dims: Sequence[int] = (1, -1, 1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
+            axis_names: Sequence[str] = ("dp", "fsdp", "mp"),
             **kwargs,
     ):
         """
@@ -104,8 +104,6 @@ class MistralConfig(PretrainedConfig, JaxBaseClassModel):
         :param bits: Optional[int]: Specify the number of bits used for quantization
         :param axis_dims: Sequence[int]: Specify the dimension of each axis
         :param axis_names: Sequence[str]: Specify the names of each axis in the tensor
-        :param &quot;fsdp&quot;: Specify the frequency dimension of the input
-        :param &quot;tp&quot;: Determine the number of time-steps in the input sequence
         :param &quot;mp&quot;): Define the maximum position embeddings
         :param **kwargs: Pass a variable number of keyword arguments to a function
         :param : Define the number of layers in the model
@@ -166,13 +164,13 @@ class MistralConfig(PretrainedConfig, JaxBaseClassModel):
         """
         return (
 
-            ("model/embed_tokens/embedding", PS("tp", ("fsdp", "mp"))),
+            ("model/embed_tokens/embedding", PS("dp", "fsdp")),
 
             ("self_attn/(q_proj|k_proj|v_proj)/kernel", PS("fsdp", "dp")),
-            ("self_attn/o_proj/kernel", PS("tp", ("fsdp", "mp"))),
+            ("self_attn/o_proj/kernel", PS("dp", "fsdp")),
 
             ("mlp/gate_proj/kernel", PS("fsdp", "dp")),
-            ("mlp/down_proj/kernel", PS("tp", ("fsdp", "mp"))),
+            ("mlp/down_proj/kernel", PS("dp", "fsdp")),
             ("mlp/up_proj/kernel", PS("fsdp", "dp")),
 
             ("input_layernorm/kernel", PS(None)),
@@ -214,12 +212,12 @@ class MistralConfig(PretrainedConfig, JaxBaseClassModel):
                      freq_max_position_embeddings: int = None,
                      bits: Optional[int] = None,
                      axis_dims: Sequence[int] = (1, -1, 1, 1),
-                     axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
-                     q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
-                     k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
-                     v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
-                     b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", None, "tp", None),
-                     a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
+                     axis_names: Sequence[str] = ("dp", "fsdp", "mp"),
+                     q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
+                     k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
+                     v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
+                     b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", None, "fsdp", None),
+                     a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
                      backend: Optional[str] = None,
                      **kwargs,
                      ):
@@ -251,7 +249,7 @@ class MistralConfig(PretrainedConfig, JaxBaseClassModel):
         :param backend: typing.Optional[str]: backend to use for model
         :param : Enable gradient checkpointing
         :return: A tuple of the following:
-        
+
         """
         self.use_flash_attention = use_flash_attention
         self.number_rep_kv = number_rep_kv

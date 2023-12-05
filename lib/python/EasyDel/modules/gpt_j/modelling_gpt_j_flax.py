@@ -88,7 +88,7 @@ class GPTJConfig(PretrainedConfig, JaxBaseClassModel):
             flash_attn_key_chunk_size: int = 2048,
             bits: Optional[int] = None,
             axis_dims: Sequence[int] = (1, -1, 1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
+            axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
             **kwargs,
     ):
         self.bits = bits
@@ -169,26 +169,26 @@ class GPTJConfig(PretrainedConfig, JaxBaseClassModel):
             )
         else:
             rules = (
-                ("model/wte/embedding", PartitionSpec('tp', ("fsdp", "mp"))),
+                ("model/wte/embedding", PartitionSpec("dp", ("fsdp", "mp"))),
 
-                ("attn/(k_proj|v_proj|q_proj)/kernel", PartitionSpec("fsdp", 'tp')),
-                ("attn/out_proj/kernel", PartitionSpec('tp', ("fsdp", "mp"), )),
+                ("attn/(k_proj|v_proj|q_proj)/kernel", PartitionSpec("fsdp", "dp")),
+                ("attn/out_proj/kernel", PartitionSpec("dp", ("fsdp", "mp"), )),
 
-                ("mlp/fc_out/kernel", PartitionSpec("fsdp", 'tp')),
-                ("mlp/fc_out/bias", PartitionSpec("fsdp", 'tp')),
+                ("mlp/fc_out/kernel", PartitionSpec("fsdp", "dp")),
+                ("mlp/fc_out/bias", PartitionSpec("fsdp", "dp")),
 
-                ("mlp/fc_in/kernel", PartitionSpec('tp', ("fsdp", "mp"), )),
-                ("mlp/fc_in/bias", PartitionSpec('tp', ("fsdp", "mp"), )),
+                ("mlp/fc_in/kernel", PartitionSpec("dp", ("fsdp", "mp"), )),
+                ("mlp/fc_in/bias", PartitionSpec("dp", ("fsdp", "mp"), )),
 
-                ("lm_head/kernel", PartitionSpec('tp', ("fsdp", "mp"), )),
-                ("lm_head/bias", PartitionSpec('tp', ("fsdp", "mp"), )),
+                ("lm_head/kernel", PartitionSpec("dp", ("fsdp", "mp"), )),
+                ("lm_head/bias", PartitionSpec("dp", ("fsdp", "mp"), )),
                 ('.*', PartitionSpec(None)),
             )
         return rules
 
     @staticmethod
     def get_mesh_names():
-        return "dp", "fsdp", "tp", "mp"
+        return "dp", "fsdp",  "mp"
 
     def add_jax_args(
             self,
@@ -215,12 +215,12 @@ class GPTJConfig(PretrainedConfig, JaxBaseClassModel):
             flash_attn_key_chunk_size: int = 2048,
             bits: Optional[int] = None,
             axis_dims: Sequence[int] = (1, -1, 1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
-            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
-            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
-            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
-            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", None, None, None),
-            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
+            axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
+            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
+            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
+            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
+            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", None, "fsdp", None),
+            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
             backend: Optional[str] = None,
             **kwargs,
     ):

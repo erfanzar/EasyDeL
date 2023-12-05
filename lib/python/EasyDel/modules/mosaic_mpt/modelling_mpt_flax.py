@@ -54,7 +54,7 @@ class MptConfig(PretrainedConfig, JaxBaseClassModel):
                  flash_attn_key_chunk_size: int = 2048,
                  bits: Optional[int] = None,
                  axis_dims: Sequence[int] = (1, -1, 1, 1),
-                 axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
+                 axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
                  **kwargs
                  ):
 
@@ -107,18 +107,18 @@ class MptConfig(PretrainedConfig, JaxBaseClassModel):
     def get_partition_rules(fully_fsdp: bool = False):
         return (
 
-            ("transformer/wte/embedding", PartitionSpec("tp", "fsdp")),
-            ("transformer/wpe/embedding", PartitionSpec("tp", "fsdp")),
+            ("transformer/wte/embedding", PartitionSpec("dp", "fsdp")),
+            ("transformer/wpe/embedding", PartitionSpec("dp", "fsdp")),
 
-            ("attn/w_qkv/kernel", PartitionSpec("fsdp", "tp")),
-            ("attn/wo/kernel", PartitionSpec("tp", "fsdp")),
-            ("attn/w_qkv/bias", PartitionSpec("fsdp", "tp")),
-            ("attn/wo/bias", PartitionSpec("tp", "fsdp")),
+            ("attn/w_qkv/kernel", PartitionSpec("fsdp", "dp")),
+            ("attn/wo/kernel", PartitionSpec("dp", "fsdp")),
+            ("attn/w_qkv/bias", PartitionSpec("fsdp", "dp")),
+            ("attn/wo/bias", PartitionSpec("dp", "fsdp")),
 
-            ("ffn/down/kernel", PartitionSpec("fsdp", "tp")),
-            ("ffn/up/kernel", PartitionSpec("fsdp", "tp")),
-            ("ffn/down/kernel", PartitionSpec("fsdp", "tp")),
-            ("ffn/up/kernel", PartitionSpec("fsdp", "tp")),
+            ("ffn/down/kernel", PartitionSpec("fsdp", "dp")),
+            ("ffn/up/kernel", PartitionSpec("fsdp", "dp")),
+            ("ffn/down/kernel", PartitionSpec("fsdp", "dp")),
+            ("ffn/up/kernel", PartitionSpec("fsdp", "dp")),
 
             ("attention_norm/kernel", PartitionSpec(None)),
             ("norm_f/kernel", PartitionSpec(None)),
@@ -126,8 +126,8 @@ class MptConfig(PretrainedConfig, JaxBaseClassModel):
 
             ("transformer/norm_f/kernel", PartitionSpec(None)),
             ("transformer/norm_f/bias", PartitionSpec(None)),
-            ("lm_head/kernel", PartitionSpec("fsdp", "tp")),
-            ("lm_head/bias", PartitionSpec("fsdp", "tp")),
+            ("lm_head/kernel", PartitionSpec("fsdp", "dp")),
+            ("lm_head/bias", PartitionSpec("fsdp", "dp")),
             ('.*', PartitionSpec(None)),
         ) if not fully_fsdp else (
 
@@ -183,12 +183,12 @@ class MptConfig(PretrainedConfig, JaxBaseClassModel):
                      flash_attn_key_chunk_size: int = 2048,
                      bits: Optional[int] = None,
                      axis_dims: Sequence[int] = (1, -1, 1, 1),
-                     axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
-                     q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
-                     k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
-                     v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
-                     b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", None, None, None),
-                     a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
+                     axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
+                     q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
+                     k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
+                     v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
+                     b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", None, "fsdp", None),
+                     a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
                      backend: Optional[str] = None,
                      **kwargs,
                      ):

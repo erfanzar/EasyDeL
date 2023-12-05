@@ -227,7 +227,7 @@ def get_ranks_and_size(mesh):
     """
     The get_ranks_and_size function is used to determine the number of MPI processes
     (``mp_node_size``) and the number of devices per process (``dp_node_size``).
-    The ``mesh.shape[&quot;tp&quot;] * mesh.shape[&quot;mp&quot;]`` determines how many MPI processes are needed,
+    The ``mesh.shape[mp]`` determines how many MPI processes are needed,
     and then we divide that by the local device count to get ``mp_node_size = max( 1, mp / jax.local )`.
     This means that if there are more than enough devices for all MPI ranks on a node, each rank will only use one device; otherwise it will use
 
@@ -236,7 +236,7 @@ def get_ranks_and_size(mesh):
     
     """
     out = dict(mesh=mesh)
-    mp_size = mesh.shape["tp"] * mesh.shape["mp"]
+    mp_size = mesh.shape["mp"]
     mp_node_size = max(1, mp_size // jax.local_device_count())
     dp_node_size = jax.process_count() // mp_node_size
     out.update(mp_node_size=mp_node_size,
@@ -444,7 +444,7 @@ def smart_flash_attention(
 
 
 def create_mesh(
-        axis_dims: Sequence[int] = (1, -1, 1, 1), axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"), backend=""
+        axis_dims: Sequence[int] = (1, -1, 1, 1), axis_names: Sequence[str] = ("dp", "fsdp", "mp"), backend=""
 ):
     """
     The create_mesh function creates a mesh object that can be used to shard arrays.
@@ -480,12 +480,12 @@ class JaxBaseClassModel:
     def __init__(
             self,
             axis_dims: Sequence[int] = (1, -1, 1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
-            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
-            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
-            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
-            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", None, None, None),
-            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
+            axis_names: Sequence[str] = ("dp", "fsdp", "mp"),
+            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
+            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
+            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
+            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", None, "fsdp", None),
+            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
             backend: Optional[None] = None
     ):
         """
@@ -575,12 +575,12 @@ class JaxBaseClassModel:
     def add_pss(
             self,
             axis_dims: Sequence[int] = (1, -1, 1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
-            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
-            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
-            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
-            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", None, "tp", None),
-            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
+            axis_names: Sequence[str] = ("dp", "fsdp", "mp"),
+            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
+            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
+            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
+            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", None, "fsdp", None),
+            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
             backend: Optional[str] = None,
     ):
         self.axis_dims = axis_dims

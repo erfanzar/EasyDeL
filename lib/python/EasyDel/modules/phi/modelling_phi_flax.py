@@ -51,7 +51,7 @@ class PhiConfig(PretrainedConfig, JaxBaseClassModel):
             pad_vocab_size_multiple: int = 64,
             bits: Optional[int] = None,
             axis_dims: Sequence[int] = (1, -1, 1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
+            axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
             gradient_checkpointing: str = "nothing_saveable",
             **kwargs
     ) -> None:
@@ -85,7 +85,7 @@ class PhiConfig(PretrainedConfig, JaxBaseClassModel):
             self,
             bits: Optional[int] = None,
             axis_dims: Sequence[int] = (1, -1, 1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
+            axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
             gradient_checkpointing: str = "nothing_saveable",
             **kwargs
     ):

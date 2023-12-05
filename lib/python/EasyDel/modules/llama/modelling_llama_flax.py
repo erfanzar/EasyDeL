@@ -68,7 +68,7 @@ class LlamaConfig(PretrainedConfig, JaxBaseClassModel):
             hidden_act: str = 'silu',
             pretraining_tp: int = 1,
             axis_dims: Sequence[int] = (1, -1, 1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
+            axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
             scan_layers: bool = True,
             use_shard_map: bool = True,
             **kwargs,
@@ -233,12 +233,12 @@ class LlamaConfig(PretrainedConfig, JaxBaseClassModel):
                      attention_bias: bool = False,
                      hidden_act: str = 'silu',
                      axis_dims: Sequence[int] = (1, -1, 1, 1),
-                     axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
-                     q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
-                     k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
-                     v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
+                     axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
+                     q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
+                     k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
+                     v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
                      b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", None, "mp", None),
-                     a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("fsdp", "mp", "tp", None),
+                     a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
                      backend: Optional[str] = None,
                      scan_layers: bool = True,
                      **kwargs,
@@ -556,9 +556,9 @@ class FlaxLlamaAttention(nn.Module):
             hidden_states)
 
         if self.config.use_pjit_attention_force:
-            query_state = with_sharding_constraint(query_state, PS("fsdp", "mp", "tp"))
-            key_state = with_sharding_constraint(key_state, PS("fsdp", "mp", "tp"))
-            value_state = with_sharding_constraint(value_state, PS("fsdp", "mp", "tp"))
+            query_state = with_sharding_constraint(query_state, PS(("dp", "fsdp"), None, "mp"))
+            key_state = with_sharding_constraint(key_state, PS(("dp", "fsdp"), None, "mp"))
+            value_state = with_sharding_constraint(value_state, PS(("dp", "fsdp"), None, "mp"))
 
         query_state = query_state.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
         key_state = key_state.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
