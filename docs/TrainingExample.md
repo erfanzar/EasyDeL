@@ -78,7 +78,7 @@ class TrainArguments(
             # Extra kwargs to be passed to optimizer for initialization
             save_steps: Union[int, None] = None,
             save_dir: str = 'easydel_ckpt',
-            use_pjit_attention_force: bool = False,
+            use_pjit_attention_force: bool = True,
             dtype=jnp.bfloat16,
             param_dtype=jnp.bfloat16,
             fully_fsdp=True,
