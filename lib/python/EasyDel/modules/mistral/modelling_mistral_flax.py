@@ -366,14 +366,12 @@ class FlaxMistralMLP(nn.Module):
 
     def setup(self) -> None:
         if self.config.bits is not None:
-            _dot_general_cls = q_config.fully_quantized(
+            dot_general_cls = q_flax.QDotGeneral(q_config.fully_quantized(
                 fwd_bits=self.config.bits,
                 bwd_bits=self.config.bits
-            )
+            ))
         else:
-            _dot_general_cls = None
-
-        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
+            dot_general_cls = jax.lax.dot_general
         dense = functools.partial(
             nn.Dense,
             use_bias=False,
@@ -407,14 +405,12 @@ class FlaxMistralAttention(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
         if self.config.bits is not None:
-            _dot_general_cls = q_config.fully_quantized(
+            dot_general_cls = q_flax.QDotGeneral(q_config.fully_quantized(
                 fwd_bits=self.config.bits,
                 bwd_bits=self.config.bits
-            )
+            ))
         else:
-            _dot_general_cls = None
-
-        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
+            dot_general_cls = jax.lax.dot_general
         dense = functools.partial(
             nn.Dense,
             use_bias=False,
@@ -1059,14 +1055,12 @@ class FlaxMistralForCausalLMModule(nn.Module):
         )
 
         if self.config.bits is not None:
-            _dot_general_cls = q_config.fully_quantized(
+            dot_general_cls = q_flax.QDotGeneral(q_config.fully_quantized(
                 fwd_bits=self.config.bits,
                 bwd_bits=self.config.bits
-            )
+            ))
         else:
-            _dot_general_cls = None
-
-        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
+            dot_general_cls = jax.lax.dot_general
         self.lm_head = nn.Dense(
             self.config.vocab_size,
             dtype=self.dtype,

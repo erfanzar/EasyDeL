@@ -272,14 +272,12 @@ class FlaxMptMLP(nn.Module):
 
     def setup(self) -> None:
         if self.config.bits is not None:
-            _dot_general_cls = q_config.fully_quantized(
+            dot_general_cls = q_flax.QDotGeneral(q_config.fully_quantized(
                 fwd_bits=self.config.bits,
                 bwd_bits=self.config.bits
-            )
+            ))
         else:
-            _dot_general_cls = None
-
-        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
+            dot_general_cls = jax.lax.dot_general
         self.up = nn.Dense(
             self.config.d_model * self.config.expansion_ratio,
             kernel_init=jax.nn.initializers.normal(),
@@ -313,14 +311,12 @@ class FlaxMptAttention(nn.Module):
     def setup(self) -> None:
 
         if self.config.bits is not None:
-            _dot_general_cls = q_config.fully_quantized(
+            dot_general_cls = q_flax.QDotGeneral(q_config.fully_quantized(
                 fwd_bits=self.config.bits,
                 bwd_bits=self.config.bits
-            )
+            ))
         else:
-            _dot_general_cls = None
-
-        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
+            dot_general_cls = jax.lax.dot_general
         self.w_qkv = nn.Dense(
             self.config.d_model * 3,
             kernel_init=jax.nn.initializers.normal(),
@@ -743,14 +739,12 @@ class FlaxFlaxMptForCausalLMModule(nn.Module):
             precision=self.precision
         )
         if self.config.bits is not None:
-            _dot_general_cls = q_config.fully_quantized(
+            dot_general_cls = q_flax.QDotGeneral(q_config.fully_quantized(
                 fwd_bits=self.config.bits,
                 bwd_bits=self.config.bits
-            )
+            ))
         else:
-            _dot_general_cls = None
-
-        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
+            dot_general_cls = jax.lax.dot_general
         if self.config.use_lm_head:
             self.lm_head = nn.Dense(self.config.vocab_size, kernel_init=jax.nn.initializers.normal(),
                                     use_bias=self.config.use_bias,
