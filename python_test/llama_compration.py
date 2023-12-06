@@ -83,7 +83,7 @@ def main():
                 _do_init=False,
                 input_shape=(batch_size, seq_len)
             )
-            llama_2_pred = llama_1(
+            llama_2_pred = llama_2(
                 input_ids=flax_input_ids,
                 params=params,
 
