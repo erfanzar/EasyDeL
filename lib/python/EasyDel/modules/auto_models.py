@@ -129,11 +129,7 @@ class AutoEasyDelModelForCausalLM:
             precision: jax.lax.Precision = jax.lax.Precision('fastest'),
             sharding_axis_dims: typing.Sequence[int] = (1, -1, 1),
             sharding_axis_names: typing.Sequence[str] = ("dp", "fsdp",  "mp"),
-            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
-            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
-            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
-            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", None, "fsdp", None),
-            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
+
             input_shape: typing.Sequence[int] = (1, 1),
             backend: typing.Optional[str] = None,
             **kwargs
@@ -151,11 +147,7 @@ class AutoEasyDelModelForCausalLM:
         :param precision: jax.lax.Precision: Control the precision of the model
         :param sharding_axis_dims: typing.Sequence[int]: Specify the dimension of each axis in the sharded model
         :param sharding_axis_names: typing.Sequence[str]: Specify the order of sharding
-        :param q_ps: jax.sharding.PartitionSpec: Specify the partitioning of the query tensor
-        :param k_ps: jax.sharding.PartitionSpec: Partition the key matrix
-        :param v_ps: jax.sharding.PartitionSpec: Specify the partitioning of the value tensor
-        :param b_ps: jax.sharding.PartitionSpec: Specify the Attention Bias partition spec
-        :param a_ps: jax.sharding.PartitionSpec: Specify the partitioning of the attention weights
+        
         :param input_shape: typing.Sequence[int]: Specify the shape of the input to the model
         :param backend: typing.Optional[str]: backend to use for model
         :param **kwargs: Pass additional arguments to the model and config classes

@@ -34,7 +34,7 @@ def main():
     torch_model = FalconForCausalLM(
         config=copy.deepcopy(config)
     )
-    params = {"params": falcon_convert_hf_to_flax(torch_model.state_dict(), config)}
+    params = {"params": falcon_convert_hf_to_flax(torch_model.state_dict(), config, jax.devices('cpu')[0])}
     np_random_input_ids = np.random.randint(0, config.vocab_size, (1, 128))
     input_ids = torch.from_numpy(np_random_input_ids).reshape(1, -1).to(torch.long)
     flax_input_ids = jnp.asarray(np_random_input_ids, dtype=jnp.int32).reshape(1, -1)
@@ -61,7 +61,8 @@ def main():
     #     print('\033[1;36mTest Passed Unfortunately 🥳')
     # else:
     #     print('\033[1;31mTest Failed Successfully  🤕')
-
+    #     error = jnp.mean(torch_output.logits.cpu().detach().numpy() - flax_output.logits)
+    #     print("Error : ", error)
     # except TypeError as e:
     #     print(e.__str__())
 
