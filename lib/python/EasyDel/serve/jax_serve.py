@@ -85,7 +85,7 @@ class JaxServerConfig:
         self.batch_size = batch_size
         self.contains_auto_format = contains_auto_format
         self.max_length = max_length
-        self.generation_ps=generation_ps
+        self.generation_ps = generation_ps
         self.max_new_tokens = max_new_tokens
         self.max_stream_tokens = max_stream_tokens
         self.temperature = temperature
