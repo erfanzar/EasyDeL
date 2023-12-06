@@ -42,8 +42,9 @@ class JaxServerConfig:
             top_p: float = 0.95,
             top_k: int = 50,
             logging: bool = True,
-            mesh_axes_names: Sequence[str] = ("dp", "fsdp",  "mp"),
+            mesh_axes_names: Sequence[str] = ("dp", "fsdp", "mp"),
             mesh_axes_shape: Sequence[int] = (1, -1, 1, 1),
+            generation_ps: jax.sharding.PartitionSpec = Ps('dp', 'fsdp'),
             dtype: str = 'fp16',
             stream_tokens_for_gradio: bool = True,
             use_prefix_tokenizer: bool = True,
@@ -63,6 +64,7 @@ class JaxServerConfig:
         :param max_length: int: Set the maximum length of the text that can be generated
         :param max_new_tokens: int: Determine how many tokens can be added to the vocabulary
         :param max_stream_tokens: int: Set the maximum number of tokens that can be streamed at a time
+        :param generation_ps: jax.sharding.PartitionSpec : PartitionSpec to use for sharding data
         :param temperature: float: Control the randomness of the output
         :param top_p: float: Control the diversity of the text generated
         :param top_k: int: Limit the number of tokens that can be generated
@@ -83,6 +85,7 @@ class JaxServerConfig:
         self.batch_size = batch_size
         self.contains_auto_format = contains_auto_format
         self.max_length = max_length
+        self.generation_ps=generation_ps
         self.max_new_tokens = max_new_tokens
         self.max_stream_tokens = max_stream_tokens
         self.temperature = temperature
@@ -221,8 +224,8 @@ class JAXServer(object):
             out_shardings=(Ps())
         )
         def greedy_generate(parameters, input_ids, attention_mask):
-            input_ids = with_sharding_constraint(input_ids, Ps(('dp', 'fsdp')))
-            attention_mask = with_sharding_constraint(attention_mask, Ps(('dp', 'fsdp')))
+            input_ids = with_sharding_constraint(input_ids, self.config.generation_ps)
+            attention_mask = with_sharding_constraint(attention_mask, self.config.generation_ps)
             predict = model.generate(
                 input_ids,
                 attention_mask=attention_mask,
@@ -245,8 +248,8 @@ class JAXServer(object):
             out_shardings=(Ps())
         )
         def generate(parameters, input_ids, attention_mask):
-            input_ids = with_sharding_constraint(input_ids, Ps(('dp', 'fsdp')))
-            attention_mask = with_sharding_constraint(attention_mask, Ps(('dp', 'fsdp')))
+            input_ids = with_sharding_constraint(input_ids, self.config.generation_ps)
+            attention_mask = with_sharding_constraint(attention_mask, self.config.generation_ps)
             predict = model.generate(
                 input_ids,
                 attention_mask=attention_mask,
