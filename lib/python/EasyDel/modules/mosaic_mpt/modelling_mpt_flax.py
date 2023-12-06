@@ -17,7 +17,7 @@ from ..flax_modelling_utils import (
     with_sharding_constraint,
     ACT2FN,
     JaxBaseClassModel,
-    smart_flash_attention
+    smart_flash_attention, get_dot_general_by_bits
 )
 import chex
 from fjformer.bits import config as q_config, q_flax
@@ -251,13 +251,7 @@ class FlaxMptMLP(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
-        if self.config.bits is not None:
-            dot_general_cls = q_flax.QDotGeneral(q_config.fully_quantized(
-                fwd_bits=self.config.bits,
-                bwd_bits=self.config.bits
-            ))
-        else:
-            dot_general_cls = jax.lax.dot_general
+
         self.up = nn.Dense(
             self.config.d_model * self.config.expansion_ratio,
             kernel_init=jax.nn.initializers.normal(),
@@ -265,7 +259,7 @@ class FlaxMptMLP(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
-            dot_general=dot_general_cls
+            dot_general=get_dot_general_by_bits(self.config.bits)
         )
         self.down = nn.Dense(
             self.config.d_model,
@@ -274,7 +268,7 @@ class FlaxMptMLP(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
-            dot_general=dot_general_cls
+            dot_general=get_dot_general_by_bits(self.config.bits)
         )
         self.act = ACT2FN[self.config.act_fn]
 
@@ -290,18 +284,12 @@ class FlaxMptAttention(nn.Module):
 
     def setup(self) -> None:
 
-        if self.config.bits is not None:
-            dot_general_cls = q_flax.QDotGeneral(q_config.fully_quantized(
-                fwd_bits=self.config.bits,
-                bwd_bits=self.config.bits
-            ))
-        else:
-            dot_general_cls = jax.lax.dot_general
+
         self.w_qkv = nn.Dense(
             self.config.d_model * 3,
             kernel_init=jax.nn.initializers.normal(),
             use_bias=self.config.use_bias,
-            dot_general=dot_general_cls,
+            dot_general=get_dot_general_by_bits(self.config.bits),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision)
@@ -312,7 +300,7 @@ class FlaxMptAttention(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
-            dot_general=dot_general_cls
+            dot_general=get_dot_general_by_bits(self.config.bits)
         )
         if self.config.qk_ln:
             self.q_ln = nn.LayerNorm(use_bias=self.config.use_norm_bias)
@@ -718,18 +706,12 @@ class FlaxFlaxMptForCausalLMModule(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        if self.config.bits is not None:
-            dot_general_cls = q_flax.QDotGeneral(q_config.fully_quantized(
-                fwd_bits=self.config.bits,
-                bwd_bits=self.config.bits
-            ))
-        else:
-            dot_general_cls = jax.lax.dot_general
+
         if self.config.use_lm_head:
             self.lm_head = nn.Dense(self.config.vocab_size, kernel_init=jax.nn.initializers.normal(),
                                     use_bias=self.config.use_bias,
                                     dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision,
-                                    dot_general=dot_general_cls)
+                                    dot_general=get_dot_general_by_bits(self.config.bits))
 
     def __call__(self,
                  input_ids: chex.Array,

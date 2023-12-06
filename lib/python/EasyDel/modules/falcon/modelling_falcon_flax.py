@@ -10,10 +10,9 @@ import jax
 from jax.sharding import PartitionSpec
 from transformers.modeling_flax_outputs import FlaxCausalLMOutput, FlaxBaseModelOutput
 from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
-    with_sharding_constraint, JaxBaseClassModel
+    with_sharding_constraint, JaxBaseClassModel, get_dot_general_by_bits
 import chex
 from fjformer.func import transpose
-from fjformer.bits import config as q_config, q_flax
 
 
 class FalconConfig(JaxBaseClassModel):
@@ -330,20 +329,13 @@ class FlaxFalconAttention(nn.Module):
     def setup(self) -> None:
         head_dim = self.config.hidden_size // self.config.num_attention_heads
 
-        if self.config.bits is not None:
-            dot_general_cls = q_flax.QDotGeneral(q_config.fully_quantized(
-                fwd_bits=self.config.bits,
-                bwd_bits=self.config.bits
-            ))
-        else:
-            dot_general_cls = jax.lax.dot_general
         self.query_key_value = nn.Dense(
             features=3 * self.config.hidden_size if not self.config.multi_query else (
                     self.config.hidden_size + 2 * head_dim),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=self.config.bias,
-            dot_general=dot_general_cls
+            dot_general=get_dot_general_by_bits(self.config.bits)
         )
         self.inv_norm_factor = 1 / math.sqrt(head_dim)
         self.dense = nn.Dense(
@@ -351,7 +343,7 @@ class FlaxFalconAttention(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=self.config.bias,
-            dot_general=dot_general_cls
+            dot_general=get_dot_general_by_bits(self.config.bits)
         )
         self.head_dim = head_dim
         self.maybe_rotary = FlaxFalconRotaryEmbedding(self.dtype) if not self.config.alibi else lambda q, k, a, s: (
@@ -554,27 +546,19 @@ class FlaxFalconMlp(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
-        if self.config.bits is not None:
-            dot_general_cls = q_flax.QDotGeneral(q_config.fully_quantized(
-                fwd_bits=self.config.bits,
-                bwd_bits=self.config.bits
-            ))
-        else:
-            dot_general_cls = jax.lax.dot_general
-
         self.dense_h_to_4h = nn.Dense(
             features=self.config.hidden_size * 4,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=self.config.bias,
-            dot_general=dot_general_cls
+            dot_general=get_dot_general_by_bits(self.config.bits)
         )
         self.dense_4h_to_h = nn.Dense(
             features=self.config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=self.config.bias,
-            dot_general=dot_general_cls
+            dot_general=get_dot_general_by_bits(self.config.bits)
         )
 
     def __call__(self, x: chex.Array, deterministic: bool = True):
@@ -948,17 +932,11 @@ class FlaxFalconForCausalLMModule(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        if self.config.bits is not None:
-            dot_general_cls = q_flax.QDotGeneral(q_config.fully_quantized(
-                fwd_bits=self.config.bits,
-                bwd_bits=self.config.bits
-            ))
-        else:
-            dot_general_cls = jax.lax.dot_general
+
         self.lm_head = nn.Dense(
             self.config.vocab_size,
             use_bias=False,
-            dot_general=dot_general_cls
+            dot_general=get_dot_general_by_bits(self.config.bits)
         )
 
     def __call__(self,
