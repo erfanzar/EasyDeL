@@ -34,12 +34,10 @@ def main():
         intermediate_size=3072,
         gradient_checkpointing=''
     )
-    print('Model Config :\n', config)
 
     torch_model = LlamaForCausalLM(
         config=copy.deepcopy(config)
     )
-    print(jax.devices('cpu'))
     params = {"params": llama_convert_hf_to_flax(torch_model.state_dict(), config, device=jax.devices('cpu')[0])}
 
     np_random_input_ids = np.random.randint(0, config.vocab_size, (1, 128))
