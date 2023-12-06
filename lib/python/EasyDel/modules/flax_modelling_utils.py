@@ -486,7 +486,8 @@ class JaxBaseClassModel:
             v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
             b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", None, "fsdp", None),
             a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
-            backend: Optional[None] = None
+            backend: Optional[None] = None,
+            **kwargs
     ):
         """
         The __init__ function is the constructor for a class.

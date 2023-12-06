@@ -32,9 +32,11 @@ def main():
         num_key_value_heads=4,
         num_hidden_layers=16,
         intermediate_size=3072,
-        gradient_checkpointing=''
-    )
+        gradient_checkpointing='',
 
+    )
+    config.pad_token_id = 0
+    config.pruned_heads = False
     torch_model = LlamaForCausalLM(
         config=copy.deepcopy(config)
     )
