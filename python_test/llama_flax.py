@@ -25,7 +25,7 @@ from fjformer.partition_utils import make_shard_and_gather_fns, match_partition_
 
 def main():
     torch.manual_seed(42)
-
+    seq_len = 128
     config = LlamaConfig(
         hidden_size=2048,
         num_attention_heads=32,
@@ -33,6 +33,7 @@ def main():
         num_hidden_layers=16,
         intermediate_size=3072,
         gradient_checkpointing='',
+        max_position_embeddings=seq_len
     )
 
     torch_model = LlamaForCausalLM(
@@ -40,8 +41,8 @@ def main():
     )
     params = {"params": llama_convert_hf_to_flax(torch_model.state_dict(), config, device=jax.devices('cpu')[0])}
     batch_size = len(jax.devices())
-    np_random_input_ids = np.random.randint(0, config.vocab_size, (batch_size, 128))
-    input_ids = torch.from_numpy(np_random_input_ids).reshape(1, -1).to(torch.long)
+    np_random_input_ids = np.random.randint(0, config.vocab_size, (batch_size, seq_len))
+    input_ids = torch.from_numpy(np_random_input_ids).reshape(batch_size, -1).to(torch.long)
     flax_input_ids = jnp.asarray(np_random_input_ids, dtype=jnp.int32).reshape(batch_size, -1)
     torch_output = torch_model(
         input_ids=input_ids
@@ -65,7 +66,7 @@ def main():
                 dtype=jnp.float32,
                 param_dtype=jnp.float32,
                 _do_init=False,
-                input_shape=(batch_size, 128)
+                input_shape=(batch_size, seq_len)
             )
             flax_output = flax_model(
                 input_ids=flax_input_ids,
