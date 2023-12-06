@@ -1,4 +1,5 @@
 import fjformer.attention
+import transformers
 from jax.interpreters import pxla
 from jax.experimental.pjit import with_sharding_constraint as wsc
 import jax
@@ -238,8 +239,8 @@ def get_ranks_and_size(mesh):
     
     """
     out = dict(mesh=mesh)
-    mp_size = mesh.shape["mp"]
-    mp_node_size = max(1, mp_size // jax.local_device_count())
+    total_process_size = mesh.shape["mp"] * mesh.shape["sp"]
+    mp_node_size = max(1, total_process_size // jax.local_device_count())
     dp_node_size = jax.process_count() // mp_node_size
     out.update(mp_node_size=mp_node_size,
                dp_node_size=dp_node_size)
@@ -446,7 +447,7 @@ def smart_flash_attention(
 
 
 def create_mesh(
-        axis_dims: Sequence[int] = (1, -1, 1), axis_names: Sequence[str] = ("dp", "fsdp", "mp"), backend=""
+        axis_dims: Sequence[int] = (1, -1, 1, 1), axis_names: Sequence[str] = ("dp", "fsdp", "mp", "sp"), backend=""
 ):
     """
     The create_mesh function creates a mesh object that can be used to shard arrays.
@@ -465,7 +466,7 @@ def create_mesh(
     )
 
 
-class JaxBaseClassModel:
+class JaxBaseClassModel(transformers.PretrainedConfig):
     """
     It initializes all the attributes of an object, and it's called when you create a new instance of that class.
     :param self: Refer to the instance of the class
@@ -476,42 +477,33 @@ class JaxBaseClassModel:
     :param v_ps: jax.sharding.PartitionSpec: Specify the partitioning of the value tensor
     :param b_ps: jax.sharding.PartitionSpec: Specify the Attention Bias partition spec
     :param a_ps: jax.sharding.PartitionSpec: Specify the partitioning of the attention weights
+    :param use_shard_map: bool: whenever to use shard_map for attention
     :param backend: Optional[None]: Specify the backend to use
     """
 
     def __init__(
             self,
-            axis_dims: Sequence[int] = (1, -1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp", "mp"),
-            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
-            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
-            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
-            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", None, "fsdp", None),
-            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
+            axis_dims: Sequence[int] = (1, -1, 1, 1),
+            axis_names: Sequence[str] = ("dp", "fsdp", "mp", "sp"),
+            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "mp", None),
+            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "mp", None),
+            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "mp", None),
+            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, "mp", None),
+            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "mp", None),
+            use_shard_map: bool = False,
             backend: Optional[None] = None,
             **kwargs
     ):
-        """
-        The __init__ function is the constructor for a class.
-        It initializes all the attributes of an object, and it's called when you create a new instance of that class.
-
-
-        :param self: Refer to the instance of the class
-        :param axis_dims: Sequence[int]: Specify the number of dimensions for each axis
-        :param axis_names: Sequence[str]: Set the names of the axes
-        
-        :param backend: Optional[None]: Specify the backend to use
-        :return: A new instance of the class
-
-        """
         self.q_ps = q_ps
         self.k_ps = k_ps
         self.v_ps = v_ps
         self.b_ps = b_ps
         self.a_ps = a_ps
+        self.use_shard_map = use_shard_map
         self.axis_dims = axis_dims
         self.axis_names = axis_names
         self.backend = backend if backend is not None else ""
+        super().__init__(**kwargs)
 
     def jax_mesh(self) -> jax.sharding.Mesh:
         """
@@ -573,15 +565,29 @@ class JaxBaseClassModel:
 
     def add_partitions(
             self,
-            axis_dims: Sequence[int] = (1, -1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp", "mp"),
-            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
-            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
-            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
-            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", None, "fsdp", None),
-            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
+            axis_dims: Sequence[int] = (1, -1, 1, 1),
+            axis_names: Sequence[str] = ("dp", "fsdp", "mp", "sp"),
+            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "mp", None),
+            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "mp", None),
+            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "mp", None),
+            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, "mp", None),
+            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "mp", None),
+            use_shard_map: bool = False,
             backend: Optional[str] = None,
     ):
+        """
+            It initializes all the attributes of an object, and it's called when you create a new instance of that class.
+            :param self: Refer to the instance of the class
+            :param axis_dims: Sequence[int]: Specify the number of dimensions for each axis
+            :param axis_names: Sequence[str]: Set the names of the axes
+            :param q_ps: jax.sharding.PartitionSpec: Specify the partitioning of the query tensor
+            :param k_ps: jax.sharding.PartitionSpec: Partition the key matrix
+            :param v_ps: jax.sharding.PartitionSpec: Specify the partitioning of the value tensor
+            :param b_ps: jax.sharding.PartitionSpec: Specify the Attention Bias partition spec
+            :param a_ps: jax.sharding.PartitionSpec: Specify the partitioning of the attention weights
+            :param use_shard_map: bool: whenever to use shard_map for attention
+            :param backend: Optional[None]: Specify the backend to use
+            """
         self.axis_dims = axis_dims
         self.axis_names = axis_names
         self.q_ps = q_ps
@@ -590,6 +596,7 @@ class JaxBaseClassModel:
         self.b_ps = b_ps
         self.a_ps = a_ps
         self.backend = backend
+        self.use_shard_map = use_shard_map
 
 
 def add_start_docstrings(*docstr):

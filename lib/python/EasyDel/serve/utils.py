@@ -106,9 +106,9 @@ def get_dtype(dtype):
 
 
 def shard_params(params, partition_rules,
-                 shard_mesh_shape=(1, -1, 1),
+                 shard_mesh_shape=(1, -1, 1, 1),
                  backend='gpu',
-                 shard_mesh=("dp", "fsdp",  "mp"), do_unf=True,
+                 shard_mesh=("dp", "fsdp", "mp", "sp"), do_unf=True,
                  dtype='fp16'):
     dtype = get_dtype(dtype)
     params = unflatten_dict(params) if do_unf else params

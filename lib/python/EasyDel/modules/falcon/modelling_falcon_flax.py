@@ -16,7 +16,7 @@ from fjformer.func import transpose
 from fjformer.bits import config as q_config, q_flax
 
 
-class FalconConfig(PretrainedConfig, JaxBaseClassModel):
+class FalconConfig(JaxBaseClassModel):
     model_type = "falcon"
     attribute_map = {
         "num_hidden_layers": "num_hidden_layers",
@@ -48,8 +48,8 @@ class FalconConfig(PretrainedConfig, JaxBaseClassModel):
             use_pjit_attention_force: bool = False,
             gradient_checkpointing: str = '',
             bits: Optional[int] = None,
-            axis_dims: Sequence[int] = (1, -1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
+            axis_dims: Sequence[int] = (1, -1, 1, 1),
+            axis_names: Sequence[str] = ("dp", "fsdp", "mp", "sp"),
             **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -124,7 +124,7 @@ class FalconConfig(PretrainedConfig, JaxBaseClassModel):
 
     @staticmethod
     def get_mesh_names():
-        return "dp", "fsdp",  "mp"
+        return "dp", "fsdp", "mp", "sp"
 
     def add_jax_args(self,
                      vocab_size: int = 65024,
@@ -150,16 +150,8 @@ class FalconConfig(PretrainedConfig, JaxBaseClassModel):
                      use_pjit_attention_force: bool = False,
                      gradient_checkpointing: str = '',
                      bits: Optional[int] = None,
-                     axis_dims: Sequence[int] = (1, -1, 1),
-                     axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
-
-                     backend: Optional[str] = None,
                      **kwargs,
                      ):
-        self.axis_names = axis_names
-        self.axis_dims = axis_dims
-
-        self.backend = backend
         basics = dict(
             bits=bits,
             vocab_size=vocab_size,

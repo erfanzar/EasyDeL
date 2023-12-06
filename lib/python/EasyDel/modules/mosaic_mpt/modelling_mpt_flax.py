@@ -23,7 +23,7 @@ import chex
 from fjformer.bits import config as q_config, q_flax
 
 
-class MptConfig(PretrainedConfig, JaxBaseClassModel):
+class MptConfig(JaxBaseClassModel):
     model_type = 'mpt'
 
     def __init__(self,
@@ -53,8 +53,6 @@ class MptConfig(PretrainedConfig, JaxBaseClassModel):
                  flash_attn_query_chunk_size: int = 1024,
                  flash_attn_key_chunk_size: int = 2048,
                  bits: Optional[int] = None,
-                 axis_dims: Sequence[int] = (1, -1, 1),
-                 axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
                  **kwargs
                  ):
 
@@ -91,8 +89,6 @@ class MptConfig(PretrainedConfig, JaxBaseClassModel):
         if 'loss_fn' in kwargs:
             del kwargs['loss_fn']
         super().__init__(
-            axis_dims=axis_dims,
-            axis_names=axis_names,
             **kwargs
         )
 
@@ -182,16 +178,8 @@ class MptConfig(PretrainedConfig, JaxBaseClassModel):
                      flash_attn_query_chunk_size: int = 1024,
                      flash_attn_key_chunk_size: int = 2048,
                      bits: Optional[int] = None,
-                     axis_dims: Sequence[int] = (1, -1, 1),
-                     axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
-
-                     backend: Optional[str] = None,
                      **kwargs,
                      ):
-        self.axis_names = axis_names
-        self.axis_dims = axis_dims
-
-        self.backend = backend
         if hasattr(self, 'attn_config'):
             for k, v in self.attn_config.items():
                 setattr(self, k, v)
@@ -555,7 +543,7 @@ def build_alibi(max_length, num_attention_heads, alibi_max: int = 8):
     w_range = jnp.arange(1 - max_length, 1).reshape(1, 1, 1, max_length)
     # cp2 = jnp.power(2, jnp.ceil(jnp.log2(num_attention_heads)))
     cp2 = 2 ** math.ceil(math.log2(num_attention_heads))
-    h_range = jnp.arange(1, 1 + num_attention_heads, ).reshape(1, -1, 1)
+    h_range = jnp.arange(1, 1 + num_attention_heads, ).reshape(1, -1, 1, 1)
     h_range = jnp.matmul(h_range, jnp.asarray(alibi_max / cp2).reshape(1, 1))
     slop = 1 / jnp.power(2, h_range)
     if cp2 != num_attention_heads:

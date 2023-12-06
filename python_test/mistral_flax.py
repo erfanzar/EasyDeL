@@ -34,26 +34,30 @@ def main():
         gradient_checkpointing='',
     )
     print('Model Config :\n', config)
-
+    batch_size = len(jax.devices())
     torch_model = MistralForCausalLM(
         config=copy.deepcopy(config)
     )
     params = {"params": mistral_convert_hf_to_flax(torch_model.state_dict(), config, jax.devices('cpu')[0])}
 
-    np_random_input_ids = np.random.randint(0, config.vocab_size, (1, 128))
-    input_ids = torch.from_numpy(np_random_input_ids).reshape(1, -1).to(torch.long)
-    flax_input_ids = jnp.asarray(np_random_input_ids, dtype=jnp.int32).reshape(1, -1)
+    np_random_input_ids = np.random.randint(0, config.vocab_size, (batch_size, 128))
+    input_ids = torch.from_numpy(np_random_input_ids).reshape(batch_size, -1).to(torch.long)
+    flax_input_ids = jnp.asarray(np_random_input_ids, dtype=jnp.int32).reshape(batch_size, -1)
     torch_output = torch_model(
         input_ids=input_ids
     )
     config.add_jax_args()
+    config.add_partitions(
+        use_shard_map=True
+    )
     try:
 
         flax_model = FlaxMistralForCausalLM(
             config=config,
             dtype=jnp.float32,
             param_dtype=jnp.float32,
-            _do_init=False, input_shape=(1, 6)
+            _do_init=False,
+            input_shape=(batch_size, 128)
         )
         flax_output = flax_model(
             input_ids=flax_input_ids,
