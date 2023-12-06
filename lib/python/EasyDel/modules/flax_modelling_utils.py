@@ -572,7 +572,7 @@ class JaxBaseClassModel:
         """
         return get_flash_attention()
 
-    def add_pss(
+    def add_partitions(
             self,
             axis_dims: Sequence[int] = (1, -1, 1, 1),
             axis_names: Sequence[str] = ("dp", "fsdp", "mp"),
