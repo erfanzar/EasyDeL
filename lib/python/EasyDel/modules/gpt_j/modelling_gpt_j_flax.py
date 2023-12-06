@@ -87,7 +87,7 @@ class GPTJConfig(PretrainedConfig, JaxBaseClassModel):
             flash_attn_query_chunk_size: int = 1024,
             flash_attn_key_chunk_size: int = 2048,
             bits: Optional[int] = None,
-            axis_dims: Sequence[int] = (1, -1, 1, 1),
+            axis_dims: Sequence[int] = ((1, -1, 1)),
             axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
             **kwargs,
     ):
@@ -214,7 +214,7 @@ class GPTJConfig(PretrainedConfig, JaxBaseClassModel):
             flash_attn_query_chunk_size: int = 1024,
             flash_attn_key_chunk_size: int = 2048,
             bits: Optional[int] = None,
-            axis_dims: Sequence[int] = (1, -1, 1, 1),
+            axis_dims: Sequence[int] = ((1, -1, 1)),
             axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
             q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
             k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),

@@ -43,7 +43,7 @@ class JaxServerConfig:
             top_k: int = 50,
             logging: bool = True,
             mesh_axes_names: Sequence[str] = ("dp", "fsdp", "mp"),
-            mesh_axes_shape: Sequence[int] = (1, -1, 1, 1),
+            mesh_axes_shape: Sequence[int] = ((1, -1, 1)),
             generation_ps: jax.sharding.PartitionSpec = Ps('dp', 'fsdp'),
             dtype: str = 'fp16',
             stream_tokens_for_gradio: bool = True,

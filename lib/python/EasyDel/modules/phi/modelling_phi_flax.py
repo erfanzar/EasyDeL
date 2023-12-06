@@ -50,7 +50,7 @@ class PhiConfig(PretrainedConfig, JaxBaseClassModel):
             tie_word_embeddings: bool = False,
             pad_vocab_size_multiple: int = 64,
             bits: Optional[int] = None,
-            axis_dims: Sequence[int] = (1, -1, 1, 1),
+            axis_dims: Sequence[int] = ((1, -1, 1)),
             axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
             gradient_checkpointing: str = "nothing_saveable",
             **kwargs
@@ -84,7 +84,7 @@ class PhiConfig(PretrainedConfig, JaxBaseClassModel):
     def add_jax_args(
             self,
             bits: Optional[int] = None,
-            axis_dims: Sequence[int] = (1, -1, 1, 1),
+            axis_dims: Sequence[int] = ((1, -1, 1)),
             axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
             gradient_checkpointing: str = "nothing_saveable",
             **kwargs

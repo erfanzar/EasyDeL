@@ -67,7 +67,7 @@ class OPTConfig(PretrainedConfig, JaxBaseClassModel):
             layer_norm_elementwise_affine: bool = True,
             gradient_checkpointing: str = 'nothing_saveable',
             use_pjit_attention_force: bool = False,
-            axis_dims: Sequence[int] = (1, -1, 1, 1),
+            axis_dims: Sequence[int] = ((1, -1, 1)),
             axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
             **kwargs,
     ):
@@ -132,7 +132,7 @@ class OPTConfig(PretrainedConfig, JaxBaseClassModel):
             layer_norm_elementwise_affine: bool = True,
             gradient_checkpointing: str = 'nothing_saveable',
             use_pjit_attention_force: bool = False,
-            axis_dims: Sequence[int] = (1, -1, 1, 1),
+            axis_dims: Sequence[int] = ((1, -1, 1)),
             axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
             q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
             k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
