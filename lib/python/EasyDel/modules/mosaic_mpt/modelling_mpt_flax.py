@@ -53,7 +53,7 @@ class MptConfig(PretrainedConfig, JaxBaseClassModel):
                  flash_attn_query_chunk_size: int = 1024,
                  flash_attn_key_chunk_size: int = 2048,
                  bits: Optional[int] = None,
-                 axis_dims: Sequence[int] = ((1, -1, 1)),
+                 axis_dims: Sequence[int] = (1, -1, 1),
                  axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
                  **kwargs
                  ):
@@ -182,7 +182,7 @@ class MptConfig(PretrainedConfig, JaxBaseClassModel):
                      flash_attn_query_chunk_size: int = 1024,
                      flash_attn_key_chunk_size: int = 2048,
                      bits: Optional[int] = None,
-                     axis_dims: Sequence[int] = ((1, -1, 1)),
+                     axis_dims: Sequence[int] = (1, -1, 1),
                      axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
                      q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
                      k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
@@ -567,7 +567,7 @@ def build_alibi(max_length, num_attention_heads, alibi_max: int = 8):
     w_range = jnp.arange(1 - max_length, 1).reshape(1, 1, 1, max_length)
     # cp2 = jnp.power(2, jnp.ceil(jnp.log2(num_attention_heads)))
     cp2 = 2 ** math.ceil(math.log2(num_attention_heads))
-    h_range = jnp.arange(1, 1 + num_attention_heads, ).reshape((1, -1, 1))
+    h_range = jnp.arange(1, 1 + num_attention_heads, ).reshape(1, -1, 1)
     h_range = jnp.matmul(h_range, jnp.asarray(alibi_max / cp2).reshape(1, 1))
     slop = 1 / jnp.power(2, h_range)
     if cp2 != num_attention_heads:

@@ -48,7 +48,7 @@ class FalconConfig(PretrainedConfig, JaxBaseClassModel):
             use_pjit_attention_force: bool = False,
             gradient_checkpointing: str = '',
             bits: Optional[int] = None,
-            axis_dims: Sequence[int] = ((1, -1, 1)),
+            axis_dims: Sequence[int] = (1, -1, 1),
             axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
             **kwargs,
     ):
@@ -150,7 +150,7 @@ class FalconConfig(PretrainedConfig, JaxBaseClassModel):
                      use_pjit_attention_force: bool = False,
                      gradient_checkpointing: str = '',
                      bits: Optional[int] = None,
-                     axis_dims: Sequence[int] = ((1, -1, 1)),
+                     axis_dims: Sequence[int] = (1, -1, 1),
                      axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
                      q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
                      k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
