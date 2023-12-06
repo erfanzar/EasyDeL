@@ -84,7 +84,7 @@ class FlaxLTConfig(PretrainedConfig, JaxBaseClassModel):
         return (
             # Emb
             ("model/wte/embedding", PartitionSpec("mp", "fsdp")),
-            ("attn/(k_proj|v_proj|q_proj)/kernel", PartitionSpec("fsdp"),
+            ("attn/(k_proj|v_proj|q_proj)/kernel", PartitionSpec("fsdp")),
              ("attn/o_proj/kernel", PartitionSpec("mp", "fsdp")),
              ("mlp/down/kernel", PartitionSpec("mp", "fsdp")),
              ("mlp/up/kernel", PartitionSpec("fsdp")),
@@ -93,7 +93,7 @@ class FlaxLTConfig(PretrainedConfig, JaxBaseClassModel):
              ('ln/kernel', PartitionSpec(None)),
              ('ln1/kernel', PartitionSpec(None)),
              ('ln2/kernel', PartitionSpec(None)),
-             ))
+             )
 
     @staticmethod
     def get_weight_decay_exclusions():

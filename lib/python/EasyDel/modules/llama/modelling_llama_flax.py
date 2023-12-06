@@ -176,7 +176,7 @@ class LlamaConfig(PretrainedConfig, JaxBaseClassModel):
         :return: A list of tuples
 
         """
-        (
+        return (
 
             ("model/embed_tokens/embedding", PS("dp", "fsdp")),
 
