@@ -5,8 +5,17 @@ import os
 import copy
 import jax
 
-from lib.python.EasyDel import LlamaConfig, FlaxLlamaForCausalLM
-from lib.python.EasyDel.transform import llama_convert_hf_to_flax
+try:
+    from lib.python.EasyDel import LlamaConfig, FlaxLlamaForCausalLM
+    from lib.python.EasyDel.transform import llama_convert_hf_to_flax
+except ModuleNotFoundError:
+    import sys
+    from pathlib import Path
+
+    cp = Path.cwd().__str__()
+    sys.path.append(cp)
+    from lib.python.EasyDel import LlamaConfig, FlaxLlamaForCausalLM
+    from lib.python.EasyDel.transform import llama_convert_hf_to_flax
 from jax import numpy as jnp
 from transformers import LlamaForCausalLM
 import torch
