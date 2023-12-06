@@ -53,7 +53,7 @@ class TrainArguments(
             extra_optimizer_kwargs: dict = None,
             save_steps: Union[int, None] = None,
             save_dir: str = 'easydel_ckpt',
-            use_pjit_attention_force: bool = False,
+            use_pjit_attention_force: bool = True,
             dtype=jnp.bfloat16,
             param_dtype=jnp.bfloat16,
             fully_fsdp=True,

@@ -52,7 +52,7 @@ class MistralConfig(PretrainedConfig, JaxBaseClassModel):
             rope_theta=10000.0,
             sliding_window=4096,
             gradient_checkpointing: str = 'nothing_saveable',
-            use_pjit_attention_force: bool = False,
+            use_pjit_attention_force: bool = True,
             use_flash_attention: bool = False,
             use_sacn_mlp: bool = False,
             flash_attn_query_chunk_size: int = 1024,
@@ -200,7 +200,7 @@ class MistralConfig(PretrainedConfig, JaxBaseClassModel):
 
     def add_jax_args(self,
                      gradient_checkpointing: str = 'nothing_saveable',
-                     use_pjit_attention_force: bool = False,
+                     use_pjit_attention_force: bool = True,
                      use_flash_attention: bool = False,
                      use_sacn_mlp: bool = False,
                      flash_attn_query_chunk_size: int = 1024,

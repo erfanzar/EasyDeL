@@ -98,7 +98,7 @@ def get_training_modules(
         dataset_train,
         ckpt_path,
         training_arguments: TrainArguments,
-        use_pjit_attention_force: bool = False,
+        use_pjit_attention_force: bool = True,
         dataset_eval=None,
         dtype=jnp.bfloat16,
         param_dtype=jnp.bfloat16,
