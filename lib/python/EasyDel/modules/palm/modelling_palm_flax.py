@@ -79,7 +79,7 @@ class PalmConfig(PretrainedConfig):
 
     def add_jax_args(
             self,
-            axis_dims: Sequence[int] = ((1, -1, 1)),
+            axis_dims: Sequence[int] = (1, -1, 1),
             axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
             q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
             k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
