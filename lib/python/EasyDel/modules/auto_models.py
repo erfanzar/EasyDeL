@@ -166,11 +166,6 @@ class AutoEasyDelModelForCausalLM:
             cfg.add_jax_args()
         cfg.axis_dims = sharding_axis_dims
         cfg.axis_names = sharding_axis_names
-        cfg.q_ps = q_ps
-        cfg.k_ps = k_ps
-        cfg.v_ps = v_ps
-        cfg.b_ps = b_ps
-        cfg.a_ps = a_ps
         cfg.backend = backend
         ed_model = module(
             config=cfg,
