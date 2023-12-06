@@ -294,7 +294,7 @@ class RNG:
 
 def get_mesh(
         shape: typing.Sequence[int] = (1, -1, 1, 1),
-        axis_names: typing.Sequence[str] = ("dp", "fsdp", "mp", "sp")
+        axis_names: typing.Sequence[str] = ("dp", "fsdp", "mp")
 ):
     """
     The get_mesh function is a helper function that creates a JAX Mesh object.

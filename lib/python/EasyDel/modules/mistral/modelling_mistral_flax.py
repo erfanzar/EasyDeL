@@ -551,7 +551,7 @@ class FlaxMistralAttention(nn.Module):
             if self.config.use_shard_map:
                 attn_weights = None
                 ring_attention_sharded = shard_map(
-                    functools.partial(fjformer.attention.ring_attention_standard, axis_name="sp"),
+                    functools.partial(fjformer.attention.ring_attention_standard, axis_name="mp"),
                     mesh=self.config.jax_mesh(),
                     in_specs=(
                         self.config.q_ps,

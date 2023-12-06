@@ -46,7 +46,7 @@ class FlaxLTConfig(JaxBaseClassModel):
                  fsdp=False,
                  hidden_act="silu",
                  axis_dims: Sequence[int] = (1, -1, 1, 1),
-                 axis_names: Sequence[str] = ("dp", "fsdp", "mp", "sp"),
+                 axis_names: Sequence[str] = ("dp", "fsdp", "mp"),
                  **kwargs
                  ):
         super().__init__(

@@ -34,7 +34,7 @@ The config input is a dictionary that contains the following keys:
 * `dtype`: The data type for the model's parameters.
     * _Default Value has been set to  `'fp16'`_
 * `mesh_axes_names`: The names of the mesh axes for distributed training.
-    * _Default Value has been set to  `("dp", "fsdp", "mp", "sp")`_
+    * _Default Value has been set to  `("dp", "fsdp", "mp")`_
 * `logging`: Whether the model should log its training progress.:
     * _Default Value has been set to  `True`_
 * `stream_tokens_for_gradio`: Whether the model should stream tokens to Gradio.
