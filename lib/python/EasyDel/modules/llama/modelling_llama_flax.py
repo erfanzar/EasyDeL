@@ -230,11 +230,6 @@ class LlamaConfig(PretrainedConfig, JaxBaseClassModel):
                      hidden_act: str = 'silu',
                      axis_dims: Sequence[int] = (1, -1, 1),
                      axis_names: Sequence[str] = ("dp", "fsdp", "mp"),
-                     q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
-                     k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
-                     v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
-                     b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", None, "fsdp", None),
-                     a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
                      backend: Optional[str] = None,
                      scan_layers: bool = True,
                      **kwargs,
@@ -263,11 +258,6 @@ class LlamaConfig(PretrainedConfig, JaxBaseClassModel):
         :param hidden_act: str : hidden_act for mlp
         :param axis_dims: Sequence[int]: Specify the dimension of each axis
         :param axis_names: Sequence[str]: Name the axes of the tensor
-        :param q_ps: jax.sharding.PartitionSpec: Specify the partitioning of the query tensor
-        :param k_ps: jax.sharding.PartitionSpec: Partition the key matrix
-        :param v_ps: jax.sharding.PartitionSpec: Specify the partitioning of the value tensor
-        :param b_ps: jax.sharding.PartitionSpec: Specify the Attention Bias partition spec
-        :param a_ps: jax.sharding.PartitionSpec: Specify the partitioning of the attention weights
         :param backend: typing.Optional[str]: backend to use for model
         :param scan_layers: bool: Determine whether to use scan layers or not
         :return: The following:
@@ -275,11 +265,7 @@ class LlamaConfig(PretrainedConfig, JaxBaseClassModel):
         """
         self.axis_names = axis_names
         self.axis_dims = axis_dims
-        self.q_ps = q_ps
-        self.k_ps = k_ps
-        self.v_ps = v_ps
-        self.b_ps = b_ps
-        self.a_ps = a_ps
+
         self.backend = backend
         self.scan_layers = scan_layers
         self.axis_names = axis_names

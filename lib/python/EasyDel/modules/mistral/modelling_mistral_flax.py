@@ -13,7 +13,7 @@ from flax.traverse_util import unflatten_dict, flatten_dict
 from flax.core import freeze, unfreeze
 from typing import Union, Optional, Tuple
 from transformers import PretrainedConfig, FlaxPreTrainedModel
-from flax.linen import partitioning as nn_partitioning, combine_masks
+from flax.linen import partitioning as nn_partitioning, combine_masks, dot_product_attention_weights
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 
 from ..flax_modelling_utils import (
@@ -213,11 +213,7 @@ class MistralConfig(PretrainedConfig, JaxBaseClassModel):
                      bits: Optional[int] = None,
                      axis_dims: Sequence[int] = (1, -1, 1),
                      axis_names: Sequence[str] = ("dp", "fsdp", "mp"),
-                     q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
-                     k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
-                     v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
-                     b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", None, "fsdp", None),
-                     a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
+
                      backend: Optional[str] = None,
                      **kwargs,
                      ):
@@ -241,11 +237,7 @@ class MistralConfig(PretrainedConfig, JaxBaseClassModel):
         :param axis_names: Sequence[str]: Name the axes of the tensors
         :param axis_dims: Sequence[int]: Specify the dimension of each axis
         :param axis_names: Sequence[str]: Name the axes of the tensor
-        :param q_ps: jax.sharding.PartitionSpec: Specify the partitioning of the query tensor
-        :param k_ps: jax.sharding.PartitionSpec: Partition the key matrix
-        :param v_ps: jax.sharding.PartitionSpec: Specify the partitioning of the value tensor
-        :param b_ps: jax.sharding.PartitionSpec: Specify the Attention Bias partition spec
-        :param a_ps: jax.sharding.PartitionSpec: Specify the partitioning of the attention weights
+        
         :param backend: typing.Optional[str]: backend to use for model
         :param : Enable gradient checkpointing
         :return: A tuple of the following:
@@ -265,11 +257,7 @@ class MistralConfig(PretrainedConfig, JaxBaseClassModel):
         self.bits = bits
         self.axis_names = axis_names
         self.axis_dims = axis_dims
-        self.q_ps = q_ps
-        self.k_ps = k_ps
-        self.v_ps = v_ps
-        self.b_ps = b_ps
-        self.a_ps = a_ps
+
         self.backend = backend
 
     @staticmethod
@@ -572,45 +560,24 @@ class FlaxMistralAttention(nn.Module):
             )
             attn_output = jnp.transpose(attn_output, rtp_axis)
         else:
-            query_length, key_length = query.shape[1], key.shape[1]
-
-            if self.has_variable("cache", "cached_key"):
-                mask_shift = self.variables["cache"]["cache_index"]
-                max_decoder_length = self.variables["cache"]["cached_key"].shape[1]
-                causal_mask = lax.dynamic_slice(
-                    causal_mask, (0, 0, mask_shift, 0), (1, 1, query_length, max_decoder_length)
-                )
-            else:
-                causal_mask = causal_mask[:, :, :query_length, :key_length]
-
-            batch_size = hidden_state.shape[0]
-            causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
-            if attention_mask.ndim == 2:
-                attention_mask = jnp.broadcast_to(jnp.expand_dims(attention_mask, axis=(-3, -2)), causal_mask.shape)
-            attention_mask = combine_masks(attention_mask, causal_mask)
-
-            if self.has_variable("cache", "cached_key") or init_cache:
-                key, value, attention_mask = self._concatenate_to_cache(key, value, query,
-                                                                        attention_mask)
-
-            attn_weights = None
-            ring_attention_sharded = shard_map(
-                functools.partial(fjformer.attention.ring_attention_standard, axis_name="mp"),
-                mesh=self.config.jax_mesh(),
-                in_specs=(
-                    self.config.q_ps,
-                    self.config.k_ps,
-                    self.config.v_ps,
-                    self.config.b_ps
-                ),
-                out_specs=self.config.a_ps,
-                check_rep=False
+            attention_bias = lax.select(
+                attention_mask > 0,
+                jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
+                jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
             )
-
-            attn_output = ring_attention_sharded(
-                query, key, value, attention_mask
+            attn_weights = dot_product_attention_weights(
+                query=query,
+                key=key,
+                bias=attention_bias,
+                dtype=jnp.promote_types(self.dtype, jnp.float32),
+                deterministic=deterministic,
+                dropout_rate=self.config.attn_pdrop,
+                precision=self.precision,
             )
-            attn_output = with_sharding_constraint(attn_output, self.config.a_ps)
+            if self.config.use_pjit_attention_force:
+                attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "mp", None, None))
+
+            attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value)
 
         out = self.o_proj(attn_output.reshape(batch_size, sequence_length, self.hidden_size))
         outputs = (out, attn_output) if output_attentions else (out,)

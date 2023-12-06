@@ -184,21 +184,13 @@ class MptConfig(PretrainedConfig, JaxBaseClassModel):
                      bits: Optional[int] = None,
                      axis_dims: Sequence[int] = (1, -1, 1),
                      axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
-                     q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
-                     k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
-                     v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
-                     b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", None, "fsdp", None),
-                     a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
+
                      backend: Optional[str] = None,
                      **kwargs,
                      ):
         self.axis_names = axis_names
         self.axis_dims = axis_dims
-        self.q_ps = q_ps
-        self.k_ps = k_ps
-        self.v_ps = v_ps
-        self.b_ps = b_ps
-        self.a_ps = a_ps
+
         self.backend = backend
         if hasattr(self, 'attn_config'):
             for k, v in self.attn_config.items():

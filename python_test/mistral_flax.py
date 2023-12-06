@@ -26,12 +26,12 @@ def main():
     torch.manual_seed(42)
 
     config = MistralConfig(
-        hidden_size=128,
-        num_attention_heads=4,
-        num_key_value_heads=8,
-        num_hidden_layers=2,
-        intermediate_size=128,
-        gradient_checkpointing=''
+        hidden_size=2048,
+        num_attention_heads=32,
+        num_key_value_heads=4,
+        num_hidden_layers=16,
+        intermediate_size=3072,
+        gradient_checkpointing='',
     )
     print('Model Config :\n', config)
 
@@ -67,7 +67,8 @@ def main():
             print('\033[1;36mTest Passed Unfortunately 🥳')
         else:
             print('\033[1;31mTest Failed Successfully  🤕')
-
+        error = jnp.mean(torch_output.logits.cpu().detach().numpy() - flax_output.logits)
+        print("Error : ", error)
     except TypeError as e:
         print(e.__str__())
 

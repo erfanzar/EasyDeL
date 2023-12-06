@@ -33,10 +33,8 @@ def main():
         num_hidden_layers=16,
         intermediate_size=3072,
         gradient_checkpointing='',
-
     )
-    config.pad_token_id = 0
-    config.pruned_heads = False
+
     torch_model = LlamaForCausalLM(
         config=copy.deepcopy(config)
     )
@@ -48,14 +46,7 @@ def main():
     torch_output = torch_model(
         input_ids=input_ids
     )
-    config.add_jax_args(
-        q_ps=jax.sharding.PartitionSpec("dp", None, None, None),
-        k_ps=jax.sharding.PartitionSpec("dp", None, None, None),
-        v_ps=jax.sharding.PartitionSpec("dp", None, None, None),
-        b_ps=jax.sharding.PartitionSpec("dp", None, None, None),
-        a_ps=jax.sharding.PartitionSpec("dp", None, None, None),
-    )
-    config.use_shard_map = False
+    config.add_jax_args()
     print("Config\n", config)
     mesh = create_mesh()
     with mesh:

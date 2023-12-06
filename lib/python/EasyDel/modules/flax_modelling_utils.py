@@ -497,11 +497,7 @@ class JaxBaseClassModel:
         :param self: Refer to the instance of the class
         :param axis_dims: Sequence[int]: Specify the number of dimensions for each axis
         :param axis_names: Sequence[str]: Set the names of the axes
-        :param q_ps: jax.sharding.PartitionSpec: Specify the partitioning of the query tensor
-        :param k_ps: jax.sharding.PartitionSpec: Partition the key matrix
-        :param v_ps: jax.sharding.PartitionSpec: Specify the partitioning of the value tensor
-        :param b_ps: jax.sharding.PartitionSpec: Specify the Attention Bias partition spec
-        :param a_ps: jax.sharding.PartitionSpec: Specify the partitioning of the attention weights
+        
         :param backend: Optional[None]: Specify the backend to use
         :return: A new instance of the class
 
