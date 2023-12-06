@@ -70,7 +70,6 @@ class LlamaConfig(PretrainedConfig, JaxBaseClassModel):
             axis_dims: Sequence[int] = (1, -1, 1),
             axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
             scan_layers: bool = True,
-            use_shard_map: bool = False,
             **kwargs,
     ):
         """
@@ -99,7 +98,6 @@ class LlamaConfig(PretrainedConfig, JaxBaseClassModel):
         :param gradient_checkpointing: str: Specify how to checkpoint the gradients
         :param fcm_min_ratio: float: Set the minimum ratio of the number of elements in a tensor to be processed by flash
         :param fcm_max_ratio: float: Determine the maximum ratio of
-        :param use_shard_map: bool: whenever to use shard map for attention
         :param use_pjit_attention_force: bool: Determine whether to use the pytorch jit compiler
         :param rope_scaling: Dict[str: Define the scaling of the rope
         :param Union[str: Specify the type of the parameter
@@ -144,7 +142,6 @@ class LlamaConfig(PretrainedConfig, JaxBaseClassModel):
         self.use_pjit_attention_force = use_pjit_attention_force
         self.fcm_min_ratio = fcm_min_ratio
         self.hidden_act = hidden_act
-        self.use_shard_map = use_shard_map
         self.fcm_max_ratio = fcm_max_ratio
         self.rope_scaling = rope_scaling
         self.use_flash_attention = use_flash_attention
@@ -223,7 +220,6 @@ class LlamaConfig(PretrainedConfig, JaxBaseClassModel):
                      use_pjit_attention_force: bool = False,
                      use_flash_attention: bool = False,
                      use_sacn_mlp: bool = False,
-                     use_shard_map: bool = False,
                      flash_attn_query_chunk_size: int = 1024,
                      flash_attn_key_chunk_size: int = 1024,
                      scan_mlp_chunk_size: int = 1024,
@@ -252,7 +248,6 @@ class LlamaConfig(PretrainedConfig, JaxBaseClassModel):
         :param attn_pdrop: float: Set the probability of dropping out the attention layer
         :param tie_word_embeddings: bool: Tie the word embeddings to the decoder
         :param gradient_checkpointing: str: Control the amount of memory used by jax
-        :param use_shard_map: bool: whenever to use shard map for attention
         :param fcm_min_ratio: float: Control the minimum ratio of the number of chunks to be used in flash-based computation
         :param fcm_max_ratio: float: Set the maximum ratio of the number of input tokens to output tokens
         :param use_pjit_attention_force: bool: Determine if the attention force is used
@@ -288,7 +283,6 @@ class LlamaConfig(PretrainedConfig, JaxBaseClassModel):
         self.backend = backend
         self.scan_layers = scan_layers
         self.axis_names = axis_names
-        self.use_shard_map = use_shard_map
         self.axis_dims = axis_dims
         self.use_flash_attention = use_flash_attention
         self.embd_pdrop = embd_pdrop
@@ -650,43 +644,25 @@ class FlaxLlamaAttention(nn.Module):
             )
             attn_output = jnp.transpose(attn_output, rtp_axis)
         else:
-            attn_weights = None
-            if self.config.use_shard_map:
-                ring_attention_sharded = shard_map(
-                    partial(fjformer.attention.ring_attention_standard, axis_name="mp"),
-                    mesh=self.config.jax_mesh(),
-                    in_specs=(
-                        self.config.q_ps,
-                        self.config.k_ps,
-                        self.config.v_ps,
-                        self.config.b_ps
-                    ),
-                    out_specs=self.config.a_ps,
-                    check_rep=False
-                )
+            attention_bias = lax.select(
+                attention_mask > 0,
+                jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
+                jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
+            )
+            attn_weights = dot_product_attention_weights(
+                query=query_state,
+                key=key_state,
+                bias=attention_bias,
+                dtype=jnp.promote_types(self.dtype, jnp.float32),
+                deterministic=deterministic,
+                dropout_rate=self.config.attn_pdrop,
+                precision=self.precision,
+            )
+            if self.config.use_pjit_attention_force:
+                attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "mp", None, None))
 
-                attn_output = ring_attention_sharded(
-                    query_state, key_state, value_state, attention_mask
-                )
-            else:
-                attention_bias = lax.select(
-                    attention_mask > 0,
-                    jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-                    jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
-                )
-                attn_weights = dot_product_attention_weights(
-                    query=query_state,
-                    key=key_state,
-                    bias=attention_bias,
-                    dtype=jnp.promote_types(self.dtype, jnp.float32),
-                    deterministic=deterministic,
-                    dropout_rate=self.config.attn_pdrop,
-                    precision=self.precision,
-                )
-                if self.config.use_pjit_attention_force:
-                    attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "mp", None, None))
+            attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value_state)
 
-                attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value_state)
         attn_output = self._merge_heads(attn_output)
         attn_output = self.o_proj(attn_output)
 
