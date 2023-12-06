@@ -24,7 +24,7 @@ from ..flax_modelling_utils import (
     apply_rotary_pos_emb,
     precompute_freq_cis,
     JaxBaseClassModel,
-    smart_flash_attention
+    smart_flash_attention, get_dot_general_by_bits
 )
 import chex
 from fjformer.bits import config as q_config, q_flax
@@ -348,13 +348,7 @@ class FlaxLlamaAttention(nn.Module):
         self.head_dim = self.config.hidden_size // self.config.num_attention_heads
         self.number_of_reps = self.config.num_attention_heads // self.config.num_key_value_heads
 
-        if self.config.bits is not None:
-            dot_general_cls = q_flax.QDotGeneral(q_config.fully_quantized(
-                fwd_bits=self.config.bits,
-                bwd_bits=self.config.bits
-            ))
-        else:
-            dot_general_cls = jax.lax.dot_general
+
 
         if self.number_of_reps == 1:
             assert self.config.num_attention_heads == self.config.num_key_value_heads
@@ -365,7 +359,7 @@ class FlaxLlamaAttention(nn.Module):
             use_bias=self.config.attention_bias,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            dot_general=dot_general_cls
+            dot_general=get_dot_general_by_bits(self.config.bits)
         )
         self.k_proj = nn.Dense(
             config.num_key_value_heads * self.head_dim,
@@ -374,7 +368,7 @@ class FlaxLlamaAttention(nn.Module):
             use_bias=self.config.attention_bias,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            dot_general=dot_general_cls
+            dot_general=get_dot_general_by_bits(self.config.bits)
         )
         self.v_proj = nn.Dense(
             config.num_key_value_heads * self.head_dim,
@@ -383,7 +377,7 @@ class FlaxLlamaAttention(nn.Module):
             use_bias=self.config.attention_bias,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            dot_general=dot_general_cls
+            dot_general=get_dot_general_by_bits(self.config.bits)
         )
         self.o_proj = nn.Dense(
             config.hidden_size,
@@ -392,7 +386,7 @@ class FlaxLlamaAttention(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            dot_general=dot_general_cls
+            dot_general=get_dot_general_by_bits(self.config.bits)
         )
 
         self.rotary = FlaxLlamaEmbedding(self.dtype)
@@ -563,7 +557,8 @@ class FlaxLlamaAttention(nn.Module):
         causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
         attention_mask = jnp.broadcast_to(jnp.expand_dims(attention_mask, axis=(-3, -2)), causal_mask.shape)
         attention_mask = combine_masks(attention_mask, causal_mask, fcm_mask)
-
+        if attention_mask.ndim == 2:
+            attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
         dropout_rng = None
         if not deterministic and self.config.attn_pdrop > 0.0:
             dropout_rng = self.make_rng("dropout")
@@ -577,10 +572,6 @@ class FlaxLlamaAttention(nn.Module):
             )
 
         if self.config.use_flash_attention and not (self.has_variable("cache", "cached_key") or init_cache):
-
-            if attention_mask.ndim == 2:
-                attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
-
             if attention_mask.shape[1] != self.config.num_attention_heads:
                 attention_mask = attention_mask.repeat(self.config.num_attention_heads, 1, )
             attention_bias = lax.select(
@@ -673,13 +664,7 @@ class FlaxLlamaMLP(nn.Module):
     def setup(self) -> None:
         config = self.config
 
-        if self.config.bits is not None:
-            dot_general_cls = q_flax.QDotGeneral(q_config.fully_quantized(
-                fwd_bits=self.config.bits,
-                bwd_bits=self.config.bits
-            ))
-        else:
-            dot_general_cls = jax.lax.dot_general
+
 
         self.gate_proj = nn.Dense(
             config.intermediate_size,
@@ -688,7 +673,7 @@ class FlaxLlamaMLP(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            dot_general=dot_general_cls
+            dot_general=get_dot_general_by_bits(self.config.bits)
         )
         self.down_proj = nn.Dense(
             config.hidden_size,
@@ -697,7 +682,7 @@ class FlaxLlamaMLP(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            dot_general=dot_general_cls
+            dot_general=get_dot_general_by_bits(self.config.bits)
         )
         self.up_proj = nn.Dense(
             config.intermediate_size,
@@ -706,7 +691,7 @@ class FlaxLlamaMLP(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            dot_general=dot_general_cls
+            dot_general=get_dot_general_by_bits(self.config.bits)
         )
         self.dropout = nn.Dropout(rate=self.config.resid_pdrop)
 
@@ -1276,13 +1261,7 @@ class FlaxLlamaForCausalLMModule(nn.Module):
                                      precision=self.precision,
                                      )
 
-        if self.config.bits is not None:
-            dot_general_cls = q_flax.QDotGeneral(q_config.fully_quantized(
-                fwd_bits=self.config.bits,
-                bwd_bits=self.config.bits
-            ))
-        else:
-            dot_general_cls = jax.lax.dot_general
+
 
         self.lm_head = nn.Dense(
             self.config.vocab_size,
@@ -1291,7 +1270,7 @@ class FlaxLlamaForCausalLMModule(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
             precision=self.precision,
-            dot_general=dot_general_cls
+            dot_general=get_dot_general_by_bits(self.config.bits)
         )
 
     def __call__(

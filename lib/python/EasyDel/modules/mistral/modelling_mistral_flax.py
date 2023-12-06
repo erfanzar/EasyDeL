@@ -25,7 +25,7 @@ from ..flax_modelling_utils import (
     precompute_freq_cis,
     JaxBaseClassModel,
     get_flash_attention,
-    smart_flash_attention
+    smart_flash_attention, get_dot_general_by_bits
 )
 import chex
 from fjformer.bits import config as q_config, q_flax
@@ -341,13 +341,7 @@ class FlaxMistralMLP(nn.Module):
     precision: Optional[Union[None, jax.lax.Precision]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
-        if self.config.bits is not None:
-            dot_general_cls = q_flax.QDotGeneral(q_config.fully_quantized(
-                fwd_bits=self.config.bits,
-                bwd_bits=self.config.bits
-            ))
-        else:
-            dot_general_cls = jax.lax.dot_general
+
         dense = functools.partial(
             nn.Dense,
             use_bias=False,
@@ -355,7 +349,7 @@ class FlaxMistralMLP(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision,
             kernel_init=nn.initializers.normal(),
-            dot_general=dot_general_cls
+            dot_general=get_dot_general_by_bits(self.config.bits)
         )
         self.gate_proj = dense(self.config.intermediate_size)
         self.up_proj = dense(self.config.intermediate_size)
@@ -380,13 +374,7 @@ class FlaxMistralAttention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
-        if self.config.bits is not None:
-            dot_general_cls = q_flax.QDotGeneral(q_config.fully_quantized(
-                fwd_bits=self.config.bits,
-                bwd_bits=self.config.bits
-            ))
-        else:
-            dot_general_cls = jax.lax.dot_general
+
         dense = functools.partial(
             nn.Dense,
             use_bias=False,
@@ -394,7 +382,7 @@ class FlaxMistralAttention(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision,
             kernel_init=nn.initializers.normal(),
-            dot_general=dot_general_cls
+            dot_general=get_dot_general_by_bits(self.config.bits)
         )
 
         self.q_proj = dense(self.num_heads * self.head_dim)
@@ -1027,13 +1015,7 @@ class FlaxMistralForCausalLMModule(nn.Module):
             precision=self.precision,
         )
 
-        if self.config.bits is not None:
-            dot_general_cls = q_flax.QDotGeneral(q_config.fully_quantized(
-                fwd_bits=self.config.bits,
-                bwd_bits=self.config.bits
-            ))
-        else:
-            dot_general_cls = jax.lax.dot_general
+
         self.lm_head = nn.Dense(
             self.config.vocab_size,
             dtype=self.dtype,
@@ -1041,7 +1023,7 @@ class FlaxMistralForCausalLMModule(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
             precision=self.precision,
-            dot_general=dot_general_cls
+            dot_general=get_dot_general_by_bits(self.config.bits)
         )
 
     def __call__(

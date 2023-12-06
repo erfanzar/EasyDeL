@@ -32,7 +32,7 @@ def main():
         hidden_size=128,
         num_attention_heads=8,
         num_key_value_heads=4,
-        num_hidden_layers=2,
+        num_hidden_layers=1,
         intermediate_size=256,
         gradient_checkpointing='',
         max_position_embeddings=seq_len
@@ -110,11 +110,11 @@ def main():
 
             # LLAMA 2 to LLAMA 1
             print(f"LLAMA 2 to LLAMA 1 : {llama_2_to_llama_1}")
-            if not llama_2_to_llama_1:
-                print("\t LLAMA 1 : \n", llama_1_pred.logits)
-                print("\t LLAMA 2 : \n", llama_2_pred.logits)
-                err = jnp.mean(llama_1_pred.logits) - jnp.mean(llama_2_pred.logits)
-                print(f'LLAMA 1/2 ERR : {err}')
+            # if not llama_2_to_llama_1:
+            print("\t LLAMA 1 : \n", llama_1_pred.logits)
+            print("\t LLAMA 2 : \n", llama_2_pred.logits)
+            err = jnp.mean(llama_1_pred.logits) - jnp.mean(llama_2_pred.logits)
+            print(f'LLAMA 1/2 ERR : {err}')
         except TypeError as e:
             print(e.__str__())
 

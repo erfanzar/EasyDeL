@@ -47,7 +47,7 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.onnx import OnnxConfigWithPast, PatchingSpec
 
 from fjformer.attention import efficient_attention
-from ..flax_modelling_utils import with_sharding_constraint, JaxBaseClassModel
+from ..flax_modelling_utils import with_sharding_constraint, JaxBaseClassModel, get_dot_general_by_bits
 import chex
 from fjformer.bits import config as q_config, q_flax
 
@@ -366,20 +366,14 @@ class FlaxGPTJAttention(nn.Module):
         self.head_dim = self.embed_dim // self.num_heads
 
         self.rotary_dim = config.rotary_dim
-        if self.config.bits is not None:
-            dot_general_cls = q_flax.QDotGeneral(q_config.fully_quantized(
-                fwd_bits=self.config.bits,
-                bwd_bits=self.config.bits
-            ))
-        else:
-            dot_general_cls = jax.lax.dot_general
+
         dense = partial(
             nn.Dense,
             self.embed_dim,
             use_bias=False,
             dtype=self.dtype,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-            dot_general=dot_general_cls
+            dot_general=get_dot_general_by_bits(self.config.bits)
         )
 
         self.q_proj, self.k_proj, self.v_proj = dense(), dense(), dense()
@@ -552,24 +546,18 @@ class FlaxGPTJMLP(nn.Module):
     def setup(self):
         embed_dim = self.config.hidden_size
         kernel_init = jax.nn.initializers.normal(self.config.initializer_range)
-        if self.config.bits is not None:
-            dot_general_cls = q_flax.QDotGeneral(q_config.fully_quantized(
-                fwd_bits=self.config.bits,
-                bwd_bits=self.config.bits
-            ))
-        else:
-            dot_general_cls = jax.lax.dot_general
+
         self.fc_in = nn.Dense(
             self.intermediate_size,
             dtype=self.dtype,
             kernel_init=kernel_init,
-            dot_general=dot_general_cls
+            dot_general=get_dot_general_by_bits(self.config.bits)
         )
         self.fc_out = nn.Dense(
             embed_dim,
             dtype=self.dtype,
             kernel_init=kernel_init,
-            dot_general=dot_general_cls
+            dot_general=get_dot_general_by_bits(self.config.bits)
         )
 
         self.act = ACT2FN[self.config.activation_function]
@@ -864,19 +852,13 @@ class FlaxGPTJForCausalLMModule(nn.Module):
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
-        if self.config.bits is not None:
-            dot_general_cls = q_flax.QDotGeneral(q_config.fully_quantized(
-                fwd_bits=self.config.bits,
-                bwd_bits=self.config.bits
-            ))
-        else:
-            dot_general_cls = jax.lax.dot_general
+
         self.transformer = FlaxGPTJModule(self.config, dtype=self.dtype)
         self.lm_head = nn.Dense(
             self.config.vocab_size,
             dtype=self.dtype,
             kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
-            dot_general=dot_general_cls
+            dot_general=get_dot_general_by_bits(self.config.bits)
         )
 
     def __call__(

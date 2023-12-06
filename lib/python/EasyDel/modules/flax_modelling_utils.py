@@ -1,5 +1,6 @@
 import fjformer.attention
 import transformers
+from fjformer.bits import q_flax, config as q_config
 from jax.interpreters import pxla
 from jax.experimental.pjit import with_sharding_constraint as wsc
 import jax
@@ -616,3 +617,22 @@ def add_start_docstrings(*docstr):
         return fn
 
     return docstring_decorator
+
+
+def get_dot_general_by_bits(
+        bits: Optional[int] = None
+):
+    """
+    The get_general_dot function is a helper function that returns a q_flax.QDotGeneral object
+    with the specified number of bits for forward and backward passes. If no bits are specified,
+    the function returns None.
+
+    :param bits: Optional[int]: Specify the number of bits for quantization
+    :return: A qdotgeneral object
+    """
+    if bits is not None:
+        return q_flax.QDotGeneral(q_config.fully_quantized(
+            fwd_bits=bits,
+            bwd_bits=bits
+        ))
+    return None
