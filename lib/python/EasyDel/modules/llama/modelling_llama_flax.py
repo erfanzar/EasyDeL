@@ -70,7 +70,7 @@ class LlamaConfig(PretrainedConfig, JaxBaseClassModel):
             axis_dims: Sequence[int] = ((1, -1, 1)),
             axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
             scan_layers: bool = True,
-            use_shard_map: bool = True,
+            use_shard_map: bool = False,
             **kwargs,
     ):
         """
@@ -223,7 +223,7 @@ class LlamaConfig(PretrainedConfig, JaxBaseClassModel):
                      use_pjit_attention_force: bool = False,
                      use_flash_attention: bool = False,
                      use_sacn_mlp: bool = False,
-                     use_shard_map: bool = True,
+                     use_shard_map: bool = False,
                      flash_attn_query_chunk_size: int = 1024,
                      flash_attn_key_chunk_size: int = 1024,
                      scan_mlp_chunk_size: int = 1024,
