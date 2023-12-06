@@ -213,6 +213,7 @@ def rotate_half(x):
 def apply_rotary_pos_emb(tensor, sin_, cos_):
     """
     The apply_rotary_pos_emb function applies a rotary positional embedding to the input tensor.
+    b,h,s,d or pytorch style
 
     :param tensor: Store the tensor that is passed into the function
     :param sin_: Rotate the tensor by pi/2
@@ -220,7 +221,8 @@ def apply_rotary_pos_emb(tensor, sin_, cos_):
     :return: A tensor with the same shape as the input tensor
     
     """
-    return (tensor * cos_) + (rotate_half(tensor) * sin_)
+    b, h, s, d = tensor.shape
+    return (tensor * cos_[:, :, :s, :]) + (rotate_half(tensor) * sin_[:, :, :s, :])
 
 
 def get_ranks_and_size(mesh):
