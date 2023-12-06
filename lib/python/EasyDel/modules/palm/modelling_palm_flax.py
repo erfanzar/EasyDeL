@@ -79,16 +79,9 @@ class PalmConfig(PretrainedConfig):
 
     def add_jax_args(
             self,
-            axis_dims: Sequence[int] = (1, -1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
-
-            backend: Optional[str] = None,
             **kwargs,
     ):
-        self.axis_names = axis_names
-        self.axis_dims = axis_dims
-
-        self.backend = backend
+        ...
 
 
 class RMSNorm(nn.Module):

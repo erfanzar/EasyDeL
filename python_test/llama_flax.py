@@ -39,16 +39,19 @@ def main():
         config=copy.deepcopy(config)
     )
     params = {"params": llama_convert_hf_to_flax(torch_model.state_dict(), config, device=jax.devices('cpu')[0])}
-
-    np_random_input_ids = np.random.randint(0, config.vocab_size, (1, 128))
+    batch_size = len(jax.devices())
+    np_random_input_ids = np.random.randint(0, config.vocab_size, (batch_size, 128))
     input_ids = torch.from_numpy(np_random_input_ids).reshape(1, -1).to(torch.long)
-    flax_input_ids = jnp.asarray(np_random_input_ids, dtype=jnp.int32).reshape(1, -1)
+    flax_input_ids = jnp.asarray(np_random_input_ids, dtype=jnp.int32).reshape(batch_size, -1)
     torch_output = torch_model(
         input_ids=input_ids
     )
     config.add_jax_args()
+    config.add_partitions(
+        use_shard_map=True
+    )
     print("Config\n", config)
-    mesh = create_mesh()
+    mesh = config.jax_mesh()
     with mesh:
         partition_specs = match_partition_rules(config.get_partition_rules(True), params)
         shard, _ = make_shard_and_gather_fns(partition_specs, jnp.float32)
@@ -61,7 +64,8 @@ def main():
                 config=config,
                 dtype=jnp.float32,
                 param_dtype=jnp.float32,
-                _do_init=False, input_shape=(1, 128)
+                _do_init=False,
+                input_shape=(batch_size, 128)
             )
             flax_output = flax_model(
                 input_ids=flax_input_ids,

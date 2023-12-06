@@ -54,7 +54,7 @@ from fjformer.bits import config as q_config, q_flax
 logger = logging.get_logger(__name__)
 
 
-class GPTJConfig(PretrainedConfig, JaxBaseClassModel):
+class GPTJConfig(JaxBaseClassModel):
     model_type = "gptj"
     attribute_map = {
         "max_position_embeddings": "n_positions",
@@ -87,8 +87,6 @@ class GPTJConfig(PretrainedConfig, JaxBaseClassModel):
             flash_attn_query_chunk_size: int = 1024,
             flash_attn_key_chunk_size: int = 2048,
             bits: Optional[int] = None,
-            axis_dims: Sequence[int] = (1, -1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
             **kwargs,
     ):
         self.bits = bits
@@ -114,8 +112,6 @@ class GPTJConfig(PretrainedConfig, JaxBaseClassModel):
         self.use_flash_attention = use_flash_attention
         self.from_pt = False
         super().__init__(
-            axis_names=axis_names,
-            axis_dims=axis_dims,
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
             tie_word_embeddings=tie_word_embeddings,
@@ -188,7 +184,7 @@ class GPTJConfig(PretrainedConfig, JaxBaseClassModel):
 
     @staticmethod
     def get_mesh_names():
-        return "dp", "fsdp",  "mp"
+        return "dp", "fsdp", "mp", "sp"
 
     def add_jax_args(
             self,
@@ -214,17 +210,8 @@ class GPTJConfig(PretrainedConfig, JaxBaseClassModel):
             flash_attn_query_chunk_size: int = 1024,
             flash_attn_key_chunk_size: int = 2048,
             bits: Optional[int] = None,
-            axis_dims: Sequence[int] = (1, -1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
-
-            backend: Optional[str] = None,
             **kwargs,
     ):
-        self.axis_names = axis_names
-        self.axis_dims = axis_dims
-
-        self.backend = backend
-        self.axis_names = axis_names
         basics = dict(
             bits=bits,
             vocab_size=vocab_size,

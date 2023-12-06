@@ -14,7 +14,7 @@ from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
 import chex
 
 
-class GPTNeoXConfig(PretrainedConfig, JaxBaseClassModel):
+class GPTNeoXConfig(JaxBaseClassModel):
     model_type = "gpt_neox"
 
     def __init__(
@@ -37,17 +37,9 @@ class GPTNeoXConfig(PretrainedConfig, JaxBaseClassModel):
             tie_word_embeddings=False,
             gradient_checkpointing='everything_saveable',
             use_parallel_residual=True,
-            axis_dims: Sequence[int] = (1, -1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
             **kwargs,
     ):
-        super().__init__(
-            axis_dims=axis_dims,
-            axis_names=axis_names,
-            bos_token_id=bos_token_id,
-            eos_token_id=eos_token_id,
-            **kwargs
-        )
+
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
@@ -66,7 +58,11 @@ class GPTNeoXConfig(PretrainedConfig, JaxBaseClassModel):
 
         self.use_parallel_residual = use_parallel_residual
         self.from_pt = False
-
+        super().__init__(
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            **kwargs
+        )
     @staticmethod
     def get_partition_rules(fully_fsdp: bool = False):
         return (
@@ -101,20 +97,12 @@ class GPTNeoXConfig(PretrainedConfig, JaxBaseClassModel):
 
     @staticmethod
     def get_mesh_names():
-        return "dp", "fsdp",  "mp"
+        return "dp", "fsdp", "mp", "sp"
 
     def add_jax_args(
             self,
-            axis_dims: Sequence[int] = (1, -1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
-
-            backend: Optional[str] = None,
             **kwargs,
     ):
-        self.axis_names = axis_names
-        self.axis_dims = axis_dims
-
-        self.backend = backend
         self.from_pt = False
 
 

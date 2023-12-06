@@ -30,7 +30,7 @@ import chex
 from fjformer.bits import config as q_config, q_flax
 
 
-class LlamaConfig(PretrainedConfig, JaxBaseClassModel):
+class LlamaConfig(JaxBaseClassModel):
     model_type = "llama"
 
     def __init__(
@@ -67,9 +67,8 @@ class LlamaConfig(PretrainedConfig, JaxBaseClassModel):
             bits: Optional[int] = None,
             hidden_act: str = 'silu',
             pretraining_tp: int = 1,
-            axis_dims: Sequence[int] = (1, -1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp", "mp"),
             scan_layers: bool = True,
+            use_shard_map: bool = True,
             **kwargs,
     ):
         """
@@ -102,6 +101,7 @@ class LlamaConfig(PretrainedConfig, JaxBaseClassModel):
         :param rope_scaling: Dict[str: Define the scaling of the rope
         :param Union[str: Specify the type of the parameter
         :param float]]: Specify the type of the parameter
+        :param use_shard_map: bool: when ever to use shard_map for attention
         :param use_flash_attention: bool: Determine whether to use the flash attention or not
         :param use_sacn_mlp: bool: Determine whether to use scan_mlp or not
         :param flash_attn_query_chunk_size: int: Specify the chunk size of the query tensor
@@ -150,11 +150,9 @@ class LlamaConfig(PretrainedConfig, JaxBaseClassModel):
         self.flash_attn_query_chunk_size = flash_attn_query_chunk_size
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.bits = bits
+        self.use_sacn_mlp = use_shard_map
         self.scan_layers = scan_layers
         super().__init__(
-            axis_dims=axis_dims,
-            axis_names=axis_names,
-            backend=None,
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
             tie_word_embeddings=tie_word_embeddings,
@@ -228,9 +226,6 @@ class LlamaConfig(PretrainedConfig, JaxBaseClassModel):
                      rope_theta: float = 10000.,
                      attention_bias: bool = False,
                      hidden_act: str = 'silu',
-                     axis_dims: Sequence[int] = (1, -1, 1),
-                     axis_names: Sequence[str] = ("dp", "fsdp", "mp"),
-                     backend: Optional[str] = None,
                      scan_layers: bool = True,
                      **kwargs,
                      ):
@@ -256,20 +251,11 @@ class LlamaConfig(PretrainedConfig, JaxBaseClassModel):
         :param rope_theta: float : rope_theta for compute rope
         :param attention_bias: bool : whenever to use attention bias or no
         :param hidden_act: str : hidden_act for mlp
-        :param axis_dims: Sequence[int]: Specify the dimension of each axis
-        :param axis_names: Sequence[str]: Name the axes of the tensor
-        :param backend: typing.Optional[str]: backend to use for model
         :param scan_layers: bool: Determine whether to use scan layers or not
         :return: The following:
 
         """
-        self.axis_names = axis_names
-        self.axis_dims = axis_dims
-
-        self.backend = backend
         self.scan_layers = scan_layers
-        self.axis_names = axis_names
-        self.axis_dims = axis_dims
         self.use_flash_attention = use_flash_attention
         self.embd_pdrop = embd_pdrop
         self.number_rep_kv = number_rep_kv
@@ -534,9 +520,9 @@ class FlaxLlamaAttention(nn.Module):
             hidden_states)
 
         if self.config.use_pjit_attention_force:
-            query_state = with_sharding_constraint(query_state, PS(("dp", "fsdp"), None, "mp"))
-            key_state = with_sharding_constraint(key_state, PS(("dp", "fsdp"), None, "mp"))
-            value_state = with_sharding_constraint(value_state, PS(("dp", "fsdp"), None, "mp"))
+            query_state = with_sharding_constraint(query_state, PS(("dp", "fsdp"), "mp", "tp"))
+            key_state = with_sharding_constraint(key_state, PS(("dp", "fsdp"), "mp", "tp"))
+            value_state = with_sharding_constraint(value_state, PS(("dp", "fsdp"), "mp", "tp"))
 
         query_state = query_state.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
         key_state = key_state.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
@@ -632,24 +618,42 @@ class FlaxLlamaAttention(nn.Module):
             )
             attn_output = jnp.transpose(attn_output, rtp_axis)
         else:
-            attention_bias = lax.select(
-                attention_mask > 0,
-                jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-                jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
-            )
-            attn_weights = dot_product_attention_weights(
-                query=query_state,
-                key=key_state,
-                bias=attention_bias,
-                dtype=jnp.promote_types(self.dtype, jnp.float32),
-                deterministic=deterministic,
-                dropout_rate=self.config.attn_pdrop,
-                precision=self.precision,
-            )
-            if self.config.use_pjit_attention_force:
-                attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "mp", None, None))
+            if self.config.use_shard_map:
+                attn_weights = None
+                ring_attention_sharded = shard_map(
+                    partial(fjformer.attention.ring_attention_standard, axis_name="sp"),
+                    mesh=self.config.jax_mesh(),
+                    in_specs=(
+                        self.config.q_ps,
+                        self.config.k_ps,
+                        self.config.v_ps,
+                        self.config.b_ps
+                    ),
+                    out_specs=self.config.a_ps,
+                    check_rep=False
+                )
+                attn_output = ring_attention_sharded(
+                    query_state, key_state, value_state, attention_mask
+                )
+            else:
+                attention_bias = lax.select(
+                    attention_mask > 0,
+                    jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
+                    jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
+                )
+                attn_weights = dot_product_attention_weights(
+                    query=query_state,
+                    key=key_state,
+                    bias=attention_bias,
+                    dtype=jnp.promote_types(self.dtype, jnp.float32),
+                    deterministic=deterministic,
+                    dropout_rate=self.config.attn_pdrop,
+                    precision=self.precision,
+                )
+                if self.config.use_pjit_attention_force:
+                    attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "mp", None, None))
 
-            attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value_state)
+                attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value_state)
 
         attn_output = self._merge_heads(attn_output)
         attn_output = self.o_proj(attn_output)

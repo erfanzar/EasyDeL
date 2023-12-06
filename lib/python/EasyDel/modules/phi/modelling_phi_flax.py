@@ -17,7 +17,7 @@ from einops import repeat, rearrange
 from transformers.modeling_flax_outputs import FlaxCausalLMOutput
 
 
-class PhiConfig(PretrainedConfig, JaxBaseClassModel):
+class PhiConfig(JaxBaseClassModel):
     """Phi configuration."""
 
     model_type = "phi"
@@ -50,8 +50,6 @@ class PhiConfig(PretrainedConfig, JaxBaseClassModel):
             tie_word_embeddings: bool = False,
             pad_vocab_size_multiple: int = 64,
             bits: Optional[int] = None,
-            axis_dims: Sequence[int] = (1, -1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
             gradient_checkpointing: str = "nothing_saveable",
             **kwargs
     ) -> None:
@@ -75,8 +73,6 @@ class PhiConfig(PretrainedConfig, JaxBaseClassModel):
         self.bits = bits
         self.gradient_checkpointing = gradient_checkpointing
         super().__init__(
-            axis_dims=axis_dims,
-            axis_names=axis_names,
             tie_word_embeddings=tie_word_embeddings,
             **kwargs
         )
@@ -84,14 +80,10 @@ class PhiConfig(PretrainedConfig, JaxBaseClassModel):
     def add_jax_args(
             self,
             bits: Optional[int] = None,
-            axis_dims: Sequence[int] = (1, -1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
             gradient_checkpointing: str = "nothing_saveable",
             **kwargs
     ):
         self.bits = bits
-        self.axis_names = axis_names
-        self.axis_dims = axis_dims
         self.gradient_checkpointing = gradient_checkpointing
 
         for k, v in kwargs.items():

@@ -39,7 +39,7 @@ from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
 import chex
 
 
-class OPTConfig(PretrainedConfig, JaxBaseClassModel):
+class OPTConfig(JaxBaseClassModel):
     model_type = "opt"
     keys_to_ignore_at_inference = ["past_key_values"]
 
@@ -67,13 +67,9 @@ class OPTConfig(PretrainedConfig, JaxBaseClassModel):
             layer_norm_elementwise_affine: bool = True,
             gradient_checkpointing: str = 'nothing_saveable',
             use_pjit_attention_force: bool = False,
-            axis_dims: Sequence[int] = (1, -1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp", "mp"),
             **kwargs,
     ):
         super().__init__(
-            axis_names=axis_names,
-            axis_dims=axis_dims,
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
@@ -132,15 +128,8 @@ class OPTConfig(PretrainedConfig, JaxBaseClassModel):
             layer_norm_elementwise_affine: bool = True,
             gradient_checkpointing: str = 'nothing_saveable',
             use_pjit_attention_force: bool = False,
-            axis_dims: Sequence[int] = (1, -1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
-            backend: Optional[str] = None,
             **kwargs,
     ):
-        self.axis_names = axis_names
-        self.axis_dims = axis_dims
-
-        self.backend = backend
         basics = dict(
             vocab_size=vocab_size,
             hidden_size=hidden_size,

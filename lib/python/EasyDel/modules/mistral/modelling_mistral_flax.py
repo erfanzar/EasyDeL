@@ -31,7 +31,7 @@ import chex
 from fjformer.bits import config as q_config, q_flax
 
 
-class MistralConfig(PretrainedConfig, JaxBaseClassModel):
+class MistralConfig(JaxBaseClassModel):
     def __init__(
             self,
             vocab_size=32000,
@@ -63,8 +63,6 @@ class MistralConfig(PretrainedConfig, JaxBaseClassModel):
             c_max_position_embeddings: int = 4096,
             freq_max_position_embeddings: int = 4096,
             bits: Optional[int] = None,
-            axis_dims: Sequence[int] = (1, -1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp", "mp"),
             **kwargs,
     ):
         """
@@ -141,8 +139,6 @@ class MistralConfig(PretrainedConfig, JaxBaseClassModel):
         self.freq_max_position_embeddings = freq_max_position_embeddings
 
         super().__init__(
-            axis_names=axis_names,
-            axis_dims=axis_dims,
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
@@ -211,17 +207,13 @@ class MistralConfig(PretrainedConfig, JaxBaseClassModel):
                      c_max_position_embeddings: int = 4096,
                      freq_max_position_embeddings: int = None,
                      bits: Optional[int] = None,
-                     axis_dims: Sequence[int] = (1, -1, 1),
-                     axis_names: Sequence[str] = ("dp", "fsdp", "mp"),
-
-                     backend: Optional[str] = None,
                      **kwargs,
                      ):
         """
         The add_jax_args function adds the following arguments to the model:
 
         :param self: Bind the attributes and methods of a class to an instance of that class
-        :param gradient_checkpointing: str: Determine whether or not to use gradient checkpointing
+        :param gradient_checkpointing: str: Determine whether to use gradient checkpointing
         :param use_pjit_attention_force: bool: Determine whether to use the pjit_attention_force function
         :param use_flash_attention: bool: Determine if the flash attention module is used or not
         :param use_sacn_mlp: bool: Determine whether to use the scan_mlp function or not
@@ -255,10 +247,6 @@ class MistralConfig(PretrainedConfig, JaxBaseClassModel):
         self.c_max_position_embeddings = c_max_position_embeddings
         self.freq_max_position_embeddings = freq_max_position_embeddings
         self.bits = bits
-        self.axis_names = axis_names
-        self.axis_dims = axis_dims
-
-        self.backend = backend
 
     @staticmethod
     def get_weight_decay_exclusions():
@@ -560,27 +548,45 @@ class FlaxMistralAttention(nn.Module):
             )
             attn_output = jnp.transpose(attn_output, rtp_axis)
         else:
-            attention_bias = lax.select(
-                attention_mask > 0,
-                jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-                jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
-            )
-            attn_weights = dot_product_attention_weights(
-                query=query,
-                key=key,
-                bias=attention_bias,
-                dtype=jnp.promote_types(self.dtype, jnp.float32),
-                deterministic=deterministic,
-                dropout_rate=self.config.attn_pdrop,
-                precision=self.precision,
-            )
-            if self.config.use_pjit_attention_force:
-                attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "mp", None, None))
+            if self.config.use_shard_map:
+                attn_weights = None
+                ring_attention_sharded = shard_map(
+                    functools.partial(fjformer.attention.ring_attention_standard, axis_name="sp"),
+                    mesh=self.config.jax_mesh(),
+                    in_specs=(
+                        self.config.q_ps,
+                        self.config.k_ps,
+                        self.config.v_ps,
+                        self.config.b_ps
+                    ),
+                    out_specs=self.config.a_ps,
+                    check_rep=False
+                )
+                attn_output = ring_attention_sharded(
+                    query, key, value, attention_mask
+                )
+            else:
+                attention_bias = lax.select(
+                    attention_mask > 0,
+                    jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
+                    jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
+                )
+                attn_weights = dot_product_attention_weights(
+                    query=query,
+                    key=key,
+                    bias=attention_bias,
+                    dtype=jnp.promote_types(self.dtype, jnp.float32),
+                    deterministic=deterministic,
+                    dropout_rate=self.config.attn_pdrop,
+                    precision=self.precision,
+                )
+                if self.config.use_pjit_attention_force:
+                    attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "mp", None, None))
 
-            attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value)
+                attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value)
 
         out = self.o_proj(attn_output.reshape(batch_size, sequence_length, self.hidden_size))
-        outputs = (out, attn_output) if output_attentions else (out,)
+        outputs = (out, attn_weights) if output_attentions else (out,)
         return outputs
 
 
