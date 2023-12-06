@@ -607,6 +607,7 @@ class FlaxLlamaAttention(nn.Module):
         if self.has_variable("cache", "cached_key") or init_cache:
             key_state, value_state, attention_mask = self._concatenate_to_cache(key_state, value_state, query_state,
                                                                                 attention_mask)
+
         if self.config.use_flash_attention and not (self.has_variable("cache", "cached_key") or init_cache):
 
             if attention_mask.ndim == 2:
@@ -649,27 +650,6 @@ class FlaxLlamaAttention(nn.Module):
             )
             attn_output = jnp.transpose(attn_output, rtp_axis)
         else:
-            query_length, key_length = query_state.shape[1], key_state.shape[1]
-
-            if self.has_variable("cache", "cached_key"):
-                mask_shift = self.variables["cache"]["cache_index"]
-                max_decoder_length = self.variables["cache"]["cached_key"].shape[1]
-                causal_mask = lax.dynamic_slice(
-                    causal_mask, (0, 0, mask_shift, 0), (1, 1, query_length, max_decoder_length)
-                )
-            else:
-                causal_mask = causal_mask[:, :, :query_length, :key_length]
-
-            batch_size = hidden_states.shape[0]
-            causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
-            if attention_mask.ndim == 2:
-                attention_mask = jnp.broadcast_to(jnp.expand_dims(attention_mask, axis=(-3, -2)), causal_mask.shape)
-            attention_mask = combine_masks(attention_mask, causal_mask, fcm_mask)
-
-            if self.has_variable("cache", "cached_key") or init_cache:
-                key_state, value_state, attention_mask = self._concatenate_to_cache(key_state, value_state, query_state,
-                                                                                    attention_mask)
-
             attn_weights = None
             if self.config.use_shard_map:
                 ring_attention_sharded = shard_map(
