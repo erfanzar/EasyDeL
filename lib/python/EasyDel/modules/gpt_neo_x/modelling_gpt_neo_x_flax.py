@@ -37,7 +37,7 @@ class GPTNeoXConfig(PretrainedConfig, JaxBaseClassModel):
             tie_word_embeddings=False,
             gradient_checkpointing='everything_saveable',
             use_parallel_residual=True,
-            axis_dims: Sequence[int] = (1, -1, 1, 1),
+            axis_dims: Sequence[int] = ((1, -1, 1)),
             axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
             **kwargs,
     ):
@@ -105,7 +105,7 @@ class GPTNeoXConfig(PretrainedConfig, JaxBaseClassModel):
 
     def add_jax_args(
             self,
-            axis_dims: Sequence[int] = (1, -1, 1, 1),
+            axis_dims: Sequence[int] = ((1, -1, 1)),
             axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
             q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
             k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),

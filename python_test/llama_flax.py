@@ -27,11 +27,11 @@ def main():
     torch.manual_seed(42)
 
     config = LlamaConfig(
-        hidden_size=128,
-        num_attention_heads=8,
+        hidden_size=2048,
+        num_attention_heads=32,
         num_key_value_heads=4,
-        num_hidden_layers=2,
-        intermediate_size=128,
+        num_hidden_layers=16,
+        intermediate_size=3072,
         gradient_checkpointing=''
     )
     print('Model Config :\n', config)
@@ -58,9 +58,7 @@ def main():
     config.use_shard_map = False
     print("Config\n", config)
     mesh = create_mesh()
-    print("Mesh:\n", mesh)
     with mesh:
-        print(config.get_partition_rules(True))
         partition_specs = match_partition_rules(config.get_partition_rules(True), params)
         shard, _ = make_shard_and_gather_fns(partition_specs, jnp.float32)
 
@@ -80,13 +78,14 @@ def main():
 
             )
             res = jnp.allclose(torch_output.logits.cpu().detach().numpy(), flax_output.logits, atol=1e-5)
-            print('LLama Huggingface Predictions :\n', torch_output.logits.cpu().detach().numpy(),
-                  '\nEasyDel Predictions: \n', flax_output.logits)
             if res:  # A Little Bit of humor
+                print('LLama Huggingface Predictions :\n', torch_output.logits.cpu().detach().numpy(),
+                      '\nEasyDel Predictions: \n', flax_output.logits)
                 print('\033[1;36mTest Passed Unfortunately 🥳')
             else:
                 print('\033[1;31mTest Failed Successfully  🤕')
-
+            error = jnp.mean(torch_output.logits.cpu().detach().numpy() - flax_output.logits)
+            print("Error : ", error)
         except TypeError as e:
             print(e.__str__())
 

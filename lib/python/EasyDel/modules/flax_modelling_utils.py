@@ -444,7 +444,7 @@ def smart_flash_attention(
 
 
 def create_mesh(
-        axis_dims: Sequence[int] = (1, -1, 1, 1), axis_names: Sequence[str] = ("dp", "fsdp", "mp"), backend=""
+        axis_dims: Sequence[int] = ((1, -1, 1)), axis_names: Sequence[str] = ("dp", "fsdp", "mp"), backend=""
 ):
     """
     The create_mesh function creates a mesh object that can be used to shard arrays.
@@ -479,7 +479,7 @@ class JaxBaseClassModel:
 
     def __init__(
             self,
-            axis_dims: Sequence[int] = (1, -1, 1, 1),
+            axis_dims: Sequence[int] = ((1, -1, 1)),
             axis_names: Sequence[str] = ("dp", "fsdp", "mp"),
             q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
             k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
@@ -574,7 +574,7 @@ class JaxBaseClassModel:
 
     def add_partitions(
             self,
-            axis_dims: Sequence[int] = (1, -1, 1, 1),
+            axis_dims: Sequence[int] = ((1, -1, 1)),
             axis_names: Sequence[str] = ("dp", "fsdp", "mp"),
             q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
             k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),

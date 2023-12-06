@@ -169,7 +169,7 @@ class RLHFConfig(PretrainedConfig):
                  dtype: Union[str, jnp.dtype] = 'bf16',
                  param_dtype: Union[str, jnp.dtype] = 'bf16',
                  precision: Optional[Union[str, jax.lax.Precision, None]] = 'fastest',
-                 sharding_array: tuple = (1, -1, 1, 1),
+                 sharding_array: tuple = ((1, -1, 1)),
                  extra_optimizer_kwargs: dict = None,
                  model_name: str = 'RLHF',
                  save_dir: str = 'easydel_ckpt',

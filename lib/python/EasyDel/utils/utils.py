@@ -293,7 +293,7 @@ class RNG:
 
 
 def get_mesh(
-        shape: typing.Sequence[int] = (1, -1, 1, 1),
+        shape: typing.Sequence[int] = ((1, -1, 1)),
         axis_names: typing.Sequence[str] = ("dp", "fsdp",  "mp")
 ):
     """

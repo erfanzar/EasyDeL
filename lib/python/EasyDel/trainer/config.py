@@ -44,7 +44,7 @@ class TrainArguments(
             weight_decay: float = 0.01,
             gradient_checkpointing: str = 'nothing_saveable',
             max_length: Union[int, None] = 4096,
-            sharding_array: Union[tuple, int] = (1, -1, 1, 1),
+            sharding_array: Union[tuple, int] = ((1, -1, 1)),
             is_fine_tuning: bool = True,
             do_train: bool = True,
             do_eval: bool = False,
