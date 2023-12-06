@@ -347,14 +347,12 @@ class FlaxFalconAttention(nn.Module):
         head_dim = self.config.hidden_size // self.config.num_attention_heads
 
         if self.config.bits is not None:
-            _dot_general_cls = q_config.fully_quantized(
+            dot_general_cls = q_flax.QDotGeneral(q_config.fully_quantized(
                 fwd_bits=self.config.bits,
                 bwd_bits=self.config.bits
-            )
+            ))
         else:
-            _dot_general_cls = None
-
-        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
+            dot_general_cls = jax.lax.dot_general
         self.query_key_value = nn.Dense(
             features=3 * self.config.hidden_size if not self.config.multi_query else (
                     self.config.hidden_size + 2 * head_dim),
@@ -573,14 +571,12 @@ class FlaxFalconMlp(nn.Module):
 
     def setup(self) -> None:
         if self.config.bits is not None:
-            _dot_general_cls = q_config.fully_quantized(
+            dot_general_cls = q_flax.QDotGeneral(q_config.fully_quantized(
                 fwd_bits=self.config.bits,
                 bwd_bits=self.config.bits
-            )
+            ))
         else:
-            _dot_general_cls = None
-
-        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
+            dot_general_cls = jax.lax.dot_general
 
         self.dense_h_to_4h = nn.Dense(
             features=self.config.hidden_size * 4,
@@ -969,14 +965,12 @@ class FlaxFalconForCausalLMModule(nn.Module):
             precision=self.precision
         )
         if self.config.bits is not None:
-            _dot_general_cls = q_config.fully_quantized(
+            dot_general_cls = q_flax.QDotGeneral(q_config.fully_quantized(
                 fwd_bits=self.config.bits,
                 bwd_bits=self.config.bits
-            )
+            ))
         else:
-            _dot_general_cls = None
-
-        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
+            dot_general_cls = jax.lax.dot_general
         self.lm_head = nn.Dense(
             self.config.vocab_size,
             use_bias=False,

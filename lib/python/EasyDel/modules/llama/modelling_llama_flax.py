@@ -68,7 +68,7 @@ class LlamaConfig(PretrainedConfig, JaxBaseClassModel):
             hidden_act: str = 'silu',
             pretraining_tp: int = 1,
             axis_dims: Sequence[int] = (1, -1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
+            axis_names: Sequence[str] = ("dp", "fsdp", "mp"),
             scan_layers: bool = True,
             **kwargs,
     ):
@@ -229,7 +229,7 @@ class LlamaConfig(PretrainedConfig, JaxBaseClassModel):
                      attention_bias: bool = False,
                      hidden_act: str = 'silu',
                      axis_dims: Sequence[int] = (1, -1, 1),
-                     axis_names: Sequence[str] = ("dp", "fsdp",  "mp"),
+                     axis_names: Sequence[str] = ("dp", "fsdp", "mp"),
                      q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
                      k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
                      v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp", None, "mp"),
@@ -377,14 +377,12 @@ class FlaxLlamaAttention(nn.Module):
         self.number_of_reps = self.config.num_attention_heads // self.config.num_key_value_heads
 
         if self.config.bits is not None:
-            _dot_general_cls = q_config.fully_quantized(
+            dot_general_cls = q_flax.QDotGeneral(q_config.fully_quantized(
                 fwd_bits=self.config.bits,
                 bwd_bits=self.config.bits
-            )
+            ))
         else:
-            _dot_general_cls = None
-
-        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
+            dot_general_cls = jax.lax.dot_general
 
         if self.number_of_reps == 1:
             assert self.config.num_attention_heads == self.config.num_key_value_heads
@@ -682,14 +680,12 @@ class FlaxLlamaMLP(nn.Module):
         config = self.config
 
         if self.config.bits is not None:
-            _dot_general_cls = q_config.fully_quantized(
+            dot_general_cls = q_flax.QDotGeneral(q_config.fully_quantized(
                 fwd_bits=self.config.bits,
                 bwd_bits=self.config.bits
-            )
+            ))
         else:
-            _dot_general_cls = None
-
-        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
+            dot_general_cls = jax.lax.dot_general
 
         self.gate_proj = nn.Dense(
             config.intermediate_size,
@@ -1287,14 +1283,12 @@ class FlaxLlamaForCausalLMModule(nn.Module):
                                      )
 
         if self.config.bits is not None:
-            _dot_general_cls = q_config.fully_quantized(
+            dot_general_cls = q_flax.QDotGeneral(q_config.fully_quantized(
                 fwd_bits=self.config.bits,
                 bwd_bits=self.config.bits
-            )
+            ))
         else:
-            _dot_general_cls = None
-
-        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
+            dot_general_cls = jax.lax.dot_general
 
         self.lm_head = nn.Dense(
             self.config.vocab_size,

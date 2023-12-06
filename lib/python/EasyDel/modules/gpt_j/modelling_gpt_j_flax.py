@@ -388,14 +388,12 @@ class FlaxGPTJAttention(nn.Module):
 
         self.rotary_dim = config.rotary_dim
         if self.config.bits is not None:
-            _dot_general_cls = q_config.fully_quantized(
+            dot_general_cls = q_flax.QDotGeneral(q_config.fully_quantized(
                 fwd_bits=self.config.bits,
                 bwd_bits=self.config.bits
-            )
+            ))
         else:
-            _dot_general_cls = None
-
-        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
+            dot_general_cls = jax.lax.dot_general
         dense = partial(
             nn.Dense,
             self.embed_dim,
@@ -576,14 +574,12 @@ class FlaxGPTJMLP(nn.Module):
         embed_dim = self.config.hidden_size
         kernel_init = jax.nn.initializers.normal(self.config.initializer_range)
         if self.config.bits is not None:
-            _dot_general_cls = q_config.fully_quantized(
+            dot_general_cls = q_flax.QDotGeneral(q_config.fully_quantized(
                 fwd_bits=self.config.bits,
                 bwd_bits=self.config.bits
-            )
+            ))
         else:
-            _dot_general_cls = None
-
-        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
+            dot_general_cls = jax.lax.dot_general
         self.fc_in = nn.Dense(
             self.intermediate_size,
             dtype=self.dtype,
@@ -890,14 +886,12 @@ class FlaxGPTJForCausalLMModule(nn.Module):
 
     def setup(self):
         if self.config.bits is not None:
-            _dot_general_cls = q_config.fully_quantized(
+            dot_general_cls = q_flax.QDotGeneral(q_config.fully_quantized(
                 fwd_bits=self.config.bits,
                 bwd_bits=self.config.bits
-            )
+            ))
         else:
-            _dot_general_cls = None
-
-        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
+            dot_general_cls = jax.lax.dot_general
         self.transformer = FlaxGPTJModule(self.config, dtype=self.dtype)
         self.lm_head = nn.Dense(
             self.config.vocab_size,
