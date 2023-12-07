@@ -127,13 +127,14 @@ class AutoEasyDelModelForCausalLM:
             dtype: jax.numpy.dtype = jax.numpy.float32,
             param_dtype: jax.numpy.dtype = jax.numpy.float32,
             precision: jax.lax.Precision = jax.lax.Precision('fastest'),
-            sharding_axis_dims: typing.Sequence[int] = (1, -1, 1, 1),
-            sharding_axis_names: typing.Sequence[str] = ('dp', 'fsdp', 'tp', 'mp'),
-            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", None, ("dp", "fsdp"), None),
-            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
+            sharding_axis_dims: typing.Sequence[int] = (1, -1, 1),
+            sharding_axis_names: typing.Sequence[str] = ("dp", "fsdp", "mp"),
+            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, "mp", None),
+            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, "mp", None),
+            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, "mp", None),
+            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, "mp", None),
+            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, "mp", None),
+            use_shard_map: bool = False,
             input_shape: typing.Sequence[int] = (1, 1),
             backend: typing.Optional[str] = None,
             **kwargs
@@ -156,6 +157,7 @@ class AutoEasyDelModelForCausalLM:
         :param v_ps: jax.sharding.PartitionSpec: Specify the partitioning of the value tensor
         :param b_ps: jax.sharding.PartitionSpec: Specify the Attention Bias partition spec
         :param a_ps: jax.sharding.PartitionSpec: Specify the partitioning of the attention weights
+        :param use_shard_map: bool: whenever to use shard_map for attention
         :param input_shape: typing.Sequence[int]: Specify the shape of the input to the model
         :param backend: typing.Optional[str]: backend to use for model
         :param **kwargs: Pass additional arguments to the model and config classes
@@ -172,14 +174,17 @@ class AutoEasyDelModelForCausalLM:
         cfg = cfg.from_pretrained(repo_id)
         if hasattr(cfg, 'add_jax_args'):
             cfg.add_jax_args()
-        cfg.axis_dims = sharding_axis_dims
-        cfg.axis_names = sharding_axis_names
-        cfg.q_ps = q_ps
-        cfg.k_ps = k_ps
-        cfg.v_ps = v_ps
-        cfg.b_ps = b_ps
-        cfg.a_ps = a_ps
-        cfg.backend = backend
+        cfg.add_partitions(
+            axis_dims=sharding_axis_dims,
+            axis_names=sharding_axis_names,
+            q_ps=q_ps,
+            k_ps=k_ps,
+            v_ps=v_ps,
+            b_ps=b_ps,
+            a_ps=a_ps,
+            backend=backend,
+            use_shard_map=use_shard_map,
+        )
         ed_model = module(
             config=cfg,
             _do_init=False,

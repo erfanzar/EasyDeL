@@ -186,7 +186,7 @@ def main(argv):
         backend=FLAGS.backend,
         max_length=FLAGS.max_sequence_length,
         gradient_checkpointing='nothing_saveable',
-        sharding_array=(1, -1, 1, 1),
+        sharding_array=(1, -1, 1),
         use_pjit_attention_force=False,
         extra_configs=conf,
         gradient_accumulation_steps=FLAGS.gradient_accumulation_steps,

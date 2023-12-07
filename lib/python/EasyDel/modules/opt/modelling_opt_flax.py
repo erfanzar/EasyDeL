@@ -39,7 +39,7 @@ from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
 import chex
 
 
-class OPTConfig(PretrainedConfig, JaxBaseClassModel):
+class OPTConfig(JaxBaseClassModel):
     model_type = "opt"
     keys_to_ignore_at_inference = ["past_key_values"]
 
@@ -67,13 +67,9 @@ class OPTConfig(PretrainedConfig, JaxBaseClassModel):
             layer_norm_elementwise_affine: bool = True,
             gradient_checkpointing: str = 'nothing_saveable',
             use_pjit_attention_force: bool = False,
-            axis_dims: Sequence[int] = (1, -1, 1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
             **kwargs,
     ):
         super().__init__(
-            axis_names=axis_names,
-            axis_dims=axis_dims,
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
@@ -105,7 +101,7 @@ class OPTConfig(PretrainedConfig, JaxBaseClassModel):
             raise NotImplementedError
         else:
             return (
-                ('.*', PartitionSpec(('fsdp', 'mp')))
+                ('.*', PartitionSpec("fsdp"))
             )
 
     def add_jax_args(
@@ -132,24 +128,8 @@ class OPTConfig(PretrainedConfig, JaxBaseClassModel):
             layer_norm_elementwise_affine: bool = True,
             gradient_checkpointing: str = 'nothing_saveable',
             use_pjit_attention_force: bool = False,
-            axis_dims: Sequence[int] = (1, -1, 1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
-            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", None, ("dp", "fsdp"), None),
-            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-            backend: Optional[str] = None,
             **kwargs,
     ):
-        self.axis_names = axis_names
-        self.axis_dims = axis_dims
-        self.q_ps = q_ps
-        self.k_ps = k_ps
-        self.v_ps = v_ps
-        self.b_ps = b_ps
-        self.a_ps = a_ps
-        self.backend = backend
         basics = dict(
             vocab_size=vocab_size,
             hidden_size=hidden_size,

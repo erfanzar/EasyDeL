@@ -49,7 +49,7 @@ from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
 import chex
 
 
-class T5Config(PretrainedConfig, JaxBaseClassModel):
+class T5Config(JaxBaseClassModel):
     model_type = "t5"
     keys_to_ignore_at_inference = ["past_key_values"]
     attribute_map = {"hidden_size": "d_model", "num_attention_heads": "num_heads", "num_hidden_layers": "num_layers"}
@@ -75,8 +75,6 @@ class T5Config(PretrainedConfig, JaxBaseClassModel):
             eos_token_id=1,
             gradient_checkpointing: str = 'nothing_saveable',
             use_pjit_attention_force: bool = False,
-            axis_dims: Sequence[int] = (1, -1, 1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
             **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -114,8 +112,6 @@ class T5Config(PretrainedConfig, JaxBaseClassModel):
             self.dense_act_fn = "gelu_new"
 
         super().__init__(
-            axis_dims=axis_dims,
-            axis_names=axis_names,
             pad_token_id=pad_token_id,
             eos_token_id=eos_token_id,
             is_encoder_decoder=is_encoder_decoder,
@@ -124,16 +120,17 @@ class T5Config(PretrainedConfig, JaxBaseClassModel):
 
     def get_partition_rules(self, fully_fsdp: bool = True):
         return (
-            ("wi_0/kernel", PartitionSpec(('fsdp', 'mp'))),
-            ("wi_1/kernel", PartitionSpec(('fsdp', 'mp'))),
-            ("wi/kernel", PartitionSpec(('fsdp', 'mp'), 'tp')),
-            ("wo/kernel", PartitionSpec(('fsdp', 'mp'), 'tp')),
-            ("SelfAttention/(q|k|v|o)/kernel", PartitionSpec(('fsdp', 'mp'))),
-            ("EncDecAttention/(q|k|v|o)/kernel", PartitionSpec(('fsdp', 'mp'))),
+            ("wi_0/kernel", PartitionSpec("fsdp")),
+            ("wi_1/kernel", PartitionSpec("fsdp")),
+            ("wi/kernel", PartitionSpec("fsdp", "dp")),
+            ("wo/kernel", PartitionSpec("fsdp", "dp")),
+            ("SelfAttention/(q|k|v|o)/kernel", PartitionSpec("fsdp")),
+            ("EncDecAttention/(q|k|v|o)/kernel", PartitionSpec("fsdp")),
             ('.*', PartitionSpec(None))
         ) if not fully_fsdp else (
-            ('.*', PartitionSpec(('fsdp', 'mp')))
+            ('.*', PartitionSpec("fsdp"))
         )
+
 
 remat = nn_partitioning.remat
 

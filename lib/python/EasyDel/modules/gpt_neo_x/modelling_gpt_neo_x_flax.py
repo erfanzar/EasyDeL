@@ -14,7 +14,7 @@ from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
 import chex
 
 
-class GPTNeoXConfig(PretrainedConfig, JaxBaseClassModel):
+class GPTNeoXConfig(JaxBaseClassModel):
     model_type = "gpt_neox"
 
     def __init__(
@@ -37,17 +37,9 @@ class GPTNeoXConfig(PretrainedConfig, JaxBaseClassModel):
             tie_word_embeddings=False,
             gradient_checkpointing='everything_saveable',
             use_parallel_residual=True,
-            axis_dims: Sequence[int] = (1, -1, 1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
             **kwargs,
     ):
-        super().__init__(
-            axis_dims=axis_dims,
-            axis_names=axis_names,
-            bos_token_id=bos_token_id,
-            eos_token_id=eos_token_id,
-            **kwargs
-        )
+
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
@@ -66,63 +58,51 @@ class GPTNeoXConfig(PretrainedConfig, JaxBaseClassModel):
 
         self.use_parallel_residual = use_parallel_residual
         self.from_pt = False
-
+        super().__init__(
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            **kwargs
+        )
     @staticmethod
     def get_partition_rules(fully_fsdp: bool = False):
         return (
-            ('wte/embedding', PartitionSpec(('fsdp', 'mp'), 'tp')),
-            ('attention/w_qkv/(kernel|bias)', PartitionSpec(('fsdp', 'mp'), 'tp')),
-            ('attention/wo/(kernel|bias)', PartitionSpec(('fsdp', 'mp'), 'tp')),
-            ('mlp/dense_h_to_4h/(kernel|bias)', PartitionSpec(('fsdp', 'mp'), 'tp')),
-            ('mlp/dense_4h_to_h/(kernel|bias)', PartitionSpec('tp', ('fsdp', 'mp'))),
+            ('wte/embedding', PartitionSpec("fsdp", "dp")),
+            ('attention/w_qkv/(kernel|bias)', PartitionSpec("fsdp", "dp")),
+            ('attention/wo/(kernel|bias)', PartitionSpec("fsdp", "dp")),
+            ('mlp/dense_h_to_4h/(kernel|bias)', PartitionSpec("fsdp", "dp")),
+            ('mlp/dense_4h_to_h/(kernel|bias)', PartitionSpec("dp", "fsdp")),
 
-            ('post_attention_layernorm/(bias|scale)', PartitionSpec(('fsdp', 'mp'), 'tp')),
-            ('input_layernorm/(bias|scale)', PartitionSpec(('fsdp', 'mp'), 'tp')),
+            ('post_attention_layernorm/(bias|scale)', PartitionSpec("fsdp", "dp")),
+            ('input_layernorm/(bias|scale)', PartitionSpec("fsdp", "dp")),
 
-            ('transformer/final_layer_norm/(scale|bias)', PartitionSpec('tp', ('fsdp', 'mp'))),
-            ('lm_head/kernel', PartitionSpec('tp', ('fsdp', 'mp'))),
+            ('transformer/final_layer_norm/(scale|bias)', PartitionSpec("dp", "fsdp")),
+            ('lm_head/kernel', PartitionSpec("dp", "fsdp")),
             ('.*', PartitionSpec(None))
         ) if not fully_fsdp else (
 
-            ('embed_in/embedding', PartitionSpec(('fsdp', 'mp'))),
+            ('embed_in/embedding', PartitionSpec("fsdp")),
 
-            ('attention/w_qkv/(kernel|bias)', PartitionSpec(('fsdp', 'mp'))),
-            ('attention/wo/(kernel|bias)', PartitionSpec(('fsdp', 'mp'))),
-            ('mlp/dense_h_to_4h/(kernel|bias)', PartitionSpec(('fsdp', 'mp'))),
-            ('mlp/dense_4h_to_h/(kernel|bias)', PartitionSpec(('fsdp', 'mp'))),
+            ('attention/w_qkv/(kernel|bias)', PartitionSpec("fsdp")),
+            ('attention/wo/(kernel|bias)', PartitionSpec("fsdp")),
+            ('mlp/dense_h_to_4h/(kernel|bias)', PartitionSpec("fsdp")),
+            ('mlp/dense_4h_to_h/(kernel|bias)', PartitionSpec("fsdp")),
 
-            ('post_attention_layernorm/(bias|scale)', PartitionSpec(('fsdp', 'mp'))),
-            ('input_layernorm/(bias|scale)', PartitionSpec(('fsdp', 'mp'))),
+            ('post_attention_layernorm/(bias|scale)', PartitionSpec("fsdp")),
+            ('input_layernorm/(bias|scale)', PartitionSpec("fsdp")),
 
-            ('transformer/final_layer_norm/(scale|bias)', PartitionSpec(('fsdp', 'mp'))),
-            ('lm_head/kernel', PartitionSpec(('fsdp', 'mp'))),
+            ('transformer/final_layer_norm/(scale|bias)', PartitionSpec("fsdp")),
+            ('lm_head/kernel', PartitionSpec("fsdp")),
             ('.*', PartitionSpec(None))
         )
 
     @staticmethod
     def get_mesh_names():
-        return "dp", "fsdp", "tp", "mp"
+        return "dp", "fsdp", "mp"
 
     def add_jax_args(
             self,
-            axis_dims: Sequence[int] = (1, -1, 1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
-            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", None, ("dp", "fsdp"), None),
-            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-            backend: Optional[str] = None,
             **kwargs,
     ):
-        self.axis_names = axis_names
-        self.axis_dims = axis_dims
-        self.q_ps = q_ps
-        self.k_ps = k_ps
-        self.v_ps = v_ps
-        self.b_ps = b_ps
-        self.a_ps = a_ps
-        self.backend = backend
         self.from_pt = False
 
 
