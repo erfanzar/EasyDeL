@@ -717,7 +717,7 @@ class JAXServer(object):
         """
         tokens = self.prefix_tokenizer(
             string,
-            max_length=self.config.max_length,
+            max_length=self.config.max_length - self.config.max_stream_tokens,
             padding='max_length',
             return_tensors='jax'
         ) \
