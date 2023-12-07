@@ -158,7 +158,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--mesh_axes_shape",
-        default=[1, -1, 1],
+        default=[(1, -1, 1)],
         nargs="+",
         type=int,
         help="The shapes of the mesh axes.",

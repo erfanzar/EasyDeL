@@ -28,13 +28,13 @@ The config input is a dictionary that contains the following keys:
 * `top_k`: The top-k parameter for sampling from the model's output distribution.
     * _Default Value has been set to  `50`_
 * `mesh_axes_shape`: The shape of the mesh axes for distributed training.
-    * _Default Value has been set to  `(1, -1, 1, 1)`_
+    * _Default Value has been set to  `(1, -1, 1)`_
 * `host`: The host address for the server.
     * _Default Value has been set to  `'0.0.0.0'`_
 * `dtype`: The data type for the model's parameters.
     * _Default Value has been set to  `'fp16'`_
 * `mesh_axes_names`: The names of the mesh axes for distributed training.
-    * _Default Value has been set to  `("dp", "fsdp", "mp", "sp")`_
+    * _Default Value has been set to  `("dp", "fsdp", "mp")`_
 * `logging`: Whether the model should log its training progress.:
     * _Default Value has been set to  `True`_
 * `stream_tokens_for_gradio`: Whether the model should stream tokens to Gradio.

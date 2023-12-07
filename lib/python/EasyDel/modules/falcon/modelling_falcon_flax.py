@@ -47,8 +47,8 @@ class FalconConfig(JaxBaseClassModel):
             use_pjit_attention_force: bool = False,
             gradient_checkpointing: str = '',
             bits: Optional[int] = None,
-            axis_dims: Sequence[int] = (1, -1, 1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp", "mp", "sp"),
+            axis_dims: Sequence[int] = (1, -1, 1),
+            axis_names: Sequence[str] = ("dp", "fsdp", "mp"),
             **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -123,7 +123,7 @@ class FalconConfig(JaxBaseClassModel):
 
     @staticmethod
     def get_mesh_names():
-        return "dp", "fsdp", "mp", "sp"
+        return "dp", "fsdp", "mp"
 
     def add_jax_args(self,
                      vocab_size: int = 65024,

@@ -97,7 +97,7 @@ class GPTNeoXConfig(JaxBaseClassModel):
 
     @staticmethod
     def get_mesh_names():
-        return "dp", "fsdp", "mp", "sp"
+        return "dp", "fsdp", "mp"
 
     def add_jax_args(
             self,
