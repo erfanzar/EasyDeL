@@ -715,9 +715,11 @@ class JAXServer(object):
         :return: A generator that yields the predicted text and the number of tokens generated
         
         """
+
+        fixed_pad = self.config.max_length - self.config.max_stream_tokens
         tokens = self.prefix_tokenizer(
             string,
-            max_length=self.config.max_length - self.config.max_stream_tokens,
+            max_length=fixed_pad,
             padding='max_length',
             return_tensors='jax'
         ) \
@@ -744,12 +746,12 @@ class JAXServer(object):
 
             input_ids = jnp.concatenate(
                 (input_ids, predicted_token), axis=-1
-            )[:, -self.config.max_length:]
+            )[:, -fixed_pad:]
 
             attention_mask = jnp.concatenate(
                 (attention_mask, plus_attn_mask), dtype=jnp.int32,
                 axis=-1
-            )[:, -self.config.max_length:]
+            )[:, -fixed_pad:]
 
             returns = (
                 self.tokenizer.decode(input_ids[0][-num_generated_tokens:], skip_special_tokens=True),
