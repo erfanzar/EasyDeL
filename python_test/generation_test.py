@@ -14,9 +14,9 @@ from jax.sharding import PartitionSpec as Ps
 import subprocess
 import functools
 
-JAXServer, JaxServerConfig, AutoEasyDelModelForCausalLM = (
+JAXServer, JAXServerConfig, AutoEasyDelModelForCausalLM = (
     ed.JAXServer,
-    ed.JaxServerConfig,
+    ed.JAXServerConfig,
     ed.AutoEasyDelModelForCausalLM
 )
 

@@ -4,7 +4,7 @@ from .serve.torch_serve import (
 )
 from .serve.jax_serve import (
     JAXServer as JAXServer,
-    JaxServerConfig as JaxServerConfig
+    JAXServerConfig as JAXServerConfig
 )
 from .modules.llama.modelling_llama_flax import (
     LlamaConfig as LlamaConfig,
