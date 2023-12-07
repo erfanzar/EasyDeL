@@ -28,7 +28,7 @@ from .utils import InstructRequest, ChatRequest, seafoam
 from jax.experimental.pjit import pjit
 
 
-class JaxServerConfig:
+class JAXServerConfig:
     def __init__(
             self,
             host: str = "0.0.0.0",
@@ -122,15 +122,15 @@ class JAXServer(object):
 
 
         :param self: Refer to the current instance of a class
-        :param config: Pass the jaxserverconfig object
+        :param config: Pass the JAXServerConfig object
         :return: A fastapi object
         
         """
         self.process_uvicorn, self.prefix_tokenizer, self.params, self.tokenizer, self.model, \
             self.rules, self._generate, self._greedy_generate = [None] * 8
-        assert config is None or isinstance(config, JaxServerConfig), 'config can be None or JaxServerConfig Type'
+        assert config is None or isinstance(config, JAXServerConfig), 'config can be None or JAXServerConfig Type'
         if config is None:
-            self.config = JaxServerConfig()
+            self.config = JAXServerConfig()
         else:
             self.config = config
         self._funcs_generated = False
@@ -730,7 +730,6 @@ class JAXServer(object):
         input_ids = tokens.input_ids
         attention_mask = tokens.attention_mask
         num_generated_tokens = 0
-        pad = self.config.max_length - self.config.max_stream_tokens
 
         for _ in range((max_new_tokens or self.config.max_new_tokens) // self.config.max_stream_tokens):
             predicted_token = self.greedy_generate(
@@ -747,16 +746,23 @@ class JAXServer(object):
 
             input_ids = jnp.concatenate(
                 (input_ids, predicted_token), axis=-1
-            )[:, -pad:]
+            )[:, -self.config.max_length:]
             attention_mask = jnp.concatenate(
                 (attention_mask, jnp.ones((len(attention_mask), self.config.max_stream_tokens), dtype=jnp.int32)),
                 axis=-1
-            )[:, -pad:]
+            )[:, -self.config.max_length:]
 
-            yield self.tokenizer.decode(input_ids[0][-num_generated_tokens:],
-                                        skip_special_tokens=True), num_generated_tokens
-            if predicted_token[0][-1] == self.tokenizer.eos_token_id or predicted_token[0][
-                -1] == self.prefix_tokenizer.eos_token_id:
+            returns = (
+                self.tokenizer.decode(input_ids[0][-num_generated_tokens:], skip_special_tokens=True),
+                num_generated_tokens
+            )
+
+            yield returns
+            if (
+                    predicted_token[0][-1] == self.tokenizer.eos_token_id
+                    or
+                    predicted_token[0][-1] == self.prefix_tokenizer.eos_token_id
+            ):
                 break
 
     def process_gradio_chat(self, prompt, history, max_new_tokens, system, greedy):

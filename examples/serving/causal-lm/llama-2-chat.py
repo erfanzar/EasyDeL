@@ -2,7 +2,7 @@ import typing
 
 import EasyDel
 import jax.lax
-from EasyDel.serve import JAXServer, JaxServerConfig
+from EasyDel.serve import JAXServer, JAXServerConfig
 from fjformer.load._load import get_float_dtype_by_name
 from EasyDel.transform import llama_from_pretrained
 from transformers import AutoTokenizer
@@ -175,7 +175,7 @@ if __name__ == "__main__":
         help="Whether to use a prefix tokenizer.",
     )
     args = parser.parse_args()
-    configs = JaxServerConfig(
+    configs = JAXServerConfig(
         contains_auto_format=args.contains_auto_format,
         max_length=args.max_length,
         max_new_tokens=args.max_new_tokens,
