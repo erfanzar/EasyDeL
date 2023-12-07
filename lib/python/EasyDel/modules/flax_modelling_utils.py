@@ -635,4 +635,4 @@ def get_dot_general_by_bits(
             fwd_bits=bits,
             bwd_bits=bits
         ))
-    return None
+    return jax.lax.dot_general
