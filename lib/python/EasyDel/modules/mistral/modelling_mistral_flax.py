@@ -802,7 +802,9 @@ class FlaxMistralPretrainedModel(FlaxPreTrainedModel):
             rng_s["dropout"] = dropout_rng
 
         inputs = {"params": params or self.params} if add_params_field else params or self.params
-        rng_s['params'] = jax.random.key(0)
+
+        if self.config.bits is not None:
+            rng_s['params'] = jax.random.key(0)
         if past_key_values:
             inputs["cache"] = past_key_values
             mutable = ["cache"]
