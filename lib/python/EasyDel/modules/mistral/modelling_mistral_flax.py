@@ -341,7 +341,6 @@ class FlaxMistralMLP(nn.Module):
     precision: Optional[Union[None, jax.lax.Precision]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
-
         dense = functools.partial(
             nn.Dense,
             use_bias=False,
@@ -536,29 +535,32 @@ class FlaxMistralAttention(nn.Module):
             )
             attn_output = jnp.transpose(attn_output, rtp_axis)
         else:
+            attention_bias = lax.select(
+                attention_mask > 0,
+                jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
+                jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
+            )
             if self.config.use_shard_map:
-                attn_weights = None
-                ring_attention_sharded = shard_map(
-                    functools.partial(fjformer.attention.ring_attention_standard, axis_name="sp"),
+                attn_weights = shard_map(
+                    functools.partial(
+                        dot_product_attention_weights,
+                        dtype=jnp.promote_types(self.dtype, jnp.float32),
+                        deterministic=deterministic,
+                        dropout_rate=self.config.attn_pdrop,
+                        precision=self.precision,
+                    ),
                     mesh=self.config.jax_mesh(),
                     in_specs=(
                         self.config.q_ps,
                         self.config.k_ps,
-                        self.config.v_ps,
                         self.config.b_ps
                     ),
-                    out_specs=self.config.a_ps,
+                    out_specs=PS(("dp", "fsdp"), None, None, None),
                     check_rep=False
-                )
-                attn_output = ring_attention_sharded(
-                    query, key, value, attention_mask
+                )(
+                    query, key, attention_bias
                 )
             else:
-                attention_bias = lax.select(
-                    attention_mask > 0,
-                    jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-                    jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
-                )
                 attn_weights = dot_product_attention_weights(
                     query=query,
                     key=key,
@@ -568,10 +570,11 @@ class FlaxMistralAttention(nn.Module):
                     dropout_rate=self.config.attn_pdrop,
                     precision=self.precision,
                 )
-                if self.config.use_pjit_attention_force:
-                    attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "mp", None, None))
 
-                attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value)
+            if self.config.use_pjit_attention_force:
+                attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "mp", None, None))
+
+            attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value)
 
         out = self.o_proj(attn_output.reshape(batch_size, sequence_length, self.hidden_size))
         outputs = (out, attn_weights) if output_attentions else (out,)
@@ -1014,7 +1017,6 @@ class FlaxMistralForCausalLMModule(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision,
         )
-
 
         self.lm_head = nn.Dense(
             self.config.vocab_size,

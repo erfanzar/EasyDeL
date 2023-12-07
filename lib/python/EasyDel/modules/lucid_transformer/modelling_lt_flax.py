@@ -45,8 +45,8 @@ class FlaxLTConfig(JaxBaseClassModel):
                  alibi_bias_max: int = 8,
                  fsdp=False,
                  hidden_act="silu",
-                 axis_dims: Sequence[int] = (1, -1, 1, 1),
-                 axis_names: Sequence[str] = ("dp", "fsdp", "mp", "sp"),
+                 axis_dims: Sequence[int] = (1, -1, 1),
+                 axis_names: Sequence[str] = ("dp", "fsdp", "mp"),
                  **kwargs
                  ):
         super().__init__(
@@ -312,7 +312,7 @@ class FlaxLTModelModule(nn.Module):
 
     def build_alibi(self, sequence_length: int):
         mxl = jnp.arange(1 - sequence_length, 1).reshape(1, 1, 1, -1)
-        mxh = jnp.arange(1, 1 + self.config.num_attention_heads).reshape(1, -1, 1, 1)
+        mxh = jnp.arange(1, 1 + self.config.num_attention_heads).reshape(1, -1, 1)
         cp2 = 2 ** math.ceil(math.log2(self.config.num_attention_heads))
         base_mxl = mxh * (self.config.alibi_bias_max / cp2)
         slope = 1 / jnp.power(2, base_mxl)

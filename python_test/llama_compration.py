@@ -61,62 +61,62 @@ def main():
 
         params = jax.tree_map(lambda p, f: f(p), params, shard)
 
-        try:
+    # try:
 
-            llama_1 = FlaxLlamaForCausalLM(
-                config=config,
-                dtype=jnp.float32,
-                param_dtype=jnp.float32,
-                _do_init=False,
-                input_shape=(batch_size, seq_len)
-            )
-            llama_1_pred = llama_1(
-                input_ids=flax_input_ids,
-                params=params,
+        llama_1 = FlaxLlamaForCausalLM(
+            config=config,
+            dtype=jnp.float32,
+            param_dtype=jnp.float32,
+            _do_init=False,
+            input_shape=(batch_size, seq_len)
+        )
+        llama_1_pred = llama_1(
+            input_ids=flax_input_ids,
+            params=params,
 
-            )
+        )
 
-            llama_2 = OFLC(
-                config=config,
-                dtype=jnp.float32,
-                param_dtype=jnp.float32,
-                _do_init=False,
-                input_shape=(batch_size, seq_len)
-            )
-            llama_2_pred = llama_2(
-                input_ids=flax_input_ids,
-                params=params,
+        llama_2 = OFLC(
+            config=config,
+            dtype=jnp.float32,
+            param_dtype=jnp.float32,
+            _do_init=False,
+            input_shape=(batch_size, seq_len)
+        )
+        llama_2_pred = llama_2(
+            input_ids=flax_input_ids,
+            params=params,
 
-            )
-            llama_1_to_hf = jnp.allclose(torch_output.logits.cpu().detach().numpy(), llama_1_pred.logits, atol=1e-5)
-            llama_2_to_hf = jnp.allclose(torch_output.logits.cpu().detach().numpy(), llama_2_pred.logits, atol=1e-5)
-            llama_2_to_llama_1 = jnp.allclose(llama_1_pred.logits, llama_2_pred.logits, atol=1e-5)
+        )
+        llama_1_to_hf = jnp.allclose(torch_output.logits.cpu().detach().numpy(), llama_1_pred.logits, atol=1e-5)
+        llama_2_to_hf = jnp.allclose(torch_output.logits.cpu().detach().numpy(), llama_2_pred.logits, atol=1e-5)
+        llama_2_to_llama_1 = jnp.allclose(llama_1_pred.logits, llama_2_pred.logits, atol=1e-5)
 
-            # LLAMA 1 to HF
-            print(f"LLAMA 1 to HF      : {llama_1_to_hf}")
-            if not llama_1_to_hf:
-                print("\t HF : \n", torch_output.logits.cpu().detach().numpy())
-                print("\t LLAMA 1 : \n", llama_1_pred.logits)
-                err = jnp.mean(llama_1_pred.logits) - jnp.mean(torch_output.logits.cpu().detach().numpy())
-                print(f'LLAMA 1/HF ERR : {err}')
-
-            # LLAMA 2 to HF
-            print(f"LLAMA 2 to HF      : {llama_2_to_hf}")
-            if not llama_2_to_hf:
-                print("\t HF : \n", torch_output.logits.cpu().detach().numpy())
-                print("\t LLAMA 2 : \n", llama_2_pred.logits)
-                err = jnp.mean(torch_output.logits.cpu().detach().numpy()) - jnp.mean(llama_2_pred.logits)
-                print(f'LLAMA 2/HF ERR : {err}')
-
-            # LLAMA 2 to LLAMA 1
-            print(f"LLAMA 2 to LLAMA 1 : {llama_2_to_llama_1}")
-            # if not llama_2_to_llama_1:
+        # LLAMA 1 to HF
+        print(f"LLAMA 1 to HF      : {llama_1_to_hf}")
+        if not llama_1_to_hf:
+            print("\t HF : \n", torch_output.logits.cpu().detach().numpy())
             print("\t LLAMA 1 : \n", llama_1_pred.logits)
+            err = jnp.mean(llama_1_pred.logits) - jnp.mean(torch_output.logits.cpu().detach().numpy())
+            print(f'LLAMA 1/HF ERR : {err}')
+
+        # LLAMA 2 to HF
+        print(f"LLAMA 2 to HF      : {llama_2_to_hf}")
+        if not llama_2_to_hf:
+            print("\t HF : \n", torch_output.logits.cpu().detach().numpy())
             print("\t LLAMA 2 : \n", llama_2_pred.logits)
-            err = jnp.mean(llama_1_pred.logits) - jnp.mean(llama_2_pred.logits)
-            print(f'LLAMA 1/2 ERR : {err}')
-        except TypeError as e:
-            print(e.__str__())
+            err = jnp.mean(torch_output.logits.cpu().detach().numpy()) - jnp.mean(llama_2_pred.logits)
+            print(f'LLAMA 2/HF ERR : {err}')
+
+        # LLAMA 2 to LLAMA 1
+        print(f"LLAMA 2 to LLAMA 1 : {llama_2_to_llama_1}")
+        # if not llama_2_to_llama_1:
+        # print("\t LLAMA 1 : \n", llama_1_pred.logits)
+        # print("\t LLAMA 2 : \n", llama_2_pred.logits)
+        print(f'LLAMA 1/2 ERR : {jnp.mean(llama_1_pred.logits) - jnp.mean(llama_2_pred.logits)}')
+        print(f'Excepted ERR  : {jnp.mean(llama_2_pred.logits) - jnp.mean(llama_2_pred.logits)}')
+    # except TypeError as e:
+    #     print(e.__str__())
 
 
 if __name__ == '__main__':

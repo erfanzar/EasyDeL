@@ -348,8 +348,6 @@ class FlaxLlamaAttention(nn.Module):
         self.head_dim = self.config.hidden_size // self.config.num_attention_heads
         self.number_of_reps = self.config.num_attention_heads // self.config.num_key_value_heads
 
-
-
         if self.number_of_reps == 1:
             assert self.config.num_attention_heads == self.config.num_key_value_heads
         self.q_proj = nn.Dense(
@@ -514,9 +512,9 @@ class FlaxLlamaAttention(nn.Module):
             hidden_states)
 
         if self.config.use_pjit_attention_force:
-            query_state = with_sharding_constraint(query_state, PS(("dp", "fsdp"), "mp", "tp"))
-            key_state = with_sharding_constraint(key_state, PS(("dp", "fsdp"), "mp", "tp"))
-            value_state = with_sharding_constraint(value_state, PS(("dp", "fsdp"), "mp", "tp"))
+            query_state = with_sharding_constraint(query_state, PS(("dp", "fsdp"), None, "mp"))
+            key_state = with_sharding_constraint(key_state, PS(("dp", "fsdp"), None, "mp"))
+            value_state = with_sharding_constraint(value_state, PS(("dp", "fsdp"), None, "mp"))
 
         query_state = query_state.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
         key_state = key_state.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
@@ -609,29 +607,32 @@ class FlaxLlamaAttention(nn.Module):
             )
             attn_output = jnp.transpose(attn_output, rtp_axis)
         else:
+            attention_bias = lax.select(
+                attention_mask > 0,
+                jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
+                jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
+            )
             if self.config.use_shard_map:
-                attn_weights = None
-                ring_attention_sharded = shard_map(
-                    partial(fjformer.attention.ring_attention_standard, axis_name="sp"),
+                attn_weights = shard_map(
+                    partial(
+                        dot_product_attention_weights,
+                        dtype=jnp.promote_types(self.dtype, jnp.float32),
+                        deterministic=deterministic,
+                        dropout_rate=self.config.attn_pdrop,
+                        precision=self.precision,
+                    ),
                     mesh=self.config.jax_mesh(),
                     in_specs=(
                         self.config.q_ps,
                         self.config.k_ps,
-                        self.config.v_ps,
                         self.config.b_ps
                     ),
-                    out_specs=self.config.a_ps,
+                    out_specs=PS(("dp", "fsdp"), None, None, None),
                     check_rep=False
-                )
-                attn_output = ring_attention_sharded(
-                    query_state, key_state, value_state, attention_mask
+                )(
+                    query_state, key_state, attention_bias
                 )
             else:
-                attention_bias = lax.select(
-                    attention_mask > 0,
-                    jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-                    jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
-                )
                 attn_weights = dot_product_attention_weights(
                     query=query_state,
                     key=key_state,
@@ -641,10 +642,11 @@ class FlaxLlamaAttention(nn.Module):
                     dropout_rate=self.config.attn_pdrop,
                     precision=self.precision,
                 )
-                if self.config.use_pjit_attention_force:
-                    attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "mp", None, None))
 
-                attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value_state)
+            if self.config.use_pjit_attention_force:
+                attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "mp", None, None))
+
+            attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value_state)
 
         attn_output = self._merge_heads(attn_output)
         attn_output = self.o_proj(attn_output)
@@ -663,8 +665,6 @@ class FlaxLlamaMLP(nn.Module):
 
     def setup(self) -> None:
         config = self.config
-
-
 
         self.gate_proj = nn.Dense(
             config.intermediate_size,
@@ -1260,8 +1260,6 @@ class FlaxLlamaForCausalLMModule(nn.Module):
                                      param_dtype=self.param_dtype,
                                      precision=self.precision,
                                      )
-
-
 
         self.lm_head = nn.Dense(
             self.config.vocab_size,
