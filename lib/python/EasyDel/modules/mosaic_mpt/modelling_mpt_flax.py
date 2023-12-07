@@ -17,13 +17,13 @@ from ..flax_modelling_utils import (
     with_sharding_constraint,
     ACT2FN,
     JaxBaseClassModel,
-    smart_flash_attention
+    smart_flash_attention, get_dot_general_by_bits
 )
 import chex
 from fjformer.bits import config as q_config, q_flax
 
 
-class MptConfig(PretrainedConfig, JaxBaseClassModel):
+class MptConfig(JaxBaseClassModel):
     model_type = 'mpt'
 
     def __init__(self,
@@ -53,8 +53,6 @@ class MptConfig(PretrainedConfig, JaxBaseClassModel):
                  flash_attn_query_chunk_size: int = 1024,
                  flash_attn_key_chunk_size: int = 2048,
                  bits: Optional[int] = None,
-                 axis_dims: Sequence[int] = (1, -1, 1, 1),
-                 axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
                  **kwargs
                  ):
 
@@ -91,8 +89,6 @@ class MptConfig(PretrainedConfig, JaxBaseClassModel):
         if 'loss_fn' in kwargs:
             del kwargs['loss_fn']
         super().__init__(
-            axis_dims=axis_dims,
-            axis_names=axis_names,
             **kwargs
         )
 
@@ -107,18 +103,18 @@ class MptConfig(PretrainedConfig, JaxBaseClassModel):
     def get_partition_rules(fully_fsdp: bool = False):
         return (
 
-            ("transformer/wte/embedding", PartitionSpec("tp", ("fsdp", "mp"))),
-            ("transformer/wpe/embedding", PartitionSpec("tp", ("fsdp", "mp"))),
+            ("transformer/wte/embedding", PartitionSpec("dp", "fsdp")),
+            ("transformer/wpe/embedding", PartitionSpec("dp", "fsdp")),
 
-            ("attn/w_qkv/kernel", PartitionSpec(("fsdp", "mp"), "tp")),
-            ("attn/wo/kernel", PartitionSpec("tp", ("fsdp", "mp"))),
-            ("attn/w_qkv/bias", PartitionSpec(("fsdp", "mp"), "tp")),
-            ("attn/wo/bias", PartitionSpec("tp", ("fsdp", "mp"))),
+            ("attn/w_qkv/kernel", PartitionSpec("fsdp", "dp")),
+            ("attn/wo/kernel", PartitionSpec("dp", "fsdp")),
+            ("attn/w_qkv/bias", PartitionSpec("fsdp", "dp")),
+            ("attn/wo/bias", PartitionSpec("dp", "fsdp")),
 
-            ("ffn/down/kernel", PartitionSpec(("fsdp", "mp"), "tp")),
-            ("ffn/up/kernel", PartitionSpec(("fsdp", "mp"), "tp")),
-            ("ffn/down/kernel", PartitionSpec(("fsdp", "mp"), "tp")),
-            ("ffn/up/kernel", PartitionSpec(("fsdp", "mp"), "tp")),
+            ("ffn/down/kernel", PartitionSpec("fsdp", "dp")),
+            ("ffn/up/kernel", PartitionSpec("fsdp", "dp")),
+            ("ffn/down/kernel", PartitionSpec("fsdp", "dp")),
+            ("ffn/up/kernel", PartitionSpec("fsdp", "dp")),
 
             ("attention_norm/kernel", PartitionSpec(None)),
             ("norm_f/kernel", PartitionSpec(None)),
@@ -126,23 +122,23 @@ class MptConfig(PretrainedConfig, JaxBaseClassModel):
 
             ("transformer/norm_f/kernel", PartitionSpec(None)),
             ("transformer/norm_f/bias", PartitionSpec(None)),
-            ("lm_head/kernel", PartitionSpec(("fsdp", "mp"), "tp")),
-            ("lm_head/bias", PartitionSpec(("fsdp", "mp"), "tp")),
+            ("lm_head/kernel", PartitionSpec("fsdp", "dp")),
+            ("lm_head/bias", PartitionSpec("fsdp", "dp")),
             ('.*', PartitionSpec(None)),
         ) if not fully_fsdp else (
 
-            ("transformer/wte/embedding", PartitionSpec(("fsdp", "mp"))),
-            ("transformer/wpe/embedding", PartitionSpec(("fsdp", "mp"))),
+            ("transformer/wte/embedding", PartitionSpec("fsdp")),
+            ("transformer/wpe/embedding", PartitionSpec("fsdp")),
 
-            ("attn/w_qkv/kernel", PartitionSpec(("fsdp", "mp"))),
-            ("attn/wo/kernel", PartitionSpec(("fsdp", "mp"))),
-            ("attn/w_qkv/bias", PartitionSpec(("fsdp", "mp"))),
-            ("attn/wo/bias", PartitionSpec(("fsdp", "mp"))),
+            ("attn/w_qkv/kernel", PartitionSpec("fsdp")),
+            ("attn/wo/kernel", PartitionSpec("fsdp")),
+            ("attn/w_qkv/bias", PartitionSpec("fsdp")),
+            ("attn/wo/bias", PartitionSpec("fsdp")),
 
-            ("ffn/down/kernel", PartitionSpec(("fsdp", "mp"))),
-            ("ffn/up/kernel", PartitionSpec(("fsdp", "mp"))),
-            ("ffn/down/kernel", PartitionSpec(("fsdp", "mp"))),
-            ("ffn/up/kernel", PartitionSpec(("fsdp", "mp"))),
+            ("ffn/down/kernel", PartitionSpec("fsdp")),
+            ("ffn/up/kernel", PartitionSpec("fsdp")),
+            ("ffn/down/kernel", PartitionSpec("fsdp")),
+            ("ffn/up/kernel", PartitionSpec("fsdp")),
 
             ("attention_norm/kernel", PartitionSpec(None)),
             ("norm_f/kernel", PartitionSpec(None)),
@@ -150,8 +146,8 @@ class MptConfig(PretrainedConfig, JaxBaseClassModel):
 
             ("transformer/norm_f/kernel", PartitionSpec(None)),
             ("transformer/norm_f/bias", PartitionSpec(None)),
-            ("lm_head/kernel", PartitionSpec(("fsdp", "mp"))),
-            ("lm_head/bias", PartitionSpec(("fsdp", "mp"))),
+            ("lm_head/kernel", PartitionSpec("fsdp")),
+            ("lm_head/bias", PartitionSpec("fsdp")),
             ('.*', PartitionSpec(None)),
         )
 
@@ -182,24 +178,8 @@ class MptConfig(PretrainedConfig, JaxBaseClassModel):
                      flash_attn_query_chunk_size: int = 1024,
                      flash_attn_key_chunk_size: int = 2048,
                      bits: Optional[int] = None,
-                     axis_dims: Sequence[int] = (1, -1, 1, 1),
-                     axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
-                     q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-                     k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-                     v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-                     b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", None, ("dp", "fsdp"), None),
-                     a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-                     backend: Optional[str] = None,
                      **kwargs,
                      ):
-        self.axis_names = axis_names
-        self.axis_dims = axis_dims
-        self.q_ps = q_ps
-        self.k_ps = k_ps
-        self.v_ps = v_ps
-        self.b_ps = b_ps
-        self.a_ps = a_ps
-        self.backend = backend
         if hasattr(self, 'attn_config'):
             for k, v in self.attn_config.items():
                 setattr(self, k, v)
@@ -271,15 +251,7 @@ class FlaxMptMLP(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
-        if self.config.bits is not None:
-            _dot_general_cls = q_config.fully_quantized(
-                fwd_bits=self.config.bits,
-                bwd_bits=self.config.bits
-            )
-        else:
-            _dot_general_cls = None
 
-        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
         self.up = nn.Dense(
             self.config.d_model * self.config.expansion_ratio,
             kernel_init=jax.nn.initializers.normal(),
@@ -287,7 +259,7 @@ class FlaxMptMLP(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
-            dot_general=dot_general_cls
+            dot_general=get_dot_general_by_bits(self.config.bits)
         )
         self.down = nn.Dense(
             self.config.d_model,
@@ -296,7 +268,7 @@ class FlaxMptMLP(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
-            dot_general=dot_general_cls
+            dot_general=get_dot_general_by_bits(self.config.bits)
         )
         self.act = ACT2FN[self.config.act_fn]
 
@@ -312,20 +284,12 @@ class FlaxMptAttention(nn.Module):
 
     def setup(self) -> None:
 
-        if self.config.bits is not None:
-            _dot_general_cls = q_config.fully_quantized(
-                fwd_bits=self.config.bits,
-                bwd_bits=self.config.bits
-            )
-        else:
-            _dot_general_cls = None
 
-        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
         self.w_qkv = nn.Dense(
             self.config.d_model * 3,
             kernel_init=jax.nn.initializers.normal(),
             use_bias=self.config.use_bias,
-            dot_general=dot_general_cls,
+            dot_general=get_dot_general_by_bits(self.config.bits),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision)
@@ -336,7 +300,7 @@ class FlaxMptAttention(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
-            dot_general=dot_general_cls
+            dot_general=get_dot_general_by_bits(self.config.bits)
         )
         if self.config.qk_ln:
             self.q_ln = nn.LayerNorm(use_bias=self.config.use_norm_bias)
@@ -567,7 +531,7 @@ def build_alibi(max_length, num_attention_heads, alibi_max: int = 8):
     w_range = jnp.arange(1 - max_length, 1).reshape(1, 1, 1, max_length)
     # cp2 = jnp.power(2, jnp.ceil(jnp.log2(num_attention_heads)))
     cp2 = 2 ** math.ceil(math.log2(num_attention_heads))
-    h_range = jnp.arange(1, 1 + num_attention_heads, ).reshape(1, -1, 1, 1)
+    h_range = jnp.arange(1, 1 + num_attention_heads, ).reshape(1, -1, 1)
     h_range = jnp.matmul(h_range, jnp.asarray(alibi_max / cp2).reshape(1, 1))
     slop = 1 / jnp.power(2, h_range)
     if cp2 != num_attention_heads:
@@ -742,20 +706,12 @@ class FlaxFlaxMptForCausalLMModule(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        if self.config.bits is not None:
-            _dot_general_cls = q_config.fully_quantized(
-                fwd_bits=self.config.bits,
-                bwd_bits=self.config.bits
-            )
-        else:
-            _dot_general_cls = None
 
-        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
         if self.config.use_lm_head:
             self.lm_head = nn.Dense(self.config.vocab_size, kernel_init=jax.nn.initializers.normal(),
                                     use_bias=self.config.use_bias,
                                     dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision,
-                                    dot_general=dot_general_cls)
+                                    dot_general=get_dot_general_by_bits(self.config.bits))
 
     def __call__(self,
                  input_ids: chex.Array,

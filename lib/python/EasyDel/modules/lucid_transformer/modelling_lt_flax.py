@@ -28,7 +28,7 @@ ACT2CLS = {
 }
 
 
-class FlaxLTConfig(PretrainedConfig, JaxBaseClassModel):
+class FlaxLTConfig(JaxBaseClassModel):
     def __init__(self,
                  initializer_range: float = 0.02,
                  hidden_size: int = 4096,
@@ -45,8 +45,8 @@ class FlaxLTConfig(PretrainedConfig, JaxBaseClassModel):
                  alibi_bias_max: int = 8,
                  fsdp=False,
                  hidden_act="silu",
-                 axis_dims: Sequence[int] = (1, -1, 1, 1),
-                 axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
+                 axis_dims: Sequence[int] = (1, -1, 1),
+                 axis_names: Sequence[str] = ("dp", "fsdp", "mp"),
                  **kwargs
                  ):
         super().__init__(
@@ -84,16 +84,16 @@ class FlaxLTConfig(PretrainedConfig, JaxBaseClassModel):
         return (
             # Emb
             ("model/wte/embedding", PartitionSpec("mp", "fsdp")),
-            ("attn/(k_proj|v_proj|q_proj)/kernel", PartitionSpec("fsdp", "mp")),
-            ("attn/o_proj/kernel", PartitionSpec("mp", "fsdp")),
-            ("mlp/down/kernel", PartitionSpec("mp", "fsdp")),
-            ("mlp/up/kernel", PartitionSpec("fsdp", "mp")),
-            ("lm_head/kernel", PartitionSpec("fsdp", "mp")),
-            ('.*', PartitionSpec(None)),
-            ('ln/kernel', PartitionSpec(None)),
-            ('ln1/kernel', PartitionSpec(None)),
-            ('ln2/kernel', PartitionSpec(None)),
-        )
+            ("attn/(k_proj|v_proj|q_proj)/kernel", PartitionSpec("fsdp")),
+             ("attn/o_proj/kernel", PartitionSpec("mp", "fsdp")),
+             ("mlp/down/kernel", PartitionSpec("mp", "fsdp")),
+             ("mlp/up/kernel", PartitionSpec("fsdp")),
+             ("lm_head/kernel", PartitionSpec("fsdp", "mp")),
+             ('.*', PartitionSpec(None)),
+             ('ln/kernel', PartitionSpec(None)),
+             ('ln1/kernel', PartitionSpec(None)),
+             ('ln2/kernel', PartitionSpec(None)),
+             )
 
     @staticmethod
     def get_weight_decay_exclusions():
@@ -164,7 +164,7 @@ class LTSelfAttention(nn.Module):
             attn_weights = jnp.add(attention_mask, attn_weights)
 
         if self.config.fsdp:
-            attn_weights = with_sharding_constraint(attn_weights, PartitionSpec(("dp", "fsdp"), "mp", None, None))
+            attn_weights = with_sharding_constraint(attn_weights, PartitionSpec("fsdp", "mp", None, None))
 
         attn_weights = jax.nn.softmax(attn_weights, axis=-1)
         value = jnp.matmul(attn_weights, wv).reshape(b, t, c)
@@ -312,7 +312,7 @@ class FlaxLTModelModule(nn.Module):
 
     def build_alibi(self, sequence_length: int):
         mxl = jnp.arange(1 - sequence_length, 1).reshape(1, 1, 1, -1)
-        mxh = jnp.arange(1, 1 + self.config.num_attention_heads).reshape(1, -1, 1, 1)
+        mxh = jnp.arange(1, 1 + self.config.num_attention_heads).reshape(1, -1, 1)
         cp2 = 2 ** math.ceil(math.log2(self.config.num_attention_heads))
         base_mxl = mxh * (self.config.alibi_bias_max / cp2)
         slope = 1 / jnp.power(2, base_mxl)

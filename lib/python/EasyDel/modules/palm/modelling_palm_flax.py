@@ -58,45 +58,30 @@ class PalmConfig(PretrainedConfig):
     @staticmethod
     def get_partition_rules(fully_fsdp: bool = False):
         return (
-            ('wi/kernel', PartitionSpec(('fsdp', 'mp'))),
-            ('attn_wo/kernel', PartitionSpec(('fsdp', 'mp'), 'tp')),
-            ('ff_wo/kernel', PartitionSpec(('fsdp', 'mp'), 'tp')),
-            ('wte/embedding', PartitionSpec(('fsdp', 'mp'), 'tp')),
-            ('lm_head/kernel', PartitionSpec(('fsdp', 'mp'))),
-            ('post_norm/kernel', PartitionSpec(('fsdp', 'mp'))),
-            ('norm/kernel', PartitionSpec(('fsdp', 'mp'), 'tp')),
+            ('wi/kernel', PartitionSpec("fsdp")),
+            ('attn_wo/kernel', PartitionSpec("fsdp", "dp")),
+            ('ff_wo/kernel', PartitionSpec("fsdp", "dp")),
+            ('wte/embedding', PartitionSpec("fsdp", "dp")),
+            ('lm_head/kernel', PartitionSpec("fsdp")),
+            ('post_norm/kernel', PartitionSpec("fsdp")),
+            ('norm/kernel', PartitionSpec("fsdp", "dp")),
             ('.*', PartitionSpec(None)),
         ) if not fully_fsdp else (
-            ('wi/kernel', PartitionSpec(('fsdp', 'mp'))),
-            ('attn_wo/kernel', PartitionSpec(('fsdp', 'mp'))),
-            ('ff_wo/kernel', PartitionSpec(('fsdp', 'mp'))),
-            ('wte/embedding', PartitionSpec(('fsdp', 'mp'))),
-            ('lm_head/kernel', PartitionSpec(('fsdp', 'mp'))),
-            ('post_norm/kernel', PartitionSpec(('fsdp', 'mp'))),
-            ('norm/kernel', PartitionSpec(('fsdp', 'mp'))),
-            ('.*', PartitionSpec(('fsdp', 'mp'))),
+            ('wi/kernel', PartitionSpec("fsdp")),
+            ('attn_wo/kernel', PartitionSpec("fsdp")),
+            ('ff_wo/kernel', PartitionSpec("fsdp")),
+            ('wte/embedding', PartitionSpec("fsdp")),
+            ('lm_head/kernel', PartitionSpec("fsdp")),
+            ('post_norm/kernel', PartitionSpec("fsdp")),
+            ('norm/kernel', PartitionSpec("fsdp")),
+            ('.*', PartitionSpec("fsdp")),
         )
 
     def add_jax_args(
             self,
-            axis_dims: Sequence[int] = (1, -1, 1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
-            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", None, ("dp", "fsdp"), None),
-            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-            backend: Optional[str] = None,
             **kwargs,
     ):
-        self.axis_names = axis_names
-        self.axis_dims = axis_dims
-        self.q_ps = q_ps
-        self.k_ps = k_ps
-        self.v_ps = v_ps
-        self.b_ps = b_ps
-        self.a_ps = a_ps
-        self.backend = backend
+        ...
 
 
 class RMSNorm(nn.Module):
@@ -217,15 +202,6 @@ class ParallelPalmBlock(nn.Module):
         ff_out = (ff * nn.swish(ff_gate)) @ self.ff_wo
 
         return attn_out + ff_out
-
-
-def get_gradient_checkpoint_policy(name):
-    return {
-        'everything_saveable': jax.checkpoint_policies.everything_saveable,
-        'nothing_saveable': jax.checkpoint_policies.nothing_saveable,
-        'checkpoint_dots': jax.checkpoint_policies.checkpoint_dots,
-        'checkpoint_dots_with_no_batch_dims': jax.checkpoint_policies.checkpoint_dots_with_no_batch_dims,
-    }[name]
 
 
 class ParallelCollection(nn.Module):

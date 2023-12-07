@@ -96,7 +96,7 @@ train_args = TrainArguments(
     backend='tpu',  # default backed is set to cpu, so you must define you want to use tpu cpu or gpu
     max_length=max_length,  # Note that you have to change this in the model config too
     gradient_checkpointing='nothing_saveable',
-    sharding_array=(1, -1, 1, 1),  # the way to shard model across gpu,cpu or TPUs using sharding array (1, -1, 1, 1)
+    sharding_array=(1, -1, 1),  # the way to shard model across gpu,cpu or TPUs using sharding array (1, -1, 1)
     # everything training will be in fully FSDP automatic and share data between devices
     use_pjit_attention_force=False,
     remove_ckpt_after_load=True,
@@ -144,7 +144,7 @@ model, params = AutoEasyDelModelForCausalLM.from_pretrained(
     jax.numpy.float16,
     jax.numpy.float16,
     jax.lax.Precision('fastest'),
-    (1, -1, 1, 1),
+    (1, -1, 1),
     device_map='auto'
 )
 

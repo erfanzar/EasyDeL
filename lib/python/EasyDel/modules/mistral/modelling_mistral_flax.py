@@ -13,7 +13,7 @@ from flax.traverse_util import unflatten_dict, flatten_dict
 from flax.core import freeze, unfreeze
 from typing import Union, Optional, Tuple
 from transformers import PretrainedConfig, FlaxPreTrainedModel
-from flax.linen import partitioning as nn_partitioning, combine_masks
+from flax.linen import partitioning as nn_partitioning, combine_masks, dot_product_attention_weights
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 
 from ..flax_modelling_utils import (
@@ -25,13 +25,13 @@ from ..flax_modelling_utils import (
     precompute_freq_cis,
     JaxBaseClassModel,
     get_flash_attention,
-    smart_flash_attention
+    smart_flash_attention, get_dot_general_by_bits
 )
 import chex
 from fjformer.bits import config as q_config, q_flax
 
 
-class MistralConfig(PretrainedConfig, JaxBaseClassModel):
+class MistralConfig(JaxBaseClassModel):
     def __init__(
             self,
             vocab_size=32000,
@@ -63,8 +63,6 @@ class MistralConfig(PretrainedConfig, JaxBaseClassModel):
             c_max_position_embeddings: int = 4096,
             freq_max_position_embeddings: int = 4096,
             bits: Optional[int] = None,
-            axis_dims: Sequence[int] = (1, -1, 1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
             **kwargs,
     ):
         """
@@ -104,8 +102,6 @@ class MistralConfig(PretrainedConfig, JaxBaseClassModel):
         :param bits: Optional[int]: Specify the number of bits used for quantization
         :param axis_dims: Sequence[int]: Specify the dimension of each axis
         :param axis_names: Sequence[str]: Specify the names of each axis in the tensor
-        :param &quot;fsdp&quot;: Specify the frequency dimension of the input
-        :param &quot;tp&quot;: Determine the number of time-steps in the input sequence
         :param &quot;mp&quot;): Define the maximum position embeddings
         :param **kwargs: Pass a variable number of keyword arguments to a function
         :param : Define the number of layers in the model
@@ -143,8 +139,6 @@ class MistralConfig(PretrainedConfig, JaxBaseClassModel):
         self.freq_max_position_embeddings = freq_max_position_embeddings
 
         super().__init__(
-            axis_names=axis_names,
-            axis_dims=axis_dims,
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
@@ -166,37 +160,37 @@ class MistralConfig(PretrainedConfig, JaxBaseClassModel):
         """
         return (
 
-            ("model/embed_tokens/embedding", PS("tp", ("fsdp", "mp"))),
+            ("model/embed_tokens/embedding", PS("dp", "fsdp")),
 
-            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PS(("fsdp", "mp"), "dp")),
-            ("self_attn/o_proj/kernel", PS("tp", ("fsdp", "mp"))),
+            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PS("fsdp", "dp")),
+            ("self_attn/o_proj/kernel", PS("dp", "fsdp")),
 
-            ("mlp/gate_proj/kernel", PS(("fsdp", "mp"), "dp")),
-            ("mlp/down_proj/kernel", PS("tp", ("fsdp", "mp"))),
-            ("mlp/up_proj/kernel", PS(("fsdp", "mp"), "dp")),
+            ("mlp/gate_proj/kernel", PS("fsdp", "dp")),
+            ("mlp/down_proj/kernel", PS("dp", "fsdp")),
+            ("mlp/up_proj/kernel", PS("fsdp", "dp")),
 
             ("input_layernorm/kernel", PS(None)),
             ("post_attention_layernorm/kernel", PS(None)),
 
             ("model/norm/kernel", PS(None)),
-            ("lm_head/kernel", PS(("fsdp", "mp"), "dp")),
+            ("lm_head/kernel", PS("fsdp", "dp")),
             ('.*', PS(None)),
         ) if not fully_fsdp else (
 
-            ("model/embed_tokens/embedding", PS(("fsdp", "mp"))),
+            ("model/embed_tokens/embedding", PS("fsdp")),
 
-            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PS(("fsdp", "mp"))),
-            ("self_attn/o_proj/kernel", PS(("fsdp", "mp"))),
+            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PS("fsdp")),
+            ("self_attn/o_proj/kernel", PS("fsdp")),
 
-            ("mlp/gate_proj/kernel", PS(("fsdp", "mp"))),
-            ("mlp/down_proj/kernel", PS(("fsdp", "mp"))),
-            ("mlp/up_proj/kernel", PS(("fsdp", "mp"))),
+            ("mlp/gate_proj/kernel", PS("fsdp")),
+            ("mlp/down_proj/kernel", PS("fsdp")),
+            ("mlp/up_proj/kernel", PS("fsdp")),
 
             ("input_layernorm/kernel", PS(None)),
             ("post_attention_layernorm/kernel", PS(None)),
 
             ("model/norm/kernel", PS(None)),
-            ("lm_head/kernel", PS(("fsdp", "mp"))),
+            ("lm_head/kernel", PS("fsdp")),
             ('.*', PS('fsdp')),
         )
 
@@ -213,21 +207,13 @@ class MistralConfig(PretrainedConfig, JaxBaseClassModel):
                      c_max_position_embeddings: int = 4096,
                      freq_max_position_embeddings: int = None,
                      bits: Optional[int] = None,
-                     axis_dims: Sequence[int] = (1, -1, 1, 1),
-                     axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
-                     q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-                     k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-                     v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-                     b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, "tp", None),
-                     a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-                     backend: Optional[str] = None,
                      **kwargs,
                      ):
         """
         The add_jax_args function adds the following arguments to the model:
 
         :param self: Bind the attributes and methods of a class to an instance of that class
-        :param gradient_checkpointing: str: Determine whether or not to use gradient checkpointing
+        :param gradient_checkpointing: str: Determine whether to use gradient checkpointing
         :param use_pjit_attention_force: bool: Determine whether to use the pjit_attention_force function
         :param use_flash_attention: bool: Determine if the flash attention module is used or not
         :param use_sacn_mlp: bool: Determine whether to use the scan_mlp function or not
@@ -243,15 +229,11 @@ class MistralConfig(PretrainedConfig, JaxBaseClassModel):
         :param axis_names: Sequence[str]: Name the axes of the tensors
         :param axis_dims: Sequence[int]: Specify the dimension of each axis
         :param axis_names: Sequence[str]: Name the axes of the tensor
-        :param q_ps: jax.sharding.PartitionSpec: Specify the partitioning of the query tensor
-        :param k_ps: jax.sharding.PartitionSpec: Partition the key matrix
-        :param v_ps: jax.sharding.PartitionSpec: Specify the partitioning of the value tensor
-        :param b_ps: jax.sharding.PartitionSpec: Specify the Attention Bias partition spec
-        :param a_ps: jax.sharding.PartitionSpec: Specify the partitioning of the attention weights
+        
         :param backend: typing.Optional[str]: backend to use for model
         :param : Enable gradient checkpointing
         :return: A tuple of the following:
-        
+
         """
         self.use_flash_attention = use_flash_attention
         self.number_rep_kv = number_rep_kv
@@ -265,14 +247,6 @@ class MistralConfig(PretrainedConfig, JaxBaseClassModel):
         self.c_max_position_embeddings = c_max_position_embeddings
         self.freq_max_position_embeddings = freq_max_position_embeddings
         self.bits = bits
-        self.axis_names = axis_names
-        self.axis_dims = axis_dims
-        self.q_ps = q_ps
-        self.k_ps = k_ps
-        self.v_ps = v_ps
-        self.b_ps = b_ps
-        self.a_ps = a_ps
-        self.backend = backend
 
     @staticmethod
     def get_weight_decay_exclusions():
@@ -367,15 +341,6 @@ class FlaxMistralMLP(nn.Module):
     precision: Optional[Union[None, jax.lax.Precision]] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
-        if self.config.bits is not None:
-            _dot_general_cls = q_config.fully_quantized(
-                fwd_bits=self.config.bits,
-                bwd_bits=self.config.bits
-            )
-        else:
-            _dot_general_cls = None
-
-        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
         dense = functools.partial(
             nn.Dense,
             use_bias=False,
@@ -383,7 +348,7 @@ class FlaxMistralMLP(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision,
             kernel_init=nn.initializers.normal(),
-            dot_general=dot_general_cls
+            dot_general=get_dot_general_by_bits(self.config.bits)
         )
         self.gate_proj = dense(self.config.intermediate_size)
         self.up_proj = dense(self.config.intermediate_size)
@@ -408,15 +373,7 @@ class FlaxMistralAttention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
-        if self.config.bits is not None:
-            _dot_general_cls = q_config.fully_quantized(
-                fwd_bits=self.config.bits,
-                bwd_bits=self.config.bits
-            )
-        else:
-            _dot_general_cls = None
 
-        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
         dense = functools.partial(
             nn.Dense,
             use_bias=False,
@@ -424,7 +381,7 @@ class FlaxMistralAttention(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision,
             kernel_init=nn.initializers.normal(),
-            dot_general=dot_general_cls
+            dot_general=get_dot_general_by_bits(self.config.bits)
         )
 
         self.q_proj = dense(self.num_heads * self.head_dim)
@@ -578,48 +535,49 @@ class FlaxMistralAttention(nn.Module):
             )
             attn_output = jnp.transpose(attn_output, rtp_axis)
         else:
-            query_length, key_length = query.shape[1], key.shape[1]
-
-            if self.has_variable("cache", "cached_key"):
-                mask_shift = self.variables["cache"]["cache_index"]
-                max_decoder_length = self.variables["cache"]["cached_key"].shape[1]
-                causal_mask = lax.dynamic_slice(
-                    causal_mask, (0, 0, mask_shift, 0), (1, 1, query_length, max_decoder_length)
+            attention_bias = lax.select(
+                attention_mask > 0,
+                jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
+                jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
+            )
+            if self.config.use_shard_map:
+                attn_weights = shard_map(
+                    functools.partial(
+                        dot_product_attention_weights,
+                        dtype=jnp.promote_types(self.dtype, jnp.float32),
+                        deterministic=deterministic,
+                        dropout_rate=self.config.attn_pdrop,
+                        precision=self.precision,
+                    ),
+                    mesh=self.config.jax_mesh(),
+                    in_specs=(
+                        self.config.q_ps,
+                        self.config.k_ps,
+                        self.config.b_ps
+                    ),
+                    out_specs=PS(("dp", "fsdp"), None, None, None),
+                    check_rep=False
+                )(
+                    query, key, attention_bias
                 )
             else:
-                causal_mask = causal_mask[:, :, :query_length, :key_length]
+                attn_weights = dot_product_attention_weights(
+                    query=query,
+                    key=key,
+                    bias=attention_bias,
+                    dtype=jnp.promote_types(self.dtype, jnp.float32),
+                    deterministic=deterministic,
+                    dropout_rate=self.config.attn_pdrop,
+                    precision=self.precision,
+                )
 
-            batch_size = hidden_state.shape[0]
-            causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
-            if attention_mask.ndim == 2:
-                attention_mask = jnp.broadcast_to(jnp.expand_dims(attention_mask, axis=(-3, -2)), causal_mask.shape)
-            attention_mask = combine_masks(attention_mask, causal_mask)
+            if self.config.use_pjit_attention_force:
+                attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "mp", None, None))
 
-            if self.has_variable("cache", "cached_key") or init_cache:
-                key, value, attention_mask = self._concatenate_to_cache(key, value, query,
-                                                                        attention_mask)
-
-            attn_weights = None
-            ring_attention_sharded = shard_map(
-                functools.partial(fjformer.attention.ring_attention_standard, axis_name="mp"),
-                mesh=self.config.jax_mesh(),
-                in_specs=(
-                    self.config.q_ps,
-                    self.config.k_ps,
-                    self.config.v_ps,
-                    self.config.b_ps
-                ),
-                out_specs=self.config.a_ps,
-                check_rep=False
-            )
-
-            attn_output = ring_attention_sharded(
-                query, key, value, attention_mask
-            )
-            attn_output = with_sharding_constraint(attn_output, self.config.a_ps)
+            attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value)
 
         out = self.o_proj(attn_output.reshape(batch_size, sequence_length, self.hidden_size))
-        outputs = (out, attn_output) if output_attentions else (out,)
+        outputs = (out, attn_weights) if output_attentions else (out,)
         return outputs
 
 
@@ -1060,15 +1018,6 @@ class FlaxMistralForCausalLMModule(nn.Module):
             precision=self.precision,
         )
 
-        if self.config.bits is not None:
-            _dot_general_cls = q_config.fully_quantized(
-                fwd_bits=self.config.bits,
-                bwd_bits=self.config.bits
-            )
-        else:
-            _dot_general_cls = None
-
-        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
         self.lm_head = nn.Dense(
             self.config.vocab_size,
             dtype=self.dtype,
@@ -1076,7 +1025,7 @@ class FlaxMistralForCausalLMModule(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
             precision=self.precision,
-            dot_general=dot_general_cls
+            dot_general=get_dot_general_by_bits(self.config.bits)
         )
 
     def __call__(

@@ -10,13 +10,12 @@ import jax
 from jax.sharding import PartitionSpec
 from transformers.modeling_flax_outputs import FlaxCausalLMOutput, FlaxBaseModelOutput
 from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
-    with_sharding_constraint, JaxBaseClassModel
+    with_sharding_constraint, JaxBaseClassModel, get_dot_general_by_bits
 import chex
 from fjformer.func import transpose
-from fjformer.bits import config as q_config, q_flax
 
 
-class FalconConfig(PretrainedConfig, JaxBaseClassModel):
+class FalconConfig(JaxBaseClassModel):
     model_type = "falcon"
     attribute_map = {
         "num_hidden_layers": "num_hidden_layers",
@@ -48,8 +47,8 @@ class FalconConfig(PretrainedConfig, JaxBaseClassModel):
             use_pjit_attention_force: bool = False,
             gradient_checkpointing: str = '',
             bits: Optional[int] = None,
-            axis_dims: Sequence[int] = (1, -1, 1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
+            axis_dims: Sequence[int] = (1, -1, 1),
+            axis_names: Sequence[str] = ("dp", "fsdp", "mp"),
             **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -97,34 +96,34 @@ class FalconConfig(PretrainedConfig, JaxBaseClassModel):
     @staticmethod
     def get_partition_rules(fully_fsdp: bool = False):
         return (
-            ('word_embeddings/embedding', PartitionSpec('tp', ('fsdp', 'mp'))),
-            ('self_attention/query_key_value/(kernel)', PartitionSpec('tp', ('fsdp', 'mp'))),
-            ('self_attention/dense/(kernel)', PartitionSpec('tp', ('fsdp', 'mp'))),
-            ('mlp/dense_4h_to_h/(kernel)', PartitionSpec('tp', ('fsdp', 'mp'))),
-            ('mlp/dense_h_to_4h/(kernel)', PartitionSpec('tp', ('fsdp', 'mp'))),
-            ('lm_head/kernel', PartitionSpec('tp', ('fsdp', 'mp'))),
-            ('transformer/ln_f/bias', PartitionSpec(('fsdp', 'mp'))),
-            ('transformer/ln_f/scale', PartitionSpec(('fsdp', 'mp'))),
-            ('transformer/post_attention_layernorm/scale', PartitionSpec(('fsdp', 'mp'))),
-            ('transformer/post_attention_layernorm/bias', PartitionSpec(('fsdp', 'mp'))),
-            ('.*', PartitionSpec('tp'))
+            ('word_embeddings/embedding', PartitionSpec("dp", "fsdp")),
+            ('self_attention/query_key_value/(kernel)', PartitionSpec("dp", "fsdp")),
+            ('self_attention/dense/(kernel)', PartitionSpec("dp", "fsdp")),
+            ('mlp/dense_4h_to_h/(kernel)', PartitionSpec("dp", "fsdp")),
+            ('mlp/dense_h_to_4h/(kernel)', PartitionSpec("dp", "fsdp")),
+            ('lm_head/kernel', PartitionSpec("dp", "fsdp")),
+            ('transformer/ln_f/bias', PartitionSpec("fsdp")),
+            ('transformer/ln_f/scale', PartitionSpec("fsdp")),
+            ('transformer/post_attention_layernorm/scale', PartitionSpec("fsdp")),
+            ('transformer/post_attention_layernorm/bias', PartitionSpec("fsdp")),
+            ('.*', PartitionSpec('fsdp'))
         ) if not fully_fsdp else (
-            ('word_embeddings/embedding', PartitionSpec(('fsdp', 'mp'))),
-            ('self_attention/query_key_value/(kernel|bias)', PartitionSpec(('fsdp', 'mp'))),
-            ('self_attention/dense/(kernel|bias)', PartitionSpec(('fsdp', 'mp'))),
-            ('mlp/dense_4h_to_h/(kernel|bias)', PartitionSpec(('fsdp', 'mp'))),
-            ('mlp/dense_h_to_4h/(kernel|bias)', PartitionSpec(('fsdp', 'mp'))),
-            ('lm_head/kernel', PartitionSpec(('fsdp', 'mp'))),
-            ('transformer/ln_f/bias', PartitionSpec(('fsdp', 'mp'))),
-            ('transformer/ln_f/scale', PartitionSpec(('fsdp', 'mp'))),
-            ('transformer/post_attention_layernorm/scale', PartitionSpec(('fsdp', 'mp'))),
-            ('transformer/post_attention_layernorm/bias', PartitionSpec(('fsdp', 'mp'))),
-            ('.*', PartitionSpec(('fsdp', 'mp')))
+            ('word_embeddings/embedding', PartitionSpec("fsdp")),
+            ('self_attention/query_key_value/(kernel|bias)', PartitionSpec("fsdp")),
+            ('self_attention/dense/(kernel|bias)', PartitionSpec("fsdp")),
+            ('mlp/dense_4h_to_h/(kernel|bias)', PartitionSpec("fsdp")),
+            ('mlp/dense_h_to_4h/(kernel|bias)', PartitionSpec("fsdp")),
+            ('lm_head/kernel', PartitionSpec("fsdp")),
+            ('transformer/ln_f/bias', PartitionSpec("fsdp")),
+            ('transformer/ln_f/scale', PartitionSpec("fsdp")),
+            ('transformer/post_attention_layernorm/scale', PartitionSpec("fsdp")),
+            ('transformer/post_attention_layernorm/bias', PartitionSpec("fsdp")),
+            ('.*', PartitionSpec("fsdp"))
         )
 
     @staticmethod
     def get_mesh_names():
-        return "dp", "fsdp", "tp", "mp"
+        return "dp", "fsdp", "mp"
 
     def add_jax_args(self,
                      vocab_size: int = 65024,
@@ -150,24 +149,8 @@ class FalconConfig(PretrainedConfig, JaxBaseClassModel):
                      use_pjit_attention_force: bool = False,
                      gradient_checkpointing: str = '',
                      bits: Optional[int] = None,
-                     axis_dims: Sequence[int] = (1, -1, 1, 1),
-                     axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
-                     q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-                     k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-                     v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-                     b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", None, ("dp", "fsdp"), None),
-                     a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-                     backend: Optional[str] = None,
                      **kwargs,
                      ):
-        self.axis_names = axis_names
-        self.axis_dims = axis_dims
-        self.q_ps = q_ps
-        self.k_ps = k_ps
-        self.v_ps = v_ps
-        self.b_ps = b_ps
-        self.a_ps = a_ps
-        self.backend = backend
         basics = dict(
             bits=bits,
             vocab_size=vocab_size,
@@ -346,22 +329,13 @@ class FlaxFalconAttention(nn.Module):
     def setup(self) -> None:
         head_dim = self.config.hidden_size // self.config.num_attention_heads
 
-        if self.config.bits is not None:
-            _dot_general_cls = q_config.fully_quantized(
-                fwd_bits=self.config.bits,
-                bwd_bits=self.config.bits
-            )
-        else:
-            _dot_general_cls = None
-
-        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
         self.query_key_value = nn.Dense(
             features=3 * self.config.hidden_size if not self.config.multi_query else (
                     self.config.hidden_size + 2 * head_dim),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=self.config.bias,
-            dot_general=dot_general_cls
+            dot_general=get_dot_general_by_bits(self.config.bits)
         )
         self.inv_norm_factor = 1 / math.sqrt(head_dim)
         self.dense = nn.Dense(
@@ -369,7 +343,7 @@ class FlaxFalconAttention(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=self.config.bias,
-            dot_general=dot_general_cls
+            dot_general=get_dot_general_by_bits(self.config.bits)
         )
         self.head_dim = head_dim
         self.maybe_rotary = FlaxFalconRotaryEmbedding(self.dtype) if not self.config.alibi else lambda q, k, a, s: (
@@ -572,29 +546,19 @@ class FlaxFalconMlp(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
-        if self.config.bits is not None:
-            _dot_general_cls = q_config.fully_quantized(
-                fwd_bits=self.config.bits,
-                bwd_bits=self.config.bits
-            )
-        else:
-            _dot_general_cls = None
-
-        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
-
         self.dense_h_to_4h = nn.Dense(
             features=self.config.hidden_size * 4,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=self.config.bias,
-            dot_general=dot_general_cls
+            dot_general=get_dot_general_by_bits(self.config.bits)
         )
         self.dense_4h_to_h = nn.Dense(
             features=self.config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=self.config.bias,
-            dot_general=dot_general_cls
+            dot_general=get_dot_general_by_bits(self.config.bits)
         )
 
     def __call__(self, x: chex.Array, deterministic: bool = True):
@@ -968,19 +932,11 @@ class FlaxFalconForCausalLMModule(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        if self.config.bits is not None:
-            _dot_general_cls = q_config.fully_quantized(
-                fwd_bits=self.config.bits,
-                bwd_bits=self.config.bits
-            )
-        else:
-            _dot_general_cls = None
 
-        dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
         self.lm_head = nn.Dense(
             self.config.vocab_size,
             use_bias=False,
-            dot_general=dot_general_cls
+            dot_general=get_dot_general_by_bits(self.config.bits)
         )
 
     def __call__(self,
