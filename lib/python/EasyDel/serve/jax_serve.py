@@ -127,7 +127,7 @@ class JAXServer(object):
         
         """
         self.process_uvicorn, self.prefix_tokenizer, self.params, self.tokenizer, self.model, \
-            self.rules, self._generate, self._greedy_generate = [None] * 8
+            self.rules, self.generate_function, self.greedy_generate_function = [None] * 8
         assert config is None or isinstance(config, JAXServerConfig), 'config can be None or JAXServerConfig Type'
         if config is None:
             self.config = JAXServerConfig()
@@ -270,8 +270,8 @@ class JAXServer(object):
             ).sequences[:, input_ids.shape[1]:]
             return predict
 
-        self._generate = generate
-        self._greedy_generate = greedy_generate
+        self.generate_function = generate
+        self.greedy_generate_function = greedy_generate
         self._funcs_generated = True
 
     def auto_configure(self, model, params, tokenizer, partition_rules):
@@ -313,7 +313,7 @@ class JAXServer(object):
             )
         else:
             with self.mesh:
-                return self._generate(
+                return self.generate_function(
                     params, input_ids, attention_mask
                 )
 
@@ -529,7 +529,7 @@ class JAXServer(object):
             )
         else:
             with self.mesh:
-                return self._greedy_generate(
+                return self.greedy_generate_function(
                     params, input_ids, attention_mask
                 )
 
@@ -717,7 +717,7 @@ class JAXServer(object):
         """
         tokens = self.prefix_tokenizer(
             string,
-            max_length=self.config.max_length - self.config.max_stream_tokens,
+            max_length=self.config.max_length,
             padding='max_length',
             return_tensors='jax'
         ) \
@@ -732,23 +732,22 @@ class JAXServer(object):
         num_generated_tokens = 0
 
         for _ in range((max_new_tokens or self.config.max_new_tokens) // self.config.max_stream_tokens):
-            predicted_token = self.greedy_generate(
-                params=self.params,
-                input_ids=input_ids,
-                attention_mask=attention_mask
-            ) if greedy else self.generate(
+            inputs_to_gen = dict(
                 params=self.params,
                 input_ids=input_ids,
                 attention_mask=attention_mask
             )
+            predicted_token = self.greedy_generate(**inputs_to_gen) if greedy else self.generate(**inputs_to_gen)
 
             num_generated_tokens += predicted_token.shape[-1]
+            plus_attn_mask = jnp.ones((len(attention_mask), self.config.max_stream_tokens), dtype=jnp.int32)
 
             input_ids = jnp.concatenate(
                 (input_ids, predicted_token), axis=-1
             )[:, -self.config.max_length:]
+
             attention_mask = jnp.concatenate(
-                (attention_mask, jnp.ones((len(attention_mask), self.config.max_stream_tokens), dtype=jnp.int32)),
+                (attention_mask, plus_attn_mask), dtype=jnp.int32,
                 axis=-1
             )[:, -self.config.max_length:]
 
