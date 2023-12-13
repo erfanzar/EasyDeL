@@ -74,9 +74,11 @@ def match_keywords(string, ts, ns):
 
 def huggingface_to_easydel(
         state_dict,
+        *,
         embedding_layer_names: List[str],
         device,
-        dtype: jax.numpy.dtype = jax.numpy.float16
+        dtype: jax.numpy.dtype = jax.numpy.float16,
+        **kwargs
 ):
     """
     The huggingface_to_easydel function takes a huggingface model's state_dict and converts it to an easydel
