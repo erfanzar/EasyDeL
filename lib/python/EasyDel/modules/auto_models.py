@@ -52,7 +52,7 @@ def get_modules_by_type(model_type: str):
         return (
             _MptConfig,
             _FlaxMptForCausalLM,
-            functools.partial(huggingface_to_easydel, embedding_layer_name="wte")
+            functools.partial(huggingface_to_easydel, embedding_layer_names="wte")
         )
 
     elif model_type == "mistral":
@@ -70,7 +70,7 @@ def get_modules_by_type(model_type: str):
         return (
             _GPTJConfig,
             _FlaxGPTJForCausalLM,
-            functools.partial(huggingface_to_easydel, embedding_layer_name="wte")
+            functools.partial(huggingface_to_easydel, embedding_layer_names="wte")
         )
 
     elif model_type == "gpt_neox":
@@ -80,7 +80,7 @@ def get_modules_by_type(model_type: str):
         return (
             _GPTNeoXConfig,
             _FlaxGPTNeoXForCausalLM,
-            functools.partial(huggingface_to_easydel, embedding_layer_name="wte")
+            functools.partial(huggingface_to_easydel, embedding_layer_names="wte")
         )
     elif model_type == "palm":
         from .palm import FlaxPalmForCausalLM as _FlaxPalmForCausalLM
@@ -88,7 +88,7 @@ def get_modules_by_type(model_type: str):
         return (
             _PalmConfig,
             _FlaxPalmForCausalLM,
-            functools.partial(huggingface_to_easydel, embedding_layer_name="wte")
+            functools.partial(huggingface_to_easydel, embedding_layer_names="wte")
         )
     elif model_type == "lt":
         from .lucid_transformer import FlaxLTForCausalLM as _FlaxLTForCausalLM
@@ -97,7 +97,16 @@ def get_modules_by_type(model_type: str):
         return (
             _FlaxLTConfig,
             _FlaxLTForCausalLM,
-            functools.partial(huggingface_to_easydel, embedding_layer_name="wte")
+            functools.partial(huggingface_to_easydel, embedding_layer_names="wte")
+        )
+    elif model_type == "gpt2":
+        from .gpt2 import FlaxGPT2LMHeadModel as _FlaxGPT2LMHeadModel
+        from .gpt2 import GPT2Config as _GPT2Config
+
+        return (
+            _GPT2Config,
+            _FlaxGPT2LMHeadModel,
+            functools.partial(huggingface_to_easydel, embedding_layer_names=["wte", "wpe"])
         )
 
     else:
