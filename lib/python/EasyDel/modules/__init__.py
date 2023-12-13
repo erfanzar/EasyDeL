@@ -1,6 +1,7 @@
 from .llama import FlaxLlamaModel, FlaxLlamaForCausalLM, LlamaConfig
 from .gpt_j import FlaxGPTJModule, FlaxGPTJForCausalLMModule, FlaxGPTJModel, FlaxGPTJForCausalLM, \
     GPTJConfig
+from .gpt2 import GPT2Config, FlaxGPT2LMHeadModel, FlaxGPT2Model
 from .lucid_transformer import FlaxLTModel, FlaxLTConfig, FlaxLTModelModule, FlaxLTForCausalLM
 from .mosaic_mpt import MptConfig, FlaxMptModel, FlaxMptForCausalLM
 from .falcon import FalconConfig, FlaxFalconModel, FlaxFalconForCausalLM
