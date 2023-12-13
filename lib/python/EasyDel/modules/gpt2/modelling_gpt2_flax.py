@@ -29,7 +29,8 @@ from transformers.modeling_flax_outputs import (
     FlaxCausalLMOutputWithCrossAttentions,
 )
 from transformers.modeling_flax_utils import ACT2FN, FlaxPreTrainedModel
-from ..flax_modelling_utils import ACT2FN, create_mesh, JaxBaseClassModel, with_sharding_constraint
+from ..flax_modelling_utils import ACT2FN, create_mesh, JaxBaseClassModel, with_sharding_constraint, \
+    get_dot_general_by_bits
 
 
 class GPT2Config(JaxBaseClassModel):
@@ -69,6 +70,7 @@ class GPT2Config(JaxBaseClassModel):
             reorder_and_upcast_attn=False,
             gradient_checkpointing: str = "nothing_saveable",
             use_pjit_attention_force: bool = False,
+            bits: Optional[int] = None,
             **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -97,17 +99,20 @@ class GPT2Config(JaxBaseClassModel):
         self.eos_token_id = eos_token_id
         self.use_pjit_attention_force = use_pjit_attention_force
         self.gradient_checkpointing = gradient_checkpointing
+        self.bits = bits
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
 
     def add_jax_args(
             self,
             gradient_checkpointing: str = "nothing_saveable",
             use_pjit_attention_force: bool = False,
+            bits: Optional[int] = None,
             **kwargs
     ):
         args = dict(
             use_pjit_attention_force=use_pjit_attention_force,
             gradient_checkpointing=gradient_checkpointing,
+            bits=bits,
             **kwargs
         )
         for k, v in args.items():
@@ -125,13 +130,19 @@ class FlaxConv1D(nn.Module):
     dtype: Any = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
     precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+    dot_general: Optional[None] = None
 
     @nn.compact
     def __call__(self, inputs):
         inputs = jnp.asarray(inputs, self.dtype)
         kernel = self.param("kernel", jax.nn.initializers.normal(stddev=0.02), (self.features, inputs.shape[-1]))
         kernel = jnp.asarray(kernel.transpose(), self.dtype)
-        y = lax.dot_general(inputs, kernel, (((inputs.ndim - 1,), (0,)), ((), ())), precision=self.precision)
+        if self.dot_general is not None:
+            dot_general = self.dot_general
+        else:
+            dot_general = lax.dot_general
+
+        y = dot_general(inputs, kernel, (((inputs.ndim - 1,), (0,)), ((), ())), precision=self.precision)
         if self.use_bias:
             bias = self.param("bias", jax.nn.initializers.zeros, (self.features,))
             bias = jnp.asarray(bias, self.dtype)
@@ -156,29 +167,32 @@ class FlaxGPT2Attention(nn.Module):
         if self.is_cross_attention:
             self.c_attn = FlaxConv1D(
                 2 * self.embed_dim,
-
                 dtype=self.dtype,
                 param_dtype=self.param_dtype,
-                precision=self.precision
+                precision=self.precision,
+                dot_general=get_dot_general_by_bits(self.config.bits)
             )
             self.q_attn = FlaxConv1D(
                 self.embed_dim,
                 dtype=self.dtype,
                 param_dtype=self.param_dtype,
-                precision=self.precision
+                precision=self.precision,
+                dot_general=get_dot_general_by_bits(self.config.bits)
             )
         else:
             self.c_attn = FlaxConv1D(
                 3 * self.embed_dim,
                 dtype=self.dtype,
                 param_dtype=self.param_dtype,
-                precision=self.precision
+                precision=self.precision,
+                dot_general=get_dot_general_by_bits(self.config.bits)
             )
         self.c_proj = FlaxConv1D(
             self.embed_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            precision=self.precision
+            precision=self.precision,
+            dot_general=get_dot_general_by_bits(self.config.bits)
         )
 
         self.resid_dropout = nn.Dropout(rate=config.resid_pdrop)
@@ -322,13 +336,15 @@ class FlaxGPT2MLP(nn.Module):
             self.intermediate_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            precision=self.precision
+            precision=self.precision,
+            dot_general=get_dot_general_by_bits(self.config.bits)
         )
         self.c_proj = FlaxConv1D(
             embed_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            precision=self.precision
+            precision=self.precision,
+            dot_general=get_dot_general_by_bits(self.config.bits)
         )
         self.act = ACT2FN[self.config.activation_function]
         self.dropout = nn.Dropout(rate=self.config.resid_pdrop)
@@ -733,6 +749,7 @@ class FlaxGPT2LMHeadModule(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision,
             kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+            dot_general=get_dot_general_by_bits(self.config.bits)
         )
 
     def __call__(
