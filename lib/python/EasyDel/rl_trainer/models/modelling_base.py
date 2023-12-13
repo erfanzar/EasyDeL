@@ -47,19 +47,17 @@ class FlaxPreTrainedModelWrapper(nn.Module):
         :param cls: Refer to the class that called this function
         :param pretrained_model_name_or_path: Specify the path to the pretrained model
         :param from_pt: bool: Determine whether to load the model from a pytorch checkpoint or not
-        :param *model_args: Pass the positional arguments of the model
-        :param **kwargs: Pass keyworded, variable-length argument list
+        :param model_args: Pass the positional arguments of the model
+        :param kwargs: Pass keyworded, variable-length argument list
         :return: A model with the state_dict loaded from a file
         
         """
         if kwargs is not None:
             reward_adapter = kwargs.pop("reward_adapter", None)
-            is_trainable = kwargs.pop("is_trainable", False)
             trl_model_args, pretrained_kwargs, peft_quantization_kwargs = cls._split_kwargs(kwargs)
             token = pretrained_kwargs.get("token", None)
         else:
             reward_adapter = None
-            is_trainable = False
             trl_model_args = {}
             pretrained_kwargs = {}
             token = None
@@ -72,11 +70,6 @@ class FlaxPreTrainedModelWrapper(nn.Module):
             )
 
         if isinstance(pretrained_model_name_or_path, str):
-
-            remote_adapter_config = None
-
-            local_adapter_present = os.path.exists(os.path.join(pretrained_model_name_or_path, "adapter_config.json"))
-
             pretrained_model = cls.transformers_parent_class.from_pretrained(
                 pretrained_model_name_or_path, *model_args, **pretrained_kwargs
             )

@@ -7,7 +7,7 @@ from EasyDel.modules import FlaxLlamaForCausalLM
 from typing import Type
 
 from transformers.modeling_flax_outputs import FlaxCausalLMOutput
-
+from ...modules.auto_models import AutoEasyDelModelForCausalLM
 from .modelling_base import FlaxPreTrainedModelWrapper
 from jax import numpy as jnp
 import chex
@@ -23,7 +23,7 @@ class ValueHead(nn.Module):
     def setup(self):
         """
         The setup function is called by the model's constructor.
-        It initializes all of the layers in your model, and assigns them to member variables.
+        It initializes all the layers in your model, and assigns them to member variables.
         The setup function should be used for any initialization that needs to happen before running forward().
         This includes things like loading weights from a file, or setting up an optimizer.
 
@@ -71,7 +71,7 @@ class ValueHead(nn.Module):
 
 class FlaxAutoModelForCausalLMWithValueHead(FlaxPreTrainedModelWrapper):
     pretrained_model: Type[FlaxPreTrainedModel] = FlaxLlamaForCausalLM
-    transformers_parent_class: Type[FlaxPreTrainedModel] = FlaxPreTrainedModel
+    transformers_parent_class: Type[FlaxPreTrainedModel] = AutoEasyDelModelForCausalLM
     lm_head_namings = ["lm_head", "embed_out"]
     supported_args = (
         "summary_dropout_prob",

@@ -123,7 +123,8 @@ class FlaxConv1D(nn.Module):
     features: int
     use_bias: bool = True
     dtype: Any = jnp.float32
-    precision: Any = None
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
 
     @nn.compact
     def __call__(self, inputs):
@@ -141,6 +142,8 @@ class FlaxConv1D(nn.Module):
 class FlaxGPT2Attention(nn.Module):
     config: GPT2Config
     dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
     causal: bool = True
     is_cross_attention: bool = False
 
@@ -151,11 +154,32 @@ class FlaxGPT2Attention(nn.Module):
         self.head_dim = self.embed_dim // self.num_heads
 
         if self.is_cross_attention:
-            self.c_attn = FlaxConv1D(2 * self.embed_dim, dtype=self.dtype)
-            self.q_attn = FlaxConv1D(self.embed_dim, dtype=self.dtype)
+            self.c_attn = FlaxConv1D(
+                2 * self.embed_dim,
+
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+                precision=self.precision
+            )
+            self.q_attn = FlaxConv1D(
+                self.embed_dim,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+                precision=self.precision
+            )
         else:
-            self.c_attn = FlaxConv1D(3 * self.embed_dim, dtype=self.dtype)
-        self.c_proj = FlaxConv1D(self.embed_dim, dtype=self.dtype)
+            self.c_attn = FlaxConv1D(
+                3 * self.embed_dim,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+                precision=self.precision
+            )
+        self.c_proj = FlaxConv1D(
+            self.embed_dim,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision
+        )
 
         self.resid_dropout = nn.Dropout(rate=config.resid_pdrop)
 
@@ -289,11 +313,23 @@ class FlaxGPT2MLP(nn.Module):
     config: GPT2Config
     intermediate_size: int
     dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
 
     def setup(self):
         embed_dim = self.config.hidden_size
-        self.c_fc = FlaxConv1D(self.intermediate_size, dtype=self.dtype)
-        self.c_proj = FlaxConv1D(embed_dim, dtype=self.dtype)
+        self.c_fc = FlaxConv1D(
+            self.intermediate_size,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision
+        )
+        self.c_proj = FlaxConv1D(
+            embed_dim,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision
+        )
         self.act = ACT2FN[self.config.activation_function]
         self.dropout = nn.Dropout(rate=self.config.resid_pdrop)
 
@@ -308,13 +344,20 @@ class FlaxGPT2MLP(nn.Module):
 class FlaxGPT2Block(nn.Module):
     config: GPT2Config
     dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
 
     def setup(self):
         hidden_size = self.config.hidden_size
         inner_dim = self.config.n_inner if self.config.n_inner is not None else 4 * hidden_size
 
         self.ln_1 = nn.LayerNorm(epsilon=self.config.layer_norm_epsilon, dtype=self.dtype)
-        self.attn = FlaxGPT2Attention(self.config, dtype=self.dtype)
+        self.attn = FlaxGPT2Attention(
+            self.config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision
+        )
         self.ln_2 = nn.LayerNorm(epsilon=self.config.layer_norm_epsilon, dtype=self.dtype)
 
         if self.config.add_cross_attention:
@@ -392,10 +435,12 @@ class FlaxGPT2PreTrainedModel(FlaxPreTrainedModel):
             input_shape: Tuple = (1, 1),
             seed: int = 0,
             dtype: jnp.dtype = jnp.float32,
+            param_dtype: jnp.dtype = jnp.float32,
+            precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
             _do_init: bool = True,
             **kwargs,
     ):
-        module = self.module_class(config=config, dtype=dtype, **kwargs)
+        module = self.module_class(config=config, dtype=dtype, param_dtype=param_dtype, precision=precision, **kwargs)
         super().__init__(config, module, input_shape=input_shape, seed=seed, dtype=dtype, _do_init=_do_init)
 
     def init_weights(self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None) -> FrozenDict:
@@ -521,10 +566,18 @@ class FlaxGPT2PreTrainedModel(FlaxPreTrainedModel):
 class FlaxGPT2BlockCollection(nn.Module):
     config: GPT2Config
     dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
 
     def setup(self):
         self.blocks = [
-            FlaxGPT2Block(self.config, name=str(i), dtype=self.dtype) for i in range(self.config.num_hidden_layers)
+            FlaxGPT2Block(
+                self.config,
+                name=str(i),
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+                precision=self.precision
+            ) for i in range(self.config.num_hidden_layers)
         ]
 
     def __call__(
@@ -574,6 +627,8 @@ class FlaxGPT2BlockCollection(nn.Module):
 class FlaxGPT2Module(nn.Module):
     config: GPT2Config
     dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
 
     def setup(self):
         self.embed_dim = self.config.hidden_size
@@ -594,7 +649,12 @@ class FlaxGPT2Module(nn.Module):
             jnp.ones((1, self.config.max_position_embeddings), dtype="bool"), dtype="bool"
         )
         self.dropout = nn.Dropout(rate=self.config.embd_pdrop)
-        self.h = FlaxGPT2BlockCollection(self.config, dtype=self.dtype)
+        self.h = FlaxGPT2BlockCollection(
+            self.config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision
+        )
         self.ln_f = nn.LayerNorm(epsilon=self.config.layer_norm_epsilon, dtype=self.dtype)
 
     def __call__(
@@ -656,13 +716,22 @@ class FlaxGPT2Model(FlaxGPT2PreTrainedModel):
 class FlaxGPT2LMHeadModule(nn.Module):
     config: GPT2Config
     dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
 
     def setup(self):
-        self.transformer = FlaxGPT2Module(self.config, dtype=self.dtype)
+        self.transformer = FlaxGPT2Module(
+            self.config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision,
+        )
         self.lm_head = nn.Dense(
             self.config.vocab_size,
             use_bias=False,
             dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision,
             kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
         )
 
