@@ -147,7 +147,7 @@ class AutoEasyDelModelForCausalLM:
             input_shape: typing.Sequence[int] = (1, 1),
             backend: typing.Optional[str] = None,
             **kwargs
-    ) -> typing.Union[FlaxPreTrainedModel, dict]:
+    ) -> typing.Tuple[FlaxPreTrainedModel, dict]:
         """
         The from_pretrained function is a helper function that allows you to instantiate a model from the pretrained
         model repository. It takes as input the name of the model (e.g., 'bert-base-uncased') and returns an instance of
