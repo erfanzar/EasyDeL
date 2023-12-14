@@ -28,7 +28,7 @@ from .utils import InstructRequest, ChatRequest, seafoam
 from jax.experimental.pjit import pjit
 
 
-class JaxServerConfig:
+class JAXServerConfig:
     def __init__(
             self,
             host: str = "0.0.0.0",
@@ -122,15 +122,15 @@ class JAXServer(object):
 
 
         :param self: Refer to the current instance of a class
-        :param config: Pass the jaxserverconfig object
+        :param config: Pass the JAXServerConfig object
         :return: A fastapi object
         
         """
         self.process_uvicorn, self.prefix_tokenizer, self.params, self.tokenizer, self.model, \
-            self.rules, self._generate, self._greedy_generate = [None] * 8
-        assert config is None or isinstance(config, JaxServerConfig), 'config can be None or JaxServerConfig Type'
+            self.rules, self.generate_function, self.greedy_generate_function = [None] * 8
+        assert config is None or isinstance(config, JAXServerConfig), 'config can be None or JAXServerConfig Type'
         if config is None:
-            self.config = JaxServerConfig()
+            self.config = JAXServerConfig()
         else:
             self.config = config
         self._funcs_generated = False
@@ -270,8 +270,8 @@ class JAXServer(object):
             ).sequences[:, input_ids.shape[1]:]
             return predict
 
-        self._generate = generate
-        self._greedy_generate = greedy_generate
+        self.generate_function = generate
+        self.greedy_generate_function = greedy_generate
         self._funcs_generated = True
 
     def auto_configure(self, model, params, tokenizer, partition_rules):
@@ -313,7 +313,7 @@ class JAXServer(object):
             )
         else:
             with self.mesh:
-                return self._generate(
+                return self.generate_function(
                     params, input_ids, attention_mask
                 )
 
@@ -529,7 +529,7 @@ class JAXServer(object):
             )
         else:
             with self.mesh:
-                return self._greedy_generate(
+                return self.greedy_generate_function(
                     params, input_ids, attention_mask
                 )
 
@@ -715,9 +715,11 @@ class JAXServer(object):
         :return: A generator that yields the predicted text and the number of tokens generated
         
         """
+
+        fixed_pad = self.config.max_length - self.config.max_stream_tokens
         tokens = self.prefix_tokenizer(
             string,
-            max_length=self.config.max_length - self.config.max_stream_tokens,
+            max_length=fixed_pad,
             padding='max_length',
             return_tensors='jax'
         ) \
@@ -730,33 +732,38 @@ class JAXServer(object):
         input_ids = tokens.input_ids
         attention_mask = tokens.attention_mask
         num_generated_tokens = 0
-        pad = self.config.max_length - self.config.max_stream_tokens
 
         for _ in range((max_new_tokens or self.config.max_new_tokens) // self.config.max_stream_tokens):
-            predicted_token = self.greedy_generate(
-                params=self.params,
-                input_ids=input_ids,
-                attention_mask=attention_mask
-            ) if greedy else self.generate(
+            inputs_to_gen = dict(
                 params=self.params,
                 input_ids=input_ids,
                 attention_mask=attention_mask
             )
+            predicted_token = self.greedy_generate(**inputs_to_gen) if greedy else self.generate(**inputs_to_gen)
 
             num_generated_tokens += predicted_token.shape[-1]
+            plus_attn_mask = jnp.ones((len(attention_mask), self.config.max_stream_tokens), dtype=jnp.int32)
 
             input_ids = jnp.concatenate(
                 (input_ids, predicted_token), axis=-1
-            )[:, -pad:]
-            attention_mask = jnp.concatenate(
-                (attention_mask, jnp.ones((len(attention_mask), self.config.max_stream_tokens), dtype=jnp.int32)),
-                axis=-1
-            )[:, -pad:]
+            )[:, -fixed_pad:]
 
-            yield self.tokenizer.decode(input_ids[0][-num_generated_tokens:],
-                                        skip_special_tokens=True), num_generated_tokens
-            if predicted_token[0][-1] == self.tokenizer.eos_token_id or predicted_token[0][
-                -1] == self.prefix_tokenizer.eos_token_id:
+            attention_mask = jnp.concatenate(
+                (attention_mask, plus_attn_mask), dtype=jnp.int32,
+                axis=-1
+            )[:, -fixed_pad:]
+
+            returns = (
+                self.tokenizer.decode(input_ids[0][-num_generated_tokens:], skip_special_tokens=True),
+                num_generated_tokens
+            )
+
+            yield returns
+            if (
+                    predicted_token[0][-1] == self.tokenizer.eos_token_id
+                    or
+                    predicted_token[0][-1] == self.prefix_tokenizer.eos_token_id
+            ):
                 break
 
     def process_gradio_chat(self, prompt, history, max_new_tokens, system, greedy):

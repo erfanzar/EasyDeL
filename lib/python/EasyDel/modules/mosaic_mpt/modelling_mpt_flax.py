@@ -251,7 +251,6 @@ class FlaxMptMLP(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
-
         self.up = nn.Dense(
             self.config.d_model * self.config.expansion_ratio,
             kernel_init=jax.nn.initializers.normal(),
@@ -283,7 +282,6 @@ class FlaxMptAttention(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
-
 
         self.w_qkv = nn.Dense(
             self.config.d_model * 3,
@@ -469,15 +467,6 @@ class FlaxMptBlock(nn.Module):
         )
         hidden_states = self.ffn(self.norm_2(hidden_states)) + hidden_states
         return hidden_states
-
-
-def get_gradient_checkpoint_policy(name):
-    return {
-        'everything_saveable': jax.checkpoint_policies.everything_saveable,
-        'nothing_saveable': jax.checkpoint_policies.nothing_saveable,
-        'checkpoint_dots': jax.checkpoint_policies.checkpoint_dots,
-        'checkpoint_dots_with_no_batch_dims': jax.checkpoint_policies.checkpoint_dots_with_no_batch_dims,
-    }[name]
 
 
 class FlaxMptCollection(nn.Module):
@@ -667,7 +656,9 @@ class FlaxMptPretrainedModel(FlaxPreTrainedModel):
         if past_key_values is not None:
             params['cache'] = past_key_values
             mutable = ['cache']
-        rngs = {'params': jax.random.key(0)}
+        rngs = {}
+        if self.config.bits is not None:
+            rngs['params'] = jax.random.key(0)
         predict = self.module.apply(
             params,
             input_ids=input_ids,

@@ -6,6 +6,8 @@ from flax.serialization import from_bytes, to_bytes, to_state_dict
 import msgpack
 import os
 
+from typing import List
+
 
 def get_float_dtype_by_name(dtype):
     """
@@ -72,9 +74,11 @@ def match_keywords(string, ts, ns):
 
 def huggingface_to_easydel(
         state_dict,
-        embedding_layer_name: str,
+        *,
+        embedding_layer_names: List[str],
         device,
-        dtype: jax.numpy.dtype = jax.numpy.float16
+        dtype: jax.numpy.dtype = jax.numpy.float16,
+        **kwargs
 ):
     """
     The huggingface_to_easydel function takes a huggingface model's state_dict and converts it to an easydel
@@ -83,24 +87,26 @@ def huggingface_to_easydel(
     the conversion will take place.
 
     :param state_dict: Load the weights from a huggingface model
-    :param embedding_layer_name: str: Identify the embedding layer in the huggingface model
+    :param embedding_layer_names: List[str]: Identify the embedding layer in the huggingface model
     :param device: Determine which device the model will be loaded on
     :param dtype: jax.numpy.dtype: Specify the data type of the tensors
     :return: A dictionary of the weights and biases in a format that can be used by flax (it's an UnFlattenDict)
     
     """
+    if isinstance(embedding_layer_names, str):
+        embedding_layer_names = [embedding_layer_names]
     _l = len('.weight')
     with jax.default_device(device):
         flax_dict = {}
         for key, tensor in state_dict.items():
-            if embedding_layer_name in key:
-                # tensor = tensor.transpose(0, 1)
-                key = key[:-_l] + '.embedding'
-            elif match_keywords(key, ['kernel'], ['none']):
-                if len(tensor.shape) == 2:
-                    tensor = tensor.transpose(0, 1)
-                if key.endswith('.weight'):
-                    key = key[:-_l] + '.kernel'
+            for embedding_layer_name in embedding_layer_names:
+                if embedding_layer_name in key:
+                    key = key[:-_l] + '.embedding'
+                elif match_keywords(key, ['kernel'], ['none']):
+                    if len(tensor.shape) == 2:
+                        tensor = tensor.transpose(0, 1)
+                    if key.endswith('.weight'):
+                        key = key[:-_l] + '.kernel'
             key_tuple = key.split('.')
             key_names = ()
             tensor = tensor.detach().cpu().numpy()

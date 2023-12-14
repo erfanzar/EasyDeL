@@ -23,7 +23,7 @@ from flax.training import train_state
 from jax import numpy as jnp
 from torch.utils.data import DataLoader
 from fjformer import match_partition_rules, make_shard_and_gather_fns, StreamingCheckpointer
-
+from ..erros import EasyDelTimer
 import chex
 
 
@@ -506,7 +506,7 @@ class CausalLMTrainer:
         dir_prefix: str = '/dev/shm'
         if self.arguments.track_memory:
             initialise_tracking(dir_prefix=dir_prefix)
-
+        start_time = time.time()
         with self.mesh:
             if self.finetune:
                 shard_fns, gather_fns = make_shard_and_gather_fns(self.train_state_partition_spec,
@@ -607,6 +607,9 @@ class CausalLMTrainer:
                                              perplexity=jnp.exp(loss).tolist(),
                                              accuracy=accuracy,
                                              )
+                            if self.arguments.training_time is not None:
+                                if time.time() - start_time > self.arguments.training_time:
+                                    raise EasyDelTimer
                         else:
                             break
                         if self.arguments.save_steps is not None and i % self.arguments.save_steps == 0:
@@ -618,6 +621,11 @@ class CausalLMTrainer:
             except KeyboardInterrupt:
                 print(
                     '\033[1;30m KeyboardInterrupt At training model Will return current state of the model * \033[1;0m')
+            except EasyDelTimer:
+                print(
+                    '\033[1;30m Training reached out maximum training Time Killing training Process '
+                    'and Will return current state of the model * \033[1;0m'
+                )
             if self.arguments.do_eval:
                 if self.dataset_eval is not None:
                     pbar_eval = tqdm(total=self.max_steps_eval)

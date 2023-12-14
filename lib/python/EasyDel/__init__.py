@@ -4,7 +4,7 @@ from .serve.torch_serve import (
 )
 from .serve.jax_serve import (
     JAXServer as JAXServer,
-    JaxServerConfig as JaxServerConfig
+    JAXServerConfig as JAXServerConfig
 )
 from .modules.llama.modelling_llama_flax import (
     LlamaConfig as LlamaConfig,
@@ -61,6 +61,14 @@ from .modules.lucid_transformer.modelling_lt_flax import (
     FlaxLTModelModule as FlaxLTModelModule,
     FlaxLTConfig as FlaxLTConfig,
     FlaxLTForCausalLM as FlaxLTForCausalLM
+)
+
+from .modules.gpt2.modelling_gpt2_flax import (
+    # GPT2 code is from huggingface but in the version of huggingface they don't support gradient checkpointing
+    # and pjit attention force
+    GPT2Config as GPT2Config,
+    FlaxGPT2LMHeadModel as FlaxGPT2LMHeadModel,
+    FlaxGPT2Model as FlaxGPT2Model
 )
 
 from .modules.auto_models import (

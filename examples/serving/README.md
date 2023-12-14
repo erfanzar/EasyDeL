@@ -383,8 +383,8 @@ def configure_generate_functions(self, model, tokenizer):
         ).sequences[:, input_ids.shape[1]:]
         return predict
 
-    self._generate = generate
-    self._greedy_generate = greedy_generate
+    self.generate_function = generate
+    self.greedy_generate_function = greedy_generate
     self._funcs_generated = True
 ```
 

@@ -557,7 +557,9 @@ class FlaxLlamaAttention(nn.Module):
         attention_mask = combine_masks(attention_mask, causal_mask, fcm_mask)
         if attention_mask.ndim == 2:
             attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
+
         dropout_rng = None
+
         if not deterministic and self.config.attn_pdrop > 0.0:
             dropout_rng = self.make_rng("dropout")
 
@@ -646,7 +648,12 @@ class FlaxLlamaAttention(nn.Module):
             if self.config.use_pjit_attention_force:
                 attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "mp", None, None))
 
-            attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value_state)
+            attn_output = jnp.einsum(
+                "...hqk,...khd->...qhd",
+                attn_weights,
+                value_state,
+                precision=self.precision
+            )
 
         attn_output = self._merge_heads(attn_output)
         attn_output = self.o_proj(attn_output)
@@ -1009,7 +1016,9 @@ class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
         if dropout_rng is not None:
             rngs["dropout"] = dropout_rng
 
-        rngs['params'] = jax.random.key(0)
+        if self.config.bits is not None:
+            rngs['params'] = jax.random.key(0)
+
         inputs = {"params": params or self.params} if add_params_field else params or self.params
 
         if past_key_values:
