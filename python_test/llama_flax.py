@@ -51,7 +51,6 @@ def main():
     config.add_partitions(
         use_shard_map=True
     )
-    print("Config\n", config)
     mesh = config.jax_mesh()
     with mesh:
         partition_specs = match_partition_rules(config.get_partition_rules(True), params)

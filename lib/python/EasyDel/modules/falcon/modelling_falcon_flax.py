@@ -854,7 +854,9 @@ class FlaxFalconPretrainedModel(FlaxPreTrainedModel):
 
             position_ids = jnp.broadcast_to(jnp.arange(input_ids.shape[1])[None, :],
                                             (input_ids.shape[0], input_ids.shape[1]))
-
+        rngs = {}
+        if self.config.bits is not None:
+            rngs['params'] = jax.random.key(0)
         if attention_mask is None:
             attention_mask = jnp.ones((input_ids.shape[0], input_ids.shape[1]))
 
@@ -868,7 +870,7 @@ class FlaxFalconPretrainedModel(FlaxPreTrainedModel):
             use_cache,
             return_dict,
             mutable=mutable,
-            rngs={'params': jax.random.key(0)}
+            rngs=rngs
         )
 
         if past_key_values is not None and return_dict:

@@ -11,7 +11,7 @@ from flax.traverse_util import unflatten_dict, flatten_dict
 from jax import numpy as jnp
 from flax import linen as nn
 from chex import Array
-from ..flax_modelling_utils import JaxBaseClassModel, ACT2FN, get_gradient_checkpoint_policy,canonicalize_dtype
+from ..flax_modelling_utils import JaxBaseClassModel, ACT2FN, get_gradient_checkpoint_policy, canonicalize_dtype
 from transformers import PretrainedConfig
 from einops import repeat, rearrange
 from transformers.modeling_flax_outputs import FlaxCausalLMOutput
@@ -987,7 +987,9 @@ class FlaxPhiPreTrainedModel(transformers.FlaxPreTrainedModel):
         if dropout_rng is not None:
             rngs["dropout"] = dropout_rng
 
-        rngs['params'] = jax.random.key(0)
+        if self.config.bits is not None:
+            rngs['params'] = jax.random.key(0)
+
         inputs = {"params": params or self.params} if add_params_field else params or self.params
 
         if past_key_values:

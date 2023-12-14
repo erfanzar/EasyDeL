@@ -1,5 +1,6 @@
 import os.path
 import pathlib
+import re
 import typing
 from typing import OrderedDict, List, Union
 
@@ -73,6 +74,7 @@ class TrainArguments(
             warmup_steps: int = 500,
             init_input_shape: typing.Tuple[int, int] = (1, 1),
             step_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(('dp', 'fsdp'), 'mp'),
+            training_time: typing.Optional[str] = None,
             **kwargs
     ):
         """
@@ -113,7 +115,8 @@ class TrainArguments(
         :param use_wandb: bool: Determine whether to use wandb or not
         :param custom_rule: Pass a custom rule to the optimizer,
         :param extra_configs: Pass extra configurations to the model class
-        :param ids_to_pop_from_dataset: list: Pop some keys from the dataset,
+        :param ids_to_pop_from_dataset: list: Pop some keys from the dataset
+        :param training_time: str: maximum time for Trainer to Train the Model
         :param remove_ckpt_after_load: bool: Remove the checkpoint after loading it
         :param configs_to_init_model_class: Pass the configs to the model class
         :param do_last_save: bool: Save the model at the end of training
@@ -196,8 +199,26 @@ class TrainArguments(
         self.init_input_shape = init_input_shape
         self.is_left_padded = is_left_padded
         self.step_partition_spec = step_partition_spec
+
+        self.training_time = self._time_to_seconds(training_time) if training_time is not None else None
         torch.set_default_device('cpu')
         self.__dict__.update(**kwargs)
+
+    @staticmethod
+    def _time_to_seconds(time_str):
+        pattern = r'(\d+)\s*(H|min|Min)'
+        match = re.match(pattern, time_str)
+
+        if match:
+            value = int(match.group(1))
+            unit = match.group(2).lower()
+
+            if unit == 'h':
+                return value * 3600  # Convert hours to seconds
+            elif unit == 'min':
+                return value * 60  # Convert minutes to seconds
+        else:
+            raise SyntaxError("Invalid input format it should be like 50Min for M and 23H for hours")
 
     def __call__(self):
         return {k: v for k, v in self.__dict__.items()}
