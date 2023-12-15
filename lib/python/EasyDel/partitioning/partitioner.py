@@ -30,11 +30,11 @@ def get_partitions(
     """
     if jax_attn_format:
         if fsdp_on_batch:
-            q_ps = PartitionSpec("fsdp", None, "mp", None)
-            k_ps = PartitionSpec("fsdp", None, "mp", None)
-            v_ps = PartitionSpec("fsdp", None, "mp", None)
-            b_ps = PartitionSpec("fsdp", None, "mp", None)
-            a_ps = PartitionSpec("fsdp", None, "mp", None)
+            q_ps = PartitionSpec("fsdp", None, "sp", None)
+            k_ps = PartitionSpec("fsdp", None, "sp", None)
+            v_ps = PartitionSpec("fsdp", None, "sp", None)
+            b_ps = PartitionSpec("fsdp", None, "sp", None)
+            a_ps = PartitionSpec("fsdp", None, "sp", None)
         else:
             q_ps = PartitionSpec("dp", "fsdp", "tp", "sp", None)
             k_ps = PartitionSpec("dp", "fsdp", "tp", "sp", None)
@@ -43,17 +43,17 @@ def get_partitions(
             a_ps = PartitionSpec("dp", "fsdp", "tp", "sp", None)
     else:
         if fsdp_on_batch:
-            q_ps = PartitionSpec("fsdp", "mp", None, None)
-            k_ps = PartitionSpec("fsdp", "mp", None, None)
-            v_ps = PartitionSpec("fsdp", "mp", None, None)
-            b_ps = PartitionSpec("fsdp", "mp", None, None)
-            a_ps = PartitionSpec("fsdp", "mp", None, None)
+            q_ps = PartitionSpec("fsdp", "sp", None, None)
+            k_ps = PartitionSpec("fsdp", "sp", None, None)
+            v_ps = PartitionSpec("fsdp", "sp", None, None)
+            b_ps = PartitionSpec("fsdp", "sp", None, None)
+            a_ps = PartitionSpec("fsdp", "sp", None, None)
         else:
-            q_ps = PartitionSpec("dp", "mp", "fsdp", None)
-            k_ps = PartitionSpec("dp", "mp", "fsdp", None)
-            v_ps = PartitionSpec("dp", "mp", "fsdp", None)
+            q_ps = PartitionSpec("dp", "sp", "fsdp", None)
+            k_ps = PartitionSpec("dp", "sp", "fsdp", None)
+            v_ps = PartitionSpec("dp", "sp", "fsdp", None)
             b_ps = PartitionSpec("dp", "fsdp", None, None)
-            a_ps = PartitionSpec("dp", "mp", "fsdp", None)
+            a_ps = PartitionSpec("dp", "sp", "fsdp", None)
     return EasyDelPartitions(
         q_ps=q_ps,
         k_ps=k_ps,

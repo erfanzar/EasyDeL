@@ -176,7 +176,6 @@ class MistralConfig(JaxBaseClassModel):
             ("lm_head/kernel", PS("fsdp", "dp")),
             ('.*', PS(None)),
         ) if not fully_fsdp else (
-
             ("model/embed_tokens/embedding", PS(("fsdp", "sp"))),
 
             ("self_attn/(q_proj|k_proj|v_proj)/kernel", PS(("fsdp", "sp"))),
@@ -460,9 +459,9 @@ class FlaxMistralAttention(nn.Module):
         query, key, value = self.q_proj(hidden_state), self.k_proj(hidden_state), self.v_proj(hidden_state)
 
         if self.config.use_pjit_attention_force:
-            query = with_sharding_constraint(query, PS("fsdp", 'mp', None))
-            key = with_sharding_constraint(key, PS("fsdp", 'mp', None))
-            value = with_sharding_constraint(value, PS("fsdp", 'mp', None))
+            query = with_sharding_constraint(query, PS("fsdp", "sp", None))
+            key = with_sharding_constraint(key, PS("fsdp", "sp", None))
+            value = with_sharding_constraint(value, PS("fsdp", "sp", None))
         query, key, value = self.t_rotary(
             batch_size=batch_size,
             sequence_length=sequence_length,

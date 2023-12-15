@@ -48,7 +48,7 @@ def calculate_accuracy(predictions: chex.Array, targets: chex.Array):
     return accuracy
 
 
-def create_fsdp_train_step(partition_spec=PartitionSpec(("dp", "fsdp"), 'mp')):
+def create_fsdp_train_step(partition_spec=PartitionSpec(("dp", "fsdp"), "sp")):
     """
     The create_fsdp_train_step function is a training step function that takes in the current state of the model,
     and a batch of data. It then calculates the loss and accuracy for this batch, and returns an updated state
@@ -90,7 +90,7 @@ def create_fsdp_train_step(partition_spec=PartitionSpec(("dp", "fsdp"), 'mp')):
     return fsdp_train_step
 
 
-def create_fsdp_eval_step(partition_spec=PartitionSpec(("dp", "fsdp"), 'mp')):
+def create_fsdp_eval_step(partition_spec=PartitionSpec(("dp", "fsdp"), "sp")):
     """
     The create_fsdp_eval_step function is used to create a function that calculates the loss and accuracy of a model.
     It takes in a set of parameters, which are then passed into the state.apply_fn function
