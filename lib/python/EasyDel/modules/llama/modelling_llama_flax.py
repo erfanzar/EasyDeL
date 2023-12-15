@@ -357,7 +357,7 @@ class FlaxLlamaAttention(nn.Module):
             use_bias=self.config.attention_bias,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            dot_general=get_dot_general_by_bits(self.config.bits)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
         self.k_proj = nn.Dense(
             config.num_key_value_heads * self.head_dim,
@@ -366,7 +366,7 @@ class FlaxLlamaAttention(nn.Module):
             use_bias=self.config.attention_bias,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            dot_general=get_dot_general_by_bits(self.config.bits)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
         self.v_proj = nn.Dense(
             config.num_key_value_heads * self.head_dim,
@@ -375,7 +375,7 @@ class FlaxLlamaAttention(nn.Module):
             use_bias=self.config.attention_bias,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            dot_general=get_dot_general_by_bits(self.config.bits)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
         self.o_proj = nn.Dense(
             config.hidden_size,
@@ -384,7 +384,7 @@ class FlaxLlamaAttention(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            dot_general=get_dot_general_by_bits(self.config.bits)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
 
         self.rotary = FlaxLlamaEmbedding(self.dtype)
@@ -680,7 +680,7 @@ class FlaxLlamaMLP(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            dot_general=get_dot_general_by_bits(self.config.bits)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
         self.down_proj = nn.Dense(
             config.hidden_size,
@@ -689,7 +689,7 @@ class FlaxLlamaMLP(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            dot_general=get_dot_general_by_bits(self.config.bits)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
         self.up_proj = nn.Dense(
             config.intermediate_size,
@@ -698,7 +698,7 @@ class FlaxLlamaMLP(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            dot_general=get_dot_general_by_bits(self.config.bits)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
         self.dropout = nn.Dropout(rate=self.config.resid_pdrop)
 
@@ -1277,7 +1277,7 @@ class FlaxLlamaForCausalLMModule(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
             precision=self.precision,
-            dot_general=get_dot_general_by_bits(self.config.bits)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
 
     def __call__(

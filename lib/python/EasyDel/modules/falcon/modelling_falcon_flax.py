@@ -335,7 +335,7 @@ class FlaxFalconAttention(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=self.config.bias,
-            dot_general=get_dot_general_by_bits(self.config.bits)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
         self.inv_norm_factor = 1 / math.sqrt(head_dim)
         self.dense = nn.Dense(
@@ -343,7 +343,7 @@ class FlaxFalconAttention(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=self.config.bias,
-            dot_general=get_dot_general_by_bits(self.config.bits)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
         self.head_dim = head_dim
         self.maybe_rotary = FlaxFalconRotaryEmbedding(self.dtype) if not self.config.alibi else lambda q, k, a, s: (
@@ -551,14 +551,14 @@ class FlaxFalconMlp(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=self.config.bias,
-            dot_general=get_dot_general_by_bits(self.config.bits)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
         self.dense_4h_to_h = nn.Dense(
             features=self.config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=self.config.bias,
-            dot_general=get_dot_general_by_bits(self.config.bits)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
 
     def __call__(self, x: chex.Array, deterministic: bool = True):
@@ -938,7 +938,7 @@ class FlaxFalconForCausalLMModule(nn.Module):
         self.lm_head = nn.Dense(
             self.config.vocab_size,
             use_bias=False,
-            dot_general=get_dot_general_by_bits(self.config.bits)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
 
     def __call__(self,

@@ -258,7 +258,7 @@ class FlaxMptMLP(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
-            dot_general=get_dot_general_by_bits(self.config.bits)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
         self.down = nn.Dense(
             self.config.d_model,
@@ -267,7 +267,7 @@ class FlaxMptMLP(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
-            dot_general=get_dot_general_by_bits(self.config.bits)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
         self.act = ACT2FN[self.config.act_fn]
 
@@ -287,7 +287,7 @@ class FlaxMptAttention(nn.Module):
             self.config.d_model * 3,
             kernel_init=jax.nn.initializers.normal(),
             use_bias=self.config.use_bias,
-            dot_general=get_dot_general_by_bits(self.config.bits),
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision)
@@ -298,7 +298,7 @@ class FlaxMptAttention(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
-            dot_general=get_dot_general_by_bits(self.config.bits)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
         if self.config.qk_ln:
             self.q_ln = nn.LayerNorm(use_bias=self.config.use_norm_bias)
@@ -702,7 +702,7 @@ class FlaxFlaxMptForCausalLMModule(nn.Module):
             self.lm_head = nn.Dense(self.config.vocab_size, kernel_init=jax.nn.initializers.normal(),
                                     use_bias=self.config.use_bias,
                                     dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision,
-                                    dot_general=get_dot_general_by_bits(self.config.bits))
+                                    **get_dot_general_by_bits(self.config.bits, self.config.easy_method))
 
     def __call__(self,
                  input_ids: chex.Array,

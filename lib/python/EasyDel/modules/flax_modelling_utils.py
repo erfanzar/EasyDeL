@@ -1,6 +1,9 @@
+import dataclasses
+import functools
+
 import fjformer.attention
 import transformers
-from fjformer.bits import q_flax, config as q_config
+from fjformer.bits import config_v4, fully_quantized, config as q_config, q_flax
 from jax.interpreters import pxla
 from jax.experimental.pjit import with_sharding_constraint as wsc
 import jax
@@ -79,6 +82,14 @@ def get_names_from_partition_spec(partition_specs):
             names.update(get_names_from_partition_spec(item))
 
     return list(names)
+
+
+@dataclasses.dataclass
+class EasyMethod:
+    TRAIN: str = "train"
+    SERVE: str = "serve"
+    EVAL: str = "serve"
+    CONVERT: str = "convert"
 
 
 def names_in_mesh(*names):
@@ -480,6 +491,7 @@ class JaxBaseClassModel(transformers.PretrainedConfig):
     :param a_ps: jax.sharding.PartitionSpec: Specify the partitioning of the attention weights
     :param use_shard_map: bool: whenever to use shard_map for attention
     :param backend: Optional[None]: Specify the backend to use
+    :param easy_method: EasyMethod: Specify the use of model to init the QDot Method for (e.q TRAIN,SERVE,...)
     """
 
     def __init__(
@@ -493,6 +505,7 @@ class JaxBaseClassModel(transformers.PretrainedConfig):
             a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, "mp", None),
             use_shard_map: bool = False,
             backend: Optional[None] = None,
+            easy_method: EasyMethod = EasyMethod.TRAIN,
             **kwargs
     ):
         self.q_ps = q_ps
@@ -504,6 +517,7 @@ class JaxBaseClassModel(transformers.PretrainedConfig):
         self.axis_dims = axis_dims
         self.axis_names = axis_names
         self.backend = backend if backend is not None else ""
+        self.easy_method = easy_method
         super().__init__(**kwargs)
 
     def jax_mesh(self) -> jax.sharding.Mesh:
@@ -620,19 +634,35 @@ def add_start_docstrings(*docstr):
 
 
 def get_dot_general_by_bits(
-        bits: Optional[int] = None
-):
+        bits: Optional[int] = None,
+        mode: EasyMethod = EasyMethod.TRAIN
+) -> dict:
     """
     The get_general_dot function is a helper function that returns a q_flax.QDotGeneral object
     with the specified number of bits for forward and backward passes. If no bits are specified,
     the function returns None.
 
     :param bits: Optional[int]: Specify the number of bits for quantization
-    :return: A qdotgeneral object
+    :param mode: EasyMethod: Specify the use of model to init the QDot Method for (e.q TRAIN,SERVE,...)
+    :return: A dict that contain dot_general_cls
     """
+    if mode == EasyMethod.TRAIN:
+        rhs_quant_mode = q_flax.QuantMode.TRAIN
+    elif mode == EasyMethod.EVAL or mode == EasyMethod.SERVE:
+        rhs_quant_mode = q_flax.QuantMode.SERVE
+    elif mode == EasyMethod.CONVERT:
+        rhs_quant_mode = q_flax.QuantMode.CONVERT
+    else:
+        raise ValueError("Unknown Quant Method for EasyMethod")
     if bits is not None:
-        return q_flax.QDotGeneral(q_config.fully_quantized(
-            fwd_bits=bits,
-            bwd_bits=bits
-        ))
-    return jax.lax.dot_general
+        return {
+            "dot_general_cls": functools.partial(
+                q_flax.QDotGeneral,
+                q_config.fully_quantized(
+                    fwd_bits=bits,
+                    bwd_bits=bits
+                ),
+                rhs_quant_mode=rhs_quant_mode
+            )
+        }
+    return {}  # empty just in case of not getting any error
