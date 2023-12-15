@@ -348,7 +348,7 @@ class FlaxMistralMLP(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision,
             kernel_init=nn.initializers.normal(),
-            dot_general=get_dot_general_by_bits(self.config.bits)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
         self.gate_proj = dense(self.config.intermediate_size)
         self.up_proj = dense(self.config.intermediate_size)
@@ -381,7 +381,7 @@ class FlaxMistralAttention(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision,
             kernel_init=nn.initializers.normal(),
-            dot_general=get_dot_general_by_bits(self.config.bits)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
 
         self.q_proj = dense(self.num_heads * self.head_dim)
@@ -1027,7 +1027,7 @@ class FlaxMistralForCausalLMModule(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
             precision=self.precision,
-            dot_general=get_dot_general_by_bits(self.config.bits)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
 
     def __call__(

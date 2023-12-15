@@ -170,14 +170,14 @@ class FlaxGPT2Attention(nn.Module):
                 dtype=self.dtype,
                 param_dtype=self.param_dtype,
                 precision=self.precision,
-                dot_general=get_dot_general_by_bits(self.config.bits)
+                **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
             )
             self.q_attn = FlaxConv1D(
                 self.embed_dim,
                 dtype=self.dtype,
                 param_dtype=self.param_dtype,
                 precision=self.precision,
-                dot_general=get_dot_general_by_bits(self.config.bits)
+                **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
             )
         else:
             self.c_attn = FlaxConv1D(
@@ -185,14 +185,14 @@ class FlaxGPT2Attention(nn.Module):
                 dtype=self.dtype,
                 param_dtype=self.param_dtype,
                 precision=self.precision,
-                dot_general=get_dot_general_by_bits(self.config.bits)
+                **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
             )
         self.c_proj = FlaxConv1D(
             self.embed_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
-            dot_general=get_dot_general_by_bits(self.config.bits)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
 
         self.resid_dropout = nn.Dropout(rate=config.resid_pdrop)
@@ -337,14 +337,14 @@ class FlaxGPT2MLP(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
-            dot_general=get_dot_general_by_bits(self.config.bits)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
         self.c_proj = FlaxConv1D(
             embed_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
-            dot_general=get_dot_general_by_bits(self.config.bits)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
         self.act = ACT2FN[self.config.activation_function]
         self.dropout = nn.Dropout(rate=self.config.resid_pdrop)
@@ -749,7 +749,7 @@ class FlaxGPT2LMHeadModule(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision,
             kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
-            dot_general=get_dot_general_by_bits(self.config.bits)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
 
     def __call__(
