@@ -73,7 +73,7 @@ class TrainArguments(
             is_left_padded: bool = False,
             warmup_steps: int = 500,
             init_input_shape: typing.Tuple[int, int] = (1, 1),
-            step_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), 'mp'),
+            step_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp"),
             training_time: typing.Optional[str] = None,
             **kwargs
     ):

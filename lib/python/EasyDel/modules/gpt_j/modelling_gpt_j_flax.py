@@ -169,26 +169,26 @@ class GPTJConfig(JaxBaseClassModel):
             )
         else:
             rules = (
-                ("model/wte/embedding", PartitionSpec("tp", ("fsdp", "mp"))),
+                ("model/wte/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
 
-                ("attn/(k_proj|v_proj|q_proj)/kernel", PartitionSpec(("fsdp", "mp"), "tp")),
-                ("attn/out_proj/kernel", PartitionSpec("tp", ("fsdp", "mp"), )),
+                ("attn/(k_proj|v_proj|q_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+                ("attn/out_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"), )),
 
-                ("mlp/fc_out/kernel", PartitionSpec(("fsdp", "mp"), "tp")),
-                ("mlp/fc_out/bias", PartitionSpec(("fsdp", "mp"), "tp")),
+                ("mlp/fc_out/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+                ("mlp/fc_out/bias", PartitionSpec(("fsdp", "sp"), "tp")),
 
-                ("mlp/fc_in/kernel", PartitionSpec("tp", ("fsdp", "mp"), )),
-                ("mlp/fc_in/bias", PartitionSpec("tp", ("fsdp", "mp"), )),
+                ("mlp/fc_in/kernel", PartitionSpec("tp", ("fsdp", "sp"), )),
+                ("mlp/fc_in/bias", PartitionSpec("tp", ("fsdp", "sp"), )),
 
-                ("lm_head/kernel", PartitionSpec("tp", ("fsdp", "mp"), )),
-                ("lm_head/bias", PartitionSpec("tp", ("fsdp", "mp"), )),
+                ("lm_head/kernel", PartitionSpec("tp", ("fsdp", "sp"), )),
+                ("lm_head/bias", PartitionSpec("tp", ("fsdp", "sp"), )),
                 ('.*', PartitionSpec(None)),
             )
         return rules
 
     @staticmethod
     def get_mesh_names():
-        return "dp", "fsdp", "tp", "mp"
+        return "dp", "fsdp", "tp", "sp"
 
     def add_jax_args(
             self,
@@ -215,12 +215,12 @@ class GPTJConfig(JaxBaseClassModel):
             flash_attn_key_chunk_size: int = 2048,
             bits: Optional[int] = None,
             axis_dims: Sequence[int] = (1, -1, 1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
-            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
-            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
+            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", None, ("dp", "fsdp"), None),
-            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "mp", "tp", None),
+            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             backend: Optional[str] = None,
             **kwargs,
     ):
@@ -463,9 +463,9 @@ class FlaxGPTJAttention(nn.Module):
 
         # Force A local Sharding
         if self.config.use_pjit_attention_force:
-            query = with_sharding_constraint(query, PartitionSpec(("dp", "fsdp"), None, 'mp'))
-            key = with_sharding_constraint(key, PartitionSpec(("dp", "fsdp"), None, 'mp'))
-            value = with_sharding_constraint(value, PartitionSpec(("dp", "fsdp"), None, 'mp'))
+            query = with_sharding_constraint(query, PartitionSpec(("dp", "fsdp"), None, "sp"))
+            key = with_sharding_constraint(key, PartitionSpec(("dp", "fsdp"), None, "sp"))
+            value = with_sharding_constraint(value, PartitionSpec(("dp", "fsdp"), None, "sp"))
 
         query = self._split_heads(query)
         key = self._split_heads(key)
@@ -556,7 +556,7 @@ class FlaxGPTJAttention(nn.Module):
                 precision=self.precision,
             )
             if self.config.use_pjit_attention_force:
-                attn_weights = with_sharding_constraint(attn_weights, PartitionSpec(("dp", "fsdp"), "mp", None, None))
+                attn_weights = with_sharding_constraint(attn_weights, PartitionSpec(("dp", "fsdp"), "sp", None, None))
 
             attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value, precision=self.precision)
         attn_output = self._merge_heads(attn_output)

@@ -423,9 +423,9 @@ class FlaxT5Attention(nn.Module):
         key_states = self.k(hidden_states) if key_value_states is None else self.k(key_value_states)
         value_states = self.v(hidden_states) if key_value_states is None else self.v(key_value_states)
         if self.config.use_pjit_attention_force:
-            query_states = with_sharding_constraint(query_states, PartitionSpec(("dp", "fsdp"), None, 'mp'))
-            key_states = with_sharding_constraint(key_states, PartitionSpec(("dp", "fsdp"), None, 'mp'))
-            value_states = with_sharding_constraint(value_states, PartitionSpec(("dp", "fsdp"), None, 'mp'))
+            query_states = with_sharding_constraint(query_states, PartitionSpec(("dp", "fsdp"), None, "sp"))
+            key_states = with_sharding_constraint(key_states, PartitionSpec(("dp", "fsdp"), None, "sp"))
+            value_states = with_sharding_constraint(value_states, PartitionSpec(("dp", "fsdp"), None, "sp"))
 
         # reshape to (batch_size, seq_length, n_heads, head_dim)
         query_states = self._split_heads(query_states)
@@ -507,7 +507,7 @@ class FlaxT5Attention(nn.Module):
 
         if self.config.use_pjit_attention_force:
             attn_weights = with_sharding_constraint(attn_weights, PartitionSpec(
-                ("dp", "fsdp"), 'mp', None, None
+                ("dp", "fsdp"), "sp", None, None
             ))
 
         # multiply with value states
