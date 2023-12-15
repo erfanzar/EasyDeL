@@ -190,13 +190,13 @@ class ParallelPalmBlock(nn.Module):
 
         sim = jnp.einsum('... h i d, ... j d -> ... h i j', q, k)
         if self.config.use_pjit_attention_force:
-            sim = with_sharding_constraint(sim, PartitionSpec(('dp', 'fsdp'), 'mp', None, None))
+            sim = with_sharding_constraint(sim, PartitionSpec(("dp", "fsdp"), 'mp', None, None))
         mask_value = jnp.finfo(hidden_state).min
         attn = nn.softmax(np.where(causal_mask, sim, mask_value), axis=-1)
 
         out = jnp.einsum('... h i j, ... j d -> ... h i d', attn, v)
         if self.config.use_pjit_attention_force:
-            out = with_sharding_constraint(out, PartitionSpec(('dp', 'fsdp'), 'mp', None, None))
+            out = with_sharding_constraint(out, PartitionSpec(("dp", "fsdp"), 'mp', None, None))
         attn_out = rearrange(out, '... h n hd -> ... n (h hd)') @ self.attn_wo
 
         ff_out = (ff * nn.swish(ff_gate)) @ self.ff_wo

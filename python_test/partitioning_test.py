@@ -18,7 +18,7 @@ from jax.sharding import PartitionSpec
 
 def main():
     initialise_tracking(interval=0.1)
-    mesh = get_jax_mesh('1,-1,1', ('dp', "fsdp", 'mp'))
+    mesh = get_jax_mesh('1,-1,1', ("dp", "fsdp", 'mp'))
     config = LlamaConfig(
         hidden_size=512,
         intermediate_size=1024,
@@ -31,7 +31,7 @@ def main():
         params = model.init_weights(jax.random.PRNGKey(0), (1, 1))
     partition_rules = (
 
-        ("model/embed_tokens/embedding", PartitionSpec("mp", 'fsdp')),
+        ("model/embed_tokens/embedding", PartitionSpec("mp", "fsdp")),
 
         ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec('mp', "fsdp")),
         ("self_attn/o_proj/kernel", PartitionSpec(("fsdp","mp"))),

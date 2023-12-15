@@ -88,7 +88,7 @@ class GPTJConfig(JaxBaseClassModel):
             flash_attn_key_chunk_size: int = 2048,
             bits: Optional[int] = None,
             axis_dims: Sequence[int] = (1, -1, 1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "mp"),
+            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "tp"),
             **kwargs,
     ):
         self.bits = bits
@@ -152,36 +152,36 @@ class GPTJConfig(JaxBaseClassModel):
     def get_partition_rules(just_fsdp: bool = True):
         if just_fsdp:
             rules = (
-                ("model/wte/embedding", PartitionSpec(("fsdp", "mp"), )),
+                ("model/wte/embedding", PartitionSpec(("fsdp", "tp"), )),
 
-                ("attn/(k_proj|v_proj|q_proj)/kernel", PartitionSpec(("fsdp", "mp"), )),
-                ("attn/out_proj/kernel", PartitionSpec(("fsdp", "mp"), )),
+                ("attn/(k_proj|v_proj|q_proj)/kernel", PartitionSpec(("fsdp", "tp"), )),
+                ("attn/out_proj/kernel", PartitionSpec(("fsdp", "tp"), )),
 
-                ("mlp/fc_out/kernel", PartitionSpec(("fsdp", "mp"), )),
-                ("mlp/fc_out/bias", PartitionSpec(("fsdp", "mp"), )),
+                ("mlp/fc_out/kernel", PartitionSpec(("fsdp", "tp"), )),
+                ("mlp/fc_out/bias", PartitionSpec(("fsdp", "tp"), )),
 
-                ("mlp/fc_in/kernel", PartitionSpec(("fsdp", "mp"), )),
-                ("mlp/fc_in/bias", PartitionSpec(("fsdp", "mp"), )),
+                ("mlp/fc_in/kernel", PartitionSpec(("fsdp", "tp"), )),
+                ("mlp/fc_in/bias", PartitionSpec(("fsdp", "tp"), )),
 
-                ("lm_head/kernel", PartitionSpec(("fsdp", "mp"), )),
-                ("lm_head/bias", PartitionSpec(("fsdp", "mp"), )),
+                ("lm_head/kernel", PartitionSpec(("fsdp", "tp"), )),
+                ("lm_head/bias", PartitionSpec(("fsdp", "tp"), )),
                 ('.*', PartitionSpec(None)),
             )
         else:
             rules = (
-                ("model/wte/embedding", PartitionSpec('tp', ("fsdp", "mp"))),
+                ("model/wte/embedding", PartitionSpec("tp", ("fsdp", "mp"))),
 
-                ("attn/(k_proj|v_proj|q_proj)/kernel", PartitionSpec(("fsdp", "mp"), 'tp')),
-                ("attn/out_proj/kernel", PartitionSpec('tp', ("fsdp", "mp"), )),
+                ("attn/(k_proj|v_proj|q_proj)/kernel", PartitionSpec(("fsdp", "mp"), "tp")),
+                ("attn/out_proj/kernel", PartitionSpec("tp", ("fsdp", "mp"), )),
 
-                ("mlp/fc_out/kernel", PartitionSpec(("fsdp", "mp"), 'tp')),
-                ("mlp/fc_out/bias", PartitionSpec(("fsdp", "mp"), 'tp')),
+                ("mlp/fc_out/kernel", PartitionSpec(("fsdp", "mp"), "tp")),
+                ("mlp/fc_out/bias", PartitionSpec(("fsdp", "mp"), "tp")),
 
-                ("mlp/fc_in/kernel", PartitionSpec('tp', ("fsdp", "mp"), )),
-                ("mlp/fc_in/bias", PartitionSpec('tp', ("fsdp", "mp"), )),
+                ("mlp/fc_in/kernel", PartitionSpec("tp", ("fsdp", "mp"), )),
+                ("mlp/fc_in/bias", PartitionSpec("tp", ("fsdp", "mp"), )),
 
-                ("lm_head/kernel", PartitionSpec('tp', ("fsdp", "mp"), )),
-                ("lm_head/bias", PartitionSpec('tp', ("fsdp", "mp"), )),
+                ("lm_head/kernel", PartitionSpec("tp", ("fsdp", "mp"), )),
+                ("lm_head/bias", PartitionSpec("tp", ("fsdp", "mp"), )),
                 ('.*', PartitionSpec(None)),
             )
         return rules
@@ -463,9 +463,9 @@ class FlaxGPTJAttention(nn.Module):
 
         # Force A local Sharding
         if self.config.use_pjit_attention_force:
-            query = with_sharding_constraint(query, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
-            key = with_sharding_constraint(key, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
-            value = with_sharding_constraint(value, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
+            query = with_sharding_constraint(query, PartitionSpec(("dp", "fsdp"), None, 'mp'))
+            key = with_sharding_constraint(key, PartitionSpec(("dp", "fsdp"), None, 'mp'))
+            value = with_sharding_constraint(value, PartitionSpec(("dp", "fsdp"), None, 'mp'))
 
         query = self._split_heads(query)
         key = self._split_heads(key)

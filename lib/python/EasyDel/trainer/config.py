@@ -45,7 +45,7 @@ class TrainArguments(
             weight_decay: float = 0.01,
             gradient_checkpointing: str = 'nothing_saveable',
             max_length: Union[int, None] = 4096,
-            sharding_array: Union[tuple, int] = (1, -1, 1),
+            sharding_array: Union[tuple, int] = (1, -1, 1, 1),
             is_fine_tuning: bool = True,
             do_train: bool = True,
             do_eval: bool = False,
@@ -73,7 +73,7 @@ class TrainArguments(
             is_left_padded: bool = False,
             warmup_steps: int = 500,
             init_input_shape: typing.Tuple[int, int] = (1, 1),
-            step_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(('dp', 'fsdp'), 'mp'),
+            step_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), 'mp'),
             training_time: typing.Optional[str] = None,
             **kwargs
     ):
@@ -327,7 +327,7 @@ class TrainArguments(
 
     @staticmethod
     def get_mesh_names():
-        return "dp", "fsdp", "mp"
+        return "dp", "fsdp", "tp", "sp"
 
     def get_optimizer_and_scheduler(self, steps=None):
         """

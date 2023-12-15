@@ -36,11 +36,11 @@ def get_partitions(
             b_ps = PartitionSpec("fsdp", None, "mp", None)
             a_ps = PartitionSpec("fsdp", None, "mp", None)
         else:
-            q_ps = PartitionSpec("dp", "fsdp", "mp", None)
-            k_ps = PartitionSpec("dp", "fsdp", "mp", None)
-            v_ps = PartitionSpec("dp", "fsdp", "mp", None)
+            q_ps = PartitionSpec("dp", "fsdp", "tp", "sp", None)
+            k_ps = PartitionSpec("dp", "fsdp", "tp", "sp", None)
+            v_ps = PartitionSpec("dp", "fsdp", "tp", "sp", None)
             b_ps = PartitionSpec("dp", None, "fsdp", None)
-            a_ps = PartitionSpec("dp", "fsdp", "mp", None)
+            a_ps = PartitionSpec("dp", "fsdp", "tp", "sp", None)
     else:
         if fsdp_on_batch:
             q_ps = PartitionSpec("fsdp", "mp", None, None)

@@ -97,7 +97,7 @@ class GPTNeoXConfig(JaxBaseClassModel):
 
     @staticmethod
     def get_mesh_names():
-        return "dp", "fsdp", "mp"
+        return "dp", "fsdp", "tp", "sp"
 
     def add_jax_args(
             self,
@@ -169,9 +169,9 @@ class FlaxGPTNeoXAttention(nn.Module):
         b, s, d = hidden_states.shape
         q, k, v = jnp.split(self.w_qkv(hidden_states), indices_or_sections=3, axis=-1)
         freq = self.freq_cis[:s].reshape(1, s, -1)
-        q = with_sharding_constraint(q, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
-        k = with_sharding_constraint(k, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
-        v = with_sharding_constraint(v, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
+        q = with_sharding_constraint(q, PartitionSpec(("dp", "fsdp"), None, 'mp'))
+        k = with_sharding_constraint(k, PartitionSpec(("dp", "fsdp"), None, 'mp'))
+        v = with_sharding_constraint(v, PartitionSpec(("dp", "fsdp"), None, 'mp'))
 
         q = rearrange(q, 'b s (h d) -> b s h d', h=self.config.num_attention_heads)
         k = rearrange(k, 'b s (h d) -> b s h d', h=self.config.num_attention_heads)
@@ -189,7 +189,7 @@ class FlaxGPTNeoXAttention(nn.Module):
         if attention_mask is not None:
             attn += attention_mask
         attn = jax.nn.softmax(attn, axis=-1)
-        attn = with_sharding_constraint(attn, PartitionSpec(('dp', 'fsdp'), 'mp', None, None))
+        attn = with_sharding_constraint(attn, PartitionSpec(("dp", "fsdp"), 'mp', None, None))
         attn = jnp.einsum('...hqk,..khd->qhd', attn, v, precision=self.precision)
         attn = self.w_o(attn.reshape(b, s, d))
         return attn
