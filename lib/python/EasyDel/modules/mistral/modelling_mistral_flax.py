@@ -177,21 +177,21 @@ class MistralConfig(JaxBaseClassModel):
             ('.*', PS(None)),
         ) if not fully_fsdp else (
 
-            ("model/embed_tokens/embedding", PS("fsdp")),
+            ("model/embed_tokens/embedding", PS(("fsdp", "sp"))),
 
-            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PS("fsdp")),
-            ("self_attn/o_proj/kernel", PS("fsdp")),
+            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PS(("fsdp", "sp"))),
+            ("self_attn/o_proj/kernel", PS(("fsdp", "sp"))),
 
-            ("mlp/gate_proj/kernel", PS("fsdp")),
-            ("mlp/down_proj/kernel", PS("fsdp")),
-            ("mlp/up_proj/kernel", PS("fsdp")),
+            ("mlp/gate_proj/kernel", PS(("fsdp", "sp"))),
+            ("mlp/down_proj/kernel", PS(("fsdp", "sp"))),
+            ("mlp/up_proj/kernel", PS(("fsdp", "sp"))),
 
             ("input_layernorm/kernel", PS(None)),
             ("post_attention_layernorm/kernel", PS(None)),
 
             ("model/norm/kernel", PS(None)),
-            ("lm_head/kernel", PS("fsdp")),
-            ('.*', PS('fsdp')),
+            ("lm_head/kernel", PS(("fsdp", "sp"))),
+            ('.*', PS(("fsdp", "sp"))),
         )
 
     def add_jax_args(self,
@@ -460,9 +460,9 @@ class FlaxMistralAttention(nn.Module):
         query, key, value = self.q_proj(hidden_state), self.k_proj(hidden_state), self.v_proj(hidden_state)
 
         if self.config.use_pjit_attention_force:
-            query = with_sharding_constraint(query, PS('fsdp', 'mp', None))
-            key = with_sharding_constraint(key, PS('fsdp', 'mp', None))
-            value = with_sharding_constraint(value, PS('fsdp', 'mp', None))
+            query = with_sharding_constraint(query, PS("fsdp", 'mp', None))
+            key = with_sharding_constraint(key, PS("fsdp", 'mp', None))
+            value = with_sharding_constraint(value, PS("fsdp", 'mp', None))
         query, key, value = self.t_rotary(
             batch_size=batch_size,
             sequence_length=sequence_length,
@@ -555,7 +555,7 @@ class FlaxMistralAttention(nn.Module):
                         self.config.k_ps,
                         self.config.b_ps
                     ),
-                    out_specs=PS(("dp", "fsdp"), None, None, None),
+                    out_specs=PS(("dp", "fsdp"), "sp", "tp", None),
                     check_rep=False
                 )(
                     query, key, attention_bias
@@ -572,7 +572,7 @@ class FlaxMistralAttention(nn.Module):
                 )
 
             if self.config.use_pjit_attention_force:
-                attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "mp", None, None))
+                attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "sp", "tp", None))
 
             attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value)
 

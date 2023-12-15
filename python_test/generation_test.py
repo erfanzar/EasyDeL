@@ -82,8 +82,8 @@ def main():
         out_shardings=(Ps())
     )
     def generate(parameters, input_ids, attention_mask):
-        input_ids = with_sharding_constraint(input_ids, Ps(('dp', 'fsdp')))
-        attention_mask = with_sharding_constraint(attention_mask, Ps(('dp', 'fsdp')))
+        input_ids = with_sharding_constraint(input_ids, Ps(("dp", "fsdp")))
+        attention_mask = with_sharding_constraint(attention_mask, Ps(("dp", "fsdp")))
         predict = model.generate(
             input_ids,
             attention_mask=attention_mask,

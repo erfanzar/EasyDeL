@@ -45,8 +45,8 @@ class FlaxLTConfig(JaxBaseClassModel):
                  alibi_bias_max: int = 8,
                  fsdp=False,
                  hidden_act="silu",
-                 axis_dims: Sequence[int] = (1, -1, 1),
-                 axis_names: Sequence[str] = ("dp", "fsdp", "mp"),
+                 axis_dims: Sequence[int] = (1, -1, 1, 1),
+                 axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
                  **kwargs
                  ):
         super().__init__(
@@ -149,9 +149,9 @@ class LTSelfAttention(nn.Module):
         wq, wk, wv = self.q_proj(hidden_state), self.k_proj(hidden_state), self.v_proj(hidden_state)
 
         if self.config.fsdp:
-            wk = with_sharding_constraint(wk, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
-            wq = with_sharding_constraint(wq, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
-            wv = with_sharding_constraint(wv, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
+            wk = with_sharding_constraint(wk, PartitionSpec(("dp", "fsdp"), None, 'mp'))
+            wq = with_sharding_constraint(wq, PartitionSpec(("dp", "fsdp"), None, 'mp'))
+            wv = with_sharding_constraint(wv, PartitionSpec(("dp", "fsdp"), None, 'mp'))
 
         wq = rearrange(wq, 'b s (h d) -> b h s d', h=self.config.num_attention_heads)
         wk = rearrange(wk, 'b s (h d) -> b h d s', h=self.config.num_attention_heads)
@@ -312,7 +312,7 @@ class FlaxLTModelModule(nn.Module):
 
     def build_alibi(self, sequence_length: int):
         mxl = jnp.arange(1 - sequence_length, 1).reshape(1, 1, 1, -1)
-        mxh = jnp.arange(1, 1 + self.config.num_attention_heads).reshape(1, -1, 1)
+        mxh = jnp.arange(1, 1 + self.config.num_attention_heads).reshape(1, -1, 1, 1)
         cp2 = 2 ** math.ceil(math.log2(self.config.num_attention_heads))
         base_mxl = mxh * (self.config.alibi_bias_max / cp2)
         slope = 1 / jnp.power(2, base_mxl)

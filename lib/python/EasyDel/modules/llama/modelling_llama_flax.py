@@ -173,38 +173,38 @@ class LlamaConfig(JaxBaseClassModel):
         """
         return (
 
-            ("model/embed_tokens/embedding", PS("dp", "fsdp")),
+            ("model/embed_tokens/embedding", PS("tp", ("fsdp", "sp"))),
 
-            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PS("fsdp", "dp")),
-            ("self_attn/o_proj/kernel", PS("dp", "fsdp")),
+            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PS(("fsdp", "sp"), "tp")),
+            ("self_attn/o_proj/kernel", PS("tp", ("fsdp", "sp"))),
 
-            ("mlp/gate_proj/kernel", PS("fsdp", "dp")),
-            ("mlp/down_proj/kernel", PS("dp", "fsdp")),
-            ("mlp/up_proj/kernel", PS("fsdp", "dp")),
+            ("mlp/gate_proj/kernel", PS(("fsdp", "sp"), "tp")),
+            ("mlp/down_proj/kernel", PS("tp", ("fsdp", "sp"))),
+            ("mlp/up_proj/kernel", PS(("fsdp", "sp"), "tp")),
 
             ("input_layernorm/kernel", PS(None)),
             ("post_attention_layernorm/kernel", PS(None)),
 
             ("model/norm/kernel", PS(None)),
-            ("lm_head/kernel", PS("fsdp", "dp")),
+            ("lm_head/kernel", PS(("fsdp", "sp"), "tp")),
             ('.*', PS(None)),
         ) if not fully_fsdp else (
 
-            ("model/embed_tokens/embedding", PS("fsdp")),
+            ("model/embed_tokens/embedding", PS(("fsdp", "sp"))),
 
-            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PS("fsdp")),
-            ("self_attn/o_proj/kernel", PS("fsdp")),
+            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PS(("fsdp", "sp"))),
+            ("self_attn/o_proj/kernel", PS(("fsdp", "sp"))),
 
-            ("mlp/gate_proj/kernel", PS("fsdp")),
-            ("mlp/down_proj/kernel", PS("fsdp")),
-            ("mlp/up_proj/kernel", PS("fsdp")),
+            ("mlp/gate_proj/kernel", PS(("fsdp", "sp"))),
+            ("mlp/down_proj/kernel", PS(("fsdp", "sp"))),
+            ("mlp/up_proj/kernel", PS(("fsdp", "sp"))),
 
             ("input_layernorm/kernel", PS(None)),
             ("post_attention_layernorm/kernel", PS(None)),
 
             ("model/norm/kernel", PS(None)),
-            ("lm_head/kernel", PS("fsdp")),
-            ('.*', PS('fsdp')),
+            ("lm_head/kernel", PS(("fsdp", "sp"))),
+            ('.*', PS(("fsdp", "sp"))),
         )
 
     def add_jax_args(self,
@@ -512,9 +512,9 @@ class FlaxLlamaAttention(nn.Module):
             hidden_states)
 
         if self.config.use_pjit_attention_force:
-            query_state = with_sharding_constraint(query_state, PS(("dp", "fsdp"), None, "mp"))
-            key_state = with_sharding_constraint(key_state, PS(("dp", "fsdp"), None, "mp"))
-            value_state = with_sharding_constraint(value_state, PS(("dp", "fsdp"), None, "mp"))
+            query_state = with_sharding_constraint(query_state, PS(("dp", "fsdp"), "sp", "tp"))
+            key_state = with_sharding_constraint(key_state, PS(("dp", "fsdp"), "sp", "tp"))
+            value_state = with_sharding_constraint(value_state, PS(("dp", "fsdp"), "sp", "tp"))
 
         query_state = query_state.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
         key_state = key_state.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
@@ -629,7 +629,7 @@ class FlaxLlamaAttention(nn.Module):
                         self.config.k_ps,
                         self.config.b_ps
                     ),
-                    out_specs=PS(("dp", "fsdp"), None, None, None),
+                    out_specs=PS(("dp", "fsdp"), "sp", "tp", None),
                     check_rep=False
                 )(
                     query_state, key_state, attention_bias
@@ -646,7 +646,7 @@ class FlaxLlamaAttention(nn.Module):
                 )
 
             if self.config.use_pjit_attention_force:
-                attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "mp", None, None))
+                attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "sp", "tp", None))
 
             attn_output = jnp.einsum(
                 "...hqk,...khd->...qhd",

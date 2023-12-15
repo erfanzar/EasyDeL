@@ -152,13 +152,13 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--mesh_axes_names",
-        default=["dp", "fsdp", "mp"],
+        default=["dp", "fsdp", "tp", "sp"],
         nargs="+",
         help="The names of the mesh axes.",
     )
     parser.add_argument(
         "--mesh_axes_shape",
-        default=[(1, -1, 1)],
+        default=[(1, -1, 1, 1)],
         nargs="+",
         type=int,
         help="The shapes of the mesh axes.",
