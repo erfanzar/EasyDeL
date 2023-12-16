@@ -45,8 +45,8 @@ class FlaxLTConfig(JaxBaseClassModel):
                  alibi_bias_max: int = 8,
                  fsdp=False,
                  hidden_act="silu",
-                 axis_dims: Sequence[int] = (1, -1, 1),
-                 axis_names: Sequence[str] = ("dp", "fsdp", "mp"),
+                 axis_dims: Sequence[int] = (1, -1, 1, 1),
+                 axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
                  **kwargs
                  ):
         super().__init__(
@@ -83,12 +83,12 @@ class FlaxLTConfig(JaxBaseClassModel):
     def get_partition_rules():
         return (
             # Emb
-            ("model/wte/embedding", PartitionSpec("mp", "fsdp")),
+            ("model/wte/embedding", PartitionSpec("sp", "fsdp")),
             ("attn/(k_proj|v_proj|q_proj)/kernel", PartitionSpec("fsdp")),
-             ("attn/o_proj/kernel", PartitionSpec("mp", "fsdp")),
-             ("mlp/down/kernel", PartitionSpec("mp", "fsdp")),
+             ("attn/o_proj/kernel", PartitionSpec("sp", "fsdp")),
+             ("mlp/down/kernel", PartitionSpec("sp", "fsdp")),
              ("mlp/up/kernel", PartitionSpec("fsdp")),
-             ("lm_head/kernel", PartitionSpec("fsdp", "mp")),
+             ("lm_head/kernel", PartitionSpec("fsdp", "sp")),
              ('.*', PartitionSpec(None)),
              ('ln/kernel', PartitionSpec(None)),
              ('ln1/kernel', PartitionSpec(None)),
@@ -149,9 +149,9 @@ class LTSelfAttention(nn.Module):
         wq, wk, wv = self.q_proj(hidden_state), self.k_proj(hidden_state), self.v_proj(hidden_state)
 
         if self.config.fsdp:
-            wk = with_sharding_constraint(wk, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
-            wq = with_sharding_constraint(wq, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
-            wv = with_sharding_constraint(wv, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
+            wk = with_sharding_constraint(wk, PartitionSpec(("dp", "fsdp"), None, "sp"))
+            wq = with_sharding_constraint(wq, PartitionSpec(("dp", "fsdp"), None, "sp"))
+            wv = with_sharding_constraint(wv, PartitionSpec(("dp", "fsdp"), None, "sp"))
 
         wq = rearrange(wq, 'b s (h d) -> b h s d', h=self.config.num_attention_heads)
         wk = rearrange(wk, 'b s (h d) -> b h d s', h=self.config.num_attention_heads)
@@ -164,7 +164,7 @@ class LTSelfAttention(nn.Module):
             attn_weights = jnp.add(attention_mask, attn_weights)
 
         if self.config.fsdp:
-            attn_weights = with_sharding_constraint(attn_weights, PartitionSpec("fsdp", "mp", None, None))
+            attn_weights = with_sharding_constraint(attn_weights, PartitionSpec("fsdp", "sp", None, None))
 
         attn_weights = jax.nn.softmax(attn_weights, axis=-1)
         value = jnp.matmul(attn_weights, wv).reshape(b, t, c)
@@ -312,7 +312,7 @@ class FlaxLTModelModule(nn.Module):
 
     def build_alibi(self, sequence_length: int):
         mxl = jnp.arange(1 - sequence_length, 1).reshape(1, 1, 1, -1)
-        mxh = jnp.arange(1, 1 + self.config.num_attention_heads).reshape(1, -1, 1)
+        mxh = jnp.arange(1, 1 + self.config.num_attention_heads).reshape(1, -1, 1, 1)
         cp2 = 2 ** math.ceil(math.log2(self.config.num_attention_heads))
         base_mxl = mxh * (self.config.alibi_bias_max / cp2)
         slope = 1 / jnp.power(2, base_mxl)

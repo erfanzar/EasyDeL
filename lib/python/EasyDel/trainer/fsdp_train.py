@@ -48,7 +48,7 @@ def calculate_accuracy(predictions: chex.Array, targets: chex.Array):
     return accuracy
 
 
-def create_fsdp_train_step(partition_spec=PartitionSpec(('dp', 'fsdp'), 'mp')):
+def create_fsdp_train_step(partition_spec=PartitionSpec(("dp", "fsdp"), "sp")):
     """
     The create_fsdp_train_step function is a training step function that takes in the current state of the model,
     and a batch of data. It then calculates the loss and accuracy for this batch, and returns an updated state
@@ -90,7 +90,7 @@ def create_fsdp_train_step(partition_spec=PartitionSpec(('dp', 'fsdp'), 'mp')):
     return fsdp_train_step
 
 
-def create_fsdp_eval_step(partition_spec=PartitionSpec(('dp', 'fsdp'), 'mp')):
+def create_fsdp_eval_step(partition_spec=PartitionSpec(("dp", "fsdp"), "sp")):
     """
     The create_fsdp_eval_step function is used to create a function that calculates the loss and accuracy of a model.
     It takes in a set of parameters, which are then passed into the state.apply_fn function
@@ -150,7 +150,7 @@ def predict(state, input_ids):
     :return: The next input_ids
 
     """
-    input_ids = with_sharding_constraint(input_ids, PartitionSpec(('dp', 'fsdp')))
+    input_ids = with_sharding_constraint(input_ids, PartitionSpec(("dp", "fsdp")))
     pred = state.apply_fn(params=state.params, input_ids=input_ids, return_dict=True)
     token = jnp.argmax(jax.nn.softmax(pred.logits)[:, -1, :])
     input_ids = jnp.concatenate([input_ids, token.reshape(1, -1)], axis=-1)

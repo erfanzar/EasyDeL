@@ -47,8 +47,8 @@ class FalconConfig(JaxBaseClassModel):
             use_pjit_attention_force: bool = False,
             gradient_checkpointing: str = '',
             bits: Optional[int] = None,
-            axis_dims: Sequence[int] = (1, -1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp", "mp"),
+            axis_dims: Sequence[int] = (1, -1, 1, 1),
+            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
             **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -106,7 +106,7 @@ class FalconConfig(JaxBaseClassModel):
             ('transformer/ln_f/scale', PartitionSpec("fsdp")),
             ('transformer/post_attention_layernorm/scale', PartitionSpec("fsdp")),
             ('transformer/post_attention_layernorm/bias', PartitionSpec("fsdp")),
-            ('.*', PartitionSpec('fsdp'))
+            ('.*', PartitionSpec("fsdp"))
         ) if not fully_fsdp else (
             ('word_embeddings/embedding', PartitionSpec("fsdp")),
             ('self_attention/query_key_value/(kernel|bias)', PartitionSpec("fsdp")),
@@ -123,7 +123,7 @@ class FalconConfig(JaxBaseClassModel):
 
     @staticmethod
     def get_mesh_names():
-        return "dp", "fsdp", "mp"
+        return "dp", "fsdp", "tp", "sp"
 
     def add_jax_args(self,
                      vocab_size: int = 65024,
@@ -335,7 +335,7 @@ class FlaxFalconAttention(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=self.config.bias,
-            dot_general=get_dot_general_by_bits(self.config.bits)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
         self.inv_norm_factor = 1 / math.sqrt(head_dim)
         self.dense = nn.Dense(
@@ -343,7 +343,7 @@ class FlaxFalconAttention(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=self.config.bias,
-            dot_general=get_dot_general_by_bits(self.config.bits)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
         self.head_dim = head_dim
         self.maybe_rotary = FlaxFalconRotaryEmbedding(self.dtype) if not self.config.alibi else lambda q, k, a, s: (
@@ -408,9 +408,9 @@ class FlaxFalconAttention(nn.Module):
             query_state, key_state, value_state = [x.reshape(x.shape[:-2] + (x.shape[-2] * x.shape[-1],)) for x in
                                                    (query_state, key_state, value_state)]
             if self.config.use_pjit_attention_force:
-                query_state = with_sharding_constraint(query_state, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
-                key_state = with_sharding_constraint(key_state, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
-                value_state = with_sharding_constraint(value_state, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
+                query_state = with_sharding_constraint(query_state, PartitionSpec(("dp", "fsdp"), None, "sp"))
+                key_state = with_sharding_constraint(key_state, PartitionSpec(("dp", "fsdp"), None, "sp"))
+                value_state = with_sharding_constraint(value_state, PartitionSpec(("dp", "fsdp"), None, "sp"))
             return query_state, key_state, value_state
         if self.config.multi_query:
             qkv = qkv.reshape(
@@ -422,9 +422,9 @@ class FlaxFalconAttention(nn.Module):
             query_state, key_state, value_state = jnp.split(qkv, 3, -1)
 
         if self.config.use_pjit_attention_force:
-            query_state = with_sharding_constraint(query_state, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
-            key_state = with_sharding_constraint(key_state, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
-            value_state = with_sharding_constraint(value_state, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
+            query_state = with_sharding_constraint(query_state, PartitionSpec(("dp", "fsdp"), None, "sp"))
+            key_state = with_sharding_constraint(key_state, PartitionSpec(("dp", "fsdp"), None, "sp"))
+            value_state = with_sharding_constraint(value_state, PartitionSpec(("dp", "fsdp"), None, "sp"))
         return query_state, key_state, value_state
 
     def _merge_heads(self, x: chex.Array) -> chex.Array:
@@ -551,14 +551,14 @@ class FlaxFalconMlp(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=self.config.bias,
-            dot_general=get_dot_general_by_bits(self.config.bits)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
         self.dense_4h_to_h = nn.Dense(
             features=self.config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=self.config.bias,
-            dot_general=get_dot_general_by_bits(self.config.bits)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
 
     def __call__(self, x: chex.Array, deterministic: bool = True):
@@ -938,7 +938,7 @@ class FlaxFalconForCausalLMModule(nn.Module):
         self.lm_head = nn.Dense(
             self.config.vocab_size,
             use_bias=False,
-            dot_general=get_dot_general_by_bits(self.config.bits)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
 
     def __call__(self,

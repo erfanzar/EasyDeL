@@ -258,7 +258,7 @@ class FlaxMptMLP(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
-            dot_general=get_dot_general_by_bits(self.config.bits)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
         self.down = nn.Dense(
             self.config.d_model,
@@ -267,7 +267,7 @@ class FlaxMptMLP(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
-            dot_general=get_dot_general_by_bits(self.config.bits)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
         self.act = ACT2FN[self.config.act_fn]
 
@@ -287,7 +287,7 @@ class FlaxMptAttention(nn.Module):
             self.config.d_model * 3,
             kernel_init=jax.nn.initializers.normal(),
             use_bias=self.config.use_bias,
-            dot_general=get_dot_general_by_bits(self.config.bits),
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision)
@@ -298,7 +298,7 @@ class FlaxMptAttention(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
-            dot_general=get_dot_general_by_bits(self.config.bits)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
         if self.config.qk_ln:
             self.q_ln = nn.LayerNorm(use_bias=self.config.use_norm_bias)
@@ -360,9 +360,9 @@ class FlaxMptAttention(nn.Module):
             q = self.q_ln(q)
             k = self.k_ln(k)
         if self.config.use_pjit_attention_force:
-            q = with_sharding_constraint(q, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
-            k = with_sharding_constraint(k, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
-            v = with_sharding_constraint(v, PartitionSpec(('dp', 'fsdp'), None, 'mp'))
+            q = with_sharding_constraint(q, PartitionSpec(("dp", "fsdp"), None, "sp"))
+            k = with_sharding_constraint(k, PartitionSpec(("dp", "fsdp"), None, "sp"))
+            v = with_sharding_constraint(v, PartitionSpec(("dp", "fsdp"), None, "sp"))
         q = rearrange(q, 'b s (h d) -> b s h d', h=self.config.n_heads)
         k = rearrange(k, 'b s (h d) -> b s h d', h=self.config.n_heads)
         v = rearrange(v, 'b s (h d) -> b s h d', h=self.config.n_heads)
@@ -418,7 +418,7 @@ class FlaxMptAttention(nn.Module):
             attn_output = jnp.einsum('...qhd,...khd->...hqk', q, k, precision=self.precision) * jax.lax.rsqrt(
                 jnp.asarray(d).astype(v.dtype))
             if self.config.use_pjit_attention_force:
-                attn_output = with_sharding_constraint(attn_output, PartitionSpec(('dp', 'fsdp'), 'mp', None, None))
+                attn_output = with_sharding_constraint(attn_output, PartitionSpec(("dp", "fsdp"), "sp", None, None))
             if attn_bias is not None:
                 attn_output += attn_bias[:, :, :, :attn_output.shape[-1]]
             mask = jnp.where(self.causal_mask == 1, 0, jnp.finfo(attn_output).min)
@@ -520,7 +520,7 @@ def build_alibi(max_length, num_attention_heads, alibi_max: int = 8):
     w_range = jnp.arange(1 - max_length, 1).reshape(1, 1, 1, max_length)
     # cp2 = jnp.power(2, jnp.ceil(jnp.log2(num_attention_heads)))
     cp2 = 2 ** math.ceil(math.log2(num_attention_heads))
-    h_range = jnp.arange(1, 1 + num_attention_heads, ).reshape(1, -1, 1)
+    h_range = jnp.arange(1, 1 + num_attention_heads, ).reshape(1, -1, 1, 1)
     h_range = jnp.matmul(h_range, jnp.asarray(alibi_max / cp2).reshape(1, 1))
     slop = 1 / jnp.power(2, h_range)
     if cp2 != num_attention_heads:
@@ -702,7 +702,7 @@ class FlaxFlaxMptForCausalLMModule(nn.Module):
             self.lm_head = nn.Dense(self.config.vocab_size, kernel_init=jax.nn.initializers.normal(),
                                     use_bias=self.config.use_bias,
                                     dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision,
-                                    dot_general=get_dot_general_by_bits(self.config.bits))
+                                    **get_dot_general_by_bits(self.config.bits, self.config.easy_method))
 
     def __call__(self,
                  input_ids: chex.Array,

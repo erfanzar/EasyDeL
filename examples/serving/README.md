@@ -336,8 +336,8 @@ def configure_generate_functions(self, model, tokenizer):
         out_shardings=(Ps())
     )
     def greedy_generate(parameters, input_ids, attention_mask):
-        input_ids = with_sharding_constraint(input_ids, Ps(('dp', 'fsdp')))
-        attention_mask = with_sharding_constraint(attention_mask, Ps(('dp', 'fsdp')))
+        input_ids = with_sharding_constraint(input_ids, Ps(("dp", "fsdp")))
+        attention_mask = with_sharding_constraint(attention_mask, Ps(("dp", "fsdp")))
         predict = model.generate(
             input_ids,
             attention_mask=attention_mask,
@@ -361,8 +361,8 @@ def configure_generate_functions(self, model, tokenizer):
         out_shardings=(Ps())
     )
     def generate(parameters, input_ids, attention_mask):
-        input_ids = with_sharding_constraint(input_ids, Ps(('dp', 'fsdp')))
-        attention_mask = with_sharding_constraint(attention_mask, Ps(('dp', 'fsdp')))
+        input_ids = with_sharding_constraint(input_ids, Ps(("dp", "fsdp")))
+        attention_mask = with_sharding_constraint(attention_mask, Ps(("dp", "fsdp")))
         predict = model.generate(
             input_ids,
             attention_mask=attention_mask,
@@ -565,7 +565,7 @@ Whether to enable logging.
 
 The names of the mesh axes.
 
-``Defualt is ('dp','fsdp','mp)``
+``Defualt is ("dp","fsdp",'mp)``
 
 ##### Note do Not change Mesh Axes names in case of you dont want to use fully customized model
 

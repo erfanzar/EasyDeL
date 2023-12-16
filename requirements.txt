@@ -1,9 +1,9 @@
 chex
 typing
-jax>=0.4.10
-jaxlib>=0.4.10
+jax>=0.4.17
+jaxlib>=0.4.17
 flax
-fjformer>=0.0.12
+fjformer>=0.0.20
 transformers>=4.33.0
 einops
 optax
