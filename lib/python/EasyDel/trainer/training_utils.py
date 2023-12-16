@@ -19,7 +19,7 @@ from fjformer import match_partition_rules, make_shard_and_gather_fns, Streaming
 
 
 def fsdp_train_step(state, batch, label_in_the_field=False, scope_logits=True):
-    batch = with_sharding_constraint(batch, PartitionSpec(('dp', 'fsdp')))
+    batch = with_sharding_constraint(batch, PartitionSpec(("dp", "fsdp")))
 
     def calculate_loss(params):
         logits = state.apply_fn(params=params, **batch,
@@ -45,7 +45,7 @@ def fsdp_eval_step(state, batch_eval):
     batch_eval = with_sharding_constraint(
         batch_eval,
         PartitionSpec(
-            ('dp', 'fsdp'))
+            ("dp", "fsdp"))
     )
 
     def calculate_loss(params):
@@ -61,7 +61,7 @@ def fsdp_eval_step(state, batch_eval):
 
 
 def predict(state, input_ids):
-    input_ids = with_sharding_constraint(input_ids, PartitionSpec(('dp', 'fsdp')))
+    input_ids = with_sharding_constraint(input_ids, PartitionSpec(("dp", "fsdp")))
     pred = state.apply_fn(params=state.params, input_ids=input_ids, return_dict=True)
     token = jnp.argmax(jax.nn.softmax(pred.logits)[:, -1, :])
     input_ids = jnp.concatenate([input_ids, token.reshape(1, -1)], axis=-1)
