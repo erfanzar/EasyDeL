@@ -60,7 +60,6 @@ def main():
         use_shard_map=True
     )
     try:
-        print("Here's this shit comin")
         flax_model = FlaxMixtralForCausalLM(
             config=config,
             dtype=jnp.float32,
