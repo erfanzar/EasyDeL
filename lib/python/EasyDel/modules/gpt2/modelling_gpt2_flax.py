@@ -686,10 +686,10 @@ class FlaxGPT2Module(nn.Module):
             output_hidden_states: bool = False,
             return_dict: bool = True,
     ):
-        input_embeds = self.wte(input_ids.astype("i4"))
+        inputs_embeds = self.wte(input_ids.astype("i4"))
         position_embeds = self.wpe(position_ids.astype("i4"))
 
-        hidden_states = input_embeds + position_embeds
+        hidden_states = inputs_embeds + position_embeds
         hidden_states = self.dropout(hidden_states, deterministic=deterministic)
 
         outputs = self.h(

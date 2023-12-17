@@ -10,4 +10,5 @@ from .palm import PalmConfig, PalmModel, FlaxPalmForCausalLM
 from .t5 import FlaxT5ForConditionalGeneration, FlaxT5Model, T5Config
 from .opt import FlaxOPTForCausalLM, FlaxOPTModel, OPTConfig
 from .mistral import FlaxMistralModule, FlaxMistralForCausalLM, MistralConfig
+from .mixtral import FlaxMixtralForCausalLM, FlaxMixtralModel, MixtralConfig
 from .auto_models import AutoEasyDelModelForCausalLM

@@ -109,6 +109,14 @@ def get_modules_by_type(model_type: str):
             functools.partial(huggingface_to_easydel, embedding_layer_names=["wte", "wpe"])
         )
 
+    elif model_type == "mixtral":
+        from .mixtral import FlaxMixtralForCausalLM as _FlaxMixtralForCausalLM
+        from .mixtral import MixtralConfig as _MixtralConfig
+        return (
+            _MixtralConfig,
+            _FlaxMixtralForCausalLM,
+            functools.partial(huggingface_to_easydel, embedding_layer_names=["embed_tokens"])
+        )
     else:
         raise EasyDelRunTimeError(f'Model Type ({model_type}) is not supported or is not found')
 

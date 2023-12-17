@@ -27,11 +27,11 @@ def main():
     torch.manual_seed(42)
     seq_len = 128
     config = LlamaConfig(
-        hidden_size=2048,
-        num_attention_heads=32,
+        hidden_size=128,
+        num_attention_heads=8,
         num_key_value_heads=4,
-        num_hidden_layers=16,
-        intermediate_size=3072,
+        num_hidden_layers=4,
+        intermediate_size=256,
         gradient_checkpointing='',
         max_position_embeddings=seq_len
     )
