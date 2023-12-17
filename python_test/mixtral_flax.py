@@ -67,21 +67,20 @@ def main():
             _do_init=False,
             input_shape=(batch_size, seq_len)
         )
-        print(flax_model)
-        # flax_output = flax_model(
-        #     input_ids=flax_input_ids,
-        #     params=params,
-        #
-        # )
-        # res = jnp.allclose(torch_output, flax_output.logits, atol=1e-5)
-        # print('Mistral Huggingface Predictions :\n', torch_output,
-        #       '\nEasyDel Predictions: \n', flax_output.logits)
-        # if res:  # A Little Bit of humor
-        #     print('\033[1;36mTest Passed Unfortunately 🥳')
-        # else:
-        #     print('\033[1;31mTest Failed Successfully  🤕')
-        # error = jnp.mean(torch_output - flax_output.logits)
-        # print("Error : ", error)
+        flax_output = flax_model(
+            input_ids=flax_input_ids,
+            params=params,
+
+        )
+        res = jnp.allclose(torch_output, flax_output.logits, atol=1e-5)
+        print('Mistral Huggingface Predictions :\n', torch_output,
+              '\nEasyDel Predictions: \n', flax_output.logits)
+        if res:  # A Little Bit of humor
+            print('\033[1;36mTest Passed Unfortunately 🥳')
+        else:
+            print('\033[1;31mTest Failed Successfully  🤕')
+        error = jnp.mean(torch_output - flax_output.logits)
+        print("Error : ", error)
     except TypeError as e:
         print(e.__str__())
 
