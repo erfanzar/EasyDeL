@@ -1147,8 +1147,8 @@ class FlaxMixtralModule(nn.Module):
     def __call__(
             self,
             input_ids: chex.Array,
-            attention_mask: Optional[chex.Array] = None,
-            position_ids: Optional[chex.Array] = None,
+            attention_mask: chex.Array,
+            position_ids: chex.Array,
             inputs_embeds: Optional[chex.Array] = None,
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
@@ -1159,13 +1159,11 @@ class FlaxMixtralModule(nn.Module):
     ) -> MoeModelOutput | Tuple:
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time")
-        elif input_ids is not None:
-            batch_size, seq_length = input_ids.shape
-        elif inputs_embeds is not None:
-            batch_size, seq_length, _ = inputs_embeds.shape
-        else:
-            raise ValueError("You have to specify either decoder_input_ids or decoder_inputs_embeds")
 
+        if inputs_embeds is None and input_ids is not None:
+            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
+        else:
+            raise ValueError("you should specify inputs_embeds or input_ids one of them")
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_router_logits = (
             output_router_logits if output_router_logits is not None else self.config.output_router_logits
@@ -1173,16 +1171,6 @@ class FlaxMixtralModule(nn.Module):
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
-
-        if attention_mask is None:
-            attention_mask = jnp.ones_like(input_ids)
-        if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
-                (batch_size, seq_length)
-            )
 
         collection_outputs = self.layers(
             hidden_state=inputs_embeds,
