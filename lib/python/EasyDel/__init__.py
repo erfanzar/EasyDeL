@@ -71,6 +71,12 @@ from .modules.gpt2.modelling_gpt2_flax import (
     FlaxGPT2Model as FlaxGPT2Model
 )
 
+from .modules.mixtral.modelling_mixtral_flax import (
+    FlaxMixtralForCausalLM as FlaxMixtralForCausalLM,
+    FlaxMixtralModel as FlaxMixtralModel,
+    MixtralConfig as MixtralConfig
+)
+
 from .modules.auto_models import (
     AutoEasyDelModelForCausalLM as AutoEasyDelModelForCausalLM,
     get_modules_by_type as get_modules_by_type

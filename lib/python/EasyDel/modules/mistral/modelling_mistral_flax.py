@@ -927,11 +927,11 @@ class FlaxMistralModule(nn.Module):
 
     def __call__(
             self,
-            input_ids: chex.Array,
-            attention_mask: chex.Array,
-            position_ids: chex.Array,
+            input_ids: Optional[chex.Array] = None,
+            attention_mask: Optional[chex.Array] = None,
+            position_ids: Optional[chex.Array] = None,
             deterministic: bool = True,
-            input_embeds: chex.Array = None,
+            inputs_embeds: chex.Array = None,
             init_cache: bool = False,
             output_attentions: bool = False,
             output_hidden_states: bool = False,
@@ -949,7 +949,7 @@ class FlaxMistralModule(nn.Module):
         :param attention_mask: chex.Array: Mask out the attention weights for certain tokens
         :param position_ids: chex.Array: Determine the position of each token in a sequence
         :param deterministic: bool: Determine whether to use dropout or not
-        :param input_embeds: chex.Array: Pass in the embedding of the input_ids
+        :param inputs_embeds: chex.Array: Pass in the embedding of the input_ids
         :param init_cache: bool: Initialize the cache for the decoder
         :param output_attentions: bool: Determine whether to return the attention weights or not
         :param output_hidden_states: bool: Return all hidden states or just the last one
@@ -958,14 +958,14 @@ class FlaxMistralModule(nn.Module):
         :return: A tuple of the hidden states, all hidden states, and attentions
         
         """
-        if input_embeds is None:
-            input_embeds = self.embed_tokens(input_ids.astype("i4"))
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
         if attention_mask.ndim == 2:
             b, s = attention_mask.shape
             attention_mask = attention_mask.reshape(b, 1, 1, s)
 
         outputs = self.layers(
-            hidden_state=input_embeds,
+            hidden_state=inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
             freq_cis=self.freq_cis,
@@ -1028,7 +1028,7 @@ class FlaxMistralForCausalLMModule(nn.Module):
             attention_mask: chex.Array,
             position_ids: chex.Array,
             deterministic: bool = True,
-            input_embeds: chex.Array = None,
+            inputs_embeds: chex.Array = None,
             init_cache: bool = False,
             output_attentions: bool = False,
             output_hidden_states: bool = False,
@@ -1038,7 +1038,7 @@ class FlaxMistralForCausalLMModule(nn.Module):
             The __call__ function is the main function of a Flax module. It defines how the model will be called,
             and what it returns. In this case, we are calling our Transformer model with input_ids and attention_mask
             as inputs (these are defined in __init__). We also have some optional arguments that can be passed to
-            the call function: deterministic (whether to use dropout), input_embeds (if you want to pass your own embeddings),
+            the call function: deterministic (whether to use dropout), inputs_embeds (if you want to pass your own embeddings),
             output_attentions and output_hidden states which return additional outputs from the transformer layers if set True. Finally,
 
             :param self: Refer to the object itself
@@ -1046,7 +1046,7 @@ class FlaxMistralForCausalLMModule(nn.Module):
             :param attention_mask: chex.Array: Mask out the padding tokens
             :param position_ids: chex.Array: Specify the position of each token in the sequence
             :param deterministic: bool: Determine whether to use dropout in the model
-            :param input_embeds: chex.Array: Pass in the embeddings of the input tokens
+            :param inputs_embeds: chex.Array: Pass in the embeddings of the input tokens
             :param init_cache: bool: Initialize the cache for the decoder
             :param output_attentions: bool: Return the attention weights
             :param output_hidden_states: bool: Return the hidden states of all layers
@@ -1068,7 +1068,7 @@ class FlaxMistralForCausalLMModule(nn.Module):
             attention_mask=attention_mask,
             position_ids=position_ids,
             deterministic=deterministic,
-            input_embeds=input_embeds,
+            inputs_embeds=inputs_embeds,
             init_cache=init_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,

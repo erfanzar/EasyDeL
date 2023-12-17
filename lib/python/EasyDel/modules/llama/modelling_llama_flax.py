@@ -50,7 +50,7 @@ class LlamaConfig(JaxBaseClassModel):
             eos_token_id: int = 1,
             resid_pdrop: float = 0.0,
             embd_pdrop: float = 0.0,
-            attn_pdrop: float = 0.0,
+            attention_dropout: float = 0.0,
             rope_theta: float = 10000.,
             attention_bias: bool = False,
             tie_word_embeddings: bool = False,
@@ -92,7 +92,7 @@ class LlamaConfig(JaxBaseClassModel):
         :param eos_token_id: int: Specify the end of sentence token
         :param resid_pdrop: float: Set the dropout rate for residual connections
         :param embd_pdrop: float: Dropout the embedding layer
-        :param attn_pdrop: float: Dropout the attention weights
+        :param attention_dropout: float: Dropout the attention weights
         :param tie_word_embeddings: bool: Tie the word embeddings and output layer weights
         :param gradient_checkpointing: str: Specify how to checkpoint the gradients
         :param fcm_min_ratio: float: Set the minimum ratio of the number of elements in a tensor to be processed by flash
@@ -137,7 +137,7 @@ class LlamaConfig(JaxBaseClassModel):
         self.pretraining_tp = pretraining_tp
         self.resid_pdrop = resid_pdrop
         self.embd_pdrop = embd_pdrop
-        self.attn_pdrop = attn_pdrop
+        self.attention_dropout = attention_dropout
         self.gradient_checkpointing = gradient_checkpointing
         self.use_pjit_attention_force = use_pjit_attention_force
         self.fcm_min_ratio = fcm_min_ratio
@@ -210,7 +210,7 @@ class LlamaConfig(JaxBaseClassModel):
     def add_jax_args(self,
                      resid_pdrop: float = 0.0,
                      embd_pdrop: float = 0.0,
-                     attn_pdrop: float = 0.0,
+                     attention_dropout: float = 0.0,
                      tie_word_embeddings: bool = False,
                      gradient_checkpointing: str = 'nothing_saveable',
                      fcm_min_ratio: float = 0.0,
@@ -235,7 +235,7 @@ class LlamaConfig(JaxBaseClassModel):
         :param self: Refer to the current object
         :param resid_pdrop: float: Set the dropout rate for residual connections
         :param embd_pdrop: float: Set the probability of dropping an embedding
-        :param attn_pdrop: float: Set the probability of dropping out the attention layer
+        :param attention_dropout: float: Set the probability of dropping out the attention layer
         :param tie_word_embeddings: bool: Tie the word embeddings to the decoder
         :param gradient_checkpointing: str: Control the amount of memory used by jax
         :param fcm_min_ratio: float: Control the minimum ratio of the number of chunks to be used in flash-based computation
@@ -262,7 +262,7 @@ class LlamaConfig(JaxBaseClassModel):
         self.resid_pdrop = resid_pdrop
         self.rope_theta = rope_theta
         self.attention_bias = attention_bias
-        self.attn_pdrop = attn_pdrop
+        self.attention_dropout = attention_dropout
         self.hidden_act = hidden_act
         self.tie_word_embeddings = tie_word_embeddings
         self.gradient_checkpointing = gradient_checkpointing
@@ -560,7 +560,7 @@ class FlaxLlamaAttention(nn.Module):
 
         dropout_rng = None
 
-        if not deterministic and self.config.attn_pdrop > 0.0:
+        if not deterministic and self.config.attention_dropout > 0.0:
             dropout_rng = self.make_rng("dropout")
 
         if self.has_variable("cache", "cached_key") or init_cache:
@@ -603,7 +603,7 @@ class FlaxLlamaAttention(nn.Module):
                 deterministic=deterministic,
                 q_seq_len=sequence_length,
                 kv_seq_len=key_length,
-                attn_pdrop=self.config.attn_pdrop,
+                attn_pdrop=self.config.attention_dropout,
                 head_dims=self.head_dim,
                 force_float32_tpu=True
             )
@@ -620,7 +620,7 @@ class FlaxLlamaAttention(nn.Module):
                         dot_product_attention_weights,
                         dtype=jnp.promote_types(self.dtype, jnp.float32),
                         deterministic=deterministic,
-                        dropout_rate=self.config.attn_pdrop,
+                        dropout_rate=self.config.attention_dropout,
                         precision=self.precision,
                     ),
                     mesh=self.config.jax_mesh(),
@@ -641,7 +641,7 @@ class FlaxLlamaAttention(nn.Module):
                     bias=attention_bias,
                     dtype=jnp.promote_types(self.dtype, jnp.float32),
                     deterministic=deterministic,
-                    dropout_rate=self.config.attn_pdrop,
+                    dropout_rate=self.config.attention_dropout,
                     precision=self.precision,
                 )
 
@@ -1182,7 +1182,7 @@ class FlaxLlamaModule(nn.Module):
             attention_mask: chex.Array,
             position_ids: chex.Array,
             deterministic: bool = True,
-            input_embeds: chex.Array = None,
+            inputs_embeds: chex.Array = None,
             init_cache: bool = False,
             output_attentions: bool = False,
             output_hidden_states: bool = False,
@@ -1200,7 +1200,7 @@ class FlaxLlamaModule(nn.Module):
         :param attention_mask: chex.Array: Mask out the padding tokens
         :param position_ids: chex.Array: Indicate the position of each token in a sequence
         :param deterministic: bool: Control whether dropout is applied or not
-        :param input_embeds: chex.Array: Pass in the embeddings of the input tokens
+        :param inputs_embeds: chex.Array: Pass in the embeddings of the input tokens
         :param init_cache: bool: Initialize the cache
         :param output_attentions: bool: Determine whether to return the attentions or not
         :param output_hidden_states: bool: Determine whether to return hidden states
@@ -1210,16 +1210,16 @@ class FlaxLlamaModule(nn.Module):
         :return: A tuple of:
 
         """
-        if input_embeds is None:
-            input_embeds = self.embed_tokens(input_ids.astype("i4"))
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
 
-        batch_size, sequence_length = input_ids.shape
+        batch_size, sequence_length, _ = inputs_embeds.shape
         assert sequence_length <= self.config.max_position_embeddings, (f'Position out of range '
                                                                         f'(Model Support '
                                                                         f'{self.config.max_position_embeddings} got'
                                                                         f' {sequence_length})')
-        input_embeds = input_embeds + extra_embedding if extra_embedding is not None else input_embeds
-        hidden_states = self.dropout(input_embeds, deterministic=deterministic)
+        inputs_embeds = inputs_embeds + extra_embedding if extra_embedding is not None else inputs_embeds
+        hidden_states = self.dropout(inputs_embeds, deterministic=deterministic)
 
         outputs = self.layers(
             hidden_states=hidden_states,
