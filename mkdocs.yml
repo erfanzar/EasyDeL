@@ -32,6 +32,8 @@ nav:
       - OPT: lib-python-EasyDel-modules-opt-modelling_opt_flax.md
       - MPT: lib-python-EasyDel-modules-mosaic_mpt-modelling_mpt_flax.md
       - Llama: lib-python-EasyDel-modules-llama-modelling_llama_flax.md
+      - Mixtral: lib-python-EasyDel-modules-mixtral-modelling_mixtral_flax.md
+      - PHI: lib-python-EasyDel-modules-phi-modelling_phi_flax.md
       - T5: lib-python-EasyDel-modules-t5-modelling_t5_flax.md
   - configs: lib-python-EasyDel-configs-configs.md
   - Utils:
@@ -44,6 +46,7 @@ nav:
       - reward: lib-python-EasyDel-rlhf-reward.md
       - ppo: lib-python-EasyDel-rlhf-ppo.md
       - utils: lib-python-EasyDel-rlhf-utils.md
+
   - Trainer:
       - fsdp_train: lib-python-EasyDel-trainer-fsdp_train.md
       - config: lib-python-EasyDel-trainer-config.md
@@ -53,9 +56,13 @@ nav:
       - bits: lib-python-EasyDel-linen-bits.md
       - utils: lib-python-EasyDel-linen-utils.md
   - RL Trainer:
-      - models/modelling_base: lib-python-EasyDel-rl_trainer-models-modelling_base.md
-      - models/modelling_value_head: lib-python-EasyDel-rl_trainer-models-modelling_value_head.md
-      - core: lib-python-EasyDel-rl_trainer-core.md
+      core: lib-python-EasyDel-rl_trainer-core.md
+      models:
+        modelling_base: lib-python-EasyDel-rl_trainer-models-modelling_base.md
+        modelling_value_head: lib-python-EasyDel-rl_trainer-models-modelling_value_head.md
+      trainer:
+        base: lib-python-EasyDel-rl_trainer-trainer-base.md
+        ppo_trainer: lib-python-EasyDel-rl_trainer-trainer-ppo_trainer.md
   - Data Preprocessing:
       - data_preprocessing/_processor: lib-python-EasyDel-data_preprocessing-_processor.md
   - Examples:

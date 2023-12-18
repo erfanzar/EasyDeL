@@ -22,8 +22,8 @@ def run(project_locations="lib/python/EasyDel"):
             is_file = not os.path.isdir(ps)
             if not ps.endswith("__init__.py") and is_file and ps.endswith('.py'):
                 name = ps.replace(".py", "").replace("/", ".")
-
-                md_doc = f"# {name}\n::: {name}"
+                _pr = "lib/python/EasyDel".replace('/', '.') + '.'
+                md_doc = f"# {name.replace(_pr, '')}\n::: {name}"
                 md_file = name.replace(".", "-") + '.md'
                 with open("docs/" + md_file, 'w') as buffer:
                     buffer.write(md_doc)
