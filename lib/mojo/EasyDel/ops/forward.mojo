@@ -425,9 +425,7 @@ fn tensor_pow[T: DType, nelts: Int](inout a: Tensor[T], b: SIMD[T, 1]) -> None:
 @always_inline
 fn concatenate[
     T: DType, nelts: Int
-](A: Tensor[T], B: Tensor[T], inout axis: Int = 0, stragedy: String = "ord") -> Tensor[
-    T
-]:
+](A: Tensor[T], B: Tensor[T], inout axis: Int, stragedy: String = "ord") -> Tensor[T]:
     debug_assert(A.rank() == B.rank(), "A,B Shapes Wont Match for concatenate")
     if axis < Int(0):
         axis = A.rank() - axis
@@ -1466,3 +1464,4 @@ fn tensor_div[
 
 fn randf[T: DType](A: Tensor[T]):
     rand[T](A.data(), A.num_elements())
+

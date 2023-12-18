@@ -21,7 +21,7 @@ from .utilities import (
     print_pointer,
 )
 
-from .tensor_utils import (
+from .ops import (
     matmul_shape,
     matmul,
     base_case_matmul,
