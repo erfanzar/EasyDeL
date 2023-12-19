@@ -615,38 +615,33 @@ class FlaxMixtralBlocKSparesTop2MLPCollection(nn.Module):
             (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype
         )
 
-        def index_add_jax(x, dim, index, source):
-            """
-            Add the elements of a source tensor to the elements of a self tensor at the specified indices.
-
-            Args:
-                x (jax.numpy.ndarray): The self tensor to which the elements of the source tensor will be added
-                dim (int): The dimension along which to index
-                index (jax.numpy.ndarray): The tensor containing the indices for insertion
-                source (jax.numpy.ndarray): The tensor containing the elements to add
-            """
-
-            # Create a mask tensor that indicates which elements of the self tensor should be updated
-            indicator = jnp.zeros_like(x)
-            indicator = indicator.at[index].set(source)
-            # Add the elements of the source tensor to the corresponding elements of the self tensor
-            x = x + indicator
-
-            return x
+        def custom_index_add_without_index_add(
+                final_hidden_states_,
+                top_x_,
+                idx_,
+                current_hidden_states_
+        ):
+            for i in range(top_x_.size):
+                # if (idx_[i]):
+                final_hidden_states_.at[top_x[i]].set(final_hidden_states_[top_x[i]] + current_hidden_states_[i])
+            return final_hidden_states_
 
         for expert_idx, expert_layer in enumerate(self.layers):
             selected_mask = expert_mask[expert_idx]
-            idx, top_x = jnp.where(selected_mask, size=selected_mask.shape[0])
+
+            idx, top_x = jnp.nonzero(selected_mask, size=selected_mask.shape[-1])
+            top_x = jnp.where(top_x != 0, top_x, -1)
             if top_x.shape[0] == 0:
                 continue
 
             current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
+
             current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
 
-            final_hidden_states = index_add_jax(
+            final_hidden_states = custom_index_add_without_index_add(
                 final_hidden_states,
-                0,
                 top_x,
+                idx,
                 current_hidden_states.astype(hidden_states.dtype)
             )
 
@@ -690,7 +685,7 @@ class FlaxMixtralSparseMoeBlock(nn.Module):
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.reshape(-1, hidden_dim)
         router_logits = self.gate(hidden_states).astype(jnp.promote_types(self.dtype, jnp.float32))
-        routing_weights = jax.nn.softmax(router_logits, axis=1)
+        routing_weights = jax.nn.softmax(router_logits.astype(jnp.promote_types(self.dtype, jnp.float32)), axis=1)
         routing_weights, selected_experts = jax.lax.top_k(routing_weights, k=self.config.num_experts_per_tok)
         routing_weights /= jnp.sum(routing_weights, axis=-1, keepdims=True)
         routing_weights = routing_weights.astype(hidden_states.dtype)
@@ -781,6 +776,7 @@ class FlaxMixtralDecoderLayer(nn.Module):
             init_cache=init_cache,
             output_attentions=output_attentions
         )
+
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -913,7 +909,7 @@ class MixtralPreTrainedModel(FlaxPreTrainedModel):
         super().__init__(
             dtype=dtype, _do_init=_do_init,
             module=module, config=config, input_shape=input_shape,
-            seed=seed
+            seed=seed,
         )
 
     def init_weights(
@@ -934,7 +930,6 @@ class MixtralPreTrainedModel(FlaxPreTrainedModel):
         :param params: flax.core.FrozenDict: Pass in the parameters of a pre-trained model
         :return: A frozendict of parameters
         """
-
         input_ids = jnp.zeros(input_shape, dtype="i4")
         attention_mask = jnp.ones_like(input_ids, dtype="i4")
         position_ids = jnp.broadcast_to(
