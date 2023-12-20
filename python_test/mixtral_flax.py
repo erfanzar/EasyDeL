@@ -58,6 +58,7 @@ def main():
     config.add_partitions(
         use_shard_map=True
     )
+    print(params['params']['model']['layers']["0"])
     try:
         flax_model = FlaxMixtralForCausalLM(
             config=config,
