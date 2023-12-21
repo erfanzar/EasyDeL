@@ -609,7 +609,7 @@ class CausalLMTrainer:
                                              )
                             if self.arguments.training_time is not None:
                                 if time.time() - start_time > self.arguments.training_time:
-                                    raise EasyDelTimer
+                                    raise EasyDelTimer("TimeOut")
                         else:
                             break
                         if self.arguments.save_steps is not None and i % self.arguments.save_steps == 0:
