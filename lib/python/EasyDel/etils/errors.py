@@ -1,0 +1,6 @@
+class EasyDelRuntimeError(Exception):
+    ...
+
+
+class EasyDeSyntaxRuntimeError(Exception):
+    ...

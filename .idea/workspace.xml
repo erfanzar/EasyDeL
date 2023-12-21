@@ -1,193 +1,116 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
-  <component name="AutoImportSettings">
-    <option name="autoReloadType" value="SELECTIVE" />
-  </component>
   <component name="ChangeListManager">
-    <list default="true" id="e9058a88-3ea4-4b63-a9f8-ea56f3a88630" name="Changes" comment="">
+    <list default="true" id="7d19d077-b1b6-456d-8292-0eb0601e9c56" name="Changes" comment="">
+      <change beforePath="$PROJECT_DIR$/.idea/inspectionProfiles/Project_Default.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/inspectionProfiles/Project_Default.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/shelf/Uncommitted_changes_before_Checkout_at_12_16_23,_10_35_PM_[Changes]/shelved.patch" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/shelf/Uncommitted_changes_before_Checkout_at_12_16_23,_10_35_PM_[Changes]1/shelved.patch" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/shelf/Uncommitted_changes_before_Update_at_12_16_23,_10_35_PM_[Changes]/shelved.patch" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/shelf/Uncommitted_changes_before_Update_at_12_18_23,_11_49_AM_[Changes]/shelved.patch" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/shelf/Uncommitted_changes_before_Update_at_12_18_23__11_49_AM__Changes_.xml" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/shelf/Uncommitted_changes_before_Update_at_12_20_23,_12_36_AM_[Changes]/shelved.patch" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/python_test/mixtral_flax.py" beforeDir="false" afterPath="$PROJECT_DIR$/python_test/mixtral_flax.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/README.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-configs-configs.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-data_preprocessing-_processor.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-erros-errors.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-eval-lm_eval.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-linen-bits.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-linen-utils.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-modules-auto_models.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-modules-falcon-modelling_falcon_flax.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-modules-flax_modelling_utils.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-modules-gpt2-modelling_gpt2_flax.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-modules-gpt_j-modelling_gpt_j_flax.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-modules-gpt_neo_x-modelling_gpt_neo_x_flax.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-modules-llama-modelling_llama_flax.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-modules-lucid_transformer-modelling_lt_flax.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-modules-mistral-modelling_mistral_flax.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-modules-mixtral-modelling_mixtral_flax.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-modules-mosaic_mpt-modelling_mpt_flax.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-modules-opt-modelling_opt_flax.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-modules-palm-modelling_palm_flax.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-modules-phi-modelling_phi_flax.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-modules-t5-modelling_t5_flax.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-partitioning-partitioner.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-rl_trainer-core.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-rl_trainer-models-modelling_base.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-rl_trainer-models-modelling_value_head.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-rl_trainer-trainer-base.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-rl_trainer-trainer-ppo_config.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-rl_trainer-trainer-ppo_trainer.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-rlhf-ppo.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-rlhf-reward.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-rlhf-trainer.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-rlhf-utils.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-serve-jax_serve.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-serve-torch_serve.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-serve-utils.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-smi-smi.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-trainer-config.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-trainer-fsdp_train.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-trainer-tf_dataset.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-trainer-training_utils.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-transform-easydel_transform.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-transform-falcon.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-transform-llama.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-transform-mistral.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-transform-mpt.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-transform-utils.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-utils-checker.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-utils-prompters.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-utils-tensor_utils.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/lib-python-EasyDel-utils-utils.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/generate_documentations.py" beforeDir="false" afterPath="$PROJECT_DIR$/generate_documentations.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/__init__.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/configs/__init__.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/configs/configs.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/trainer/config.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/trainer/config.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/mkdocs.yml" beforeDir="false" afterPath="$PROJECT_DIR$/mkdocs.yml" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
     <option name="LAST_RESOLUTION" value="IGNORE" />
   </component>
-  <component name="FileTemplateManagerImpl">
-    <option name="RECENT_TEMPLATES">
-      <list>
-        <option value="Python Script" />
-      </list>
-    </option>
-  </component>
   <component name="Git.Settings">
-    <option name="RECENT_BRANCH_BY_REPOSITORY">
-      <map>
-        <entry key="$PROJECT_DIR$" value="main" />
-      </map>
-    </option>
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
   </component>
   <component name="MarkdownSettingsMigration">
     <option name="stateVersion" value="1" />
   </component>
-  <component name="ProjectColorInfo">{
-  &quot;customColor&quot;: &quot;&quot;,
-  &quot;associatedIndex&quot;: 6
-}</component>
-  <component name="ProjectId" id="2ZXHOtjPa3CdcVdlW1mCznNWdgB" />
-  <component name="ProjectLevelVcsManager">
-    <ConfirmationsSetting value="2" id="Add" />
-  </component>
+  <component name="ProjectColorInfo"><![CDATA[{
+  "customColor": "",
+  "associatedIndex": 6
+}]]></component>
+  <component name="ProjectId" id="2ZqlkPcyqDReJoEZaR9WZuvom5Z" />
   <component name="ProjectViewState">
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent">{
-  &quot;keyToString&quot;: {
-    &quot;RunOnceActivity.OpenProjectViewOnStart&quot;: &quot;true&quot;,
-    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
-    &quot;WebServerToolWindowFactoryState&quot;: &quot;false&quot;,
-    &quot;git-widget-placeholder&quot;: &quot;main&quot;,
-    &quot;last_opened_file_path&quot;: &quot;/home/erfan/PycharmProjects/EasyDeL&quot;,
-    &quot;node.js.detected.package.eslint&quot;: &quot;true&quot;,
-    &quot;node.js.detected.package.tslint&quot;: &quot;true&quot;,
-    &quot;node.js.selected.package.eslint&quot;: &quot;(autodetect)&quot;,
-    &quot;node.js.selected.package.tslint&quot;: &quot;(autodetect)&quot;,
-    &quot;nodejs_package_manager_path&quot;: &quot;npm&quot;,
-    &quot;vue.rearranger.settings.migration&quot;: &quot;true&quot;
+  <component name="PropertiesComponent"><![CDATA[{
+  "keyToString": {
+    "RunOnceActivity.OpenProjectViewOnStart": "true",
+    "RunOnceActivity.ShowReadmeOnStart": "true",
+    "WebServerToolWindowFactoryState": "false",
+    "git-widget-placeholder": "main",
+    "nodejs_package_manager_path": "npm",
+    "vue.rearranger.settings.migration": "true"
   }
-}</component>
-  <component name="RunManager" selected="Python.mixtral_flax">
-    <configuration name="env" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
-      <module name="EasyDeL" />
-      <option name="INTERPRETER_OPTIONS" value="" />
-      <option name="PARENT_ENVS" value="true" />
-      <envs>
-        <env name="PYTHONUNBUFFERED" value="1" />
-      </envs>
-      <option name="SDK_HOME" value="" />
-      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/lib/python/" />
-      <option name="IS_MODULE_SDK" value="true" />
-      <option name="ADD_CONTENT_ROOTS" value="true" />
-      <option name="ADD_SOURCE_ROOTS" value="true" />
-      <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
-      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/env.py" />
-      <option name="PARAMETERS" value="" />
-      <option name="SHOW_COMMAND_LINE" value="false" />
-      <option name="EMULATE_TERMINAL" value="false" />
-      <option name="MODULE_MODE" value="false" />
-      <option name="REDIRECT_INPUT" value="false" />
-      <option name="INPUT_FILE" value="" />
-      <method v="2" />
-    </configuration>
-    <configuration name="llama_compration" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
-      <module name="EasyDeL" />
-      <option name="INTERPRETER_OPTIONS" value="" />
-      <option name="PARENT_ENVS" value="true" />
-      <envs>
-        <env name="PYTHONUNBUFFERED" value="1" />
-      </envs>
-      <option name="SDK_HOME" value="" />
-      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/python_test" />
-      <option name="IS_MODULE_SDK" value="true" />
-      <option name="ADD_CONTENT_ROOTS" value="true" />
-      <option name="ADD_SOURCE_ROOTS" value="true" />
-      <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
-      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/python_test/llama_compration.py" />
-      <option name="PARAMETERS" value="" />
-      <option name="SHOW_COMMAND_LINE" value="false" />
-      <option name="EMULATE_TERMINAL" value="false" />
-      <option name="MODULE_MODE" value="false" />
-      <option name="REDIRECT_INPUT" value="false" />
-      <option name="INPUT_FILE" value="" />
-      <method v="2" />
-    </configuration>
-    <configuration name="llama_flax" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
-      <module name="EasyDeL" />
-      <option name="INTERPRETER_OPTIONS" value="" />
-      <option name="PARENT_ENVS" value="true" />
-      <envs>
-        <env name="PYTHONUNBUFFERED" value="1" />
-      </envs>
-      <option name="SDK_HOME" value="" />
-      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/python_test" />
-      <option name="IS_MODULE_SDK" value="true" />
-      <option name="ADD_CONTENT_ROOTS" value="true" />
-      <option name="ADD_SOURCE_ROOTS" value="true" />
-      <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
-      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/python_test/llama_flax.py" />
-      <option name="PARAMETERS" value="" />
-      <option name="SHOW_COMMAND_LINE" value="false" />
-      <option name="EMULATE_TERMINAL" value="false" />
-      <option name="MODULE_MODE" value="false" />
-      <option name="REDIRECT_INPUT" value="false" />
-      <option name="INPUT_FILE" value="" />
-      <method v="2" />
-    </configuration>
-    <configuration name="mixtral_flax" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
-      <module name="EasyDeL" />
-      <option name="INTERPRETER_OPTIONS" value="" />
-      <option name="PARENT_ENVS" value="true" />
-      <envs>
-        <env name="PYTHONUNBUFFERED" value="1" />
-      </envs>
-      <option name="SDK_HOME" value="" />
-      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/python_test" />
-      <option name="IS_MODULE_SDK" value="true" />
-      <option name="ADD_CONTENT_ROOTS" value="true" />
-      <option name="ADD_SOURCE_ROOTS" value="true" />
-      <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
-      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/python_test/mixtral_flax.py" />
-      <option name="PARAMETERS" value="" />
-      <option name="SHOW_COMMAND_LINE" value="false" />
-      <option name="EMULATE_TERMINAL" value="false" />
-      <option name="MODULE_MODE" value="false" />
-      <option name="REDIRECT_INPUT" value="false" />
-      <option name="INPUT_FILE" value="" />
-      <method v="2" />
-    </configuration>
-    <recent_temporary>
-      <list>
-        <item itemvalue="Python.mixtral_flax" />
-        <item itemvalue="Python.llama_flax" />
-        <item itemvalue="Python.env" />
-        <item itemvalue="Python.llama_compration" />
-        <item itemvalue="Python.env" />
-      </list>
-    </recent_temporary>
-  </component>
+}]]></component>
   <component name="SpellCheckerSettings" RuntimeDictionaries="0" Folders="0" CustomDictionaries="0" DefaultDictionary="application-level" UseSingleDictionary="true" transferred="true" />
   <component name="TaskManager">
     <task active="true" id="Default" summary="Default task">
-      <changelist id="e9058a88-3ea4-4b63-a9f8-ea56f3a88630" name="Changes" comment="" />
-      <created>1702561475154</created>
+      <changelist id="7d19d077-b1b6-456d-8292-0eb0601e9c56" name="Changes" comment="" />
+      <created>1703157633342</created>
       <option name="number" value="Default" />
       <option name="presentableId" value="Default" />
-      <updated>1702561475154</updated>
-      <workItem from="1702561476600" duration="2879000" />
-      <workItem from="1702564997855" duration="1585000" />
-      <workItem from="1702570696725" duration="5776000" />
-      <workItem from="1702625797888" duration="1904000" />
-      <workItem from="1702627837344" duration="3368000" />
-      <workItem from="1702795436603" duration="757000" />
-      <workItem from="1702799337712" duration="11633000" />
-      <workItem from="1702811433240" duration="3570000" />
-      <workItem from="1702830071828" duration="8197000" />
-      <workItem from="1703012471527" duration="615000" />
+      <updated>1703157633342</updated>
+      <workItem from="1703157635504" duration="172000" />
     </task>
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
     <option name="version" value="3" />
-  </component>
-  <component name="com.intellij.coverage.CoverageDataManagerImpl">
-    <SUITE FILE_PATH="coverage/EasyDeL$llama_compration.coverage" NAME="llama_compration Coverage Results" MODIFIED="1701936876438" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/python_test" />
-    <SUITE FILE_PATH="coverage/EasyDeL$env.coverage" NAME="env Coverage Results" MODIFIED="1702474767871" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/lib/python" />
-    <SUITE FILE_PATH="coverage/EasyDeL$mistral_flax.coverage" NAME="mistral_flax Coverage Results" MODIFIED="1701867908351" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/python_test" />
-    <SUITE FILE_PATH="coverage/EasyDeL$llama_flax.coverage" NAME="llama_flax Coverage Results" MODIFIED="1702815788053" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/python_test" />
-    <SUITE FILE_PATH="coverage/EasyDeL$mixtral_flax.coverage" NAME="mixtral_flax Coverage Results" MODIFIED="1702925720693" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/python_test" />
-    <SUITE FILE_PATH="coverage/EasyDeL$falcon_flax.coverage" NAME="falcon_flax Coverage Results" MODIFIED="1701860359932" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/python_test" />
-    <SUITE FILE_PATH="coverage/EasyDeL$phi_flax.coverage" NAME="phi_flax Coverage Results" MODIFIED="1701867632398" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/python_test" />
   </component>
 </project>

@@ -143,4 +143,10 @@ from .transform.mistral import (
     mistral_easydel_to_hf as mistral_easydel_to_hf
 )
 
+from .etils import (
+    EasyDelGradientCheckPointers as EasyDelGradientCheckPointers,
+    EasyDelOptimizers as EasyDelOptimizers,
+    EasyDelSchedulers as EasyDelSchedulers
+)
+
 __version__ = "0.0.40"
