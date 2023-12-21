@@ -7,64 +7,67 @@ nav:
   - AvailableModels: AvailableModels.md
   - EasyBIT: Bits.md
   - Eval:
-      - lm_eval: lib-python-EasyDel-eval-lm_eval.md
+      - lm_eval: eval-lm_eval.md
   - Transform:
-      - easydel_transform: lib-python-EasyDel-transform-easydel_transform.md
-      - mpt: lib-python-EasyDel-transform-mpt.md
-      - llama: lib-python-EasyDel-transform-llama.md
-      - falcon: lib-python-EasyDel-transform-falcon.md
-      - mistral: lib-python-EasyDel-transform-mistral.md
-      - utils: lib-python-EasyDel-transform-utils.md
-  - smi: lib-python-EasyDel-smi-smi.md
+      - easydel_transform: transform-easydel_transform.md
+      - mpt: transform-mpt.md
+      - llama: transform-llama.md
+      - falcon: transform-falcon.md
+      - mistral: transform-mistral.md
+      - utils: transform-utils.md
+  - smi: smi-smi.md
   - Serve:
-      - torch_serve: lib-python-EasyDel-serve-torch_serve.md
-      - jax_serve: lib-python-EasyDel-serve-jax_serve.md
-      - utils: lib-python-EasyDel-serve-utils.md
+      - torch_serve: serve-torch_serve.md
+      - jax_serve: serve-jax_serve.md
+      - utils: serve-utils.md
   - Modules:
-      - Falcon: lib-python-EasyDel-modules-falcon-modelling_falcon_flax.md
-      - Palm: lib-python-EasyDel-modules-palm-modelling_palm_flax.md
-      - flax_modelling_utils: lib-python-EasyDel-modules-flax_modelling_utils.md
-      - GPT-Neox: lib-python-EasyDel-modules-gpt_neo_x-modelling_gpt_neo_x_flax.md
-      - GPT-J: lib-python-EasyDel-modules-gpt_j-modelling_gpt_j_flax.md
-      - Mistral: lib-python-EasyDel-modules-mistral-modelling_mistral_flax.md
-      - auto_models: lib-python-EasyDel-modules-auto_models.md
-      - LucidTransformers: lib-python-EasyDel-modules-lucid_transformer-modelling_lt_flax.md
-      - OPT: lib-python-EasyDel-modules-opt-modelling_opt_flax.md
-      - MPT: lib-python-EasyDel-modules-mosaic_mpt-modelling_mpt_flax.md
-      - Llama: lib-python-EasyDel-modules-llama-modelling_llama_flax.md
-      - Mixtral: lib-python-EasyDel-modules-mixtral-modelling_mixtral_flax.md
-      - PHI: lib-python-EasyDel-modules-phi-modelling_phi_flax.md
-      - T5: lib-python-EasyDel-modules-t5-modelling_t5_flax.md
-  - configs: lib-python-EasyDel-configs-configs.md
+      - Falcon: modules-falcon-modelling_falcon_flax.md
+      - Palm: modules-palm-modelling_palm_flax.md
+      - flax_modelling_utils: modules-flax_modelling_utils.md
+      - GPT-Neox: modules-gpt_neo_x-modelling_gpt_neo_x_flax.md
+      - GPT-J: modules-gpt_j-modelling_gpt_j_flax.md
+      - Mistral: modules-mistral-modelling_mistral_flax.md
+      - auto_models: modules-auto_models.md
+      - LucidTransformers: modules-lucid_transformer-modelling_lt_flax.md
+      - OPT: modules-opt-modelling_opt_flax.md
+      - MPT: modules-mosaic_mpt-modelling_mpt_flax.md
+      - Llama: modules-llama-modelling_llama_flax.md
+      - Mixtral: modules-mixtral-modelling_mixtral_flax.md
+      - PHI: modules-phi-modelling_phi_flax.md
+      - T5: modules-t5-modelling_t5_flax.md
+  - Etils:
+      - configs: etils-configs.md
+      - Errors: etils-errors.md
+      - Etils: etils-etils.md
   - Utils:
-      - tensor_utils: lib-python-EasyDel-utils-tensor_utils.md
-      - prompters: lib-python-EasyDel-utils-prompters.md
-      - utils: lib-python-EasyDel-utils-utils.md
-      - checker: lib-python-EasyDel-utils-checker.md
+      - tensor_utils: utils-tensor_utils.md
+      - prompters: utils-prompters.md
+      - utils: utils-utils.md
+      - checker: utils-checker.md
   - RLHF:
-      - trainer: lib-python-EasyDel-rlhf-trainer.md
-      - reward: lib-python-EasyDel-rlhf-reward.md
-      - ppo: lib-python-EasyDel-rlhf-ppo.md
-      - utils: lib-python-EasyDel-rlhf-utils.md
+      - trainer: rlhf-trainer.md
+      - reward: rlhf-reward.md
+      - ppo: rlhf-ppo.md
+      - utils: rlhf-utils.md
 
   - Trainer:
-      - fsdp_train: lib-python-EasyDel-trainer-fsdp_train.md
-      - config: lib-python-EasyDel-trainer-config.md
-      - tf_dataset: lib-python-EasyDel-trainer-tf_dataset.md
-      - training_utils: lib-python-EasyDel-trainer-training_utils.md
+      - fsdp_train: trainer-fsdp_train.md
+      - config: trainer-config.md
+      - tf_dataset: trainer-tf_dataset.md
+      - training_utils: trainer-training_utils.md
   - Linen:
-      - bits: lib-python-EasyDel-linen-bits.md
-      - utils: lib-python-EasyDel-linen-utils.md
+      - bits: linen-bits.md
+      - utils: linen-utils.md
   - RL Trainer:
-      core: lib-python-EasyDel-rl_trainer-core.md
+      core: rl_trainer-core.md
       models:
-        modelling_base: lib-python-EasyDel-rl_trainer-models-modelling_base.md
-        modelling_value_head: lib-python-EasyDel-rl_trainer-models-modelling_value_head.md
+        modelling_base: rl_trainer-models-modelling_base.md
+        modelling_value_head: rl_trainer-models-modelling_value_head.md
       trainer:
-        base: lib-python-EasyDel-rl_trainer-trainer-base.md
-        ppo_trainer: lib-python-EasyDel-rl_trainer-trainer-ppo_trainer.md
+        base: rl_trainer-trainer-base.md
+        ppo_trainer: rl_trainer-trainer-ppo_trainer.md
   - Data Preprocessing:
-      - data_preprocessing/_processor: lib-python-EasyDel-data_preprocessing-_processor.md
+      - data_preprocessing/_processor: data_preprocessing-_processor.md
   - Examples:
       - PytorchServer: PyTorchServer.md
       - JAXServer: JAXServer.md

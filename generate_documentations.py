@@ -20,12 +20,13 @@ def run(project_locations="lib/python/EasyDel"):
     try:
         for ps in get_inner(project_locations):
             is_file = not os.path.isdir(ps)
-            if not ps.endswith("__init__.py") and is_file and ps.endswith('.py'):
+            if not ps.endswith("__init__.py") and is_file and ps.endswith(".py"):
                 name = ps.replace(".py", "").replace("/", ".")
-                _pr = "lib/python/EasyDel".replace('/', '.') + '.'
+                _pr = "lib/python/EasyDel".replace("/", ".") + "."
                 md_doc = f"# {name.replace(_pr, '')}\n::: {name}"
-                md_file = name.replace(".", "-") + '.md'
-                with open("docs/" + md_file, 'w') as buffer:
+                md_file = (name.replace(".", "-") +
+                           ".md").replace("lib-python-EasyDel-", "")
+                with open("docs/" + md_file, "w") as buffer:
                     buffer.write(md_doc)
 
                 print(f" - {name.replace('.', '/')} : {md_file}")
