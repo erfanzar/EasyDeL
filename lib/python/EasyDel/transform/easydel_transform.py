@@ -5,6 +5,7 @@ from flax.traverse_util import flatten_dict
 from flax.serialization import from_bytes, to_bytes, to_state_dict
 import msgpack
 import os
+from transformers import PretrainedConfig
 
 from typing import List
 
@@ -18,17 +19,17 @@ def get_float_dtype_by_name(dtype):
 
     :param dtype: Specify the type of data that is being passed into the function
     :return: The float dtype of the input string
-    
+
     """
     return {
-        'bf16': jax.numpy.bfloat16,
-        'bfloat16': jax.numpy.bfloat16,
-        'fp16': jax.numpy.float16,
-        'float16': jax.numpy.float16,
-        'fp32': jax.numpy.float32,
-        'float32': jax.numpy.float32,
-        'fp64': jax.numpy.float64,
-        'float64': jax.numpy.float64,
+        "bf16": jax.numpy.bfloat16,
+        "bfloat16": jax.numpy.bfloat16,
+        "fp16": jax.numpy.float16,
+        "float16": jax.numpy.float16,
+        "fp32": jax.numpy.float32,
+        "float32": jax.numpy.float32,
+        "fp64": jax.numpy.float64,
+        "float64": jax.numpy.float64,
     }[dtype]
 
 
@@ -39,14 +40,15 @@ def float_tensor_to_dtype(tensor, dtype):
     :param tensor: Convert the tensor to a float dtype
     :param dtype: Convert the tensor to a specific dtype
     :return: A tensor with the specified dtype
-    
+
     """
-    if dtype is None or dtype == '':
+    if dtype is None or dtype == "":
         return tensor
     if isinstance(dtype, str):
         dtype = get_float_dtype_by_name(dtype)
-    float_dtypes = (jax.numpy.bfloat16, jax.numpy.float16, jax.numpy.float32, jax.numpy.float64)
-    if getattr(tensor, 'dtype', None) in float_dtypes:
+    float_dtypes = (jax.numpy.bfloat16, jax.numpy.float16,
+                    jax.numpy.float32, jax.numpy.float64)
+    if getattr(tensor, "dtype", None) in float_dtypes:
         tensor = tensor.astype(dtype)
     return tensor
 
@@ -61,7 +63,7 @@ def match_keywords(string, ts, ns):
     :param ts: Specify the required keywords and ns is used to specify the non-required keywords
     :param ns: Specify a list of negative keywords
     :return: True if all the keywords in ts are present and none of the
-    
+
     """
     for t in ts:
         if t not in string:
@@ -72,10 +74,52 @@ def match_keywords(string, ts, ns):
     return True
 
 
+def easydel_to_torch_dict(
+
+    params: dict | flax.core.FrozenDict,
+    dtype: jax.numpy.dtype = jax.numpy.float16
+) -> dict:
+    """
+    The function `easydel_to_torch_dict` converts a dictionary of parameters from the Flax library to a
+    PyTorch state dictionary, with some specific transformations applied to the keys.
+
+    :param params: The `params` parameter is a dictionary or a `flax.core.FrozenDict` object that
+    contains the parameters of a model
+    :type params: dict | flax.core.FrozenDict
+    :param dtype: The `dtype` parameter specifies the data type of the tensors in the resulting Torch
+    state dictionary. By default, it is set to `jax.numpy.float16`, which is a 16-bit floating-point
+    data type
+    :type dtype: jax.numpy.dtype
+    :return: a dictionary containing the state dictionary for the PyTorch model.
+    """
+    import torch
+    if isinstance(params, flax.core.FrozenDict):
+        params = flax.core.unfreeze(params)
+    state_dict = flax.traverse_util.flatten_dict(
+        params,
+        sep="."
+    )
+    state_dict = {}
+
+    kernel_word_length = len("kernel")
+    embedding_word_length = len("embedding")
+
+    for key, tensor in params.items():
+        key_len = len(key)
+        if match_keywords(key, ["kernel"], ["none"]):
+            tensor = tensor.T
+            key[key_len-kernel_word_length:] = "weight"
+        elif match_keywords(key, ["embedding"], ["none"]):
+            key[key_len-embedding_word_length:] = "weight"
+
+        state_dict[key] = torch.from_numpy(tensor.astype(dtype=dtype))
+    return state_dict
+
+
 def huggingface_to_easydel(
         state_dict,
         *,
-        embedding_layer_names: List[str],
+        embedding_layer_names: List[str] | str,
         device,
         dtype: jax.numpy.dtype = jax.numpy.float16,
         **kwargs
@@ -91,23 +135,23 @@ def huggingface_to_easydel(
     :param device: Determine which device the model will be loaded on
     :param dtype: jax.numpy.dtype: Specify the data type of the tensors
     :return: A dictionary of the weights and biases in a format that can be used by flax (it's an UnFlattenDict)
-    
+
     """
     if isinstance(embedding_layer_names, str):
         embedding_layer_names = [embedding_layer_names]
-    _l = len('.weight')
+    _l = len(".weight")
     with jax.default_device(device):
         flax_dict = {}
         for key, tensor in state_dict.items():
             for embedding_layer_name in embedding_layer_names:
                 if embedding_layer_name in key:
-                    key = key[:-_l] + '.embedding'
-                elif match_keywords(key, ['weight'], ['none']):
+                    key = key[:-_l] + ".embedding"
+                elif match_keywords(key, ["weight"], ["none"]):
                     if len(tensor.shape) == 2:
                         tensor = tensor.transpose(0, 1)
-                    if key.endswith('.weight'):
-                        key = key[:-_l] + '.kernel'
-            key_tuple = key.split('.')
+                    if key.endswith(".weight"):
+                        key = key[:-_l] + ".kernel"
+            key_tuple = key.split(".")
             key_names = ()
             tensor = tensor.detach().cpu().numpy()
             for k in key_tuple:
@@ -125,11 +169,12 @@ def read_ckpt(path: [str, os.PathLike], shard_fns=None, add_extra_past_fix: list
     :param shard_fns: Shard the tensors
     :param add_extra_past_fix: list: Add an extra past to the key
     :return: A dictionary of tensors
-    
+
     """
     tensors = {}
-    with open(path, 'rb') as stream:
-        unpacker = msgpack.Unpacker(stream, read_size=83886080, max_buffer_size=0)
+    with open(path, "rb") as stream:
+        unpacker = msgpack.Unpacker(
+            stream, read_size=83886080, max_buffer_size=0)
         for key, value in unpacker:
             if add_extra_past_fix is not None:
                 key = add_extra_past_fix + key
@@ -150,7 +195,7 @@ def save_ckpt(train_state, path, gather_fns=None, float_dtype=None):
     :param gather_fns: Specify a function that will be used to convert the tensor to bytes
     :param float_dtype: Convert the tensor to a specific dtype
     :return: Nothing
-    
+
     """
 
     train_state = to_state_dict(train_state)

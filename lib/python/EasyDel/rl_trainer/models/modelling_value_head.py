@@ -18,7 +18,8 @@ class ValueHead(nn.Module):
     summary_dropout_prob: float = 0.0
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: typing.Optional[jax.lax.Precision] = jax.lax.Precision('fastest')
+    precision: typing.Optional[jax.lax.Precision] = jax.lax.Precision(
+        "fastest")
 
     def setup(self):
         """
@@ -29,7 +30,7 @@ class ValueHead(nn.Module):
 
         :param self: Represent the instance of the class
         :return: A tuple of the following:
-        
+
         """
         config = self.config
 
@@ -61,7 +62,7 @@ class ValueHead(nn.Module):
         :param hidden_states: chex.Array: Pass the hidden states of the previous layer
         :param deterministic: bool: Determine whether to use dropout
         :return: A tensor of shape (batch_size, num_classes)
-        
+
         """
         output = self.dropout(hidden_states, deterministic=deterministic)
         if output.dtype != self.summary.weight.dtype:
@@ -78,34 +79,54 @@ class FlaxAutoModelForCausalLMWithValueHead(FlaxPreTrainedModelWrapper):
         "v_head_initializer_range",
         "v_head_init_strategy",
     )
+    summary_dropout_prob: float = 0.0
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: typing.Optional[jax.lax.Precision] = jax.lax.Precision(
+        "fastest")
 
     def setup(self):
         if not any(hasattr(self.pretrained_model, attribute) for attribute in self.lm_head_namings):
-            raise ValueError("The model does not have a language model head, please use a model that has one.")
+            raise ValueError(
+                "The model does not have a language model head, please use a model that has one.")
 
-        self.v_head = ValueHead(self.pretrained_model.config)
+        self.v_head = ValueHead(
+            self.pretrained_model.config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision,
+        )
 
     def __call__(
+
             self,
+            module_params: dict,
             input_ids=None,
             past_key_values=None,
             attention_mask=None,
             **kwargs,
     ):
         """
-        The __call__ function is the main function of a Flax model.
-        It takes in input_ids, attention_mask, and past_key_values as arguments.
-        The output is a tuple containing lm logits and value.
+        The function takes in module parameters, input IDs, past key values, and attention mask, and
+        returns language model logits and a value.
 
-        :param self: Represent the instance of the class
-        :param input_ids: Pass the input to the model
-        :param past_key_values: Pass the past key values to the model
-        :param attention_mask: Mask out the padding tokens
-        :param **kwargs: Pass in the past_key_values parameter
-        :param : Pass the past key values to the model
-        :return: The logits and the value
-        
+        :param module_params: The `module_params` parameter is a dictionary that contains the parameters
+        for the module. It is used to pass any additional parameters that are specific to the module
+        being called
+        :type module_params: dict
+        :param input_ids: The `input_ids` parameter is used to specify the input sequence of token IDs
+        for the model. These token IDs represent the input text that the model will process
+        :param past_key_values: The `past_key_values` parameter is used for autoregressive decoding. It
+        allows you to pass the previous key-value pairs from the attention mechanism to the model, which
+        can be used to generate the next token in the sequence. This is useful when generating text one
+        token at a time
+        :param attention_mask: The `attention_mask` parameter is used to mask certain tokens in the
+        input sequence. It is a binary tensor of shape `(batch_size, sequence_length)` where each
+        element is either 0 or 1. A value of 0 indicates that the corresponding token should be masked,
+        while a value of
+        :return: two values: `lm_logits` and `value`.
         """
+
         kwargs["output_hidden_states"] = True
         kwargs["past_key_values"] = past_key_values
 
@@ -113,29 +134,23 @@ class FlaxAutoModelForCausalLMWithValueHead(FlaxPreTrainedModelWrapper):
             input_ids=input_ids,
             attention_mask=attention_mask,
             return_dict=True,
+            params=module_params,
             **kwargs,
         )
 
         last_hidden_state = base_model_output.hidden_states[-1]
         lm_logits = base_model_output.logits
 
-        value = self.v_head(last_hidden_state).squeeze(-1)
+        value = self.v_head(last_hidden_state)
 
         return lm_logits, value
 
     def generate(self, *args, **kwargs):
-        return self.pretrained_model.generate(*args, **kwargs)
+        raise NotImplementedError()
 
     def push_to_hub(self, *args, **kwargs):
-        """
-        The push_to_hub function is used to push the model to a remote location.
+        raise NotImplementedError()
 
-        :param self: Represent the instance of the class
-        :param *args: Send a non-keyworded variable length argument list to the function
-        :param **kwargs: Pass keyworded, variable-length argument list to a function
-        :return: The pretrained model
-        
-        """
-        setattr(self.pretrained_model, "v_head", self.v_head)
-
-        return self.pretrained_model.push_to_hub(*args, **kwargs)
+    def post_init(self, *args, **kwargs):
+        # print(args, kwargs)
+        ...
