@@ -93,6 +93,9 @@ class FlaxPreTrainedModelWrapper(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
         )
+        params = rl_model.post_init(
+            params, config
+        )
         return rl_model, params
 
     @classmethod
