@@ -11,6 +11,8 @@ from ...modules.auto_models import AutoEasyDelModelForCausalLM
 from .modelling_base import FlaxPreTrainedModelWrapper
 from jax import numpy as jnp
 import chex
+import flax
+from flax.traverse_util import unflatten_dict, flatten_dict
 
 
 class ValueHead(nn.Module):
@@ -70,7 +72,7 @@ class ValueHead(nn.Module):
         return self.summary(output)
 
 
-class FlaxAutoModelForCausalLMWithValueHead(FlaxPreTrainedModelWrapper):
+class FlaxAutoModelForCausalLMWithValueHead(FlaxPreTrainedModelWrapper,flax.linen.Module):
     pretrained_model: Type[FlaxPreTrainedModel] = FlaxLlamaForCausalLM
     transformers_parent_class: Type[FlaxPreTrainedModel] = AutoEasyDelModelForCausalLM
     lm_head_namings = ["lm_head", "embed_out"]
@@ -151,6 +153,17 @@ class FlaxAutoModelForCausalLMWithValueHead(FlaxPreTrainedModelWrapper):
     def push_to_hub(self, *args, **kwargs):
         raise NotImplementedError()
 
-    def post_init(self, *args, **kwargs):
-        # print(args, kwargs)
-        ...
+    def post_init(self, params: dict, config) -> dict:
+        self.setup()
+        has_v_head = True in set(
+            [key for key, _ in flatten_dict(params).items()]
+        )
+        if not has_v_head:
+            vh_params = self.v_head.init(
+                jnp.ones((1, config.vocab_size))
+            )
+            print(
+                vh_params
+            )
+            
+        return params
