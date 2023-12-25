@@ -4,11 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="e9058a88-3ea4-4b63-a9f8-ea56f3a88630" name="Changes" comment="">
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/modules/mixtral/modelling_mixtral_flax.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/mixtral/modelling_mixtral_flax.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/python_test/mixtral_flax.py" beforeDir="false" afterPath="$PROJECT_DIR$/python_test/mixtral_flax.py" afterDir="false" />
-    </list>
+    <list default="true" id="e9058a88-3ea4-4b63-a9f8-ea56f3a88630" name="Changes" comment="" />
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -182,11 +178,12 @@
     <option name="version" value="3" />
   </component>
   <component name="com.intellij.coverage.CoverageDataManagerImpl">
+    <SUITE FILE_PATH="coverage/EasyDeL$generate_documentations.coverage" NAME="generate_documentations Coverage Results" MODIFIED="1702887955454" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
     <SUITE FILE_PATH="coverage/EasyDeL$llama_compration.coverage" NAME="llama_compration Coverage Results" MODIFIED="1701936876438" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/python_test" />
     <SUITE FILE_PATH="coverage/EasyDeL$env.coverage" NAME="env Coverage Results" MODIFIED="1702474767871" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/lib/python" />
     <SUITE FILE_PATH="coverage/EasyDeL$mistral_flax.coverage" NAME="mistral_flax Coverage Results" MODIFIED="1701867908351" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/python_test" />
-    <SUITE FILE_PATH="coverage/EasyDeL$llama_flax.coverage" NAME="llama_flax Coverage Results" MODIFIED="1702815788053" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/python_test" />
-    <SUITE FILE_PATH="coverage/EasyDeL$mixtral_flax.coverage" NAME="mixtral_flax Coverage Results" MODIFIED="1702840217424" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/python_test" />
+    <SUITE FILE_PATH="coverage/EasyDeL$llama_flax.coverage" NAME="llama_flax Coverage Results" MODIFIED="1701943680350" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/python_test" />
+    <SUITE FILE_PATH="coverage/EasyDeL$mixtral_flax.coverage" NAME="mixtral_flax Coverage Results" MODIFIED="1702977128554" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/python_test" />
     <SUITE FILE_PATH="coverage/EasyDeL$falcon_flax.coverage" NAME="falcon_flax Coverage Results" MODIFIED="1701860359932" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/python_test" />
     <SUITE FILE_PATH="coverage/EasyDeL$phi_flax.coverage" NAME="phi_flax Coverage Results" MODIFIED="1701867632398" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/python_test" />
   </component>

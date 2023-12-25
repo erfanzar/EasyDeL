@@ -291,11 +291,13 @@ def jax_load_balancing_loss_func(gate_logits: chex.Array, num_experts: chex.Arra
         selected_experts = selected_experts.astype(jnp.int64)
     if len(selected_experts.shape) == 2:
         selected_experts = selected_experts[:, :, jnp.newaxis]
-    expert_mask = jnp.max(jax.nn.one_hot(selected_experts, num_experts), axis=-2)
-    tokens_per_group_and_expert = jnp.mean(expert_mask.astype(jnp.float32), axis=-2)
+    expert_mask = jnp.max(jax.nn.one_hot(
+        selected_experts, num_experts), axis=-2)
+    tokens_per_group_and_expert = jnp.mean(
+        expert_mask.astype(jnp.float32), axis=-2)
     router_prob_per_group_and_expert = jnp.mean(routing_weights, axis=-1)
     return jnp.mean(tokens_per_group_and_expert * jnp.expand_dims(router_prob_per_group_and_expert, axis=-1)) * (
-            num_experts ** 2)
+        num_experts ** 2)
 
 
 class MixtralRMSNorm(nn.Module):
@@ -342,7 +344,8 @@ class FlaxMixtralAttention(nn.Module):
     layer_index: int
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[None, jax.lax.Precision]] = jax.lax.Precision('fastest')
+    precision: Optional[Union[None, jax.lax.Precision]
+                        ] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         config = self.config
@@ -372,14 +375,18 @@ class FlaxMixtralAttention(nn.Module):
     @nn.compact
     def concatenate_to_cache_(self, query: chex.Array, key: chex.Array, value: chex.Array, attention_mask: chex.Array):
         is_cache_available = self.has_variable('cache', 'key')
-        key_cache = self.variable('cache', 'key', jnp.zeros, key.shape, key.dtype)
-        value_cache = self.variable('cache', 'value', jnp.zeros, key.shape, value.dtype)
-        index_cache = self.variable('cache', 'index', lambda: jnp.array(0, dtype=jnp.int32))
+        key_cache = self.variable(
+            'cache', 'key', jnp.zeros, key.shape, key.dtype)
+        value_cache = self.variable(
+            'cache', 'value', jnp.zeros, key.shape, value.dtype)
+        index_cache = self.variable(
+            'cache', 'index', lambda: jnp.array(0, dtype=jnp.int32))
         if is_cache_available:
             *bd, ml, nh, dph = key_cache.value.shape
             indices = (0,) * len(bd) + (index_cache.value, 0, 0)
             key = jax.lax.dynamic_update_slice(key_cache.value, key, indices)
-            value = jax.lax.dynamic_update_slice(value_cache.value, value, indices)
+            value = jax.lax.dynamic_update_slice(
+                value_cache.value, value, indices)
             key_cache.value = key
             value_cache.value = value
             num_updated_cache_vector = query.shape[1]
@@ -396,12 +403,16 @@ class FlaxMixtralAttention(nn.Module):
         return jnp.transpose(query, (0, 2, 1, 3)), jnp.transpose(key, (0, 2, 1, 3)), jnp.transpose(value, (0, 2, 1, 3))
 
     def t_rotary(self, batch_size, sequence_length, query, key, value, freq_cis, position_ids):
-        query = query.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
-        key = key.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
-        value = value.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
+        query = query.reshape(batch_size, sequence_length,
+                              self.config.num_attention_heads, self.head_dim)
+        key = key.reshape(batch_size, sequence_length,
+                          self.config.num_key_value_heads, self.head_dim)
+        value = value.reshape(batch_size, sequence_length,
+                              self.config.num_key_value_heads, self.head_dim)
 
         query, key, value = self._t(query, key, value)
-        query, key = self.rotary(position_ids=position_ids, query=query, key=key, freq_cis=freq_cis)
+        query, key = self.rotary(
+            position_ids=position_ids, query=query, key=key, freq_cis=freq_cis)
         key = repeat_kv_bnsh(key, self.num_key_value_groups)
         value = repeat_kv_bnsh(value, self.num_key_value_groups)
         return self._t(query, key, value)
@@ -436,7 +447,8 @@ class FlaxMixtralAttention(nn.Module):
 
         """
         batch_size, sequence_length = hidden_states.shape[:2]
-        query, key, value = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(hidden_states)
+        query, key, value = self.q_proj(hidden_states), self.k_proj(
+            hidden_states), self.v_proj(hidden_states)
 
         if self.config.use_pjit_attention_force:
             query = with_sharding_constraint(query, PS("fsdp", "sp", None))
@@ -452,7 +464,8 @@ class FlaxMixtralAttention(nn.Module):
             position_ids=position_ids
         )
         if self.has_variable('cache', 'key') or init_cache:
-            query, key, value, attention_mask = self.concatenate_to_cache_(query, key, value, attention_mask)
+            query, key, value, attention_mask = self.concatenate_to_cache_(
+                query, key, value, attention_mask)
 
         q_l, k_l = query.shape[1], key.shape[1]
         if self.has_variable('cache', 'key'):
@@ -466,9 +479,11 @@ class FlaxMixtralAttention(nn.Module):
         dropout_rng = None
         if not deterministic and self.config.attn_pdrop > 0.0:
             dropout_rng = self.make_rng("dropout")
-        causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
+        causal_mask = jnp.broadcast_to(
+            causal_mask, (batch_size,) + causal_mask.shape[1:])
         if attention_mask.ndim == 2:
-            attention_mask = jnp.broadcast_to(jnp.expand_dims(attention_mask, axis=(-3, -2)), causal_mask.shape)
+            attention_mask = jnp.broadcast_to(jnp.expand_dims(
+                attention_mask, axis=(-3, -2)), causal_mask.shape)
 
         attention_mask = nn.combine_masks(attention_mask, causal_mask)
 
@@ -478,11 +493,13 @@ class FlaxMixtralAttention(nn.Module):
                 attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
 
             if attention_mask.shape[1] != self.config.num_attention_heads:
-                attention_mask = attention_mask.repeat(self.config.num_attention_heads, 1, )
+                attention_mask = attention_mask.repeat(
+                    self.config.num_attention_heads, 1, )
             attention_bias = lax.select(
                 attention_mask > 0,
                 jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-                jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
+                jnp.full(attention_mask.shape, jnp.finfo(
+                    self.dtype).min).astype(self.dtype),
             )
             attn_weights = None
             rtp_axis = (0, 2, 1, 3)
@@ -517,7 +534,8 @@ class FlaxMixtralAttention(nn.Module):
             attention_bias = lax.select(
                 attention_mask > 0,
                 jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-                jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
+                jnp.full(attention_mask.shape, jnp.finfo(
+                    self.dtype).min).astype(self.dtype),
             )
             if self.config.use_shard_map:
                 attn_weights = shard_map(
@@ -551,11 +569,14 @@ class FlaxMixtralAttention(nn.Module):
                 )
 
             if self.config.use_pjit_attention_force:
-                attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "sp", "tp", None))
+                attn_weights = with_sharding_constraint(
+                    attn_weights, PS(("dp", "fsdp"), "sp", "tp", None))
 
-            attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value)
+            attn_output = jnp.einsum(
+                "...hqk,...khd->...qhd", attn_weights, value)
 
-        out = self.o_proj(attn_output.reshape(batch_size, sequence_length, self.hidden_size))
+        out = self.o_proj(attn_output.reshape(
+            batch_size, sequence_length, self.hidden_size))
         return out, attn_weights
 
 
@@ -563,7 +584,8 @@ class FlaxMixtralBLockSparseTop2MLP(nn.Module):
     config: MixtralConfig
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[None, jax.lax.Precision]] = jax.lax.Precision('fastest')
+    precision: Optional[Union[None, jax.lax.Precision]
+                        ] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         dense = functools.partial(
@@ -588,7 +610,8 @@ class FlaxMixtralBlocKSparesTop2MLPCollection(nn.Module):
     config: MixtralConfig
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[None, jax.lax.Precision]] = jax.lax.Precision('fastest')
+    precision: Optional[Union[None, jax.lax.Precision]
+                        ] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         self.layers = [
@@ -623,20 +646,23 @@ class FlaxMixtralBlocKSparesTop2MLPCollection(nn.Module):
         ):
             for i in range(top_x_.size):
                 # if (idx_[i]):
-                final_hidden_states_.at[top_x[i]].set(final_hidden_states_[top_x[i]] + current_hidden_states_[i])
+                final_hidden_states_.at[top_x[i]].set(
+                    final_hidden_states_[top_x[i]] + current_hidden_states_[i])
             return final_hidden_states_
 
         for expert_idx, expert_layer in enumerate(self.layers):
             selected_mask = expert_mask[expert_idx]
 
-            idx, top_x = jnp.nonzero(selected_mask, size=selected_mask.shape[-1])
+            idx, top_x = jnp.nonzero(
+                selected_mask, size=selected_mask.shape[-1])
             top_x = jnp.where(top_x != 0, top_x, -1)
             if top_x.shape[0] == 0:
                 continue
 
             current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
 
-            current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
+            current_hidden_states = expert_layer(
+                current_state) * routing_weights[top_x, idx, None]
 
             final_hidden_states = custom_index_add_without_index_add(
                 final_hidden_states,
@@ -662,7 +688,8 @@ class FlaxMixtralSparseMoeBlock(nn.Module):
     config: MixtralConfig
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[None, jax.lax.Precision]] = jax.lax.Precision('fastest')
+    precision: Optional[Union[None, jax.lax.Precision]
+                        ] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         self.gate = nn.Dense(
@@ -684,12 +711,16 @@ class FlaxMixtralSparseMoeBlock(nn.Module):
     def __call__(self, hidden_states: chex.Array) -> Tuple[chex.Array, chex.Array]:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.reshape(-1, hidden_dim)
-        router_logits = self.gate(hidden_states).astype(jnp.promote_types(self.dtype, jnp.float32))
-        routing_weights = jax.nn.softmax(router_logits.astype(jnp.promote_types(self.dtype, jnp.float32)), axis=1)
-        routing_weights, selected_experts = jax.lax.top_k(routing_weights, k=self.config.num_experts_per_tok)
+        router_logits = self.gate(hidden_states).astype(
+            jnp.promote_types(self.dtype, jnp.float32))
+        routing_weights = jax.nn.softmax(router_logits.astype(
+            jnp.promote_types(self.dtype, jnp.float32)), axis=1)
+        routing_weights, selected_experts = jax.lax.top_k(
+            routing_weights, k=self.config.num_experts_per_tok)
         routing_weights /= jnp.sum(routing_weights, axis=-1, keepdims=True)
         routing_weights = routing_weights.astype(hidden_states.dtype)
-        expert_mask = jax.nn.one_hot(selected_experts, num_classes=self.config.num_local_experts).transpose(2, 1, 0)
+        expert_mask = jax.nn.one_hot(
+            selected_experts, num_classes=self.config.num_local_experts).transpose(2, 1, 0)
         return self.experts(
             expert_mask=expert_mask,
             batch_size=batch_size,
@@ -705,7 +736,8 @@ class FlaxMixtralDecoderLayer(nn.Module):
     layer_index: int
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[None, jax.lax.Precision]] = jax.lax.Precision('fastest')
+    precision: Optional[Union[None, jax.lax.Precision]
+                        ] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         self.self_attn = FlaxMixtralAttention(
@@ -939,7 +971,8 @@ class MixtralPreTrainedModel(FlaxPreTrainedModel):
         params_rng, dropout_rng = jax.random.split(rng)
         rngs = {"params": params_rng, "dropout": dropout_rng}
         if self.config.add_cross_attention:
-            encoder_hidden_states = jnp.zeros(input_shape + (self.config.hidden_size,))
+            encoder_hidden_states = jnp.zeros(
+                input_shape + (self.config.hidden_size,))
             encoder_attention_mask = attention_mask
             module_init_outputs = self.module.init(
                 rngs,
@@ -974,7 +1007,8 @@ class MixtralPreTrainedModel(FlaxPreTrainedModel):
 
         input_ids = jnp.ones((batch_size, max_length))
         attention_mask = jnp.ones_like(input_ids)
-        position_ids = jnp.broadcast_to(jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape)
+        position_ids = jnp.broadcast_to(jnp.arange(
+            jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape)
 
         init_variables = self.module.init(
             jax.random.PRNGKey(0), input_ids, attention_mask, position_ids, return_dict=False, init_cache=True
@@ -1031,9 +1065,11 @@ class MixtralPreTrainedModel(FlaxPreTrainedModel):
 
         if position_ids is None:
             if past_key_values is not None:
-                raise ValueError("Make sure to provide `position_ids` when passing `past_key_values`.")
+                raise ValueError(
+                    "Make sure to provide `position_ids` when passing `past_key_values`.")
 
-            position_ids = jnp.broadcast_to(jnp.arange(sequence_length)[None, :], (batch_size, sequence_length))
+            position_ids = jnp.broadcast_to(jnp.arange(sequence_length)[
+                                            None, :], (batch_size, sequence_length))
 
         if attention_mask is None:
             attention_mask = jnp.ones((batch_size, sequence_length))
@@ -1042,7 +1078,8 @@ class MixtralPreTrainedModel(FlaxPreTrainedModel):
         if dropout_rng is not None:
             rng_s["dropout"] = dropout_rng
 
-        inputs = {"params": params or self.params} if add_params_field else params or self.params
+        inputs = {
+            "params": params or self.params} if add_params_field else params or self.params
 
         if self.config.bits is not None:
             rng_s['params'] = jax.random.key(0)
@@ -1055,12 +1092,16 @@ class MixtralPreTrainedModel(FlaxPreTrainedModel):
         outputs = self.module.apply(
             inputs,
             jnp.array(input_ids, dtype="i4"),  # input_ids: chex.Array
-            jnp.array(attention_mask, dtype="i4"),  # attention_mask: Optional[chex.Array] = None
-            jnp.array(position_ids, dtype="i4"),  # position_ids: Optional[chex.Array] = None
+            # attention_mask: Optional[chex.Array] = None
+            jnp.array(attention_mask, dtype="i4"),
+            # position_ids: Optional[chex.Array] = None
+            jnp.array(position_ids, dtype="i4"),
             None,  # inputs_embeds: Optional[chex.Array] = None
             output_attentions,  # output_attentions: Optional[bool] = None
-            output_hidden_states,  # output_hidden_states: Optional[bool] = None
-            output_router_logits,  # output_router_logits: Optional[bool] = None
+            # output_hidden_states: Optional[bool] = None
+            output_hidden_states,
+            # output_router_logits: Optional[bool] = None
+            output_router_logits,
             False,  # init_cache: bool = False
             not train,  # deterministic: bool = True
             return_dict,  # return_dict: bool = True
@@ -1074,7 +1115,8 @@ class MixtralPreTrainedModel(FlaxPreTrainedModel):
             return outputs
         elif past_key_values is not None and not return_dict:
             outputs, past_key_values = outputs
-            outputs = outputs[:1] + (unfreeze(past_key_values["cache"]),) + outputs[1:]
+            outputs = outputs[:1] + \
+                (unfreeze(past_key_values["cache"]),) + outputs[1:]
 
         return outputs
 
@@ -1107,11 +1149,24 @@ class FlaxMixtralModule(nn.Module):
             param_dtype=self.param_dtype
         )
 
-        self.freq_cis = precompute_freq_cis(
-            max_position_embedding=self.config.freq_max_position_embeddings if self.config.freq_max_position_embeddings is not None else self.config.max_position_embeddings,
-            head_dim=self.config.hidden_size // self.config.num_attention_heads
+        initial_rope_kwargs = dict(
+            rope_type="none"
         )
-        self.causal_mask = nn.make_causal_mask(jnp.ones((1, self.config.c_max_position_embeddings), dtype='i4'))
+        if self.config.rope_scaling is not None:
+            scaling_type = self.config.rope_scaling["type"]
+            scaling_factor = self.config.rope_scaling["factor"]
+            initial_rope_kwargs = dict(
+                scaling_factor=scaling_factor,
+                rope_type=scaling_type
+            )
+        self.freq_cis = precompute_freq_cis(
+            max_position_embedding=self.config.max_position_embeddings,
+            dim=self.config.hidden_size // self.config.num_attention_heads,
+            base=self.config.rope_theta,
+            **initial_rope_kwargs
+        )
+        self.causal_mask = nn.make_causal_mask(
+            jnp.ones((1, self.config.c_max_position_embeddings), dtype='i4'))
 
     def __call__(
             self,
@@ -1127,12 +1182,14 @@ class FlaxMixtralModule(nn.Module):
             return_dict: bool = True,
     ) -> MoeModelOutput | Tuple:
         if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time")
+            raise ValueError(
+                "You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time")
 
         if inputs_embeds is None and input_ids is not None:
             inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
         else:
-            raise ValueError("you should specify inputs_embeds or input_ids one of them")
+            raise ValueError(
+                "you should specify inputs_embeds or input_ids one of them")
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_router_logits = (
             output_router_logits if output_router_logits is not None else self.config.output_router_logits
@@ -1277,12 +1334,15 @@ class FlaxMixtralForCausalLM(MixtralPreTrainedModel):
         batch_size, seq_length = input_ids.shape
 
         past_key_values = self.init_cache(batch_size, max_length)
-        extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
+        extended_attention_mask = jnp.ones(
+            (batch_size, max_length), dtype="i4")
         if attention_mask is not None:
             position_ids = attention_mask.cumsum(axis=-1) - 1
-            extended_attention_mask = lax.dynamic_update_slice(extended_attention_mask, attention_mask, (0, 0))
+            extended_attention_mask = lax.dynamic_update_slice(
+                extended_attention_mask, attention_mask, (0, 0))
         else:
-            position_ids = jnp.broadcast_to(jnp.arange(seq_length, dtype="i4")[None, :], (batch_size, seq_length))
+            position_ids = jnp.broadcast_to(jnp.arange(seq_length, dtype="i4")[
+                                            None, :], (batch_size, seq_length))
 
         return {
             "past_key_values": past_key_values,

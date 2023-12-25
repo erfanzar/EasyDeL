@@ -106,7 +106,7 @@ class MistralConfig(JaxBaseClassModel):
         :param **kwargs: Pass a variable number of keyword arguments to a function
         :param : Define the number of layers in the model
         :return: An instance of the class
-        
+
         """
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
@@ -156,7 +156,7 @@ class MistralConfig(JaxBaseClassModel):
 
         :param fully_fsdp: bool: Determine whether to use the fully_fsdp partitioning scheme or not
         :return: A list of tuples
-        
+
         """
         return (
 
@@ -283,7 +283,8 @@ def _make_sliding_window_causal_mask(
     mask = jnp.log(mask).astype(dtype)
 
     if past_key_values_length > 0:
-        mask = jnp.concatenate([jnp.zeros((tgt_len, past_key_values_length), dtype=dtype), mask], axis=-1)
+        mask = jnp.concatenate(
+            [jnp.zeros((tgt_len, past_key_values_length), dtype=dtype), mask], axis=-1)
     return mask[None, None, :, :].repeat(bsz, 0)
 
 
@@ -330,7 +331,8 @@ class FlaxMistralMLP(nn.Module):
     config: MistralConfig
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[None, jax.lax.Precision]] = jax.lax.Precision('fastest')
+    precision: Optional[Union[None, jax.lax.Precision]
+                        ] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         dense = functools.partial(
@@ -355,7 +357,8 @@ class FlaxMistralAttention(nn.Module):
     config: MistralConfig
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[None, jax.lax.Precision]] = jax.lax.Precision('fastest')
+    precision: Optional[Union[None, jax.lax.Precision]
+                        ] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         config = self.config
@@ -385,14 +388,18 @@ class FlaxMistralAttention(nn.Module):
     @nn.compact
     def concatenate_to_cache_(self, query: chex.Array, key: chex.Array, value: chex.Array, attention_mask: chex.Array):
         is_cache_available = self.has_variable('cache', 'key')
-        key_cache = self.variable('cache', 'key', jnp.zeros, key.shape, key.dtype)
-        value_cache = self.variable('cache', 'value', jnp.zeros, key.shape, value.dtype)
-        index_cache = self.variable('cache', 'index', lambda: jnp.array(0, dtype=jnp.int32))
+        key_cache = self.variable(
+            'cache', 'key', jnp.zeros, key.shape, key.dtype)
+        value_cache = self.variable(
+            'cache', 'value', jnp.zeros, key.shape, value.dtype)
+        index_cache = self.variable(
+            'cache', 'index', lambda: jnp.array(0, dtype=jnp.int32))
         if is_cache_available:
             *bd, ml, nh, dph = key_cache.value.shape
             indices = (0,) * len(bd) + (index_cache.value, 0, 0)
             key = jax.lax.dynamic_update_slice(key_cache.value, key, indices)
-            value = jax.lax.dynamic_update_slice(value_cache.value, value, indices)
+            value = jax.lax.dynamic_update_slice(
+                value_cache.value, value, indices)
             key_cache.value = key
             value_cache.value = value
             num_updated_cache_vector = query.shape[1]
@@ -409,12 +416,16 @@ class FlaxMistralAttention(nn.Module):
         return jnp.transpose(query, (0, 2, 1, 3)), jnp.transpose(key, (0, 2, 1, 3)), jnp.transpose(value, (0, 2, 1, 3))
 
     def t_rotary(self, batch_size, sequence_length, query, key, value, freq_cis, position_ids):
-        query = query.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
-        key = key.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
-        value = value.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
+        query = query.reshape(batch_size, sequence_length,
+                              self.config.num_attention_heads, self.head_dim)
+        key = key.reshape(batch_size, sequence_length,
+                          self.config.num_key_value_heads, self.head_dim)
+        value = value.reshape(batch_size, sequence_length,
+                              self.config.num_key_value_heads, self.head_dim)
 
         query, key, value = self._t(query, key, value)
-        query, key = self.rotary(position_ids=position_ids, query=query, key=key, freq_cis=freq_cis)
+        query, key = self.rotary(
+            position_ids=position_ids, query=query, key=key, freq_cis=freq_cis)
         key = repeat_kv_bnsh(key, self.num_key_value_groups)
         value = repeat_kv_bnsh(value, self.num_key_value_groups)
         return self._t(query, key, value)
@@ -446,10 +457,11 @@ class FlaxMistralAttention(nn.Module):
         :param init_cache: bool: Initialize the cache
         :param output_attentions: bool: Determine whether to return the attention weights
         :return: A tuple of (out, attn_output)
-        
+
         """
         batch_size, sequence_length = hidden_state.shape[:2]
-        query, key, value = self.q_proj(hidden_state), self.k_proj(hidden_state), self.v_proj(hidden_state)
+        query, key, value = self.q_proj(hidden_state), self.k_proj(
+            hidden_state), self.v_proj(hidden_state)
 
         if self.config.use_pjit_attention_force:
             query = with_sharding_constraint(query, PS("fsdp", "sp", None))
@@ -465,7 +477,8 @@ class FlaxMistralAttention(nn.Module):
             position_ids=position_ids
         )
         if self.has_variable('cache', 'key') or init_cache:
-            query, key, value, attention_mask = self.concatenate_to_cache_(query, key, value, attention_mask)
+            query, key, value, attention_mask = self.concatenate_to_cache_(
+                query, key, value, attention_mask)
 
         q_l, k_l = query.shape[1], key.shape[1]
         if self.has_variable('cache', 'key'):
@@ -479,9 +492,11 @@ class FlaxMistralAttention(nn.Module):
         dropout_rng = None
         if not deterministic and self.config.attn_pdrop > 0.0:
             dropout_rng = self.make_rng("dropout")
-        causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
+        causal_mask = jnp.broadcast_to(
+            causal_mask, (batch_size,) + causal_mask.shape[1:])
         if attention_mask.ndim == 2:
-            attention_mask = jnp.broadcast_to(jnp.expand_dims(attention_mask, axis=(-3, -2)), causal_mask.shape)
+            attention_mask = jnp.broadcast_to(jnp.expand_dims(
+                attention_mask, axis=(-3, -2)), causal_mask.shape)
 
         attention_mask = nn.combine_masks(attention_mask, causal_mask)
 
@@ -491,11 +506,13 @@ class FlaxMistralAttention(nn.Module):
                 attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
 
             if attention_mask.shape[1] != self.config.num_attention_heads:
-                attention_mask = attention_mask.repeat(self.config.num_attention_heads, 1, )
+                attention_mask = attention_mask.repeat(
+                    self.config.num_attention_heads, 1, )
             attention_bias = lax.select(
                 attention_mask > 0,
                 jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-                jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
+                jnp.full(attention_mask.shape, jnp.finfo(
+                    self.dtype).min).astype(self.dtype),
             )
             attn_weights = None
             rtp_axis = (0, 2, 1, 3)
@@ -530,7 +547,8 @@ class FlaxMistralAttention(nn.Module):
             attention_bias = lax.select(
                 attention_mask > 0,
                 jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-                jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
+                jnp.full(attention_mask.shape, jnp.finfo(
+                    self.dtype).min).astype(self.dtype),
             )
             if self.config.use_shard_map:
                 attn_weights = shard_map(
@@ -564,11 +582,14 @@ class FlaxMistralAttention(nn.Module):
                 )
 
             if self.config.use_pjit_attention_force:
-                attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "sp", "tp", None))
+                attn_weights = with_sharding_constraint(
+                    attn_weights, PS(("dp", "fsdp"), "sp", "tp", None))
 
-            attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value)
+            attn_output = jnp.einsum(
+                "...hqk,...khd->...qhd", attn_weights, value)
 
-        out = self.o_proj(attn_output.reshape(batch_size, sequence_length, self.hidden_size))
+        out = self.o_proj(attn_output.reshape(
+            batch_size, sequence_length, self.hidden_size))
         outputs = (out, attn_weights) if output_attentions else (out,)
         return outputs
 
@@ -577,7 +598,8 @@ class FlaxMistralDecoderLayer(nn.Module):
     config: MistralConfig
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[None, jax.lax.Precision]] = jax.lax.Precision('fastest')
+    precision: Optional[Union[None, jax.lax.Precision]
+                        ] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         self.self_attn = FlaxMistralAttention(
@@ -632,7 +654,7 @@ class FlaxMistralDecoderLayer(nn.Module):
         :param init_cache: bool: Initialize the cache for the self-attention layer
         :param output_attentions: bool: Determine whether to return the attention weights or not
         :return: A tuple of hidden_state and attention_output
-        
+
         """
         residual = hidden_state
         attention_output = self.self_attn(
@@ -648,7 +670,8 @@ class FlaxMistralDecoderLayer(nn.Module):
 
         hidden_state = attention_output[0] + residual
 
-        hidden_state = self.mlp(self.post_attention_layernorm(hidden_state)) + hidden_state
+        hidden_state = self.mlp(
+            self.post_attention_layernorm(hidden_state)) + hidden_state
         outputs = (hidden_state,)
         if output_attentions:
             outputs += attention_output[1]
@@ -669,7 +692,8 @@ class FlaxMistralPretrainedModel(FlaxPreTrainedModel):
                  **kwargs
                  ):
         module = self.module_class(config=config, dtype=dtype, **kwargs)
-        super().__init__(config, module, input_shape=input_shape, seed=seed, dtype=dtype, _do_init=_do_init)
+        super().__init__(config, module, input_shape=input_shape,
+                         seed=seed, dtype=dtype, _do_init=_do_init)
 
     def init_weights(
             self,
@@ -677,7 +701,6 @@ class FlaxMistralPretrainedModel(FlaxPreTrainedModel):
             input_shape: Tuple,
             params: flax.core.FrozenDict = None
     ) -> flax.core.FrozenDict:
-
         """
         The init_weights function is used to initialize the weights of a model.
         It takes in an rng, which is a random number generator key that can be used to generate random numbers.
@@ -689,16 +712,18 @@ class FlaxMistralPretrainedModel(FlaxPreTrainedModel):
         :param input_shape: Tuple: Initialize the input_ids, attention_mask and position_ids
         :param params: flax.core.FrozenDict: Pass in the parameters of a pre-trained model
         :return: A frozendict of parameters
-        
+
         """
         input_ids = jnp.zeros(input_shape, dtype="i4")
         attention_mask = jnp.ones_like(input_ids)
-        position_ids = jnp.broadcast_to(jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_shape)
+        position_ids = jnp.broadcast_to(jnp.arange(
+            jnp.atleast_2d(input_ids).shape[-1]), input_shape)
         params_rng, dropout_rng = jax.random.split(rng)
         rng_s = {"params": params_rng, "dropout": dropout_rng}
 
         if self.config.add_cross_attention:
-            encoder_hidden_states = jnp.zeros(input_shape + (self.config.hidden_size,))
+            encoder_hidden_states = jnp.zeros(
+                input_shape + (self.config.hidden_size,))
             encoder_attention_mask = attention_mask
             module_init_outputs = self.module.init(
                 rng_s,
@@ -710,7 +735,8 @@ class FlaxMistralPretrainedModel(FlaxPreTrainedModel):
                 return_dict=False,
             )
         else:
-            module_init_outputs = self.module.init(rng_s, input_ids, attention_mask, position_ids, return_dict=False)
+            module_init_outputs = self.module.init(
+                rng_s, input_ids, attention_mask, position_ids, return_dict=False)
 
         random_params = module_init_outputs["params"]
 
@@ -728,7 +754,8 @@ class FlaxMistralPretrainedModel(FlaxPreTrainedModel):
 
         input_ids = jnp.ones((batch_size, max_length))
         attention_mask = jnp.ones_like(input_ids)
-        position_ids = jnp.broadcast_to(jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape)
+        position_ids = jnp.broadcast_to(jnp.arange(
+            jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape)
 
         init_variables = self.module.init(
             jax.random.PRNGKey(0), input_ids, attention_mask, position_ids, return_dict=False, init_cache=True
@@ -770,7 +797,7 @@ class FlaxMistralPretrainedModel(FlaxPreTrainedModel):
         :param return_dict: Optional[bool]: Return a dictionary of the outputs
         :param add_params_field: bool: Add a params field to the inputs dictionary
         :return: A tuple of (last_hidden_state, past_key_values)
-        
+
         """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -782,9 +809,11 @@ class FlaxMistralPretrainedModel(FlaxPreTrainedModel):
 
         if position_ids is None:
             if past_key_values is not None:
-                raise ValueError("Make sure to provide `position_ids` when passing `past_key_values`.")
+                raise ValueError(
+                    "Make sure to provide `position_ids` when passing `past_key_values`.")
 
-            position_ids = jnp.broadcast_to(jnp.arange(sequence_length)[None, :], (batch_size, sequence_length))
+            position_ids = jnp.broadcast_to(jnp.arange(sequence_length)[
+                                            None, :], (batch_size, sequence_length))
 
         if attention_mask is None:
             attention_mask = jnp.ones((batch_size, sequence_length))
@@ -793,7 +822,8 @@ class FlaxMistralPretrainedModel(FlaxPreTrainedModel):
         if dropout_rng is not None:
             rng_s["dropout"] = dropout_rng
 
-        inputs = {"params": params or self.params} if add_params_field else params or self.params
+        inputs = {
+            "params": params or self.params} if add_params_field else params or self.params
 
         if self.config.bits is not None:
             rng_s['params'] = jax.random.key(0)
@@ -824,7 +854,8 @@ class FlaxMistralPretrainedModel(FlaxPreTrainedModel):
             return outputs
         elif past_key_values is not None and not return_dict:
             outputs, past_key_values = outputs
-            outputs = outputs[:1] + (unfreeze(past_key_values["cache"]),) + outputs[1:]
+            outputs = outputs[:1] + \
+                (unfreeze(past_key_values["cache"]),) + outputs[1:]
 
         return outputs
 
@@ -833,7 +864,8 @@ class FlaxMistralDecoratorCollection(nn.Module):
     config: MistralConfig
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[None, jax.lax.Precision]] = jax.lax.Precision('fastest')
+    precision: Optional[Union[None, jax.lax.Precision]
+                        ] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         block = FlaxMistralDecoderLayer
@@ -901,7 +933,8 @@ class FlaxMistralModule(nn.Module):
         self.embed_tokens = nn.Embed(
             self.config.vocab_size,
             self.config.hidden_size,
-            embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+            embedding_init=jax.nn.initializers.normal(
+                stddev=self.config.initializer_range),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
         )
@@ -919,11 +952,24 @@ class FlaxMistralModule(nn.Module):
             param_dtype=self.param_dtype
         )
 
-        self.freq_cis = precompute_freq_cis(
-            max_position_embedding=self.config.freq_max_position_embeddings if self.config.freq_max_position_embeddings is not None else self.config.max_position_embeddings,
-            head_dim=self.config.hidden_size // self.config.num_attention_heads
+        initial_rope_kwargs = dict(
+            rope_type="none"
         )
-        self.causal_mask = nn.make_causal_mask(jnp.ones((1, self.config.c_max_position_embeddings), dtype='i4'))
+        if self.config.rope_scaling is not None:
+            scaling_type = self.config.rope_scaling["type"]
+            scaling_factor = self.config.rope_scaling["factor"]
+            initial_rope_kwargs = dict(
+                scaling_factor=scaling_factor,
+                rope_type=scaling_type
+            )
+        self.freq_cis = precompute_freq_cis(
+            max_position_embedding=self.config.max_position_embeddings,
+            dim=self.config.hidden_size // self.config.num_attention_heads,
+            base=self.config.rope_theta,
+            **initial_rope_kwargs
+        )
+        self.causal_mask = nn.make_causal_mask(
+            jnp.ones((1, self.config.c_max_position_embeddings), dtype='i4'))
 
     def __call__(
             self,
@@ -956,7 +1002,7 @@ class FlaxMistralModule(nn.Module):
         :param return_dict: bool: Return a dictionary of the outputs or not
         :param : Determine whether the model is in training mode or not
         :return: A tuple of the hidden states, all hidden states, and attentions
-        
+
         """
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
@@ -1017,7 +1063,8 @@ class FlaxMistralForCausalLMModule(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+            kernel_init=jax.nn.initializers.normal(
+                stddev=self.config.initializer_range),
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
@@ -1053,11 +1100,12 @@ class FlaxMistralForCausalLMModule(nn.Module):
             :param return_dict: bool: Return a dictionary of the outputs or just the logits
             :param : Determine whether to return the logits or not
             :return: A tuple of (lm_logits, hidden_states, attentions)
-            
+
         """
         batch_size, seq_length = input_ids.shape
 
-        if attention_mask is None: attention_mask = jnp.ones_like(input_ids)
+        if attention_mask is None:
+            attention_mask = jnp.ones_like(input_ids)
         if position_ids is None:
             position_ids = jnp.broadcast_to(
                 jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
@@ -1079,7 +1127,8 @@ class FlaxMistralForCausalLMModule(nn.Module):
 
         if self.config.tie_word_embeddings:
             shared_kernel = self.transformer.variables["params"]["wte"]["embedding"].T
-            lm_logits = self.lm_head.apply({"params": {"kernel": shared_kernel}}, hidden_states)
+            lm_logits = self.lm_head.apply(
+                {"params": {"kernel": shared_kernel}}, hidden_states)
         else:
             lm_logits = self.lm_head(hidden_states)
 
@@ -1098,12 +1147,15 @@ class FlaxMistralForCausalLM(FlaxMistralPretrainedModel):
         batch_size, seq_length = input_ids.shape
 
         past_key_values = self.init_cache(batch_size, max_length)
-        extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
+        extended_attention_mask = jnp.ones(
+            (batch_size, max_length), dtype="i4")
         if attention_mask is not None:
             position_ids = attention_mask.cumsum(axis=-1) - 1
-            extended_attention_mask = jax.lax.dynamic_update_slice(extended_attention_mask, attention_mask, (0, 0))
+            extended_attention_mask = jax.lax.dynamic_update_slice(
+                extended_attention_mask, attention_mask, (0, 0))
         else:
-            position_ids = jnp.broadcast_to(jnp.arange(seq_length, dtype="i4")[None, :], (batch_size, seq_length))
+            position_ids = jnp.broadcast_to(jnp.arange(seq_length, dtype="i4")[
+                                            None, :], (batch_size, seq_length))
 
         return {
             "past_key_values": past_key_values,

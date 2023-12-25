@@ -68,7 +68,7 @@ def get_names_from_partition_spec(partition_specs):
 
     :param partition_specs: Define the partitioning of a table
     :return: A list of the names of all partitions
-    
+
     """
     names = set()
     if isinstance(partition_specs, dict):
@@ -101,7 +101,7 @@ def names_in_mesh(*names):
 
     :param *names: Collect all the names passed to the function into a tuple
     :return: A boolean indicating whether all the given
-    
+
     """
     return set(names) <= set(pxla.thread_resources.env.physical_mesh.axis_names)
 
@@ -116,7 +116,7 @@ def with_sharding_constraint(x, partition_specs):
     :param x: Define the tensor that will be sharded
     :param partition_specs: Specify the partitioning of the data
     :return: The same tensor with the
-    
+
     """
     axis_names = get_names_from_partition_spec(partition_specs)
     if names_in_mesh(*axis_names):
@@ -131,7 +131,7 @@ def get_gradient_checkpoint_policy(name):
 
     :param name: Select the checkpoint policy from the dictionary
     :return: A function that is used in the jax
-    
+
     """
     gradients = dict(
         everything_saveable=jax.checkpoint_policies.everything_saveable,
@@ -159,7 +159,7 @@ def repeat_kv_bnsh(x: chex.Array, n_rep: int) -> chex.Array:
     :param x: chex.Array: Pass in the input to the function
     :param n_rep: int: Repeat the key and value heads
     :return: A new array with the same shape as x, except for the second dimension which is n_kv_heads * n_rep
-    
+
     """
     bs, n_kv_heads, s, head_dim = x.shape
     if n_rep == 1:
@@ -177,7 +177,7 @@ def repeat_kv_bsnh(x: chex.Array, n_rep: int) -> chex.Array:
     :param x: chex.Array: Specify the input array
     :param n_rep: int: Repeat the key-value attention heads n_rep times
     :return: A new array with the same batch size, sequence length, and head dimension as the input array
-    
+
     """
     bs, s, n_kv_heads, head_dim = x.shape
     x = x.transpose(0, 2, 1, 3)
@@ -191,17 +191,30 @@ def repeat_kv_bsnh(x: chex.Array, n_rep: int) -> chex.Array:
     return x.reshape(bs, s, n_kv_heads * n_rep, head_dim)
 
 
-def precompute_freq_cis(max_position_embedding, head_dim):
-    """
-    The precompute_freq_cis function is used to precompute the sinusoidal embeddings for positional encoding.
+def precompute_freq_cis(
+    dim, max_position_embeddings=2048, base=10000, scaling_factor=1.0, rope_type: str | None = None
+):
 
-    :param max_position_embedding: Define the maximum length of the sequence
-    :param head_dim: Determine the number of heads in the attention layer
-    :return: Two arrays:
-    
-    """
-    inv_freq = 1.0 / (10000 ** (jax.numpy.arange(0, head_dim, 2, dtype=jax.numpy.float32) / head_dim))
-    freq = jax.numpy.einsum("i , j -> i j", jax.numpy.arange(max_position_embedding), inv_freq).astype("float32")
+    if rope_type == "none":
+        rope_type = None
+    assert rope_type in ["linear", "dynamic",
+                         None], "wrong rope type has been given"
+    t = jax.numpy.arange(max_position_embeddings)
+
+    if rope_type == "linear":
+        t = t / scaling_factor
+
+    if rope_type == "dynamic":
+        base = base * (
+            scaling_factor - (scaling_factor - 1)
+        ) ** (dim / (dim - 2))
+
+    inv_freq = 1.0 / (
+        base ** (jax.numpy.arange(0, dim, 2, dtype=jax.numpy.float32) / dim)
+    )
+    freq = jax.numpy.einsum(
+        "i , j -> i j", t, inv_freq
+    ).astype("float32")
 
     embed = jax.numpy.concatenate((freq, freq), axis=-1)
     return jax.numpy.sin(embed)[:, :], jax.numpy.cos(embed)[:, :]
@@ -216,7 +229,7 @@ def rotate_half(x):
 
     :param x: Specify the input array
     :return: A new array that is the same as the input
-    
+
     """
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2:]
@@ -232,7 +245,7 @@ def apply_rotary_pos_emb(tensor, sin_, cos_):
     :param sin_: Rotate the tensor by pi/2
     :param cos_: Apply the cosine function to the tensor
     :return: A tensor with the same shape as the input tensor
-    
+
     """
     b, h, s, d = tensor.shape
     return (tensor * cos_[:, :, :s, :]) + (rotate_half(tensor) * sin_[:, :, :s, :])
@@ -248,7 +261,7 @@ def get_ranks_and_size(mesh):
 
     :param mesh: Get the shape of the mesh
     :return: A dictionary with the following keys:
-    
+
     """
     out = dict(mesh=mesh)
     total_process_size = mesh.shape["tp"] * mesh.shape["sp"]
@@ -394,15 +407,20 @@ def smart_flash_attention(
     batch_size = q.shape[0]
     assert batch_size == k.shape[0] == v.shape[0], 'Batch Size for q,k,v wont match'
 
-    assert q.shape == (batch_size, num_attention_heads, q_seq_len, head_dims), assertion_mkv_err
-    assert k.shape == (batch_size, num_attention_heads, kv_seq_len, head_dims), assertion_mkv_err
-    assert v.shape == (batch_size, num_attention_heads, kv_seq_len, head_dims), assertion_mkv_err
-    assert bias.shape == (batch_size, num_attention_heads, q_seq_len, kv_seq_len), assertion_mkv_err
+    assert q.shape == (batch_size, num_attention_heads,
+                       q_seq_len, head_dims), assertion_mkv_err
+    assert k.shape == (batch_size, num_attention_heads,
+                       kv_seq_len, head_dims), assertion_mkv_err
+    assert v.shape == (batch_size, num_attention_heads,
+                       kv_seq_len, head_dims), assertion_mkv_err
+    assert bias.shape == (batch_size, num_attention_heads,
+                          q_seq_len, kv_seq_len), assertion_mkv_err
 
     flash_attn_fn, f32_upcast, do_shard_map = get_flash_attention()
 
     if do_shard_map:
-        q, k, v = map(lambda x: jax.numpy.transpose(x, (0, 2, 1, 3)), [q, k, v])
+        q, k, v = map(lambda x: jax.numpy.transpose(
+            x, (0, 2, 1, 3)), [q, k, v])
         assert mesh is not None, 'For Using Shard Map on GPUs you have to pass Mesh'
         ring_attention_sharded = shard_map(
             partial(
@@ -468,9 +486,10 @@ def create_mesh(
     :param axis_names: Sequence[str]: Name the axes of the mesh
     :param backend: Specify the backend to use
     :return: A mesh object
-    
+
     """
-    array_devices = jax.numpy.ones((len(jax.devices() if backend == "" else jax.devices(backend)), 1))
+    array_devices = jax.numpy.ones(
+        (len(jax.devices() if backend == "" else jax.devices(backend)), 1))
     resh = array_devices.reshape(axis_dims).shape
 
     return jax.sharding.Mesh(
@@ -498,11 +517,16 @@ class JaxBaseClassModel(transformers.PretrainedConfig):
             self,
             axis_dims: Sequence[int] = (1, -1, 1, 1),
             axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, None, None),
-            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
+                ("dp", "fsdp"), "sp", "tp", None),
+            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
+                ("dp", "fsdp"), "sp", "tp", None),
+            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
+                ("dp", "fsdp"), "sp", "tp", None),
+            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
+                ("dp", "fsdp"), None, None, None),
+            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
+                ("dp", "fsdp"), "sp", "tp", None),
             use_shard_map: bool = False,
             backend: Optional[None] = None,
             easy_method: EasyMethod = EasyMethod.TRAIN,
@@ -533,7 +557,8 @@ class JaxBaseClassModel(transformers.PretrainedConfig):
         return create_mesh(
             axis_dims=self.axis_dims,
             axis_names=self.axis_names,
-            backend=(self.backend if self.backend is not None else "") if hasattr(self, 'backend') else ""
+            backend=(self.backend if self.backend is not None else "") if hasattr(
+                self, 'backend') else ""
         )
 
     def get_axis_dims(self) -> Sequence[int]:
@@ -582,11 +607,16 @@ class JaxBaseClassModel(transformers.PretrainedConfig):
             self,
             axis_dims: Sequence[int] = (1, -1, 1, 1),
             axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, None, None),
-            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
+                ("dp", "fsdp"), "sp", "tp", None),
+            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
+                ("dp", "fsdp"), "sp", "tp", None),
+            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
+                ("dp", "fsdp"), "sp", "tp", None),
+            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
+                ("dp", "fsdp"), None, None, None),
+            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
+                ("dp", "fsdp"), "sp", "tp", None),
             use_shard_map: bool = False,
             backend: Optional[str] = None,
     ):
@@ -620,14 +650,15 @@ def add_start_docstrings(*docstr):
     The add_start_docstrings function takes in an arbitrary number of strings and returns a decorator.
     The returned decorator takes in one argument, fn, which is assumed to be a function. The docstring for fn is set equal to
     the concatenation of all the strings passed into add_start_docstrings plus (if it exists) the original docstring for fn.
-    
+
     :param *docstr: Pass in a variable number of arguments to the function
     :return: A decorator that adds the docstrings to the function
-    
+
     """
 
     def docstring_decorator(fn):
-        fn.__doc__ = "".join(docstr) + (fn.__doc__ if fn.__doc__ is not None else "")
+        fn.__doc__ = "".join(docstr) + \
+            (fn.__doc__ if fn.__doc__ is not None else "")
         return fn
 
     return docstring_decorator
