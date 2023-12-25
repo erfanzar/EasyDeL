@@ -55,7 +55,7 @@
     &quot;vue.rearranger.settings.migration&quot;: &quot;true&quot;
   }
 }</component>
-  <component name="RunManager" selected="Python.mixtral_flax">
+  <component name="RunManager" selected="Python.env">
     <configuration name="env" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
       <module name="EasyDeL" />
       <option name="INTERPRETER_OPTIONS" value="" />
@@ -146,9 +146,9 @@
     </configuration>
     <recent_temporary>
       <list>
+        <item itemvalue="Python.env" />
         <item itemvalue="Python.mixtral_flax" />
         <item itemvalue="Python.llama_flax" />
-        <item itemvalue="Python.env" />
         <item itemvalue="Python.llama_compration" />
         <item itemvalue="Python.env" />
       </list>

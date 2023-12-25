@@ -963,7 +963,7 @@ class FlaxMistralModule(nn.Module):
                 rope_type=scaling_type
             )
         self.freq_cis = precompute_freq_cis(
-            max_position_embedding=self.config.max_position_embeddings,
+            max_position_embeddings=self.config.max_position_embeddings,
             dim=self.config.hidden_size // self.config.num_attention_heads,
             base=self.config.rope_theta,
             **initial_rope_kwargs
