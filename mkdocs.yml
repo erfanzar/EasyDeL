@@ -1,6 +1,25 @@
-site_name: EasyDel
+site_name: "EasyDel"
 
 copyright: "Erfan Zare Chavoshi-EasyDel"
+
+site_author: "Erfan Zare Chavoshi"
+repo_url: "https://github.com/erfanzar/EasyDel"
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            docstring_style: sphinx
+
+theme:
+  name: material
+  highlightjs: true
+  hljs_languages:
+    - yaml
+    - python
+
 nav:
   - Home: index.md
   - Install: Install.md
@@ -76,20 +95,4 @@ nav:
       - Mistral Models: Mistral.md
       - MosaicMPT Models: MosaicMPT.md
 
-site_author: "Erfan Zare Chavoshi"
-repo_url: "https://github.com/erfanzar/EasyDel"
 
-plugins:
-  - search
-  - mkdocstrings:
-      handlers:
-        python:
-          options:
-            docstring_style: sphinx
-
-theme:
-  name: material
-  highlightjs: true
-  hljs_languages:
-    - yaml
-    - python
