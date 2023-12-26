@@ -6,5 +6,5 @@ class EasyDeSyntaxRuntimeError(Exception):
     ...
 
 
-class EasyDelTimer(Exception):
+class EasyDelTimerError(Exception):
     ...

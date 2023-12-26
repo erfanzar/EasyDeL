@@ -142,5 +142,10 @@ from .transform.mistral import (
 from .transform.easydel_transform import (
     huggingface_to_easydel as huggingface_to_easydel
 )
+from .etils import (
+    EasyDelOptimizers,
+    EasyDelSchedulers,
+    EasyDelGradientCheckPointers
+)
 
 __version__ = "0.0.41"

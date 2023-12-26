@@ -23,7 +23,7 @@ from flax.training import train_state
 from jax import numpy as jnp
 from torch.utils.data import DataLoader
 from fjformer import match_partition_rules, make_shard_and_gather_fns, StreamingCheckpointer
-from ..etils.errors import EasyDelTimer
+from ..etils.errors import EasyDelTimerError
 import chex
 
 
@@ -609,7 +609,7 @@ class CausalLanguageModelTrainer:
                                              )
                             if self.arguments.training_time is not None:
                                 if time.time() - start_time > self.arguments.training_time:
-                                    raise EasyDelTimer("Time Out")
+                                    raise EasyDelTimerError("Time Out")
                         else:
                             break
                         if self.arguments.save_steps is not None and i % self.arguments.save_steps == 0:
@@ -621,7 +621,7 @@ class CausalLanguageModelTrainer:
             except KeyboardInterrupt:
                 print(
                     "\033[1;30m KeyboardInterrupt At training model Will return current state of the model * \033[1;0m")
-            except EasyDelTimer:
+            except EasyDelTimerError:
                 print(
                     "\033[1;30m Training reached out maximum training Time Killing training Process "
                     "and Will return current state of the model * \033[1;0m"
