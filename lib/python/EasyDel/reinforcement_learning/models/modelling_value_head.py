@@ -19,7 +19,7 @@ class ValueHead(nn.Module):
     summary_dropout_prob: float = 0.0
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: typing.Optional[jax.lax.Precision] = jax.lax.Precision('fastest')
+    precision: typing.Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
 
     def setup(self):
         """

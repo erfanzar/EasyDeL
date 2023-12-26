@@ -391,7 +391,7 @@ class FlaxMptPretrainedModel(FlaxPreTrainedModel):
                  dtype: jnp.dtype = jnp.float32,
                  param_dtype: jnp.dtype = jnp.float32,
                  _do_init: bool = False,
-                 precision: Optional[Union[jax.lax.Precision, None]] = jax.lax.Precision('fastest'),
+                 precision: Optional[Union[jax.lax.Precision, None]] = jax.lax.Precision("fastest"),
                  input_shape: Tuple = (1, 16),
                  **kwargs
                  ):

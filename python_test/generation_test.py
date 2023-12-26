@@ -1,17 +1,11 @@
 import EasyDel as ed
 from transformers import AutoTokenizer
-from fjformer.load import get_float_dtype_by_name
 from jax.experimental.pjit import pjit
-import threading
-import typing
-from datasets import load_dataset
 import jax
-import IPython
 import jax.numpy as jnp
 import fjformer
 from transformers import GenerationConfig
 from jax.sharding import PartitionSpec as Ps
-import subprocess
 import functools
 
 JAXServer, JAXServerConfig, AutoEasyDelModelForCausalLM = (
@@ -57,7 +51,7 @@ def main():
         pretrained_model_name_or_path,
         dtype=jax.numpy.bfloat16,
         param_dtype=jax.numpy.bfloat16,
-        precision=jax.lax.Precision('fastest'),
+        precision=jax.lax.Precision("fastest"),
         device=jax.devices('cpu')[0]
     )
     tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path)

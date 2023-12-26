@@ -146,7 +146,7 @@ model, params = AutoEasyDelModelForCausalLM.from_pretrained(
     model_id,
     dtype=jax.numpy.bfloat16,
     param_dtype=jax.numpy.bfloat16,
-    precision=jax.lax.Precision('fastest'),
+    precision=jax.lax.Precision("fastest"),
     device=jax.devices('cpu')[0],  # Load JAX Model and initialize or load Parameters on CPU 
     # The Rest of kwargs here will be passed to AutoModelForCausalLM huggingface such as this device_map
     device_map='auto'

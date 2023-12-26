@@ -168,7 +168,7 @@ server = Llama2JaxServer.load_from_params(
         config=config,
         dtype=jax.numpy.bfloat16,  # Im on TPUs
         param_dtype=jax.numpy.bfloat16,  # Im on TPUs
-        precision=jax.lax.Precision('fastest'),
+        precision=jax.lax.Precision("fastest"),
         _do_init=False,
         input_shape=(1, 1024)
     ),

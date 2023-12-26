@@ -143,7 +143,7 @@ class AutoEasyDelModelForCausalLM:
             device=jax.devices('cpu')[0],
             dtype: jax.numpy.dtype = jax.numpy.float32,
             param_dtype: jax.numpy.dtype = jax.numpy.float32,
-            precision: jax.lax.Precision = jax.lax.Precision('fastest'),
+            precision: jax.lax.Precision = jax.lax.Precision("fastest"),
             sharding_axis_dims: typing.Sequence[int] = (1, -1, 1, 1),
             sharding_axis_names: typing.Sequence[str] = ("dp", "fsdp", "tp", "sp"),
             q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),

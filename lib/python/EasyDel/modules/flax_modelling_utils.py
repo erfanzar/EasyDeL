@@ -323,7 +323,7 @@ def smart_flash_attention(
         attn_pdrop: float,
         mesh: jax.sharding.Mesh = None,
         dtype: jax.numpy.dtype = jax.numpy.float32,
-        precision: jax.lax.Precision = jax.lax.Precision('fastest'),
+        precision: jax.lax.Precision = jax.lax.Precision("fastest"),
         dropout_rng: jax.random.PRNGKey = None,
         force_float32_tpu: bool = True,
         deterministic: bool = False
