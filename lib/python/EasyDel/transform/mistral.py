@@ -34,8 +34,8 @@ def mistral_convert_hf_to_flax_load(checkpoints_dir, config: MistralConfig,
     ckpt_paths = sorted(Path(checkpoints_dir).glob("*.bin"))
     state_dict = {}
     with jax.default_device(device):
-        for i, ckpt_path in enumerate(ckpt_paths):
-            checkpoint = torch.load(ckpt_path, map_location="cpu")
+        for i, checkpoint_path in enumerate(ckpt_paths):
+            checkpoint = torch.load(checkpoint_path, map_location="cpu")
             for k, v in checkpoint.items():
                 if k.startswith("model."):
                     k = k[6:]

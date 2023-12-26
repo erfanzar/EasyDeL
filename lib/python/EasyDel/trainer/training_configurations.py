@@ -14,15 +14,10 @@ from jax.experimental.mesh_utils import create_device_mesh
 from jax.sharding import Mesh
 from jax import numpy as jnp
 import jax
+from ..etils import EasyDelGradientCheckPointers, EasyDelOptimizers, EasyDelSchedulers
 
-AVAILABLE_OPTIMIZERS: List[str] = ['adafactor', 'lion', 'adamw']
-AVAILABLE_SCHEDULERS: List[str] = ['linear', 'cosine', 'none', 'warm_up_cosine', "warm_up_linear"]
-AVAILABLE_GRADIENT_CHECK_POINTING: List[str] = ['everything_saveable',
-                                                'nothing_saveable',
-                                                'checkpoint_dots',
-                                                'checkpoint_dots_with_no_batch_dims']
 AVAILABLE_BACKENDS: List[str] = [
-    'cpu', 'gpu', 'tpu', None
+    "cpu", "gpu", "tpu", None
 ]
 
 
@@ -37,13 +32,13 @@ class TrainArguments(
             model_class=None,
             total_batch_size: int = 32,
             max_steps: Union[int, None] = None,
-            optimizer: str = 'lion',
-            scheduler: str = 'linear',
+            optimizer: EasyDelOptimizers | str = EasyDelOptimizers.ADAMW,
+            scheduler: EasyDelSchedulers | str = EasyDelSchedulers.NONE,
             learning_rate: Union[int, float] = 5e-5,
             learning_rate_end: Union[None, float] = 5e-6,
             gradient_accumulation_steps: int = 1,
             weight_decay: float = 0.01,
-            gradient_checkpointing: str = 'nothing_saveable',
+            gradient_checkpointing: EasyDelGradientCheckPointers | str = EasyDelGradientCheckPointers.NOTHING_SAVEABLE,
             max_length: Union[int, None] = 4096,
             sharding_array: Union[tuple, int] = (1, -1, 1, 1),
             is_fine_tuning: bool = True,
@@ -53,7 +48,7 @@ class TrainArguments(
             backend: Union[str, None] = None,
             extra_optimizer_kwargs: dict = None,
             save_steps: Union[int, None] = None,
-            save_dir: str = 'easydel_ckpt',
+            save_dir: str = "easydel_ckpt",
             use_pjit_attention_force: bool = False,
             dtype=jnp.bfloat16,
             param_dtype=jnp.bfloat16,
@@ -68,12 +63,13 @@ class TrainArguments(
             model_parameters=None,
             do_shard_fns: bool = True,
             track_memory: bool = True,
-            loss_remat: str = '',
+            loss_remat: str = "",
             loss_chunk: int = 1024,
             is_left_padded: bool = False,
             warmup_steps: int = 500,
             init_input_shape: typing.Tuple[int, int] = (1, 1),
-            step_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp"),
+            step_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
+                ("dp", "fsdp"), "sp"),
             training_time: typing.Optional[str] = None,
             **kwargs
     ):
@@ -129,31 +125,24 @@ class TrainArguments(
         :param warmup_steps: int: Warm up the learning rate
         :param init_input_shape: typing.Tuple[int]: Initialize the input shape of the model
         :param step_partition_spec: jax.sharding.PartitionSpec: PartitionSpec Custom to be used in training and eval or test loop
-        :param kwargs: Pass a variable number of keyword arguments to a function
+        :param **kwargs: Pass a variable number of keyword arguments to a function
         :return: Nothing
-        
+
         """
         super().__init__()
         if ids_to_pop_from_dataset is None:
             ids_to_pop_from_dataset = []
         if extra_optimizer_kwargs is None:
             extra_optimizer_kwargs = {}
-        assert model_class is not None or model_id is not None, 'you cant pass model_class and model_id both None ' \
-                                                                'you should at least pass one of them to build ' \
-                                                                'model with'
-        assert backend in AVAILABLE_BACKENDS, f'{backend} is not recognized, ' \
-                                              f'available backends are {AVAILABLE_BACKENDS}'
-        assert gradient_checkpointing in AVAILABLE_GRADIENT_CHECK_POINTING, f'{gradient_checkpointing} is not ' \
-                                                                            f'recognized, available gradient ' \
-                                                                            f'checkpointing methods are ' \
-                                                                            f'{AVAILABLE_GRADIENT_CHECK_POINTING}'
-        assert scheduler in AVAILABLE_SCHEDULERS, f'{scheduler} is not recognized, ' \
-                                                  f'available schedulers are {AVAILABLE_SCHEDULERS}'
-        assert optimizer in AVAILABLE_OPTIMIZERS, f'{optimizer} is not recognized, ' \
-                                                  f'available optimizers are {AVAILABLE_OPTIMIZERS}'
+        assert model_class is not None or model_id is not None, "you cant pass model_class and model_id both None " \
+                                                                "you should at least pass one of them to build " \
+                                                                "model with"
+        assert backend in AVAILABLE_BACKENDS, f"{backend} is not recognized, " \
+                                              f"available backends are {AVAILABLE_BACKENDS}"
         self.available_backends = len(jax.devices(backend))
         total_batch_size *= gradient_accumulation_steps
-        array_devices = jnp.ones((self.available_backends, 1)).reshape(sharding_array)
+        array_devices = jnp.ones(
+            (self.available_backends, 1)).reshape(sharding_array)
         self.array_devices_shape = array_devices.shape
 
         self.model_id = model_id
@@ -193,32 +182,33 @@ class TrainArguments(
         self.do_shard_fns = do_shard_fns
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.track_memory = track_memory
-
         self.loss_chunk = loss_chunk
         self.loss_remat = loss_remat
         self.init_input_shape = init_input_shape
         self.is_left_padded = is_left_padded
         self.step_partition_spec = step_partition_spec
 
-        self.training_time = self._time_to_seconds(training_time) if training_time is not None else None
-        torch.set_default_device('cpu')
+        self.training_time = self._time_to_seconds(
+            training_time) if training_time is not None else None
+        torch.set_default_device("cpu")
         self.__dict__.update(**kwargs)
 
     @staticmethod
     def _time_to_seconds(time_str):
-        pattern = r'(\d+)\s*(H|min|Min)'
+        pattern = r"(\d+)\s*(H|min|Min)"
         match = re.match(pattern, time_str)
 
         if match:
             value = int(match.group(1))
             unit = match.group(2).lower()
 
-            if unit == 'h':
+            if unit == "h":
                 return value * 3600  # Convert hours to seconds
-            elif unit == 'min':
+            elif unit == "min":
                 return value * 60  # Convert minutes to seconds
         else:
-            raise SyntaxError("Invalid input format it should be like 50Min for M and 23H for hours")
+            raise SyntaxError(
+                "Invalid input format it should be like 50Min for M and 23H for hours")
 
     def __call__(self):
         return {k: v for k, v in self.__dict__.items()}
@@ -231,7 +221,7 @@ class TrainArguments(
 
         :param self: Represent the instance of the class
         :return: A dictionary of hyperparameters
-        
+
         """
         return {f"hyperparameters/{k}": v for k, v in self.__dict__.items() if
                 isinstance(v, (int, float, str, bool, torch.Tensor))}
@@ -243,33 +233,33 @@ class TrainArguments(
 
         :param self: Pass the class instance to the function
         :return: A wandb
-        
+
         """
         return wandb.init(
-            project=f'easydel-{self.model_name}',
+            project=f"easydel-{self.model_name}",
             config=self(),
             tags=[
-                'Easy Del',
-                'OST-OpenSourceTransformers',
-                'Jax/Flax'
+                "Easy Del",
+                "OST-OpenSourceTransformers",
+                "Jax/Flax"
             ]
         )
 
     def __str__(self):
-        string = f'TrainingArguments(\n'
+        string = f"TrainingArguments(\n"
         for k, v in self.__call__().items():
             if isinstance(v, typing.Callable):
                 def string_func(it_self):
-                    string_ = f'{it_self.__class__.__name__}(\n'
+                    string_ = f"{it_self.__class__.__name__}(\n"
                     for k_, v_ in it_self.__dict__.items():
-                        string_ += f'\t\t{k_} : {v_}\n'
-                    string_ += '\t)'
+                        string_ += f"\t\t{k_} : {v_}\n"
+                    string_ += "\t)"
                     return string_
 
                 v.__str__ = string_func
                 v = v.__str__(v)
-            string += f'\t{k} : {v}\n'
-        string += ')'
+            string += f"\t{k} : {v}\n"
+        string += ")"
         return string
 
     def get_path(self):
@@ -284,7 +274,7 @@ class TrainArguments(
 
         :param self: Represent the instance of the class
         :return: A pathlib
-        
+
         """
         return pathlib.Path(
             self.save_dir, self.model_name
@@ -296,7 +286,7 @@ class TrainArguments(
 
         :param self: Represent the instance of the class
         :return: A path
-        
+
         """
         path = self.get_path()
         if not path.exists():
@@ -313,7 +303,7 @@ class TrainArguments(
 
         :param self: Refer to the object itself
         :return: A mesh object with the device array shape and the mesh names
-        
+
         """
         return Mesh(
             create_device_mesh(
@@ -337,13 +327,13 @@ class TrainArguments(
         :param self: Represent the instance of the class
         :param steps: Calculate the number of steps to train
         :return: A tuple of two objects:
-        
+
         """
         steps = self.max_steps or steps
-        assert steps is not None, 'if you haven\'t pass max steps to init you should pass init in func'
+        assert steps is not None, "if you haven\'t pass max steps to init you should pass init in func"
 
-        if self.optimizer == 'adafactor':
-            if self.scheduler == 'linear':
+        if self.optimizer == EasyDelOptimizers.ADAFACTOR:
+            if self.scheduler == EasyDelSchedulers.LINEAR:
                 tx, sc = fjformer.optimizers.get_adafactor_with_linear_scheduler(
                     learning_rate_start=self.learning_rate,
                     learning_rate_end=self.learning_rate_end,
@@ -351,14 +341,14 @@ class TrainArguments(
                     steps=steps,
                     **self.extra_optimizer_kwargs
                 )
-            elif self.scheduler == 'cosine':
+            elif self.scheduler == EasyDelSchedulers.COSINE:
                 tx, sc = fjformer.optimizers.get_adafactor_with_cosine_scheduler(
                     learning_rate=self.learning_rate,
                     steps=steps,
                     gradient_accumulation_steps=self.gradient_accumulation_steps,
                     **self.extra_optimizer_kwargs
                 )
-            elif self.scheduler == 'none':
+            elif self.scheduler == EasyDelSchedulers.NONE:
                 tx, sc = fjformer.optimizers.get_adafactor_with_linear_scheduler(
                     learning_rate_start=self.learning_rate,
                     learning_rate_end=self.learning_rate,
@@ -366,7 +356,7 @@ class TrainArguments(
                     gradient_accumulation_steps=self.gradient_accumulation_steps,
                     **self.extra_optimizer_kwargs
                 )
-            elif self.scheduler == 'warm_up_cosine':
+            elif self.scheduler == EasyDelSchedulers.WARM_UP_COSINE:
                 tx, sc = fjformer.optimizers.get_adafactor_with_warm_up_cosine_scheduler(
                     learning_rate=self.learning_rate,
                     steps=steps,
@@ -374,7 +364,7 @@ class TrainArguments(
                     gradient_accumulation_steps=self.gradient_accumulation_steps,
                     **self.extra_optimizer_kwargs
                 )
-            elif self.scheduler == 'warm_up_linear':
+            elif self.scheduler == EasyDelSchedulers.WARM_UP_LINEAR:
                 tx, sc = fjformer.optimizers.get_adafactor_with_warmup_linear_scheduler(
                     learning_rate_start=self.learning_rate,
                     steps=steps,
@@ -386,9 +376,11 @@ class TrainArguments(
                 )
 
             else:
-                raise ValueError('seems like you have choose wrong type or unavailable scheduler')
-        elif self.optimizer == 'lion':
-            if self.scheduler == 'linear':
+                raise ValueError(
+                    "seems like you have choose wrong type or unavailable scheduler"
+                )
+        elif self.optimizer == EasyDelOptimizers.LION:
+            if self.scheduler == EasyDelSchedulers.LINEAR:
                 tx, sc = fjformer.optimizers.get_lion_with_linear_scheduler(
                     learning_rate_start=self.learning_rate,
                     learning_rate_end=self.learning_rate_end,
@@ -396,14 +388,14 @@ class TrainArguments(
                     gradient_accumulation_steps=self.gradient_accumulation_steps,
                     **self.extra_optimizer_kwargs
                 )
-            elif self.scheduler == 'cosine':
+            elif self.scheduler == EasyDelSchedulers.COSINE:
                 tx, sc = fjformer.optimizers.get_lion_with_cosine_scheduler(
                     learning_rate=self.learning_rate,
                     gradient_accumulation_steps=self.gradient_accumulation_steps,
                     steps=steps,
                     **self.extra_optimizer_kwargs
                 )
-            elif self.scheduler == 'none':
+            elif self.scheduler == EasyDelSchedulers.NONE:
                 tx, sc = fjformer.optimizers.get_lion_with_linear_scheduler(
                     learning_rate_start=self.learning_rate,
                     learning_rate_end=self.learning_rate,
@@ -411,7 +403,7 @@ class TrainArguments(
                     gradient_accumulation_steps=self.gradient_accumulation_steps,
                     **self.extra_optimizer_kwargs
                 )
-            elif self.scheduler == 'warm_up_cosine':
+            elif self.scheduler == EasyDelSchedulers.WARM_UP_COSINE:
                 tx, sc = fjformer.optimizers.get_lion_with_warm_up_cosine_scheduler(
                     learning_rate=self.learning_rate,
                     steps=steps,
@@ -419,7 +411,7 @@ class TrainArguments(
                     **self.extra_optimizer_kwargs
                 )
 
-            elif self.scheduler == 'warm_up_linear':
+            elif self.scheduler == EasyDelSchedulers.WARM_UP_LINEAR:
                 tx, sc = fjformer.optimizers.get_lion_with_with_warmup_linear_scheduler(
                     learning_rate_start=self.learning_rate,
                     steps=steps,
@@ -429,9 +421,10 @@ class TrainArguments(
                     **self.extra_optimizer_kwargs
                 )
             else:
-                raise ValueError('seems like you have choose wrong type or unavailable scheduler')
-        elif self.optimizer == 'adamw':
-            if self.scheduler == 'linear':
+                raise ValueError(
+                    "seems like you have choose wrong type or unavailable scheduler")
+        elif self.optimizer == EasyDelOptimizers.ADAMW:
+            if self.scheduler == EasyDelSchedulers.LINEAR:
                 tx, sc = fjformer.optimizers.get_adamw_with_linear_scheduler(
                     learning_rate_start=self.learning_rate,
                     learning_rate_end=self.learning_rate_end,
@@ -439,7 +432,7 @@ class TrainArguments(
                     gradient_accumulation_steps=self.gradient_accumulation_steps,
                     **self.extra_optimizer_kwargs
                 )
-            elif self.scheduler == 'cosine':
+            elif self.scheduler == EasyDelSchedulers.COSINE:
                 tx, sc = fjformer.optimizers.get_adamw_with_cosine_scheduler(
                     learning_rate=self.learning_rate,
                     gradient_accumulation_steps=self.gradient_accumulation_steps,
@@ -447,7 +440,7 @@ class TrainArguments(
                     weight_decay=self.weight_decay,
                     **self.extra_optimizer_kwargs
                 )
-            elif self.scheduler == 'none':
+            elif self.scheduler == EasyDelSchedulers.NONE:
                 tx, sc = fjformer.optimizers.get_adamw_with_linear_scheduler(
                     learning_rate_start=self.learning_rate,
                     learning_rate_end=self.learning_rate,
@@ -455,7 +448,7 @@ class TrainArguments(
                     steps=steps,
                     **self.extra_optimizer_kwargs
                 )
-            elif self.scheduler == 'warm_up_cosine':
+            elif self.scheduler == EasyDelSchedulers.WARM_UP_COSINE:
                 tx, sc = fjformer.optimizers.get_adamw_with_warm_up_cosine_scheduler(
                     learning_rate=self.learning_rate,
                     steps=steps,
@@ -463,7 +456,7 @@ class TrainArguments(
                     gradient_accumulation_steps=self.gradient_accumulation_steps,
                     **self.extra_optimizer_kwargs
                 )
-            elif self.scheduler == 'warm_up_linear':
+            elif self.scheduler == EasyDelSchedulers.WARM_UP_LINEAR:
                 tx, sc = fjformer.optimizers.get_adamw_with_warmup_linear_scheduler(
                     learning_rate_start=self.learning_rate,
                     steps=steps,
@@ -474,9 +467,13 @@ class TrainArguments(
                     **self.extra_optimizer_kwargs
                 )
             else:
-                raise ValueError('seems like you have choose wrong type or unavailable scheduler')
+                raise ValueError(
+                    "seems like you have choose wrong type or unavailable scheduler"
+                )
         else:
-            raise ValueError('seems like you have choose wrong type or unavailable optimizer')
+            raise ValueError(
+                "seems like you have choose wrong type or unavailable optimizer"
+            )
         return tx, sc
 
     def get_streaming_checkpointer(self):
@@ -488,7 +485,7 @@ class TrainArguments(
 
         :param self: Represent the instance of the class
         :return: A streamingcheckpointer object
-        
+
         """
         return StreamingCheckpointer(StreamingCheckpointer.get_default_config(),
                                      os.path.join(self.save_dir, self.model_name))
@@ -502,10 +499,10 @@ class TrainArguments(
 
         :param self: Represent the instance of the class
         :return: A summary-writer object
-        
+
         """
         return torch.utils.tensorboard.SummaryWriter(
             log_dir=str(self.get_path()),
-            comment=f'{self.model_name}',
-            filename_suffix='easydel'
+            comment=f"{self.model_name}",
+            filename_suffix="easydel"
         )

@@ -89,11 +89,10 @@ from .utils.utils import (
 )
 
 from .trainer import (
-    CausalLMTrainer,
+    CausalLanguageModelTrainer,
     TrainArguments,
-    create_fsdp_eval_step,
-    create_fsdp_train_step,
-    get_training_modules
+    create_casual_language_model_evaluation_step,
+    create_casual_language_model_train_step,
 )
 
 from .linen import (

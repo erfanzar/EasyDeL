@@ -8,7 +8,7 @@ rewritten for mojo as well.
 Some of the key features provided by EasyDeL include:
 
 - Support for 8, 6, and 4 BIT inference and training in JAX
-- Wide Range of models in Jax are supported which have never been implemented before such as _falcon_ 
+- Wide Range of models in Jax are supported which have never been implemented before such as _falcon_
 - Integration of flashAttention in JAX for GPUs and TPUs
 - Automatic serving of LLMs with mid and high-level APIs in both JAX and PyTorch
 - LLM Trainer and fine-tuner in JAX
@@ -34,7 +34,7 @@ chat model (70B model is supported too)
 
 ```shell
 python -m examples.serving.causal-lm.llama-2-chat \
-  --pretrained_model_name_or_path='meta-llama/Llama-2-7b-chat-hf' --max_length=4096 \
+  --repo_id='meta-llama/Llama-2-7b-chat-hf' --max_length=4096 \
   --max_new_tokens=2048 --max_stream_tokens=32 --temperature=0.6 \
   --top_p=0.95 --top_k=50 \
   --dtype='fp16' --use_prefix_tokenizer
@@ -64,7 +64,13 @@ now it's time to finetune our model
 
 ```python
 import jax.numpy
-from EasyDel import TrainArguments, CausalLMTrainer, AutoEasyDelModelForCausalLM, FlaxLlamaForCausalLM
+from EasyDel import (TrainArguments,
+                     CausalLanguageModelTrainer,
+                     AutoEasyDelModelForCausalLM,
+                     EasyDelOptimizers,
+                     EasyDelSchedulers,
+                     EasyDelGradientCheckPointers
+                     )
 from datasets import load_dataset
 import flax
 from jax import numpy as jnp
@@ -86,8 +92,9 @@ train_args = TrainArguments(
     num_train_epochs=3,
     learning_rate=5e-5,
     learning_rate_end=1e-6,
-    optimizer='adamw',  # 'adamw', 'lion', 'adafactor' are supported
-    scheduler='linear',  # 'linear','cosine', 'none' ,'warm_up_cosine' and 'warm_up_linear'  are supported
+    optimizer=EasyDelOptimizers.ADAMW,  # 'adamw', 'lion', 'adafactor' are supported
+    scheduler=EasyDelSchedulers.LINEAR,
+    # 'linear','cosine', 'none' ,'warm_up_cosine' and 'warm_up_linear'  are supported
     weight_decay=0.01,
     total_batch_size=64,
     max_steps=None,  # None to let trainer Decide
@@ -95,7 +102,7 @@ train_args = TrainArguments(
     do_eval=False,  # it's optional but supported 
     backend='tpu',  # default backed is set to cpu, so you must define you want to use tpu cpu or gpu
     max_length=max_length,  # Note that you have to change this in the model config too
-    gradient_checkpointing='nothing_saveable',
+    gradient_checkpointing=EasyDelGradientCheckPointers.NOTHING_SAVEABLE,
     sharding_array=(1, -1, 1, 1),  # the way to shard model across gpu,cpu or TPUs using sharding array (1, -1, 1, 1)
     # everything training will be in fully FSDP automatic and share data between devices
     use_pjit_attention_force=False,
@@ -108,10 +115,10 @@ dataset = load_dataset('TRAIN_DATASET')
 dataset_train = dataset['train']
 dataset_eval = dataset['eval']
 
-trainer = CausalLMTrainer(
+trainer = CausalLanguageModelTrainer(
     train_args,
     dataset_train,
-    ckpt_path=None
+    checkpoint_path=None
 )
 
 output = trainer.train(flax.core.FrozenDict({'params': params}))
@@ -162,7 +169,7 @@ for response, tokens_used in server.process(
 ):
     print(response[response_printed:], end='')
     response_printed = len(response)
-``` 
+```
 
 ## Contributing
 
