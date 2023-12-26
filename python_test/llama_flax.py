@@ -33,7 +33,11 @@ def main():
         num_hidden_layers=4,
         intermediate_size=256,
         gradient_checkpointing='',
-        max_position_embeddings=seq_len
+        max_position_embeddings=seq_len,
+        rope_scaling={
+            "factor": 4.0,
+            "type": "linear"
+        },
     )
 
     torch_model = LlamaForCausalLM(

@@ -1084,7 +1084,7 @@ class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
         elif past_key_values is not None and not return_dict:
             outputs, past_key_values = outputs
             outputs = outputs[:1] + \
-                (unfreeze(past_key_values["cache"]),) + outputs[1:]
+                      (unfreeze(past_key_values["cache"]),) + outputs[1:]
 
         return outputs
 
@@ -1209,7 +1209,7 @@ class FlaxLlamaModule(nn.Module):
         config = self.config
         self.causal_mask = make_causal_mask(
             jnp.ones((1, config.max_position_embeddings)))
-        
+
         initial_rope_kwargs = dict(
             rope_type="none"
         )
@@ -1270,7 +1270,7 @@ class FlaxLlamaModule(nn.Module):
                                                                         f'{self.config.max_position_embeddings} got'
                                                                         f' {sequence_length})')
         inputs_embeds = inputs_embeds + \
-            extra_embedding if extra_embedding is not None else inputs_embeds
+                        extra_embedding if extra_embedding is not None else inputs_embeds
         hidden_states = self.dropout(
             inputs_embeds, deterministic=deterministic)
 
