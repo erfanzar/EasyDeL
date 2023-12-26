@@ -81,7 +81,7 @@ using Mistral Models are the same as all the other models in EasyDel Collection 
 or finetune a Mistral model
 
 ```python
-from EasyDel.trainer import TrainArguments, CausalLMTrainer
+from EasyDel.trainer import TrainArguments, CausalLanguageModelTrainer
 from datasets import load_dataset
 from transformers import AutoTokenizer
 from jax import numpy as jnp
@@ -132,10 +132,10 @@ train_args = TrainArguments(
     dtype=jnp.bfloat16
 )
 
-trainer = CausalLMTrainer(
+trainer = CausalLanguageModelTrainer(
     train_args,
     dataset_train['train'],
-    ckpt_path=None
+    checkpoint_path=None
 )
 
 output = trainer.train(flax.core.FrozenDict({'params': params}))

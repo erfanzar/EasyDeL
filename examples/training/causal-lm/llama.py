@@ -2,7 +2,7 @@ import flax.core
 
 from EasyDel.transform import llama_from_pretrained
 
-from EasyDel import TrainArguments, CausalLMTrainer
+from EasyDel import TrainArguments, CausalLanguageModelTrainer
 from datasets import load_dataset
 from huggingface_hub import HfApi
 import EasyDel
@@ -20,7 +20,7 @@ flags.DEFINE_string(
 )
 
 flags.DEFINE_string(
-    name='ckpt_path',
+    name='checkpoint_path',
     required=False,
     help='path to model weights for example (ckpt/llama_easydel_format)',
     default=None
@@ -208,10 +208,10 @@ def main(argv):
 
     )
 
-    trainer = CausalLMTrainer(train_args,
+    trainer = CausalLanguageModelTrainer(train_args,
                               dataset_train=dataset_train['train'],
                               dataset_eval=dataset_train['eval'] if FLAGS.do_eval else None,
-                              ckpt_path=FLAGS.ckpt_path)
+                              checkpoint_path=FLAGS.checkpoint_path)
     output = trainer.train(
         model_parameters=flax.core.FrozenDict({'params': params})
     )

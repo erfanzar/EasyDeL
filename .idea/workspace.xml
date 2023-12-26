@@ -5,51 +5,26 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="e9058a88-3ea4-4b63-a9f8-ea56f3a88630" name="Changes" comment="">
-      <change afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/falcon/falcon_configuration.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/gpt2/gpt2_configuration.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/gpt_j/gpt_j_configuration.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/gpt_neo_x/gpt_neo_x_configuration.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/llama/llama_configuration.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/lucid_transformer/lt_configuration.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/mistral/mistral_configuration.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/mixtral/mixtral_configuration.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/mosaic_mpt/mosaic_configuration.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/opt/opt_configuration.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/palm/palm_configuration.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/phi/phi_configuration.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/t5/t5_configuration.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/lib/python/EasyDel/etils/errors.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/lib/python/EasyDel/etils/etils.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/README.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/Mistral.md" beforeDir="false" afterPath="$PROJECT_DIR$/docs/Mistral.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/TrainingExample.md" beforeDir="false" afterPath="$PROJECT_DIR$/docs/TrainingExample.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/examples/training/causal-lm/falcon.py" beforeDir="false" afterPath="$PROJECT_DIR$/examples/training/causal-lm/falcon.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/examples/training/causal-lm/gpt-j.py" beforeDir="false" afterPath="$PROJECT_DIR$/examples/training/causal-lm/gpt-j.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/examples/training/causal-lm/llama.py" beforeDir="false" afterPath="$PROJECT_DIR$/examples/training/causal-lm/llama.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/examples/training/causal-lm/mpt.py" beforeDir="false" afterPath="$PROJECT_DIR$/examples/training/causal-lm/mpt.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/__init__.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/modules/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/__init__.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/modules/falcon/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/falcon/__init__.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/modules/falcon/modelling_falcon_flax.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/falcon/modelling_falcon_flax.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/modules/flax_modelling_utils.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/flax_modelling_utils.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/modules/gpt2/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/gpt2/__init__.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/modules/gpt2/modelling_gpt2_flax.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/gpt2/modelling_gpt2_flax.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/modules/gpt_j/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/gpt_j/__init__.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/modules/gpt_j/modelling_gpt_j_flax.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/gpt_j/modelling_gpt_j_flax.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/modules/gpt_neo_x/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/gpt_neo_x/__init__.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/modules/gpt_neo_x/modelling_gpt_neo_x_flax.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/gpt_neo_x/modelling_gpt_neo_x_flax.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/modules/llama/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/llama/__init__.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/modules/llama/modelling_llama_flax.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/llama/modelling_llama_flax.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/modules/lucid_transformer/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/lucid_transformer/__init__.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/modules/lucid_transformer/modelling_lt_flax.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/lucid_transformer/modelling_lt_flax.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/modules/mistral/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/mistral/__init__.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/modules/mistral/modelling_mistral_flax.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/mistral/modelling_mistral_flax.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/modules/mixtral/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/mixtral/__init__.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/modules/mixtral/modelling_mixtral_flax.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/mixtral/modelling_mixtral_flax.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/modules/mosaic_mpt/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/mosaic_mpt/__init__.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/modules/mosaic_mpt/modelling_mpt_flax.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/mosaic_mpt/modelling_mpt_flax.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/modules/opt/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/opt/__init__.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/modules/opt/modelling_opt_flax.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/opt/modelling_opt_flax.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/modules/palm/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/palm/__init__.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/modules/palm/modelling_palm_flax.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/palm/modelling_palm_flax.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/modules/phi/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/phi/__init__.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/modules/phi/modelling_phi_flax.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/phi/modelling_phi_flax.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/modules/t5/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/t5/__init__.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/modules/t5/modelling_t5_flax.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/t5/modelling_t5_flax.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/rl_trainer/models/modelling_base.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/rl_trainer/models/modelling_base.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/rl_trainer/models/modelling_value_head.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/rl_trainer/models/modelling_value_head.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/configs/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/etils/__init__.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/configs/configs.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/etils/configs.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/erros/__init__.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/erros/errors.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/trainer/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/trainer/__init__.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/trainer/config.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/trainer/config.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/trainer/fsdp_train.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/trainer/causal_language_model_trainer.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/requirements.txt" beforeDir="false" afterPath="$PROJECT_DIR$/requirements.txt" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/setup.py" beforeDir="false" afterPath="$PROJECT_DIR$/setup.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -89,22 +64,26 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent">{
-  &quot;keyToString&quot;: {
-    &quot;RunOnceActivity.OpenProjectViewOnStart&quot;: &quot;true&quot;,
-    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
-    &quot;WebServerToolWindowFactoryState&quot;: &quot;false&quot;,
-    &quot;git-widget-placeholder&quot;: &quot;main&quot;,
-    &quot;last_opened_file_path&quot;: &quot;/home/erfan/PycharmProjects/EasyDeL&quot;,
-    &quot;node.js.detected.package.eslint&quot;: &quot;true&quot;,
-    &quot;node.js.detected.package.tslint&quot;: &quot;true&quot;,
-    &quot;node.js.selected.package.eslint&quot;: &quot;(autodetect)&quot;,
-    &quot;node.js.selected.package.tslint&quot;: &quot;(autodetect)&quot;,
-    &quot;nodejs_package_manager_path&quot;: &quot;npm&quot;,
-    &quot;vue.rearranger.settings.migration&quot;: &quot;true&quot;
+  <component name="PropertiesComponent"><![CDATA[{
+  "keyToString": {
+    "RunOnceActivity.OpenProjectViewOnStart": "true",
+    "RunOnceActivity.ShowReadmeOnStart": "true",
+    "WebServerToolWindowFactoryState": "false",
+    "git-widget-placeholder": "main",
+    "last_opened_file_path": "/home/erfan/PycharmProjects/EasyDeL/lib/python/EasyDel/trainer",
+    "node.js.detected.package.eslint": "true",
+    "node.js.detected.package.tslint": "true",
+    "node.js.selected.package.eslint": "(autodetect)",
+    "node.js.selected.package.tslint": "(autodetect)",
+    "nodejs_package_manager_path": "npm",
+    "vue.rearranger.settings.migration": "true"
   }
-}</component>
+}]]></component>
   <component name="RecentsManager">
+    <key name="CopyFile.RECENT_KEYS">
+      <recent name="$PROJECT_DIR$/lib/python/EasyDel/trainer" />
+      <recent name="$PROJECT_DIR$/lib/python/EasyDel" />
+    </key>
     <key name="MoveFile.RECENT_KEYS">
       <recent name="$PROJECT_DIR$" />
       <recent name="$PROJECT_DIR$/lib/python/EasyDel" />
@@ -226,7 +205,7 @@
       <workItem from="1702799337712" duration="11633000" />
       <workItem from="1702811433240" duration="3570000" />
       <workItem from="1702830071828" duration="8103000" />
-      <workItem from="1703583904578" duration="10479000" />
+      <workItem from="1703583904578" duration="12596000" />
     </task>
     <servers />
   </component>
@@ -236,7 +215,7 @@
   <component name="com.intellij.coverage.CoverageDataManagerImpl">
     <SUITE FILE_PATH="coverage/EasyDeL$generate_documentations.coverage" NAME="generate_documentations Coverage Results" MODIFIED="1702887955454" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
     <SUITE FILE_PATH="coverage/EasyDeL$llama_compration.coverage" NAME="llama_compration Coverage Results" MODIFIED="1701936876438" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/python_test" />
-    <SUITE FILE_PATH="coverage/EasyDeL$env.coverage" NAME="env Coverage Results" MODIFIED="1703593496820" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/lib/python/" />
+    <SUITE FILE_PATH="coverage/EasyDeL$env.coverage" NAME="env Coverage Results" MODIFIED="1703596749179" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/lib/python/" />
     <SUITE FILE_PATH="coverage/EasyDeL$mistral_flax.coverage" NAME="mistral_flax Coverage Results" MODIFIED="1701867908351" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/python_test" />
     <SUITE FILE_PATH="coverage/EasyDeL$llama_flax.coverage" NAME="llama_flax Coverage Results" MODIFIED="1703585720752" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/python_test" />
     <SUITE FILE_PATH="coverage/EasyDeL$mixtral_flax.coverage" NAME="mixtral_flax Coverage Results" MODIFIED="1702977128554" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="true" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/python_test" />

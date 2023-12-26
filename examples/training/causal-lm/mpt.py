@@ -1,4 +1,4 @@
-from EasyDel import TrainArguments, CausalLMTrainer
+from EasyDel import TrainArguments, CausalLanguageModelTrainer
 from datasets import load_dataset
 from huggingface_hub import HfApi
 import EasyDel
@@ -16,7 +16,7 @@ flags.DEFINE_string(
 )
 
 flags.DEFINE_string(
-    name='ckpt_path',
+    name='checkpoint_path',
     required=True,
     help='path to model weights for example (ckpt/falcon_easydel_format)',
     default=None
@@ -196,10 +196,10 @@ def main(argv):
 
     )
 
-    trainer = CausalLMTrainer(train_args,
+    trainer = CausalLanguageModelTrainer(train_args,
                               dataset_train=dataset_train['train'],
                               dataset_eval=dataset_train['eval'] if FLAGS.do_eval else None,
-                              ckpt_path=FLAGS.ckpt_path)
+                              checkpoint_path=FLAGS.checkpoint_path)
     output = trainer.train()
     # Done You can simply train any Falcon LLM that you want in less than 50 lines of code
 

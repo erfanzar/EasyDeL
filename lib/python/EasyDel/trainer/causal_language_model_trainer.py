@@ -9,7 +9,7 @@ from fjformer.func.loss_func import fused_cross_entropy_loss_and_accuracy, cross
 import wandb
 from datasets import Dataset
 
-from .config import TrainArguments
+from .training_configurations import TrainArguments
 
 import jax
 import flax
@@ -23,7 +23,7 @@ from flax.training import train_state
 from jax import numpy as jnp
 from torch.utils.data import DataLoader
 from fjformer import match_partition_rules, make_shard_and_gather_fns, StreamingCheckpointer
-from ..erros import EasyDelTimer
+from ..etils.errors import EasyDelTimer
 import chex
 
 
@@ -48,9 +48,9 @@ def calculate_accuracy(predictions: chex.Array, targets: chex.Array):
     return accuracy
 
 
-def create_fsdp_train_step(partition_spec=PartitionSpec(("dp", "fsdp"), "sp")):
+def create_casual_language_model_train_step(partition_spec=PartitionSpec(("dp", "fsdp"), "sp")):
     """
-    The create_fsdp_train_step function is a training step function that takes in the current state of the model,
+    The create_casual_language_model_train_step function is a training step function that takes in the current state of the model,
     and a batch of data. It then calculates the loss and accuracy for this batch, and returns an updated state
     with new parameters based on these gradients.
 
@@ -73,12 +73,12 @@ def create_fsdp_train_step(partition_spec=PartitionSpec(("dp", "fsdp"), "sp")):
         batch = with_sharding_constraint(batch, partition_spec)
 
         def calculate_loss(params):
-            labels = batch.pop('labels')
+            labels = batch.pop("labels")
             logits = state.apply_fn(params=params, **batch,
                                     return_dict=True).logits
 
             loss, accuracy = cross_entropy_loss_and_accuracy(
-                logits[:, :-1, :], labels, batch['attention_mask'].astype(jnp.float32)[:, 1:]
+                logits[:, :-1, :], labels, batch["attention_mask"].astype(jnp.float32)[:, 1:]
             )
             return loss, accuracy
 
@@ -90,9 +90,9 @@ def create_fsdp_train_step(partition_spec=PartitionSpec(("dp", "fsdp"), "sp")):
     return fsdp_train_step
 
 
-def create_fsdp_eval_step(partition_spec=PartitionSpec(("dp", "fsdp"), "sp")):
+def create_casual_language_model_evaluation_step(partition_spec=PartitionSpec(("dp", "fsdp"), "sp")):
     """
-    The create_fsdp_eval_step function is used to create a function that calculates the loss and accuracy of a model.
+    The create_casual_language_model_evaluation_step function is used to create a function that calculates the loss and accuracy of a model.
     It takes in a set of parameters, which are then passed into the state.apply_fn function
     to generate logits for each token in the batch. The cross entropy loss and accuracy are then calculated from these logits.
 
@@ -126,12 +126,12 @@ def create_fsdp_eval_step(partition_spec=PartitionSpec(("dp", "fsdp"), "sp")):
             :return: The loss and the accuracy
 
             """
-            labels = batch_eval.pop('labels')
+            labels = batch_eval.pop("labels")
             logits = state.apply_fn(params=params, **batch_eval,
                                     return_dict=True).logits
 
             loss, accuracy = cross_entropy_loss_and_accuracy(
-                logits[:, :-1, :], labels, batch_eval['attention_mask'].astype(jnp.float32)[:, 1:]
+                logits[:, :-1, :], labels, batch_eval["attention_mask"].astype(jnp.float32)[:, 1:]
             )
             return loss, accuracy
 
@@ -168,13 +168,13 @@ class OutputFineTuner:
     last_save_file_name: str
 
 
-class CausalLMTrainer:
+class CausalLanguageModelTrainer:
     def __init__(self,
                  arguments: TrainArguments,
                  dataset_train: Dataset,
                  dataset_eval: Dataset = None,
                  finetune: bool = True,
-                 ckpt_path: typing.Union[str, os.PathLike] = None,
+                 checkpoint_path: typing.Union[str, os.PathLike] = None,
                  _do_init_fns: bool = True
                  ):
         """
@@ -192,7 +192,7 @@ class CausalLMTrainer:
         :param dataset_train: Dataset: Pass the training dataset to the trainer
         :param dataset_eval: Dataset: Pass the validation dataset
         :param finetune: bool: Load the model from a checkpoint
-        :param ckpt_path: typing.Union[str,os.PathLike] : Load the checkpoint path
+        :param checkpoint_path: typing.Union[str,os.PathLike] : Load the checkpoint path
         :param _do_init_fns: bool: Initialize the functions
         :return: Nothing, it just initializes the class
 
@@ -219,32 +219,32 @@ class CausalLMTrainer:
         self.dataset_train = dataset_train
         self.dataset_eval = dataset_eval
         self.finetune = finetune
-        self.ckpt_path = ckpt_path
+        self.checkpoint_path = checkpoint_path
         self.dtype = arguments.dtype
         self.param_dtype = arguments.param_dtype
         if finetune:
-            if ckpt_path is None:
+            if checkpoint_path is None:
                 prefix_print(
-                    'Warning',
-                    'In case of using finetune = True and Passing ckpt_path = None you should pass parameters'
-                    'in train function'
+                    "Warning",
+                    "In case of using finetune = True and Passing checkpoint_path = None you should pass parameters"
+                    "in train function"
                 )
         if _do_init_fns:
             self.init_functions()
         else:
-            prefix_print('Warning', 'you have set _do_init_fns to False so function will not me initialized you have '
-                                    f'to do in manually (simply with  trainer.init_functions() )')
+            prefix_print("Warning", "you have set _do_init_fns to False so function will not me initialized you have "
+                                    f"to do in manually (simply with  trainer.init_functions() )")
 
     def __str__(self):
-        string = f'CausalLMTrainer('
+        string = f"CausalLanguageModelTrainer("
         for k, v in self.__dict__.items():
             if isinstance(v, typing.Callable):
                 def string_func(it_self):
 
-                    string_ = f'{it_self.__class__.__name__}(\n'
+                    string_ = f"{it_self.__class__.__name__}(\n"
                     for k_, v_ in it_self.__dict__.items():
-                        string_ += f'\t\t{k_} : {v_}\n'
-                    string_ += '\t)'
+                        string_ += f"\t\t{k_} : {v_}\n"
+                    string_ += "\t)"
                     return string_
 
                 try:
@@ -253,8 +253,8 @@ class CausalLMTrainer:
                 except RuntimeError:
                     pass
 
-            string += f'\n\t{k} : {v}'
-        string += ')'
+            string += f"\n\t{k} : {v}"
+        string += ")"
         return string
 
     def __repr__(self):
@@ -266,7 +266,7 @@ class CausalLMTrainer:
         The finish function is called when the experiment ends.
         It can be used to save data, upload files, or do any other cleanup tasks.
 
-        :return: A dictionary of the run's metadata
+        :return: A dictionary of the run"s metadata
 
         """
         wandb.finish()
@@ -289,27 +289,27 @@ class CausalLMTrainer:
             tensorboard_writer=self.arguments.get_board()
         )
         self.timer(
-            'configure dataloaders'
+            "configure dataloaders"
         ).start()
         self.dataloader_train, self.max_steps_train, \
             self.dataloader_eval, self.max_steps_eval = self.configure_dataloader()
         self.timer(
-            'configure dataloaders'
+            "configure dataloaders"
         ).stop()
 
-        self.timer.log(['configure dataloaders'])
+        self.timer.log(["configure dataloaders"])
 
         self.timer(
-            'configure Model ,Optimizer ,Scheduler and Config'
+            "configure Model ,Optimizer ,Scheduler and Config"
         ).start()
         self.model, self.tx, self.scheduler, self.config = self.configure_model()
         self.timer(
-            'configure Model ,Optimizer ,Scheduler and Config'
+            "configure Model ,Optimizer ,Scheduler and Config"
         ).stop()
-        self.timer.log(['configure Model ,Optimizer ,Scheduler and Config'])
+        self.timer.log(["configure Model ,Optimizer ,Scheduler and Config"])
 
         self.timer(
-            'configure functions and sharding them'
+            "configure functions and sharding them"
         ).start()
         funcs = self.configure_functions()
         self.sharded_create_from_params_fn = funcs[0]
@@ -319,9 +319,9 @@ class CausalLMTrainer:
         self.ckpt_streamer = funcs[4]
         self.init_fn = funcs[5]
         self.timer(
-            'configure functions and sharding them'
+            "configure functions and sharding them"
         ).stop()
-        self.timer.log(['configure functions and sharding them'])
+        self.timer.log(["configure functions and sharding them"])
 
     def configure_dataloader(self):
 
@@ -372,28 +372,28 @@ class CausalLMTrainer:
                                                 **extra_configs
                                                 )
 
-            assert hasattr(config, 'get_partition_rules')
+            assert hasattr(config, "get_partition_rules")
             model = FlaxAutoModelForCausalLM.from_config(config, trust_remote_code=True, dtype=self.arguments.dtype,
                                                          param_dtype=self.arguments.param_dtype,
                                                          _do_init=False)
 
         else:
-            if not hasattr(self.arguments.configs_to_init_model_class['config'], 'get_partition_rules'):
-                assert self.arguments.custom_rule is not None, 'if you are using custom model to init you must' \
-                                                               ' pass custom_rule for partition rules '
+            if not hasattr(self.arguments.configs_to_init_model_class["config"], "get_partition_rules"):
+                assert self.arguments.custom_rule is not None, "if you are using custom model to init you must" \
+                                                               " pass custom_rule for partition rules "
 
             self.arguments.configs_to_init_model_class[
-                'config'
+                "config"
             ].use_pjit_attention_force = self.arguments.use_pjit_attention_force
 
-            self.arguments.configs_to_init_model_class['config'].axis_dims = self.arguments.sharding_array
+            self.arguments.configs_to_init_model_class["config"].axis_dims = self.arguments.sharding_array
 
             model = self.arguments.model_class(
                 **self.arguments.configs_to_init_model_class,
                 _do_init=False
             )
 
-            config = self.arguments.configs_to_init_model_class['config']
+            config = self.arguments.configs_to_init_model_class["config"]
 
         tx, scheduler = self.arguments.get_optimizer_and_scheduler(self.max_steps_train)
         return model, tx, scheduler, config
@@ -420,7 +420,7 @@ class CausalLMTrainer:
                 params__ = self.model.to_fp16(params__)
             return train_state.TrainState.create(
                 tx=self.tx,
-                params=flax.core.freeze({'params': params__}),
+                params=flax.core.freeze({"params": params__}),
                 apply_fn=self.model.__call__
             )
 
@@ -431,9 +431,9 @@ class CausalLMTrainer:
                 params=params_
             )
 
-        if self.arguments.loss_remat == 'OHA':
+        if self.arguments.loss_remat == "OHA":
             loss_fn = fjformer.func.loss_func.cross_entropy_with_logits
-        elif self.arguments.loss_remat != '':
+        elif self.arguments.loss_remat != "":
             loss_fn = fused_cross_entropy_loss_and_accuracy
         else:
             loss_fn = cross_entropy_loss_and_accuracy
@@ -442,12 +442,12 @@ class CausalLMTrainer:
             batch = with_sharding_constraint(batch, self.arguments.step_partition_spec)
 
             def calculate_loss(params):
-                labels = batch.pop('labels')
+                labels = batch.pop("labels")
                 logits = state.apply_fn(params=params, **batch,
                                         return_dict=True).logits[:, :-1, :]
 
                 loss, accuracy = loss_fn(
-                    logits, labels, batch['attention_mask'].astype(jnp.float32)[:, 1:]
+                    logits, labels, batch["attention_mask"].astype(jnp.float32)[:, 1:]
                 )
                 return loss, accuracy
 
@@ -499,11 +499,11 @@ class CausalLMTrainer:
         """
 
         def count_params(_p):
-            print('\033[1;31mModel Contain : ',
+            print("\033[1;31mModel Contain : ",
                   sum(i.size for i in jax.tree_util.tree_flatten(flax.core.unfreeze(_p))[0]) / 1e9,
-                  ' Billion Parameters')
+                  " Billion Parameters")
 
-        dir_prefix: str = '/dev/shm'
+        dir_prefix: str = "/dev/shm"
         if self.arguments.track_memory:
             initialise_tracking(dir_prefix=dir_prefix)
         start_time = time.time()
@@ -514,23 +514,23 @@ class CausalLMTrainer:
 
                 if model_parameters is None:
                     prefix_print(
-                        'Action', f'Loading Model From {self.ckpt_path}'
+                        "Action", f"Loading Model From {self.checkpoint_path}"
                     )
                     _, params = StreamingCheckpointer.load_trainstate_checkpoint(
-                        f'params::{self.ckpt_path}', self.train_state_shape, shard_fns
+                        f"params::{self.checkpoint_path}", self.train_state_shape, shard_fns
                     )
 
                     if self.arguments.remove_ckpt_after_load:
-                        os.remove(self.ckpt_path)
+                        os.remove(self.checkpoint_path)
                 else:
                     prefix_print(
-                        'Action', f'Sharding Passed Parameters'
+                        "Action", f"Sharding Passed Parameters"
                     )
                     from flax.core import unfreeze
                     if not isinstance(model_parameters, flax.core.FrozenDict):
                         prefix_print(
-                            'Warning', 'Model Parameters should be like FrozenDict({"params" : params}) make sure to '
-                                       'pass as type FrozenDict in case of not getting UnExcepted Errors '
+                            "Warning", "Model Parameters should be like FrozenDict({'params': params}) make sure to "
+                                       "pass as type FrozenDict in case of not getting UnExcepted Errors "
                         )
                     params = model_parameters if not self.arguments.do_shard_fns else jax.tree_util.tree_map(
                         lambda f, x: f(x), shard_fns.params,
@@ -553,7 +553,7 @@ class CausalLMTrainer:
             if self.arguments.use_wandb:
                 self.wandb_runtime.log(
                     {
-                        'model billion parameters': sum(
+                        "model billion parameters": sum(
                             i.size for i in
                             jax.tree_util.tree_flatten(flax.core.unfreeze(sharded_train_state_.params))[0]) / 1e9
                     }
@@ -564,7 +564,7 @@ class CausalLMTrainer:
                         i += 1
                         if i < self.max_steps_train:
 
-                            batch['labels'] = batch['input_ids'][..., 1:]
+                            batch["labels"] = batch["input_ids"][..., 1:]
 
                             for ssb in self.arguments.ids_to_pop_from_dataset:
                                 _ = batch.pop(ssb, None)
@@ -579,7 +579,7 @@ class CausalLMTrainer:
                             if self.arguments.track_memory:
                                 mem_res = get_mem(dir_prefix=dir_prefix)
                             else:
-                                mem_res = 'Tracking Option is OFF'
+                                mem_res = "Tracking Option is OFF"
                             pbar.update(1)
 
                             if self.arguments.use_wandb:
@@ -609,48 +609,48 @@ class CausalLMTrainer:
                                              )
                             if self.arguments.training_time is not None:
                                 if time.time() - start_time > self.arguments.training_time:
-                                    raise EasyDelTimer
+                                    raise EasyDelTimer("Time Out")
                         else:
                             break
                         if self.arguments.save_steps is not None and i % self.arguments.save_steps == 0:
-                            filename = f'{self.arguments.model_name}-{sum(losses) / len(losses)}-{i}'
-                            print(f'Saving Model to \033[1;30m{filename}\033[1;0m')
-                            self.ckpt_streamer.save_checkpoint(sharded_train_state_.params['params'],
+                            filename = f"{self.arguments.model_name}-{sum(losses) / len(losses)}-{i}"
+                            print(f"Saving Model to \033[1;30m{filename}\033[1;0m")
+                            self.ckpt_streamer.save_checkpoint(sharded_train_state_.params["params"],
                                                                filename,
-                                                               gather_fns=gather_fns.params['params'])
+                                                               gather_fns=gather_fns.params["params"])
             except KeyboardInterrupt:
                 print(
-                    '\033[1;30m KeyboardInterrupt At training model Will return current state of the model * \033[1;0m')
+                    "\033[1;30m KeyboardInterrupt At training model Will return current state of the model * \033[1;0m")
             except EasyDelTimer:
                 print(
-                    '\033[1;30m Training reached out maximum training Time Killing training Process '
-                    'and Will return current state of the model * \033[1;0m'
+                    "\033[1;30m Training reached out maximum training Time Killing training Process "
+                    "and Will return current state of the model * \033[1;0m"
                 )
             if self.arguments.do_eval:
                 if self.dataset_eval is not None:
                     pbar_eval = tqdm(total=self.max_steps_eval)
                     for i_eval, batch_eval in enumerate(self.dataloader_eval):
-                        _ = batch_eval.pop('token_type_ids', None)
-                        batch_eval['labels'] = batch_eval['input_ids'][..., 1:]
+                        _ = batch_eval.pop("token_type_ids", None)
+                        batch_eval["labels"] = batch_eval["input_ids"][..., 1:]
                         for i in self.arguments.ids_to_pop_from_dataset:
                             _ = batch_eval.pop(i, None)
-                        loss_eval, accuracy = create_fsdp_eval_step(self.arguments.step_partition_spec)(
+                        loss_eval, accuracy = create_casual_language_model_evaluation_step(self.arguments.step_partition_spec)(
                             sharded_train_state_, batch_eval)
                         pbar_eval.update(1)
                         if self.arguments.use_wandb:
                             self.wandb_runtime.log(
-                                {'loss_eval': loss_eval.tolist(),
-                                 'accuracy': accuracy.tolist()}
+                                {"loss_eval": loss_eval.tolist(),
+                                 "accuracy": accuracy.tolist()}
                             )
                         pbar_eval.set_postfix(loss_eval=loss_eval.tolist())
             if self.arguments.save_steps is None and self.arguments.do_last_save:
-                filename = f'{self.arguments.model_name}-{sum(losses) / len(losses)}-{i}'
-                print(f'Saving Model to \033[1;30m{filename}\033[1;0m')
-                self.ckpt_streamer.save_checkpoint(sharded_train_state_.params['params'],
+                filename = f"{self.arguments.model_name}-{sum(losses) / len(losses)}-{i}"
+                print(f"Saving Model to \033[1;30m{filename}\033[1;0m")
+                self.ckpt_streamer.save_checkpoint(sharded_train_state_.params["params"],
                                                    filename,
-                                                   gather_fns=gather_fns.params['params'])
+                                                   gather_fns=gather_fns.params["params"])
             else:
-                filename = 'not_saved | None'
+                filename = "not_saved | None"
         output = OutputFineTuner(
             last_save_file_name=filename,
             predict_fun=self.sharded_predict,
