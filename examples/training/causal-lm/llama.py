@@ -26,7 +26,7 @@ flags.DEFINE_string(
     default=None
 )
 flags.DEFINE_string(
-    name='repo_id',
+    name='pretrained_model_name_or_path',
     required=True,
     help='repo to get model from',
     default=None
@@ -176,7 +176,7 @@ def main(argv):
     #     config.max_sequence_length = FLAGS.max_sequence_length
     #     config.rope_scaling = None
 
-    params, config = llama_from_pretrained(FLAGS.repo_id)
+    params, config = llama_from_pretrained(FLAGS.pretrained_model_name_or_path)
 
     train_args = TrainArguments(
         model_class=EasyDel.modules.FlaxLlamaForCausalLM,

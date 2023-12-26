@@ -129,7 +129,7 @@ class TrainArguments(
         :param warmup_steps: int: Warm up the learning rate
         :param init_input_shape: typing.Tuple[int]: Initialize the input shape of the model
         :param step_partition_spec: jax.sharding.PartitionSpec: PartitionSpec Custom to be used in training and eval or test loop
-        :param **kwargs: Pass a variable number of keyword arguments to a function
+        :param kwargs: Pass a variable number of keyword arguments to a function
         :return: Nothing
         
         """

@@ -13,7 +13,7 @@ tqdm
 pydantic==2.4.2
 datasets
 setuptools
-gradio
+gradio==4.12.0
 distrax
 rlax
 wandb>=0.15.9

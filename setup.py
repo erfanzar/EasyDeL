@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="EasyDeL",
-    version="0.0.40",
+    version="0.0.41",
     author="Erfan Zare Chavoshi",
     author_email="erfanzare82@eyahoo.com",
     description="An open-source library to make training faster and more optimized in Jax/Flax",
@@ -38,12 +38,11 @@ setup(
         "tqdm",
         "datasets",
         "pydantic==2.4.2",
-        "gradio",
+        "gradio==4.12.0",
         "distrax",
         "rlax",
         "wandb>=0.15.9",
         "tensorboard",
-        # add any other required dependencies here
     ],
     python_requires=">=3.8",
     package_dir={'': "lib/python"},

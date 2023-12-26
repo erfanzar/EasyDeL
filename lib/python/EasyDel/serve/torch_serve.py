@@ -337,27 +337,27 @@ class PyTorchServer(object):
             ).logits[0])
             return pred
 
-    def load(self, repo_id: str, tokenizer_repo: str = None, auto_config: bool = True, **kwargs):
+    def load(self, pretrained_model_name_or_path: str, tokenizer_repo: str = None, auto_config: bool = True, **kwargs):
         """
         The load function is used to load a model from the HuggingFace Model Hub.
 
         :param self: Represent the instance of the class
-        :param repo_id: str: Specify the name of the model to be loaded
+        :param pretrained_model_name_or_path: str: Specify the name of the model to be loaded
         :param tokenizer_repo: str: Specify the repo id of the tokenizer
         :param auto_config: bool: Determine whether the model should be loaded with a config file or not
-        :param **kwargs: Pass a variable number of keyword arguments to the function
+        :param kwargs: Pass a variable number of keyword arguments to the function
         :return: A tuple of model and tokenizer
         
         """
         load_kwargs = kwargs if not auto_config else self.get_model_load_kwargs()
         load_kwargs = load_kwargs | kwargs
         model = transformers.AutoModelForCausalLM.from_pretrained(
-            repo_id,
+            pretrained_model_name_or_path,
             trust_remote_code=True,
             **load_kwargs
         )
         tokenizer = transformers.AutoTokenizer.from_pretrained(
-            tokenizer_repo or repo_id,
+            tokenizer_repo or pretrained_model_name_or_path,
             trust_remote_code=True
         )
 

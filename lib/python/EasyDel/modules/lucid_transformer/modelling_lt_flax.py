@@ -5,17 +5,17 @@ from jax import numpy as jnp
 
 from functools import partial
 
-from jax.experimental.pjit import with_sharding_constraint as _wish_sharding_constraint
-from jax.interpreters import pxla
 from flax import linen as nn
-from transformers import FlaxPreTrainedModel, PretrainedConfig
+from transformers import FlaxPreTrainedModel
 from jax.sharding import PartitionSpec
 import flax
 from einops import rearrange
-from typing import Dict, Any, Optional, Sequence
+from typing import Dict, Optional
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
-from ..flax_modelling_utils import JaxBaseClassModel
+
 import chex
+from .lt_configuration import FlaxLTConfig
+
 
 ACT2CLS = {
     "gelu": nn.gelu,
@@ -26,105 +26,6 @@ ACT2CLS = {
     "swish": nn.swish,
     "tanh": nn.tanh,
 }
-
-
-class FlaxLTConfig(JaxBaseClassModel):
-    def __init__(self,
-                 initializer_range: float = 0.02,
-                 hidden_size: int = 4096,
-                 bos_token_id=2,
-                 eos_token_id=1,
-                 pad_token_id=0,
-                 intermediate_size: int = 8192,
-                 num_hidden_layers: int = 32,
-                 vocab_size: int = 32000,
-                 num_attention_heads: int = 32,
-                 weight_decay: float = 0.02,
-                 max_sequence_length: int = 2048,
-                 softmax_scale: float = None,
-                 alibi_bias_max: int = 8,
-                 fsdp=False,
-                 hidden_act="silu",
-                 axis_dims: Sequence[int] = (1, -1, 1, 1),
-                 axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-                 **kwargs
-                 ):
-        super().__init__(
-            axis_dims=axis_dims,
-            axis_names=axis_names,
-            eos_token_id=eos_token_id,
-            bos_token_id=bos_token_id,
-            pad_token_id=pad_token_id
-        )
-        self.max_sequence_length = max_sequence_length
-        self.weight_decay = weight_decay
-        self.alibi_bias_max = alibi_bias_max
-        self.num_attention_heads = num_attention_heads
-        self.vocab_size = vocab_size
-        self.num_hidden_layers = num_hidden_layers
-        self.intermediate_size = intermediate_size
-        self.pad_token_id = pad_token_id
-        self.bos_token_id = bos_token_id
-        self.eos_token_id = eos_token_id
-        self.hidden_size = hidden_size
-        self.initializer_range = initializer_range
-        self.softmax_scale = softmax_scale
-        self.fsdp = fsdp
-        self.axis_dims = axis_dims
-        self.axis_names = axis_names
-        self.hidden_act = hidden_act
-
-        self.__dict__.update(
-
-            **kwargs
-        )
-
-    @staticmethod
-    def get_partition_rules():
-        return (
-            # Emb
-            ("model/wte/embedding", PartitionSpec("sp", "fsdp")),
-            ("attn/(k_proj|v_proj|q_proj)/kernel", PartitionSpec("fsdp")),
-             ("attn/o_proj/kernel", PartitionSpec("sp", "fsdp")),
-             ("mlp/down/kernel", PartitionSpec("sp", "fsdp")),
-             ("mlp/up/kernel", PartitionSpec("fsdp")),
-             ("lm_head/kernel", PartitionSpec("fsdp", "sp")),
-             ('.*', PartitionSpec(None)),
-             ('ln/kernel', PartitionSpec(None)),
-             ('ln1/kernel', PartitionSpec(None)),
-             ('ln2/kernel', PartitionSpec(None)),
-             )
-
-    @staticmethod
-    def get_weight_decay_exclusions():
-        return tuple()
-
-    @staticmethod
-    def rng_keys():
-        return 'params', 'dropout', 'fcm'
-
-
-def is_name(*names):
-    return set(names) <= set(pxla.thread_resources.env.physical_mesh.axis_names)
-
-
-def get_partition_names(partition):
-    names = set()
-    for name in partition:
-        if name is None:
-            continue
-        elif isinstance(name, str):
-            names.add(name)
-        else:
-            names.update(get_partition_names(name))
-    return names
-
-
-def with_sharding_constraint(x, p):
-    names = get_partition_names(p)
-    if is_name(*names):
-        x = _wish_sharding_constraint(x, p)
-    return x
 
 
 class LTSelfAttention(nn.Module):
@@ -290,7 +191,7 @@ class FlaxLTPretrainedModel(FlaxPreTrainedModel):
         return outputs
 
 
-class FlaxLTModelModule(nn.Module):
+class FlaxLTModule(nn.Module):
     config: FlaxLTConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -354,7 +255,7 @@ class FlaxLTModelModule(nn.Module):
 
 
 class FlaxLTModel(FlaxLTPretrainedModel):
-    module_class = FlaxLTModelModule
+    module_class = FlaxLTModule
 
 
 class FlaxLTModelForCausalLMModule(nn.Module):
@@ -363,7 +264,7 @@ class FlaxLTModelForCausalLMModule(nn.Module):
     param_dtype: jnp.dtype = jnp.float32
 
     def setup(self) -> None:
-        self.model = FlaxLTModelModule(
+        self.model = FlaxLTModule(
             config=self.config, dtype=self.dtype, param_dtype=self.param_dtype
         )
         self.lm_head = nn.Dense(

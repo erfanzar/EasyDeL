@@ -60,7 +60,7 @@ class PPOConfig:
            :param accelerator_kwargs: Optional[dict] :Keyword arguments for the accelerator
            :param project_kwargs: Optional[dict] : Keyword arguments for the accelerator project config (e.g. `logging_dir`)
            :param tracker_project_name: str :Name of project to use for tracking
-           :param push_to_hub_if_best_kwargs: Optional[dict] :Keyword arguments for pushing model to the hub during training (e.g. repo_id)
+           :param push_to_hub_if_best_kwargs: Optional[dict] :Keyword arguments for pushing model to the hub during training (e.g. pretrained_model_name_or_path)
            :param steps: int : Number of training steps
            :param learning_rate: float :Adam learning rate
            :param adap_kl_ctrl: bool :Use adaptive KL control, otherwise linear
