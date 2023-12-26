@@ -711,7 +711,7 @@ class JAXServer(object):
         :param *: Pass a variable number of arguments to a function
         :param greedy: bool: Determine whether to use the greedy or non-greedy version of the generate function
         :param max_new_tokens: int: Set the number of tokens to generate
-        :param **kwargs: Pass any additional parameters to the process function
+        :param kwargs: Pass any additional parameters to the process function
         :return: A generator that yields the predicted text and the number of tokens generated
         
         """

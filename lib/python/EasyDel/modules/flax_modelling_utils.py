@@ -20,7 +20,12 @@ ACT2FN = {
     "silu": nn.swish,
     "swish": nn.swish,
     "gelu_new": partial(nn.gelu, approximate=True),
-
+    "tanh": nn.tanh,
+    "sigmoid": nn.sigmoid,
+    "leaky_relu": partial(nn.leaky_relu, negative_slope=0.01),
+    "glu": nn.glu,
+    "elu": nn.elu,
+    "softmax": nn.softmax
 }
 
 
@@ -561,6 +566,14 @@ class JaxBaseClassModel(transformers.PretrainedConfig):
             backend=(self.backend if self.backend is not None else "") if hasattr(
                 self, 'backend') else ""
         )
+
+    def get_partition_rules(self, fully_fsdp: bool = True):
+        if not fully_fsdp:
+            raise NotImplementedError
+        else:
+            return (
+                ('.*', jax.sharding.PartitionSpec(("fsdp", "sp")))
+            )
 
     def get_axis_dims(self) -> Sequence[int]:
         """

@@ -139,7 +139,7 @@ class AutoEasyDelModelForCausalLM:
     @classmethod
     def from_pretrained(
             cls,
-            repo_id: str,
+            pretrained_model_name_or_path: str,
             device=jax.devices('cpu')[0],
             dtype: jax.numpy.dtype = jax.numpy.float32,
             param_dtype: jax.numpy.dtype = jax.numpy.float32,
@@ -162,7 +162,7 @@ class AutoEasyDelModelForCausalLM:
         the class corresponding to your model, with all weights loaded from disk.
 
         :param cls: Create an instance of the class that called this function
-        :param repo_id: str: Identify the model in the huggingface model hub
+        :param pretrained_model_name_or_path: str: Identify the model in the huggingface model hub
         :param device: Specify the device on which to run the model
         :param dtype: jax.numpy.dtype: Specify the data type of the model
         :param param_dtype: jax.numpy.dtype: Specify the dtype of the parameters
@@ -177,18 +177,18 @@ class AutoEasyDelModelForCausalLM:
         :param use_shard_map: bool: whenever to use shard_map for attention
         :param input_shape: typing.Sequence[int]: Specify the shape of the input to the model
         :param backend: typing.Optional[str]: backend to use for model
-        :param **kwargs: Pass additional arguments to the model and config classes
+        :param kwargs: Pass additional arguments to the model and config classes
         :return: A model and parameters
         
         """
 
-        config = AutoConfig.from_pretrained(repo_id)
+        config = AutoConfig.from_pretrained(pretrained_model_name_or_path)
         model_type = config.model_type
 
         cfg, module, trf = get_modules_by_type(model_type)
 
-        model = AutoModelForCausalLM.from_pretrained(repo_id, **kwargs)
-        cfg = cfg.from_pretrained(repo_id)
+        model = AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path, **kwargs)
+        cfg = cfg.from_pretrained(pretrained_model_name_or_path)
         if hasattr(cfg, 'add_jax_args'):
             cfg.add_jax_args()
         cfg.add_partitions(

@@ -52,15 +52,15 @@ def del_prompter(
 
 
 def main():
-    repo_id = "meta-llama/Llama-2-7b-chat-hf"
+    pretrained_model_name_or_path = "meta-llama/Llama-2-7b-chat-hf"
     model, params = AutoEasyDelModelForCausalLM.from_pretrained(
-        repo_id,
+        pretrained_model_name_or_path,
         dtype=jax.numpy.bfloat16,
         param_dtype=jax.numpy.bfloat16,
         precision=jax.lax.Precision('fastest'),
         device=jax.devices('cpu')[0]
     )
-    tokenizer = AutoTokenizer.from_pretrained(repo_id)
+    tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
     params = {"params": params}
     partition_specs = fjformer.match_partition_rules(model.config.get_partition_rules(True), params)
     shard, _ = fjformer.make_shard_and_gather_fns(partition_specs, jnp.bfloat16)

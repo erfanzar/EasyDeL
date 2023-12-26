@@ -1,5 +1,6 @@
 import typing
 
+import flax.linen
 import jax.lax
 from flax import linen as nn
 from transformers import FlaxPreTrainedModel
@@ -63,33 +64,20 @@ class ValueHead(nn.Module):
         :return: A tensor of shape (batch_size, num_classes)
         
         """
-        output = self.dropout(hidden_states, deterministic=deterministic)
-        if output.dtype != self.summary.weight.dtype:
-            output = output.to(self.summary.weight.dtype)
-        return self.summary(output)
+        return self.summary(self.dropout(hidden_states, deterministic=deterministic))
 
 
-class FlaxAutoModelForCausalLMWithValueHead(FlaxPreTrainedModelWrapper):
-    pretrained_model: Type[FlaxPreTrainedModel] = FlaxLlamaForCausalLM
-    transformers_parent_class: Type[FlaxPreTrainedModel] = AutoEasyDelModelForCausalLM
-    lm_head_namings = ["lm_head", "embed_out"]
-    supported_args = (
-        "summary_dropout_prob",
-        "v_head_initializer_range",
-        "v_head_init_strategy",
-    )
+class FlaxAutoModelForCausalLMWithValueHead(FlaxPreTrainedModelWrapper, flax.linen.Module):
 
     def setup(self):
-        if not any(hasattr(self.pretrained_model, attribute) for attribute in self.lm_head_namings):
-            raise ValueError("The model does not have a language model head, please use a model that has one.")
-
         self.v_head = ValueHead(self.pretrained_model.config)
 
     def __call__(
             self,
-            input_ids=None,
-            past_key_values=None,
-            attention_mask=None,
+            pretrained_model_params: dict | flax.core.FrozenDict,
+            input_ids: chex.Array = None,
+            past_key_values: chex.Array = None,
+            attention_mask: chex.Array = None,
             **kwargs,
     ):
         """
@@ -101,7 +89,7 @@ class FlaxAutoModelForCausalLMWithValueHead(FlaxPreTrainedModelWrapper):
         :param input_ids: Pass the input to the model
         :param past_key_values: Pass the past key values to the model
         :param attention_mask: Mask out the padding tokens
-        :param **kwargs: Pass in the past_key_values parameter
+        :param kwargs: Pass in the past_key_values parameter
         :param : Pass the past key values to the model
         :return: The logits and the value
         
@@ -109,10 +97,11 @@ class FlaxAutoModelForCausalLMWithValueHead(FlaxPreTrainedModelWrapper):
         kwargs["output_hidden_states"] = True
         kwargs["past_key_values"] = past_key_values
 
-        base_model_output: FlaxCausalLMOutput = self.pretrained_model(
+        base_model_output = self.pretrained_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             return_dict=True,
+            params=pretrained_model_params,
             **kwargs,
         )
 
@@ -131,11 +120,29 @@ class FlaxAutoModelForCausalLMWithValueHead(FlaxPreTrainedModelWrapper):
         The push_to_hub function is used to push the model to a remote location.
 
         :param self: Represent the instance of the class
-        :param *args: Send a non-keyworded variable length argument list to the function
-        :param **kwargs: Pass keyworded, variable-length argument list to a function
+        :param args: Send a non-keyworded variable length argument list to the function
+        :param kwargs: Pass keyworded, variable-length argument list to a function
         :return: The pretrained model
         
         """
         setattr(self.pretrained_model, "v_head", self.v_head)
 
         return self.pretrained_model.push_to_hub(*args, **kwargs)
+
+    def post_init(
+            self,
+            params: dict | flax.core.FrozenDict,
+            input_shape: typing.Tuple[int, int],
+            head_name: str = "v_head"
+    ):
+        input_ids = jnp.zeros(input_shape, dtype="i4")
+        attention_mask = jnp.ones_like(input_ids)
+        params = self.init({
+            "params": jax.random.key(42)
+        },
+            {"params": params},
+            input_ids,
+            None,
+            attention_mask,
+        )["params"] | params
+        return params

@@ -1,1 +1,9 @@
-from .modelling_llama_flax import FlaxLlamaModel, FlaxLlamaForCausalLM, LlamaConfig
+from .llama_configuration import LlamaConfig
+from .modelling_llama_flax import (
+    FlaxLlamaForSequenceClassification,
+    FlaxLlamaForSequenceClassificationModule,
+    FlaxLlamaForCausalLM,
+    FlaxLlamaForCausalLMModule,
+    FlaxLlamaModel,
+    FlaxLlamaModule
+)

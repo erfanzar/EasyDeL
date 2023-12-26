@@ -34,7 +34,7 @@ chat model (70B model is supported too)
 
 ```shell
 python -m examples.serving.causal-lm.llama-2-chat \
-  --repo_id='meta-llama/Llama-2-7b-chat-hf' --max_length=4096 \
+  --pretrained_model_name_or_path='meta-llama/Llama-2-7b-chat-hf' --max_length=4096 \
   --max_new_tokens=2048 --max_stream_tokens=32 --temperature=0.6 \
   --top_p=0.95 --top_k=50 \
   --dtype='fp16' --use_prefix_tokenizer

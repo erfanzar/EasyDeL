@@ -48,12 +48,12 @@ class Llama2Host(JAXServer):
         return get_prompt_llama2_format(prompt, history, system)
 
     @classmethod
-    def load_from_torch(cls, repo_id, config=None):
+    def load_from_torch(cls, pretrained_model_name_or_path, config=None):
         with jax.default_device(jax.devices('cpu')[0]):
             param, config_model = llama_from_pretrained(
-                repo_id
+                pretrained_model_name_or_path
             )
-        tokenizer = AutoTokenizer.from_pretrained(repo_id)
+        tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
         model = EasyDel.modules.FlaxLlamaForCausalLM(
             config=config_model,
             dtype=get_float_dtype_by_name(config['dtype'] if config is not None else 'fp16'),
@@ -72,11 +72,11 @@ class Llama2Host(JAXServer):
         )
 
     @classmethod
-    def load_from_jax(cls, repo_id, checkpoint_path, config_repo=None, config=None):
+    def load_from_jax(cls, pretrained_model_name_or_path, checkpoint_path, config_repo=None, config=None):
         from huggingface_hub import hf_hub_download
-        path = hf_hub_download(repo_id, checkpoint_path)
-        tokenizer = AutoTokenizer.from_pretrained(repo_id)
-        config_model = EasyDel.LlamaConfig.from_pretrained(config_repo or repo_id)
+        path = hf_hub_download(pretrained_model_name_or_path, checkpoint_path)
+        tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
+        config_model = EasyDel.LlamaConfig.from_pretrained(config_repo or pretrained_model_name_or_path)
         model = EasyDel.FlaxLlamaForCausalLM(
             config=config_model,
             dtype=get_float_dtype_by_name(config['dtype'] if config is not None else 'fp16'),
@@ -98,7 +98,7 @@ class Llama2Host(JAXServer):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Argument parser for Llama2.")
     parser.add_argument(
-        '--repo_id',
+        '--pretrained_model_name_or_path',
         default='meta-llama/Llama-2-7b-chat-hf',
         help='HuggingFace Repo to load model From'
     )
@@ -191,7 +191,7 @@ if __name__ == "__main__":
     )
 
     server = Llama2Host.load_from_torch(
-        repo_id=args.repo_id,
+        pretrained_model_name_or_path=args.pretrained_model_name_or_path,
         config=configs
     )
     try:
