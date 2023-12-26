@@ -3,7 +3,7 @@ import functools
 
 import fjformer.attention
 import transformers
-from fjformer.bits import config_v4, fully_quantized, config as q_config, q_flax
+from fjformer.bits import config as q_config, q_flax
 from jax.interpreters import pxla
 from jax.experimental.pjit import with_sharding_constraint as wsc
 import jax
@@ -12,7 +12,6 @@ from functools import partial
 import chex
 from typing import Sequence, Optional
 from jax.experimental.mesh_utils import create_device_mesh
-from jax.sharding import PartitionSpec as PS
 from jax.experimental.shard_map import shard_map
 
 ACT2FN = {
@@ -192,13 +191,15 @@ def repeat_kv_bsnh(x: chex.Array, n_rep: int) -> chex.Array:
 
 
 def precompute_freq_cis(
-    dim, max_position_embeddings=2048, base=10000, scaling_factor=1.0, rope_type: str | None = None
+        dim, max_position_embeddings=2048, base=10000, scaling_factor=1.0, rope_type: str | None = None
 ):
-
     if rope_type == "none":
         rope_type = None
-    assert rope_type in ["linear", "dynamic",
-                         None], "wrong rope type has been given"
+    assert rope_type in [
+        "linear",
+        "dynamic",
+        None
+    ], "wrong rope type has been given"
     t = jax.numpy.arange(max_position_embeddings)
 
     if rope_type == "linear":
@@ -206,11 +207,11 @@ def precompute_freq_cis(
 
     if rope_type == "dynamic":
         base = base * (
-            scaling_factor - (scaling_factor - 1)
+                scaling_factor - (scaling_factor - 1)
         ) ** (dim / (dim - 2))
 
     inv_freq = 1.0 / (
-        base ** (jax.numpy.arange(0, dim, 2, dtype=jax.numpy.float32) / dim)
+            base ** (jax.numpy.arange(0, dim, 2, dtype=jax.numpy.float32) / dim)
     )
     freq = jax.numpy.einsum(
         "i , j -> i j", t, inv_freq
@@ -658,7 +659,7 @@ def add_start_docstrings(*docstr):
 
     def docstring_decorator(fn):
         fn.__doc__ = "".join(docstr) + \
-            (fn.__doc__ if fn.__doc__ is not None else "")
+                     (fn.__doc__ if fn.__doc__ is not None else "")
         return fn
 
     return docstring_decorator

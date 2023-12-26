@@ -297,7 +297,7 @@ def jax_load_balancing_loss_func(gate_logits: chex.Array, num_experts: chex.Arra
         expert_mask.astype(jnp.float32), axis=-2)
     router_prob_per_group_and_expert = jnp.mean(routing_weights, axis=-1)
     return jnp.mean(tokens_per_group_and_expert * jnp.expand_dims(router_prob_per_group_and_expert, axis=-1)) * (
-        num_experts ** 2)
+            num_experts ** 2)
 
 
 class MixtralRMSNorm(nn.Module):
@@ -345,7 +345,7 @@ class FlaxMixtralAttention(nn.Module):
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[None, jax.lax.Precision]
-                        ] = jax.lax.Precision('fastest')
+    ] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         config = self.config
@@ -585,7 +585,7 @@ class FlaxMixtralBLockSparseTop2MLP(nn.Module):
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[None, jax.lax.Precision]
-                        ] = jax.lax.Precision('fastest')
+    ] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         dense = functools.partial(
@@ -611,7 +611,7 @@ class FlaxMixtralBlocKSparesTop2MLPCollection(nn.Module):
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[None, jax.lax.Precision]
-                        ] = jax.lax.Precision('fastest')
+    ] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         self.layers = [
@@ -645,7 +645,6 @@ class FlaxMixtralBlocKSparesTop2MLPCollection(nn.Module):
                 current_hidden_states_
         ):
             for i in range(top_x_.size):
-                # if (idx_[i]):
                 final_hidden_states_.at[top_x[i]].set(
                     final_hidden_states_[top_x[i]] + current_hidden_states_[i])
             return final_hidden_states_
@@ -688,8 +687,9 @@ class FlaxMixtralSparseMoeBlock(nn.Module):
     config: MixtralConfig
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[None, jax.lax.Precision]
-                        ] = jax.lax.Precision('fastest')
+    precision: Optional[
+        Union[None, jax.lax.Precision]
+    ] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         self.gate = nn.Dense(
@@ -737,7 +737,7 @@ class FlaxMixtralDecoderLayer(nn.Module):
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[None, jax.lax.Precision]
-                        ] = jax.lax.Precision('fastest')
+    ] = jax.lax.Precision('fastest')
 
     def setup(self) -> None:
         self.self_attn = FlaxMixtralAttention(
@@ -1116,7 +1116,7 @@ class MixtralPreTrainedModel(FlaxPreTrainedModel):
         elif past_key_values is not None and not return_dict:
             outputs, past_key_values = outputs
             outputs = outputs[:1] + \
-                (unfreeze(past_key_values["cache"]),) + outputs[1:]
+                      (unfreeze(past_key_values["cache"]),) + outputs[1:]
 
         return outputs
 
