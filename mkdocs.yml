@@ -4,8 +4,6 @@ nav:
   - AvailableModels: AvailableModels.md
   - Install: Install.md
   - EasyBIT: Bits.md
-  - Data Preprocessing:
-      - Processor: data_preprocessing-_processor.md
   - Etils:
       - Configs: etils-configs.md
       - Errors: etils-errors.md
@@ -103,13 +101,15 @@ nav:
 plugins:
   - search
   - mkdocstrings:
-      - handlers:
-          - python:
-            options:
-              docstring_style: sphinx
+      handlers:
+        python:
+          options:
+            docstring_style: sphinx
+
 repo_url: https://github.com/erfanzar/EasyDel
 site_author: Erfan Zare Chavoshi
 site_name: EasyDel
+
 theme:
   highlightjs: true
   hljs_languages:

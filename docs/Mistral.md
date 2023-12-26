@@ -46,31 +46,6 @@ including GLUE, SuperGLUE, and the Stanford Question Answering Dataset.
 4. Call the model's `generate()` method to generate text, translate languages, answer questions, or perform other NLP
    tasks.
 
-**Here is an example of how to generate text with Mistral-7B-v0.1:**
-
-```python
-import transformers
-
-# Load the model weights
-model = transformers.BartModel.from_pretrained("mistralai/Mistral-7B-Instruct-v0.1")
-
-# Generate text
-prompt = "Write a poem about a cat."
-generated_text = model.generate(prompt, max_length=100)
-
-# Print the generated text
-print(generated_text)
-```
-
-**Output:**
-
-```
-A furry friend, a playful elf,
-A curious cat, a cuddly elf.
-With paws so soft and eyes so bright,
-A cat brings joy both day and night.
-```
-
 **Mistral LLM models are still under development, but they have the potential to be used in a wide range of
 applications.** If you are interested in using Mistral's LLMs, please visit the Mistral AI website: https://mistral.ai/
 for more information.
@@ -87,13 +62,18 @@ from transformers import AutoTokenizer
 from jax import numpy as jnp
 import flax
 import EasyDel
-from EasyDel.transform import llama_from_pretrained, mistral_from_pretrained
+from EasyDel import (
+    AutoEasyDelModelForCausalLM,
+    EasyDelOptimizers,
+    EasyDelSchedulers,
+    EasyDelGradientCheckPointers
+)
 
 model_id = 'mistralai/Mistral-7B-v0.1'
 dataset_train = load_dataset('<TOKENIZED_MISTRAL_DATASET_AT_HUGGINGFACE>')
 tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-params, config = mistral_from_pretrained(model_id)
-
+model, params = AutoEasyDelModelForCausalLM.from_pretrained(model_id)
+config = model.config
 config.freq_max_position_embeddings = config.max_position_embeddings  # 32768
 config.max_position_embeddings = 4096  # Let use context length of 4096 for training
 config.c_max_position_embeddings = config.max_position_embeddings
@@ -113,8 +93,8 @@ train_args = TrainArguments(
     num_train_epochs=2,
     learning_rate=4e-5,
     learning_rate_end=5e-6,
-    optimizer='adamw',
-    scheduler='cosine',
+    optimizer=EasyDelOptimizers.ADAMW,
+    scheduler=EasyDelSchedulers.WARM_UP_COSINE,
     weight_decay=0.01,
     total_batch_size=32,
     max_steps=None,
@@ -122,7 +102,7 @@ train_args = TrainArguments(
     do_eval=False,
     backend='tpu',
     max_length=max_length,
-    gradient_checkpointing='nothing_saveable',
+    gradient_checkpointing=EasyDelGradientCheckPointers.NOTHING_SAVEABLE,
     sharding_array=(1, -1, 1, 1),
     use_pjit_attention_force=False,
     gradient_accumulation_steps=8,
