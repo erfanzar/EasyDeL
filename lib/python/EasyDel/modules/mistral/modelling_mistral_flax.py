@@ -111,7 +111,7 @@ class FlaxMistralMLP(nn.Module):
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[None, jax.lax.Precision]
-    ] = jax.lax.Precision('fastest')
+    ] = jax.lax.Precision("fastest")
 
     def setup(self) -> None:
         dense = functools.partial(
@@ -137,7 +137,7 @@ class FlaxMistralAttention(nn.Module):
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[None, jax.lax.Precision]
-    ] = jax.lax.Precision('fastest')
+    ] = jax.lax.Precision("fastest")
 
     def setup(self) -> None:
         config = self.config
@@ -378,7 +378,7 @@ class FlaxMistralDecoderLayer(nn.Module):
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[None, jax.lax.Precision]
-    ] = jax.lax.Precision('fastest')
+    ] = jax.lax.Precision("fastest")
 
     def setup(self) -> None:
         self.self_attn = FlaxMistralAttention(
@@ -644,7 +644,7 @@ class FlaxMistralDecoratorCollection(nn.Module):
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[None, jax.lax.Precision]
-    ] = jax.lax.Precision('fastest')
+    ] = jax.lax.Precision("fastest")
 
     def setup(self) -> None:
         block = FlaxMistralDecoderLayer

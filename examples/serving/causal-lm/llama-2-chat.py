@@ -58,7 +58,7 @@ class Llama2Host(JAXServer):
             config=config_model,
             dtype=get_float_dtype_by_name(config['dtype'] if config is not None else 'fp16'),
             param_dtype=get_float_dtype_by_name(config['dtype'] if config is not None else 'fp16'),
-            precision=jax.lax.Precision('fastest'),
+            precision=jax.lax.Precision("fastest"),
             _do_init=False
         )
         return cls.load_from_params(
@@ -81,7 +81,7 @@ class Llama2Host(JAXServer):
             config=config_model,
             dtype=get_float_dtype_by_name(config['dtype'] if config is not None else 'fp16'),
             param_dtype=get_float_dtype_by_name(config['dtype'] if config is not None else 'fp16'),
-            precision=jax.lax.Precision('fastest'),
+            precision=jax.lax.Precision("fastest"),
             _do_init=False
         )
         return cls.load(

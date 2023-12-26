@@ -115,7 +115,7 @@ class FlaxMixtralAttention(nn.Module):
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[None, jax.lax.Precision]
-    ] = jax.lax.Precision('fastest')
+    ] = jax.lax.Precision("fastest")
 
     def setup(self) -> None:
         config = self.config
@@ -355,7 +355,7 @@ class FlaxMixtralBLockSparseTop2MLP(nn.Module):
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[None, jax.lax.Precision]
-    ] = jax.lax.Precision('fastest')
+    ] = jax.lax.Precision("fastest")
 
     def setup(self) -> None:
         dense = functools.partial(
@@ -381,7 +381,7 @@ class FlaxMixtralBlocKSparesTop2MLPCollection(nn.Module):
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[None, jax.lax.Precision]
-    ] = jax.lax.Precision('fastest')
+    ] = jax.lax.Precision("fastest")
 
     def setup(self) -> None:
         self.layers = [
@@ -459,7 +459,7 @@ class FlaxMixtralSparseMoeBlock(nn.Module):
     param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[
         Union[None, jax.lax.Precision]
-    ] = jax.lax.Precision('fastest')
+    ] = jax.lax.Precision("fastest")
 
     def setup(self) -> None:
         self.gate = nn.Dense(
@@ -507,7 +507,7 @@ class FlaxMixtralDecoderLayer(nn.Module):
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[None, jax.lax.Precision]
-    ] = jax.lax.Precision('fastest')
+    ] = jax.lax.Precision("fastest")
 
     def setup(self) -> None:
         self.self_attn = FlaxMixtralAttention(

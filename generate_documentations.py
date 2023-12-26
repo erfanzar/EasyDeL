@@ -1,5 +1,4 @@
 import os
-import sys
 import yaml
 
 cache = {}
@@ -57,7 +56,13 @@ def run(project_locations="lib/python/EasyDel", docs_file="docs/"):
                 with open(docs_file + markdown_filename, "w") as buffer:
                     buffer.write(markdown_documentation)
                 category_tuple = tuple(categorical_name.split("."))
-                cache[category_tuple] = markdown_filename
+                edited_category_tuple = ()
+                for key in category_tuple:
+                    key = key.split("_")
+                    capitalized_words = [word.capitalize() for word in key if word != ""]
+                    edited_category_tuple += (' '.join(capitalized_words),)
+
+                cache[edited_category_tuple] = markdown_filename
             else:
                 run(current_file)
     except NotADirectoryError:
@@ -67,13 +72,58 @@ def run(project_locations="lib/python/EasyDel", docs_file="docs/"):
 def main():
     global cache
     run()
+    mkdocstrings_options = {
+        "mkdocstrings": {
+            "handlers": {
+                "python": {
+                    "options": {
+                        "docstring_style": "sphinx"
+                    }
+                }
+            },
+        }
+    }
+    theme_options = {
+
+        "name": "material",
+        "highlightjs": True,
+        "hljs_languages": [
+            "yaml", "python"
+        ]
+
+    }
+
+    statics = {
+        ("Home",): "index.md",
+        ("install",): "Install.md",
+        ("AvailableModels",): "AvailableModels.md",
+        ("EasyBIT",): "Bits.md",
+        ("Examples", "PytorchServer"): "PyTorchServer.md",
+        ("Examples", "JAXServer"): "JAXServer.md",
+        ("Examples", "DataProcessing"): "DataProcessing.md",
+        ("Examples", "TrainingExample"): "TrainingExample.md",
+        ("Examples", "Falcon Models"): "Falcon.md",
+        ("Examples", "Llama Models"): "Llama.md",
+        ("Examples", "Llama2 Models"): "Llama2.md",
+        ("Examples", "Mistral Models"): "Mistral.md",
+        ("Examples", "MosaicMPT Models"): "MosaicMPT.md",
+    }
+
+    cache = statics | cache
     yaml_data = {
         "nav": unflatten_dict(cache),
         "site_name": "EasyDel",
         "copyright": "Erfan Zare Chavoshi-EasyDel",
         "site_author": "Erfan Zare Chavoshi",
-        "repo_url": "https://github.com/erfanzar/EasyDel"
+        "repo_url": "https://github.com/erfanzar/EasyDel",
+        "plugins": [
+            "search",
+            mkdocstrings_options
+        ],
+        "theme": theme_options
     }
+
+    yaml.safe_dump(yaml_data, open("mkdocs.yml", "w"))
 
 
 if __name__ == "__main__":
