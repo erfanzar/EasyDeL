@@ -55,13 +55,13 @@ def create_casual_language_model_train_step(partition_spec=PartitionSpec(("dp", 
     with new parameters based on these gradients.
 
     :param partition_spec: Specify which devices the model will be split across
-    :return: A fsdp_train_step function that takes in the current state of the model,
+    :return: A casual_language_model_train_step function that takes in the current state of the model,
 
     """
 
-    def fsdp_train_step(state, batch):
+    def casual_language_model_train_step(state, batch):
         """
-        The fsdp_train_step function is a training step function that takes in the current state of the model,
+        The casual_language_model_train_step function is a training step function that takes in the current state of the model,
         and a batch of data. It then calculates the loss and accuracy for this batch, and returns an updated state
         with new parameters based on these gradients.
 
@@ -87,7 +87,7 @@ def create_casual_language_model_train_step(partition_spec=PartitionSpec(("dp", 
         state = state.apply_gradients(grads=grad)
         return state, loss__, accuracy__
 
-    return fsdp_train_step
+    return casual_language_model_train_step
 
 
 def create_casual_language_model_evaluation_step(partition_spec=PartitionSpec(("dp", "fsdp"), "sp")):
@@ -101,9 +101,9 @@ def create_casual_language_model_evaluation_step(partition_spec=PartitionSpec(("
 
     """
 
-    def fsdp_eval_step(state, batch_eval):
+    def casual_language_model_evaluation_step(state, batch_eval):
         """
-        The fsdp_eval_step function is used to calculate the loss and accuracy of a model.
+        The casual_language_model_evaluation_step function is used to calculate the loss and accuracy of a model.
         It takes in a set of parameters, which are then passed into the state.apply_fn function
         to generate logits for each token in the batch. The cross entropy loss and accuracy are then calculated from these logits.
 
@@ -138,7 +138,7 @@ def create_casual_language_model_evaluation_step(partition_spec=PartitionSpec(("
         loss__, accuracy__ = calculate_loss(state.params)
         return loss__, accuracy__
 
-    return fsdp_eval_step
+    return casual_language_model_evaluation_step
 
 
 def predict(state, input_ids):
