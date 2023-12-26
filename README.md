@@ -34,15 +34,15 @@ chat model (70B model is supported too)
 
 ```shell
 python -m examples.serving.causal-lm.llama-2-chat \
-  --repo_id='meta-llama/Llama-2-7b-chat-hf' --max_length=4096 \
+  --repo_id="meta-llama/Llama-2-7b-chat-hf" --max_length=4096 \
   --max_new_tokens=2048 --max_stream_tokens=32 --temperature=0.6 \
   --top_p=0.95 --top_k=50 \
-  --dtype='fp16' --use_prefix_tokenizer
+  --dtype="fp16" --use_prefix_tokenizer
 
 ```
 
 > [!NOTE]
-> you can use all the llama models not just 'meta-llama/Llama-2-7b-chat-hf'
+> you can use all the llama models not just "meta-llama/Llama-2-7b-chat-hf"
 > float16 or float32 , bfloat16 are supported dtype and make sure to use --use_prefix_tokenizer,
 > and you will get links or api to use model from gradio app chat/instruct or FastAPI apis
 
@@ -64,43 +64,50 @@ now it's time to finetune our model
 
 ```python
 import jax.numpy
-from EasyDel import (TrainArguments,
-                     CausalLanguageModelTrainer,
-                     AutoEasyDelModelForCausalLM,
-                     EasyDelOptimizers,
-                     EasyDelSchedulers,
-                     EasyDelGradientCheckPointers
-                     )
+from EasyDel import (
+    TrainArguments,
+    CausalLanguageModelTrainer,
+    AutoEasyDelModelForCausalLM,
+    EasyDelOptimizers,
+    EasyDelSchedulers,
+    EasyDelGradientCheckPointers
+)
 from datasets import load_dataset
 import flax
 from jax import numpy as jnp
+from transformers import AutoTokenizer
 
-model, params = AutoEasyDelModelForCausalLM.from_pretrained("", )
+huggingface_repo_id_or_path = ""
+
+model, params = AutoEasyDelModelForCausalLM.from_pretrained(huggingface_repo_id_or_path, )
 
 max_length = 4096
-
+tokenizer = AutoTokenizer.from_pretrained(
+    huggingface_repo_id_or_path,
+    trust_remote_code=True
+)
 configs_to_init_model_class = {
-    'config': model.config,
-    'dtype': jnp.bfloat16,
-    'param_dtype': jnp.bfloat16,
-    'input_shape': (1, 1)
+    "config": model.config,
+    "dtype": jnp.bfloat16,
+    "param_dtype": jnp.bfloat16,
+    "input_shape": (1, 1)
 }
 
-train_args = TrainArguments(
+train_arguments = TrainArguments(
     model_class=type(model),
-    model_name='my_first_model_to_train_using_easydel',
+    model_name="my_first_model_to_train_using_easydel",
     num_train_epochs=3,
     learning_rate=5e-5,
     learning_rate_end=1e-6,
-    optimizer=EasyDelOptimizers.ADAMW,  # 'adamw', 'lion', 'adafactor' are supported
+    optimizer=EasyDelOptimizers.ADAMW,  # "adamw", "lion", "adafactor" are supported
     scheduler=EasyDelSchedulers.LINEAR,
-    # 'linear','cosine', 'none' ,'warm_up_cosine' and 'warm_up_linear'  are supported
+    # "linear","cosine", "none" ,"warm_up_cosine" and "warm_up_linear"  are supported
     weight_decay=0.01,
     total_batch_size=64,
     max_steps=None,  # None to let trainer Decide
     do_train=True,
     do_eval=False,  # it's optional but supported 
-    backend='tpu',  # default backed is set to cpu, so you must define you want to use tpu cpu or gpu
+    backend="tpu",  # default backed is set to cpu, so you must define you want to use tpu cpu or gpu
     max_length=max_length,  # Note that you have to change this in the model config too
     gradient_checkpointing=EasyDelGradientCheckPointers.NOTHING_SAVEABLE,
     sharding_array=(1, -1, 1, 1),  # the way to shard model across gpu,cpu or TPUs using sharding array (1, -1, 1, 1)
@@ -108,21 +115,54 @@ train_args = TrainArguments(
     use_pjit_attention_force=False,
     remove_ckpt_after_load=True,
     gradient_accumulation_steps=8,
-    loss_remat='',
+    loss_remat="",
     dtype=jnp.bfloat16
 )
-dataset = load_dataset('TRAIN_DATASET')
-dataset_train = dataset['train']
-dataset_eval = dataset['eval']
+
+
+def ultra_chat_prompting_process(
+        data_chunk
+):
+    user_part = [
+        chunk["content"] for chunk in data_chunk["messages"] if chunk["role"] == "user"
+    ]
+    assistant_part = [
+        chunk["content"] for chunk in data_chunk["messages"] if chunk["role"] == "assistant"
+    ]
+
+    prompt = ""
+
+    for uc, ac in zip(user_part, assistant_part):
+        prompt += f"<|user|>\n{uc}</s>\n<|assistant|>\n{ac}</s>\n"
+
+    return {"prompt": prompt}
+
+
+tokenization_process = lambda data_chunk: tokenizer(
+    data_chunk["prompt"],
+    add_special_tokens=False,
+    max_length=max_length,
+    padding="max_length"
+)
+
+dataset = load_dataset("HuggingFaceH4/ultrachat_200k")
+dataset_train = dataset["train_gen"].map(ultra_chat_prompting_process, num_proc=12)
+dataset_train = dataset_train.map(
+    tokenization_process,
+    num_proc=12,
+    remove_columns=dataset_train.column_names
+)
+
+# you can do the same for evaluation process dataset
 
 trainer = CausalLanguageModelTrainer(
-    train_args,
-    dataset_train,
+    train_arguments,
+    dataset,
     checkpoint_path=None
 )
 
-output = trainer.train(flax.core.FrozenDict({'params': params}))
-print(f'Hey ! , here\'s where your model saved {output.last_save_file_name}')
+output = trainer.train(flax.core.FrozenDict({"params": params}))
+print(f"Hey ! , here's where your model saved {output.last_save_file_name}")
 
 
 ```
@@ -142,17 +182,17 @@ from EasyDel.serve import JAXServer
 from transformers import AutoTokenizer
 import jax
 
-model_id = 'meta-llama/Llama.md-2-7b-chat-hf'
+model_id = "meta-llama/Llama.md-2-7b-chat-hf"
 
 tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 model, params = AutoEasyDelModelForCausalLM.from_pretrained(
     model_id,
-    jax.devices('cpu')[0],
+    jax.devices("cpu")[0],
     jax.numpy.float16,
     jax.numpy.float16,
-    jax.lax.Precision('fastest'),
+    jax.lax.Precision("fastest"),
     (1, -1, 1, 1),
-    device_map='auto'
+    device_map="auto"
 )
 
 server = JAXServer.load_from_params(
@@ -165,9 +205,9 @@ server = JAXServer.load_from_params(
 
 response_printed = 0
 for response, tokens_used in server.process(
-        'String To The Model', stream=True
+        "String To The Model", stream=True
 ):
-    print(response[response_printed:], end='')
+    print(response[response_printed:], end="")
     response_printed = len(response)
 ```
 

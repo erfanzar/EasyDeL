@@ -4,7 +4,13 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="e9058a88-3ea4-4b63-a9f8-ea56f3a88630" name="Changes" comment="" />
+    <list default="true" id="e9058a88-3ea4-4b63-a9f8-ea56f3a88630" name="Changes" comment="">
+      <change beforePath="$PROJECT_DIR$/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/README.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/__init__.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/etils/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/etils/__init__.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/etils/errors.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/etils/errors.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/trainer/causal_language_model_trainer.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/trainer/causal_language_model_trainer.py" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -184,7 +190,7 @@
       <workItem from="1702799337712" duration="11633000" />
       <workItem from="1702811433240" duration="3570000" />
       <workItem from="1702830071828" duration="8103000" />
-      <workItem from="1703583904578" duration="13052000" />
+      <workItem from="1703583904578" duration="13410000" />
     </task>
     <servers />
   </component>

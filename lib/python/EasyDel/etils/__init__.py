@@ -14,4 +14,8 @@ from .etils import (
     EasyDelSchedulers
 )
 
-from .errors import (EasyDelTimer, EasyDelRuntimeError, EasyDeSyntaxRuntimeError)
+from .errors import (
+    EasyDelTimerError,
+    EasyDelRuntimeError,
+    EasyDeSyntaxRuntimeError
+)
