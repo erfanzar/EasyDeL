@@ -68,12 +68,10 @@ Here is a table comparing the different sizes of Llama models:
 ## How to Use/Load Them in EasyDel
 
 ```python
-import jax
-from EasyDel.transform import llama_from_pretrained
-
-params, config = llama_from_pretrained(
+from EasyDel import AutoEasyDelModelForCausalLM
+model, params = AutoEasyDelModelForCausalLM.from_pretrained(
     'meta-llama/Llama-2-7b',
-    device  # Offload on CPU
+    # other kwargs
 )
 ```
 
@@ -82,15 +80,15 @@ also keep that in mind that returned `config` includes `.get_partition_rules(fsd
 #### Use With JaxServer
 
 ```python
-from EasyDel.serve import JAXServer
-from EasyDel.modules.llama import FlaxLlamaForCausalLM
+from EasyDel.serve import JAXServer, JAXServerConfig
 import jax
-from EasyDel.transform import llama_from_pretrained
 from transformers import AutoTokenizer
 
-params, config = llama_from_pretrained(
+from EasyDel import AutoEasyDelModelForCausalLM
+
+model, params = AutoEasyDelModelForCausalLM.from_pretrained(
     'meta-llama/Llama-2-7b',
-    device  # Offload on CPU
+    # other kwargs
 )
 
 DEFAULT_SYSTEM_PROMPT = "You are a helpful, respectful and honest assistant and act as wanted"
@@ -164,27 +162,13 @@ class Llama2JaxServer(JAXServer):
 
 server = Llama2JaxServer.load_from_params(
     params=params,
-    model=FlaxLlamaForCausalLM(
-        config=config,
-        dtype=jax.numpy.bfloat16,  # Im on TPUs
-        param_dtype=jax.numpy.bfloat16,  # Im on TPUs
-        precision=jax.lax.Precision("fastest"),
-        _do_init=False,
-        input_shape=(1, 1024)
-    ),
-    config_model=config,
+    model=model,
+    config_model=model.config,
     add_params_field=True,
     tokenizer=AutoTokenizer.from_pretrained('meta-llama/Llama-2-7b'),
     verbose=False,
     do_memory_log=True,
-    config={
-        "max_length": 4096,
-        "max_new_tokens": 4096,
-        "max_stream_tokens": 64,
-        "dtype": 'bf16',
-        "use_prefix_tokenizer": True,
-        'pre_compile': True
-    }
+    config=JAXServerConfig()
 )
 
 server.fire()  # Launch FastAPI functions
