@@ -2,10 +2,10 @@ from typing import Sequence, Optional
 
 from jax.sharding import PartitionSpec
 
-from ..flax_modelling_utils import JaxBaseClassModel
+from ..easydel_modelling_utils import EasyDelPretrainedConfig
 
 
-class MistralConfig(JaxBaseClassModel):
+class MistralConfig(EasyDelPretrainedConfig):
     def __init__(
             self,
             vocab_size=32000,

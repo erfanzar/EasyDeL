@@ -2,10 +2,10 @@ from typing import Sequence, Optional
 
 from jax.sharding import PartitionSpec
 
-from ..flax_modelling_utils import JaxBaseClassModel
+from ..easydel_modelling_utils import EasyDelPretrainedConfig
 
 
-class GPTNeoXConfig(JaxBaseClassModel):
+class GPTNeoXConfig(EasyDelPretrainedConfig):
     model_type = "gpt_neox"
 
     def __init__(

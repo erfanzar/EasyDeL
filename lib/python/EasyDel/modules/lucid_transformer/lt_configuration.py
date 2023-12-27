@@ -2,10 +2,10 @@ from typing import Sequence, Optional
 
 from jax.sharding import PartitionSpec
 
-from ..flax_modelling_utils import JaxBaseClassModel
+from ..easydel_modelling_utils import EasyDelPretrainedConfig
 
 
-class FlaxLTConfig(JaxBaseClassModel):
+class FlaxLTConfig(EasyDelPretrainedConfig):
     def __init__(self,
                  initializer_range: float = 0.02,
                  hidden_size: int = 4096,

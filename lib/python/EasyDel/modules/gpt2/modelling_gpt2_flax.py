@@ -28,10 +28,10 @@ from transformers.modeling_flax_outputs import (
     FlaxBaseModelOutputWithPastAndCrossAttentions,
     FlaxCausalLMOutputWithCrossAttentions,
 )
-from transformers.modeling_flax_utils import ACT2FN, FlaxPreTrainedModel
-from ..flax_modelling_utils import ACT2FN, create_mesh, JaxBaseClassModel, with_sharding_constraint, \
-    get_dot_general_by_bits
+from ..flax_modelling_utils import ACT2FN, with_sharding_constraint, \
+    get_dot_general_by_bits, ACT2FN
 from .gpt2_configuration import GPT2Config
+from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 
 _CHECKPOINT_FOR_DOC = "gpt2"
 _CONFIG_FOR_DOC = "GPT2Config"
@@ -353,7 +353,7 @@ class FlaxGPT2Block(nn.Module):
         return outputs
 
 
-class FlaxGPT2PreTrainedModel(FlaxPreTrainedModel):
+class FlaxGPT2PreTrainedModel(EasyDelFlaxPretrainedModel):
     config_class = GPT2Config
     base_model_prefix = "transformer"
     module_class: nn.Module = None
@@ -641,6 +641,12 @@ class FlaxGPT2Module(nn.Module):
 class FlaxGPT2Model(FlaxGPT2PreTrainedModel):
     module_class = FlaxGPT2Module
 
+    def get_input_embeddings(self):
+        return self.module.wte
+
+    def set_input_embeddings(self, value):
+        self.module.wte = value
+
 
 class FlaxGPT2LMHeadModule(nn.Module):
     config: GPT2Config
@@ -712,6 +718,24 @@ class FlaxGPT2LMHeadModule(nn.Module):
 
 class FlaxGPT2LMHeadModel(FlaxGPT2PreTrainedModel):
     module_class = FlaxGPT2LMHeadModule
+
+    def get_output_embeddings(self):
+        return self.module.lm_head
+
+    def get_decoder(self):
+        return self.module.transformer
+
+    def get_input_embeddings(self):
+        return self.module.transformer.wte
+
+    def set_output_embeddings(self, new_embeddings):
+        self.module.lm_head = new_embeddings
+
+    def set_decoder(self, decoder):
+        self.module.transformer = decoder
+
+    def set_input_embeddings(self, value):
+        self.module.transformer.wte = value
 
     def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[jax.Array] = None):
         batch_size, seq_length = input_ids.shape

@@ -2,10 +2,10 @@ from typing import Sequence, Optional
 
 from jax.sharding import PartitionSpec
 
-from ..flax_modelling_utils import JaxBaseClassModel
+from ..easydel_modelling_utils import EasyDelPretrainedConfig
 
 
-class OPTConfig(JaxBaseClassModel):
+class OPTConfig(EasyDelPretrainedConfig):
     model_type = "opt"
     keys_to_ignore_at_inference = ["past_key_values"]
 

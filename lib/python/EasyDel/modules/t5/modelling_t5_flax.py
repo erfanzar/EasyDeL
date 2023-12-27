@@ -16,7 +16,7 @@
 """ Flax T5 model."""
 
 import copy
-from typing import Callable, Optional, Tuple, Sequence
+from typing import Callable, Optional, Tuple
 
 import flax.linen as nn
 import jax
@@ -40,15 +40,14 @@ from transformers.modeling_flax_utils import (
     FlaxPreTrainedModel,
 )
 
-from transformers import PretrainedConfig
 from jax.sharding import PartitionSpec
 
 from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
-    with_sharding_constraint, JaxBaseClassModel
+    with_sharding_constraint
 
 import chex
 from .t5_configuration import T5Config
-
+from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 remat = nn_partitioning.remat
 
 
@@ -785,7 +784,7 @@ class FlaxT5Stack(nn.Module):
         )
 
 
-class FlaxT5PreTrainedModel(FlaxPreTrainedModel):
+class FlaxT5PreTrainedModel(EasyDelFlaxPretrainedModel):
     config_class = T5Config
     base_model_prefix = "transformer"
     module_class: nn.Module = None

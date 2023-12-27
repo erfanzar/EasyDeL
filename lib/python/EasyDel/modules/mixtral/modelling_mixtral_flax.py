@@ -13,22 +13,20 @@ from flax import linen as nn
 from flax.traverse_util import unflatten_dict, flatten_dict
 from flax.core import freeze, unfreeze, FrozenDict
 from typing import Union, Optional, Tuple
-from transformers import FlaxPreTrainedModel
 from flax.linen import partitioning as nn_partitioning, dot_product_attention_weights
 
 from ..flax_modelling_utils import (
     ACT2FN,
     with_sharding_constraint,
-    get_gradient_checkpoint_policy,
     repeat_kv_bnsh,
     apply_rotary_pos_emb,
     precompute_freq_cis,
-    JaxBaseClassModel,
     smart_flash_attention,
     get_dot_general_by_bits
 )
 import chex
 from .mixtral_configuration import MixtralConfig
+from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 
 re_mat = nn_partitioning.remat
 
@@ -682,7 +680,7 @@ class FlaxMixtralDecoderLayerCollection(nn.Module):
         return outputs
 
 
-class MixtralPreTrainedModel(FlaxPreTrainedModel):
+class MixtralPreTrainedModel(EasyDelFlaxPretrainedModel):
     config_class: MixtralConfig = MixtralConfig
     module_class: nn.Module = None
     base_model_prefix = "model"
@@ -1010,6 +1008,12 @@ class FlaxMixtralModule(nn.Module):
 class FlaxMixtralModel(MixtralPreTrainedModel):
     module_class = FlaxMixtralModule
 
+    def set_input_embeddings(self, value):
+        self.module.embed_tokens = value
+
+    def get_input_embeddings(self):
+        return self.module.embed_tokens
+
 
 class FlaxMixtralForCausalLMModule(nn.Module):
     config: MixtralConfig
@@ -1089,6 +1093,24 @@ class FlaxMixtralForCausalLMModule(nn.Module):
 
 class FlaxMixtralForCausalLM(MixtralPreTrainedModel):
     module_class = FlaxMixtralForCausalLMModule
+
+    def set_input_embeddings(self, value):
+        self.module.model.embed_tokens = value
+
+    def get_input_embeddings(self):
+        return self.module.model.embed_tokens
+
+    def set_decoder(self, decoder):
+        self.module.model = decoder
+
+    def get_decoder(self):
+        return self.module.model
+
+    def get_output_embeddings(self):
+        return self.module.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.module.lm_head = new_embeddings
 
     def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[chex.Array] = None):
         """

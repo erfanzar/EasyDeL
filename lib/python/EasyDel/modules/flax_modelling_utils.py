@@ -1,8 +1,6 @@
-import dataclasses
 import functools
 
 import fjformer.attention
-import transformers
 from fjformer.bits import config as q_config, q_flax
 from jax.interpreters import pxla
 from jax.experimental.pjit import with_sharding_constraint as wsc
@@ -13,6 +11,8 @@ import chex
 from typing import Sequence, Optional
 from jax.experimental.mesh_utils import create_device_mesh
 from jax.experimental.shard_map import shard_map
+from .easydel_modelling_utils import EasyMethod
+
 
 ACT2FN = {
     "gelu": partial(nn.gelu, approximate=False),
@@ -88,14 +88,6 @@ def get_names_from_partition_spec(partition_specs):
     return list(names)
 
 
-@dataclasses.dataclass
-class EasyMethod:
-    TRAIN: str = "train"
-    SERVE: str = "serve"
-    EVAL: str = "serve"
-    CONVERT: str = "convert"
-
-
 def names_in_mesh(*names):
     """
     The names_in_mesh function is a decorator that can be used to check whether
@@ -103,7 +95,7 @@ def names_in_mesh(*names):
     exception if any of the axis names are not in the physical mesh.  For example,
     if you have a function that takes two axes as arguments, and you want to make sure they're both in your mesh:
 
-    :param *names: Collect all the names passed to the function into a tuple
+    :param names: Collect all the names passed to the function into a tuple
     :return: A boolean indicating whether all the given
 
     """
@@ -503,161 +495,6 @@ def create_mesh(
     )
 
 
-class JaxBaseClassModel(transformers.PretrainedConfig):
-    """
-    It initializes all the attributes of an object, and it's called when you create a new instance of that class.
-    :param self: Refer to the instance of the class
-    :param axis_dims: Sequence[int]: Specify the number of dimensions for each axis
-    :param axis_names: Sequence[str]: Set the names of the axes
-    :param q_ps: jax.sharding.PartitionSpec: Specify the partitioning of the query tensor
-    :param k_ps: jax.sharding.PartitionSpec: Partition the key matrix
-    :param v_ps: jax.sharding.PartitionSpec: Specify the partitioning of the value tensor
-    :param b_ps: jax.sharding.PartitionSpec: Specify the Attention Bias partition spec
-    :param a_ps: jax.sharding.PartitionSpec: Specify the partitioning of the attention weights
-    :param use_shard_map: bool: whenever to use shard_map for attention
-    :param backend: Optional[None]: Specify the backend to use
-    :param easy_method: EasyMethod: Specify the use of model to init the QDot Method for (e.q TRAIN,SERVE,...)
-    """
-
-    def __init__(
-            self,
-            axis_dims: Sequence[int] = (1, -1, 1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
-                ("dp", "fsdp"), "sp", "tp", None),
-            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
-                ("dp", "fsdp"), "sp", "tp", None),
-            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
-                ("dp", "fsdp"), "sp", "tp", None),
-            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
-                ("dp", "fsdp"), None, None, None),
-            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
-                ("dp", "fsdp"), "sp", "tp", None),
-            use_shard_map: bool = False,
-            backend: Optional[None] = None,
-            easy_method: EasyMethod = EasyMethod.TRAIN,
-            **kwargs
-    ):
-        self.q_ps = q_ps
-        self.k_ps = k_ps
-        self.v_ps = v_ps
-        self.b_ps = b_ps
-        self.a_ps = a_ps
-        self.use_shard_map = use_shard_map
-        self.axis_dims = axis_dims
-        self.axis_names = axis_names
-        self.backend = backend if backend is not None else ""
-        self.easy_method = easy_method
-        super().__init__(**kwargs)
-
-    def jax_mesh(self) -> jax.sharding.Mesh:
-        """
-        The jax_mesh function is a helper function that creates a jax.sharding.Mesh object from the
-        axis_dims and axis_names attributes of an object, which are assumed to be lists of integers and strings, respectively.
-        The backend attribute is also used if it exists.
-
-        :param self: Refer to the object itself
-        :return: A jaxMesh
-
-        """
-        return create_mesh(
-            axis_dims=self.axis_dims,
-            axis_names=self.axis_names,
-            backend=(self.backend if self.backend is not None else "") if hasattr(
-                self, 'backend') else ""
-        )
-
-    def get_partition_rules(self, fully_fsdp: bool = True):
-        if not fully_fsdp:
-            raise NotImplementedError
-        else:
-            return (
-                ('.*', jax.sharding.PartitionSpec(("fsdp", "sp")))
-            )
-
-    def get_axis_dims(self) -> Sequence[int]:
-        """
-        The get_axis_dims function returns a sequence of integers representing the dimensions of each axis.
-
-        :param self: Represent the instance of the class
-        :return: The dimensions of the axes
-
-        """
-        return self.axis_dims
-
-    def get_axis_names(self) -> Sequence[str]:
-        """
-        The get_axis_names function returns a list of the names of the axes.
-
-        :param self: Represent the instance of the class
-        :return: A list of the names of all axes
-
-        """
-        return self.axis_names
-
-    def get_backend(self) -> str:
-        """
-        The get_backend function returns the backend that is currently being used.
-        If no backend has been set, it will return the default JAX backend.
-
-        :param self: Bind the method to an object
-        :return: The backend platform
-
-        """
-        return self.backend if not self.backend == "" else jax.lib.xla_bridge.get_backend().platform
-
-    @staticmethod
-    def get_flash_attention():
-        """
-        The get_flash_attention function is used to get the flash attention value from the database.
-            :returns: The flash attention value from the database.
-
-        :return: A function
-
-        """
-        return get_flash_attention()
-
-    def add_partitions(
-            self,
-            axis_dims: Sequence[int] = (1, -1, 1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
-                ("dp", "fsdp"), "sp", "tp", None),
-            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
-                ("dp", "fsdp"), "sp", "tp", None),
-            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
-                ("dp", "fsdp"), "sp", "tp", None),
-            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
-                ("dp", "fsdp"), None, None, None),
-            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
-                ("dp", "fsdp"), "sp", "tp", None),
-            use_shard_map: bool = False,
-            backend: Optional[str] = None,
-    ):
-        """
-            It initializes all the attributes of an object, and it's called when you create a new instance of that class.
-            :param self: Refer to the instance of the class
-            :param axis_dims: Sequence[int]: Specify the number of dimensions for each axis
-            :param axis_names: Sequence[str]: Set the names of the axes
-            :param q_ps: jax.sharding.PartitionSpec: Specify the partitioning of the query tensor
-            :param k_ps: jax.sharding.PartitionSpec: Partition the key matrix
-            :param v_ps: jax.sharding.PartitionSpec: Specify the partitioning of the value tensor
-            :param b_ps: jax.sharding.PartitionSpec: Specify the Attention Bias partition spec
-            :param a_ps: jax.sharding.PartitionSpec: Specify the partitioning of the attention weights
-            :param use_shard_map: bool: whenever to use shard_map for attention
-            :param backend: Optional[None]: Specify the backend to use
-            """
-        self.axis_dims = axis_dims
-        self.axis_names = axis_names
-        self.q_ps = q_ps
-        self.k_ps = k_ps
-        self.v_ps = v_ps
-        self.b_ps = b_ps
-        self.a_ps = a_ps
-        self.backend = backend
-        self.use_shard_map = use_shard_map
-
-
 def add_start_docstrings(*docstr):
     """
     The add_start_docstrings function is a decorator that adds the docstrings to the beginning of a function.
@@ -665,7 +502,7 @@ def add_start_docstrings(*docstr):
     The returned decorator takes in one argument, fn, which is assumed to be a function. The docstring for fn is set equal to
     the concatenation of all the strings passed into add_start_docstrings plus (if it exists) the original docstring for fn.
 
-    :param *docstr: Pass in a variable number of arguments to the function
+    :param docstr: Pass in a variable number of arguments to the function
     :return: A decorator that adds the docstrings to the function
 
     """

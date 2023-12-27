@@ -6,10 +6,10 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.onnx import OnnxConfigWithPast, PatchingSpec
 from collections import OrderedDict
 
-from ..flax_modelling_utils import JaxBaseClassModel
+from ..easydel_modelling_utils import EasyDelPretrainedConfig
 
 
-class GPTJConfig(JaxBaseClassModel):
+class GPTJConfig(EasyDelPretrainedConfig):
     model_type = "gptj"
     attribute_map = {
         "max_position_embeddings": "n_positions",

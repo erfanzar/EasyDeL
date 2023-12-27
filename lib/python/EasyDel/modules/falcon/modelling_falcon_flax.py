@@ -1,10 +1,9 @@
 import math
 from flax import linen as nn
 from flax.core import FrozenDict, unfreeze
-from typing import Optional, Dict, Union, Tuple, Sequence
+from typing import Optional, Dict, Union, Tuple
 
 from flax.linen import combine_masks
-from transformers import FlaxPreTrainedModel, PretrainedConfig
 from jax import numpy as jnp, lax
 import jax
 from jax.sharding import PartitionSpec
@@ -14,6 +13,7 @@ from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
 import chex
 from fjformer.func import transpose
 from .falcon_configuration import FalconConfig
+from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 
 
 def built_bloom_alibi(attention_mask, num_attention_heads):
@@ -637,7 +637,7 @@ class FlaxFalconModule(nn.Module):
             return output, outputs
 
 
-class FlaxFalconPretrainedModel(FlaxPreTrainedModel):
+class FlaxFalconPretrainedModel(EasyDelFlaxPretrainedModel):
     module_class: nn.Module = None
     config_class = FalconConfig
 
@@ -752,6 +752,12 @@ class FlaxFalconPretrainedModel(FlaxPreTrainedModel):
 class FlaxFalconModel(FlaxFalconPretrainedModel):
     module_class = FlaxFalconModule
 
+    def get_input_embeddings(self):
+        return self.module.word_embeddings
+
+    def set_input_embeddings(self, value):
+        self.module.word_embeddings = value
+
 
 class FlaxFalconForCausalLMModule(nn.Module):
     config: FalconConfig
@@ -811,3 +817,21 @@ class FlaxFalconForCausalLMModule(nn.Module):
 
 class FlaxFalconForCausalLM(FlaxFalconPretrainedModel):
     module_class = FlaxFalconForCausalLMModule
+
+    def get_decoder(self):
+        return self.module.transformer
+
+    def get_output_embeddings(self):
+        return self.module.lm_head
+
+    def get_input_embeddings(self):
+        return self.module.transformer.word_embeddings
+
+    def set_input_embeddings(self, value):
+        self.module.transformer.word_embeddings = value
+
+    def set_decoder(self, decoder):
+        self.module.transformer = decoder
+
+    def set_output_embeddings(self, new_embeddings):
+        self.module.lm_head = new_embeddings

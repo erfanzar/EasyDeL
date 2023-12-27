@@ -2,10 +2,10 @@ from typing import Sequence, Optional
 
 from jax.sharding import PartitionSpec
 
-from ..flax_modelling_utils import JaxBaseClassModel
+from ..easydel_modelling_utils import EasyDelPretrainedConfig
 
 
-class FalconConfig(JaxBaseClassModel):
+class FalconConfig(EasyDelPretrainedConfig):
     model_type = "falcon"
     attribute_map = {
         "num_hidden_layers": "num_hidden_layers",

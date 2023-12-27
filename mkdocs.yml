@@ -1,8 +1,7 @@
-copyright: Erfan Zare Chavoshi-EasyDel
 nav:
-  - Home: index.md
   - AvailableModels: AvailableModels.md
-  - Install: Install.md
+  - Data Preprocessing:
+      - Processor: data_preprocessing-_processor.md
   - EasyBIT: Bits.md
   - Etils:
       - Configs: etils-configs.md
@@ -20,11 +19,13 @@ nav:
       - MosaicMPT Models: MosaicMPT.md
       - PytorchServer: PyTorchServer.md
       - TrainingExample: TrainingExample.md
+  - Home: index.md
   - Linen:
       - Bits: linen-bits.md
       - Utils: linen-utils.md
   - Modules:
-      - Auto Models: modules-auto_models.md
+      - Auto Easydel Model: modules-auto_easydel_model.md
+      - Easydel Modelling Utils: modules-easydel_modelling_utils.md
       - Falcon:
           - Falcon Configuration: modules-falcon-falcon_configuration.md
           - Modelling Falcon Flax: modules-falcon-modelling_falcon_flax.md
@@ -97,6 +98,7 @@ nav:
       - Prompters: utils-prompters.md
       - Tensor Utils: utils-tensor_utils.md
       - Utils: utils-utils.md
+  - install: Install.md
 
 plugins:
   - search
@@ -109,6 +111,7 @@ plugins:
 repo_url: https://github.com/erfanzar/EasyDel
 site_author: Erfan Zare Chavoshi
 site_name: EasyDel
+copyright: Erfan Zare Chavoshi-EasyDel
 
 theme:
   highlightjs: true

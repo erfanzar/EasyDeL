@@ -2,7 +2,7 @@ import math
 from flax import linen as nn
 from flax.core import FrozenDict
 from typing import Optional, Union, Tuple
-from transformers import FlaxPreTrainedModel
+
 from jax import numpy as jnp
 import jax
 from jax.sharding import PartitionSpec
@@ -15,6 +15,7 @@ from ..flax_modelling_utils import (
     ACT2FN,
     smart_flash_attention, get_dot_general_by_bits
 )
+from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 import chex
 
 from .mosaic_configuration import MptConfig
@@ -382,7 +383,7 @@ class FlaxMptModule(nn.Module):
             return (hidden_states,)
 
 
-class FlaxMptPretrainedModel(FlaxPreTrainedModel):
+class FlaxMptPretrainedModel(EasyDelFlaxPretrainedModel):
     module_class: nn.Module = None
     config_class: MptConfig = MptConfig
 
@@ -483,6 +484,12 @@ class FlaxMptPretrainedModel(FlaxPreTrainedModel):
 class FlaxMptModel(FlaxMptPretrainedModel):
     module_class = FlaxMptModule
 
+    def get_input_embeddings(self):
+        return self.module.wte
+
+    def set_input_embeddings(self, value):
+        self.module.wte = value
+
 
 class FlaxMptForCausalLMModule(nn.Module):
     config: MptConfig
@@ -537,6 +544,24 @@ class FlaxMptForCausalLMModule(nn.Module):
 
 class FlaxMptForCausalLM(FlaxMptPretrainedModel):
     module_class = FlaxMptForCausalLMModule
+
+    def get_input_embeddings(self):
+        return self.module.transformer.wte
+
+    def get_decoder(self):
+        return self.module.transformer
+
+    def set_input_embeddings(self, value):
+        self.module.transformer.wte = value
+
+    def set_decoder(self, decoder):
+        self.module.transformer = decoder
+
+    def set_output_embeddings(self, new_embeddings):
+        self.module.lm_head = new_embeddings
+
+    def get_output_embeddings(self):
+        return self.module.lm_head
 
     def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[chex.Array] = None):
 
