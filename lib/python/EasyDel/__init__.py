@@ -6,6 +6,10 @@ from .serve.jax_serve import (
     JAXServer as JAXServer,
     JAXServerConfig as JAXServerConfig
 )
+from .serve.gradio_user_interface_base import (
+    GradioUserInference as GradioUserInference
+)
+
 from .modules.llama import (
     LlamaConfig as LlamaConfig,
     FlaxLlamaForCausalLM as FlaxLlamaForCausalLM,
