@@ -78,9 +78,11 @@ class JAXServerConfig:
     stream_tokens_for_gradio: bool = True
     use_prefix_tokenizer: bool = True
     pre_compile: bool = True
-    assert max_new_tokens % max_compile_tokens == 0, (
-        f"max_new_tokens should be divisible by max_compile_tokens  {max_new_tokens % max_compile_tokens}"
-    )
+
+    def __post_init__(self):
+        assert self.max_new_tokens % self.max_compile_tokens == 0, (
+            f"max_new_tokens should be divisible by max_compile_tokens  {self.max_new_tokens % self.max_compile_tokens}"
+        )
 
 
 class JAXServer(GradioUserInference):
