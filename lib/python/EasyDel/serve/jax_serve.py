@@ -131,7 +131,7 @@ class JAXServer(GradioUserInference):
     def status(self):
         """
         The status function returns a dictionary with the following keys:
-            config: A dictionary containing all of the configuration parameters for this server.
+            config: A dictionary containing all the configuration parameters for this server.
             devices: A string describing which devices are available to JAX.
             number_of_backends: The number of backends available to JAX.  This is usually equal to the number of GPUs
             on your machine, but can be less if you have not installed CUDA or if you have disabled some GPUs in your
