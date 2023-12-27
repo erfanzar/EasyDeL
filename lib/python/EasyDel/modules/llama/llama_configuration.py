@@ -1,11 +1,11 @@
-from typing import Sequence, Optional, Dict, Union
+from typing import Optional, Dict, Union
 
 from jax.sharding import PartitionSpec
 
-from ..flax_modelling_utils import JaxBaseClassModel
+from ..easydel_modelling_utils import EasyDelPretrainedConfig
 
 
-class LlamaConfig(JaxBaseClassModel):
+class LlamaConfig(EasyDelPretrainedConfig):
     model_type = "llama"
 
     def __init__(

@@ -1,11 +1,8 @@
-from typing import Sequence, Optional
-
-from jax.sharding import PartitionSpec
-
-from ..flax_modelling_utils import JaxBaseClassModel
+from typing import Optional
+from ..easydel_modelling_utils import EasyDelPretrainedConfig
 
 
-class GPT2Config(JaxBaseClassModel):
+class GPT2Config(EasyDelPretrainedConfig):
     model_type = "gpt2"
     keys_to_ignore_at_inference = ["past_key_values"]
     attribute_map = {
@@ -90,4 +87,3 @@ class GPT2Config(JaxBaseClassModel):
         for k, v in args.items():
             if not hasattr(self, k):
                 setattr(self, k, v)
-

@@ -2,10 +2,10 @@ from typing import Sequence, Optional, Union
 
 from jax.sharding import PartitionSpec
 
-from ..flax_modelling_utils import JaxBaseClassModel
+from ..easydel_modelling_utils import EasyDelPretrainedConfig
 
 
-class MptConfig(JaxBaseClassModel):
+class MptConfig(EasyDelPretrainedConfig):
     model_type = 'mpt'
 
     def __init__(self,

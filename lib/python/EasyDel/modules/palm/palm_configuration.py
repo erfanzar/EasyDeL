@@ -2,10 +2,10 @@ from typing import Sequence, Optional
 
 from jax.sharding import PartitionSpec
 
-from ..flax_modelling_utils import JaxBaseClassModel
+from ..easydel_modelling_utils import EasyDelPretrainedConfig
 
 
-class PalmConfig(JaxBaseClassModel):
+class PalmConfig(EasyDelPretrainedConfig):
     def __init__(self,
                  vocab_size: Optional[int] = 32000,
                  hidden_size: Optional[int] = 4096,

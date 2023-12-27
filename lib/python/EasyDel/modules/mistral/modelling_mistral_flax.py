@@ -12,7 +12,7 @@ from flax import linen as nn
 from flax.traverse_util import unflatten_dict, flatten_dict
 from flax.core import freeze, unfreeze
 from typing import Union, Optional, Tuple
-from transformers import FlaxPreTrainedModel
+from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 from flax.linen import partitioning as nn_partitioning, dot_product_attention_weights
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 
@@ -420,8 +420,11 @@ class FlaxMistralDecoderLayer(nn.Module):
         """
         The __call__ function is the main function of a TransformerEncoderLayer.
         It takes in the following arguments:
-            hidden_state (chex.Array): The input to the encoder layer, which is also its output after being processed by all sublayers.
-            freq_cis (chex.Array): A tensor containing frequency-domain representations of each token's context vector, used for computing self-attention weights and biases in a more efficient manner than using position embeddings or sinusoidal positional encoding vectors would allow for [2]. This tensor has shape `(batch_size, num
+            hidden_state (chex.Array): The input to the encoder layer, which is also its output after being processed
+            by all sublayers.
+            freq_cis (chex.Array): A tensor containing frequency-domain representations of each token's context vector,
+            used for computing self-attention weights and biases in a more efficient manner than using position
+            embeddings or sinusoidal positional encoding vectors would allow for [2].
 
         :param self: Represent the instance of the class
         :param hidden_state: chex.Array: Represent the input to the encoder layer
@@ -457,7 +460,7 @@ class FlaxMistralDecoderLayer(nn.Module):
         return outputs
 
 
-class FlaxMistralPretrainedModel(FlaxPreTrainedModel):
+class FlaxMistralPretrainedModel(EasyDelFlaxPretrainedModel):
     config_class = MistralConfig
     base_model_prefix = 'mistral'
     module_class: nn.Module = None
@@ -822,6 +825,12 @@ class FlaxMistralModule(nn.Module):
 class FlaxMistralModel(FlaxMistralPretrainedModel):
     module_class = FlaxMistralModule
 
+    def set_input_embeddings(self, value):
+        self.module.embed_tokens = value
+
+    def get_input_embeddings(self):
+        return self.module.embed_tokens
+
 
 class FlaxMistralForCausalLMModule(nn.Module):
     config: MistralConfig
@@ -921,6 +930,24 @@ class FlaxMistralForCausalLMModule(nn.Module):
 
 class FlaxMistralForCausalLM(FlaxMistralPretrainedModel):
     module_class = FlaxMistralForCausalLMModule
+
+    def set_input_embeddings(self, value):
+        self.module.model.embed_tokens = value
+
+    def get_input_embeddings(self):
+        return self.module.model.embed_tokens
+
+    def set_decoder(self, decoder):
+        self.module.model = decoder
+
+    def get_decoder(self):
+        return self.module.model
+
+    def get_output_embeddings(self):
+        return self.module.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.module.lm_head = new_embeddings
 
     def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[chex.Array] = None):
         batch_size, seq_length = input_ids.shape

@@ -13,14 +13,7 @@ from flax.serialization import from_bytes
 import msgpack
 from typing import Sequence, Optional, Type, Tuple
 
-from ...modules.auto_models import AutoEasyDelModelForCausalLM
-
-LAYER_PATTERNS = [
-    "transformer.h.{layer}",
-    "model.decoder.layers.{layer}",
-    "gpt_neox.layers.{layer}",
-    "model.layers.{layer}",
-]
+from ...modules.auto_easydel_model import AutoEasyDelModelForCausalLM
 
 
 def match_keywords(string, ts, ns):
@@ -87,104 +80,6 @@ class FlaxPreTrainedModelWrapper(nn.Module):
                 head_name="v_head"
             )
         return model, params
-
-    @classmethod
-    def _get_checkpoint_from_hub(
-            cls,
-            pretrained_model,
-            pretrained_model_name_or_path,
-            index_filename,
-            token=None,
-            model_name="pytorch_model.bin",
-            model_index_name="pytorch_model.bin.index.json",
-    ):
-        """
-        The _get_checkpoint_from_hub function is used to download a pretrained model from the Hugging Face Hub.
-        It will first attempt to download the entire model, and if that fails it will try downloading just the v_head weights.
-        If neither of those attempts succeed, it will return None for all outputs.
-
-        :param cls: Specify the class of the model
-        :param pretrained_model: Load the pretrained model
-        :param pretrained_model_name_or_path: Load the pretrained model from a checkpoint
-        :param index_filename: Load the index file for sharded models
-        :param token: Authenticate with the hugging face model hub
-        :param model_name: Specify the name of the model file to be downloaded
-        :param model_index_name: Specify the name of the index file
-        :param : Load the pretrained model
-        :return: A tuple of four elements:
-        
-        """
-        files_to_download = None
-        filename = None
-        is_resuming_training = True
-        is_sharded = False
-
-        try:
-            filename = hf_hub_download(
-                pretrained_model_name_or_path,
-                model_name,
-                token=token,
-            )
-        # sharded
-        except (EntryNotFoundError, LocalEntryNotFoundError, HFValidationError):
-            index_file_name = ''
-            if os.path.exists(index_filename):
-                index_file_name = index_filename
-            else:
-                try:
-                    index_file_name = hf_hub_download(
-                        pretrained_model_name_or_path,
-                        model_index_name,
-                        token=token,
-                    )
-                except (EntryNotFoundError, LocalEntryNotFoundError, HFValidationError):
-                    # not continue training, do not have v_head weight
-                    is_resuming_training = False
-                    logging.warning(
-                        f"A {type(pretrained_model)} model is loaded from '{pretrained_model_name_or_path}', "
-                        f"and no v_head weight is found. This IS expected if you are not resuming PPO training."
-                    )
-            # load json
-            if is_resuming_training:
-                with open(index_file_name, "r") as f:
-                    index = json.load(f)
-                files_to_download = set()
-                for k, v in index["weight_map"].items():
-                    if any([module in k for module in cls.supported_modules]):
-                        files_to_download.add(v)
-                is_sharded = True
-
-        return filename, files_to_download, is_sharded, is_resuming_training
-
-    @classmethod
-    def _split_kwargs(cls, kwargs):
-        """
-        The _split_kwargs function is used to split the kwargs into three categories:
-            1. supported_kwargs - These are the arguments that are supported by this class and will be passed on to the
-            parent class.
-            2. unsupported_kwargs - These are arguments that aren't supported by this class, but may be useful for other
-             classes in a chain of inheritance (e.g., if you're using multiple mixins).
-            3. peft_kwargs - These are arguments specific to PEFT and will not be passed on to any other classes.
-
-        :param cls: Refer to the class itself
-        :param kwargs: Pass keyword arguments to the function
-        :return: A tuple of three dictionaries
-        
-        """
-        supported_kwargs = {}
-        unsupported_kwargs = {}
-        peft_kwargs = {}
-
-        for key, value in kwargs.items():
-            if key in cls.supported_args:
-                supported_kwargs[key] = value
-            else:
-                unsupported_kwargs[key] = value
-
-        return supported_kwargs, unsupported_kwargs, peft_kwargs
-
-    def push_to_hub(self, *args, **kwargs):
-        raise NotImplementedError
 
     def post_init(
             self,

@@ -37,14 +37,14 @@ from flax.linen.attention import dot_product_attention_weights
 from jax import lax
 
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
-from transformers.modeling_flax_utils import ACT2FN, FlaxPreTrainedModel
 from transformers.utils import logging
 
 from fjformer.attention import efficient_attention
-from ..flax_modelling_utils import with_sharding_constraint
+from ..flax_modelling_utils import with_sharding_constraint, ACT2FN
+from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 import chex
 from fjformer.bits import config as q_config, q_flax
-from .gpt_j_configuration import GPTJConfig, GPTJOnnxConfig
+from .gpt_j_configuration import GPTJConfig
 
 logger = logging.get_logger(__name__)
 
@@ -350,7 +350,7 @@ class FlaxGPTJBlock(nn.Module):
         return (hidden_states,) + attn_outputs[1:]
 
 
-class FlaxGPTJPreTrainedModel(FlaxPreTrainedModel):
+class FlaxGPTJPreTrainedModel(EasyDelFlaxPretrainedModel):
     config_class = GPTJConfig
     base_model_prefix = "transformer"
     module_class: nn.Module = None
@@ -586,6 +586,12 @@ class FlaxGPTJModule(nn.Module):
 class FlaxGPTJModel(FlaxGPTJPreTrainedModel):
     module_class = FlaxGPTJModule
 
+    def get_input_embeddings(self):
+        return self.module.wte
+
+    def set_input_embeddings(self, value):
+        self.module.wte = value
+
 
 class FlaxGPTJForCausalLMModule(nn.Module):
     config: GPTJConfig
@@ -647,6 +653,24 @@ class FlaxGPTJForCausalLMModule(nn.Module):
 
 class FlaxGPTJForCausalLM(FlaxGPTJPreTrainedModel):
     module_class = FlaxGPTJForCausalLMModule
+
+    def get_output_embeddings(self):
+        return self.module.lm_head
+
+    def get_decoder(self):
+        return self.module.transformer
+
+    def get_input_embeddings(self):
+        return self.module.transformer.wte
+
+    def set_output_embeddings(self, new_embeddings):
+        self.module.lm_head = new_embeddings
+
+    def set_decoder(self, decoder):
+        self.module.transformer = decoder
+
+    def set_input_embeddings(self, value):
+        self.module.transformer.wte = value
 
     def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[chex.Array] = None):
 

@@ -9,6 +9,7 @@ from .serve.jax_serve import (
 from .modules.llama import (
     LlamaConfig as LlamaConfig,
     FlaxLlamaForCausalLM as FlaxLlamaForCausalLM,
+    FlaxLlamaForSequenceClassification as FlaxLlamaForSequenceClassification,
     FlaxLlamaModel as FlaxLlamaModel
 )
 from .modules.gpt_j import (
@@ -74,7 +75,7 @@ from .modules.mixtral import (
     MixtralConfig as MixtralConfig
 )
 
-from .modules.auto_models import (
+from .modules.auto_easydel_model import (
     AutoEasyDelModelForCausalLM as AutoEasyDelModelForCausalLM,
     get_modules_by_type as get_modules_by_type
 )

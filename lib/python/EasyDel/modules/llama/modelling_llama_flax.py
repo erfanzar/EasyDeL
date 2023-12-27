@@ -12,7 +12,6 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from flax.linen import partitioning as nn_partitioning, dot_product_attention_weights
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks, make_causal_mask
-from transformers.modeling_flax_utils import FlaxPreTrainedModel
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput, FlaxSequenceClassifierOutput
 # EasyDel.modules
 from ..flax_modelling_utils import (
@@ -23,6 +22,7 @@ from ..flax_modelling_utils import (
     precompute_freq_cis,
     smart_flash_attention, get_dot_general_by_bits
 )
+from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 import chex
 from .llama_configuration import LlamaConfig
 
@@ -622,7 +622,7 @@ class FlaxLlamaBlock(nn.Module):
         return (hidden_states,) + attn_outputs[1:]
 
 
-class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
+class FlaxLlamaPreTrainedModel(EasyDelFlaxPretrainedModel):
     config_class = LlamaConfig
     base_model_prefix = "model"
     module_class: nn.Module = None
@@ -1051,6 +1051,12 @@ class FlaxLlamaModule(nn.Module):
 class FlaxLlamaModel(FlaxLlamaPreTrainedModel):
     module_class = FlaxLlamaModule
 
+    def set_input_embeddings(self, value):
+        self.module.embed_tokens = value
+
+    def get_input_embeddings(self):
+        return self.module.embed_tokens
+
 
 class FlaxLlamaForCausalLMModule(nn.Module):
     config: LlamaConfig
@@ -1144,6 +1150,24 @@ class FlaxLlamaForCausalLMModule(nn.Module):
 
 class FlaxLlamaForCausalLM(FlaxLlamaPreTrainedModel):
     module_class = FlaxLlamaForCausalLMModule
+
+    def set_input_embeddings(self, value):
+        self.module.model.embed_tokens = value
+
+    def get_input_embeddings(self):
+        return self.module.model.embed_tokens
+
+    def set_decoder(self, decoder):
+        self.module.model = decoder
+
+    def get_decoder(self):
+        return self.module.model
+
+    def get_output_embeddings(self):
+        return self.module.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.module.lm_head = new_embeddings
 
     def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[chex.Array] = None):
         """

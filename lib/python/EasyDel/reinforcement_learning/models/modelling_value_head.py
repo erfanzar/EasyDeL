@@ -8,7 +8,7 @@ from EasyDel.modules import FlaxLlamaForCausalLM
 from typing import Type
 
 from transformers.modeling_flax_outputs import FlaxCausalLMOutput
-from ...modules.auto_models import AutoEasyDelModelForCausalLM
+from ...modules.auto_easydel_model import AutoEasyDelModelForCausalLM
 from .modelling_base import FlaxPreTrainedModelWrapper
 from jax import numpy as jnp
 import chex

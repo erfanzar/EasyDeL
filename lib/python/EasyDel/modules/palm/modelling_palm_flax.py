@@ -1,4 +1,4 @@
-from typing import Union, Optional, Tuple, Any, Mapping, Sequence
+from typing import Union, Optional, Tuple, Any, Mapping
 import jax
 import jax.numpy as jnp
 import numpy as onp
@@ -14,6 +14,7 @@ from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
     with_sharding_constraint
 import chex
 from .palm_configuration import PalmConfig
+from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 
 
 class RMSNorm(nn.Module):
@@ -175,7 +176,7 @@ class ParallelCollection(nn.Module):
         return hidden_state, saves
 
 
-class PalmPretrainedModel(transformers.FlaxPreTrainedModel):
+class PalmPretrainedModel(EasyDelFlaxPretrainedModel):
     module_class: nn.Module
     config_class = PalmConfig
     dtype: jnp.dtype = jnp.bfloat16
@@ -319,6 +320,12 @@ class FlaxPalmModule(nn.Module):
 class FlaxPalmModel(PalmPretrainedModel):
     module_class = FlaxPalmModule
 
+    def get_input_embeddings(self):
+        return self.module.wte
+
+    def set_input_embeddings(self, value):
+        self.module.wte = value
+
 
 class FlaxPalmForCausalLMModule(nn.Module):
     config: PalmConfig
@@ -369,3 +376,21 @@ class FlaxPalmForCausalLMModule(nn.Module):
 
 class FlaxPalmForCausalLM(PalmPretrainedModel):
     module_class = FlaxPalmForCausalLMModule
+
+    def get_input_embeddings(self):
+        return self.module.path_way.wte
+
+    def get_decoder(self):
+        return self.module.path_way
+
+    def set_input_embeddings(self, value):
+        self.module.path_way.wte = value
+
+    def set_decoder(self, decoder):
+        self.module.path_way = decoder
+
+    def set_output_embeddings(self, new_embeddings):
+        self.module.lm_head = new_embeddings
+
+    def get_output_embeddings(self):
+        return self.module.lm_head

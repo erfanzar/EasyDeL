@@ -27,18 +27,18 @@ from flax.linen.attention import dot_product_attention_weights
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax.random import PRNGKey
-from transformers import PretrainedConfig
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxMaskedLMOutput
-from transformers.modeling_flax_utils import ACT2FN, FlaxPreTrainedModel
+from transformers.modeling_flax_utils import ACT2FN
 from jax.sharding import PartitionSpec
 from transformers import logging
 
 from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
-    with_sharding_constraint, JaxBaseClassModel
+    with_sharding_constraint
 
 import chex
 
 from .opt_configuration import OPTConfig
+from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 
 logger = logging.get_logger(__name__)
 
@@ -442,7 +442,7 @@ class FlaxOPTDecoder(nn.Module):
         )
 
 
-class FlaxOPTPreTrainedModel(FlaxPreTrainedModel):
+class FlaxOPTPreTrainedModel(EasyDelFlaxPretrainedModel):
     config_class = OPTConfig
     base_model_prefix: str = "model"
     module_class: nn.Module = None
@@ -603,11 +603,14 @@ class FlaxOPTModule(nn.Module):
         )
 
 
-# Copied from transformers.models.bart.modeling_flax_bart.FlaxBartModel with Bart->OPT
 class FlaxOPTModel(FlaxOPTPreTrainedModel):
-    config: OPTConfig
-    dtype: jnp.dtype = jnp.float32  # the dtype of the computation
     module_class = FlaxOPTModule
+
+    def set_input_embeddings(self, value):
+        self.module.embed_tokens = value
+
+    def get_input_embeddings(self):
+        return self.module.embed_tokens
 
 
 class FlaxOPTForCausalLMModule(nn.Module):
@@ -665,6 +668,24 @@ class FlaxOPTForCausalLMModule(nn.Module):
 
 class FlaxOPTForCausalLM(FlaxOPTPreTrainedModel):
     module_class = FlaxOPTForCausalLMModule
+
+    def set_input_embeddings(self, value):
+        self.module.model.embed_tokens = value
+
+    def get_input_embeddings(self):
+        return self.module.model.embed_tokens
+
+    def set_decoder(self, decoder):
+        self.module.model = decoder
+
+    def get_decoder(self):
+        return self.module.model
+
+    def get_output_embeddings(self):
+        return self.module.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.module.lm_head = new_embeddings
 
     def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[chex.Array] = None):
         # initializing the cache

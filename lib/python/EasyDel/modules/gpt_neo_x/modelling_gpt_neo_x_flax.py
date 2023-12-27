@@ -13,6 +13,7 @@ from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
     with_sharding_constraint, ACT2FN
 import chex
 from .gpt_neo_x_configuration import GPTNeoXConfig
+from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0,
@@ -261,7 +262,7 @@ class FlaxGPTNeoXModule(nn.Module):
             return hidden_state,
 
 
-class FlaxGPTNeoXPretrainedModel(FlaxPreTrainedModel):
+class FlaxGPTNeoXPretrainedModel(EasyDelFlaxPretrainedModel):
     module_class: nn.Module = None
     config_class = GPTNeoXConfig
 
@@ -306,6 +307,12 @@ class FlaxGPTNeoXPretrainedModel(FlaxPreTrainedModel):
 class FlaxGPTNeoXModel(FlaxGPTNeoXPretrainedModel):
     module_class = FlaxGPTNeoXModule
 
+    def get_input_embeddings(self):
+        return self.module.wte
+
+    def set_input_embeddings(self, value):
+        self.module.wte = value
+
 
 class FlaxGPTNeoXForCausalLMModule(nn.Module):
     config: GPTNeoXConfig
@@ -332,3 +339,21 @@ class FlaxGPTNeoXForCausalLMModule(nn.Module):
 
 class FlaxGPTNeoXForCausalLM(FlaxGPTNeoXPretrainedModel):
     module_class = FlaxGPTNeoXForCausalLMModule
+
+    def get_output_embeddings(self):
+        return self.module.lm_head
+
+    def get_decoder(self):
+        return self.module.transformer
+
+    def get_input_embeddings(self):
+        return self.module.transformer.wte
+
+    def set_output_embeddings(self, new_embeddings):
+        self.module.lm_head = new_embeddings
+
+    def set_decoder(self, decoder):
+        self.module.transformer = decoder
+
+    def set_input_embeddings(self, value):
+        self.module.transformer.wte = value

@@ -14,6 +14,7 @@ from ..flax_modelling_utils import ACT2FN, get_gradient_checkpoint_policy, canon
 from einops import repeat, rearrange
 from transformers.modeling_flax_outputs import FlaxCausalLMOutput
 from .phi_configuration import PhiConfig
+from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 
 
 @dataclass
@@ -1051,6 +1052,30 @@ class FlaxPhiForCausalLMModule(nn.Module):
 class FlaxPhiForCausalLM(FlaxPhiPreTrainedModel):
     module_class = FlaxPhiForCausalLMModule
 
+    def get_input_embeddings(self):
+        return self.module.transformer.embd
+
+    def get_decoder(self):
+        return self.module.transformer
+
+    def set_input_embeddings(self, value):
+        self.module.transformer.embd = value
+
+    def set_decoder(self, decoder):
+        self.module.transformer = decoder
+
+    def set_output_embeddings(self, new_embeddings):
+        self.module.lm_head = new_embeddings
+
+    def get_output_embeddings(self):
+        return self.module.lm_head
+
 
 class FlaxPhiModel(FlaxPhiPreTrainedModel):
     module_class = FlaxPhiModule
+
+    def get_input_embeddings(self):
+        return self.module.embd
+
+    def set_input_embeddings(self, value):
+        self.module.embd = value

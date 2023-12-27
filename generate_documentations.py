@@ -93,6 +93,28 @@ def main():
 
     }
 
+    string_options = """
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            docstring_style: sphinx
+
+repo_url: https://github.com/erfanzar/EasyDel
+site_author: Erfan Zare Chavoshi
+site_name: EasyDel
+copyright: Erfan Zare Chavoshi-EasyDel
+
+theme:
+  highlightjs: true
+  hljs_languages:
+    - yaml
+    - python
+  name: material
+"""
+
     statics = {
         ("Home",): "index.md",
         ("install",): "Install.md",
@@ -112,18 +134,10 @@ def main():
     cache = statics | cache
     yaml_data = {
         "nav": unflatten_dict(cache),
-        "site_name": "EasyDel",
-        "copyright": "Erfan Zare Chavoshi-EasyDel",
-        "site_author": "Erfan Zare Chavoshi",
-        "repo_url": "https://github.com/erfanzar/EasyDel",
-        "plugins": [
-            "search",
-            mkdocstrings_options
-        ],
-        "theme": theme_options
     }
-
-    yaml.safe_dump(yaml_data, open("mkdocs.yml", "w"))
+    buff = open("mkdocs.yml", "w")
+    yaml.safe_dump(yaml_data, buff)
+    buff.write(string_options)
 
 
 if __name__ == "__main__":
