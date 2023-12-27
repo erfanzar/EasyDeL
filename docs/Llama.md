@@ -97,14 +97,14 @@ DEFAULT_SYSTEM_PROMPT = "You are a helpful, respectful and honest assistant and 
 class Llama2JaxServer(JAXServer):
     def process_gradio_chat(self, prompt, history, max_new_tokens, system, greedy):
 
-        system = None if system == '' else system
+        system = None if system == "" else system
         string = self.prompt_llama2_model(
             message=prompt,
             chat_history=history or [],
             system_prompt=system or DEFAULT_SYSTEM_PROMPT
         )
         if not self.config.stream_tokens_for_gradio:
-            response = ''
+            response = ""
             for response, _ in self.process(
                     string=string,
                     greedy=greedy,
@@ -113,21 +113,21 @@ class Llama2JaxServer(JAXServer):
                 ...
             history.append([prompt, response])
         else:
-            history.append([prompt, ''])
+            history.append([prompt, ""])
             for response, _ in self.process(
                     string=string,
                     greedy=greedy,
                     max_new_tokens=max_new_tokens
             ):
                 history[-1][-1] = response
-                yield '', history
+                yield "", history
 
-        return '', history
+        return "", history
 
     def process_gradio_instruct(self, prompt, system, max_new_tokens, greedy):
         string = self.prompt_llama2_model(system_prompt=DEFAULT_SYSTEM_PROMPT, message=prompt, chat_history=[])
         if not self.config.stream_tokens_for_gradio:
-            response = ''
+            response = ""
             for response, _ in self.process(
                     string=string,
                     greedy=greedy,
@@ -135,15 +135,15 @@ class Llama2JaxServer(JAXServer):
             ):
                 pass
         else:
-            response = ''
+            response = ""
             for response, _ in self.process(
                     string=string,
                     greedy=greedy,
                     max_new_tokens=max_new_tokens,
                     stream=True
             ):
-                yield '', response
-        return '', response
+                yield "", response
+        return "", response
 
     @staticmethod
     def prompt_llama2_model(message: str, chat_history,
@@ -157,7 +157,7 @@ class Llama2JaxServer(JAXServer):
             texts.append(f'{user_input} [/INST] {response.strip()} </s><s>[INST] ')
         message = message.strip() if do_strip else message
         texts.append(f'{message} [/INST]')
-        return ''.join(texts)
+        return "".join(texts)
 
 
 server = Llama2JaxServer.load_from_params(

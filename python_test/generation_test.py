@@ -30,7 +30,7 @@ def llama2_prompt(
         texts.append(f'{user_input} [/INST] {response.strip()} </s><s>[INST] ')
     message = message.strip() if do_strip else message
     texts.append(f'{message} [/INST]')
-    return ''.join(texts)
+    return "".join(texts)
 
 
 def del_prompter(
@@ -39,7 +39,7 @@ def del_prompter(
         system=None
 ):
     sys_str = f"<|system|>\n{system}</s>\n" if system is not None else ""
-    histories = ''
+    histories = ""
     for user, assistance in history:
         histories += f"<|user|>\n{user}</s>\n<|assistant|>\n{assistance}</s>\n"
     return sys_str + histories + f"<|user|>\n{prompt}</s>\n<|assistant|>\n"

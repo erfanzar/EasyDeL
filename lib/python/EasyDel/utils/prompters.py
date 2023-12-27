@@ -19,7 +19,7 @@ def antitoxin_prompter(
     
     """
     sys_str = f"<|im_start|>system\n{system}<|im_end|>\n" if system is not None else ""
-    histories = ''
+    histories = ""
     for user, assistance in history:
         histories += f"<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n{assistance}<|im_end|>\n"
     text = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
@@ -42,7 +42,7 @@ def antitoxin_prompter_chat_format(
     
     """
     sys_str = f"<|im_start|>system\n{system}<|im_end|>\n" if system is not None else ""
-    histories = ''
+    histories = ""
     for user, assistance in history:
         histories += f"<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n{assistance}<|im_end|>\n"
     return sys_str + histories
@@ -77,7 +77,7 @@ def llama2_prompter(
         texts.append(f'{user_input} [/INST] {response.strip()} </s><s>[INST] ')
     prompt = prompt.strip() if do_strip else prompt
     texts.append(f'{prompt} [/INST]')
-    return ''.join(texts)
+    return "".join(texts)
 
 
 def llama2_prompter_chat_format(
@@ -104,4 +104,4 @@ def llama2_prompter_chat_format(
     for index in range(0, len(messages), 2):
         string.append(
             f'{messages[index]} [/INST] {messages[index + 1].strip()} </s><s>[INST] ')
-    return ''.join(string).strip()
+    return "".join(string).strip()

@@ -32,7 +32,7 @@ def get_prompt_llama2_format(message: str, chat_history,
         texts.append(f'{user_input} [/INST] {response.strip()} </s><s>[INST] ')
     message = message.strip() if do_strip else message
     texts.append(f'{message} [/INST]')
-    return ''.join(texts)
+    return "".join(texts)
 
 
 class Llama2Host(JAXServer):
@@ -121,7 +121,7 @@ if __name__ == "__main__":
         help="The maximum number of new tokens to generate.",
     )
     parser.add_argument(
-        "--max_stream_tokens",
+        "--max_compile_tokens",
         default=32,
         type=int,
         help="The maximum number of tokens to generate per stream.",
@@ -179,7 +179,7 @@ if __name__ == "__main__":
         contains_auto_format=args.contains_auto_format,
         max_length=args.max_length,
         max_new_tokens=args.max_new_tokens,
-        max_stream_tokens=args.max_stream_tokens,
+        max_compile_tokens=args.max_compile_tokens,
         temperature=args.temperature,
         top_p=args.top_p,
         top_k=args.top_k,

@@ -290,7 +290,7 @@ class FlaxOPTDecoderLayerCollection(nn.Module):
 
     def setup(self):
         block = FlaxOPTDecoderLayer
-        if self.config.gradient_checkpointing != '':
+        if self.config.gradient_checkpointing != "":
             block = nn.remat(
                 block,
                 static_argnums=(3, 4),

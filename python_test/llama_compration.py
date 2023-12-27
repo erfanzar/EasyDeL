@@ -34,7 +34,7 @@ def main():
         num_key_value_heads=4,
         num_hidden_layers=1,
         intermediate_size=256,
-        gradient_checkpointing='',
+        gradient_checkpointing="",
         max_position_embeddings=seq_len
     )
 

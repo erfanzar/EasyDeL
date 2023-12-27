@@ -594,7 +594,7 @@ class FlaxT5LayerCollection(nn.Module):
 
     def setup(self):
         block = FlaxT5Block
-        if self.config.gradient_checkpointing != '':
+        if self.config.gradient_checkpointing != "":
             block = remat(
                 block, static_argnums=(5, 6, 7, 8, 9),
                 policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing)
@@ -645,7 +645,7 @@ class FlaxT5BlockCollection(nn.Module):
     def setup(self):
         self.causal = self.config.causal
         block = FlaxT5LayerCollection
-        if self.config.gradient_checkpointing != '':
+        if self.config.gradient_checkpointing != "":
             block = remat(block,
                           policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
                           static_argnums=(6, 7, 8))

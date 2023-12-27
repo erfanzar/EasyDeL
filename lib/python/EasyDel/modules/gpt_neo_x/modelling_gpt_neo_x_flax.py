@@ -188,7 +188,7 @@ class FlaxGPTNeoXCollection(nn.Module):
 
     def setup(self) -> None:
         block = FlaxGPTNeoXBlock
-        if self.config.gradient_checkpointing != '':
+        if self.config.gradient_checkpointing != "":
             block = nn.remat(
                 block, static_argnums=None,
                 policy=get_gradient_checkpoint_policy(

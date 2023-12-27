@@ -498,7 +498,7 @@ class FlaxLlamaBlock(nn.Module):
 
     def setup(self) -> None:
         attn_block = FlaxLlamaAttention
-        if self.config.gradient_checkpointing != '':
+        if self.config.gradient_checkpointing != "":
             attn_block = nn_partitioning.remat(
                 FlaxLlamaAttention, static_argnums=(5, 6, 7),
                 policy=get_gradient_checkpoint_policy(
@@ -513,7 +513,7 @@ class FlaxLlamaBlock(nn.Module):
         )
         mlp_block = FlaxLlamaMLP
 
-        if self.config.gradient_checkpointing != '':
+        if self.config.gradient_checkpointing != "":
             mlp_block = nn_partitioning.remat(
                 FlaxLlamaMLP, static_argnums=(1,),
                 policy=get_gradient_checkpoint_policy(
