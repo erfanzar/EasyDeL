@@ -1,25 +1,16 @@
 nav:
+  - Home: index.md
   - AvailableModels: AvailableModels.md
+  - install: Install.md
+  - EasyBIT: Bits.md
   - Data Preprocessing:
       - Processor: data_preprocessing-_processor.md
-  - EasyBIT: Bits.md
   - Etils:
       - Configs: etils-configs.md
       - Errors: etils-errors.md
       - Etils: etils-etils.md
   - Eval:
       - Lm Eval: eval-lm_eval.md
-  - Examples:
-      - DataProcessing: DataProcessing.md
-      - Falcon Models: Falcon.md
-      - JAXServer: JAXServer.md
-      - Llama Models: Llama.md
-      - Llama2 Models: Llama2.md
-      - Mistral Models: Mistral.md
-      - MosaicMPT Models: MosaicMPT.md
-      - PytorchServer: PyTorchServer.md
-      - TrainingExample: TrainingExample.md
-  - Home: index.md
   - Linen:
       - Bits: linen-bits.md
       - Utils: linen-utils.md
@@ -98,7 +89,16 @@ nav:
       - Prompters: utils-prompters.md
       - Tensor Utils: utils-tensor_utils.md
       - Utils: utils-utils.md
-  - install: Install.md
+  - Examples:
+      - DataProcessing: DataProcessing.md
+      - Falcon Models: Falcon.md
+      - JAXServer: JAXServer.md
+      - Llama Models: Llama.md
+      - Llama2 Models: Llama2.md
+      - Mistral Models: Mistral.md
+      - MosaicMPT Models: MosaicMPT.md
+      - PytorchServer: PyTorchServer.md
+      - TrainingExample: TrainingExample.md
 
 plugins:
   - search
