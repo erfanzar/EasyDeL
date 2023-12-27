@@ -343,7 +343,7 @@ def configure_generate_functions(self, model, tokenizer):
             attention_mask=attention_mask,
             params=parameters,
             generation_config=GenerationConfig(
-                max_new_tokens=self.config.max_stream_tokens,
+                max_new_tokens=self.config.max_compile_tokens,
                 eos_token_id=tokenizer.eos_token_id,
                 pad_token_id=tokenizer.pad_token_id,
                 bos_token_id=tokenizer.bos_token_id,
@@ -368,7 +368,7 @@ def configure_generate_functions(self, model, tokenizer):
             attention_mask=attention_mask,
             params=parameters,
             generation_config=GenerationConfig(
-                max_new_tokens=self.config.max_stream_tokens,
+                max_new_tokens=self.config.max_compile_tokens,
 
                 eos_token_id=tokenizer.eos_token_id,
                 pad_token_id=tokenizer.pad_token_id,
@@ -406,7 +406,7 @@ _These are all the attributes in Config_
 12. contains_auto_format
 13. max_length
 14. max_new_tokens
-15. max_stream_tokens
+15. max_compile_tokens
 16. temperature
 17. top_p
 18. top_k
@@ -509,9 +509,9 @@ import typing
 
 def process_chat_history(self, history: typing.List):
     if len(history) == 0:
-        return ''
+        return ""
     else:
-        message_history = ''
+        message_history = ""
         for message in history:
             message_history += self.config.chat_format.format(prompt=message[0], assistant=message[1])
 
@@ -530,7 +530,7 @@ The maximum number of new tokens that can be generated in each instruction or ch
 
 ``Defualt is 2048``
 
-### max_stream_tokens (int)
+### max_compile_tokens (int)
 
 The maximum number of tokens that can be generated in a stream of instructions or chat
 messages.

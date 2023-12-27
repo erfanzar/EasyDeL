@@ -651,7 +651,7 @@ class FlaxMistralDecoratorCollection(nn.Module):
 
     def setup(self) -> None:
         block = FlaxMistralDecoderLayer
-        if self.config.gradient_checkpointing != '':
+        if self.config.gradient_checkpointing != "":
             block = re_mat(
                 block,
                 static_argnums=(5, 6, 7),

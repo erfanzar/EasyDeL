@@ -108,7 +108,7 @@ train_args = TrainArguments(
     gradient_accumulation_steps=8,
     remove_ckpt_after_load=True,
     ids_to_pop_from_dataset=['token_type_ids'],
-    loss_remat='',
+    loss_remat="",
     dtype=jnp.bfloat16
 )
 

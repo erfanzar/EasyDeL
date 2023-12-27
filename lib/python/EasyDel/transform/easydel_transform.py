@@ -41,7 +41,7 @@ def float_tensor_to_dtype(tensor, dtype):
     :return: A tensor with the specified dtype
     
     """
-    if dtype is None or dtype == '':
+    if dtype is None or dtype == "":
         return tensor
     if isinstance(dtype, str):
         dtype = get_float_dtype_by_name(dtype)

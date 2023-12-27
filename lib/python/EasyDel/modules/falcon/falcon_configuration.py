@@ -35,7 +35,7 @@ class FalconConfig(EasyDelPretrainedConfig):
             bos_token_id: int = 11,
             eos_token_id: int = 11,
             use_pjit_attention_force: bool = False,
-            gradient_checkpointing: str = '',
+            gradient_checkpointing: str = "",
             bits: Optional[int] = None,
             axis_dims: Sequence[int] = (1, -1, 1, 1),
             axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
@@ -137,7 +137,7 @@ class FalconConfig(EasyDelPretrainedConfig):
                      bos_token_id: int = 11,
                      eos_token_id: int = 11,
                      use_pjit_attention_force: bool = False,
-                     gradient_checkpointing: str = '',
+                     gradient_checkpointing: str = "",
                      bits: Optional[int] = None,
                      **kwargs,
                      ):

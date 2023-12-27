@@ -51,6 +51,6 @@ setup(
         "pydantic-core==2.14.6"
     ],
     python_requires=">=3.8",
-    package_dir={'': "lib/python"},
+    package_dir={"": "lib/python"},
 
 )

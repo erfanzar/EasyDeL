@@ -145,7 +145,7 @@ class ParallelCollection(nn.Module):
 
     def setup(self) -> None:
         block = ParallelPalmBlock
-        if self.config.gradient_checkpointing != '':
+        if self.config.gradient_checkpointing != "":
             block = nn.remat(
                 block,
                 policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing)

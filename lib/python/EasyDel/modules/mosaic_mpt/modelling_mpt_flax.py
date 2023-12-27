@@ -279,7 +279,7 @@ class FlaxMptCollection(nn.Module):
     def setup(self) -> None:
         block = FlaxMptBlock
 
-        if self.config.gradient_checkpointing != '':
+        if self.config.gradient_checkpointing != "":
             block = flax.linen.remat(
                 block,
                 policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),

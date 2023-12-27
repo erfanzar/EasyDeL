@@ -26,7 +26,7 @@ def main():
         hidden_size=256,
         num_attention_heads=8,
         num_hidden_layers=1,
-        gradient_checkpointing='',
+        gradient_checkpointing="",
         alibi=False
     )
     print('Model Config :\n', config)

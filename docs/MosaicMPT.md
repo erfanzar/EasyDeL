@@ -115,7 +115,7 @@ server = MPTJaxServer.load_from_params(
   config={
     "max_length": 2048,
     "max_new_tokens": 2048,
-    "max_stream_tokens": 64,
+    "max_compile_tokens": 64,
     "dtype": 'bf16',
     "use_prefix_tokenizer": True,
     'pre_compile': True
