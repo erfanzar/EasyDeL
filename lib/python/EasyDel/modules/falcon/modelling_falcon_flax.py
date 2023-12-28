@@ -671,6 +671,7 @@ class FlaxFalconPretrainedModel(EasyDelFlaxPretrainedModel):
                  return_dict: Optional[bool] = False,
                  params: FrozenDict = None,
                  add_params_field: bool = False,
+                 **kwargs
                  ):
         input_ids = jnp.asarray(input_ids, dtype=jnp.int32)
         inputs = {'params': params or self.params} if add_params_field else params or self.params

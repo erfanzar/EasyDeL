@@ -512,6 +512,7 @@ class FlaxOPTPreTrainedModel(EasyDelFlaxPretrainedModel):
             return_dict: Optional[bool] = None,
             dropout_rng: PRNGKey = None,
             deterministic: bool = True,
+            **kwargs
     ):
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (

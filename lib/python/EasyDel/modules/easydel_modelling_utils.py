@@ -1,3 +1,4 @@
+import chex
 from jax.experimental.mesh_utils import create_device_mesh
 from transformers import PretrainedConfig, FlaxPreTrainedModel
 import jax
@@ -245,3 +246,26 @@ class EasyDelFlaxPretrainedModel(FlaxPreTrainedModel):
         :return: A decoder object
         """
         raise NotImplementedError()
+
+    def __str__(self):
+        padded_model = "\t" + "\n\t".join(self.module.__str__().split("\n"))
+        string = f"EasyDelFlaxPretrainedModel(\n{padded_model}\n)"
+        return string
+
+    def __call__(
+            self,
+            input_ids: chex.Array,
+            attention_mask: chex.Array = None,
+            position_ids: chex.Array = None,
+            params: dict = None,
+            past_key_values: dict = None,
+            dropout_rng: jax.random.PRNGKey = None,
+            train: bool = False,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+            extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+            add_params_field: bool = False,
+            **kwargs
+    ):
+        raise NotImplementedError("Not Implemented Yet")

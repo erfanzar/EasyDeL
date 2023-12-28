@@ -1,2 +1,1 @@
-from .modelling_base import FlaxPreTrainedModelWrapper
-from .modelling_value_head import ValueHead, FlaxAutoModelForCausalLMWithValueHead
+from .modelling_casual_language_rl import FlaxPreTrainedModelWrapper, BaseCasualLMWithValueHeadModule
