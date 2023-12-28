@@ -10,7 +10,7 @@ from typing import Sequence, Optional, Type, Tuple, Any, Callable
 from jax import numpy as jnp
 from ...modules.auto_easydel_model import AutoEasyDelModelForCausalLM
 from ...modules.easydel_modelling_utils import EasyDelPretrainedConfig, EasyDelFlaxPretrainedModel
-from fjformer import GenerateRNG, with_sharding_constraint
+from fjformer import GenerateRNG, with_sharding_constraint, make_shard_and_gather_fns, match_partition_rules
 from dataclasses import dataclass
 
 
@@ -130,7 +130,10 @@ class BaseCasualLMWithValueHeadModule:
         @partial(
             pjit.pjit,
             in_shardings=(
-                    self.module.params_shape_tree,
+                    match_partition_rules(
+                        self.module.config.get_partition_rules(True),
+                        self.module_params
+                    ),
                     jax.sharding.PartitionSpec(),
                     jax.sharding.PartitionSpec()
             ),
