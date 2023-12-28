@@ -249,7 +249,7 @@ class EasyDelFlaxPretrainedModel(FlaxPreTrainedModel):
 
     def __str__(self):
         padded_model = "\t" + "\n\t".join(self.module.__str__().split("\n"))
-        string = f"EasyDelFlaxPretrainedModel(\n{padded_model}\n)"
+        string = f"{self.__class__.__name__}(\n{padded_model}\n)"
         return string
 
     def __call__(

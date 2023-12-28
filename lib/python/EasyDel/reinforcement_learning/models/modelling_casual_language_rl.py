@@ -114,13 +114,24 @@ class BaseCasualLMWithValueHeadModule:
 
         resume_training = "v_head" in params.keys()
         if not resume_training:
+            hidden_size = None
+            if hasattr(self.module_config, "hidden_size"):
+                hidden_size = self.module_config.hidden_size
+            elif hasattr(self.module_config, "word_embed_proj_dim"):
+                hidden_size = self.module_config.word_embed_proj_dim
+            elif hasattr(self.module_config, "is_encoder_decoder"):
+                if self.module_config.is_encoder_decoder and hasattr(self.module_config, "decoder"):
+                    if hasattr(self.module_config, "hidden_size"):
+                        hidden_size = self.module_config.decoder.hidden_size
+
+            assert hidden_size is not None, "Seems like the models doesn't have any hidden_size"
             params = self.v_head.init(
                 {
                     "params": self._get_rng()
                 },
                 jnp.ones(
                     (
-                        1, self.module_config.vocab_size
+                        1, hidden_size
                     )
                 )
             )["params"] | params
@@ -154,6 +165,9 @@ class BaseCasualLMWithValueHeadModule:
 
         return generate
 
+    def get_mesh(self):
+        return self.module.config.jax_mesh()
+
     def generate(self, input_id, attention_mask, params: dict | flax.core.FrozenDict = None):
         params = self.module_params if params is None else params
         return self.generation_function(
@@ -161,6 +175,25 @@ class BaseCasualLMWithValueHeadModule:
             input_id,
             attention_mask
         )
+
+    def shard_parameters(self, params, partition_rules=None):
+        partition_rules = self.module.config.get_partition_rules(True) if partition_rules is None else partition_rules
+        with self.get_mesh():
+            return jax.tree_util.tree_map(
+                lambda f, p: f(p),
+                make_shard_and_gather_fns(
+                    match_partition_rules(
+                        partition_rules,
+                        params
+                    )
+                )[0],
+                params
+            )
+
+    def __str__(self):
+        padded_model = "\t" + "\n\t".join(self.module.__str__().split("\n"))
+        string = f"{self.__class__.__name__}(\n{padded_model}\n)"
+        return string
 
     def __call__(
             self,
@@ -184,7 +217,7 @@ class BaseCasualLMWithValueHeadModule:
         logits = base_model_output.logits
         last_hidden_state = base_model_output.hidden_states[-1]
         summery = self.v_head.apply(
-            {"params": params},
+            params,
             last_hidden_state,
             True
         )
