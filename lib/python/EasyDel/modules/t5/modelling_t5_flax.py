@@ -48,6 +48,7 @@ from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
 import chex
 from .t5_configuration import T5Config
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
+
 remat = nn_partitioning.remat
 
 
@@ -1182,6 +1183,7 @@ class FlaxT5EncoderModel(FlaxT5PreTrainedModel):
             train: bool = False,
             params: dict = None,
             dropout_rng: PRNGKey = None,
+            **kwargs
     ):
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (

@@ -299,13 +299,17 @@ class FlaxMptCollection(nn.Module):
             )
         ]
 
-    def __call__(self,
-                 hidden_states: chex.Array,
-                 attention_mask: chex.Array,
-                 position_ids: chex.Array,
-                 attn_bias: chex.Array = None,
-                 init_cache: bool = False
-                 ):
+    def __call__(
+            self,
+            hidden_states: chex.Array,
+            attention_mask: chex.Array,
+            position_ids: chex.Array,
+            attn_bias: chex.Array = None,
+            init_cache: bool = False,
+            output_hidden_states: bool = True
+    ):
+
+        all_hidden_states = () if output_hidden_states else None
         for block in self.blocks:
             hidden_states = block(
                 hidden_states=hidden_states,
@@ -314,7 +318,10 @@ class FlaxMptCollection(nn.Module):
                 position_ids=position_ids,
                 init_cache=init_cache
             )
-        return hidden_states
+
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+        return hidden_states, all_hidden_states
 
 
 def build_alibi(max_length, num_attention_heads, alibi_max: int = 8):
@@ -349,15 +356,16 @@ class FlaxMptModule(nn.Module):
         self.norm_f = nn.LayerNorm(use_bias=self.config.use_norm_bias)
         self.alibi = build_alibi(self.config.max_seq_len, self.config.n_heads)
 
-    def __call__(self,
-
-                 input_ids: chex.Array,
-                 attention_mask: chex.Array = None,
-                 position_ids: chex.Array = None,
-                 init_cache: bool = False,
-                 return_dict: bool = True,
-                 extra_embedding: Optional[Union[jnp.ndarray, None]] = None
-                 ):
+    def __call__(
+            self,
+            input_ids: chex.Array,
+            attention_mask: chex.Array = None,
+            position_ids: chex.Array = None,
+            init_cache: bool = False,
+            return_dict: bool = True,
+            output_hidden_states: bool = True,
+            extra_embedding: Optional[Union[jnp.ndarray, None]] = None
+    ):
         b, s = input_ids.shape
         hidden_states = self.wte(input_ids)
         hidden_states = hidden_states + extra_embedding if extra_embedding is not None else hidden_states
@@ -368,19 +376,23 @@ class FlaxMptModule(nn.Module):
             pos_id = self.wpe(jnp.arange(s, dtype='i4').reshape(1, -1))
             hidden_states += pos_id
             alibi = None
-        hidden_states = self.norm_f(
-            self.h(
-                hidden_states,
-                attn_bias=alibi,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                init_cache=init_cache
-            )
+        hidden_states, all_hidden_states = self.h(
+            hidden_states,
+            attn_bias=alibi,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            init_cache=init_cache,
+            output_hidden_states=output_hidden_states
         )
+        hidden_states = self.norm_f(
+            hidden_states
+        )
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
         if return_dict:
-            return FlaxBaseModelOutput(last_hidden_state=hidden_states, hidden_states=None)
+            return FlaxBaseModelOutput(last_hidden_state=hidden_states, hidden_states=all_hidden_states)
         else:
-            return (hidden_states,)
+            return hidden_states, all_hidden_states
 
 
 class FlaxMptPretrainedModel(EasyDelFlaxPretrainedModel):
@@ -438,12 +450,18 @@ class FlaxMptPretrainedModel(EasyDelFlaxPretrainedModel):
                  attention_mask=None,
                  past_key_values=None,
                  position_ids=None,
+                 output_hidden_states: Optional[bool] = None,
                  init_cache: bool = False,
                  params: dict = None,
                  add_params_field: bool = False,
                  return_dict: bool = True,
                  extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+                 **kwargs
                  ):
+
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
         params = {'params': params or self.params} if add_params_field else params or self.params
         input_ids = jnp.asarray(input_ids, dtype='i4')
         mutable = False
@@ -468,6 +486,7 @@ class FlaxMptPretrainedModel(EasyDelFlaxPretrainedModel):
             extra_embedding=extra_embedding,
             position_ids=position_ids,
             init_cache=init_cache,
+            output_hidden_states=output_hidden_states,
             mutable=mutable,
             rngs=rngs
         )
@@ -511,20 +530,22 @@ class FlaxMptForCausalLMModule(nn.Module):
                                     dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision,
                                     **get_dot_general_by_bits(self.config.bits, self.config.easy_method))
 
-    def __call__(self,
-                 input_ids: chex.Array,
-                 attention_mask: chex.Array = None,
-                 init_cache: bool = False,
-                 position_ids: chex.Array = None,
-                 return_dict: bool = True,
-                 extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
-
-                 ):
+    def __call__(
+            self,
+            input_ids: chex.Array,
+            attention_mask: chex.Array = None,
+            init_cache: bool = False,
+            position_ids: chex.Array = None,
+            return_dict: bool = True,
+            output_hidden_states: bool = True,
+            extra_embedding: Optional[Union[jnp.ndarray, None]] = None
+    ):
         predict: FlaxBaseModelOutput = self.transformer(
             input_ids=input_ids,
             attention_mask=attention_mask,
             return_dict=True,
             extra_embedding=extra_embedding,
+            output_hidden_states=output_hidden_states,
             position_ids=position_ids,
             init_cache=init_cache
         )
@@ -536,10 +557,10 @@ class FlaxMptForCausalLMModule(nn.Module):
 
             return FlaxCausalLMOutput(
                 logits=logits,
-                hidden_states=predict.last_hidden_state
+                hidden_states=predict.hidden_states
             )
         else:
-            return (logits,)
+            return logits, predict.hidden_states if output_hidden_states else (logits,)
 
 
 class FlaxMptForCausalLM(FlaxMptPretrainedModel):

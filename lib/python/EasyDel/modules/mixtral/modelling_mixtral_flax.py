@@ -796,7 +796,8 @@ class MixtralPreTrainedModel(EasyDelFlaxPretrainedModel):
             output_hidden_states: Optional[bool] = None,
             output_router_logits: Optional[bool] = None,
             return_dict: Optional[bool] = None,
-            add_params_field: bool = False
+            add_params_field: bool = False,
+            **kwargs
     ):
         """
         The __call__ function is the main function of a JAX module.

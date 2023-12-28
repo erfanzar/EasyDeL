@@ -62,8 +62,7 @@ nav:
   - Reinforcement Learning:
       - Core: reinforcement_learning-core.md
       - Models:
-          - Modelling Base: reinforcement_learning-models-modelling_base.md
-          - Modelling Value Head: reinforcement_learning-models-modelling_value_head.md
+          - Modelling Causal Language RL: reinforcement_learning-models-modelling_casual_language_rl.md
       - Trainer:
           - Base: reinforcement_learning-trainer-base.md
           - Ppo Config: reinforcement_learning-trainer-ppo_config.md

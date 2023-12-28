@@ -740,7 +740,8 @@ class FlaxLlamaPreTrainedModel(EasyDelFlaxPretrainedModel):
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
             extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
-            add_params_field: bool = False
+            add_params_field: bool = False,
+            **kwargs
     ):
         """
         The __call__ function is the main function of a JAX module.
@@ -796,7 +797,8 @@ class FlaxLlamaPreTrainedModel(EasyDelFlaxPretrainedModel):
             rngs['params'] = jax.random.key(0)
 
         inputs = {
-            "params": params or self.params} if add_params_field else params or self.params
+            "params": params or self.params
+        } if add_params_field else params or self.params
 
         if past_key_values:
             inputs["cache"] = past_key_values
@@ -1104,7 +1106,7 @@ class FlaxLlamaForCausalLMModule(nn.Module):
         :param deterministic: bool: Control whether the model is trained or not
         :param init_cache: bool: Initialize the cache for the decoder
         :param output_attentions: bool: Return the attention weights
-        :param output_hidden_states: bool: Determine whether or not to return the hidden states
+        :param output_hidden_states: bool: Determine whether to return the hidden states
         :param return_dict: bool: Return a dictionary of the outputs or not
         :param extra_embedding: Optional[Union[jnp.ndarray: Pass in the embedding of the word that we want to predict
         :param None]]: Pass in the extra embedding

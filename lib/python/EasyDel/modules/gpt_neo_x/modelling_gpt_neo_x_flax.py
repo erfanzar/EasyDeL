@@ -280,11 +280,15 @@ class FlaxGPTNeoXPretrainedModel(EasyDelFlaxPretrainedModel):
             )
         return params['params']
 
-    def __call__(self, input_ids,
-                 attention_mask=None,
-                 params: FrozenDict = None,
-                 add_params_field: bool = False,
-                 return_dict: bool = True):
+    def __call__(
+            self,
+            input_ids,
+            attention_mask=None,
+            params: FrozenDict = None,
+            add_params_field: bool = False,
+            return_dict: bool = True,
+            **kwargs
+    ):
         params = {'params': params or self.params} if add_params_field else params or self.params
         predict = self.module.apply(
             params,

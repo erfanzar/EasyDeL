@@ -5,11 +5,10 @@ import typing
 import jax.numpy
 
 from flax.traverse_util import unflatten_dict
-from transformers import AutoConfig, PretrainedConfig, AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM
 
 from ..transform.easydel_transform import huggingface_to_easydel
-
-from transformers import FlaxPreTrainedModel
+from .easydel_modelling_utils import EasyDelFlaxPretrainedModel
 
 
 class EasyDelRunTimeError(Exception):
@@ -155,7 +154,7 @@ class AutoEasyDelModelForCausalLM:
             input_shape: typing.Sequence[int] = (1, 1),
             backend: typing.Optional[str] = None,
             **kwargs
-    ) -> typing.Tuple[FlaxPreTrainedModel, dict]:
+    ) -> typing.Tuple[EasyDelFlaxPretrainedModel, dict]:
         """
         The from_pretrained function is a helper function that allows you to instantiate a model from the pretrained
         model repository. It takes as input the name of the model (e.g., 'bert-base-uncased') and returns an instance of
