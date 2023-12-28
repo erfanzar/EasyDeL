@@ -6,7 +6,6 @@
   <component name="ChangeListManager">
     <list default="true" id="e9058a88-3ea4-4b63-a9f8-ea56f3a88630" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/modules/easydel_modelling_utils.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/modules/easydel_modelling_utils.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/reinforcement_learning/models/modelling_casual_language_rl.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/reinforcement_learning/models/modelling_casual_language_rl.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -212,7 +211,7 @@
       <workItem from="1702830071828" duration="8103000" />
       <workItem from="1703583904578" duration="15895000" />
       <workItem from="1703607345702" duration="4303000" />
-      <workItem from="1703750172212" duration="11254000" />
+      <workItem from="1703750172212" duration="12454000" />
     </task>
     <servers />
   </component>

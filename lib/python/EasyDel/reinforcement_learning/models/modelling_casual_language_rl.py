@@ -71,7 +71,7 @@ class ValueHead(nn.Module):
         return self.summary(self.dropout(hidden_states, deterministic=deterministic))
 
 
-class BaseCasualLMWithValueHeadModule:
+class AutoRLModelForCasualLMWithValueHead:
     def __init__(
             self,
             module: EasyDelFlaxPretrainedModel,
@@ -226,13 +226,6 @@ class BaseCasualLMWithValueHeadModule:
             logits=logits
         )
 
-
-class FlaxPreTrainedModelWrapper(nn.Module):
-    pretrained_model: Type[EasyDelFlaxPretrainedModel]
-    supported_modules = ("v_head",)
-    supported_rm_modules = ("score",)
-    supported_pretrained_model_architectures = EasyDelFlaxPretrainedModel
-
     @classmethod
     def from_pretrained(
             cls,
@@ -251,6 +244,11 @@ class FlaxPreTrainedModelWrapper(nn.Module):
             use_shard_map: bool = False,
             input_shape: Tuple[int, int] = (1, 1),
             backend: Optional[str] = None,
+            kernel_init: Callable = nn.initializers.orthogonal(),
+            generation_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp"),
+            generation_config: GenerationConfig = GenerationConfig(),
+            seed: int = 42,
+            summary_dropout_prob: float = 0.0,
             **kwargs
     ):
         model, params = AutoEasyDelModelForCausalLM.from_pretrained(
@@ -271,12 +269,18 @@ class FlaxPreTrainedModelWrapper(nn.Module):
             backend=backend,
             **kwargs
         )
-        model = cls(pretrained_model=model)
-        is_resuming_training = "v_head" in params.keys()
-        if not is_resuming_training:
-            params = model.post_init(
-                params=params,
-                input_shape=input_shape,
-                head_name="v_head"
-            )
-        return model, params
+        rl_model = cls(
+            module=model,
+            dtype=dtype,
+            module_params=params,
+            precision=precision,
+            param_dtype=param_dtype,
+            config=model.config,
+            kernel_init=kernel_init,
+            summary_dropout_prob=summary_dropout_prob,
+            seed=seed,
+            generation_config=generation_config,
+            generation_partition_spec=generation_partition_spec
+        )
+
+        return rl_model, rl_model.module_params
