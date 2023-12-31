@@ -1,6 +1,6 @@
 import fjformer.optimizers
 
-from EasyDel import EasyDelSchedulers, EasyDelOptimizers
+from ..etils import EasyDelSchedulers, EasyDelOptimizers
 
 
 def get_optimizer_and_scheduler(
@@ -14,7 +14,6 @@ def get_optimizer_and_scheduler(
         weight_decay: float = 0.02,
         warmup_steps: int = 0
 ):
-
     if extra_optimizer_kwargs is None:
         extra_optimizer_kwargs = {}
     if optimizer == EasyDelOptimizers.ADAFACTOR:

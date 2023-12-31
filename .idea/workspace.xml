@@ -4,13 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="e9058a88-3ea4-4b63-a9f8-ea56f3a88630" name="Changes" comment="">
-      <change afterPath="$PROJECT_DIR$/lib/python/EasyDel/trainer/utils.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/reinforcement_learning/trainer/ppo_config.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/reinforcement_learning/trainer/ppo_config.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/reinforcement_learning/trainer/ppo_trainer.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/reinforcement_learning/trainer/ppo_trainer.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/lib/python/EasyDel/trainer/training_configurations.py" beforeDir="false" afterPath="$PROJECT_DIR$/lib/python/EasyDel/trainer/training_configurations.py" afterDir="false" />
-    </list>
+    <list default="true" id="e9058a88-3ea4-4b63-a9f8-ea56f3a88630" name="Changes" comment="" />
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -215,7 +209,7 @@
       <workItem from="1703583904578" duration="15895000" />
       <workItem from="1703607345702" duration="4303000" />
       <workItem from="1703750172212" duration="16061000" />
-      <workItem from="1704015715718" duration="3313000" />
+      <workItem from="1704015715718" duration="3704000" />
     </task>
     <servers />
   </component>
