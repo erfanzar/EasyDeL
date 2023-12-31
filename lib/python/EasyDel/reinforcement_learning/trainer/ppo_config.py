@@ -45,51 +45,56 @@ class PPOConfig:
             score_clip: Optional[float] = None,
             whiten_rewards: bool = False,
             is_encoder_decoder: Optional[bool] = None,
-            is_peft_model: Optional[bool] = None,
+            warmup_steps: Optional[int] = 0,
+            learning_rate_end: float = 1e-5,
+            extra_optimizer_kwargs: dict | None = None,
+            weight_decay: Optional[float] = 0.01,
     ):
         """
-           Configuration class for PPOTrainer
-           :param exp_name: str : the name of this experiment (by default is the file name without the extension name)
-           :param seed: int :Seed value for random generations
-           :param task_name: Optional[str] : Name of task to use - used only for tracking purposes
-           :param model_name: Optional[str] :Name of model to use - used only for tracking purposes
-           :param query_dataset: Optional[str] :Name of dataset to query - used only for tracking purposes
-           :param reward_model: Optional[str] :The reward model to use - used only for tracking purposes
-           :param remove_unused_columns: bool : Remove unused columns from the dataset if `datasets.Dataset` is used
-           :param tracker_kwargs: Optional[dict] : Keyword arguments for the tracker
-           :param accelerator_kwargs: Optional[dict] :Keyword arguments for the accelerator
-           :param project_kwargs: Optional[dict] : Keyword arguments for the accelerator project config (e.g. `logging_dir`)
-           :param tracker_project_name: str :Name of project to use for tracking
-           :param push_to_hub_if_best_kwargs: Optional[dict] :Keyword arguments for pushing model to the hub during training (e.g. pretrained_model_name_or_path)
-           :param steps: int : Number of training steps
-           :param learning_rate: float :Adam learning rate
-           :param adap_kl_ctrl: bool :Use adaptive KL control, otherwise linear
-           :param init_kl_coef: Optional[float] : Initial KL penalty coefficient (used for adaptive and linear control)
-           :param kl_penalty: Literal["kl", "abs", "mse", "full"] : kl penalty options: 'kl': model_logp - ref_logp,
-           'abs': abs(kl),  'mse': mean squared error mse(kl) and 'full': the actual kl for all tokens in the distribution
-           :param target: Optional[float] :Target KL value for adaptive KL control
-           :param horizon: Optional[float] :Horizon for adaptive KL control
-           :param gamma: float :Gamma parameter for advantage calculation
-           :param lam: float : Lambda parameter for advantage calculation
-           :param cliprange: float : Range for clipping in PPO policy gradient loss
-           :param cliprange_value: float : Range for clipping values in loss calculation
-           :param vf_coef: float : Scaling factor for value loss
-           :param batch_size: int :Number of samples per optimisation step
-           :param gradient_accumulation_steps: int :The number of gradient accumulation steps
-           :param ppo_epochs: int : Number of optimisation epochs per batch of samples
-           :param max_grad_norm: Optional[float] :Maximum gradient norm for gradient clipping
-           :param target_kl: float :Stop early if we exceed this value by over 50%
-           :param compare_steps: int : Number of steps between comparison of the current reward with the best seen so far
-           :param ratio_threshold : float :Skip mini-batches with high PPO ratios that can cause loss spikes
-           :param use_score_scaling: bool : Use score scaling
-           :param use_score_norm: bool : Use score normalization. Only applicable if use_score_scaling is True
-           :param score_clip: Optional[float] :Score clipping
-           :param whiten_rewards: bool :Whiten the rewards before compute advantages
-           :param is_encoder_decoder: Optional[bool] :TO BE FILLED In RUNTIME: Whether the model is
-           an encoder-decoder model
-           :param is_peft_model: Optional[bool] :TO BE FILLED In RUNTIME: Whether the model is a
-            PEFT model
-           """
+    Configuration class for PPOTrainer
+    :param exp_name: str : the name of this experiment (by default is the file name without the extension name)
+    :param seed: int :Seed value for random generations
+    :param task_name: Optional[str] : Name of task to use - used only for tracking purposes
+    :param model_name: Optional[str] :Name of model to use - used only for tracking purposes
+    :param query_dataset: Optional[str] :Name of dataset to query - used only for tracking purposes
+    :param reward_model: Optional[str] :The reward model to use - used only for tracking purposes
+    :param remove_unused_columns: bool : Remove unused columns from the dataset if `datasets.Dataset` is used
+    :param tracker_kwargs: Optional[dict] : Keyword arguments for the tracker
+    :param accelerator_kwargs: Optional[dict] :Keyword arguments for the accelerator
+    :param project_kwargs: Optional[dict] : Keyword arguments for the accelerator project config (e.g. `logging_dir`)
+    :param tracker_project_name: str :Name of project to use for tracking
+    :param push_to_hub_if_best_kwargs: Optional[dict] :Keyword arguments for pushing model to the hub during training
+    (e.g. pretrained_model_name_or_path).
+    :param steps: int : Number of training steps
+    :param learning_rate: float :Adam learning rate
+    :param adap_kl_ctrl: bool :Use adaptive KL control, otherwise linear
+    :param init_kl_coef: Optional[float] : Initial KL penalty coefficient (used for adaptive and linear control)
+    :param kl_penalty: Literal["kl", "abs", "mse", "full"] : kl penalty options: 'kl': model_logp - ref_logp,
+    'abs': abs(kl),  'mse': mean squared error mse(kl) and 'full': the actual kl for all tokens in the distribution
+    :param target: Optional[float] :Target KL value for adaptive KL control
+    :param horizon: Optional[float] :Horizon for adaptive KL control
+    :param gamma: float :Gamma parameter for advantage calculation
+    :param lam: float : Lambda parameter for advantage calculation
+    :param cliprange: float : Range for clipping in PPO policy gradient loss
+    :param cliprange_value: float : Range for clipping values in loss calculation
+    :param vf_coef: float : Scaling factor for value loss
+    :param batch_size: int :Number of samples per optimisation step
+    :param gradient_accumulation_steps: int :The number of gradient accumulation steps
+    :param ppo_epochs: int : Number of optimisation epochs per batch of samples
+    :param max_grad_norm: Optional[float] :Maximum gradient norm for gradient clipping
+    :param target_kl: float :Stop early if we exceed this value by over 50%
+    :param compare_steps: int : Number of steps between comparison of the current reward with the best seen so far
+    :param ratio_threshold : float :Skip mini-batches with high PPO ratios that can cause loss spikes
+    :param use_score_scaling: bool : Use score scaling
+    :param use_score_norm: bool : Use score normalization. Only applicable if use_score_scaling is True
+    :param score_clip: Optional[float] :Score clipping
+    :param whiten_rewards: bool :Whiten the rewards before compute advantages
+    :param is_encoder_decoder: Optional[bool] :TO BE FILLED In RUNTIME: Whether the model is an encoder-decoder model
+    :param warmup_steps: Optional[int]:
+    :param learning_rate_end: float :
+    :param extra_optimizer_kwargs: dict | None :
+    :param weight_decay: Optional[float] : Weight decay is Optimizer Weight decay :\
+        """
 
         tracker_kwargs = tracker_kwargs if tracker_kwargs is not None else {}
         accelerator_kwargs = accelerator_kwargs if accelerator_kwargs is not None else {}
@@ -131,7 +136,10 @@ class PPOConfig:
         self.score_clip = score_clip
         self.whiten_rewards = whiten_rewards
         self.is_encoder_decoder = is_encoder_decoder
-        self.is_peft_model = is_peft_model
+        self.warmup_steps = warmup_steps
+        self.learning_rate_end = learning_rate_end
+        self.extra_optimizer_kwargs = extra_optimizer_kwargs
+        self.weight_decay = weight_decay
         self.total_ppo_epochs = int(np.ceil(self.steps / (self.batch_size * self.gradient_accumulation_steps)))
         assert self.kl_penalty in ["kl", "abs", "mse", "full"]
 
