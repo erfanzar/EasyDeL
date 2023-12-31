@@ -3,8 +3,7 @@ import pathlib
 import re
 import typing
 from typing import OrderedDict, List, Union
-
-import fjformer.optimizers
+from .utils import get_optimizer_and_scheduler
 
 import torch.utils.tensorboard
 import wandb
@@ -69,7 +68,8 @@ class TrainArguments(
             warmup_steps: int = 500,
             init_input_shape: typing.Tuple[int, int] = (1, 1),
             step_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
-                ("dp", "fsdp"), "sp"),
+                ("dp", "fsdp"), "sp"
+            ),
             training_time: typing.Optional[str] = None,
             **kwargs
     ):
@@ -319,162 +319,21 @@ class TrainArguments(
     def get_mesh_names():
         return "dp", "fsdp", "tp", "sp"
 
-    def get_optimizer_and_scheduler(self, steps=None):
-        """
-        The get_optimizer_and_scheduler function is a helper function that returns the optimizer and scheduler
-            based on the parameters passed to it.
-
-        :param self: Represent the instance of the class
-        :param steps: Calculate the number of steps to train
-        :return: A tuple of two objects:
-
-        """
-        steps = self.max_steps or steps
-        assert steps is not None, "if you haven\'t pass max steps to init you should pass init in func"
-
-        if self.optimizer == EasyDelOptimizers.ADAFACTOR:
-            if self.scheduler == EasyDelSchedulers.LINEAR:
-                tx, sc = fjformer.optimizers.get_adafactor_with_linear_scheduler(
-                    learning_rate_start=self.learning_rate,
-                    learning_rate_end=self.learning_rate_end,
-                    gradient_accumulation_steps=self.gradient_accumulation_steps,
-                    steps=steps,
-                    **self.extra_optimizer_kwargs
-                )
-            elif self.scheduler == EasyDelSchedulers.COSINE:
-                tx, sc = fjformer.optimizers.get_adafactor_with_cosine_scheduler(
-                    learning_rate=self.learning_rate,
-                    steps=steps,
-                    gradient_accumulation_steps=self.gradient_accumulation_steps,
-                    **self.extra_optimizer_kwargs
-                )
-            elif self.scheduler == EasyDelSchedulers.NONE:
-                tx, sc = fjformer.optimizers.get_adafactor_with_linear_scheduler(
-                    learning_rate_start=self.learning_rate,
-                    learning_rate_end=self.learning_rate,
-                    steps=steps,
-                    gradient_accumulation_steps=self.gradient_accumulation_steps,
-                    **self.extra_optimizer_kwargs
-                )
-            elif self.scheduler == EasyDelSchedulers.WARM_UP_COSINE:
-                tx, sc = fjformer.optimizers.get_adafactor_with_warm_up_cosine_scheduler(
-                    learning_rate=self.learning_rate,
-                    steps=steps,
-                    weight_decay=self.weight_decay,
-                    gradient_accumulation_steps=self.gradient_accumulation_steps,
-                    **self.extra_optimizer_kwargs
-                )
-            elif self.scheduler == EasyDelSchedulers.WARM_UP_LINEAR:
-                tx, sc = fjformer.optimizers.get_adafactor_with_warmup_linear_scheduler(
-                    learning_rate_start=self.learning_rate,
-                    steps=steps,
-                    learning_rate_end=self.learning_rate_end,
-                    gradient_accumulation_steps=self.gradient_accumulation_steps,
-                    warmup_steps=self.warmup_steps,
-                    **self.extra_optimizer_kwargs
-
-                )
-
-            else:
-                raise ValueError(
-                    "seems like you have choose wrong type or unavailable scheduler"
-                )
-        elif self.optimizer == EasyDelOptimizers.LION:
-            if self.scheduler == EasyDelSchedulers.LINEAR:
-                tx, sc = fjformer.optimizers.get_lion_with_linear_scheduler(
-                    learning_rate_start=self.learning_rate,
-                    learning_rate_end=self.learning_rate_end,
-                    steps=steps,
-                    gradient_accumulation_steps=self.gradient_accumulation_steps,
-                    **self.extra_optimizer_kwargs
-                )
-            elif self.scheduler == EasyDelSchedulers.COSINE:
-                tx, sc = fjformer.optimizers.get_lion_with_cosine_scheduler(
-                    learning_rate=self.learning_rate,
-                    gradient_accumulation_steps=self.gradient_accumulation_steps,
-                    steps=steps,
-                    **self.extra_optimizer_kwargs
-                )
-            elif self.scheduler == EasyDelSchedulers.NONE:
-                tx, sc = fjformer.optimizers.get_lion_with_linear_scheduler(
-                    learning_rate_start=self.learning_rate,
-                    learning_rate_end=self.learning_rate,
-                    steps=steps,
-                    gradient_accumulation_steps=self.gradient_accumulation_steps,
-                    **self.extra_optimizer_kwargs
-                )
-            elif self.scheduler == EasyDelSchedulers.WARM_UP_COSINE:
-                tx, sc = fjformer.optimizers.get_lion_with_warm_up_cosine_scheduler(
-                    learning_rate=self.learning_rate,
-                    steps=steps,
-                    gradient_accumulation_steps=self.gradient_accumulation_steps,
-                    **self.extra_optimizer_kwargs
-                )
-
-            elif self.scheduler == EasyDelSchedulers.WARM_UP_LINEAR:
-                tx, sc = fjformer.optimizers.get_lion_with_with_warmup_linear_scheduler(
-                    learning_rate_start=self.learning_rate,
-                    steps=steps,
-                    learning_rate_end=self.learning_rate_end,
-                    gradient_accumulation_steps=self.gradient_accumulation_steps,
-                    warmup_steps=self.warmup_steps,
-                    **self.extra_optimizer_kwargs
-                )
-            else:
-                raise ValueError(
-                    "seems like you have choose wrong type or unavailable scheduler")
-        elif self.optimizer == EasyDelOptimizers.ADAMW:
-            if self.scheduler == EasyDelSchedulers.LINEAR:
-                tx, sc = fjformer.optimizers.get_adamw_with_linear_scheduler(
-                    learning_rate_start=self.learning_rate,
-                    learning_rate_end=self.learning_rate_end,
-                    steps=steps,
-                    gradient_accumulation_steps=self.gradient_accumulation_steps,
-                    **self.extra_optimizer_kwargs
-                )
-            elif self.scheduler == EasyDelSchedulers.COSINE:
-                tx, sc = fjformer.optimizers.get_adamw_with_cosine_scheduler(
-                    learning_rate=self.learning_rate,
-                    gradient_accumulation_steps=self.gradient_accumulation_steps,
-                    steps=steps,
-                    weight_decay=self.weight_decay,
-                    **self.extra_optimizer_kwargs
-                )
-            elif self.scheduler == EasyDelSchedulers.NONE:
-                tx, sc = fjformer.optimizers.get_adamw_with_linear_scheduler(
-                    learning_rate_start=self.learning_rate,
-                    learning_rate_end=self.learning_rate,
-                    gradient_accumulation_steps=self.gradient_accumulation_steps,
-                    steps=steps,
-                    **self.extra_optimizer_kwargs
-                )
-            elif self.scheduler == EasyDelSchedulers.WARM_UP_COSINE:
-                tx, sc = fjformer.optimizers.get_adamw_with_warm_up_cosine_scheduler(
-                    learning_rate=self.learning_rate,
-                    steps=steps,
-                    weight_decay=self.weight_decay,
-                    gradient_accumulation_steps=self.gradient_accumulation_steps,
-                    **self.extra_optimizer_kwargs
-                )
-            elif self.scheduler == EasyDelSchedulers.WARM_UP_LINEAR:
-                tx, sc = fjformer.optimizers.get_adamw_with_warmup_linear_scheduler(
-                    learning_rate_start=self.learning_rate,
-                    steps=steps,
-                    weight_decay=self.weight_decay,
-                    learning_rate_end=self.learning_rate_end,
-                    gradient_accumulation_steps=self.gradient_accumulation_steps,
-                    warmup_steps=self.warmup_steps,
-                    **self.extra_optimizer_kwargs
-                )
-            else:
-                raise ValueError(
-                    "seems like you have choose wrong type or unavailable scheduler"
-                )
-        else:
-            raise ValueError(
-                "seems like you have choose wrong type or unavailable optimizer"
-            )
-        return tx, sc
+    def get_optimizer_and_scheduler(
+            self,
+            steps: int | None = None
+    ):
+        return get_optimizer_and_scheduler(
+            learning_rate=self.learning_rate,
+            learning_rate_end=self.learning_rate_end,
+            optimizer=self.optimizer,
+            scheduler=self.scheduler,
+            extra_optimizer_kwargs=self.extra_optimizer_kwargs,
+            warmup_steps=self.warmup_steps,
+            gradient_accumulation_steps=self.gradient_accumulation_steps,
+            weight_decay=self.weight_decay,
+            steps=steps or self.max_steps,
+        )
 
     def get_streaming_checkpointer(self):
         """
