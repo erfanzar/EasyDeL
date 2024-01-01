@@ -1,4 +1,4 @@
-from typing import Sequence, Optional
+from typing import Sequence, Optional, Dict, Union
 
 from jax.sharding import PartitionSpec
 
@@ -44,6 +44,7 @@ class MixtralConfig(EasyDelPretrainedConfig):
             c_max_position_embeddings: int = 4096,
             freq_max_position_embeddings: int = 4096,
             bits: Optional[int] = None,
+            rope_scaling: Dict[str, Union[str, float]] = None,
             **kwargs,
     ):
         """
@@ -85,6 +86,7 @@ class MixtralConfig(EasyDelPretrainedConfig):
         :param axis_names: Sequence[str]: Specify the names of each axis in the tensor
         :param &quot;mp&quot;): Define the maximum position embeddings
         :param kwargs: Pass a variable number of keyword arguments to a function
+        :param rope_scaling: Dict[str, Union[str, float]]: rope scaling information
         :param : Define the number of layers in the model
         :return: An instance of the class
 
@@ -103,6 +105,7 @@ class MixtralConfig(EasyDelPretrainedConfig):
         self.output_router_logits = output_router_logits
         self.router_aux_loss_coef = router_aux_loss_coef
         # for backward compatibility
+        self.rope_scaling = rope_scaling
         if num_key_value_heads is None:
             num_key_value_heads = num_attention_heads
 
