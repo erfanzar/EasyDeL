@@ -392,14 +392,15 @@ class FlaxMixtralBlocKSparesTop2MLPCollection(nn.Module):
             for i in range(self.config.num_local_experts)
         ]
 
-    def __call__(self,
-                 expert_mask: chex.Array,
-                 hidden_states: chex.Array,
-                 routing_weights: chex.Array,
-                 batch_size: int,
-                 sequence_length: int,
-                 hidden_dim: int
-                 ) -> chex.Array:
+    def __call__(
+            self,
+            expert_mask: chex.Array,
+            hidden_states: chex.Array,
+            routing_weights: chex.Array,
+            batch_size: int,
+            sequence_length: int,
+            hidden_dim: int
+    ) -> chex.Array:
         assert hidden_states.ndim == 2
         final_hidden_states = jnp.zeros(
             (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype
@@ -407,7 +408,7 @@ class FlaxMixtralBlocKSparesTop2MLPCollection(nn.Module):
 
         for expert_idx, expert_layer in enumerate(self.layers):
             selected_mask = expert_mask[expert_idx]
-            idx, top_x = jnp.where(selected_mask)
+            idx, top_x = jnp.nonzero(selected_mask)
             if top_x.shape[0] == 0:
                 continue
 
@@ -415,8 +416,7 @@ class FlaxMixtralBlocKSparesTop2MLPCollection(nn.Module):
 
             current_hidden_states = expert_layer(
                 current_state) * routing_weights[top_x, idx, None]
-
-            final_hidden_states.at[0, top_x].set(current_hidden_states)
+            final_hidden_states.at[top_x].set(current_hidden_states)
 
         return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
 
@@ -752,8 +752,8 @@ class MixtralPreTrainedModel(EasyDelFlaxPretrainedModel):
             else:
                 return random_params
         except Exception as err:
-            print(err)
-            return freeze({"some": jnp.array([0, 0, 0, 0])})
+            print(err, "\nRetuning Empty Params")
+            return freeze({})
 
     def init_cache(self, batch_size, max_length):
 
