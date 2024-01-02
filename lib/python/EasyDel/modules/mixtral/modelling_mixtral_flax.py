@@ -415,8 +415,11 @@ class FlaxMixtralBlocKSparesTop2MLPCollection(nn.Module):
             current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
 
             current_hidden_states = expert_layer(
-                current_state) * routing_weights[top_x, idx, None]
-            final_hidden_states.at[top_x].set(current_hidden_states)
+                current_state
+            ) * routing_weights[top_x, idx, None]
+            final_hidden_states.at[top_x].set(
+                current_hidden_states + final_hidden_states[top_x]
+            )
 
         return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
 
