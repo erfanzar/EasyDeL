@@ -26,12 +26,12 @@ def main():
     torch.manual_seed(42)
     seq_len = 128
     config = MixtralConfig(
-        hidden_size=128,
+        hidden_size=256,
         num_attention_heads=8,
+        num_hidden_layers=8,
         num_key_value_heads=4,
-        num_hidden_layers=1,
-        intermediate_size=256,
-        gradient_checkpointing="",
+        intermediate_size=512,
+        num_local_experts=8,
         max_position_embeddings=seq_len
     )
     batch_size = len(jax.devices())
