@@ -13,7 +13,6 @@ from jax.experimental.mesh_utils import create_device_mesh
 from jax.experimental.shard_map import shard_map
 from .easydel_modelling_utils import EasyMethod
 
-
 ACT2FN = {
     "gelu": partial(nn.gelu, approximate=False),
     "relu": nn.relu,
@@ -548,3 +547,51 @@ def get_dot_general_by_bits(
             )
         }
     return {}  # empty just in case of not getting any error
+
+
+def read_depth(
+        params: dict,
+        path: str | None = None,
+        state: dict | None = None
+):
+    if state is None:
+        state = {}
+    for key, value in params.items():
+        if isinstance(value, dict):
+            accureated_path = path + "/" + key if path is not None else key
+            state = read_depth(
+                params[key],
+                path=key if path is None else accureated_path,
+                state=state
+            )
+        else:
+            value_string = type(value).__name__ + f"(shape={value.shape})"
+            state[path] = value_string
+    return state
+
+
+def get_maximum_depths(dictionary: dict):
+    maximums = {}
+    minimums = {}
+    for k, v in dictionary.items():
+        splits = k.split("/")
+        for index, split in enumerate(splits):
+            try:
+                split = int(split)
+                if str(index) in maximums.keys():
+                    current = maximums[str(index)]
+                    if current < split:
+                        maximums[str(index)] = split
+                else:
+                    maximums[str(index)] = split
+                if str(index) in minimums.keys():
+                    split = int(split)
+                    if str(index) in minimums.keys():
+                        current = minimums[str(index)]
+                        if current > split:
+                            minimums[str(index)] = split
+                else:
+                    minimums[str(index)] = split
+            except ValueError:
+                ...
+    return maximums, minimums
