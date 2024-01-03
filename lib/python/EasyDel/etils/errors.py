@@ -8,3 +8,4 @@ class EasyDeSyntaxRuntimeError(Exception):
 
 class EasyDelTimerError(Exception):
     ...
+
