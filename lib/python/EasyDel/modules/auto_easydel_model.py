@@ -9,10 +9,7 @@ from transformers import AutoConfig, AutoModelForCausalLM
 
 from ..transform.easydel_transform import huggingface_to_easydel
 from .easydel_modelling_utils import EasyDelFlaxPretrainedModel
-
-
-class EasyDelRunTimeError(Exception):
-    ...
+from ..etils.errors import EasyDelRuntimeError
 
 
 def get_modules_by_type(model_type: str):
@@ -117,7 +114,7 @@ def get_modules_by_type(model_type: str):
             functools.partial(huggingface_to_easydel, embedding_layer_names=["embed_tokens"])
         )
     else:
-        raise EasyDelRunTimeError(f'Model Type ({model_type}) is not supported or is not found')
+        raise EasyDelRuntimeError(f'Model Type ({model_type}) is not supported or is not found')
 
 
 def is_flatten(pytree: dict):
