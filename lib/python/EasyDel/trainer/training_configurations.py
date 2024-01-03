@@ -13,7 +13,14 @@ from jax.experimental.mesh_utils import create_device_mesh
 from jax.sharding import Mesh
 from jax import numpy as jnp
 import jax
-from ..etils import EasyDelGradientCheckPointers, EasyDelOptimizers, EasyDelSchedulers
+from ..etils import (
+    EasyDelGradientCheckPointers,
+    EasyDelOptimizers,
+    EasyDelSchedulers,
+    AVAILABLE_GRADIENT_CHECKPOINTS,
+    AVAILABLE_SCHEDULERS,
+    AVAILABLE_OPTIMIZERS
+)
 
 AVAILABLE_BACKENDS: List[str] = [
     "cpu", "gpu", "tpu", None
@@ -31,13 +38,13 @@ class TrainArguments(
             model_class=None,
             total_batch_size: int = 32,
             max_steps: Union[int, None] = None,
-            optimizer: EasyDelOptimizers | str = EasyDelOptimizers.ADAMW,
-            scheduler: EasyDelSchedulers | str = EasyDelSchedulers.NONE,
+            optimizer: AVAILABLE_OPTIMIZERS = EasyDelOptimizers.ADAMW,
+            scheduler: AVAILABLE_SCHEDULERS = EasyDelSchedulers.NONE,
             learning_rate: Union[int, float] = 5e-5,
             learning_rate_end: Union[None, float] = 5e-6,
             gradient_accumulation_steps: int = 1,
             weight_decay: float = 0.01,
-            gradient_checkpointing: EasyDelGradientCheckPointers | str = EasyDelGradientCheckPointers.NOTHING_SAVEABLE,
+            gradient_checkpointing: AVAILABLE_GRADIENT_CHECKPOINTS = EasyDelGradientCheckPointers.NOTHING_SAVEABLE,
             max_length: Union[int, None] = 4096,
             sharding_array: Union[tuple, int] = (1, -1, 1, 1),
             is_fine_tuning: bool = True,

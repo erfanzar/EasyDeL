@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Literal
 
 
 @dataclass
@@ -41,3 +42,25 @@ class EasyDelGradientCheckPointers:
     NOTHING_SAVEABLE: str = "nothing_saveable"
     CHECKPOINT_DOTS: str = "checkpoint_dots"
     CHECKPOINT_DOTS_WITH_NO_BATCH_DMIS: str = "checkpoint_dots_with_no_batch_dims"
+
+
+AVAILABLE_GRADIENT_CHECKPOINTS = Literal[
+    "everything_saveable",
+    "nothing_saveable",
+    "checkpoint_dots",
+    "checkpoint_dots_with_no_batch_dims"
+]
+
+AVAILABLE_SCHEDULERS = Literal[
+    "linear",
+    "cosine",
+    "none",
+    "warm_up_cosine",
+    "warm_up_linear"
+]
+
+AVAILABLE_OPTIMIZERS = Literal[
+    "adafactor",
+    "lion",
+    'adamw'
+]

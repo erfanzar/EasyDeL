@@ -42,6 +42,7 @@ setup(
         "gradio~=4.12.0",
         "distrax",
         "rlax",
+        "termcolor",
         "wandb>=0.15.9",
         "tensorboard",
         "torch~=2.1.0",

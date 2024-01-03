@@ -11,7 +11,10 @@ from .configs import (
 from .etils import (
     EasyDelGradientCheckPointers,
     EasyDelOptimizers,
-    EasyDelSchedulers
+    EasyDelSchedulers,
+    AVAILABLE_OPTIMIZERS,
+    AVAILABLE_SCHEDULERS,
+    AVAILABLE_GRADIENT_CHECKPOINTS
 )
 
 from .errors import (
