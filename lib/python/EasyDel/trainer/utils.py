@@ -1,11 +1,16 @@
 import fjformer.optimizers
 
-from ..etils import EasyDelSchedulers, EasyDelOptimizers
+from ..etils import (
+    EasyDelSchedulers,
+    EasyDelOptimizers,
+    AVAILABLE_SCHEDULERS,
+    AVAILABLE_OPTIMIZERS
+)
 
 
 def get_optimizer_and_scheduler(
-        optimizer: str,
-        scheduler: str,
+        optimizer: AVAILABLE_OPTIMIZERS,
+        scheduler: AVAILABLE_SCHEDULERS,
         steps: int,
         learning_rate: float = 1e-5,
         learning_rate_end: float = 1e-5,
