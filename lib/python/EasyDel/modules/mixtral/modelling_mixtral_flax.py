@@ -1,9 +1,5 @@
 import functools
-import typing
-from typing import Sequence, Dict
 
-import fjformer.attention
-import flax.core
 from flax.struct import dataclass
 from jax import numpy as jnp, Array, lax
 from jax.experimental.shard_map import shard_map
@@ -408,6 +404,7 @@ class FlaxMixtralBlocKSparesTop2MLPCollection(nn.Module):
 
         for expert_idx, expert_layer in enumerate(self.layers):
             selected_mask = expert_mask[expert_idx]
+
             idx, top_x = jnp.nonzero(selected_mask)
             if top_x.shape[0] == 0:
                 continue
@@ -417,7 +414,7 @@ class FlaxMixtralBlocKSparesTop2MLPCollection(nn.Module):
             current_hidden_states = expert_layer(
                 current_state
             ) * routing_weights[top_x, idx, None]
-            final_hidden_states.at[top_x].set(
+            final_hidden_states = final_hidden_states.at[top_x].set(
                 current_hidden_states + final_hidden_states[top_x]
             )
 
@@ -462,16 +459,31 @@ class FlaxMixtralSparseMoeBlock(nn.Module):
     def __call__(self, hidden_states: chex.Array) -> Tuple[chex.Array, chex.Array]:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.reshape(-1, hidden_dim)
+
         router_logits = self.gate(hidden_states).astype(
-            jnp.promote_types(self.dtype, jnp.float32))
-        routing_weights = jax.nn.softmax(router_logits.astype(
-            jnp.promote_types(self.dtype, jnp.float32)), axis=1)
+            jnp.promote_types(self.dtype, jnp.float32)
+        )
+
+        routing_weights = jax.nn.softmax(
+            router_logits.astype(
+                jnp.promote_types(self.dtype, jnp.float32)
+            ), axis=1
+        )
         routing_weights, selected_experts = jax.lax.top_k(
-            routing_weights, k=self.config.num_experts_per_tok)
-        routing_weights /= jnp.sum(routing_weights, axis=-1, keepdims=True)
-        routing_weights = routing_weights.astype(hidden_states.dtype)
+            routing_weights,
+            k=self.config.num_experts_per_tok
+        )
+        routing_weights /= jnp.sum(
+            routing_weights,
+            axis=-1,
+            keepdims=True
+        )
+        routing_weights = routing_weights.astype(
+            hidden_states.dtype
+        )
         expert_mask = jax.nn.one_hot(
             selected_experts, num_classes=self.config.num_local_experts).transpose(2, 1, 0)
+
         return self.experts(
             expert_mask=expert_mask,
             batch_size=batch_size,
