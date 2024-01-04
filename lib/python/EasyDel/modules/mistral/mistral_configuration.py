@@ -24,7 +24,7 @@ class MistralConfig(EasyDelPretrainedConfig):
             eos_token_id=2,
             tie_word_embeddings=False,
             rope_theta=10000.0,
-            rope_scaling=None,
+            rope_scaling: Dict[str, Union[str, float]] = None,
             sliding_window=4096,
             gradient_checkpointing: str = 'nothing_saveable',
             use_pjit_attention_force: bool = False,
@@ -34,10 +34,11 @@ class MistralConfig(EasyDelPretrainedConfig):
             flash_attn_key_chunk_size: int = 1024,
             scan_mlp_chunk_size: int = 1024,
             number_rep_kv: int = 1,
-            attn_pdrop: float = 0.0,
+            attention_dropout: float = 0.0,
             c_max_position_embeddings: int = 4096,
             freq_max_position_embeddings: int = 4096,
             bits: Optional[int] = None,
+            attention_bias: bool = False,
             **kwargs,
     ):
         """
@@ -71,13 +72,14 @@ class MistralConfig(EasyDelPretrainedConfig):
         :param flash_attn_key_chunk_size: int: Control the size of chunks that are used for the key matrix in flash attention
         :param scan_mlp_chunk_size: int: Specify the chunk size of the scan mlp
         :param number_rep_kv: int: Specify the number of times to repeat the key and value vectors
-        :param attn_pdrop: float: Set the dropout rate for the attention layer
+        :param attention_dropout: float: Set the dropout rate for the attention layer
         :param c_max_position_embeddings: int: Set the maximum number of tokens in a sequence
         :param freq_max_position_embeddings: int: Set the maximum number of frequency bins that can be used in the model
         :param bits: Optional[int]: Specify the number of bits used for quantization
         :param axis_dims: Sequence[int]: Specify the dimension of each axis
         :param axis_names: Sequence[str]: Specify the names of each axis in the tensor
         :param &quot;mp&quot;): Define the maximum position embeddings
+        :param attention_bias: bool: when ever to use attention_bias
         :param kwargs: Pass a variable number of keyword arguments to a function
         :param : Define the number of layers in the model
         :return: An instance of the class
@@ -110,7 +112,8 @@ class MistralConfig(EasyDelPretrainedConfig):
         self.flash_attn_query_chunk_size = flash_attn_query_chunk_size
         self.flash_attn_key_chunk_size = flash_attn_key_chunk_size
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
-        self.attn_pdrop = attn_pdrop
+        self.attention_bias = attention_bias
+        self.attention_dropout = attention_dropout
         self.c_max_position_embeddings = c_max_position_embeddings
         self.freq_max_position_embeddings = freq_max_position_embeddings
 
@@ -170,22 +173,23 @@ class MistralConfig(EasyDelPretrainedConfig):
         )
 
     def add_jax_args(
-        self,
-        gradient_checkpointing: str = 'nothing_saveable',
-        use_pjit_attention_force: bool = False,
-        use_flash_attention: bool = False,
-        use_sacn_mlp: bool = False,
-        flash_attn_query_chunk_size: int = 1024,
-        flash_attn_key_chunk_size: int = 1024,
-        scan_mlp_chunk_size: int = 1024,
-        number_rep_kv: int = 1,
-        attn_pdrop: float = 0.0,
-        c_max_position_embeddings: int = 4096,
-        freq_max_position_embeddings: int = None,
-        bits: Optional[int] = None,
-        rope_scaling=None,
-        **kwargs,
-     ):
+            self,
+            gradient_checkpointing: str = 'nothing_saveable',
+            use_pjit_attention_force: bool = False,
+            use_flash_attention: bool = False,
+            use_sacn_mlp: bool = False,
+            flash_attn_query_chunk_size: int = 1024,
+            flash_attn_key_chunk_size: int = 1024,
+            scan_mlp_chunk_size: int = 1024,
+            number_rep_kv: int = 1,
+            c_max_position_embeddings: int = 4096,
+            freq_max_position_embeddings: int = None,
+            bits: Optional[int] = None,
+            attention_dropout: float = 0.0,
+            rope_scaling: Dict[str, Union[str, float]] = None,
+            attention_bias: bool = False,
+            **kwargs,
+    ):
         """
         The add_jax_args function adds the following arguments to the model:
 
@@ -198,14 +202,17 @@ class MistralConfig(EasyDelPretrainedConfig):
         :param flash_attn_key_chunk_size: int: Chunk the keys for flash attention
         :param scan_mlp_chunk_size: int: Chunk the input to the mlp
         :param number_rep_kv: int: Control the number of times that the key and value vectors are repeated
-        :param attn_pdrop: float: Set the dropout rate for the attention layer
         :param c_max_position_embeddings: int: Set the maximum number of positional embeddings for the causal axis
         :param freq_max_position_embeddings: int: Set the maximum length of the frequency axis
         :param bits: Optional[int]: Specify the number of bits to use for quantization
+        :param attention_dropout: float: Set the dropout rate for the attention layer
+        :param attention_bias: bool: when ever to use attention_bias
+        :param rope_scaling: Dict[str, Union[str, float]]: rope_scaling for rope
         :return: A tuple of the following:
 
         """
 
+        self.attention_bias = attention_bias
         self.rope_scaling = rope_scaling
         self.use_flash_attention = use_flash_attention
         self.number_rep_kv = number_rep_kv
@@ -215,7 +222,7 @@ class MistralConfig(EasyDelPretrainedConfig):
         self.flash_attn_query_chunk_size = flash_attn_query_chunk_size
         self.flash_attn_key_chunk_size = flash_attn_key_chunk_size
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
-        self.attn_pdrop = attn_pdrop
+        self.attention_dropout = attention_dropout
         self.c_max_position_embeddings = c_max_position_embeddings
         self.freq_max_position_embeddings = freq_max_position_embeddings
         self.bits = bits

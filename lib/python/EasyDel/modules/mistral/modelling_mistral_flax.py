@@ -150,7 +150,7 @@ class FlaxMistralAttention(nn.Module):
 
         dense = functools.partial(
             nn.Dense,
-            use_bias=False,
+            use_bias=self.config.attention_bias,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
@@ -269,7 +269,7 @@ class FlaxMistralAttention(nn.Module):
         else:
             causal_mask = causal_mask[:, :, :q_l, :k_l]
         dropout_rng = None
-        if not deterministic and self.config.attn_pdrop > 0.0:
+        if not deterministic and self.config.attention_dropout > 0.0:
             dropout_rng = self.make_rng("dropout")
         causal_mask = jnp.broadcast_to(
             causal_mask, (batch_size,) + causal_mask.shape[1:])
@@ -317,7 +317,7 @@ class FlaxMistralAttention(nn.Module):
                 deterministic=deterministic,
                 q_seq_len=q_l,
                 kv_seq_len=k_l,
-                attn_pdrop=self.config.attn_pdrop,
+                attn_pdrop=self.config.attention_dropout,
                 head_dims=self.head_dim,
                 force_float32_tpu=True
             )
@@ -335,7 +335,7 @@ class FlaxMistralAttention(nn.Module):
                         dot_product_attention_weights,
                         dtype=jnp.promote_types(self.dtype, jnp.float32),
                         deterministic=deterministic,
-                        dropout_rate=self.config.attn_pdrop,
+                        dropout_rate=self.config.attention_dropout,
                         precision=self.precision,
                     ),
                     mesh=self.config.jax_mesh(),
@@ -356,7 +356,7 @@ class FlaxMistralAttention(nn.Module):
                     bias=attention_bias,
                     dtype=jnp.promote_types(self.dtype, jnp.float32),
                     deterministic=deterministic,
-                    dropout_rate=self.config.attn_pdrop,
+                    dropout_rate=self.config.attention_dropout,
                     precision=self.precision,
                 )
 
