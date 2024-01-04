@@ -183,7 +183,7 @@ class MistralConfig(EasyDelPretrainedConfig):
         c_max_position_embeddings: int = 4096,
         freq_max_position_embeddings: int = None,
         bits: Optional[int] = None,
-        rope_scaling=None
+        rope_scaling=None,
         **kwargs,
      ):
         """
