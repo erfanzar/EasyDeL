@@ -24,6 +24,7 @@ class MistralConfig(EasyDelPretrainedConfig):
             eos_token_id=2,
             tie_word_embeddings=False,
             rope_theta=10000.0,
+            rope_scaling=None,
             sliding_window=4096,
             gradient_checkpointing: str = 'nothing_saveable',
             use_pjit_attention_force: bool = False,
@@ -100,6 +101,7 @@ class MistralConfig(EasyDelPretrainedConfig):
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
         self.rope_theta = rope_theta
+        self.rope_scaling = rope_scaling
         self.use_flash_attention = use_flash_attention
         self.number_rep_kv = number_rep_kv
         self.gradient_checkpointing = gradient_checkpointing
@@ -167,21 +169,23 @@ class MistralConfig(EasyDelPretrainedConfig):
             ('.*', PartitionSpec(("fsdp", "sp"))),
         )
 
-    def add_jax_args(self,
-                     gradient_checkpointing: str = 'nothing_saveable',
-                     use_pjit_attention_force: bool = False,
-                     use_flash_attention: bool = False,
-                     use_sacn_mlp: bool = False,
-                     flash_attn_query_chunk_size: int = 1024,
-                     flash_attn_key_chunk_size: int = 1024,
-                     scan_mlp_chunk_size: int = 1024,
-                     number_rep_kv: int = 1,
-                     attn_pdrop: float = 0.0,
-                     c_max_position_embeddings: int = 4096,
-                     freq_max_position_embeddings: int = None,
-                     bits: Optional[int] = None,
-                     **kwargs,
-                     ):
+    def add_jax_args(
+        self,
+        gradient_checkpointing: str = 'nothing_saveable',
+        use_pjit_attention_force: bool = False,
+        use_flash_attention: bool = False,
+        use_sacn_mlp: bool = False,
+        flash_attn_query_chunk_size: int = 1024,
+        flash_attn_key_chunk_size: int = 1024,
+        scan_mlp_chunk_size: int = 1024,
+        number_rep_kv: int = 1,
+        attn_pdrop: float = 0.0,
+        c_max_position_embeddings: int = 4096,
+        freq_max_position_embeddings: int = None,
+        bits: Optional[int] = None,
+        rope_scaling=None
+        **kwargs,
+     ):
         """
         The add_jax_args function adds the following arguments to the model:
 
@@ -201,6 +205,8 @@ class MistralConfig(EasyDelPretrainedConfig):
         :return: A tuple of the following:
 
         """
+
+        self.rope_scaling = rope_scaling
         self.use_flash_attention = use_flash_attention
         self.number_rep_kv = number_rep_kv
         self.gradient_checkpointing = gradient_checkpointing
