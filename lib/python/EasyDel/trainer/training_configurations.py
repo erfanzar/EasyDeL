@@ -78,6 +78,8 @@ class TrainArguments(
                 ("dp", "fsdp"), "sp"
             ),
             training_time: typing.Optional[str] = None,
+            dataloader_num_workers: typing.Optional[int] = 4,
+            dataloader_pin_memory: typing.Optional[bool] = False,
             **kwargs
     ):
         """
@@ -132,6 +134,8 @@ class TrainArguments(
         :param warmup_steps: int: Warm up the learning rate
         :param init_input_shape: typing.Tuple[int]: Initialize the input shape of the model
         :param step_partition_spec: jax.sharding.PartitionSpec: PartitionSpec Custom to be used in training and eval or test loop
+        :param dataloader_num_workers: typing.Optional[int] : dataloader_num_workers pytorch attrebute
+        :param dataloader_pin_memory: typing.Optional[bool] : dataloader_pin_memory pytorch attrebute
         :param **kwargs: Pass a variable number of keyword arguments to a function
         :return: Nothing
 
@@ -151,7 +155,6 @@ class TrainArguments(
         array_devices = jnp.ones(
             (self.available_backends, 1)).reshape(sharding_array)
         self.array_devices_shape = array_devices.shape
-
         self.model_id = model_id
         self.num_train_epochs = num_train_epochs
         self.total_batch_size = total_batch_size
@@ -195,6 +198,8 @@ class TrainArguments(
         self.is_left_padded = is_left_padded
         self.step_partition_spec = step_partition_spec
 
+        self.dataloader_num_workers = dataloader_num_workers
+        self.dataloader_pin_memory = dataloader_pin_memory
         self.training_time = self._time_to_seconds(
             training_time) if training_time is not None else None
         torch.set_default_device("cpu")
