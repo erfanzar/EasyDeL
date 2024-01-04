@@ -1,4 +1,4 @@
-from typing import Sequence, Optional
+from typing import Sequence, Optional, Dict, Union
 
 from jax.sharding import PartitionSpec
 
