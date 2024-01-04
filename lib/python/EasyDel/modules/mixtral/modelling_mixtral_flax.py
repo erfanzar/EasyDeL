@@ -122,7 +122,7 @@ class FlaxMixtralAttention(nn.Module):
 
         dense = functools.partial(
             nn.Dense,
-            use_bias=self.config.attention_bias,
+            use_bias=getattr(self.config, "attention_bias", False),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
