@@ -97,7 +97,7 @@ class TrainArguments(
             model_parameters=None,
             do_shard_fns: bool = True,
             track_memory: bool = True,
-            loss_remat: str = "",
+            loss_re_mat: str = "",
             loss_chunk: int = 1024,
             is_left_padded: bool = False,
             # Is model using Left padded or right padded dataset
@@ -191,7 +191,7 @@ train_args = TrainArguments(
     gradient_accumulation_steps=1,
     remove_ckpt_after_load=True,
     ids_to_pop_from_dataset=['token_type_ids'],
-    loss_remat="",
+    loss_re_mat="",
     dtype=jax.numpy.bfloat16
 )
 
