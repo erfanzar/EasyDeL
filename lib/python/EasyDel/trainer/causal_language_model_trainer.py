@@ -550,14 +550,14 @@ class CausalLanguageModelTrainer:
                 count_params(sharded_train_state_.params)
 
             pbar = tqdm(total=self.max_steps_train)
-            i = sharded_train_state_.step.tolist()
+            current_step = sharded_train_state_.step.tolist()
             losses = []
             accuracies = []
             pbar.update(sharded_train_state_.step.tolist())
             learning_rates = []
             if self.wandb_runtime is not None:
                 model_parameters_number = sum(
-                    i.size for i in
+                    n.size for n in
                     jax.tree_util.tree_flatten(flax.core.unfreeze(sharded_train_state_.params))[0]
                 ) / 1e9
                 self.wandb_runtime.log(
@@ -569,8 +569,8 @@ class CausalLanguageModelTrainer:
             try:
                 for ep in range(self.arguments.num_train_epochs):
                     for batch in self.dataloader_train:
-                        i += 1
-                        if i < self.max_steps_train:
+                        current_step += 1
+                        if current_step < self.max_steps_train:
 
                             batch["labels"] = batch["input_ids"][..., 1:]
 
@@ -582,7 +582,7 @@ class CausalLanguageModelTrainer:
                                                                                               )
                             ttl_time = time.time() - time_s
                             losses.append(loss)
-                            learning_rates.append(self.scheduler(i).tolist())
+                            learning_rates.append(self.scheduler(current_step).tolist())
                             accuracies.append(accuracy)
                             if self.arguments.track_memory:
                                 mem_res = get_mem(dir_prefix=dir_prefix)
@@ -621,12 +621,14 @@ class CausalLanguageModelTrainer:
                                     raise EasyDelTimerError("Time Out")
                         else:
                             break
-                        if self.arguments.save_steps is not None and i % self.arguments.save_steps == 0:
-                            filename = f"{self.arguments.model_name}-{sum(losses) / len(losses)}-{i}"
+                        if self.arguments.save_steps is not None and current_step % self.arguments.save_steps == 0:
+                            filename = f"{self.arguments.model_name}-{sum(losses) / len(losses)}-{current_step}"
                             print(f"Saving Model to \033[1;30m{filename}\033[1;0m")
-                            self.ckpt_streamer.save_checkpoint(sharded_train_state_.params["params"],
-                                                               filename,
-                                                               gather_fns=gather_fns.params["params"])
+                            self.ckpt_streamer.save_checkpoint(
+                                sharded_train_state_.params["params"],
+                                filename,
+                                gather_fns=gather_fns.params["params"]
+                            )
             except KeyboardInterrupt:
                 print(
                     "\033[1;30m KeyboardInterrupt At training model Will return current state of the model * \033[1;0m")
@@ -641,8 +643,8 @@ class CausalLanguageModelTrainer:
                     for i_eval, batch_eval in enumerate(self.dataloader_eval):
                         _ = batch_eval.pop("token_type_ids", None)
                         batch_eval["labels"] = batch_eval["input_ids"][..., 1:]
-                        for i in self.arguments.ids_to_pop_from_dataset:
-                            _ = batch_eval.pop(i, None)
+                        for pop_arg in self.arguments.ids_to_pop_from_dataset:
+                            _ = batch_eval.pop(pop_arg, None)
                         loss_eval, accuracy = create_casual_language_model_evaluation_step(
                             self.arguments.step_partition_spec)(
                             sharded_train_state_, batch_eval)
@@ -658,10 +660,10 @@ class CausalLanguageModelTrainer:
             if self.arguments.save_steps is None and self.arguments.do_last_save:
                 loss_mean = sum(losses) / len(losses)
                 trained_tokens = (
-                        i * self.arguments.total_batch_size *
+                        current_step * self.arguments.total_batch_size *
                         self.arguments.gradient_checkpointing * self.arguments.max_length
                 )
-                filename = f"{self.arguments.model_name}-T{trained_tokens}-L{loss_mean}-S{i}"
+                filename = f"{self.arguments.model_name}-T{trained_tokens}-L{loss_mean}-S{current_step}"
                 print(f"Saving Model to \033[1;30m{filename}\033[1;0m")
                 self.ckpt_streamer.save_checkpoint(
                     sharded_train_state_.params["params"],
