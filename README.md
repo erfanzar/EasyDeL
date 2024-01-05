@@ -114,7 +114,7 @@ train_arguments = TrainArguments(
     use_pjit_attention_force=False,
     remove_ckpt_after_load=True,
     gradient_accumulation_steps=8,
-    loss_remat="",
+    loss_re_mat="",
     dtype=jnp.bfloat16
 )
 

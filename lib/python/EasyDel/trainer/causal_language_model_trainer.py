@@ -8,6 +8,8 @@ import fjformer.func.loss_func
 from fjformer.func.loss_func import fused_cross_entropy_loss_and_accuracy, cross_entropy_loss_and_accuracy
 import wandb
 from datasets import Dataset
+from wandb.apis.public import Run
+from wandb.sdk.lib import RunDisabled
 
 from .training_configurations import TrainArguments
 
@@ -166,6 +168,7 @@ class OutputFineTuner:
     gather_fns: typing.Any
     shard_fns: typing.Any
     last_save_file_name: str
+    checkpoint_path: str
 
 
 class CausalLanguageModelTrainer:
@@ -201,7 +204,7 @@ class CausalLanguageModelTrainer:
         self.dataloader_train = None
         self.dataloader_eval = None
         self.model = None
-        self.wandb_runtime = None
+        self.wandb_runtime: Run | RunDisabled | None = None
         self.max_steps_train = None
         self.max_steps_eval = None
         self.config = None
@@ -379,8 +382,10 @@ class CausalLanguageModelTrainer:
 
         else:
             if not hasattr(self.arguments.configs_to_init_model_class["config"], "get_partition_rules"):
-                assert self.arguments.custom_rule is not None, "if you are using custom model to init you must" \
-                                                               " pass custom_rule for partition rules "
+                assert self.arguments.custom_rule is not None, (
+                    "if you are using custom model to init you must"
+                    " pass custom_rule for partition rules "
+                )
 
             self.arguments.configs_to_init_model_class[
                 "config"
@@ -431,9 +436,9 @@ class CausalLanguageModelTrainer:
                 params=params_
             )
 
-        if self.arguments.loss_remat == "OHA":
+        if self.arguments.loss_re_mat == "OHA":
             loss_fn = fjformer.func.loss_func.cross_entropy_with_logits
-        elif self.arguments.loss_remat != "":
+        elif self.arguments.loss_re_mat != "":
             loss_fn = fused_cross_entropy_loss_and_accuracy
         else:
             loss_fn = cross_entropy_loss_and_accuracy
@@ -499,8 +504,8 @@ class CausalLanguageModelTrainer:
         """
 
         def count_params(_p):
-            print("\033[1;31mModel Contain : ",
-                  sum(i.size for i in jax.tree_util.tree_flatten(flax.core.unfreeze(_p))[0]) / 1e9,
+            print("\033[1;31mModel Contain ",
+                  sum(n.size for n in jax.tree_util.tree_flatten(flax.core.unfreeze(_p))[0]) / 1e9,
                   " Billion Parameters")
 
         dir_prefix: str = "/dev/shm"
@@ -550,14 +555,17 @@ class CausalLanguageModelTrainer:
             accuracies = []
             pbar.update(sharded_train_state_.step.tolist())
             learning_rates = []
-            if self.arguments.use_wandb:
+            if self.wandb_runtime is not None:
+                model_parameters_number = sum(
+                    i.size for i in
+                    jax.tree_util.tree_flatten(flax.core.unfreeze(sharded_train_state_.params))[0]
+                ) / 1e9
                 self.wandb_runtime.log(
                     {
-                        "model billion parameters": sum(
-                            i.size for i in
-                            jax.tree_util.tree_flatten(flax.core.unfreeze(sharded_train_state_.params))[0]) / 1e9
+                        "Number of Model Parameters (Billion)": model_parameters_number
                     }
                 )
+                wandb.summary["Number of Model Parameters (Billion)"] = model_parameters_number
             try:
                 for ep in range(self.arguments.num_train_epochs):
                     for batch in self.dataloader_train:
@@ -582,7 +590,7 @@ class CausalLanguageModelTrainer:
                                 mem_res = "Tracking Option is OFF"
                             pbar.update(1)
 
-                            if self.arguments.use_wandb:
+                            if self.wandb_runtime is not None:
                                 with jax.spmd_mode("allow_all"):
                                     self.wandb_runtime.log(
                                         {
@@ -597,7 +605,8 @@ class CausalLanguageModelTrainer:
                                             "avg_accuracy": (sum(accuracies) / len(accuracies)).tolist(),
                                             "mem_res": mem_res,
                                         }
-                                    )
+                                    ),
+
                             if self.arguments.track_memory:
                                 IPython.display.clear_output(True)
                                 pbar.display(mem_res)
@@ -634,21 +643,31 @@ class CausalLanguageModelTrainer:
                         batch_eval["labels"] = batch_eval["input_ids"][..., 1:]
                         for i in self.arguments.ids_to_pop_from_dataset:
                             _ = batch_eval.pop(i, None)
-                        loss_eval, accuracy = create_casual_language_model_evaluation_step(self.arguments.step_partition_spec)(
+                        loss_eval, accuracy = create_casual_language_model_evaluation_step(
+                            self.arguments.step_partition_spec)(
                             sharded_train_state_, batch_eval)
                         pbar_eval.update(1)
-                        if self.arguments.use_wandb:
+                        if self.wandb_runtime is not None:
                             self.wandb_runtime.log(
-                                {"loss_eval": loss_eval.tolist(),
-                                 "accuracy": accuracy.tolist()}
+                                {
+                                    "loss_eval": loss_eval.tolist(),
+                                    "accuracy": accuracy.tolist()
+                                }
                             )
                         pbar_eval.set_postfix(loss_eval=loss_eval.tolist())
             if self.arguments.save_steps is None and self.arguments.do_last_save:
-                filename = f"{self.arguments.model_name}-{sum(losses) / len(losses)}-{i}"
+                loss_mean = sum(losses) / len(losses)
+                trained_tokens = (
+                        i * self.arguments.total_batch_size *
+                        self.arguments.gradient_checkpointing * self.arguments.max_length
+                )
+                filename = f"{self.arguments.model_name}-T{trained_tokens}-L{loss_mean}-S{i}"
                 print(f"Saving Model to \033[1;30m{filename}\033[1;0m")
-                self.ckpt_streamer.save_checkpoint(sharded_train_state_.params["params"],
-                                                   filename,
-                                                   gather_fns=gather_fns.params["params"])
+                self.ckpt_streamer.save_checkpoint(
+                    sharded_train_state_.params["params"],
+                    filename,
+                    gather_fns=gather_fns.params["params"]
+                )
             else:
                 filename = "not_saved | None"
         output = OutputFineTuner(
@@ -658,7 +677,8 @@ class CausalLanguageModelTrainer:
             mesh=self.mesh,
             shard_fns=shard_fns,
             gather_fns=gather_fns,
-            ckpt_stream=self.ckpt_streamer
+            ckpt_stream=self.ckpt_streamer,
+            checkpoint_path=f"{str(self.arguments.get_path())}/{filename}"
         )
         wandb.finish()
 
