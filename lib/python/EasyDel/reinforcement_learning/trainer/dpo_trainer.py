@@ -340,5 +340,33 @@ class DPOTrainer:
         or
         (per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1)
         """
-        # TODO : Complete get_batch_logps
-        ...
+
+        if logits.shape[:-1] != labels.shape:
+            raise ValueError("Logits (batch and sequence length dim) and labels must have the same shape.")
+
+        if not is_encoder_decoder:
+            labels = labels[:, 1:]
+            logits = logits[:, :-1, :]
+
+        batch, seq_len, dim = logits.shape
+        loss_mask = labels != label_pad_token_id
+        labels = jax.lax.select(
+            labels == label_pad_token_id,
+            jnp.zeros(labels.shape, dtype=labels.dtype),
+            labels
+        )
+        logits_log_s = jax.nn.log_softmax(
+            logits, -1
+        )
+        per_token_logps = jnp.take_along_axis(
+            logits_log_s,
+            axis=2,
+            indices=labels[:, :, None]
+        ).reshape(batch, seq_len)
+
+        if average_log_prob:
+            log_prob = jnp.sum((per_token_logps * loss_mask), axis=-1) / jnp.sum(loss_mask, axis=-1)
+        else:
+            log_prob = jnp.sum((per_token_logps * loss_mask), axis=-1)
+
+        return log_prob
