@@ -1,223 +1,24 @@
 import math
-
-import einops
 from flax import linen as nn
 from flax.core import FrozenDict
-from typing import Optional, Union, Tuple, Sequence
-from transformers import FlaxPreTrainedModel, PretrainedConfig
+from typing import Optional, Union, Tuple
+
 from jax import numpy as jnp
 import jax
 from jax.sharding import PartitionSpec
 from transformers.modeling_flax_outputs import FlaxCausalLMOutput, FlaxBaseModelOutput
 import flax
 from einops import rearrange
-from fjformer.attention import efficient_attention
 from ..flax_modelling_utils import (
     get_gradient_checkpoint_policy,
     with_sharding_constraint,
     ACT2FN,
-    JaxBaseClassModel,
     smart_flash_attention, get_dot_general_by_bits
 )
+from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 import chex
-from fjformer.bits import config as q_config, q_flax
 
-
-class MptConfig(JaxBaseClassModel):
-    model_type = 'mpt'
-
-    def __init__(self,
-                 d_model: int = 2048,
-                 n_heads: int = 16,
-                 n_layers: int = 24,
-                 expansion_ratio: int = 4,
-                 max_seq_len: int = 2048,
-                 vocab_size: int = 50368,
-                 resid_prob_drop: float = 0.0,
-                 emb_prob_drop: float = 0.0,
-                 alibi: bool = True,
-                 use_bias: bool = False,
-                 learned_pos_emb: bool = True,
-                 act_fn: str = 'gelu',
-                 logit_scale: Optional[Union[float, str]] = None,
-                 no_bias: bool = False,
-                 verbose: int = 0,
-                 embedding_fraction: float = 1.0,
-                 use_cache: bool = False,
-                 qk_ln: bool = False,
-                 use_lm_head: bool = False,
-                 use_norm_bias: bool = False,
-                 gradient_checkpointing: str = 'nothing_saveable',
-                 use_pjit_attention_force: bool = False,
-                 use_flash_attention: bool = False,
-                 flash_attn_query_chunk_size: int = 1024,
-                 flash_attn_key_chunk_size: int = 2048,
-                 bits: Optional[int] = None,
-                 **kwargs
-                 ):
-
-        self.d_model = d_model
-        self.use_norm_bias = use_norm_bias
-        self.use_lm_head = use_lm_head
-        self.n_heads = n_heads
-        self.n_layers = n_layers
-        self.expansion_ratio = expansion_ratio
-        self.max_seq_len = max_seq_len
-        self.vocab_size = vocab_size
-        self.resid_prob_drop = resid_prob_drop
-        self.use_bias = use_bias
-        self.emb_prob_drop = emb_prob_drop
-        self.use_pjit_attention_force = use_pjit_attention_force
-        self.gradient_checkpointing = gradient_checkpointing
-        self.learned_pos_emb = learned_pos_emb
-        self.act_fn = act_fn
-        self.logit_scale = logit_scale
-        self.no_bias = no_bias
-        self.qk_ln = qk_ln
-        self.alibi = alibi
-        self.verbose = verbose
-        self.embedding_fraction = embedding_fraction
-        self.use_cache = use_cache
-        self.use_flash_attention = use_flash_attention
-        self.flash_attn_key_chunk_size = flash_attn_key_chunk_size
-        self.flash_attn_query_chunk_size = flash_attn_query_chunk_size
-        self.bits = bits
-
-        self.from_pt = False
-        if 'name' in kwargs:
-            del kwargs['name']
-        if 'loss_fn' in kwargs:
-            del kwargs['loss_fn']
-        super().__init__(
-            **kwargs
-        )
-
-    @staticmethod
-    def _set_config_defaults(config, config_defaults):
-        for (k, v) in config_defaults.items():
-            if k not in config:
-                config[k] = v
-        return config
-
-    @staticmethod
-    def get_partition_rules(fully_fsdp: bool = False):
-        return (
-
-            ("transformer/wte/embedding", PartitionSpec("dp", "fsdp")),
-            ("transformer/wpe/embedding", PartitionSpec("dp", "fsdp")),
-
-            ("attn/w_qkv/kernel", PartitionSpec("fsdp", "dp")),
-            ("attn/wo/kernel", PartitionSpec("dp", "fsdp")),
-            ("attn/w_qkv/bias", PartitionSpec("fsdp", "dp")),
-            ("attn/wo/bias", PartitionSpec("dp", "fsdp")),
-
-            ("ffn/down/kernel", PartitionSpec("fsdp", "dp")),
-            ("ffn/up/kernel", PartitionSpec("fsdp", "dp")),
-            ("ffn/down/kernel", PartitionSpec("fsdp", "dp")),
-            ("ffn/up/kernel", PartitionSpec("fsdp", "dp")),
-
-            ("attention_norm/kernel", PartitionSpec(None)),
-            ("norm_f/kernel", PartitionSpec(None)),
-            ("norm_f/bias", PartitionSpec(None)),
-
-            ("transformer/norm_f/kernel", PartitionSpec(None)),
-            ("transformer/norm_f/bias", PartitionSpec(None)),
-            ("lm_head/kernel", PartitionSpec("fsdp", "dp")),
-            ("lm_head/bias", PartitionSpec("fsdp", "dp")),
-            ('.*', PartitionSpec(None)),
-        ) if not fully_fsdp else (
-
-            ("transformer/wte/embedding", PartitionSpec("fsdp")),
-            ("transformer/wpe/embedding", PartitionSpec("fsdp")),
-
-            ("attn/w_qkv/kernel", PartitionSpec("fsdp")),
-            ("attn/wo/kernel", PartitionSpec("fsdp")),
-            ("attn/w_qkv/bias", PartitionSpec("fsdp")),
-            ("attn/wo/bias", PartitionSpec("fsdp")),
-
-            ("ffn/down/kernel", PartitionSpec("fsdp")),
-            ("ffn/up/kernel", PartitionSpec("fsdp")),
-            ("ffn/down/kernel", PartitionSpec("fsdp")),
-            ("ffn/up/kernel", PartitionSpec("fsdp")),
-
-            ("attention_norm/kernel", PartitionSpec(None)),
-            ("norm_f/kernel", PartitionSpec(None)),
-            ("norm_f/bias", PartitionSpec(None)),
-
-            ("transformer/norm_f/kernel", PartitionSpec(None)),
-            ("transformer/norm_f/bias", PartitionSpec(None)),
-            ("lm_head/kernel", PartitionSpec("fsdp")),
-            ("lm_head/bias", PartitionSpec("fsdp")),
-            ('.*', PartitionSpec(None)),
-        )
-
-    def add_jax_args(self,
-                     d_model: int = 2048,
-                     n_heads: int = 16,
-                     n_layers: int = 24,
-                     expansion_ratio: int = 4,
-                     max_seq_len: int = 2048,
-                     vocab_size: int = 50368,
-                     resid_prob_drop: float = 0.0,
-                     emb_prob_drop: float = 0.0,
-                     alibi: bool = True,
-                     use_bias: bool = True,
-                     learned_pos_emb: bool = True,
-                     act_fn: str = 'gelu',
-                     logit_scale: Optional[Union[float, str]] = None,
-                     no_bias: bool = False,
-                     verbose: int = 0,
-                     embedding_fraction: float = 1.0,
-                     use_cache: bool = False,
-                     qk_ln: bool = True,
-                     use_lm_head: bool = False,
-                     use_norm_bias: bool = False,
-                     gradient_checkpointing: str = 'nothing_saveable',
-                     use_pjit_attention_force: bool = False,
-                     use_flash_attention: bool = False,
-                     flash_attn_query_chunk_size: int = 1024,
-                     flash_attn_key_chunk_size: int = 2048,
-                     bits: Optional[int] = None,
-                     **kwargs,
-                     ):
-        if hasattr(self, 'attn_config'):
-            for k, v in self.attn_config.items():
-                setattr(self, k, v)
-        basics = dict(
-            bits=bits,
-            d_model=d_model,
-            n_heads=n_heads,
-            n_layers=n_layers,
-            expansion_ratio=expansion_ratio,
-            max_seq_len=max_seq_len,
-            vocab_size=vocab_size,
-            resid_prob_drop=resid_prob_drop,
-            emb_prob_drop=emb_prob_drop,
-            alibi=alibi,
-            use_bias=use_bias,
-            learned_pos_emb=learned_pos_emb,
-            act_fn=act_fn,
-            logit_scale=logit_scale,
-            no_bias=no_bias,
-            verbose=verbose,
-            embedding_fraction=embedding_fraction,
-            use_cache=use_cache,
-            qk_ln=qk_ln,
-            use_lm_head=use_lm_head,
-            use_norm_bias=use_norm_bias,
-            gradient_checkpointing=gradient_checkpointing,
-            use_pjit_attention_force=use_pjit_attention_force,
-            use_flash_attention=use_flash_attention,
-            flash_attn_query_chunk_size=flash_attn_query_chunk_size,
-            flash_attn_key_chunk_size=flash_attn_key_chunk_size,
-            **kwargs
-        )
-        for k, v in basics.items():
-            if not hasattr(self, k):
-                print(f' Key {k} not found in loaded config setting that to default of {v}')
-                setattr(self, k, v)
-
-        self.from_pt = False
+from .mosaic_configuration import MptConfig
 
 
 class RMSNorm(nn.Module):
@@ -478,7 +279,7 @@ class FlaxMptCollection(nn.Module):
     def setup(self) -> None:
         block = FlaxMptBlock
 
-        if self.config.gradient_checkpointing != '':
+        if self.config.gradient_checkpointing != "":
             block = flax.linen.remat(
                 block,
                 policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
@@ -498,13 +299,17 @@ class FlaxMptCollection(nn.Module):
             )
         ]
 
-    def __call__(self,
-                 hidden_states: chex.Array,
-                 attention_mask: chex.Array,
-                 position_ids: chex.Array,
-                 attn_bias: chex.Array = None,
-                 init_cache: bool = False
-                 ):
+    def __call__(
+            self,
+            hidden_states: chex.Array,
+            attention_mask: chex.Array,
+            position_ids: chex.Array,
+            attn_bias: chex.Array = None,
+            init_cache: bool = False,
+            output_hidden_states: bool = True
+    ):
+
+        all_hidden_states = () if output_hidden_states else None
         for block in self.blocks:
             hidden_states = block(
                 hidden_states=hidden_states,
@@ -513,7 +318,10 @@ class FlaxMptCollection(nn.Module):
                 position_ids=position_ids,
                 init_cache=init_cache
             )
-        return hidden_states
+
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+        return hidden_states, all_hidden_states
 
 
 def build_alibi(max_length, num_attention_heads, alibi_max: int = 8):
@@ -548,15 +356,16 @@ class FlaxMptModule(nn.Module):
         self.norm_f = nn.LayerNorm(use_bias=self.config.use_norm_bias)
         self.alibi = build_alibi(self.config.max_seq_len, self.config.n_heads)
 
-    def __call__(self,
-
-                 input_ids: chex.Array,
-                 attention_mask: chex.Array = None,
-                 position_ids: chex.Array = None,
-                 init_cache: bool = False,
-                 return_dict: bool = True,
-                 extra_embedding: Optional[Union[jnp.ndarray, None]] = None
-                 ):
+    def __call__(
+            self,
+            input_ids: chex.Array,
+            attention_mask: chex.Array = None,
+            position_ids: chex.Array = None,
+            init_cache: bool = False,
+            return_dict: bool = True,
+            output_hidden_states: bool = True,
+            extra_embedding: Optional[Union[jnp.ndarray, None]] = None
+    ):
         b, s = input_ids.shape
         hidden_states = self.wte(input_ids)
         hidden_states = hidden_states + extra_embedding if extra_embedding is not None else hidden_states
@@ -567,22 +376,26 @@ class FlaxMptModule(nn.Module):
             pos_id = self.wpe(jnp.arange(s, dtype='i4').reshape(1, -1))
             hidden_states += pos_id
             alibi = None
-        hidden_states = self.norm_f(
-            self.h(
-                hidden_states,
-                attn_bias=alibi,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                init_cache=init_cache
-            )
+        hidden_states, all_hidden_states = self.h(
+            hidden_states,
+            attn_bias=alibi,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            init_cache=init_cache,
+            output_hidden_states=output_hidden_states
         )
+        hidden_states = self.norm_f(
+            hidden_states
+        )
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
         if return_dict:
-            return FlaxBaseModelOutput(last_hidden_state=hidden_states, hidden_states=None)
+            return FlaxBaseModelOutput(last_hidden_state=hidden_states, hidden_states=all_hidden_states)
         else:
-            return (hidden_states,)
+            return hidden_states, all_hidden_states
 
 
-class FlaxMptPretrainedModel(FlaxPreTrainedModel):
+class FlaxMptPretrainedModel(EasyDelFlaxPretrainedModel):
     module_class: nn.Module = None
     config_class: MptConfig = MptConfig
 
@@ -591,7 +404,7 @@ class FlaxMptPretrainedModel(FlaxPreTrainedModel):
                  dtype: jnp.dtype = jnp.float32,
                  param_dtype: jnp.dtype = jnp.float32,
                  _do_init: bool = False,
-                 precision: Optional[Union[jax.lax.Precision, None]] = jax.lax.Precision('fastest'),
+                 precision: Optional[Union[jax.lax.Precision, None]] = jax.lax.Precision("fastest"),
                  input_shape: Tuple = (1, 16),
                  **kwargs
                  ):
@@ -637,12 +450,18 @@ class FlaxMptPretrainedModel(FlaxPreTrainedModel):
                  attention_mask=None,
                  past_key_values=None,
                  position_ids=None,
+                 output_hidden_states: Optional[bool] = None,
                  init_cache: bool = False,
                  params: dict = None,
                  add_params_field: bool = False,
                  return_dict: bool = True,
                  extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+                 **kwargs
                  ):
+
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
         params = {'params': params or self.params} if add_params_field else params or self.params
         input_ids = jnp.asarray(input_ids, dtype='i4')
         mutable = False
@@ -667,6 +486,7 @@ class FlaxMptPretrainedModel(FlaxPreTrainedModel):
             extra_embedding=extra_embedding,
             position_ids=position_ids,
             init_cache=init_cache,
+            output_hidden_states=output_hidden_states,
             mutable=mutable,
             rngs=rngs
         )
@@ -683,8 +503,14 @@ class FlaxMptPretrainedModel(FlaxPreTrainedModel):
 class FlaxMptModel(FlaxMptPretrainedModel):
     module_class = FlaxMptModule
 
+    def get_input_embeddings(self):
+        return self.module.wte
 
-class FlaxFlaxMptForCausalLMModule(nn.Module):
+    def set_input_embeddings(self, value):
+        self.module.wte = value
+
+
+class FlaxMptForCausalLMModule(nn.Module):
     config: MptConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -704,20 +530,22 @@ class FlaxFlaxMptForCausalLMModule(nn.Module):
                                     dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision,
                                     **get_dot_general_by_bits(self.config.bits, self.config.easy_method))
 
-    def __call__(self,
-                 input_ids: chex.Array,
-                 attention_mask: chex.Array = None,
-                 init_cache: bool = False,
-                 position_ids: chex.Array = None,
-                 return_dict: bool = True,
-                 extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
-
-                 ):
+    def __call__(
+            self,
+            input_ids: chex.Array,
+            attention_mask: chex.Array = None,
+            init_cache: bool = False,
+            position_ids: chex.Array = None,
+            return_dict: bool = True,
+            output_hidden_states: bool = True,
+            extra_embedding: Optional[Union[jnp.ndarray, None]] = None
+    ):
         predict: FlaxBaseModelOutput = self.transformer(
             input_ids=input_ids,
             attention_mask=attention_mask,
             return_dict=True,
             extra_embedding=extra_embedding,
+            output_hidden_states=output_hidden_states,
             position_ids=position_ids,
             init_cache=init_cache
         )
@@ -729,14 +557,32 @@ class FlaxFlaxMptForCausalLMModule(nn.Module):
 
             return FlaxCausalLMOutput(
                 logits=logits,
-                hidden_states=predict.last_hidden_state
+                hidden_states=predict.hidden_states
             )
         else:
-            return (logits,)
+            return logits, predict.hidden_states if output_hidden_states else (logits,)
 
 
 class FlaxMptForCausalLM(FlaxMptPretrainedModel):
-    module_class = FlaxFlaxMptForCausalLMModule
+    module_class = FlaxMptForCausalLMModule
+
+    def get_input_embeddings(self):
+        return self.module.transformer.wte
+
+    def get_decoder(self):
+        return self.module.transformer
+
+    def set_input_embeddings(self, value):
+        self.module.transformer.wte = value
+
+    def set_decoder(self, decoder):
+        self.module.transformer = decoder
+
+    def set_output_embeddings(self, new_embeddings):
+        self.module.lm_head = new_embeddings
+
+    def get_output_embeddings(self):
+        return self.module.lm_head
 
     def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[chex.Array] = None):
 

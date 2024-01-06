@@ -41,7 +41,7 @@ def float_tensor_to_dtype(tensor, dtype):
     :return: A tensor with the specified dtype
     
     """
-    if dtype is None or dtype == '':
+    if dtype is None or dtype == "":
         return tensor
     if isinstance(dtype, str):
         dtype = get_float_dtype_by_name(dtype)
@@ -102,7 +102,7 @@ def huggingface_to_easydel(
             for embedding_layer_name in embedding_layer_names:
                 if embedding_layer_name in key:
                     key = key[:-_l] + '.embedding'
-                elif match_keywords(key, ['kernel'], ['none']):
+                elif match_keywords(key, ['weight'], ['none']):
                     if len(tensor.shape) == 2:
                         tensor = tensor.transpose(0, 1)
                     if key.endswith('.weight'):

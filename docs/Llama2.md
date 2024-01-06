@@ -59,12 +59,10 @@ available for free, making them a valuable resource for researchers and develope
 ## How to Use/Load Them in EasyDel
 
 ```python
-import jax
-from EasyDel.transform import llama_from_pretrained
-
-params, config = llama_from_pretrained(
+from EasyDel import AutoEasyDelModelForCausalLM
+model, params = AutoEasyDelModelForCausalLM.from_pretrained(
     'meta-llama/Llama-2-7b',
-    device=jax.devices('cpu')[0]  # Offload on CPU
+    # other kwargs
 )
 ```
 
@@ -73,15 +71,15 @@ also keep that in mind that returned `config` includes `.get_partition_rules(fsd
 #### Use With JaxServer
 
 ```python
-from EasyDel.modules import FlaxLlamaForCausalLM
-from EasyDel.serve import JAXServer
+from EasyDel.serve import JAXServer, JAXServerConfig
 import jax
-from EasyDel.transform import llama_from_pretrained
 from transformers import AutoTokenizer
 
-params, config = llama_from_pretrained(
+from EasyDel import AutoEasyDelModelForCausalLM
+
+model, params = AutoEasyDelModelForCausalLM.from_pretrained(
     'meta-llama/Llama-2-7b',
-    device=jax.devices('cpu')[0]  # Offload on CPU
+    # other kwargs
 )
 
 DEFAULT_SYSTEM_PROMPT = "You are a helpful, respectful and honest assistant and act as wanted"
@@ -90,14 +88,14 @@ DEFAULT_SYSTEM_PROMPT = "You are a helpful, respectful and honest assistant and 
 class Llama2JaxServer(JAXServer):
     def process_gradio_chat(self, prompt, history, max_new_tokens, system, greedy):
 
-        system = None if system == '' else system
+        system = None if system == "" else system
         string = self.prompt_llama2_model(
             message=prompt,
             chat_history=history or [],
             system_prompt=system or DEFAULT_SYSTEM_PROMPT
         )
         if not self.config.stream_tokens_for_gradio:
-            response = ''
+            response = ""
             for response, _ in self.process(
                     string=string,
                     greedy=greedy,
@@ -106,21 +104,21 @@ class Llama2JaxServer(JAXServer):
                 ...
             history.append([prompt, response])
         else:
-            history.append([prompt, ''])
+            history.append([prompt, ""])
             for response, _ in self.process(
                     string=string,
                     greedy=greedy,
                     max_new_tokens=max_new_tokens
             ):
                 history[-1][-1] = response
-                yield '', history
+                yield "", history
 
-        return '', history
+        return "", history
 
     def process_gradio_instruct(self, prompt, system, max_new_tokens, greedy):
         string = self.prompt_llama2_model(system_prompt=DEFAULT_SYSTEM_PROMPT, message=prompt, chat_history=[])
         if not self.config.stream_tokens_for_gradio:
-            response = ''
+            response = ""
             for response, _ in self.process(
                     string=string,
                     greedy=greedy,
@@ -128,15 +126,15 @@ class Llama2JaxServer(JAXServer):
             ):
                 pass
         else:
-            response = ''
+            response = ""
             for response, _ in self.process(
                     string=string,
                     greedy=greedy,
                     max_new_tokens=max_new_tokens,
                     stream=True
             ):
-                yield '', response
-        return '', response
+                yield "", response
+        return "", response
 
     @staticmethod
     def prompt_llama2_model(message: str, chat_history,
@@ -150,32 +148,18 @@ class Llama2JaxServer(JAXServer):
             texts.append(f'{user_input} [/INST] {response.strip()} </s><s>[INST] ')
         message = message.strip() if do_strip else message
         texts.append(f'{message} [/INST]')
-        return ''.join(texts)
+        return "".join(texts)
 
 
 server = Llama2JaxServer.load_from_params(
     params=params,
-    model=FlaxLlamaForCausalLM(
-        config=config,
-        dtype=jax.numpy.bfloat16,  # Im on TPUs
-        param_dtype=jax.numpy.bfloat16,  # Im on TPUs
-        precision=jax.lax.Precision('fastest'),
-        _do_init=False,
-        input_shape=(1, 1024)
-    ),
-    config_model=config,
+    model=model,
+    config_model=model.config,
     add_params_field=True,
     tokenizer=AutoTokenizer.from_pretrained('meta-llama/Llama-2-7b'),
     verbose=False,
     do_memory_log=True,
-    config={
-        "max_length": 4096,
-        "max_new_tokens": 4096,
-        "max_stream_tokens": 64,
-        "dtype": 'bf16',
-        "use_prefix_tokenizer": True,
-        'pre_compile': True
-    }
+    config=JAXServerConfig()
 )
 
 server.fire()  # Launch FastAPI functions

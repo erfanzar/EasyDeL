@@ -1,10 +1,10 @@
-# About EasyDel.CausalLMTrainer
+# About EasyDel.CausalLanguageModelTrainer
 
 What Will we cover in this tutorial
 
-- Inputs args/kwargs for CausalLMTrainer
+- Inputs args/kwargs for CausalLanguageModelTrainer
 - How to use
-- Example of Training a Llama2 Model with CausalLMTrainer with jax on TPU/CPU/GPU
+- Example of Training a Llama2 Model with CausalLanguageModelTrainer with jax on TPU/CPU/GPU
 - Reconvert Model to HuggingFace PyTorch
 
 ## What Do we need to start
@@ -21,7 +21,7 @@ apt-get update && apt-get upgrade -y -q
 apt-get install golang -y -q
 ```
 
-## Inputs to CausalLMTrainer
+## Inputs to CausalLanguageModelTrainer
 
 ```arguments: TrainArguments```
 
@@ -31,7 +31,7 @@ apt-get install golang -y -q
 
 ```finetune: bool = True```
 
-```ckpt_path: typing.Union[str, os.PathLike] = None```
+```checkpoint_path: typing.Union[str, os.PathLike] = None```
 
 ```_do_init_fns: bool = True```
 
@@ -77,7 +77,7 @@ class TrainArguments(
             extra_optimizer_kwargs: dict = None,
             # Extra kwargs to be passed to optimizer for initialization
             save_steps: Union[int, None] = None,
-            save_dir: str = 'easydel_ckpt',
+            save_dir: str = 'easydel_checkpoint',
             use_pjit_attention_force: bool = False,
             dtype=jnp.bfloat16,
             param_dtype=jnp.bfloat16,
@@ -97,7 +97,7 @@ class TrainArguments(
             model_parameters=None,
             do_shard_fns: bool = True,
             track_memory: bool = True,
-            loss_remat: str = '',
+            loss_re_mat: str = "",
             loss_chunk: int = 1024,
             is_left_padded: bool = False,
             # Is model using Left padded or right padded dataset
@@ -122,7 +122,7 @@ fine-tune is a boolean field which stand for should EasyDel initialize the param
 will pass the
 model parameters later in training section
 
-### ckpt_path
+### checkpoint_path
 
 path to Read Params from Checkpoint in case of passing string you are reading from file
 and in case of passing none you can pass params manually to Tariner
@@ -134,7 +134,7 @@ here's a script
 here in this script we will see an example for how to finetune models in EasyDel
 
 ```python
-from EasyDel import TrainArguments, CausalLMTrainer, AutoEasyDelModelForCausalLM
+from EasyDel import TrainArguments, CausalLanguageModelTrainer, AutoEasyDelModelForCausalLM
 import jax
 import flax
 from datasets import load_dataset
@@ -146,7 +146,7 @@ model, params = AutoEasyDelModelForCausalLM.from_pretrained(
     model_id,
     dtype=jax.numpy.bfloat16,
     param_dtype=jax.numpy.bfloat16,
-    precision=jax.lax.Precision('fastest'),
+    precision=jax.lax.Precision("fastest"),
     device=jax.devices('cpu')[0],  # Load JAX Model and initialize or load Parameters on CPU 
     # The Rest of kwargs here will be passed to AutoModelForCausalLM huggingface such as this device_map
     device_map='auto'
@@ -191,14 +191,14 @@ train_args = TrainArguments(
     gradient_accumulation_steps=1,
     remove_ckpt_after_load=True,
     ids_to_pop_from_dataset=['token_type_ids'],
-    loss_remat='',
+    loss_re_mat="",
     dtype=jax.numpy.bfloat16
 )
 
-trainer = CausalLMTrainer(
+trainer = CausalLanguageModelTrainer(
     train_args,
     dataset_train,
-    ckpt_path=None
+    checkpoint_path=None
 )
 
 output = trainer.train(flax.core.FrozenDict({'params': params}))

@@ -32,7 +32,7 @@ def get_prompt_llama2_format(message: str, chat_history,
         texts.append(f'{user_input} [/INST] {response.strip()} </s><s>[INST] ')
     message = message.strip() if do_strip else message
     texts.append(f'{message} [/INST]')
-    return ''.join(texts)
+    return "".join(texts)
 
 
 class Llama2Host(JAXServer):
@@ -48,17 +48,17 @@ class Llama2Host(JAXServer):
         return get_prompt_llama2_format(prompt, history, system)
 
     @classmethod
-    def load_from_torch(cls, repo_id, config=None):
+    def load_from_torch(cls, pretrained_model_name_or_path, config=None):
         with jax.default_device(jax.devices('cpu')[0]):
             param, config_model = llama_from_pretrained(
-                repo_id
+                pretrained_model_name_or_path
             )
-        tokenizer = AutoTokenizer.from_pretrained(repo_id)
+        tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
         model = EasyDel.modules.FlaxLlamaForCausalLM(
             config=config_model,
             dtype=get_float_dtype_by_name(config['dtype'] if config is not None else 'fp16'),
             param_dtype=get_float_dtype_by_name(config['dtype'] if config is not None else 'fp16'),
-            precision=jax.lax.Precision('fastest'),
+            precision=jax.lax.Precision("fastest"),
             _do_init=False
         )
         return cls.load_from_params(
@@ -72,16 +72,16 @@ class Llama2Host(JAXServer):
         )
 
     @classmethod
-    def load_from_jax(cls, repo_id, checkpoint_path, config_repo=None, config=None):
+    def load_from_jax(cls, pretrained_model_name_or_path, checkpoint_path, config_repo=None, config=None):
         from huggingface_hub import hf_hub_download
-        path = hf_hub_download(repo_id, checkpoint_path)
-        tokenizer = AutoTokenizer.from_pretrained(repo_id)
-        config_model = EasyDel.LlamaConfig.from_pretrained(config_repo or repo_id)
+        path = hf_hub_download(pretrained_model_name_or_path, checkpoint_path)
+        tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
+        config_model = EasyDel.LlamaConfig.from_pretrained(config_repo or pretrained_model_name_or_path)
         model = EasyDel.FlaxLlamaForCausalLM(
             config=config_model,
             dtype=get_float_dtype_by_name(config['dtype'] if config is not None else 'fp16'),
             param_dtype=get_float_dtype_by_name(config['dtype'] if config is not None else 'fp16'),
-            precision=jax.lax.Precision('fastest'),
+            precision=jax.lax.Precision("fastest"),
             _do_init=False
         )
         return cls.load(
@@ -98,7 +98,7 @@ class Llama2Host(JAXServer):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Argument parser for Llama2.")
     parser.add_argument(
-        '--repo_id',
+        '--pretrained_model_name_or_path',
         default='meta-llama/Llama-2-7b-chat-hf',
         help='HuggingFace Repo to load model From'
     )
@@ -121,7 +121,7 @@ if __name__ == "__main__":
         help="The maximum number of new tokens to generate.",
     )
     parser.add_argument(
-        "--max_stream_tokens",
+        "--max_compile_tokens",
         default=32,
         type=int,
         help="The maximum number of tokens to generate per stream.",
@@ -179,7 +179,7 @@ if __name__ == "__main__":
         contains_auto_format=args.contains_auto_format,
         max_length=args.max_length,
         max_new_tokens=args.max_new_tokens,
-        max_stream_tokens=args.max_stream_tokens,
+        max_compile_tokens=args.max_compile_tokens,
         temperature=args.temperature,
         top_p=args.top_p,
         top_k=args.top_k,
@@ -191,7 +191,7 @@ if __name__ == "__main__":
     )
 
     server = Llama2Host.load_from_torch(
-        repo_id=args.repo_id,
+        pretrained_model_name_or_path=args.pretrained_model_name_or_path,
         config=configs
     )
     try:

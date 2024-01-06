@@ -6,64 +6,66 @@ from .serve.jax_serve import (
     JAXServer as JAXServer,
     JAXServerConfig as JAXServerConfig
 )
-from .modules.llama.modelling_llama_flax import (
+from .serve.gradio_user_interface_base import (
+    GradioUserInference as GradioUserInference
+)
+
+from .modules.llama import (
     LlamaConfig as LlamaConfig,
     FlaxLlamaForCausalLM as FlaxLlamaForCausalLM,
+    FlaxLlamaForSequenceClassification as FlaxLlamaForSequenceClassification,
     FlaxLlamaModel as FlaxLlamaModel
 )
-from .modules.gpt_j.modelling_gpt_j_flax import (
+from .modules.gpt_j import (
     GPTJConfig as GPTJConfig,
     FlaxGPTJForCausalLM as FlaxGPTJForCausalLM,
-    FlaxGPTJModule as FlaxGPTJModule,
     FlaxGPTJModel as FlaxGPTJModel,
-    FlaxGPTJForCausalLMModule as FlaxGPTJForCausalLMModule
 )
-from .modules.t5.modelling_t5_flax import (
+from .modules.t5 import (
     T5Config as T5Config,
     FlaxT5ForConditionalGeneration as FlaxT5ForConditionalGeneration,
     FlaxT5Model as FlaxT5Model
 )
-from .modules.falcon.modelling_falcon_flax import (
+from .modules.falcon import (
     FalconConfig as FalconConfig,
     FlaxFalconModel as FlaxFalconModel,
     FlaxFalconForCausalLM as FlaxFalconForCausalLM
 )
-from .modules.opt.modelling_opt_flax import (
+from .modules.opt import (
     OPTConfig as OPTConfig,
     FlaxOPTForCausalLM as FlaxOPTForCausalLM,
     FlaxOPTModel as FlaxOPTModel
 )
-from .modules.mistral.modelling_mistral_flax import (
+from .modules.mistral import (
     MistralConfig as MistralConfig,
     FlaxMistralForCausalLM as FlaxMistralForCausalLM,
-    FlaxMistralModule as FlaxMistralModule
+    FlaxMistralModel as FlaxMistralModel
 )
-from .modules.palm.modelling_palm_flax import (
-    PalmModel as PalmModel,
+from .modules.palm import (
+    FlaxPalmModel as FlaxPalmModel,
     PalmConfig as PalmConfig,
     FlaxPalmForCausalLM as FlaxPalmForCausalLM
 )
 
-from .modules.mosaic_mpt.modelling_mpt_flax import (
+from .modules.mosaic_mpt import (
     MptConfig as MptConfig,
     FlaxMptForCausalLM as FlaxMptForCausalLM,
     FlaxMptModel as FlaxMptModel
 )
 
-from .modules.gpt_neo_x.modelling_gpt_neo_x_flax import (
+from .modules.gpt_neo_x import (
     GPTNeoXConfig as GPTNeoXConfig,
     FlaxGPTNeoXModel as FlaxGPTNeoXModel,
     FlaxGPTNeoXForCausalLM as FlaxGPTNeoXForCausalLM
 )
 
-from .modules.lucid_transformer.modelling_lt_flax import (
+from .modules.lucid_transformer import (
     FlaxLTModel as FlaxLTModel,
-    FlaxLTModelModule as FlaxLTModelModule,
     FlaxLTConfig as FlaxLTConfig,
     FlaxLTForCausalLM as FlaxLTForCausalLM
 )
 
-from .modules.gpt2.modelling_gpt2_flax import (
+from .modules.gpt2 import (
     # GPT2 code is from huggingface but in the version of huggingface they don't support gradient checkpointing
     # and pjit attention force
     GPT2Config as GPT2Config,
@@ -71,7 +73,13 @@ from .modules.gpt2.modelling_gpt2_flax import (
     FlaxGPT2Model as FlaxGPT2Model
 )
 
-from .modules.auto_models import (
+from .modules.mixtral import (
+    FlaxMixtralForCausalLM as FlaxMixtralForCausalLM,
+    FlaxMixtralModel as FlaxMixtralModel,
+    MixtralConfig as MixtralConfig
+)
+
+from .modules.auto_easydel_model import (
     AutoEasyDelModelForCausalLM as AutoEasyDelModelForCausalLM,
     get_modules_by_type as get_modules_by_type
 )
@@ -86,11 +94,10 @@ from .utils.utils import (
 )
 
 from .trainer import (
-    CausalLMTrainer,
+    CausalLanguageModelTrainer,
     TrainArguments,
-    create_fsdp_eval_step,
-    create_fsdp_train_step,
-    get_training_modules
+    create_casual_language_model_evaluation_step,
+    create_casual_language_model_train_step,
 )
 
 from .linen import (
@@ -137,4 +144,13 @@ from .transform.mistral import (
     mistral_easydel_to_hf as mistral_easydel_to_hf
 )
 
-__version__ = "0.0.40"
+from .transform.easydel_transform import (
+    huggingface_to_easydel as huggingface_to_easydel
+)
+from .etils import (
+    EasyDelOptimizers,
+    EasyDelSchedulers,
+    EasyDelGradientCheckPointers
+)
+
+__version__ = "0.0.41"

@@ -103,7 +103,7 @@ server = MPTJaxServer.load_from_params(
     config=config,
     dtype=jax.numpy.bfloat16,  # Im on TPUs
     param_dtype=jax.numpy.bfloat16,  # Im on TPUs
-    precision=jax.lax.Precision('fastest'),
+    precision=jax.lax.Precision("fastest"),
     _do_init=False,
     input_shape=(1, 1024)
   ),
@@ -115,7 +115,7 @@ server = MPTJaxServer.load_from_params(
   config={
     "max_length": 2048,
     "max_new_tokens": 2048,
-    "max_stream_tokens": 64,
+    "max_compile_tokens": 64,
     "dtype": 'bf16',
     "use_prefix_tokenizer": True,
     'pre_compile': True

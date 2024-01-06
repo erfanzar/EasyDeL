@@ -1,20 +1,17 @@
 from functools import partial
-from typing import Dict, Optional, Tuple, Union, Sequence
+from typing import Optional, Tuple, Union
 
-import fjformer.attention
 from einops import einops
 import jax
 import jax.numpy as jnp
 from jax import lax
-from jax.sharding import PartitionSpec as PS
+from jax.sharding import PartitionSpec
 import flax.linen as nn
 from jax.experimental.shard_map import shard_map
 from flax.traverse_util import flatten_dict, unflatten_dict
 from flax.linen import partitioning as nn_partitioning, dot_product_attention_weights
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks, make_causal_mask
-from transformers.configuration_utils import PretrainedConfig
-from transformers.modeling_flax_utils import FlaxPreTrainedModel
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput, FlaxSequenceClassifierOutput
 # EasyDel.modules
 from ..flax_modelling_utils import (
@@ -23,266 +20,11 @@ from ..flax_modelling_utils import (
     repeat_kv_bnsh,
     apply_rotary_pos_emb,
     precompute_freq_cis,
-    JaxBaseClassModel,
     smart_flash_attention, get_dot_general_by_bits
 )
+from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 import chex
-from fjformer.bits import config as q_config, q_flax
-
-
-class LlamaConfig(JaxBaseClassModel):
-    model_type = "llama"
-
-    def __init__(
-            self,
-            vocab_size: int = 32000,
-            hidden_size: int = 4096,
-            intermediate_size: int = 11008,
-            num_hidden_layers: int = 32,
-            num_attention_heads: int = 32,
-            number_rep_kv: int = 1,
-            num_key_value_heads: Optional[int] = None,
-            max_position_embeddings: int = 2048,
-            rms_norm_eps: float = 1e-6,
-            initializer_range: float = 0.02,
-            use_cache: bool = True,
-            bos_token_id: int = 0,
-            eos_token_id: int = 1,
-            resid_pdrop: float = 0.0,
-            embd_pdrop: float = 0.0,
-            attn_pdrop: float = 0.0,
-            rope_theta: float = 10000.,
-            attention_bias: bool = False,
-            tie_word_embeddings: bool = False,
-            gradient_checkpointing: str = "nothing_saveable",
-            fcm_min_ratio: float = -1,
-            fcm_max_ratio: float = -1,
-            use_pjit_attention_force: bool = False,
-            rope_scaling: Dict[str, Union[str, float]] = None,
-            use_flash_attention: bool = False,
-            use_sacn_mlp: bool = False,
-            flash_attn_query_chunk_size: int = 1024,
-            flash_attn_key_chunk_size: int = 1024,
-            scan_mlp_chunk_size: int = 1024,
-            bits: Optional[int] = None,
-            hidden_act: str = 'silu',
-            pretraining_tp: int = 1,
-            scan_layers: bool = True,
-            use_shard_map: bool = True,
-            **kwargs,
-    ):
-        """
-        The __init__ function is called when the class is instantiated.
-        It sets up the attributes of an object, which are sometimes called fields or properties.
-        The __init__ function can accept arguments, but self must be the first one.
-
-        :param self: Refer to the object itself
-        :param vocab_size: int: Set the size of the vocabulary
-        :param hidden_size: int: Set the size of the hidden layers in each transformer block
-        :param intermediate_size: int: Set the size of the intermediate layer
-        :param num_hidden_layers: int: Determine the number of layers in the transformer
-        :param num_attention_heads: int: Determine the number of attention heads
-        :param number_rep_kv: int: Set the number of times to repeat the key and value vectors
-        :param num_key_value_heads: Optional[int]: Define the number of key-value heads
-        :param max_position_embeddings: int: Set the maximum length of a sequence
-        :param rms_norm_eps: float: Prevent division by zero in the rms normalization
-        :param initializer_range: float: Initialize the weights of the model
-        :param use_cache: bool: Determine whether the attention layer should use a cache for faster computation
-        :param bos_token_id: int: Set the beginning of sequence token
-        :param eos_token_id: int: Specify the end of sentence token
-        :param resid_pdrop: float: Set the dropout rate for residual connections
-        :param embd_pdrop: float: Dropout the embedding layer
-        :param attn_pdrop: float: Dropout the attention weights
-        :param tie_word_embeddings: bool: Tie the word embeddings and output layer weights
-        :param gradient_checkpointing: str: Specify how to checkpoint the gradients
-        :param fcm_min_ratio: float: Set the minimum ratio of the number of elements in a tensor to be processed by flash
-        :param fcm_max_ratio: float: Determine the maximum ratio of
-        :param use_pjit_attention_force: bool: Determine whether to use the pytorch jit compiler
-        :param rope_scaling: Dict[str: Define the scaling of the rope
-        :param Union[str: Specify the type of the parameter
-        :param float]]: Specify the type of the parameter
-        :param use_shard_map: bool: when ever to use shard_map for attention
-        :param use_flash_attention: bool: Determine whether to use the flash attention or not
-        :param use_sacn_mlp: bool: Determine whether to use scan_mlp or not
-        :param flash_attn_query_chunk_size: int: Specify the chunk size of the query tensor
-        :param flash_attn_key_chunk_size: int: Determine the chunk size of the key tensor
-        :param scan_mlp_chunk_size: int: Specify the chunk size of the scan_mlp
-        :param bits: Optional[int]: Specify the number of bits used to quantize the weights
-        :param rope_theta: float : rope_theta for compute rope
-        :param attention_bias: bool : whenever to use attention bias or no
-        :param hidden_act: str : hidden_act for mlp
-        :param axis_dims: Sequence[int]: Specify the dimensions of each axis
-        :param axis_names: Sequence[str]: Specify the names of the axes in a tensor
-        :param scan_layers: bool: Determine whether to use the scan_layers or not
-        :param **kwargs: Pass a variable number of keyword arguments to a function
-        :param : Define the number of layers in the model
-        :return: Nothing
-
-        """
-        num_key_value_heads = num_key_value_heads or number_rep_kv * num_attention_heads
-        self.num_key_value_heads = num_key_value_heads
-        self.vocab_size = vocab_size
-
-        self.number_rep_kv = number_rep_kv
-        self.hidden_size = hidden_size
-        self.initializer_range = initializer_range
-        self.intermediate_size = intermediate_size
-        self.num_hidden_layers = num_hidden_layers
-        self.rope_theta = rope_theta
-        self.attention_bias = attention_bias
-        self.num_attention_heads = num_attention_heads
-        self.max_position_embeddings = max_position_embeddings
-        self.rms_norm_eps = rms_norm_eps
-        self.use_cache = use_cache
-        self.pretraining_tp = pretraining_tp
-        self.resid_pdrop = resid_pdrop
-        self.embd_pdrop = embd_pdrop
-        self.attn_pdrop = attn_pdrop
-        self.gradient_checkpointing = gradient_checkpointing
-        self.use_pjit_attention_force = use_pjit_attention_force
-        self.fcm_min_ratio = fcm_min_ratio
-        self.hidden_act = hidden_act
-        self.fcm_max_ratio = fcm_max_ratio
-        self.rope_scaling = rope_scaling
-        self.use_flash_attention = use_flash_attention
-        self.use_sacn_mlp = use_sacn_mlp
-        self.flash_attn_key_chunk_size = flash_attn_key_chunk_size
-        self.flash_attn_query_chunk_size = flash_attn_query_chunk_size
-        self.scan_mlp_chunk_size = scan_mlp_chunk_size
-        self.bits = bits
-        self.use_sacn_mlp = use_shard_map
-        self.scan_layers = scan_layers
-        super().__init__(
-            bos_token_id=bos_token_id,
-            eos_token_id=eos_token_id,
-            tie_word_embeddings=tie_word_embeddings,
-            **kwargs,
-        )
-
-    @staticmethod
-    def get_partition_rules(fully_fsdp: bool = True):
-        """
-        The get_partition_rules function is used to define the partitioning scheme for a model.
-        It returns a list of tuples, where each tuple contains two elements:
-            1) A regex string that matches the name of one or more parameters in the model.
-            2) A PartitionScheme object that defines how those parameters should be partitioned across devices.
-
-        :param fully_fsdp: bool: Determine whether to partition the model fully or not
-        :return: A list of tuples
-
-        """
-        return (
-
-            ("model/embed_tokens/embedding", PS("tp", ("fsdp", "sp"))),
-
-            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PS(("fsdp", "sp"), "tp")),
-            ("self_attn/o_proj/kernel", PS("tp", ("fsdp", "sp"))),
-
-            ("mlp/gate_proj/kernel", PS(("fsdp", "sp"), "tp")),
-            ("mlp/down_proj/kernel", PS("tp", ("fsdp", "sp"))),
-            ("mlp/up_proj/kernel", PS(("fsdp", "sp"), "tp")),
-
-            ("input_layernorm/kernel", PS(None)),
-            ("post_attention_layernorm/kernel", PS(None)),
-
-            ("model/norm/kernel", PS(None)),
-            ("lm_head/kernel", PS(("fsdp", "sp"), "tp")),
-            ('.*', PS(None)),
-        ) if not fully_fsdp else (
-
-            ("model/embed_tokens/embedding", PS(("fsdp", "sp"))),
-
-            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PS(("fsdp", "sp"))),
-            ("self_attn/o_proj/kernel", PS(("fsdp", "sp"))),
-
-            ("mlp/gate_proj/kernel", PS(("fsdp", "sp"))),
-            ("mlp/down_proj/kernel", PS(("fsdp", "sp"))),
-            ("mlp/up_proj/kernel", PS(("fsdp", "sp"))),
-
-            ("input_layernorm/kernel", PS(None)),
-            ("post_attention_layernorm/kernel", PS(None)),
-
-            ("model/norm/kernel", PS(None)),
-            ("lm_head/kernel", PS(("fsdp", "sp"))),
-            ('.*', PS(("fsdp", "sp"))),
-        )
-
-    def add_jax_args(self,
-                     resid_pdrop: float = 0.0,
-                     embd_pdrop: float = 0.0,
-                     attn_pdrop: float = 0.0,
-                     tie_word_embeddings: bool = False,
-                     gradient_checkpointing: str = 'nothing_saveable',
-                     fcm_min_ratio: float = 0.0,
-                     fcm_max_ratio: float = 0.0,
-                     use_pjit_attention_force: bool = False,
-                     use_flash_attention: bool = False,
-                     use_sacn_mlp: bool = False,
-                     flash_attn_query_chunk_size: int = 1024,
-                     flash_attn_key_chunk_size: int = 1024,
-                     scan_mlp_chunk_size: int = 1024,
-                     number_rep_kv: int = 1,
-                     bits: Optional[int] = None,
-                     rope_theta: float = 10000.,
-                     attention_bias: bool = False,
-                     hidden_act: str = 'silu',
-                     scan_layers: bool = True,
-                     **kwargs,
-                     ):
-        """
-        The add_jax_args function adds the following arguments to the Transformer class:
-
-        :param self: Refer to the current object
-        :param resid_pdrop: float: Set the dropout rate for residual connections
-        :param embd_pdrop: float: Set the probability of dropping an embedding
-        :param attn_pdrop: float: Set the probability of dropping out the attention layer
-        :param tie_word_embeddings: bool: Tie the word embeddings to the decoder
-        :param gradient_checkpointing: str: Control the amount of memory used by jax
-        :param fcm_min_ratio: float: Control the minimum ratio of the number of chunks to be used in flash-based computation
-        :param fcm_max_ratio: float: Set the maximum ratio of the number of input tokens to output tokens
-        :param use_pjit_attention_force: bool: Determine if the attention force is used
-        :param use_flash_attention: bool: Determine whether to use the flash attention or not
-        :param use_sacn_mlp: bool: Determine whether to use the scan_mlp function or not
-        :param flash_attn_query_chunk_size: int: Determine the size of the chunks that will be used to compute
-        :param flash_attn_key_chunk_size: int: Set the size of the key chunk
-        :param scan_mlp_chunk_size: int: Set the chunk size for scan_mlp
-        :param number_rep_kv: int: Determine how many times the key and value vectors are repeated
-        :param bits: Optional[int]: Determine the number of bits used in the quantization
-        :param rope_theta: float : rope_theta for compute rope
-        :param attention_bias: bool : whenever to use attention bias or no
-        :param hidden_act: str : hidden_act for mlp
-        :param scan_layers: bool: Determine whether to use scan layers or not
-        :return: The following:
-
-        """
-        self.scan_layers = scan_layers
-        self.use_flash_attention = use_flash_attention
-        self.embd_pdrop = embd_pdrop
-        self.number_rep_kv = number_rep_kv
-        self.resid_pdrop = resid_pdrop
-        self.rope_theta = rope_theta
-        self.attention_bias = attention_bias
-        self.attn_pdrop = attn_pdrop
-        self.hidden_act = hidden_act
-        self.tie_word_embeddings = tie_word_embeddings
-        self.gradient_checkpointing = gradient_checkpointing
-        self.fcm_min_ratio = fcm_min_ratio
-        self.fcm_max_ratio = fcm_max_ratio
-        self.use_pjit_attention_force = use_pjit_attention_force
-
-        self.use_sacn_mlp = use_sacn_mlp
-        self.flash_attn_query_chunk_size = flash_attn_query_chunk_size
-        self.flash_attn_key_chunk_size = flash_attn_key_chunk_size
-        self.scan_mlp_chunk_size = scan_mlp_chunk_size
-        self.bits = bits
-
-    @staticmethod
-    def get_weight_decay_exclusions():
-        return tuple()
-
-    @staticmethod
-    def rng_keys():
-        return 'params', 'dropout', 'fcm'
+from .llama_configuration import LlamaConfig
 
 
 class FlaxLlamaEmbedding(nn.Module):
@@ -355,7 +97,8 @@ class FlaxLlamaAttention(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=self.config.attention_bias,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=jax.nn.initializers.normal(
+                self.config.initializer_range),
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
@@ -364,7 +107,8 @@ class FlaxLlamaAttention(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=self.config.attention_bias,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=jax.nn.initializers.normal(
+                self.config.initializer_range),
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
@@ -373,7 +117,8 @@ class FlaxLlamaAttention(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=self.config.attention_bias,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=jax.nn.initializers.normal(
+                self.config.initializer_range),
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
@@ -382,7 +127,8 @@ class FlaxLlamaAttention(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=jax.nn.initializers.normal(
+                self.config.initializer_range),
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
@@ -412,16 +158,20 @@ class FlaxLlamaAttention(nn.Module):
 
         """
         is_initialized = self.has_variable("cache", "cached_key")
-        cached_key = self.variable("cache", "cached_key", jnp.zeros, key.shape, key.dtype)
-        cached_value = self.variable("cache", "cached_value", jnp.zeros, value.shape, value.dtype)
-        cache_index = self.variable("cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32))
+        cached_key = self.variable(
+            "cache", "cached_key", jnp.zeros, key.shape, key.dtype)
+        cached_value = self.variable(
+            "cache", "cached_value", jnp.zeros, value.shape, value.dtype)
+        cache_index = self.variable(
+            "cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32))
 
         if is_initialized:
             *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
             cur_index = cache_index.value
             indices = (0,) * len(batch_dims) + (cur_index, 0, 0)
             key = lax.dynamic_update_slice(cached_key.value, key, indices)
-            value = lax.dynamic_update_slice(cached_value.value, value, indices)
+            value = lax.dynamic_update_slice(
+                cached_value.value, value, indices)
             cached_key.value = key
             cached_value.value = value
             num_updated_cache_vectors = query.shape[1]
@@ -464,12 +214,16 @@ class FlaxLlamaAttention(nn.Module):
         :return: A tuple of 3 tensors: query, key and value
 
         """
-        query = query.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
-        key = key.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
-        value = value.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
+        query = query.reshape(batch_size, sequence_length,
+                              self.config.num_attention_heads, self.head_dim)
+        key = key.reshape(batch_size, sequence_length,
+                          self.config.num_key_value_heads, self.head_dim)
+        value = value.reshape(batch_size, sequence_length,
+                              self.config.num_key_value_heads, self.head_dim)
 
         query, key, value = self._t(query, key, value)
-        query, key = self.rotary(position_ids=position_ids, query=query, key=key, freq_cis=freq_cis)
+        query, key = self.rotary(
+            position_ids=position_ids, query=query, key=key, freq_cis=freq_cis)
         key = repeat_kv_bnsh(key, self.number_of_reps)
         value = repeat_kv_bnsh(value, self.number_of_reps)
         return self._t(query, key, value)
@@ -486,7 +240,6 @@ class FlaxLlamaAttention(nn.Module):
             output_attentions: bool = False,
             fcm_mask=None,
     ):
-
         """
 
         The __call__ function is the main function of a JAX module. It defines how the module behaves when called
@@ -512,13 +265,19 @@ class FlaxLlamaAttention(nn.Module):
             hidden_states)
 
         if self.config.use_pjit_attention_force:
-            query_state = with_sharding_constraint(query_state, PS(("dp", "fsdp"), "sp", "tp"))
-            key_state = with_sharding_constraint(key_state, PS(("dp", "fsdp"), "sp", "tp"))
-            value_state = with_sharding_constraint(value_state, PS(("dp", "fsdp"), "sp", "tp"))
+            query_state = with_sharding_constraint(
+                query_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
+            key_state = with_sharding_constraint(
+                key_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
+            value_state = with_sharding_constraint(
+                value_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
 
-        query_state = query_state.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
-        key_state = key_state.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
-        value_state = value_state.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
+        query_state = query_state.reshape(
+            batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
+        key_state = key_state.reshape(
+            batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
+        value_state = value_state.reshape(
+            batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
 
         query_state, key_state, value_state = self.apply_rotary(
             query=query_state,
@@ -546,21 +305,24 @@ class FlaxLlamaAttention(nn.Module):
             mask_shift = self.variables["cache"]["cache_index"]
             max_decoder_length = self.variables["cache"]["cached_key"].shape[1]
             causal_mask = lax.dynamic_slice(
-                causal_mask, (0, 0, mask_shift, 0), (1, 1, query_length, max_decoder_length)
+                causal_mask, (0, 0, mask_shift, 0), (1, 1,
+                                                     query_length, max_decoder_length)
             )
         else:
             causal_mask = causal_mask[:, :, :query_length, :key_length]
 
         batch_size = hidden_states.shape[0]
-        causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
-        attention_mask = jnp.broadcast_to(jnp.expand_dims(attention_mask, axis=(-3, -2)), causal_mask.shape)
+        causal_mask = jnp.broadcast_to(
+            causal_mask, (batch_size,) + causal_mask.shape[1:])
+        attention_mask = jnp.broadcast_to(jnp.expand_dims(
+            attention_mask, axis=(-3, -2)), causal_mask.shape)
         attention_mask = combine_masks(attention_mask, causal_mask, fcm_mask)
         if attention_mask.ndim == 2:
             attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
 
         dropout_rng = None
 
-        if not deterministic and self.config.attn_pdrop > 0.0:
+        if not deterministic and self.config.attention_dropout > 0.0:
             dropout_rng = self.make_rng("dropout")
 
         if self.has_variable("cache", "cached_key") or init_cache:
@@ -573,11 +335,13 @@ class FlaxLlamaAttention(nn.Module):
 
         if self.config.use_flash_attention and not (self.has_variable("cache", "cached_key") or init_cache):
             if attention_mask.shape[1] != self.config.num_attention_heads:
-                attention_mask = attention_mask.repeat(self.config.num_attention_heads, 1, )
+                attention_mask = attention_mask.repeat(
+                    self.config.num_attention_heads, 1, )
             attention_bias = lax.select(
                 attention_mask > 0,
                 jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-                jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
+                jnp.full(attention_mask.shape, jnp.finfo(
+                    self.dtype).min).astype(self.dtype),
             )
             attn_weights = None
             rtp_axis = (0, 2, 1, 3)
@@ -603,7 +367,7 @@ class FlaxLlamaAttention(nn.Module):
                 deterministic=deterministic,
                 q_seq_len=sequence_length,
                 kv_seq_len=key_length,
-                attn_pdrop=self.config.attn_pdrop,
+                attn_pdrop=self.config.attention_dropout,
                 head_dims=self.head_dim,
                 force_float32_tpu=True
             )
@@ -612,7 +376,8 @@ class FlaxLlamaAttention(nn.Module):
             attention_bias = lax.select(
                 attention_mask > 0,
                 jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-                jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
+                jnp.full(attention_mask.shape, jnp.finfo(
+                    self.dtype).min).astype(self.dtype),
             )
             if self.config.use_shard_map:
                 attn_weights = shard_map(
@@ -620,7 +385,7 @@ class FlaxLlamaAttention(nn.Module):
                         dot_product_attention_weights,
                         dtype=jnp.promote_types(self.dtype, jnp.float32),
                         deterministic=deterministic,
-                        dropout_rate=self.config.attn_pdrop,
+                        dropout_rate=self.config.attention_dropout,
                         precision=self.precision,
                     ),
                     mesh=self.config.jax_mesh(),
@@ -629,7 +394,7 @@ class FlaxLlamaAttention(nn.Module):
                         self.config.k_ps,
                         self.config.b_ps
                     ),
-                    out_specs=PS(("dp", "fsdp"), "sp", "tp", None),
+                    out_specs=PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
                     check_rep=False
                 )(
                     query_state, key_state, attention_bias
@@ -641,12 +406,13 @@ class FlaxLlamaAttention(nn.Module):
                     bias=attention_bias,
                     dtype=jnp.promote_types(self.dtype, jnp.float32),
                     deterministic=deterministic,
-                    dropout_rate=self.config.attn_pdrop,
+                    dropout_rate=self.config.attention_dropout,
                     precision=self.precision,
                 )
 
             if self.config.use_pjit_attention_force:
-                attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "sp", "tp", None))
+                attn_weights = with_sharding_constraint(
+                    attn_weights, PartitionSpec(("dp", "fsdp"), "sp", "tp", None))
 
             attn_output = jnp.einsum(
                 "...hqk,...khd->...qhd",
@@ -658,8 +424,10 @@ class FlaxLlamaAttention(nn.Module):
         attn_output = self._merge_heads(attn_output)
         attn_output = self.o_proj(attn_output)
 
-        attn_output = self.resid_dropout(attn_output, deterministic=deterministic)
-        outputs = (attn_output, attn_weights) if output_attentions else (attn_output,)
+        attn_output = self.resid_dropout(
+            attn_output, deterministic=deterministic)
+        outputs = (attn_output, attn_weights) if output_attentions else (
+            attn_output,)
 
         return outputs
 
@@ -678,7 +446,8 @@ class FlaxLlamaMLP(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=jax.nn.initializers.normal(
+                self.config.initializer_range),
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
@@ -687,7 +456,8 @@ class FlaxLlamaMLP(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=jax.nn.initializers.normal(
+                self.config.initializer_range),
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
@@ -696,7 +466,8 @@ class FlaxLlamaMLP(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=jax.nn.initializers.normal(
+                self.config.initializer_range),
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
@@ -727,10 +498,11 @@ class FlaxLlamaBlock(nn.Module):
 
     def setup(self) -> None:
         attn_block = FlaxLlamaAttention
-        if self.config.gradient_checkpointing != '':
+        if self.config.gradient_checkpointing != "":
             attn_block = nn_partitioning.remat(
                 FlaxLlamaAttention, static_argnums=(5, 6, 7),
-                policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing)
+                policy=get_gradient_checkpoint_policy(
+                    self.config.gradient_checkpointing)
             )
 
         self.self_attn = attn_block(
@@ -741,10 +513,11 @@ class FlaxLlamaBlock(nn.Module):
         )
         mlp_block = FlaxLlamaMLP
 
-        if self.config.gradient_checkpointing != '':
+        if self.config.gradient_checkpointing != "":
             mlp_block = nn_partitioning.remat(
                 FlaxLlamaMLP, static_argnums=(1,),
-                policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing)
+                policy=get_gradient_checkpoint_policy(
+                    self.config.gradient_checkpointing)
             )
 
         self.mlp = mlp_block(
@@ -779,7 +552,6 @@ class FlaxLlamaBlock(nn.Module):
             output_attentions: bool = False,
             fcm_mask: Optional[jnp.ndarray] = None,
     ):
-
         """
         The __call__ function is the main function of a TransformerEncoderLayer.
         It takes in hidden states, frequency-domain inputs, and masks as input. It then
@@ -850,7 +622,7 @@ class FlaxLlamaBlock(nn.Module):
         return (hidden_states,) + attn_outputs[1:]
 
 
-class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
+class FlaxLlamaPreTrainedModel(EasyDelFlaxPretrainedModel):
     config_class = LlamaConfig
     base_model_prefix = "model"
     module_class: nn.Module = None
@@ -876,16 +648,16 @@ class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
         :param seed: int: Set the seed for random number generation
         :param dtype: jnp.dtype: Specify the data type of the input
         :param _do_init: bool: Control whether the module is initialized or not
-        :param **kwargs: Pass in any additional parameters that the module_class might need
+        :param kwargs: Pass in any additional parameters that the module_class might need
         :param : Specify the number of layers in the network
         :return: The super() of the class
 
         """
         module = self.module_class(config=config, dtype=dtype, **kwargs)
-        super().__init__(config, module, input_shape=input_shape, seed=seed, dtype=dtype, _do_init=_do_init)
+        super().__init__(config, module, input_shape=input_shape,
+                         seed=seed, dtype=dtype, _do_init=_do_init)
 
     def init_weights(self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None) -> FrozenDict:
-
         """
         The init_weights function is used to initialize the weights of a model.
 
@@ -898,12 +670,14 @@ class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
         """
         input_ids = jnp.zeros(input_shape, dtype="i4")
         attention_mask = jnp.ones_like(input_ids)
-        position_ids = jnp.broadcast_to(jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_shape)
+        position_ids = jnp.broadcast_to(jnp.arange(
+            jnp.atleast_2d(input_ids).shape[-1]), input_shape)
         params_rng, dropout_rng = jax.random.split(rng)
         rngs = {"params": params_rng, "dropout": dropout_rng}
 
         if self.config.add_cross_attention:
-            encoder_hidden_states = jnp.zeros(input_shape + (self.config.hidden_size,))
+            encoder_hidden_states = jnp.zeros(
+                input_shape + (self.config.hidden_size,))
             encoder_attention_mask = attention_mask
             module_init_outputs = self.module.init(
                 rngs,
@@ -915,7 +689,8 @@ class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
                 return_dict=False,
             )
         else:
-            module_init_outputs = self.module.init(rngs, input_ids, attention_mask, position_ids, return_dict=False)
+            module_init_outputs = self.module.init(
+                rngs, input_ids, attention_mask, position_ids, return_dict=False)
 
         random_params = module_init_outputs["params"]
 
@@ -930,7 +705,6 @@ class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
             return random_params
 
     def init_cache(self, batch_size, max_length):
-
         """
         The init_cache function is used to initialize the cache for a given batch size and sequence length.
         The cache is a dictionary that contains all the intermediate states from each layer in the model.
@@ -945,7 +719,8 @@ class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
         """
         input_ids = jnp.ones((batch_size, max_length))
         attention_mask = jnp.ones_like(input_ids)
-        position_ids = jnp.broadcast_to(jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape)
+        position_ids = jnp.broadcast_to(jnp.arange(
+            jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape)
 
         init_variables = self.module.init(
             jax.random.PRNGKey(0), input_ids, attention_mask, position_ids, return_dict=False, init_cache=True
@@ -965,9 +740,9 @@ class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
             extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
-            add_params_field: bool = False
+            add_params_field: bool = False,
+            **kwargs
     ):
-
         """
         The __call__ function is the main function of a JAX module.
         It takes in inputs and returns outputs, but it also has some other important features:
@@ -1005,9 +780,11 @@ class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
 
         if position_ids is None:
             if past_key_values is not None:
-                raise ValueError("Make sure to provide `position_ids` when passing `past_key_values`.")
+                raise ValueError(
+                    "Make sure to provide `position_ids` when passing `past_key_values`.")
 
-            position_ids = jnp.broadcast_to(jnp.arange(sequence_length)[None, :], (batch_size, sequence_length))
+            position_ids = jnp.broadcast_to(jnp.arange(sequence_length)[
+                                            None, :], (batch_size, sequence_length))
 
         if attention_mask is None:
             attention_mask = jnp.ones((batch_size, sequence_length))
@@ -1019,7 +796,9 @@ class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
         if self.config.bits is not None:
             rngs['params'] = jax.random.key(0)
 
-        inputs = {"params": params or self.params} if add_params_field else params or self.params
+        inputs = {
+            "params": params or self.params
+        } if add_params_field else params or self.params
 
         if past_key_values:
             inputs["cache"] = past_key_values
@@ -1048,7 +827,8 @@ class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
             return outputs
         elif past_key_values is not None and not return_dict:
             outputs, past_key_values = outputs
-            outputs = outputs[:1] + (unfreeze(past_key_values["cache"]),) + outputs[1:]
+            outputs = outputs[:1] + \
+                      (unfreeze(past_key_values["cache"]),) + outputs[1:]
 
         return outputs
 
@@ -1160,7 +940,8 @@ class FlaxLlamaModule(nn.Module):
         self.embed_tokens = nn.Embed(
             self.config.vocab_size,
             self.config.hidden_size,
-            embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+            embedding_init=jax.nn.initializers.normal(
+                stddev=self.config.initializer_range),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
         )
@@ -1170,10 +951,24 @@ class FlaxLlamaModule(nn.Module):
         self.norm = RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps, dtype=self.dtype,
                             param_dtype=self.param_dtype)
         config = self.config
-        self.causal_mask = make_causal_mask(jnp.ones((1, config.max_position_embeddings)))
+        self.causal_mask = make_causal_mask(
+            jnp.ones((1, config.max_position_embeddings)))
+
+        initial_rope_kwargs = dict(
+            rope_type="none"
+        )
+        if config.rope_scaling is not None:
+            scaling_type = config.rope_scaling["type"]
+            scaling_factor = config.rope_scaling["factor"]
+            initial_rope_kwargs = dict(
+                scaling_factor=scaling_factor,
+                rope_type=scaling_type
+            )
         self.freq_cis = precompute_freq_cis(
-            max_position_embedding=config.max_position_embeddings,
-            head_dim=config.hidden_size // config.num_attention_heads
+            max_position_embeddings=config.max_position_embeddings,
+            dim=config.hidden_size // config.num_attention_heads,
+            base=config.rope_theta,
+            **initial_rope_kwargs
         )
 
     def __call__(
@@ -1182,7 +977,7 @@ class FlaxLlamaModule(nn.Module):
             attention_mask: chex.Array,
             position_ids: chex.Array,
             deterministic: bool = True,
-            input_embeds: chex.Array = None,
+            inputs_embeds: chex.Array = None,
             init_cache: bool = False,
             output_attentions: bool = False,
             output_hidden_states: bool = False,
@@ -1200,7 +995,7 @@ class FlaxLlamaModule(nn.Module):
         :param attention_mask: chex.Array: Mask out the padding tokens
         :param position_ids: chex.Array: Indicate the position of each token in a sequence
         :param deterministic: bool: Control whether dropout is applied or not
-        :param input_embeds: chex.Array: Pass in the embeddings of the input tokens
+        :param inputs_embeds: chex.Array: Pass in the embeddings of the input tokens
         :param init_cache: bool: Initialize the cache
         :param output_attentions: bool: Determine whether to return the attentions or not
         :param output_hidden_states: bool: Determine whether to return hidden states
@@ -1210,16 +1005,18 @@ class FlaxLlamaModule(nn.Module):
         :return: A tuple of:
 
         """
-        if input_embeds is None:
-            input_embeds = self.embed_tokens(input_ids.astype("i4"))
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
 
-        batch_size, sequence_length = input_ids.shape
+        batch_size, sequence_length, _ = inputs_embeds.shape
         assert sequence_length <= self.config.max_position_embeddings, (f'Position out of range '
                                                                         f'(Model Support '
                                                                         f'{self.config.max_position_embeddings} got'
                                                                         f' {sequence_length})')
-        input_embeds = input_embeds + extra_embedding if extra_embedding is not None else input_embeds
-        hidden_states = self.dropout(input_embeds, deterministic=deterministic)
+        inputs_embeds = inputs_embeds + \
+                        extra_embedding if extra_embedding is not None else inputs_embeds
+        hidden_states = self.dropout(
+            inputs_embeds, deterministic=deterministic)
 
         outputs = self.layers(
             hidden_states=hidden_states,
@@ -1256,6 +1053,12 @@ class FlaxLlamaModule(nn.Module):
 class FlaxLlamaModel(FlaxLlamaPreTrainedModel):
     module_class = FlaxLlamaModule
 
+    def set_input_embeddings(self, value):
+        self.module.embed_tokens = value
+
+    def get_input_embeddings(self):
+        return self.module.embed_tokens
+
 
 class FlaxLlamaForCausalLMModule(nn.Module):
     config: LlamaConfig
@@ -1275,7 +1078,8 @@ class FlaxLlamaForCausalLMModule(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+            kernel_init=jax.nn.initializers.normal(
+                stddev=self.config.initializer_range),
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
@@ -1302,7 +1106,7 @@ class FlaxLlamaForCausalLMModule(nn.Module):
         :param deterministic: bool: Control whether the model is trained or not
         :param init_cache: bool: Initialize the cache for the decoder
         :param output_attentions: bool: Return the attention weights
-        :param output_hidden_states: bool: Determine whether or not to return the hidden states
+        :param output_hidden_states: bool: Determine whether to return the hidden states
         :param return_dict: bool: Return a dictionary of the outputs or not
         :param extra_embedding: Optional[Union[jnp.ndarray: Pass in the embedding of the word that we want to predict
         :param None]]: Pass in the extra embedding
@@ -1333,7 +1137,8 @@ class FlaxLlamaForCausalLMModule(nn.Module):
 
         if self.config.tie_word_embeddings:
             shared_kernel = self.model.variables["params"]["embed_tokens"]["embedding"].T
-            lm_logits = self.lm_head.apply({"params": {"kernel": shared_kernel}}, hidden_states)
+            lm_logits = self.lm_head.apply(
+                {"params": {"kernel": shared_kernel}}, hidden_states)
         else:
             lm_logits = self.lm_head(hidden_states)
 
@@ -1347,6 +1152,24 @@ class FlaxLlamaForCausalLMModule(nn.Module):
 
 class FlaxLlamaForCausalLM(FlaxLlamaPreTrainedModel):
     module_class = FlaxLlamaForCausalLMModule
+
+    def set_input_embeddings(self, value):
+        self.module.model.embed_tokens = value
+
+    def get_input_embeddings(self):
+        return self.module.model.embed_tokens
+
+    def set_decoder(self, decoder):
+        self.module.model = decoder
+
+    def get_decoder(self):
+        return self.module.model
+
+    def get_output_embeddings(self):
+        return self.module.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.module.lm_head = new_embeddings
 
     def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[chex.Array] = None):
         """
@@ -1362,12 +1185,15 @@ class FlaxLlamaForCausalLM(FlaxLlamaPreTrainedModel):
         batch_size, seq_length = input_ids.shape
 
         past_key_values = self.init_cache(batch_size, max_length)
-        extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
+        extended_attention_mask = jnp.ones(
+            (batch_size, max_length), dtype="i4")
         if attention_mask is not None:
             position_ids = attention_mask.cumsum(axis=-1) - 1
-            extended_attention_mask = lax.dynamic_update_slice(extended_attention_mask, attention_mask, (0, 0))
+            extended_attention_mask = lax.dynamic_update_slice(
+                extended_attention_mask, attention_mask, (0, 0))
         else:
-            position_ids = jnp.broadcast_to(jnp.arange(seq_length, dtype="i4")[None, :], (batch_size, seq_length))
+            position_ids = jnp.broadcast_to(jnp.arange(seq_length, dtype="i4")[
+                                            None, :], (batch_size, seq_length))
 
         return {
             "past_key_values": past_key_values,
@@ -1402,7 +1228,8 @@ class FlaxLlamaForSequenceClassificationModule(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+            kernel_init=jax.nn.initializers.normal(
+                stddev=self.config.initializer_range),
             precision=self.precision,
         )
 

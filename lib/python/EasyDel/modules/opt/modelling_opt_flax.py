@@ -27,139 +27,18 @@ from flax.linen.attention import dot_product_attention_weights
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax.random import PRNGKey
-from transformers import PretrainedConfig
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxMaskedLMOutput
-from transformers.modeling_flax_utils import ACT2FN, FlaxPreTrainedModel
+from transformers.modeling_flax_utils import ACT2FN
 from jax.sharding import PartitionSpec
 from transformers import logging
 
 from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
-    with_sharding_constraint, JaxBaseClassModel
+    with_sharding_constraint
 
 import chex
 
-
-class OPTConfig(JaxBaseClassModel):
-    model_type = "opt"
-    keys_to_ignore_at_inference = ["past_key_values"]
-
-    def __init__(
-            self,
-            vocab_size: int = 50272,
-            hidden_size: int = 768,
-            num_hidden_layers: int = 12,
-            ffn_dim: int = 3072,
-            max_position_embeddings: int = 2048,
-            do_layer_norm_before: bool = True,
-            _remove_final_layer_norm: bool = False,
-            word_embed_proj_dim: int = None,
-            dropout: float = 0.1,
-            attention_dropout: float = 0.0,
-            num_attention_heads: int = 12,
-            activation_function: str = "relu",
-            layerdrop: float = 0.0,
-            init_std: float = 0.02,
-            use_cache: bool = True,
-            pad_token_id: int = 1,
-            bos_token_id: int = 2,
-            eos_token_id: int = 2,
-            enable_bias: bool = True,
-            layer_norm_elementwise_affine: bool = True,
-            gradient_checkpointing: str = 'nothing_saveable',
-            use_pjit_attention_force: bool = False,
-            **kwargs,
-    ):
-        super().__init__(
-            pad_token_id=pad_token_id,
-            bos_token_id=bos_token_id,
-            eos_token_id=eos_token_id,
-            **kwargs,
-        )
-        self.vocab_size = vocab_size
-        self.use_pjit_attention_force = use_pjit_attention_force
-        self.gradient_checkpointing = gradient_checkpointing
-        self.max_position_embeddings = max_position_embeddings
-        self.num_attention_heads = num_attention_heads
-        self.word_embed_proj_dim = word_embed_proj_dim if word_embed_proj_dim is not None else hidden_size
-        self.ffn_dim = ffn_dim
-        self.hidden_size = hidden_size
-        self.num_hidden_layers = num_hidden_layers
-        self.dropout = dropout
-        self.attention_dropout = attention_dropout
-        self.activation_function = activation_function
-        self.init_std = init_std
-        self.layerdrop = layerdrop
-        self.use_cache = use_cache
-        self.do_layer_norm_before = do_layer_norm_before
-        self.enable_bias = enable_bias
-        self.layer_norm_elementwise_affine = layer_norm_elementwise_affine
-        self._remove_final_layer_norm = _remove_final_layer_norm
-        self.from_pt = False
-
-    def get_partition_rules(self, fully_fsdp: bool = True):
-        if not fully_fsdp:
-            raise NotImplementedError
-        else:
-            return (
-                ('.*', PartitionSpec("fsdp"))
-            )
-
-    def add_jax_args(
-            self,
-            vocab_size: int = 50272,
-            hidden_size: int = 768,
-            num_hidden_layers: int = 12,
-            ffn_dim: int = 3072,
-            max_position_embeddings: int = 2048,
-            do_layer_norm_before: bool = True,
-            _remove_final_layer_norm: bool = False,
-            word_embed_proj_dim: int = None,
-            dropout: float = 0.1,
-            attention_dropout: float = 0.0,
-            num_attention_heads: int = 12,
-            activation_function: str = "relu",
-            layerdrop: float = 0.0,
-            init_std: float = 0.02,
-            use_cache: bool = True,
-            pad_token_id: int = 1,
-            bos_token_id: int = 2,
-            eos_token_id: int = 2,
-            enable_bias: bool = True,
-            layer_norm_elementwise_affine: bool = True,
-            gradient_checkpointing: str = 'nothing_saveable',
-            use_pjit_attention_force: bool = False,
-            **kwargs,
-    ):
-        basics = dict(
-            vocab_size=vocab_size,
-            hidden_size=hidden_size,
-            num_hidden_layers=num_hidden_layers,
-            ffn_dim=ffn_dim,
-            max_position_embeddings=max_position_embeddings,
-            do_layer_norm_before=do_layer_norm_before,
-            _remove_final_layer_norm=_remove_final_layer_norm,
-            word_embed_proj_dim=word_embed_proj_dim,
-            dropout=dropout,
-            attention_dropout=attention_dropout,
-            num_attention_heads=num_attention_heads,
-            activation_function=activation_function,
-            layerdrop=layerdrop,
-            init_std=init_std,
-            use_cache=use_cache,
-            pad_token_id=pad_token_id,
-            bos_token_id=bos_token_id,
-            eos_token_id=eos_token_id,
-            enable_bias=enable_bias,
-            layer_norm_elementwise_affine=layer_norm_elementwise_affine,
-            gradient_checkpointing=gradient_checkpointing,
-            use_pjit_attention_force=use_pjit_attention_force,
-            **kwargs
-        )
-        for k, v in basics.items():
-            if not hasattr(self, k):
-                setattr(self, k, v)
-        self.from_pt = False
-
+from .opt_configuration import OPTConfig
+from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 
 logger = logging.get_logger(__name__)
 
@@ -411,7 +290,7 @@ class FlaxOPTDecoderLayerCollection(nn.Module):
 
     def setup(self):
         block = FlaxOPTDecoderLayer
-        if self.config.gradient_checkpointing != '':
+        if self.config.gradient_checkpointing != "":
             block = nn.remat(
                 block,
                 static_argnums=(3, 4),
@@ -563,7 +442,7 @@ class FlaxOPTDecoder(nn.Module):
         )
 
 
-class FlaxOPTPreTrainedModel(FlaxPreTrainedModel):
+class FlaxOPTPreTrainedModel(EasyDelFlaxPretrainedModel):
     config_class = OPTConfig
     base_model_prefix: str = "model"
     module_class: nn.Module = None
@@ -633,6 +512,7 @@ class FlaxOPTPreTrainedModel(FlaxPreTrainedModel):
             return_dict: Optional[bool] = None,
             dropout_rng: PRNGKey = None,
             deterministic: bool = True,
+            **kwargs
     ):
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -724,11 +604,14 @@ class FlaxOPTModule(nn.Module):
         )
 
 
-# Copied from transformers.models.bart.modeling_flax_bart.FlaxBartModel with Bart->OPT
 class FlaxOPTModel(FlaxOPTPreTrainedModel):
-    config: OPTConfig
-    dtype: jnp.dtype = jnp.float32  # the dtype of the computation
     module_class = FlaxOPTModule
+
+    def set_input_embeddings(self, value):
+        self.module.embed_tokens = value
+
+    def get_input_embeddings(self):
+        return self.module.embed_tokens
 
 
 class FlaxOPTForCausalLMModule(nn.Module):
@@ -786,6 +669,24 @@ class FlaxOPTForCausalLMModule(nn.Module):
 
 class FlaxOPTForCausalLM(FlaxOPTPreTrainedModel):
     module_class = FlaxOPTForCausalLMModule
+
+    def set_input_embeddings(self, value):
+        self.module.model.embed_tokens = value
+
+    def get_input_embeddings(self):
+        return self.module.model.embed_tokens
+
+    def set_decoder(self, decoder):
+        self.module.model = decoder
+
+    def get_decoder(self):
+        return self.module.model
+
+    def get_output_embeddings(self):
+        return self.module.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.module.lm_head = new_embeddings
 
     def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[chex.Array] = None):
         # initializing the cache

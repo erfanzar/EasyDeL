@@ -4,6 +4,7 @@ __pycache__/
 *$py.class
 
 # C extensions
+.idea
 *.so
 env.ipynb
 pallas_env.py

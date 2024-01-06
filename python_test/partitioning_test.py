@@ -6,7 +6,7 @@ import typing
 import numpy as np
 from jax._src.mesh import Mesh
 
-os.environ['CUDA_VISIBLE_DEVICES'] = ''
+os.environ['CUDA_VISIBLE_DEVICES'] = ""
 os.environ["XLA_FLAGS"] = '--xla_force_host_platform_device_count=8'
 
 import jax

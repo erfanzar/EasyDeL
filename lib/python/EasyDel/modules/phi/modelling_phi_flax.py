@@ -1,4 +1,3 @@
-import math
 from dataclasses import field, dataclass
 from typing import Optional, Tuple, Any, Union, Dict, Sequence, Callable
 
@@ -11,84 +10,11 @@ from flax.traverse_util import unflatten_dict, flatten_dict
 from jax import numpy as jnp
 from flax import linen as nn
 from chex import Array
-from ..flax_modelling_utils import JaxBaseClassModel, ACT2FN, get_gradient_checkpoint_policy, canonicalize_dtype
-from transformers import PretrainedConfig
+from ..flax_modelling_utils import ACT2FN, get_gradient_checkpoint_policy, canonicalize_dtype
 from einops import repeat, rearrange
 from transformers.modeling_flax_outputs import FlaxCausalLMOutput
-
-
-class PhiConfig(JaxBaseClassModel):
-    """Phi configuration."""
-
-    model_type = "phi"
-    attribute_map = {
-        "max_position_embeddings": "n_positions",
-        "hidden_size": "n_embd",
-        "num_attention_heads": "n_head",
-        "num_hidden_layers": "n_layer",
-    }
-
-    def __init__(
-            self,
-            vocab_size: int = 50304,
-            n_positions: int = 2048,
-            n_embd: int = 1024,
-            n_layer: int = 20,
-            n_inner: Optional[int] = None,
-            n_head: int = 16,
-            n_head_kv: Optional[int] = None,
-            rotary_dim: Optional[int] = 32,
-            activation_function: Optional[str] = "gelu_new",
-            flash_attn: bool = False,
-            flash_rotary: bool = False,
-            fused_dense: bool = False,
-            attn_pdrop: float = 0.0,
-            embd_pdrop: float = 0.0,
-            resid_pdrop: float = 0.0,
-            layer_norm_epsilon: float = 1e-5,
-            initializer_range: float = 0.02,
-            tie_word_embeddings: bool = False,
-            pad_vocab_size_multiple: int = 64,
-            bits: Optional[int] = None,
-            gradient_checkpointing: str = "nothing_saveable",
-            **kwargs
-    ) -> None:
-        self.vocab_size = int(math.ceil(vocab_size / pad_vocab_size_multiple) * pad_vocab_size_multiple)
-        self.n_positions = n_positions
-        self.n_embd = n_embd
-        self.n_layer = n_layer
-        self.n_inner = n_inner
-        self.n_head = n_head
-        self.n_head_kv = n_head_kv
-        self.rotary_dim = min(rotary_dim, n_embd // n_head)
-        self.activation_function = activation_function
-        self.flash_attn = flash_attn
-        self.flash_rotary = flash_rotary
-        self.fused_dense = fused_dense
-        self.attn_pdrop = attn_pdrop
-        self.embd_pdrop = embd_pdrop
-        self.resid_pdrop = resid_pdrop
-        self.layer_norm_epsilon = layer_norm_epsilon
-        self.initializer_range = initializer_range
-        self.bits = bits
-        self.gradient_checkpointing = gradient_checkpointing
-        super().__init__(
-            tie_word_embeddings=tie_word_embeddings,
-            **kwargs
-        )
-
-    def add_jax_args(
-            self,
-            bits: Optional[int] = None,
-            gradient_checkpointing: str = "nothing_saveable",
-            **kwargs
-    ):
-        self.bits = bits
-        self.gradient_checkpointing = gradient_checkpointing
-
-        for k, v in kwargs.items():
-            if not hasattr(self, k):
-                setattr(self, k, v)
+from .phi_configuration import PhiConfig
+from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 
 
 @dataclass
@@ -1126,6 +1052,30 @@ class FlaxPhiForCausalLMModule(nn.Module):
 class FlaxPhiForCausalLM(FlaxPhiPreTrainedModel):
     module_class = FlaxPhiForCausalLMModule
 
+    def get_input_embeddings(self):
+        return self.module.transformer.embd
+
+    def get_decoder(self):
+        return self.module.transformer
+
+    def set_input_embeddings(self, value):
+        self.module.transformer.embd = value
+
+    def set_decoder(self, decoder):
+        self.module.transformer = decoder
+
+    def set_output_embeddings(self, new_embeddings):
+        self.module.lm_head = new_embeddings
+
+    def get_output_embeddings(self):
+        return self.module.lm_head
+
 
 class FlaxPhiModel(FlaxPhiPreTrainedModel):
     module_class = FlaxPhiModule
+
+    def get_input_embeddings(self):
+        return self.module.embd
+
+    def set_input_embeddings(self, value):
+        self.module.embd = value
