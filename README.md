@@ -76,15 +76,16 @@ import flax
 from jax import numpy as jnp
 from transformers import AutoTokenizer
 
-huggingface_repo_id_or_path = ""
+huggingface_repo_id_or_path = "TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T"
 
 model, params = AutoEasyDelModelForCausalLM.from_pretrained(huggingface_repo_id_or_path, )
 
-max_length = 4096
+max_length = 2048
 tokenizer = AutoTokenizer.from_pretrained(
     huggingface_repo_id_or_path,
     trust_remote_code=True
 )
+tokenizer.pad_token = tokenizer.eos_token
 configs_to_init_model_class = {
     "config": model.config,
     "dtype": jnp.bfloat16,
@@ -96,6 +97,7 @@ train_arguments = TrainArguments(
     model_class=type(model),
     model_name="my_first_model_to_train_using_easydel",
     num_train_epochs=3,
+    configs_to_init_model_class=configs_to_init_model_class,
     learning_rate=5e-5,
     learning_rate_end=1e-6,
     optimizer=EasyDelOptimizers.ADAMW,  # "adamw", "lion", "adafactor" are supported
@@ -156,14 +158,12 @@ dataset_train = dataset_train.map(
 
 trainer = CausalLanguageModelTrainer(
     train_arguments,
-    dataset,
+    dataset_train,
     checkpoint_path=None
 )
 
 output = trainer.train(flax.core.FrozenDict({"params": params}))
-print(f"Hey ! , here's where your model saved {output.last_save_file_name}")
-
-
+print(f"Hey ! , here's where your model saved {output.checkpoint_path}")
 ```
 
 > [!TIP]
