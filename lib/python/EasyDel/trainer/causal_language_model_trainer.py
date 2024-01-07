@@ -565,7 +565,7 @@ class CausalLanguageModelTrainer:
                 self.arguments.gradient_checkpointing * self.arguments.max_length
         )
         filename = f"{self.arguments.model_name}-T{trained_tokens}-S{current_step}"
-        print(f"Saving Model to \033[1;30m{filename}\033[1;0m")
+        print(f"Saving Model \033[1;30m{filename}\033[1;0m")
         self.checkpoint_streamer.save_checkpoint(
             state.params["params"],
             filename,
@@ -641,6 +641,10 @@ class CausalLanguageModelTrainer:
                             pbar.update(1)
 
                             if self.wandb_runtime is not None:
+                                trained_tokens = (
+                                        current_step * self.arguments.total_batch_size *
+                                        self.arguments.gradient_checkpointing * self.arguments.max_length
+                                )
                                 with jax.spmd_mode("allow_all"):
                                     self.wandb_runtime.log(
                                         {
@@ -654,6 +658,7 @@ class CausalLanguageModelTrainer:
                                             "accuracy": accuracy.tolist(),
                                             "avg_accuracy": (sum(accuracies) / len(accuracies)).tolist(),
                                             "captured_memory_log": mem_res,
+                                            "trained_tokens": trained_tokens
                                         }
                                     ),
                                     wandb.summary["captured_memory_log"] = mem_res
@@ -683,35 +688,62 @@ class CausalLanguageModelTrainer:
 
             except KeyboardInterrupt:
                 print(
-                    "\033[1;30m KeyboardInterrupt At training model Will return current state of the model * \033[1;0m")
+                    "\033[1;30m KeyboardInterrupt At training model Will return current state of the model\033[1;0m"
+                )
+                output = TrainerOutput(
+                    predict_function=self.sharded_predict,
+                    state=_sharded_state,
+                    mesh=self.mesh,
+                    shard_fns=shard_fns,
+                    gather_fns=gather_fns,
+                    checkpoint_stream=self.checkpoint_streamer,
+                )
+                if self.arguments.save_steps is None and self.arguments.do_last_save:
+                    filename = self._save_state(
+                        current_step=current_step,
+                        state=_sharded_state,
+                        gather_fns=gather_fns
+                    )
+                    checkpoint_path = f"{str(self.arguments.get_path())}/{filename}"
+
+                if self.arguments.do_eval:
+                    self.eval(
+                        _sharded_state
+                    )
+
+                output.checkpoint_path = checkpoint_path
+                output.last_save_file_name = filename
+                wandb.finish()
+
+                return output
             except EasyDelTimerError:
                 print(
                     "\033[1;30m Training reached out maximum training Time Killing training Process "
                     "and Will return current state of the model * \033[1;0m"
                 )
-            output = TrainerOutput(
-                predict_function=self.sharded_predict,
-                state=_sharded_state,
-                mesh=self.mesh,
-                shard_fns=shard_fns,
-                gather_fns=gather_fns,
-                checkpoint_stream=self.checkpoint_streamer,
-            )
-            if self.arguments.save_steps is None and self.arguments.do_last_save:
-                filename = self._save_state(
-                    current_step=current_step,
+                output = TrainerOutput(
+                    predict_function=self.sharded_predict,
                     state=_sharded_state,
-                    gather_fns=gather_fns
+                    mesh=self.mesh,
+                    shard_fns=shard_fns,
+                    gather_fns=gather_fns,
+                    checkpoint_stream=self.checkpoint_streamer,
                 )
-                checkpoint_path = f"{str(self.arguments.get_path())}/{filename}"
+                if self.arguments.save_steps is None and self.arguments.do_last_save:
+                    filename = self._save_state(
+                        current_step=current_step,
+                        state=_sharded_state,
+                        gather_fns=gather_fns
+                    )
+                    checkpoint_path = f"{str(self.arguments.get_path())}/{filename}"
 
-            if self.arguments.do_eval:
-                self.eval(
-                    _sharded_state
-                )
+                if self.arguments.do_eval:
+                    self.eval(
+                        _sharded_state
+                    )
 
-        output.checkpoint_path = checkpoint_path
-        output.last_save_file_name = filename
-        wandb.finish()
+                output.checkpoint_path = checkpoint_path
+                output.last_save_file_name = filename
+                wandb.finish()
 
-        return output
+                return output
