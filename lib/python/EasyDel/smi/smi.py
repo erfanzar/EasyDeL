@@ -109,11 +109,14 @@ def get_capacity_matrix(dir_prefix: str = '/dev/shm'):
 
     matches = re.findall(pattern, get_mem(dir_prefix=dir_prefix))
     information = {}
-    for match in matches:
-        information[match[2]] = {
-            "Used": match[0],
-            "Usage Percent": match[1],
-            "Process": match[3][1:] if match[3] else "∞",
-            "Full Capacity": calculate_full_size(match[0], match[1])
-        }
+    try:
+        for match in matches:
+            information[match[2]] = {
+                "Used": match[0],
+                "Usage Percent": match[1],
+                "Process": match[3][1:] if match[3] else "∞",
+                "Full Capacity": calculate_full_size(match[0], match[1])
+            }
+    except (ArithmeticError, AttributeError, KeyError, ValueError):
+        ...
     return information
