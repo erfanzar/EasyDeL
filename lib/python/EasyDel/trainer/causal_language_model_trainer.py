@@ -664,9 +664,7 @@ class CausalLanguageModelTrainer:
                                             "accuracy": accuracy.tolist(),
                                             "avg_accuracy": (sum(accuracies) / len(accuracies)).tolist(),
                                             "trained_tokens": trained_tokens,
-                                            "accelerators": wandb.Table(
-                                                data=information_queries, columns=list(information_queries.keys())
-                                            )
+                                            "accelerators": information_queries
                                         }
                                     ),
                                     wandb.summary["captured_memory_log"] = mem_res
