@@ -23,3 +23,7 @@ def load_and_convert_checkpoint(path):
         tensor = float_tensor_to_dtype(tensor, 'fp16')
         torch_params[key] = torch.from_numpy(tensor)
     return torch_params
+
+
+def get_pytorch_model_and_config_by_type():
+    ...
