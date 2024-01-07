@@ -564,7 +564,7 @@ class CausalLanguageModelTrainer:
                 current_step * self.arguments.total_batch_size *
                 self.arguments.gradient_accumulation_steps * self.arguments.max_length
         )
-        filename = f"{self.arguments.model_name}-S{current_step}"
+        filename = f"{self.arguments.model_name}-T{trained_tokens}-S{current_step}"
         print(f"Saving Model \033[1;30m{filename}\033[1;0m")
         self.checkpoint_streamer.save_checkpoint(
             state.params["params"],
@@ -690,60 +690,35 @@ class CausalLanguageModelTrainer:
                 print(
                     "\033[1;30m KeyboardInterrupt At training model Will return current state of the model\033[1;0m"
                 )
-                output = TrainerOutput(
-                    predict_function=self.sharded_predict,
-                    state=_sharded_state,
-                    mesh=self.mesh,
-                    shard_fns=shard_fns,
-                    gather_fns=gather_fns,
-                    checkpoint_stream=self.checkpoint_streamer,
-                )
-                if self.arguments.save_steps is None and self.arguments.do_last_save:
-                    filename = self._save_state(
-                        current_step=current_step,
-                        state=_sharded_state,
-                        gather_fns=gather_fns
-                    )
-                    checkpoint_path = f"{str(self.arguments.get_path())}/{filename}"
 
-                if self.arguments.do_eval:
-                    self.eval(
-                        _sharded_state
-                    )
-
-                output.checkpoint_path = checkpoint_path
-                output.last_save_file_name = filename
-                wandb.finish()
-
-                return output
             except EasyDelTimerError:
                 print(
                     "\033[1;30m Training reached out maximum training Time Killing training Process "
                     "and Will return current state of the model * \033[1;0m"
                 )
-                output = TrainerOutput(
-                    predict_function=self.sharded_predict,
+            output = TrainerOutput(
+                predict_function=self.sharded_predict,
+                state=_sharded_state,
+                mesh=self.mesh,
+                shard_fns=shard_fns,
+                gather_fns=gather_fns,
+                checkpoint_stream=self.checkpoint_streamer,
+            )
+            if self.arguments.save_steps is None and self.arguments.do_last_save:
+                filename = self._save_state(
+                    current_step=current_step,
                     state=_sharded_state,
-                    mesh=self.mesh,
-                    shard_fns=shard_fns,
-                    gather_fns=gather_fns,
-                    checkpoint_stream=self.checkpoint_streamer,
+                    gather_fns=gather_fns
                 )
-                if self.arguments.save_steps is None and self.arguments.do_last_save:
-                    filename = self._save_state(
-                        current_step=current_step,
-                        state=_sharded_state,
-                        gather_fns=gather_fns
-                    )
-                    checkpoint_path = f"{str(self.arguments.get_path())}/{filename}"
+                checkpoint_path = f"{str(self.arguments.get_path())}/{filename}"
 
-                if self.arguments.do_eval:
-                    self.eval(
-                        _sharded_state
-                    )
+            if self.arguments.do_eval:
+                self.eval(
+                    _sharded_state
+                )
 
-                output.checkpoint_path = checkpoint_path
-                output.last_save_file_name = filename
-                wandb.finish()
+            output.checkpoint_path = checkpoint_path
+            output.last_save_file_name = filename
+            wandb.finish()
 
-                return output
+            return output
