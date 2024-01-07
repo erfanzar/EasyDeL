@@ -1,7 +1,6 @@
 import dataclasses
 import os
 import time
-import typing
 
 import IPython.display
 import fjformer.func.loss_func
@@ -27,6 +26,8 @@ from torch.utils.data import DataLoader
 from fjformer import match_partition_rules, make_shard_and_gather_fns, StreamingCheckpointer
 from ..etils.errors import EasyDelTimerError
 import chex
+from typing import Any, Optional, Union, Tuple, Callable, Mapping
+from .state import EasyState  # Same as Flax.TrainingState
 
 
 def calculate_accuracy(predictions: chex.Array, targets: chex.Array):
@@ -52,9 +53,9 @@ def calculate_accuracy(predictions: chex.Array, targets: chex.Array):
 
 def create_casual_language_model_train_step(partition_spec=PartitionSpec(("dp", "fsdp"), "sp")):
     """
-    The create_casual_language_model_train_step function is a training step function that takes in the current state of the model,
-    and a batch of data. It then calculates the loss and accuracy for this batch, and returns an updated state
-    with new parameters based on these gradients.
+    The create_casual_language_model_train_step function is a training step function that takes in the current state 
+    of the model,and a batch of data. It then calculates the loss and accuracy for this batch, and returns 
+    an updated state with new parameters based on these gradients.
 
     :param partition_spec: Specify which devices the model will be split across
     :return: A casual_language_model_train_step function that takes in the current state of the model,
@@ -63,9 +64,9 @@ def create_casual_language_model_train_step(partition_spec=PartitionSpec(("dp", 
 
     def casual_language_model_train_step(state, batch):
         """
-        The casual_language_model_train_step function is a training step function that takes in the current state of the model,
-        and a batch of data. It then calculates the loss and accuracy for this batch, and returns an updated state
-        with new parameters based on these gradients.
+        The casual_language_model_train_step function is a training step function that takes in the current state 
+        of the model and a batch of data. It then calculates the loss and accuracy for this batch, 
+        and returns an updated state with new parameters based on these gradients.
 
         :param state: Store the model parameters
         :param batch: Pass the data to the model
@@ -94,9 +95,10 @@ def create_casual_language_model_train_step(partition_spec=PartitionSpec(("dp", 
 
 def create_casual_language_model_evaluation_step(partition_spec=PartitionSpec(("dp", "fsdp"), "sp")):
     """
-    The create_casual_language_model_evaluation_step function is used to create a function that calculates the loss and accuracy of a model.
-    It takes in a set of parameters, which are then passed into the state.apply_fn function
-    to generate logits for each token in the batch. The cross entropy loss and accuracy are then calculated from these logits.
+    The create_casual_language_model_evaluation_step function is used to create a function that calculates the loss
+     and accuracy of a model. It takes in a set of parameters, which are then passed into the state.apply_fn function
+    to generate logits for each token in the batch. The cross entropy loss and accuracy are then calculated from these 
+    logits.
 
     :param partition_spec: Specify the partitioning of the model parameters
     :return: A function that can be used to calculate the loss and accuracy of a model
@@ -107,7 +109,8 @@ def create_casual_language_model_evaluation_step(partition_spec=PartitionSpec(("
         """
         The casual_language_model_evaluation_step function is used to calculate the loss and accuracy of a model.
         It takes in a set of parameters, which are then passed into the state.apply_fn function
-        to generate logits for each token in the batch. The cross entropy loss and accuracy are then calculated from these logits.
+        to generate logits for each token in the batch. The cross entropy loss and accuracy are then calculated from 
+        these logits.
 
         :param state: Store the model parameters and other information about the training process
         :param batch_eval: Pass the batch of data to the function
@@ -122,7 +125,8 @@ def create_casual_language_model_evaluation_step(partition_spec=PartitionSpec(("
             """
             The calculate_loss function is used to calculate the loss and accuracy of a model.
             It takes in a set of parameters, which are then passed into the state.apply_fn function
-            to generate logits for each token in the batch. The cross entropy loss and accuracy are then calculated from these logits.
+            to generate logits for each token in the batch. The cross entropy loss and accuracy are then calculated 
+            from these logits.
 
             :param params: Pass the model parameters to the function
             :return: The loss and the accuracy
@@ -160,26 +164,27 @@ def predict(state, input_ids):
 
 
 @dataclasses.dataclass
-class OutputFineTuner:
-    train_state: typing.Any
-    predict_fun: typing.Any
-    mesh: typing.Any
-    ckpt_stream: typing.Any
-    gather_fns: typing.Any
-    shard_fns: typing.Any
-    last_save_file_name: str
-    checkpoint_path: str
+class TrainerOutput:
+    state: EasyState
+    predict_function: Optional[Callable]
+    mesh: Optional[jax.sharding.Mesh]
+    checkpoint_stream: Any
+    gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]] = None
+    shard_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]] = None
+    last_save_file_name: Optional[str] = None
+    checkpoint_path: Optional[str] = None
 
 
 class CausalLanguageModelTrainer:
-    def __init__(self,
-                 arguments: TrainArguments,
-                 dataset_train: Dataset,
-                 dataset_eval: Dataset = None,
-                 finetune: bool = True,
-                 checkpoint_path: typing.Union[str, os.PathLike] = None,
-                 _do_init_fns: bool = True
-                 ):
+    def __init__(
+            self,
+            arguments: TrainArguments,
+            dataset_train: Dataset,
+            dataset_eval: Dataset = None,
+            finetune: bool = True,
+            checkpoint_path: Union[str, os.PathLike] = None,
+            _do_init_fns: bool = True
+    ):
         """
         The __init__ function is called when the class is instantiated.
         It sets up all the variables that are needed for training, including:
@@ -195,7 +200,7 @@ class CausalLanguageModelTrainer:
         :param dataset_train: Dataset: Pass the training dataset to the trainer
         :param dataset_eval: Dataset: Pass the validation dataset
         :param finetune: bool: Load the model from a checkpoint
-        :param checkpoint_path: typing.Union[str,os.PathLike] : Load the checkpoint path
+        :param checkpoint_path: Union[str,os.PathLike] : Load the checkpoint path
         :param _do_init_fns: bool: Initialize the functions
         :return: Nothing, it just initializes the class
 
@@ -214,10 +219,10 @@ class CausalLanguageModelTrainer:
         self.sharded_train_step_fn = None
         self.sharded_predict = None
         self.mesh = None
-        self.ckpt_streamer = None
+        self.checkpoint_streamer = None
         self.init_fn = None
-        self.train_state_shape = None
-        self.train_state_partition_spec = None
+        self.state_shape = None
+        self.state_partition_spec = None
         self.arguments = arguments
         self.dataset_train = dataset_train
         self.dataset_eval = dataset_eval
@@ -239,24 +244,9 @@ class CausalLanguageModelTrainer:
                                     f"to do in manually (simply with  trainer.init_functions() )")
 
     def __str__(self):
-        string = f"CausalLanguageModelTrainer("
-        for k, v in self.__dict__.items():
-            if isinstance(v, typing.Callable):
-                def string_func(it_self):
-
-                    string_ = f"{it_self.__class__.__name__}(\n"
-                    for k_, v_ in it_self.__dict__.items():
-                        string_ += f"\t\t{k_} : {v_}\n"
-                    string_ += "\t)"
-                    return string_
-
-                try:
-                    v.__str__ = string_func
-                    v = v.__str__(v)
-                except RuntimeError:
-                    pass
-
-            string += f"\n\t{k} : {v}"
+        string = f"{self.__class__.__name__}("
+        for key, value in self.__dict__.items():
+            string += value.__str__().replace("\n", "\n\t")
         string += ")"
         return string
 
@@ -319,7 +309,7 @@ class CausalLanguageModelTrainer:
         self.sharded_train_step_fn = funcs[1]
         self.sharded_predict = funcs[2]
         self.mesh = funcs[3]
-        self.ckpt_streamer = funcs[4]
+        self.checkpoint_streamer = funcs[4]
         self.init_fn = funcs[5]
         self.timer(
             "configure functions and sharding them"
@@ -406,10 +396,9 @@ class CausalLanguageModelTrainer:
     def configure_functions(self):
         """
         The configure_functions function is responsible for configuring the functions that will be used in training.
-        It does this by first defining a function called init_fn, which initializes the model parameters and returns them as a
-        TrainState object. The TrainState object contains all of the information needed to train or evaluate on a batch of data,
-        including:
-
+        It does this by first defining a function called init_fn, which initializes the model parameters and returns
+        them as a EasyState object. The EasyState object contains all the information needed to train or evaluate
+        on a batch of data, including:
         :param self: Access the class attributes
         :return: A tuple of functions
 
@@ -423,14 +412,14 @@ class CausalLanguageModelTrainer:
                 params__ = self.model.to_bf16(params__)
             elif self.arguments.dtype == jnp.float16:
                 params__ = self.model.to_fp16(params__)
-            return train_state.TrainState.create(
+            return EasyState.create(
                 tx=self.tx,
                 params=flax.core.freeze({"params": params__}),
                 apply_fn=self.model.__call__
             )
 
-        def create_train_state_from_params(params_):
-            return train_state.TrainState.create(
+        def create_state_from_params(params_):
+            return EasyState.create(
                 tx=self.tx,
                 apply_fn=self.model.__call__,
                 params=params_
@@ -461,68 +450,78 @@ class CausalLanguageModelTrainer:
             state = state.apply_gradients(grads=grad)
             return state, loss__, accuracy__
 
-        train_state_shape = jax.eval_shape(init_fn)
-        train_state_partition_spec = match_partition_rules(
+        state_shape = jax.eval_shape(init_fn)
+        state_partition_spec = match_partition_rules(
             self.config.get_partition_rules(
                 fully_fsdp=self.arguments.fully_fsdp
             ) if self.arguments.custom_rule is None else self.arguments.custom_rule,
-            train_state_shape
+            state_shape
         )
         sharded_create_from_params_fn = pjit(
-            create_train_state_from_params,
-            in_shardings=(train_state_partition_spec.params,),
-            out_shardings=train_state_partition_spec,
+            create_state_from_params,
+            in_shardings=(state_partition_spec.params,),
+            out_shardings=state_partition_spec,
             donate_argnums=(0,)
         )
         sharded_train_step_fn = pjit(
             fsdp_train_step_,
-            in_shardings=(train_state_partition_spec, PartitionSpec()),
-            out_shardings=(train_state_partition_spec, PartitionSpec(), PartitionSpec()),
+            in_shardings=(state_partition_spec, PartitionSpec()),
+            out_shardings=(state_partition_spec, PartitionSpec(), PartitionSpec()),
             donate_argnums=(0, 0),
         )
         sharded_predict = pjit(predict, out_shardings=PartitionSpec(),
-                               in_shardings=(train_state_partition_spec, PartitionSpec()))
+                               in_shardings=(state_partition_spec, PartitionSpec()))
         mesh = self.arguments.get_mesh()
         self.arguments.ckpt_path_exists()
-        ckpt_streamer = self.arguments.get_streaming_checkpointer()
-        self.train_state_partition_spec = train_state_partition_spec
-        self.train_state_shape = train_state_shape
-        return sharded_create_from_params_fn, sharded_train_step_fn, sharded_predict, mesh, ckpt_streamer, init_fn
+        checkpoint_streamer = self.arguments.get_streaming_checkpointer()
+        self.state_partition_spec = state_partition_spec
+        self.state_shape = state_shape
+        return sharded_create_from_params_fn, sharded_train_step_fn, sharded_predict, mesh, checkpoint_streamer, init_fn
 
-    def train(self, model_parameters: flax.core.FrozenDict = None) -> OutputFineTuner:
-        """
-        The train function is the main function of this module.
-        It takes a model_parameters argument which can be used to load a pretrained model and finetune it.
-        The train function returns an OutputFineTuner object that contains the last saved file name, predict func,
-        train state, mesh and checkpoint streamer.
+    def eval(
+            self,
+            state: EasyState
+    ):
+        if self.dataset_eval is not None:
+            pbar_eval = tqdm(total=self.max_steps_eval)
+            for _, batch_eval in enumerate(self.dataloader_eval):
+                _ = batch_eval.pop("token_type_ids", None)
+                batch_eval["labels"] = batch_eval["input_ids"][..., 1:]
+                for pop_arg in self.arguments.ids_to_pop_from_dataset:
+                    _ = batch_eval.pop(pop_arg, None)
+                loss_eval, accuracy_eval = create_casual_language_model_evaluation_step(
+                    self.arguments.step_partition_spec
+                )(
+                    state, batch_eval
+                )
+                pbar_eval.update(1)
+                if self.wandb_runtime is not None:
+                    self.wandb_runtime.log(
+                        {
+                            "loss_eval": loss_eval.tolist(),
+                            "accuracy_eval": accuracy_eval.tolist()
+                        }
+                    )
+                pbar_eval.set_postfix(loss_eval=loss_eval.tolist(), accuracy_eval=accuracy_eval.tolist())
 
-
-        :param self: Make the class methods aware of other methods and attributes within the class
-        :param model_parameters: flax.core.FrozenDict: Load a pre-trained model
-        :return: An object of type "OutputFineTuner"
-
-        """
-
-        def count_params(_p):
-            print("\033[1;31mModel Contain ",
-                  sum(n.size for n in jax.tree_util.tree_flatten(flax.core.unfreeze(_p))[0]) / 1e9,
-                  " Billion Parameters")
-
-        dir_prefix: str = "/dev/shm"
-        if self.arguments.track_memory:
-            initialise_tracking(dir_prefix=dir_prefix)
-        start_time = time.time()
+    def init_state(
+            self,
+            model_parameters: Optional[flax.core.FrozenDict] = None
+    ) -> Tuple[EasyState, Mapping[str, Callable], Mapping[str, Callable]]:
         with self.mesh:
+            shard_fns, gather_fns = make_shard_and_gather_fns(
+                self.state_partition_spec,
+                dtype_specs=self.dtype
+            )
             if self.finetune:
-                shard_fns, gather_fns = make_shard_and_gather_fns(self.train_state_partition_spec,
-                                                                  dtype_specs=self.dtype)
-
                 if model_parameters is None:
                     prefix_print(
                         "Action", f"Loading Model From {self.checkpoint_path}"
                     )
                     _, params = StreamingCheckpointer.load_trainstate_checkpoint(
-                        f"params::{self.checkpoint_path}", self.train_state_shape, shard_fns
+                        f"params::{self.checkpoint_path}",
+                        self.state_shape,
+                        shard_fns
                     )
 
                     if self.arguments.remove_ckpt_after_load:
@@ -534,31 +533,82 @@ class CausalLanguageModelTrainer:
                     from flax.core import unfreeze
                     if not isinstance(model_parameters, flax.core.FrozenDict):
                         prefix_print(
-                            "Warning", "Model Parameters should be like FrozenDict({'params': params}) make sure to "
-                                       "pass as type FrozenDict in case of not getting UnExcepted Errors "
+                            "Warning",
+                            "Model Parameters should be like FrozenDict({'params': params}) make sure to "
+                            "pass as type FrozenDict in case of not getting UnExcepted Errors "
                         )
                     params = model_parameters if not self.arguments.do_shard_fns else jax.tree_util.tree_map(
-                        lambda f, x: f(x), shard_fns.params,
-                        model_parameters)
+                        lambda f, x: f(x),
+                        shard_fns.params,
+                        model_parameters
+                    )
 
-                sharded_train_state_ = self.sharded_create_from_params_fn(params)
-
-                count_params(sharded_train_state_.params)
+                _sharded_state = self.sharded_create_from_params_fn(params)
             else:
-                sharded_train_state_ = self.init_fn()
+                _sharded_state = self.init_fn()
+                params = _sharded_state.params if not self.arguments.do_shard_fns else jax.tree_util.tree_map(
+                    lambda f, x: f(x),
+                    shard_fns.params,
+                    _sharded_state.params
+                )
+                _sharded_state.params = params
+            return _sharded_state, shard_fns, gather_fns
 
-                count_params(sharded_train_state_.params)
+    def _save_state(
+            self,
+            current_step: int,
+            state: EasyState,
+            gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]]
+    ) -> str:
+        trained_tokens = (
+                current_step * self.arguments.total_batch_size *
+                self.arguments.gradient_checkpointing * self.arguments.max_length
+        )
+        filename = f"{self.arguments.model_name}-T{trained_tokens}-S{current_step}"
+        print(f"Saving Model to \033[1;30m{filename}\033[1;0m")
+        self.checkpoint_streamer.save_checkpoint(
+            state.params["params"],
+            filename,
+            gather_fns=gather_fns.params["params"]
+        )
+        return filename
 
+    def train(self, model_parameters: Optional[flax.core.FrozenDict] = None) -> TrainerOutput:
+        """
+        The train function is the main function of this module.
+        It takes a model_parameters argument which can be used to load a pretrained model and finetune it.
+        The train function returns an TrainerOutput object that contains the last saved file name, predict func,
+        train state, mesh and checkpoint streamer.
+
+
+        :param self: Make the class methods aware of other methods and attributes within the class
+        :param model_parameters: flax.core.FrozenDict: Load a pre-trained model
+        :return: An object of type "TrainerOutput"
+
+        """
+
+        def count_model_parameters(_p):
+            print("\033[1;31mModel Contain ",
+                  sum(n.size for n in jax.tree_util.tree_flatten(flax.core.unfreeze(_p))[0]) / 1e9,
+                  " Billion Parameters")
+
+        dir_prefix: str = "/dev/shm"
+        if self.arguments.track_memory:
+            initialise_tracking(dir_prefix=dir_prefix)
+        start_time = time.time()
+        _sharded_state, shard_fns, gather_fns = self.init_state(model_parameters=model_parameters)
+        count_model_parameters(_sharded_state.params)
+        with self.mesh:
             pbar = tqdm(total=self.max_steps_train)
-            current_step = sharded_train_state_.step.tolist()
+            current_step = _sharded_state.step.tolist()
             losses = []
             accuracies = []
-            pbar.update(sharded_train_state_.step.tolist())
+            pbar.update(_sharded_state.step.tolist())
             learning_rates = []
             if self.wandb_runtime is not None:
                 model_parameters_number = sum(
                     n.size for n in
-                    jax.tree_util.tree_flatten(flax.core.unfreeze(sharded_train_state_.params))[0]
+                    jax.tree_util.tree_flatten(flax.core.unfreeze(_sharded_state.params))[0]
                 ) / 1e9
                 self.wandb_runtime.log(
                     {
@@ -577,9 +627,9 @@ class CausalLanguageModelTrainer:
                             for ssb in self.arguments.ids_to_pop_from_dataset:
                                 _ = batch.pop(ssb, None)
                             time_s = time.time()
-                            sharded_train_state_, loss, accuracy = self.sharded_train_step_fn(sharded_train_state_,
-                                                                                              batch
-                                                                                              )
+                            _sharded_state, loss, accuracy = self.sharded_train_step_fn(_sharded_state,
+                                                                                        batch
+                                                                                        )
                             ttl_time = time.time() - time_s
                             losses.append(loss)
                             learning_rates.append(self.scheduler(current_step).tolist())
@@ -596,39 +646,41 @@ class CausalLanguageModelTrainer:
                                         {
                                             "loss": loss.tolist(),
                                             "learning_rate": self.scheduler(
-                                                sharded_train_state_.step.tolist()
+                                                _sharded_state.step.tolist()
                                             ).tolist(),
-                                            "step": sharded_train_state_.step.tolist(),
+                                            "step": _sharded_state.step.tolist(),
                                             "step time": ttl_time,
                                             "perplexity": jnp.exp(loss).tolist(),
                                             "accuracy": accuracy.tolist(),
                                             "avg_accuracy": (sum(accuracies) / len(accuracies)).tolist(),
-                                            "mem_res": mem_res,
+                                            "captured_memory_log": mem_res,
                                         }
                                     ),
+                                    wandb.summary["captured_memory_log"] = mem_res
 
                             if self.arguments.track_memory:
                                 IPython.display.clear_output(True)
                                 pbar.display(mem_res)
-                            pbar.set_postfix(loss=loss,
-                                             learning_rate=self.scheduler(sharded_train_state_.step.tolist()).tolist(),
-                                             step=sharded_train_state_.step.tolist(),
-                                             perplexity=jnp.exp(loss).tolist(),
-                                             accuracy=accuracy,
-                                             )
+                            pbar.set_postfix(
+                                loss=loss,
+                                learning_rate=self.scheduler(_sharded_state.step.tolist()).tolist(),
+                                step=_sharded_state.step.tolist(),
+                                perplexity=jnp.exp(loss).tolist(),
+                                accuracy=accuracy,
+                            )
                             if self.arguments.training_time is not None:
                                 if time.time() - start_time > self.arguments.training_time:
                                     raise EasyDelTimerError("Time Out")
                         else:
                             break
                         if self.arguments.save_steps is not None and current_step % self.arguments.save_steps == 0:
-                            filename = f"{self.arguments.model_name}-{sum(losses) / len(losses)}-{current_step}"
-                            print(f"Saving Model to \033[1;30m{filename}\033[1;0m")
-                            self.ckpt_streamer.save_checkpoint(
-                                sharded_train_state_.params["params"],
-                                filename,
-                                gather_fns=gather_fns.params["params"]
+                            filename = self._save_state(
+                                current_step=current_step,
+                                state=_sharded_state,
+                                gather_fns=gather_fns
                             )
+                            checkpoint_path = f"{str(self.arguments.get_path())}/{filename}"
+
             except KeyboardInterrupt:
                 print(
                     "\033[1;30m KeyboardInterrupt At training model Will return current state of the model * \033[1;0m")
@@ -637,51 +689,29 @@ class CausalLanguageModelTrainer:
                     "\033[1;30m Training reached out maximum training Time Killing training Process "
                     "and Will return current state of the model * \033[1;0m"
                 )
-            if self.arguments.do_eval:
-                if self.dataset_eval is not None:
-                    pbar_eval = tqdm(total=self.max_steps_eval)
-                    for i_eval, batch_eval in enumerate(self.dataloader_eval):
-                        _ = batch_eval.pop("token_type_ids", None)
-                        batch_eval["labels"] = batch_eval["input_ids"][..., 1:]
-                        for pop_arg in self.arguments.ids_to_pop_from_dataset:
-                            _ = batch_eval.pop(pop_arg, None)
-                        loss_eval, accuracy = create_casual_language_model_evaluation_step(
-                            self.arguments.step_partition_spec)(
-                            sharded_train_state_, batch_eval)
-                        pbar_eval.update(1)
-                        if self.wandb_runtime is not None:
-                            self.wandb_runtime.log(
-                                {
-                                    "loss_eval": loss_eval.tolist(),
-                                    "accuracy": accuracy.tolist()
-                                }
-                            )
-                        pbar_eval.set_postfix(loss_eval=loss_eval.tolist())
+            output = TrainerOutput(
+                predict_function=self.sharded_predict,
+                state=_sharded_state,
+                mesh=self.mesh,
+                shard_fns=shard_fns,
+                gather_fns=gather_fns,
+                checkpoint_stream=self.checkpoint_streamer,
+            )
             if self.arguments.save_steps is None and self.arguments.do_last_save:
-                loss_mean = sum(losses) / len(losses)
-                trained_tokens = (
-                        current_step * self.arguments.total_batch_size *
-                        self.arguments.gradient_checkpointing * self.arguments.max_length
+                filename = self._save_state(
+                    current_step=current_step,
+                    state=_sharded_state,
+                    gather_fns=gather_fns
                 )
-                filename = f"{self.arguments.model_name}-T{trained_tokens}-L{loss_mean}-S{current_step}"
-                print(f"Saving Model to \033[1;30m{filename}\033[1;0m")
-                self.ckpt_streamer.save_checkpoint(
-                    sharded_train_state_.params["params"],
-                    filename,
-                    gather_fns=gather_fns.params["params"]
+                checkpoint_path = f"{str(self.arguments.get_path())}/{filename}"
+
+            if self.arguments.do_eval:
+                self.eval(
+                    _sharded_state
                 )
-            else:
-                filename = "not_saved | None"
-        output = OutputFineTuner(
-            last_save_file_name=filename,
-            predict_fun=self.sharded_predict,
-            train_state=sharded_train_state_,
-            mesh=self.mesh,
-            shard_fns=shard_fns,
-            gather_fns=gather_fns,
-            ckpt_stream=self.ckpt_streamer,
-            checkpoint_path=f"{str(self.arguments.get_path())}/{filename}"
-        )
+
+        output.checkpoint_path = checkpoint_path
+        output.last_save_file_name = filename
         wandb.finish()
 
         return output
