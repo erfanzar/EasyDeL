@@ -562,7 +562,7 @@ class CausalLanguageModelTrainer:
     ) -> str:
         trained_tokens = (
                 current_step * self.arguments.total_batch_size *
-                self.arguments.gradient_checkpointing * self.arguments.max_length
+                self.arguments.gradient_accumulation_steps * self.arguments.max_length
         )
         filename = f"{self.arguments.model_name}-S{current_step}"
         print(f"Saving Model \033[1;30m{filename}\033[1;0m")
@@ -643,7 +643,7 @@ class CausalLanguageModelTrainer:
                             if self.wandb_runtime is not None:
                                 trained_tokens = (
                                         current_step * self.arguments.total_batch_size *
-                                        self.arguments.gradient_checkpointing * self.arguments.max_length
+                                        self.arguments.gradient_accumulation_steps * self.arguments.max_length
                                 )
                                 with jax.spmd_mode("allow_all"):
                                     self.wandb_runtime.log(
