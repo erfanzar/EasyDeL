@@ -78,7 +78,7 @@ def get_mem(dir_prefix: str = '/dev/shm'):
     ).stdout.decode('utf-8')
 
 
-def initialise_tracking(interval: float = 1., dir_prefix: str = '/dev/shm') -> None:
+def initialise_tracking(interval: float = 0.5, dir_prefix: str = '/dev/shm') -> None:
     """
     The initialise_tracking function starts a daemon thread that periodically saves the current memory profile to disk.
 
