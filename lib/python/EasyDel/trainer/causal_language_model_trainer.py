@@ -17,10 +17,9 @@ import flax
 from transformers import FlaxAutoModelForCausalLM, AutoConfig
 from tqdm import tqdm
 from ..utils.utils import Timers, prefix_print
-from ..smi import initialise_tracking, get_mem
+from ..smi import initialise_tracking, get_mem, get_capacity_matrix
 from jax.experimental.pjit import pjit, with_sharding_constraint
 from jax.sharding import PartitionSpec
-from flax.training import train_state
 from jax import numpy as jnp
 from torch.utils.data import DataLoader
 from fjformer import match_partition_rules, make_shard_and_gather_fns, StreamingCheckpointer
@@ -645,6 +644,13 @@ class CausalLanguageModelTrainer:
                                         current_step * self.arguments.total_batch_size *
                                         self.arguments.gradient_accumulation_steps * self.arguments.max_length
                                 )
+
+                                information_queries = {}
+                                if self.arguments.track_memory:
+                                    for key in ["Used", "Usage Percent"]:
+                                        for device, info in get_capacity_matrix(dir_prefix=dir_prefix).items():
+                                            information_queries[f"{device.replace('_', ' ')} ({key})"] = float(
+                                                info[key].replace("%", "").replace("GB", ""))
                                 with jax.spmd_mode("allow_all"):
                                     self.wandb_runtime.log(
                                         {
@@ -657,8 +663,8 @@ class CausalLanguageModelTrainer:
                                             "perplexity": jnp.exp(loss).tolist(),
                                             "accuracy": accuracy.tolist(),
                                             "avg_accuracy": (sum(accuracies) / len(accuracies)).tolist(),
-                                            "captured_memory_log": mem_res,
-                                            "trained_tokens": trained_tokens
+                                            "trained_tokens": trained_tokens,
+                                            **information_queries
                                         }
                                     ),
                                     wandb.summary["captured_memory_log"] = mem_res
