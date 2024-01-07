@@ -564,7 +564,7 @@ class CausalLanguageModelTrainer:
                 current_step * self.arguments.total_batch_size *
                 self.arguments.gradient_checkpointing * self.arguments.max_length
         )
-        filename = f"{self.arguments.model_name}-T{trained_tokens}-S{current_step}"
+        filename = f"{self.arguments.model_name}-S{current_step}"
         print(f"Saving Model \033[1;30m{filename}\033[1;0m")
         self.checkpoint_streamer.save_checkpoint(
             state.params["params"],
