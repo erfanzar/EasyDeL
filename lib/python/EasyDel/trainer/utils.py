@@ -1,3 +1,5 @@
+import pickle
+
 import fjformer.optimizers
 import jax
 from ml_collections import ConfigDict
@@ -200,3 +202,8 @@ class JaxDistributedConfig(object):
                 process_id=config.process_id,
                 local_device_ids=local_device_ids,
             )
+
+
+def load_opt_state_from_pkl(pkl_path):
+    params = pickle.load(open(pkl_path, "rb"))
+    return params

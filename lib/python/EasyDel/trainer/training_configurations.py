@@ -85,6 +85,8 @@ class TrainArguments(
             jax_distributed_config: Optional[dict] = None,
             log_all_workers: bool = False,
             wandb_entity: Optional[str] = None,
+            save_optimizer_state_and_configs: bool = False,
+            step_start_point: Optional[int] = None,
             **kwargs
     ):
         """
@@ -143,6 +145,9 @@ class TrainArguments(
     :param jax_distributed_config: Optional[dict]: Configure the jax distributed backend
     :param log_all_workers: bool: Log all workers in wandb,
     :param wandb_entity: Optional[str]: Specify the entity to use when logging to weights &amp; biases
+    :param save_optimizer_state_and_configs : bool: when ever to save optimizer state and other args in checkpoint
+    :param step_start_point: Optional[int]: start training from given step for example instead of starting training from
+    step 0 it will start from 20000 and leave the data behind
     :param **kwargs: Pass keyword, variable-length argument list
     :return: Nothing
         """
@@ -213,6 +218,8 @@ class TrainArguments(
         self.log_all_workers = log_all_workers
         self.dataloader_num_workers = dataloader_num_workers
         self.dataloader_pin_memory = dataloader_pin_memory
+        self.save_optimizer_state_and_configs = save_optimizer_state_and_configs
+        self.step_start_point = step_start_point
         self.training_time = self._time_to_seconds(
             training_time) if training_time is not None else None
         torch.set_default_device("cpu")
@@ -377,8 +384,12 @@ class TrainArguments(
         :return: A streamingcheckpointer object
 
         """
-        return StreamingCheckpointer(StreamingCheckpointer.get_default_config(),
-                                     os.path.join(self.save_dir, self.model_name))
+        return StreamingCheckpointer(
+            StreamingCheckpointer.get_default_config(
+                {"save_optimizer_state": self.save_optimizer_state_and_configs}
+            ),
+            os.path.join(self.save_dir, self.model_name)
+        )
 
     def get_board(self):
         """
