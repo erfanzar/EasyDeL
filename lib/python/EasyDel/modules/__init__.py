@@ -59,4 +59,7 @@ from .mixtral import (
     FlaxMixtralForCausalLM as FlaxMixtralForCausalLM,
     MixtralConfig as MixtralConfig,
 )
-from .auto_easydel_model import AutoEasyDelModelForCausalLM
+from .auto_easydel_model import (
+    AutoEasyDelModelForCausalLM as AutoEasyDelModelForCausalLM,
+    AutoEasyDelConfig as AutoEasyDelConfig
+)

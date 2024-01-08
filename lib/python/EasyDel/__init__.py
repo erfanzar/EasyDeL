@@ -81,6 +81,7 @@ from .modules.mixtral import (
 
 from .modules.auto_easydel_model import (
     AutoEasyDelModelForCausalLM as AutoEasyDelModelForCausalLM,
+    AutoEasyDelConfig as AutoEasyDelConfig,
     get_modules_by_type as get_modules_by_type
 )
 
