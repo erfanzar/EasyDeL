@@ -215,3 +215,62 @@ class AutoEasyDelModelForCausalLM:
             params = unflatten_dict(params)
 
         return ed_model, params
+
+
+class AutoEasyDelConfig:
+    @classmethod
+    def from_pretrained(
+            cls,
+            pretrained_model_name_or_path: str,
+            sharding_axis_dims: typing.Sequence[int] = (1, -1, 1, 1),
+            sharding_axis_names: typing.Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, None, None),
+            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            use_shard_map: bool = False,
+            backend: typing.Optional[str] = None,
+            **kwargs
+    ) -> typing.Tuple[EasyDelFlaxPretrainedModel, dict]:
+        """
+        The from_pretrained function is a helper function that allows you to instantiate a model from the pretrained
+        model repository. It takes as input the name of the model (e.g., 'bert-base-uncased') and returns an instance of
+        the class corresponding to your model, with all weights loaded from disk.
+
+        :param cls: Create an instance of the class that called this function
+        :param pretrained_model_name_or_path: str: Identify the model in the huggingface model hub
+        :param sharding_axis_dims: typing.Sequence[int]: Specify the dimension of each axis in the sharded model
+        :param sharding_axis_names: typing.Sequence[str]: Specify the order of sharding
+        :param q_ps: jax.sharding.PartitionSpec: Specify the partitioning of the query tensor
+        :param k_ps: jax.sharding.PartitionSpec: Partition the key matrix
+        :param v_ps: jax.sharding.PartitionSpec: Specify the partitioning of the value tensor
+        :param b_ps: jax.sharding.PartitionSpec: Specify the Attention Bias partition spec
+        :param a_ps: jax.sharding.PartitionSpec: Specify the partitioning of the attention weights
+        :param use_shard_map: bool: whenever to use shard_map for attention
+        :param backend: typing.Optional[str]: backend to use for model
+        :param kwargs: Pass additional arguments to the model and config classes
+        :return: A Model Config
+
+        """
+
+        config = AutoConfig.from_pretrained(pretrained_model_name_or_path)
+        model_type = config.model_type
+
+        cfg, module, trf = get_modules_by_type(model_type)
+        cfg = cfg.from_pretrained(pretrained_model_name_or_path)
+        if hasattr(cfg, 'add_jax_args'):
+            cfg.add_jax_args()
+        cfg.add_partitions(
+            axis_dims=sharding_axis_dims,
+            axis_names=sharding_axis_names,
+            q_ps=q_ps,
+            k_ps=k_ps,
+            v_ps=v_ps,
+            b_ps=b_ps,
+            a_ps=a_ps,
+            backend=backend,
+            use_shard_map=use_shard_map,
+        )
+
+        return cfg
