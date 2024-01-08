@@ -218,7 +218,7 @@ class CausalLanguageModelTrainer:
         self.sharded_train_step_fn = None
         self.sharded_predict = None
         self.mesh = None
-        self.checkpoint_streamer = None
+        self.checkpoint_streamer: fjformer.StreamingCheckpointer | None = None
         self.init_fn = None
         self.state_shape = None
         self.state_partition_spec = None
@@ -555,21 +555,38 @@ class CausalLanguageModelTrainer:
 
     def _save_state(
             self,
-            current_step: int,
             state: EasyState,
-            gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]]
+            gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
+            milestone: bool = False
     ) -> str:
+        step = int(jax.device_get(state.step))
         trained_tokens = (
-                current_step * self.arguments.total_batch_size *
+                step * self.arguments.total_batch_size *
                 self.arguments.gradient_accumulation_steps * self.arguments.max_length
         )
-        filename = f"{self.arguments.model_name}-T{trained_tokens}-S{current_step}"
-        print(f"Saving Model \033[1;30m{filename}\033[1;0m")
-        self.checkpoint_streamer.save_checkpoint(
-            state.params["params"],
-            filename,
-            gather_fns=gather_fns.params["params"]
-        )
+        if self.arguments.save_optimizer_state_and_configs:
+            checkpoint_name = "streaming_train_state"
+            filename = f"{checkpoint_name}_{step}" if milestone else f"{checkpoint_name}"
+            print(f"Saving Model \033[1;30m{filename}\033[1;0m")
+            metadata = dict(
+                step=step,
+                model_config=self.model.config.to_dict(),
+            )
+            self.checkpoint_streamer.save_all(
+                train_state=state,
+                gather_fns=gather_fns,
+                metadata=metadata,
+                milestone=milestone,
+            )
+        else:
+            filename = f"M{self.arguments.model_name}-T{trained_tokens}-S{step}"
+            print(f"Saving Model \033[1;30m{filename}\033[1;0m")
+
+            self.checkpoint_streamer.save_checkpoint(
+                train_state=state.params["params"],
+                gather_fns=gather_fns.params["params"],
+                filename=filename
+            )
         return filename
 
     def train(self, model_parameters: Optional[flax.core.FrozenDict] = None) -> TrainerOutput:
@@ -616,10 +633,16 @@ class CausalLanguageModelTrainer:
                 )
                 wandb.summary["Number of Model Parameters (Billion)"] = model_parameters_number
             try:
-                for ep in range(self.arguments.num_train_epochs):
+                for epoch in range(self.arguments.num_train_epochs):
                     for batch in self.dataloader_train:
                         current_step += 1
-                        if current_step < self.max_steps_train:
+                        if (
+                                self.arguments.step_start_point is not None
+                                and
+                                self.arguments.step_start_point > current_step
+                        ):
+                            pbar.update(1)
+                        elif current_step < self.max_steps_train:
 
                             batch["labels"] = batch["input_ids"][..., 1:]
 
@@ -655,16 +678,18 @@ class CausalLanguageModelTrainer:
                                     self.wandb_runtime.log(
                                         {
                                             "loss": loss.tolist(),
+                                            "mean loss": (sum(losses) / len(losses)).tolist(),
+                                            "accuracy": accuracy.tolist(),
+                                            "mean accuracy": (sum(accuracies) / len(accuracies)).tolist(),
                                             "learning_rate": self.scheduler(
                                                 _sharded_state.step.tolist()
                                             ).tolist(),
                                             "step": _sharded_state.step.tolist(),
                                             "step time": ttl_time,
                                             "perplexity": jnp.exp(loss).tolist(),
-                                            "accuracy": accuracy.tolist(),
-                                            "avg_accuracy": (sum(accuracies) / len(accuracies)).tolist(),
                                             "trained_tokens": trained_tokens,
-                                            "accelerators": information_queries
+                                            "accelerators": information_queries,
+                                            "epoch": epoch
                                         }
                                     ),
                                     wandb.summary["captured_memory_log"] = mem_res
@@ -678,6 +703,7 @@ class CausalLanguageModelTrainer:
                                 step=_sharded_state.step.tolist(),
                                 perplexity=jnp.exp(loss).tolist(),
                                 accuracy=accuracy,
+                                epoch=epoch
                             )
                             if self.arguments.training_time is not None:
                                 if time.time() - start_time > self.arguments.training_time:
@@ -686,9 +712,9 @@ class CausalLanguageModelTrainer:
                             break
                         if self.arguments.save_steps is not None and current_step % self.arguments.save_steps == 0:
                             filename = self._save_state(
-                                current_step=current_step,
                                 state=_sharded_state,
-                                gather_fns=gather_fns
+                                gather_fns=gather_fns,
+                                milestone=True
                             )
                             checkpoint_path = f"{str(self.arguments.get_path())}/{filename}"
 
@@ -712,7 +738,6 @@ class CausalLanguageModelTrainer:
             )
             if self.arguments.save_steps is None and self.arguments.do_last_save:
                 filename = self._save_state(
-                    current_step=current_step,
                     state=_sharded_state,
                     gather_fns=gather_fns
                 )
