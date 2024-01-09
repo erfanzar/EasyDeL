@@ -183,10 +183,16 @@ class EasyDelState(struct.PyTreeNode):
         """
         if tx_init is None:
             tx_init = {}
+        optimizer = tx_init.pop("optimizer", None)
+        if tx_name is not None:
+            optimizer = tx_name
 
+        scheduler = tx_init.pop("scheduler", None)
+        if tx_name is not None:
+            scheduler = sc_name
         tx, sc = get_optimizer_and_scheduler(
-            optimizer=tx_name,
-            scheduler=sc_name,
+            optimizer=optimizer,
+            scheduler=scheduler,
             **tx_init
         )
         return cls(
