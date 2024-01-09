@@ -143,7 +143,7 @@ class EasyDelState(struct.PyTreeNode):
             step: int,
             apply_fn: Callable,
             params: core.FrozenDict[str, Any] | Mapping[str, Any],
-            opt_state: Optional[optax.OptState],
+            opt_state: Optional[optax.OptState] = None,
             tx_init: Optional[dict] = None,
             hyperparameters: Optional[dict] = None,
             module: Optional[EasyDelFlaxPretrainedModel] = None,
