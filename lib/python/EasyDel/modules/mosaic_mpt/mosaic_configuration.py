@@ -82,7 +82,7 @@ class MptConfig(EasyDelPretrainedConfig):
         return config
 
     @staticmethod
-    def get_partition_rules(fully_fsdp: bool = False):
+    def get_partition_rules(fully_sharded_data_parallel: bool = False):
         return (
 
             ("transformer/wte/embedding", PartitionSpec("dp", "fsdp")),
@@ -107,7 +107,7 @@ class MptConfig(EasyDelPretrainedConfig):
             ("lm_head/kernel", PartitionSpec("fsdp", "dp")),
             ("lm_head/bias", PartitionSpec("fsdp", "dp")),
             ('.*', PartitionSpec(None)),
-        ) if not fully_fsdp else (
+        ) if not fully_sharded_data_parallel else (
 
             ("transformer/wte/embedding", PartitionSpec("fsdp")),
             ("transformer/wpe/embedding", PartitionSpec("fsdp")),

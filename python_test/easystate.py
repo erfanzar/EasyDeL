@@ -46,6 +46,7 @@ def main():
 
 def load():
     state = EasyDelState.load_state("state.easy", init_optimizer_state=False, verbose=True)
+    state = state.shard_params()
     print(state)
 
 

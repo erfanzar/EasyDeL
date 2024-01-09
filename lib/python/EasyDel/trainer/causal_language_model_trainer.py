@@ -192,7 +192,8 @@ class CausalLanguageModelTrainer:
         - The model itself, which will be created from a checkpoint if one was provided.  Otherwise,
          it will be created from scratch using the arguments passed in by the user.
          Note that this function also handles creating a mesh if one was not already specified in arguments
-         or loaded from a checkpoint file (see below).   This means that you can pass in either
+         or loaded from a checkpoint file (see below).
+          This means that you can pass in either
 
         :param self: Represent the instance of the class
         :param arguments: TrainArguments: Pass the arguments to the trainer
@@ -445,7 +446,7 @@ class CausalLanguageModelTrainer:
         state_shape = jax.eval_shape(init_fn)
         state_partition_spec = match_partition_rules(
             self.config.get_partition_rules(
-                fully_fsdp=self.arguments.fully_fsdp
+                fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
             ) if self.arguments.custom_rule is None else self.arguments.custom_rule,
             state_shape
         )
@@ -501,14 +502,31 @@ class CausalLanguageModelTrainer:
 
     def init_state(
             self,
-            model_parameters: Optional[flax.core.FrozenDict] = None
+            model_parameters: Optional[flax.core.FrozenDict] = None,
+            state: Optional[EasyDelState] = None,
     ) -> Tuple[EasyDelState, Mapping[str, Callable], Mapping[str, Callable]]:
         with self.mesh:
             shard_fns, gather_fns = make_shard_and_gather_fns(
                 self.state_partition_spec,
                 dtype_specs=self.dtype
             )
-            if self.finetune:
+            if state is not None:
+
+                sharded_state = state
+                params = sharded_state.params if not self.arguments.do_shard_fns else jax.tree_util.tree_map(
+                    lambda f, x: f(x),
+                    shard_fns.params,
+                    sharded_state.params
+                )
+                sharded_state.params = params
+                if sharded_state.opt_state is None:
+                    prefix_print(
+                        "Action", "Optimizer State is not Found!, initializing one."
+                    )
+                    with jax.default_device(self.arguments.offload_device):
+                        sharded_state = sharded_state.init_opt_state()
+            elif self.finetune:
+
                 if model_parameters is None and self.checkpoint_path is not None:
                     prefix_print(
                         "Action", f"Loading Model From {self.checkpoint_path}"
@@ -522,7 +540,7 @@ class CausalLanguageModelTrainer:
                     sharded_state = EasyDelState.load_state(
                         verbose=self.arguments.verbose,
                         state_shard_fns=shard_fns,
-                        init_optimizer=True,
+                        init_optimizer_state=True,
                         checkpoint_path=self.checkpoint_path,
                     )
 
@@ -586,7 +604,11 @@ class CausalLanguageModelTrainer:
         )
         return filename
 
-    def train(self, model_parameters: Optional[flax.core.FrozenDict] = None) -> TrainerOutput:
+    def train(
+            self,
+            model_parameters: Optional[flax.core.FrozenDict] = None,
+            state: Optional[EasyDelState] = None
+    ) -> TrainerOutput:
         """
         The train function is the main function of this module.
         It takes a model_parameters argument which can be used to load a pretrained model and finetune it.
@@ -596,6 +618,7 @@ class CausalLanguageModelTrainer:
 
         :param self: Make the class methods aware of other methods and attributes within the class
         :param model_parameters: flax.core.FrozenDict: Load a pre-trained model
+        :param state: Optional[EasyDelState]: Ready to Use State
         :return: An object of type "TrainerOutput"
 
         """
@@ -612,7 +635,8 @@ class CausalLanguageModelTrainer:
             initialise_tracking(dir_prefix=dir_prefix)
         start_time = time.time()
         sharded_state, shard_fns, gather_fns = self.init_state(
-            model_parameters=model_parameters
+            model_parameters=model_parameters,
+            state=state
         )
         count_model_parameters(sharded_state.params)
         with self.mesh:
