@@ -1,4 +1,5 @@
 nav:
+  - Home: index.md
   - AvailableModels: AvailableModels.md
   - EasyBIT: Bits.md
   - install: Install.md
@@ -22,7 +23,6 @@ nav:
       - MosaicMPT Models: MosaicMPT.md
       - PytorchServer: PyTorchServer.md
       - TrainingExample: TrainingExample.md
-  - Home: index.md
   - Linen:
       - Bits: linen-bits.md
       - Utils: linen-utils.md
@@ -30,7 +30,7 @@ nav:
       - Auto Easydel Model: modules-auto_easydel_model.md
       - Easydel Modelling Utils: modules-easydel_modelling_utils.md
       - Falcon:
-          - - Falcon Configuration: modules-falcon-falcon_configuration.md
+          - Falcon Configuration: modules-falcon-falcon_configuration.md
           - Modelling Falcon Flax: modules-falcon-modelling_falcon_flax.md
       - Flax Modelling Utils: modules-flax_modelling_utils.md
       - Gpt J:
