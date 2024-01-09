@@ -88,7 +88,6 @@ def eval_shape_create_test():
             module=module,
             module_config_args=None
         )
-        print(state)
         return state
 
     print(jax.eval_shape(create_state))

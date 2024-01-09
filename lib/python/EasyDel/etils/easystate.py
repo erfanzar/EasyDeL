@@ -103,19 +103,29 @@ class EasyDelState(struct.PyTreeNode):
         )
         opt_state = tx.init(params_with_opt)
 
-        if module_config is not None and module_config_args is None:
-            module_config_args = module_config.to_dict()
-
         if module_config_args is not None:
             module_config_args = {
                 k: v for k, v in module_config_args.items() if isinstance(
                     v, (
-                        int, float, str, list, tuple, bool, dict
+                        int, float, list, tuple, bool, dict
                     )
                 ) and not isinstance(
                     v, jax.sharding.PartitionSpec
                 )
             }
+        if module_config is not None:
+            for k in list(module_config.__dict__.keys()):
+                val = module_config.__dict__.get(k)
+                if not isinstance(val, (int, bool)):
+                    val = module_config.__dict__.pop(k)
+                    hyperparameters[f"{k}_is_{val}"] = 1
+
+        if tx_init is not None:
+            for k in list(tx_init.keys()):
+                val = tx_init.get(k)
+                if not isinstance(val, (int, bool)):
+                    val = tx_init.pop(k)
+                    tx_init[f"{k}_is_{val}"] = 1
         return cls(
             step=0,
             apply_fn=apply_fn,
@@ -478,6 +488,26 @@ class EasyDelState(struct.PyTreeNode):
         return {
             f"model_type_is_{model_type}": 1
         }
+
+    @staticmethod
+    def safe_dict(dictionary: dict):
+        for k in list(dictionary.keys()):
+            val = dictionary.get(k)
+            if not isinstance(val, (int, bool)):
+                val = dictionary.pop(k)
+                dictionary[f"{k}_is_{val}"] = 1
+        return dictionary
+
+    @staticmethod
+    def unsafe_dict(dictionary: dict):
+        result = {}
+        for k in list(dictionary.keys()):
+            try:
+                key, val = k.split("_is_")
+                result[key] = val
+            except:
+                ...
+        return result
 
     def __str__(self):
 
