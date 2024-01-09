@@ -534,13 +534,13 @@ class CausalLanguageModelTrainer:
                     prefix_print(
                         "Action", f"Loading Model From {self.checkpoint_path}"
                     )
-
-                    sharded_state = EasyDelState.load_state(
-                        verbose=self.arguments.verbose,
-                        state_shard_fns=shard_fns,
-                        init_optimizer_state=True,
-                        checkpoint_path=self.checkpoint_path,
-                    )
+                    with jax.default_device(self.arguments.offload_device):
+                        sharded_state = EasyDelState.load_state(
+                            verbose=self.arguments.verbose,
+                            state_shard_fns=shard_fns,
+                            init_optimizer_state=True,
+                            checkpoint_path=self.checkpoint_path,
+                        )
 
                     if self.arguments.remove_ckpt_after_load:
                         os.remove(self.checkpoint_path)
