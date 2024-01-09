@@ -234,7 +234,6 @@ class TrainArguments(
             gradient_accumulation_steps=self.gradient_accumulation_steps,
             weight_decay=self.weight_decay,
             steps=self.max_steps,
-            **extra_optimizer_kwargs
         )
         self.training_time = self._time_to_seconds(
             training_time) if training_time is not None else None
