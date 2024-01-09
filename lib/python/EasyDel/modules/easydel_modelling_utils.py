@@ -46,7 +46,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
                 ("dp", "fsdp"), "sp", "tp", None),
             use_shard_map: bool = False,
-            backend: Optional[None] = None,
+            backend: Optional[None] = jax.default_backend(),
             easy_method: EasyMethod = EasyMethod.TRAIN,
             **kwargs
     ):
