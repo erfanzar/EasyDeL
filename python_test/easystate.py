@@ -1,6 +1,8 @@
-from fjformer.optimizers import get_adamw_with_linear_scheduler
+import jax
+
 from lib.python.EasyDel import LlamaConfig, FlaxLlamaForCausalLM
 from lib.python.EasyDel import EasyDelState
+from lib.python.EasyDel.etils.auto_tx import get_optimizer_and_scheduler
 
 
 def main():
@@ -20,9 +22,12 @@ def main():
     )
 
     tx_init = dict(
+        optimizer="adamw",
+        scheduler="none",
+        learning_rate=1e-5,
         steps=5000
     )
-    tx, sc = get_adamw_with_linear_scheduler(
+    tx, sc = get_optimizer_and_scheduler(
         **tx_init
     )
     state = EasyDelState.create(
@@ -30,11 +35,8 @@ def main():
         apply_fn=module.__call__,
         tx=tx,
         tx_init=tx_init,
-        tx_name="adamw",
-        sc_name="linear",
-        model_type="llama",
         hyperparameters={
-            "some": 2
+            "model_type_is_llama": 1
         },
         module_config=config,
     )
@@ -47,7 +49,46 @@ def main():
 def load():
     state = EasyDelState.load_state("state.easy", init_optimizer_state=False, verbose=True)
     state = state.shard_params()
-    print(state)
+    print(jax.eval_shape(lambda: state))
+
+
+def eval_shape_create_test():
+    config = LlamaConfig(
+        hidden_size=512,
+        intermediate_size=512,
+        num_hidden_layers=4,
+        num_attention_heads=8,
+        num_key_value_heads=4,
+        use_sacn_mlp=False,
+    )
+
+    module = FlaxLlamaForCausalLM(
+        config=config,
+        input_shape=(8, 8),
+        _do_init=True
+    )
+
+    tx_init = dict(
+        optimizer="adamw",
+        scheduler="none",
+        learning_rate=1e-5,
+        steps=5000
+    )
+
+    def create_state():
+        return EasyDelState.create(
+            module_config=config,
+            params=module.params,
+            tx_init=tx_init,
+            apply_fn=module.__call__,
+            tx=get_optimizer_and_scheduler(**tx_init),
+            hyperparameters={
+                "model_type_is_llama": 1
+            },
+            module=module
+        )
+
+    print(jax.eval_shape(create_state))
 
 
 if __name__ == "__main__":

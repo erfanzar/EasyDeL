@@ -418,9 +418,11 @@ class CausalLanguageModelTrainer:
                 apply_fn=self.model.__call__,
                 module_config=self.model.config,
                 tx_init=self.arguments.optimizer_kwargs,
-                tx_name=self.arguments.optimizer,
-                sc_name=self.arguments.scheduler,
-                model_type=self.model.config.model_type,
+                hyperparameters=EasyDelState.create_hyperparameters(
+                    self.model.config.model_type
+                ),
+                module=self.model,
+                module_config_args=None
             )
 
         def create_state_from_params(params_):
@@ -430,9 +432,11 @@ class CausalLanguageModelTrainer:
                 apply_fn=self.model.__call__,
                 module_config=self.model.config,
                 tx_init=self.arguments.optimizer_kwargs,
-                tx_name=self.arguments.optimizer,
-                sc_name=self.arguments.scheduler,
-                model_type=self.model.config.model_type,
+                hyperparameters=EasyDelState.create_hyperparameters(
+                    self.model.config.model_type
+                ),
+                module=self.model,
+                module_config_args=None
             )
 
         # OHA is useless
