@@ -94,34 +94,17 @@ class EasyDelState(struct.PyTreeNode):
         :param kwargs: Pass in additional parameters to the
         :return: A EasyDelState object
         """
+        if hyperparameters is None:
+            hyperparameters = {}
         params_with_opt = (
             params['params'] if OVERWRITE_WITH_GRADIENT in params else params
         )
         opt_state = tx.init(params_with_opt)
-
-        if module_config_args is not None:
-            module_config_args = {
-                k: v for k, v in module_config_args.items() if isinstance(
-                    v, (
-                        int, float, list, tuple, bool, dict
-                    )
-                ) and not isinstance(
-                    v, jax.sharding.PartitionSpec
-                )
-            }
         if module_config is not None:
-            for k in list(module_config.__dict__.keys()):
-                val = module_config.__dict__.get(k)
-                if not isinstance(val, (int, bool)):
-                    val = module_config.__dict__.pop(k)
-                    hyperparameters[f"{k}_is_{val}"] = 1
-
+            hyperparameters = cls.safe_dict(module_config.__dict__) | hyperparameters
         if tx_init is not None:
-            for k in list(tx_init.keys()):
-                val = tx_init.get(k)
-                if not isinstance(val, (int, bool)):
-                    val = tx_init.pop(k)
-                    tx_init[f"{k}_is_{val}"] = 1
+            hyperparameters = cls.safe_dict(tx_init) | hyperparameters
+
         return cls(
             step=0,
             apply_fn=apply_fn,
@@ -132,7 +115,7 @@ class EasyDelState(struct.PyTreeNode):
             tx_init=tx_init,
             hyperparameters=hyperparameters,
             module_config=module_config,
-            module_config_args=module_config_args,
+            module_config_args=None,
             **kwargs,
         )
 
@@ -180,6 +163,13 @@ class EasyDelState(struct.PyTreeNode):
         tx, sc = get_optimizer_and_scheduler(
             **tx_init
         )
+        if hyperparameters is None:
+            hyperparameters = {}
+        hyperparameters = cls.safe_dict(tx_init) | hyperparameters
+        if module_config is not None:
+            hyperparameters = cls.create_hyperparameters(module_config.model_type) | hyperparameters
+            hyperparameters = cls.safe_dict(module_config.__dict__) | hyperparameters
+
         return cls(
             step=step,
             apply_fn=apply_fn,
@@ -190,7 +180,7 @@ class EasyDelState(struct.PyTreeNode):
             hyperparameters=hyperparameters,
             module=module,
             module_config=module_config,
-            module_config_args=module_config_args,
+            module_config_args=None,
             **kwargs,
         )
 
