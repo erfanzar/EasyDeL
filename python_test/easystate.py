@@ -45,7 +45,7 @@ def main():
 
 
 def load():
-    state = EasyDelState.load_state("state.easy", init_optimizer=False, verbose=True)
+    state = EasyDelState.load_state("state.easy", init_optimizer_state=False, verbose=True)
     print(state)
 
 

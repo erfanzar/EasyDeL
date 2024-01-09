@@ -10,6 +10,7 @@ env.ipynb
 pallas_env.py
 test_EasyDelState.py
 io.py
+*.easy
 # Distribution / packaging
 *.json
 .Python

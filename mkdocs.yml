@@ -1,16 +1,28 @@
 nav:
-  - Home: index.md
   - AvailableModels: AvailableModels.md
-  - install: Install.md
   - EasyBIT: Bits.md
-  - Data Preprocessing:
-      - Processor: data_preprocessing-_processor.md
+  - install: Install.md
   - Etils:
+      - Auto Tx: etils-auto_tx.md
       - Configs: etils-configs.md
+      - Easystate: etils-easystate.md
       - Errors: etils-errors.md
       - Etils: etils-etils.md
   - Eval:
       - Lm Eval: eval-lm_eval.md
+  - Data Preprocessing:
+      - Processor: data_preprocessing-_processor.md
+  - Examples:
+      - DataProcessing: DataProcessing.md
+      - Falcon Models: Falcon.md
+      - JAXServer: JAXServer.md
+      - Llama Models: Llama.md
+      - Llama2 Models: Llama2.md
+      - Mistral Models: Mistral.md
+      - MosaicMPT Models: MosaicMPT.md
+      - PytorchServer: PyTorchServer.md
+      - TrainingExample: TrainingExample.md
+  - Home: index.md
   - Linen:
       - Bits: linen-bits.md
       - Utils: linen-utils.md
@@ -18,7 +30,7 @@ nav:
       - Auto Easydel Model: modules-auto_easydel_model.md
       - Easydel Modelling Utils: modules-easydel_modelling_utils.md
       - Falcon:
-          - Falcon Configuration: modules-falcon-falcon_configuration.md
+          - - Falcon Configuration: modules-falcon-falcon_configuration.md
           - Modelling Falcon Flax: modules-falcon-modelling_falcon_flax.md
       - Flax Modelling Utils: modules-flax_modelling_utils.md
       - Gpt J:
@@ -62,12 +74,17 @@ nav:
   - Reinforcement Learning:
       - Core: reinforcement_learning-core.md
       - Models:
-          - Modelling Causal Language RL: reinforcement_learning-models-modelling_casual_language_rl.md
+          - Modelling Casual Language Rl: reinforcement_learning-models-modelling_casual_language_rl.md
       - Trainer:
           - Base: reinforcement_learning-trainer-base.md
+          - Dpo Trainer: reinforcement_learning-trainer-dpo_trainer.md
           - Ppo Config: reinforcement_learning-trainer-ppo_config.md
           - Ppo Trainer: reinforcement_learning-trainer-ppo_trainer.md
+          - Training Configs: reinforcement_learning-trainer-training_configs.md
+      - Utils:
+          - Collectors: reinforcement_learning-utils-collectors.md
   - Serve:
+      - Gradio User Interface Base: serve-gradio_user_interface_base.md
       - Jax Serve: serve-jax_serve.md
       - Torch Serve: serve-torch_serve.md
       - Utils: serve-utils.md
@@ -76,6 +93,7 @@ nav:
   - Trainer:
       - Causal Language Model Trainer: trainer-causal_language_model_trainer.md
       - Training Configurations: trainer-training_configurations.md
+      - Utils: trainer-utils.md
   - Transform:
       - Easydel Transform: transform-easydel_transform.md
       - Falcon: transform-falcon.md
@@ -88,16 +106,6 @@ nav:
       - Prompters: utils-prompters.md
       - Tensor Utils: utils-tensor_utils.md
       - Utils: utils-utils.md
-  - Examples:
-      - DataProcessing: DataProcessing.md
-      - Falcon Models: Falcon.md
-      - JAXServer: JAXServer.md
-      - Llama Models: Llama.md
-      - Llama2 Models: Llama2.md
-      - Mistral Models: Mistral.md
-      - MosaicMPT Models: MosaicMPT.md
-      - PytorchServer: PyTorchServer.md
-      - TrainingExample: TrainingExample.md
 
 plugins:
   - search
