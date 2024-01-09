@@ -167,7 +167,7 @@ class TrainerOutput:
     state: EasyDelState
     predict_function: Optional[Callable]
     mesh: Optional[jax.sharding.Mesh]
-    checkpoint_stream: Any
+    checkpoint_manager: Any
     gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]] = None
     shard_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]] = None
     last_save_file_name: Optional[str] = None
@@ -515,7 +515,6 @@ class CausalLanguageModelTrainer:
                 dtype_specs=self.dtype
             )
             if state is not None:
-
                 sharded_state = state
                 params = sharded_state.params if not self.arguments.do_shard_fns else jax.tree_util.tree_map(
                     lambda f, x: f(x),
@@ -535,12 +534,7 @@ class CausalLanguageModelTrainer:
                     prefix_print(
                         "Action", f"Loading Model From {self.checkpoint_path}"
                     )
-                    _, params = CheckpointManager.load_state_checkpoint(
-                        "params",
-                        self.checkpoint_path,
-                        self.state_shape,
-                        shard_fns
-                    )
+
                     sharded_state = EasyDelState.load_state(
                         verbose=self.arguments.verbose,
                         state_shard_fns=shard_fns,
@@ -763,7 +757,7 @@ class CausalLanguageModelTrainer:
                 mesh=self.mesh,
                 shard_fns=shard_fns,
                 gather_fns=gather_fns,
-                checkpoint_stream=self.checkpoint_manager,
+                checkpoint_manager=self.checkpoint_manager,
             )
             if self.arguments.save_steps is None and self.arguments.do_last_save:
                 filename = self._save_state(
