@@ -8,7 +8,7 @@ __pycache__/
 *.so
 env.ipynb
 pallas_env.py
-env.py
+test_EasyDelState.py
 io.py
 # Distribution / packaging
 *.json

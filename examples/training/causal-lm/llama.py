@@ -7,7 +7,7 @@ from datasets import load_dataset
 from huggingface_hub import HfApi
 import EasyDel
 from absl import flags, app
-from fjformer.load._load import get_float_dtype_by_name
+from fjformer.checkpoint import get_dtype
 
 FLAGS = flags.FLAGS
 
@@ -182,8 +182,8 @@ def main(argv):
         model_class=EasyDel.modules.FlaxLlamaForCausalLM,
         configs_to_init_model_class={
             'config': config,
-            'dtype': get_float_dtype_by_name(FLAGS.dtype),
-            'param_dtype': get_float_dtype_by_name(FLAGS.dtype)
+            'dtype': get_dtype(FLAGS.dtype),
+            'param_dtype': get_dtype(FLAGS.dtype)
         },
         custom_rule=config.get_partition_rules(True),
         model_name=FLAGS.project_name,

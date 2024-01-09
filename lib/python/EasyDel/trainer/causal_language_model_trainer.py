@@ -4,7 +4,7 @@ import time
 
 import IPython.display
 import fjformer.func.loss_func
-from fjformer.func.loss_func import fused_cross_entropy_loss_and_accuracy, cross_entropy_loss_and_accuracy
+from fjformer.func.loss_func import cross_entropy_loss_and_accuracy
 import wandb
 from datasets import Dataset
 from wandb.apis.public import Run
@@ -22,11 +22,11 @@ from jax.experimental.pjit import pjit, with_sharding_constraint
 from jax.sharding import PartitionSpec
 from jax import numpy as jnp
 from torch.utils.data import DataLoader
-from fjformer import match_partition_rules, make_shard_and_gather_fns, StreamingCheckpointer
+from fjformer import match_partition_rules, make_shard_and_gather_fns, CheckpointManager
 from ..etils.errors import EasyDelTimerError
 import chex
 from typing import Any, Optional, Union, Tuple, Callable, Mapping
-from .state import EasyState  # Same as Flax.TrainingState
+from ..etils.easystate import EasyDelState
 
 
 def calculate_accuracy(predictions: chex.Array, targets: chex.Array):
@@ -164,7 +164,7 @@ def predict(state, input_ids):
 
 @dataclasses.dataclass
 class TrainerOutput:
-    state: EasyState
+    state: EasyDelState
     predict_function: Optional[Callable]
     mesh: Optional[jax.sharding.Mesh]
     checkpoint_stream: Any
@@ -214,11 +214,11 @@ class CausalLanguageModelTrainer:
         self.config = None
         self.scheduler = None
         self.tx = None
-        self.sharded_create_from_params_fn = None
+        self.create_sharded_state_from_params_fn = None
         self.sharded_train_step_fn = None
         self.sharded_predict = None
         self.mesh = None
-        self.checkpoint_streamer: fjformer.StreamingCheckpointer | None = None
+        self.checkpoint_manager: fjformer.CheckpointManager | None = None
         self.init_fn = None
         self.state_shape = None
         self.state_partition_spec = None
@@ -304,11 +304,11 @@ class CausalLanguageModelTrainer:
             "configure functions and sharding them"
         ).start()
         funcs = self.configure_functions()
-        self.sharded_create_from_params_fn = funcs[0]
+        self.create_sharded_state_from_params_fn = funcs[0]
         self.sharded_train_step_fn = funcs[1]
         self.sharded_predict = funcs[2]
         self.mesh = funcs[3]
-        self.checkpoint_streamer = funcs[4]
+        self.checkpoint_manager = funcs[4]
         self.init_fn = funcs[5]
         self.timer(
             "configure functions and sharding them"
@@ -396,7 +396,7 @@ class CausalLanguageModelTrainer:
         """
         The configure_functions function is responsible for configuring the functions that will be used in training.
         It does this by first defining a function called init_fn, which initializes the model parameters and returns
-        them as a EasyState object. The EasyState object contains all the information needed to train or evaluate
+        them as a EasyDelState object. The EasyDelState object contains all the information needed to train or evaluate
         on a batch of data, including:
         :param self: Access the class attributes
         :return: A tuple of functions
@@ -411,43 +411,36 @@ class CausalLanguageModelTrainer:
                 params__ = self.model.to_bf16(params__)
             elif self.arguments.dtype == jnp.float16:
                 params__ = self.model.to_fp16(params__)
-            return EasyState.create(
+            return EasyDelState.create(
                 tx=self.tx,
                 params=flax.core.freeze({"params": params__}),
-                apply_fn=self.model.__call__
+                apply_fn=self.model.__call__,
+                module_config=self.model.config,
+                tx_init=self.arguments.optimizer_kwargs,
+                tx_name=self.arguments.optimizer,
+                sc_name=self.arguments.scheduler,
+                model_type=self.model.config.model_type,
             )
 
         def create_state_from_params(params_):
-            return EasyState.create(
+            return EasyDelState.create(
                 tx=self.tx,
+                params=params_,
                 apply_fn=self.model.__call__,
-                params=params_
+                module_config=self.model.config,
+                tx_init=self.arguments.optimizer_kwargs,
+                tx_name=self.arguments.optimizer,
+                sc_name=self.arguments.scheduler,
+                model_type=self.model.config.model_type,
             )
 
-        if self.arguments.loss_re_mat == "OHA":
-            loss_fn = fjformer.func.loss_func.cross_entropy_with_logits
-        elif self.arguments.loss_re_mat != "":
-            loss_fn = fused_cross_entropy_loss_and_accuracy
-        else:
-            loss_fn = cross_entropy_loss_and_accuracy
-
-        def fsdp_train_step_(state, batch):
-            batch = with_sharding_constraint(batch, self.arguments.step_partition_spec)
-
-            def calculate_loss(params):
-                labels = batch.pop("labels")
-                logits = state.apply_fn(params=params, **batch,
-                                        return_dict=True).logits[:, :-1, :]
-
-                loss, accuracy = loss_fn(
-                    logits, labels, batch["attention_mask"].astype(jnp.float32)[:, 1:]
-                )
-                return loss, accuracy
-
-            grad_fn = jax.value_and_grad(calculate_loss, has_aux=True)
-            (loss__, accuracy__), grad = grad_fn(state.params)
-            state = state.apply_gradients(grads=grad)
-            return state, loss__, accuracy__
+        # OHA is useless
+        # if self.arguments.loss_re_mat == "OHA":
+        #     loss_fn = fjformer.func.loss_func.cross_entropy_with_logits
+        # elif self.arguments.loss_re_mat != "":
+        #     loss_fn = fused_cross_entropy_loss_and_accuracy
+        # else:
+        #     loss_fn = cross_entropy_loss_and_accuracy
 
         state_shape = jax.eval_shape(init_fn)
         state_partition_spec = match_partition_rules(
@@ -456,30 +449,33 @@ class CausalLanguageModelTrainer:
             ) if self.arguments.custom_rule is None else self.arguments.custom_rule,
             state_shape
         )
-        sharded_create_from_params_fn = pjit(
+        create_sharded_state_from_params_fn = pjit(
             create_state_from_params,
             in_shardings=(state_partition_spec.params,),
             out_shardings=state_partition_spec,
             donate_argnums=(0,)
         )
         sharded_train_step_fn = pjit(
-            fsdp_train_step_,
+            create_casual_language_model_train_step(self.arguments.step_partition_spec),
             in_shardings=(state_partition_spec, PartitionSpec()),
             out_shardings=(state_partition_spec, PartitionSpec(), PartitionSpec()),
             donate_argnums=(0, 0),
         )
-        sharded_predict = pjit(predict, out_shardings=PartitionSpec(),
-                               in_shardings=(state_partition_spec, PartitionSpec()))
+        sharded_predict = pjit(
+            predict,
+            out_shardings=PartitionSpec(),
+            in_shardings=(state_partition_spec, PartitionSpec())
+        )
         mesh = self.arguments.get_mesh()
         self.arguments.ckpt_path_exists()
-        checkpoint_streamer = self.arguments.get_streaming_checkpointer()
+        checkpoint_manager = self.arguments.get_streaming_checkpointer()
         self.state_partition_spec = state_partition_spec
         self.state_shape = state_shape
-        return sharded_create_from_params_fn, sharded_train_step_fn, sharded_predict, mesh, checkpoint_streamer, init_fn
+        return create_sharded_state_from_params_fn, sharded_train_step_fn, sharded_predict, mesh, checkpoint_manager, init_fn
 
     def eval(
             self,
-            state: EasyState
+            state: EasyDelState
     ):
         if self.dataset_eval is not None:
             pbar_eval = tqdm(total=self.max_steps_eval)
@@ -506,26 +502,33 @@ class CausalLanguageModelTrainer:
     def init_state(
             self,
             model_parameters: Optional[flax.core.FrozenDict] = None
-    ) -> Tuple[EasyState, Mapping[str, Callable], Mapping[str, Callable]]:
+    ) -> Tuple[EasyDelState, Mapping[str, Callable], Mapping[str, Callable]]:
         with self.mesh:
             shard_fns, gather_fns = make_shard_and_gather_fns(
                 self.state_partition_spec,
                 dtype_specs=self.dtype
             )
             if self.finetune:
-                if model_parameters is None:
+                if model_parameters is None and self.checkpoint_path is not None:
                     prefix_print(
                         "Action", f"Loading Model From {self.checkpoint_path}"
                     )
-                    _, params = StreamingCheckpointer.load_trainstate_checkpoint(
-                        f"params::{self.checkpoint_path}",
+                    _, params = CheckpointManager.load_state_checkpoint(
+                        "params",
+                        self.checkpoint_path,
                         self.state_shape,
                         shard_fns
+                    )
+                    sharded_state = EasyDelState.load_state(
+                        verbose=self.arguments.verbose,
+                        state_shard_fns=shard_fns,
+                        init_optimizer=True,
+                        checkpoint_path=self.checkpoint_path,
                     )
 
                     if self.arguments.remove_ckpt_after_load:
                         os.remove(self.checkpoint_path)
-                else:
+                elif model_parameters is not None and self.checkpoint_path is None:
                     prefix_print(
                         "Action", f"Sharding Passed Parameters"
                     )
@@ -541,54 +544,46 @@ class CausalLanguageModelTrainer:
                         shard_fns.params,
                         model_parameters
                     )
-
-                _sharded_state = self.sharded_create_from_params_fn(params)
+                    sharded_state = self.create_sharded_state_from_params_fn(params)
+                elif model_parameters is not None and self.checkpoint_path is not None:
+                    raise EasyDelTimerError(
+                        "You can't pass `model_parameters` and `checkpoint_path` at same time"
+                    )
+                else:
+                    raise EasyDelTimerError(
+                        "You should pass `model_parameters` or `checkpoint_path` to trainer in order to load model"
+                    )
             else:
-                _sharded_state = self.init_fn()
-                params = _sharded_state.params if not self.arguments.do_shard_fns else jax.tree_util.tree_map(
+                sharded_state = self.init_fn()
+                params = sharded_state.params if not self.arguments.do_shard_fns else jax.tree_util.tree_map(
                     lambda f, x: f(x),
                     shard_fns.params,
-                    _sharded_state.params
+                    sharded_state.params
                 )
-                _sharded_state.params = params
-            return _sharded_state, shard_fns, gather_fns
+                sharded_state.params = params
+            return sharded_state, shard_fns, gather_fns
 
     def _save_state(
             self,
-            state: EasyState,
+            state: EasyDelState,
             gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
             milestone: bool = False
     ) -> str:
         step = int(jax.device_get(
             state.step)) + self.arguments.step_start_point if self.arguments.step_start_point is not None else int(
             jax.device_get(state.step))
-        trained_tokens = (
-                step * self.arguments.total_batch_size *
-                self.arguments.gradient_accumulation_steps * self.arguments.max_length
+        checkpoint_name = "streaming_train_state"
+        filename = f"{checkpoint_name}_{step}" if milestone else f"{checkpoint_name}"
+        filename += ".easy"
+        print(f"Saving Model \033[1;30m{filename}\033[1;0m")
+        state.save_state(
+            filename=filename,
+            checkpoint_dir=os.path.join(self.arguments.save_dir, self.arguments.model_name),
+            gather_fns=gather_fns,
+            float_dtype=self.dtype,
+            verbose=self.arguments.verbose,
+            save_optimizer=self.arguments.save_optimizer_state,
         )
-        if self.arguments.save_optimizer_state_and_configs:
-            checkpoint_name = "streaming_train_state"
-            filename = f"{checkpoint_name}_{step}" if milestone else f"{checkpoint_name}"
-            print(f"Saving Model \033[1;30m{filename}\033[1;0m")
-            metadata = dict(
-                step=step,
-                model_config=self.model.config.to_dict(),
-            )
-            self.checkpoint_streamer.save_all(
-                train_state=state,
-                gather_fns=gather_fns,
-                metadata=metadata,
-                milestone=milestone,
-            )
-        else:
-            filename = f"M{self.arguments.model_name}-T{trained_tokens}-S{step}"
-            print(f"Saving Model \033[1;30m{filename}\033[1;0m")
-
-            self.checkpoint_streamer.save_checkpoint(
-                train_state=state.params["params"],
-                gather_fns=gather_fns.params["params"],
-                filename=filename
-            )
         return filename
 
     def train(self, model_parameters: Optional[flax.core.FrozenDict] = None) -> TrainerOutput:
@@ -606,27 +601,31 @@ class CausalLanguageModelTrainer:
         """
 
         def count_model_parameters(_p):
-            print("\033[1;31mModel Contain ",
-                  sum(n.size for n in jax.tree_util.tree_flatten(flax.core.unfreeze(_p))[0]) / 1e9,
-                  " Billion Parameters")
+            print(
+                "\033[1;31mModel Contain ",
+                sum(n.size for n in jax.tree_util.tree_flatten(flax.core.unfreeze(_p))[0]) / 1e9,
+                " Billion Parameters"
+            )
 
         dir_prefix: str = "/dev/shm"
         if self.arguments.track_memory:
             initialise_tracking(dir_prefix=dir_prefix)
         start_time = time.time()
-        _sharded_state, shard_fns, gather_fns = self.init_state(model_parameters=model_parameters)
-        count_model_parameters(_sharded_state.params)
+        sharded_state, shard_fns, gather_fns = self.init_state(
+            model_parameters=model_parameters
+        )
+        count_model_parameters(sharded_state.params)
         with self.mesh:
             pbar = tqdm(total=self.max_steps_train)
-            current_step = _sharded_state.step.tolist()
+            current_step = sharded_state.step.tolist()
             losses = []
             accuracies = []
-            pbar.update(_sharded_state.step.tolist())
+            pbar.update(sharded_state.step.tolist())
             learning_rates = []
             if self.wandb_runtime is not None:
                 model_parameters_number = sum(
                     n.size for n in
-                    jax.tree_util.tree_flatten(flax.core.unfreeze(_sharded_state.params))[0]
+                    jax.tree_util.tree_flatten(flax.core.unfreeze(sharded_state.params))[0]
                 ) / 1e9
                 self.wandb_runtime.log(
                     {
@@ -651,9 +650,9 @@ class CausalLanguageModelTrainer:
                             for ssb in self.arguments.ids_to_pop_from_dataset:
                                 _ = batch.pop(ssb, None)
                             time_s = time.time()
-                            _sharded_state, loss, accuracy = self.sharded_train_step_fn(_sharded_state,
-                                                                                        batch
-                                                                                        )
+                            sharded_state, loss, accuracy = self.sharded_train_step_fn(sharded_state,
+                                                                                       batch
+                                                                                       )
                             ttl_time = time.time() - time_s
                             losses.append(loss)
                             learning_rates.append(self.scheduler(current_step).tolist())
@@ -684,9 +683,9 @@ class CausalLanguageModelTrainer:
                                             "accuracy": accuracy.tolist(),
                                             "mean accuracy": (sum(accuracies) / len(accuracies)).tolist(),
                                             "learning_rate": self.scheduler(
-                                                _sharded_state.step.tolist()
+                                                sharded_state.step.tolist()
                                             ).tolist(),
-                                            "step": _sharded_state.step.tolist(),
+                                            "step": sharded_state.step.tolist(),
                                             "step time": ttl_time,
                                             "perplexity": jnp.exp(loss).tolist(),
                                             "trained_tokens": trained_tokens,
@@ -701,8 +700,8 @@ class CausalLanguageModelTrainer:
                                 pbar.display(mem_res)
                             pbar.set_postfix(
                                 loss=loss,
-                                learning_rate=self.scheduler(_sharded_state.step.tolist()).tolist(),
-                                step=_sharded_state.step.tolist(),
+                                learning_rate=self.scheduler(sharded_state.step.tolist()).tolist(),
+                                step=sharded_state.step.tolist(),
                                 perplexity=jnp.exp(loss).tolist(),
                                 accuracy=accuracy,
                                 epoch=epoch
@@ -714,7 +713,7 @@ class CausalLanguageModelTrainer:
                             break
                         if self.arguments.save_steps is not None and current_step % self.arguments.save_steps == 0:
                             filename = self._save_state(
-                                state=_sharded_state,
+                                state=sharded_state,
                                 gather_fns=gather_fns,
                                 milestone=True
                             )
@@ -732,22 +731,22 @@ class CausalLanguageModelTrainer:
                 )
             output = TrainerOutput(
                 predict_function=self.sharded_predict,
-                state=_sharded_state,
+                state=sharded_state,
                 mesh=self.mesh,
                 shard_fns=shard_fns,
                 gather_fns=gather_fns,
-                checkpoint_stream=self.checkpoint_streamer,
+                checkpoint_stream=self.checkpoint_manager,
             )
             if self.arguments.save_steps is None and self.arguments.do_last_save:
                 filename = self._save_state(
-                    state=_sharded_state,
+                    state=sharded_state,
                     gather_fns=gather_fns
                 )
                 checkpoint_path = f"{str(self.arguments.get_path())}/{filename}"
 
             if self.arguments.do_eval:
                 self.eval(
-                    _sharded_state
+                    sharded_state
                 )
 
             output.checkpoint_path = checkpoint_path

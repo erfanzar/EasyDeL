@@ -42,8 +42,8 @@ class LlamaConfig(EasyDelPretrainedConfig):
             bits: Optional[int] = None,
             hidden_act: str = 'silu',
             pretraining_tp: int = 1,
-            scan_layers: bool = True,
-            use_shard_map: bool = True,
+            scan_layers: bool = False,
+            use_shard_map: bool = False,
             **kwargs,
     ):
         """
