@@ -94,10 +94,6 @@ class EasyDelState(struct.PyTreeNode):
         :param kwargs: Pass in additional parameters to the
         :return: A EasyDelState object
         """
-        if tx_init is None:
-            tx_init = {
-                "steps": 1e9
-            }
         params_with_opt = (
             params['params'] if OVERWRITE_WITH_GRADIENT in params else params
         )
@@ -177,10 +173,11 @@ class EasyDelState(struct.PyTreeNode):
             tx_init = {}
         optimizer = tx_init.pop("optimizer", "adamw")
         scheduler = tx_init.pop("scheduler", "none")
-
+        steps = tx_init.pop("steps", 1e6)
+        tx_init["optimizer"] = optimizer
+        tx_init["scheduler"] = scheduler
+        tx_init["steps"] = steps
         tx, sc = get_optimizer_and_scheduler(
-            optimizer=optimizer,
-            scheduler=scheduler,
             **tx_init
         )
         return cls(
