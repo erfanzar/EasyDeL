@@ -76,21 +76,25 @@ def eval_shape_create_test():
     )
 
     def create_state():
-        return EasyDelState.create(
+        state = EasyDelState.create(
             module_config=config,
             params=module.params,
             tx_init=tx_init,
             apply_fn=module.__call__,
-            tx=get_optimizer_and_scheduler(**tx_init),
+            tx=get_optimizer_and_scheduler(**tx_init)[0],
             hyperparameters={
                 "model_type_is_llama": 1
             },
-            module=module
+            module=module,
+            module_config_args=None
         )
+        print(state)
+        return state
 
     print(jax.eval_shape(create_state))
 
 
 if __name__ == "__main__":
-    main()
-    load()
+    # main()
+    # load()
+    eval_shape_create_test()
