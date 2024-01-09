@@ -559,7 +559,9 @@ class CausalLanguageModelTrainer:
             gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
             milestone: bool = False
     ) -> str:
-        step = int(jax.device_get(state.step))
+        step = int(jax.device_get(
+            state.step)) + self.arguments.step_start_point if self.arguments.step_start_point is not None else int(
+            jax.device_get(state.step))
         trained_tokens = (
                 step * self.arguments.total_batch_size *
                 self.arguments.gradient_accumulation_steps * self.arguments.max_length
