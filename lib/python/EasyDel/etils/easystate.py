@@ -537,7 +537,7 @@ class EasyDelState(struct.PyTreeNode):
             try:
                 k_, v_ = k.split("_is_")
                 if k_ == key:
-                    result = v
+                    result = v_
                     break
             except:
                 ...
