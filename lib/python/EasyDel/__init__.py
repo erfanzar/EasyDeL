@@ -149,9 +149,13 @@ from .transform.easydel_transform import (
     huggingface_to_easydel as huggingface_to_easydel
 )
 from .etils import (
-    EasyDelOptimizers,
-    EasyDelSchedulers,
-    EasyDelGradientCheckPointers
+    EasyDelOptimizers as EasyDelOptimizers,
+    EasyDelSchedulers as EasyDelSchedulers,
+    EasyDelGradientCheckPointers as EasyDelGradientCheckPointers,
+    EasyDelState as EasyDelState,
+    EasyDelTimerError as EasyDelTimerError,
+    EasyDelRuntimeError as EasyDelRuntimeError,
+    EasyDelSyntaxRuntimeError as EasyDelSyntaxRuntimeError
 )
 
-__version__ = "0.0.41"
+__version__ = "0.0.42"

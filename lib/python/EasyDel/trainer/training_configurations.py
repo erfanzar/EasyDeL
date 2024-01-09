@@ -6,11 +6,12 @@ from typing import OrderedDict, List, Union, Mapping, Optional, Tuple, Callable
 from wandb.apis.public import Run
 from wandb.sdk.lib import RunDisabled
 
-from .utils import get_optimizer_and_scheduler, JaxDistributedConfig
+from .utils import JaxDistributedConfig
+from ..etils.auto_tx import get_optimizer_and_scheduler
 from jax.sharding import PartitionSpec
 import torch.utils.tensorboard
 import wandb
-from fjformer import StreamingCheckpointer
+from fjformer import CheckpointManager
 from jax.experimental.mesh_utils import create_device_mesh
 
 from jax.sharding import Mesh
@@ -85,8 +86,9 @@ class TrainArguments(
             jax_distributed_config: Optional[dict] = None,
             log_all_workers: bool = False,
             wandb_entity: Optional[str] = None,
-            save_optimizer_state_and_configs: bool = False,
+            save_optimizer_state: bool = False,
             step_start_point: Optional[int] = None,
+            verbose: bool = False,
             **kwargs
     ):
         """
@@ -145,9 +147,10 @@ class TrainArguments(
     :param jax_distributed_config: Optional[dict]: Configure the jax distributed backend
     :param log_all_workers: bool: Log all workers in wandb,
     :param wandb_entity: Optional[str]: Specify the entity to use when logging to weights &amp; biases
-    :param save_optimizer_state_and_configs : bool: when ever to save optimizer state and other args in checkpoint
+    :param save_optimizer_state : bool: when ever to save optimizer state and other args in checkpoint
     :param step_start_point: Optional[int]: start training from given step for example instead of starting training from
     step 0 it will start from 20000 and leave the data behind
+    :param verbose: bool: when ever to turn verbose mode of or on
     :param **kwargs: Pass keyword, variable-length argument list
     :return: Nothing
         """
@@ -218,8 +221,21 @@ class TrainArguments(
         self.log_all_workers = log_all_workers
         self.dataloader_num_workers = dataloader_num_workers
         self.dataloader_pin_memory = dataloader_pin_memory
-        self.save_optimizer_state_and_configs = save_optimizer_state_and_configs
+        self.save_optimizer_state = save_optimizer_state
         self.step_start_point = step_start_point
+        self.verbose = verbose
+        self.optimizer_kwargs = dict(
+            learning_rate=self.learning_rate,
+            learning_rate_end=self.learning_rate_end,
+            optimizer=self.optimizer,
+            scheduler=self.scheduler,
+            extra_optimizer_kwargs=self.extra_optimizer_kwargs,
+            warmup_steps=self.warmup_steps,
+            gradient_accumulation_steps=self.gradient_accumulation_steps,
+            weight_decay=self.weight_decay,
+            steps=self.max_steps,
+            **extra_optimizer_kwargs
+        )
         self.training_time = self._time_to_seconds(
             training_time) if training_time is not None else None
         torch.set_default_device("cpu")
@@ -227,8 +243,8 @@ class TrainArguments(
 
     @staticmethod
     def _time_to_seconds(time_str):
-        pattern = r"(\d+)\s*(H|min|Min)"
-        match = re.match(pattern, time_str)
+        pattern = r"(\d+)\s*(h|min)"
+        match = re.match(pattern, time_str.lower())
 
         if match:
             value = int(match.group(1))
@@ -361,16 +377,9 @@ class TrainArguments(
             self,
             steps: int | None = None
     ):
+        self.optimizer_kwargs["steps"] = steps or self.optimizer_kwargs["steps"]
         return get_optimizer_and_scheduler(
-            learning_rate=self.learning_rate,
-            learning_rate_end=self.learning_rate_end,
-            optimizer=self.optimizer,
-            scheduler=self.scheduler,
-            extra_optimizer_kwargs=self.extra_optimizer_kwargs,
-            warmup_steps=self.warmup_steps,
-            gradient_accumulation_steps=self.gradient_accumulation_steps,
-            weight_decay=self.weight_decay,
-            steps=steps or self.max_steps,
+            **self.optimizer_kwargs
         )
 
     def get_streaming_checkpointer(self):
@@ -381,14 +390,13 @@ class TrainArguments(
         checkpoint_002, etc.). This allows you to keep multiple versions of your trained models.
 
         :param self: Represent the instance of the class
-        :return: A streamingcheckpointer object
+        :return: A CheckpointManager object
 
         """
-        return StreamingCheckpointer(
-            StreamingCheckpointer.get_default_config(
-                {"save_optimizer_state": self.save_optimizer_state_and_configs}
-            ),
-            os.path.join(self.save_dir, self.model_name)
+        return CheckpointManager(
+            os.path.join(self.save_dir, self.model_name),
+            save_optimizer_state=self.save_optimizer_state,
+            verbose=self.verbose
         )
 
     def get_board(self):

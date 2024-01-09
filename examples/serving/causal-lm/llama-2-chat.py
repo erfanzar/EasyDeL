@@ -3,7 +3,7 @@ import typing
 import EasyDel
 import jax.lax
 from EasyDel.serve import JAXServer, JAXServerConfig
-from fjformer.load._load import get_float_dtype_by_name
+from fjformer.checkpoint import get_dtype
 from EasyDel.transform import llama_from_pretrained
 from transformers import AutoTokenizer
 import gradio as gr
@@ -56,8 +56,8 @@ class Llama2Host(JAXServer):
         tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
         model = EasyDel.modules.FlaxLlamaForCausalLM(
             config=config_model,
-            dtype=get_float_dtype_by_name(config['dtype'] if config is not None else 'fp16'),
-            param_dtype=get_float_dtype_by_name(config['dtype'] if config is not None else 'fp16'),
+            dtype=get_dtype(config['dtype'] if config is not None else 'fp16'),
+            param_dtype=get_dtype(config['dtype'] if config is not None else 'fp16'),
             precision=jax.lax.Precision("fastest"),
             _do_init=False
         )
@@ -79,8 +79,8 @@ class Llama2Host(JAXServer):
         config_model = EasyDel.LlamaConfig.from_pretrained(config_repo or pretrained_model_name_or_path)
         model = EasyDel.FlaxLlamaForCausalLM(
             config=config_model,
-            dtype=get_float_dtype_by_name(config['dtype'] if config is not None else 'fp16'),
-            param_dtype=get_float_dtype_by_name(config['dtype'] if config is not None else 'fp16'),
+            dtype=get_dtype(config['dtype'] if config is not None else 'fp16'),
+            param_dtype=get_dtype(config['dtype'] if config is not None else 'fp16'),
             precision=jax.lax.Precision("fastest"),
             _do_init=False
         )

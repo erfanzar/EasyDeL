@@ -16,7 +16,7 @@ from ..smi import get_mem, initialise_tracking
 from jax import numpy as jnp
 from jax.experimental import mesh_utils
 from flax.serialization import from_bytes
-from fjformer.load._load import get_float_dtype_by_name
+from fjformer.checkpoint import get_dtype
 from jax.sharding import Mesh, PartitionSpec as Ps
 from transformers import GenerationConfig
 import logging
@@ -346,7 +346,7 @@ class JAXServer(GradioUserInference):
         rules = match_partition_rules(params=shape, rules=config_model.get_partition_rules(True))
 
         with server.mesh:
-            shard_fns, _ = make_shard_and_gather_fns(rules, get_float_dtype_by_name(server.config.dtype))
+            shard_fns, _ = make_shard_and_gather_fns(rules, get_dtype(server.config.dtype))
             logging.info(
                 "loading checkpoints"
             )
@@ -479,7 +479,7 @@ class JAXServer(GradioUserInference):
                 "matching partition rules"
             )
             rules = match_partition_rules(params=params, rules=config_model.get_partition_rules(True))
-            shard_fns, _ = make_shard_and_gather_fns(rules, get_float_dtype_by_name(server.config.dtype))
+            shard_fns, _ = make_shard_and_gather_fns(rules, get_dtype(server.config.dtype))
             logging.info(
                 "sharding parameters across all of the chosen backend(tpu/gpu/cpu)s"
             )
@@ -593,7 +593,7 @@ class JAXServer(GradioUserInference):
             "the parameters will be sharded and ba saved inside server you can access them by ``JAXServer.params``")
         rules = match_partition_rules(params=params, rules=partition_rules)
         self.rules = rules
-        shard_fns, _ = make_shard_and_gather_fns(rules, get_float_dtype_by_name(self.config.dtype))
+        shard_fns, _ = make_shard_and_gather_fns(rules, get_dtype(self.config.dtype))
 
         with self.mesh:
             self.params = jax.tree_map(

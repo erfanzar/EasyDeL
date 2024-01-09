@@ -2,7 +2,7 @@ class EasyDelRuntimeError(Exception):
     ...
 
 
-class EasyDeSyntaxRuntimeError(Exception):
+class EasyDelSyntaxRuntimeError(Exception):
     ...
 
 

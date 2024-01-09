@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="EasyDeL",
-    version="0.0.41",
+    version="0.0.42",
     author="Erfan Zare Chavoshi",
     author_email="erfanzare82@eyahoo.com",
     description="An open-source library to make training faster and more optimized in Jax/Flax",
@@ -29,7 +29,7 @@ setup(
         "jax>=0.4.17",
         "jaxlib>=0.4.17",
         "flax~=0.7.5",
-        "fjformer>=0.0.20",
+        "fjformer>=0.0.22",
         "transformers>=4.33.0",
         "einops~=0.6.1",
         "optax~=0.1.7",

@@ -9,9 +9,9 @@ import os
 from typing import List
 
 
-def get_float_dtype_by_name(dtype):
+def get_dtype(dtype):
     """
-    The get_float_dtype_by_name function is a helper function that returns the JAX float dtype
+    The get_dtype function is a helper function that returns the JAX float dtype
     corresponding to the string name of a floating point type.  This is useful for converting
     between strings and JAX float types, which are used in many places throughout this codebase.
 
@@ -44,7 +44,7 @@ def float_tensor_to_dtype(tensor, dtype):
     if dtype is None or dtype == "":
         return tensor
     if isinstance(dtype, str):
-        dtype = get_float_dtype_by_name(dtype)
+        dtype = get_dtype(dtype)
     float_dtypes = (jax.numpy.bfloat16, jax.numpy.float16, jax.numpy.float32, jax.numpy.float64)
     if getattr(tensor, 'dtype', None) in float_dtypes:
         tensor = tensor.astype(dtype)
