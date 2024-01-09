@@ -22,9 +22,6 @@ class EasyDelState(struct.PyTreeNode):
     params: core.FrozenDict[str, Any] = struct.field(pytree_node=True)
     tx: optax.GradientTransformation = struct.field(pytree_node=False)
     opt_state: Optional[optax.OptState] = struct.field(pytree_node=True)
-    tx_name: str
-    sc_name: str
-    model_type: str
     tx_init: Optional[dict] = struct.field(pytree_node=True)
     hyperparameters: Optional[dict] = struct.field(pytree_node=True)
 
@@ -73,9 +70,6 @@ class EasyDelState(struct.PyTreeNode):
             apply_fn: Callable,
             params: core.FrozenDict[str, Any] | Mapping[str, Any],
             tx: optax.GradientTransformation,
-            model_type: str,
-            tx_name: AVAILABLE_OPTIMIZERS = "adamw",
-            sc_name: AVAILABLE_SCHEDULERS = "none",
             tx_init: Optional[dict] = None,
             hyperparameters: Optional[dict] = None,
             module: Optional[EasyDelFlaxPretrainedModel] = None,
@@ -92,13 +86,10 @@ class EasyDelState(struct.PyTreeNode):
         :param apply_fn: Callable: Apply the model to a batch of data
         :param params: core.FrozenDict[str,Any] | Mapping[str,Any]: Pass in the parameters of the model
         :param tx: optax.GradientTransformation: Initialize the optimizer
-        :param model_type: str: Determine which model is being used
-        :param tx_name: AVAILABLE_OPTIMIZERS: Set the optimizer
-        :param sc_name: AVAILABLE_SCHEDULERS: Specify the type of scheduler to be used
         :param tx_init: Optional[dict]: Initialize the optimizer
-        :param hyperparameters: Optional[dict]: Pass hyperparameters to the optimizer
-        :param module: Optional[EasyDelFlaxPretrainedModel]: Pass the model to be trained
-        :param module_config: Optional[EasyDelPretrainedConfig]: Pass in the pretrained config
+        :param hyperparameters: Optional[dict]: Pass hyperparameters to the state for init
+        :param module: Optional[EasyDelFlaxPretrainedModel]: Pass the module to be used int state
+        :param module_config: Optional[EasyDelPretrainedConfig]: Pass in the module config
         :param module_config_args: Optional[dict]: Store the config args of the model
         :param kwargs: Pass in additional parameters to the
         :return: A EasyDelState object
@@ -132,10 +123,7 @@ class EasyDelState(struct.PyTreeNode):
             params=params,
             tx=tx,
             opt_state=opt_state,
-            tx_name=tx_name,
-            sc_name=sc_name,
             tx_init=tx_init,
-            model_type=model_type,
             hyperparameters=hyperparameters,
             module_config=module_config,
             module_config_args=module_config_args,
@@ -150,9 +138,6 @@ class EasyDelState(struct.PyTreeNode):
             apply_fn: Callable,
             params: core.FrozenDict[str, Any] | Mapping[str, Any],
             opt_state: Optional[optax.OptState],
-            model_type: str,
-            tx_name: AVAILABLE_OPTIMIZERS = "adamw",
-            sc_name: AVAILABLE_SCHEDULERS = "none",
             tx_init: Optional[dict] = None,
             hyperparameters: Optional[dict] = None,
             module: Optional[EasyDelFlaxPretrainedModel] = None,
@@ -169,27 +154,20 @@ class EasyDelState(struct.PyTreeNode):
         :param step: int: Keep track of the number of steps that have been taken
         :param apply_fn: Callable: Apply the optimizer to the model
         :param params: core.FrozenDict[str,Any] | Mapping[str,Any]: Pass in the parameters of the model
-        :param opt_state: Optional[optax.OptState]: Load the optimizer state
-        :param model_type: str: Identify the model type
-        :param tx_name: AVAILABLE_OPTIMIZERS: Specify the optimizer used for training
-        :param sc_name: AVAILABLE_SCHEDULERS: Set the scheduler
+        :param opt_state: Optional[optax.OptState]: optimizer state
         :param tx_init: Optional[dict]: Pass the hyperparameters to the optimizer
         :param hyperparameters: Optional[dict]: Load hyperparameters from the state dict
-        :param module: Optional[EasyDelFlaxPretrainedModel]: Pass in the model
-        :param module_config: Optional[EasyDelPretrainedConfig]: Load the pretrained model
+        :param module: Optional[EasyDelFlaxPretrainedModel]: Pass in the module
+        :param module_config: Optional[EasyDelPretrainedConfig]: Pass the module config
         :param module_config_args: Optional[dict]: Pass the config_args to the model
         :param kwargs: Pass in any additional parameters that may be needed for the model
         :return: A new instance of the class
         """
         if tx_init is None:
             tx_init = {}
-        optimizer = tx_init.pop("optimizer", None)
-        if tx_name is not None:
-            optimizer = tx_name
+        optimizer = tx_init.pop("optimizer", "adamw")
+        scheduler = tx_init.pop("scheduler", "none")
 
-        scheduler = tx_init.pop("scheduler", None)
-        if tx_name is not None:
-            scheduler = sc_name
         tx, sc = get_optimizer_and_scheduler(
             optimizer=optimizer,
             scheduler=scheduler,
@@ -201,11 +179,8 @@ class EasyDelState(struct.PyTreeNode):
             params=params,
             tx=tx,
             opt_state=opt_state,
-            tx_name=tx_name,
-            sc_name=sc_name,
             tx_init=tx_init,
             hyperparameters=hyperparameters,
-            model_type=model_type,
             module=module,
             module_config=module_config,
             module_config_args=module_config_args,
@@ -240,19 +215,32 @@ class EasyDelState(struct.PyTreeNode):
             shard_fns=state_shard_fns,
             verbose=verbose,
         )
-        cfg, module, convertor = get_modules_by_type(model_type=checkpoint["model_type"])
+
+        hyperparameters = checkpoint.get("hyperparameters")
+        cfg, module, convertor = get_modules_by_type(model_type=cls.get_model_type(hyperparameters))
         module_config = checkpoint.pop("module_config", None)
         if checkpoint["module_config_args"] is not None:
-            module_config = cfg.from_dict(checkpoint["module_config_args"])
+            module_config = cfg.from_dict(checkpoint.get("module_config_args", {}))
         state = cls.load(
             apply_fn=module.__call__,
             module=module,
             module_config=module_config,
             **checkpoint
         )
+        state = state.replace(
+            module_config_args=None  # removing because it's not needed anymore
+        )
         if init_optimizer_state:
             state = state.init_opt_state()
         return state
+
+    @staticmethod
+    def get_model_type(hyperparameters):
+        model_type = None
+        for k, _ in hyperparameters.items():
+            if k.startswith("model_type_is_"):
+                model_type = k.split("model_type_is_")[-1]
+        return model_type
 
     def save_state(
             self,
@@ -327,8 +315,8 @@ class EasyDelState(struct.PyTreeNode):
             cls,
             pretrained_model_name_or_path: str,
             filename: Optional[str] = None,
-            tx_name: AVAILABLE_OPTIMIZERS = "adamw",
-            sc_name: AVAILABLE_SCHEDULERS = "none",
+            optimizer: AVAILABLE_OPTIMIZERS = "adamw",
+            scheduler: AVAILABLE_SCHEDULERS = "none",
             tx_init: Optional[dict] = None,
             device=jax.devices('cpu')[0],
             dtype: jax.numpy.dtype = jax.numpy.float32,
@@ -353,13 +341,15 @@ class EasyDelState(struct.PyTreeNode):
 
         """
         The from_pretrained function is a helper function to quickly load a pretrained model and its associated configuration.
-        This method takes care of returning the correct model class instance based on the `model_type` property in the config object, or when it's missing, falling back to using pattern matching on the `pretrained_model_name_or_path` string:
+        This method takes care of returning the correct model class instance based on the `model_type` property in the
+        config object, or when it's missing, falling back to using pattern matching on the
+         `pretrained_model_name_or_path` string:
 
         :param cls: Refer to the class that is being defined
         :param pretrained_model_name_or_path: str: Load the pretrained model
         :param filename: Optional[str]: Specify the name of the file to download from huggingface hub
-        :param tx_name: AVAILABLE_OPTIMIZERS: Specify the optimizer used for training
-        :param sc_name: AVAILABLE_SCHEDULERS: Specify the name of the scheduler to use
+        :param optimizer: AVAILABLE_OPTIMIZERS: Specify the optimizer used for training
+        :param scheduler: AVAILABLE_SCHEDULERS: Specify the name of the scheduler to use
         :param tx_init: Optional[dict]: Pass the hyperparameters of the optimizer
         :param device: Specify the device on which to run the model
         :param dtype: jax.numpy.dtype: Specify the dtype of the model parameters
@@ -413,18 +403,16 @@ class EasyDelState(struct.PyTreeNode):
 
             steps = tx_init.get("steps", 1e9)
             tx_init["steps"] = steps
-
+            tx_init.pop("optimizer")
+            tx_init.pop("scheduler")
             state = cls.load(
                 apply_fn=model.__call__,
-                model_type=model.config.model_type,
-                sc_name=sc_name,
-                tx_name=tx_name,
                 tx_init=tx_init,
                 module_config=model.config,
                 params=FrozenDict({'params': params}),
                 tx=get_optimizer_and_scheduler(
-                    optimizer=tx_name,
-                    scheduler=sc_name,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
                     **tx_init
                 ),
                 step=0,
@@ -482,6 +470,15 @@ class EasyDelState(struct.PyTreeNode):
                 )
             )
 
+    @staticmethod
+    def create_hyperparameters(model_type: str):
+        """
+        it's the only way we can dump xla compiler
+        """
+        return {
+            f"model_type_is_{model_type}": 1
+        }
+
     def __str__(self):
 
         """
@@ -497,6 +494,8 @@ class EasyDelState(struct.PyTreeNode):
         module_config_string = self.module_config.__str__().replace("\n",
                                                                     "\n\t"
                                                                     "") if self.module_config is not None else None
+        optimizer = self.tx_init.get("optimizer")
+        scheduler = self.tx_init.get("scheduler")
         string = (
             f"{self.__class__.__name__}("
             f"\n\tstep: int = {self.step}"
@@ -504,9 +503,8 @@ class EasyDelState(struct.PyTreeNode):
             f"\n\tmodule_config: Optional[EasyDelPretrainedConfig] = {module_config_string}"
             f"\n\tapply_fn: Callable = {self.apply_fn}"
             f"\n\tparams: core.FrozenDict[str, Any] = {params_size} Parameters"
-            f"\n\ttx: optax.GradientTransformation = {self.tx_name} Optimizer with {self.sc_name} Scheduler"
+            f"\n\ttx: optax.GradientTransformation = {optimizer} Optimizer with {scheduler} Scheduler"
             f"\n\topt_state: Optional[optax.OptState] = {opt_state_size} Parameters"
-            f"\n\tmodel_type: str = {self.model_type}"
             f"\n\thyperparameters: Optional[dict] = {self.hyperparameters}"
             f"\n)"
         )
