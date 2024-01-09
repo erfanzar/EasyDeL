@@ -63,7 +63,7 @@ class TrainArguments(
             use_pjit_attention_force: bool = False,
             dtype: jnp.dtype = jnp.bfloat16,
             param_dtype: jnp.dtype = jnp.bfloat16,
-            fully_fsdp: bool = True,
+            fully_sharded_data_parallel: bool = True,
             use_wandb: bool = True,
             custom_rule: Mapping[str, PartitionSpec] = None,
             extra_configs: Optional[dict] = None,
@@ -89,6 +89,7 @@ class TrainArguments(
             save_optimizer_state: bool = False,
             step_start_point: Optional[int] = None,
             verbose: bool = False,
+            offload_device: jax.Device = jax.devices("cpu")[0],
             **kwargs
     ):
         """
@@ -124,7 +125,7 @@ class TrainArguments(
     :param use_pjit_attention_force: bool: Force the use of pjit for attention layers
     :param dtype: jnp.dtype: Set the dtype of the model parameters
     :param param_dtype: jnp.dtype: Specify the data type of the model parameters
-    :param fully_fsdp: bool: Determine if the model should be fully fsdp or not
+    :param fully_sharded_data_parallel: bool: Determine if the model should be fully fsdp or not
     :param use_wandb: bool: Enable or disable the wandb logging
     :param custom_rule: Mapping[str, PartitionSpec]: Specify the partitioning rules of the model
     :param extra_configs: Optional[dict]: Pass extra configurations to the model class
@@ -151,6 +152,7 @@ class TrainArguments(
     :param step_start_point: Optional[int]: start training from given step for example instead of starting training from
     step 0 it will start from 20000 and leave the data behind
     :param verbose: bool: when ever to turn verbose mode of or on
+    :param offload_device: jax.Device: device to be used to offload parameters on
     :param **kwargs: Pass keyword, variable-length argument list
     :return: Nothing
         """
@@ -199,7 +201,7 @@ class TrainArguments(
         self.dtype = dtype
         self.warmup_steps = warmup_steps
         self.param_dtype = param_dtype
-        self.fully_fsdp = fully_fsdp
+        self.fully_sharded_data_parallel = fully_sharded_data_parallel
         self.use_wandb = use_wandb
         self.custom_rule = custom_rule
         self.extra_configs = extra_configs
@@ -224,6 +226,7 @@ class TrainArguments(
         self.save_optimizer_state = save_optimizer_state
         self.step_start_point = step_start_point
         self.verbose = verbose
+        self.offload_device = offload_device
         self.optimizer_kwargs = dict(
             learning_rate=self.learning_rate,
             learning_rate_end=self.learning_rate_end,

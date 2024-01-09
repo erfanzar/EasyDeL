@@ -137,14 +137,14 @@ class MixtralConfig(EasyDelPretrainedConfig):
         )
 
     @staticmethod
-    def get_partition_rules(fully_fsdp: bool = True):
+    def get_partition_rules(fully_sharded_data_parallel: bool = True):
         """
         The get_partition_rules function is used to define the partitioning scheme for a model.
         It returns a list of tuples, where each tuple contains two elements:
           1) A regex string that matches the name of one or more parameters in the model.
           2) A PartitionScheme object that defines how those parameters should be partitioned.
 
-        :param fully_fsdp: bool: Determine whether to use the fully_fsdp partitioning scheme or not
+        :param fully_sharded_data_parallel: bool: Determine whether to use the fully_sharded_data_parallel partitioning scheme or not
         :return: A list of tuples
 
         """
@@ -165,7 +165,7 @@ class MixtralConfig(EasyDelPretrainedConfig):
             ("model/norm/kernel", PartitionSpec(None)),
             ("lm_head/kernel", PartitionSpec("fsdp", "sp")),
             ('.*', PartitionSpec(None)),
-        ) if not fully_fsdp else (
+        ) if not fully_sharded_data_parallel else (
             ("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"))),
 
             ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"))),

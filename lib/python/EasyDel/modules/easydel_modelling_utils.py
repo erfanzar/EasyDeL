@@ -94,15 +94,24 @@ class EasyDelPretrainedConfig(PretrainedConfig):
 
         """
         return self.create_mesh(
-            axis_dims=self.axis_dims,
-            axis_names=self.axis_names,
+            axis_dims=[v for k, v in self.axis_dims.items()] if isinstance(self.axis_dims, dict) else self.axis_dims,
+            axis_names=[v for k, v in self.axis_names.items()] if isinstance(self.axis_names,
+                                                                             dict) else self.axis_names,
             backend=(self.backend if self.backend is not None else "") if hasattr(
                 self, 'backend') else ""
         )
 
-    def get_partition_rules(self, fully_fsdp: bool = True):
-        if not fully_fsdp:
-            raise NotImplementedError
+    def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
+
+        """
+        The get_partition_rules function is used to specify how the parameters of a model are partitioned across devices.
+
+        :param self: Access the attributes of the class
+        :param fully_sharded_data_parallel: bool: Determine whether the model is fully sharded or not
+        :return: A tuple of tuples
+        """
+        if not fully_sharded_data_parallel:
+            raise NotImplementedError()
         else:
             return (
                 ('.*', jax.sharding.PartitionSpec(("fsdp", "sp")))

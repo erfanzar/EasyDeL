@@ -74,7 +74,7 @@ class T5Config(EasyDelPretrainedConfig):
             **kwargs,
         )
 
-    def get_partition_rules(self, fully_fsdp: bool = True):
+    def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
         return (
             ("wi_0/kernel", PartitionSpec("fsdp")),
             ("wi_1/kernel", PartitionSpec("fsdp")),
@@ -83,6 +83,6 @@ class T5Config(EasyDelPretrainedConfig):
             ("SelfAttention/(q|k|v|o)/kernel", PartitionSpec("fsdp")),
             ("EncDecAttention/(q|k|v|o)/kernel", PartitionSpec("fsdp")),
             ('.*', PartitionSpec(None))
-        ) if not fully_fsdp else (
+        ) if not fully_sharded_data_parallel else (
             ('.*', PartitionSpec("fsdp"))
         )

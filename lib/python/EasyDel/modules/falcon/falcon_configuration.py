@@ -84,7 +84,7 @@ class FalconConfig(EasyDelPretrainedConfig):
         return not self.alibi
 
     @staticmethod
-    def get_partition_rules(fully_fsdp: bool = False):
+    def get_partition_rules(fully_sharded_data_parallel: bool = False):
         return (
             ('word_embeddings/embedding', PartitionSpec("dp", "fsdp")),
             ('self_attention/query_key_value/(kernel)', PartitionSpec("dp", "fsdp")),
@@ -97,7 +97,7 @@ class FalconConfig(EasyDelPretrainedConfig):
             ('transformer/post_attention_layernorm/scale', PartitionSpec("fsdp")),
             ('transformer/post_attention_layernorm/bias', PartitionSpec("fsdp")),
             ('.*', PartitionSpec("fsdp"))
-        ) if not fully_fsdp else (
+        ) if not fully_sharded_data_parallel else (
             ('word_embeddings/embedding', PartitionSpec("fsdp")),
             ('self_attention/query_key_value/(kernel|bias)', PartitionSpec("fsdp")),
             ('self_attention/dense/(kernel|bias)', PartitionSpec("fsdp")),

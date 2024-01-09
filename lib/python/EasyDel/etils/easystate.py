@@ -1,5 +1,5 @@
 import os
-from typing import Any, Callable, Optional, Mapping, Sequence
+from typing import Any, Callable, Optional, Mapping, Sequence, Tuple
 
 import fjformer
 import jax.tree_util
@@ -206,51 +206,6 @@ class EasyDelState(struct.PyTreeNode):
             **kwargs,
         )
 
-    def __str__(self):
-
-        """
-        The __str__ function is called when you call str(object) or print(object).
-        The __repr__ function is called when you type the object name in the interpreter.
-        If no __str__ method exists, Python will use __repr__ as a fallback.
-
-        :param self: Refer to the object itself
-        :return: string
-        """
-        params_size = sum(n.size for n in jax.tree_util.tree_flatten(self.params)[0])
-        opt_state_size = sum(n.size for n in jax.tree_util.tree_flatten(self.opt_state)[0])
-        module_config_string = self.module_config.__str__().replace("\n",
-                                                                    "\n\t"
-                                                                    "") if self.module_config is not None else None
-        string = f"""
-{self.__class__.__name__}(
-    step: int = {self.step}
-    module: Optional[EasyDelFlaxPretrainedModel] = {self.module}
-    module_config: Optional[EasyDelPretrainedConfig] = {module_config_string}
-    apply_fn: Callable = {self.apply_fn}
-    params: core.FrozenDict[str, Any] = {params_size} Parameters
-    tx: optax.GradientTransformation = {self.tx_name} Optimizer with {self.sc_name} Scheduler
-    opt_state: Optional[optax.OptState] = {opt_state_size} Parameters
-    model_type: str = {self.model_type}
-    hyperparameters: Optional[dict] = {self.hyperparameters}
-)
-"""
-        return string
-
-    def __repr__(self):
-
-        """    
-        The __repr__ function is the &quot;official&quot; string representation of an object.
-        It's what you get when you type the object name at the Python prompt, or pass it to str().
-        The goal of __repr__ is to be unambiguous: if eval(repr(x)) == x, then __repr__ should return a string that
-        looks like a valid Python expression that could be used to recreate an object with the same value (
-        given an appropriate environment). If this is not possible, a string formatted using %s
-        formatting is also acceptable.
-
-        :param self: Represent the instance of the class
-        :return: A string that is a valid python expression
-        """
-        return self.__str__()
-
     @classmethod
     def load_state(
             cls,
@@ -271,7 +226,6 @@ class EasyDelState(struct.PyTreeNode):
         to shard the loaded state
         :param verbose: bool: Print out the progress of loading
         :return: A state object
-        :doc-author: Trelent
         """
         from ..modules.auto_easydel_model import get_modules_by_type
 
@@ -283,7 +237,7 @@ class EasyDelState(struct.PyTreeNode):
         cfg, module, convertor = get_modules_by_type(model_type=checkpoint["model_type"])
         module_config = checkpoint.pop("module_config", None)
         if checkpoint["module_config_args"] is not None:
-            module_config = EasyDelPretrainedConfig.from_dict(checkpoint["module_config_args"])
+            module_config = cfg.from_dict(checkpoint["module_config_args"])
         state = cls.load(
             apply_fn=module.__call__,
             module=module,
@@ -489,3 +443,80 @@ class EasyDelState(struct.PyTreeNode):
         if free_optimizer_state:
             state = state.free_opt_state()
         return state
+
+    def shard_params(
+            self,
+            fully_sharded_data_parallel: bool = True,
+            shard_fns: Optional[Mapping[str, Callable]] = None,
+            dtype: jax.numpy.dtype | str = "bf16",
+            mesh: Optional[jax.sharding.Mesh] = None,
+            rules: Optional[Sequence[Mapping[str, jax.sharding.PartitionSpec]]] = None
+    ):
+        dtype = fjformer.get_dtype(dtype)
+        if shard_fns is None and self.module_config is None and rules is None:
+            raise EasyDelRuntimeError(
+                "the model doesn't carrying `module_config` you should pass `shard_fns` or `rules`"
+            )
+        elif shard_fns is None and rules is not None or self.module_config is not None:
+            from fjformer import match_partition_rules, make_shard_and_gather_fns
+            rules = rules or self.module_config.get_partition_rules(fully_sharded_data_parallel)
+            partition_specs = match_partition_rules(
+                rules=rules, params=self.params
+            )
+            shard_fns, gather_fns = make_shard_and_gather_fns(
+                partition_specs=partition_specs,
+                dtype_specs=dtype
+            )
+        if mesh is None:
+            mesh = self.module_config.jax_mesh()
+        with mesh:
+            return self.replace(
+                params=jax.tree_util.tree_map(
+                    lambda f, p: f(p), shard_fns, self.params
+                )
+            )
+
+    def __str__(self):
+
+        """
+        The __str__ function is called when you call str(object) or print(object).
+        The __repr__ function is called when you type the object name in the interpreter.
+        If no __str__ method exists, Python will use __repr__ as a fallback.
+
+        :param self: Refer to the object itself
+        :return: string
+        """
+        params_size = sum(n.size for n in jax.tree_util.tree_flatten(self.params)[0])
+        opt_state_size = sum(n.size for n in jax.tree_util.tree_flatten(self.opt_state)[0])
+        module_config_string = self.module_config.__str__().replace("\n",
+                                                                    "\n\t"
+                                                                    "") if self.module_config is not None else None
+        string = (
+            f"{self.__class__.__name__}("
+            f"\n\tstep: int = {self.step}"
+            f"\n\tmodule: Optional[EasyDelFlaxPretrainedModel] = {self.module}"
+            f"\n\tmodule_config: Optional[EasyDelPretrainedConfig] = {module_config_string}"
+            f"\n\tapply_fn: Callable = {self.apply_fn}"
+            f"\n\tparams: core.FrozenDict[str, Any] = {params_size} Parameters"
+            f"\n\ttx: optax.GradientTransformation = {self.tx_name} Optimizer with {self.sc_name} Scheduler"
+            f"\n\topt_state: Optional[optax.OptState] = {opt_state_size} Parameters"
+            f"\n\tmodel_type: str = {self.model_type}"
+            f"\n\thyperparameters: Optional[dict] = {self.hyperparameters}"
+            f"\n)"
+        )
+        return string
+
+    def __repr__(self):
+
+        """
+        The __repr__ function is the &quot;official&quot; string representation of an object.
+        It's what you get when you type the object name at the Python prompt, or pass it to str().
+        The goal of __repr__ is to be unambiguous: if eval(repr(x)) == x, then __repr__ should return a string that
+        looks like a valid Python expression that could be used to recreate an object with the same value (
+        given an appropriate environment). If this is not possible, a string formatted using %s
+        formatting is also acceptable.
+
+        :param self: Represent the instance of the class
+        :return: A string that is a valid python expression
+        """
+        return self.__str__()

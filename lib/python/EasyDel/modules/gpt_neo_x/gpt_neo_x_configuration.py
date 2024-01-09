@@ -55,7 +55,7 @@ class GPTNeoXConfig(EasyDelPretrainedConfig):
         )
 
     @staticmethod
-    def get_partition_rules(fully_fsdp: bool = False):
+    def get_partition_rules(fully_sharded_data_parallel: bool = False):
         return (
             ('wte/embedding', PartitionSpec("fsdp", "dp")),
             ('attention/w_qkv/(kernel|bias)', PartitionSpec("fsdp", "dp")),
@@ -69,7 +69,7 @@ class GPTNeoXConfig(EasyDelPretrainedConfig):
             ('transformer/final_layer_norm/(scale|bias)', PartitionSpec("dp", "fsdp")),
             ('lm_head/kernel', PartitionSpec("dp", "fsdp")),
             ('.*', PartitionSpec(None))
-        ) if not fully_fsdp else (
+        ) if not fully_sharded_data_parallel else (
 
             ('embed_in/embedding', PartitionSpec("fsdp")),
 

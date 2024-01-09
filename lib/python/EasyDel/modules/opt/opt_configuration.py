@@ -62,8 +62,8 @@ class OPTConfig(EasyDelPretrainedConfig):
         self._remove_final_layer_norm = _remove_final_layer_norm
         self.from_pt = False
 
-    def get_partition_rules(self, fully_fsdp: bool = True):
-        if not fully_fsdp:
+    def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
+        if not fully_sharded_data_parallel:
             raise NotImplementedError
         else:
             return (
