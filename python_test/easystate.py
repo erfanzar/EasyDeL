@@ -9,7 +9,7 @@ def main():
     config = LlamaConfig(
         hidden_size=512,
         intermediate_size=512,
-        num_hidden_layers=4,
+        num_hidden_layers=1,
         num_attention_heads=8,
         num_key_value_heads=4,
         use_sacn_mlp=False,
@@ -94,6 +94,6 @@ def eval_shape_create_test():
 
 
 if __name__ == "__main__":
-    # main()
-    # load()
-    eval_shape_create_test()
+    main()
+    load()
+    # eval_shape_create_test()
