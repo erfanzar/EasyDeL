@@ -101,10 +101,7 @@ class EasyDelState(struct.PyTreeNode):
         )
         opt_state = tx.init(params_with_opt)
         if module_config is not None:
-            hyperparameters = cls.safe_dict(module_config.__dict__) | hyperparameters
-        if tx_init is not None:
-            hyperparameters = cls.safe_dict(tx_init) | hyperparameters
-
+            cls.safe_dict(module_config.__dict__)
         return cls(
             step=0,
             apply_fn=apply_fn,
@@ -112,7 +109,7 @@ class EasyDelState(struct.PyTreeNode):
             params=params,
             tx=tx,
             opt_state=opt_state,
-            tx_init=tx_init,
+            tx_init=cls.safe_dict(tx_init),
             hyperparameters=hyperparameters,
             module_config=module_config,
             module_config_args=None,
@@ -123,9 +120,9 @@ class EasyDelState(struct.PyTreeNode):
     def load(
             cls,
             *,
-            step: int,
             apply_fn: Callable,
             params: core.FrozenDict[str, Any] | Mapping[str, Any],
+            step: int = 0,
             opt_state: Optional[optax.OptState] = None,
             tx_init: Optional[dict] = None,
             hyperparameters: Optional[dict] = None,
@@ -165,10 +162,10 @@ class EasyDelState(struct.PyTreeNode):
         )
         if hyperparameters is None:
             hyperparameters = {}
-        hyperparameters = cls.safe_dict(tx_init) | hyperparameters
+
         if module_config is not None:
-            hyperparameters = cls.create_hyperparameters(module_config.model_type) | hyperparameters
-            hyperparameters = cls.safe_dict(module_config.__dict__) | hyperparameters
+            hyperparameters = cls.create_hyperparameters(module_config.model_type)
+            cls.safe_dict(module_config.__dict__)
 
         return cls(
             step=step,
@@ -176,7 +173,7 @@ class EasyDelState(struct.PyTreeNode):
             params=params,
             tx=tx,
             opt_state=opt_state,
-            tx_init=tx_init,
+            tx_init=cls.safe_dict(tx_init),
             hyperparameters=hyperparameters,
             module=module,
             module_config=module_config,
@@ -511,8 +508,14 @@ class EasyDelState(struct.PyTreeNode):
         module_config_string = self.module_config.__str__().replace("\n",
                                                                     "\n\t"
                                                                     "") if self.module_config is not None else None
-        optimizer = self.tx_init.get("optimizer")
-        scheduler = self.tx_init.get("scheduler")
+        optimizer = self.tx_init.get("optimizer", None)
+        scheduler = self.tx_init.get("scheduler", None)
+
+        if optimizer is None:
+            optimizer = self.find_key("optimizer", self.tx_init)
+        if scheduler is None:
+            scheduler = self.find_key("scheduler", self.tx_init)
+
         string = (
             f"{self.__class__.__name__}("
             f"\n\tstep: int = {self.step}"
@@ -526,6 +529,19 @@ class EasyDelState(struct.PyTreeNode):
             f"\n)"
         )
         return string
+
+    @staticmethod
+    def find_key(key, dictionary: dict) -> str | None:
+        result = None
+        for k, v in dictionary.items():
+            try:
+                k_, v_ = k.split("_is_")
+                if k_ == key:
+                    result = v
+                    break
+            except:
+                ...
+        return result
 
     def __repr__(self):
 
