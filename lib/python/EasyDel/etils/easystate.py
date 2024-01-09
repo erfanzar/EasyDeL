@@ -151,12 +151,11 @@ class EasyDelState(struct.PyTreeNode):
         """
         if tx_init is None:
             tx_init = {}
-        optimizer = tx_init.pop("optimizer", "adamw")
-        scheduler = tx_init.pop("scheduler", "none")
-        steps = tx_init.pop("steps", 1e6)
-        tx_init["optimizer"] = optimizer
-        tx_init["scheduler"] = scheduler
-        tx_init["steps"] = steps
+
+        tx_init["optimizer"] = cls.search("optimizer", tx_init, "admaw")
+        tx_init["scheduler"] = cls.search("scheduler", tx_init, "none")
+        tx_init["steps"] = cls.search("steps", tx_init, 1e6)
+
         tx, sc = get_optimizer_and_scheduler(
             **tx_init
         )
@@ -529,6 +528,13 @@ class EasyDelState(struct.PyTreeNode):
             f"\n)"
         )
         return string
+
+    @classmethod
+    def search(cls, key, dictionary: dict, default: Any = None):
+        req = dictionary.get(key, None)
+        if req is None:
+            req = cls.find_key(key, dictionary) or default
+        return req
 
     @staticmethod
     def find_key(key, dictionary: dict) -> str | None:
