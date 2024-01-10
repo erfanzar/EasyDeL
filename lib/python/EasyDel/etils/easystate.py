@@ -12,6 +12,45 @@ from .auto_tx import get_optimizer_and_scheduler
 from ..etils import AVAILABLE_SCHEDULERS, AVAILABLE_OPTIMIZERS, EasyDelRuntimeError
 from ..modules.easydel_modelling_utils import EasyDelFlaxPretrainedModel, EasyDelPretrainedConfig
 
+TYPE_SEP = "<*TYPE*>"
+VALUE_SEP = "<*VALUE*>"
+
+STRING_REP = "{type}" + TYPE_SEP + "{key}" + VALUE_SEP + "{value}"
+DEFAULT_ES_VAL = -1
+
+
+def revert_type_back(tp, val):
+    assert tp in ["int", "float", "dict", "bool", "list", "str"], f"type {tp} not supported"
+    if tp == "int":
+        val = int(val)
+    elif tp == "float":
+        val = float(val)
+    elif tp == "dict":
+        val = dict(val)
+    elif tp == "bool":
+        val = bool(val)
+    elif tp == "list":
+        val = list(val)
+    elif tp == "str":
+        val = str(val)
+    return val
+
+
+def break_format(key, value):
+    k, v = [None] * 2
+    if value == DEFAULT_ES_VAL:
+        try:
+            tp, rs = key.split(TYPE_SEP)
+            k, v = rs.split(VALUE_SEP)
+            v = revert_type_back(tp=tp, val=v)
+            return k, v
+        except (KeyError, ValueError):
+            ...
+    else:
+        k = key
+        v = value
+    return k, v
+
 
 class EasyDelState(struct.PyTreeNode):
     step: int
@@ -151,16 +190,11 @@ class EasyDelState(struct.PyTreeNode):
         """
         if tx_init is None:
             tx_init = {}
-
+        tx_init = cls.unsafe_dict(tx_init)
         tx_init["optimizer"] = cls.search("optimizer", tx_init, "admaw")
         tx_init["scheduler"] = cls.search("scheduler", tx_init, "none")
         tx_init["steps"] = cls.search("steps", tx_init, 1e6)
-        for k in list(tx_init.keys()):
-            if "_is_" in k:
-                org_k = k.split("_is_")[0]
-                tx_init[org_k] = cls.search(org_k, tx_init)
-                tx_init.pop(k, None)  # Make sure it's removed
-        print(tx_init)
+
         tx, sc = get_optimizer_and_scheduler(
             **tx_init
         )
@@ -219,6 +253,7 @@ class EasyDelState(struct.PyTreeNode):
         module_config = checkpoint.pop("module_config", None)
         if checkpoint["module_config_args"] is not None:
             module_config = cfg.from_dict(checkpoint.get("module_config_args", {}))
+
         state = cls.load(
             apply_fn=module.__call__,
             module=module,
@@ -232,13 +267,9 @@ class EasyDelState(struct.PyTreeNode):
             state = state.init_opt_state()
         return state
 
-    @staticmethod
-    def get_model_type(hyperparameters):
-        model_type = None
-        for k, _ in hyperparameters.items():
-            if k.startswith("model_type_is_"):
-                model_type = k.split("model_type_is_")[-1]
-        return model_type
+    @classmethod
+    def get_model_type(cls, dictionary):
+        return cls.find_key("model_type", dictionary)
 
     def save_state(
             self,
@@ -399,22 +430,19 @@ class EasyDelState(struct.PyTreeNode):
             if tx_init is None:
                 tx_init = {}
 
-            steps = tx_init.get("steps", 1e9)
-            tx_init["steps"] = steps
-            tx_init.pop("optimizer")
-            tx_init.pop("scheduler")
+            tx_init["optimizer"] = optimizer
+            tx_init["scheduler"] = scheduler
+
             state = cls.load(
                 apply_fn=model.__call__,
-                tx_init=tx_init,
-                module_config=model.config,
                 params=FrozenDict({'params': params}),
-                tx=get_optimizer_and_scheduler(
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    **tx_init
-                ),
                 step=0,
-                opt_state=None
+                opt_state=None,
+                tx_init=tx_init,
+                hyperparameters=None,
+                module=model,
+                module_config=model.config,
+                module_config_args=model.config.to_dict()
             )
         else:
             with jax.default_device(device):
@@ -474,7 +502,11 @@ class EasyDelState(struct.PyTreeNode):
         it's the only way we can dump xla compiler
         """
         return {
-            f"model_type_is_{model_type}": 1
+            STRING_REP.format(
+                type="str",
+                key="model_type",
+                value=model_type
+            ): DEFAULT_ES_VAL
         }
 
     @staticmethod
@@ -483,18 +515,21 @@ class EasyDelState(struct.PyTreeNode):
             val = dictionary.get(k)
             if not isinstance(val, (int, bool)):
                 val = dictionary.pop(k)
-                dictionary[f"{k}_is_{val}"] = 1
+                string_value_format = STRING_REP.format(
+                    type=type(val).__name__,
+                    key=k,
+                    value=val
+                )
+                dictionary[string_value_format] = DEFAULT_ES_VAL
         return dictionary
 
     @staticmethod
     def unsafe_dict(dictionary: dict):
         result = {}
         for k in list(dictionary.keys()):
-            try:
-                key, val = k.split("_is_")
-                result[key] = val
-            except:
-                ...
+            v = dictionary[k]
+            key, value = break_format(key=k, value=v)
+            result[key] = value
         return result
 
     def __str__(self):
@@ -537,26 +572,18 @@ class EasyDelState(struct.PyTreeNode):
     @classmethod
     def search(cls, key, dictionary: dict, default: Any = None):
         req = dictionary.get(key, None)
-        re_type = False
         if req is None:
             req = cls.find_key(key, dictionary)
-            re_type = True
-        if req is not None and re_type:
-            name = f"{key}_is_{req}"
-            _ = dictionary.pop(name)
         return req or default
 
     @staticmethod
     def find_key(key, dictionary: dict) -> str | None:
         result = None
         for k, v in dictionary.items():
-            try:
-                k_, v_ = k.split("_is_")
-                if k_ == key:
-                    result = v_
-                    break
-            except:
-                ...
+            k_, v_ = break_format(key=k, value=v)
+            if k_ == key:
+                result = v_
+                break
         return result
 
     def __repr__(self):

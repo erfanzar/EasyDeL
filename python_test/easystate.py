@@ -35,9 +35,9 @@ def main():
         apply_fn=module.__call__,
         tx=tx,
         tx_init=tx_init,
-        hyperparameters={
-            "model_type_is_llama": 1
-        },
+        hyperparameters=EasyDelState.create_hyperparameters(
+            model_type="llama"
+        ),
         module_config=config,
     )
 
@@ -48,7 +48,6 @@ def main():
 
 def load():
     state = EasyDelState.load_state("state.easy", init_optimizer_state=False, verbose=True)
-    state = state.shard_params()
     print(jax.eval_shape(lambda: state))
 
 
@@ -94,6 +93,6 @@ def eval_shape_create_test():
 
 
 if __name__ == "__main__":
-    main()
-    load()
-    # eval_shape_create_test()
+    # main()
+    # load()
+    eval_shape_create_test()
