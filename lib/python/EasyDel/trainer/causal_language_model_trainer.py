@@ -336,8 +336,13 @@ class CausalLanguageModelTrainer:
                 rs[key] = jnp.stack(ssp).reshape(-1, ssp[0].shape[-1])
             return rs
 
-        dataloader_train = DataLoader(self.dataset_train, collate_fn=collate_fn,
-                                      batch_size=self.arguments.total_batch_size, drop_last=True)
+        dataloader_train = DataLoader(
+            self.dataset_train,
+            collate_fn=collate_fn,
+            batch_size=self.arguments.total_batch_size,
+            drop_last=True,
+            num_workers=os.cpu_count()
+        )
         max_steps_train = self.arguments.num_train_epochs * len(
             dataloader_train) if self.arguments.max_steps is None else self.arguments.max_steps
         if self.dataset_eval is not None and self.arguments.do_eval:
