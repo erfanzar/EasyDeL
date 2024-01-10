@@ -68,7 +68,7 @@ class GPTNeoXConfig(EasyDelPretrainedConfig):
 
             ('transformer/final_layer_norm/(scale|bias)', PartitionSpec("dp", "fsdp")),
             ('lm_head/kernel', PartitionSpec("dp", "fsdp")),
-            ('.*', PartitionSpec(None))
+            (".*", PartitionSpec(None))
         ) if not fully_sharded_data_parallel else (
 
             ('embed_in/embedding', PartitionSpec("fsdp")),
@@ -83,7 +83,7 @@ class GPTNeoXConfig(EasyDelPretrainedConfig):
 
             ('transformer/final_layer_norm/(scale|bias)', PartitionSpec("fsdp")),
             ('lm_head/kernel', PartitionSpec("fsdp")),
-            ('.*', PartitionSpec(None))
+            (".*", PartitionSpec(None))
         )
 
     @staticmethod

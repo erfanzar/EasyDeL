@@ -342,7 +342,7 @@ class CausalLanguageModelTrainer:
             collate_fn=collate_fn,
             batch_size=self.arguments.total_batch_size,
             drop_last=True,
-            num_workers=os.cpu_count()
+            num_workers=1
         )
         max_steps_train = self.arguments.num_train_epochs * len(
             dataloader_train) if self.arguments.max_steps is None else self.arguments.max_steps

@@ -45,7 +45,7 @@ def main():
 
         ("model/norm/kernel", PartitionSpec(("fsdp", "tp"))),
         ("lm_head/kernel", PartitionSpec(("fsdp", "tp"))),
-        ('.*', PartitionSpec(None)),
+        (".*", PartitionSpec(None)),
     )
     partition_specs = match_partition_rules(partition_rules, params=params)
     with mesh:

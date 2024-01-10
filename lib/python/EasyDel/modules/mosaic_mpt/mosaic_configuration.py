@@ -106,7 +106,7 @@ class MptConfig(EasyDelPretrainedConfig):
             ("transformer/norm_f/bias", PartitionSpec(None)),
             ("lm_head/kernel", PartitionSpec("fsdp", "dp")),
             ("lm_head/bias", PartitionSpec("fsdp", "dp")),
-            ('.*', PartitionSpec(None)),
+            (".*", PartitionSpec(None)),
         ) if not fully_sharded_data_parallel else (
 
             ("transformer/wte/embedding", PartitionSpec("fsdp")),
@@ -130,7 +130,7 @@ class MptConfig(EasyDelPretrainedConfig):
             ("transformer/norm_f/bias", PartitionSpec(None)),
             ("lm_head/kernel", PartitionSpec("fsdp")),
             ("lm_head/bias", PartitionSpec("fsdp")),
-            ('.*', PartitionSpec(None)),
+            (".*", PartitionSpec(None)),
         )
 
     def add_jax_args(self,

@@ -58,7 +58,7 @@ class PalmConfig(EasyDelPretrainedConfig):
             ('lm_head/kernel', PartitionSpec("fsdp")),
             ('post_norm/kernel', PartitionSpec("fsdp")),
             ('norm/kernel', PartitionSpec("fsdp", "dp")),
-            ('.*', PartitionSpec(None)),
+            (".*", PartitionSpec(None)),
         ) if not fully_sharded_data_parallel else (
             ('wi/kernel', PartitionSpec("fsdp")),
             ('attn_wo/kernel', PartitionSpec("fsdp")),
