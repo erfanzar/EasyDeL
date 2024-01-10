@@ -21,7 +21,7 @@ DEFAULT_ES_VAL = -1
 
 
 def revert_type_back(tp, val):
-    assert tp in ["int", "float", "dict", "bool", "list", "str"], f"type {tp} not supported"
+    # assert tp in ["int", "float", "dict", "bool", "list", "str"], f"type {tp} not supported"
     if tp == "int":
         val = int(val)
     elif tp == "float":
