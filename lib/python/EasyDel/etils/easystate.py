@@ -1,3 +1,4 @@
+import copy
 import os
 from typing import Any, Callable, Optional, Mapping, Sequence, Tuple
 
@@ -140,6 +141,7 @@ class EasyDelState(struct.PyTreeNode):
         )
         opt_state = tx.init(params_with_opt)
         if module_config is not None:
+            module_config = copy.deepcopy(module_config)
             cls.safe_dict(module_config.__dict__)
         return cls(
             step=0,
@@ -188,8 +190,12 @@ class EasyDelState(struct.PyTreeNode):
         :param kwargs: Pass in any additional parameters that may be needed for the model
         :return: A new instance of the class
         """
+        if module_config is not None:
+            module_config = copy.deepcopy(module_config)
+
         if tx_init is None:
             tx_init = {}
+        tx_init = copy.deepcopy(tx_init)
         tx_init = cls.unsafe_dict(tx_init)
         tx_init["optimizer"] = cls.search("optimizer", tx_init, "admaw")
         tx_init["scheduler"] = cls.search("scheduler", tx_init, "none")
