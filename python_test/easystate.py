@@ -81,9 +81,7 @@ def eval_shape_create_test():
             tx_init=tx_init,
             apply_fn=module.__call__,
             tx=get_optimizer_and_scheduler(**tx_init)[0],
-            hyperparameters={
-                "model_type_is_llama": 1
-            },
+            hyperparameters=EasyDelState.create_hyperparameters(model_type=config.model_type),
             module=module,
             module_config_args=None
         )
