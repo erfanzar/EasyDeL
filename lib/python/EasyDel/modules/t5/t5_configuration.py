@@ -84,5 +84,5 @@ class T5Config(EasyDelPretrainedConfig):
             ("EncDecAttention/(q|k|v|o)/kernel", PartitionSpec("fsdp")),
             (".*", PartitionSpec(None))
         ) if not fully_sharded_data_parallel else (
-            ('.*', PartitionSpec("fsdp"))
+            ('.*', PartitionSpec(("fsdp", "sp")))
         )

@@ -83,7 +83,7 @@ class GPTNeoXConfig(EasyDelPretrainedConfig):
 
             ('transformer/final_layer_norm/(scale|bias)', PartitionSpec("fsdp")),
             ('lm_head/kernel', PartitionSpec("fsdp")),
-            (".*", PartitionSpec(None))
+            (".*", PartitionSpec(("fsdp", "sp")))
         )
 
     @staticmethod

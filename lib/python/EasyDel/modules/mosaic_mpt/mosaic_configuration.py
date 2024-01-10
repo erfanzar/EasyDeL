@@ -130,7 +130,7 @@ class MptConfig(EasyDelPretrainedConfig):
             ("transformer/norm_f/bias", PartitionSpec(None)),
             ("lm_head/kernel", PartitionSpec("fsdp")),
             ("lm_head/bias", PartitionSpec("fsdp")),
-            (".*", PartitionSpec(None)),
+            (".*", PartitionSpec(("fsdp", "sp"))),
         )
 
     def add_jax_args(self,
