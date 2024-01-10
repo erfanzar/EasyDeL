@@ -224,6 +224,7 @@ class CausalLanguageModelTrainer:
         self.init_fn = None
         self.state_shape = None
         self.state_partition_spec = None
+        self.sharded_state = None
         self.arguments = arguments
         self.dataset_train = dataset_train
         self.dataset_eval = dataset_eval
@@ -342,7 +343,6 @@ class CausalLanguageModelTrainer:
             collate_fn=collate_fn,
             batch_size=self.arguments.total_batch_size,
             drop_last=True,
-            num_workers=1
         )
         max_steps_train = self.arguments.num_train_epochs * len(
             dataloader_train) if self.arguments.max_steps is None else self.arguments.max_steps
@@ -560,7 +560,6 @@ class CausalLanguageModelTrainer:
                             init_optimizer_state=True,
                             checkpoint_path=self.checkpoint_path,
                         )
-
                     if self.arguments.remove_ckpt_after_load:
                         os.remove(self.checkpoint_path)
                 elif model_parameters is not None and self.checkpoint_path is None:
@@ -577,7 +576,7 @@ class CausalLanguageModelTrainer:
                     params = model_parameters if not self.arguments.do_shard_fns else jax.tree_util.tree_map(
                         lambda f, x: f(x),
                         shard_fns.params,
-                        model_parameters
+                        model_parameters,
                     )
                     sharded_state = self.create_sharded_state_from_params_fn(params)
                 elif model_parameters is not None and self.checkpoint_path is not None:
@@ -596,6 +595,7 @@ class CausalLanguageModelTrainer:
                     sharded_state.params
                 )
                 sharded_state.params = params
+            self.sharded_state = sharded_state
             return sharded_state, shard_fns, gather_fns
 
     def _save_state(
