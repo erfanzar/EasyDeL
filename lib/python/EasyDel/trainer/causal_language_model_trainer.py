@@ -547,6 +547,14 @@ class CausalLanguageModelTrainer:
                     )
                     with jax.default_device(self.arguments.offload_device):
                         sharded_state = sharded_state.init_opt_state()
+                        opt_state = sharded_state.opt_state if not self.arguments.do_shard_fns else jax.tree_util.tree_map(
+                            lambda f, x: f(x),
+                            shard_fns.opt_state,
+                            sharded_state.opt_state
+                        )
+                        sharded_state = sharded_state.replace(
+                            opt_state=opt_state
+                        )
             elif self.finetune:
 
                 if model_parameters is None and self.checkpoint_path is not None:
