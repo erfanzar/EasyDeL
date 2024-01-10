@@ -116,7 +116,7 @@ class GPTJConfig(EasyDelPretrainedConfig):
 
                 ("lm_head/kernel", PartitionSpec(("fsdp", "tp"), )),
                 ("lm_head/bias", PartitionSpec(("fsdp", "tp"), )),
-                ('.*', PartitionSpec(None)),
+                (".*", PartitionSpec(None)),
             )
         else:
             rules = (
@@ -133,7 +133,7 @@ class GPTJConfig(EasyDelPretrainedConfig):
 
                 ("lm_head/kernel", PartitionSpec("tp", ("fsdp", "sp"), )),
                 ("lm_head/bias", PartitionSpec("tp", ("fsdp", "sp"), )),
-                ('.*', PartitionSpec(None)),
+                (".*", PartitionSpec(None)),
             )
         return rules
 

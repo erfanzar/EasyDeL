@@ -162,7 +162,7 @@ class LlamaConfig(EasyDelPretrainedConfig):
 
             ("model/norm/kernel", PartitionSpec(None)),
             ("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ('.*', PartitionSpec(None)),
+            (".*", PartitionSpec(None)),
         ) if not fully_sharded_data_parallel else (
 
             ("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"))),
@@ -179,7 +179,7 @@ class LlamaConfig(EasyDelPretrainedConfig):
 
             ("model/norm/kernel", PartitionSpec(None)),
             ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
-            ('.*', PartitionSpec(("fsdp", "sp"))),
+            (".*", PartitionSpec(None)),
         )
 
     def add_jax_args(self,
