@@ -133,7 +133,7 @@ class GPTJConfig(EasyDelPretrainedConfig):
 
                 ("lm_head/kernel", PartitionSpec("tp", ("fsdp", "sp"), )),
                 ("lm_head/bias", PartitionSpec("tp", ("fsdp", "sp"), )),
-                (".*", PartitionSpec(None)),
+                (".*", PartitionSpec(("fsdp", "sp"))),
             )
         return rules
 

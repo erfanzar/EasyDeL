@@ -57,7 +57,7 @@ class FlaxLTConfig(EasyDelPretrainedConfig):
             ("mlp/down/kernel", PartitionSpec("sp", "fsdp")),
             ("mlp/up/kernel", PartitionSpec("fsdp")),
             ("lm_head/kernel", PartitionSpec("fsdp", "sp")),
-            (".*", PartitionSpec(None)),
+            (".*", PartitionSpec(("fsdp", "sp")),
             ('ln/kernel', PartitionSpec(None)),
             ('ln1/kernel', PartitionSpec(None)),
             ('ln2/kernel', PartitionSpec(None)),

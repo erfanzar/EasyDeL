@@ -179,7 +179,7 @@ class LlamaConfig(EasyDelPretrainedConfig):
 
             ("model/norm/kernel", PartitionSpec(None)),
             ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
-            (".*", PartitionSpec(None)),
+            (".*", PartitionSpec(("fsdp", "sp"))),
         )
 
     def add_jax_args(self,

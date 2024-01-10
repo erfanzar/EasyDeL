@@ -67,7 +67,7 @@ class OPTConfig(EasyDelPretrainedConfig):
             raise NotImplementedError
         else:
             return (
-                (".*", PartitionSpec(None))
+                (".*", PartitionSpec(("fsdp", "sp")))
             )
 
     def add_jax_args(
