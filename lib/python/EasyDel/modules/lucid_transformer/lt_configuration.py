@@ -48,7 +48,7 @@ class FlaxLTConfig(EasyDelPretrainedConfig):
         )
 
     @staticmethod
-    def get_partition_rules():
+    def get_partition_rules(fsdp: bool = True):
         return (
             # Emb
             ("model/wte/embedding", PartitionSpec("sp", "fsdp")),

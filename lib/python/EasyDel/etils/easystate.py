@@ -548,11 +548,13 @@ class EasyDelState(struct.PyTreeNode):
         :param self: Refer to the object itself
         :return: string
         """
-        params_size = sum(n.size for n in jax.tree_util.tree_flatten(self.params)[0])
-        opt_state_size = sum(n.size for n in jax.tree_util.tree_flatten(self.opt_state)[0])
-        module_config_string = self.module_config.__str__().replace("\n",
-                                                                    "\n\t"
-                                                                    "") if self.module_config is not None else None
+        params_size = sum(getattr(n, "size", 0) for n in jax.tree_util.tree_flatten(self.params)[0])
+        opt_state_size = sum(getattr(n, "size", 0) for n in jax.tree_util.tree_flatten(self.opt_state)[0])
+        module_config_string = self.module_config.__str__(
+
+        ).replace("\n",
+                  "\n\t"
+                  "") if self.module_config is not None else None
         optimizer = self.tx_init.get("optimizer", None)
         scheduler = self.tx_init.get("scheduler", None)
 
@@ -563,14 +565,14 @@ class EasyDelState(struct.PyTreeNode):
 
         string = (
             f"{self.__class__.__name__}("
-            f"\n\tstep: int = {self.step}"
-            f"\n\tmodule: Optional[EasyDelFlaxPretrainedModel] = {self.module}"
-            f"\n\tmodule_config: Optional[EasyDelPretrainedConfig] = {module_config_string}"
+            f"\n\tstep = {self.step}"
+            f"\n\tmodule = {self.module}"
+            f"\n\tmodule_config = {module_config_string}"
             f"\n\tapply_fn: Callable = {self.apply_fn}"
-            f"\n\tparams: core.FrozenDict[str, Any] = {params_size} Parameters"
-            f"\n\ttx: optax.GradientTransformation = {optimizer} Optimizer with {scheduler} Scheduler"
-            f"\n\topt_state: Optional[optax.OptState] = {opt_state_size} Parameters"
-            f"\n\thyperparameters: Optional[dict] = {self.hyperparameters}"
+            f"\n\tparams : {params_size} Parameters"
+            f"\n\ttx = {optimizer} Optimizer with {scheduler} Scheduler"
+            f"\n\topt_state : {opt_state_size} Parameters"
+            f"\n\thyperparameters : {self.hyperparameters}"
             f"\n)"
         )
         return string

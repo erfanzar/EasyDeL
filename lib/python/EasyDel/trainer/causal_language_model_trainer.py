@@ -691,9 +691,10 @@ class CausalLanguageModelTrainer:
                             for ssb in self.arguments.ids_to_pop_from_dataset:
                                 _ = batch.pop(ssb, None)
                             time_s = time.time()
-                            sharded_state, loss, accuracy = self.sharded_train_step_fn(sharded_state,
-                                                                                       batch
-                                                                                       )
+                            sharded_state, loss, accuracy = self.sharded_train_step_fn(
+                                sharded_state,
+                                batch
+                            )
                             ttl_time = time.time() - time_s
                             losses.append(loss)
                             learning_rates.append(self.scheduler(current_step).tolist())
