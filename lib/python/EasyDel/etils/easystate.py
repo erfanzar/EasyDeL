@@ -197,13 +197,21 @@ class EasyDelState(struct.PyTreeNode):
             tx_init = {}
         tx_init = copy.deepcopy(tx_init)
         tx_init = cls.unsafe_dict(tx_init)
+
         tx_init["optimizer"] = cls.search("optimizer", tx_init, "admaw")
         tx_init["scheduler"] = cls.search("scheduler", tx_init, "none")
         tx_init["steps"] = cls.search("steps", tx_init, 1e6)
-
-        tx, sc = get_optimizer_and_scheduler(
-            **tx_init
-        )
+        try:
+            tx, sc = get_optimizer_and_scheduler(
+                **tx_init
+            )
+        except TypeError:
+            print("\033[1;32mCouldn't load past optimizer State initializing new one\033[1;0m")
+            tx, sc = get_optimizer_and_scheduler(
+                optimizer="adamw",
+                scheduler="none",
+                steps=10000,
+            )
         if hyperparameters is None:
             hyperparameters = {}
 
