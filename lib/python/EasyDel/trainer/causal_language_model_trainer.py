@@ -604,10 +604,16 @@ class CausalLanguageModelTrainer:
             gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
             milestone: bool = False
     ) -> str:
-        step = int(jax.device_get(
-            state.step)) + self.arguments.step_start_point if self.arguments.step_start_point is not None else int(
-            jax.device_get(state.step))
-        checkpoint_name = "streaming_train_state"
+        step = int(
+            jax.device_get(
+                state.step
+            )
+        ) + self.arguments.step_start_point if self.arguments.step_start_point is not None else int(
+            jax.device_get(
+                state.step
+            )
+        )
+        checkpoint_name = f"{self.arguments.model_name}-S{step}"
         filename = f"{checkpoint_name}_{step}" if milestone else f"{checkpoint_name}"
         filename += ".easy"
         print(f"Saving Model \033[1;30m{filename}\033[1;0m")

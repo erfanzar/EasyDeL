@@ -88,7 +88,7 @@ class TrainArguments(
             wandb_entity: Optional[str] = None,
             save_optimizer_state: bool = False,
             step_start_point: Optional[int] = None,
-            verbose: bool = False,
+            verbose: bool = True,
             offload_device: jax.Device = jax.devices("cpu")[0],
             **kwargs
     ):

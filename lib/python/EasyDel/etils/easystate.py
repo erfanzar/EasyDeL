@@ -559,9 +559,15 @@ class EasyDelState(struct.PyTreeNode):
         scheduler = self.tx_init.get("scheduler", None)
 
         if optimizer is None:
-            optimizer = self.find_key("optimizer", self.tx_init)
+            optimizer = self.find_key(
+                "optimizer",
+                self.tx_init
+            )
         if scheduler is None:
-            scheduler = self.find_key("scheduler", self.tx_init)
+            scheduler = self.find_key(
+                "scheduler",
+                self.tx_init
+            )
 
         string = (
             f"{self.__class__.__name__}("
