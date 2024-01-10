@@ -1,3 +1,4 @@
+import copy
 import dataclasses
 import os
 import time
@@ -364,16 +365,21 @@ class CausalLanguageModelTrainer:
         """
         extra_configs = {} if self.arguments.extra_configs is None else self.arguments.extra_configs
         if self.arguments.model_class is None:
-            config = AutoConfig.from_pretrained(self.arguments.model_id, trust_remote_code=True
-                                                , gradient_checkpointing=self.arguments.gradient_checkpointing,
-                                                use_pjit_attention_force=self.arguments.use_pjit_attention_force,
-                                                **extra_configs
-                                                )
+            config = AutoConfig.from_pretrained(
+                self.arguments.model_id,
+                trust_remote_code=True,
+                gradient_checkpointing=self.arguments.gradient_checkpointing,
+                use_pjit_attention_force=self.arguments.use_pjit_attention_force,
+                **extra_configs
+            )
 
             assert hasattr(config, "get_partition_rules")
-            model = FlaxAutoModelForCausalLM.from_config(config, trust_remote_code=True, dtype=self.arguments.dtype,
-                                                         param_dtype=self.arguments.param_dtype,
-                                                         _do_init=False)
+            model = FlaxAutoModelForCausalLM.from_config(
+                config, trust_remote_code=True,
+                dtype=self.arguments.dtype,
+                param_dtype=self.arguments.param_dtype,
+                _do_init=False
+            )
 
         else:
             if not hasattr(self.arguments.configs_to_init_model_class["config"], "get_partition_rules"):
@@ -421,8 +427,12 @@ class CausalLanguageModelTrainer:
                 tx=self.tx,
                 params=flax.core.freeze({"params": params__}),
                 apply_fn=self.model.__call__,
-                module_config=self.model.config,
-                tx_init=self.arguments.optimizer_kwargs,
+                module_config=copy.deepcopy(
+                    self.model.config
+                ),
+                tx_init=copy.deepcopy(
+                    self.arguments.optimizer_kwargs
+                ),
                 hyperparameters=EasyDelState.create_hyperparameters(
                     self.model.config.model_type
                 ),
@@ -435,8 +445,12 @@ class CausalLanguageModelTrainer:
                 tx=self.tx,
                 params=params_,
                 apply_fn=self.model.__call__,
-                module_config=self.model.config,
-                tx_init=self.arguments.optimizer_kwargs,
+                module_config=copy.deepcopy(
+                    self.model.config
+                ),
+                tx_init=copy.deepcopy(
+                    self.arguments.optimizer_kwargs
+                ),
                 hyperparameters=EasyDelState.create_hyperparameters(
                     self.model.config.model_type
                 ),
