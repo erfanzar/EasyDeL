@@ -5,33 +5,11 @@ from flax.traverse_util import flatten_dict
 from flax.serialization import from_bytes, to_bytes, to_state_dict
 import msgpack
 import os
-
+from fjformer import get_dtype
 from jax import numpy as jnp
 from typing import List
 from tqdm import tqdm
 
-
-def get_dtype(dtype):
-    """
-    The get_dtype function is a helper function that returns the JAX float dtype
-    corresponding to the string name of a floating point type.  This is useful for converting
-    between strings and JAX float types, which are used in many places throughout this codebase.
-
-
-    :param dtype: Specify the type of data that is being passed into the function
-    :return: The float dtype of the input string
-    
-    """
-    return {
-        'bf16': jax.numpy.bfloat16,
-        'bfloat16': jax.numpy.bfloat16,
-        'fp16': jax.numpy.float16,
-        'float16': jax.numpy.float16,
-        'fp32': jax.numpy.float32,
-        'float32': jax.numpy.float32,
-        'fp64': jax.numpy.float64,
-        'float64': jax.numpy.float64,
-    }[dtype]
 
 
 def float_tensor_to_dtype(tensor, dtype):
