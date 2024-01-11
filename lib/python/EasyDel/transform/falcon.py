@@ -147,17 +147,6 @@ def falcon_convert_flax_to_pt_7b(state_dict_flax, num_hidden_layers: int, device
     return state_dict
 
 
-def falcon_easydel_to_hf(path, config: FalconConfig):
-    """
-        Takes path to easydel saved ckpt and return the model in pytorch (Transformers Huggingface)
-    """
-    torch_params = load_and_convert_checkpoint_to_torch(path)
-    edited_params = {}
-    for k, v in torch_params.items():
-        edited_params[k.replace('.kernel', '.weight').replace('.embedding', '.weight')] = v
-    model = FalconForCausalLM(config=config)
-    model.load_state_dict(edited_params)
-    return model
 
 
 def falcon_convert_hf_to_flax(state_dict: Dict[str, torch.Tensor], config: FalconConfig, device):
