@@ -194,7 +194,7 @@ def easystate_to_torch(
     model_parameters = flatten_dict(
         state.params['params'],
         sep='.'
-    ) if model_parameters else flatten_dict(
+    ) if select_params_field else flatten_dict(
         state.params,
         sep='.'
     )
