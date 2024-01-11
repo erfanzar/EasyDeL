@@ -8,6 +8,7 @@ import os
 
 from jax import numpy as jnp
 from typing import List
+from tqdm import tqdm
 
 
 def get_dtype(dtype):
