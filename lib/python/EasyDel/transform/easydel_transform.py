@@ -6,6 +6,7 @@ from flax.serialization import from_bytes, to_bytes, to_state_dict
 import msgpack
 import os
 
+from jax import numpy as jnp
 from typing import List
 
 
@@ -165,3 +166,76 @@ def save_ckpt(train_state, path, gather_fns=None, float_dtype=None):
                 value = gather_fns[key](value)
             value = float_tensor_to_dtype(value, float_dtype)
             stream.write(packer.pack((key, to_bytes(value))))
+
+
+def easystate_to_torch(
+    state,
+    dtype=jnp.float16,
+    transpose_needed=None,
+    transpose_not_needed=None,
+    select_params_field: bool = True
+):
+    import torch
+
+    if transpose_needed is None:
+        transpose_needed = ["kernel"]
+    if transpose_not_needed is None:
+        transpose_not_needed = ['none']
+
+    def match_keywords(string, do_transpose, dont_transpose):
+        for dtr in do_transpose:
+            if dtr not in string:
+                return False
+        for ntr in dont_transpose:
+            if ntr in string:
+                return False
+        return True
+
+    model_parameters = flatten_dict(
+        state.params['params'],
+        sep='.'
+    ) if model_parameters else flatten_dict(
+        state.params,
+        sep='.'
+    )
+    torch_state_dict = {}
+    pbar = tqdm(
+        model_parameters.items(),
+        desc="Converting EasyDelState to torch state_dict"
+    )
+    for key, tensor in pbar:
+        if match_keywords(key, transpose_needed, transpose_not_needed):
+            tensor = tensor.T
+        tensor = tensor.astype(get_dtype(dtype))
+        torch_state_dict[key.replace(".kernel",".weight").replace(".embedding",".weight")] = torch.from_numpy(tensor)
+    return torch_state_dict
+
+
+def easystate_to_huggingface_model(
+    state,
+    config,
+    base_huggingface_module,
+    base_huggingface_module_kwarguments=None,
+    dtype=jnp.float16,
+    transpose_needed=None,
+    transpose_not_needed=None,
+    select_params_field: bool = True
+):
+    if base_huggingface_module_kwarguments is None:
+        base_huggingface_module_kwarguments = {}
+    state_dict = easystate_to_torch(
+        state=state,
+        dtype=dtype,
+        transpose_needed=transpose_needed,
+        transpose_not_needed=transpose_not_needed,
+        select_params_field=select_params_field
+    )
+    model = base_huggingface_module(
+        config=config,
+        **base_huggingface_module_kwarguments
+    )
+    model.load_state_dict(state_dict)
+    return model
+
+
+    
