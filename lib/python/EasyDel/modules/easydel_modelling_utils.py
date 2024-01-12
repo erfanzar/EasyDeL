@@ -5,6 +5,7 @@ import jax
 from jax import numpy as jnp
 from typing import Sequence, Union, Optional
 from dataclasses import dataclass
+from jax.sharding import PartitionSpec, Mesh
 
 
 @dataclass
@@ -21,11 +22,11 @@ class EasyDelPretrainedConfig(PretrainedConfig):
     :param self: Refer to the instance of the class
     :param axis_dims: Sequence[int]: Specify the number of dimensions for each axis
     :param axis_names: Sequence[str]: Set the names of the axes
-    :param q_ps: jax.sharding.PartitionSpec: Specify the partitioning of the query tensor
-    :param k_ps: jax.sharding.PartitionSpec: Partition the key matrix
-    :param v_ps: jax.sharding.PartitionSpec: Specify the partitioning of the value tensor
-    :param b_ps: jax.sharding.PartitionSpec: Specify the Attention Bias partition spec
-    :param a_ps: jax.sharding.PartitionSpec: Specify the partitioning of the attention weights
+    :param q_ps: PartitionSpec: Specify the partitioning of the query tensor
+    :param k_ps: PartitionSpec: Partition the key matrix
+    :param v_ps: PartitionSpec: Specify the partitioning of the value tensor
+    :param b_ps: PartitionSpec: Specify the Attention Bias partition spec
+    :param a_ps: PartitionSpec: Specify the partitioning of the attention weights
     :param use_shard_map: bool: whenever to use shard_map for attention
     :param backend: Optional[None]: Specify the backend to use
     :param easy_method: EasyMethod: Specify the use of model to init the QDot Method for (e.q TRAIN,SERVE,...)
@@ -35,16 +36,21 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             self,
             axis_dims: Sequence[int] = (1, -1, 1, 1),
             axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
-                ("dp", "fsdp"), "sp", "tp", None),
-            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
-                ("dp", "fsdp"), "sp", "tp", None),
-            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
-                ("dp", "fsdp"), "sp", "tp", None),
-            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
-                ("dp", "fsdp"), None, None, None),
-            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
-                ("dp", "fsdp"), "sp", "tp", None),
+            q_ps: PartitionSpec = PartitionSpec(
+                ("dp", "fsdp"), "sp", "tp", None
+            ),
+            k_ps: PartitionSpec = PartitionSpec(
+                ("dp", "fsdp"), "sp", "tp", None
+            ),
+            v_ps: PartitionSpec = PartitionSpec(
+                ("dp", "fsdp"), "sp", "tp", None
+            ),
+            b_ps: PartitionSpec = PartitionSpec(
+                ("dp", "fsdp"), None, None, None
+            ),
+            a_ps: PartitionSpec = PartitionSpec(
+                ("dp", "fsdp"), "sp", "tp", None
+            ),
             use_shard_map: bool = False,
             backend: Optional[None] = jax.default_backend(),
             easy_method: EasyMethod = EasyMethod.TRAIN,
@@ -79,13 +85,13 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             (len(jax.devices() if backend == "" else jax.devices(backend)), 1))
         resh = array_devices.reshape(axis_dims).shape
 
-        return jax.sharding.Mesh(
+        return Mesh(
             create_device_mesh(resh), axis_names
         )
 
-    def jax_mesh(self) -> jax.sharding.Mesh:
+    def jax_mesh(self) -> Mesh:
         """
-        The jax_mesh function is a helper function that creates a jax.sharding.Mesh object from the
+        The jax_mesh function is a helper function that creates a Mesh object from the
         axis_dims and axis_names attributes of an object, which are assumed to be lists of integers and strings, respectively.
         The backend attribute is also used if it exists.
 
@@ -114,7 +120,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             raise NotImplementedError()
         else:
             return (
-                ('.*', jax.sharding.PartitionSpec(("fsdp", "sp")))
+                ('.*', PartitionSpec(("fsdp", "sp")))
             )
 
     def get_axis_dims(self) -> Sequence[int]:
@@ -152,19 +158,19 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             self,
             axis_dims: Sequence[int] = (1, -1, 1, 1),
             axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
+            q_ps: PartitionSpec = PartitionSpec(
                 ("dp", "fsdp"), "sp", "tp", None
             ),
-            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
+            k_ps: PartitionSpec = PartitionSpec(
                 ("dp", "fsdp"), "sp", "tp", None
             ),
-            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
+            v_ps: PartitionSpec = PartitionSpec(
                 ("dp", "fsdp"), "sp", "tp", None
             ),
-            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
+            b_ps: PartitionSpec = PartitionSpec(
                 ("dp", "fsdp"), None, None, None
             ),
-            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
+            a_ps: PartitionSpec = PartitionSpec(
                 ("dp", "fsdp"), "sp", "tp", None
             ),
             use_shard_map: bool = False,
@@ -175,11 +181,11 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             :param self: Refer to the instance of the class
             :param axis_dims: Sequence[int]: Specify the number of dimensions for each axis
             :param axis_names: Sequence[str]: Set the names of the axes
-            :param q_ps: jax.sharding.PartitionSpec: Specify the partitioning of the query tensor
-            :param k_ps: jax.sharding.PartitionSpec: Partition the key matrix
-            :param v_ps: jax.sharding.PartitionSpec: Specify the partitioning of the value tensor
-            :param b_ps: jax.sharding.PartitionSpec: Specify the Attention Bias partition spec
-            :param a_ps: jax.sharding.PartitionSpec: Specify the partitioning of the attention weights
+            :param q_ps: PartitionSpec: Specify the partitioning of the query tensor
+            :param k_ps: PartitionSpec: Partition the key matrix
+            :param v_ps: PartitionSpec: Specify the partitioning of the value tensor
+            :param b_ps: PartitionSpec: Specify the Attention Bias partition spec
+            :param a_ps: PartitionSpec: Specify the partitioning of the attention weights
             :param use_shard_map: bool: whenever to use shard_map for attention
             :param backend: Optional[None]: Specify the backend to use
             """
