@@ -81,7 +81,7 @@ class TrainArguments(
             init_input_shape: Tuple[int, int] = (1, 1),
             step_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp"),
             training_time: Optional[str] = None,
-            dataloader_num_workers: Optional[int] = 4,
+            dataloader_num_workers: Optional[int] = 0,
             dataloader_pin_memory: Optional[bool] = False,
             jax_distributed_config: Optional[dict] = None,
             log_all_workers: bool = False,

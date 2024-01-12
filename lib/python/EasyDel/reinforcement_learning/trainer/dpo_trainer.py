@@ -2,19 +2,21 @@ import warnings
 from collections import defaultdict
 
 import chex
+import flax.core
 import jax
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from ..utils.collectors import DPODataCollatorWithPadding
 from typing import Optional, Literal, Dict, Union, Any, Tuple, List
-
+from .utils import pad_to_length
 from ...modules.auto_easydel_model import AutoEasyDelModelForCausalLM
 from datasets import Dataset
 from jax import numpy as jnp
 from ...modules.easydel_modelling_utils import EasyDelFlaxPretrainedModel
 from ...trainer.training_configurations import TrainArguments
 from transformers import PreTrainedTokenizerBase
+from .partitioner_config import PartitionerConfig
 
 
 class DPOTrainer:
@@ -22,6 +24,7 @@ class DPOTrainer:
             self,
             model: EasyDelFlaxPretrainedModel | str = None,
             ref_model: Optional[EasyDelFlaxPretrainedModel | str] = None,
+            partitioner_config: Optional[PartitionerConfig] = PartitionerConfig(),
             beta: float = 0.1,
             label_smoothing: float = 0,
             loss_type: Literal["sigmoid", "hinge", "ipo", "kto"] = "sigmoid",
@@ -39,6 +42,9 @@ class DPOTrainer:
             model_init_kwarguments: Optional[Dict] = None,
             ref_model_init_kwarguments: Optional[Dict] = None,
     ):
+        if partitioner_config is None:
+            partitioner_config = PartitionerConfig()
+        self.partitioner_config = partitioner_config
         if model_init_kwarguments is None:
             model_init_kwarguments = {}
         elif not isinstance(model, str):
@@ -78,7 +84,7 @@ class DPOTrainer:
         self.max_target_length = max_target_length
         self.tokenizer = tokenizer
         self.precompute_ref_log_probs = precompute_ref_log_probs
-
+        self.is_encoder_decoder = False
         self._precomputed_train_ref_log_probs = False
         self._precomputed_eval_ref_log_probs = False
         if loss_type in ["hinge", "ipo", "kto_pair"] and label_smoothing > 0:
@@ -275,7 +281,8 @@ class DPOTrainer:
         chosen_sequence_tokens["labels"][: len(chosen_tokens["prompt_input_ids"])] = [
                                                                                          self.label_pad_token_id
                                                                                      ] * len(
-            chosen_tokens["prompt_input_ids"])
+            chosen_tokens["prompt_input_ids"]
+        )
         rejected_sequence_tokens["labels"] = rejected_sequence_tokens["input_ids"][:]
         rejected_sequence_tokens["labels"][: len(rejected_tokens["prompt_input_ids"])] = [
                                                                                              self.label_pad_token_id
@@ -318,13 +325,53 @@ class DPOTrainer:
         return self.mesh
 
     def concatenated_forward(
-            self, model: EasyDelFlaxPretrainedModel, batch: Dict[str, Union[List, chex.Array]]
+            self,
+            model: EasyDelFlaxPretrainedModel,
+            batch: Dict[str, Union[List, chex.Array]],
+            params: flax.core.FrozenDict | dict
     ) -> Tuple[chex.Array, chex.Array, chex.Array, chex.Array]:
         """
         Run the given model on the given batch of inputs, concatenating the chosen and rejected inputs together.
         """
-        # TODO : Complete concatenated_forward
-        ...
+
+        concatenated_batch = self.concatenated_inputs(
+            batch,
+            is_encoder_decoder=self.is_encoder_decoder,
+            label_pad_token_id=self.label_pad_token_id,
+            padding_value=self.padding_value,
+        )
+        len_chosen = batch["chosen_labels"].shape[0]
+
+        model_kwargs = (
+            {
+                "labels": concatenated_batch["concatenated_labels"],
+                "decoder_input_ids": concatenated_batch.pop("concatenated_decoder_input_ids", None),
+            }
+            if self.is_encoder_decoder
+            else {}
+        )
+        all_logits = model(
+            concatenated_batch["concatenated_input_ids"],
+            attention_mask=concatenated_batch["concatenated_attention_mask"],
+            params=params,
+            **model_kwargs,
+        ).logits
+
+        all_logps = self.get_batch_logps(
+            all_logits,
+            concatenated_batch["concatenated_labels"],
+            average_log_prob=False,
+            is_encoder_decoder=self.is_encoder_decoder,
+            label_pad_token_id=self.label_pad_token_id,
+        )
+
+        chosen_logps = all_logps[:len_chosen]
+        rejected_logps = all_logps[len_chosen:]
+
+        chosen_logits = all_logits[:len_chosen]
+        rejected_logits = all_logits[len_chosen:]
+
+        return chosen_logps, rejected_logps, chosen_logits, rejected_logits
 
     @staticmethod
     def get_batch_logps(
@@ -370,3 +417,116 @@ class DPOTrainer:
             log_prob = jnp.sum((per_token_logps * loss_mask), axis=-1)
 
         return log_prob
+
+    @staticmethod
+    def concatenated_inputs(
+            batch: Dict[str, Union[List, chex.Array]],
+            is_encoder_decoder: bool = False,
+            label_pad_token_id: int = -100,
+            padding_value: int = 0,
+    ) -> Dict[str, chex.Array]:
+        concatenated_batch = {}
+
+        if is_encoder_decoder:
+            max_length = max(batch["chosen_labels"].shape[1], batch["rejected_labels"].shape[1])
+        else:
+            max_length = max(batch["chosen_input_ids"].shape[1], batch["rejected_input_ids"].shape[1])
+
+        for k in batch:
+            if k.startswith("chosen") and isinstance(batch[k], jax.Array):
+                if "labels" in k or is_encoder_decoder:
+                    pad_value = label_pad_token_id
+                elif k.endswith("_input_ids"):
+                    pad_value = padding_value
+                elif k.endswith("_attention_mask"):
+                    pad_value = 0
+                else:
+                    raise KeyError("couldn't find pad_value [Dataset Issue]")
+                concatenated_key = k.replace("chosen", "concatenated")
+                concatenated_batch[concatenated_key] = pad_to_length(batch[k], max_length, pad_value=pad_value)
+        for k in batch:
+            if k.startswith("rejected") and isinstance(batch[k], jax.Array):
+                if "labels" in k or is_encoder_decoder:
+                    pad_value = label_pad_token_id
+                elif k.endswith("_input_ids"):
+                    pad_value = padding_value
+                elif k.endswith("_attention_mask"):
+                    pad_value = 0
+                else:
+                    raise KeyError("couldn't find pad_value [Dataset Issue]")
+                concatenated_key = k.replace("rejected", "concatenated")
+                concatenated_batch[concatenated_key] = jnp.concatenate(
+                    (
+                        concatenated_batch[concatenated_key],
+                        pad_to_length(batch[k], max_length, pad_value=pad_value),
+                    ),
+                    axis=0,
+                )
+
+        if is_encoder_decoder:
+            concatenated_batch["concatenated_input_ids"] = batch["prompt_input_ids"].repeat(2, 1)
+            concatenated_batch["concatenated_attention_mask"] = (
+                batch["prompt_attention_mask"].repeat(2, 1)
+            )
+
+        return concatenated_batch
+
+    def dpo_loss(
+            self,
+            policy_chosen_logps: chex.Array,
+            policy_rejected_logps: chex.Array,
+            reference_chosen_logps: chex.Array,
+            reference_rejected_logps: chex.Array,
+            reference_free: bool = False,
+    ) -> Tuple[chex.Array, chex.Array, chex.Array]:
+
+        pi_logratios = policy_chosen_logps - policy_rejected_logps
+        if reference_free:
+            ref_logratios = 0
+        else:
+            ref_logratios = reference_chosen_logps - reference_rejected_logps
+
+        logits = pi_logratios - ref_logratios
+
+        if self.loss_type == "sigmoid":
+            losses = (
+                    -jax.nn.log_sigmoid(self.beta * logits) * (1 - self.label_smoothing)
+                    - jax.nn.log_sigmoid(-self.beta * logits) * self.label_smoothing
+            )
+        elif self.loss_type == "hinge":
+            losses = jax.relu(1 - self.beta * logits)
+        elif self.loss_type == "ipo":
+            losses = (logits - 1 / (2 * self.beta)) ** 2
+        elif self.loss_type == "kto_pair":
+            chosen_KL = jax.lax.clamp(min=0, x=jnp.mean(policy_chosen_logps - reference_chosen_logps))
+            rejected_KL = jax.lax.clamp(min=0, x=jnp.mean(policy_rejected_logps - reference_rejected_logps))
+
+            chosen_logratios = policy_chosen_logps - reference_chosen_logps
+            rejected_logratios = policy_rejected_logps - reference_rejected_logps
+            losses = jnp.concatenate(
+                (
+                    1 - jax.nn.sigmoid(self.beta * (chosen_logratios - rejected_KL)),
+                    1 - jax.nn.sigmoid(self.beta * (chosen_KL - rejected_logratios)),
+                ),
+                0,
+            )
+        else:
+            raise ValueError(
+                f"Unknown loss type: {self.loss_type}. Should be one of ['sigmoid', 'hinge', 'ipo', 'kto_pair']"
+            )
+
+        chosen_rewards = (
+                self.beta
+                * (
+                        policy_chosen_logps - reference_chosen_logps
+                )
+        )
+        rejected_rewards = (
+                self.beta
+                * (
+                        policy_rejected_logps
+                        - reference_rejected_logps
+                )
+        )
+
+        return losses, chosen_rewards, rejected_rewards
