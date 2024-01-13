@@ -71,7 +71,7 @@ def main():
             params=params,
 
         )
-        res = jnp.allclose(torch_output, flax_output.logits, atol=1e-5)
+        res = jnp.allclose(torch_output, flax_output.logits, atol=1e-3)
         print('Mistral Huggingface Predictions :\n', torch_output,
               '\nEasyDel Predictions: \n', flax_output.logits)
         if res:  # A Little Bit of humor

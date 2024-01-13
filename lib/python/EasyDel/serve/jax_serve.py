@@ -7,6 +7,7 @@ import flax.core
 import gradio as gr
 import jax
 import msgpack
+import termcolor
 import tqdm
 import transformers
 import uvicorn
@@ -20,7 +21,7 @@ from fjformer.checkpoint import get_dtype
 from jax.sharding import Mesh, PartitionSpec as Ps
 from transformers import GenerationConfig
 import logging
-from ..utils.utils import RNG, prefix_str
+from ..utils.utils import RNG, prefix_print
 import multiprocessing as mp
 from typing import Union, Sequence, List
 import chex
@@ -188,7 +189,7 @@ class JAXServer(GradioUserInference):
             tokenizer.truncation_side = "right"
             self.tokenizer = copy.deepcopy(tokenizer)
         except:
-            prefix_str(
+            prefix_print(
                 "Warning", f"The class Model of Tokenizer {type(tokenizer)} do not support deepcopy option "
             )
             if self.config.use_prefix_tokenizer:
@@ -521,8 +522,16 @@ class JAXServer(GradioUserInference):
         assert self.rules is not None, "rules should not be None"
         if self.config.use_prefix_tokenizer:
             if verbose:
-                print("\033[1;91mCompiling Model Forwards Greedy/NonGreedy(Generate)")
-                print("Compiling Greedy Funcs")
+                termcolor.cprint(
+                    "Compiling Model Forwards Greedy/Non-Greedy(Generate)",
+                    color="cyan",
+                    force_color=True
+                )
+                termcolor.cprint(
+                    "Compiling Greedy Functions",
+                    color="cyan",
+                    force_color=True
+                )
 
             r, a = [None] * 2
             for r, a in self.process(
@@ -531,7 +540,12 @@ class JAXServer(GradioUserInference):
                     greedy=True
             ):
                 ...
-            print("Compiling NonGreedy(Generate) Funcs\033[1;0m")
+            if verbose:
+                termcolor.cprint(
+                    "Compiling Non-Greedy(Generate) Functions",
+                    color="cyan",
+                    force_color=True
+                )
             for r, a in self.process(
                     string="",
                     max_new_tokens=self.config.max_compile_tokens,
@@ -540,9 +554,11 @@ class JAXServer(GradioUserInference):
                 ...
 
         else:
-            print(
-                "\033[1;91mSkip Compiling the compiling process is useless "
-                "when you are not using prefix tokenizer\033[1;0m")
+            termcolor.cprint(
+                "Skip Compiling the compiling process is useless "
+                "when you are not using prefix tokenizer",
+                color="red", force_color=True
+            )
         return True
 
     def greedy_generate(self,
