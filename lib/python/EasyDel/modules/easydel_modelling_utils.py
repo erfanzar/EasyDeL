@@ -1,4 +1,6 @@
 import chex
+from fjformer import with_sharding_constraint
+from fjformer.func.loss_func import cross_entropy_loss_and_accuracy
 from jax.experimental.mesh_utils import create_device_mesh
 from transformers import PretrainedConfig, FlaxPreTrainedModel
 import jax
