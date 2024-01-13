@@ -10,12 +10,10 @@ from tqdm import tqdm
 from ..utils.collectors import DPODataCollatorWithPadding
 from typing import Optional, Literal, Dict, Union, Any, Tuple, List
 from .utils import pad_to_length
-from ...modules.auto_easydel_model import AutoEasyDelModelForCausalLM
 from datasets import Dataset
 from jax import numpy as jnp
-from ...modules.easydel_modelling_utils import EasyDelFlaxPretrainedModel
 from ...trainer.training_configurations import TrainArguments
-
+from ...etils.easystate import EasyDelState
 from transformers import PreTrainedTokenizerBase
 from .partitioner_config import PartitionerConfig
 
@@ -23,8 +21,8 @@ from .partitioner_config import PartitionerConfig
 class DPOTrainer:
     def __init__(
             self,
-            model: EasyDelFlaxPretrainedModel | str = None,
-            ref_model: Optional[EasyDelFlaxPretrainedModel | str] = None,
+            model_state: EasyDelState | str = None,
+            ref_model_state: Optional[EasyDelState | str] = None,
             partitioner_config: Optional[PartitionerConfig] = PartitionerConfig(),
             beta: float = 0.1,
             label_smoothing: float = 0,
@@ -55,46 +53,41 @@ class DPOTrainer:
         )
         if model_init_kwarguments is None:
             model_init_kwarguments = {}
-        elif not isinstance(model, str):
+        elif not isinstance(model_state, str):
             raise ValueError("You passed model_kwarguments to the DPOTrainer. But your model is already instantiated.")
 
         if ref_model_init_kwarguments is None:
             ref_model_init_kwarguments = {}
-        elif not isinstance(ref_model, str):
+        elif not isinstance(ref_model_state, str):
             raise ValueError(
                 "You passed ref_model_kwarguments to the DPOTrainer. But your ref_model is already instantiated."
             )
 
-        if isinstance(model, str):
+        if isinstance(model_state, str):
             warnings.warn(
                 "You passed a model_id to the DPOTrainer. This will automatically create an "
                 "`AutoEasyDelModelForCausalLM` for you."
             )
-            model, model_params = AutoEasyDelModelForCausalLM.from_pretrained(
-                model,
+            model_state = EasyDelState.from_pretrained(
+                model_state,
                 **model_init_kwarguments
             )
-        else:
-            model_params = None
-        if isinstance(ref_model, str):
+        if isinstance(ref_model_state, str):
             warnings.warn(
                 "You passed a ref model_id to the DPOTrainer. This will automatically create an "
                 "`AutoEasyDelModelForCausalLM`"
             )
-            ref_model, ref_model_params = AutoEasyDelModelForCausalLM.from_pretrained(
-                ref_model,
+            ref_model_state = EasyDelState.from_pretrained(
+                ref_model_state,
                 **ref_model_init_kwarguments
             )
 
-        else:
-            ref_model_params = None
         data_collator = DPODataCollatorWithPadding(
             pad_token_id=tokenizer.pad_token_id,
             label_pad_token_id=label_pad_token_id,
             is_encoder_decoder=False,
         )
-        self.ref_model_params = ref_model_params
-        self.model_params = model_params
+
         self.max_length = max_length
         self.label_pad_token_id = label_pad_token_id
         self.padding_value = padding_value if padding_value is not None else tokenizer.pad_token_id
@@ -130,8 +123,8 @@ class DPOTrainer:
         self.train_dataset = train_dataset
         self.eval_dataset = eval_dataset
         self.tokenizer = tokenizer
-        self.ref_model = ref_model
-        self.model = model
+        self.ref_model_state = ref_model_state
+        self.model_state = model_state
         self._loggers_initialized = False
         self.mesh = self.arguments.get_mesh()
 
@@ -154,7 +147,9 @@ class DPOTrainer:
 
         return DataLoader(train_dataset, **dataloader_params)
 
-    def get_train_dataloader(self) -> DataLoader:
+    def get_train_dataloader(
+            self,
+    ) -> DataLoader:
         """
         Returns the training [`~torch.utils.data.DataLoader`].
 
@@ -175,7 +170,9 @@ class DPOTrainer:
             reference_chosen_logps = []
             reference_rejected_logps = []
             for padded_batch in tqdm(iterable=data_loader, desc="Train dataset reference log probs"):
-                reference_chosen_logp, reference_rejected_logp = self.compute_reference_log_probs(padded_batch)
+                reference_chosen_logp, reference_rejected_logp = self.compute_reference_log_probs(
+                    padded_batch,
+                )
                 reference_chosen_logps.append(reference_chosen_logp.cpu())
                 reference_rejected_logps.append(reference_rejected_logp.cpu())
 
@@ -196,8 +193,6 @@ class DPOTrainer:
         """
         Llama tokenizer does satisfy `enc(a + b) = enc(a) + enc(b)`.
         It does ensure `enc(a + b) = enc(a) + enc(a + b)[len(enc(a)):]`.
-        Reference:
-            https://github.com/EleutherAI/lm-evaluation-harness/pull/531#issuecomment-1595586257
         """
 
         full_tokenized = self.tokenizer(prompt + answer, add_special_tokens=False)
@@ -240,7 +235,7 @@ class DPOTrainer:
             attention_mask=answer_attention_mask,
         )
 
-    def tokenize_row(self, feature, model: EasyDelFlaxPretrainedModel = None) -> Dict:
+    def tokenize_row(self, feature, state: EasyDelState = None) -> Dict:
         batch = {}
         prompt = feature["prompt"]
         chosen = feature["chosen"]
@@ -326,23 +321,34 @@ class DPOTrainer:
 
         return batch
 
-    def compute_reference_log_probs(self, padded_batch: Dict) -> tuple[Any, Any]:
+    def compute_reference_log_probs(
+            self,
+            padded_batch: Dict,
+    ) -> tuple[Any, Any]:
         """Computes log probabilities of the reference model for a single padded batch of a DPO specific dataset."""
 
-        if self.ref_model is None:
+        if self.ref_model_state is None:
             (
                 reference_chosen_logps,
                 reference_rejected_logps,
                 _,
                 _,
-            ) = self.concatenated_forward(self.model, padded_batch)
+            ) = self.concatenated_forward(
+                apply_fn=self.model_state.apply_fn,
+                params=self.model_state.params,
+                batch=padded_batch,
+            )
         else:
             (
                 reference_chosen_logps,
                 reference_rejected_logps,
                 _,
                 _,
-            ) = self.concatenated_forward(self.ref_model, padded_batch)
+            ) = self.concatenated_forward(
+                apply_fn=self.ref_model_state.apply_fn,
+                params=self.ref_model_state.params,
+                batch=padded_batch,
+            )
 
         return reference_chosen_logps, reference_rejected_logps
 
@@ -351,9 +357,9 @@ class DPOTrainer:
 
     def concatenated_forward(
             self,
-            model: EasyDelFlaxPretrainedModel,
+            apply_fn,
+            params,
             batch: Dict[str, Union[List, chex.Array]],
-            params: flax.core.FrozenDict | dict
     ) -> Tuple[chex.Array, chex.Array, chex.Array, chex.Array]:
         """
         Run the given model on the given batch of inputs, concatenating the chosen and rejected inputs together.
@@ -375,7 +381,10 @@ class DPOTrainer:
             if self.is_encoder_decoder
             else {}
         )
-        all_logits = model(
+
+        # TODO : model be upgraded to state
+
+        all_logits = apply_fn(
             concatenated_batch["concatenated_input_ids"],
             attention_mask=concatenated_batch["concatenated_attention_mask"],
             params=params,
@@ -555,6 +564,104 @@ class DPOTrainer:
         )
 
         return losses, chosen_rewards, rejected_rewards
+
+    def get_batch_loss_metrics(
+            self,
+            state: EasyDelState,
+            batch: Dict[str, Union[List, chex.Array]],
+            train_eval: Literal["train", "eval"] = "train",
+    ):
+        """Compute the DPO loss and other metrics for the given batch of inputs for train or test."""
+        metrics = {}
+
+        def step_forward(params):
+            (
+                policy_chosen_logps,
+                policy_rejected_logps,
+                policy_chosen_logits,
+                policy_rejected_logits,
+            ) = self.concatenated_forward(state.apply_fn, params, batch)
+
+            if "reference_chosen_logps" in batch and "reference_rejected_logps" in batch:
+                reference_chosen_logps = batch["reference_chosen_logps"]
+                reference_rejected_logps = batch["reference_rejected_logps"]
+            else:
+                if self.ref_model_state is None:
+                    (
+                        reference_chosen_logps,
+                        reference_rejected_logps,
+                        _,
+                        _,
+                    ) = self.concatenated_forward(
+                        apply_fn=self.model_state.apply_fn,
+                        params=self.model_state.params,
+                        batch=batch
+                    )
+                else:
+                    (
+                        reference_chosen_logps,
+                        reference_rejected_logps,
+                        _,
+                        _,
+                    ) = self.concatenated_forward(
+                        apply_fn=self.ref_model_state.apply_fn,
+                        params=self.ref_model_state.params,
+                        batch=batch
+                    )
+
+            losses, chosen_rewards, rejected_rewards = self.dpo_loss(
+                policy_chosen_logps,
+                policy_rejected_logps,
+                reference_chosen_logps,
+                reference_rejected_logps,
+            )
+            reward_accuracies = (chosen_rewards > rejected_rewards).float()
+
+            prefix = "eval_" if train_eval == "eval" else ""
+            metrics[f"{prefix}rewards/chosen"] = chosen_rewards.mean()
+            metrics[f"{prefix}rewards/rejected"] = rejected_rewards.mean()
+            metrics[f"{prefix}rewards/accuracies"] = reward_accuracies.mean()
+            metrics[f"{prefix}rewards/margins"] = (chosen_rewards - rejected_rewards).mean()
+            metrics[f"{prefix}logps/rejected"] = policy_rejected_logps.mean()
+            metrics[f"{prefix}logps/chosen"] = policy_chosen_logps.mean()
+            metrics[f"{prefix}logits/rejected"] = policy_rejected_logits.mean()
+            metrics[f"{prefix}logits/chosen"] = policy_chosen_logits.mean()
+            return losses.mean(), metrics
+
+        if train_eval == "train":
+            (loss, metrics), grad = jax.value_and_grad(step_forward, has_aux=True)(state.params)
+        else:
+            loss, metrics = step_forward(state.params)
+            grad = None
+        return loss, metrics, grad
+
+    def prediction_step(
+            self,
+            model_state: EasyDelState,
+            inputs: Dict[str, Union[chex.Array, Any]],
+            prediction_loss_only: bool,
+            ignore_keys: Optional[List[str]] = None,
+    ):
+        if ignore_keys is None:
+            if hasattr(model_state, "config"):
+                ignore_keys = getattr(model_state.config, "keys_to_ignore_at_inference", [])
+            else:
+                ignore_keys = []
+
+        loss, metrics, grad = self.get_batch_loss_metrics(model_state, inputs, train_eval="eval")
+
+        if prediction_loss_only:
+            return loss, None, None
+
+        logits_dict = {
+            "eval_logits/chosen": metrics["eval_logits/chosen"],
+            "eval_logits/rejected": metrics["eval_logits/rejected"],
+        }
+        logits = tuple(v for k, v in logits_dict.items() if k not in ignore_keys)
+        logits = jnp.mean(jnp.stack(logits), axis=1)
+        labels = jnp.zeros(logits.shape[0])
+
+        return loss, logits, labels
 
     def __repr__(self):
         string = f"{self.__class__.__name__}(\n"
