@@ -5,6 +5,7 @@ import time
 
 import IPython.display
 import fjformer.func.loss_func
+import termcolor
 from fjformer.func.loss_func import cross_entropy_loss_and_accuracy
 import wandb
 from datasets import Dataset
@@ -624,7 +625,7 @@ class CausalLanguageModelTrainer:
         checkpoint_name = f"{self.arguments.model_name}-S{step}"
         filename = f"{checkpoint_name}_{step}" if milestone else f"{checkpoint_name}"
         filename += ".easy"
-        print(f"Saving Model \033[1;30m{filename}\033[1;0m")
+        termcolor.cprint(f"Saving Model {filename}.", color="cyan", force_color=True)
         state.save_state(
             filename=filename,
             checkpoint_dir=os.path.join(self.arguments.save_dir, self.arguments.model_name),
@@ -655,10 +656,10 @@ class CausalLanguageModelTrainer:
         """
 
         def count_model_parameters(_p):
-            print(
-                "\033[1;31mModel Contain ",
-                sum(n.size for n in jax.tree_util.tree_flatten(flax.core.unfreeze(_p))[0]) / 1e9,
-                " Billion Parameters"
+            termcolor.cprint(
+                f"Model Contain {sum(n.size for n in jax.tree_util.tree_flatten(flax.core.unfreeze(_p))[0]) / 1e9} "
+                f"Billion Parameters",
+                color="red", force_color=True
             )
 
         dir_prefix: str = "/dev/shm"
@@ -776,14 +777,18 @@ class CausalLanguageModelTrainer:
                             checkpoint_path = f"{str(self.arguments.get_path())}/{filename}"
 
             except KeyboardInterrupt:
-                print(
-                    "\033[1;30m KeyboardInterrupt At training model Will return current state of the model\033[1;0m"
+                termcolor.cprint(
+                    "KeyboardInterrupt At training model Will return Current State of the Model with Parameters.",
+                    color="cyan",
+                    force_color=True
                 )
 
             except EasyDelTimerError:
-                print(
-                    "\033[1;30m Training reached out maximum training Time Killing training Process "
-                    "and Will return current state of the model * \033[1;0m"
+                termcolor.cprint(
+                    "Training reached out maximum training Time Killing training Process "
+                    "and Will return Current State of the Model with Parameters.",
+                    color="cyan",
+                    force_color=True
                 )
             output = TrainerOutput(
                 predict_function=self.sharded_predict,

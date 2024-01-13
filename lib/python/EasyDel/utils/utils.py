@@ -4,6 +4,8 @@ import jax
 import jax.numpy as jnp
 import os
 import time
+
+import termcolor
 import wandb
 from jax.experimental.pjit import pjit, with_sharding_constraint as wsc
 from jax.interpreters import pxla
@@ -26,9 +28,9 @@ def make_shard_and_gather_fns(partition_specs, dtype_specs=None):
 
     def make_to_dtype_fn(dtype_spec):
         def to_dtype(tensor):
-            if dtype_specs in float_dtypes and getattr(tensor, 'dtype', None) in float_dtypes:
+            if dtype_specs in float_dtypes and getattr(tensor, "dtype", None) in float_dtypes:
                 return tensor.astype(dtype_specs)
-            elif hasattr(dtype_spec, 'dtype') and hasattr(tensor, 'dtype'):
+            elif hasattr(dtype_spec, "dtype") and hasattr(tensor, "dtype"):
                 return tensor.astype(dtype_spec.dtype)
             return tensor
 
@@ -207,12 +209,39 @@ class Timer:
         return elapsed_
 
 
-def prefix_str(prefix, string):
-    return f'\033[1;36m{prefix}\033[1;0m : {string}'
+Color = typing.Literal[
+    "black",
+    "grey",
+    "red",
+    "green",
+    "yellow",
+    "blue",
+    "magenta",
+    "cyan",
+    "light_grey",
+    "dark_grey",
+    "light_red",
+    "light_green",
+    "light_yellow",
+    "light_blue",
+    "light_magenta",
+    "light_cyan",
+    "white",
+]
 
 
-def prefix_print(prefix, string):
-    print(f'\033[1;31m{prefix}\033[1;0m : {string}')
+def prefix_print(
+        prefix,
+        string,
+        prefix_color: Color | None = "red"
+):
+    print(
+        termcolor.colored(
+            f"{prefix} : ",
+            color=prefix_color,
+            force_color=True
+        ) + string
+    )
 
 
 class Timers:
@@ -268,9 +297,12 @@ class Timers:
             names = [names]
         for name in names:
             elapsed_time = self.timers[name].elapsed(reset=reset) * 1000.0 / normalizer
-            string = prefix_str(f'Time For {name} (ms)', elapsed_time)
-
-            print(string, flush=True)
+            termcolor.cprint(
+                f"Time Took to Complete Task {name} (microseconds) : "
+                f"{termcolor.colored(elapsed_time, color='white', force_color=True)}",
+                color="cyan",
+                force_color=True
+            )
 
 
 class RNG:

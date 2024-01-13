@@ -1,5 +1,7 @@
 import typing
 
+import termcolor
+
 import EasyDel
 import jax.lax
 from EasyDel.serve import JAXServer, JAXServerConfig
@@ -195,11 +197,23 @@ if __name__ == "__main__":
         config=configs
     )
     try:
-        print('\033[1;36mLaunching Chat App ...\033[1;0m')
+        termcolor.cprint(
+            'Launching Chat App ...',
+            color="cyan",
+            force_color=True
+        )
         server.gradio_app_chat.launch(share=True)
-        print('\033[1;36mLaunching Instruct App ...\033[1;0m')
+        termcolor.cprint(
+            'Launching Instruct App ...',
+            color="cyan",
+            force_color=True
+        )
         server.gradio_app_instruct.launch(share=True)
-        print('\033[1;36mLaunching Server APIS (Fire) ...\033[1;0m')
+        termcolor.cprint(
+            'Launching Server APIS (Fire) ...',
+            color="cyan",
+            force_color=True
+        )
         server.fire()
     except KeyboardInterrupt:
         print('Exiting ...')

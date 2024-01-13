@@ -3,6 +3,7 @@ import pathlib
 import re
 from typing import OrderedDict, List, Union, Mapping, Optional, Tuple, Callable
 
+import termcolor
 from wandb.apis.public import Run
 from wandb.sdk.lib import RunDisabled
 
@@ -163,9 +164,16 @@ class TrainArguments(
         if extra_optimizer_kwargs is None:
             extra_optimizer_kwargs = {}
 
-        assert model_class is not None or model_id is not None, ("you cant pass model_class and model_id both None "
-                                                                 "you should at least pass one of them to build "
-                                                                 "model with")
+        if model_class is None and model_id is None:
+            print(
+                termcolor.colored(
+                    "Warning : ", color="red", force_color=True
+                ) + termcolor.colored(
+                    "You should at least pass model_class or model_id if you want to use CasualLanguageModel Trainer "
+                    "But in case that you want to use DPOTrainer you can ignore this warning", color="white",
+                    force_color=True
+                )
+            )
         assert backend in AVAILABLE_BACKENDS, f"{backend} is not recognized, " \
                                               f"available backends are {AVAILABLE_BACKENDS}"
 

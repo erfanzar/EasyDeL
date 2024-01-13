@@ -4,6 +4,7 @@ from typing import Any, Callable, Optional, Mapping, Sequence, Tuple
 
 import fjformer
 import jax.tree_util
+import termcolor
 from flax import core
 from flax import struct
 from flax.core import FrozenDict
@@ -206,7 +207,10 @@ class EasyDelState(struct.PyTreeNode):
                 **tx_init
             )
         except TypeError:
-            print("\033[1;32mCouldn't load past optimizer State initializing new one\033[1;0m")
+            termcolor.cprint(
+                "Couldn't load past optimizer State initializing new one with default Optimizer and Scheduler",
+                color="red", force_color=True
+            )
             tx, sc = get_optimizer_and_scheduler(
                 optimizer="adamw",
                 scheduler="none",

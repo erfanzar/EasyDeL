@@ -15,6 +15,7 @@ from datasets import Dataset
 from jax import numpy as jnp
 from ...modules.easydel_modelling_utils import EasyDelFlaxPretrainedModel
 from ...trainer.training_configurations import TrainArguments
+
 from transformers import PreTrainedTokenizerBase
 from .partitioner_config import PartitionerConfig
 
@@ -45,6 +46,13 @@ class DPOTrainer:
         if partitioner_config is None:
             partitioner_config = PartitionerConfig()
         self.partitioner_config = partitioner_config
+        assert arguments is not None, (
+            "You Have to pass arguments that will be used for training but you have passed"
+            "`arguments=None`"
+        )
+        assert isinstance(arguments, TrainArguments), (
+            f"arguments type must be `TrainArguments` but got {type(arguments)}"
+        )
         if model_init_kwarguments is None:
             model_init_kwarguments = {}
         elif not isinstance(model, str):
@@ -62,20 +70,31 @@ class DPOTrainer:
                 "You passed a model_id to the DPOTrainer. This will automatically create an "
                 "`AutoEasyDelModelForCausalLM` for you."
             )
-            model = AutoEasyDelModelForCausalLM.from_pretrained(model, **model_init_kwarguments)
-
+            model, model_params = AutoEasyDelModelForCausalLM.from_pretrained(
+                model,
+                **model_init_kwarguments
+            )
+        else:
+            model_params = None
         if isinstance(ref_model, str):
             warnings.warn(
                 "You passed a ref model_id to the DPOTrainer. This will automatically create an "
                 "`AutoEasyDelModelForCausalLM`"
             )
-            ref_model = AutoEasyDelModelForCausalLM.from_pretrained(ref_model, **ref_model_init_kwarguments)
+            ref_model, ref_model_params = AutoEasyDelModelForCausalLM.from_pretrained(
+                ref_model,
+                **ref_model_init_kwarguments
+            )
+
+        else:
+            ref_model_params = None
         data_collator = DPODataCollatorWithPadding(
             pad_token_id=tokenizer.pad_token_id,
             label_pad_token_id=label_pad_token_id,
             is_encoder_decoder=False,
         )
-
+        self.ref_model_params = ref_model_params
+        self.model_params = model_params
         self.max_length = max_length
         self.label_pad_token_id = label_pad_token_id
         self.padding_value = padding_value if padding_value is not None else tokenizer.pad_token_id
@@ -98,7 +117,7 @@ class DPOTrainer:
 
         self._stored_metrics = defaultdict(lambda: defaultdict(list))
 
-        train_dataset = train_dataset.map(self.tokenize_row)
+        train_dataset = train_dataset.map(self.tokenize_row, )
         if eval_dataset is not None:
             eval_dataset = eval_dataset.map(self.tokenize_row)
 
@@ -186,8 +205,14 @@ class DPOTrainer:
 
         answer_input_ids = full_tokenized["input_ids"][len(prompt_input_ids):]
         answer_attention_mask = full_tokenized["attention_mask"][len(prompt_input_ids):]
-
-        full_concat_input_ids = jnp.concatenate([prompt_input_ids, answer_input_ids])
+        prompt_input_ids = jnp.asarray(prompt_input_ids, dtype="i4")
+        answer_input_ids = jnp.asarray(answer_input_ids, dtype="i4")
+        full_concat_input_ids = jnp.concatenate(
+            (
+                prompt_input_ids,
+                answer_input_ids
+            )
+        )
 
         # Prepare input tokens for token by token comparison
         full_input_ids = jnp.array(full_tokenized["input_ids"])
@@ -196,7 +221,7 @@ class DPOTrainer:
             raise ValueError("Prompt input ids and answer input ids should have the same length.")
 
         response_token_ids_start_idx = len(prompt_input_ids)
-        if prompt_input_ids != full_tokenized["input_ids"][:response_token_ids_start_idx]:
+        if prompt_input_ids.tolist() != full_tokenized["input_ids"][:response_token_ids_start_idx]:
             response_token_ids_start_idx -= 1
 
         prompt_input_ids = full_tokenized["input_ids"][:response_token_ids_start_idx]
@@ -530,3 +555,14 @@ class DPOTrainer:
         )
 
         return losses, chosen_rewards, rejected_rewards
+
+    def __repr__(self):
+        string = f"{self.__class__.__name__}(\n"
+        for k, v in self.__dict__.items():
+            if not k.startswith("_"):
+                repr_src = f"\t{k} : " + v.__str__().replace("\n", "\n\t") + "\n"
+                string += repr_src if len(repr_src) < 350 else f"\t{k} : " + f"{v.__class__.__name__}(...)" + "\n"
+        return string + ")"
+
+    def __str__(self):
+        return self.__repr__()

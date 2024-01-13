@@ -1,3 +1,4 @@
+import termcolor
 from datasets import load_dataset, Dataset, DatasetDict
 from dataclasses import dataclass
 from typing import Optional, Union, List
@@ -64,9 +65,10 @@ class DataProcessor:
                 map_kwargs[k] = v
 
         if tokenizer.pad_token is None:
-            print(
-                "\033[1;31mTokenizer Doesn't include the padding "
-                "token so i set `(tokenizer.pad_token = tokenizer.eos_token)`\033[1;0m"
+            termcolor.cprint(
+                "Tokenizer Doesn't include the padding "
+                "token so i set `(tokenizer.pad_token = tokenizer.eos_token)`",
+                color="red", force_color=True
             )
             tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = 'left' if arguments.is_left_padded else 'right'
@@ -81,4 +83,3 @@ class DataProcessor:
         )
 
         return DatasetDict({field: data})
-
