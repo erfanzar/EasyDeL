@@ -232,7 +232,7 @@ class AutoEasyDelConfig:
             use_shard_map: bool = False,
             backend: typing.Optional[str] = None,
             **kwargs
-    ) -> typing.Tuple[EasyDelFlaxPretrainedModel, dict]:
+    ) -> EasyDelFlaxPretrainedModel:
         """
         The from_pretrained function is a helper function that allows you to instantiate a model from the pretrained
         model repository. It takes as input the name of the model (e.g., 'bert-base-uncased') and returns an instance of
