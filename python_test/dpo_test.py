@@ -5,7 +5,7 @@ from datasets import load_dataset, Dataset
 from lib.python.EasyDel.reinforcement_learning.trainer.dpo_trainer import DPOTrainer, PartitionerConfig, TrainArguments
 from absl.app import FLAGS, run
 from transformers import AutoTokenizer
-from lib.python.EasyDel import AutoEasyDelModelForCausalLM
+from lib.python.EasyDel import AutoEasyDelModelForCausalLM, EasyDelState
 
 
 def dpo_data():
@@ -38,12 +38,8 @@ def main(argv):
             num_train_epochs=4,
             model_name="DPO_TEST"
         )
-        model, params = AutoEasyDelModelForCausalLM.from_pretrained(
+        model = EasyDelState.from_pretrained(
             pretrained_model_name_or_path="erfanzar/LLamaStory-70M"
-        )
-
-        model_ref, params_ref = AutoEasyDelModelForCausalLM.from_pretrained(
-            pretrained_model_name_or_path="ahxt/LiteLlama-460M-1T"
         )
 
         tokenizer = AutoTokenizer.from_pretrained(
@@ -61,7 +57,6 @@ def main(argv):
         val_data = Dataset.from_pandas(val_df)
         dpo_trainer = DPOTrainer(
             model,
-            model_ref,
             beta=0.1,
             train_dataset=train_data,
             eval_dataset=val_data,

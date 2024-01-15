@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from ..utils.collectors import DPODataCollatorWithPadding
-from typing import Optional, Literal, Dict, Union, Any, Tuple, List
+from typing import Optional, Literal, Dict, Union, Any, Tuple, List, Callable
 from .utils import pad_to_length
 from datasets import Dataset
 from jax import numpy as jnp
@@ -18,7 +18,456 @@ from transformers import PreTrainedTokenizerBase
 from .partitioner_config import PartitionerConfig
 
 
+def create_concatenated_forward(
+        is_encoder_decoder,
+        label_pad_token_id,
+        padding_value
+):
+    """
+    The create_concatenated_forward function is a helper function that creates a forward pass function for the
+    model. The forward pass function takes in an apply_fn, which is the model's apply_fn, and runs it on concatenated
+    inputs. It returns chosen log probs, rejected log probs, chosen logits and rejected logits.
+
+    :param is_encoder_decoder: Determine whether the model is an encoder-decoder model or not
+    :param label_pad_token_id: Pad the labels to the same length
+    :param padding_value: Pad the inputs to the same length
+    :return: A function that takes in a apply_fn, params and a batch of inputs,
+    """
+
+    def concatenated_forward(
+            apply_fn: Callable,
+            params: dict | flax.core.FrozenDict,
+            batch: Dict[str, Union[List, chex.Array]]
+
+    ) -> Tuple[chex.Array, chex.Array, chex.Array, chex.Array]:
+        """
+        The concatenated_forward function is used to compute the log-probabilities of both chosen and rejected labels.
+
+        :param apply_fn: Callable: Pass in the model function
+        :param params: dict | flax.core.FrozenDict: Pass the model parameters to the function
+        :param batch: Dict[str, Union[List, chex.Array]] : Pass the batch of data to the concatenated_forward function
+        :return: The log_probs of the chosen and rejected labels, as well as their corresponding logits
+        """
+        concatenated_batch = concatenated_inputs(
+            batch,
+            is_encoder_decoder=is_encoder_decoder,
+            label_pad_token_id=label_pad_token_id,
+            padding_value=padding_value,
+        )
+        len_chosen = batch["chosen_labels"].shape[0]
+
+        model_kwargs = (
+            {
+                "labels": concatenated_batch["concatenated_labels"],
+                "decoder_input_ids": concatenated_batch.pop("concatenated_decoder_input_ids", None),
+            }
+            if is_encoder_decoder
+            else {}
+        )
+
+        all_logits = apply_fn(
+            concatenated_batch["concatenated_input_ids"],
+            attention_mask=concatenated_batch["concatenated_attention_mask"],
+            params=params,
+            **model_kwargs,
+        ).logits
+
+        all_log_probs = get_batch_log_probs(
+            all_logits,
+            concatenated_batch["concatenated_labels"],
+            average_log_prob=False,
+            is_encoder_decoder=is_encoder_decoder,
+            label_pad_token_id=label_pad_token_id,
+        )
+
+        chosen_log_probs = all_log_probs[:len_chosen]
+        rejected_log_probs = all_log_probs[len_chosen:]
+
+        chosen_logits = all_logits[:len_chosen]
+        rejected_logits = all_logits[len_chosen:]
+
+        return chosen_log_probs, rejected_log_probs, chosen_logits, rejected_logits
+
+    return concatenated_forward
+
+
+def get_batch_log_probs(
+        logits: chex.Array,
+        labels: chex.Array,
+        average_log_prob: bool = False,
+        label_pad_token_id: int = -100,
+        is_encoder_decoder: bool = False,
+) -> chex.Array:
+    """
+    The get_batch_log_probs function computes the log probability of a batch of sequences.
+
+    :param logits: chex.Array: Compute the log_softmax of the input
+    :param labels: chex.Array: Mask the logits
+    :param average_log_prob: bool: Determine whether to average the log prob over the sequence length
+    :param label_pad_token_id: int: Mask out the padding tokens in the labels
+    :param is_encoder_decoder: bool: Indicate whether the model is an encoder-decoder model
+    :param : Determine whether to average the log probability over all tokens or not
+    :return: The log probability of the labels given the logits
+    """
+
+    # sudo code
+    # (per_token_log_probs * loss_mask).sum(-1)
+    # or
+    # (per_token_log_probs * loss_mask).sum(-1) / loss_mask.sum(-1)
+
+    if logits.shape[:-1] != labels.shape:
+        raise ValueError("Logits (batch and sequence length dim) and labels must have the same shape.")
+
+    if not is_encoder_decoder:
+        labels = labels[:, 1:]
+        logits = logits[:, :-1, :]
+
+    batch, seq_len, dim = logits.shape
+    loss_mask = labels != label_pad_token_id
+    labels = jax.lax.select(
+        labels == label_pad_token_id,
+        jnp.zeros(labels.shape, dtype=labels.dtype),
+        labels
+    )
+    logits_log_s = jax.nn.log_softmax(
+        logits, -1
+    )
+    per_token_log_probs = jnp.take_along_axis(
+        logits_log_s,
+        axis=2,
+        indices=labels[:, :, None]
+    ).reshape(batch, seq_len)
+
+    if average_log_prob:
+        log_prob = jnp.sum((per_token_log_probs * loss_mask), axis=-1) / jnp.sum(loss_mask, axis=-1)
+    else:
+        log_prob = jnp.sum((per_token_log_probs * loss_mask), axis=-1)
+
+    return log_prob
+
+
+def concatenated_inputs(
+        batch: Dict[str, Union[List, chex.Array]],
+        is_encoder_decoder: bool = False,
+        label_pad_token_id: int = -100,
+        padding_value: int = 0,
+) -> Dict[str, chex.Array]:
+    """
+    The concatenated_inputs function takes a batch of chosen and rejected examples,
+    and concatenates them together. This is useful for training the model to predict whether     an example was chosen by the human annotator. The function also pads all inputs to
+    the same length as the longest input in that batch.
+
+    :param batch: Dict[str,Union[List,chex.Array]]: Pass the batch of data into the function,
+    Allow for the batch to be a list of arrays or just an array,
+     Specify the type of data that is being passed in
+    :param is_encoder_decoder: bool: Determine whether the model is an encoder-decoder model
+    :param label_pad_token_id: int: Pad the labels with a value of -100
+    :param padding_value: int: Pad the input_ids and attention_mask arrays to the same length
+    :return: A dictionary of the concatenated inputs
+    """
+    concatenated_batch = {}
+
+    if is_encoder_decoder:
+        max_length = max(batch["chosen_labels"].shape[1], batch["rejected_labels"].shape[1])
+    else:
+        max_length = max(batch["chosen_input_ids"].shape[1], batch["rejected_input_ids"].shape[1])
+
+    for k in batch:
+        if k.startswith("chosen") and isinstance(batch[k], jax.Array):
+            if "labels" in k or is_encoder_decoder:
+                pad_value = label_pad_token_id
+            elif k.endswith("_input_ids"):
+                pad_value = padding_value
+            elif k.endswith("_attention_mask"):
+                pad_value = 0
+            else:
+                raise KeyError("couldn't find pad_value [Dataset Issue]")
+            concatenated_key = k.replace("chosen", "concatenated")
+            concatenated_batch[concatenated_key] = pad_to_length(batch[k], max_length, pad_value=pad_value)
+    for k in batch:
+        if k.startswith("rejected") and isinstance(batch[k], jax.Array):
+            if "labels" in k or is_encoder_decoder:
+                pad_value = label_pad_token_id
+            elif k.endswith("_input_ids"):
+                pad_value = padding_value
+            elif k.endswith("_attention_mask"):
+                pad_value = 0
+            else:
+                raise KeyError("couldn't find pad_value [Dataset Issue]")
+            concatenated_key = k.replace("rejected", "concatenated")
+            concatenated_batch[concatenated_key] = jnp.concatenate(
+                (
+                    concatenated_batch[concatenated_key],
+                    pad_to_length(batch[k], max_length, pad_value=pad_value),
+                ),
+                axis=0,
+            )
+
+    if is_encoder_decoder:
+        concatenated_batch["concatenated_input_ids"] = batch["prompt_input_ids"].repeat(2, 1)
+        concatenated_batch["concatenated_attention_mask"] = (
+            batch["prompt_attention_mask"].repeat(2, 1)
+        )
+
+    return concatenated_batch
+
+
+def create_dpo_train_step(
+        concatenated_forward: Callable,
+        ref_state: EasyDelState = None,
+        beta: float = 0.1,
+        label_smoothing: float = 0,
+        loss_type: Literal["sigmoid", "hinge", "ipo", "kto"] = "sigmoid",
+        reference_free: bool = False,
+):
+    """
+    The create_dpo_train_step function is a helper function that creates the DPO training step.
+
+    :param concatenated_forward: Callable: Define the forward pass of the model
+    :param ref_state: EasyDelState: Specify the reference policy
+    :param beta: float: Scale the logits
+    :param label_smoothing: float: Smooth the labels
+    :param loss_type:  Literal["sigmoid", "hinge", "ipo", "kto"]: Determine the loss function
+    :param reference_free: bool: Indicate whether the reference policy is used or not
+    :return: A function that takes in a state and a batch
+    """
+
+    def _sigmoid_dpo_loss(
+            logits: chex.Array,
+            policy_chosen_log_probs: chex.Array = None,  # IGNORED
+            reference_chosen_log_probs: chex.Array = None,  # IGNORED
+            policy_rejected_log_probs: chex.Array = None,  # IGNORED
+            reference_rejected_log_probs: chex.Array = None  # IGNORED
+    ):
+
+        """
+        The _sigmoid_dpo_loss function is a helper function for the sigmoid_dpo_loss
+            function. It computes the loss of each example in a batch, given its logits
+            and (optionally) its chosen/rejected log probabilities under both policies.
+
+        :param logits: chex.Array: Compute the loss
+        :param policy_chosen_log_probs: chex.Array: Calculate the policy loss
+        :param # IGNORED
+                    reference_chosen_log_probs: chex.Array: Compute the loss for the reference policy
+        :param # IGNORED
+                    policy_rejected_log_probs: chex.Array: Calculate the loss for the rejected samples
+        :param # IGNORED
+                    reference_rejected_log_probs: chex.Array: Calculate the loss of rejected samples
+        :return: an array represent loss
+        """
+        losses = (
+                -jax.nn.log_sigmoid(beta * logits) * (1 - label_smoothing)
+                - jax.nn.log_sigmoid(-beta * logits) * label_smoothing
+        )
+        return losses
+
+    def _hinge_dpo_loss(
+            logits: chex.Array,
+            policy_chosen_log_probs: chex.Array,  # IGNORED
+            reference_chosen_log_probs: chex.Array,  # IGNORED
+            policy_rejected_log_probs: chex.Array,  # IGNORED
+            reference_rejected_log_probs: chex.Array  # IGNORED
+    ):
+
+        """
+        The _hinge_dpo_loss function is a helper function that computes the loss for DPO.
+
+        :param logits: chex.Array: Calculate the hinge loss
+        :param policy_chosen_log_probs: chex.Array: Compute the policy loss
+        :param # IGNORED
+                    reference_chosen_log_probs: chex.Array: Compute the loss
+        :param # IGNORED
+                    policy_rejected_log_probs: chex.Array: Calculate the loss
+        :param # IGNORED
+                    reference_rejected_log_probs: chex.Array  # IGNORED: Calculate the loss
+        :return: an array represent The hinge loss
+        """
+        return jax.relu(1 - beta * logits)
+
+    def _ipo_dpo_loss(
+            logits: chex.Array,
+            policy_chosen_log_probs: chex.Array,  # IGNORED
+            reference_chosen_log_probs: chex.Array,  # IGNORED
+            policy_rejected_log_probs: chex.Array,  # IGNORED
+            reference_rejected_log_probs: chex.Array  # IGNORED
+    ):
+        """
+         The _ipo_dpo_loss function is a helper function that calculates the loss for
+         the IPO-DPO algorithm. It takes in the logits, policy_chosen_log_probs,
+         reference_chosen_log_probs, policy rejected log probs and reference rejected
+         log probs as inputs. The output of this function is used to calculate the loss
+         for each batch of data.
+
+         :param logits: chex.Array: Calculate the loss
+         :param policy_chosen_log_probs: chex.Array: Compute the
+         :param # IGNORED
+                     reference_chosen_log_probs: chex.Array: Compute the loss
+         :param # IGNORED
+                     policy_rejected_log_probs: chex.Array: Calculate the probability of rejecting a policy
+         :param # IGNORED
+                     reference_rejected_log_probs: chex.Array  # IGNORED: Make sure that the function
+         :return: an array represent loss
+         """
+        return (logits - 1 / (2 * beta)) ** 2
+
+    def _kto_pair_dpo_loss(
+            logits: chex.Array,  # IGNORED
+            policy_chosen_log_probs: chex.Array,
+            reference_chosen_log_probs: chex.Array,
+            policy_rejected_log_probs: chex.Array,
+            reference_rejected_log_probs: chex.Array
+    ):
+
+        """
+        The _kto_pair_dpo_loss function is a helper function that computes the loss for
+        a single pair of trajectories. It takes in two sets of log probabilities, one from
+        the policy and one from the reference distribution. The first set are the log
+        probabilities for actions taken by each agent in a trajectory, while the second set
+        are those for actions not taken by each agent (i.e., rejected). The function then
+        computes KL divergences between these two sets of distributions and uses them to compute losses.
+
+        :param logits: chex.Array: Calculate the log_probs
+        :param # IGNORED
+                    policy_chosen_log_probs: chex.Array: Calculate the chosen_kl
+        :param reference_chosen_log_probs: chex.Array: Calculate the chosen_kl
+        :param policy_rejected_log_probs: chex.Array: Calculate the rejected_kl variable
+        :param reference_rejected_log_probs: chex.Array: Calculate the rejected_kl variable
+        :return: an array represent loss
+        """
+        chosen_kl = jax.lax.clamp(
+            min=0,
+            x=jnp.mean(policy_chosen_log_probs - reference_chosen_log_probs),
+            max=1e9
+        )
+        rejected_kl = jax.lax.clamp(
+            min=0,
+            x=jnp.mean(policy_rejected_log_probs - reference_rejected_log_probs),
+            max=1e9
+        )
+
+        chosen_log_ratios = policy_chosen_log_probs - reference_chosen_log_probs
+        rejected_log_ratios = policy_rejected_log_probs - reference_rejected_log_probs
+        losses = jnp.concatenate(
+            (
+                1 - jax.nn.sigmoid(beta * (chosen_log_ratios - rejected_kl)),
+                1 - jax.nn.sigmoid(beta * (chosen_kl - rejected_log_ratios)),
+            ),
+            0,
+        )
+
+        return losses
+
+    if loss_type == "sigmoid":
+        _loss_func = _sigmoid_dpo_loss
+    elif loss_type == "hinge":
+        _loss_func = _hinge_dpo_loss
+    elif loss_type == "ipo":
+        _loss_func = _ipo_dpo_loss
+    elif loss_type == "kto_pair":
+        _loss_func = _kto_pair_dpo_loss
+    else:
+        raise ValueError(f"UnKnown loss_type {loss_type}")
+
+    def dpo_step(
+            state: EasyDelState,
+            batch: dict
+    ) -> EasyDelState:
+
+        """
+        The dpo_step function is the core of DPO. It takes a state and a batch,
+        and returns an updated state. The update is done by calculating the loss
+        for each example in the batch, then taking its gradient with respect to
+        the parameters of the policy network (which are stored in `state`). This
+        gradient is then used to update `state`.
+
+        :param state: EasyDelState: Store the parameters of the model
+        :param batch: dict: Pass the data to the model
+        :return: A new state, which is a collection of the parameters and apply_fn
+        """
+
+        def calculate_loss(params: dict | flax.core.FrozenDict):
+            (
+                policy_chosen_log_probs,
+                policy_rejected_log_probs,
+                policy_chosen_logits,
+                policy_rejected_logits,
+            ) = concatenated_forward(
+                state.apply_fn,
+                params,
+                batch
+            )
+
+            if "reference_chosen_log_probs" in batch and "reference_rejected_log_probs" in batch:
+                reference_chosen_log_probs = batch["reference_chosen_log_probs"]
+                reference_rejected_log_probs = batch["reference_rejected_log_probs"]
+            else:
+                if ref_state is None:
+                    (
+                        reference_chosen_log_probs,
+                        reference_rejected_log_probs,
+                        _,
+                        _,
+                    ) = concatenated_forward(
+                        state.apply_fn,
+                        state.params,
+                        batch
+                    )
+                else:
+                    (
+                        reference_chosen_log_probs,
+                        reference_rejected_log_probs,
+                        _,
+                        _,
+                    ) = concatenated_forward(
+                        ref_state.apply_fn,
+                        ref_state.params,
+                        batch
+                    )
+
+            pi_log_ratios = policy_chosen_log_probs - policy_rejected_log_probs
+
+            if reference_free:
+                ref_log_ratios = 0
+            else:
+                ref_log_ratios = reference_chosen_log_probs - reference_rejected_log_probs
+
+            logits = pi_log_ratios - ref_log_ratios
+            losses = _loss_func(
+                logits,
+                policy_chosen_log_probs,
+                reference_chosen_log_probs,
+                policy_rejected_log_probs,
+                reference_rejected_log_probs
+            )
+            chosen_rewards = (
+                    beta
+                    * (
+                            policy_chosen_log_probs - reference_chosen_log_probs
+                    )
+            )
+            rejected_rewards = (
+                    beta
+                    * (
+                            policy_rejected_log_probs
+                            - reference_rejected_log_probs
+                    )
+            )
+
+            return losses, chosen_rewards, rejected_rewards
+
+        grad_fn = jax.value_and_grad(calculate_loss, has_aux=True)
+        (__loss, __chosen_rewards, __rejected_rewards), grads = grad_fn(state.params)
+        state = state.apply_gradients(grads=grads)
+        return state
+
+    return dpo_step
+
+
 class DPOTrainer:
+    """
+    EasyDel DPO Trainer Class
+    """
+
     def __init__(
             self,
             model_state: EasyDelState | str = None,
@@ -41,6 +490,34 @@ class DPOTrainer:
             model_init_kwarguments: Optional[Dict] = None,
             ref_model_init_kwarguments: Optional[Dict] = None,
     ):
+
+        """
+        The __init__ function is called when the class is instantiated.
+        It sets up the attributes of an object.
+
+
+        :param self: Refer to the object itself
+        :param model_state: EasyDelState | str: Pass the model state to the trainer
+        :param ref_model_state: Optional[EasyDelState | str]: Pass the reference model state
+        :param partitioner_config: Optional[PartitionerConfig]: Specify the partitioner configuration
+        :param beta: float: Control the strength of the regularization term
+        :param label_smoothing: float: Smooth the labels
+        :param loss_type: Literal["sigmoid", "hinge", "ipo", "kto"] : Determine the loss function used
+        :param arguments: TrainArguments: Pass the arguments to the trainer
+        :param label_pad_token_id: int: Pad the labels
+        :param padding_value: int: Specify the value that is used for padding
+        :param truncation_mode: str: Truncate the input text
+        :param train_dataset: Optional[Dataset]: Load the training dataset
+        :param eval_dataset: Optional[Union[Dataset, Dict[str, Dataset]]] : Pass the evaluation dataset to the trainer
+        :param tokenizer: Optional[PreTrainedTokenizerBase]: Pass the tokenizer to the trainer
+        :param max_length: Optional[int]: Set the maximum length of the input sequence
+        :param max_prompt_length: Optional[int]: Set the maximum length of the prompt
+        :param max_target_length: Optional[int]: Truncate the target sequence
+        :param precompute_ref_log_probs: bool: Precompute the log probabilities of the reference model
+        :param model_init_kwarguments: Optional[Dict]: Pass in the model_kwarguments to model for init process
+        :param ref_model_init_kwarguments: Optional[Dict]: Pass the ref_model_init_kwarguments to ref_model for init process
+        :param : Set the padding value for the model
+        """
         if partitioner_config is None:
             partitioner_config = PartitionerConfig()
         self.partitioner_config = partitioner_config
@@ -128,16 +605,32 @@ class DPOTrainer:
         self._loggers_initialized = False
         self.mesh = self.arguments.get_mesh()
 
+        self.concatenated_forward = create_concatenated_forward(
+            is_encoder_decoder=self.is_encoder_decoder,
+            padding_value=padding_value,
+            label_pad_token_id=label_pad_token_id
+        )
+
     def _get_train_dataloader(self) -> DataLoader:
 
+        """
+        The _get_train_dataloader function is used to create a DataLoader object for the training dataset.
+
+        :param self: Represent the instance of the class
+        :return: A dataloader object
+        """
         if self.train_dataset is None:
             raise ValueError("Trainer: training requires a train_dataset.")
 
         train_dataset = self.train_dataset
         data_collator = self.data_collator
-
-        train_dataset = self._remove_unused_columns(train_dataset, description="training")
-
+        if hasattr(self, "_remove_unused_columns"):
+            train_dataset = self._remove_unused_columns(train_dataset, description="training")
+        else:
+            warnings.warn(
+                "Couldn't find function `_remove_unused_columns` if you are the "
+                "developer fix this otherwise ignore this warning"
+            )
         dataloader_params = {
             "batch_size": self.arguments.total_batch_size,
             "collate_fn": data_collator,
@@ -167,23 +660,24 @@ class DPOTrainer:
 
             data_loader = DataLoader(self.train_dataset, **dataloader_params)
 
-            reference_chosen_logps = []
-            reference_rejected_logps = []
+            reference_chosen_log_probs = []
+            reference_rejected_log_probs = []
             for padded_batch in tqdm(iterable=data_loader, desc="Train dataset reference log probs"):
                 reference_chosen_logp, reference_rejected_logp = self.compute_reference_log_probs(
+                    self.model_state,
                     padded_batch,
                 )
-                reference_chosen_logps.append(reference_chosen_logp.cpu())
-                reference_rejected_logps.append(reference_rejected_logp.cpu())
+                reference_chosen_log_probs.append(reference_chosen_logp.cpu())
+                reference_rejected_log_probs.append(reference_rejected_logp.cpu())
 
-            all_reference_chosen_logps = jnp.concatenate(reference_chosen_logps)
-            all_reference_rejected_logps = jnp.concatenate(reference_rejected_logps)
+            all_reference_chosen_log_probs = jnp.concatenate(reference_chosen_log_probs)
+            all_reference_rejected_log_probs = jnp.concatenate(reference_rejected_log_probs)
 
             self.train_dataset = self.train_dataset.add_column(
-                name="reference_chosen_logps", column=all_reference_chosen_logps
+                name="reference_chosen_log_probs", column=all_reference_chosen_log_probs
             )
             self.train_dataset = self.train_dataset.add_column(
-                name="reference_rejected_logps", column=all_reference_rejected_logps
+                name="reference_rejected_log_probs", column=all_reference_rejected_log_probs
             )
 
             self._precomputed_train_ref_log_probs = True
@@ -236,6 +730,19 @@ class DPOTrainer:
         )
 
     def tokenize_row(self, feature, state: EasyDelState = None) -> Dict:
+
+        """
+        The tokenize_row function is responsible for taking a single row of data and converting it into the format that
+        the model expects. This includes:
+        - Tokenizing the text (using HuggingFace's tokenizer)
+        - Padding/truncating sequences to a fixed length (if necessary)
+        - Creating attention masks, which tell the model which tokens are padding and which aren't.
+
+        :param self: Represent the instance of the class
+        :param feature: Pass in the data from the dataset
+        :param state: EasyDelState: Keep track of the state of the tokenizer
+        :return: A dictionary of the following keys
+        """
         batch = {}
         prompt = feature["prompt"]
         chosen = feature["chosen"]
@@ -309,12 +816,12 @@ class DPOTrainer:
                                                                                          ] * len(
             rejected_tokens["prompt_input_ids"])
 
-        for k, toks in {
+        for k, tokens_ in {
             "chosen_": chosen_sequence_tokens,
             "rejected_": rejected_sequence_tokens,
             "": prompt_tokens,
         }.items():
-            for type_key, tokens in toks.items():
+            for type_key, tokens in tokens_.items():
                 if type_key == "token_type_ids":
                     continue
                 batch[f"{k}{type_key}"] = tokens
@@ -323,25 +830,28 @@ class DPOTrainer:
 
     def compute_reference_log_probs(
             self,
+            state: EasyDelState,
             padded_batch: Dict,
     ) -> tuple[Any, Any]:
-        """Computes log probabilities of the reference model for a single padded batch of a DPO specific dataset."""
+        """
+        Computes log probabilities of the reference model for a single padded batch of a DPO specific dataset.
+        """
 
         if self.ref_model_state is None:
             (
-                reference_chosen_logps,
-                reference_rejected_logps,
+                reference_chosen_log_probs,
+                reference_rejected_log_probs,
                 _,
                 _,
             ) = self.concatenated_forward(
-                apply_fn=self.model_state.apply_fn,
-                params=self.model_state.params,
+                apply_fn=state.apply_fn,
+                params=state.params,
                 batch=padded_batch,
             )
         else:
             (
-                reference_chosen_logps,
-                reference_rejected_logps,
+                reference_chosen_log_probs,
+                reference_rejected_log_probs,
                 _,
                 _,
             ) = self.concatenated_forward(
@@ -350,320 +860,43 @@ class DPOTrainer:
                 batch=padded_batch,
             )
 
-        return reference_chosen_logps, reference_rejected_logps
+        return reference_chosen_log_probs, reference_rejected_log_probs
 
     def get_mesh(self) -> jax.sharding.Mesh:
+
+        """
+        The get_mesh function returns the mesh of a given instance of the class.
+
+        :param self: Bind the method to an object
+        :return: The mesh of the device
+        """
         return self.mesh
 
-    def concatenated_forward(
-            self,
-            apply_fn,
-            params,
-            batch: Dict[str, Union[List, chex.Array]],
-    ) -> Tuple[chex.Array, chex.Array, chex.Array, chex.Array]:
+    def train(self):
         """
-        Run the given model on the given batch of inputs, concatenating the chosen and rejected inputs together.
+        Process is Under Progress ...
         """
+        # TODO : Finish Train Step
+        ...
 
-        concatenated_batch = self.concatenated_inputs(
-            batch,
-            is_encoder_decoder=self.is_encoder_decoder,
-            label_pad_token_id=self.label_pad_token_id,
-            padding_value=self.padding_value,
-        )
-        len_chosen = batch["chosen_labels"].shape[0]
-
-        model_kwargs = (
-            {
-                "labels": concatenated_batch["concatenated_labels"],
-                "decoder_input_ids": concatenated_batch.pop("concatenated_decoder_input_ids", None),
-            }
-            if self.is_encoder_decoder
-            else {}
-        )
-
-        # TODO : model be upgraded to state
-
-        all_logits = apply_fn(
-            concatenated_batch["concatenated_input_ids"],
-            attention_mask=concatenated_batch["concatenated_attention_mask"],
-            params=params,
-            **model_kwargs,
-        ).logits
-
-        all_logps = self.get_batch_logps(
-            all_logits,
-            concatenated_batch["concatenated_labels"],
-            average_log_prob=False,
-            is_encoder_decoder=self.is_encoder_decoder,
-            label_pad_token_id=self.label_pad_token_id,
-        )
-
-        chosen_logps = all_logps[:len_chosen]
-        rejected_logps = all_logps[len_chosen:]
-
-        chosen_logits = all_logits[:len_chosen]
-        rejected_logits = all_logits[len_chosen:]
-
-        return chosen_logps, rejected_logps, chosen_logits, rejected_logits
-
-    @staticmethod
-    def get_batch_logps(
-            logits: chex.Array,
-            labels: chex.Array,
-            average_log_prob: bool = False,
-            label_pad_token_id: int = -100,
-            is_encoder_decoder: bool = False,
-    ) -> chex.Array:
+    def eval(self):
         """
-        sudo code
-        (per_token_logps * loss_mask).sum(-1)
-        or
-        (per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1)
+        Process is Under Progress ...
         """
-
-        if logits.shape[:-1] != labels.shape:
-            raise ValueError("Logits (batch and sequence length dim) and labels must have the same shape.")
-
-        if not is_encoder_decoder:
-            labels = labels[:, 1:]
-            logits = logits[:, :-1, :]
-
-        batch, seq_len, dim = logits.shape
-        loss_mask = labels != label_pad_token_id
-        labels = jax.lax.select(
-            labels == label_pad_token_id,
-            jnp.zeros(labels.shape, dtype=labels.dtype),
-            labels
-        )
-        logits_log_s = jax.nn.log_softmax(
-            logits, -1
-        )
-        per_token_logps = jnp.take_along_axis(
-            logits_log_s,
-            axis=2,
-            indices=labels[:, :, None]
-        ).reshape(batch, seq_len)
-
-        if average_log_prob:
-            log_prob = jnp.sum((per_token_logps * loss_mask), axis=-1) / jnp.sum(loss_mask, axis=-1)
-        else:
-            log_prob = jnp.sum((per_token_logps * loss_mask), axis=-1)
-
-        return log_prob
-
-    @staticmethod
-    def concatenated_inputs(
-            batch: Dict[str, Union[List, chex.Array]],
-            is_encoder_decoder: bool = False,
-            label_pad_token_id: int = -100,
-            padding_value: int = 0,
-    ) -> Dict[str, chex.Array]:
-        concatenated_batch = {}
-
-        if is_encoder_decoder:
-            max_length = max(batch["chosen_labels"].shape[1], batch["rejected_labels"].shape[1])
-        else:
-            max_length = max(batch["chosen_input_ids"].shape[1], batch["rejected_input_ids"].shape[1])
-
-        for k in batch:
-            if k.startswith("chosen") and isinstance(batch[k], jax.Array):
-                if "labels" in k or is_encoder_decoder:
-                    pad_value = label_pad_token_id
-                elif k.endswith("_input_ids"):
-                    pad_value = padding_value
-                elif k.endswith("_attention_mask"):
-                    pad_value = 0
-                else:
-                    raise KeyError("couldn't find pad_value [Dataset Issue]")
-                concatenated_key = k.replace("chosen", "concatenated")
-                concatenated_batch[concatenated_key] = pad_to_length(batch[k], max_length, pad_value=pad_value)
-        for k in batch:
-            if k.startswith("rejected") and isinstance(batch[k], jax.Array):
-                if "labels" in k or is_encoder_decoder:
-                    pad_value = label_pad_token_id
-                elif k.endswith("_input_ids"):
-                    pad_value = padding_value
-                elif k.endswith("_attention_mask"):
-                    pad_value = 0
-                else:
-                    raise KeyError("couldn't find pad_value [Dataset Issue]")
-                concatenated_key = k.replace("rejected", "concatenated")
-                concatenated_batch[concatenated_key] = jnp.concatenate(
-                    (
-                        concatenated_batch[concatenated_key],
-                        pad_to_length(batch[k], max_length, pad_value=pad_value),
-                    ),
-                    axis=0,
-                )
-
-        if is_encoder_decoder:
-            concatenated_batch["concatenated_input_ids"] = batch["prompt_input_ids"].repeat(2, 1)
-            concatenated_batch["concatenated_attention_mask"] = (
-                batch["prompt_attention_mask"].repeat(2, 1)
-            )
-
-        return concatenated_batch
-
-    def dpo_loss(
-            self,
-            policy_chosen_logps: chex.Array,
-            policy_rejected_logps: chex.Array,
-            reference_chosen_logps: chex.Array,
-            reference_rejected_logps: chex.Array,
-            reference_free: bool = False,
-    ) -> Tuple[chex.Array, chex.Array, chex.Array]:
-
-        pi_logratios = policy_chosen_logps - policy_rejected_logps
-        if reference_free:
-            ref_logratios = 0
-        else:
-            ref_logratios = reference_chosen_logps - reference_rejected_logps
-
-        logits = pi_logratios - ref_logratios
-
-        if self.loss_type == "sigmoid":
-            losses = (
-                    -jax.nn.log_sigmoid(self.beta * logits) * (1 - self.label_smoothing)
-                    - jax.nn.log_sigmoid(-self.beta * logits) * self.label_smoothing
-            )
-        elif self.loss_type == "hinge":
-            losses = jax.relu(1 - self.beta * logits)
-        elif self.loss_type == "ipo":
-            losses = (logits - 1 / (2 * self.beta)) ** 2
-        elif self.loss_type == "kto_pair":
-            chosen_KL = jax.lax.clamp(min=0, x=jnp.mean(policy_chosen_logps - reference_chosen_logps))
-            rejected_KL = jax.lax.clamp(min=0, x=jnp.mean(policy_rejected_logps - reference_rejected_logps))
-
-            chosen_logratios = policy_chosen_logps - reference_chosen_logps
-            rejected_logratios = policy_rejected_logps - reference_rejected_logps
-            losses = jnp.concatenate(
-                (
-                    1 - jax.nn.sigmoid(self.beta * (chosen_logratios - rejected_KL)),
-                    1 - jax.nn.sigmoid(self.beta * (chosen_KL - rejected_logratios)),
-                ),
-                0,
-            )
-        else:
-            raise ValueError(
-                f"Unknown loss type: {self.loss_type}. Should be one of ['sigmoid', 'hinge', 'ipo', 'kto_pair']"
-            )
-
-        chosen_rewards = (
-                self.beta
-                * (
-                        policy_chosen_logps - reference_chosen_logps
-                )
-        )
-        rejected_rewards = (
-                self.beta
-                * (
-                        policy_rejected_logps
-                        - reference_rejected_logps
-                )
-        )
-
-        return losses, chosen_rewards, rejected_rewards
-
-    def get_batch_loss_metrics(
-            self,
-            state: EasyDelState,
-            batch: Dict[str, Union[List, chex.Array]],
-            train_eval: Literal["train", "eval"] = "train",
-    ):
-        """Compute the DPO loss and other metrics for the given batch of inputs for train or test."""
-        metrics = {}
-
-        def step_forward(params):
-            (
-                policy_chosen_logps,
-                policy_rejected_logps,
-                policy_chosen_logits,
-                policy_rejected_logits,
-            ) = self.concatenated_forward(state.apply_fn, params, batch)
-
-            if "reference_chosen_logps" in batch and "reference_rejected_logps" in batch:
-                reference_chosen_logps = batch["reference_chosen_logps"]
-                reference_rejected_logps = batch["reference_rejected_logps"]
-            else:
-                if self.ref_model_state is None:
-                    (
-                        reference_chosen_logps,
-                        reference_rejected_logps,
-                        _,
-                        _,
-                    ) = self.concatenated_forward(
-                        apply_fn=self.model_state.apply_fn,
-                        params=self.model_state.params,
-                        batch=batch
-                    )
-                else:
-                    (
-                        reference_chosen_logps,
-                        reference_rejected_logps,
-                        _,
-                        _,
-                    ) = self.concatenated_forward(
-                        apply_fn=self.ref_model_state.apply_fn,
-                        params=self.ref_model_state.params,
-                        batch=batch
-                    )
-
-            losses, chosen_rewards, rejected_rewards = self.dpo_loss(
-                policy_chosen_logps,
-                policy_rejected_logps,
-                reference_chosen_logps,
-                reference_rejected_logps,
-            )
-            reward_accuracies = (chosen_rewards > rejected_rewards).float()
-
-            prefix = "eval_" if train_eval == "eval" else ""
-            metrics[f"{prefix}rewards/chosen"] = chosen_rewards.mean()
-            metrics[f"{prefix}rewards/rejected"] = rejected_rewards.mean()
-            metrics[f"{prefix}rewards/accuracies"] = reward_accuracies.mean()
-            metrics[f"{prefix}rewards/margins"] = (chosen_rewards - rejected_rewards).mean()
-            metrics[f"{prefix}logps/rejected"] = policy_rejected_logps.mean()
-            metrics[f"{prefix}logps/chosen"] = policy_chosen_logps.mean()
-            metrics[f"{prefix}logits/rejected"] = policy_rejected_logits.mean()
-            metrics[f"{prefix}logits/chosen"] = policy_chosen_logits.mean()
-            return losses.mean(), metrics
-
-        if train_eval == "train":
-            (loss, metrics), grad = jax.value_and_grad(step_forward, has_aux=True)(state.params)
-        else:
-            loss, metrics = step_forward(state.params)
-            grad = None
-        return loss, metrics, grad
-
-    def prediction_step(
-            self,
-            model_state: EasyDelState,
-            inputs: Dict[str, Union[chex.Array, Any]],
-            prediction_loss_only: bool,
-            ignore_keys: Optional[List[str]] = None,
-    ):
-        if ignore_keys is None:
-            if hasattr(model_state, "config"):
-                ignore_keys = getattr(model_state.config, "keys_to_ignore_at_inference", [])
-            else:
-                ignore_keys = []
-
-        loss, metrics, grad = self.get_batch_loss_metrics(model_state, inputs, train_eval="eval")
-
-        if prediction_loss_only:
-            return loss, None, None
-
-        logits_dict = {
-            "eval_logits/chosen": metrics["eval_logits/chosen"],
-            "eval_logits/rejected": metrics["eval_logits/rejected"],
-        }
-        logits = tuple(v for k, v in logits_dict.items() if k not in ignore_keys)
-        logits = jnp.mean(jnp.stack(logits), axis=1)
-        labels = jnp.zeros(logits.shape[0])
-
-        return loss, logits, labels
+        # TODO : Finish Eval Step
+        ...
 
     def __repr__(self):
+
+        """
+        The __repr__ function is used to generate a string representation of an object.
+        This function should return a string that can be parsed by the Python interpreter
+        to recreate the object. The __repr__ function is called when you use print() on an
+        object, or when you type its name in the REPL.
+
+        :param self: Refer to the instance of the class
+        :return: A string representation of the object
+        """
         string = f"{self.__class__.__name__}(\n"
         for k, v in self.__dict__.items():
             if not k.startswith("_"):
@@ -672,4 +905,12 @@ class DPOTrainer:
         return string + ")"
 
     def __str__(self):
+
+        """
+        The __str__ function is called when you use the print function or when str() is used.
+        It should return a string representation of the object.
+
+        :param self: Refer to the instance of the class
+        :return: The object's string representation
+        """
         return self.__repr__()
