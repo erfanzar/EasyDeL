@@ -749,12 +749,12 @@ class DPOTrainer:
         rejected = feature["rejected"]
 
         if not isinstance(prompt, str):
-            raise ValueError(f"prompt should be an str but got {type(prompt)}")
+            raise ValueError(f"prompt should be an str but got {type(prompt)} , {prompt}")
         prompt_tokens = self.tokenizer(prompt, add_special_tokens=False)
         prompt_tokens = {f"prompt_{k}": v for k, v in prompt_tokens.items()}
 
         if not isinstance(chosen, str):
-            raise ValueError(f"chosen should be an str but got {type(chosen)}")
+            raise ValueError(f"chosen should be an str but got {type(chosen)} , {chosen}")
         chosen_tokens = self.build_tokenized_answer(prompt, chosen)
 
         if not isinstance(rejected, str):
@@ -873,11 +873,14 @@ class DPOTrainer:
         return self.mesh
 
     def train(self):
-        """
-        Process is Under Progress ...
-        """
-        # TODO : Finish Train Step
-        ...
+        step = 0
+        for epoch_index in range(self.arguments.num_train_epochs):
+            for batch in self.get_train_dataloader():
+                step += 1
+                if self.arguments.step_start_point > step:
+                    ...
+                else:
+                    ...
 
     def eval(self):
         """

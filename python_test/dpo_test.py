@@ -2,10 +2,10 @@ import jax
 import termcolor
 from datasets import load_dataset, Dataset
 
-from lib.python.EasyDel.reinforcement_learning.trainer.dpo_trainer import DPOTrainer, PartitionerConfig, TrainArguments
+from lib.python.EasyDel.reinforcement_learning.trainer.dpo_trainer import DPOTrainer, TrainArguments
 from absl.app import FLAGS, run
 from transformers import AutoTokenizer
-from lib.python.EasyDel import AutoEasyDelModelForCausalLM, EasyDelState
+from lib.python.EasyDel import EasyDelState
 
 
 def dpo_data():
@@ -20,8 +20,9 @@ def dpo_data():
     def return_prompt_and_responses(samples) -> dict:
         return {
             "prompt": [prompt for prompt in samples["prompt"]],
-            "chosen": samples["chosen"],
-            "rejected": samples["rejected"],
+            # "prompt": samples["prompt"],
+            "chosen": [chosen[0]["content"] for chosen in samples["chosen"]],
+            "rejected": [rejected[0]["content"] for rejected in samples["rejected"]],
         }
 
     dataset = dataset.map(
@@ -38,28 +39,25 @@ def main(argv):
             num_train_epochs=4,
             model_name="DPO_TEST"
         )
-        model = EasyDelState.from_pretrained(
-            pretrained_model_name_or_path="erfanzar/LLamaStory-70M"
+        state = EasyDelState.from_pretrained(
+            pretrained_model_name_or_path="gpt2"
+        )
+
+        ref_state = EasyDelState.from_pretrained(
+            pretrained_model_name_or_path="gpt2"
         )
 
         tokenizer = AutoTokenizer.from_pretrained(
-            "ahxt/LiteLlama-460M-1T"
+            "gpt2"
         )
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
-        train_df = dpo_data().to_pandas()
-        train_df["chosen"] = train_df["chosen"].apply(lambda x: x[1]["content"])
-        train_df["rejected"] = train_df["rejected"].apply(lambda x: x[1]["content"])
-        train_df = train_df.dropna()
-        val_df = train_df.sample(10)
-        train_data = Dataset.from_pandas(train_df)
-        val_data = Dataset.from_pandas(val_df)
         dpo_trainer = DPOTrainer(
-            model,
+            state,
+            ref_state,
             beta=0.1,
-            train_dataset=train_data,
-            eval_dataset=val_data,
+            train_dataset=dpo_data(),
             tokenizer=tokenizer,
             arguments=arguments,
             max_length=512,
@@ -68,6 +66,7 @@ def main(argv):
         )
 
         print(dpo_trainer)
+        dpo_trainer.train()
 
 
 if __name__ == "__main__":
