@@ -6,10 +6,7 @@ import EasyDel
 import jax.lax
 from EasyDel.serve import JAXServer, JAXServerConfig
 from fjformer.checkpoint import get_dtype
-from EasyDel.transform import llama_from_pretrained
 from transformers import AutoTokenizer
-import gradio as gr
-
 import argparse
 
 DEFAULT_SYSTEM_PROMPT = "You are a helpful, respectful and honest assistant in the rule of a operator. Always answer " \
@@ -48,53 +45,6 @@ class Llama2Host(JAXServer):
     @staticmethod
     def format_chat(history: typing.List[str], prompt: str, system: typing.Union[str, None]) -> str:
         return get_prompt_llama2_format(prompt, history, system)
-
-    @classmethod
-    def load_from_torch(cls, pretrained_model_name_or_path, config=None):
-        with jax.default_device(jax.devices('cpu')[0]):
-            param, config_model = llama_from_pretrained(
-                pretrained_model_name_or_path
-            )
-        tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
-        model = EasyDel.modules.FlaxLlamaForCausalLM(
-            config=config_model,
-            dtype=get_dtype(config['dtype'] if config is not None else 'fp16'),
-            param_dtype=get_dtype(config['dtype'] if config is not None else 'fp16'),
-            precision=jax.lax.Precision("fastest"),
-            _do_init=False
-        )
-        return cls.load_from_params(
-            config_model=config_model,
-            model=model,
-            config=config,
-            params=param,
-            tokenizer=tokenizer,
-            add_params_field=True,
-            do_memory_log=False
-        )
-
-    @classmethod
-    def load_from_jax(cls, pretrained_model_name_or_path, checkpoint_path, config_repo=None, config=None):
-        from huggingface_hub import hf_hub_download
-        path = hf_hub_download(pretrained_model_name_or_path, checkpoint_path)
-        tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
-        config_model = EasyDel.LlamaConfig.from_pretrained(config_repo or pretrained_model_name_or_path)
-        model = EasyDel.FlaxLlamaForCausalLM(
-            config=config_model,
-            dtype=get_dtype(config['dtype'] if config is not None else 'fp16'),
-            param_dtype=get_dtype(config['dtype'] if config is not None else 'fp16'),
-            precision=jax.lax.Precision("fastest"),
-            _do_init=False
-        )
-        return cls.load(
-            path=path,
-            config_model=config_model,
-            model=model,
-            config=config,
-            tokenizer=tokenizer,
-            add_params_field=True,
-            do_memory_log=False
-        )
 
 
 if __name__ == "__main__":
@@ -160,7 +110,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--mesh_axes_shape",
-        default=[(1, -1, 1, 1)],
+        default=[1, -1, 1, 1],
         nargs="+",
         type=int,
         help="The shapes of the mesh axes.",
@@ -192,23 +142,17 @@ if __name__ == "__main__":
         use_prefix_tokenizer=args.use_prefix_tokenizer
     )
 
-    server = Llama2Host.load_from_torch(
+    server = Llama2Host.load_from_huggingface_torch(
         pretrained_model_name_or_path=args.pretrained_model_name_or_path,
-        config=configs
+        server_config=configs
     )
     try:
         termcolor.cprint(
-            'Launching Chat App ...',
+            'Launching App ...',
             color="cyan",
             force_color=True
         )
-        server.gradio_app_chat.launch(share=True)
-        termcolor.cprint(
-            'Launching Instruct App ...',
-            color="cyan",
-            force_color=True
-        )
-        server.gradio_app_instruct.launch(share=True)
+        server.gradio_inference().launch(share=True)
         termcolor.cprint(
             'Launching Server APIS (Fire) ...',
             color="cyan",

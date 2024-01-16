@@ -209,9 +209,9 @@ def main(argv):
     )
 
     trainer = CausalLanguageModelTrainer(train_args,
-                              dataset_train=dataset_train['train'],
-                              dataset_eval=dataset_train['eval'] if FLAGS.do_eval else None,
-                              checkpoint_path=FLAGS.checkpoint_path)
+                                         dataset_train=dataset_train['train'],
+                                         dataset_eval=dataset_train['eval'] if FLAGS.do_eval else None,
+                                         checkpoint_path=FLAGS.checkpoint_path)
     output = trainer.train(
         model_parameters=flax.core.FrozenDict({'params': params})
     )
