@@ -1,29 +1,78 @@
+[project]
+name = "EasyDeL"
+authors = [
+    { name = "Erfan Zare Chavoshi", email = "Erfanzare810@gmail.com" }
+]
+requires-python = ">=3.8"
+
+readme = "README.md"
+
+version = "0.0.42"
+
+dependencies = [
+    "chex~=0.1.84",
+    "typing~=3.7.4.3",
+    "jax>=0.4.17",
+    "jaxlib>=0.4.17",
+    "flax~=0.7.5",
+    "fjformer>=0.0.25",
+    "transformers>=4.33.0",
+    "einops~=0.6.1",
+    "optax~=0.1.7",
+    "msgpack~=1.0.7",
+    "ipython~=8.17.2",
+    "tqdm~=4.64.1",
+    "pydantic==2.5.3",
+    "datasets~=2.14.6",
+    "setuptools~=68.1.2",
+    "gradio~=4.12.0",
+    "distrax",
+    "rlax",
+    "termcolor",
+    "wandb>=0.15.9",
+    "tensorboard",
+    "torch~=2.1.0",
+    "numpy~=1.26.2",
+    "uvicorn~=0.23.2",
+    "fastapi~=0.104.1",
+    "pydantic-core==2.14.6"
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+description = "An open-source library to make training faster and more optimized in Jax/Flax"
+
+license = { text = "Apache-2.0" }
+
+keywords = [
+    "JAX", "Torch", "Deep Learning", "Machine Learning", "Flax", "XLA"
+]
+
+
+[project.optional-dependencies]
+
+torch = [
+    "torch",
+    "torchvision",
+    "torchaudio"
+]
+
+all = [
+    "EasyDeL[torch]"
+]
+
 [build-system]
-requires = ["setuptools>=46.4.0", "wheel>=0.34.2", "jax", "flax", "fjformer"]
+requires = ["setuptools>=46.4.0", "wheel>=0.34.2"]
 build-backend = "setuptools.build_meta"
 
-[tool.black]
-line-length = 88
-target-version = ["py38", "py39", "py310", "py311", "py312"]
-
-[tool.isort]
-line_length = 88
-multi_line_output = 3
-include_trailing_comma = true
-force_grid_wrap = 0
-use_parentheses = true
-ensure_newline_before_comments = true
-known_third_party = ["torch", "jax", "flax"]
-
-[tool.flake8]
-max-line-length = 88
-[tool.poetry]
-readme = "README.md"
-authors = ["Erfan zare chavoshi"]
-name = "EasyDel"
-description = "An open-source library to make training faster and more optimized in Jax/Flax"
-version = "0.0.41"
-
-[tool.mypy]
-ignore_missing_imports = true
-warn_unused_configs = true
+[tool.setuptools.packages]
+find = { where = ["lib/python"] }
