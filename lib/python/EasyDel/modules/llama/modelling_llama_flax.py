@@ -20,7 +20,8 @@ from ..flax_modelling_utils import (
     repeat_kv_bnsh,
     apply_rotary_pos_emb,
     precompute_freq_cis,
-    smart_flash_attention, get_dot_general_by_bits
+    smart_flash_attention,
+    get_dot_general_by_bits
 )
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 import chex
@@ -214,16 +215,29 @@ class FlaxLlamaAttention(nn.Module):
         :return: A tuple of 3 tensors: query, key and value
 
         """
-        query = query.reshape(batch_size, sequence_length,
-                              self.config.num_attention_heads, self.head_dim)
-        key = key.reshape(batch_size, sequence_length,
-                          self.config.num_key_value_heads, self.head_dim)
-        value = value.reshape(batch_size, sequence_length,
-                              self.config.num_key_value_heads, self.head_dim)
+        query = query.reshape(
+            batch_size,
+            sequence_length,
+            self.config.num_attention_heads,
+            self.head_dim
+        )
+        key = key.reshape(
+            batch_size,
+            sequence_length,
+            self.config.num_key_value_heads,
+            self.head_dim
+        )
+        value = value.reshape(
+            batch_size,
+            sequence_length,
+            self.config.num_key_value_heads,
+            self.head_dim
+        )
 
         query, key, value = self._t(query, key, value)
         query, key = self.rotary(
-            position_ids=position_ids, query=query, key=key, freq_cis=freq_cis)
+            position_ids=position_ids, query=query, key=key, freq_cis=freq_cis
+        )
         key = repeat_kv_bnsh(key, self.number_of_reps)
         value = repeat_kv_bnsh(value, self.number_of_reps)
         return self._t(query, key, value)
@@ -773,10 +787,7 @@ class FlaxLlamaPreTrainedModel(EasyDelFlaxPretrainedModel):
 
         batch_size, sequence_length = input_ids.shape
 
-        assert sequence_length <= self.config.max_position_embeddings, (f'Position out of range '
-                                                                        f'(Model Support '
-                                                                        f'{self.config.max_position_embeddings} got'
-                                                                        f' {sequence_length})')
+        assert sequence_length <= self.config.max_position_embeddings, "Maximum Position Embedding Reached !"
 
         if position_ids is None:
             if past_key_values is not None:
@@ -866,8 +877,10 @@ class FlaxLlamaBlockCollection(nn.Module):
     ):
         """
         The __call__ function is the main function of a JAX nn.Module.
-        It defines how the module behaves when called as a function, and it's what you'll use to call your model in training loops or inference scripts.
-        The __call__ method should take all inputs that are necessary for computing outputs from the module, and return all outputs that are computed by this module.
+        It defines how the module behaves when called as a function, and it's what you'll use to call your model
+         in training loops or inference scripts.
+        The __call__ method should take all inputs that are necessary for computing outputs from the module,
+        and return all outputs that are computed by this module.
 
         :param self: Represent the instance of the class
         :param hidden_states: chex.Array: Pass the input tensor to the encoder
@@ -1009,10 +1022,8 @@ class FlaxLlamaModule(nn.Module):
             inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
 
         batch_size, sequence_length, _ = inputs_embeds.shape
-        assert sequence_length <= self.config.max_position_embeddings, (f'Position out of range '
-                                                                        f'(Model Support '
-                                                                        f'{self.config.max_position_embeddings} got'
-                                                                        f' {sequence_length})')
+
+        assert sequence_length <= self.config.max_position_embeddings, "Maximum Position Embedding Reached !"
         inputs_embeds = inputs_embeds + \
                         extra_embedding if extra_embedding is not None else inputs_embeds
         hidden_states = self.dropout(

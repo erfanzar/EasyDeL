@@ -13,55 +13,66 @@ class PhiConfig(EasyDelPretrainedConfig):
     attribute_map = {
         "max_position_embeddings": "n_positions",
         "hidden_size": "n_embd",
-        "num_attention_heads": "n_head",
-        "num_hidden_layers": "n_layer",
+        "num_attention_heads": "num_attention_heads",
+        "num_hidden_layers": "num_hidden_layers",
     }
 
     def __init__(
             self,
-            vocab_size: int = 50304,
-            n_positions: int = 2048,
-            n_embd: int = 1024,
-            n_layer: int = 20,
-            n_inner: Optional[int] = None,
-            n_head: int = 16,
-            n_head_kv: Optional[int] = None,
-            rotary_dim: Optional[int] = 32,
-            activation_function: Optional[str] = "gelu_new",
-            flash_attn: bool = False,
-            flash_rotary: bool = False,
-            fused_dense: bool = False,
-            attn_pdrop: float = 0.0,
-            embd_pdrop: float = 0.0,
-            resid_pdrop: float = 0.0,
-            layer_norm_epsilon: float = 1e-5,
-            initializer_range: float = 0.02,
-            tie_word_embeddings: bool = False,
-            pad_vocab_size_multiple: int = 64,
+            vocab_size=51200,
+            hidden_size=2048,
+            intermediate_size=8192,
+            num_hidden_layers=24,
+            num_attention_heads=32,
+            num_key_value_heads=None,
+            resid_pdrop=0.0,
+            embd_pdrop=0.0,
+            attention_dropout=0.0,
+            hidden_act="gelu_new",
+            max_position_embeddings=2048,
+            initializer_range=0.02,
+            layer_norm_eps=1e-5,
+            use_cache=True,
+            tie_word_embeddings=False,
+            rope_theta=10000.0,
+            rope_scaling=None,
+            partial_rotary_factor=0.5,
+            qk_layernorm=False,
+            bos_token_id=1,
+            eos_token_id=2,
             bits: Optional[int] = None,
             gradient_checkpointing: str = "nothing_saveable",
+            use_pjit_attention_force: bool = False,
             **kwargs
     ) -> None:
-        self.vocab_size = int(math.ceil(vocab_size / pad_vocab_size_multiple) * pad_vocab_size_multiple)
-        self.n_positions = n_positions
-        self.n_embd = n_embd
-        self.n_layer = n_layer
-        self.n_inner = n_inner
-        self.n_head = n_head
-        self.n_head_kv = n_head_kv
-        self.rotary_dim = min(rotary_dim, n_embd // n_head)
-        self.activation_function = activation_function
-        self.flash_attn = flash_attn
-        self.flash_rotary = flash_rotary
-        self.fused_dense = fused_dense
-        self.attn_pdrop = attn_pdrop
-        self.embd_pdrop = embd_pdrop
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+
+        if num_key_value_heads is None:
+            num_key_value_heads = num_attention_heads
+
+        self.num_key_value_heads = num_key_value_heads
         self.resid_pdrop = resid_pdrop
-        self.layer_norm_epsilon = layer_norm_epsilon
+        self.embd_pdrop = embd_pdrop
+        self.attention_dropout = attention_dropout
+        self.hidden_act = hidden_act
+        self.max_position_embeddings = max_position_embeddings
         self.initializer_range = initializer_range
+        self.layer_norm_eps = layer_norm_eps
+        self.use_cache = use_cache
+        self.rope_theta = rope_theta
+        self.rope_scaling = rope_scaling
+        self.partial_rotary_factor = partial_rotary_factor
+        self.qk_layernorm = qk_layernorm
         self.bits = bits
         self.gradient_checkpointing = gradient_checkpointing
+        self.use_pjit_attention_force = use_pjit_attention_force
         super().__init__(
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
             tie_word_embeddings=tie_word_embeddings,
             **kwargs
         )
@@ -70,11 +81,12 @@ class PhiConfig(EasyDelPretrainedConfig):
             self,
             bits: Optional[int] = None,
             gradient_checkpointing: str = "nothing_saveable",
+            use_pjit_attention_force: bool = False,
             **kwargs
     ):
         self.bits = bits
         self.gradient_checkpointing = gradient_checkpointing
-
+        self.use_pjit_attention_force = use_pjit_attention_force
         for k, v in kwargs.items():
             if not hasattr(self, k):
                 setattr(self, k, v)
