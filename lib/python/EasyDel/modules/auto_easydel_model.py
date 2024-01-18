@@ -113,6 +113,22 @@ def get_modules_by_type(model_type: str):
             _FlaxMixtralForCausalLM,
             functools.partial(huggingface_to_easydel, embedding_layer_names=["embed_tokens"])
         )
+    elif model_type == "phi":
+        from .phi import FlaxPhiForCausalLMModule as _FlaxPhiForCausalLMModule
+        from .phi import PhiConfig as _PhiConfig
+        return (
+            _PhiConfig,
+            _FlaxPhiForCausalLMModule,
+            functools.partial(
+                huggingface_to_easydel,
+                embedding_layer_names=["embed_tokens"],
+                layer_norm_names=[
+                    "input_layernorm",
+                    "final_layernorm",
+                    "q_layernorm",
+                    "k_layernorm"
+                ])
+        )
     else:
         raise EasyDelRuntimeError(f'Model Type ({model_type}) is not supported or is not found')
 

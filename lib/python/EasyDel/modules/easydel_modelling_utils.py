@@ -269,6 +269,44 @@ class EasyDelFlaxPretrainedModel(FlaxPreTrainedModel):
         string = f"{self.__class__.__name__}(\n{padded_model}\n)"
         return string
 
+    def init_cache(self, batch_size: int, max_length: int):
+        raise NotImplementedError("init_cache is not Implemented Yet!")
+
+    def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[chex.Array] = None):
+        """
+        The prepare_inputs_for_generation function is used to prepare the inputs for a generation task.
+
+        :param self: Access variables that belong to the class
+        :param input_ids: Pass in the input tokens
+        :param max_length: Set the length of the sequence to be generated
+        :param attention_mask: Optional[chex.Array]: Mask the attention weights
+        :return: A dictionary of the past_key_values, attention_mask and position ids
+
+        """
+        batch_size, seq_length = input_ids.shape
+
+        past_key_values = self.init_cache(batch_size, max_length)
+        extended_attention_mask = jnp.ones(
+            (batch_size, max_length), dtype="i4")
+        if attention_mask is not None:
+            position_ids = attention_mask.cumsum(axis=-1) - 1
+            extended_attention_mask = jax.lax.dynamic_update_slice(
+                extended_attention_mask, attention_mask, (0, 0))
+        else:
+            position_ids = jnp.broadcast_to(jnp.arange(seq_length, dtype="i4")[
+                                            None, :], (batch_size, seq_length))
+
+        return {
+            "past_key_values": past_key_values,
+            "attention_mask": extended_attention_mask,
+            "position_ids": position_ids,
+        }
+
+    def update_inputs_for_generation(self, model_outputs, model_kwargs):
+        model_kwargs["past_key_values"] = model_outputs.past_key_values
+        model_kwargs["position_ids"] = model_kwargs["position_ids"][:, -1:] + 1
+        return model_kwargs
+
     def __call__(
             self,
             input_ids: chex.Array,

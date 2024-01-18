@@ -7,9 +7,8 @@ import msgpack
 import os
 from fjformer import get_dtype
 from jax import numpy as jnp
-from typing import List
+from typing import List, Optional
 from tqdm import tqdm
-
 
 
 def float_tensor_to_dtype(tensor, dtype):
@@ -26,7 +25,7 @@ def float_tensor_to_dtype(tensor, dtype):
     if isinstance(dtype, str):
         dtype = get_dtype(dtype)
     float_dtypes = (jax.numpy.bfloat16, jax.numpy.float16, jax.numpy.float32, jax.numpy.float64)
-    if getattr(tensor, 'dtype', None) in float_dtypes:
+    if getattr(tensor, "dtype", None) in float_dtypes:
         tensor = tensor.astype(dtype)
     return tensor
 
@@ -55,8 +54,9 @@ def match_keywords(string, ts, ns):
 def huggingface_to_easydel(
         state_dict,
         *,
-        embedding_layer_names: List[str],
         device,
+        embedding_layer_names: Optional[List[str]] = None,
+        layer_norm_names: Optional[List[str]] = None,
         dtype: jax.numpy.dtype = jax.numpy.float16,
         **kwargs
 ):
@@ -69,25 +69,36 @@ def huggingface_to_easydel(
     :param state_dict: Load the weights from a huggingface model
     :param embedding_layer_names: List[str]: Identify the embedding layer in the huggingface model
     :param device: Determine which device the model will be loaded on
+    :param layer_norm_names: Replaces weight or kernel with (scale)
     :param dtype: jax.numpy.dtype: Specify the data type of the tensors
     :return: A dictionary of the weights and biases in a format that can be used by flax (it's an UnFlattenDict)
     
     """
+    embedding_layer_names = embedding_layer_names or []
+    layer_norm_names = layer_norm_names or []
     if isinstance(embedding_layer_names, str):
         embedding_layer_names = [embedding_layer_names]
-    _l = len('.weight')
+    _l = len(".weight")
+    _b = len(".bias")
     with jax.default_device(device):
         flax_dict = {}
         for key, tensor in state_dict.items():
+            do_rc = True
             for embedding_layer_name in embedding_layer_names:
                 if embedding_layer_name in key:
-                    key = key[:-_l] + '.embedding'
-                elif match_keywords(key, ['weight'], ['none']):
-                    if len(tensor.shape) == 2:
-                        tensor = tensor.transpose(0, 1)
-                    if key.endswith('.weight'):
-                        key = key[:-_l] + '.kernel'
-            key_tuple = key.split('.')
+                    key = key[:-_l] + ".embedding"
+                    do_rc = False
+            for layer_norm in layer_norm_names:
+                if layer_norm in key:
+                    if key.endswith(".weight"):
+                        key = key[:-_l] + ".scale"
+                        do_rc = False
+            if match_keywords(key, ["weight"], ["none"]) and do_rc:
+                if len(tensor.shape) == 2:
+                    tensor = tensor.transpose(0, 1)
+                if key.endswith(".weight"):
+                    key = key[:-_l] + ".kernel"
+            key_tuple = key.split(".")
             key_names = ()
             tensor = tensor.detach().cpu().numpy()
             for k in key_tuple:
@@ -108,7 +119,7 @@ def read_ckpt(path: [str, os.PathLike], shard_fns=None, add_extra_past_fix: list
     
     """
     tensors = {}
-    with open(path, 'rb') as stream:
+    with open(path, "rb") as stream:
         unpacker = msgpack.Unpacker(stream, read_size=83886080, max_buffer_size=0)
         for key, value in unpacker:
             if add_extra_past_fix is not None:
@@ -148,18 +159,18 @@ def save_ckpt(train_state, path, gather_fns=None, float_dtype=None):
 
 
 def easystate_to_torch(
-    state,
-    dtype=jnp.float16,
-    transpose_needed=None,
-    transpose_not_needed=None,
-    select_params_field: bool = True
+        state,
+        dtype=jnp.float16,
+        transpose_needed=None,
+        transpose_not_needed=None,
+        select_params_field: bool = True
 ):
     import torch
 
     if transpose_needed is None:
         transpose_needed = ["kernel"]
     if transpose_not_needed is None:
-        transpose_not_needed = ['none']
+        transpose_not_needed = ["none"]
 
     def match_keywords(string, do_transpose, dont_transpose):
         for dtr in do_transpose:
@@ -171,11 +182,11 @@ def easystate_to_torch(
         return True
 
     model_parameters = flatten_dict(
-        state.params['params'],
-        sep='.'
+        state.params["params"],
+        sep="."
     ) if select_params_field else flatten_dict(
         state.params,
-        sep='.'
+        sep="."
     )
     torch_state_dict = {}
     pbar = tqdm(
@@ -186,19 +197,19 @@ def easystate_to_torch(
         if match_keywords(key, transpose_needed, transpose_not_needed):
             tensor = tensor.T
         tensor = tensor.astype(get_dtype(dtype))
-        torch_state_dict[key.replace(".kernel",".weight").replace(".embedding",".weight")] = torch.from_numpy(tensor)
+        torch_state_dict[key.replace(".kernel", ".weight").replace(".embedding", ".weight")] = torch.from_numpy(tensor)
     return torch_state_dict
 
 
 def easystate_to_huggingface_model(
-    state,
-    config,
-    base_huggingface_module,
-    base_huggingface_module_kwarguments=None,
-    dtype=jnp.float16,
-    transpose_needed=None,
-    transpose_not_needed=None,
-    select_params_field: bool = True
+        state,
+        config,
+        base_huggingface_module,
+        base_huggingface_module_kwarguments=None,
+        dtype=jnp.float16,
+        transpose_needed=None,
+        transpose_not_needed=None,
+        select_params_field: bool = True
 ):
     if base_huggingface_module_kwarguments is None:
         base_huggingface_module_kwarguments = {}
@@ -215,6 +226,3 @@ def easystate_to_huggingface_model(
     )
     model.load_state_dict(state_dict)
     return model
-
-
-    
