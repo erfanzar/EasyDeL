@@ -27,18 +27,19 @@ def main():
         'microsoft/phi-2',
         trust_remote_code=True
     )
-    torch_config.hidden_size = 256
-    torch_config.intermediate_size = 512
+    torch_config.hidden_size = 128
+    torch_config.intermediate_size = 256
     torch_config.max_position_embeddings = 128
-    torch_config.num_hidden_layers = 4
-    torch_config.num_key_value_heads = 4
-    torch_config.num_attention_heads = 8
+    torch_config.num_hidden_layers = 2
+    torch_config.num_key_value_heads = 2
+    torch_config.num_attention_heads = 4
 
     torch_model = AutoModelForCausalLM.from_config(
         config=torch_config,
         trust_remote_code=True
     )
 
+    torch_model.eval()
     params = {
         "params": huggingface_to_easydel(
             torch_model.state_dict(),
@@ -52,8 +53,8 @@ def main():
             ]
         )
     }
-    print(params)
-    np_random_input_ids = np.random.randint(0, torch_config.vocab_size, (1, 128))
+
+    np_random_input_ids = np.random.randint(0, torch_config.vocab_size, (1, 8))
     input_ids = torch.from_numpy(np_random_input_ids).reshape(1, -1).to(torch.long)
     flax_input_ids = jnp.asarray(np_random_input_ids, dtype=jnp.int32).reshape(1, -1)
 

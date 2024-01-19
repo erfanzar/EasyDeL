@@ -134,12 +134,14 @@ class FlaxPhiAttention(nn.Module):
             self.q_layernorm = nn.LayerNorm(
                 epsilon=config.layer_norm_eps,
                 dtype=self.dtype,
-                param_dtype=self.param_dtype
+                param_dtype=self.param_dtype,
+                use_bias=True
             )
             self.k_layernorm = nn.LayerNorm(
                 epsilon=config.layer_norm_eps,
                 dtype=self.dtype,
-                param_dtype=self.param_dtype
+                param_dtype=self.param_dtype,
+                use_bias=True
             )
 
     def _merge_heads(self, hidden_states):
@@ -443,7 +445,6 @@ class FlaxPhiDecoderLayer(nn.Module):
             init_cache: bool = False,
     ):
         residual = hidden_states
-
         hidden_states = self.input_layernorm(hidden_states)
 
         attn_out = self.self_attn(
@@ -562,7 +563,10 @@ class FlaxPhiModule(nn.Module):
             param_dtype=self.param_dtype
         )
         self.causal_mask = make_causal_mask(
-            jnp.ones((1, config.max_position_embeddings)))
+            jnp.ones(
+                (1, config.max_position_embeddings)
+            )
+        )
 
         initial_rope_kwargs = dict(
             rope_type="none"
