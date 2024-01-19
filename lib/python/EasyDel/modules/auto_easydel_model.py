@@ -1,6 +1,6 @@
 import functools
 import gc
-import typing
+from typing import Sequence, Optional, Tuple, Mapping, Callable, Type
 
 import jax.numpy
 
@@ -8,11 +8,15 @@ from flax.traverse_util import unflatten_dict
 from transformers import AutoConfig, AutoModelForCausalLM
 
 from ..transform.easydel_transform import huggingface_to_easydel
-from .easydel_modelling_utils import EasyDelFlaxPretrainedModel
+from .easydel_modelling_utils import EasyDelFlaxPretrainedModel, EasyDelPretrainedConfig
 from ..etils.errors import EasyDelRuntimeError
 
 
-def get_modules_by_type(model_type: str):
+def get_modules_by_type(model_type: str) -> Tuple[
+    Type[EasyDelPretrainedConfig],
+    Type[EasyDelFlaxPretrainedModel],
+    Callable
+]:
     """
     The get_modules_by_type function is a helper function that returns the following:
         1. The config class for the model type specified (e.g., LlamaConfig, FalconConfig)
@@ -26,11 +30,10 @@ def get_modules_by_type(model_type: str):
     if model_type == "llama":
         from .llama import LlamaConfig as _LlamaConfig
         from .llama import FlaxLlamaForCausalLM as _FlaxLlamaForCausalLM
-        from ..transform import llama_convert_hf_to_flax as _llama_convert_hf_to_flax
         return (
             _LlamaConfig,
             _FlaxLlamaForCausalLM,
-            _llama_convert_hf_to_flax
+            functools.partial(huggingface_to_easydel, embedding_layer_names=["embed_tokens"])
         )
     elif model_type == "falcon":
         from .falcon import FlaxFalconForCausalLM as _FlaxFalconForCausalLM
@@ -54,11 +57,10 @@ def get_modules_by_type(model_type: str):
     elif model_type == "mistral":
         from .mistral import FlaxMistralForCausalLM as _FlaxMistralForCausalLM
         from .mistral import MistralConfig as _MistralConfig
-        from ..transform import mistral_convert_hf_to_flax as _mistral_convert_hf_to_flax
         return (
             _MistralConfig,
             _FlaxMistralForCausalLM,
-            _mistral_convert_hf_to_flax
+            functools.partial(huggingface_to_easydel, embedding_layer_names=["embed_tokens"])
         )
     elif model_type == "gptj":
         from .gpt_j import FlaxGPTJForCausalLM as _FlaxGPTJForCausalLM
@@ -156,18 +158,19 @@ class AutoEasyDelModelForCausalLM:
             dtype: jax.numpy.dtype = jax.numpy.float32,
             param_dtype: jax.numpy.dtype = jax.numpy.float32,
             precision: jax.lax.Precision = jax.lax.Precision("fastest"),
-            sharding_axis_dims: typing.Sequence[int] = (1, -1, 1, 1),
-            sharding_axis_names: typing.Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+            sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
+            sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
             q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, None, None),
             a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             use_shard_map: bool = False,
-            input_shape: typing.Sequence[int] = (1, 1),
-            backend: typing.Optional[str] = None,
+            input_shape: Sequence[int] = (1, 1),
+            shard_fns: Optional[Mapping[tuple, Callable]] = None,
+            backend: Optional[str] = None,
             **kwargs
-    ) -> typing.Tuple[EasyDelFlaxPretrainedModel, dict]:
+    ) -> Tuple[EasyDelFlaxPretrainedModel, dict]:
         """
         The from_pretrained function is a helper function that allows you to instantiate a model from the pretrained
         model repository. It takes as input the name of the model (e.g., 'bert-base-uncased') and returns an instance of
@@ -188,10 +191,11 @@ class AutoEasyDelModelForCausalLM:
         :param a_ps: jax.sharding.PartitionSpec: Specify the partitioning of the attention weights
         :param use_shard_map: bool: whenever to use shard_map for attention
         :param input_shape: typing.Sequence[int]: Specify the shape of the input to the model
+        :param shard_fns: Optional[Mapping[tuple, Callable]]: Sharding Function to be used to shard model
         :param backend: typing.Optional[str]: backend to use for model
         :param kwargs: Pass additional arguments to the model and config classes
         :return: A model and parameters
-        
+
         """
 
         config = AutoConfig.from_pretrained(pretrained_model_name_or_path)
@@ -238,17 +242,17 @@ class AutoEasyDelConfig:
     def from_pretrained(
             cls,
             pretrained_model_name_or_path: str,
-            sharding_axis_dims: typing.Sequence[int] = (1, -1, 1, 1),
-            sharding_axis_names: typing.Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+            sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
+            sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
             q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, None, None),
             a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             use_shard_map: bool = False,
-            backend: typing.Optional[str] = None,
+            backend: Optional[str] = None,
             **kwargs
-    ) -> EasyDelFlaxPretrainedModel:
+    ) -> EasyDelPretrainedConfig:
         """
         The from_pretrained function is a helper function that allows you to instantiate a model from the pretrained
         model repository. It takes as input the name of the model (e.g., 'bert-base-uncased') and returns an instance of
@@ -256,15 +260,15 @@ class AutoEasyDelConfig:
 
         :param cls: Create an instance of the class that called this function
         :param pretrained_model_name_or_path: str: Identify the model in the huggingface model hub
-        :param sharding_axis_dims: typing.Sequence[int]: Specify the dimension of each axis in the sharded model
-        :param sharding_axis_names: typing.Sequence[str]: Specify the order of sharding
+        :param sharding_axis_dims: Sequence[int]: Specify the dimension of each axis in the sharded model
+        :param sharding_axis_names: Sequence[str]: Specify the order of sharding
         :param q_ps: jax.sharding.PartitionSpec: Specify the partitioning of the query tensor
         :param k_ps: jax.sharding.PartitionSpec: Partition the key matrix
         :param v_ps: jax.sharding.PartitionSpec: Specify the partitioning of the value tensor
         :param b_ps: jax.sharding.PartitionSpec: Specify the Attention Bias partition spec
         :param a_ps: jax.sharding.PartitionSpec: Specify the partitioning of the attention weights
         :param use_shard_map: bool: whenever to use shard_map for attention
-        :param backend: typing.Optional[str]: backend to use for model
+        :param backend: Optional[str]: backend to use for model
         :param kwargs: Pass additional arguments to the model and config classes
         :return: A Model Config
 

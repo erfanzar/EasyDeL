@@ -7,7 +7,7 @@ import msgpack
 import os
 from fjformer import get_dtype
 from jax import numpy as jnp
-from typing import List, Optional
+from typing import List, Optional, Mapping, Callable
 from tqdm import tqdm
 
 
@@ -57,6 +57,7 @@ def huggingface_to_easydel(
         device,
         embedding_layer_names: Optional[List[str]] = None,
         layer_norm_names: Optional[List[str]] = None,
+        shard_fns: Optional[Mapping[tuple, Callable]] = None,
         dtype: jax.numpy.dtype = jax.numpy.float16,
         **kwargs
 ):
@@ -70,6 +71,7 @@ def huggingface_to_easydel(
     :param embedding_layer_names: List[str]: Identify the embedding layer in the huggingface model
     :param device: Determine which device the model will be loaded on
     :param layer_norm_names: Replaces weight or kernel with (scale)
+    :param shard_fns: Optional[Mapping[tuple, Callable]]: Sharding Function to be used to shard model
     :param dtype: jax.numpy.dtype: Specify the data type of the tensors
     :return: A dictionary of the weights and biases in a format that can be used by flax (it's an UnFlattenDict)
     
@@ -101,9 +103,13 @@ def huggingface_to_easydel(
             key_tuple = key.split(".")
             key_names = ()
             tensor = tensor.detach().cpu().numpy()
+            tensor = jnp.asarray(tensor, dtype=dtype)
+
             for k in key_tuple:
                 key_names += k,
-            flax_dict[key_names] = tensor.astype(dtype)
+            if shard_fns is not None:
+                tensor = shard_fns[key_names](tensor)
+            flax_dict[key_names] = tensor
         return flax.traverse_util.unflatten_dict(flax_dict)
 
 
@@ -111,8 +117,7 @@ def read_ckpt(path: [str, os.PathLike], shard_fns=None, add_extra_past_fix: list
     """
     The read_ckpt function reads a checkpoint file and returns the tensors in it.
 
-    :param path: [str: Specify the path to the checkpoint file
-    :param os.PathLike]: Specify the path to the checkpoint file
+    :param path: [str, os.PathLike]: Specify the path to the checkpoint file
     :param shard_fns: Shard the tensors
     :param add_extra_past_fix: list: Add an extra past to the key
     :return: A dictionary of tensors
