@@ -56,13 +56,31 @@ class GradioUserInference:
                     placeholder='System Prompt',
                     container=False
                 )
+
+                max_length = gr.Slider(
+                    value=_max_length,
+                    maximum=10000,
+                    minimum=1,
+                    label='Max Tokens',
+                    step=1
+                )
+
                 max_new_tokens = gr.Slider(
                     value=_max_new_tokens,
                     maximum=10000,
                     minimum=_max_compile_tokens,
-                    label='Max Tokens',
+                    label='Max New Tokens',
                     step=_max_compile_tokens
                 )
+
+                max_compile_tokens = gr.Slider(
+                    value=_max_compile_tokens,
+                    maximum=_max_compile_tokens,
+                    minimum=_max_compile_tokens,
+                    label='Max Compile Tokens',
+                    step=_max_compile_tokens
+                )
+
                 temperature = gr.Slider(
                     value=0.8,
                     maximum=1,
