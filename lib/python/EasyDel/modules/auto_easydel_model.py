@@ -168,7 +168,7 @@ class AutoEasyDelModelForCausalLM:
             a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             use_shard_map: bool = False,
             input_shape: Sequence[int] = (1, 1),
-            shard_fns: Optional[Mapping[tuple, Callable]] = None,
+            shard_fns: Optional[Mapping[tuple, Callable] | dict] = None,
             backend: Optional[str] = None,
             **kwargs
     ) -> Tuple[EasyDelFlaxPretrainedModel, dict]:
@@ -227,8 +227,9 @@ class AutoEasyDelModelForCausalLM:
             precision=precision,
             input_shape=input_shape
         )
-        if not is_flatten(shard_fns):
-            shard_fns = flax.traverse_util.flatten_dict(shard_fns)
+        if shard_fns is not None:
+            if not is_flatten(shard_fns):
+                shard_fns = flax.traverse_util.flatten_dict(shard_fns)
         with cfg.jax_mesh():
             params = trf(model.state_dict(), config=config, device=device, shard_fns=shard_fns)
         del model,
