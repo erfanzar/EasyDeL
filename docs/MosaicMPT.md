@@ -97,7 +97,7 @@ class MPTJaxServer(JAXServer):
   # need read JaxServer Documents inorder to learn how
 
 
-server = MPTJaxServer.load_from_params(
+server = MPTJaxServer.from_parameters(
   params=params,
   model=FlaxMptForCausalLM(
     config=config,

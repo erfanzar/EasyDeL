@@ -160,7 +160,7 @@ class Llama2JaxServer(JAXServer):
         return "".join(texts)
 
 
-server = Llama2JaxServer.load_from_params(
+server = Llama2JaxServer.from_parameters(
     params=params,
     model=model,
     config_model=model.config,

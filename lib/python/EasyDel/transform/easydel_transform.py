@@ -103,7 +103,6 @@ def huggingface_to_easydel(
             key_tuple = key.split(".")
             key_names = ()
             tensor = tensor.detach().cpu().numpy()
-            tensor = jnp.asarray(tensor, dtype=dtype)
 
             for k in key_tuple:
                 key_names += k,

@@ -70,7 +70,7 @@ with jax.default_device(jax.devices('cpu')[0]):
         param_dtype='float16'
     )
 
-server = JAXServer.load_from_params(
+server = JAXServer.from_parameters(
     model=model,
     config_model=config,
     config=config_server,

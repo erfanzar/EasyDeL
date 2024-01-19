@@ -425,7 +425,7 @@ class JAXServer(GradioUserInference):
             **kwargs
         )
 
-        return cls.load_from_params(
+        return cls.from_parameters(
             model=model,
             config_model=model.config,
             tokenizer=transformers.AutoTokenizer.from_pretrained(pretrained_model_name_or_path),
@@ -437,7 +437,7 @@ class JAXServer(GradioUserInference):
         )
 
     @classmethod
-    def load_from_params(
+    def from_parameters(
             cls,
             model: transformers.FlaxPreTrainedModel,
             config_model: transformers.PretrainedConfig,
@@ -449,7 +449,7 @@ class JAXServer(GradioUserInference):
             verbose: bool = True
     ):
         """
-        The load_from_params function is used to load a model from the parameters of a pretrained model.
+        The from_parameters function is used to load a model from the parameters of a pretrained model.
         It takes in the following arguments:
             - cls: The class of the server you are loading, this should be Server or TPU_Server depending on
             what backend you want to use.
@@ -491,10 +491,8 @@ class JAXServer(GradioUserInference):
             shard_fns = flax.traverse_util.flatten_dict(shard_fns)
             pbar = tqdm.tqdm(params.keys())
             for key in pbar:
-
                 key = tuple(key)
                 params[key] = shard_fns[key](params[key])
-
                 if do_memory_log:
                     pbar.write(server.get_memory())
                 pbar.set_description("Sharding Params")
