@@ -32,6 +32,7 @@ def main():
         partition_specs=partition_specs,
         dtype_specs=jax.numpy.float16
     )
+
     model, params = AutoEasyDelModelForCausalLM.from_pretrained(model_id, shard_fns=shard_fns)
 
 

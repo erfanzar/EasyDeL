@@ -6,7 +6,7 @@ import jax
 from jax.experimental import pjit
 from transformers import PretrainedConfig, GenerationConfig
 from flax import linen as nn
-from typing import Sequence, Optional, Type, Tuple, Any, Callable
+from typing import Sequence, Optional, Type, Tuple, Any, Callable, Mapping
 from jax import numpy as jnp
 from ...modules.auto_easydel_model import AutoEasyDelModelForCausalLM
 from ...modules.easydel_modelling_utils import EasyDelPretrainedConfig, EasyDelFlaxPretrainedModel
@@ -247,6 +247,7 @@ class AutoRLModelForCasualLMWithValueHead:
             kernel_init: Callable = nn.initializers.orthogonal(),
             generation_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp"),
             generation_config: GenerationConfig = GenerationConfig(),
+            shard_fns: Optional[Mapping[tuple, Callable]] = None,
             seed: int = 42,
             summary_dropout_prob: float = 0.0,
             **kwargs
@@ -266,6 +267,7 @@ class AutoRLModelForCasualLMWithValueHead:
             a_ps=a_ps,
             use_shard_map=use_shard_map,
             input_shape=input_shape,
+            shard_fns=shard_fns,
             backend=backend,
             **kwargs
         )

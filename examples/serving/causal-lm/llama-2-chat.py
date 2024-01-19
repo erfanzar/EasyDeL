@@ -142,7 +142,7 @@ if __name__ == "__main__":
         use_prefix_tokenizer=args.use_prefix_tokenizer
     )
 
-    server = Llama2Host.load_from_huggingface_torch(
+    server = Llama2Host.from_torch_pretrained(
         pretrained_model_name_or_path=args.pretrained_model_name_or_path,
         server_config=configs
     )

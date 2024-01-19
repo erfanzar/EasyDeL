@@ -18,50 +18,50 @@ class GradioUserInference:
         a chat history, message box, buttons for submitting, stopping, and clearing the conversation,
         and sliders for advanced options.
         """
+
         _max_length = max_length
         _max_new_tokens = max_new_tokens
         _max_compile_tokens = max_compile_tokens
-        with gr.Row():
-            with gr.Column(scale=4):
-                history = gr.Chatbot(
-                    elem_id="EasyDel",
-                    label="EasyDel",
-                    container=True,
-                    height=800
+
+        with gr.Column("100%"):
+            gr.Markdown(
+                "# <h1><center style='color:white;'>Powered by "
+                "[EasyDeL](https://github.com/erfanzar/EasyDel)</center></h1>",
+            )
+            history = gr.Chatbot(
+                elem_id="EasyDel",
+                label="EasyDel",
+                container=True,
+                height="65vh",
+            )
+            prompt = gr.Textbox(
+                show_label=False, placeholder='Enter Your Prompt Here.', container=False
+            )
+            with gr.Row():
+                submit = gr.Button(
+                    value="Run",
+                    variant="primary"
                 )
-                prompt = gr.Textbox(placeholder='Message Box', container=False)
-            with gr.Column(scale=1):
-                gr.Markdown(
-                    "# <h1><center>Powered by [EasyDeL](https://github.com/erfanzar/EasyDel)</center></h1>"
+                stop = gr.Button(
+                    value='Stop'
                 )
+                clear = gr.Button(
+                    value='Clear Conversation'
+                )
+            with gr.Accordion(open=False, label="Advanced Options"):
                 system_prompt = gr.Textbox(
                     value="",
+                    show_label=True,
                     label="System Prompt",
                     placeholder='System Prompt',
                     container=False
                 )
-                max_length = gr.Slider(
-                    value=_max_length,
-                    minimum=1,
-                    maximum=_max_length,
-                    step=1,
-                    label="Maximum Length"
-                )
-
                 max_new_tokens = gr.Slider(
                     value=_max_new_tokens,
-                    maximum=_max_length,
+                    maximum=10000,
                     minimum=_max_compile_tokens,
-                    label='Max New Tokens',
+                    label='Max Tokens',
                     step=_max_compile_tokens
-                )
-
-                max_compile_tokens = gr.Slider(
-                    value=max_compile_tokens,
-                    maximum=_max_new_tokens,
-                    minimum=max_compile_tokens,
-                    label='Max Compile Tokens (JAX)',
-                    step=max_compile_tokens,
                 )
                 temperature = gr.Slider(
                     value=0.8,
@@ -84,27 +84,19 @@ class GradioUserInference:
                     label='Top K',
                     step=1
                 )
-                mode = gr.Dropdown(
-                    choices=["Chat", "Instruction"],
-                    value="Chat",
-                    label="Mode",
-                    multiselect=False,
-                )
-                greedy = gr.Checkbox(
-                    value=False,
-                    label="Greedy"
+
+                greedy = gr.Radio(
+                    value=True,
+                    label="Do Sample or Greedy Generation"
                 )
 
-                stop = gr.Button(
-                    value='Stop'
+                mode = gr.Dropdown(
+                    choices=["Chat", "Instruct"],
+                    value="Chat",
+                    label="Mode",
+                    multiselect=False
                 )
-                clear = gr.Button(
-                    value='Clear Conversation'
-                )
-                submit = gr.Button(
-                    value="Run",
-                    variant="primary"
-                )
+
         inputs = [
             prompt,
             history,

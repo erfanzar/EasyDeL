@@ -2,6 +2,7 @@ import functools
 import gc
 from typing import Sequence, Optional, Tuple, Mapping, Callable, Type
 
+import flax.traverse_util
 import jax.numpy
 
 from flax.traverse_util import unflatten_dict
@@ -116,11 +117,11 @@ def get_modules_by_type(model_type: str) -> Tuple[
             functools.partial(huggingface_to_easydel, embedding_layer_names=["embed_tokens"])
         )
     elif model_type == "phi":
-        from .phi import FlaxPhiForCausalLMModule as _FlaxPhiForCausalLMModule
+        from .phi import FlaxPhiForCausalLM as _FlaxPhiForCausalLM
         from .phi import PhiConfig as _PhiConfig
         return (
             _PhiConfig,
-            _FlaxPhiForCausalLMModule,
+            _FlaxPhiForCausalLM,
             functools.partial(
                 huggingface_to_easydel,
                 embedding_layer_names=["embed_tokens"],
@@ -226,8 +227,10 @@ class AutoEasyDelModelForCausalLM:
             precision=precision,
             input_shape=input_shape
         )
-
-        params = trf(model.state_dict(), config=config, device=device)
+        if not is_flatten(shard_fns):
+            shard_fns = flax.traverse_util.flatten_dict(shard_fns)
+        with cfg.jax_mesh():
+            params = trf(model.state_dict(), config=config, device=device, shard_fns=shard_fns)
         del model,
         gc.collect()
 
