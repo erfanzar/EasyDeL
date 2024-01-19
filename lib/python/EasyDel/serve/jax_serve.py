@@ -1,7 +1,7 @@
 import copy
 import functools
 import os
-import typing
+from typing import Sequence, Tuple, Optional, Mapping, Callable, Dict
 
 import flax.core
 import gradio as gr
@@ -274,11 +274,12 @@ class JAXServer(GradioUserInference):
         self.shard_params(params=params, partition_rules=partition_rules)
         self.configure_generate_functions(model, tokenizer)
 
-    def generate(self,
-                 params: Union[flax.core.FrozenDict, dict],
-                 input_ids: chex.Array,
-                 attention_mask: chex.Array,
-                 ):
+    def generate(
+            self,
+            params: Union[flax.core.FrozenDict, dict],
+            input_ids: chex.Array,
+            attention_mask: chex.Array,
+    ):
         """
         The generate function is used to generate a sequence of tokens from the model.
 
@@ -305,7 +306,7 @@ class JAXServer(GradioUserInference):
             model: transformers.FlaxPreTrainedModel,
             config_model: transformers.PretrainedConfig,
             tokenizer: transformers.PreTrainedTokenizer,
-            path: typing.Union[str, os.PathLike],
+            path: Union[str, os.PathLike],
             config=None,
             add_params_field: bool = True,
             init_shape: tuple = (1, 1),
@@ -319,7 +320,7 @@ class JAXServer(GradioUserInference):
         :param model: transformers.FlaxPreTrainedModel: Initialize the server
         :param config_model: transformers.PretrainedConfig: Get the partition rules
         :param tokenizer: transformers.PreTrainedTokenizer: Load the tokenizer from the model
-        :param path: typing.Union[str, os.PathLike]: Specify the path to the checkpoint file
+        :param path: Union[str, os.PathLike]: Specify the path to the checkpoint file
         :param config: Configure the server
         :param add_params_field: bool: Add a params field to the server
         :param init_shape: tuple: Specify the shape of the input to be used for generating shard_fns
@@ -379,7 +380,7 @@ class JAXServer(GradioUserInference):
         return server
 
     @classmethod
-    def load_from_huggingface_torch(
+    def from_torch_pretrained(
             cls,
             server_config: JAXServerConfig,
             pretrained_model_name_or_path: str,
@@ -387,16 +388,17 @@ class JAXServer(GradioUserInference):
             dtype: jax.numpy.dtype = jax.numpy.float32,
             param_dtype: jax.numpy.dtype = jax.numpy.float32,
             precision: jax.lax.Precision = jax.lax.Precision("fastest"),
-            sharding_axis_dims: typing.Sequence[int] = (1, -1, 1, 1),
-            sharding_axis_names: typing.Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+            sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
+            sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
             q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, None, None),
             a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             use_shard_map: bool = False,
-            input_shape: typing.Sequence[int] = (1, 1),
-            backend: typing.Optional[str] = None,
+            input_shape: Sequence[int] = (1, 1),
+            shard_fns: Optional[Mapping[tuple, Callable]] = None,
+            backend: Optional[str] = None,
             add_params_field: bool = True,
             do_memory_log: bool = False,
             verbose: bool = True,
@@ -417,6 +419,7 @@ class JAXServer(GradioUserInference):
             k_ps=k_ps,
             b_ps=b_ps,
             use_shard_map=use_shard_map,
+            shard_fns=shard_fns,
             input_shape=input_shape,
             backend=backend,
             **kwargs
@@ -439,7 +442,7 @@ class JAXServer(GradioUserInference):
             model: transformers.FlaxPreTrainedModel,
             config_model: transformers.PretrainedConfig,
             tokenizer: transformers.PreTrainedTokenizer,
-            params: typing.Dict,
+            params: Dict,
             config: JAXServerConfig = None,
             add_params_field: bool = True,
             do_memory_log: bool = False,
@@ -459,7 +462,7 @@ class JAXServer(GradioUserInference):
         :param model: transformers.FlaxPreTrainedModel: Load the model
         :param config_model: transformers.PretrainedConfig: Get the partition rules
         :param tokenizer: transformers.PreTrainedTokenizer: Tokenize the input text
-        :param params: typing.Dict: Pass in the parameters of the model
+        :param params: Dict: Pass in the parameters of the model
         :param config: Pass in the config file for the server
         :param add_params_field: bool: Add a params field to the server
         :param do_memory_log: bool: Log the memory usage of the server
