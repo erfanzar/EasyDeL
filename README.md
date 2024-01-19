@@ -194,7 +194,7 @@ model, params = AutoEasyDelModelForCausalLM.from_pretrained(
     device_map="auto"
 )
 
-server = JAXServer.load_from_params(
+server = JAXServer.from_parameters(
     model=model,
     config_model=model.config,
     tokenizer=tokenizer,

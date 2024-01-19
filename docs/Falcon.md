@@ -90,7 +90,7 @@ class FalconJaxServer(JAXServer):
   # need read JaxServer Documents inorder to learn how
 
 
-server = FalconJaxServer.load_from_params(
+server = FalconJaxServer.from_parameters(
   params=params,
   model=model,
   config_model=model.config,
