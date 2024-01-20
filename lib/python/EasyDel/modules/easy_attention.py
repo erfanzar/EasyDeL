@@ -291,7 +291,8 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
             query_sequence_length,
             key_value_sequence_length
         ), self.assertion_mkv_err
-
+        sm_scale = query_states.shape[-1] / 2
+        sm_scale = jnp.power(2, -sm_scale)
         flash_func, float32_logits, _ = get_flash_attention()
         if float32_logits:
             query_states, key_states, value_states = map(
@@ -302,6 +303,7 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
             partial(
                 flash_func,
                 causal=causal,
+                sm_scale=sm_scale,
                 block_sizes=flash_attn_tpu.BlockSizes(
                     block_b=self.block_b,
                     block_k=self.block_k,
