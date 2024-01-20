@@ -298,26 +298,41 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
                 lambda s: s.astype(jnp.float32),
                 (query_states, key_states, value_states)
             )
-        attention_o = flash_func(
-            q=query_states,
-            k=key_states,
-            v=value_states,
-            causal=causal,
-            block_sizes=flash_attn_tpu.BlockSizes(
-                block_b=self.block_b,
-                block_k=self.block_k,
-                block_q=self.block_q,
-                block_k_major=self.block_k_major,
-                block_k_dq=self.block_k_dq,
-                block_q_dq=self.block_q_dq,
-                block_k_dkv=self.block_k_dkv,
-                block_q_dkv=self.block_q_dkv,
-                block_k_major_dq=self.block_k_major_dq,
-                block_k_major_dkv=self.block_k_major_dkv,
-                block_q_major_dkv=self.block_q_major_dkv,
+        attention_o = shard_map(
+            partial(
+                flash_func,
+                causal=causal,
+                block_sizes=flash_attn_tpu.BlockSizes(
+                    block_b=self.block_b,
+                    block_k=self.block_k,
+                    block_q=self.block_q,
+                    block_k_major=self.block_k_major,
+                    block_k_dq=self.block_k_dq,
+                    block_q_dq=self.block_q_dq,
+                    block_k_dkv=self.block_k_dkv,
+                    block_q_dkv=self.block_q_dkv,
+                    block_k_major_dq=self.block_k_major_dq,
+                    block_k_major_dkv=self.block_k_major_dkv,
+                    block_q_major_dkv=self.block_q_major_dkv,
+                ),
+                debug=False
             ),
-            ab=bias,
-            debug=False
+            in_specs=(
+                self.query_partition_spec,
+                self.key_partition_spec,
+                self.value_partition_spec,
+                self.bias_partition_spec
+            ),
+            out_specs=(
+                self.attention_partition_spec
+            ),
+            mesh=self.mesh,
+            check_rep=False,
+        )(
+            query_states,
+            key_states,
+            value_states,
+            bias,
         )
         return AttentionOutput(
             attention_outputs=attention_o,
