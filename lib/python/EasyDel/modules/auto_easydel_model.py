@@ -161,11 +161,11 @@ class AutoEasyDelModelForCausalLM:
             precision: jax.lax.Precision = jax.lax.Precision("fastest"),
             sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
             sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, None, None),
-            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            query_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            key_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            value_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            bias_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, None, None),
+            attention_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             use_shard_map: bool = False,
             input_shape: Sequence[int] = (1, 1),
             shard_fns: Optional[Mapping[tuple, Callable] | dict] = None,
@@ -185,11 +185,11 @@ class AutoEasyDelModelForCausalLM:
         :param precision: jax.lax.Precision: Control the precision of the model
         :param sharding_axis_dims: typing.Sequence[int]: Specify the dimension of each axis in the sharded model
         :param sharding_axis_names: typing.Sequence[str]: Specify the order of sharding
-        :param q_ps: jax.sharding.PartitionSpec: Specify the partitioning of the query tensor
-        :param k_ps: jax.sharding.PartitionSpec: Partition the key matrix
-        :param v_ps: jax.sharding.PartitionSpec: Specify the partitioning of the value tensor
-        :param b_ps: jax.sharding.PartitionSpec: Specify the Attention Bias partition spec
-        :param a_ps: jax.sharding.PartitionSpec: Specify the partitioning of the attention weights
+        :param query_partition_spec: jax.sharding.PartitionSpec: Specify the partitioning of the query tensor
+        :param key_partition_spec: jax.sharding.PartitionSpec: Partition the key matrix
+        :param value_partition_spec: jax.sharding.PartitionSpec: Specify the partitioning of the value tensor
+        :param bias_partition_spec: jax.sharding.PartitionSpec: Specify the Attention Bias partition spec
+        :param attention_partition_spec: jax.sharding.PartitionSpec: Specify the partitioning of the attention weights
         :param use_shard_map: bool: whenever to use shard_map for attention
         :param input_shape: typing.Sequence[int]: Specify the shape of the input to the model
         :param shard_fns: Optional[Mapping[tuple, Callable]]: Sharding Function to be used to shard model
@@ -208,14 +208,14 @@ class AutoEasyDelModelForCausalLM:
         cfg = cfg.from_pretrained(pretrained_model_name_or_path)
         if hasattr(cfg, 'add_jax_args'):
             cfg.add_jax_args()
-        cfg.add_partitions(
+        cfg.add_basic_configurations(
             axis_dims=sharding_axis_dims,
             axis_names=sharding_axis_names,
-            q_ps=q_ps,
-            k_ps=k_ps,
-            v_ps=v_ps,
-            b_ps=b_ps,
-            a_ps=a_ps,
+            query_partition_spec=query_partition_spec,
+            key_partition_spec=key_partition_spec,
+            value_partition_spec=value_partition_spec,
+            bias_partition_spec=bias_partition_spec,
+            attention_partition_spec=attention_partition_spec,
             backend=backend,
             use_shard_map=use_shard_map,
         )
@@ -248,11 +248,11 @@ class AutoEasyDelConfig:
             pretrained_model_name_or_path: str,
             sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
             sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, None, None),
-            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            query_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            key_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            value_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            bias_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, None, None),
+            attention_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             use_shard_map: bool = False,
             backend: Optional[str] = None,
             **kwargs
@@ -266,11 +266,11 @@ class AutoEasyDelConfig:
         :param pretrained_model_name_or_path: str: Identify the model in the huggingface model hub
         :param sharding_axis_dims: Sequence[int]: Specify the dimension of each axis in the sharded model
         :param sharding_axis_names: Sequence[str]: Specify the order of sharding
-        :param q_ps: jax.sharding.PartitionSpec: Specify the partitioning of the query tensor
-        :param k_ps: jax.sharding.PartitionSpec: Partition the key matrix
-        :param v_ps: jax.sharding.PartitionSpec: Specify the partitioning of the value tensor
-        :param b_ps: jax.sharding.PartitionSpec: Specify the Attention Bias partition spec
-        :param a_ps: jax.sharding.PartitionSpec: Specify the partitioning of the attention weights
+        :param query_partition_spec: jax.sharding.PartitionSpec: Specify the partitioning of the query tensor
+        :param key_partition_spec: jax.sharding.PartitionSpec: Partition the key matrix
+        :param value_partition_spec: jax.sharding.PartitionSpec: Specify the partitioning of the value tensor
+        :param bias_partition_spec: jax.sharding.PartitionSpec: Specify the Attention Bias partition spec
+        :param attention_partition_spec: jax.sharding.PartitionSpec: Specify the partitioning of the attention weights
         :param use_shard_map: bool: whenever to use shard_map for attention
         :param backend: Optional[str]: backend to use for model
         :param kwargs: Pass additional arguments to the model and config classes
@@ -285,14 +285,14 @@ class AutoEasyDelConfig:
         cfg = cfg.from_pretrained(pretrained_model_name_or_path)
         if hasattr(cfg, 'add_jax_args'):
             cfg.add_jax_args()
-        cfg.add_partitions(
+        cfg.add_basic_configurations(
             axis_dims=sharding_axis_dims,
             axis_names=sharding_axis_names,
-            q_ps=q_ps,
-            k_ps=k_ps,
-            v_ps=v_ps,
-            b_ps=b_ps,
-            a_ps=a_ps,
+            query_partition_spec=query_partition_spec,
+            key_partition_spec=key_partition_spec,
+            value_partition_spec=value_partition_spec,
+            bias_partition_spec=bias_partition_spec,
+            attention_partition_spec=attention_partition_spec,
             backend=backend,
             use_shard_map=use_shard_map,
         )

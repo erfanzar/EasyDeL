@@ -1,23 +1,22 @@
 import functools
 
 from flax.struct import dataclass
-from jax import numpy as jnp, Array, lax
-from jax.experimental.shard_map import shard_map
-from jax.sharding import PartitionSpec as PS
+from jax import numpy as jnp, lax
+from jax.sharding import PartitionSpec
 import jax
 from flax import linen as nn
 from flax.traverse_util import unflatten_dict, flatten_dict
 from flax.core import freeze, unfreeze, FrozenDict
 from typing import Union, Optional, Tuple
-from flax.linen import partitioning as nn_partitioning, dot_product_attention_weights
+from flax.linen import partitioning as nn_partitioning, combine_masks
 
+from ..easy_attention import EasyAttention
 from ..flax_modelling_utils import (
     ACT2FN,
     with_sharding_constraint,
     repeat_kv_bnsh,
     apply_rotary_pos_emb,
     precompute_freq_cis,
-    smart_flash_attention,
     get_dot_general_by_bits
 )
 import chex
@@ -135,6 +134,27 @@ class FlaxMixtralAttention(nn.Module):
         self.v_proj = dense(self.num_key_value_heads * self.head_dim)
         self.o_proj = dense(self.hidden_size)
         self.rotary = FlaxMixtralRotaryEmbedding(self.dtype)
+        self.attention_performer = EasyAttention(
+            attn_type="normal",
+            block_k_major=self.config.block_k_major,
+            block_b=self.config.block_b,
+            block_q=self.config.block_q,
+            block_k=self.config.block_k,
+            num_attention_heads=self.config.num_attention_heads,
+            attention_dropout=self.config.attention_dropout,
+            head_dims=self.head_dim,
+            attention_partition_spec=self.config.attention_partition_spec,
+            use_shard_map=self.config.use_shard_map,
+            precision=self.precision,
+            force_float32_tpu=True,
+            attn_mechanism=self.config.attn_mechanism,
+            dtype=self.dtype,
+            bias_partition_spec=self.config.bias_partition_spec,
+            key_partition_spec=self.config.key_partition_spec,
+            query_partition_spec=self.config.query_partition_spec,
+            value_partition_spec=self.config.value_partition_spec,
+            mesh=self.config.jax_mesh(),
+        )
 
     @nn.compact
     def concatenate_to_cache_(self, query: chex.Array, key: chex.Array, value: chex.Array, attention_mask: chex.Array):
@@ -166,7 +186,7 @@ class FlaxMixtralAttention(nn.Module):
     def _t(query, key, value):
         return jnp.transpose(query, (0, 2, 1, 3)), jnp.transpose(key, (0, 2, 1, 3)), jnp.transpose(value, (0, 2, 1, 3))
 
-    def t_rotary(self, batch_size, sequence_length, query, key, value, freq_cis, position_ids):
+    def apply_rotary(self, batch_size, sequence_length, query, key, value, freq_cis, position_ids):
         query = query.reshape(batch_size, sequence_length,
                               self.config.num_attention_heads, self.head_dim)
         key = key.reshape(batch_size, sequence_length,
@@ -180,6 +200,9 @@ class FlaxMixtralAttention(nn.Module):
         key = repeat_kv_bnsh(key, self.num_key_value_groups)
         value = repeat_kv_bnsh(value, self.num_key_value_groups)
         return self._t(query, key, value)
+
+    def _merge_heads(self, hidden_states):
+        return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
 
     def __call__(
             self,
@@ -200,7 +223,7 @@ class FlaxMixtralAttention(nn.Module):
 
         :param self: Refer to the object itself
         :param hidden_states: chex.Array: Pass in the hidden state of the model
-        :param freq_cis: chex.Array: Create the t_rotary variable
+        :param freq_cis: chex.Array: Create the apply_rotary variable
         :param attention_mask: chex.Array: Mask the attention weights
         :param causal_mask: chex.Array: Mask the attention weights
         :param position_ids: chex.Array: Specify the position of each token in a sequence
@@ -211,145 +234,118 @@ class FlaxMixtralAttention(nn.Module):
 
         """
         batch_size, sequence_length = hidden_states.shape[:2]
-        query, key, value = self.q_proj(hidden_states), self.k_proj(
-            hidden_states), self.v_proj(hidden_states)
+        query_state, key_state, value_state = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(
+            hidden_states)
 
         if self.config.use_pjit_attention_force:
-            query = with_sharding_constraint(query, PS("fsdp", "sp", None))
-            key = with_sharding_constraint(key, PS("fsdp", "sp", None))
-            value = with_sharding_constraint(value, PS("fsdp", "sp", None))
-        query, key, value = self.t_rotary(
-            batch_size=batch_size,
-            sequence_length=sequence_length,
-            query=query,
-            key=key,
-            value=value,
-            freq_cis=freq_cis,
-            position_ids=position_ids
-        )
-        if self.has_variable('cache', 'key') or init_cache:
-            query, key, value, attention_mask = self.concatenate_to_cache_(
-                query, key, value, attention_mask)
+            query_state = with_sharding_constraint(
+                query_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
+            key_state = with_sharding_constraint(
+                key_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
+            value_state = with_sharding_constraint(
+                value_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
 
-        q_l, k_l = query.shape[1], key.shape[1]
-        if self.has_variable('cache', 'key'):
-            mask_shift: int = self.variables['cache']['index']
-            dl = self.variables['cache']['key'].shape[1]
-            causal_mask = jax.lax.dynamic_slice(
-                causal_mask, (0, 0, mask_shift, 0), (1, 1, q_l, dl)
+        query_state = query_state.reshape(
+            batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
+        key_state = key_state.reshape(
+            batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
+        value_state = value_state.reshape(
+            batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
+
+        query_state, key_state, value_state = self.apply_rotary(
+            query=query_state,
+            key=key_state,
+            value=value_state,
+            position_ids=position_ids,
+            freq_cis=freq_cis,
+            batch_size=batch_size,
+            sequence_length=sequence_length
+        )
+
+        assert_msg = (
+            "num_attention_heads repeat wont work likely\n"
+            f"INFO :\n\trepeat_kv_bnsh Used with num_key_value_groups = {self.num_key_value_groups}\n\t"
+            f"NH : {self.config.num_attention_heads} KVH : {self.config.num_attention_heads}"
+        )
+
+        assert query_state.shape[-2] == self.config.num_attention_heads, assert_msg
+        assert key_state.shape[-2] == self.config.num_attention_heads, assert_msg
+        assert value_state.shape[-2] == self.config.num_attention_heads, assert_msg
+
+        query_length, key_length = query_state.shape[1], key_state.shape[1]
+
+        if self.has_variable("cache", "cached_key"):
+            mask_shift = self.variables["cache"]["cache_index"]
+            max_decoder_length = self.variables["cache"]["cached_key"].shape[1]
+            causal_mask = lax.dynamic_slice(
+                causal_mask, (0, 0, mask_shift, 0), (1, 1,
+                                                     query_length, max_decoder_length)
             )
         else:
-            causal_mask = causal_mask[:, :, :q_l, :k_l]
-        dropout_rng = None
-        if not deterministic and self.config.attention_dropout > 0.0:
-            dropout_rng = self.make_rng("dropout")
+            causal_mask = causal_mask[:, :, :query_length, :key_length]
+
+        batch_size = hidden_states.shape[0]
         causal_mask = jnp.broadcast_to(
             causal_mask, (batch_size,) + causal_mask.shape[1:])
+        attention_mask = jnp.broadcast_to(jnp.expand_dims(
+            attention_mask, axis=(-3, -2)), causal_mask.shape)
+        attention_mask = combine_masks(attention_mask, causal_mask)
         if attention_mask.ndim == 2:
-            attention_mask = jnp.broadcast_to(jnp.expand_dims(
-                attention_mask, axis=(-3, -2)), causal_mask.shape)
+            attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
 
-        attention_mask = nn.combine_masks(attention_mask, causal_mask)
+        dropout_rng = None
 
-        if self.config.use_flash_attention and not (self.has_variable("cache", "cached_key") or init_cache):
+        if not deterministic and self.config.attention_dropout > 0.0:
+            dropout_rng = self.make_rng("dropout")
 
-            if attention_mask.ndim == 2:
-                attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
-
-            if attention_mask.shape[1] != self.config.num_attention_heads:
-                attention_mask = attention_mask.repeat(
-                    self.config.num_attention_heads, 1, )
-            attention_bias = lax.select(
-                attention_mask > 0,
-                jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-                jnp.full(attention_mask.shape, jnp.finfo(
-                    self.dtype).min).astype(self.dtype),
+        if self.has_variable("cache", "cached_key") or init_cache:
+            key_state, value_state, attention_mask = self._concatenate_to_cache(
+                key_state,
+                value_state,
+                query_state,
+                attention_mask
             )
-            attn_weights = None
-            rtp_axis = (0, 2, 1, 3)
-            attn_output = smart_flash_attention(
-                q=jnp.transpose(query, rtp_axis),
-                k=jnp.transpose(key, rtp_axis),
-                v=jnp.transpose(value, rtp_axis),
-                q_ps=self.config.q_ps,
-                k_ps=self.config.k_ps,
-                v_ps=self.config.v_ps,
-                b_ps=self.config.b_ps,
-                a_ps=self.config.a_ps,
-                bias=attention_bias,
-                block_q=self.config.flash_attn_query_chunk_size,
-                block_k=self.config.flash_attn_key_chunk_size,
-                block_b=1,
-                num_attention_heads=self.config.num_attention_heads,
-                precision=self.precision,
-                dtype=self.dtype,
-                causal=False,
-                mesh=self.config.jax_mesh(),
-                dropout_rng=dropout_rng,
-                deterministic=deterministic,
-                q_seq_len=q_l,
-                kv_seq_len=k_l,
-                attn_pdrop=self.config.attention_dropout,
-                head_dims=self.head_dim,
-                force_float32_tpu=True
-            )
-            attn_output = jnp.transpose(attn_output, rtp_axis)
-        else:
-            attention_bias = lax.select(
-                attention_mask > 0,
-                jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-                jnp.full(attention_mask.shape, jnp.finfo(
-                    self.dtype).min).astype(self.dtype),
-            )
-            if self.config.use_shard_map:
-                attn_weights = shard_map(
-                    functools.partial(
-                        dot_product_attention_weights,
-                        dtype=jnp.promote_types(self.dtype, jnp.float32),
-                        deterministic=deterministic,
-                        dropout_rate=self.config.attention_dropout,
-                        precision=self.precision,
-                    ),
-                    mesh=self.config.jax_mesh(),
-                    in_specs=(
-                        self.config.q_ps,
-                        self.config.k_ps,
-                        self.config.b_ps
-                    ),
-                    out_specs=PS(("dp", "fsdp"), "sp", "tp", None),
-                    check_rep=False
-                )(
-                    query, key, attention_bias
-                )
-            else:
-                attn_weights = dot_product_attention_weights(
-                    query=query,
-                    key=key,
-                    bias=attention_bias,
-                    dtype=jnp.promote_types(self.dtype, jnp.float32),
-                    deterministic=deterministic,
-                    dropout_rate=self.config.attention_dropout,
-                    precision=self.precision,
-                )
 
-            if self.config.use_pjit_attention_force:
-                attn_weights = with_sharding_constraint(
-                    attn_weights, PS(("dp", "fsdp"), "sp", "tp", None))
+        attention_bias = lax.select(
+            attention_mask > 0,
+            jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
+            jnp.full(attention_mask.shape, jnp.finfo(
+                self.dtype).min).astype(self.dtype),
+        )
 
-            attn_output = jnp.einsum(
-                "...hqk,...khd->...qhd", attn_weights, value)
+        query_state, key_state, value_state = map(
+            lambda a: a.transpose(0, 2, 1, 3),
+            [query_state, key_state, value_state]
+        )
 
-        out = self.o_proj(attn_output.reshape(
-            batch_size, sequence_length, self.hidden_size))
-        return out, attn_weights
+        attentions = self.attention_performer.__call__(
+            query_states=query_state,
+            key_states=key_state,
+            value_states=value_state,
+            bias=attention_bias,
+            causal=False,
+            use_pjit_attention_force=self.config.use_pjit_attention_force,
+            dropout_rng=dropout_rng,
+            deterministic=deterministic,
+            query_sequence_length=query_length,
+            key_value_sequence_length=key_length,
+            uses_cache=self.has_variable("cache", "cached_key") or init_cache,
+        )
+        attentions.attention_outputs = attentions.attention_outputs.transpose(0, 2, 1, 3)
+
+        attn_output = self._merge_heads(attentions.attention_outputs)
+        attn_output = self.o_proj(attn_output)
+        outputs = (
+            attn_output, attentions.attention_weights
+        )
+        return outputs
 
 
 class FlaxMixtralBLockSparseTop2MLP(nn.Module):
     config: MixtralConfig
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[None, jax.lax.Precision]
-    ] = jax.lax.Precision("fastest")
+    precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
 
     def setup(self) -> None:
         dense = functools.partial(
