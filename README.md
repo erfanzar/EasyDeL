@@ -317,6 +317,23 @@ with jax.default_device(jax.devices("cpu")[0]):
 model = model.half()  # it's a huggingface model now
 ```
 
+### Flash Attention or Splash Attention Are Here 🥵
+
+here's a simple example about how can you use Flash Attention in EasyDeL
+
+```python
+# Config is built in config for every model (EasyDelPretrainedConfig)
+config.add_basic_configurations(
+    attn_mechanism="flash",  # flash , normal or splash (not fully supported yet on GPU,TPU) 
+    block_b=1,
+    block_q=512,
+    block_k=512,
+    block_k_major=512
+)
+```
+
+_Flash Attention works on TPU with ease but for gpu there are still some improvements in process._
+
 ### Other Use Cases
 
 `EasyDelState` have a general use you can use it everywhere in easydel for example for a stand-alone model
