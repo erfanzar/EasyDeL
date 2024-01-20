@@ -28,7 +28,13 @@ class EasyDelPretrainedConfig(PretrainedConfig):
     :param block_k: int: block size of key_states
     :param block_q: int: block size of query_states
     :param block_b: int: block size of bias
-    :param block_k_major: int: block size of key_states
+    :param block_q_major_dkv: int: block size of block_q_major_dkv
+    :param block_k_major_dkv: int: block size of block_k_major_dkv
+    :param block_k_dkv: int: block size of block_k_dkv
+    :param block_q_dkv: int: block size of block_q_dkv
+    :param block_k_major_dq: int: block size of block_k_major_dq
+    :param block_k_dq: int: block size of block_k_dq
+    :param block_q_dq: int: block size of block_q_dq
     :param query_partition_spec: PartitionSpec: Specify the partitioning of the query tensor
     :param key_partition_spec: PartitionSpec: Partition the key matrix
     :param value_partition_spec: PartitionSpec: Specify the partitioning of the value tensor
@@ -36,7 +42,6 @@ class EasyDelPretrainedConfig(PretrainedConfig):
     :param attention_partition_spec: PartitionSpec: Specify the partitioning of the attention weights
     :param use_shard_map: bool: whenever to use shard_map for attention
     :param backend: Optional[None]: Specify the backend to use
-    :param easy_method: EasyMethod: Specify the use of model to init the QDot Method for (e.q TRAIN,SERVE,...)
     """
 
     def __init__(
@@ -48,6 +53,13 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             block_q: int = 128,
             block_b: int = 1,
             block_k_major: int = 128,
+            block_q_major_dkv: int | None = None,
+            block_k_major_dkv: int | None = None,
+            block_k_dkv: int | None = None,
+            block_q_dkv: int | None = None,
+            block_k_major_dq: int | None = None,
+            block_k_dq: int | None = None,
+            block_q_dq: int | None = None,
             query_partition_spec: PartitionSpec = PartitionSpec(
                 ("dp", "fsdp"), "sp", "tp", None
             ),
@@ -83,6 +95,13 @@ class EasyDelPretrainedConfig(PretrainedConfig):
         self.block_k = block_k
         self.block_q = block_q
         self.block_k_major = block_k_major
+        self.block_q_major_dkv = block_q_major_dkv or block_q
+        self.block_k_major_dkv = block_k_major_dkv or block_k
+        self.block_k_dkv = block_k_dkv or block_k
+        self.block_q_dkv = block_q_dkv or block_q
+        self.block_k_major_dq = block_k_major_dq or block_k
+        self.block_k_dq = block_k_dq or block_k
+        self.block_q_dq = block_q_dq or block_q
         super().__init__(**kwargs)
 
     @staticmethod
@@ -178,8 +197,15 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             attn_mechanism: Literal["normal", "flash", "splash"] = "normal",
             block_k: int = 128,
             block_q: int = 128,
-            block_b: int = 128,
+            block_b: int = 1,
             block_k_major: int = 128,
+            block_q_major_dkv: int | None = None,
+            block_k_major_dkv: int | None = None,
+            block_k_dkv: int | None = None,
+            block_q_dkv: int | None = None,
+            block_k_major_dq: int | None = None,
+            block_k_dq: int | None = None,
+            block_q_dq: int | None = None,
             query_partition_spec: PartitionSpec = PartitionSpec(
                 ("dp", "fsdp"), "sp", "tp", None
             ),
@@ -207,7 +233,13 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             :param block_k: int: block size of key_states
             :param block_q: int: block size of query_states
             :param block_b: int: block size of bias
-            :param block_k_major: int: block size of key_states
+            :param block_q_major_dkv: int: block size of block_q_major_dkv
+            :param block_k_major_dkv: int: block size of block_k_major_dkv
+            :param block_k_dkv: int: block size of block_k_dkv
+            :param block_q_dkv: int: block size of block_q_dkv
+            :param block_k_major_dq: int: block size of block_k_major_dq
+            :param block_k_dq: int: block size of block_k_dq
+            :param block_q_dq: int: block size of block_q_dq
             :param query_partition_spec: PartitionSpec: Specify the partitioning of the query tensor
             :param key_partition_spec: PartitionSpec: Partition the key matrix
             :param value_partition_spec: PartitionSpec: Specify the partitioning of the value tensor
@@ -230,6 +262,13 @@ class EasyDelPretrainedConfig(PretrainedConfig):
         self.block_k = block_k
         self.block_q = block_q
         self.block_k_major = block_k_major
+        self.block_q_major_dkv = block_q_major_dkv or block_q
+        self.block_k_major_dkv = block_k_major_dkv or block_k
+        self.block_k_dkv = block_k_dkv or block_k
+        self.block_q_dkv = block_q_dkv or block_q
+        self.block_k_major_dq = block_k_major_dq or block_k
+        self.block_k_dq = block_k_dq or block_k
+        self.block_q_dq = block_q_dq or block_q
 
 
 class EasyDelFlaxPretrainedModel(FlaxPreTrainedModel):

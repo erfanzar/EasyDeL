@@ -47,6 +47,13 @@ class EasyAttention:
             block_q: int,
             block_b: int,
             block_k_major: int,
+            block_q_major_dkv: int,
+            block_k_major_dkv: int,
+            block_k_dkv: int,
+            block_q_dkv: int,
+            block_k_major_dq: int,
+            block_k_dq: int,
+            block_q_dq: int,
             num_attention_heads: int,
             head_dims: int,
             mesh: Mesh,
@@ -73,6 +80,13 @@ class EasyAttention:
         self.block_q = block_q
         self.block_b = block_b
         self.block_k_major = block_k_major
+        self.block_q_major_dkv = block_q_major_dkv
+        self.block_k_major_dkv = block_k_major_dkv
+        self.block_k_dkv = block_k_dkv
+        self.block_q_dkv = block_q_dkv
+        self.block_k_major_dq = block_k_major_dq
+        self.block_k_dq = block_k_dq
+        self.block_q_dq = block_q_dq
         self.num_attention_heads = num_attention_heads
         self.head_dims = head_dims
         self.mesh = mesh
@@ -293,7 +307,14 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
                 block_b=self.block_b,
                 block_k=self.block_k,
                 block_q=self.block_q,
-                block_k_major=self.block_k_major
+                block_k_major=self.block_k_major,
+                block_k_dq=self.block_k_dq,
+                block_q_dq=self.block_q_dq,
+                block_k_dkv=self.block_k_dkv,
+                block_q_dkv=self.block_q_dkv,
+                block_k_major_dq=self.block_k_major_dq,
+                block_k_major_dkv=self.block_k_major_dkv,
+                block_q_major_dkv=self.block_q_major_dkv,
             ),
             ab=bias,
             debug=False
