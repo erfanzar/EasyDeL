@@ -130,6 +130,7 @@ class FlaxMptAttention(nn.Module):
             query_partition_spec=self.config.query_partition_spec,
             value_partition_spec=self.config.value_partition_spec,
             mesh=self.config.jax_mesh(),
+            sm_scale=2 ** -(self.head_dim / 2)
         )
         if self.config.qk_ln:
             self.q_ln = nn.LayerNorm(use_bias=self.config.use_norm_bias)

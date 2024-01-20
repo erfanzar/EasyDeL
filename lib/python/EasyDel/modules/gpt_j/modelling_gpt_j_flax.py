@@ -117,6 +117,7 @@ class FlaxGPTJAttention(nn.Module):
 
         pos_embd_dim = self.rotary_dim or self.embed_dim
         self.embed_positions = create_sinusoidal_positions(config.max_position_embeddings, pos_embd_dim)
+
         self.attention_performer = EasyAttention(
             attn_type="normal",
             block_k_major=self.config.block_k_major,
@@ -144,6 +145,7 @@ class FlaxGPTJAttention(nn.Module):
             query_partition_spec=self.config.query_partition_spec,
             value_partition_spec=self.config.value_partition_spec,
             mesh=self.config.jax_mesh(),
+            sm_scale=2 ** -(self.head_dim / 2)
         )
 
     def _split_heads(self, hidden_states):
