@@ -265,7 +265,6 @@ config = AutoEasyDelConfig.from_pretrained(
 )
 
 config.use_pjit_attention_force = False
-config.use_flash_attention = False
 
 tokenizer = AutoTokenizer.from_pretrained(
     huggingface_model_repo_id,

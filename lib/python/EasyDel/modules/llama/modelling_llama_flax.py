@@ -7,9 +7,8 @@ import jax.numpy as jnp
 from jax import lax
 from jax.sharding import PartitionSpec
 import flax.linen as nn
-from jax.experimental.shard_map import shard_map
 from flax.traverse_util import flatten_dict, unflatten_dict
-from flax.linen import partitioning as nn_partitioning, dot_product_attention_weights
+from flax.linen import partitioning as nn_partitioning
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks, make_causal_mask
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput, FlaxSequenceClassifierOutput

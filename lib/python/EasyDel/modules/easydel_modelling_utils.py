@@ -46,7 +46,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             attn_mechanism: Literal["normal", "flash", "splash"] = "normal",
             block_k: int = 128,
             block_q: int = 128,
-            block_b: int = 128,
+            block_b: int = 1,
             block_k_major: int = 128,
             query_partition_spec: PartitionSpec = PartitionSpec(
                 ("dp", "fsdp"), "sp", "tp", None

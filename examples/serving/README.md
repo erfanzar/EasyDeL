@@ -22,7 +22,6 @@ def main():
 
     conf = EasyDel.configs.configs.llama_configs['7b']
     config = EasyDel.LlamaConfig(**conf, rotary_type='complex')
-    config.use_flash_attention = False
     config.use_mlp_attention = False
     config.rope_scaling = None
     config.max_sequence_length = 2048
@@ -232,7 +231,6 @@ def main():
 
     conf = EasyDel.configs.configs.llama_configs['7b']
     config = EasyDel.LlamaConfig(**conf, rotary_type='complex')
-    config.use_flash_attention = False
     config.use_mlp_attention = False
     config.rope_scaling = None
     config.max_sequence_length = 2048
