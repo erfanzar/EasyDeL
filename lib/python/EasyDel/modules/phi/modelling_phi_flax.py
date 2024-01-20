@@ -366,9 +366,9 @@ class FlaxPhiAttention(nn.Module):
                 ),
                 mesh=self.config.jax_mesh(),
                 in_specs=(
-                    self.config.q_ps,
-                    self.config.k_ps,
-                    self.config.b_ps
+                    self.config.query_partition_spec,
+                    self.config.key_partition_spec,
+                    self.config.bias_partition_spec
                 ),
                 out_specs=PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
                 check_rep=False

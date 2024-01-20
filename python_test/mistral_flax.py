@@ -49,7 +49,7 @@ def main():
         input_ids=input_ids
     )
     config.add_jax_args()
-    config.add_partitions(
+    config.add_basic_configurations(
         use_shard_map=True
     )
     try:

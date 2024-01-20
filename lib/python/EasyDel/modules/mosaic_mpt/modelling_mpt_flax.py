@@ -9,11 +9,13 @@ from jax.sharding import PartitionSpec
 from transformers.modeling_flax_outputs import FlaxCausalLMOutput, FlaxBaseModelOutput
 import flax
 from einops import rearrange
+
+from ..easy_attention import EasyAttention
 from ..flax_modelling_utils import (
     get_gradient_checkpoint_policy,
     with_sharding_constraint,
     ACT2FN,
-    smart_flash_attention, get_dot_general_by_bits
+    get_dot_general_by_bits
 )
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 import chex
@@ -101,6 +103,27 @@ class FlaxMptAttention(nn.Module):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
+        self.attention_performer = EasyAttention(
+            attn_type="normal",
+            block_k_major=self.config.block_k_major,
+            block_b=self.config.block_b,
+            block_q=self.config.block_q,
+            block_k=self.config.block_k,
+            num_attention_heads=self.config.num_attention_heads,
+            attention_dropout=self.config.attention_dropout,
+            head_dims=self.head_dim,
+            attention_partition_spec=self.config.attention_partition_spec,
+            use_shard_map=self.config.use_shard_map,
+            precision=self.precision,
+            force_float32_tpu=True,
+            attn_mechanism=self.config.attn_mechanism,
+            dtype=self.dtype,
+            bias_partition_spec=self.config.bias_partition_spec,
+            key_partition_spec=self.config.key_partition_spec,
+            query_partition_spec=self.config.query_partition_spec,
+            value_partition_spec=self.config.value_partition_spec,
+            mesh=self.config.jax_mesh(),
+        )
         if self.config.qk_ln:
             self.q_ln = nn.LayerNorm(use_bias=self.config.use_norm_bias)
             self.k_ln = nn.LayerNorm(use_bias=self.config.use_norm_bias)
@@ -170,7 +193,7 @@ class FlaxMptAttention(nn.Module):
         attention_mask = attention_mask.reshape(b, 1, 1, -1)
         if self.has_variable('cache', 'key') or init_cache:
             k, v, attention_mask = self._concatenate_to_cache(key=k, value=v, query=q, attention_mask=attention_mask)
-
+        # TODO: MPT WONT WORK CAUSE OF NEW ATTENTION MEC ON FJFORMER
         q_l = q.shape[1]
         k_l = k.shape[1]
         dropout_rng = None

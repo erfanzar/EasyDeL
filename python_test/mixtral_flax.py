@@ -55,7 +55,7 @@ def main():
     )
     torch_output = torch_output.logits.cpu().detach().numpy()
     config.add_jax_args()
-    config.add_partitions(
+    config.add_basic_configurations(
         use_shard_map=True
     )
     try:
