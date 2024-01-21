@@ -317,7 +317,7 @@ with jax.default_device(jax.devices("cpu")[0]):
 model = model.half()  # it's a huggingface model now
 ```
 
-### Flash Attention or Splash Attention Are Here 🥵
+### Flash Attention and Splash Attention Are Here 🥵
 
 here's a simple example about how can you use Flash Attention in EasyDeL
 
