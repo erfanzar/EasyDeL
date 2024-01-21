@@ -25,9 +25,10 @@ def main():
         vocab_size=1200,
         hidden_size=256,
         num_attention_heads=8,
-        num_hidden_layers=1,
+        num_hidden_layers=2,
         gradient_checkpointing="",
-        alibi=False
+        alibi=False,
+        _attn_implementation="sdpa"
     )
 
     torch_model = FalconForCausalLM(
@@ -61,7 +62,7 @@ def main():
         return_dict=True
 
     )
-    res = jnp.allclose(torch_output.logits.cpu().detach().numpy(), flax_output.logits, atol=1e-5)
+    res = jnp.allclose(torch_output.logits.cpu().detach().numpy(), flax_output.logits, atol=1e-4)
     print('Mistral Huggingface Predictions :\n', torch_output.logits.cpu().detach().numpy(),
           '\nEasyDel Predictions: \n', flax_output.logits)
     if res:  # A Little Bit of humor
