@@ -51,7 +51,7 @@ class GradioUserInference:
             with gr.Accordion(open=False, label="Advanced Options"):
                 system_prompt = gr.Textbox(
                     value="",
-                    show_label=True,
+                    show_label=False,
                     label="System Prompt",
                     placeholder='System Prompt',
                     container=False

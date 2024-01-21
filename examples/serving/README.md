@@ -315,7 +315,7 @@ Ps = jax.sharding.PartitionSpec
 def configure_generate_functions(self, model, tokenizer):
     # Your override ed function in case that you want to create custom configure generation configs must contain
     # These attributes
-    assert self.rules is not None, 'you should first shard params with using ``shard_params`` method'
+    assert self.partition_specs is not None, 'you should first shard params with using ``shard_params`` method'
 
     if tokenizer.pad_token is None:
         logging.info(
@@ -330,7 +330,7 @@ def configure_generate_functions(self, model, tokenizer):
 
     @functools.partial(
         pjit,
-        in_shardings=(self.rules, Ps(), Ps()),
+        in_shardings=(self.partition_specs, Ps(), Ps()),
         out_shardings=(Ps())
     )
     def greedy_generate(parameters, input_ids, attention_mask):
@@ -355,7 +355,7 @@ def configure_generate_functions(self, model, tokenizer):
 
     @functools.partial(
         pjit,
-        in_shardings=(self.rules, Ps(), Ps()),
+        in_shardings=(self.partition_specs, Ps(), Ps()),
         out_shardings=(Ps())
     )
     def generate(parameters, input_ids, attention_mask):
