@@ -118,37 +118,14 @@ def dropout_add(linen_drop: nn.Dropout, x: chex.Array, residual: chex.Array, det
 class FlaxFalconRotaryEmbedding(nn.Module):
     dtype: jnp.dtype = jnp.float32
 
-    def __call__(self, key, query, freq_cis, position_ids):
+    def __call__(self, query, key, freq_cis, position_ids):
         sin, cos = freq_cis
 
         sin = sin[position_ids][:, :]
         cos = cos[position_ids][:, :]
 
-        _, sequence_length, _ = query.shape
-
-        # query_expansion_factor = int(query.shape[0] / cos.shape[0])
-        # key_expansion_factor = int(key.shape[0] / cos.shape[0])
-
-        query_expansion_factor = 1
-        key_expansion_factor = 1
-
-        if query_expansion_factor > 1:
-            query_cos = jnp.tile(cos, (query_expansion_factor,))
-            query_sin = jnp.tile(sin, (query_expansion_factor,))
-        else:
-            query_cos, query_sin = cos, sin
-
-        if key_expansion_factor > 1:
-            if key_expansion_factor != query_expansion_factor:
-                key_cos = jnp.tile(cos, (key_expansion_factor,))
-                key_sin = jnp.tile(sin, (key_expansion_factor,))
-            else:
-                key_cos, key_sin = query_cos, query_sin
-        else:
-            key_cos, key_sin = cos, sin
-
-        query = apply_rotary_pos_embedding(query, query_sin, query_cos)
-        key = apply_rotary_pos_embedding(key, key_sin, key_cos)
+        query = apply_rotary_pos_embedding(query, sin, cos)
+        key = apply_rotary_pos_embedding(key, sin, cos)
         return query.astype(self.dtype), key.astype(self.dtype)
 
 
@@ -181,12 +158,9 @@ class FlaxFalconAttention(nn.Module):
         self.maybe_rotary = FlaxFalconRotaryEmbedding(self.dtype) if not self.config.alibi else lambda q, k, a, s: (
             q, k)
         assert self.head_dim * self.config.num_attention_heads == self.config.hidden_size
-        if self.config.num_kv_heads is not None:
-
-            self.num_kv_heads = self.config.num_kv_heads if (
-                    self.config.new_decoder_architecture or not self.config.multi_query) else 1
-        else:
-            self.num_kv_heads = self.config.num_attention_heads
+        self.num_kv_heads = self.config.num_kv_heads if (
+                self.config.new_decoder_architecture or not self.config.multi_query
+        ) else 1
         self.num_heads = self.config.num_attention_heads
 
     @nn.compact
@@ -217,17 +191,9 @@ class FlaxFalconAttention(nn.Module):
     def _t(query, key, value):
         return jnp.transpose(query, (0, 2, 1, 3)), jnp.transpose(key, (0, 2, 1, 3)), jnp.transpose(value, (0, 2, 1, 3))
 
-    def apply_maybe_rotary(self, batch_size, sequence_length, query, key, value, freq_cis, position_ids):
-        query = query.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
-        key = key.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
-        value = value.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
-
-        query, key, value = self._t(query, key, value)
-        query, key = self.rotary(position_ids=position_ids, query=query, key=key, freq_cis=freq_cis)
-        return self._t(query, key, value)
-
     def split_head(self, qkv: chex.Array):
         batch_size, sequence_length, _ = qkv.shape
+
         if self.config.new_decoder_architecture:
             batch, sequence_length, _ = qkv.shape
             qkv = qkv.reshape(batch, sequence_length, -1, self.num_heads // self.num_kv_heads + 2, self.head_dim)
@@ -278,38 +244,42 @@ class FlaxFalconAttention(nn.Module):
             freq_cis: Tuple[chex.Array, chex.Array] = None,
             output_attentions: bool = False,
     ):
+        # FLAX
         batch_size, sequence_length, _ = hidden_states.shape
-        num_kv_heads = self.num_kv_heads
-        query_layer, key_layer, value_layer = self.split_head(self.query_key_value(hidden_states))
+        num_kv_heads = self.num_heads if self.config.new_decoder_architecture else self.num_kv_heads
+        qkv = self.query_key_value(hidden_states)
+
+        query_layer, key_layer, value_layer = self.split_head(qkv)
+
         query_layer = transpose(
             query_layer, 1, 2
         ).reshape(
-            batch_size * self.config.num_attention_heads,
+            batch_size,
+            self.config.num_attention_heads,
             sequence_length,
             self.head_dim
         )
         key_layer = transpose(
             key_layer, 1, 2
         ).reshape(
-            batch_size * num_kv_heads,
+            batch_size,
+            num_kv_heads,
             sequence_length,
             self.head_dim,
         )
         value_layer = transpose(
             value_layer, 1, 2
         ).reshape(
-            batch_size * num_kv_heads,
+            batch_size,
+            num_kv_heads,
             sequence_length,
             self.head_dim
         )
-        kv_length = key_layer.shape[1]
+
+        kv_length = key_layer.shape[-2]
         if not self.config.alibi:
-            query_layer, key_layer = self.maybe_rotary(
-                query_layer,
-                key_layer,
-                freq_cis,
-                position_ids
-            )
+            query_layer, key_layer = self.maybe_rotary(position_ids=position_ids, query=query_layer, key=key_layer,
+                                                       freq_cis=freq_cis)
 
         float_min = jnp.finfo(query_layer.dtype).min
         attention_bias = lax.select(
@@ -317,18 +287,25 @@ class FlaxFalconAttention(nn.Module):
             jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
             jnp.full(attention_mask.shape, float_min).astype(self.dtype),
         )
+        dtype = jnp.promote_types(key_layer.dtype, jnp.float32)
 
-        query_layer_ = query_layer.reshape(batch_size, self.config.num_attention_heads, -1, self.head_dim)
-        key_layer_ = key_layer.reshape(batch_size, num_kv_heads, -1, self.head_dim)
-        value_layer_ = value_layer.reshape(batch_size, num_kv_heads, -1, self.head_dim)
+        (
+            query_layer,
+            key_layer,
+            value_layer,
+            attention_bias
+        ) = map(
+            lambda x: x.astype(dtype=dtype), (
+                query_layer, key_layer, value_layer, attention_bias
+            )
+        )
 
-        dtype = jnp.promote_types(key_layer_.dtype, jnp.float32)
-
-        query_layer_, key_layer_, value_layer_, attention_bias = map(lambda x: x.astype(dtype=dtype), (
-            query_layer_, key_layer_, value_layer_, attention_bias))
-
-        attention_scores = jax.lax.batch_matmul(query_layer_, transpose(key_layer_, len(key_layer_.shape) - 2,
-                                                                        len(key_layer_.shape) - 1))
+        attention_scores = jnp.einsum(
+            "...qhd,...khd->...hqk",
+            query_layer.transpose(0, 2, 1, 3),
+            key_layer.transpose(0, 2, 1, 3),
+            precision=self.precision
+        )
         if alibi is None:
 
             attention_scores /= math.sqrt(self.head_dim)
@@ -336,11 +313,15 @@ class FlaxFalconAttention(nn.Module):
             attention_scores = jax.nn.softmax(
                 attention_scores + attention_bias, axis=-1
             )
-            attn_output = jax.lax.batch_matmul(attention_scores, value_layer_)
-            attn_output = attn_output.reshape(batch_size, self.num_heads, sequence_length, self.head_dim)
-            attn_output = transpose(attn_output, 2, 1)
+            attn_output = jnp.einsum(
+                "...hqk,...khd->...qhd",
+                attention_scores,
+                value_layer.transpose(0, 2, 1, 3),
+                precision=self.precision
+            )
+            attn_output = attn_output.reshape(batch_size, sequence_length, self.num_heads, self.head_dim)
+            # attn_output = transpose(attn_output, 2, 1)
             attn_output = attn_output.reshape(batch_size, sequence_length, self.num_heads * self.head_dim)
-
             output_tensor = self.dense(attn_output)
 
             if output_attentions:
@@ -359,7 +340,7 @@ class FlaxFalconAttention(nn.Module):
 
             # matmul: [batch_size * num_heads, q_length, head_dim]
 
-            attn_output = jax.lax.batch_matmul(attention_scores, value_layer_)
+            attn_output = jax.lax.batch_matmul(attention_scores, value_layer)
             attn_output = attn_output.reshape((attn_output.shape[1] * attn_output.shape[0],) + attn_output.shape[2:])
             attn_output = self._merge_heads(attn_output)
 

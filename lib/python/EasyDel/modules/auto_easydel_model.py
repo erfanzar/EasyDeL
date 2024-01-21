@@ -39,12 +39,20 @@ def get_modules_by_type(model_type: str) -> Tuple[
     elif model_type == "falcon":
         from .falcon import FlaxFalconForCausalLM as _FlaxFalconForCausalLM
         from .falcon import FalconConfig as _FalconConfig
-        from ..transform import falcon_convert_hf_to_flax as _falcon_convert_pt_to_flax
-
         return (
             _FalconConfig,
             _FlaxFalconForCausalLM,
-            _falcon_convert_pt_to_flax
+            functools.partial(
+                huggingface_to_easydel,
+                embedding_layer_names=["word_embeddings"],
+                layer_norm_names=[
+                    "input_layernorm",
+                    "ln_f",
+                    "ln_attn",
+                    "ln_mlp",
+                    "post_attention_layernorm"
+                ]
+            )
         )
     elif model_type == "mpt":
         from .mosaic_mpt import FlaxMptForCausalLM as _FlaxMptForCausalLM
@@ -161,11 +169,16 @@ class AutoEasyDelModelForCausalLM:
             precision: jax.lax.Precision = jax.lax.Precision("fastest"),
             sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
             sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            query_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            key_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            value_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            bias_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, None, None),
-            attention_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            query_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp",
+                                                                                          None),
+            key_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp",
+                                                                                        None),
+            value_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp",
+                                                                                          None),
+            bias_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, None,
+                                                                                         None),
+            attention_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp",
+                                                                                              "tp", None),
             use_shard_map: bool = False,
             input_shape: Sequence[int] = (1, 1),
             shard_fns: Optional[Mapping[tuple, Callable] | dict] = None,
@@ -248,11 +261,16 @@ class AutoEasyDelConfig:
             pretrained_model_name_or_path: str,
             sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
             sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            query_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            key_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            value_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            bias_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, None, None),
-            attention_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            query_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp",
+                                                                                          None),
+            key_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp",
+                                                                                        None),
+            value_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp",
+                                                                                          None),
+            bias_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, None,
+                                                                                         None),
+            attention_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp",
+                                                                                              "tp", None),
             use_shard_map: bool = False,
             backend: Optional[str] = None,
             **kwargs
