@@ -113,7 +113,13 @@ def get_modules_by_type(model_type: str) -> Tuple[
         return (
             _GPT2Config,
             _FlaxGPT2LMHeadModel,
-            functools.partial(huggingface_to_easydel, embedding_layer_names=["wte", "wpe"])
+            functools.partial(
+                huggingface_to_easydel,
+                embedding_layer_names=["wte", "wpe"],
+                layer_norm_names=[
+                    "ln_1", "ln_2", "ln_f"
+                ]
+            )
         )
 
     elif model_type == "mixtral":
