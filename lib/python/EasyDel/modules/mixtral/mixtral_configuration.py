@@ -42,6 +42,7 @@ class MixtralConfig(EasyDelPretrainedConfig):
             bits: Optional[int] = None,
             rope_scaling: Dict[str, Union[str, float]] = None,
             attention_bias: bool = False,
+            initialization_of_moe: bool = False,
             **kwargs,
     ):
         """
@@ -81,6 +82,8 @@ class MixtralConfig(EasyDelPretrainedConfig):
         :param kwargs: Pass a variable number of keyword arguments to a function
         :param rope_scaling: Dict[str, Union[str, float]]: rope scaling information
         :param attention_dropout: float: Set the dropout rate for the attention layer
+        :param initialization_of_moe: bool: initialization of moe needs to disable some dynamic part's this boolean
+         variable will turn them off.
         :param attention_bias: bool: when ever to use attention_bias
         :param : Define the number of layers in the model
         :return: An instance of the class
@@ -107,6 +110,7 @@ class MixtralConfig(EasyDelPretrainedConfig):
 
         self.num_key_value_heads = num_key_value_heads
         self.hidden_act = hidden_act
+        self.initialization_of_moe = initialization_of_moe
         self.initializer_range = initializer_range
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
@@ -187,6 +191,7 @@ class MixtralConfig(EasyDelPretrainedConfig):
             attention_dropout: float = 0.0,
             rope_scaling: Dict[str, Union[str, float]] = None,
             attention_bias: bool = False,
+            initialization_of_moe: bool = False,
             **kwargs,
     ):
         """
@@ -203,6 +208,8 @@ class MixtralConfig(EasyDelPretrainedConfig):
         :param bits: Optional[int]: Specify the number of bits to use for quantization
         :param attention_dropout: float: Set the dropout rate for the attention layer
         :param attention_bias: bool: when ever to use attention_bias
+        :param initialization_of_moe: bool: initialization of moe needs to disable some dynamic part's this boolean
+         variable will turn them off.
         :param rope_scaling: Dict[str, Union[str, float]]: rope_scaling for rope
         :return: A tuple of the following:
 
@@ -218,6 +225,7 @@ class MixtralConfig(EasyDelPretrainedConfig):
         self.c_max_position_embeddings = c_max_position_embeddings
         self.freq_max_position_embeddings = freq_max_position_embeddings
         self.bits = bits
+        self.initialization_of_moe = initialization_of_moe
 
     @staticmethod
     def get_weight_decay_exclusions():
