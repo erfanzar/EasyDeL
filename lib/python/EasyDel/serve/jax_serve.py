@@ -106,7 +106,7 @@ class JAXServer(GradioUserInference):
             self.params,
             self.tokenizer,
             self.model,
-            self.rules,
+            self.partition_specs,
             self.generate_function,
             self.greedy_generate_function
         ) = [None] * 8
@@ -174,7 +174,7 @@ class JAXServer(GradioUserInference):
         :return: A function that takes in three parameters:
         
         """
-        assert self.rules is not None, "you should first shard params with using ``shard_params`` method"
+        assert self.partition_specs is not None, "you should first shard params with using ``shard_params`` method"
 
         if tokenizer.pad_token is None:
             logging.info(
@@ -202,7 +202,7 @@ class JAXServer(GradioUserInference):
 
         @functools.partial(
             pjit,
-            in_shardings=(self.rules, Ps(), Ps()),
+            in_shardings=(self.partition_specs, Ps(), Ps()),
             out_shardings=(Ps())
         )
         def greedy_generate(parameters, input_ids, attention_mask):
@@ -226,7 +226,7 @@ class JAXServer(GradioUserInference):
 
         @functools.partial(
             pjit,
-            in_shardings=(self.rules, Ps(), Ps()),
+            in_shardings=(self.partition_specs, Ps(), Ps()),
             out_shardings=(Ps())
         )
         def generate(parameters, input_ids, attention_mask):
@@ -390,11 +390,11 @@ class JAXServer(GradioUserInference):
             precision: jax.lax.Precision = jax.lax.Precision("fastest"),
             sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
             sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, None, None),
-            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            query_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            key_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            value_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            bias_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, None, None),
+            attention_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             use_shard_map: bool = False,
             input_shape: Sequence[int] = (1, 1),
             shard_fns: Optional[Mapping[tuple, Callable]] = None,
@@ -413,11 +413,11 @@ class JAXServer(GradioUserInference):
             precision=precision,
             sharding_axis_names=sharding_axis_names,
             sharding_axis_dims=sharding_axis_dims,
-            q_ps=q_ps,
-            a_ps=a_ps,
-            v_ps=v_ps,
-            k_ps=k_ps,
-            b_ps=b_ps,
+            query_partition_spec=query_partition_spec,
+            attention_partition_spec=attention_partition_spec,
+            value_partition_spec=value_partition_spec,
+            key_partition_spec=key_partition_spec,
+            bias_partition_spec=bias_partition_spec,
             use_shard_map=use_shard_map,
             shard_fns=shard_fns,
             input_shape=input_shape,
@@ -482,8 +482,8 @@ class JAXServer(GradioUserInference):
             logging.info(
                 "matching partition rules"
             )
-            rules = match_partition_rules(params=params, rules=config_model.get_partition_rules(True))
-            shard_fns, _ = make_shard_and_gather_fns(rules, get_dtype(server.config.dtype))
+            partition_specs = match_partition_rules(params=params, rules=config_model.get_partition_rules(True))
+            shard_fns, _ = make_shard_and_gather_fns(partition_specs, get_dtype(server.config.dtype))
             logging.info(
                 "sharding parameters across all of the chosen backend(tpu/gpu/cpu)s"
             )
@@ -498,7 +498,7 @@ class JAXServer(GradioUserInference):
                 pbar.set_description("Sharding Params")
             server.params = flax.traverse_util.unflatten_dict(params)
             server.params = {"params": server.params} if add_params_field else server.params
-        server.rules = {"params": rules} if add_params_field else rules
+        server.partition_specs = {"params": partition_specs} if add_params_field else partition_specs
         logging.info(
             "configuring generate functions for the server"
         )
@@ -520,7 +520,7 @@ class JAXServer(GradioUserInference):
         :return: True, but what does it do?
         """
         assert self._funcs_generated, "funcs are not generated yet"
-        assert self.rules is not None, "rules should not be None"
+        assert self.partition_specs is not None, "rules should not be None"
         if self.config.use_prefix_tokenizer:
             if verbose:
                 termcolor.cprint(
@@ -609,7 +609,7 @@ class JAXServer(GradioUserInference):
             logging.INFO,
             "the parameters will be sharded and ba saved inside server you can access them by ``JAXServer.params``")
         rules = match_partition_rules(params=params, rules=partition_rules)
-        self.rules = rules
+        self.partition_specs = rules
         shard_fns, _ = make_shard_and_gather_fns(rules, get_dtype(self.config.dtype))
 
         with self.mesh:

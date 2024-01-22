@@ -39,7 +39,9 @@ from jax import lax
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 from transformers.utils import logging
 
-from fjformer.attention import efficient_attention
+from fjformer.pallas_operations.efficient_attention import efficient_attention
+
+from ..easy_attention import EasyAttention
 from ..flax_modelling_utils import with_sharding_constraint, ACT2FN
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 import chex
@@ -115,6 +117,36 @@ class FlaxGPTJAttention(nn.Module):
 
         pos_embd_dim = self.rotary_dim or self.embed_dim
         self.embed_positions = create_sinusoidal_positions(config.max_position_embeddings, pos_embd_dim)
+
+        self.attention_performer = EasyAttention(
+            attn_type="normal",
+            block_k_major=self.config.block_k_major,
+            block_b=self.config.block_b,
+            block_q=self.config.block_q,
+            block_k=self.config.block_k,
+            block_q_major_dkv=self.config.block_q_major_dkv,
+            block_k_major_dkv=self.config.block_k_major_dkv,
+            block_k_major_dq=self.config.block_k_major_dq,
+            block_k_dkv=self.config.block_k_dkv,
+            block_q_dkv=self.config.block_q_dkv,
+            block_q_dq=self.config.block_q_dq,
+            block_k_dq=self.config.block_k_dq,
+            num_attention_heads=self.config.num_attention_heads,
+            attention_dropout=self.config.attention_dropout,
+            head_dims=self.head_dim,
+            attention_partition_spec=self.config.attention_partition_spec,
+            use_shard_map=self.config.use_shard_map,
+            precision=self.precision,
+            force_float32_tpu=True,
+            attn_mechanism=self.config.attn_mechanism,
+            dtype=self.dtype,
+            bias_partition_spec=self.config.bias_partition_spec,
+            key_partition_spec=self.config.key_partition_spec,
+            query_partition_spec=self.config.query_partition_spec,
+            value_partition_spec=self.config.value_partition_spec,
+            mesh=self.config.jax_mesh(),
+            sm_scale=1 # TOBE CHANGED
+        )
 
     def _split_heads(self, hidden_states):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.num_heads, self.head_dim))
@@ -224,47 +256,24 @@ class FlaxGPTJAttention(nn.Module):
         )
 
         # usual dot product attention
-        if self.config.use_flash_attention:
-            attn_weights = None
-            attention_mask = einops.rearrange(
-                attention_bias,
-                '... s q k -> ... s 1 q k'
-            )
-            attn_output = efficient_attention(
-                query,
-                key,
-                value,
-                bias=attention_mask,
-                dropout_rng=dropout_rng,
-                attention_drop_rate=self.config.attn_pdrop,
-                deterministic=not deterministic and self.config.attn_pdrop > 0.0,
-                float32_logits=True,
-                causal=True,
-                dtype=self.dtype,
-                precision=self.precision,
-                query_chunk_size=self.config.flash_attn_query_chunk_size,
-                key_chunk_size=self.config.flash_attn_key_chunk_size,
-            )
-        else:
-            attn_weights = dot_product_attention_weights(
-                query,
-                key,
-                bias=attention_bias,
-                dropout_rng=dropout_rng,
-                dropout_rate=self.config.attn_pdrop,
-                deterministic=deterministic,
-                dtype=jnp.promote_types(self.dtype, jnp.bfloat16),
-                precision=self.precision,
-            )
-            if self.config.use_pjit_attention_force:
-                attn_weights = with_sharding_constraint(attn_weights, PartitionSpec(("dp", "fsdp"), "sp", None, None))
-
-            attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value, precision=self.precision)
-        attn_output = self._merge_heads(attn_output)
+        attentions = self.attention_performer.__call__(
+            query_states=query,
+            key_states=key,
+            value_states=value,
+            bias=attention_bias,
+            causal=False,
+            use_pjit_attention_force=self.config.use_pjit_attention_force,
+            dropout_rng=dropout_rng,
+            deterministic=deterministic,
+            query_sequence_length=query_length,
+            key_value_sequence_length=key_length,
+            uses_cache=self.has_variable("cache", "cached_key") or init_cache,
+        )
+        attn_output = self._merge_heads(attentions.attention_outputs)
         attn_output = self.out_proj(attn_output)
         attn_output = self.resid_dropout(attn_output, deterministic=deterministic)
 
-        outputs = (attn_output, attn_weights) if output_attentions else (attn_output,)
+        outputs = (attn_output, attentions.attention_weights) if output_attentions else (attn_output,)
         return outputs
 
 

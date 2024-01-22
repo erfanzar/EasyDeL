@@ -7,9 +7,8 @@ import jax.numpy as jnp
 from jax import lax
 from jax.sharding import PartitionSpec
 import flax.linen as nn
-from jax.experimental.shard_map import shard_map
 from flax.traverse_util import flatten_dict, unflatten_dict
-from flax.linen import partitioning as nn_partitioning, dot_product_attention_weights
+from flax.linen import partitioning as nn_partitioning
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks, make_causal_mask
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput, FlaxSequenceClassifierOutput
@@ -20,9 +19,10 @@ from ..flax_modelling_utils import (
     repeat_kv_bnsh,
     apply_rotary_pos_emb,
     precompute_freq_cis,
-    smart_flash_attention,
     get_dot_general_by_bits
 )
+from ..easy_attention import AttentionOutput, EasyAttention
+
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 import chex
 from .llama_configuration import LlamaConfig
@@ -89,9 +89,9 @@ class FlaxLlamaAttention(nn.Module):
         config = self.config
         self.hidden_size = config.hidden_size
         self.head_dim = self.config.hidden_size // self.config.num_attention_heads
-        self.number_of_reps = self.config.num_attention_heads // self.config.num_key_value_heads
+        self.num_key_value_groups = self.config.num_attention_heads // self.config.num_key_value_heads
 
-        if self.number_of_reps == 1:
+        if self.num_key_value_groups == 1:
             assert self.config.num_attention_heads == self.config.num_key_value_heads
         self.q_proj = nn.Dense(
             config.num_attention_heads * self.head_dim,
@@ -135,7 +135,35 @@ class FlaxLlamaAttention(nn.Module):
         )
 
         self.rotary = FlaxLlamaEmbedding(self.dtype)
-
+        self.attention_performer = EasyAttention(
+            attn_type="normal",
+            block_k_major=self.config.block_k_major,
+            block_b=self.config.block_b,
+            block_q=self.config.block_q,
+            block_k=self.config.block_k,
+            block_q_major_dkv=self.config.block_q_major_dkv,
+            block_k_major_dkv=self.config.block_k_major_dkv,
+            block_k_major_dq=self.config.block_k_major_dq,
+            block_k_dkv=self.config.block_k_dkv,
+            block_q_dkv=self.config.block_q_dkv,
+            block_q_dq=self.config.block_q_dq,
+            block_k_dq=self.config.block_k_dq,
+            num_attention_heads=self.config.num_attention_heads,
+            attention_dropout=self.config.attention_dropout,
+            head_dims=self.head_dim,
+            attention_partition_spec=self.config.attention_partition_spec,
+            use_shard_map=self.config.use_shard_map,
+            precision=self.precision,
+            force_float32_tpu=True,
+            attn_mechanism=self.config.attn_mechanism,
+            dtype=self.dtype,
+            bias_partition_spec=self.config.bias_partition_spec,
+            key_partition_spec=self.config.key_partition_spec,
+            query_partition_spec=self.config.query_partition_spec,
+            value_partition_spec=self.config.value_partition_spec,
+            mesh=self.config.jax_mesh(),
+            sm_scale=1 # TOBE CHANGED
+        )
         self.resid_dropout = nn.Dropout(rate=config.resid_pdrop)
 
     def _merge_heads(self, hidden_states):
@@ -238,8 +266,8 @@ class FlaxLlamaAttention(nn.Module):
         query, key = self.rotary(
             position_ids=position_ids, query=query, key=key, freq_cis=freq_cis
         )
-        key = repeat_kv_bnsh(key, self.number_of_reps)
-        value = repeat_kv_bnsh(value, self.number_of_reps)
+        key = repeat_kv_bnsh(key, self.num_key_value_groups)
+        value = repeat_kv_bnsh(value, self.num_key_value_groups)
         return self._t(query, key, value)
 
     def __call__(
@@ -305,7 +333,7 @@ class FlaxLlamaAttention(nn.Module):
 
         assert_msg = (
             "num_attention_heads repeat wont work likely\n"
-            f"INFO :\n\trepeat_kv_bnsh Used with number_of_reps = {self.number_of_reps}\n\t"
+            f"INFO :\n\trepeat_kv_bnsh Used with num_key_value_groups = {self.num_key_value_groups}\n\t"
             f"NH : {self.config.num_attention_heads} KVH : {self.config.num_attention_heads}"
         )
 
@@ -347,102 +375,43 @@ class FlaxLlamaAttention(nn.Module):
                 attention_mask
             )
 
-        if self.config.use_flash_attention and not (self.has_variable("cache", "cached_key") or init_cache):
-            if attention_mask.shape[1] != self.config.num_attention_heads:
-                attention_mask = attention_mask.repeat(
-                    self.config.num_attention_heads, 1, )
-            attention_bias = lax.select(
-                attention_mask > 0,
-                jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-                jnp.full(attention_mask.shape, jnp.finfo(
-                    self.dtype).min).astype(self.dtype),
-            )
-            attn_weights = None
-            rtp_axis = (0, 2, 1, 3)
-            attn_output = smart_flash_attention(
-                q=jnp.transpose(query_state, rtp_axis),
-                k=jnp.transpose(key_state, rtp_axis),
-                v=jnp.transpose(value_state, rtp_axis),
-                q_ps=self.config.q_ps,
-                k_ps=self.config.k_ps,
-                v_ps=self.config.v_ps,
-                b_ps=self.config.b_ps,
-                a_ps=self.config.a_ps,
-                bias=attention_bias,
-                block_q=self.config.flash_attn_query_chunk_size,
-                block_k=self.config.flash_attn_key_chunk_size,
-                block_b=1,
-                num_attention_heads=self.config.num_attention_heads,
-                precision=self.precision,
-                dtype=self.dtype,
-                causal=False,
-                mesh=self.config.jax_mesh(),
-                dropout_rng=dropout_rng,
-                deterministic=deterministic,
-                q_seq_len=sequence_length,
-                kv_seq_len=key_length,
-                attn_pdrop=self.config.attention_dropout,
-                head_dims=self.head_dim,
-                force_float32_tpu=True
-            )
-            attn_output = jnp.transpose(attn_output, rtp_axis)
-        else:
-            attention_bias = lax.select(
-                attention_mask > 0,
-                jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-                jnp.full(attention_mask.shape, jnp.finfo(
-                    self.dtype).min).astype(self.dtype),
-            )
-            if self.config.use_shard_map:
-                attn_weights = shard_map(
-                    partial(
-                        dot_product_attention_weights,
-                        dtype=jnp.promote_types(self.dtype, jnp.float32),
-                        deterministic=deterministic,
-                        dropout_rate=self.config.attention_dropout,
-                        precision=self.precision,
-                    ),
-                    mesh=self.config.jax_mesh(),
-                    in_specs=(
-                        self.config.q_ps,
-                        self.config.k_ps,
-                        self.config.b_ps
-                    ),
-                    out_specs=PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-                    check_rep=False
-                )(
-                    query_state, key_state, attention_bias
-                )
-            else:
-                attn_weights = dot_product_attention_weights(
-                    query=query_state,
-                    key=key_state,
-                    bias=attention_bias,
-                    dtype=jnp.promote_types(self.dtype, jnp.float32),
-                    deterministic=deterministic,
-                    dropout_rate=self.config.attention_dropout,
-                    precision=self.precision,
-                )
+        attention_bias = lax.select(
+            attention_mask > 0,
+            jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
+            jnp.full(attention_mask.shape, jnp.finfo(
+                self.dtype).min).astype(self.dtype),
+        )
 
-            if self.config.use_pjit_attention_force:
-                attn_weights = with_sharding_constraint(
-                    attn_weights, PartitionSpec(("dp", "fsdp"), "sp", "tp", None))
+        query_state, key_state, value_state = map(
+            lambda a: a.transpose(0, 2, 1, 3),
+            [query_state, key_state, value_state]
+        )
 
-            attn_output = jnp.einsum(
-                "...hqk,...khd->...qhd",
-                attn_weights,
-                value_state,
-                precision=self.precision
-            )
+        attentions = self.attention_performer.__call__(
+            query_states=query_state,
+            key_states=key_state,
+            value_states=value_state,
+            bias=attention_bias,
+            causal=False,
+            use_pjit_attention_force=self.config.use_pjit_attention_force,
+            dropout_rng=dropout_rng,
+            deterministic=deterministic,
+            query_sequence_length=query_length,
+            key_value_sequence_length=key_length,
+            uses_cache=self.has_variable("cache", "cached_key") or init_cache,
+        )
+        attentions.attention_outputs = attentions.attention_outputs.transpose(0, 2, 1, 3)
 
-        attn_output = self._merge_heads(attn_output)
+        attn_output = self._merge_heads(attentions.attention_outputs)
         attn_output = self.o_proj(attn_output)
 
         attn_output = self.resid_dropout(
             attn_output, deterministic=deterministic)
-        outputs = (attn_output, attn_weights) if output_attentions else (
-            attn_output,)
-
+        outputs = (
+            attn_output, attentions.attention_weights
+        ) if output_attentions else (
+            attn_output,
+        )
         return outputs
 
 

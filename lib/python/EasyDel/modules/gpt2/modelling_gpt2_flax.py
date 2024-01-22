@@ -155,7 +155,6 @@ class FlaxGPT2Attention(nn.Module):
         # for the decoder
         is_cross_attention = key_value_states is not None
         batch_size = hidden_states.shape[0]
-
         if not is_cross_attention:
             qkv_out = self.c_attn(hidden_states)
             query, key, value = jnp.split(qkv_out, 3, axis=2)
@@ -168,6 +167,7 @@ class FlaxGPT2Attention(nn.Module):
         query = self._split_heads(query)
         key = self._split_heads(key)
         value = self._split_heads(value)
+
         if self.config.use_pjit_attention_force:
             query = with_sharding_constraint(query, jax.sharding.PartitionSpec(("dp", "fsdp"), None, "tp"))
             key = with_sharding_constraint(key, jax.sharding.PartitionSpec(("dp", "fsdp"), None, "tp"))
@@ -280,7 +280,10 @@ class FlaxGPT2Block(nn.Module):
         hidden_size = self.config.hidden_size
         inner_dim = self.config.n_inner if self.config.n_inner is not None else 4 * hidden_size
 
-        self.ln_1 = nn.LayerNorm(epsilon=self.config.layer_norm_epsilon, dtype=self.dtype)
+        self.ln_1 = nn.LayerNorm(
+            epsilon=self.config.layer_norm_epsilon,
+            dtype=self.dtype
+        )
         self.attn = FlaxGPT2Attention(
             self.config,
             dtype=self.dtype,
@@ -291,9 +294,15 @@ class FlaxGPT2Block(nn.Module):
 
         if self.config.add_cross_attention:
             self.crossattention = FlaxGPT2Attention(
-                config=self.config, dtype=self.dtype, causal=False, is_cross_attention=True
+                config=self.config,
+                dtype=self.dtype,
+                causal=False,
+                is_cross_attention=True
             )
-            self.ln_cross_attn = nn.LayerNorm(epsilon=self.config.layer_norm_epsilon, dtype=self.dtype)
+            self.ln_cross_attn = nn.LayerNorm(
+                epsilon=self.config.layer_norm_epsilon,
+                dtype=self.dtype
+            )
 
         self.mlp = FlaxGPT2MLP(self.config, inner_dim, dtype=self.dtype)
 
@@ -428,6 +437,7 @@ class FlaxGPT2PreTrainedModel(EasyDelFlaxPretrainedModel):
             past_key_values: dict = None,
             dropout_rng: jax.random.PRNGKey = None,
             train: bool = False,
+            add_params_field: bool = False,
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
@@ -457,8 +467,7 @@ class FlaxGPT2PreTrainedModel(EasyDelFlaxPretrainedModel):
         rngs = {}
         if dropout_rng is not None:
             rngs["dropout"] = dropout_rng
-
-        inputs = {"params": params or self.params}
+        inputs = {"params": params or self.params} if add_params_field is True else params or self.params
 
         if past_key_values:
             inputs["cache"] = past_key_values

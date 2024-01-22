@@ -16,6 +16,10 @@ Some of the key features provided by EasyDeL include:
 - And various other features to enhance the training process and optimize performance.
 
 > [!NOTE]
+> EasyDel Will only support JAX>=0.4.22 Due to miss computations being happened in older version and also not bein able
+> to run Flash Attention and Splash Attention (Splash Attention is still under Process)
+
+> [!NOTE]
 > These features collectively aim to simplify and accelerate the training of machine learning models, making it more
 > efficient and accessible for developers working with Jax/Flax.
 
@@ -246,11 +250,11 @@ state = EasyDelState.from_pretrained(
     precision=lax.Precision("fastest"),
     sharding_axis_dims=(1, -1, 1, 1),
     sharding_axis_names=("dp", "fsdp", "tp", "sp"),
-    q_ps=jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-    k_ps=jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-    v_ps=jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-    b_ps=jax.sharding.PartitionSpec(("dp", "fsdp"), None, None, None),
-    a_ps=jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+    query_partition_spec=jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+    key_partition_spec=jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+    value_partition_spec=jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+    bias_partition_spec=jax.sharding.PartitionSpec(("dp", "fsdp"), None, None, None),
+    attention_partition_spec=jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
     use_shard_map=False,
     input_shape=(1, 1),
     backend=None,
@@ -265,7 +269,6 @@ config = AutoEasyDelConfig.from_pretrained(
 )
 
 config.use_pjit_attention_force = False
-config.use_flash_attention = False
 
 tokenizer = AutoTokenizer.from_pretrained(
     huggingface_model_repo_id,
@@ -317,6 +320,23 @@ with jax.default_device(jax.devices("cpu")[0]):
 
 model = model.half()  # it's a huggingface model now
 ```
+
+### Flash Attention and Splash Attention Are Here 🥵
+
+here's a simple example about how can you use Flash Attention in EasyDeL
+
+```python
+# Config is built in config for every model (EasyDelPretrainedConfig)
+config.add_basic_configurations(
+    attn_mechanism="flash",  # flash , normal or splash (not fully supported yet on GPU,TPU) 
+    block_b=1,
+    block_q=512,
+    block_k=512,
+    block_k_major=512
+)
+```
+
+_Flash Attention works on TPU with ease but for gpu there are still some improvements in process._
 
 ### Other Use Cases
 

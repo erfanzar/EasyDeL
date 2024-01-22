@@ -9,11 +9,13 @@ from jax.sharding import PartitionSpec
 from transformers.modeling_flax_outputs import FlaxCausalLMOutput, FlaxBaseModelOutput
 import flax
 from einops import rearrange
+
+from ..easy_attention import EasyAttention
 from ..flax_modelling_utils import (
     get_gradient_checkpoint_policy,
     with_sharding_constraint,
     ACT2FN,
-    smart_flash_attention, get_dot_general_by_bits
+    get_dot_general_by_bits
 )
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 import chex
@@ -101,6 +103,35 @@ class FlaxMptAttention(nn.Module):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
+        self.attention_performer = EasyAttention(
+            attn_type="normal",
+            block_k_major=self.config.block_k_major,
+            block_b=self.config.block_b,
+            block_q=self.config.block_q,
+            block_k=self.config.block_k,
+            block_q_major_dkv=self.config.block_q_major_dkv,
+            block_k_major_dkv=self.config.block_k_major_dkv,
+            block_k_major_dq=self.config.block_k_major_dq,
+            block_k_dkv=self.config.block_k_dkv,
+            block_q_dkv=self.config.block_q_dkv,
+            block_q_dq=self.config.block_q_dq,
+            block_k_dq=self.config.block_k_dq,
+            num_attention_heads=self.config.num_attention_heads,
+            attention_dropout=self.config.attention_dropout,
+            head_dims=self.head_dim,
+            attention_partition_spec=self.config.attention_partition_spec,
+            use_shard_map=self.config.use_shard_map,
+            precision=self.precision,
+            force_float32_tpu=True,
+            attn_mechanism=self.config.attn_mechanism,
+            dtype=self.dtype,
+            bias_partition_spec=self.config.bias_partition_spec,
+            key_partition_spec=self.config.key_partition_spec,
+            query_partition_spec=self.config.query_partition_spec,
+            value_partition_spec=self.config.value_partition_spec,
+            mesh=self.config.jax_mesh(),
+            sm_scale=1 # TOBE CHANGED
+        )
         if self.config.qk_ln:
             self.q_ln = nn.LayerNorm(use_bias=self.config.use_norm_bias)
             self.k_ln = nn.LayerNorm(use_bias=self.config.use_norm_bias)
@@ -170,7 +201,7 @@ class FlaxMptAttention(nn.Module):
         attention_mask = attention_mask.reshape(b, 1, 1, -1)
         if self.has_variable('cache', 'key') or init_cache:
             k, v, attention_mask = self._concatenate_to_cache(key=k, value=v, query=q, attention_mask=attention_mask)
-
+        # TODO: MPT WONT WORK CAUSE OF NEW ATTENTION MEC ON FJFORMER
         q_l = q.shape[1]
         k_l = k.shape[1]
         dropout_rng = None
@@ -178,61 +209,24 @@ class FlaxMptAttention(nn.Module):
         if deterministic:
             dropout_rng = self.make_rng("dropout")
 
-        if self.config.use_flash_attention and not (self.has_variable("cache", "cached_key") or init_cache):
-
-            if attention_mask.ndim == 2:
-                attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
-
-            if attention_mask.shape[1] != self.config.num_attention_heads:
-                attention_mask = attention_mask.repeat(self.config.num_attention_heads, 1, )
-            attention_bias = jax.lax.select(
-                attention_mask > 0,
-                jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-                jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
+        d = q.shape[-1]
+        attn_output = jnp.einsum('...qhd,...khd->...hqk', q, k, precision=self.precision) * jax.lax.rsqrt(
+            jnp.asarray(d).astype(v.dtype))
+        if self.config.use_pjit_attention_force:
+            attn_output = with_sharding_constraint(attn_output, PartitionSpec(("dp", "fsdp"), "sp", None, None))
+        if attn_bias is not None:
+            attn_output += attn_bias[:, :, :, :attn_output.shape[-1]]
+        mask = jnp.where(self.causal_mask == 1, 0, jnp.finfo(attn_output).min)
+        if attention_mask is not None:
+            attention_mask = jnp.where(
+                attention_mask == 1,
+                0,
+                jnp.finfo(attn_output).min
             )
-            attn_weights = None
-            rtp_axis = (0, 2, 1, 3)
-            attn_output = smart_flash_attention(
-                q=jnp.transpose(q, rtp_axis),
-                k=jnp.transpose(k, rtp_axis),
-                v=jnp.transpose(b, rtp_axis),
-                bias=attention_bias + attn_bias,
-                block_q=self.config.flash_attn_query_chunk_size,
-                block_k=self.config.flash_attn_key_chunk_size,
-                block_b=1,
-                num_attention_heads=self.config.num_attention_heads,
-                precision=self.precision,
-                dtype=self.dtype,
-                causal=False,
-                mesh=self.config.jax_mesh(),
-                dropout_rng=dropout_rng,
-                deterministic=deterministic,
-                q_seq_len=q_l,
-                kv_seq_len=k_l,
-                attn_pdrop=self.config.attn_pdrop,
-                head_dims=self.head_dim,
-                force_float32_tpu=True
-            )
-            attn_output = jnp.transpose(attn_output, rtp_axis)
-        else:
-            d = q.shape[-1]
-            attn_output = jnp.einsum('...qhd,...khd->...hqk', q, k, precision=self.precision) * jax.lax.rsqrt(
-                jnp.asarray(d).astype(v.dtype))
-            if self.config.use_pjit_attention_force:
-                attn_output = with_sharding_constraint(attn_output, PartitionSpec(("dp", "fsdp"), "sp", None, None))
-            if attn_bias is not None:
-                attn_output += attn_bias[:, :, :, :attn_output.shape[-1]]
-            mask = jnp.where(self.causal_mask == 1, 0, jnp.finfo(attn_output).min)
-            if attention_mask is not None:
-                attention_mask = jnp.where(
-                    attention_mask == 1,
-                    0,
-                    jnp.finfo(attn_output).min
-                )
-                attn_output += attention_mask
-            attn_output += mask[:, :, :attn_output.shape[-2], :attn_output.shape[-1]]
-            attn_output = nn.softmax(attn_output, -1)
-            attn_output = jnp.einsum('...hqk,...khd->...qhd', attn_output, v)
+            attn_output += attention_mask
+        attn_output += mask[:, :, :attn_output.shape[-2], :attn_output.shape[-1]]
+        attn_output = nn.softmax(attn_output, -1)
+        attn_output = jnp.einsum('...hqk,...khd->...qhd', attn_output, v)
         return self.wo(attn_output.reshape(inp_shape))
 
 
