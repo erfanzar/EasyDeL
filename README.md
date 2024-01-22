@@ -16,6 +16,10 @@ Some of the key features provided by EasyDeL include:
 - And various other features to enhance the training process and optimize performance.
 
 > [!NOTE]
+> EasyDel Will only support JAX>=0.4.22 Due to miss computations being happened in older version and also not bein able
+> to run Flash Attention and Splash Attention (Splash Attention is still under Process)
+
+> [!NOTE]
 > These features collectively aim to simplify and accelerate the training of machine learning models, making it more
 > efficient and accessible for developers working with Jax/Flax.
 
