@@ -371,11 +371,11 @@ class EasyDelState(struct.PyTreeNode):
             precision: jax.lax.Precision = jax.lax.Precision("fastest"),
             sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
             sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, None, None),
-            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            query_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            key_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            value_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            bias_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, None, None),
+            attention_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             use_shard_map: bool = False,
             input_shape: Sequence[int] = (1, 1),
             backend: Optional[str] = None,
@@ -404,11 +404,11 @@ class EasyDelState(struct.PyTreeNode):
         :param precision: jax.lax.Precision: Control the precision of the calculation
         :param sharding_axis_dims: Sequence[int]: Specify the dimension of each axis
         :param sharding_axis_names: Sequence[str]: Specify the names of the axes in each shard
-        :param q_ps: jax.sharding.PartitionSpec: Specify the partitioning of the query matrix
-        :param k_ps: jax.sharding.PartitionSpec: Specify the partitioning of the key matrix
-        :param v_ps: jax.sharding.PartitionSpec: Specify the partitioning of the value tensor
-        :param b_ps: jax.sharding.PartitionSpec: Specify the partitioning of the bias
-        :param a_ps: jax.sharding.PartitionSpec: Partition the attention weights
+        :param query_partition_spec: jax.sharding.PartitionSpec: Specify the partitioning of the query matrix
+        :param key_partition_spec: jax.sharding.PartitionSpec: Specify the partitioning of the key matrix
+        :param value_partition_spec: jax.sharding.PartitionSpec: Specify the partitioning of the value tensor
+        :param bias_partition_spec: jax.sharding.PartitionSpec: Specify the partitioning of the bias
+        :param attention_partition_spec: jax.sharding.PartitionSpec: Partition the attention weights
         :param use_shard_map: bool: Determine whether to use shard_map or not
         :param input_shape: Sequence[int]: Specify the shape of the input to be used for training
         :param backend: Optional[str]: Specify the backend used for the model
@@ -435,11 +435,11 @@ class EasyDelState(struct.PyTreeNode):
                 precision=precision,
                 sharding_axis_dims=sharding_axis_dims,
                 sharding_axis_names=sharding_axis_names,
-                q_ps=q_ps,
-                k_ps=k_ps,
-                v_ps=v_ps,
-                b_ps=b_ps,
-                a_ps=a_ps,
+                query_partition_spec=query_partition_spec,
+                key_partition_spec=key_partition_spec,
+                value_partition_spec=value_partition_spec,
+                bias_partition_spec=bias_partition_spec,
+                attention_partition_spec=attention_partition_spec,
                 use_shard_map=use_shard_map,
                 input_shape=input_shape,
                 backend=backend,

@@ -4,11 +4,11 @@ from dataclasses import dataclass
 
 @dataclass
 class EasyDelPartitions:
-    q_ps: PartitionSpec
-    k_ps: PartitionSpec
-    v_ps: PartitionSpec
-    b_ps: PartitionSpec
-    a_ps: PartitionSpec
+    query_partition_spec: PartitionSpec
+    key_partition_spec: PartitionSpec
+    value_partition_spec: PartitionSpec
+    bias_partition_spec: PartitionSpec
+    attention_partition_spec: PartitionSpec
 
 
 def get_partitions(
@@ -22,7 +22,7 @@ def get_partitions(
     the attention computation: query, key, value, bias and attention. The PartitionSpec objects are
     used to specify how each tensor should be partitioned across devices (i.e., which dimensions of
     each tensor should be split across devices). For example, if we want to split the batch dimension
-    of all five tensors across two devices then we would set ``q_ps=k_ps=v_ps=
+    of all five tensors across two devices then we would set ``query_partition_spec=key_partition_spec=value_partition_spec=
 
     :param jax_attn_format: bool: Specify whether the attention
     :param fsdp_on_batch: bool: Determine whether the batch dimension is partitioned
@@ -30,34 +30,34 @@ def get_partitions(
     """
     if jax_attn_format:
         if fsdp_on_batch:
-            q_ps = PartitionSpec("fsdp", None, "sp", None)
-            k_ps = PartitionSpec("fsdp", None, "sp", None)
-            v_ps = PartitionSpec("fsdp", None, "sp", None)
-            b_ps = PartitionSpec("fsdp", None, "sp", None)
-            a_ps = PartitionSpec("fsdp", None, "sp", None)
+            query_partition_spec = PartitionSpec("fsdp", None, "sp", None)
+            key_partition_spec = PartitionSpec("fsdp", None, "sp", None)
+            value_partition_spec = PartitionSpec("fsdp", None, "sp", None)
+            bias_partition_spec = PartitionSpec("fsdp", None, "sp", None)
+            attention_partition_spec = PartitionSpec("fsdp", None, "sp", None)
         else:
-            q_ps = PartitionSpec("dp", "fsdp", "tp", "sp", None)
-            k_ps = PartitionSpec("dp", "fsdp", "tp", "sp", None)
-            v_ps = PartitionSpec("dp", "fsdp", "tp", "sp", None)
-            b_ps = PartitionSpec("dp", None, "fsdp", None)
-            a_ps = PartitionSpec("dp", "fsdp", "tp", "sp", None)
+            query_partition_spec = PartitionSpec("dp", "fsdp", "tp", "sp", None)
+            key_partition_spec = PartitionSpec("dp", "fsdp", "tp", "sp", None)
+            value_partition_spec = PartitionSpec("dp", "fsdp", "tp", "sp", None)
+            bias_partition_spec = PartitionSpec("dp", None, "fsdp", None)
+            attention_partition_spec = PartitionSpec("dp", "fsdp", "tp", "sp", None)
     else:
         if fsdp_on_batch:
-            q_ps = PartitionSpec("fsdp", "sp", None, None)
-            k_ps = PartitionSpec("fsdp", "sp", None, None)
-            v_ps = PartitionSpec("fsdp", "sp", None, None)
-            b_ps = PartitionSpec("fsdp", "sp", None, None)
-            a_ps = PartitionSpec("fsdp", "sp", None, None)
+            query_partition_spec = PartitionSpec("fsdp", "sp", None, None)
+            key_partition_spec = PartitionSpec("fsdp", "sp", None, None)
+            value_partition_spec = PartitionSpec("fsdp", "sp", None, None)
+            bias_partition_spec = PartitionSpec("fsdp", "sp", None, None)
+            attention_partition_spec = PartitionSpec("fsdp", "sp", None, None)
         else:
-            q_ps = PartitionSpec("dp", "sp", "fsdp", None)
-            k_ps = PartitionSpec("dp", "sp", "fsdp", None)
-            v_ps = PartitionSpec("dp", "sp", "fsdp", None)
-            b_ps = PartitionSpec("dp", "fsdp", None, None)
-            a_ps = PartitionSpec("dp", "sp", "fsdp", None)
+            query_partition_spec = PartitionSpec("dp", "sp", "fsdp", None)
+            key_partition_spec = PartitionSpec("dp", "sp", "fsdp", None)
+            value_partition_spec = PartitionSpec("dp", "sp", "fsdp", None)
+            bias_partition_spec = PartitionSpec("dp", "fsdp", None, None)
+            attention_partition_spec = PartitionSpec("dp", "sp", "fsdp", None)
     return EasyDelPartitions(
-        q_ps=q_ps,
-        k_ps=k_ps,
-        v_ps=v_ps,
-        b_ps=b_ps,
-        a_ps=a_ps
+        query_partition_spec=query_partition_spec,
+        key_partition_spec=key_partition_spec,
+        value_partition_spec=value_partition_spec,
+        bias_partition_spec=bias_partition_spec,
+        attention_partition_spec=attention_partition_spec
     )

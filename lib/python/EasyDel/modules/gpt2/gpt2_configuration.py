@@ -1,4 +1,7 @@
 from typing import Optional
+
+import jax
+
 from ..easydel_modelling_utils import EasyDelPretrainedConfig
 
 
@@ -87,3 +90,8 @@ class GPT2Config(EasyDelPretrainedConfig):
         for k, v in args.items():
             if not hasattr(self, k):
                 setattr(self, k, v)
+
+    def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
+        return (
+            (".*", jax.sharding.PartitionSpec(("fsdp", "sp"))),
+        )

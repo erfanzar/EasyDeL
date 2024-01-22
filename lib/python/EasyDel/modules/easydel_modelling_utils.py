@@ -5,7 +5,7 @@ from jax.experimental.mesh_utils import create_device_mesh
 from transformers import PretrainedConfig, FlaxPreTrainedModel
 import jax
 from jax import numpy as jnp
-from typing import Sequence, Union, Optional
+from typing import Sequence, Union, Optional, Literal
 from dataclasses import dataclass
 from jax.sharding import PartitionSpec, Mesh
 
@@ -24,33 +24,55 @@ class EasyDelPretrainedConfig(PretrainedConfig):
     :param self: Refer to the instance of the class
     :param axis_dims: Sequence[int]: Specify the number of dimensions for each axis
     :param axis_names: Sequence[str]: Set the names of the axes
-    :param q_ps: PartitionSpec: Specify the partitioning of the query tensor
-    :param k_ps: PartitionSpec: Partition the key matrix
-    :param v_ps: PartitionSpec: Specify the partitioning of the value tensor
-    :param b_ps: PartitionSpec: Specify the Attention Bias partition spec
-    :param a_ps: PartitionSpec: Specify the partitioning of the attention weights
+    :param attn_mechanism: Literal["normal", "flash", "splash"]: attention mechanism to use
+    :param block_k: int: block size of key_states
+    :param block_q: int: block size of query_states
+    :param block_b: int: block size of bias
+    :param block_q_major_dkv: int: block size of block_q_major_dkv
+    :param block_k_major_dkv: int: block size of block_k_major_dkv
+    :param block_k_dkv: int: block size of block_k_dkv
+    :param block_q_dkv: int: block size of block_q_dkv
+    :param block_k_major_dq: int: block size of block_k_major_dq
+    :param block_k_dq: int: block size of block_k_dq
+    :param block_q_dq: int: block size of block_q_dq
+    :param query_partition_spec: PartitionSpec: Specify the partitioning of the query tensor
+    :param key_partition_spec: PartitionSpec: Partition the key matrix
+    :param value_partition_spec: PartitionSpec: Specify the partitioning of the value tensor
+    :param bias_partition_spec: PartitionSpec: Specify the Attention Bias partition spec
+    :param attention_partition_spec: PartitionSpec: Specify the partitioning of the attention weights
     :param use_shard_map: bool: whenever to use shard_map for attention
     :param backend: Optional[None]: Specify the backend to use
-    :param easy_method: EasyMethod: Specify the use of model to init the QDot Method for (e.q TRAIN,SERVE,...)
     """
 
     def __init__(
             self,
             axis_dims: Sequence[int] = (1, -1, 1, 1),
             axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            q_ps: PartitionSpec = PartitionSpec(
+            attn_mechanism: Literal["normal", "flash", "splash"] = "normal",
+            block_k: int = 128,
+            block_q: int = 128,
+            block_b: int = 1,
+            block_k_major: int = 128,
+            block_q_major_dkv: int | None = None,
+            block_k_major_dkv: int | None = None,
+            block_k_dkv: int | None = None,
+            block_q_dkv: int | None = None,
+            block_k_major_dq: int | None = None,
+            block_k_dq: int | None = None,
+            block_q_dq: int | None = None,
+            query_partition_spec: PartitionSpec = PartitionSpec(
                 ("dp", "fsdp"), "sp", "tp", None
             ),
-            k_ps: PartitionSpec = PartitionSpec(
+            key_partition_spec: PartitionSpec = PartitionSpec(
                 ("dp", "fsdp"), "sp", "tp", None
             ),
-            v_ps: PartitionSpec = PartitionSpec(
+            value_partition_spec: PartitionSpec = PartitionSpec(
                 ("dp", "fsdp"), "sp", "tp", None
             ),
-            b_ps: PartitionSpec = PartitionSpec(
+            bias_partition_spec: PartitionSpec = PartitionSpec(
                 ("dp", "fsdp"), None, None, None
             ),
-            a_ps: PartitionSpec = PartitionSpec(
+            attention_partition_spec: PartitionSpec = PartitionSpec(
                 ("dp", "fsdp"), "sp", "tp", None
             ),
             use_shard_map: bool = False,
@@ -58,16 +80,28 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             easy_method: EasyMethod = EasyMethod.TRAIN,
             **kwargs
     ):
-        self.q_ps = q_ps
-        self.k_ps = k_ps
-        self.v_ps = v_ps
-        self.b_ps = b_ps
-        self.a_ps = a_ps
+        self.query_partition_spec = query_partition_spec
+        self.key_partition_spec = key_partition_spec
+        self.value_partition_spec = value_partition_spec
+        self.bias_partition_spec = bias_partition_spec
+        self.attention_partition_spec = attention_partition_spec
         self.use_shard_map = use_shard_map
         self.axis_dims = axis_dims
         self.axis_names = axis_names
         self.backend = backend if backend is not None else ""
         self.easy_method = easy_method
+        self.attn_mechanism = attn_mechanism
+        self.block_b = block_b
+        self.block_k = block_k
+        self.block_q = block_q
+        self.block_k_major = block_k_major
+        self.block_q_major_dkv = block_q_major_dkv or block_q
+        self.block_k_major_dkv = block_k_major_dkv or block_k
+        self.block_k_dkv = block_k_dkv or block_k
+        self.block_q_dkv = block_q_dkv or block_q
+        self.block_k_major_dq = block_k_major_dq or block_k
+        self.block_k_dq = block_k_dq or block_k
+        self.block_q_dq = block_q_dq or block_q
         super().__init__(**kwargs)
 
     @staticmethod
@@ -156,50 +190,85 @@ class EasyDelPretrainedConfig(PretrainedConfig):
         """
         return self.backend if not self.backend == "" else jax.lib.xla_bridge.get_backend().platform
 
-    def add_partitions(
+    def add_basic_configurations(
             self,
             axis_dims: Sequence[int] = (1, -1, 1, 1),
             axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            q_ps: PartitionSpec = PartitionSpec(
+            attn_mechanism: Literal["normal", "flash", "splash"] = "normal",
+            block_k: int = 128,
+            block_q: int = 128,
+            block_b: int = 1,
+            block_k_major: int = 128,
+            block_q_major_dkv: int | None = None,
+            block_k_major_dkv: int | None = None,
+            block_k_dkv: int | None = None,
+            block_q_dkv: int | None = None,
+            block_k_major_dq: int | None = None,
+            block_k_dq: int | None = None,
+            block_q_dq: int | None = None,
+            query_partition_spec: PartitionSpec = PartitionSpec(
                 ("dp", "fsdp"), "sp", "tp", None
             ),
-            k_ps: PartitionSpec = PartitionSpec(
+            key_partition_spec: PartitionSpec = PartitionSpec(
                 ("dp", "fsdp"), "sp", "tp", None
             ),
-            v_ps: PartitionSpec = PartitionSpec(
+            value_partition_spec: PartitionSpec = PartitionSpec(
                 ("dp", "fsdp"), "sp", "tp", None
             ),
-            b_ps: PartitionSpec = PartitionSpec(
+            bias_partition_spec: PartitionSpec = PartitionSpec(
                 ("dp", "fsdp"), None, None, None
             ),
-            a_ps: PartitionSpec = PartitionSpec(
+            attention_partition_spec: PartitionSpec = PartitionSpec(
                 ("dp", "fsdp"), "sp", "tp", None
             ),
             use_shard_map: bool = False,
-            backend: Optional[str] = None,
+            backend: Optional[None] = jax.default_backend(),
     ):
         """
             It initializes all the attributes of an object, and it's called when you create a new instance of that class.
             :param self: Refer to the instance of the class
             :param axis_dims: Sequence[int]: Specify the number of dimensions for each axis
             :param axis_names: Sequence[str]: Set the names of the axes
-            :param q_ps: PartitionSpec: Specify the partitioning of the query tensor
-            :param k_ps: PartitionSpec: Partition the key matrix
-            :param v_ps: PartitionSpec: Specify the partitioning of the value tensor
-            :param b_ps: PartitionSpec: Specify the Attention Bias partition spec
-            :param a_ps: PartitionSpec: Specify the partitioning of the attention weights
+            :param attn_mechanism: Literal["normal", "flash", "splash"]: attention mechanism to use
+            :param block_k: int: block size of key_states
+            :param block_q: int: block size of query_states
+            :param block_b: int: block size of bias
+            :param block_q_major_dkv: int: block size of block_q_major_dkv
+            :param block_k_major_dkv: int: block size of block_k_major_dkv
+            :param block_k_dkv: int: block size of block_k_dkv
+            :param block_q_dkv: int: block size of block_q_dkv
+            :param block_k_major_dq: int: block size of block_k_major_dq
+            :param block_k_dq: int: block size of block_k_dq
+            :param block_q_dq: int: block size of block_q_dq
+            :param query_partition_spec: PartitionSpec: Specify the partitioning of the query tensor
+            :param key_partition_spec: PartitionSpec: Partition the key matrix
+            :param value_partition_spec: PartitionSpec: Specify the partitioning of the value tensor
+            :param bias_partition_spec: PartitionSpec: Specify the Attention Bias partition spec
+            :param attention_partition_spec: PartitionSpec: Specify the partitioning of the attention weights
             :param use_shard_map: bool: whenever to use shard_map for attention
             :param backend: Optional[None]: Specify the backend to use
-            """
+        """
         self.axis_dims = axis_dims
         self.axis_names = axis_names
-        self.q_ps = q_ps
-        self.k_ps = k_ps
-        self.v_ps = v_ps
-        self.b_ps = b_ps
-        self.a_ps = a_ps
+        self.query_partition_spec = query_partition_spec
+        self.key_partition_spec = key_partition_spec
+        self.value_partition_spec = value_partition_spec
+        self.bias_partition_spec = bias_partition_spec
+        self.attention_partition_spec = attention_partition_spec
         self.backend = backend
         self.use_shard_map = use_shard_map
+        self.attn_mechanism = attn_mechanism
+        self.block_b = block_b
+        self.block_k = block_k
+        self.block_q = block_q
+        self.block_k_major = block_k_major
+        self.block_q_major_dkv = block_q_major_dkv or block_q
+        self.block_k_major_dkv = block_k_major_dkv or block_k
+        self.block_k_dkv = block_k_dkv or block_k
+        self.block_q_dkv = block_q_dkv or block_q
+        self.block_k_major_dq = block_k_major_dq or block_k
+        self.block_k_dq = block_k_dq or block_k
+        self.block_q_dq = block_q_dq or block_q
 
 
 class EasyDelFlaxPretrainedModel(FlaxPreTrainedModel):

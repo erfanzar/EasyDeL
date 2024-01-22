@@ -17,6 +17,8 @@ Some of the key features provided by EasyDeL include:
 > These features collectively aim to simplify and accelerate the training of machine learning models, making it more
 > efficient and accessible for developers working with Jax/Flax.
 
+> FlashAttention and Splash Attention are currently disabled for Falcon, MPT, PHI and GPTJ
+
 ## What Makes EasyDeL 🔮 Special
 
 EasyDeL is built up on JAX and Flax and that's why EasyDeL can perform as fast and as easy

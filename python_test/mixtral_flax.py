@@ -55,9 +55,10 @@ def main():
     )
     torch_output = torch_output.logits.cpu().detach().numpy()
     config.add_jax_args()
-    config.add_partitions(
+    config.add_basic_configurations(
         use_shard_map=True
     )
+
     try:
         flax_model = FlaxMixtralForCausalLM(
             config=config,
@@ -69,9 +70,8 @@ def main():
         flax_output = flax_model(
             input_ids=flax_input_ids,
             params=params,
-
         )
-        res = jnp.allclose(torch_output, flax_output.logits, atol=1e-3)
+        res = jnp.allclose(torch_output, flax_output.logits, atol=1e-5)
         print('Mistral Huggingface Predictions :\n', torch_output,
               '\nEasyDel Predictions: \n', flax_output.logits)
         if res:  # A Little Bit of humor

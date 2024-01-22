@@ -34,10 +34,7 @@ class LlamaConfig(EasyDelPretrainedConfig):
             fcm_max_ratio: float = -1,
             use_pjit_attention_force: bool = False,
             rope_scaling: Dict[str, Union[str, float]] = None,
-            use_flash_attention: bool = False,
             use_sacn_mlp: bool = False,
-            flash_attn_query_chunk_size: int = 1024,
-            flash_attn_key_chunk_size: int = 1024,
             scan_mlp_chunk_size: int = 1024,
             bits: Optional[int] = None,
             hidden_act: str = 'silu',
@@ -77,10 +74,7 @@ class LlamaConfig(EasyDelPretrainedConfig):
         :param Union[str: Specify the type of the parameter
         :param float]]: Specify the type of the parameter
         :param use_shard_map: bool: when ever to use shard_map for attention
-        :param use_flash_attention: bool: Determine whether to use the flash attention or not
         :param use_sacn_mlp: bool: Determine whether to use scan_mlp or not
-        :param flash_attn_query_chunk_size: int: Specify the chunk size of the query tensor
-        :param flash_attn_key_chunk_size: int: Determine the chunk size of the key tensor
         :param scan_mlp_chunk_size: int: Specify the chunk size of the scan_mlp
         :param bits: Optional[int]: Specify the number of bits used to quantize the weights
         :param rope_theta: float : rope_theta for compute rope
@@ -119,10 +113,7 @@ class LlamaConfig(EasyDelPretrainedConfig):
         self.hidden_act = hidden_act
         self.fcm_max_ratio = fcm_max_ratio
         self.rope_scaling = rope_scaling
-        self.use_flash_attention = use_flash_attention
         self.use_sacn_mlp = use_sacn_mlp
-        self.flash_attn_key_chunk_size = flash_attn_key_chunk_size
-        self.flash_attn_query_chunk_size = flash_attn_query_chunk_size
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.bits = bits
         self.use_sacn_mlp = use_shard_map
@@ -182,28 +173,26 @@ class LlamaConfig(EasyDelPretrainedConfig):
             (".*", PartitionSpec(("fsdp", "sp"))),
         )
 
-    def add_jax_args(self,
-                     resid_pdrop: float = 0.0,
-                     embd_pdrop: float = 0.0,
-                     attention_dropout: float = 0.0,
-                     tie_word_embeddings: bool = False,
-                     gradient_checkpointing: str = 'nothing_saveable',
-                     fcm_min_ratio: float = 0.0,
-                     fcm_max_ratio: float = 0.0,
-                     use_pjit_attention_force: bool = False,
-                     use_flash_attention: bool = False,
-                     use_sacn_mlp: bool = False,
-                     flash_attn_query_chunk_size: int = 1024,
-                     flash_attn_key_chunk_size: int = 1024,
-                     scan_mlp_chunk_size: int = 1024,
-                     number_rep_kv: int = 1,
-                     bits: Optional[int] = None,
-                     rope_theta: float = 10000.,
-                     attention_bias: bool = False,
-                     hidden_act: str = 'silu',
-                     scan_layers: bool = True,
-                     **kwargs,
-                     ):
+    def add_jax_args(
+            self,
+            resid_pdrop: float = 0.0,
+            embd_pdrop: float = 0.0,
+            attention_dropout: float = 0.0,
+            tie_word_embeddings: bool = False,
+            gradient_checkpointing: str = 'nothing_saveable',
+            fcm_min_ratio: float = 0.0,
+            fcm_max_ratio: float = 0.0,
+            use_pjit_attention_force: bool = False,
+            use_sacn_mlp: bool = False,
+            scan_mlp_chunk_size: int = 1024,
+            number_rep_kv: int = 1,
+            bits: Optional[int] = None,
+            rope_theta: float = 10000.,
+            attention_bias: bool = False,
+            hidden_act: str = 'silu',
+            scan_layers: bool = True,
+            **kwargs,
+    ):
         """
         The add_jax_args function adds the following arguments to the Transformer class:
 
@@ -216,10 +205,7 @@ class LlamaConfig(EasyDelPretrainedConfig):
         :param fcm_min_ratio: float: Control the minimum ratio of the number of chunks to be used in flash-based computation
         :param fcm_max_ratio: float: Set the maximum ratio of the number of input tokens to output tokens
         :param use_pjit_attention_force: bool: Determine if the attention force is used
-        :param use_flash_attention: bool: Determine whether to use the flash attention or not
         :param use_sacn_mlp: bool: Determine whether to use the scan_mlp function or not
-        :param flash_attn_query_chunk_size: int: Determine the size of the chunks that will be used to compute
-        :param flash_attn_key_chunk_size: int: Set the size of the key chunk
         :param scan_mlp_chunk_size: int: Set the chunk size for scan_mlp
         :param number_rep_kv: int: Determine how many times the key and value vectors are repeated
         :param bits: Optional[int]: Determine the number of bits used in the quantization
@@ -231,7 +217,6 @@ class LlamaConfig(EasyDelPretrainedConfig):
 
         """
         self.scan_layers = scan_layers
-        self.use_flash_attention = use_flash_attention
         self.embd_pdrop = embd_pdrop
         self.number_rep_kv = number_rep_kv
         self.resid_pdrop = resid_pdrop
@@ -246,8 +231,6 @@ class LlamaConfig(EasyDelPretrainedConfig):
         self.use_pjit_attention_force = use_pjit_attention_force
 
         self.use_sacn_mlp = use_sacn_mlp
-        self.flash_attn_query_chunk_size = flash_attn_query_chunk_size
-        self.flash_attn_key_chunk_size = flash_attn_key_chunk_size
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.bits = bits
 

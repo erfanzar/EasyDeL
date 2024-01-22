@@ -28,12 +28,6 @@ flags.DEFINE_string(
 )
 
 flags.DEFINE_bool(
-    name='use_flash_attention',
-    default=False,
-    help='use_flash_attention or no'
-)
-
-flags.DEFINE_bool(
     name='use_sacn_mlp',
     default=False,
     help='use_sacn_mlp or no'
@@ -156,12 +150,10 @@ def main(argv):
     if FLAGS.config_repo is not None:
         conf = None
         config = EasyDel.modules.FalconConfig.from_pretrained(FLAGS.config_repo, trust_remote_code=True)
-        config.use_flash_attention = FLAGS.use_flash_attention
         config.use_sacn_mlp = FLAGS.use_sacn_mlp
     else:
         conf = EasyDel.configs.configs.falcon_configs[FLAGS.model_type]
         config = EasyDel.modules.FalconConfig(**conf, rotary_type=FLAGS.rotary_type)
-        config.use_flash_attention = FLAGS.use_flash_attention
         config.use_sacn_mlp = FLAGS.use_sacn_mlp
         config.max_sequence_length = FLAGS.max_sequence_length
         config.max_length = FLAGS.max_sequence_length

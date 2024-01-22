@@ -27,11 +27,8 @@ flags.DEFINE_string(
     help='which model type of gpt-j 1 to train example [6b] (default is 6b model)'
 )
 
-flags.DEFINE_bool(
-    name='use_flash_attention',
-    default=False,
-    help='use_flash_attention or no'
-)
+
+assert 0 != 0, "Out of date"
 
 flags.DEFINE_bool(
     name='use_sacn_mlp',
@@ -156,12 +153,10 @@ def main(argv):
     if FLAGS.config_repo is not None:
         conf = None
         config = EasyDel.modules.GPTJConfig.from_pretrained(FLAGS.config_repo, trust_remote_code=True)
-        config.use_flash_attention = FLAGS.use_flash_attention
         config.use_sacn_mlp = FLAGS.use_sacn_mlp
     else:
         conf = EasyDel.modules.configs.configs.gptj_configs[FLAGS.model_type]
         config = EasyDel.modules.GPTJConfig(**conf, rotary_type=FLAGS.rotary_type)
-        config.use_flash_attention = FLAGS.use_flash_attention
         config.use_sacn_mlp = FLAGS.use_sacn_mlp
         config.max_sequence_length = FLAGS.max_sequence_length
         config.rope_scaling = None
@@ -195,9 +190,9 @@ def main(argv):
     )
 
     trainer = CausalLanguageModelTrainer(train_args,
-                              dataset_train=dataset_train['train'],
-                              dataset_eval=dataset_train['eval'] if FLAGS.do_eval else None,
-                              checkpoint_path=FLAGS.checkpoint_path)
+                                         dataset_train=dataset_train['train'],
+                                         dataset_eval=dataset_train['eval'] if FLAGS.do_eval else None,
+                                         checkpoint_path=FLAGS.checkpoint_path)
     output = trainer.train()
     # Done You can simply train any GPT-j LLM that you want in less than 50 lines of code
 
