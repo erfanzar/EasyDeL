@@ -164,32 +164,6 @@ class FlaxMixtralAttention(nn.Module):
             sm_scale=1  # TOBE CHANGED
         )
 
-    @nn.compact
-    def concatenate_to_cache_(self, query: chex.Array, key: chex.Array, value: chex.Array, attention_mask: chex.Array):
-        is_cache_available = self.has_variable('cache', 'key')
-        key_cache = self.variable(
-            'cache', 'key', jnp.zeros, key.shape, key.dtype)
-        value_cache = self.variable(
-            'cache', 'value', jnp.zeros, key.shape, value.dtype)
-        index_cache = self.variable(
-            'cache', 'index', lambda: jnp.array(0, dtype=jnp.int32))
-        if is_cache_available:
-            *bd, ml, nh, dph = key_cache.value.shape
-            indices = (0,) * len(bd) + (index_cache.value, 0, 0)
-            key = jax.lax.dynamic_update_slice(key_cache.value, key, indices)
-            value = jax.lax.dynamic_update_slice(
-                value_cache.value, value, indices)
-            key_cache.value = key
-            value_cache.value = value
-            num_updated_cache_vector = query.shape[1]
-            index_cache.value = index_cache.value + num_updated_cache_vector
-            pad_mask = jnp.broadcast_to(
-                jnp.arange(ml) < index_cache.value,
-                tuple(bd) + (1, num_updated_cache_vector, ml)
-            )
-            attention_mask = nn.combine_masks(pad_mask, attention_mask)
-        return query, key, value, attention_mask
-
     @staticmethod
     def _t(query, key, value):
         return jnp.transpose(query, (0, 2, 1, 3)), jnp.transpose(key, (0, 2, 1, 3)), jnp.transpose(value, (0, 2, 1, 3))
@@ -452,8 +426,10 @@ class FlaxMixtralBlocKSparesTop2MLPCollection(nn.Module):
 
         for expert_idx, expert_layer in enumerate(self.layers):
             selected_mask = expert_mask[expert_idx]
-
-            idx, top_x = jnp.nonzero(selected_mask)
+            if self.config.initialization_of_moe:
+                continue
+            else:
+                idx, top_x = jnp.nonzero(selected_mask)
             if top_x.shape[0] == 0:
                 continue
 
@@ -774,6 +750,8 @@ class MixtralPreTrainedModel(EasyDelFlaxPretrainedModel):
         :return: A frozendict of parameters
         """
         try:
+
+            self.config.initialization_of_moe = True
             input_ids = jnp.zeros(input_shape, dtype="i4")
             attention_mask = jnp.ones_like(input_ids, dtype="i4")
             position_ids = jnp.broadcast_to(
@@ -805,6 +783,7 @@ class MixtralPreTrainedModel(EasyDelFlaxPretrainedModel):
                 )
             random_params = module_init_outputs["params"]
 
+            self.config.initialization_of_moe = False
             if params is not None:
                 random_params = flatten_dict(unfreeze(random_params))
                 params = flatten_dict(unfreeze(params))
