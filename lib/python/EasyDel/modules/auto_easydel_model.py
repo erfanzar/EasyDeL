@@ -359,3 +359,17 @@ class AutoShardAndGatherFunctions:
             shard_fns = flax.traverse_util.unflatten_dict(shard_fns)
 
         return shard_fns, gather_fns
+
+    @classmethod
+    def from_pretrained(
+            cls,
+            pretrained_model_name_or_path: str,
+            partition_rules: Optional[Tuple[Tuple[str, jax.sharding.PartitionSpec]]] = None,
+            flatten: bool = True
+    ):
+        config = AutoEasyDelConfig.from_pretrained(pretrained_model_name_or_path)
+        return cls.from_config(
+            config=config,
+            partition_rules=partition_rules,
+            flatten=flatten
+        )
