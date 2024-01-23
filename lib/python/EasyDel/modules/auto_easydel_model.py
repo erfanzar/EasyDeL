@@ -1,9 +1,11 @@
 import functools
 import gc
+import warnings
 from typing import Sequence, Optional, Tuple, Mapping, Callable, Type
 
 import flax.traverse_util
 import jax.numpy
+from fjformer import match_partition_rules, make_shard_and_gather_fns
 
 from flax.traverse_util import unflatten_dict
 from transformers import AutoConfig, AutoModelForCausalLM
@@ -322,3 +324,38 @@ class AutoEasyDelConfig:
         )
 
         return cfg
+
+
+class AutoShardAndGatherFunctions:
+    @classmethod
+    def from_config(
+            cls,
+            config: EasyDelPretrainedConfig,
+            partition_rules: Optional[Tuple[Tuple[str, jax.sharding.PartitionSpec]]] = None,
+            flatten: bool = True
+    ):
+        if partition_rules is None:
+            warnings.warn("Using config partition rules from `get_partition_rules(fully_sharded_data_parallel=True)`")
+            partition_rules = config.get_partition_rules(True)
+        _, module, _ = get_modules_by_type(config.model_type)
+        model = module(
+            config=config,
+            _do_init=False
+        )
+
+        partition_specs = match_partition_rules(
+            partition_rules,
+            model.params_shape_tree
+        )
+        shard_fns, gather_fns = make_shard_and_gather_fns(
+            partition_specs=partition_specs,
+            dtype_specs=jax.numpy.float16
+        )
+        if flatten and not is_flatten(shard_fns):
+            gather_fns = flax.traverse_util.flatten_dict(gather_fns)
+            shard_fns = flax.traverse_util.flatten_dict(shard_fns)
+        elif not flatten and is_flatten(shard_fns):
+            gather_fns = flax.traverse_util.unflatten_dict(gather_fns)
+            shard_fns = flax.traverse_util.unflatten_dict(shard_fns)
+
+        return shard_fns, gather_fns
