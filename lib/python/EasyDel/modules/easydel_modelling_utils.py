@@ -270,6 +270,38 @@ class EasyDelPretrainedConfig(PretrainedConfig):
         self.block_k_dq = block_k_dq or block_k
         self.block_q_dq = block_q_dq or block_q
 
+    def __repr__(self):
+
+        """
+        The __repr__ function is used to generate a string representation of an object.
+        This function should return a string that can be parsed by the Python interpreter
+        to recreate the object. The __repr__ function is called when you use print() on an
+        object, or when you type its name in the REPL.
+
+        :param self: Refer to the instance of the class
+        :return: A string representation of the object
+        """
+        string = f"{self.__class__.__name__}(\n"
+        for k, v in self.__dict__.items():
+            if not k.startswith("_"):
+                try:
+                    repr_src = f"\t{k} : " + v.__str__().replace("\n", "\n\t") + "\n"
+                    string += repr_src if len(repr_src) < 500 else f"\t{k} : " + f"{v.__class__.__name__}(...)" + "\n"
+                except TypeError:
+                    pass
+        return string + ")"
+
+    def __str__(self):
+
+        """
+        The __str__ function is called when you use the print function or when str() is used.
+        It should return a string representation of the object.
+
+        :param self: Refer to the instance of the class
+        :return: The object's string representation
+        """
+        return self.__repr__()
+
 
 class EasyDelFlaxPretrainedModel(FlaxPreTrainedModel):
 
@@ -333,11 +365,6 @@ class EasyDelFlaxPretrainedModel(FlaxPreTrainedModel):
         """
         raise NotImplementedError()
 
-    def __str__(self):
-        padded_model = "\t" + "\n\t".join(self.module.__str__().split("\n"))
-        string = f"{self.__class__.__name__}(\n{padded_model}\n)"
-        return string
-
     def init_cache(self, batch_size: int, max_length: int):
         raise NotImplementedError("init_cache is not Implemented Yet!")
 
@@ -393,3 +420,35 @@ class EasyDelFlaxPretrainedModel(FlaxPreTrainedModel):
             **kwargs
     ):
         raise NotImplementedError("Not Implemented Yet")
+
+    def __repr__(self):
+
+        """
+        The __repr__ function is used to generate a string representation of an object.
+        This function should return a string that can be parsed by the Python interpreter
+        to recreate the object. The __repr__ function is called when you use print() on an
+        object, or when you type its name in the REPL.
+
+        :param self: Refer to the instance of the class
+        :return: A string representation of the object
+        """
+        string = f"{self.__class__.__name__}(\n"
+        for k, v in self.__dict__.items():
+            if not k.startswith("_"):
+                try:
+                    repr_src = f"\t{k} : " + v.__str__().replace("\n", "\n\t") + "\n"
+                    string += repr_src if len(repr_src) < 500 else f"\t{k} : " + f"{v.__class__.__name__}(...)" + "\n"
+                except TypeError:
+                    pass
+        return string + ")"
+
+    def __str__(self):
+
+        """
+        The __str__ function is called when you use the print function or when str() is used.
+        It should return a string representation of the object.
+
+        :param self: Refer to the instance of the class
+        :return: The object's string representation
+        """
+        return self.__repr__()
