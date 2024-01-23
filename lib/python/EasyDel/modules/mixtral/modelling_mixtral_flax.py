@@ -423,23 +423,47 @@ class FlaxMixtralBlocKSparesTop2MLPCollection(nn.Module):
         final_hidden_states = jnp.zeros(
             (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype
         )
-
         for expert_idx, expert_layer in enumerate(self.layers):
-            selected_mask = expert_mask[expert_idx]
+            selected_mask = jnp.pad(expert_mask[expert_idx], ((0, 0), (1, 0)), constant_values=-2)
             if self.config.initialization_of_moe:
                 continue
             else:
-                idx, top_x = jnp.nonzero(selected_mask)
-            if top_x.shape[0] == 0:
+                f_idx, f_top_x = jnp.nonzero(selected_mask, size=sequence_length + 1)
+
+                idx = jnp.zeros(sequence_length, dtype="i4") - 15
+                top_x = jnp.zeros(sequence_length, dtype="i4") - 15
+
+                for index in range(sequence_length):
+                    val_f_top_x = f_top_x[index] - 1
+                    if val_f_top_x != -1:
+                        val_f_idx = f_idx[index]
+                        idx = idx.at[index].set(val_f_idx)
+                        top_x = top_x.at[index].set(val_f_top_x)
+
+            if jnp.max(top_x) == 0:
                 continue
+            current_state = jnp.concatenate([hidden_states[None, i].reshape(-1, hidden_dim) for i in top_x if i != -15],
+                                            axis=0).reshape(-1, hidden_dim)
 
-            current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
+            cat_routing_weights = []
+            for i_i, x_i in enumerate(top_x):
+                if x_i != -15:
+                    cat_routing_weights.append(routing_weights[x_i, idx[i_i]].reshape(1, 1))
+            cat_routing_weights = jnp.concatenate(cat_routing_weights, axis=0)
 
-            current_hidden_states = expert_layer(
+            expert_layer_output = expert_layer(
                 current_state
-            ) * routing_weights[top_x, idx, None]
-            final_hidden_states = final_hidden_states.at[top_x].set(
-                current_hidden_states + final_hidden_states[top_x]
+            )
+            current_hidden_states = expert_layer_output * cat_routing_weights
+            ext_top_x = []
+            for i_i, x_i in enumerate(top_x):
+                if x_i != -15:
+                    ext_top_x.append(x_i.reshape(1, 1))
+
+            ext_top_x = jnp.concatenate(ext_top_x).reshape(-1)
+
+            final_hidden_states = final_hidden_states.at[ext_top_x].set(
+                current_hidden_states + final_hidden_states[ext_top_x]
             )
 
         return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
@@ -749,53 +773,49 @@ class MixtralPreTrainedModel(EasyDelFlaxPretrainedModel):
         :param params: flax.core.FrozenDict: Pass in the parameters of a pre-trained model
         :return: A frozendict of parameters
         """
-        try:
 
-            self.config.initialization_of_moe = True
-            input_ids = jnp.zeros(input_shape, dtype="i4")
-            attention_mask = jnp.ones_like(input_ids, dtype="i4")
-            position_ids = jnp.broadcast_to(
-                jnp.arange(jnp.atleast_2d(input_ids).shape[-1], dtype="i4"),
-                input_shape,
+        self.config.initialization_of_moe = True
+        input_ids = jnp.zeros(input_shape, dtype="i4")
+        attention_mask = jnp.ones_like(input_ids, dtype="i4")
+        position_ids = jnp.broadcast_to(
+            jnp.arange(jnp.atleast_2d(input_ids).shape[-1], dtype="i4"),
+            input_shape,
+        )
+        params_rng, dropout_rng = jax.random.split(rng)
+        rngs = {"params": params_rng, "dropout": dropout_rng}
+        if self.config.add_cross_attention:
+            encoder_hidden_states = jnp.zeros(
+                input_shape + (self.config.hidden_size,))
+            encoder_attention_mask = attention_mask
+            module_init_outputs = self.module.init(
+                rngs,
+                input_ids,
+                attention_mask,
+                position_ids,
+                encoder_hidden_states,
+                encoder_attention_mask,
+                return_dict=False,
             )
-            params_rng, dropout_rng = jax.random.split(rng)
-            rngs = {"params": params_rng, "dropout": dropout_rng}
-            if self.config.add_cross_attention:
-                encoder_hidden_states = jnp.zeros(
-                    input_shape + (self.config.hidden_size,))
-                encoder_attention_mask = attention_mask
-                module_init_outputs = self.module.init(
-                    rngs,
-                    input_ids,
-                    attention_mask,
-                    position_ids,
-                    encoder_hidden_states,
-                    encoder_attention_mask,
-                    return_dict=False,
-                )
-            else:
-                module_init_outputs = self.module.init(
-                    rngs,
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    return_dict=False
-                )
-            random_params = module_init_outputs["params"]
+        else:
+            module_init_outputs = self.module.init(
+                rngs,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                return_dict=False
+            )
+        random_params = module_init_outputs["params"]
 
-            self.config.initialization_of_moe = False
-            if params is not None:
-                random_params = flatten_dict(unfreeze(random_params))
-                params = flatten_dict(unfreeze(params))
-                for missing_key in self._missing_keys:
-                    params[missing_key] = random_params[missing_key]
-                self._missing_keys = set()
-                return freeze(unflatten_dict(params))
-            else:
-                return random_params
-        except Exception as err:
-            print(err, "\nRetuning Empty Params")
-            return freeze({})
+        self.config.initialization_of_moe = False
+        if params is not None:
+            random_params = flatten_dict(unfreeze(random_params))
+            params = flatten_dict(unfreeze(params))
+            for missing_key in self._missing_keys:
+                params[missing_key] = random_params[missing_key]
+            self._missing_keys = set()
+            return freeze(unflatten_dict(params))
+        else:
+            return random_params
 
     def init_cache(self, batch_size, max_length):
 
