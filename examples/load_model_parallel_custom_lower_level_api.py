@@ -8,14 +8,14 @@ import jax
 import torch
 
 try:
-    from lib.python.EasyDel import get_modules_by_type
+    from lib.python.EasyDel import get_modules_by_type, AutoShardAndGatherFunctions
 except ModuleNotFoundError:
     import sys
     from pathlib import Path
 
     cp = Path.cwd().__str__()
     sys.path.append(cp)
-    from lib.python.EasyDel import get_modules_by_type
+    from lib.python.EasyDel import get_modules_by_type, AutoShardAndGatherFunctions
 
 from fjformer import make_shard_and_gather_fns, match_partition_rules
 from transformers import FalconForCausalLM
@@ -40,10 +40,9 @@ def main():
         config=config
     )
 
-    partition_specs = match_partition_rules(config.get_partition_rules(True), easy_model.params_shape_tree)
-    shard_fns, gather_fns = make_shard_and_gather_fns(
-        partition_specs=partition_specs,
-        dtype_specs=jax.numpy.float16
+    shard_fns, gather_fns = AutoShardAndGatherFunctions.from_config(
+        config=config,
+        flatten=True
     )
 
     pytorch_dict = torch_model.state_dict()
@@ -52,7 +51,7 @@ def main():
             pytorch_dict,
             device=jax.devices("cpu")[0],  # This got no use but incase that some key missmatch and not getting
             # Kwargs req error we just pass that (No any params will be load on CPU for suer :) )
-            shard_fns=flax.traverse_util.flatten_dict(shard_fns)
+            shard_fns=shard_fns
         )
     print("Sharded Successfully")
 

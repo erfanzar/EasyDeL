@@ -61,5 +61,6 @@ from .mixtral import (
 )
 from .auto_easydel_model import (
     AutoEasyDelModelForCausalLM as AutoEasyDelModelForCausalLM,
-    AutoEasyDelConfig as AutoEasyDelConfig
+    AutoEasyDelConfig as AutoEasyDelConfig,
+    AutoShardAndGatherFunctions as AutoShardAndGatherFunctions
 )

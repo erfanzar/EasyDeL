@@ -82,6 +82,7 @@ from .modules.mixtral import (
 from .modules.auto_easydel_model import (
     AutoEasyDelModelForCausalLM as AutoEasyDelModelForCausalLM,
     AutoEasyDelConfig as AutoEasyDelConfig,
+    AutoShardAndGatherFunctions as AutoShardAndGatherFunctions,
     get_modules_by_type as get_modules_by_type
 )
 
@@ -146,4 +147,4 @@ from .etils import (
     EasyDelSyntaxRuntimeError as EasyDelSyntaxRuntimeError
 )
 
-__version__ = "0.0.42"
+__version__ = "0.0.50"

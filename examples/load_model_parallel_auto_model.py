@@ -5,14 +5,16 @@
 import jax
 
 try:
-    from lib.python.EasyDel import AutoEasyDelModelForCausalLM, AutoEasyDelConfig, get_modules_by_type
+    from lib.python.EasyDel import AutoEasyDelModelForCausalLM, AutoEasyDelConfig, get_modules_by_type, \
+        AutoShardAndGatherFunctions
 except ModuleNotFoundError:
     import sys
     from pathlib import Path
 
     cp = Path.cwd().__str__()
     sys.path.append(cp)
-    from lib.python.EasyDel import AutoEasyDelModelForCausalLM, AutoEasyDelConfig, get_modules_by_type
+    from lib.python.EasyDel import AutoEasyDelModelForCausalLM, AutoEasyDelConfig, get_modules_by_type, \
+        AutoShardAndGatherFunctions
 
 from fjformer import make_shard_and_gather_fns, match_partition_rules
 
@@ -30,10 +32,8 @@ def main():
         config=config,
         _do_init=False
     )
-    partition_specs = match_partition_rules(config.get_partition_rules(True), dummy_model.params_shape_tree)
-    shard_fns, gather_fns = make_shard_and_gather_fns(
-        partition_specs=partition_specs,
-        dtype_specs=jax.numpy.float16
+    shard_fns, gather_fns = AutoShardAndGatherFunctions.from_config(
+        config=config
     )
     model, params = AutoEasyDelModelForCausalLM.from_pretrained(model_id, shard_fns=shard_fns)
 
