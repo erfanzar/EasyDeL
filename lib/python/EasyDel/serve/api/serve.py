@@ -11,17 +11,20 @@ from ...modules.easydel_modelling_utils import EasyDelFlaxPretrainedModel
 from flax.core import FrozenDict
 from transformers import PreTrainedTokenizerBase, GenerationConfig
 from typing import Callable, Mapping, Tuple, Optional
-from .configuration import ServeConfig
+from .configuration import EasyServeConfig
 from jax.sharding import PartitionSpec, Mesh
 from functools import partial
 from jax.experimental.pjit import pjit
 from dataclasses import dataclass
+from .dantics import GenerateAPIRequest
 
 
 @dataclass
 class LLMBaseReq:
     greedy_generate_function: Callable
     non_greedy_generate_function: Callable
+    n_p_jit_greedy_generate_function: Callable
+    n_p_jit_non_greedy_generate_function: Callable
     tokenizer: PreTrainedTokenizerBase
     prefix_tokenizer: PreTrainedTokenizerBase
 
@@ -33,19 +36,41 @@ class EasyServe:
             params: FrozenDict | dict,
             tokenizer: PreTrainedTokenizerBase,
             prefix_tokenizer: PreTrainedTokenizerBase,
-            greedy_generation_function: Callable,
-            non_greedy_generation_function: Callable,
-            serve_config: ServeConfig,
+            greedy_generate_function: Callable,
+            non_greedy_generate_function: Callable,
+            n_p_jit_greedy_generate_function: Callable,
+            n_p_jit_non_greedy_generate_function: Callable,
+            serve_config: EasyServeConfig,
     ):
         self.llm = llm
         self.params = params
         self.tokenizer = tokenizer
         self.prefix_tokenizer = prefix_tokenizer
-        self.greedy_generation_function = greedy_generation_function
-        self.non_greedy_generation_function = non_greedy_generation_function
+        self.greedy_generate_function = greedy_generate_function
+        self.non_greedy_generate_function = non_greedy_generate_function
         self.serve_config = serve_config
+        self.n_p_jit_non_greedy_generate_function = n_p_jit_non_greedy_generate_function
+        self.n_p_jit_greedy_generate_function = n_p_jit_greedy_generate_function
         if serve_config.pre_compile:
             self.compile(verbose=serve_config.verbose)
+        self.fast_api = FastAPI(
+            title="EasyDeL"
+        )
+
+    def get_generation_function(self, greedy: bool):
+        return (
+            self.greedy_generate_function if greedy else self.non_greedy_generate_function
+        ) if self.serve_config.use_partition_jit else (
+            self.n_p_jit_greedy_generate_function if greedy else self.n_p_jit_non_greedy_generate_function
+        )
+
+    def conversation_template(
+            self, conversation: list[dict]
+    ):
+        ...
+
+    def api_generate_request(self, request: GenerateAPIRequest):
+        print(request.conversation)
 
     @staticmethod
     def create_shard_and_gather_functions(
@@ -65,7 +90,7 @@ class EasyServe:
             mesh: Mesh,
             params: FrozenDict | dict,
             partition_rules: Tuple[Tuple[str, PartitionSpec]],
-            serve_config: ServeConfig,
+            serve_config: EasyServeConfig,
     ):
 
         partition_specs = match_partition_rules(params=params, rules=partition_rules)
@@ -82,7 +107,7 @@ class EasyServe:
     def create_generation_functions_and_tokenizers(
             model: EasyDelFlaxPretrainedModel,
             tokenizer: PreTrainedTokenizerBase,
-            serve_config: ServeConfig,
+            serve_config: EasyServeConfig,
             partition_specs: Mapping[str, PartitionSpec]
     ) -> LLMBaseReq:
 
@@ -111,12 +136,7 @@ class EasyServe:
                 tokenizer.truncation_side = "right"
             prefix_tokenizer = tokenizer
 
-        @partial(
-            pjit,
-            in_shardings=(partition_specs, PartitionSpec(), PartitionSpec()),
-            out_shardings=(PartitionSpec())
-        )
-        def greedy_generate_function(parameters, input_ids, attention_mask):
+        def n_p_jit_greedy_generate_function(parameters, input_ids, attention_mask):
             input_ids = with_sharding_constraint(input_ids, serve_config.generation_ps)
             attention_mask = with_sharding_constraint(attention_mask, serve_config.generation_ps)
             predict = model.generate(
@@ -135,12 +155,7 @@ class EasyServe:
             ).sequences[:, input_ids.shape[1]:]
             return predict
 
-        @partial(
-            pjit,
-            in_shardings=(partition_specs, PartitionSpec(), PartitionSpec()),
-            out_shardings=(PartitionSpec())
-        )
-        def non_greedy_generate_function(parameters, input_ids, attention_mask):
+        def n_p_jit_non_greedy_generate_function(parameters, input_ids, attention_mask):
             input_ids = with_sharding_constraint(input_ids, serve_config.generation_ps)
             attention_mask = with_sharding_constraint(attention_mask, serve_config.generation_ps)
             predict = model.generate(
@@ -163,9 +178,21 @@ class EasyServe:
             ).sequences[:, input_ids.shape[1]:]
             return predict
 
+        non_greedy_generate_function = pjit(
+            n_p_jit_non_greedy_generate_function,
+            in_shardings=(partition_specs, PartitionSpec(), PartitionSpec()),
+            out_shardings=(PartitionSpec())
+        )
+        greedy_generate_function = pjit(
+            n_p_jit_greedy_generate_function,
+            in_shardings=(partition_specs, PartitionSpec(), PartitionSpec()),
+            out_shardings=(PartitionSpec())
+        )
         return LLMBaseReq(
             greedy_generate_function=greedy_generate_function,
             non_greedy_generate_function=non_greedy_generate_function,
+            n_p_jit_greedy_generate_function=n_p_jit_greedy_generate_function,
+            n_p_jit_non_greedy_generate_function=n_p_jit_non_greedy_generate_function,
             tokenizer=tokenizer,
             prefix_tokenizer=prefix_tokenizer
         )
@@ -176,7 +203,7 @@ class EasyServe:
             llm: EasyDelFlaxPretrainedModel,
             params: FrozenDict | dict,
             tokenizer: PreTrainedTokenizerBase,
-            serve_config: ServeConfig,
+            serve_config: EasyServeConfig,
             partition_rules: Tuple[Tuple[str, PartitionSpec]],
             shard_parameters: bool = True,
     ):
@@ -206,8 +233,10 @@ class EasyServe:
             tokenizer=llm_base_req.tokenizer,
             prefix_tokenizer=llm_base_req.prefix_tokenizer,
             params=params,
-            greedy_generation_function=llm_base_req.greedy_generate_function,
-            non_greedy_generation_function=llm_base_req.non_greedy_generate_function
+            greedy_generate_function=llm_base_req.greedy_generate_function,
+            non_greedy_generate_function=llm_base_req.non_greedy_generate_function,
+            n_p_jit_non_greedy_generate_function=llm_base_req.n_p_jit_non_greedy_generate_function,
+            n_p_jit_greedy_generate_function=llm_base_req.n_p_jit_greedy_generate_function
         )
 
     def sample(
@@ -249,29 +278,28 @@ class EasyServe:
         attention_mask = tokens.attention_mask
         num_generated_tokens = 0
 
-        for _ in range((max_new_tokens or self.serve_config.max_new_tokens) // self.serve_config.max_compile_tokens):
+        for _ in range(
+                (max_new_tokens or self.serve_config.max_new_tokens) // self.serve_config.max_compile_tokens):
             generation_input = dict(
                 params=self.params,
                 input_ids=input_ids,
                 attention_mask=attention_mask
             )
-            predicted_token = self.greedy_generation_function(
-                **generation_input
-            ) if greedy else self.non_greedy_generation_function(
-                **generation_input
-            )
+            predicted_token = self.get_generation_function(greedy=greedy)(**generation_input)
 
             num_generated_tokens += predicted_token.shape[-1]
             plus_attn_mask = jnp.ones(
                 (len(attention_mask), self.serve_config.max_compile_tokens),
-                dtype=jnp.int32)
+                dtype="i4"
+            )
 
             input_ids = jnp.concatenate(
-                (input_ids, predicted_token), axis=-1
+                (input_ids, predicted_token), dtype="i4",
+                axis=-1
             )[:, -fixed_pad:]
 
             attention_mask = jnp.concatenate(
-                (attention_mask, plus_attn_mask), dtype=jnp.int32,
+                (attention_mask, plus_attn_mask), dtype="i4",
                 axis=-1
             )[:, -fixed_pad:]
 
@@ -340,3 +368,32 @@ class EasyServe:
                 color="red", force_color=True
             )
         return True
+
+    def __repr__(self):
+
+        """
+        The __repr__ function is used to generate a string representation of an object.
+        This function should return a string that can be parsed by the Python interpreter
+        to recreate the object. The __repr__ function is called when you use print() on an
+        object, or when you type its name in the REPL.
+
+        :param self: Refer to the instance of the class
+        :return: A string representation of the object
+        """
+        string = f"{self.__class__.__name__}(\n"
+        for k, v in self.__dict__.items():
+            if not k.startswith("_"):
+                repr_src = f"\t{k} : " + v.__str__().replace("\n", "\n\t") + "\n"
+                string += repr_src if len(repr_src) < 500 else f"\t{k} : " + f"{v.__class__.__name__}(...)" + "\n"
+        return string + ")"
+
+    def __str__(self):
+
+        """
+        The __str__ function is called when you use the print function or when str() is used.
+        It should return a string representation of the object.
+
+        :param self: Refer to the instance of the class
+        :return: The object's string representation
+        """
+        return self.__repr__()

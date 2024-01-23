@@ -1,20 +1,16 @@
-from typing import Optional
+from typing import Optional, List, Literal
 
 from pydantic import BaseModel
 
 
-class InstructRequest(BaseModel):
-    instruction: str
-    system: Optional[str] = None
-    temperature: Optional[float] = None
-    greedy: Optional[bool] = False
+class ConversationItem(BaseModel):
+    role: Literal["user", "assistant", "system"]
+    content: str
 
 
-class ChatRequest(BaseModel):
-    prompt: str
-    system: Optional[str] = None
-    history: Optional[list[list[str]]] = None
-    temperature: Optional[float] = None
+class GenerateAPIRequest(BaseModel):
+    conversation: List[ConversationItem]
+    max_new_tokens: Optional[int] = None
     greedy: Optional[bool] = False
 
 
@@ -23,4 +19,3 @@ class ModelOutput(BaseModel):
     tokens_used: Optional[int] = None
     model_name: Optional[str] = None
     generation_time: Optional[float] = None
-
