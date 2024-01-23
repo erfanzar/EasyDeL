@@ -28,7 +28,7 @@ def main():
     config = MixtralConfig(
         hidden_size=256,
         num_attention_heads=8,
-        num_hidden_layers=8,
+        num_hidden_layers=1,
         num_key_value_heads=4,
         intermediate_size=512,
         num_local_experts=8,
