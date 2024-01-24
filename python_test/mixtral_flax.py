@@ -2,7 +2,7 @@ import copy
 
 import os
 
-os.environ["JAX_TRACEBACK_FILTERING"] = 'off'
+os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 import jax
 
 try:
@@ -43,7 +43,7 @@ def main():
         huggingface_to_easydel(
             torch_model.state_dict(),
             embedding_layer_names=["embed_tokens"],
-            device=jax.devices('cpu')[0]
+            device=jax.devices("cpu")[0]
         )
     }
 
@@ -72,17 +72,17 @@ def main():
             params=params,
         )
         res = jnp.allclose(torch_output, flax_output.logits, atol=1e-5)
-        print('Mistral Huggingface Predictions :\n', torch_output,
-              '\nEasyDel Predictions: \n', flax_output.logits)
+        print("Mixtral Huggingface Predictions :\n", torch_output,
+              "\nEasyDel Predictions: \n", flax_output.logits)
         if res:  # A Little Bit of humor
-            print('\033[1;36mTest Passed Unfortunately 🥳')
+            print("\033[1;36mTest Passed Unfortunately 🥳")
         else:
-            print('\033[1;31mTest Failed Successfully  🤕')
+            print("\033[1;31mTest Failed Successfully  🤕")
         error = jnp.mean(torch_output - flax_output.logits)
         print("Error : ", error)
     except TypeError as e:
         print(e.__str__())
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

@@ -422,9 +422,14 @@ class FlaxMixtralBlocKSparesTop2MLPCollection(nn.Module):
             hidden_dim: int
     ) -> chex.Array:
         assert hidden_states.ndim == 2
-        final_hidden_states = jnp.zeros(
-            (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype
-        )
+        if self.config.initialization_of_moe:
+            final_hidden_states = jnp.zeros(
+                (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype
+            )
+        else:
+            final_hidden_states = jnp.zeros(
+                ((batch_size * sequence_length) + 1, hidden_dim), dtype=hidden_states.dtype
+            )
         for expert_idx, expert_layer in enumerate(self.layers):
             if self.config.initialization_of_moe:
                 idx, top_x = jnp.nonzero(expert_mask[expert_idx], size=sequence_length)
@@ -440,46 +445,21 @@ class FlaxMixtralBlocKSparesTop2MLPCollection(nn.Module):
 
             else:
                 selected_mask = jnp.pad(expert_mask[expert_idx], ((0, 0), (1, 0)), constant_values=-2)
-                f_idx, f_top_x = jnp.nonzero(selected_mask, size=sequence_length + 1)
-
-                idx = jnp.zeros(sequence_length, dtype="i4") - 15
-                top_x = jnp.zeros(sequence_length, dtype="i4") - 15
-
-                for index in range(sequence_length):
-                    val_f_top_x = f_top_x[index] - 1
-                    if val_f_top_x != -1:
-                        val_f_idx = f_idx[index]
-                        idx = idx.at[index].set(val_f_idx)
-                        top_x = top_x.at[index].set(val_f_top_x)
+                idx, top_x = jnp.nonzero(selected_mask, size=sequence_length + 1)
 
                 if jnp.max(top_x) == 0:
-                    continue
-                hsd = [hidden_states[None, i].reshape(-1, hidden_dim) for i in top_x if i != -15]
-                if len(hsd) == 0:
-                    continue
-                current_state = jnp.concatenate(hsd, axis=0).reshape(-1, hidden_dim)
-
-                cat_routing_weights = []
-                for i_i, x_i in enumerate(top_x):
-                    if x_i != -15:
-                        cat_routing_weights.append(routing_weights[x_i, idx[i_i]].reshape(1, 1))
-                cat_routing_weights = jnp.concatenate(cat_routing_weights, axis=0)
-
+                    # TODO: Fix this one Some how later.
+                    continue  # This makes JAX incompatible with MoE and I don't find anyway to avoid this
                 expert_layer_output = expert_layer(
-                    current_state
+                    hidden_states[top_x]
                 )
-                current_hidden_states = expert_layer_output * cat_routing_weights
-                ext_top_x = []
-                for i_i, x_i in enumerate(top_x):
-                    if x_i != -15:
-                        ext_top_x.append(x_i.reshape(1, 1))
+                current_hidden_states = expert_layer_output * routing_weights[top_x, idx, None]
 
-                ext_top_x = jnp.concatenate(ext_top_x).reshape(-1)
-
-                final_hidden_states = final_hidden_states.at[ext_top_x].set(
-                    current_hidden_states + final_hidden_states[ext_top_x]
+                final_hidden_states = final_hidden_states.at[top_x].set(
+                    current_hidden_states + final_hidden_states[top_x]
                 )
-
+        if not self.config.initialization_of_moe:
+            final_hidden_states = final_hidden_states[1:]
         return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
 
 

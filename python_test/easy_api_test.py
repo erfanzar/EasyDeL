@@ -2,12 +2,12 @@ import flax.core
 import transformers
 
 from lib.python.EasyDel.serve.api.serve import EasyServe, EasyServeConfig
-from lib.python.EasyDel import MistralConfig, FlaxMistralForCausalLM
+from lib.python.EasyDel import MixtralConfig, FlaxMixtralForCausalLM
 from jax import numpy as jnp, lax
 
 
 def main():
-    mistral_config = MistralConfig(
+    mistral_config = MixtralConfig(
         hidden_size=128,
         intermediate_size=256,
         num_hidden_layers=4,
@@ -17,7 +17,7 @@ def main():
         max_position_embeddings=512
     )
 
-    mistral_model = FlaxMistralForCausalLM(
+    mistral_model = FlaxMixtralForCausalLM(
         config=mistral_config,
         dtype=jnp.float16,
         param_dtype=jnp.float16,
