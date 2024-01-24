@@ -2,8 +2,13 @@ import copy
 
 import os
 
-os.environ["JAX_TRACEBACK_FILTERING"] = 'off'
+os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 import jax
+
+from jax import numpy as jnp
+from transformers import MistralForCausalLM
+import torch
+import numpy as np
 
 try:
     from lib.python.EasyDel import MistralConfig, FlaxMistralForCausalLM
@@ -16,10 +21,6 @@ except ModuleNotFoundError:
     sys.path.append(cp)
     from lib.python.EasyDel import MistralConfig, FlaxMistralForCausalLM
     from lib.python.EasyDel.transform import mistral_convert_hf_to_flax
-from jax import numpy as jnp
-from transformers import MistralForCausalLM
-import torch
-import numpy as np
 
 
 def main():
@@ -34,13 +35,13 @@ def main():
         gradient_checkpointing="",
         max_position_embeddings=seq_len
     )
-    print('Model Config :\n', config)
+    print("Model Config :\n", config)
     batch_size = len(jax.devices())
 
     torch_model = MistralForCausalLM(
         config=copy.deepcopy(config)
     )
-    params = {"params": mistral_convert_hf_to_flax(torch_model.state_dict(), config, jax.devices('cpu')[0])}
+    params = {"params": mistral_convert_hf_to_flax(torch_model.state_dict(), config, jax.devices("cpu")[0])}
 
     np_random_input_ids = np.random.randint(0, config.vocab_size, (batch_size, seq_len))
     input_ids = torch.from_numpy(np_random_input_ids).reshape(batch_size, -1).to(torch.long)
@@ -67,17 +68,17 @@ def main():
 
         )
         res = jnp.allclose(torch_output.logits.cpu().detach().numpy(), flax_output.logits, atol=1e-5)
-        print('Mistral Huggingface Predictions :\n', torch_output.logits.cpu().detach().numpy(),
-              '\nEasyDel Predictions: \n', flax_output.logits)
+        print("Mistral Huggingface Predictions :\n", torch_output.logits.cpu().detach().numpy(),
+              "\nEasyDel Predictions: \n", flax_output.logits)
         if res:  # A Little Bit of humor
-            print('\033[1;36mTest Passed Unfortunately 🥳')
+            print("\033[1;36mTest Passed Unfortunately 🥳")
         else:
-            print('\033[1;31mTest Failed Successfully  🤕')
+            print("\033[1;31mTest Failed Successfully  🤕")
         error = jnp.mean(torch_output.logits.cpu().detach().numpy() - flax_output.logits)
         print("Error : ", error)
     except TypeError as e:
         print(e.__str__())
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

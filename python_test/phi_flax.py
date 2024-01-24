@@ -24,7 +24,7 @@ def main():
     torch.manual_seed(42)
 
     torch_config = AutoConfig.from_pretrained(
-        'microsoft/phi-2',
+        "microsoft/phi-2",
         trust_remote_code=True
     )
     torch_config.hidden_size = 128
@@ -80,14 +80,14 @@ def main():
     )
     torch_output = torch_output.logits.cpu().detach().numpy()
     res = jnp.allclose(torch_output, flax_output.logits, atol=1e-5)
-    print('PHI Huggingface Predictions :\n', torch_output,
-          '\nEasyDel Predictions: \n', flax_output.logits)
+    print("PHI Huggingface Predictions :\n", torch_output,
+          "\nEasyDel Predictions: \n", flax_output.logits)
     if res:
-        print('\033[1;36mTest Passed Unfortunately 🥳')
+        print("\033[1;36mTest Passed Unfortunately 🥳")
     else:
-        print('\033[1;31mTest Failed Successfully  🤕')
+        print("\033[1;31mTest Failed Successfully  🤕")
     print()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

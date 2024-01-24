@@ -1,9 +1,10 @@
 import math
 from flax import linen as nn
-from flax.core import FrozenDict, unfreeze
+from flax.core import FrozenDict, unfreeze, freeze
 from typing import Optional, Dict, Union, Tuple
 
 from flax.linen import combine_masks
+from flax.traverse_util import unflatten_dict, flatten_dict
 from jax import numpy as jnp, lax
 import jax
 from jax.sharding import PartitionSpec
@@ -164,7 +165,13 @@ class FlaxFalconAttention(nn.Module):
         self.num_heads = self.config.num_attention_heads
 
     @nn.compact
-    def _concatenate_to_cache(self, key: chex.Array, value: chex.Array, query: chex.Array, attention_mask: chex.Array):
+    def _concatenate_to_cache(
+            self,
+            key: chex.Array,
+            value: chex.Array,
+            query: chex.Array,
+            attention_mask: chex.Array
+    ):
         is_initialized = self.has_variable("cache", "cached_key")
         cached_key = self.variable("cache", "cached_key", jnp.zeros, key.shape, key.dtype)
         cached_value = self.variable("cache", "cached_value", jnp.zeros, value.shape, value.dtype)
@@ -172,12 +179,12 @@ class FlaxFalconAttention(nn.Module):
         if is_initialized:
             *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
             cur_index = cache_index.value
-            indices = (0,) * len(batch_dims) + (int(cur_index), 0, 0)
+            indices = (0,) * len(batch_dims) + (cur_index, 0, 0)
             key = lax.dynamic_update_slice(cached_key.value, key, indices)
             value = lax.dynamic_update_slice(cached_value.value, value, indices)
             cached_key.value = key
             cached_value.value = value
-            num_updated_cache_vectors = query.shape[1]
+            num_updated_cache_vectors = query.shape[2]
             cache_index.value = cache_index.value + num_updated_cache_vectors
 
             pad_mask = jnp.broadcast_to(
@@ -246,7 +253,7 @@ class FlaxFalconAttention(nn.Module):
             output_attentions: bool = False,
     ):
         # FLAX
-        batch_size, _, _ = hidden_states.shape
+        batch_size, sequence_length, _ = hidden_states.shape
         num_kv_heads = self.num_heads if self.config.new_decoder_architecture else self.num_kv_heads
         qkv = self.query_key_value(hidden_states)
 
@@ -280,15 +287,25 @@ class FlaxFalconAttention(nn.Module):
             mask_shift = self.variables["cache"]["cache_index"]
             max_decoder_length = self.variables["cache"]["cached_key"].shape[1]
             causal_mask = lax.dynamic_slice(
-                causal_mask, (0, 0, mask_shift, 0), (1, 1,
-                                                     query_length, max_decoder_length)
+                causal_mask, (
+                    0,
+                    0,
+                    mask_shift,
+                    0
+                ), (
+                    1,
+                    1,
+                    query_length,
+                    max_decoder_length
+                )
             )
         else:
             causal_mask = causal_mask[:, :, :query_length, :key_length]
 
         batch_size = hidden_states.shape[0]
         causal_mask = jnp.broadcast_to(
-            causal_mask, (batch_size,) + causal_mask.shape[1:])
+            causal_mask, (batch_size,) + causal_mask.shape[1:]
+        )
         if attention_mask.ndim == 2:
             attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
         attention_mask = combine_masks(attention_mask, causal_mask)
@@ -300,14 +317,6 @@ class FlaxFalconAttention(nn.Module):
                 key=key_layer,
                 freq_cis=freq_cis
             )
-
-        float_min = jnp.finfo(query_layer.dtype).min
-        attention_bias = lax.select(
-            attention_mask > 0,
-            jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-            jnp.full(attention_mask.shape, float_min).astype(self.dtype),
-        )
-        dtype = jnp.promote_types(key_layer.dtype, jnp.float32)
         if self.has_variable("cache", "cached_key") or init_cache:
             key_layer, value_layer, attention_mask = self._concatenate_to_cache(
                 key_layer,
@@ -315,6 +324,13 @@ class FlaxFalconAttention(nn.Module):
                 query_layer,
                 attention_mask
             )
+        float_min = jnp.finfo(query_layer.dtype).min
+        attention_bias = lax.select(
+            attention_mask > 0,
+            jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
+            jnp.full(attention_mask.shape, float_min).astype(self.dtype),
+        )
+        dtype = jnp.promote_types(key_layer.dtype, jnp.float32)
 
         (
             query_layer,
@@ -323,7 +339,10 @@ class FlaxFalconAttention(nn.Module):
             attention_bias
         ) = map(
             lambda x: x.astype(dtype=dtype), (
-                query_layer, key_layer, value_layer, attention_bias
+                query_layer,
+                key_layer,
+                value_layer,
+                attention_bias
             )
         )
 
@@ -595,7 +614,7 @@ class FlaxFalconModule(nn.Module):
             output_attentions: bool = False,
             deterministic: bool = True,
             init_cache: bool = False,
-            return_dict: Optional[bool] = False
+            return_dict: Optional[bool] = True
     ):
         batch, sequence_length = input_ids.shape
 
@@ -653,34 +672,77 @@ class FlaxFalconPretrainedModel(EasyDelFlaxPretrainedModel):
                  _do_init=False,
                  dtype: jnp.dtype = jnp.float32,
                  param_dtype: jnp.dtype = jnp.float32,
-                 input_shape: Tuple = (1, 1024),
+                 input_shape: Tuple = (1, 1),
                  precision: Optional[Union[None, jax.lax.Precision]] = jax.lax.Precision("fastest")
                  ):
         module = self.module_class(config=config, dtype=dtype, param_dtype=param_dtype, precision=precision)
         super().__init__(_do_init=_do_init, module=module, config=config, dtype=dtype, input_shape=input_shape)
 
-    def init_weights(self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None) -> Dict:
-        if params is None:
-            params = self.module.init(
-                rngs=rng,
-                input_ids=jnp.ones(input_shape),
-                attention_mask=jnp.ones(input_shape)
-            )
-        return params['params']
+    def init_weights(self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None) -> FrozenDict:
+        """
+        The init_weights function is used to initialize the weights of a model.
 
-    def __call__(self,
-                 input_ids: chex.Array,
-                 attention_mask: Optional[chex.Array] = None,
-                 position_ids: Optional[chex.Array] = None,
-                 past_key_values: Optional[nn.Module] = None,
-                 output_attentions: bool = False,
-                 deterministic: bool = True,
-                 init_cache: Optional[bool] = None,
-                 return_dict: Optional[bool] = False,
-                 params: FrozenDict = None,
-                 add_params_field: bool = False,
-                 **kwargs
-                 ):
+        :param self: Access variables that belong to the class
+        :param rng: jax.random.PRNGKey: Initialize the weights of the model
+        :param input_shape: Tuple: Specify the shape of the input tensor
+        :param params: FrozenDict: Pass in the parameters of a pre-trained model
+        :return: A frozendict of parameters
+
+        """
+        input_ids = jnp.zeros(input_shape, dtype="i4")
+        attention_mask = jnp.ones_like(input_ids)
+        position_ids = jnp.broadcast_to(jnp.arange(
+            jnp.atleast_2d(input_ids).shape[-1]), input_shape)
+        params_rng, dropout_rng = jax.random.split(rng)
+        rngs = {"params": params_rng, "dropout": dropout_rng}
+
+        if self.config.add_cross_attention:
+            encoder_hidden_states = jnp.zeros(
+                input_shape + (self.config.hidden_size,))
+            encoder_attention_mask = attention_mask
+            module_init_outputs = self.module.init(
+                rngs,
+                input_ids,
+                attention_mask,
+                position_ids,
+                encoder_hidden_states,
+                encoder_attention_mask,
+                return_dict=False,
+            )
+        else:
+            module_init_outputs = self.module.init(
+                rngs,
+                input_ids,
+                attention_mask,
+                position_ids,
+                return_dict=False
+            )
+
+        random_params = module_init_outputs["params"]
+
+        if params is not None:
+            random_params = flatten_dict(unfreeze(random_params))
+            params = flatten_dict(unfreeze(params))
+            for missing_key in self._missing_keys:
+                params[missing_key] = random_params[missing_key]
+            self._missing_keys = set()
+            return freeze(unflatten_dict(params))
+        else:
+            return random_params
+
+    def __call__(
+            self,
+            input_ids: chex.Array,
+            attention_mask: Optional[chex.Array] = None,
+            position_ids: Optional[chex.Array] = None,
+            past_key_values: Optional[nn.Module] = None,
+            output_attentions: bool = False,
+            train: bool = True,
+            return_dict: Optional[bool] = True,
+            params: FrozenDict = None,
+            add_params_field: bool = False,
+            **kwargs
+    ):
         input_ids = jnp.asarray(input_ids, dtype=jnp.int32)
         inputs = {'params': params or self.params} if add_params_field else params or self.params
         if past_key_values:
@@ -707,8 +769,8 @@ class FlaxFalconPretrainedModel(EasyDelFlaxPretrainedModel):
             jnp.array(attention_mask, dtype="i4"),
             jnp.array(position_ids, dtype="i4"),
             output_attentions,
-            deterministic,
-            init_cache,
+            not train,
+            False,
             return_dict,
             mutable=mutable,
             rngs=rngs
