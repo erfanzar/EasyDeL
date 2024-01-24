@@ -1,3 +1,4 @@
+import math
 from functools import partial
 from typing import Optional, Tuple, Union
 
@@ -162,7 +163,7 @@ class FlaxLlamaAttention(nn.Module):
             query_partition_spec=self.config.query_partition_spec,
             value_partition_spec=self.config.value_partition_spec,
             mesh=self.config.jax_mesh(),
-            sm_scale=1  # TOBE CHANGED
+            sm_scale=1 / math.sqrt(self.head_dim)
         )
         self.resid_dropout = nn.Dropout(rate=config.resid_pdrop)
 

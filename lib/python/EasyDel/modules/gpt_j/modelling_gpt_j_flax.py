@@ -20,7 +20,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """ GPT-J model configuration"""
-
+import math
 from functools import partial
 from typing import Optional, Tuple
 
@@ -145,7 +145,7 @@ class FlaxGPTJAttention(nn.Module):
             query_partition_spec=self.config.query_partition_spec,
             value_partition_spec=self.config.value_partition_spec,
             mesh=self.config.jax_mesh(),
-            sm_scale=1  # TOBE CHANGED
+            sm_scale=1 / math.sqrt(self.head_dim)
         )
 
     def _split_heads(self, hidden_states):
