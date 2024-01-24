@@ -1,6 +1,6 @@
 import os
 
-# os.environ["XLA_FLAGS"] = '--xla_force_host_platform_device_count=8'
+# os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
 
 import copy
 import jax
@@ -43,7 +43,7 @@ def main():
     torch_model = LlamaForCausalLM(
         config=copy.deepcopy(config)
     )
-    params = {"params": llama_convert_hf_to_flax(torch_model.state_dict(), config, device=jax.devices('cpu')[0])}
+    params = {"params": llama_convert_hf_to_flax(torch_model.state_dict(), config, device=jax.devices("cpu")[0])}
     batch_size = len(jax.devices())
     np_random_input_ids = np.random.randint(0, config.vocab_size, (batch_size, seq_len))
     input_ids = torch.from_numpy(np_random_input_ids).reshape(batch_size, -1).to(torch.long)
@@ -62,32 +62,28 @@ def main():
 
         params = jax.tree_map(lambda p, f: f(p), params, shard)
 
-        try:
+        flax_model = FlaxLlamaForCausalLM(
+            config=config,
+            dtype=jnp.float32,
+            param_dtype=jnp.float32,
+            _do_init=False,
+            input_shape=(batch_size, seq_len)
+        )
+        flax_output = flax_model(
+            input_ids=flax_input_ids,
+            params=params,
 
-            flax_model = FlaxLlamaForCausalLM(
-                config=config,
-                dtype=jnp.float32,
-                param_dtype=jnp.float32,
-                _do_init=False,
-                input_shape=(batch_size, seq_len)
-            )
-            flax_output = flax_model(
-                input_ids=flax_input_ids,
-                params=params,
-
-            )
-            res = jnp.allclose(torch_output.logits.cpu().detach().numpy(), flax_output.logits, atol=1e-5)
-            if res:  # A Little Bit of humor
-                print('LLama Huggingface Predictions :\n', torch_output.logits.cpu().detach().numpy(),
-                      '\nEasyDel Predictions: \n', flax_output.logits)
-                print('\033[1;36mTest Passed Unfortunately 🥳')
-            else:
-                print('\033[1;31mTest Failed Successfully  🤕')
-            error = jnp.mean(torch_output.logits.cpu().detach().numpy() - flax_output.logits)
-            print("Error : ", error)
-        except TypeError as e:
-            print(e.__str__())
+        )
+        res = jnp.allclose(torch_output.logits.cpu().detach().numpy(), flax_output.logits, atol=1e-5)
+        if res:  # A Little Bit of humor
+            print("LLama Huggingface Predictions :\n", torch_output.logits.cpu().detach().numpy(),
+                  "\nEasyDel Predictions: \n", flax_output.logits)
+            print("\033[1;36mTest Passed Unfortunately 🥳")
+        else:
+            print("\033[1;31mTest Failed Successfully  🤕")
+        error = jnp.mean(torch_output.logits.cpu().detach().numpy() - flax_output.logits)
+        print("Error : ", error)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

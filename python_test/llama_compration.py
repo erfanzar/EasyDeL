@@ -115,8 +115,6 @@ def main():
         # print("\t LLAMA 2 : \n", llama_2_pred.logits)
         print(f'LLAMA 1/2 ERR : {jnp.mean(llama_1_pred.logits) - jnp.mean(llama_2_pred.logits)}')
         print(f'Excepted ERR  : {jnp.mean(llama_2_pred.logits) - jnp.mean(llama_2_pred.logits)}')
-    # except TypeError as e:
-    #     print(e.__str__())
 
 
 if __name__ == '__main__':

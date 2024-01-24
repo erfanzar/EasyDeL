@@ -19,13 +19,16 @@ class EasyClient:
             conversation: list[dict[str, str]],
             max_new_tokens: Optional[int] = None,
             greedy: bool = False,
+            version: str = "v1"
     ):
         port = ":" + str(self.port) if self.port is not None else ""
-        requests.post(
-            url=f"{self.method}://{self.host}{port}",
+        response = requests.post(
+            url=f"{self.method}://{self.host}{port}/generate/{version}/conversation",
             data={
                 "conversation": conversation,
                 "max_new_tokens": max_new_tokens,
                 "greedy": greedy
             },
         )
+
+        return response

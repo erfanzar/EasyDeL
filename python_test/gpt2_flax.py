@@ -64,17 +64,15 @@ def main():
 
     )
     res = jnp.allclose(torch_output.logits.cpu().detach().numpy(), flax_output.logits, atol=1e-4)
-    print('Mistral Huggingface Predictions :\n', torch_output.logits.cpu().detach().numpy(),
-          '\nEasyDel Predictions: \n', flax_output.logits)
+    print("Mistral Huggingface Predictions :\n", torch_output.logits.cpu().detach().numpy(),
+          "\nEasyDel Predictions: \n", flax_output.logits)
     if res:  # A Little Bit of humor
-        print('\033[1;36mTest Passed Unfortunately 🥳')
+        print("\033[1;36mTest Passed Unfortunately 🥳")
     else:
-        print('\033[1;31mTest Failed Successfully  🤕')
+        print("\033[1;31mTest Failed Successfully  🤕")
     error = jnp.mean(torch_output.logits.cpu().detach().numpy() - flax_output.logits)
     print("Error : ", error)
-    # except TypeError as e:
-    #     print(e.__str__())
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
