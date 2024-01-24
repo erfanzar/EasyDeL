@@ -138,24 +138,30 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
         with self.mesh:
             batch_size = query_states.shape[0]
             assert batch_size == key_states.shape[0] == value_states.shape[0], "Batch Size for q,k,v wont match"
-            assert query_states.shape == (
+            k_v_req_shape = (
+                batch_size,
+                self.num_attention_heads,
+                key_value_sequence_length,
+                self.head_dims
+            )
+            q_shape = (
                 batch_size,
                 self.num_attention_heads,
                 query_sequence_length,
                 self.head_dims
-            ), self.assertion_mkv_err
-            assert key_states.shape == (
-                batch_size,
-                self.num_attention_heads,
-                key_value_sequence_length,
-                self.head_dims
-            ), self.assertion_mkv_err
-            assert value_states.shape == (
-                batch_size,
-                self.num_attention_heads,
-                key_value_sequence_length,
-                self.head_dims
-            ), self.assertion_mkv_err
+            )
+            assert query_states.shape == q_shape, self.assertion_mkv_err + (
+                f"\nMiss Match {query_states.shape} and "
+                f"required Shape {q_shape}"
+            )
+            assert key_states.shape == k_v_req_shape, self.assertion_mkv_err + (
+                f"\nMiss Match {key_states.shape} and "
+                f"required Shape {k_v_req_shape}"
+            )
+            assert value_states.shape == k_v_req_shape, self.assertion_mkv_err + (
+                f"\nMiss Match {value_states.shape} and "
+                f"required Shape {k_v_req_shape}"
+            )
 
             if self.attn_type == "normal":
 

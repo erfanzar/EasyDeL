@@ -133,34 +133,59 @@ class FlaxMistralMLP(nn.Module):
 
 class FlaxMistralAttention(nn.Module):
     config: MistralConfig
-    dtype: jnp.dtype = jnp.bfloat16
-    param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[None, jax.lax.Precision]
-    ] = jax.lax.Precision("fastest")
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[Union[jax.lax.Precision, str]] = None
 
-    def setup(self) -> None:
+    def setup(self):
         config = self.config
         self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
-        self.num_key_value_heads = config.num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.max_position_embeddings = config.max_position_embeddings
+        self.head_dim = self.config.hidden_size // self.config.num_attention_heads
+        self.num_key_value_groups = self.config.num_attention_heads // self.config.num_key_value_heads
 
-        dense = functools.partial(
-            nn.Dense,
-            use_bias=getattr(self.config, "attention_bias", False),
+        if self.num_key_value_groups == 1:
+            assert self.config.num_attention_heads == self.config.num_key_value_heads
+        self.q_proj = nn.Dense(
+            config.num_attention_heads * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
+            use_bias=self.config.attention_bias,
+            kernel_init=jax.nn.initializers.normal(
+                self.config.initializer_range),
             precision=self.precision,
-            kernel_init=nn.initializers.normal(),
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
+        )
+        self.k_proj = nn.Dense(
+            config.num_key_value_heads * self.head_dim,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            use_bias=self.config.attention_bias,
+            kernel_init=jax.nn.initializers.normal(
+                self.config.initializer_range),
+            precision=self.precision,
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
+        )
+        self.v_proj = nn.Dense(
+            config.num_key_value_heads * self.head_dim,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            use_bias=self.config.attention_bias,
+            kernel_init=jax.nn.initializers.normal(
+                self.config.initializer_range),
+            precision=self.precision,
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
+        )
+        self.o_proj = nn.Dense(
+            config.hidden_size,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(
+                self.config.initializer_range),
+            precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
 
-        self.q_proj = dense(self.num_heads * self.head_dim)
-        self.k_proj = dense(self.num_key_value_heads * self.head_dim)
-        self.v_proj = dense(self.num_key_value_heads * self.head_dim)
-        self.o_proj = dense(self.hidden_size)
         self.rotary = FlaxMistralRotaryEmbedding(self.dtype)
         self.attention_performer = EasyAttention(
             attn_type="normal",
@@ -189,84 +214,143 @@ class FlaxMistralAttention(nn.Module):
             query_partition_spec=self.config.query_partition_spec,
             value_partition_spec=self.config.value_partition_spec,
             mesh=self.config.jax_mesh(),
-            sm_scale=1 # TOBE CHANGED
+            sm_scale=1  # TOBE CHANGED
         )
-
-    @nn.compact
-    def concatenate_to_cache_(self, query: chex.Array, key: chex.Array, value: chex.Array, attention_mask: chex.Array):
-        is_cache_available = self.has_variable('cache', 'key')
-        key_cache = self.variable(
-            'cache', 'key', jnp.zeros, key.shape, key.dtype)
-        value_cache = self.variable(
-            'cache', 'value', jnp.zeros, key.shape, value.dtype)
-        index_cache = self.variable(
-            'cache', 'index', lambda: jnp.array(0, dtype=jnp.int32))
-        if is_cache_available:
-            *bd, ml, nh, dph = key_cache.value.shape
-            indices = (0,) * len(bd) + (index_cache.value, 0, 0)
-            key = jax.lax.dynamic_update_slice(key_cache.value, key, indices)
-            value = jax.lax.dynamic_update_slice(
-                value_cache.value, value, indices)
-            key_cache.value = key
-            value_cache.value = value
-            num_updated_cache_vector = query.shape[1]
-            index_cache.value = index_cache.value + num_updated_cache_vector
-            pad_mask = jnp.broadcast_to(
-                jnp.arange(ml) < index_cache.value,
-                tuple(bd) + (1, num_updated_cache_vector, ml)
-            )
-            attention_mask = nn.combine_masks(pad_mask, attention_mask)
-        return query, key, value, attention_mask
-
-    @staticmethod
-    def _t(query, key, value):
-        return jnp.transpose(query, (0, 2, 1, 3)), jnp.transpose(key, (0, 2, 1, 3)), jnp.transpose(value, (0, 2, 1, 3))
-
-    def apply_rotary(self, batch_size, sequence_length, query, key, value, freq_cis, position_ids):
-        query = query.reshape(batch_size, sequence_length,
-                              self.config.num_attention_heads, self.head_dim)
-        key = key.reshape(batch_size, sequence_length,
-                          self.config.num_key_value_heads, self.head_dim)
-        value = value.reshape(batch_size, sequence_length,
-                              self.config.num_key_value_heads, self.head_dim)
-
-        query, key, value = self._t(query, key, value)
-        query, key = self.rotary(
-            position_ids=position_ids, query=query, key=key, freq_cis=freq_cis)
-        key = repeat_kv_bnsh(key, self.num_key_value_groups)
-        value = repeat_kv_bnsh(value, self.num_key_value_groups)
-        return self._t(query, key, value)
 
     def _merge_heads(self, hidden_states):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
+
+    @nn.compact
+    def _concatenate_to_cache(self, key, value, query, attention_mask):
+        """
+        The _concatenate_to_cache function is used to concatenate the key and value vectors
+        of a query with those of previous queries. This allows for the attention mechanism to
+        look at all previous queries when computing its output. The function takes in three
+        arguments: key, value, and query. It also uses two variables that are stored in the cache:
+        cached_key and cached_value.
+
+        :param self: Access the variables stored in the cache
+        :param key: Store the keys of the encoder-decoder attention
+        :param value: Initialize the cached_value variable
+        :param query: Determine the number of cache vectors to update
+        :param attention_mask: Mask out the padded vectors in the cache
+        :return: The key, value and attention_mask
+
+        """
+        is_initialized = self.has_variable("cache", "cached_key")
+        cached_key = self.variable(
+            "cache", "cached_key", jnp.zeros, key.shape, key.dtype)
+        cached_value = self.variable(
+            "cache", "cached_value", jnp.zeros, value.shape, value.dtype)
+        cache_index = self.variable(
+            "cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32))
+
+        if is_initialized:
+            *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
+            cur_index = cache_index.value
+            indices = (0,) * len(batch_dims) + (cur_index, 0, 0)
+            key = lax.dynamic_update_slice(cached_key.value, key, indices)
+            value = lax.dynamic_update_slice(
+                cached_value.value, value, indices)
+            cached_key.value = key
+            cached_value.value = value
+            num_updated_cache_vectors = query.shape[1]
+            cache_index.value = cache_index.value + num_updated_cache_vectors
+
+            pad_mask = jnp.broadcast_to(
+                jnp.arange(max_length) < cur_index + num_updated_cache_vectors,
+                tuple(batch_dims) + (1, num_updated_cache_vectors, max_length),
+            )
+            attention_mask = combine_masks(pad_mask, attention_mask)
+        return key, value, attention_mask
+
+    @staticmethod
+    def _t(query, key, value):
+        """
+        The _t function transposes the query, key and value matrices.
+
+        :param query: Get the attention weights for each of the heads
+        :param key: Determine the number of heads
+        :param value: Store the values of the input
+        :return: The transpose of the query, key and value matrices
+
+        """
+        return jnp.transpose(query, (0, 2, 1, 3)), jnp.transpose(key, (0, 2, 1, 3)), jnp.transpose(value, (0, 2, 1, 3))
+
+    def apply_rotary(self, batch_size, sequence_length, query, key, value, freq_cis, position_ids):
+        """
+        The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
+        The main difference is that it takes in an additional argument, freq_cis, which are used to calculate
+        the rotary attention weights. The other differences are minor and mostly related to reshaping tensors.
+
+        :param self: Access variables that belong to the class
+        :param batch_size: Reshape the query, key and value tensors
+        :param sequence_length: Reshape the query, key and value tensors
+        :param query: Calculate the attention weights
+        :param key: Calculate the attention
+        :param value: Compute the attention weights
+        :param freq_cis: Calculate the frequency of each word in the vocabulary
+        :param position_ids: Identify the position of each token in the sequence
+        :return: A tuple of 3 tensors: query, key and value
+
+        """
+        query = query.reshape(
+            batch_size,
+            sequence_length,
+            self.config.num_attention_heads,
+            self.head_dim
+        )
+        key = key.reshape(
+            batch_size,
+            sequence_length,
+            self.config.num_key_value_heads,
+            self.head_dim
+        )
+        value = value.reshape(
+            batch_size,
+            sequence_length,
+            self.config.num_key_value_heads,
+            self.head_dim
+        )
+
+        query, key, value = self._t(query, key, value)
+        query, key = self.rotary(
+            position_ids=position_ids, query=query, key=key, freq_cis=freq_cis
+        )
+        key = repeat_kv_bnsh(key, self.num_key_value_groups)
+        value = repeat_kv_bnsh(value, self.num_key_value_groups)
+        return self._t(query, key, value)
 
     def __call__(
             self,
             hidden_states: chex.Array,
             freq_cis: chex.Array,
             attention_mask: chex.Array,
-            causal_mask: chex.Array,
             position_ids: chex.Array,
+            causal_mask: chex.Array,
             deterministic: bool = True,
             init_cache: bool = False,
-            output_attentions: bool = True
+            output_attentions: bool = False,
+            fcm_mask=None,
     ):
         """
-        The __call__ function is the main function of a JAX module.
-        It defines how the module behaves when called as a function, and it's what you'll use to call your model in practice.
-        The __call__ method takes an input tensor (x) and returns an output tensor (y).
-        In this case, we're defining our model to be a simple linear layer with no activation: y = x @ w + b.
 
-        :param self: Refer to the object itself
-        :param hidden_states: chex.Array: Pass in the hidden state of the model
-        :param freq_cis: chex.Array: Create the apply_rotary variable
-        :param attention_mask: chex.Array: Mask the attention weights
-        :param causal_mask: chex.Array: Mask the attention weights
-        :param position_ids: chex.Array: Specify the position of each token in a sequence
+        The __call__ function is the main function of a JAX module. It defines how the module behaves when called
+        with inputs. The __call__ function can be thought of as a &quot;forward pass&quot; through the model,
+        and it should return all outputs that are needed for training or inference.
+
+        :param self: Access variables that belong to the class
+        :param hidden_states: chex.Array: Pass the hidden states of the previous layer
+        :param freq_cis: chex.Array: Pass in the frequency coefficients for each position
+        :param attention_mask: chex.Array: Mask out certain tokens in the input sequence
+        :param position_ids: chex.Array: Determine the position of each token in a sequence
+        :param causal_mask: chex.Array: Mask out the future tokens in the decoder
         :param deterministic: bool: Determine whether to use dropout or not
         :param init_cache: bool: Initialize the cache
-        :param output_attentions: bool: Determine whether to return the attention weights
-        :return: A tuple of (out, attn_output)
+        :param output_attentions: bool: Determine whether to return the attention weights or not
+        :param fcm_mask: Mask out the attention weights between the input and output tokens
+        :param : Determine if the attention is causal or not
+        :return: A tuple of two arrays
 
         """
         batch_size, sequence_length = hidden_states.shape[:2]
@@ -322,18 +406,13 @@ class FlaxMistralAttention(nn.Module):
 
         batch_size = hidden_states.shape[0]
         causal_mask = jnp.broadcast_to(
-            causal_mask, (batch_size,) + causal_mask.shape[1:]
-        )
+            causal_mask, (batch_size,) + causal_mask.shape[1:])
         if attention_mask.ndim == 2:
-            attention_mask = jnp.expand_dims(
-                attention_mask, axis=(-3, -2)
-            )
+            attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
         attention_mask = jnp.broadcast_to(
             attention_mask, causal_mask.shape
         )
-        attention_mask = combine_masks(attention_mask, causal_mask)
-        if attention_mask.ndim == 2:
-            attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
+        attention_mask = combine_masks(attention_mask, causal_mask, fcm_mask)
 
         dropout_rng = None
 
@@ -359,6 +438,8 @@ class FlaxMistralAttention(nn.Module):
             lambda a: a.transpose(0, 2, 1, 3),
             [query_state, key_state, value_state]
         )
+
+        query_length, key_length = query_state.shape[-2], key_state.shape[-2]
 
         attentions = self.attention_performer.__call__(
             query_states=query_state,
@@ -530,7 +611,8 @@ class FlaxMistralPretrainedModel(EasyDelFlaxPretrainedModel):
             )
         else:
             module_init_outputs = self.module.init(
-                rng_s, input_ids, attention_mask, position_ids, return_dict=False)
+                rng_s, input_ids, attention_mask, position_ids, return_dict=False
+            )
 
         random_params = module_init_outputs["params"]
 
