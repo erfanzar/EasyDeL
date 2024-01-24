@@ -9,7 +9,7 @@ def load_model(
         device=jax.devices('cpu')[0],  # Device to be used in order to Load Model on (Offload device)
         dtype: jax.numpy.dtype = jax.numpy.float32,
         param_dtype: jax.numpy.dtype = jax.numpy.float32,
-        precision: jax.lax.Precision = jax.lax.Precision("fastest"),
+        precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
         sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
         sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
         query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),

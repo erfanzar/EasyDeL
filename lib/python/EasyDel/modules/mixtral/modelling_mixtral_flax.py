@@ -1,5 +1,6 @@
 import functools
 
+import flax
 from flax.struct import dataclass
 from jax import numpy as jnp, lax
 from jax.sharding import PartitionSpec
@@ -9,6 +10,7 @@ from flax.traverse_util import unflatten_dict, flatten_dict
 from flax.core import freeze, unfreeze, FrozenDict
 from typing import Union, Optional, Tuple
 from flax.linen import partitioning as nn_partitioning, combine_masks
+from transformers.modeling_flax_outputs import FlaxMaskedLMOutput
 
 from ..easy_attention import EasyAttention
 from ..flax_modelling_utils import (
@@ -26,7 +28,7 @@ from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 re_mat = nn_partitioning.remat
 
 
-@dataclass
+@flax.struct.dataclass
 class MoeModelOutput:
     last_hidden_state: chex.Array = None
     hidden_states: Optional[Tuple[chex.Array]] = None
@@ -34,12 +36,9 @@ class MoeModelOutput:
     router_logits: Optional[Tuple[chex.Array]] = None
 
 
-@dataclass
-class MoeCausalLMOutput:
+@flax.struct.dataclass
+class MoeCausalLMOutput(FlaxMaskedLMOutput):
     aux_loss: Optional[chex.Array] = None
-    logits: chex.Array = None
-    hidden_states: Optional[Tuple[chex.Array]] = None
-    attentions: Optional[Tuple[chex.Array]] = None
     router_logits: Optional[Tuple[chex.Array]] = None
 
 
@@ -344,6 +343,8 @@ class FlaxMixtralAttention(nn.Module):
             [query_state, key_state, value_state]
         )
 
+        query_length, key_length = query_state.shape[-2], key_state.shape[-2]
+
         attentions = self.attention_performer.__call__(
             query_states=query_state,
             key_states=key_state,
@@ -424,10 +425,20 @@ class FlaxMixtralBlocKSparesTop2MLPCollection(nn.Module):
             (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype
         )
         for expert_idx, expert_layer in enumerate(self.layers):
-            selected_mask = jnp.pad(expert_mask[expert_idx], ((0, 0), (1, 0)), constant_values=-2)
             if self.config.initialization_of_moe:
-                continue
+                idx, top_x = jnp.nonzero(expert_mask[expert_idx], size=sequence_length)
+
+                expert_layer_output = expert_layer(
+                    hidden_states[top_x]
+                )
+                current_hidden_states = expert_layer_output * routing_weights[top_x, idx, None]
+
+                final_hidden_states = final_hidden_states.at[top_x].set(
+                    current_hidden_states + final_hidden_states[top_x]
+                )
+
             else:
+                selected_mask = jnp.pad(expert_mask[expert_idx], ((0, 0), (1, 0)), constant_values=-2)
                 f_idx, f_top_x = jnp.nonzero(selected_mask, size=sequence_length + 1)
 
                 idx = jnp.zeros(sequence_length, dtype="i4") - 15
@@ -440,31 +451,33 @@ class FlaxMixtralBlocKSparesTop2MLPCollection(nn.Module):
                         idx = idx.at[index].set(val_f_idx)
                         top_x = top_x.at[index].set(val_f_top_x)
 
-            if jnp.max(top_x) == 0:
-                continue
-            current_state = jnp.concatenate([hidden_states[None, i].reshape(-1, hidden_dim) for i in top_x if i != -15],
-                                            axis=0).reshape(-1, hidden_dim)
+                if jnp.max(top_x) == 0:
+                    continue
+                hsd = [hidden_states[None, i].reshape(-1, hidden_dim) for i in top_x if i != -15]
+                if len(hsd) == 0:
+                    continue
+                current_state = jnp.concatenate(hsd, axis=0).reshape(-1, hidden_dim)
 
-            cat_routing_weights = []
-            for i_i, x_i in enumerate(top_x):
-                if x_i != -15:
-                    cat_routing_weights.append(routing_weights[x_i, idx[i_i]].reshape(1, 1))
-            cat_routing_weights = jnp.concatenate(cat_routing_weights, axis=0)
+                cat_routing_weights = []
+                for i_i, x_i in enumerate(top_x):
+                    if x_i != -15:
+                        cat_routing_weights.append(routing_weights[x_i, idx[i_i]].reshape(1, 1))
+                cat_routing_weights = jnp.concatenate(cat_routing_weights, axis=0)
 
-            expert_layer_output = expert_layer(
-                current_state
-            )
-            current_hidden_states = expert_layer_output * cat_routing_weights
-            ext_top_x = []
-            for i_i, x_i in enumerate(top_x):
-                if x_i != -15:
-                    ext_top_x.append(x_i.reshape(1, 1))
+                expert_layer_output = expert_layer(
+                    current_state
+                )
+                current_hidden_states = expert_layer_output * cat_routing_weights
+                ext_top_x = []
+                for i_i, x_i in enumerate(top_x):
+                    if x_i != -15:
+                        ext_top_x.append(x_i.reshape(1, 1))
 
-            ext_top_x = jnp.concatenate(ext_top_x).reshape(-1)
+                ext_top_x = jnp.concatenate(ext_top_x).reshape(-1)
 
-            final_hidden_states = final_hidden_states.at[ext_top_x].set(
-                current_hidden_states + final_hidden_states[ext_top_x]
-            )
+                final_hidden_states = final_hidden_states.at[ext_top_x].set(
+                    current_hidden_states + final_hidden_states[ext_top_x]
+                )
 
         return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
 
@@ -735,7 +748,7 @@ class MixtralPreTrainedModel(EasyDelFlaxPretrainedModel):
             config: MixtralConfig,
             dtype: jnp.dtype = jnp.bfloat16,
             param_dtype: jnp.dtype = jnp.bfloat16,
-            precision: jax.lax.Precision = jax.lax.Precision("fastest"),
+            precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
             input_shape: Tuple[int, int] = (1, 1),
             seed: int = 0,
             _do_init: bool = False,

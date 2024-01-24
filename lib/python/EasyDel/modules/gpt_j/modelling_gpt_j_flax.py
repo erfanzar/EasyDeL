@@ -145,7 +145,7 @@ class FlaxGPTJAttention(nn.Module):
             query_partition_spec=self.config.query_partition_spec,
             value_partition_spec=self.config.value_partition_spec,
             mesh=self.config.jax_mesh(),
-            sm_scale=1 # TOBE CHANGED
+            sm_scale=1  # TOBE CHANGED
         )
 
     def _split_heads(self, hidden_states):
@@ -255,6 +255,7 @@ class FlaxGPTJAttention(nn.Module):
             jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
         )
 
+        query_length, key_length = query.shape[-2], key.shape[-2]
         # usual dot product attention
         attentions = self.attention_performer.__call__(
             query_states=query,

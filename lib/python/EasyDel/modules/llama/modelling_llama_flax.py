@@ -162,7 +162,7 @@ class FlaxLlamaAttention(nn.Module):
             query_partition_spec=self.config.query_partition_spec,
             value_partition_spec=self.config.value_partition_spec,
             mesh=self.config.jax_mesh(),
-            sm_scale=1 # TOBE CHANGED
+            sm_scale=1  # TOBE CHANGED
         )
         self.resid_dropout = nn.Dropout(rate=config.resid_pdrop)
 
@@ -386,6 +386,8 @@ class FlaxLlamaAttention(nn.Module):
             lambda a: a.transpose(0, 2, 1, 3),
             [query_state, key_state, value_state]
         )
+
+        query_length, key_length = query_state.shape[-2], key_state.shape[-2]
 
         attentions = self.attention_performer.__call__(
             query_states=query_state,

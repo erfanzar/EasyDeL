@@ -718,7 +718,7 @@ class FlaxPhiPreTrainedModel(EasyDelFlaxPretrainedModel):
             config: PhiConfig,
             dtype: jnp.dtype = jnp.float32,
             param_dtype: jnp.dtype = jnp.float32,
-            precision: jax.lax.Precision = jax.lax.Precision("fastest"),
+            precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
             input_shape=(1, 1),
             seed: int = 42,
             _do_init: bool = False
