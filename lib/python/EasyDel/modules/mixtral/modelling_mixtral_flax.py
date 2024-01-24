@@ -1,4 +1,5 @@
 import functools
+import math
 
 import flax
 from flax.struct import dataclass
@@ -160,7 +161,7 @@ class FlaxMixtralAttention(nn.Module):
             query_partition_spec=self.config.query_partition_spec,
             value_partition_spec=self.config.value_partition_spec,
             mesh=self.config.jax_mesh(),
-            sm_scale=1  # TOBE CHANGED
+            sm_scale=1 / math.sqrt(self.head_dim)
         )
 
     @staticmethod
