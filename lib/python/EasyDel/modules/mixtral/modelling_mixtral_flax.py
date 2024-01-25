@@ -430,11 +430,41 @@ class FlaxMixtralBlocKSparesTop2MLPCollection(nn.Module):
             final_hidden_states = jnp.zeros(
                 ((batch_size * sequence_length) + 1, hidden_dim), dtype=hidden_states.dtype
             )
-        for expert_idx, expert_layer in enumerate(self.layers):
-            if self.config.initialization_of_moe:
+
+        def expert_forward(_final_hidden_states, _expert_layer, _top_x, _idx):
+            expert_layer_output = _expert_layer(
+                hidden_states[_top_x]
+            )
+            current_hidden_states = expert_layer_output * routing_weights[_top_x, _idx, None]
+
+            return _final_hidden_states.at[_top_x].add(current_hidden_states[_top_x])
+
+        # map_layers = [self.layers[i] for i in range(self.config.num_local_experts)]
+
+        def expert_layer_forward(carry, _):
+            forward_hidden_state, forward_index = carry
+
+            selected_mask = jnp.pad(expert_mask[forward_index], ((0, 0), (1, 0)), constant_values=-2)
+            forward_idx, forward_top_x = jnp.nonzero(selected_mask, size=sequence_length + 1)
+            forward_hidden_state = nn.cond(
+                jnp.all(forward_top_x == 0),
+                lambda f, e, t, i: forward_hidden_state,
+                expert_forward,
+                self,
+                forward_hidden_state,
+                self.layers[1],
+                forward_top_x,
+                forward_idx
+            )
+            forward_index += 1
+            return (forward_hidden_state, forward_index), None
+
+        # if self.config.initialization_of_moe:
+        if False:
+            for expert_idx in range(self.config.num_local_experts):
                 idx, top_x = jnp.nonzero(expert_mask[expert_idx], size=sequence_length)
 
-                expert_layer_output = expert_layer(
+                expert_layer_output = self.layers[expert_idx](
                     hidden_states[top_x]
                 )
                 current_hidden_states = expert_layer_output * routing_weights[top_x, idx, None]
@@ -443,21 +473,13 @@ class FlaxMixtralBlocKSparesTop2MLPCollection(nn.Module):
                     current_hidden_states + final_hidden_states[top_x]
                 )
 
-            else:
-                selected_mask = jnp.pad(expert_mask[expert_idx], ((0, 0), (1, 0)), constant_values=-2)
-                idx, top_x = jnp.nonzero(selected_mask, size=sequence_length + 1)
-
-                if jnp.max(top_x) == 0:
-                    # TODO: Fix this one Some how later.
-                    continue  # This makes JAX incompatible with MoE and I don't find anyway to avoid this
-                expert_layer_output = expert_layer(
-                    hidden_states[top_x]
-                )
-                current_hidden_states = expert_layer_output * routing_weights[top_x, idx, None]
-
-                final_hidden_states = final_hidden_states.at[top_x].set(
-                    current_hidden_states + final_hidden_states[top_x]
-                )
+        else:
+            (final_hidden_states, _), _ = jax.lax.scan(
+                expert_layer_forward,
+                (final_hidden_states, 0),
+                xs=None,
+                length=self.config.num_local_experts
+            )
         if not self.config.initialization_of_moe:
             final_hidden_states = final_hidden_states[1:]
         return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
