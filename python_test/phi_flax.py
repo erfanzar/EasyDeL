@@ -76,7 +76,8 @@ def main():
         input_ids=flax_input_ids,
         params=params,
         add_params_field=False,
-        train=False
+        train=False,
+        return_dict=True
     )
     torch_output = torch_output.logits.cpu().detach().numpy()
     res = jnp.allclose(torch_output, flax_output.logits, atol=1e-5)
@@ -86,7 +87,8 @@ def main():
         print("\033[1;36mTest Passed Unfortunately 🥳")
     else:
         print("\033[1;31mTest Failed Successfully  🤕")
-    print()
+    error = jnp.mean(torch_output - flax_output.logits)
+    print("Error : ", error)
 
 
 if __name__ == "__main__":

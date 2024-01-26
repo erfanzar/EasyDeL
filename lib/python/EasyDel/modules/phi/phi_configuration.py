@@ -90,3 +90,10 @@ class PhiConfig(EasyDelPretrainedConfig):
         for k, v in kwargs.items():
             if not hasattr(self, k):
                 setattr(self, k, v)
+
+    def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
+        return (
+            (
+                ".*", PartitionSpec(("fsdp", "sp"))
+             ),
+        )

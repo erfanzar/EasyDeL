@@ -7,7 +7,7 @@ import jax
 from flax import linen as nn
 from functools import partial
 import chex
-from typing import Sequence, Optional
+from typing import Sequence, Optional, Literal
 from jax.experimental.mesh_utils import create_device_mesh
 from .easydel_modelling_utils import EasyMethod
 
@@ -315,7 +315,7 @@ def add_start_docstrings(*docstr):
 
 def get_dot_general_by_bits(
         bits: Optional[int] = None,
-        mode: EasyMethod = EasyMethod.TRAIN
+        mode: Literal["train", "serve", "convert"] = EasyMethod.TRAIN
 ) -> dict:
     """
     The get_general_dot function is a helper function that returns a q_flax.QDotGeneral object

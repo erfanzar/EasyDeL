@@ -77,7 +77,8 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             ),
             use_shard_map: bool = False,
             backend: Optional[None] = jax.default_backend(),
-            easy_method: EasyMethod = EasyMethod.TRAIN,
+            easy_method: Literal["train", "serve", "convert"] = EasyMethod.TRAIN,
+            bits: Optional[int] = None,
             **kwargs
     ):
         self.query_partition_spec = query_partition_spec
@@ -102,6 +103,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
         self.block_k_major_dq = block_k_major_dq or block_k
         self.block_k_dq = block_k_dq or block_k
         self.block_q_dq = block_q_dq or block_q
+        self.bits = bits
         super().__init__(**kwargs)
 
     @staticmethod
@@ -223,6 +225,8 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             ),
             use_shard_map: bool = False,
             backend: Optional[None] = jax.default_backend(),
+            easy_method: Literal["train", "serve", "convert"] = EasyMethod.TRAIN,
+            bits: Optional[int] = None,
     ):
         """
             It initializes all the attributes of an object, and it's called when you create a new instance of that class.
@@ -247,6 +251,8 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             :param attention_partition_spec: PartitionSpec: Specify the partitioning of the attention weights
             :param use_shard_map: bool: whenever to use shard_map for attention
             :param backend: Optional[None]: Specify the backend to use
+            :param easy_method: Literal["train", "serve", "convert"]: EasyDel Quantization Method to be applied for
+            :param bits: Optional[int]: Model bits for quantization
         """
         self.axis_dims = axis_dims
         self.axis_names = axis_names
@@ -269,6 +275,8 @@ class EasyDelPretrainedConfig(PretrainedConfig):
         self.block_k_major_dq = block_k_major_dq or block_k
         self.block_k_dq = block_k_dq or block_k
         self.block_q_dq = block_q_dq or block_q
+        self.easy_method = easy_method
+        self.bits = bits
 
     def __repr__(self):
 
