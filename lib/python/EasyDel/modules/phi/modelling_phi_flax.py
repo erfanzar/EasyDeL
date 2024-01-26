@@ -737,6 +737,18 @@ class FlaxPhiPreTrainedModel(EasyDelFlaxPretrainedModel):
             seed=seed
         )
 
+    def init_cache(self, batch_size, max_length):
+
+        input_ids = jnp.ones((batch_size, max_length))
+        attention_mask = jnp.ones_like(input_ids)
+        position_ids = jnp.broadcast_to(jnp.arange(
+            jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape)
+
+        init_variables = self.module.init(
+            jax.random.PRNGKey(0), input_ids, attention_mask, position_ids, return_dict=False, init_cache=True
+        )
+        return init_variables["cache"]
+
     def init_weights(self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None) -> FrozenDict:
         input_ids = jnp.zeros(input_shape, dtype="i4")
         attention_mask = jnp.ones_like(input_ids)
@@ -768,7 +780,7 @@ class FlaxPhiPreTrainedModel(EasyDelFlaxPretrainedModel):
             train: bool = False,
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
+            return_dict: Optional[bool] = True,
             extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
             add_params_field: bool = False,
             **kwargs
@@ -784,7 +796,8 @@ class FlaxPhiPreTrainedModel(EasyDelFlaxPretrainedModel):
 
         assert sequence_length <= self.config.max_position_embeddings, "Maximum Position Embedding Reached !"
 
-        attention_mask = attention_mask or jnp.ones((batch_size, sequence_length))
+        if attention_mask is None:
+            attention_mask = jnp.ones((batch_size, sequence_length))
 
         rngs = {}
         if dropout_rng is not None:

@@ -2,13 +2,13 @@ import flax.core
 import transformers
 
 from lib.python.EasyDel.serve.api.serve import EasyServe, EasyServeConfig
-from lib.python.EasyDel import FalconConfig, FlaxFalconForCausalLM
+from lib.python.EasyDel import PhiConfig, FlaxPhiForCausalLM
 from jax import numpy as jnp, lax
 
 
 def main():
     max_position_embeddings = 512
-    config = FalconConfig(
+    config = PhiConfig(
         hidden_size=128,
         intermediate_size=256,
         num_hidden_layers=4,
@@ -22,7 +22,7 @@ def main():
         # n_positions=512
     )
 
-    model = FlaxFalconForCausalLM(
+    model = FlaxPhiForCausalLM(
         config=config,
         dtype=jnp.float16,
         param_dtype=jnp.float16,
