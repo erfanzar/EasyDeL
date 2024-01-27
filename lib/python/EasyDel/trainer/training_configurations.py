@@ -1,7 +1,7 @@
 import os.path
 import pathlib
 import re
-from typing import OrderedDict, List, Union, Mapping, Optional, Tuple, Callable
+from typing import OrderedDict, List, Union, Mapping, Optional, Tuple, Callable, Type
 
 import termcolor
 from wandb.apis.public import Run
@@ -41,7 +41,7 @@ class TrainArguments(
             model_name: str,
             num_train_epochs: int,
             model_id: Optional[str] = None,
-            model_class: Optional[EasyDelFlaxPretrainedModel] = None,
+            model_class: Optional[EasyDelFlaxPretrainedModel | Type[EasyDelFlaxPretrainedModel]] = None,
             total_batch_size: int = 32,
             max_steps: Optional[int] = None,
             optimizer: AVAILABLE_OPTIMIZERS = EasyDelOptimizers.ADAMW,
