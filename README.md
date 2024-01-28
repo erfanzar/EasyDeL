@@ -8,7 +8,7 @@ rewritten for mojo as well.
 Some of the key features provided by EasyDeL include:
 
 - Support for 8, 6, and 4 BIT inference and training in JAX
-- Wide Range of models in Jax are supported which have never been implemented before such as _falcon_
+- Wide Range of models in Jax are supported which have never been implemented before such as _falcon, Qwen2, Phi2, MPT ..._
 - Integration of flashAttention in JAX for GPUs and TPUs
 - Automatic serving of LLMs with mid and high-level APIs in both JAX and PyTorch
 - LLM Trainer and fine-tuner in JAX
