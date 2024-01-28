@@ -84,6 +84,12 @@ from .modules.phi import (
     PhiConfig as PhiConfig,
     FlaxPhiModel as FlaxPhiModel
 )
+from .modules.qwen2 import (
+    FlaxQwen2Model as FlaxQwen2Model,
+    FlaxQwen2ForCausalLM as FlaxQwen2ForCausalLM,
+    FlaxQwen2ForSequenceClassification as FlaxQwen2ForSequenceClassification,
+    Qwen2Config as Qwen2Config
+)
 
 from .modules.auto_easydel_model import (
     AutoEasyDelModelForCausalLM as AutoEasyDelModelForCausalLM,

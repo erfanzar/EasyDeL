@@ -148,6 +148,14 @@ def get_modules_by_type(model_type: str) -> Tuple[
                     "k_layernorm"
                 ])
         )
+    if model_type == "qwen2":
+        from .qwen2 import Qwen2Config as _Qwen2Config
+        from .qwen2 import FlaxQwen2ForCausalLM as _FlaxQwen2ForCausalLM
+        return (
+            _Qwen2Config,
+            _FlaxQwen2ForCausalLM,
+            functools.partial(huggingface_to_easydel, embedding_layer_names=["embed_tokens"])
+        )
     else:
         raise EasyDelRuntimeError(f'Model Type ({model_type}) is not supported or is not found')
 
