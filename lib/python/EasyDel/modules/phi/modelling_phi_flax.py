@@ -1,4 +1,5 @@
 import functools
+import math
 import warnings
 from typing import Optional, Tuple, Any, Union, Dict, Sequence, Callable
 import chex
@@ -12,6 +13,7 @@ from flax import linen as nn
 from chex import Array
 from jax.experimental.shard_map import shard_map
 
+from ..easy_attention import EasyAttention
 from ..flax_modelling_utils import (
     ACT2FN,
     get_gradient_checkpoint_policy,
@@ -143,6 +145,36 @@ class FlaxPhiAttention(nn.Module):
                 param_dtype=self.param_dtype,
                 use_bias=True
             )
+
+        self.attention_performer = EasyAttention(
+            attn_type="normal",
+            block_k_major=self.config.block_k_major,
+            block_b=self.config.block_b,
+            block_q=self.config.block_q,
+            block_k=self.config.block_k,
+            block_q_major_dkv=self.config.block_q_major_dkv,
+            block_k_major_dkv=self.config.block_k_major_dkv,
+            block_k_major_dq=self.config.block_k_major_dq,
+            block_k_dkv=self.config.block_k_dkv,
+            block_q_dkv=self.config.block_q_dkv,
+            block_q_dq=self.config.block_q_dq,
+            block_k_dq=self.config.block_k_dq,
+            num_attention_heads=self.config.num_attention_heads,
+            attention_dropout=self.config.attention_dropout,
+            head_dims=self.head_dim,
+            attention_partition_spec=self.config.attention_partition_spec,
+            use_shard_map=self.config.use_shard_map,
+            precision=self.precision,
+            force_float32_tpu=True,
+            attn_mechanism=self.config.attn_mechanism,
+            dtype=self.dtype,
+            bias_partition_spec=self.config.bias_partition_spec,
+            key_partition_spec=self.config.key_partition_spec,
+            query_partition_spec=self.config.query_partition_spec,
+            value_partition_spec=self.config.value_partition_spec,
+            mesh=self.config.jax_mesh(),
+            sm_scale=1 / math.sqrt(self.head_dim)
+        )
 
     def _merge_heads(self, hidden_states):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
@@ -354,53 +386,31 @@ class FlaxPhiAttention(nn.Module):
             jnp.full(attention_mask.shape, jnp.finfo(
                 self.dtype).min).astype(self.dtype),
         )
-        if self.config.use_shard_map:
-            attn_weights = shard_map(
-                functools.partial(
-                    dot_product_attention_weights,
-                    dtype=jnp.promote_types(self.dtype, jnp.float32),
-                    deterministic=deterministic,
-                    dropout_rate=self.config.attention_dropout,
-                    precision=self.precision,
-                    dropout_rng=dropout_rng
-                ),
-                mesh=self.config.jax_mesh(),
-                in_specs=(
-                    self.config.query_partition_spec,
-                    self.config.key_partition_spec,
-                    self.config.bias_partition_spec
-                ),
-                out_specs=PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-                check_rep=False
-            )(
-                query_states, key_states, attention_bias
-            )
-        else:
-            attn_weights = dot_product_attention_weights(
-                query=query_states,
-                key=key_states,
-                bias=attention_bias,
-                dtype=jnp.promote_types(self.dtype, jnp.float32),
-                deterministic=deterministic,
-                dropout_rate=self.config.attention_dropout,
-                precision=self.precision,
-                dropout_rng=dropout_rng
-            )
-
-        if self.config.use_pjit_attention_force:
-            attn_weights = with_sharding_constraint(
-                attn_weights, PartitionSpec(("dp", "fsdp"), "sp", "tp", None))
-
-        attn_output = jnp.einsum(
-            "...hqk,...khd->...qhd",
-            attn_weights,
-            value_states,
-            precision=self.precision
+        query_states, key_states, value_states = map(
+            lambda a: a.transpose(0, 2, 1, 3),
+            [query_states, key_states, value_states]
         )
-        attn_output = self._merge_heads(attn_output)
+
+        query_length, key_length = query_states.shape[-2], key_states.shape[-2]
+
+        attentions = self.attention_performer.__call__(
+            query_states=query_states,
+            key_states=key_states,
+            value_states=value_states,
+            bias=attention_bias,
+            causal=False,
+            use_pjit_attention_force=self.config.use_pjit_attention_force,
+            dropout_rng=dropout_rng,
+            deterministic=deterministic,
+            query_sequence_length=query_length,
+            key_value_sequence_length=key_length,
+            uses_cache=self.has_variable("cache", "cached_key") or init_cache,
+        )
+        attentions.attention_outputs = attentions.attention_outputs.transpose(0, 2, 1, 3)
+        attn_output = self._merge_heads(attentions.attention_outputs)
         attn_output = self.dense(attn_output)
 
-        outputs = (attn_output, attn_weights) if output_attentions else (attn_output,)
+        outputs = (attn_output, attentions.attention_weights) if output_attentions else (attn_output,)
         return outputs
 
 
