@@ -60,7 +60,7 @@ def jax_load_balancing_loss_func(gate_logits: chex.Array, num_experts: chex.Arra
         expert_mask.astype(jnp.float32), axis=-2)
     router_prob_per_group_and_expert = jnp.mean(routing_weights, axis=-1)
     return jnp.mean(tokens_per_group_and_expert * jnp.expand_dims(router_prob_per_group_and_expert, axis=-1)) * (
-            num_experts ** 2)
+        num_experts ** 2)
 
 
 class MixtralRMSNorm(nn.Module):
@@ -108,7 +108,7 @@ class FlaxMixtralAttention(nn.Module):
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[None, jax.lax.Precision]
-    ] = jax.lax.Precision("fastest")
+                        ] = jax.lax.Precision("fastest")
 
     def setup(self) -> None:
         config = self.config
@@ -359,7 +359,8 @@ class FlaxMixtralAttention(nn.Module):
             key_value_sequence_length=key_length,
             uses_cache=self.has_variable("cache", "cached_key") or init_cache,
         )
-        attentions.attention_outputs = attentions.attention_outputs.transpose(0, 2, 1, 3)
+        attentions.attention_outputs = attentions.attention_outputs.transpose(
+            0, 2, 1, 3)
 
         attn_output = self._merge_heads(attentions.attention_outputs)
         attn_output = self.o_proj(attn_output)
@@ -431,26 +432,30 @@ class FlaxMixtralBlocKSparesTop2MLPCollection(nn.Module):
                 ((batch_size * sequence_length) + 1, hidden_dim), dtype=hidden_states.dtype
             )
 
-        def expert_forward(_final_hidden_states, _expert_layer, _top_x, _idx):
+        def expert_forward_true(mdl, _final_hidden_states, _expert_layer, _top_x, _idx):
             expert_layer_output = _expert_layer(
                 hidden_states[_top_x]
             )
-            current_hidden_states = expert_layer_output * routing_weights[_top_x, _idx, None]
+            current_hidden_states = expert_layer_output * \
+                routing_weights[_top_x, _idx, None]
 
             return _final_hidden_states.at[_top_x].add(current_hidden_states[_top_x])
 
+        def expert_forward_false(mdl, _final_hidden_states, _expert_layer, _top_x, _idx):
+            return _final_hidden_states
         # map_layers = [self.layers[i] for i in range(self.config.num_local_experts)]
 
-        def expert_layer_forward(carry, _):
+        def expert_layer_forward(mdl, carry, _):
             forward_hidden_state, forward_index = carry
-
-            selected_mask = jnp.pad(expert_mask[forward_index], ((0, 0), (1, 0)), constant_values=-2)
-            forward_idx, forward_top_x = jnp.nonzero(selected_mask, size=sequence_length + 1)
+            selected_mask = jnp.pad(
+                expert_mask[forward_index], ((0, 0), (1, 0)), constant_values=-2)
+            forward_idx, forward_top_x = jnp.nonzero(
+                selected_mask, size=sequence_length + 1)
             forward_hidden_state = nn.cond(
                 jnp.all(forward_top_x == 0),
-                lambda f, e, t, i: forward_hidden_state,
-                expert_forward,
-                self,
+                expert_forward_false,
+                expert_forward_true,
+                mdl,
                 forward_hidden_state,
                 self.layers[1],
                 forward_top_x,
@@ -459,27 +464,27 @@ class FlaxMixtralBlocKSparesTop2MLPCollection(nn.Module):
             forward_index += 1
             return (forward_hidden_state, forward_index), None
 
-        # if self.config.initialization_of_moe:
-        if False:
+        if self.config.initialization_of_moe:
             for expert_idx in range(self.config.num_local_experts):
-                idx, top_x = jnp.nonzero(expert_mask[expert_idx], size=sequence_length)
+                idx, top_x = jnp.nonzero(
+                    expert_mask[expert_idx], size=sequence_length)
 
                 expert_layer_output = self.layers[expert_idx](
                     hidden_states[top_x]
                 )
-                current_hidden_states = expert_layer_output * routing_weights[top_x, idx, None]
+                current_hidden_states = expert_layer_output * \
+                    routing_weights[top_x, idx, None]
 
                 final_hidden_states = final_hidden_states.at[top_x].set(
                     current_hidden_states + final_hidden_states[top_x]
                 )
-
         else:
-            (final_hidden_states, _), _ = jax.lax.scan(
+            final_hidden_states, _, _ = nn.scan(
                 expert_layer_forward,
-                (final_hidden_states, 0),
-                xs=None,
+                in_axes=1,
+                out_axes=1,
                 length=self.config.num_local_experts
-            )
+            )(self, (final_hidden_states, 0), None)
         if not self.config.initialization_of_moe:
             final_hidden_states = final_hidden_states[1:]
         return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
@@ -564,7 +569,7 @@ class FlaxMixtralDecoderLayer(nn.Module):
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[None, jax.lax.Precision]
-    ] = jax.lax.Precision("fastest")
+                        ] = jax.lax.Precision("fastest")
 
     def setup(self) -> None:
         self.self_attn = FlaxMixtralAttention(
@@ -751,7 +756,8 @@ class MixtralPreTrainedModel(EasyDelFlaxPretrainedModel):
             config: MixtralConfig,
             dtype: jnp.dtype = jnp.bfloat16,
             param_dtype: jnp.dtype = jnp.bfloat16,
-            precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
+            precision: Optional[jax.lax.Precision] = jax.lax.Precision(
+                "fastest"),
             input_shape: Tuple[int, int] = (1, 1),
             seed: int = 0,
             _do_init: bool = False,
@@ -947,7 +953,7 @@ class MixtralPreTrainedModel(EasyDelFlaxPretrainedModel):
         elif past_key_values is not None and not return_dict:
             outputs, past_key_values = outputs
             outputs = outputs[:1] + \
-                      (unfreeze(past_key_values["cache"]),) + outputs[1:]
+                (unfreeze(past_key_values["cache"]),) + outputs[1:]
 
         return outputs
 
