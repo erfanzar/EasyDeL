@@ -200,28 +200,69 @@ class CausalLanguageModelTrainer(BaseTrainer):
             elif self.arguments.dtype == jnp.float16:
                 initialized_parameters = self.model.to_fp16(initialized_parameters)
 
-            return EasyDelState.create(
-                tx=self.tx,
-                params=flax.core.freeze({"params": initialized_parameters}),
-                apply_fn=self.model.__call__,
-                module_config=copy.deepcopy(self.model.config),
-                tx_init=copy.deepcopy(self.arguments.optimizer_kwargs),
-                hyperparameters=EasyDelState.create_hyperparameters(self.model.config.model_type),
-                module=self.model,
-                module_config_args=None
-            )
+            tx = self.tx
+            parameters = flax.core.freeze({"params": initialized_parameters})
+            tx_init = copy.deepcopy(self.arguments.optimizer_kwargs)
+
+            if self.rapture is not None:
+                lora_modules = self.rapture.apply_lora(
+                    module=self.model,
+                    parameters=parameters,
+                    tx=tx
+                )
+                return EasyDelState.load(
+                    params=lora_modules.lora_parameters,
+                    opt_state=lora_modules.lora_opt_state,
+                    module_config_args=None,
+                    tx_init=tx_init,
+                    apply_fn=lora_modules.lora_module.__call__,
+                    module=lora_modules.lora_module,
+                    hyperparameters=EasyDelState.create_hyperparameters(self.model.config.model_type),
+                    module_config=None
+                )
+            else:
+                return EasyDelState.create(
+                    tx=tx,
+                    params=parameters,
+                    apply_fn=self.model.__call__,
+                    module_config=copy.deepcopy(self.model.config),
+                    tx_init=tx_init,
+                    hyperparameters=EasyDelState.create_hyperparameters(self.model.config.model_type),
+                    module=self.model,
+                    module_config_args=None
+                )
 
         def create_state_from_params_function(parameters):
-            return EasyDelState.create(
-                tx=self.tx,
-                params=parameters,
-                apply_fn=self.model.__call__,
-                module_config=copy.deepcopy(self.model.config),
-                tx_init=copy.deepcopy(self.arguments.optimizer_kwargs),
-                hyperparameters=EasyDelState.create_hyperparameters(self.model.config.model_type),
-                module=self.model,
-                module_config_args=None
-            )
+            parameters = parameters
+            tx_init = copy.deepcopy(self.arguments.optimizer_kwargs)
+            tx = self.tx
+            if self.rapture is not None:
+                lora_modules = self.rapture.apply_lora(
+                    module=self.model,
+                    parameters=parameters,
+                    tx=tx
+                )
+                return EasyDelState.create(
+                    params=parameters,
+                    tx=lora_modules.lora_tx,
+                    module_config_args=None,
+                    tx_init=tx_init,
+                    apply_fn=lora_modules.lora_module.__call__,
+                    module=lora_modules.lora_module,
+                    hyperparameters=EasyDelState.create_hyperparameters(self.model.config.model_type),
+                    module_config=None
+                )
+            else:
+                return EasyDelState.create(
+                    tx=tx,
+                    params=parameters,
+                    apply_fn=self.model.__call__,
+                    module_config=copy.deepcopy(self.model.config),
+                    tx_init=tx_init,
+                    hyperparameters=EasyDelState.create_hyperparameters(self.model.config.model_type),
+                    module=self.model,
+                    module_config_args=None
+                )
 
         state_shape = jax.eval_shape(initialize_state_function)
         state_partition_spec = match_partition_rules(
@@ -342,12 +383,19 @@ class CausalLanguageModelTrainer(BaseTrainer):
                             "pass as type FrozenDict in case of not getting UnExcepted Errors "
                         )
 
+                    if self.rapture is not None:
+                        model_parameters = self.rapture.apply_lora(
+                            module=self.model,
+                            tx=self.tx,
+                            parameters=model_parameters
+                        ).lora_parameters
+
                     params = model_parameters if not self.arguments.do_shard_fns else jax.tree_util.tree_map(
                         lambda f, x: f(x),
                         shard_fns.params,
                         model_parameters,
                     )
-                    sharded_state = self.create_sharded_state_from_params_function(params)
+                    sharded_state = self.create_sharded_state_from_params_function(model_parameters)
                 elif model_parameters is not None and self.checkpoint_path is not None:
                     raise EasyDelTimerError(
                         "You can't pass `model_parameters` and `checkpoint_path` at same time"
@@ -364,24 +412,6 @@ class CausalLanguageModelTrainer(BaseTrainer):
                     sharded_state.params
                 )
                 sharded_state.params = params
-            if self.rapture is not None:
-                module = sharded_state.module
-                module.generation_config = None
-                lora_modules = self.rapture.apply_lora(
-                    module=module,
-                    parameters=sharded_state.params,
-                    tx=sharded_state.tx
-                )
-                sharded_state = sharded_state.replace(
-                    tx=lora_modules.lora_tx,
-                    opt_state=lora_modules.lora_opt_state,
-                    params=lora_modules.lora_parameters,
-                    module=lora_modules.lora_module,
-                    apply_fn=lora_modules.lora_module.__call__,
-                    module_config=None
-                )
-
-                print(sharded_state)
 
             self.sharded_state = sharded_state
             return sharded_state, shard_fns, gather_fns
