@@ -53,9 +53,9 @@ def launch():
         trust_remote_code=True
     )
 
-    max_length = config.max_position_embeddings
+    max_sequence_length = config.max_position_embeddings
 
-    configs_to_init_model_class = {
+    configs_to_initialize_model_class = {
         'config': config,
         'dtype': jnp.bfloat16,
         'param_dtype': jnp.bfloat16,
@@ -72,7 +72,7 @@ def launch():
     tokenization_process = lambda data_chunk: tokenizer(
         data_chunk["prompt"],
         add_special_tokens=False,
-        max_length=max_length,
+        max_length=max_sequence_length,
         padding="max_length"
     )
     dataset = dataset.map(
@@ -82,7 +82,7 @@ def launch():
     )
     train_args = TrainArguments(
         model_class=get_modules_by_type(config.model_type)[1],
-        configs_to_init_model_class=configs_to_init_model_class,
+        configs_to_initialize_model_class=configs_to_initialize_model_class,
         custom_rule=config.get_partition_rules(True),
         model_name="FlashAttentionTest",
         num_train_epochs=2,
@@ -93,7 +93,7 @@ def launch():
         scheduler=EasyDelSchedulers.LINEAR,
         weight_decay=0.02,
         total_batch_size=16,
-        max_length=max_length,
+        max_sequence_length=max_sequence_length,
         gradient_checkpointing=EasyDelGradientCheckPointers.NOTHING_SAVEABLE,
         sharding_array=(1, -1, 1, 1),
         use_pjit_attention_force=False,

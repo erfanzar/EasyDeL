@@ -38,7 +38,7 @@ def main():
         pre_compile=False,
         max_new_tokens=256,
         max_compile_tokens=32,
-        max_length=max_position_embeddings
+        max_sequence_length=max_position_embeddings
     )
 
     server = EasyServe.from_parameters(

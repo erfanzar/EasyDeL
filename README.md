@@ -90,7 +90,7 @@ tokenizer = AutoTokenizer.from_pretrained(
     trust_remote_code=True
 )
 tokenizer.pad_token = tokenizer.eos_token
-configs_to_init_model_class = {
+configs_to_initialize_model_class = {
     "config": model.config,
     "dtype": jnp.bfloat16,
     "param_dtype": jnp.bfloat16,
@@ -101,7 +101,7 @@ train_arguments = TrainArguments(
     model_class=type(model),
     model_name="my_first_model_to_train_using_easydel",
     num_train_epochs=3,
-    configs_to_init_model_class=configs_to_init_model_class,
+    configs_to_initialize_model_class=configs_to_initialize_model_class,
     learning_rate=5e-5,
     learning_rate_end=1e-6,
     optimizer=EasyDelOptimizers.ADAMW,  # "adamw", "lion", "adafactor" are supported
@@ -109,7 +109,7 @@ train_arguments = TrainArguments(
     # "linear","cosine", "none" ,"warm_up_cosine" and "warm_up_linear"  are supported
     weight_decay=0.01,
     total_batch_size=64,
-    max_steps=None,  # None to let trainer Decide
+    max_training_steps=None,  # None to let trainer Decide
     do_train=True,
     do_eval=False,  # it's optional but supported 
     backend="tpu",  # default backed is set to cpu, so you must define you want to use tpu cpu or gpu
@@ -185,11 +185,11 @@ from EasyDel.serve import JAXServer
 from transformers import AutoTokenizer
 import jax
 
-model_id = "meta-llama/Llama.md-2-7b-chat-hf"
+model_huggingface_repo_id = "meta-llama/Llama.md-2-7b-chat-hf"
 
-tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+tokenizer = AutoTokenizer.from_pretrained(model_huggingface_repo_id, trust_remote_code=True)
 model, params = AutoEasyDelModelForCausalLM.from_pretrained(
-    model_id,
+    model_huggingface_repo_id,
     jax.devices("cpu")[0],
     jax.numpy.float16,
     jax.numpy.float16,
@@ -277,7 +277,7 @@ tokenizer = AutoTokenizer.from_pretrained(
 
 max_length = config.max_position_embeddings
 
-configs_to_init_model_class = {
+configs_to_initialize_model_class = {
     'config': config,
     'dtype': jnp.bfloat16,
     'param_dtype': jnp.bfloat16,

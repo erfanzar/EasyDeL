@@ -69,20 +69,20 @@ from EasyDel import (
     EasyDelGradientCheckPointers
 )
 
-model_id = 'mistralai/Mistral-7B-v0.1'
+model_huggingface_repo_id = 'mistralai/Mistral-7B-v0.1'
 dataset_train = load_dataset('<TOKENIZED_MISTRAL_DATASET_AT_HUGGINGFACE>')
-tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-model, params = AutoEasyDelModelForCausalLM.from_pretrained(model_id)
+tokenizer = AutoTokenizer.from_pretrained(model_huggingface_repo_id, trust_remote_code=True)
+model, params = AutoEasyDelModelForCausalLM.from_pretrained(model_huggingface_repo_id)
 config = model.config
 config.freq_max_position_embeddings = config.max_position_embeddings  # 32768
 config.max_position_embeddings = 4096  # Let use context length of 4096 for training
 config.c_max_position_embeddings = config.max_position_embeddings
 
-max_length = config.max_position_embeddings
+max_sequence_length = config.max_position_embeddings
 
 train_args = TrainArguments(
     model_class=EasyDel.FlaxMistralForCausalLM,
-    configs_to_init_model_class={
+    configs_to_initialize_model_class={
         'config': config,
         'dtype': jnp.bfloat16,
         'param_dtype': jnp.bfloat16,
@@ -97,11 +97,11 @@ train_args = TrainArguments(
     scheduler=EasyDelSchedulers.WARM_UP_COSINE,
     weight_decay=0.01,
     total_batch_size=32,
-    max_steps=None,
+    max_training_steps=None,
     do_train=True,
     do_eval=False,
     backend='tpu',
-    max_length=max_length,
+    max_sequence_length=max_sequence_length,
     gradient_checkpointing=EasyDelGradientCheckPointers.NOTHING_SAVEABLE,
     sharding_array=(1, -1, 1, 1),
     use_pjit_attention_force=False,

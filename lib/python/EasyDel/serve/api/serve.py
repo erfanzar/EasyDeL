@@ -287,7 +287,7 @@ class EasyServe:
 
         """
         with self.llm.config.jax_mesh():
-            fixed_pad = self.serve_config.max_length - self.serve_config.max_compile_tokens
+            fixed_pad = self.serve_config.max_sequence_length - self.serve_config.max_compile_tokens
             tokens = self.prefix_tokenizer(
                 string,
                 max_length=fixed_pad,

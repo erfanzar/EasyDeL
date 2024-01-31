@@ -61,7 +61,7 @@ if __name__ == "__main__":
         help="Whether the input text contains auto-format tokens.",
     )
     parser.add_argument(
-        "--max_length",
+        "--max_sequence_length",
         default=4096,
         type=int,
         help="The maximum length of the input text.",
@@ -129,7 +129,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     configs = JAXServerConfig(
         contains_auto_format=args.contains_auto_format,
-        max_length=args.max_length,
+        max_sequence_length=args.max_sequence_length,
         max_new_tokens=args.max_new_tokens,
         max_compile_tokens=args.max_compile_tokens,
         temperature=args.temperature,

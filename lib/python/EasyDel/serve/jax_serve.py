@@ -43,7 +43,7 @@ class JAXServerConfig:
     :param port: int: Specify the port number that the server will run on
     :param batch_size: int: Set the batch size of the model
     :param contains_auto_format: bool: Determine whether the input text contains auto-formatting
-    :param max_length: int: Set the maximum length of the text that can be generated
+    :param max_sequence_length: int: Set the maximum length of the text that can be generated
     :param max_new_tokens: int: Determine how many tokens can be added to the vocabulary
     :param max_compile_tokens: int: Set the maximum number of tokens that can be streamed at a time
     :param generation_ps: jax.sharding.PartitionSpec : PartitionSpec to use for sharding data
@@ -65,7 +65,7 @@ class JAXServerConfig:
     port: int = 2059
     batch_size: int = 1
     contains_auto_format: bool = True
-    max_length: int = 4096
+    max_sequence_length: int = 4096
     max_new_tokens: int = 4096
     max_compile_tokens: int = 64
     temperature: float = 0.1
