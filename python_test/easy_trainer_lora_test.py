@@ -45,6 +45,7 @@ def main():
             rapture_config=rab_config,
             use_wandb=False,
             model_class=type(model),
+            do_shard_fns=False,
             max_sequence_length=sequence_length,
             configs_to_initialize_model_class={
                 "config": model.config,
