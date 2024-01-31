@@ -236,7 +236,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
             out_shardings=state_partition_spec,
             donate_argnums=(0,)
         )
-        sharded_train_step_fn = pjit(
+        sharded_train_step_function = pjit(
             create_casual_language_model_train_step(self.arguments.step_partition_spec),
             in_shardings=(state_partition_spec, PartitionSpec()),
             out_shardings=(state_partition_spec, PartitionSpec(), PartitionSpec()),
@@ -251,7 +251,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
 
         return TrainerConfigureFunctionFuncOutput(
             create_sharded_state_from_params_function=create_sharded_state_from_params_function,
-            sharded_train_step_function=sharded_train_step_fn,
+            sharded_train_step_function=sharded_train_step_function,
             mesh=mesh,
             checkpoint_manager=checkpoint_manager,
             initialize_state_function=initialize_state_function
@@ -347,7 +347,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
                         shard_fns.params,
                         model_parameters,
                     )
-                    sharded_state = self.create_sharded_state_from_params_fn(params)
+                    sharded_state = self.create_sharded_state_from_params_function(params)
                 elif model_parameters is not None and self.checkpoint_path is not None:
                     raise EasyDelTimerError(
                         "You can't pass `model_parameters` and `checkpoint_path` at same time"
@@ -357,25 +357,32 @@ class CausalLanguageModelTrainer(BaseTrainer):
                         "You should pass `model_parameters` or `checkpoint_path` to trainer in order to load model"
                     )
             else:
-                sharded_state = self.function_configurations()
+                sharded_state = self.initialize_state_function()
                 params = sharded_state.params if not self.arguments.do_shard_fns else jax.tree_util.tree_map(
                     lambda f, x: f(x),
                     shard_fns.params,
                     sharded_state.params
                 )
                 sharded_state.params = params
-            if self.rapture:
+            if self.rapture is not None:
+                module = sharded_state.module
+                module.generation_config = None
                 lora_modules = self.rapture.apply_lora(
-                    module=sharded_state.module,
+                    module=module,
                     parameters=sharded_state.params,
                     tx=sharded_state.tx
                 )
-                sharded_state.replace(
+                sharded_state = sharded_state.replace(
                     tx=lora_modules.lora_tx,
                     opt_state=lora_modules.lora_opt_state,
                     params=lora_modules.lora_parameters,
-                    module=lora_modules.lora_module
+                    module=lora_modules.lora_module,
+                    apply_fn=lora_modules.lora_module.__call__,
+                    module_config=None
                 )
+
+                print(sharded_state)
+
             self.sharded_state = sharded_state
             return sharded_state, shard_fns, gather_fns
 
@@ -478,7 +485,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
                             for ssb in self.arguments.ids_to_pop_from_dataset:
                                 _ = batch.pop(ssb, None)
                             time_s = time.time()
-                            sharded_state, loss, accuracy = self.sharded_train_step_fn(
+                            sharded_state, loss, accuracy = self.sharded_train_step_function(
                                 sharded_state,
                                 batch
                             )
