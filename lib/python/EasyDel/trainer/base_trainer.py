@@ -87,11 +87,11 @@ class BaseTrainer:
         self.config = None
         self.scheduler = None
         self.tx = None
-        self.create_sharded_state_from_params_fn = None
-        self.sharded_train_step_fn = None
+        self.create_sharded_state_from_params_function = None
+        self.sharded_train_step_function = None
         self.mesh = None
         self.checkpoint_manager: fjformer.CheckpointManager | None = None
-        self.function_configurations = None
+        self.initialize_state_function = None
         self.state_shape = None
         self.state_partition_spec = None
         self.sharded_state = None
@@ -179,11 +179,12 @@ class BaseTrainer:
         self.timer.log(["configure Model ,Optimizer ,Scheduler and Config"])
         self.timer("configure functions and sharding them").start()
         function_configurations = self.configure_functions()
-        self.create_sharded_state_from_params_fn = function_configurations.create_sharded_state_from_params_function
-        self.sharded_train_step_fn = function_configurations.sharded_train_step_function
+        self.create_sharded_state_from_params_function = \
+            function_configurations.create_sharded_state_from_params_function
+        self.sharded_train_step_function = function_configurations.sharded_train_step_function
         self.mesh = function_configurations.mesh
         self.checkpoint_manager = function_configurations.checkpoint_manager
-        self.function_configurations = function_configurations.initialize_state_function
+        self.initialize_state_function = function_configurations.initialize_state_function
         self.timer("configure functions and sharding them").stop()
         self.timer.log(["configure functions and sharding them"])
 

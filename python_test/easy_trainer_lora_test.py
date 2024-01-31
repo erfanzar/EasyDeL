@@ -1,3 +1,7 @@
+import os
+
+os.environ["JAX_TRACEBACK_FILTERING"] = "off"
+
 from lib.python.EasyDel import (
     EasyDeLXRapTureConfig,
     CausalLanguageModelTrainer,
@@ -31,7 +35,7 @@ def main():
                 )
             }
 
-    example_data = Dataset.from_generator(data_generator,)
+    example_data = Dataset.from_generator(data_generator, )
     print(example_data)
     print(len(example_data))
     trainer = CausalLanguageModelTrainer(
@@ -41,6 +45,7 @@ def main():
             rapture_config=rab_config,
             use_wandb=False,
             model_class=type(model),
+            max_sequence_length=sequence_length,
             configs_to_initialize_model_class={
                 "config": model.config,
                 "input_shape": (1, 1),

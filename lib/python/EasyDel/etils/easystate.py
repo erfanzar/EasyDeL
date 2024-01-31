@@ -371,11 +371,16 @@ class EasyDelState(struct.PyTreeNode):
             precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
             sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
             sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            query_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            key_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            value_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            bias_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, None, None),
-            attention_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            query_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp",
+                                                                                          None),
+            key_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp",
+                                                                                        None),
+            value_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp",
+                                                                                          None),
+            bias_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, None,
+                                                                                         None),
+            attention_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp",
+                                                                                              "tp", None),
             use_shard_map: bool = False,
             input_shape: Sequence[int] = (1, 1),
             backend: Optional[str] = None,
@@ -562,11 +567,17 @@ class EasyDelState(struct.PyTreeNode):
         """
         params_size = sum(getattr(n, "size", 0) for n in jax.tree_util.tree_flatten(self.params)[0])
         opt_state_size = sum(getattr(n, "size", 0) for n in jax.tree_util.tree_flatten(self.opt_state)[0])
-        module_config_string = self.module_config.__str__(
 
-        ).replace("\n",
-                  "\n\t"
-                  "") if self.module_config is not None else None
+        def make_depth(mdl=None):
+            if mdl is not None:
+                return mdl.__str__().replace(
+                    "\n",
+                    "\n\t"
+                    ""
+                ) if hasattr(mdl, "__str__") else None
+
+            return mdl
+
         optimizer = self.tx_init.get("optimizer", None)
         scheduler = self.tx_init.get("scheduler", None)
 
@@ -584,9 +595,9 @@ class EasyDelState(struct.PyTreeNode):
         string = (
             f"{self.__class__.__name__}("
             f"\n\tstep = {self.step}"
-            f"\n\tmodule = {self.module}"
-            f"\n\tmodule_config = {module_config_string}"
-            f"\n\tapply_fn: Callable = {self.apply_fn}"
+            f"\n\tmodule = {make_depth(self.module)}"
+            f"\n\tmodule_config = {make_depth(self.module_config)}"
+            f"\n\tapply_fn: Callable = {make_depth(self.apply_fn)}"
             f"\n\tparams : {params_size} Parameters"
             f"\n\ttx = {optimizer} Optimizer with {scheduler} Scheduler"
             f"\n\topt_state : {opt_state_size} Parameters"
