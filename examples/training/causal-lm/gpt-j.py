@@ -85,9 +85,9 @@ flags.DEFINE_integer(
 )
 
 flags.DEFINE_integer(
-    name='max_steps',
+    name='max_training_steps',
     default=None,
-    help='number of max_steps (have been set to None for max number of steps)'
+    help='number of max_training_steps (have been set to None for max number of steps)'
 )
 
 flags.DEFINE_string(
@@ -163,7 +163,7 @@ def main(argv):
 
     train_args = TrainArguments(
         model_class=EasyDel.modules.FlaxGPTJForCausalLM,
-        configs_to_init_model_class={'config': config, 'dtype': get_dtype(FLAGS.dtype),
+        configs_to_initialize_model_class={'config': config, 'dtype': get_dtype(FLAGS.dtype),
                                      'param_dtype': get_dtype(FLAGS.dtype)},
         custom_rule=config.get_partition_rules(True),
         model_name=FLAGS.project_name,
@@ -174,12 +174,12 @@ def main(argv):
         scheduler=FLAGS.scheduler,
         weight_decay=0.01,
         total_batch_size=FLAGS.batch_size,
-        max_steps=FLAGS.max_steps,
+        max_training_steps=FLAGS.max_training_steps,
         do_train=FLAGS.do_train,
         do_eval=FLAGS.do_eval,
         do_test=FLAGS.do_test,
         backend=FLAGS.backend,
-        max_length=FLAGS.max_sequence_length,
+        max_sequence_length=FLAGS.max_sequence_length,
         gradient_checkpointing='nothing_saveable',
         sharding_array=(1, -1, 1, 1),
         use_pjit_attention_force=False,

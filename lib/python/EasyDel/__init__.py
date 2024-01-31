@@ -108,10 +108,11 @@ from .utils.utils import (
 )
 
 from .trainer import (
-    CausalLanguageModelTrainer,
-    TrainArguments,
-    create_casual_language_model_evaluation_step,
-    create_casual_language_model_train_step,
+    CausalLanguageModelTrainer as CausalLanguageModelTrainer,
+    EasyDeLXRapTureConfig as EasyDeLXRapTureConfig,
+    TrainArguments as TrainArguments,
+    create_casual_language_model_evaluation_step as create_casual_language_model_evaluation_step,
+    create_casual_language_model_train_step as create_casual_language_model_train_step,
 )
 
 from .linen import (

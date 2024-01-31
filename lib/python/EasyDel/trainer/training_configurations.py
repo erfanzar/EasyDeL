@@ -14,7 +14,7 @@ import torch.utils.tensorboard
 import wandb
 from fjformer import CheckpointManager
 from jax.experimental.mesh_utils import create_device_mesh
-
+from fjformer.xrapture import XRapTureConfig, XRapTure
 from jax.sharding import Mesh
 from jax import numpy as jnp
 import jax
@@ -33,6 +33,10 @@ AVAILABLE_BACKENDS: List[str] = [
 ]
 
 
+class EasyDeLXRapTureConfig(XRapTureConfig):  # Don't Make user involved with FJFormer
+    ...
+
+
 class TrainArguments(
     OrderedDict
 ):
@@ -40,10 +44,10 @@ class TrainArguments(
             self,
             model_name: str,
             num_train_epochs: int,
-            model_id: Optional[str] = None,
             model_class: Optional[EasyDelFlaxPretrainedModel | Type[EasyDelFlaxPretrainedModel]] = None,
+            model_huggingface_repo_id: Optional[str] = None,
             total_batch_size: int = 32,
-            max_steps: Optional[int] = None,
+            max_training_steps: Optional[int] = None,
             optimizer: AVAILABLE_OPTIMIZERS = EasyDelOptimizers.ADAMW,
             scheduler: AVAILABLE_SCHEDULERS = EasyDelSchedulers.NONE,
             learning_rate: Union[int, float] = 5e-5,
@@ -51,7 +55,7 @@ class TrainArguments(
             gradient_accumulation_steps: int = 1,
             weight_decay: float = 0.01,
             gradient_checkpointing: AVAILABLE_GRADIENT_CHECKPOINTS = EasyDelGradientCheckPointers.NOTHING_SAVEABLE,
-            max_length: Optional[int] = 4096,
+            max_sequence_length: Optional[int] = 4096,
             sharding_array: Union[tuple, int] = (1, -1, 1, 1),
             is_fine_tuning: bool = True,
             do_train: bool = True,
@@ -70,7 +74,7 @@ class TrainArguments(
             extra_configs: Optional[dict] = None,
             ids_to_pop_from_dataset: Optional[list] = None,
             remove_ckpt_after_load: bool = False,
-            configs_to_init_model_class: Optional[dict] = None,
+            configs_to_initialize_model_class: Optional[dict] = None,
             do_last_save: bool = True,
             model_parameters: Optional[dict] = None,
             do_shard_fns: bool = True,
@@ -91,6 +95,8 @@ class TrainArguments(
             step_start_point: Optional[int] = None,
             verbose: bool = True,
             offload_device: jax.Device = jax.devices("cpu")[0],
+            rapture_config: Optional[EasyDeLXRapTureConfig] = None,
+            merge_lora_rapture_parameters: bool = True,
             **kwargs
     ):
         """
@@ -101,10 +107,10 @@ class TrainArguments(
     :param self: Represent the instance of the class
     :param model_name: str: Specify the model name
     :param num_train_epochs: int: Set the number of epochs for training
-    :param model_id: Optional[str]: Load a pretrained model from the huggingface model hub
+    :param model_huggingface_repo_id: Optional[str]: Load a pretrained model from the huggingface model hub
     :param model_class: Optional[EasyDelFlaxPretrainedModel]: Pass a model class to the trainer
     :param total_batch_size: int: Set the batch size of the model
-    :param max_steps: Optional[int]: Set the maximum number of steps to train for
+    :param max_training_steps: Optional[int]: Set the maximum number of steps to train for
     :param optimizer: AVAILABLE_OPTIMIZERS: Specify the optimizer used to train the model
     :param scheduler: AVAILABLE_SCHEDULERS: Set the learning rate scheduler
     :param learning_rate: Union[int: Set the learning rate for the optimizer
@@ -113,7 +119,7 @@ class TrainArguments(
     :param gradient_accumulation_steps: int: Accumulate gradients over multiple batches
     :param weight_decay: float: Specify the weight decay to be used by the optimizer
     :param gradient_checkpointing: AVAILABLE_GRADIENT_CHECKPOINTS: Determine how to use gradient checkpointing
-    :param max_length: Optional[int]: Set the maximum length of the input sequence
+    :param max_sequence_length: Optional[int]: Set the maximum length of the input sequence
     :param sharding_array: Union[tuple,int]: Specify the mesh of devices to use for training
     :param is_fine_tuning: bool: Tell the model whether or not to initialize the weights of
     :param do_train: bool: Indicate whether to train the model or not
@@ -132,7 +138,7 @@ class TrainArguments(
     :param extra_configs: Optional[dict]: Pass extra configurations to the model class
     :param ids_to_pop_from_dataset: Optional[list]: Remove some of the ids from the dataset
     :param remove_ckpt_after_load: bool: Remove the checkpoint after loading it
-    :param configs_to_init_model_class: Optional[dict]: Pass extra configurations to the model class
+    :param configs_to_initialize_model_class: Optional[dict]: Pass extra configurations to the model class
     :param do_last_save: bool: Save the model after training is complete
     :param model_parameters: Optional[dict]: Pass the model parameters to the model class
     :param do_shard_fns: bool: Shard the model functions across devices
@@ -154,6 +160,8 @@ class TrainArguments(
     step 0 it will start from 20000 and leave the data behind
     :param verbose: bool: when ever to turn verbose mode of or on
     :param offload_device: jax.Device: device to be used to offload parameters on
+    :param rapture_config: Optional[EasyDeLXRaptureConfig]: LoRA Config for models
+    :param merge_lora_rapture_parameters: bool: whenever to merge lora parameters with original parameters before saving
     :param **kwargs: Pass keyword, variable-length argument list
     :return: Nothing
         """
@@ -164,31 +172,37 @@ class TrainArguments(
         if extra_optimizer_kwargs is None:
             extra_optimizer_kwargs = {}
 
-        if model_class is None and model_id is None:
+        if model_class is None and model_huggingface_repo_id is None:
             print(
                 termcolor.colored(
                     "Warning : ", color="red", force_color=True
                 ) + termcolor.colored(
-                    "You should at least pass model_class or model_id if you want to use CasualLanguageModel Trainer "
-                    "But in case that you want to use DPOTrainer you can ignore this warning", color="white",
+                    "You should at least pass model_class or model_huggingface_repo_id if you want to use "
+                    "CasualLanguageModel Trainer But in case that you want to use "
+                    "DPOTrainer you can ignore this warning", color="white",
                     force_color=True
                 )
             )
-        assert backend in AVAILABLE_BACKENDS, f"{backend} is not recognized, " \
-                                              f"available backends are {AVAILABLE_BACKENDS}"
+        assert backend in AVAILABLE_BACKENDS, (
+            f"{backend} is not recognized, "
+            f"available backends are {AVAILABLE_BACKENDS}"
+        )
 
         available_backends = len(jax.devices(backend))
+
         total_batch_size *= gradient_accumulation_steps
+
         array_devices = jnp.ones((available_backends, 1)).reshape(sharding_array)
+
         JaxDistributedConfig.initialize(jax_distributed_config)
 
         self.available_backends = available_backends
         self.array_devices_shape = array_devices.shape
-        self.model_id = model_id
+        self.model_huggingface_repo_id = model_huggingface_repo_id
         self.num_train_epochs = num_train_epochs
         self.wandb_entity = wandb_entity
         self.total_batch_size = total_batch_size
-        self.max_steps = max_steps
+        self.max_training_steps = max_training_steps
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.extra_optimizer_kwargs = extra_optimizer_kwargs
@@ -197,7 +211,7 @@ class TrainArguments(
         self.weight_decay = weight_decay
         self.model_name = model_name
         self.gradient_checkpointing = gradient_checkpointing
-        self.max_length = max_length
+        self.max_sequence_length = max_sequence_length
         self.sharding_array = sharding_array
         self.is_fine_tuning = is_fine_tuning
         self.do_train = do_train
@@ -216,7 +230,7 @@ class TrainArguments(
         self.ids_to_pop_from_dataset = ids_to_pop_from_dataset
         self.remove_ckpt_after_load = remove_ckpt_after_load
         self.model_class = model_class
-        self.configs_to_init_model_class = configs_to_init_model_class
+        self.configs_to_initialize_model_class = configs_to_initialize_model_class
         self.do_last_save = do_last_save
         self.model_parameters = model_parameters
         self.do_shard_fns = do_shard_fns
@@ -244,11 +258,22 @@ class TrainArguments(
             warmup_steps=self.warmup_steps,
             gradient_accumulation_steps=self.gradient_accumulation_steps,
             weight_decay=self.weight_decay,
-            steps=self.max_steps,
+            steps=self.max_training_steps,
         )
-        self.training_time = self._time_to_seconds(
-            training_time) if training_time is not None else None
+        self.training_time = self._time_to_seconds(training_time) if training_time is not None else None
         torch.set_default_device("cpu")
+        self.merge_lora_rapture_parameters = merge_lora_rapture_parameters
+        self.rapture = None
+        if rapture_config is not None:
+            print(
+                termcolor.colored("Warning : ", color="red", force_color=True),
+                termcolor.colored(
+                    "You are using LoRA (Low-Rank Adaptation of Large Language Models) and this feature is"
+                    "still in Beta mode so it might act unexpected", color="red", force_color=True
+                )
+            )
+            self.rapture = XRapTure(config=rapture_config)
+
         self.__dict__.update(**kwargs)
 
     @staticmethod

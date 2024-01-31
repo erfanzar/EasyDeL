@@ -177,7 +177,7 @@ class FlaxFalconAttention(nn.Module):
         cached_value = self.variable("cache", "cached_value", jnp.zeros, value.shape, value.dtype)
         cache_index = self.variable("cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32))
         if is_initialized:
-            *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
+            *batch_dims, max_sequence_length, num_heads, depth_per_head = cached_key.value.shape
             cur_index = cache_index.value
             indices = (0,) * len(batch_dims) + (cur_index, 0, 0)
             key = lax.dynamic_update_slice(cached_key.value, key, indices)
@@ -188,8 +188,8 @@ class FlaxFalconAttention(nn.Module):
             cache_index.value = cache_index.value + num_updated_cache_vectors
 
             pad_mask = jnp.broadcast_to(
-                jnp.arange(max_length) < cur_index + num_updated_cache_vectors,
-                tuple(batch_dims) + (1, num_updated_cache_vectors, max_length),
+                jnp.arange(max_sequence_length) < cur_index + num_updated_cache_vectors,
+                tuple(batch_dims) + (1, num_updated_cache_vectors, max_sequence_length),
             )
             attention_mask = combine_masks(pad_mask, attention_mask)
         return key, value, attention_mask

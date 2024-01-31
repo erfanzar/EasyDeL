@@ -402,7 +402,7 @@ _These are all the attributes in Config_
 10. prompt_postfix_chat
 11. chat_prefix
 12. contains_auto_format
-13. max_length
+13. max_sequence_length
 14. max_new_tokens
 15. max_compile_tokens
 16. temperature
@@ -516,7 +516,7 @@ def process_chat_history(self, history: typing.List):
     return message_history
 ```
 
-### max_length (int)
+### max_sequence_length (int)
 
 The maximum length of the instructions and chat messages.
 

@@ -9,7 +9,7 @@ class GradioUserInference:
     @staticmethod
     def chat_interface_components(
             sample_func: typing.Callable,
-            max_length: int,
+            max_sequence_length: int,
             max_new_tokens: int,
             max_compile_tokens: int
     ):
@@ -19,7 +19,7 @@ class GradioUserInference:
         and sliders for advanced options.
         """
 
-        _max_length = max_length
+        _max_length = max_sequence_length
         _max_new_tokens = max_new_tokens
         _max_compile_tokens = max_compile_tokens
 
@@ -57,7 +57,7 @@ class GradioUserInference:
                     container=False
                 )
 
-                max_length = gr.Slider(
+                max_sequence_length = gr.Slider(
                     value=_max_length,
                     maximum=10000,
                     minimum=1,
