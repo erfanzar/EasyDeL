@@ -12,8 +12,9 @@ Some of the key features provided by EasyDeL include:
 - Integration of flashAttention in JAX for GPUs and TPUs
 - Automatic serving of LLMs with mid and high-level APIs in both JAX and PyTorch
 - LLM Trainer and fine-tuner in JAX
-- RLHF (Reinforcement Learning from Human Feedback) in Jax
+- RLHF (Reinforcement Learning from Human Feedback) in Jax (Beta Stage)
 - And various other features to enhance the training process and optimize performance.
+- LoRA: Low-Rank Adaptation of Large Language Models (Beta Stage and will be available totally soon)
 
 > [!NOTE]
 > EasyDel Will only support JAX>=0.4.22 Due to miss computations being happened in older version and also not bein able
