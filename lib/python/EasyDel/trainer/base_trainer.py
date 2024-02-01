@@ -77,33 +77,54 @@ class BaseTrainer:
         :return: Nothing, it just initializes the class
 
         """
+        # Loggers
         self.timer = None
+        self.wandb_runtime: Run | RunDisabled | None = None
+
+        # Data
         self.dataloader_train = None
         self.dataloader_eval = None
-        self.model = None
-        self.lora_model = None
-        self.wandb_runtime: Run | RunDisabled | None = None
         self.max_training_steps = None
         self.max_evaluation_steps = None
+        self.dataset_train = dataset_train
+        self.dataset_eval = dataset_eval
+
+        # Model Related
+        self.model = None
         self.config = None
         self.scheduler = None
         self.tx = None
+
+        # LoRA Related
+        self.rapture = arguments.rapture
+        self.lora_parameters = None
+        self.lora_model = None
+        self.lora_tx = None
+        self.lora_opt_state = None
+        self.lora_apply_fn = None
+
+        # PJit functions
         self.create_sharded_state_from_params_function = None
         self.sharded_train_step_function = None
-        self.mesh = None
-        self.checkpoint_manager: fjformer.CheckpointManager | None = None
         self.initialize_state_function = None
+        self.mesh = None
+
+        # Checkpoint Managers
+        self.checkpoint_manager: fjformer.CheckpointManager | None = None
+
+        # EasyState
         self.state_shape = None
         self.state_partition_spec = None
         self.sharded_state = None
-        self.rapture = arguments.rapture
+
+        # Rest
+
         self.arguments = arguments
-        self.dataset_train = dataset_train
-        self.dataset_eval = dataset_eval
         self.finetune = finetune
         self.checkpoint_path = checkpoint_path
         self.dtype = arguments.dtype
         self.param_dtype = arguments.param_dtype
+
         if finetune:
             if checkpoint_path is None:
                 prefix_print(
@@ -176,14 +197,22 @@ class BaseTrainer:
         tx = model_configurations.tx
         scheduler = model_configurations.scheduler
         config = model_configurations.config
-
-        if self.rapture is not None:
-            from fjformer.xrapture import use_implicit_args
-            self.lora_model = use_implicit_args(model)
         self.model = model
         self.tx = tx
         self.scheduler = scheduler
         self.config = config
+        if self.rapture is not None:
+            lora_modules = self.rapture.apply_lora(
+                module=model,
+                parameters=self.arguments.rapture_config.parameters,
+                tx=tx,
+            )
+            self.lora_parameters = lora_modules.lora_parameters
+            self.lora_apply_fn = lora_modules.lora_module.__call__
+            self.lora_opt_state = lora_modules.lora_opt_state
+            self.lora_model = lora_modules.lora_module
+            self.lora_tx = lora_modules.lora_tx
+
         self.timer("configure Model ,Optimizer ,Scheduler and Config").stop()
         self.timer.log(["configure Model ,Optimizer ,Scheduler and Config"])
         self.timer("configure functions and sharding them").start()

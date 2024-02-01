@@ -17,6 +17,8 @@ io.py
 .Python
 build/
 develop-eggs/
+memory.prof.new
+memory.prof
 dist/
 downloads/
 eggs/

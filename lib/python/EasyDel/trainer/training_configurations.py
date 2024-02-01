@@ -28,13 +28,21 @@ from ..etils import (
 )
 from ..modules.easydel_modelling_utils import EasyDelFlaxPretrainedModel
 
+from jax.tree_util import PyTreeDef
+
 AVAILABLE_BACKENDS: List[str] = [
     "cpu", "gpu", "tpu", None
 ]
 
 
 class EasyDeLXRapTureConfig(XRapTureConfig):  # Don't Make user involved with FJFormer
-    ...
+    def __init__(
+            self,
+            parameters: PyTreeDef | dict,
+            **kwargs
+    ):
+        self.parameters = parameters
+        super().__init__(**kwargs)
 
 
 class TrainArguments(
@@ -264,6 +272,7 @@ class TrainArguments(
         torch.set_default_device("cpu")
         self.merge_lora_rapture_parameters = merge_lora_rapture_parameters
         self.rapture = None
+        self.rapture_config = None
         if rapture_config is not None:
             print(
                 termcolor.colored("Warning : ", color="red", force_color=True),
@@ -272,6 +281,7 @@ class TrainArguments(
                     "still in Beta mode so it might act unexpected", color="red", force_color=True
                 )
             )
+            self.rapture_config = rapture_config
             self.rapture = XRapTure(config=rapture_config)
 
         self.__dict__.update(**kwargs)
