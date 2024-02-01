@@ -206,28 +206,23 @@ class CausalLanguageModelTrainer(BaseTrainer):
             tx_init = copy.deepcopy(self.arguments.optimizer_kwargs)
 
             if self.rapture is not None:
-                lora_modules = self.rapture.apply_lora(
-                    module=self.model,
-                    parameters=parameters,
-                    tx=tx
-                )
-
-                lora_parameters = lora_modules.lora_parameters
-
+                lora_parameters = self.lora_parameters
                 if self.arguments.dtype == jnp.bfloat16:
                     lora_parameters = self.model.to_bf16(lora_parameters)
                 elif self.arguments.dtype == jnp.float16:
                     lora_parameters = self.model.to_fp16(lora_parameters)
 
-                return EasyDelState.load(
+                return EasyDelState(
+                    step=0,
+                    apply_fn=self.lora_apply_fn,
                     params=lora_parameters,
-                    opt_state=lora_modules.lora_opt_state,
-                    module_config_args=None,
-                    tx_init=tx_init,
-                    apply_fn=self.lora_model.__call__,
-                    module=self.lora_model,
+                    tx=self.lora_tx,
+                    opt_state=self.lora_opt_state,
+                    tx_init=EasyDelState.safe_dict(tx_init),
                     hyperparameters=EasyDelState.create_hyperparameters(self.model.config.model_type),
-                    module_config=None
+                    module=self.lora_model,
+                    module_config=self.model.config,
+                    module_config_args=None,
                 )
             else:
                 return EasyDelState.create(
@@ -242,17 +237,30 @@ class CausalLanguageModelTrainer(BaseTrainer):
                 )
 
         def create_state_from_params_function(parameters):
-
-            return EasyDelState.create(
-                tx=self.tx,
-                params=parameters,
-                apply_fn=self.model.__call__ if self.lora_model is None else self.lora_model.__call__,
-                module_config=copy.deepcopy(self.model.config) if self.lora_model is None else None,
-                tx_init=copy.deepcopy(self.arguments.optimizer_kwargs),
-                hyperparameters=EasyDelState.create_hyperparameters(self.model.config.model_type),
-                module=self.model if self.lora_model is None else self.lora_model,
-                module_config_args=None
-            )
+            if self.rapture is None:
+                return EasyDelState.create(
+                    tx=self.tx,
+                    params=parameters,
+                    apply_fn=self.model.__call__,
+                    module_config=copy.deepcopy(self.model.config),
+                    tx_init=copy.deepcopy(self.arguments.optimizer_kwargs),
+                    hyperparameters=EasyDelState.create_hyperparameters(self.model.config.model_type),
+                    module=self.model,
+                    module_config_args=None
+                )
+            else:
+                return EasyDelState(
+                    step=0,
+                    apply_fn=self.lora_apply_fn,
+                    params=parameters,
+                    tx=self.lora_tx,
+                    opt_state=self.lora_opt_state,
+                    tx_init=EasyDelState.safe_dict(copy.deepcopy(self.arguments.optimizer_kwargs)),
+                    hyperparameters=EasyDelState.create_hyperparameters(self.model.config.model_type),
+                    module=self.lora_model,
+                    module_config=self.model.config,
+                    module_config_args=None,
+                )
 
         state_shape = jax.eval_shape(initialize_state_function)
         state_partition_spec = match_partition_rules(
@@ -319,6 +327,14 @@ class CausalLanguageModelTrainer(BaseTrainer):
             model_parameters: Optional[flax.core.FrozenDict] = None,
             state: Optional[EasyDelState] = None,
     ) -> Tuple[EasyDelState, Mapping[str, Callable], Mapping[str, Callable]]:
+        if model_parameters is None and state is None and self.rapture is None:
+            raise RuntimeError(
+                "You are passing `model_parameters=None` and `state=None` and also you are not using LoRA if you are "
+                "Using LoRA make sure to pass parameters and Rapture Config correctly otherwise pass the "
+                "model_parameters or state."
+            )
+        if model_parameters is None and state is None:
+            model_parameters = self.lora_parameters
         with self.mesh:
             shard_fns, gather_fns = make_shard_and_gather_fns(
                 self.state_partition_spec,
@@ -373,19 +389,11 @@ class CausalLanguageModelTrainer(BaseTrainer):
                             "pass as type FrozenDict in case of not getting UnExcepted Errors "
                         )
 
-                    if self.rapture is not None:
-                        model_parameters = self.rapture.apply_lora(
-                            module=self.model,
-                            tx=self.tx,
-                            parameters=model_parameters
-                        ).lora_parameters
-
                     params = model_parameters if not self.arguments.do_shard_fns else jax.tree_util.tree_map(
                         lambda f, x: f(x),
                         shard_fns.params,
                         model_parameters,
                     )
-
                     sharded_state = self.create_sharded_state_from_params_function(params)
                 elif model_parameters is not None and self.checkpoint_path is not None:
                     raise EasyDelTimerError(

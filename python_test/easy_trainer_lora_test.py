@@ -18,7 +18,8 @@ def main():
     data_row_size = 1_000
     sequence_length = 128
     rab_config = EasyDeLXRapTureConfig(
-        64,
+        parameters={"params": params},
+        lora_dim=64,
         fully_fine_tune_parameters=["embed_tokens"],
         lora_fine_tune_parameters=["q_proj", "v_proj", "k_proj", "o_proj"],
         verbose=False
@@ -43,7 +44,7 @@ def main():
         arguments=TrainArguments(
             model_name="Lora-Test",
             num_train_epochs=100,
-            # rapture_config=rab_config,
+            rapture_config=rab_config,
             use_wandb=False,
             model_class=type(model),
             do_shard_fns=False,
@@ -55,14 +56,13 @@ def main():
                 "param_dtype": dtype
             },
             dtype=dtype,
-            param_dtype=dtype
+            param_dtype=dtype,
+            track_memory=False
         ),
         dataset_train=example_data,
     )
 
-    trainer.train(
-        model_parameters=FrozenDict({"params": params})
-    )
+    trainer.train()
 
 
 if __name__ == "__main__":
