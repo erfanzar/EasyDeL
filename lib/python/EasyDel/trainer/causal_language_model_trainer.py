@@ -1,6 +1,7 @@
 import copy
 import dataclasses
 import os
+import sys
 import time
 
 import IPython.display
@@ -210,13 +211,21 @@ class CausalLanguageModelTrainer(BaseTrainer):
                     parameters=parameters,
                     tx=tx
                 )
+
+                lora_parameters = lora_modules.lora_parameters
+
+                if self.arguments.dtype == jnp.bfloat16:
+                    lora_parameters = self.model.to_bf16(lora_parameters)
+                elif self.arguments.dtype == jnp.float16:
+                    lora_parameters = self.model.to_fp16(lora_parameters)
+
                 return EasyDelState.load(
-                    params=lora_modules.lora_parameters,
+                    params=lora_parameters,
                     opt_state=lora_modules.lora_opt_state,
                     module_config_args=None,
                     tx_init=tx_init,
-                    apply_fn=lora_modules.lora_module.__call__,
-                    module=lora_modules.lora_module,
+                    apply_fn=self.lora_model.__call__,
+                    module=self.lora_model,
                     hyperparameters=EasyDelState.create_hyperparameters(self.model.config.model_type),
                     module_config=None
                 )
@@ -233,36 +242,17 @@ class CausalLanguageModelTrainer(BaseTrainer):
                 )
 
         def create_state_from_params_function(parameters):
-            parameters = parameters
-            tx_init = copy.deepcopy(self.arguments.optimizer_kwargs)
-            tx = self.tx
-            if self.rapture is not None:
-                lora_modules = self.rapture.apply_lora(
-                    module=self.model,
-                    parameters=parameters,
-                    tx=tx
-                )
-                return EasyDelState.create(
-                    params=parameters,
-                    tx=lora_modules.lora_tx,
-                    module_config_args=None,
-                    tx_init=tx_init,
-                    apply_fn=lora_modules.lora_module.__call__,
-                    module=lora_modules.lora_module,
-                    hyperparameters=EasyDelState.create_hyperparameters(self.model.config.model_type),
-                    module_config=None
-                )
-            else:
-                return EasyDelState.create(
-                    tx=tx,
-                    params=parameters,
-                    apply_fn=self.model.__call__,
-                    module_config=copy.deepcopy(self.model.config),
-                    tx_init=tx_init,
-                    hyperparameters=EasyDelState.create_hyperparameters(self.model.config.model_type),
-                    module=self.model,
-                    module_config_args=None
-                )
+
+            return EasyDelState.create(
+                tx=self.tx,
+                params=parameters,
+                apply_fn=self.model.__call__ if self.lora_model is None else self.lora_model.__call__,
+                module_config=copy.deepcopy(self.model.config) if self.lora_model is None else None,
+                tx_init=copy.deepcopy(self.arguments.optimizer_kwargs),
+                hyperparameters=EasyDelState.create_hyperparameters(self.model.config.model_type),
+                module=self.model if self.lora_model is None else self.lora_model,
+                module_config_args=None
+            )
 
         state_shape = jax.eval_shape(initialize_state_function)
         state_partition_spec = match_partition_rules(
@@ -395,7 +385,8 @@ class CausalLanguageModelTrainer(BaseTrainer):
                         shard_fns.params,
                         model_parameters,
                     )
-                    sharded_state = self.create_sharded_state_from_params_function(model_parameters)
+
+                    sharded_state = self.create_sharded_state_from_params_function(params)
                 elif model_parameters is not None and self.checkpoint_path is not None:
                     raise EasyDelTimerError(
                         "You can't pass `model_parameters` and `checkpoint_path` at same time"
@@ -471,7 +462,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
                 color="red", force_color=True
             )
 
-        dir_prefix: str = "/dev/shm"
+        dir_prefix: str = "/dev/shm" if sys.platform != "win32" else "."
         if self.arguments.track_memory:
             initialise_tracking(dir_prefix=dir_prefix)
         start_time = time.time()

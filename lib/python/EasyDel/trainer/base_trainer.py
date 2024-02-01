@@ -81,6 +81,7 @@ class BaseTrainer:
         self.dataloader_train = None
         self.dataloader_eval = None
         self.model = None
+        self.lora_model = None
         self.wandb_runtime: Run | RunDisabled | None = None
         self.max_training_steps = None
         self.max_evaluation_steps = None
@@ -171,10 +172,18 @@ class BaseTrainer:
 
         self.timer("configure Model ,Optimizer ,Scheduler and Config").start()
         model_configurations = self.configure_model()
-        self.model = model_configurations.model
-        self.tx = model_configurations.tx
-        self.scheduler = model_configurations.scheduler
-        self.config = model_configurations.config
+        model = model_configurations.model
+        tx = model_configurations.tx
+        scheduler = model_configurations.scheduler
+        config = model_configurations.config
+
+        if self.rapture is not None:
+            from fjformer.xrapture import use_implicit_args
+            self.lora_model = use_implicit_args(model)
+        self.model = model
+        self.tx = tx
+        self.scheduler = scheduler
+        self.config = config
         self.timer("configure Model ,Optimizer ,Scheduler and Config").stop()
         self.timer.log(["configure Model ,Optimizer ,Scheduler and Config"])
         self.timer("configure functions and sharding them").start()
