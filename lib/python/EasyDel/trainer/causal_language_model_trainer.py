@@ -166,11 +166,11 @@ class CausalLanguageModelTrainer(BaseTrainer):
             for key in batch[0].keys():
                 if is_left_padded:
                     corrected_sequence = [
-                        jnp.array(f[key]).reshape(1, -1)[..., -max_sequence_length:] for f in batch
+                        jnp.array(f[key])[..., -max_sequence_length:] for f in batch
                     ]
                 else:
                     corrected_sequence = [
-                        jnp.array(f[key]).reshape(1, -1)[..., :max_sequence_length] for f in batch
+                        jnp.array(f[key])[..., :max_sequence_length] for f in batch
                     ]
                 results[key] = jnp.stack(corrected_sequence).reshape(
                     -1,
