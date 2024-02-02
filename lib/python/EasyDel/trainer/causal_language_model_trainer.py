@@ -389,7 +389,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
                             "pass as type FrozenDict in case of not getting UnExcepted Errors "
                         )
 
-                    sharded_state = self.create_sharded_state_from_params_function(params)
+                    sharded_state = self.create_sharded_state_from_params_function(model_parameters)
                 elif model_parameters is not None and self.checkpoint_path is not None:
                     raise EasyDelTimerError(
                         "You can't pass `model_parameters` and `checkpoint_path` at same time"
