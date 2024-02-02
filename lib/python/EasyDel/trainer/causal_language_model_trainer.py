@@ -155,13 +155,14 @@ class TrainerOutput:
 
 class CausalLanguageModelTrainer(BaseTrainer):
 
-    def create_collect_function(
+    def create_collate_function(
             self,
             max_sequence_length: int,
             is_left_padded: bool
     ) -> Callable:
         def collate_fn(batch):
             results = {}
+            corrected_sequence = None
             for key in batch[0].keys():
                 if is_left_padded:
                     corrected_sequence = [
