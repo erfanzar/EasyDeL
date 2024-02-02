@@ -387,7 +387,8 @@ class FlaxGPT2PreTrainedModel(EasyDelFlaxPretrainedModel):
         position_ids = jnp.broadcast_to(jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_shape)
         params_rng, dropout_rng = jax.random.split(rng)
         rngs = {"params": params_rng, "dropout": dropout_rng}
-
+        tie_word_embeddings = self.module.config.tie_word_embeddings
+        self.module.config.tie_word_embeddings = False
         if self.config.add_cross_attention:
             encoder_hidden_states = jnp.zeros(input_shape + (self.config.n_embd,))
             encoder_attention_mask = attention_mask
@@ -402,7 +403,7 @@ class FlaxGPT2PreTrainedModel(EasyDelFlaxPretrainedModel):
             )
         else:
             module_init_outputs = self.module.init(rngs, input_ids, attention_mask, position_ids, return_dict=False)
-
+        self.module.config.tie_word_embeddings = tie_word_embeddings
         random_params = module_init_outputs["params"]
 
         if params is not None:
