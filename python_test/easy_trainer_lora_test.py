@@ -20,7 +20,7 @@ def main():
     rab_config = EasyDeLXRapTureConfig(
         parameters={"params": params},
         lora_dim=64,
-        fully_fine_tune_parameters=["embed_tokens"],
+        fully_fine_tune_parameters=[],
         lora_fine_tune_parameters=["q_proj", "v_proj", "k_proj", "o_proj"],
         verbose=False
     )
@@ -37,14 +37,14 @@ def main():
             }
 
     example_data = Dataset.from_generator(data_generator, )
-    print(example_data)
     dtype = jnp.float32
-    print(len(example_data))
     trainer = CausalLanguageModelTrainer(
         arguments=TrainArguments(
             model_name="Lora-Test",
             num_train_epochs=100,
             rapture_config=rab_config,
+            total_batch_size=64,
+            gradient_accumulation_steps=4,
             use_wandb=False,
             model_class=type(model),
             do_shard_fns=False,
