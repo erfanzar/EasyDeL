@@ -610,6 +610,14 @@ class CausalLanguageModelTrainer(BaseTrainer):
                     force_color=True
                 )
             if self.arguments.merge_lora_rapture_parameters and self.rapture is not None:
+                print(
+                    termcolor.colored(
+                        "Info : ", color="red", force_color=True
+                    ),
+                    termcolor.colored(
+                        "Merging LoRA Parameters.", color="white", force_color=True
+                    )
+                )
                 sharded_state = sharded_state.replace(
                     params=self.rapture.merge_parameters(sharded_state.params)
                 )
@@ -621,6 +629,16 @@ class CausalLanguageModelTrainer(BaseTrainer):
                 checkpoint_manager=self.checkpoint_manager,
             )
             if self.arguments.save_steps is None and self.arguments.do_last_save:
+                shard_fns, gather_fns = make_shard_and_gather_fns(
+                    match_partition_rules(
+                        self.config.get_partition_rules(
+                            fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
+                        ) if self.arguments.custom_rule is None else self.arguments.custom_rule,
+                        jax.eval_shape(lambda: sharded_state)
+                    ),
+                    dtype_specs=self.dtype
+                )  # You have to re-init the new shard and gather functions in order to be able to skip LoRA weight
+                # crashing errors and saving errors
                 filename = self._save_state(
                     state=sharded_state,
                     gather_fns=gather_fns
