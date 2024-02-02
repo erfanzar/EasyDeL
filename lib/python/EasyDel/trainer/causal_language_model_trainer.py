@@ -389,7 +389,12 @@ class CausalLanguageModelTrainer(BaseTrainer):
                             "Model Parameters should be like FrozenDict({'params': params}) make sure to "
                             "pass as type FrozenDict in case of not getting UnExcepted Errors "
                         )
-
+                    if self.rapture is None:
+                        model_parameters = model_parameters if not self.arguments.do_shard_fns else jax.tree_util.tree_map(
+                            lambda f, x: f(x),
+                            shard_fns.params,
+                            model_parameters,
+                        )
                     sharded_state = self.create_sharded_state_from_params_function(model_parameters)
                 elif model_parameters is not None and self.checkpoint_path is not None:
                     raise EasyDelTimerError(
