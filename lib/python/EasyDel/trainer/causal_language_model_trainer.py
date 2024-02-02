@@ -599,7 +599,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
                     force_color=True
                 )
             if self.arguments.merge_lora_rapture_parameters and self.rapture is not None:
-                sharded_state.replace(
+                sharded_state = sharded_state.replace(
                     params=self.rapture.merge_parameters(sharded_state.params)
                 )
             output = TrainerOutput(
