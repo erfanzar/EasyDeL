@@ -99,5 +99,7 @@ class GPT2Config(EasyDelPretrainedConfig):
 
     def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
         return (
+            ("transformer/wte/embedding", jax.sharding.PartitionSpec("tp", ("fsdp", "sp"))),
+            ("transformer/lm_head", jax.sharding.PartitionSpec(("fsdp", "sp"), "tp")),
             (".*", jax.sharding.PartitionSpec(("fsdp", "sp"))),
         )
