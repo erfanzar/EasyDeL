@@ -227,7 +227,7 @@ class BaseTrainer:
         self.timer.log(["configure functions and sharding them"])
 
     @abstractmethod
-    def create_collect_function(
+    def create_collate_function(
             self,
             max_sequence_length: int,
             is_left_padded: bool
@@ -259,7 +259,7 @@ class BaseTrainer:
 
         dataloader_train = DataLoader(
             self.dataset_train,
-            collate_fn=self.create_collect_function(
+            collate_fn=self.create_collate_function(
                 max_sequence_length=self.arguments.max_sequence_length,
                 is_left_padded=self.arguments.is_left_padded
             ),
@@ -272,7 +272,7 @@ class BaseTrainer:
         if self.dataset_eval is not None and self.arguments.do_eval:
             dataloader_eval = DataLoader(
                 self.dataset_eval,
-                collate_fn=self.create_collect_function(
+                collate_fn=self.create_collate_function(
                     max_sequence_length=self.arguments.max_sequence_length,
                     is_left_padded=self.arguments.is_left_padded
                 ),
