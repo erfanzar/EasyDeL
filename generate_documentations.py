@@ -140,15 +140,19 @@ theme:
         ("install",): "Install.md",
         ("AvailableModels",): "AvailableModels.md",
         ("EasyBIT",): "Bits.md",
+        ("Examples", "EasyState"): "EasyStateExample.md",
+        ("Examples", "LoRA and Transfer Learning"): "LoRA-TransferLearningExample.md",
+        ("Examples", "Fine Tuning Example"): "FineTuningExample.md",
         ("Examples", "PytorchServer"): "PyTorchServer.md",
         ("Examples", "JAXServer"): "JAXServer.md",
         ("Examples", "DataProcessing"): "DataProcessing.md",
-        ("Examples", "TrainingExample"): "TrainingExample.md",
         ("Examples", "Falcon Models"): "Falcon.md",
         ("Examples", "Llama Models"): "Llama.md",
         ("Examples", "Llama2 Models"): "Llama2.md",
         ("Examples", "Mistral Models"): "Mistral.md",
         ("Examples", "MosaicMPT Models"): "MosaicMPT.md",
+        ("CONTRIBUTING",): "CONTRIBUTING.md"
+
     }
 
     cache = statics | cache

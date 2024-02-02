@@ -1,6 +1,6 @@
 # Installing EasyDeL
 
-EasyDeL uses FJFormer and JAX as main dependecies in order to run the scripts but there are some things that needs to be installed such as GO-lang to JAX specific platform installations, but you can simply install EasyDeL via pip:
+EasyDeL uses FJFormer and JAX as main dependencies in order to run the scripts but there are some things that needs to be installed such as GO-lang to JAX specific platform installations, but you can simply install EasyDeL via pip:
 
 ```
 pip install easydel
