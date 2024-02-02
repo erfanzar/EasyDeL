@@ -471,6 +471,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
             )
 
         dir_prefix: str = "/dev/shm" if sys.platform != "win32" else "."
+        checkpoint_path = "SAVING_SKIPPED"
         if self.arguments.track_memory:
             initialise_tracking(dir_prefix=dir_prefix)
         start_time = time.time()
@@ -577,13 +578,23 @@ class CausalLanguageModelTrainer(BaseTrainer):
                         else:
                             break
                         if self.arguments.save_steps is not None and current_step % self.arguments.save_steps == 0:
-                            filename = self._save_state(
-                                state=sharded_state,
-                                gather_fns=gather_fns,
-                                milestone=True
-                            )
-                            checkpoint_path = f"{str(self.arguments.get_path())}/{filename}"
-
+                            if self.rapture is None:
+                                filename = self._save_state(
+                                    state=sharded_state,
+                                    gather_fns=gather_fns,
+                                    milestone=True
+                                )
+                                checkpoint_path = f"{str(self.arguments.get_path())}/{filename}"
+                            else:
+                                print(
+                                    termcolor.colored(
+                                        "Info : ", color="red", force_color=True
+                                    ),
+                                    termcolor.colored(
+                                        "You can not use `save_steps` while using LoRA "
+                                        "right now. this action will be skipped", color="white", force_color=True
+                                    )
+                                )
             except KeyboardInterrupt:
                 termcolor.cprint(
                     "KeyboardInterrupt At training model Will return Current State of the Model with Parameters.",
