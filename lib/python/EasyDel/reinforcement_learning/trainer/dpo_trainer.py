@@ -55,7 +55,15 @@ def create_concatenated_forward(
             padding_value=padding_value,
         )
         len_chosen = batch["chosen_labels"].shape[0]
-
+        concatenated_batch["concatenated_input_ids"] = concatenated_batch["concatenated_input_ids"].reshape(
+            concatenated_batch["concatenated_input_ids"].shape[0], -1
+        )
+        concatenated_batch["concatenated_labels"] = concatenated_batch["concatenated_labels"].reshape(
+            concatenated_batch["concatenated_labels"].shape[0], -1
+        )
+        concatenated_batch["concatenated_attention_mask"] = concatenated_batch["concatenated_attention_mask"].reshape(
+            concatenated_batch["concatenated_attention_mask"].shape[0], -1
+        )
         model_kwargs = (
             {
                 "labels": concatenated_batch["concatenated_labels"],
@@ -64,7 +72,6 @@ def create_concatenated_forward(
             if is_encoder_decoder
             else {}
         )
-
         all_logits = apply_fn(
             concatenated_batch["concatenated_input_ids"],
             attention_mask=concatenated_batch["concatenated_attention_mask"],
@@ -212,7 +219,7 @@ def concatenated_inputs(
     return concatenated_batch
 
 
-def create_dpo_train_step(
+def create_dpo_train_function(
         concatenated_forward: Callable,
         ref_state: EasyDelState = None,
         beta: float = 0.1,
@@ -221,7 +228,7 @@ def create_dpo_train_step(
         reference_free: bool = False,
 ):
     """
-    The create_dpo_train_step function is a helper function that creates the DPO training step.
+    The create_dpo_train_function function is a helper function that creates the DPO training step.
 
     :param concatenated_forward: Callable: Define the forward pass of the model
     :param ref_state: EasyDelState: Specify the reference policy
@@ -489,6 +496,7 @@ class DPOTrainer:
             precompute_ref_log_probs: bool = False,
             model_init_kwarguments: Optional[Dict] = None,
             ref_model_init_kwarguments: Optional[Dict] = None,
+            reference_free: bool = False,
     ):
 
         """
@@ -573,6 +581,7 @@ class DPOTrainer:
         self.max_target_length = max_target_length
         self.tokenizer = tokenizer
         self.precompute_ref_log_probs = precompute_ref_log_probs
+        self.reference_free = reference_free
         self.is_encoder_decoder = False
         self._precomputed_train_ref_log_probs = False
         self._precomputed_eval_ref_log_probs = False
@@ -638,7 +647,10 @@ class DPOTrainer:
             "pin_memory": self.arguments.dataloader_pin_memory,
         }
 
-        return DataLoader(train_dataset, **dataloader_params)
+        return DataLoader(
+            train_dataset,
+            **dataloader_params
+        )
 
     def get_train_dataloader(
             self,
@@ -874,13 +886,23 @@ class DPOTrainer:
 
     def train(self):
         step = 0
+        train_function = create_dpo_train_function(
+            concatenated_forward=self.concatenated_forward,
+            ref_state=self.ref_model_state,
+            loss_type=self.loss_type,
+            reference_free=self.reference_free,
+            label_smoothing=self.label_smoothing,
+            beta=self.beta
+        )
         for epoch_index in range(self.arguments.num_train_epochs):
             for batch in self.get_train_dataloader():
                 step += 1
                 if self.arguments.step_start_point > step:
                     ...
                 else:
-                    ...
+                    self.model_state, mt = train_function(self.model_state, batch=batch)
+                    print(mt)
+                    break
 
     def eval(self):
         """

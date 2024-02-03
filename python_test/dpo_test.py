@@ -40,15 +40,15 @@ def main(argv):
             model_name="DPO_TEST"
         )
         state = EasyDelState.from_pretrained(
-            pretrained_model_name_or_path="gpt2"
+            pretrained_model_name_or_path="erfanzar/LLamaStory-70M"
         )
 
         ref_state = EasyDelState.from_pretrained(
-            pretrained_model_name_or_path="gpt2"
+            pretrained_model_name_or_path="erfanzar/LLamaStory-70M"
         )
 
         tokenizer = AutoTokenizer.from_pretrained(
-            "gpt2"
+            "erfanzar/LLamaStory-70M"
         )
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token

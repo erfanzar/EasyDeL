@@ -51,7 +51,7 @@ class DPODataCollatorWithPadding:
 
                     padded_batch[k] = pad_sequence(to_pad, batch_first=True, padding_value=padding_value)
                     if "prompt" in k:
-                        padded_batch[k] = padded_batch[k].flip(dims=[1])
+                        padded_batch[k] = jnp.flip(padded_batch[k], axis=[1])
             elif k.endswith("_logps"):
                 padded_batch[k] = jnp.array([ex[k] for ex in features])
             else:
