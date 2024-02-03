@@ -254,7 +254,7 @@ class TrainArguments(
         self.dataloader_num_workers = dataloader_num_workers
         self.dataloader_pin_memory = dataloader_pin_memory
         self.save_optimizer_state = save_optimizer_state
-        self.step_start_point = step_start_point
+        self.step_start_point = step_start_point if step_start_point is not None else 0
         self.verbose = verbose
         self.offload_device = offload_device
         self.optimizer_kwargs = dict(
