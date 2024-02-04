@@ -487,13 +487,13 @@ class FlaxQwen7BBlock(nn.Module):
         )
         self.ln_1 = Qwen7BRMSNorm(
             self.config.hidden_size,
-            eps=self.config.rms_norm_eps,
+            eps=self.config.layer_norm_epsilon,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
         )
         self.ln_2 = Qwen7BRMSNorm(
             self.config.hidden_size,
-            eps=self.config.rms_norm_eps,
+            eps=self.config.layer_norm_epsilon,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
 
@@ -612,7 +612,7 @@ class FlaxQwen7BPreTrainedModel(EasyDelFlaxPretrainedModel):
         :param dtype: jnp.dtype: Specify the data type of the input
         :param _do_init: bool: Control whether the module is initialized or not
         :param kwargs: Pass in any additional parameters that the module_class might need
-        :param : Specify the number of layers in the network
+        :param : Specify the number of h in the network
         :return: The super() of the class
 
         """
@@ -719,7 +719,7 @@ class FlaxQwen7BPreTrainedModel(EasyDelFlaxPretrainedModel):
         :param dropout_rng: jax.random.PRNGKey: Make sure that the dropout is applied in a random way
         :param train: bool: Determine whether to use dropout or not
         :param output_attentions: Optional[bool]: Determine whether to return the attention weights
-        :param output_hidden_states: Optional[bool]: Return the hidden states of all layers
+        :param output_hidden_states: Optional[bool]: Return the hidden states of all h
         :param return_dict: Optional[bool]: Determine whether to return a dictionary or not
         :param extra_embedding: Optional[Union[jnp.ndarray,None]]: Pass in the embedding for the input_ids
         :param add_params_field: bool: Add the params field to the inputs dictionary
@@ -734,7 +734,7 @@ class FlaxQwen7BPreTrainedModel(EasyDelFlaxPretrainedModel):
 
         batch_size, sequence_length = input_ids.shape
 
-        assert sequence_length <= self.config.max_position_embeddings, "Maximum Position Embedding Reached !"
+        assert sequence_length <= self.config.seq_length, "Maximum Position Embedding Reached !"
 
         if position_ids is None:
             if past_key_values is not None:
@@ -899,7 +899,7 @@ class FlaxQwen7BModule(nn.Module):
 
     def setup(self):
 
-        self.embed_tokens = nn.Embed(
+        self.wte = nn.Embed(
             self.config.vocab_size,
             self.config.hidden_size,
             embedding_init=jax.nn.initializers.normal(
@@ -908,38 +908,32 @@ class FlaxQwen7BModule(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
         )
-        self.dropout = nn.Dropout(rate=self.config.embd_pdrop)
-        self.layers = FlaxQwen7BBlockCollection(
+        self.drop = nn.Dropout(rate=self.config.emb_dropout_prob)
+        self.h = FlaxQwen7BBlockCollection(
             self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.norm = Qwen7BRMSNorm(
+        self.ln_f = Qwen7BRMSNorm(
             self.config.hidden_size,
-            eps=self.config.rms_norm_eps,
+            eps=self.config.layer_norm_epsilon,
             dtype=self.dtype,
             param_dtype=self.param_dtype
         )
         config = self.config
         self.causal_mask = make_causal_mask(
-            jnp.ones((1, config.max_position_embeddings))
+            jnp.ones((1, config.seq_length))
         )
 
         initial_rope_kwargs = dict(
             rope_type="none"
         )
-        if config.rope_scaling is not None:
-            scaling_type = config.rope_scaling["type"]
-            scaling_factor = config.rope_scaling["factor"]
-            initial_rope_kwargs = dict(
-                scaling_factor=scaling_factor,
-                rope_type=scaling_type
-            )
+
         self.freq_cis = precompute_freq_cis(
-            max_position_embeddings=config.max_position_embeddings,
+            max_position_embeddings=config.seq_length,
             dim=config.hidden_size // config.num_attention_heads,
-            base=config.rope_theta,
+            base=config.rotary_emb_base,
             **initial_rope_kwargs
         )
 
@@ -978,16 +972,17 @@ class FlaxQwen7BModule(nn.Module):
 
         """
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
+            inputs_embeds = self.wte(input_ids.astype("i4"))
 
         batch_size, sequence_length, _ = inputs_embeds.shape
 
-        assert sequence_length <= self.config.max_position_embeddings, "Maximum Position Embedding Reached !"
+        assert sequence_length <= self.config.seq_length, "Maximum Position Embedding Reached !"
         inputs_embeds = inputs_embeds + extra_embedding if extra_embedding is not None else inputs_embeds
-        hidden_states = self.dropout(
-            inputs_embeds, deterministic=deterministic)
+        hidden_states = self.drop(
+            inputs_embeds, deterministic=deterministic
+        )
 
-        outputs = self.layers(
+        outputs = self.h(
             hidden_states=hidden_states,
             freq_cis=self.freq_cis,
             attention_mask=attention_mask,
@@ -1001,7 +996,7 @@ class FlaxQwen7BModule(nn.Module):
         )
 
         hidden_states = outputs[0]
-        hidden_states = self.norm(hidden_states)
+        hidden_states = self.ln_f(hidden_states)
 
         if output_hidden_states:
             all_hidden_states = outputs[1] + (hidden_states,)
@@ -1023,10 +1018,10 @@ class FlaxQwen7BModel(FlaxQwen7BPreTrainedModel):
     module_class = FlaxQwen7BModule
 
     def set_input_embeddings(self, value):
-        self.module.embed_tokens = value
+        self.module.wte = value
 
     def get_input_embeddings(self):
-        return self.module.embed_tokens
+        return self.module.wte
 
 
 class FlaxQwen7BForCausalLMModule(nn.Module):
@@ -1105,7 +1100,7 @@ class FlaxQwen7BForCausalLMModule(nn.Module):
         hidden_states = outputs[0]
 
         if self.config.tie_word_embeddings:
-            shared_kernel = self.model.variables["params"]["embed_tokens"]["embedding"].T
+            shared_kernel = self.model.variables["params"]["wte"]["embedding"].T
             lm_logits = self.lm_head.apply(
                 {"params": {"kernel": shared_kernel}}, hidden_states)
         else:
@@ -1123,10 +1118,10 @@ class FlaxQwen7BForCausalLM(FlaxQwen7BPreTrainedModel):
     module_class = FlaxQwen7BForCausalLMModule
 
     def set_input_embeddings(self, value):
-        self.module.model.embed_tokens = value
+        self.module.model.wte = value
 
     def get_input_embeddings(self):
-        return self.module.model.embed_tokens
+        return self.module.model.wte
 
     def set_decoder(self, decoder):
         self.module.model = decoder
@@ -1228,7 +1223,7 @@ class FlaxQwen7BForSequenceClassificationModule(nn.Module):
         :param deterministic: bool: Control whether the model is run in deterministic or stochastic mode
         :param init_cache: bool: Initialize the cache for the transformer
         :param output_attentions: bool: Return the attention weights
-        :param output_hidden_states: bool: Return the hidden states of all layers
+        :param output_hidden_states: bool: Return the hidden states of all h
         :param return_dict: bool: Return a dictionary of outputs
         :param extra_embedding: Optional[Union[jnp.ndarray: Pass in the embedding of a new word
         :param None]]: Pass the extra embedding to the model

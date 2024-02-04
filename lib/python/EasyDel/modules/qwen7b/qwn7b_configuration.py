@@ -17,7 +17,7 @@ class Qwen7BConfig(EasyDelPretrainedConfig):
             attn_dropout_prob=0.0,
             layer_norm_epsilon=1e-6,
             initializer_range=0.02,
-            max_position_embeddings=8192,
+            seq_length=8192,
             scale_attn_weights=True,
             use_cache=True,
             kv_channels=128,
@@ -38,7 +38,7 @@ class Qwen7BConfig(EasyDelPretrainedConfig):
             **kwargs,
     ):
         self.vocab_size = vocab_size
-        self.max_position_embeddings = max_position_embeddings
+        self.seq_length = seq_length
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.scale_attn_weights = scale_attn_weights

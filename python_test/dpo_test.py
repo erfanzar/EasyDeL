@@ -12,7 +12,6 @@ def dpo_data():
     dataset = load_dataset(
         "HuggingFaceH4/ultrafeedback_binarized",
         split="test_prefs",
-        use_auth_token=True
     )
 
     original_columns: list[str] | dict[str, list[str]] = dataset.column_names
@@ -37,7 +36,8 @@ def main(argv):
     with jax.default_device(jax.devices("cpu")[0]):
         arguments = TrainArguments(
             num_train_epochs=4,
-            model_name="DPO_TEST"
+            model_name="DPO_TEST",
+            total_batch_size=1
         )
         state = EasyDelState.from_pretrained(
             pretrained_model_name_or_path="erfanzar/LLamaStory-70M"
@@ -60,7 +60,7 @@ def main(argv):
             train_dataset=dpo_data(),
             tokenizer=tokenizer,
             arguments=arguments,
-            max_length=512,
+            max_length=64,
             max_target_length=256,
             max_prompt_length=256
         )

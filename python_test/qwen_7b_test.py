@@ -24,14 +24,15 @@ def main():
     torch.manual_seed(42)
 
     torch_config = AutoConfig.from_pretrained(
-        "Qwen/Qwen-7B-Chat/",
+        "Qwen/Qwen-7B-Chat",
         trust_remote_code=True
     )
-    torch_config.hidden_size = 128
-    torch_config.intermediate_size = 256
+    torch_config.hidden_size = 256
+    torch_config.intermediate_size = 200
     torch_config.max_position_embeddings = 128
     torch_config.num_hidden_layers = 2
-    torch_config.num_attention_heads = 4
+    torch_config.num_attention_heads = 2
+    torch_config.cv_channels = 32
 
     torch_model = AutoModelForCausalLM.from_config(
         config=torch_config,
