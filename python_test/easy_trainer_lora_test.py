@@ -44,10 +44,10 @@ def main():
             num_train_epochs=100,
             rapture_config=rab_config,
             total_batch_size=64,
-            gradient_accumulation_steps=4,
+            gradient_accumulation_steps=2,
             use_wandb=False,
             model_class=type(model),
-            do_shard_fns=False,
+            do_shard_fns=True,
             max_sequence_length=sequence_length,
             configs_to_initialize_model_class={
                 "config": model.config,
