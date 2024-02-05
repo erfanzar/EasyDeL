@@ -2,6 +2,8 @@ import math
 from typing import Optional, Tuple, Union
 
 from einops import einops
+
+from einops import rearrange
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -12,45 +14,57 @@ from flax.linen import partitioning as nn_partitioning
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks, make_causal_mask
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput, FlaxSequenceClassifierOutput
-# EasyDel.modules
+
 from ..flax_modelling_utils import (
     with_sharding_constraint,
     get_gradient_checkpoint_policy,
-    repeat_kv_bnsh,
-    apply_rotary_pos_emb,
-    precompute_freq_cis,
     get_dot_general_by_bits
 )
-from ..easy_attention import AttentionOutput, EasyAttention
+from ..easy_attention import EasyAttention
 
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 import chex
 from .qwn7b_configuration import Qwen7BConfig
 
 
-class FlaxQwen7BEmbedding(nn.Module):
+def _rotate_half(x):
+    x = rearrange(x, "... (j d) -> ... j d", j=2)
+    x1, x2 = jnp.split(x, 2, -2)
+    return jnp.concatenate((-x2, x1), axis=-1)
+
+
+def apply_rotary_pos_emb(t: chex.Array, freqs):
+    rot_dim = freqs[0].shape[-1]
+    cos, sin = freqs
+    t_float = t.astype(jnp.float32)
+    t_rot, t_pass = t_float[..., :rot_dim], t_float[..., rot_dim:]
+    t_rot = (t_rot * cos) + (_rotate_half(t_rot) * sin)
+    return jnp.concatenate((t_rot, t_pass), axis=-1).astype(t.dtype)
+
+
+class FlaxQwen7BEmbeddingApplyer(nn.Module):
     dtype: jnp.dtype = jnp.float32
 
     def __call__(
             self,
             query: chex.Array,
             key: chex.Array,
-            freq_cis: chex.Array | None = None,
+            rotary_pos_emb_list: list[chex.Array] | None = None,
             position_ids: chex.Array | None = None,
     ):
-        if freq_cis is not None:
+        if rotary_pos_emb_list is not None:
             current_length = query.shape[1]
-            if len(freq_cis) == 1:
-                rotary_pos_emb = freq_cis[0]
+            if len(rotary_pos_emb_list) == 1:
+                rotary_pos_emb = rotary_pos_emb_list[0]
                 rotary_pos_emb = [i[:, -current_length:, :, :] for i in rotary_pos_emb]
                 rotary_pos_emb = (rotary_pos_emb,) * 2
                 q_pos_emb, k_pos_emb = rotary_pos_emb
-                query = apply_rotary_pos_emb(query, q_pos_emb[1], q_pos_emb[0])
-                key = apply_rotary_pos_emb(key, k_pos_emb[1], k_pos_emb[0])
+                query = apply_rotary_pos_emb(query, q_pos_emb)
+                key = apply_rotary_pos_emb(key, k_pos_emb)
             else:
                 query_list = []
                 key_list = []
-                for i, rotary_pos_emb in enumerate(freq_cis):
+                for i, rotary_pos_emb in enumerate(rotary_pos_emb_list):
                     rotary_pos_emb = [i[:, -current_length:, :, :] for i in rotary_pos_emb]
                     rotary_pos_emb = (rotary_pos_emb,) * 2
                     q_pos_emb, k_pos_emb = rotary_pos_emb
@@ -68,9 +82,62 @@ def repeat_kv(x: chex.Array, n_rep: int) -> chex.Array:
     x = x[:, :, jnp.newaxis, :, :]
     x = jnp.repeat(x, n_rep, axis=2)
 
-    return x.reshape(bs, s,
-                     n_kv_heads * n_rep,
-                     head_dim)
+    return x.reshape(
+        bs,
+        s,
+        n_kv_heads * n_rep,
+        head_dim
+    )
+
+
+class FlaxQwen7BRotaryEmbeddingInitiator(nn.Module):
+    dim: int
+    base: int | float = 10000
+
+    def setup(self):
+        dim = self.dim
+        base = self.base
+        inv_freq = 1.0 / (base ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim))
+        self.inv_freq = inv_freq
+
+        self.variable("rope_cache", "_rotary_pos_emb_cache", lambda: None)
+        self.variable("rope_cache", "_seq_len_cached", lambda: 0)
+        self.variable("rope_cache", "_ntk_alpha_cached", lambda: 1.0)
+        self.variable("rope_cache", "ntk_alpha_cached_list", lambda: jnp.array([1.0], dtype=jnp.float32))
+
+    @nn.compact
+    def update_rotary_pos_emb_cache(self, seqlen, ntk_alpha=1.0):
+        if (
+                seqlen > self.get_variable("rope_cache", "_seq_len_cached")
+        ) or (
+                ntk_alpha != self.get_variable("rope_cache", "_ntk_alpha_cached")
+        ):
+            base = self.base * ntk_alpha ** (self.dim / (self.dim - 2))
+            inv_freq = 1.0 / (
+                    base
+                    ** (
+                            jnp.arange(0, self.dim, 2, dtype=jnp.float32)
+                            / self.dim
+                    )
+            )
+            new_seq_len_cached = max(2 * seqlen, 16)
+            new_ntk_alpha_cached = ntk_alpha
+            self.put_variable("rope_cache", "_seq_len_cached", new_seq_len_cached)
+            self.put_variable("rope_cache", "_ntk_alpha_cached", new_ntk_alpha_cached)
+            seq = jnp.arange(new_seq_len_cached)
+            freqs = jnp.outer(seq.astype(inv_freq.dtype), inv_freq)
+
+            emb = jnp.concatenate([freqs, freqs], axis=-1)
+            emb = rearrange(emb, "n d -> 1 n 1 d")
+            self.put_variable("rope_cache", "_rotary_pos_emb_cache", [jnp.cos(emb), jnp.sin(emb)])
+
+    def set_ntk_alpha_cached_list(self, ntk_alpha_cached_list):
+        self.put_variable("rope_cache", "ntk_alpha_cached_list", ntk_alpha_cached_list)
+
+    def __call__(self, max_seq_len, ntk_alpha=1.0):
+        self.update_rotary_pos_emb_cache(max_seq_len, ntk_alpha)
+        cos, sin = self.get_variable("rope_cache", "_rotary_pos_emb_cache")
+        return [cos[:, :max_seq_len], sin[:, :max_seq_len]]
 
 
 class Qwen7BRMSNorm(nn.Module):
@@ -193,12 +260,12 @@ class FlaxQwen7BAttention(nn.Module):
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
         logn_list = [
-            math.log(i, self.seq_length) if i > self.seq_length else 1
+            math.log(i, self.config.seq_length) if i > self.config.seq_length else 1
             for i in range(1, 32768)
         ]
         logn_tensor = jnp.asarray(logn_list)[None, :, None, None]
         self.logn_tensor = logn_tensor
-        self.rotary = FlaxQwen7BEmbedding(self.dtype)
+        self.rotary = FlaxQwen7BEmbeddingApplyer(self.dtype)
         self.attention_performer = EasyAttention(
             attn_type="normal",
             block_k_major=self.config.block_k_major,
@@ -213,7 +280,7 @@ class FlaxQwen7BAttention(nn.Module):
             block_q_dq=self.config.block_q_dq,
             block_k_dq=self.config.block_k_dq,
             num_attention_heads=self.config.num_attention_heads,
-            attention_dropout=self.config.attention_dropout,
+            attention_dropout=self.config.attn_dropout_prob,
             head_dims=self.head_dim,
             attention_partition_spec=self.config.attention_partition_spec,
             use_shard_map=self.config.use_shard_map,
@@ -255,7 +322,8 @@ class FlaxQwen7BAttention(nn.Module):
         cached_value = self.variable(
             "cache", "cached_value", jnp.zeros, value.shape, value.dtype)
         cache_index = self.variable(
-            "cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32))
+            "cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32)
+        )
 
         if is_initialized:
             *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
@@ -289,10 +357,10 @@ class FlaxQwen7BAttention(nn.Module):
         """
         return jnp.transpose(query, (0, 2, 1, 3)), jnp.transpose(key, (0, 2, 1, 3)), jnp.transpose(value, (0, 2, 1, 3))
 
-    def apply_rotary(self, batch_size, sequence_length, query, key, value, freq_cis, position_ids):
+    def apply_rotary(self, batch_size, sequence_length, query, key, value, rotary_pos_emb_list, position_ids):
         """
         The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
-        The main difference is that it takes in an additional argument, freq_cis, which are used to calculate
+        The main difference is that it takes in an additional argument, rotary_pos_emb_list, which are used to calculate
         the rotary attention weights. The other differences are minor and mostly related to reshaping tensors.
 
         :param self: Access variables that belong to the class
@@ -301,7 +369,7 @@ class FlaxQwen7BAttention(nn.Module):
         :param query: Calculate the attention weights
         :param key: Calculate the attention
         :param value: Compute the attention weights
-        :param freq_cis: Calculate the frequency of each word in the vocabulary
+        :param rotary_pos_emb_list: Calculate the frequency of each word in the vocabulary
         :param position_ids: Identify the position of each token in the sequence
         :return: A tuple of 3 tensors: query, key and value
 
@@ -312,14 +380,14 @@ class FlaxQwen7BAttention(nn.Module):
 
         query, key, value = self._t(query, key, value)
         query, key = self.rotary(
-            position_ids=position_ids, query=query, key=key, freq_cis=freq_cis
+            position_ids=position_ids, query=query, key=key, rotary_pos_emb_list=rotary_pos_emb_list
         )
         return self._t(query, key, value)
 
     def __call__(
             self,
             hidden_states: chex.Array,
-            freq_cis: chex.Array,
+            rotary_pos_emb_list: list[chex.Array],
             attention_mask: chex.Array,
             position_ids: chex.Array,
             causal_mask: chex.Array,
@@ -338,7 +406,7 @@ class FlaxQwen7BAttention(nn.Module):
 
         :param self: Access variables that belong to the class
         :param hidden_states: chex.Array: Pass the hidden states of the previous layer
-        :param freq_cis: chex.Array: Pass in the frequency coefficients for each position
+        :param rotary_pos_emb_list: list[chex.Array]: Pass in the frequency coefficients for each position
         :param attention_mask: chex.Array: Mask out certain tokens in the input sequence
         :param position_ids: chex.Array: Determine the position of each token in a sequence
         :param causal_mask: chex.Array: Mask out the future tokens in the decoder
@@ -352,7 +420,7 @@ class FlaxQwen7BAttention(nn.Module):
         """
         batch_size, sequence_length = hidden_states.shape[:2]
         mixed_x_layer: chex.Array = self.c_attn(hidden_states)
-        query_state, key_state, value_state = jnp.split(mixed_x_layer, self.config.hidden_size, 2)
+        query_state, key_state, value_state = jnp.split(mixed_x_layer, 3, 2)
 
         if self.config.use_pjit_attention_force:
             query_state = with_sharding_constraint(query_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
@@ -368,7 +436,7 @@ class FlaxQwen7BAttention(nn.Module):
             key=key_state,
             value=value_state,
             position_ids=position_ids,
-            freq_cis=freq_cis,
+            rotary_pos_emb_list=rotary_pos_emb_list,
             batch_size=batch_size,
             sequence_length=sequence_length
         )
@@ -502,7 +570,7 @@ class FlaxQwen7BBlock(nn.Module):
     def __call__(
             self,
             hidden_states: chex.Array,
-            freq_cis: chex.Array,
+            rotary_pos_emb_list: list[chex.Array],
             attention_mask: chex.Array,
             position_ids: chex.Array,
             causal_mask: chex.Array,
@@ -521,7 +589,7 @@ class FlaxQwen7BBlock(nn.Module):
 
         :param self: Refer to the class instance itself
         :param hidden_states: chex.Array: Pass in the hidden state of the previous layer
-        :param freq_cis: chex.Array: Pass in the frequency information
+        :param rotary_pos_emb_list: list[chex.Array]: Pass in the frequency information
         :param attention_mask: chex.Array: Mask out the attention weights for padding tokens
         :param position_ids: chex.Array: Determine the position of each token in the sequence
         :param causal_mask: chex.Array: Mask the attention weights
@@ -533,18 +601,30 @@ class FlaxQwen7BBlock(nn.Module):
         :return: A tuple of two items
 
         """
+        # hidden_states: chex.Array
+        # rotary_pos_emb_list: list[chex.Array]
+        # attention_mask: chex.Array
+        # position_ids: chex.Array
+        # causal_mask: chex.Array
+        # deterministic: bool = True
+        # init_cache: bool = False
+        # output_attentions: bool = False
+        # encoder_hidden_states: Optional[chex.Array] = None
+        # encoder_attention_mask: Optional[chex.Array] = None
+        # fcm_mask = None
+
         attn_outputs = self.attn(
-            hidden_states=self.ln_1(hidden_states),
-            freq_cis=freq_cis,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            causal_mask=causal_mask,
-            deterministic=deterministic,
-            init_cache=init_cache,
-            output_attentions=output_attentions,
-            fcm_mask=fcm_mask,
-            encoder_attention_mask=encoder_attention_mask,
-            encoder_hidden_states=encoder_hidden_states,
+            self.ln_1(hidden_states),
+            rotary_pos_emb_list,
+            attention_mask,
+            position_ids,
+            causal_mask,
+            deterministic,
+            init_cache,
+            output_attentions,
+            encoder_attention_mask,
+            encoder_hidden_states,
+            fcm_mask,
         )
         attn_output = attn_outputs[0]
         hidden_states = hidden_states + attn_output
@@ -814,7 +894,7 @@ class FlaxQwen7BBlockCollection(nn.Module):
     def __call__(
             self,
             hidden_states: chex.Array,
-            freq_cis: chex.Array,
+            rotary_pos_emb_list: list[chex.Array],
             attention_mask: chex.Array,
             position_ids: chex.Array,
             causal_mask: chex.Array,
@@ -833,7 +913,7 @@ class FlaxQwen7BBlockCollection(nn.Module):
 
         :param self: Represent the instance of the class
         :param hidden_states: chex.Array: Pass the input tensor to the encoder
-        :param freq_cis: chex.Array: Pass in the frequency of each token
+        :param rotary_pos_emb_list: chex.Array: Pass in the frequency of each token
         :param attention_mask: chex.Array: Mask out certain tokens in the input sequence
         :param position_ids: chex.Array: Specify the position of each token in a sequence
         :param causal_mask: chex.Array: Mask the attention weights
@@ -872,7 +952,7 @@ class FlaxQwen7BBlockCollection(nn.Module):
 
             layer_outputs = block(
                 hidden_states=hidden_states,
-                freq_cis=freq_cis,
+                rotary_pos_emb_list=rotary_pos_emb_list,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 causal_mask=causal_mask,
@@ -922,19 +1002,20 @@ class FlaxQwen7BModule(nn.Module):
             param_dtype=self.param_dtype
         )
         config = self.config
+        if config.rotary_pct == 1.0:
+            self.rotary_ndims = None
+        else:
+            assert config.rotary_pct < 1
+            self.rotary_ndims = int(
+                config.kv_channels * config.rotary_pct
+            )
         self.causal_mask = make_causal_mask(
             jnp.ones((1, config.seq_length))
         )
 
-        initial_rope_kwargs = dict(
-            rope_type="none"
-        )
-
-        self.freq_cis = precompute_freq_cis(
-            max_position_embeddings=config.seq_length,
-            dim=config.hidden_size // config.num_attention_heads,
-            base=config.rotary_emb_base,
-            **initial_rope_kwargs
+        self.rotary_emb = FlaxQwen7BRotaryEmbeddingInitiator(
+            dim=self.rotary_ndims if self.rotary_ndims is not None else config.kv_channels,
+            base=self.config.rotary_emb_base
         )
 
     def __call__(
@@ -966,8 +1047,7 @@ class FlaxQwen7BModule(nn.Module):
         :param output_attentions: bool: Determine whether to return the attentions or not
         :param output_hidden_states: bool: Determine whether to return hidden states
         :param return_dict: bool: Return a dictionary of the output or not
-        :param extra_embedding: Optional[Union[jnp.ndarray: Pass in the embedding of the
-        :param None]]: Pass in the extra embedding
+        :param extra_embedding: Optional[Union[jnp.ndarray, None]]: Pass in the embedding of the
         :return: A tuple of:
 
         """
@@ -975,7 +1055,33 @@ class FlaxQwen7BModule(nn.Module):
             inputs_embeds = self.wte(input_ids.astype("i4"))
 
         batch_size, sequence_length, _ = inputs_embeds.shape
+        kv_seq_len = sequence_length
 
+        if self.h.blocks[0].attn.has_variable("cache", "cached_key"):
+            cache_index = self.h.blocks[0].attn.variable(
+                "cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32)
+            )
+            kv_seq_len += cache_index
+
+        if deterministic or not self.config.use_dynamic_ntk:
+            ntk_alpha_list = [1.0]
+        elif kv_seq_len != inputs_embeds.shape[1]:
+            ntk_alpha_list = self.rotary_emb._ntk_alpha_cached_list
+        else:
+            ntk_alpha_list = []
+            if attention_mask is not None and kv_seq_len > self.seq_length:
+                true_seq_lens = jnp.sum(attention_mask.reshape(batch_size, 1, 1, -1) == 0, axis=-1, dtype=jnp.float32)
+                for i in range(inputs_embeds.shape[0]):
+                    true_seq_len = true_seq_lens[i].item()
+                    ntk_alpha = self.get_ntk_alpha(true_seq_len)
+                    ntk_alpha_list.append(ntk_alpha)
+            else:
+                ntk_alpha = self.get_ntk_alpha(kv_seq_len)
+                ntk_alpha_list.append(ntk_alpha)
+        self.rotary_emb.set_ntk_alpha_cached_list(ntk_alpha_list)
+        rotary_pos_emb_list = [
+            self.rotary_emb(kv_seq_len, ntk_alpha=ntk_alpha) for ntk_alpha in ntk_alpha_list
+        ]
         assert sequence_length <= self.config.seq_length, "Maximum Position Embedding Reached !"
         inputs_embeds = inputs_embeds + extra_embedding if extra_embedding is not None else inputs_embeds
         hidden_states = self.drop(
@@ -984,7 +1090,7 @@ class FlaxQwen7BModule(nn.Module):
 
         outputs = self.h(
             hidden_states=hidden_states,
-            freq_cis=self.freq_cis,
+            rotary_pos_emb_list=rotary_pos_emb_list,
             attention_mask=attention_mask,
             position_ids=position_ids,
             causal_mask=self.causal_mask,
