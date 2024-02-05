@@ -32,7 +32,7 @@ def main():
     torch_config.max_position_embeddings = 128
     torch_config.num_hidden_layers = 2
     torch_config.num_attention_heads = 2
-    torch_config.cv_channels = 32
+    torch_config.cv_channels = 64
 
     torch_model = AutoModelForCausalLM.from_config(
         config=torch_config,
