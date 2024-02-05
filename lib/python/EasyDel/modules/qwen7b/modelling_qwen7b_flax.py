@@ -18,7 +18,7 @@ from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLM
 from ..flax_modelling_utils import (
     with_sharding_constraint,
     get_gradient_checkpoint_policy,
-    get_dot_general_by_bits
+    get_dot_general_by_bits, rotate_half
 )
 from ..easy_attention import EasyAttention
 
@@ -27,18 +27,12 @@ import chex
 from .qwn7b_configuration import Qwen7BConfig
 
 
-def _rotate_half(x):
-    x = rearrange(x, "... (j d) -> ... j d", j=2)
-    x1, x2 = jnp.split(x, 2, -2)
-    return jnp.concatenate((-x2, x1), axis=-1)
-
-
 def apply_rotary_pos_emb(t: chex.Array, freqs):
     rot_dim = freqs[0].shape[-1]
     cos, sin = freqs
     t_float = t.astype(jnp.float32)
     t_rot, t_pass = t_float[..., :rot_dim], t_float[..., rot_dim:]
-    t_rot = (t_rot * cos) + (_rotate_half(t_rot) * sin)
+    t_rot = (t_rot * cos) + (rotate_half(t_rot) * sin)
     return jnp.concatenate((t_rot, t_pass), axis=-1).astype(t.dtype)
 
 
@@ -505,10 +499,8 @@ class FlaxQwen7BAttention(nn.Module):
         attentions.attention_outputs = attentions.attention_outputs.transpose(0, 2, 1, 3)
 
         attn_output = self._merge_heads(attentions.attention_outputs)
-        attn_output = self.o_proj(attn_output)
+        attn_output = self.c_proj(attn_output)
 
-        attn_output = self.resid_dropout(
-            attn_output, deterministic=deterministic)
         outputs = (
             attn_output, attentions.attention_weights
         ) if output_attentions else (
@@ -768,6 +760,25 @@ class FlaxQwen7BPreTrainedModel(EasyDelFlaxPretrainedModel):
         )
         return init_variables["cache"]
 
+    def init_rope(self, batch_size, max_length):
+        """
+        The init_rope function is used to initialize the rope for a given batch size and sequence length.
+        The cache is a dictionary that contains all the intermediate states from each layer in the model.
+
+        :param self: Access the module
+        :param batch_size: Define the batch size of the input tensors
+        :param max_length: Set the length of the input sequence
+        """
+        input_ids = jnp.ones((batch_size, max_length))
+        attention_mask = jnp.ones_like(input_ids)
+        position_ids = jnp.broadcast_to(jnp.arange(
+            jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape)
+
+        init_variables = self.module.init(
+            jax.random.PRNGKey(0), input_ids, attention_mask, position_ids, return_dict=False, init_cache=True
+        )
+        return init_variables["rope_cache"]
+
     def __call__(
             self,
             input_ids: chex.Array,
@@ -775,11 +786,12 @@ class FlaxQwen7BPreTrainedModel(EasyDelFlaxPretrainedModel):
             position_ids: chex.Array = None,
             params: dict = None,
             past_key_values: dict = None,
+            past_rope_cache: chex.Array = None,
             dropout_rng: jax.random.PRNGKey = None,
             train: bool = False,
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
+            return_dict: Optional[bool] = True,
             extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
             add_params_field: bool = False,
             **kwargs
@@ -842,7 +854,14 @@ class FlaxQwen7BPreTrainedModel(EasyDelFlaxPretrainedModel):
             inputs["cache"] = past_key_values
             mutable = ["cache"]
         else:
-            mutable = False
+            mutable = []
+
+        if past_rope_cache is not None:
+            inputs["rope_cache"] = past_rope_cache
+        else:
+            inputs["rope_cache"] = self.init_rope(batch_size=batch_size, max_length=sequence_length)
+
+        mutable.append("rope_cache")
 
         outputs = self.module.apply(
             inputs,
@@ -858,6 +877,12 @@ class FlaxQwen7BPreTrainedModel(EasyDelFlaxPretrainedModel):
             rngs=rngs,
             mutable=mutable,
         )
+        if past_key_values is not None:
+            o, pkv, rope_cache = outputs
+            outputs = o, pkv
+        else:
+            o, rope_cache = outputs
+            outputs = o
 
         if past_key_values is not None and return_dict:
             outputs, past_key_values = outputs
@@ -865,9 +890,11 @@ class FlaxQwen7BPreTrainedModel(EasyDelFlaxPretrainedModel):
             return outputs
         elif past_key_values is not None and not return_dict:
             outputs, past_key_values = outputs
-            outputs = outputs[:1] + \
-                      (unfreeze(past_key_values["cache"]),) + outputs[1:]
-
+            outputs = outputs[:1] + (unfreeze(past_key_values["cache"]),) + outputs[1:]
+        if return_dict:
+            outputs["past_rope_cache"] = unfreeze(rope_cache["rope_cache"])
+        else:
+            outputs = outputs, unfreeze(rope_cache["rope_cache"])
         return outputs
 
 
@@ -1012,7 +1039,6 @@ class FlaxQwen7BModule(nn.Module):
         self.causal_mask = make_causal_mask(
             jnp.ones((1, config.seq_length))
         )
-
         self.rotary_emb = FlaxQwen7BRotaryEmbeddingInitiator(
             dim=self.rotary_ndims if self.rotary_ndims is not None else config.kv_channels,
             base=self.config.rotary_emb_base
@@ -1137,7 +1163,7 @@ class FlaxQwen7BForCausalLMModule(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self):
-        self.model = FlaxQwen7BModule(
+        self.transformer = FlaxQwen7BModule(
             self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -1191,7 +1217,7 @@ class FlaxQwen7BForCausalLMModule(nn.Module):
                 jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
                 (batch_size, seq_length)
             )
-        outputs = self.model(
+        outputs = self.transformer(
             input_ids,
             attention_mask,
             position_ids,

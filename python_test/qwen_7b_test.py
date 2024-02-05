@@ -27,6 +27,7 @@ def main():
         "Qwen/Qwen-7B-Chat",
         trust_remote_code=True
     )
+    sequence_length = 8
     torch_config.hidden_size = 256
     torch_config.intermediate_size = 200
     torch_config.max_position_embeddings = 128
@@ -48,7 +49,7 @@ def main():
         )
     }
 
-    np_random_input_ids = np.random.randint(0, torch_config.vocab_size, (1, 8))
+    np_random_input_ids = np.random.randint(0, torch_config.vocab_size, (1, sequence_length))
     input_ids = torch.from_numpy(np_random_input_ids).reshape(1, -1).to(torch.long)
     flax_input_ids = jnp.asarray(np_random_input_ids, dtype=jnp.int32).reshape(1, -1)
 
@@ -64,8 +65,9 @@ def main():
         dtype=jnp.float32,
         param_dtype=jnp.float32,
         _do_init=False,
-        input_shape=(1, 6)
+        input_shape=(1, sequence_length)
     )
+
     flax_output = flax_model(
         input_ids=flax_input_ids,
         params=params,
@@ -73,6 +75,7 @@ def main():
         train=False,
         return_dict=True
     )
+    print(flax_output)
     torch_output = torch_output.logits.cpu().detach().numpy()
     res = jnp.allclose(torch_output, flax_output.logits, atol=1e-5)
     print("PHI Huggingface Predictions :\n", torch_output,
