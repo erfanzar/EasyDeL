@@ -7,3 +7,5 @@ from .modelling_llama_flax import (
     FlaxLlamaModel,
     FlaxLlamaModule
 )
+
+__all__ = "FlaxLlamaModel", "FlaxLlamaForCausalLM", "FlaxLlamaForSequenceClassification", "LlamaConfig"

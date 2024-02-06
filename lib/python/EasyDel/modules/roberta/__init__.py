@@ -7,3 +7,12 @@ from .modelling_roberta_flax import (
     FlaxRobertaForSequenceClassification,
     FlaxRobertaForTokenClassification,
 )
+
+__all__ = (
+    "FlaxRobertaForSequenceClassification",
+    "FlaxRobertaForQuestionAnswering",
+    "FlaxRobertaForTokenClassification",
+    "FlaxRobertaForMultipleChoice",
+    "FlaxRobertaForCausalLM",
+    "RobertaConfig"
+)

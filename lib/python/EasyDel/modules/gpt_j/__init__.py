@@ -5,3 +5,5 @@ from .modelling_gpt_j_flax import (
     FlaxGPTJModel,
     FlaxGPTJModule,
 )
+
+__all__ = "FlaxGPTJModel", "FlaxGPTJForCausalLM", "GPTJConfig"

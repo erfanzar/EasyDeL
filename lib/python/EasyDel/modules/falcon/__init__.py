@@ -5,3 +5,5 @@ from .modelling_falcon_flax import (
     FlaxFalconModel,
     FlaxFalconModule,
 )
+
+__all__ = "FlaxFalconModel", "FlaxFalconForCausalLM", "FalconConfig"
