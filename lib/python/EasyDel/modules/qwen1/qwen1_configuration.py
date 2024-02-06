@@ -4,8 +4,8 @@ from jax.sharding import PartitionSpec
 from ..easydel_modelling_utils import EasyDelPretrainedConfig
 
 
-class Qwen7BConfig(EasyDelPretrainedConfig):
-    model_type = "qwen2"
+class Qwen1Config(EasyDelPretrainedConfig):
+    model_type = "qwen"
 
     def __init__(
             self,

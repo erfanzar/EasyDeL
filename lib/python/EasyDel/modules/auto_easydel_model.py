@@ -148,6 +148,15 @@ def get_modules_by_type(model_type: str) -> Tuple[
                     "k_layernorm"
                 ])
         )
+    if model_type == "qwen":
+        from .qwen1 import Qwen1Config as _Qwen1Config
+        from .qwen1 import FlaxQwenForCausalLM as _FlaxQwen1ForCausalLM
+        return (
+            _Qwen1Config,
+            _FlaxQwen1ForCausalLM,
+            functools.partial(huggingface_to_easydel, embedding_layer_names=["wte"])
+        )
+
     if model_type == "qwen2":
         from .qwen2 import Qwen2Config as _Qwen2Config
         from .qwen2 import FlaxQwen2ForCausalLM as _FlaxQwen2ForCausalLM
