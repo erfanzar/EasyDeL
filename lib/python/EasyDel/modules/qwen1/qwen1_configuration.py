@@ -35,6 +35,7 @@ class Qwen1Config(EasyDelPretrainedConfig):
             scan_mlp_chunk_size: int = 1024,
             bits: Optional[int] = None,
             scan_layers: bool = True,
+            init_rope_cache_auto: bool = False,
             **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -57,6 +58,7 @@ class Qwen1Config(EasyDelPretrainedConfig):
         self.scan_layers = scan_layers
         self.emb_dropout_prob = emb_dropout_prob
         self.attn_dropout_prob = attn_dropout_prob
+        self.init_rope_cache_auto = init_rope_cache_auto
         self.tie_word_embeddings = tie_word_embeddings
         self.gradient_checkpointing = gradient_checkpointing
         self.use_pjit_attention_force = use_pjit_attention_force
@@ -81,38 +83,39 @@ class Qwen1Config(EasyDelPretrainedConfig):
         """
         return (
 
-            ("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
+            ("model/wte/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
 
-            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("self_attn/o_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+            ("self_attn/c_attn/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+            ("self_attn/c_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
 
-            ("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-            ("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+            ("mlp/w1/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+            ("mlp/w2/kernel", PartitionSpec(("fsdp", "sp")), "tp"),
+            ("mlp/c_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
 
-            ("input_layernorm/kernel", PartitionSpec(None)),
-            ("post_attention_layernorm/kernel", PartitionSpec(None)),
+            ("ln_1/kernel", PartitionSpec(None)),
+            ("ln_2/kernel", PartitionSpec(None)),
 
-            ("model/norm/kernel", PartitionSpec(None)),
+            ("model/ln_f/kernel", PartitionSpec(None)),
             ("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
             (".*", PartitionSpec(None)),
         ) if not fully_sharded_data_parallel else (
 
-            ("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"))),
+            ("model/wte/embedding", PartitionSpec(("fsdp", "sp"))),
 
-            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+            ("self_attn/c_attn/kernel", PartitionSpec(("fsdp", "sp"))),
+            ("self_attn/c_proj/kernel", PartitionSpec(("fsdp", "sp"))),
 
-            ("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("mlp/down_proj/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+            ("mlp/w1/kernel", PartitionSpec(("fsdp", "sp"))),
+            ("mlp/w2/kernel", PartitionSpec(("fsdp", "sp"))),
+            ("mlp/c_proj/kernel", PartitionSpec(("fsdp", "sp"))),
 
-            ("input_layernorm/kernel", PartitionSpec(None)),
-            ("post_attention_layernorm/kernel", PartitionSpec(None)),
+            ("ln_1/kernel", PartitionSpec(None)),
+            ("ln_2/kernel", PartitionSpec(None)),
 
-            ("model/norm/kernel", PartitionSpec(None)),
+            ("model/ln_f/kernel", PartitionSpec(None)),
             ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
-            (".*", PartitionSpec(("fsdp", "sp"))),
+            (".*", PartitionSpec(None)),
+
         )
 
     def add_jax_args(
@@ -123,6 +126,7 @@ class Qwen1Config(EasyDelPretrainedConfig):
             scan_mlp_chunk_size: int = 1024,
             bits: Optional[int] = None,
             scan_layers: bool = True,
+            init_rope_cache_auto: bool = False,
             **kwargs,
     ):
         """
@@ -133,7 +137,7 @@ class Qwen1Config(EasyDelPretrainedConfig):
         :param use_pjit_attention_force: bool: Determine if the attention force is used
         :param use_sacn_mlp: bool: Determine whether to use the scan_mlp function or not
         :param scan_mlp_chunk_size: int: Set the chunk size for scan_mlp
-
+        :param init_rope_cache_auto: bool: Whether to use the rope_cache_auto in model
         :param bits: Optional[int]: Determine the number of bits used in the quantization
         :param scan_layers: bool: Determine whether to use scan layers or not
         :return: The following:
@@ -145,6 +149,7 @@ class Qwen1Config(EasyDelPretrainedConfig):
         self.use_sacn_mlp = use_sacn_mlp
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.bits = bits
+        self.init_rope_cache_auto = init_rope_cache_auto
 
     @staticmethod
     def get_weight_decay_exclusions():
