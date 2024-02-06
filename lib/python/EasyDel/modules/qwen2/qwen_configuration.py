@@ -109,7 +109,7 @@ class Qwen2Config(EasyDelPretrainedConfig):
             (".*", PartitionSpec(None)),
         ) if not fully_sharded_data_parallel else (
 
-            ("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"))),
+            ("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
 
             ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"))),
             ("self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"))),
@@ -122,7 +122,7 @@ class Qwen2Config(EasyDelPretrainedConfig):
             ("post_attention_layernorm/kernel", PartitionSpec(None)),
 
             ("model/norm/kernel", PartitionSpec(None)),
-            ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
+            ("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
             (".*", PartitionSpec(("fsdp", "sp"))),
         )
 
