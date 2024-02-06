@@ -84,54 +84,28 @@ def repeat_kv(x: chex.Array, n_rep: int) -> chex.Array:
     )
 
 
-class FlaxQwen1RotaryEmbeddingInitiator(nn.Module):
-    dim: int
-    base: int | float = 10000
-
-    def setup(self):
-        dim = self.dim
-        base = self.base
-        inv_freq = 1.0 / (base ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim))
-        self.inv_freq = inv_freq
-
-        self.variable("rope_cache", "_rotary_pos_emb_cache", lambda: None)
-        self.variable("rope_cache", "_seq_len_cached", lambda: 0)
-        self.variable("rope_cache", "_ntk_alpha_cached", lambda: 1.0)
-        self.variable("rope_cache", "ntk_alpha_cached_list", lambda: jnp.array([1.0], dtype=jnp.float32))
-
-    @nn.compact
-    def update_rotary_pos_emb_cache(self, seqlen, ntk_alpha=1.0):
-        if (
-                seqlen > self.get_variable("rope_cache", "_seq_len_cached")
-        ) or (
-                ntk_alpha != self.get_variable("rope_cache", "_ntk_alpha_cached")
-        ):
-            base = self.base * ntk_alpha ** (self.dim / (self.dim - 2))
-            inv_freq = 1.0 / (
-                    base
-                    ** (
-                            jnp.arange(0, self.dim, 2, dtype=jnp.float32)
-                            / self.dim
-                    )
+def compute_qwen1_rope(
+        dim: int,
+        seqlen,
+        base: int | float = 10000,
+        ntk_alpha=1
+):
+    base = base * ntk_alpha ** (dim / (dim - 2))
+    inv_freq = 1.0 / (
+            base
+            ** (
+                    jnp.arange(0, dim, 2, dtype=jnp.float32)
+                    / dim
             )
-            new_seq_len_cached = max(2 * seqlen, 16)
-            new_ntk_alpha_cached = ntk_alpha
-            self.put_variable("rope_cache", "_seq_len_cached", new_seq_len_cached)
-            self.put_variable("rope_cache", "_ntk_alpha_cached", new_ntk_alpha_cached)
-            seq = jnp.arange(new_seq_len_cached)
-            freqs = jnp.outer(seq.astype(inv_freq.dtype), inv_freq)
+    )
+    new_seq_len_cached = max(2 * seqlen, 16)
+    seq = jnp.arange(new_seq_len_cached)
+    freqs = jnp.outer(seq.astype(inv_freq.dtype), inv_freq)
 
-            emb = jnp.concatenate([freqs, freqs], axis=-1)
-            emb = rearrange(emb, "n d -> 1 n 1 d")
-            self.put_variable("rope_cache", "_rotary_pos_emb_cache", [jnp.cos(emb), jnp.sin(emb)])
+    emb = jnp.concatenate([freqs, freqs], axis=-1)
+    emb = rearrange(emb, "n d -> 1 n 1 d")
 
-    def set_ntk_alpha_cached_list(self, ntk_alpha_cached_list):
-        self.put_variable("rope_cache", "ntk_alpha_cached_list", ntk_alpha_cached_list)
-
-    def __call__(self, max_seq_len, ntk_alpha=1.0):
-        self.update_rotary_pos_emb_cache(max_seq_len, ntk_alpha)
-        cos, sin = self.get_variable("rope_cache", "_rotary_pos_emb_cache")
-        return [cos[:, :max_seq_len], sin[:, :max_seq_len]]
+    return jnp.cos(emb), jnp.sin(emb)
 
 
 class Qwen1RMSNorm(nn.Module):
@@ -754,24 +728,24 @@ class FlaxQwen1PreTrainedModel(EasyDelFlaxPretrainedModel):
         )
         return init_variables["cache"]
 
-    def init_rope(self, batch_size, max_length):
-        """
-        The init_rope function is used to initialize the rope for a given batch size and sequence length.
-        The cache is a dictionary that contains all the intermediate states from each layer in the model.
-
-        :param self: Access the module
-        :param batch_size: Define the batch size of the input tensors
-        :param max_length: Set the length of the input sequence
-        """
-        input_ids = jnp.ones((batch_size, max_length))
-        attention_mask = jnp.ones_like(input_ids)
-        position_ids = jnp.broadcast_to(jnp.arange(
-            jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape)
-
-        init_variables = self.module.init(
-            jax.random.PRNGKey(0), input_ids, attention_mask, position_ids, return_dict=False, init_cache=True
-        )
-        return init_variables["rope_cache"]
+    # def init_rope(self, batch_size, max_length):
+    #     """
+    #     The init_rope function is used to initialize the rope for a given batch size and sequence length.
+    #     The cache is a dictionary that contains all the intermediate states from each layer in the model.
+    #
+    #     :param self: Access the module
+    #     :param batch_size: Define the batch size of the input tensors
+    #     :param max_length: Set the length of the input sequence
+    #     """
+    #     input_ids = jnp.ones((batch_size, max_length))
+    #     attention_mask = jnp.ones_like(input_ids)
+    #     position_ids = jnp.broadcast_to(jnp.arange(
+    #         jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape)
+    #
+    #     init_variables = self.module.init(
+    #         jax.random.PRNGKey(0), input_ids, attention_mask, position_ids, return_dict=False, init_cache=True
+    #     )
+    #     return init_variables["rope_cache"]
 
     def __call__(
             self,
@@ -780,7 +754,7 @@ class FlaxQwen1PreTrainedModel(EasyDelFlaxPretrainedModel):
             position_ids: chex.Array = None,
             params: dict = None,
             past_key_values: dict = None,
-            past_rope_cache: chex.Array = None,
+            # past_rope_cache: dict = None,
             dropout_rng: jax.random.PRNGKey = None,
             train: bool = False,
             output_attentions: Optional[bool] = None,
@@ -843,20 +817,19 @@ class FlaxQwen1PreTrainedModel(EasyDelFlaxPretrainedModel):
         inputs = {
             "params": params or self.params
         } if add_params_field else params or self.params
-
+        mutable = False
         if past_key_values:
             inputs["cache"] = past_key_values
             mutable = ["cache"]
-        else:
-            mutable = []
 
-        if past_rope_cache is not None:
-            inputs["rope_cache"] = past_rope_cache
-        else:
-            inputs["rope_cache"] = self.init_rope(batch_size=batch_size, max_length=sequence_length)
-
-        mutable.append("rope_cache")
-
+        # if past_rope_cache is not None:
+        #     inputs["rope_cache"] = past_rope_cache
+        # elif self.config.init_rope_cache_auto:
+        #     inputs["rope_cache"] = self.init_rope(batch_size=batch_size, max_length=sequence_length)
+        # else:
+        #     raise ValueError(
+        #         "if you are setting `init_rope_cache_auto=False` you should pass `rope_cache` beside param"
+        #     )
         outputs = self.module.apply(
             inputs,
             jnp.array(input_ids, dtype="i4"),
@@ -871,12 +844,6 @@ class FlaxQwen1PreTrainedModel(EasyDelFlaxPretrainedModel):
             rngs=rngs,
             mutable=mutable,
         )
-        if past_key_values is not None:
-            o, pkv, rope_cache = outputs
-            outputs = o, pkv
-        else:
-            o, rope_cache = outputs
-            outputs = o
 
         if past_key_values is not None and return_dict:
             outputs, past_key_values = outputs
@@ -885,11 +852,46 @@ class FlaxQwen1PreTrainedModel(EasyDelFlaxPretrainedModel):
         elif past_key_values is not None and not return_dict:
             outputs, past_key_values = outputs
             outputs = outputs[:1] + (unfreeze(past_key_values["cache"]),) + outputs[1:]
-        if return_dict:
-            outputs["past_rope_cache"] = unfreeze(rope_cache["rope_cache"])
-        else:
-            outputs = outputs, unfreeze(rope_cache["rope_cache"])
+        # if return_dict:
+        #     outputs["past_rope_cache"] = unfreeze(rope_cache["rope_cache"])
+        # else:
+        #     outputs = outputs, unfreeze(rope_cache["rope_cache"])
         return outputs
+
+    def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[chex.Array] = None):
+        """
+        The prepare_inputs_for_generation function is used to prepare the inputs for a generation task.
+
+        :param self: Access variables that belong to the class
+        :param input_ids: Pass in the input tokens
+        :param max_length: Set the length of the sequence to be generated
+        :param attention_mask: Optional[chex.Array]: Mask the attention weights
+        :return: A dictionary of the past_key_values, attention_mask and position ids
+
+        """
+        batch_size, seq_length = input_ids.shape
+        extended_attention_mask = jnp.ones(
+            (batch_size, max_length), dtype="i4")
+        if attention_mask is not None:
+            position_ids = attention_mask.cumsum(axis=-1) - 1
+            extended_attention_mask = jax.lax.dynamic_update_slice(
+                extended_attention_mask, attention_mask, (0, 0))
+        else:
+            position_ids = jnp.broadcast_to(jnp.arange(seq_length, dtype="i4")[
+                                            None, :], (batch_size, seq_length))
+
+        return {
+            "past_key_values": self.init_cache(batch_size, max_length),
+            "attention_mask": extended_attention_mask,
+            "position_ids": position_ids,
+            # "past_rope_cache": self.init_rope(batch_size=batch_size, max_length=max_length)
+        }
+
+    def update_inputs_for_generation(self, model_outputs, model_kwargs):
+        model_kwargs["past_key_values"] = model_outputs.past_key_values
+        # model_kwargs["past_rope_cache"] = model_outputs.past_rope_cache
+        model_kwargs["position_ids"] = model_kwargs["position_ids"][:, -1:] + 1
+        return model_kwargs
 
 
 class FlaxQwen1BlockCollection(nn.Module):
@@ -1033,9 +1035,10 @@ class FlaxQwen1Module(nn.Module):
         self.causal_mask = make_causal_mask(
             jnp.ones((1, config.seq_length))
         )
-        self.rotary_emb = FlaxQwen1RotaryEmbeddingInitiator(
+        self.rope_cache = compute_qwen1_rope(
             dim=self.rotary_ndims if self.rotary_ndims is not None else config.kv_channels,
-            base=self.config.rotary_emb_base
+            base=self.config.rotary_emb_base,
+            seqlen=self.config.seq_length
         )
 
     def __call__(
@@ -1078,30 +1081,28 @@ class FlaxQwen1Module(nn.Module):
         kv_seq_len = sequence_length
 
         if self.h.blocks[0].attn.has_variable("cache", "cached_key"):
-            cache_index = self.h.blocks[0].attn.variable(
+            cache_index = self.h.blocks[0].attn.get_variable(
                 "cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32)
             )
             kv_seq_len += cache_index
 
-        if deterministic or not self.config.use_dynamic_ntk:
-            ntk_alpha_list = [1.0]
-        elif kv_seq_len != inputs_embeds.shape[1]:
-            ntk_alpha_list = self.rotary_emb._ntk_alpha_cached_list
-        else:
-            ntk_alpha_list = []
-            if attention_mask is not None and kv_seq_len > self.seq_length:
-                true_seq_lens = jnp.sum(attention_mask.reshape(batch_size, 1, 1, -1) == 0, axis=-1, dtype=jnp.float32)
-                for i in range(inputs_embeds.shape[0]):
-                    true_seq_len = true_seq_lens[i].item()
-                    ntk_alpha = self.get_ntk_alpha(true_seq_len)
-                    ntk_alpha_list.append(ntk_alpha)
-            else:
-                ntk_alpha = self.get_ntk_alpha(kv_seq_len)
-                ntk_alpha_list.append(ntk_alpha)
-        self.rotary_emb.set_ntk_alpha_cached_list(ntk_alpha_list)
-        rotary_pos_emb_list = [
-            self.rotary_emb(kv_seq_len, ntk_alpha=ntk_alpha) for ntk_alpha in ntk_alpha_list
-        ]
+        # if deterministic or not self.config.use_dynamic_ntk:
+        #     ntk_alpha_list = [1.0]
+        # elif kv_seq_len != inputs_embeds.shape[1]:
+        #     ntk_alpha_list = self.rotary_emb._ntk_alpha_cached_list
+        # else:
+        #     ntk_alpha_list = []
+        #     if attention_mask is not None and kv_seq_len > self.seq_length:
+        #         true_seq_lens = jnp.sum(attention_mask.reshape(batch_size, 1, 1, -1) == 0, axis=-1, dtype=jnp.float32)
+        #         for i in range(inputs_embeds.shape[0]):
+        #             true_seq_len = true_seq_lens[i].item()
+        #             ntk_alpha = self.get_ntk_alpha(true_seq_len)
+        #             ntk_alpha_list.append(ntk_alpha)
+        #     else:
+        #         ntk_alpha = self.get_ntk_alpha(kv_seq_len)
+        #         ntk_alpha_list.append(ntk_alpha)
+        # self.rotary_emb.set_ntk_alpha_cached_list(ntk_alpha_list)
+        # rotary_pos_emb_list = []
         assert sequence_length <= self.config.seq_length, "Maximum Position Embedding Reached !"
         inputs_embeds = inputs_embeds + extra_embedding if extra_embedding is not None else inputs_embeds
         hidden_states = self.drop(
@@ -1110,7 +1111,7 @@ class FlaxQwen1Module(nn.Module):
 
         outputs = self.h(
             hidden_states=hidden_states,
-            rotary_pos_emb_list=rotary_pos_emb_list,
+            rotary_pos_emb_list=[self.rope_cache],
             attention_mask=attention_mask,
             position_ids=position_ids,
             causal_mask=self.causal_mask,
@@ -1260,41 +1261,6 @@ class FlaxQwen1ForCausalLM(FlaxQwen1PreTrainedModel):
 
     def set_output_embeddings(self, new_embeddings):
         self.module.lm_head = new_embeddings
-
-    def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[chex.Array] = None):
-        """
-        The prepare_inputs_for_generation function is used to prepare the inputs for a generation task.
-
-        :param self: Access variables that belong to the class
-        :param input_ids: Pass in the input tokens
-        :param max_length: Set the length of the sequence to be generated
-        :param attention_mask: Optional[chex.Array]: Mask the attention weights
-        :return: A dictionary of the past_key_values, attention_mask and position ids
-
-        """
-        batch_size, seq_length = input_ids.shape
-
-        past_key_values = self.init_cache(batch_size, max_length)
-        extended_attention_mask = jnp.ones(
-            (batch_size, max_length), dtype="i4")
-        if attention_mask is not None:
-            position_ids = attention_mask.cumsum(axis=-1) - 1
-            extended_attention_mask = lax.dynamic_update_slice(
-                extended_attention_mask, attention_mask, (0, 0))
-        else:
-            position_ids = jnp.broadcast_to(jnp.arange(seq_length, dtype="i4")[
-                                            None, :], (batch_size, seq_length))
-
-        return {
-            "past_key_values": past_key_values,
-            "attention_mask": extended_attention_mask,
-            "position_ids": position_ids,
-        }
-
-    def update_inputs_for_generation(self, model_outputs, model_kwargs):
-        model_kwargs["past_key_values"] = model_outputs.past_key_values
-        model_kwargs["position_ids"] = model_kwargs["position_ids"][:, -1:] + 1
-        return model_kwargs
 
 
 class FlaxQwen1ForSequenceClassificationModule(nn.Module):

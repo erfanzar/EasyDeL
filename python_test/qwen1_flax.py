@@ -72,7 +72,7 @@ def main():
         train=False,
         return_dict=True
     )
-
+    print(flax_output)
     torch_output = torch_output.logits.cpu().detach().numpy()
     res = jnp.allclose(torch_output, flax_output.logits, atol=1e-5)
     print("Qwen 1 Huggingface Predictions :\n", torch_output,
