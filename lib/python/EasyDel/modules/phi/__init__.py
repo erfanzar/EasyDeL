@@ -5,3 +5,5 @@ from .modelling_phi_flax import (
     FlaxPhiModel,
     FlaxPhiModule
 )
+
+__all__ = "FlaxPhiModel", "FlaxPhiForCausalLMModule", "FlaxPhiForCausalLM", "PhiConfig"

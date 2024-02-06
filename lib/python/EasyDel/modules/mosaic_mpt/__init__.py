@@ -5,3 +5,5 @@ from .modelling_mpt_flax import (
     FlaxMptModel,
     FlaxMptModule
 )
+
+__all__ = "FlaxMptModel", "FlaxMptForCausalLM", "MptConfig"

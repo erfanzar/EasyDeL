@@ -5,3 +5,5 @@ from .modelling_palm_flax import (
     FlaxPalmModel,
     FlaxPalmModule
 )
+
+__all__ = "PalmConfig", "FlaxPalmForCausalLM", "FlaxPalmModel"

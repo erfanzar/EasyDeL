@@ -5,3 +5,5 @@ from .modelling_gpt_neo_x_flax import (
     FlaxGPTNeoXModel,
     FlaxGPTNeoXModule
 )
+
+__all__ = "FlaxGPTNeoXModel", "FlaxGPTNeoXForCausalLM", "GPTNeoXConfig"
