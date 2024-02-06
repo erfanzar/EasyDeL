@@ -489,8 +489,8 @@ class CausalLanguageModelTrainer(BaseTrainer):
         with self.mesh:
             pbar = tqdm(total=self.max_training_steps)
             current_step = sharded_state.step.tolist()
-            losses = []
-            accuracies = []
+            loss_sum = None
+            accuracy_sum = None
             pbar.update(sharded_state.step.tolist())
             learning_rates = []
             if self.wandb_runtime is not None:
@@ -525,15 +525,14 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                 batch
                             )
                             ttl_time = time.time() - time_s
-                            losses.append(loss)
+                            loss_sum = loss.tolist() if loss_sum is None else loss_sum + loss
+                            accuracy_sum = accuracy.tolist() if accuracy_sum is None else accuracy_sum + accuracy
                             learning_rates.append(self.scheduler(current_step).tolist())
-                            accuracies.append(accuracy)
                             if self.arguments.track_memory:
                                 mem_res = get_mem(dir_prefix=dir_prefix)
                             else:
                                 mem_res = "Tracking Option is OFF"
                             pbar.update(1)
-
                             if self.wandb_runtime is not None:
                                 trained_tokens = (
                                         current_step * self.arguments.total_batch_size *
@@ -550,9 +549,9 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                     self.wandb_runtime.log(
                                         {
                                             "loss": loss.tolist(),
-                                            "mean loss": (sum(losses) / len(losses)).tolist(),
+                                            "mean loss": loss_sum / (current_step - self.arguments.step_start_point),
                                             "accuracy": accuracy.tolist(),
-                                            "mean accuracy": (sum(accuracies) / len(accuracies)).tolist(),
+                                            "mean accuracy": accuracy_sum / (current_step - self.arguments.step_start_point),
                                             "learning_rate": self.scheduler(
                                                 sharded_state.step.tolist()
                                             ).tolist(),
