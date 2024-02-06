@@ -105,6 +105,7 @@ class TrainArguments(
             offload_device: jax.Device = jax.devices("cpu")[0],
             rapture_config: Optional[EasyDeLXRapTureConfig] = None,
             merge_lora_rapture_parameters: bool = True,
+            state_apply_fn_kwarguments_to_model: Optional[dict] = None,
             **kwargs
     ):
         """
@@ -170,6 +171,8 @@ class TrainArguments(
     :param offload_device: jax.Device: device to be used to offload parameters on
     :param rapture_config: Optional[EasyDeLXRaptureConfig]: LoRA Config for models
     :param merge_lora_rapture_parameters: bool: whenever to merge lora parameters with original parameters before saving
+    :param state_apply_fn_kwarguments_to_model: Optional[dict]: state_apply_fn_kwarguments_to_model is a dictionary that
+    be used to apply the parameters and extra things that you want to deliver to model.
     :param **kwargs: Pass keyword, variable-length argument list
     :return: Nothing
         """
@@ -273,6 +276,9 @@ class TrainArguments(
         self.merge_lora_rapture_parameters = merge_lora_rapture_parameters
         self.rapture = None
         self.rapture_config = None
+        self.state_apply_fn_kwarguments_to_model = (
+            state_apply_fn_kwarguments_to_model
+        ) if state_apply_fn_kwarguments_to_model is not None else {}
         if rapture_config is not None:
             print(
                 termcolor.colored("Warning : ", color="red", force_color=True),

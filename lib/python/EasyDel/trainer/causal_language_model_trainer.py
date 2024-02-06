@@ -1,5 +1,6 @@
 import copy
 import dataclasses
+import functools
 import os
 import sys
 import time
@@ -72,8 +73,11 @@ def create_casual_language_model_train_step(partition_spec=PartitionSpec(("dp", 
 
         def calculate_loss(params):
             labels = batch.pop("labels")
-            logits = state.apply_fn(params=params, **batch,
-                                    return_dict=True).logits
+            logits = state.apply_fn(
+                params=params,
+                **batch,
+                return_dict=True
+            ).logits
 
             loss, accuracy = cross_entropy_loss_and_accuracy(
                 logits[:, :-1, :], labels, batch["attention_mask"].astype(jnp.float32)[:, 1:]
@@ -479,6 +483,13 @@ class CausalLanguageModelTrainer(BaseTrainer):
         sharded_state, shard_fns, gather_fns = self.initialize_state(
             model_parameters=model_parameters,
             state=state
+        )
+
+        sharded_state = sharded_state.replace(
+            apply_fn=functools.partial(
+                sharded_state.apply_fn,
+                **self.arguments.state_apply_fn_kwarguments_to_model
+            )
         )
         count_model_parameters(sharded_state.params)
         with self.mesh:
