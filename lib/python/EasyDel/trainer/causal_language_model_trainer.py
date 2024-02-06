@@ -485,12 +485,6 @@ class CausalLanguageModelTrainer(BaseTrainer):
             state=state
         )
 
-        sharded_state = sharded_state.replace(
-            apply_fn=functools.partial(
-                sharded_state.apply_fn,
-                **self.arguments.state_apply_fn_kwarguments_to_model
-            )
-        )
         count_model_parameters(sharded_state.params)
         with self.mesh:
             pbar = tqdm(total=self.max_training_steps)
@@ -523,7 +517,6 @@ class CausalLanguageModelTrainer(BaseTrainer):
                         elif current_step < self.max_training_steps:
 
                             batch["labels"] = batch["input_ids"][..., 1:]
-
                             for ssb in self.arguments.ids_to_pop_from_dataset:
                                 _ = batch.pop(ssb, None)
                             time_s = time.time()

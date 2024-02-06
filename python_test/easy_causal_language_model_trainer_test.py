@@ -2,21 +2,35 @@ import os
 
 import flax.core
 
+from EasyDel import Qwen2Config
+
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 
 from lib.python.EasyDel import (
     CausalLanguageModelTrainer,
     AutoEasyDelModelForCausalLM,
-    TrainArguments
+    TrainArguments,
+    FlaxQwen2ForCausalLM
 )
 from jax import numpy as jnp, random
 from datasets import Dataset
 
 
 def main():
-    model, params = AutoEasyDelModelForCausalLM.from_pretrained('gpt2')
-    data_row_size = 100
     sequence_length = 128
+    data_row_size = 100
+    config = Qwen2Config(
+        hidden_size=128,
+        num_attention_heads=8,
+        num_key_value_heads=4,
+        num_hidden_layers=4,
+        intermediate_size=256,
+        gradient_checkpointing="",
+        max_position_embeddings=sequence_length,
+    )
+
+    model = FlaxQwen2ForCausalLM(config=config, _do_init=True)
+    params = model.params
 
     def data_generator():
         for i in range(data_row_size):
@@ -33,7 +47,7 @@ def main():
     dtype = jnp.float32
     trainer = CausalLanguageModelTrainer(
         arguments=TrainArguments(
-            model_name="Lora-Test",
+            model_name="Qwen2Test",
             num_train_epochs=100,
             total_batch_size=1,
             gradient_accumulation_steps=1,
