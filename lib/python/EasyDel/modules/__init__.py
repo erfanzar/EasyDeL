@@ -65,6 +65,12 @@ from .phi import (
     PhiConfig as PhiConfig,
     FlaxPhiModel as FlaxPhiModel
 )
+from .qwen1 import (
+    FlaxQwen1Model as FlaxQwen1Model,
+    FlaxQwen1ForCausalLM as FlaxQwen1ForCausalLM,
+    FlaxQwen1ForSequenceClassification as FlaxQwen1ForSequenceClassification,
+    Qwen1Config as Qwen1Config
+)
 
 from .qwen2 import (
     FlaxQwen2Model as FlaxQwen2Model,

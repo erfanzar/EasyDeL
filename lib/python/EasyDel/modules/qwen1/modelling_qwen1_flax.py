@@ -24,7 +24,7 @@ from ..easy_attention import EasyAttention
 
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 import chex
-from .qwn7b_configuration import Qwen7BConfig
+from .qwen1_configuration import Qwen1Config
 
 
 def apply_rotary_pos_emb(t: chex.Array, freqs):
@@ -36,7 +36,7 @@ def apply_rotary_pos_emb(t: chex.Array, freqs):
     return jnp.concatenate((t_rot, t_pass), axis=-1).astype(t.dtype)
 
 
-class FlaxQwen7BEmbeddingApplyer(nn.Module):
+class FlaxQwen1EmbeddingApplyer(nn.Module):
     dtype: jnp.dtype = jnp.float32
 
     def __call__(
@@ -84,7 +84,7 @@ def repeat_kv(x: chex.Array, n_rep: int) -> chex.Array:
     )
 
 
-class FlaxQwen7BRotaryEmbeddingInitiator(nn.Module):
+class FlaxQwen1RotaryEmbeddingInitiator(nn.Module):
     dim: int
     base: int | float = 10000
 
@@ -134,7 +134,7 @@ class FlaxQwen7BRotaryEmbeddingInitiator(nn.Module):
         return [cos[:, :max_seq_len], sin[:, :max_seq_len]]
 
 
-class Qwen7BRMSNorm(nn.Module):
+class Qwen1RMSNorm(nn.Module):
     dim: int
     eps: float = 1e-6
     dtype: jnp.dtype = jnp.float32
@@ -158,8 +158,8 @@ class Qwen7BRMSNorm(nn.Module):
         return output * weight
 
 
-class FlaxQwen7BMLP(nn.Module):
-    config: Qwen7BConfig
+class FlaxQwen1MLP(nn.Module):
+    config: Qwen1Config
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]] = None
@@ -215,8 +215,8 @@ class FlaxQwen7BMLP(nn.Module):
         return x
 
 
-class FlaxQwen7BAttention(nn.Module):
-    config: Qwen7BConfig
+class FlaxQwen1Attention(nn.Module):
+    config: Qwen1Config
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]] = None
@@ -259,7 +259,7 @@ class FlaxQwen7BAttention(nn.Module):
         ]
         logn_tensor = jnp.asarray(logn_list)[None, :, None, None]
         self.logn_tensor = logn_tensor
-        self.rotary = FlaxQwen7BEmbeddingApplyer(self.dtype)
+        self.rotary = FlaxQwen1EmbeddingApplyer(self.dtype)
         self.attention_performer = EasyAttention(
             attn_type="normal",
             block_k_major=self.config.block_k_major,
@@ -368,15 +368,10 @@ class FlaxQwen7BAttention(nn.Module):
         :return: A tuple of 3 tensors: query, key and value
 
         """
-        query = query.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
-        key = key.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
-        value = value.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
-
-        query, key, value = self._t(query, key, value)
         query, key = self.rotary(
             position_ids=position_ids, query=query, key=key, rotary_pos_emb_list=rotary_pos_emb_list
         )
-        return self._t(query, key, value)
+        return query, key, value
 
     def __call__(
             self,
@@ -436,7 +431,6 @@ class FlaxQwen7BAttention(nn.Module):
         )
 
         query_length, key_length = query_state.shape[1], key_state.shape[1]
-
         if self.has_variable("cache", "cached_key"):
             mask_shift = self.variables["cache"]["cache_index"]
             max_decoder_length = self.variables["cache"]["cached_key"].shape[1]
@@ -509,17 +503,17 @@ class FlaxQwen7BAttention(nn.Module):
         return outputs
 
 
-class FlaxQwen7BBlock(nn.Module):
-    config: Qwen7BConfig
+class FlaxQwen1Block(nn.Module):
+    config: Qwen1Config
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
-        attn_block = FlaxQwen7BAttention
+        attn_block = FlaxQwen1Attention
         if self.config.gradient_checkpointing != "":
             attn_block = nn_partitioning.remat(
-                FlaxQwen7BAttention, static_argnums=(5, 6, 7),
+                FlaxQwen1Attention, static_argnums=(5, 6, 7),
                 policy=get_gradient_checkpoint_policy(
                     self.config.gradient_checkpointing)
             )
@@ -530,11 +524,11 @@ class FlaxQwen7BBlock(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        mlp_block = FlaxQwen7BMLP
+        mlp_block = FlaxQwen1MLP
 
         if self.config.gradient_checkpointing != "":
             mlp_block = nn_partitioning.remat(
-                FlaxQwen7BMLP, static_argnums=(1,),
+                FlaxQwen1MLP, static_argnums=(1,),
                 policy=get_gradient_checkpoint_policy(
                     self.config.gradient_checkpointing)
             )
@@ -545,13 +539,13 @@ class FlaxQwen7BBlock(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision,
         )
-        self.ln_1 = Qwen7BRMSNorm(
+        self.ln_1 = Qwen1RMSNorm(
             self.config.hidden_size,
             eps=self.config.layer_norm_epsilon,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
         )
-        self.ln_2 = Qwen7BRMSNorm(
+        self.ln_2 = Qwen1RMSNorm(
             self.config.hidden_size,
             eps=self.config.layer_norm_epsilon,
             dtype=self.dtype,
@@ -657,14 +651,14 @@ class FlaxQwen7BBlock(nn.Module):
         return (hidden_states,) + attn_outputs[1:]
 
 
-class FlaxQwen7BPreTrainedModel(EasyDelFlaxPretrainedModel):
-    config_class = Qwen7BConfig
+class FlaxQwen1PreTrainedModel(EasyDelFlaxPretrainedModel):
+    config_class = Qwen1Config
     base_model_prefix = "model"
     module_class: nn.Module = None
 
     def __init__(
             self,
-            config: Qwen7BConfig,
+            config: Qwen1Config,
             input_shape: Tuple = (1, 1),
             seed: int = 0,
             dtype: jnp.dtype = jnp.float32,
@@ -678,7 +672,7 @@ class FlaxQwen7BPreTrainedModel(EasyDelFlaxPretrainedModel):
 
 
         :param self: Refer to the object itself
-        :param config: Qwen7BConfig: Pass the configuration to the module
+        :param config: Qwen1Config: Pass the configuration to the module
         :param input_shape: Tuple: Specify the shape of the input to the model
         :param seed: int: Set the seed for random number generation
         :param dtype: jnp.dtype: Specify the data type of the input
@@ -898,15 +892,15 @@ class FlaxQwen7BPreTrainedModel(EasyDelFlaxPretrainedModel):
         return outputs
 
 
-class FlaxQwen7BBlockCollection(nn.Module):
-    config: Qwen7BConfig
+class FlaxQwen1BlockCollection(nn.Module):
+    config: Qwen1Config
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self):
         self.blocks = [
-            FlaxQwen7BBlock(
+            FlaxQwen1Block(
                 self.config,
                 name=str(i),
                 dtype=self.dtype,
@@ -998,8 +992,8 @@ class FlaxQwen7BBlockCollection(nn.Module):
         return outputs
 
 
-class FlaxQwen7BModule(nn.Module):
-    config: Qwen7BConfig
+class FlaxQwen1Module(nn.Module):
+    config: Qwen1Config
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]] = None
@@ -1016,13 +1010,13 @@ class FlaxQwen7BModule(nn.Module):
             param_dtype=self.param_dtype,
         )
         self.drop = nn.Dropout(rate=self.config.emb_dropout_prob)
-        self.h = FlaxQwen7BBlockCollection(
+        self.h = FlaxQwen1BlockCollection(
             self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.ln_f = Qwen7BRMSNorm(
+        self.ln_f = Qwen1RMSNorm(
             self.config.hidden_size,
             eps=self.config.layer_norm_epsilon,
             dtype=self.dtype,
@@ -1039,7 +1033,7 @@ class FlaxQwen7BModule(nn.Module):
         self.causal_mask = make_causal_mask(
             jnp.ones((1, config.seq_length))
         )
-        self.rotary_emb = FlaxQwen7BRotaryEmbeddingInitiator(
+        self.rotary_emb = FlaxQwen1RotaryEmbeddingInitiator(
             dim=self.rotary_ndims if self.rotary_ndims is not None else config.kv_channels,
             base=self.config.rotary_emb_base
         )
@@ -1146,8 +1140,8 @@ class FlaxQwen7BModule(nn.Module):
         )
 
 
-class FlaxQwen7BModel(FlaxQwen7BPreTrainedModel):
-    module_class = FlaxQwen7BModule
+class FlaxQwen1Model(FlaxQwen1PreTrainedModel):
+    module_class = FlaxQwen1Module
 
     def set_input_embeddings(self, value):
         self.module.wte = value
@@ -1156,14 +1150,14 @@ class FlaxQwen7BModel(FlaxQwen7BPreTrainedModel):
         return self.module.wte
 
 
-class FlaxQwen7BForCausalLMModule(nn.Module):
-    config: Qwen7BConfig
+class FlaxQwen1ForCausalLMModule(nn.Module):
+    config: Qwen1Config
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self):
-        self.transformer = FlaxQwen7BModule(
+        self.transformer = FlaxQwen1Module(
             self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -1246,8 +1240,8 @@ class FlaxQwen7BForCausalLMModule(nn.Module):
         return FlaxCausalLMOutput(logits=lm_logits, hidden_states=outputs.hidden_states, attentions=outputs.attentions)
 
 
-class FlaxQwen7BForCausalLM(FlaxQwen7BPreTrainedModel):
-    module_class = FlaxQwen7BForCausalLMModule
+class FlaxQwen1ForCausalLM(FlaxQwen1PreTrainedModel):
+    module_class = FlaxQwen1ForCausalLMModule
 
     def set_input_embeddings(self, value):
         self.module.model.wte = value
@@ -1303,9 +1297,9 @@ class FlaxQwen7BForCausalLM(FlaxQwen7BPreTrainedModel):
         return model_kwargs
 
 
-class FlaxQwen7BForSequenceClassificationModule(nn.Module):
+class FlaxQwen1ForSequenceClassificationModule(nn.Module):
     num_classes: int
-    config: Qwen7BConfig
+    config: Qwen1Config
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]] = None
@@ -1318,7 +1312,7 @@ class FlaxQwen7BForSequenceClassificationModule(nn.Module):
         :param self: Access variables that belong to the class
         :return: A tuple of the model and the classifier
         """
-        self.model = FlaxQwen7BModule(self.config, dtype=self.dtype)
+        self.model = FlaxQwen1Module(self.config, dtype=self.dtype)
         self.classifier = nn.Dense(
             self.num_classes,
             dtype=self.dtype,
@@ -1393,5 +1387,5 @@ class FlaxQwen7BForSequenceClassificationModule(nn.Module):
             return prediction,
 
 
-class FlaxQwen7BForSequenceClassification(FlaxQwen7BPreTrainedModel):
-    module_class = FlaxQwen7BForSequenceClassificationModule
+class FlaxQwen1ForSequenceClassification(FlaxQwen1PreTrainedModel):
+    module_class = FlaxQwen1ForSequenceClassificationModule
