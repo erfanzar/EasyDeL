@@ -60,7 +60,7 @@ def jax_load_balancing_loss_func(gate_logits: chex.Array, num_experts: chex.Arra
         expert_mask.astype(jnp.float32), axis=-2)
     router_prob_per_group_and_expert = jnp.mean(routing_weights, axis=-1)
     return jnp.mean(tokens_per_group_and_expert * jnp.expand_dims(router_prob_per_group_and_expert, axis=-1)) * (
-        num_experts ** 2)
+            num_experts ** 2)
 
 
 class MixtralRMSNorm(nn.Module):
@@ -108,7 +108,7 @@ class FlaxMixtralAttention(nn.Module):
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[None, jax.lax.Precision]
-                        ] = jax.lax.Precision("fastest")
+    ] = jax.lax.Precision("fastest")
 
     def setup(self) -> None:
         config = self.config
@@ -423,70 +423,24 @@ class FlaxMixtralBlocKSparesTop2MLPCollection(nn.Module):
             hidden_dim: int
     ) -> chex.Array:
         assert hidden_states.ndim == 2
-        if self.config.initialization_of_moe:
-            final_hidden_states = jnp.zeros(
-                (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype
+        final_hidden_states = jnp.zeros(
+            ((batch_size * sequence_length) + 1, hidden_dim), dtype=hidden_states.dtype
+        )
+
+        for expert_idx in range(self.config.num_local_experts):
+            selected_mask = expert_mask[expert_idx]
+            idx, top_x = jnp.nonzero(selected_mask, size=sequence_length, fill_value=-1)
+
+            expert_layer_output = self.layers[expert_idx](
+                hidden_states[top_x]
             )
-        else:
-            final_hidden_states = jnp.zeros(
-                ((batch_size * sequence_length) + 1, hidden_dim), dtype=hidden_states.dtype
+            current_hidden_states = expert_layer_output * routing_weights[top_x, idx, None]
+
+            final_hidden_states = final_hidden_states.at[top_x].set(
+                current_hidden_states + final_hidden_states[top_x]
             )
 
-        def expert_forward_true(mdl, _final_hidden_states, _expert_layer, _top_x, _idx):
-            expert_layer_output = _expert_layer(
-                hidden_states[_top_x]
-            )
-            current_hidden_states = expert_layer_output * \
-                routing_weights[_top_x, _idx, None]
-
-            return _final_hidden_states.at[_top_x].add(current_hidden_states[_top_x])
-
-        def expert_forward_false(mdl, _final_hidden_states, _expert_layer, _top_x, _idx):
-            return _final_hidden_states
-        # map_layers = [self.layers[i] for i in range(self.config.num_local_experts)]
-
-        def expert_layer_forward(mdl, carry, _):
-            forward_hidden_state, forward_index = carry
-            selected_mask = jnp.pad(
-                expert_mask[forward_index], ((0, 0), (1, 0)), constant_values=-2)
-            forward_idx, forward_top_x = jnp.nonzero(
-                selected_mask, size=sequence_length + 1)
-            forward_hidden_state = nn.cond(
-                jnp.all(forward_top_x == 0),
-                expert_forward_false,
-                expert_forward_true,
-                mdl,
-                forward_hidden_state,
-                self.layers[1],
-                forward_top_x,
-                forward_idx
-            )
-            forward_index += 1
-            return (forward_hidden_state, forward_index), None
-
-        if self.config.initialization_of_moe:
-            for expert_idx in range(self.config.num_local_experts):
-                idx, top_x = jnp.nonzero(
-                    expert_mask[expert_idx], size=sequence_length)
-
-                expert_layer_output = self.layers[expert_idx](
-                    hidden_states[top_x]
-                )
-                current_hidden_states = expert_layer_output * \
-                    routing_weights[top_x, idx, None]
-
-                final_hidden_states = final_hidden_states.at[top_x].set(
-                    current_hidden_states + final_hidden_states[top_x]
-                )
-        else:
-            final_hidden_states, _, _ = nn.scan(
-                expert_layer_forward,
-                in_axes=1,
-                out_axes=1,
-                length=self.config.num_local_experts
-            )(self, (final_hidden_states, 0), None)
-        if not self.config.initialization_of_moe:
-            final_hidden_states = final_hidden_states[1:]
+        final_hidden_states = final_hidden_states[:-1]
         return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
 
 
@@ -551,7 +505,9 @@ class FlaxMixtralSparseMoeBlock(nn.Module):
             hidden_states.dtype
         )
         expert_mask = jax.nn.one_hot(
-            selected_experts, num_classes=self.config.num_local_experts).transpose(2, 1, 0)
+            selected_experts,
+            num_classes=self.config.num_local_experts
+        ).transpose(2, 1, 0)
 
         return self.experts(
             expert_mask=expert_mask,
@@ -569,7 +525,7 @@ class FlaxMixtralDecoderLayer(nn.Module):
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
     precision: Optional[Union[None, jax.lax.Precision]
-                        ] = jax.lax.Precision("fastest")
+    ] = jax.lax.Precision("fastest")
 
     def setup(self) -> None:
         self.self_attn = FlaxMixtralAttention(
@@ -953,7 +909,7 @@ class MixtralPreTrainedModel(EasyDelFlaxPretrainedModel):
         elif past_key_values is not None and not return_dict:
             outputs, past_key_values = outputs
             outputs = outputs[:1] + \
-                (unfreeze(past_key_values["cache"]),) + outputs[1:]
+                      (unfreeze(past_key_values["cache"]),) + outputs[1:]
 
         return outputs
 
