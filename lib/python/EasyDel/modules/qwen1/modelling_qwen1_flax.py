@@ -1033,12 +1033,12 @@ class FlaxQwen1Module(nn.Module):
                 config.kv_channels * config.rotary_pct
             )
         self.causal_mask = make_causal_mask(
-            jnp.ones((1, config.seq_length))
+            jnp.ones((1, getattr(config, "c_max_position_embeddings", config.seq_length)))
         )
         self.rope_cache = compute_qwen1_rope(
             dim=self.rotary_ndims if self.rotary_ndims is not None else config.kv_channels,
             base=self.config.rotary_emb_base,
-            seqlen=self.config.seq_length
+            seqlen=getattr(config, "freq_max_position_embeddings", config.seq_length)
         )
 
     def __call__(

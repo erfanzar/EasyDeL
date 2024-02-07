@@ -930,7 +930,7 @@ class FlaxQwen2Module(nn.Module):
         )
         config = self.config
         self.causal_mask = make_causal_mask(
-            jnp.ones((1, config.max_position_embeddings))
+            jnp.ones((1, getattr(config, "c_max_position_embeddings", config.max_position_embeddings)))
         )
 
         initial_rope_kwargs = dict(
@@ -944,7 +944,7 @@ class FlaxQwen2Module(nn.Module):
                 rope_type=scaling_type
             )
         self.freq_cis = precompute_freq_cis(
-            max_position_embeddings=config.max_position_embeddings,
+            max_position_embeddings=getattr(config, "freq_max_position_embeddings", config.max_position_embeddings),
             dim=config.hidden_size // config.num_attention_heads,
             base=config.rope_theta,
             **initial_rope_kwargs
