@@ -431,15 +431,29 @@ class FlaxMixtralBlocKSparesTop2MLPCollection(nn.Module):
             selected_mask = expert_mask[expert_idx]
             idx, top_x = jnp.nonzero(selected_mask, size=sequence_length, fill_value=-1)
 
-            expert_layer_output = self.layers[expert_idx](
-                hidden_states[top_x]
-            )
-            current_hidden_states = expert_layer_output * routing_weights[top_x, idx, None]
+            def true_fn(mdl, input_final_hidden_states):
+                expert_layer_output = mdl.layers[expert_idx](
+                    hidden_states[top_x]
+                )
+                current_hidden_states = expert_layer_output * routing_weights[top_x, idx, None]
 
-            final_hidden_states = final_hidden_states.at[top_x].set(
-                current_hidden_states + final_hidden_states[top_x]
-            )
+                input_final_hidden_states = input_final_hidden_states.at[top_x].set(
+                    current_hidden_states + input_final_hidden_states[top_x]
+                )
+                return input_final_hidden_states
 
+            def false_fn(mdl, input_final_hidden_states):
+                return input_final_hidden_states
+
+            final_hidden_states = true_fn(self, final_hidden_states)
+            # final_hidden_states = nn.cond(
+            #     # jnp.max(idx) == -1,
+            #     True,
+            #     true_fn,
+            #     false_fn,
+            #     self,
+            #     final_hidden_states
+            # )
         final_hidden_states = final_hidden_states[:-1]
         return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
 
