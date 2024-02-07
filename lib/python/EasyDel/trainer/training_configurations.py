@@ -86,7 +86,7 @@ class TrainArguments(
             do_last_save: bool = True,
             model_parameters: Optional[dict] = None,
             do_shard_fns: bool = True,
-            track_memory: bool = True,
+            track_memory: Optional[bool] = None,
             loss_re_mat: str = "",
             loss_chunk: int = 1024,
             is_left_padded: bool = False,
@@ -198,6 +198,18 @@ class TrainArguments(
             f"{backend} is not recognized, "
             f"available backends are {AVAILABLE_BACKENDS}"
         )
+
+        if track_memory is None:
+            # https://github.com/erfanzar/EasyDeL/pull/100/commits/523ce7b1515d7896d456759d0bcd0bd02369bd10
+            print(
+                termcolor.colored("Information : ", color="red", force_color=True),
+                termcolor.colored(
+                    "track_memory is set to False by default inorder make make training faster "
+                    "and you can turn it on with just passing `track_memory=True` in TrainArguments",
+                    color="red", force_color=True
+                )
+            )
+            track_memory = False
 
         available_backends = len(jax.devices(backend))
 
