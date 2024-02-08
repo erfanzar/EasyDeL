@@ -60,6 +60,19 @@ class EasyServe:
     def conversation_template(
             self, conversation: List[ConversationItem]
     ) -> str:
+        """
+        The conversation_template function takes a list of ConversationItem objects and returns a string.
+        The string is formatted as follows:
+            &lt;s&gt;[INST] &lt;&lt;SYS&gt;&gt;{system_message}&lt;&lt;/SYS&gt;&gt;\n\n{user_message} [/INST]
+            {assistant_message} &lt;/s&gt;&lt;s&gt;[INST] ...
+        where system message, user message, and assistant message are the content fields of the ConversationItem objects.
+        If there is no system message in the conversation, then it will be omitted from the template.
+
+        :param self: Refer to the current instance of a class
+        :param conversation: List[ConversationItem]: Pass in the conversation items
+        :return: A string that is a concatenation of the messages in the conversation
+
+        """
         system = None
         do_strip = False
         for conv in conversation:
@@ -76,6 +89,17 @@ class EasyServe:
 
     def api_generate_request(self, request: GenerateAPIRequest):
 
+        """
+        The api_generate_request function is the main function that will be called by the API.
+        It takes in a GenerateAPIRequest object, which contains all the information needed to generate a response.
+        The request object has two fields: conversation and max_new_tokens. The conversation field is an array of strings,
+        which are each one turn in a conversation (i.e., one person's utterance). The max_new_tokens field specifies
+         how many tokens can be generated at most for this response.
+
+        :param self: Access the attributes and methods of the class
+        :param request: GenerateAPIRequest: Pass the request object to the api_generate_request function
+        :return: A dictionary with the following keys {"response", "num_token_generated", "greedy", "model_prompt"}
+        """
         prompt = self.conversation_template(
             request.conversation
         )
@@ -100,6 +124,19 @@ class EasyServe:
             partition_rules: Tuple[Tuple[str, PartitionSpec]],
             dtype: jax.numpy.dtype | str = "fp16"
     ):
+
+        """
+        The create_shard_and_gather_functions function takes in a dictionary of parameters,
+        a tuple of partition rules, and an optional dtype. It then matches the partition rules to the
+        parameters and creates shard functions for each parameter. The shard functions are used to
+        split up a parameter into shards (or partitions) that can be stored on different devices.
+        The gather function is used to combine all the shards back together again.
+
+        :param parameters: dict: Specify the parameters of the model
+        :param partition_rules: Tuple[Tuple[str,  PartitionSpec]]: Specify which parameters to partition
+        :param dtype: jax.numpy.dtype | str: Specify the data type of the parameters
+        :return: A tuple of three elements:
+        """
         partition_specs = match_partition_rules(partition_rules, parameters)
         shard_fns, gather_fns = make_shard_and_gather_fns(
             partition_specs=partition_specs,
@@ -114,6 +151,17 @@ class EasyServe:
             partition_rules: Tuple[Tuple[str, PartitionSpec]],
             serve_config: EasyServeConfig,
     ):
+
+        """
+        The shard_parameters function takes a set of parameters and partitions them according to the partition_rules.
+
+        :param mesh: Mesh: Create a mesh object that is used to shard the parameters
+        :param params: FrozenDict | dict: Pass in the parameters of the model
+        :param partition_rules: Tuple[Tuple[str, PartitionSpec]]: Specify the partitioning rules for each parameter
+        :param serve_config: EasyServeConfig: Specify the dtype of the parameters
+        :param : Create a mesh of devices
+        :return: sharded parameters
+        """
 
         partition_specs = match_partition_rules(params=params, rules=partition_rules)
         shard_fns, _ = make_shard_and_gather_fns(partition_specs, get_dtype(serve_config.dtype))
@@ -132,7 +180,18 @@ class EasyServe:
             serve_config: EasyServeConfig,
             partition_specs: dict[str, PartitionSpec]
     ) -> LLMBaseReq:
+        """
+        The create_generation_functions_and_tokenizers function is used to create the functions that will be used for
+        generation. It also creates a tokenizer object that can be used to encode and decode text. The function takes in
+        a model, a tokenizer, an EasyServeConfig object (which contains all the parameters needed for generation), and
+        partition_specs which are specifications about how data should be partitioned across devices.
 
+        :param model: EasyDelFlaxPretrainedModel: Create the model and tokenizer
+        :param tokenizer: PreTrainedTokenizerBase: Create a tokenizer object
+        :param serve_config: EasyServeConfig: Create the generation function
+        :param partition_specs: dict[str, PartitionSpec]: Specify the sharding of the model parameters
+        :return: An LLMBaseReq object
+        """
         if tokenizer.pad_token is None:
             logging.info(
                 "Tokenizer does not contain padding token setting padding token to eos token for open end generation")
@@ -235,6 +294,22 @@ class EasyServe:
             partition_rules: Tuple[Tuple[str, PartitionSpec]],
             shard_parameters: bool = True,
     ):
+
+        """
+        The from_parameters function is the main entry point for creating a model that can be served.
+        It takes in a pretrained model, parameters, tokenizer and serve_config as input and returns an object of type
+        EasyServe.
+
+        :param cls: Create a new instance of the class
+        :param llm: EasyDelFlaxPretrainedModel: Pass the model to the class
+        :param params: dict: Pass the parameters of the model
+        :param tokenizer: PreTrainedTokenizerBase: Create the tokenizer and prefix_tokenizer
+        :param serve_config: EasyServeConfig: Configure the model for serving
+        :param partition_rules: Tuple[Tuple[str, PartitionSpec]]: Partition the parameters of the model
+        :param shard_parameters: bool: Specify whether the parameters should be sharded or not
+        :param : Shard the parameters of the model
+        :return: A EasyServe object
+        """
         shard_fns, gather_fns, partition_specs = cls.create_shard_and_gather_functions(
             parameters=params,
             partition_rules=partition_rules,

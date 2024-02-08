@@ -188,7 +188,7 @@ class PyTorchServer(GradioUserInference):
         The forward_chat_fast_api function is a ReST API endpoint that takes in a ChatRequest object and returns the response from the model.
 
         :param self: Refer to the object itself
-        :param data: ChatRequest: Pass the data from the api to the function
+        :param data: ChatRequest: Pass the data from the serve_engine to the function
         :return: A dictionary with a single key, response
         
         """
