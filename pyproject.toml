@@ -8,7 +8,6 @@ requires-python = ">=3.8"
 readme = "README.md"
 
 version = "0.0.50"
-
 dependencies = [
     "chex~=0.1.84",
     "typing~=3.7.4.3",
@@ -76,3 +75,8 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages]
 find = { where = ["lib/python"] }
+
+
+[project.urls]
+Homepage = "https://github.com/erfanzar/EasyDeL"
+Issues = "https://github.com/erfanzar/EasyDeL/issues"
