@@ -2,130 +2,143 @@ nav:
   - AvailableModels: AvailableModels.md
   - CONTRIBUTING: CONTRIBUTING.md
   - Data Preprocessing:
-      - Processor: generated-data_preprocessing-_processor.md
+    - Processor: generated-data_preprocessing-_processor.md
   - EasyBIT: Bits.md
   - Etils:
-      - Auto Tx: generated-etils-auto_tx.md
-      - Configs: generated-etils-configs.md
-      - Easystate: generated-etils-easystate.md
-      - Errors: generated-etils-errors.md
-      - Etils: generated-etils-etils.md
+    - Auto Tx: generated-etils-auto_tx.md
+    - Configs: generated-etils-configs.md
+    - Easystate: generated-etils-easystate.md
+    - Errors: generated-etils-errors.md
+    - Etils: generated-etils-etils.md
   - Eval:
-      - Lm Eval: generated-eval-lm_eval.md
+    - Lm Eval: generated-eval-lm_eval.md
   - Examples:
-      - DataProcessing: DataProcessing.md
-      - EasyState: EasyStateExample.md
-      - Falcon Models: Falcon.md
-      - Fine Tuning Example: FineTuningExample.md
-      - JAXServer: JAXServer.md
-      - Llama Models: Llama.md
-      - Llama2 Models: Llama2.md
-      - LoRA and Transfer Learning: LoRA-TransferLearningExample.md
-      - Mistral Models: Mistral.md
-      - MosaicMPT Models: MosaicMPT.md
-      - PytorchServer: PyTorchServer.md
+    - DataProcessing: DataProcessing.md
+    - EasyState: EasyStateExample.md
+    - Falcon Models: Falcon.md
+    - Fine Tuning Example: FineTuningExample.md
+    - JAXServer: JAXServer.md
+    - Llama Models: Llama.md
+    - Llama2 Models: Llama2.md
+    - LoRA and Transfer Learning: LoRA-TransferLearningExample.md
+    - Mistral Models: Mistral.md
+    - MosaicMPT Models: MosaicMPT.md
+    - PytorchServer: PyTorchServer.md
   - Home: index.md
   - Linen:
-      - Bits: generated-linen-bits.md
-      - Utils: generated-linen-utils.md
+    - Bits: generated-linen-bits.md
+    - Utils: generated-linen-utils.md
   - Modules:
-      - Auto Easydel Model: generated-modules-auto_easydel_model.md
-      - Easy Attention: generated-modules-easy_attention.md
-      - Easydel Modelling Utils: generated-modules-easydel_modelling_utils.md
-      - Falcon:
-          - Falcon Configuration: generated-modules-falcon-falcon_configuration.md
-          - Modelling Falcon Flax: generated-modules-falcon-modelling_falcon_flax.md
-      - Flax Modelling Utils: generated-modules-flax_modelling_utils.md
-      - Gpt J:
-          - Gpt J Configuration: generated-modules-gpt_j-gpt_j_configuration.md
-          - Modelling Gpt J Flax: generated-modules-gpt_j-modelling_gpt_j_flax.md
-      - Gpt Neo X:
-          - Gpt Neo X Configuration: generated-modules-gpt_neo_x-gpt_neo_x_configuration.md
-          - Modelling Gpt Neo X Flax: generated-modules-gpt_neo_x-modelling_gpt_neo_x_flax.md
-      - Gpt2:
-          - Gpt2 Configuration: generated-modules-gpt2-gpt2_configuration.md
-          - Modelling Gpt2 Flax: generated-modules-gpt2-modelling_gpt2_flax.md
-      - Llama:
-          - Llama Configuration: generated-modules-llama-llama_configuration.md
-          - Modelling Llama Flax: generated-modules-llama-modelling_llama_flax.md
-      - Lucid Transformer:
-          - Lt Configuration: generated-modules-lucid_transformer-lt_configuration.md
-          - Modelling Lt Flax: generated-modules-lucid_transformer-modelling_lt_flax.md
-      - Mamba:
-          - Mamba Configuration: generated-modules-mamba-mamba_configuration.md
-          - Modelling Mamba Flax: generated-modules-mamba-modelling_mamba_flax.md
-      - Mistral:
-          - Mistral Configuration: generated-modules-mistral-mistral_configuration.md
-          - Modelling Mistral Flax: generated-modules-mistral-modelling_mistral_flax.md
-      - Mixtral:
-          - Mixtral Configuration: generated-modules-mixtral-mixtral_configuration.md
-          - Modelling Mixtral Flax: generated-modules-mixtral-modelling_mixtral_flax.md
-      - Mosaic Mpt:
-          - Modelling Mpt Flax: generated-modules-mosaic_mpt-modelling_mpt_flax.md
-          - Mosaic Configuration: generated-modules-mosaic_mpt-mosaic_configuration.md
-      - Opt:
-          - Modelling Opt Flax: generated-modules-opt-modelling_opt_flax.md
-          - Opt Configuration: generated-modules-opt-opt_configuration.md
-      - Palm:
-          - Modelling Palm Flax: generated-modules-palm-modelling_palm_flax.md
-          - Palm Configuration: generated-modules-palm-palm_configuration.md
-      - Phi:
-          - Modelling Phi Flax: generated-modules-phi-modelling_phi_flax.md
-          - Phi Configuration: generated-modules-phi-phi_configuration.md
-      - Qwen2:
-          - Modelling Qwen Flax: generated-modules-qwen2-modelling_qwen_flax.md
-          - Qwen Configuration: generated-modules-qwen2-qwen_configuration.md
-      - Roberta:
-          - Modelling Roberta Flax: generated-modules-roberta-modelling_roberta_flax.md
-          - Roberta Configuration: generated-modules-roberta-roberta_configuration.md
-      - T5:
-          - Modelling T5 Flax: generated-modules-t5-modelling_t5_flax.md
-          - T5 Configuration: generated-modules-t5-t5_configuration.md
+    - Auto Easydel Model: generated-modules-auto_easydel_model.md
+    - Easy Attention: generated-modules-easy_attention.md
+    - Easydel Modelling Utils: generated-modules-easydel_modelling_utils.md
+    - Falcon:
+      - Falcon Configuration: generated-modules-falcon-falcon_configuration.md
+      - Modelling Falcon Flax: generated-modules-falcon-modelling_falcon_flax.md
+    - Flax Modelling Utils: generated-modules-flax_modelling_utils.md
+    - Gpt J:
+      - Gpt J Configuration: generated-modules-gpt_j-gpt_j_configuration.md
+      - Modelling Gpt J Flax: generated-modules-gpt_j-modelling_gpt_j_flax.md
+    - Gpt Neo X:
+      - Gpt Neo X Configuration: generated-modules-gpt_neo_x-gpt_neo_x_configuration.md
+      - Modelling Gpt Neo X Flax: generated-modules-gpt_neo_x-modelling_gpt_neo_x_flax.md
+    - Gpt2:
+      - Gpt2 Configuration: generated-modules-gpt2-gpt2_configuration.md
+      - Modelling Gpt2 Flax: generated-modules-gpt2-modelling_gpt2_flax.md
+    - Llama:
+      - Llama Configuration: generated-modules-llama-llama_configuration.md
+      - Modelling Llama Flax: generated-modules-llama-modelling_llama_flax.md
+    - Lucid Transformer:
+      - Lt Configuration: generated-modules-lucid_transformer-lt_configuration.md
+      - Modelling Lt Flax: generated-modules-lucid_transformer-modelling_lt_flax.md
+    - Mamba:
+      - Mamba Configuration: generated-modules-mamba-mamba_configuration.md
+      - Modelling Mamba Flax: generated-modules-mamba-modelling_mamba_flax.md
+    - Mistral:
+      - Mistral Configuration: generated-modules-mistral-mistral_configuration.md
+      - Modelling Mistral Flax: generated-modules-mistral-modelling_mistral_flax.md
+    - Mixtral:
+      - Mixtral Configuration: generated-modules-mixtral-mixtral_configuration.md
+      - Modelling Mixtral Flax: generated-modules-mixtral-modelling_mixtral_flax.md
+    - Mosaic Mpt:
+      - Modelling Mpt Flax: generated-modules-mosaic_mpt-modelling_mpt_flax.md
+      - Mosaic Configuration: generated-modules-mosaic_mpt-mosaic_configuration.md
+    - Olmo:
+      - Modelling Olmo Flax: generated-modules-olmo-modelling_olmo_flax.md
+      - Olmo Configuration: generated-modules-olmo-olmo_configuration.md
+    - Opt:
+      - Modelling Opt Flax: generated-modules-opt-modelling_opt_flax.md
+      - Opt Configuration: generated-modules-opt-opt_configuration.md
+    - Palm:
+      - Modelling Palm Flax: generated-modules-palm-modelling_palm_flax.md
+      - Palm Configuration: generated-modules-palm-palm_configuration.md
+    - Phi:
+      - Modelling Phi Flax: generated-modules-phi-modelling_phi_flax.md
+      - Phi Configuration: generated-modules-phi-phi_configuration.md
+    - Qwen1:
+      - Modelling Qwen1 Flax: generated-modules-qwen1-modelling_qwen1_flax.md
+      - Qwen1 Configuration: generated-modules-qwen1-qwen1_configuration.md
+    - Qwen2:
+      - Modelling Qwen Flax: generated-modules-qwen2-modelling_qwen_flax.md
+      - Qwen Configuration: generated-modules-qwen2-qwen_configuration.md
+    - Roberta:
+      - Modelling Roberta Flax: generated-modules-roberta-modelling_roberta_flax.md
+      - Roberta Configuration: generated-modules-roberta-roberta_configuration.md
+    - T5:
+      - Modelling T5 Flax: generated-modules-t5-modelling_t5_flax.md
+      - T5 Configuration: generated-modules-t5-t5_configuration.md
   - Partitioning:
-      - Partitioner: generated-partitioning-partitioner.md
+    - Partitioner: generated-partitioning-partitioner.md
   - Reinforcement Learning:
-      - Core: generated-reinforcement_learning-core.md
-      - Models:
-          - Modelling Casual Language Rl: generated-reinforcement_learning-models-modelling_casual_language_rl.md
-      - Trainer:
-          - Base: generated-reinforcement_learning-trainer-base.md
-          - Dpo Trainer: generated-reinforcement_learning-trainer-dpo_trainer.md
-          - Partitioner Config: generated-reinforcement_learning-trainer-partitioner_config.md
-          - Ppo Config: generated-reinforcement_learning-trainer-ppo_config.md
-          - Ppo Trainer: generated-reinforcement_learning-trainer-ppo_trainer.md
-          - Training Configs: generated-reinforcement_learning-trainer-training_configs.md
-          - Utils: generated-reinforcement_learning-trainer-utils.md
-      - Utils:
-          - Collectors: generated-reinforcement_learning-utils-collectors.md
+    - Core: generated-reinforcement_learning-core.md
+    - Models:
+      - Modelling Casual Language Rl: generated-reinforcement_learning-models-modelling_casual_language_rl.md
+    - Trainer:
+      - Base: generated-reinforcement_learning-trainer-base.md
+      - Dpo Trainer: generated-reinforcement_learning-trainer-dpo_trainer.md
+      - Partitioner Config: generated-reinforcement_learning-trainer-partitioner_config.md
+      - Ppo Config: generated-reinforcement_learning-trainer-ppo_config.md
+      - Ppo Trainer: generated-reinforcement_learning-trainer-ppo_trainer.md
+      - Training Configs: generated-reinforcement_learning-trainer-training_configs.md
+      - Utils: generated-reinforcement_learning-trainer-utils.md
+    - Utils:
+      - Collectors: generated-reinforcement_learning-utils-collectors.md
   - Serve:
-      - Api:
-          - Client: generated-serve-serve_engine-client.md
-          - Configuration: generated-serve-serve_engine-configuration.md
-          - Dantics: generated-serve-serve_engine-dantics.md
-          - Serve: generated-serve-serve_engine-serve.md
-      - Gradio User Interface Base: generated-serve-gradio_user_interface_base.md
-      - Jax Serve: generated-serve-jax_serve.md
-      - Torch Serve: generated-serve-torch_serve.md
-      - Utils: generated-serve-utils.md
+    - Gradio User Interface Base: generated-serve-gradio_user_interface_base.md
+    - Jax Serve: generated-serve-jax_serve.md
+    - Prompters:
+      - Base Prompter: generated-serve-prompters-base_prompter.md
+      - Cargo Prompter: generated-serve-prompters-cargo_prompter.md
+      - Guanaco Prompter: generated-serve-prompters-guanaco_prompter.md
+      - Llama2 Prompter: generated-serve-prompters-llama2_prompter.md
+      - Openchat Prompter: generated-serve-prompters-openchat_prompter.md
+      - Qwen2 Prompter: generated-serve-prompters-qwen2_prompter.md
+    - Serve Engine:
+      - Client: generated-serve-serve_engine-client.md
+      - Configuration: generated-serve-serve_engine-configuration.md
+      - Dantics: generated-serve-serve_engine-dantics.md
+      - Serve: generated-serve-serve_engine-serve.md
+    - Torch Serve: generated-serve-torch_serve.md
+    - Utils: generated-serve-utils.md
   - Smi:
-      - Smi: generated-smi-smi.md
+    - Smi: generated-smi-smi.md
   - Trainer:
-      - Base Trainer: generated-trainer-base_trainer.md
-      - Causal Language Model Trainer: generated-trainer-causal_language_model_trainer.md
-      - Training Configurations: generated-trainer-training_configurations.md
-      - Utils: generated-trainer-utils.md
+    - Base Trainer: generated-trainer-base_trainer.md
+    - Causal Language Model Trainer: generated-trainer-causal_language_model_trainer.md
+    - Training Configurations: generated-trainer-training_configurations.md
+    - Utils: generated-trainer-utils.md
   - Transform:
-      - Easydel Transform: generated-transform-easydel_transform.md
-      - Falcon: generated-transform-falcon.md
-      - Llama: generated-transform-llama.md
-      - Mistral: generated-transform-mistral.md
-      - Mpt: generated-transform-mpt.md
-      - Utils: generated-transform-utils.md
+    - Easydel Transform: generated-transform-easydel_transform.md
+    - Falcon: generated-transform-falcon.md
+    - Llama: generated-transform-llama.md
+    - Mistral: generated-transform-mistral.md
+    - Mpt: generated-transform-mpt.md
+    - Utils: generated-transform-utils.md
   - Utils:
-      - Checker: generated-utils-checker.md
-      - Prompters: generated-utils-prompters.md
-      - Tensor Utils: generated-utils-tensor_utils.md
-      - Utils: generated-utils-utils.md
+    - Checker: generated-utils-checker.md
+    - Prompters: generated-utils-prompters.md
+    - Tensor Utils: generated-utils-tensor_utils.md
+    - Utils: generated-utils-utils.md
   - install: Install.md
 
 plugins:
