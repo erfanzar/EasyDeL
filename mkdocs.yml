@@ -99,10 +99,10 @@ nav:
           - Collectors: generated-reinforcement_learning-utils-collectors.md
   - Serve:
       - Api:
-          - Client: generated-serve-api-client.md
-          - Configuration: generated-serve-api-configuration.md
-          - Dantics: generated-serve-api-dantics.md
-          - Serve: generated-serve-api-serve.md
+          - Client: generated-serve-serve_engine-client.md
+          - Configuration: generated-serve-serve_engine-configuration.md
+          - Dantics: generated-serve-serve_engine-dantics.md
+          - Serve: generated-serve-serve_engine-serve.md
       - Gradio User Interface Base: generated-serve-gradio_user_interface_base.md
       - Jax Serve: generated-serve-jax_serve.md
       - Torch Serve: generated-serve-torch_serve.md
