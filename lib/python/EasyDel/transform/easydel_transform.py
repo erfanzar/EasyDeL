@@ -1,5 +1,8 @@
+import gc
+
 import flax.traverse_util
 import jax
+import numpy
 
 from flax.traverse_util import flatten_dict
 from flax.serialization import from_bytes, to_bytes, to_state_dict
@@ -102,8 +105,10 @@ def huggingface_to_easydel(
                     key = key[:-_l] + ".kernel"
             key_tuple = key.split(".")
             key_names = ()
-            tensor = tensor.detach().cpu().numpy()
-
+            numpy_tensor: numpy.array = tensor.detach().cpu().numpy()
+            tensor = jax.numpy.array(numpy_tensor)
+            del numpy_tensor
+            gc.collect()
             for k in key_tuple:
                 key_names += k,
             if shard_fns is not None:
