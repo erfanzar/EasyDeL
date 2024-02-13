@@ -1,13 +1,17 @@
 import copy
 import dataclasses
-import functools
 import os
 import sys
 import time
 
 import IPython.display
 import termcolor
-from fjformer.func.loss_func import cross_entropy_loss_and_accuracy
+from fjformer.func.loss_func import (
+    cross_entropy_loss_and_accuracy,
+    SpecialLossNormalizingFactor,
+    get_loss_normalizing_factor_and_weights,
+    compute_weighted_cross_entropy_and_accuracy,
+)
 import wandb
 
 import jax
@@ -47,40 +51,63 @@ def calculate_accuracy(predictions: chex.Array, targets: chex.Array):
     return accuracy
 
 
-def create_casual_language_model_train_step(partition_spec=PartitionSpec(("dp", "fsdp"), "sp")):
+def create_casual_language_model_train_step(
+    partition_spec=PartitionSpec(("dp", "fsdp"), "sp"), label_smoothing_factor=0.0, z_loss=0.0
+):
     """
-    The create_casual_language_model_train_step function is a training step function that takes in the current state 
-    of the model,and a batch of data. It then calculates the loss and accuracy for this batch, and returns 
+    The create_casual_language_model_train_step function is a training step function that takes in the current state
+    of the model,and a batch of data. It then calculates the loss and accuracy for this batch, and returns
     an updated state with new parameters based on these gradients.
 
     :param partition_spec: Specify which devices the model will be split across
+    :param label_smoothing_factor: A float in [0, 1] specifying the amount of label smoothing to apply,
+           where 0 means no smoothing.
+    :param z_loss: A regularization term that adds a penalty for large weights, where 0 means no regularization.
     :return: A casual_language_model_train_step function that takes in the current state of the model,
-
     """
 
     def casual_language_model_train_step(state, batch):
         """
-        The casual_language_model_train_step function is a training step function that takes in the current state 
-        of the model and a batch of data. It then calculates the loss and accuracy for this batch, 
+        The casual_language_model_train_step function is a training step function that takes in the current state
+        of the model and a batch of data. It then calculates the loss and accuracy for this batch,
         and returns an updated state with new parameters based on these gradients.
 
         :param state: Store the model parameters
-        :param batch: Pass the data to the model
+        :param batch: Pass the data to the model, dict with
+                      input_ids(bs, seq_len), labels(bs, seq_len-1), attention_mask(bs, seq_len)
         :return: A tuple of (state, loss, accuracy)
-
         """
         batch = with_sharding_constraint(batch, partition_spec)
 
         def calculate_loss(params):
             labels = batch.pop("labels")
-            logits = state.apply_fn(
-                params=params,
-                **batch,
-                return_dict=True
-            ).logits
-
-            loss, accuracy = cross_entropy_loss_and_accuracy(
-                logits[:, :-1, :], labels, batch["attention_mask"].astype(jnp.float32)[:, 1:]
+            logits = state.apply_fn(params=params, **batch, return_dict=True).logits
+            loss_normalizing_factor = (
+                SpecialLossNormalizingFactor.NUM_REAL_TARGET_TOKENS
+            )
+            # loss_weights is 1 unless the label is <= 0 or the attention mask is 0
+            loss_weights = jnp.where(
+                (batch["attention_mask"][:, :-1] != 0) & (labels > 0), 1, 0
+            )
+            lnf, weights = get_loss_normalizing_factor_and_weights(
+                loss_normalizing_factor,
+                {
+                    "decoder_target_tokens": labels,
+                    "decoder_loss_weights": loss_weights,
+                },
+            )
+            (
+                loss,
+                z_loss_computed,
+                weight_sum,
+                accuracy,
+            ) = compute_weighted_cross_entropy_and_accuracy(
+                logits=logits[:, :-1, :],
+                targets=labels,
+                weights=weights,
+                label_smoothing=label_smoothing_factor,
+                z_loss=z_loss,
+                loss_normalizing_factor=lnf,
             )
             return loss, accuracy
 
@@ -132,11 +159,19 @@ def create_casual_language_model_evaluation_step(partition_spec=PartitionSpec(("
 
             """
             labels = batch_eval.pop("labels")
-            logits = state.apply_fn(params=params, **batch_eval,
-                                    return_dict=True).logits
-
+            logits = state.apply_fn(
+                params=params, **batch_eval, return_dict=True
+            ).logits
+            valid = jnp.where(
+                (batch_eval["attention_mask"][:, 1:].astype(jnp.float32) != 0)
+                & (labels > 0),
+                1.0,
+                0.0,
+            )
             loss, accuracy = cross_entropy_loss_and_accuracy(
-                logits[:, :-1, :], labels, batch_eval["attention_mask"].astype(jnp.float32)[:, 1:]
+                logits[:, :-1, :],
+                labels,
+                valid,
             )
             return loss, accuracy
 
@@ -281,7 +316,11 @@ class CausalLanguageModelTrainer(BaseTrainer):
             donate_argnums=(0,)
         )
         sharded_train_step_function = pjit(
-            create_casual_language_model_train_step(self.arguments.step_partition_spec),
+            create_casual_language_model_train_step(
+                partition_spec=self.arguments.step_partition_spec,
+                label_smoothing_factor=self.arguments.label_smoothing_factor,
+                z_loss=self.arguments.z_loss,
+            ),
             in_shardings=(state_partition_spec, PartitionSpec()),
             out_shardings=(state_partition_spec, PartitionSpec(), PartitionSpec()),
             donate_argnums=(0, 0),
@@ -309,7 +348,11 @@ class CausalLanguageModelTrainer(BaseTrainer):
             pbar_eval = tqdm(total=self.max_evaluation_steps)
             for _, batch_eval in enumerate(self.dataloader_eval):
                 _ = batch_eval.pop("token_type_ids", None)
-                batch_eval["labels"] = batch_eval["input_ids"][..., 1:]
+                batch_eval["labels"] = (
+                    batch_eval["labels"][..., 1:]
+                    if "labels" in batch_eval
+                    else batch_eval["input_ids"][..., 1:]
+                )
                 for pop_arg in self.arguments.ids_to_pop_from_dataset:
                     _ = batch_eval.pop(pop_arg, None)
                 loss_eval, accuracy_eval = create_casual_language_model_evaluation_step(
@@ -515,8 +558,11 @@ class CausalLanguageModelTrainer(BaseTrainer):
                         ):
                             pbar.update(1)
                         elif current_step < self.max_training_steps:
-
-                            batch["labels"] = batch["input_ids"][..., 1:]
+                            batch["labels"] = (
+                                batch["labels"][..., 1:]
+                                if "labels" in batch
+                                else batch["input_ids"][..., 1:]
+                            )
                             for ssb in self.arguments.ids_to_pop_from_dataset:
                                 _ = batch.pop(ssb, None)
                             time_s = time.time()

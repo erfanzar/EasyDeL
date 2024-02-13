@@ -62,6 +62,8 @@ class TrainArguments(
             learning_rate_end: Optional[float] = 5e-6,
             gradient_accumulation_steps: int = 1,
             weight_decay: float = 0.01,
+            label_smoothing_factor: float = 0.0,
+            z_loss: float = 0.0,
             gradient_checkpointing: AVAILABLE_GRADIENT_CHECKPOINTS = EasyDelGradientCheckPointers.NOTHING_SAVEABLE,
             max_sequence_length: Optional[int] = 4096,
             sharding_array: Union[tuple, int] = (1, -1, 1, 1),
@@ -127,6 +129,8 @@ class TrainArguments(
     :param learning_rate_end: Optional[float]: Set the learning rate at the end of training
     :param gradient_accumulation_steps: int: Accumulate gradients over multiple batches
     :param weight_decay: float: Specify the weight decay to be used by the optimizer
+    :param label_smoothing_factor: float: Set the label smoothing factor to be used by the loss function
+    :param z_loss: float: Set the z loss factor to be used by the loss function
     :param gradient_checkpointing: AVAILABLE_GRADIENT_CHECKPOINTS: Determine how to use gradient checkpointing
     :param max_sequence_length: Optional[int]: Set the maximum length of the input sequence
     :param sharding_array: Union[tuple,int]: Specify the mesh of devices to use for training
@@ -220,6 +224,8 @@ class TrainArguments(
         self.learning_rate = learning_rate
         self.learning_rate_end = learning_rate_end
         self.weight_decay = weight_decay
+        self.label_smoothing_factor = label_smoothing_factor
+        self.z_loss = z_loss
         self.model_name = model_name
         self.gradient_checkpointing = gradient_checkpointing
         self.max_sequence_length = max_sequence_length
