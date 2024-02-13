@@ -106,6 +106,7 @@ class TrainArguments(
             rapture_config: Optional[EasyDeLXRapTureConfig] = None,
             merge_lora_rapture_parameters: bool = True,
             state_apply_fn_kwarguments_to_model: Optional[dict] = None,
+            remove_unused_columns: bool = True,
             **kwargs
     ):
         """
@@ -173,6 +174,7 @@ class TrainArguments(
     :param merge_lora_rapture_parameters: bool: whenever to merge lora parameters with original parameters before saving
     :param state_apply_fn_kwarguments_to_model: Optional[dict]: state_apply_fn_kwarguments_to_model is a dictionary that
     be used to apply the parameters and extra things that you want to deliver to model.
+    :param remove_unused_columns: bool: when ever to remove the unused data columns from dataset
     :param **kwargs: Pass keyword, variable-length argument list
     :return: Nothing
         """
@@ -288,6 +290,7 @@ class TrainArguments(
         self.merge_lora_rapture_parameters = merge_lora_rapture_parameters
         self.rapture = None
         self.rapture_config = None
+        self.remove_unused_columns = remove_unused_columns
         self.state_apply_fn_kwarguments_to_model = (
             state_apply_fn_kwarguments_to_model
         ) if state_apply_fn_kwarguments_to_model is not None else {}

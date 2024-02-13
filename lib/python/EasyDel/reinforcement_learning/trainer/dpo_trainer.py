@@ -1,21 +1,37 @@
+import copy
+import dataclasses
+import time
 import warnings
+from abc import ABC
 from collections import defaultdict
 
 import chex
 import flax.core
 import jax
+from fjformer import match_partition_rules
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from ..utils.collectors import DPODataCollatorWithPadding
 from typing import Optional, Literal, Dict, Union, Any, Tuple, List, Callable
 from .utils import pad_to_length
+from jax.experimental.pjit import pjit
 from datasets import Dataset
 from jax import numpy as jnp
 from ...trainer.training_configurations import TrainArguments
+from ...trainer.base_trainer import BaseTrainer, TrainerConfigureFunctionFuncOutput, \
+    TrainerConfigureDataloaderFuncOutput, TrainerConfigureModelFuncOutput
 from ...etils.easystate import EasyDelState
 from transformers import PreTrainedTokenizerBase
 from .partitioner_config import PartitionerConfig
+from jax.sharding import PartitionSpec
+
+
+@dataclasses.dataclass
+class DPOStepOut:
+    loss: chex.Array
+    chosen_rewards: chex.Array
+    rejected_rewards: chex.Array
 
 
 def create_concatenated_forward(
@@ -161,7 +177,8 @@ def concatenated_inputs(
 ) -> Dict[str, chex.Array]:
     """
     The concatenated_inputs function takes a batch of chosen and rejected examples,
-    and concatenates them together. This is useful for training the model to predict whether     an example was chosen by the human annotator. The function also pads all inputs to
+    and concatenates them together. This is useful for training the model to predict whether     an example was chosen
+    by the human annotator. The function also pads all inputs to
     the same length as the longest input in that batch.
 
     :param batch: Dict[str,Union[List,chex.Array]]: Pass the batch of data into the function,
@@ -378,7 +395,7 @@ def create_dpo_train_function(
     def dpo_step(
             state: EasyDelState,
             batch: dict
-    ) -> EasyDelState:
+    ) -> tuple[EasyDelState, DPOStepOut]:
 
         """
         The dpo_step function is the core of DPO. It takes a state and a batch,
@@ -459,26 +476,32 @@ def create_dpo_train_function(
                             - reference_rejected_log_probs
                     )
             )
-
-            return losses, chosen_rewards, rejected_rewards
+            # jax.debug.print("{x}", x=chosen_rewards)
+            # jax.debug.print("{x}", x=rejected_rewards)
+            # jax.debug.print("{x}", x=losses)
+            return losses[0], (chosen_rewards, rejected_rewards)
 
         grad_fn = jax.value_and_grad(calculate_loss, has_aux=True)
-        (__loss, __chosen_rewards, __rejected_rewards), grads = grad_fn(state.params)
+        (__loss, (__chosen_rewards, __rejected_rewards)), grads = grad_fn(state.params)
         state = state.apply_gradients(grads=grads)
-        return state
+        return state, DPOStepOut(
+            loss=__loss,
+            rejected_rewards=__rejected_rewards,
+            chosen_rewards=__chosen_rewards
+        )
 
     return dpo_step
 
 
-class DPOTrainer:
+class DPOTrainer(BaseTrainer, ABC):
     """
     EasyDel DPO Trainer Class
     """
 
     def __init__(
             self,
-            model_state: EasyDelState | str = None,
-            ref_model_state: Optional[EasyDelState | str] = None,
+            model: EasyDelState | str = None,
+            ref_model: Optional[EasyDelState | str] = None,
             partitioner_config: Optional[PartitionerConfig] = PartitionerConfig(),
             beta: float = 0.1,
             label_smoothing: float = 0,
@@ -497,6 +520,7 @@ class DPOTrainer:
             model_init_kwarguments: Optional[Dict] = None,
             ref_model_init_kwarguments: Optional[Dict] = None,
             reference_free: bool = False,
+            auto_configure: bool = True,
     ):
 
         """
@@ -524,6 +548,8 @@ class DPOTrainer:
         :param precompute_ref_log_probs: bool: Precompute the log probabilities of the reference model
         :param model_init_kwarguments: Optional[Dict]: Pass in the model_kwarguments to model for init process
         :param ref_model_init_kwarguments: Optional[Dict]: Pass the ref_model_init_kwarguments to ref_model for init process
+        :param auto_configure:bool: preferred to set ture to trainer will automaticly configure
+        model with provided training Arguments
         :param : Set the padding value for the model
         """
         if partitioner_config is None:
@@ -572,7 +598,7 @@ class DPOTrainer:
             label_pad_token_id=label_pad_token_id,
             is_encoder_decoder=False,
         )
-
+        self.auto_configure = auto_configure
         self.max_length = max_length
         self.label_pad_token_id = label_pad_token_id
         self.padding_value = padding_value if padding_value is not None else tokenizer.pad_token_id
@@ -620,6 +646,154 @@ class DPOTrainer:
             label_pad_token_id=label_pad_token_id
         )
 
+        super().__init__(
+            arguments=arguments,
+            dataset_train=train_dataset,
+            dataset_eval=eval_dataset,
+            finetune=True,
+            checkpoint_path=None,
+            _do_init_fns=False
+        )
+
+    def create_collate_function(
+            self,
+            max_sequence_length: int,
+            is_left_padded: bool
+    ) -> Callable:
+        return self.data_collator
+
+    def configure_dataloader(self) -> TrainerConfigureDataloaderFuncOutput:
+        dataloader_train = self.get_train_dataloader()
+        max_evaluation_steps = None
+        dataloader_eval = None
+        if self.eval_dataset is not None:
+            dataloader_eval = self.get_eval_dataloader(self.eval_dataset)
+            max_evaluation_steps = len(dataloader_eval)
+        return TrainerConfigureDataloaderFuncOutput(
+            dataloader_train=dataloader_train,
+            max_training_steps=len(dataloader_train),
+            dataloader_eval=dataloader_eval,
+            max_evaluation_steps=max_evaluation_steps
+        )
+
+    def configure_functions(self) -> TrainerConfigureFunctionFuncOutput:
+        def initialize_state_function():
+            initialized_parameters = self.model.init_weights(
+                jax.random.PRNGKey(0),
+                self.arguments.init_input_shape
+            )
+
+            if self.arguments.dtype == jnp.bfloat16:
+                initialized_parameters = self.model.to_bf16(initialized_parameters)
+            elif self.arguments.dtype == jnp.float16:
+                initialized_parameters = self.model.to_fp16(initialized_parameters)
+
+            tx = self.tx
+            parameters = flax.core.freeze({"params": initialized_parameters})
+            tx_init = copy.deepcopy(self.arguments.optimizer_kwargs)
+
+            if self.rapture is not None:
+                lora_parameters = self.lora_parameters
+                if self.arguments.dtype == jnp.bfloat16:
+                    lora_parameters = self.model.to_bf16(lora_parameters)
+                elif self.arguments.dtype == jnp.float16:
+                    lora_parameters = self.model.to_fp16(lora_parameters)
+
+                return EasyDelState(
+                    step=0,
+                    apply_fn=self.lora_apply_fn,
+                    params=lora_parameters,
+                    tx=self.lora_tx,
+                    opt_state=self.lora_opt_state,
+                    tx_init=EasyDelState.safe_dict(tx_init),
+                    hyperparameters=EasyDelState.create_hyperparameters(self.model.config.model_type),
+                    module=self.lora_model,
+                    module_config=self.model.config,
+                    module_config_args=None,
+                )
+            else:
+                return EasyDelState.create(
+                    tx=tx,
+                    params=parameters,
+                    apply_fn=self.model.__call__,
+                    module_config=copy.deepcopy(self.model.config),
+                    tx_init=tx_init,
+                    hyperparameters=EasyDelState.create_hyperparameters(self.model.config.model_type),
+                    module=self.model,
+                    module_config_args=None
+                )
+
+        def create_state_from_params_function(parameters):
+            if self.rapture is None:
+                return EasyDelState.create(
+                    tx=self.tx,
+                    params=parameters,
+                    apply_fn=self.model.__call__,
+                    module_config=copy.deepcopy(self.model.config),
+                    tx_init=copy.deepcopy(self.arguments.optimizer_kwargs),
+                    hyperparameters=EasyDelState.create_hyperparameters(self.model.config.model_type),
+                    module=self.model,
+                    module_config_args=None
+                )
+            else:
+                return EasyDelState(
+                    step=0,
+                    apply_fn=self.lora_apply_fn,
+                    params=parameters,
+                    tx=self.lora_tx,
+                    opt_state=self.lora_opt_state,
+                    tx_init=EasyDelState.safe_dict(copy.deepcopy(self.arguments.optimizer_kwargs)),
+                    hyperparameters=EasyDelState.create_hyperparameters(self.model.config.model_type),
+                    module=self.lora_model,
+                    module_config=self.model.config,
+                    module_config_args=None,
+                )
+
+        state_shape = jax.eval_shape(initialize_state_function)
+
+        state_partition_spec = match_partition_rules(
+            self.config.get_partition_rules(
+                fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
+            ) if self.arguments.custom_rule is None else self.arguments.custom_rule,
+            state_shape
+        )
+        create_sharded_state_from_params_function = pjit(
+            create_state_from_params_function,
+            in_shardings=(state_partition_spec.params,),
+            out_shardings=state_partition_spec,
+            donate_argnums=(0,)
+        )
+        train_function = create_dpo_train_function(
+            concatenated_forward=self.concatenated_forward,
+            ref_state=self.ref_model_state,
+            loss_type=self.loss_type,
+            reference_free=self.reference_free,
+            label_smoothing=self.label_smoothing,
+            beta=self.beta
+        )
+        sharded_train_step_function = pjit(
+            train_function,
+
+            in_shardings=(state_partition_spec, self.arguments.step_partition_spec),
+            out_shardings=(state_partition_spec, PartitionSpec()),
+        )
+
+        self.arguments.ckpt_path_exists()
+        self.state_partition_spec = state_partition_spec
+        self.state_shape = state_shape
+        checkpoint_manager = self.arguments.get_streaming_checkpointer()
+        mesh = self.arguments.get_mesh()
+        return TrainerConfigureFunctionFuncOutput(
+            initialize_state_function=initialize_state_function,
+            sharded_train_step_function=sharded_train_step_function,
+            create_sharded_state_from_params_function=create_sharded_state_from_params_function,
+            checkpoint_manager=checkpoint_manager,
+            mesh=mesh
+        )
+
+    def configure_model(self) -> TrainerConfigureModelFuncOutput:
+        ...
+
     def _get_train_dataloader(self) -> DataLoader:
 
         """
@@ -633,13 +807,6 @@ class DPOTrainer:
 
         train_dataset = self.train_dataset
         data_collator = self.data_collator
-        if hasattr(self, "_remove_unused_columns"):
-            train_dataset = self._remove_unused_columns(train_dataset, description="training")
-        else:
-            warnings.warn(
-                "Couldn't find function `_remove_unused_columns` if you are the "
-                "developer fix this otherwise ignore this warning"
-            )
         dataloader_params = {
             "batch_size": self.arguments.total_batch_size,
             "collate_fn": data_collator,
@@ -652,13 +819,40 @@ class DPOTrainer:
             **dataloader_params
         )
 
+    def _get_eval_dataloader(self, eval_dataset: Optional[Dataset] = None) -> DataLoader:
+        """
+        Returns the evaluation [`~torch.utils.data.DataLoader`].
+
+        Subclass and override this method if you want to inject some custom behavior.
+
+        Args:
+            eval_dataset (`torch.utils.data.Dataset`, *optional*):
+                If provided, will override `self.eval_dataset`. If it is a [`~datasets.Dataset`], columns not accepted
+                by the `model.forward()` method are automatically removed. It must implement `__len__`.
+        """
+        if eval_dataset is None and self.eval_dataset is None:
+            raise ValueError("Trainer: evaluation requires an eval_dataset.")
+        eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+
+        dataloader_params = {
+            "batch_size": self.arguments.total_batch_size,
+            "collate_fn": self.data_collator,
+            "num_workers": self.arguments.dataloader_num_workers,
+            "pin_memory": self.arguments.dataloader_pin_memory,
+            "shuffle": False,
+            "drop_last": True,
+        }
+
+        return DataLoader(
+            eval_dataset,
+            **dataloader_params
+        )
+
     def get_train_dataloader(
             self,
     ) -> DataLoader:
         """
         Returns the training [`~torch.utils.data.DataLoader`].
-
-        Subclass of transformers.src.transformers.trainer.get_train_dataloader to precompute `ref_log_probs`.
         """
 
         if self.precompute_ref_log_probs and not self._precomputed_train_ref_log_probs:
@@ -671,7 +865,6 @@ class DPOTrainer:
             }
 
             data_loader = DataLoader(self.train_dataset, **dataloader_params)
-
             reference_chosen_log_probs = []
             reference_rejected_log_probs = []
             for padded_batch in tqdm(iterable=data_loader, desc="Train dataset reference log probs"):
@@ -684,7 +877,6 @@ class DPOTrainer:
 
             all_reference_chosen_log_probs = jnp.concatenate(reference_chosen_log_probs)
             all_reference_rejected_log_probs = jnp.concatenate(reference_rejected_log_probs)
-
             self.train_dataset = self.train_dataset.add_column(
                 name="reference_chosen_log_probs", column=all_reference_chosen_log_probs
             )
@@ -694,6 +886,51 @@ class DPOTrainer:
 
             self._precomputed_train_ref_log_probs = True
         return self._get_train_dataloader()
+
+    def get_eval_dataloader(self, eval_dataset: Optional[Dataset] = None) -> DataLoader:
+        """
+        Returns the evaluation [`~torch.utils.data.DataLoader`].
+        """
+        if eval_dataset is None and self.eval_dataset is None:
+            raise ValueError("Trainer: evaluation requires an eval_dataset.")
+        eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+
+        if self.precompute_ref_log_probs and not self._precomputed_eval_ref_log_probs:
+            dataloader_params = {
+                "batch_size": self.arguments.total_batch_size,
+                "collate_fn": self.data_collator,
+                "num_workers": self.arguments.dataloader_num_workers,
+                "pin_memory": self.arguments.dataloader_pin_memory,
+                "shuffle": False,
+            }
+
+            # prepare dataloader
+            data_loader = DataLoader(eval_dataset, **dataloader_params)
+
+            reference_chosen_log_probs = []
+            reference_rejected_log_probs = []
+            for padded_batch in tqdm(iterable=data_loader, desc="Eval dataset reference log probs"):
+                reference_chosen_logp, reference_rejected_logp = self.compute_reference_log_probs(
+                    self.model_state,
+                    padded_batch
+                )
+                reference_chosen_log_probs.append(reference_chosen_logp.cpu())
+                reference_rejected_log_probs.append(reference_rejected_logp.cpu())
+
+            all_reference_chosen_log_probs = jnp.concatenate(reference_chosen_log_probs)
+            all_reference_rejected_log_probs = jnp.concatenate(reference_rejected_log_probs)
+
+            eval_dataset = eval_dataset.add_column(name="reference_chosen_log_probs",
+                                                   column=all_reference_chosen_log_probs)
+            eval_dataset = eval_dataset.add_column(
+                name="reference_rejected_log_probs", column=all_reference_rejected_log_probs
+            )
+
+            if self.eval_dataset is not None:
+                self.eval_dataset = eval_dataset
+            self._precomputed_eval_ref_log_probs = True
+
+        return self._get_eval_dataloader(eval_dataset=eval_dataset)
 
     def build_tokenized_answer(self, prompt, answer):
         """
@@ -735,10 +972,10 @@ class DPOTrainer:
         answer_attention_mask = full_tokenized["attention_mask"][response_token_ids_start_idx:]
 
         return dict(
-            prompt_input_ids=prompt_input_ids,
-            prompt_attention_mask=prompt_attention_mask,
-            input_ids=answer_input_ids,
-            attention_mask=answer_attention_mask,
+            prompt_input_ids=jnp.array(prompt_input_ids, dtype="i4"),
+            prompt_attention_mask=jnp.array(prompt_attention_mask, dtype="i4"),
+            input_ids=jnp.array(answer_input_ids, dtype="i4"),
+            attention_mask=jnp.array(answer_attention_mask, dtype="i4"),
         )
 
     def tokenize_row(self, feature, state: EasyDelState = None) -> Dict:
@@ -772,8 +1009,6 @@ class DPOTrainer:
         if not isinstance(rejected, str):
             raise ValueError(f"rejected should be an str but got {type(rejected)}")
         rejected_tokens = self.build_tokenized_answer(prompt, rejected)
-
-        # add BOS token to head of prompt
         prompt_tokens["prompt_input_ids"] = [self.tokenizer.bos_token_id] + prompt_tokens["prompt_input_ids"]
         chosen_tokens["prompt_input_ids"] = [self.tokenizer.bos_token_id] + chosen_tokens["prompt_input_ids"]
         rejected_tokens["prompt_input_ids"] = [self.tokenizer.bos_token_id] + rejected_tokens["prompt_input_ids"]
@@ -817,11 +1052,9 @@ class DPOTrainer:
             k: rejected_tokens[f"prompt_{k}"] + rejected_tokens[k] for k in ["input_ids", "attention_mask"]
         }
         chosen_sequence_tokens["labels"] = chosen_sequence_tokens["input_ids"][:]
-        chosen_sequence_tokens["labels"][: len(chosen_tokens["prompt_input_ids"])] = [
-                                                                                         self.label_pad_token_id
-                                                                                     ] * len(
-            chosen_tokens["prompt_input_ids"]
-        )
+        chosen_sequence_tokens["labels"][
+        : len(chosen_tokens["prompt_input_ids"])
+        ] = [self.label_pad_token_id] * len(chosen_tokens["prompt_input_ids"])
         rejected_sequence_tokens["labels"] = rejected_sequence_tokens["input_ids"][:]
         rejected_sequence_tokens["labels"][: len(rejected_tokens["prompt_input_ids"])] = [
                                                                                              self.label_pad_token_id
@@ -885,24 +1118,26 @@ class DPOTrainer:
         return self.mesh
 
     def train(self):
-        step = 0
-        train_function = create_dpo_train_function(
-            concatenated_forward=self.concatenated_forward,
-            ref_state=self.ref_model_state,
-            loss_type=self.loss_type,
-            reference_free=self.reference_free,
-            label_smoothing=self.label_smoothing,
-            beta=self.beta
-        )
-        for epoch_index in range(self.arguments.num_train_epochs):
-            for batch in self.get_train_dataloader():
-                step += 1
-                if self.arguments.step_start_point > step:
-                    ...
-                else:
-                    self.model_state, mt = train_function(self.model_state, batch=batch)
-                    print(mt)
-                    break
+        with self.mesh:
+            step = 0
+
+            pbar = tqdm(total=self.max_training_steps)
+            current_step = self.model_state.step.tolist()
+            loss_sum = None
+            accuracy_sum = None
+            for epoch_index in range(self.arguments.num_train_epochs):
+                for batch in self.get_train_dataloader():
+                    step += 1
+                    if self.arguments.step_start_point > step:
+                        ...
+                    else:
+                        time_start = time.time()
+                        self.model_state, metrics = self.sharded_train_step_function(self.model_state, batch=batch)
+                        total_time = time.time() - time_start
+                        (
+                            loss, chosen_rewards, rejected_rewards
+                        ) = metrics.loss, metrics.chosen_rewards, metrics.rejected_rewards
+            return self.model_state
 
     def eval(self):
         """

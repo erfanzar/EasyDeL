@@ -34,7 +34,7 @@ class DPODataCollatorWithPadding:
                         padding_value = self.label_pad_token_id
                     else:
                         raise ValueError(f"Unexpected key in batch '{k}'")
-                    padded_batch[k] = pad_sequence(to_pad, batch_first=True, padding_value=padding_value)
+                    padded_batch[k] = pad_sequence(to_pad, batch_first=True, padding_value=padding_value).astype("i4")
                 else:
                     if "prompt" in k:
                         to_pad = [jnp.array(ex[k][::-1], dtype="i4") for ex in features]
@@ -49,12 +49,11 @@ class DPODataCollatorWithPadding:
                     else:
                         raise ValueError(f"Unexpected key in batch '{k}'")
 
-                    padded_batch[k] = pad_sequence(to_pad, batch_first=True, padding_value=padding_value)
+                    padded_batch[k] = pad_sequence(to_pad, batch_first=True, padding_value=padding_value).astype("i4")
                     if "prompt" in k:
                         padded_batch[k] = jnp.flip(padded_batch[k], axis=[1])
             elif k.endswith("_logps"):
                 padded_batch[k] = jnp.array([ex[k] for ex in features])
             else:
                 padded_batch[k] = [ex[k] for ex in features]
-
         return padded_batch

@@ -81,8 +81,8 @@ def main():
     )
     torch_output = torch_output.logits.cpu().detach().numpy()
     res = jnp.allclose(torch_output, flax_output.logits, atol=1e-5)
-    print("PHI Huggingface Predictions :\n", torch_output,
-          "\nEasyDel Predictions: \n", flax_output.logits)
+    print("PHI Huggingface Predictions :\n", jnp.array(torch_output),
+          "\nEasyDel Predictions: \n", jnp.array(flax_output.logits))
     if res:
         print("\033[1;36mTest Passed Unfortunately 🥳")
     else:
