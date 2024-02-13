@@ -3,6 +3,7 @@ import math
 import warnings
 from typing import Optional, Tuple, Any, Union, Dict, Sequence, Callable
 import chex
+import flax.linen.partitioning
 import jax.lax
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput, FlaxMaskedLMOutput
 from flax.core import FrozenDict, freeze, unfreeze
@@ -487,8 +488,27 @@ class FlaxPhiDecoderLayerCollection(nn.Module):
     precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
 
     def setup(self) -> None:
+        block = FlaxPhiDecoderLayer
+        if self.config.gradient_checkpointing != "":
+            # hidden_states: chex.Array,
+            # freq_cis: Tuple[chex.Array, chex.Array],
+            # attention_mask: Optional[chex.Array],
+            # position_ids: Optional[chex.Array],
+            # causal_mask: Optional[chex.Array],
+            # deterministic: bool = True,
+            # output_attentions: bool = False,
+            # init_cache: bool = False,
+
+            block = flax.linen.partitioning.remat(
+                block,
+                policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
+                static_argnums=(
+                    4, 5, 6, 7
+                )
+            )
         self.layers = [
-            FlaxPhiDecoderLayer(
+
+            block(
                 config=self.config,
                 dtype=self.dtype,
                 param_dtype=self.param_dtype,
