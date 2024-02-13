@@ -538,15 +538,23 @@ class FlaxPhiDecoderLayerCollection(nn.Module):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
+            # hidden_states: chex.Array,
+            # freq_cis: Tuple[chex.Array, chex.Array],
+            # attention_mask: Optional[chex.Array],
+            # position_ids: Optional[chex.Array],
+            # causal_mask: Optional[chex.Array],
+            # deterministic: bool = True,
+            # output_attentions: bool = False,
+            # init_cache: bool = False,
             layer_outputs = decoder_layer(
-                hidden_states=hidden_states,
-                freq_cis=freq_cis,
-                attention_mask=attention_mask,
-                causal_mask=causal_mask,
-                position_ids=position_ids,
-                output_attentions=output_attentions,
-                deterministic=deterministic,
-                init_cache=init_cache,
+                hidden_states,
+                freq_cis,
+                attention_mask,
+                position_ids,
+                causal_mask,
+                deterministic,
+                output_attentions,
+                init_cache,
             )
 
             hidden_states = layer_outputs[0]
