@@ -26,6 +26,8 @@ from transformers import PreTrainedTokenizerBase
 from .partitioner_config import PartitionerConfig
 from jax.sharding import PartitionSpec
 
+from ...utils import Timers
+
 
 @dataclasses.dataclass
 class DPOStepOut:
@@ -500,8 +502,8 @@ class DPOTrainer(BaseTrainer, ABC):
 
     def __init__(
             self,
-            model: EasyDelState | str = None,
-            ref_model: Optional[EasyDelState | str] = None,
+            model_state: EasyDelState | str,
+            ref_model_state: Optional[EasyDelState | str] = None,
             partitioner_config: Optional[PartitionerConfig] = PartitionerConfig(),
             beta: float = 0.1,
             label_smoothing: float = 0,
@@ -517,10 +519,12 @@ class DPOTrainer(BaseTrainer, ABC):
             max_prompt_length: Optional[int] = None,
             max_target_length: Optional[int] = None,
             precompute_ref_log_probs: bool = False,
-            model_init_kwarguments: Optional[Dict] = None,
-            ref_model_init_kwarguments: Optional[Dict] = None,
+            model_init_kwargs: Optional[Dict] = None,
+            ref_model_init_kwargs: Optional[Dict] = None,
             reference_free: bool = False,
-            auto_configure: bool = True,
+            auto_shard_model_state: bool = True,
+            auto_shard_ref_model_state: bool = True,
+            _do_init_fns: bool = True,
     ):
 
         """
@@ -546,9 +550,11 @@ class DPOTrainer(BaseTrainer, ABC):
         :param max_prompt_length: Optional[int]: Set the maximum length of the prompt
         :param max_target_length: Optional[int]: Truncate the target sequence
         :param precompute_ref_log_probs: bool: Precompute the log probabilities of the reference model
-        :param model_init_kwarguments: Optional[Dict]: Pass in the model_kwarguments to model for init process
-        :param ref_model_init_kwarguments: Optional[Dict]: Pass the ref_model_init_kwarguments to ref_model for init process
-        :param auto_configure:bool: preferred to set ture to trainer will automaticly configure
+        :param model_init_kwargs: Optional[Dict]: Pass in the model_kwargs to model for init process
+        :param ref_model_init_kwargs: Optional[Dict]: Pass the ref_model_init_kwargs to ref_model for init process
+        :param auto_shard_model_state: bool: whenever to automaticly shard `model_state`
+        :param auto_shard_ref_model_state: bool: whenever to automaticly shard `ref_model_state`
+        :param _do_init_fns: bool : preferred to set ture to trainer will automaticly configure
         model with provided training Arguments
         :param : Set the padding value for the model
         """
@@ -562,16 +568,16 @@ class DPOTrainer(BaseTrainer, ABC):
         assert isinstance(arguments, TrainArguments), (
             f"arguments type must be `TrainArguments` but got {type(arguments)}"
         )
-        if model_init_kwarguments is None:
-            model_init_kwarguments = {}
+        if model_init_kwargs is None:
+            model_init_kwargs = {}
         elif not isinstance(model_state, str):
-            raise ValueError("You passed model_kwarguments to the DPOTrainer. But your model is already instantiated.")
+            raise ValueError("You passed model_kwargs to the DPOTrainer. But your model is already instantiated.")
 
-        if ref_model_init_kwarguments is None:
-            ref_model_init_kwarguments = {}
+        if ref_model_init_kwargs is None:
+            ref_model_init_kwargs = {}
         elif not isinstance(ref_model_state, str):
             raise ValueError(
-                "You passed ref_model_kwarguments to the DPOTrainer. But your ref_model is already instantiated."
+                "You passed ref_model_kwargs to the DPOTrainer. But your ref_model is already instantiated."
             )
 
         if isinstance(model_state, str):
@@ -581,7 +587,7 @@ class DPOTrainer(BaseTrainer, ABC):
             )
             model_state = EasyDelState.from_pretrained(
                 model_state,
-                **model_init_kwarguments
+                **model_init_kwargs
             )
         if isinstance(ref_model_state, str):
             warnings.warn(
@@ -590,7 +596,7 @@ class DPOTrainer(BaseTrainer, ABC):
             )
             ref_model_state = EasyDelState.from_pretrained(
                 ref_model_state,
-                **ref_model_init_kwarguments
+                **ref_model_init_kwargs
             )
 
         data_collator = DPODataCollatorWithPadding(
@@ -598,7 +604,6 @@ class DPOTrainer(BaseTrainer, ABC):
             label_pad_token_id=label_pad_token_id,
             is_encoder_decoder=False,
         )
-        self.auto_configure = auto_configure
         self.max_length = max_length
         self.label_pad_token_id = label_pad_token_id
         self.padding_value = padding_value if padding_value is not None else tokenizer.pad_token_id
@@ -645,15 +650,97 @@ class DPOTrainer(BaseTrainer, ABC):
             padding_value=padding_value,
             label_pad_token_id=label_pad_token_id
         )
-
+        self.auto_shard_ref_model_state = auto_shard_ref_model_state
+        self.auto_shard_model_state = auto_shard_model_state
         super().__init__(
             arguments=arguments,
             dataset_train=train_dataset,
             dataset_eval=eval_dataset,
             finetune=True,
             checkpoint_path=None,
-            _do_init_fns=False
+            _do_init_fns=_do_init_fns
         )
+
+    def initialize_trainer_utils(self):
+        """
+        The initialize_trainer_utils function is responsible for initializing the following:
+            - wandb_runtime (if you use_wandb is True)
+            - timer object (for logging time taken by various functions)
+            - dataloader objects for training and evaluation data, along with max steps per epoch.
+              The configure_dataloader function accomplishes this task.
+
+        :param self: Represent the instance of the class
+        :return: A tuple of functions
+
+        """
+        self.wandb_runtime = self.arguments.get_wandb_init() if self.arguments.use_wandb else None
+        self.timer = Timers(
+            use_wandb=False,
+            tensorboard_writer=self.arguments.get_board()
+        )
+
+        self.timer("configure dataloaders").start()
+        dataset_configurations = self.configure_dataloader()
+        self.dataloader_train = dataset_configurations.dataloader_train
+        self.max_training_steps = dataset_configurations.max_training_steps
+        self.dataloader_eval = dataset_configurations.dataloader_eval
+        self.max_evaluation_steps = dataset_configurations.max_evaluation_steps
+
+        self.timer("configure dataloaders").stop()
+
+        self.timer.log(["configure dataloaders"])
+
+        self.timer("configure Model, Optimizer, Scheduler and Config").start()
+        model_configurations = self.configure_model()
+        model = model_configurations.model
+        tx = model_configurations.tx
+        scheduler = model_configurations.scheduler
+        config = model_configurations.config
+        self.model = model
+        self.tx = tx
+        self.scheduler = scheduler
+        self.config = config
+        if self.rapture is not None:
+            lora_modules = self.rapture.apply_lora(
+                module=model,
+                parameters=self.arguments.rapture_config.parameters,
+                tx=tx,
+            )
+            self.lora_parameters = lora_modules.lora_parameters
+            self.lora_apply_fn = lora_modules.lora_module.__call__
+            self.lora_opt_state = lora_modules.lora_opt_state
+            self.lora_model = lora_modules.lora_module
+            self.lora_tx = lora_modules.lora_tx
+
+        self.timer("configure Model, Optimizer, Scheduler and Config").stop()
+        self.timer.log(["configure Model, Optimizer, Scheduler and Config"])
+        self.timer("configure functions and sharding them").start()
+        function_configurations = self.configure_functions()
+        self.create_sharded_state_from_params_function = \
+            function_configurations.create_sharded_state_from_params_function
+        self.sharded_train_step_function = function_configurations.sharded_train_step_function
+        self.mesh = function_configurations.mesh
+        self.checkpoint_manager = function_configurations.checkpoint_manager
+        self.initialize_state_function = function_configurations.initialize_state_function
+        self.timer("configure functions and sharding them").stop()
+        self.timer.log(["configure functions and sharding them"])
+
+        if self.auto_shard_model_state:
+            self.timer("Sharding Model State").start()
+            self.model_state = self.shard_states(
+                self.model_state,
+                self.model_state.module.config.get_partition_rules(self.arguments.fully_sharded_data_parallel)
+            )
+            self.timer("Sharding Model State").stop()
+            self.timer.log(["Sharding Model State"])
+        if self.auto_shard_ref_model_state and self.ref_model_state is not None:
+            self.timer("Sharding Ref Model State").start()
+            self.ref_model_state = self.shard_states(
+                self.ref_model_state,
+                self.ref_model_state.module.config.get_partition_rules(self.arguments.fully_sharded_data_parallel)
+            )
+            self.timer("Sharding Ref Model State").stop()
+            self.timer.log(["Sharding Ref Model State"])
 
     def create_collate_function(
             self,
@@ -661,6 +748,20 @@ class DPOTrainer(BaseTrainer, ABC):
             is_left_padded: bool
     ) -> Callable:
         return self.data_collator
+
+    def shard_states(self, state, rules):
+        with self.mesh:
+            partition_spec = match_partition_rules(rules=rules, params=jax.eval_shape(lambda: state))
+
+            def _shard(x):
+                return x
+
+            shard = pjit(
+                _shard,
+                in_shardings=(PartitionSpec(),),
+                out_shardings=partition_spec
+            )
+            return shard(state)
 
     def configure_dataloader(self) -> TrainerConfigureDataloaderFuncOutput:
         dataloader_train = self.get_train_dataloader()
@@ -708,7 +809,7 @@ class DPOTrainer(BaseTrainer, ABC):
                     tx_init=EasyDelState.safe_dict(tx_init),
                     hyperparameters=EasyDelState.create_hyperparameters(self.model.config.model_type),
                     module=self.lora_model,
-                    module_config=self.model.config,
+                    module_config=self.model_state.module.config,
                     module_config_args=None,
                 )
             else:
@@ -716,7 +817,7 @@ class DPOTrainer(BaseTrainer, ABC):
                     tx=tx,
                     params=parameters,
                     apply_fn=self.model.__call__,
-                    module_config=copy.deepcopy(self.model.config),
+                    module_config=copy.deepcopy(self.model_state.module.config),
                     tx_init=tx_init,
                     hyperparameters=EasyDelState.create_hyperparameters(self.model.config.model_type),
                     module=self.model,
@@ -729,7 +830,7 @@ class DPOTrainer(BaseTrainer, ABC):
                     tx=self.tx,
                     params=parameters,
                     apply_fn=self.model.__call__,
-                    module_config=copy.deepcopy(self.model.config),
+                    module_config=copy.deepcopy(self.model_state.module.config),
                     tx_init=copy.deepcopy(self.arguments.optimizer_kwargs),
                     hyperparameters=EasyDelState.create_hyperparameters(self.model.config.model_type),
                     module=self.model,
@@ -745,7 +846,7 @@ class DPOTrainer(BaseTrainer, ABC):
                     tx_init=EasyDelState.safe_dict(copy.deepcopy(self.arguments.optimizer_kwargs)),
                     hyperparameters=EasyDelState.create_hyperparameters(self.model.config.model_type),
                     module=self.lora_model,
-                    module_config=self.model.config,
+                    module_config=self.model_state.module.config,
                     module_config_args=None,
                 )
 
@@ -792,7 +893,14 @@ class DPOTrainer(BaseTrainer, ABC):
         )
 
     def configure_model(self) -> TrainerConfigureModelFuncOutput:
-        ...
+        config = self.model_state.module.config
+        tx, scheduler = self.arguments.get_optimizer_and_scheduler(self.max_training_steps)
+        return TrainerConfigureModelFuncOutput(
+            model=self.model_state.module,
+            config=config,
+            scheduler=scheduler,
+            tx=tx
+        )
 
     def _get_train_dataloader(self) -> DataLoader:
 
@@ -1107,36 +1215,51 @@ class DPOTrainer(BaseTrainer, ABC):
 
         return reference_chosen_log_probs, reference_rejected_log_probs
 
-    def get_mesh(self) -> jax.sharding.Mesh:
-
-        """
-        The get_mesh function returns the mesh of a given instance of the class.
-
-        :param self: Bind the method to an object
-        :return: The mesh of the device
-        """
-        return self.mesh
-
     def train(self):
+        assert self.model_state is not None, "model_state can not be None for training purpose"
         with self.mesh:
             step = 0
-
             pbar = tqdm(total=self.max_training_steps)
-            current_step = self.model_state.step.tolist()
+            pbar.set_description("Training")
+            current_step = self.model_state.step.tolist() if isinstance(
+                self.model_state.step,
+                jax.Array
+            ) else self.model_state.step
             loss_sum = None
             accuracy_sum = None
             for epoch_index in range(self.arguments.num_train_epochs):
-                for batch in self.get_train_dataloader():
+                for batch in self.dataloader_train:
                     step += 1
                     if self.arguments.step_start_point > step:
                         ...
                     else:
                         time_start = time.time()
-                        self.model_state, metrics = self.sharded_train_step_function(self.model_state, batch=batch)
+
+                        for key in self.arguments.ids_to_pop_from_dataset:
+                            _ = batch.pop(key, None)
+                        for key in list(batch.keys()):
+                            if not (
+                                    key.endswith("_input_ids")
+                                    or key.endswith("_attention_mask")
+                                    or key.endswith("_labels")
+                            ):
+                                _ = batch.pop(key, None)
+                        self.model_state, metrics = self.sharded_train_step_function(
+                            self.model_state,
+                            batch
+                        )
                         total_time = time.time() - time_start
                         (
                             loss, chosen_rewards, rejected_rewards
                         ) = metrics.loss, metrics.chosen_rewards, metrics.rejected_rewards
+                        pbar.update(1)
+                        pbar.set_postfix(
+                            loss=loss,
+                            chosen_rewards=chosen_rewards,
+                            rejected_rewards=rejected_rewards,
+                            each_step_time=total_time,
+                            step=current_step
+                        )
             return self.model_state
 
     def eval(self):

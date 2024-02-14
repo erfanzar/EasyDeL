@@ -191,7 +191,7 @@ class BaseTrainer:
 
         self.timer.log(["configure dataloaders"])
 
-        self.timer("configure Model ,Optimizer ,Scheduler and Config").start()
+        self.timer("configure Model, Optimizer, Scheduler and Config").start()
         model_configurations = self.configure_model()
         model = model_configurations.model
         tx = model_configurations.tx
@@ -213,8 +213,8 @@ class BaseTrainer:
             self.lora_model = lora_modules.lora_module
             self.lora_tx = lora_modules.lora_tx
 
-        self.timer("configure Model ,Optimizer ,Scheduler and Config").stop()
-        self.timer.log(["configure Model ,Optimizer ,Scheduler and Config"])
+        self.timer("configure Model, Optimizer, Scheduler and Config").stop()
+        self.timer.log(["configure Model, Optimizer, Scheduler and Config"])
         self.timer("configure functions and sharding them").start()
         function_configurations = self.configure_functions()
         self.create_sharded_state_from_params_function = \
