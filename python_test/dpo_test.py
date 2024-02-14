@@ -81,7 +81,8 @@ def main():
         arguments = TrainArguments(
             num_train_epochs=4,
             model_name="DPO_TEST",
-            total_batch_size=1
+            total_batch_size=1,
+            use_wandb=False
         )
 
         torch_dtype = torch.float32
