@@ -113,10 +113,6 @@ from .modules.auto_easydel_model import (
 
 from .utils.utils import (
     get_mesh as get_mesh,
-    names_in_mesh as names_in_mesh,
-    get_names_from_partition_spec as get_names_from_partition_spec,
-    make_shard_and_gather_fns as make_shard_and_gather_fns,
-    with_sharding_constraint as with_sharding_constraint,
     RNG as RNG
 )
 
@@ -273,10 +269,6 @@ __all__ = (
 
     # Utils
     "get_mesh",
-    "names_in_mesh",
-    "get_names_from_partition_spec",
-    "make_shard_and_gather_fns",
-    "with_sharding_constraint",
     "RNG",
 
     # Trainers
@@ -292,12 +284,24 @@ __all__ = (
     "get_mem",
 
     # Converters
-    "huggingface_to_easydel", "easystate_to_huggingface_model", "easystate_to_torch",
-    "falcon_convert_flax_to_pt_7b", "falcon_from_pretrained", "falcon_convert_hf_to_flax", "mpt_convert_pt_to_flax_1b",
-    "mpt_convert_pt_to_flax_7b", "mpt_convert_flax_to_pt_7b", "mpt_from_pretrained", "mistral_convert_hf_to_flax_load",
-    "mistral_convert_flax_to_pt", 'mistral_from_pretrained', "falcon_convert_pt_to_flax_7b",
+    "huggingface_to_easydel",
+    "easystate_to_huggingface_model",
+    "easystate_to_torch",
+    "falcon_convert_flax_to_pt_7b",
+    "falcon_from_pretrained",
+    "falcon_convert_hf_to_flax",
+    "mpt_convert_pt_to_flax_1b",
+    "mpt_convert_pt_to_flax_7b",
+    "mpt_convert_flax_to_pt_7b",
+    "mpt_from_pretrained",
+    "mistral_convert_hf_to_flax_load",
+    "mistral_convert_flax_to_pt",
+    'mistral_from_pretrained',
+    "falcon_convert_pt_to_flax_7b",
     "mistral_convert_hf_to_flax",
-    "mpt_convert_flax_to_pt_1b", "llama_convert_flax_to_pt", "llama_convert_hf_to_flax_load",
+    "mpt_convert_flax_to_pt_1b",
+    "llama_convert_flax_to_pt",
+    "llama_convert_hf_to_flax_load",
     "llama_convert_hf_to_flax",
     "llama_from_pretrained",
 

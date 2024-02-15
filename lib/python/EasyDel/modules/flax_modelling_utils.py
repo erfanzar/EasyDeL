@@ -1,8 +1,8 @@
 import functools
 
+import fjformer
 from fjformer.bits import config as q_config, q_flax
 from jax.interpreters import pxla
-from jax.experimental.pjit import with_sharding_constraint as wsc
 import jax
 from flax import linen as nn
 from functools import partial
@@ -99,22 +99,7 @@ def names_in_mesh(*names):
     return set(names) <= set(pxla.thread_resources.env.physical_mesh.axis_names)
 
 
-def with_sharding_constraint(x, partition_specs):
-    """
-    The with_sharding_constraint function is used to ensure that the sharding of a tensor
-    is consistent with the sharding of its inputs.  This function should be called on any
-    tensor which has been created by an operation which does not automatically handle this,
-    such as tf.concat or tf.split.
-
-    :param x: Define the tensor that will be sharded
-    :param partition_specs: Specify the partitioning of the data
-    :return: The same tensor with the
-
-    """
-    axis_names = get_names_from_partition_spec(partition_specs)
-    if names_in_mesh(*axis_names):
-        x = wsc(x, partition_specs)
-    return x
+with_sharding_constraint = fjformer.with_sharding_constraint
 
 
 def get_gradient_checkpoint_policy(name):

@@ -15,10 +15,15 @@ import flax
 from tqdm import tqdm
 from ..utils.utils import prefix_print
 from ..smi import initialise_tracking, get_mem, get_capacity_matrix
-from jax.experimental.pjit import pjit, with_sharding_constraint
+from jax.experimental.pjit import pjit
 from jax.sharding import PartitionSpec
 from jax import numpy as jnp
-from fjformer import match_partition_rules, make_shard_and_gather_fns, CheckpointManager
+from fjformer import (
+    match_partition_rules,
+    make_shard_and_gather_fns,
+    CheckpointManager,
+    with_sharding_constraint
+)
 from ..etils.errors import EasyDelTimerError
 import chex
 from typing import Any, Optional, Union, Tuple, Callable, Mapping
@@ -49,8 +54,8 @@ def calculate_accuracy(predictions: chex.Array, targets: chex.Array):
 
 def create_casual_language_model_train_step(partition_spec=PartitionSpec(("dp", "fsdp"), "sp")):
     """
-    The create_casual_language_model_train_step function is a training step function that takes in the current state 
-    of the model,and a batch of data. It then calculates the loss and accuracy for this batch, and returns 
+    The create_casual_language_model_train_step function is a training step function that takes in the current state
+    of the model,and a batch of data. It then calculates the loss and accuracy for this batch, and returns
     an updated state with new parameters based on these gradients.
 
     :param partition_spec: Specify which devices the model will be split across
@@ -60,8 +65,8 @@ def create_casual_language_model_train_step(partition_spec=PartitionSpec(("dp", 
 
     def casual_language_model_train_step(state, batch):
         """
-        The casual_language_model_train_step function is a training step function that takes in the current state 
-        of the model and a batch of data. It then calculates the loss and accuracy for this batch, 
+        The casual_language_model_train_step function is a training step function that takes in the current state
+        of the model and a batch of data. It then calculates the loss and accuracy for this batch,
         and returns an updated state with new parameters based on these gradients.
 
         :param state: Store the model parameters
@@ -96,7 +101,7 @@ def create_casual_language_model_evaluation_step(partition_spec=PartitionSpec(("
     """
     The create_casual_language_model_evaluation_step function is used to create a function that calculates the loss
      and accuracy of a model. It takes in a set of parameters, which are then passed into the state.apply_fn function
-    to generate logits for each token in the batch. The cross entropy loss and accuracy are then calculated from these 
+    to generate logits for each token in the batch. The cross entropy loss and accuracy are then calculated from these
     logits.
 
     :param partition_spec: Specify the partitioning of the model parameters
@@ -108,7 +113,7 @@ def create_casual_language_model_evaluation_step(partition_spec=PartitionSpec(("
         """
         The casual_language_model_evaluation_step function is used to calculate the loss and accuracy of a model.
         It takes in a set of parameters, which are then passed into the state.apply_fn function
-        to generate logits for each token in the batch. The cross entropy loss and accuracy are then calculated from 
+        to generate logits for each token in the batch. The cross entropy loss and accuracy are then calculated from
         these logits.
 
         :param state: Store the model parameters and other information about the training process
@@ -124,7 +129,7 @@ def create_casual_language_model_evaluation_step(partition_spec=PartitionSpec(("
             """
             The calculate_loss function is used to calculate the loss and accuracy of a model.
             It takes in a set of parameters, which are then passed into the state.apply_fn function
-            to generate logits for each token in the batch. The cross entropy loss and accuracy are then calculated 
+            to generate logits for each token in the batch. The cross entropy loss and accuracy are then calculated
             from these logits.
 
             :param params: Pass the model parameters to the function
@@ -551,7 +556,8 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                             "loss": loss.tolist(),
                                             "mean loss": loss_sum / (current_step - self.arguments.step_start_point),
                                             "accuracy": accuracy.tolist(),
-                                            "mean accuracy": accuracy_sum / (current_step - self.arguments.step_start_point),
+                                            "mean accuracy": accuracy_sum / (
+                                                        current_step - self.arguments.step_start_point),
                                             "learning_rate": self.scheduler(
                                                 sharded_state.step.tolist()
                                             ).tolist(),
