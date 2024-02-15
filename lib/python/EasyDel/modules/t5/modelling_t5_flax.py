@@ -37,7 +37,6 @@ from transformers.modeling_flax_outputs import (
 )
 from transformers.modeling_flax_utils import (
     ACT2FN,
-    FlaxPreTrainedModel,
 )
 
 from jax.sharding import PartitionSpec
@@ -52,7 +51,7 @@ from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 remat = nn_partitioning.remat
 
 
-def shift_tokens_right(input_ids: np.array, pad_token_id: int, decoder_start_token_id: int) -> np.ndarray:
+def shift_tokens_right(input_ids: np.array, pad_token_id: int, decoder_start_token_id: int) -> chex.Array:
     """
     Shift input ids one token to the right.
     """
