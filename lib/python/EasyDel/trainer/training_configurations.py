@@ -206,7 +206,7 @@ class TrainArguments(
             print(
                 termcolor.colored("Information : ", color="red", force_color=True),
                 termcolor.colored(
-                    "track_memory is set to False by default inorder make make training faster.\n\t"
+                    "track_memory is set to False by default inorder make make training faster. "
                     "you can turn it on with just passing `track_memory=True` in TrainArguments",
                     color="white", force_color=True
                 )
