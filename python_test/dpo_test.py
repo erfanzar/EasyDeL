@@ -1,6 +1,8 @@
-import jax
-from ctransformers import transformers
+import os
 
+os.environ["JAX_TRACEBACK_FILTERING"] = "off"
+
+import jax
 from lib.python.EasyDel.reinforcement_learning.trainer.dpo_trainer import DPOTrainer as EasyDeLDPOTrainer, \
     TrainArguments
 from lib.python.EasyDel import EasyDelState

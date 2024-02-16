@@ -714,23 +714,31 @@ class DPOTrainer(BaseTrainer, ABC):
 
         self.timer("configure Model, Optimizer, Scheduler and Config").stop()
         self.timer.log(["configure Model, Optimizer, Scheduler and Config"])
+
         self.timer("configure functions and sharding them").start()
-        function_configurations = self.configure_functions()
-        self.create_sharded_state_from_params_function = \
-            function_configurations.create_sharded_state_from_params_function
-        self.sharded_train_step_function = function_configurations.sharded_train_step_function
-        self.mesh = function_configurations.mesh
-        self.checkpoint_manager = function_configurations.checkpoint_manager
-        self.initialize_state_function = function_configurations.initialize_state_function
-        self.timer("configure functions and sharding them").stop()
-        self.timer.log(["configure functions and sharding them"])
 
         if self.auto_shard_model_state:
             self.timer("Sharding Model State").start()
-            self.model_state = self.shard_states(
+            self.model_state: EasyDelState = self.shard_states(
                 self.model_state,
                 self.model_state.module.config.get_partition_rules(self.arguments.fully_sharded_data_parallel)
             )
+
+            if self.model_state.opt_state is None:
+                print("initializing TX and Schedulers")
+
+                params_with_opt = (
+                    self.model_state.params[
+                        'params'
+                    ] if '_overwrite_with_gradient' in self.model_state.params else self.model_state.params
+                )
+                opt_state = self.tx.init(params_with_opt)
+
+                self.model_state = self.model_state.replace(
+                    opt_state=opt_state,
+                    tx=self.tx
+                )
+
             self.timer("Sharding Model State").stop()
             self.timer.log(["Sharding Model State"])
         if self.auto_shard_ref_model_state and self.ref_model_state is not None:
@@ -742,6 +750,16 @@ class DPOTrainer(BaseTrainer, ABC):
             self.timer("Sharding Ref Model State").stop()
             self.timer.log(["Sharding Ref Model State"])
 
+        function_configurations = self.configure_functions()
+        self.create_sharded_state_from_params_function = \
+            function_configurations.create_sharded_state_from_params_function
+        self.sharded_train_step_function = function_configurations.sharded_train_step_function
+        self.mesh = function_configurations.mesh
+        self.checkpoint_manager = function_configurations.checkpoint_manager
+        self.initialize_state_function = function_configurations.initialize_state_function
+        self.timer("configure functions and sharding them").stop()
+        self.timer.log(["configure functions and sharding them"])
+
     def create_collate_function(
             self,
             max_sequence_length: int,
@@ -750,7 +768,7 @@ class DPOTrainer(BaseTrainer, ABC):
         return self.data_collator
 
     def shard_states(self, state, rules):
-        with self.mesh:
+        with self.arguments.get_mesh():
             partition_spec = match_partition_rules(rules=rules, params=jax.eval_shape(lambda: state))
 
             def _shard(x):
@@ -850,7 +868,7 @@ class DPOTrainer(BaseTrainer, ABC):
                     module_config_args=None,
                 )
 
-        state_shape = jax.eval_shape(initialize_state_function)
+        state_shape = jax.eval_shape(lambda: self.model_state)
 
         state_partition_spec = match_partition_rules(
             self.config.get_partition_rules(
@@ -874,7 +892,6 @@ class DPOTrainer(BaseTrainer, ABC):
         )
         sharded_train_step_function = pjit(
             train_function,
-
             in_shardings=(state_partition_spec, self.arguments.step_partition_spec),
             out_shardings=(state_partition_spec, PartitionSpec()),
         )
