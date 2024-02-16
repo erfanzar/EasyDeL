@@ -1,23 +1,32 @@
 import copy
 import dataclasses
+import os
+import sys
 import time
 import warnings
 from abc import ABC
 from collections import defaultdict
 
+import IPython
 import chex
 import flax.core
 import jax
-from fjformer import match_partition_rules
+import termcolor
+import wandb
+from fjformer import match_partition_rules, make_shard_and_gather_fns
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from ..utils.collectors import DPODataCollatorWithPadding
-from typing import Optional, Literal, Dict, Union, Any, Tuple, List, Callable
+from typing import Optional, Literal, Dict, Union, Any, Tuple, List, Callable, Mapping
 from .utils import pad_to_length
 from jax.experimental.pjit import pjit
 from datasets import Dataset
 from jax import numpy as jnp
+
+from ... import initialise_tracking, get_mem, EasyDelTimerError
+from ...smi import get_capacity_matrix
+from ...trainer.causal_language_model_trainer import TrainerOutput
 from ...trainer.training_configurations import TrainArguments
 from ...trainer.base_trainer import BaseTrainer, TrainerConfigureFunctionFuncOutput, \
     TrainerConfigureDataloaderFuncOutput, TrainerConfigureModelFuncOutput
@@ -27,9 +36,10 @@ from .partitioner_config import PartitionerConfig
 from jax.sharding import PartitionSpec
 
 from ...utils import Timers
+from flax.struct import dataclass
 
 
-@dataclasses.dataclass
+@dataclass
 class DPOStepOut:
     loss: chex.Array
     chosen_rewards: chex.Array
@@ -724,20 +734,19 @@ class DPOTrainer(BaseTrainer, ABC):
                 self.model_state.module.config.get_partition_rules(self.arguments.fully_sharded_data_parallel)
             )
 
-            if self.model_state.opt_state is None:
-                print("initializing TX and Schedulers")
+            termcolor.cprint("initializing TX and Schedulers for `model_state`", force_color=True, color="cyan")
 
-                params_with_opt = (
-                    self.model_state.params[
-                        'params'
-                    ] if '_overwrite_with_gradient' in self.model_state.params else self.model_state.params
-                )
-                opt_state = self.tx.init(params_with_opt)
+            params_with_opt = (
+                self.model_state.params[
+                    'params'
+                ] if '_overwrite_with_gradient' in self.model_state.params else self.model_state.params
+            )
+            opt_state = self.tx.init(params_with_opt)
 
-                self.model_state = self.model_state.replace(
-                    opt_state=opt_state,
-                    tx=self.tx
-                )
+            self.model_state = self.model_state.replace(
+                opt_state=opt_state,
+                tx=self.tx
+            )
 
             self.timer("Sharding Model State").stop()
             self.timer.log(["Sharding Model State"])
@@ -1232,9 +1241,43 @@ class DPOTrainer(BaseTrainer, ABC):
 
         return reference_chosen_log_probs, reference_rejected_log_probs
 
+    def _save_state(
+            self,
+            state: EasyDelState,
+            gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
+            milestone: bool = False
+    ) -> str:
+        step = int(
+            jax.device_get(
+                state.step
+            )
+        ) + self.arguments.step_start_point if self.arguments.step_start_point is not None else int(
+            jax.device_get(
+                state.step
+            )
+        )
+        checkpoint_name = f"{self.arguments.model_name}-S{step}"
+        filename = f"{checkpoint_name}_{step}" if milestone else f"{checkpoint_name}"
+        filename += ".easy"
+        termcolor.cprint(f"Saving Model {filename}.", color="cyan", force_color=True)
+        state.save_state(
+            filename=filename,
+            checkpoint_dir=os.path.join(self.arguments.save_dir, self.arguments.model_name),
+            gather_fns=gather_fns,
+            float_dtype=self.dtype,
+            verbose=self.arguments.verbose,
+            save_optimizer=self.arguments.save_optimizer_state,
+        )
+        return filename
+
     def train(self):
         assert self.model_state is not None, "model_state can not be None for training purpose"
         with self.mesh:
+
+            dir_prefix: str = "/dev/shm" if sys.platform != "win32" else "."
+            checkpoint_path = "SAVING_SKIPPED"
+            if self.arguments.track_memory:
+                initialise_tracking(dir_prefix=dir_prefix)
             step = 0
             pbar = tqdm(total=self.max_training_steps)
             pbar.set_description("Training")
@@ -1244,40 +1287,135 @@ class DPOTrainer(BaseTrainer, ABC):
             ) else self.model_state.step
             loss_sum = None
             accuracy_sum = None
-            for epoch_index in range(self.arguments.num_train_epochs):
-                for batch in self.dataloader_train:
-                    step += 1
-                    if self.arguments.step_start_point > step:
-                        ...
-                    else:
-                        time_start = time.time()
+            mem_res = "Tracking Option is OFF"
 
-                        for key in self.arguments.ids_to_pop_from_dataset:
-                            _ = batch.pop(key, None)
-                        for key in list(batch.keys()):
-                            if not (
-                                    key.endswith("_input_ids")
-                                    or key.endswith("_attention_mask")
-                                    or key.endswith("_labels")
-                            ):
+            try:
+                for epoch_index in range(self.arguments.num_train_epochs):
+                    for batch in self.dataloader_train:
+                        step += 1
+                        if self.arguments.step_start_point > step:
+                            ...
+                        elif current_step < self.max_training_steps:
+                            time_start = time.time()
+
+                            for key in self.arguments.ids_to_pop_from_dataset:
                                 _ = batch.pop(key, None)
-                        self.model_state, metrics = self.sharded_train_step_function(
-                            self.model_state,
-                            batch
-                        )
-                        total_time = time.time() - time_start
-                        (
-                            loss, chosen_rewards, rejected_rewards
-                        ) = metrics.loss, metrics.chosen_rewards, metrics.rejected_rewards
-                        pbar.update(1)
-                        pbar.set_postfix(
-                            loss=loss,
-                            chosen_rewards=chosen_rewards,
-                            rejected_rewards=rejected_rewards,
-                            each_step_time=total_time,
-                            step=current_step
-                        )
-            return self.model_state
+                            for key in list(batch.keys()):
+                                if not (
+                                        key.endswith("_input_ids")
+                                        or key.endswith("_attention_mask")
+                                        or key.endswith("_labels")
+                                ):
+                                    _ = batch.pop(key, None)
+                            self.model_state, metrics = self.sharded_train_step_function(
+                                self.model_state,
+                                batch
+                            )
+                            total_time = time.time() - time_start
+                            (
+                                loss, chosen_rewards, rejected_rewards
+                            ) = metrics.loss, metrics.chosen_rewards[0], metrics.rejected_rewards[0]
+
+                            if self.arguments.track_memory:
+                                mem_res = get_mem(dir_prefix=dir_prefix)
+
+                            information_queries = {}
+                            if self.arguments.track_memory:
+                                for key in ["Used", "Usage Percent"]:
+                                    for device, info in get_capacity_matrix(dir_prefix=dir_prefix).items():
+                                        information_queries[f"{device.replace('_', ' ')} ({key})"] = float(
+                                            info[key].replace("%", "").replace("GB", ""))
+                            with jax.spmd_mode("allow_all"):
+                                self.wandb_runtime.log(
+                                    {
+                                        "loss": loss.tolist(),
+                                        "learning_rate": self.scheduler(
+                                            self.model_state.step.tolist()
+                                        ).tolist(),
+                                        "step": current_step,
+                                        "step time": total_time,
+                                        "perplexity": jnp.exp(loss).tolist(),
+                                        "accelerators": information_queries,
+                                        "epoch": epoch_index
+                                    }
+                                ),
+                                wandb.summary["captured_memory_log"] = mem_res
+
+                            if self.arguments.track_memory:
+                                IPython.display.clear_output(True)
+                                pbar.display(mem_res)
+
+                            pbar.update(1)
+                            pbar.set_postfix(
+                                loss=loss,
+                                chosen_rewards=chosen_rewards,
+                                rejected_rewards=rejected_rewards,
+                                each_step_time=total_time,
+                                step=current_step
+                            )
+                        else:
+                            break
+            except KeyboardInterrupt:
+                termcolor.cprint(
+                    "KeyboardInterrupt At training model Will return Current State of the Model with Parameters.",
+                    color="cyan",
+                    force_color=True
+                )
+
+            except EasyDelTimerError:
+                termcolor.cprint(
+                    "Training reached out maximum training Time Killing training Process "
+                    "and Will return Current State of the Model with Parameters.",
+                    color="cyan",
+                    force_color=True
+                )
+
+            if self.arguments.merge_lora_rapture_parameters and self.rapture is not None:
+                print(
+                    termcolor.colored(
+                        "Info : ", color="red", force_color=True
+                    ),
+                    termcolor.colored(
+                        "Merging LoRA Parameters.", color="white", force_color=True
+                    )
+                )
+                self.model_state = self.model_state.replace(
+                    params=self.rapture.merge_parameters(self.model_state.params)
+                )
+            output = TrainerOutput(
+                state=self.model_state,
+                mesh=self.mesh,
+                shard_fns=lambda x: x,  # TODO: fix this
+                gather_fns=lambda x: x,  # TODO: fix this
+                checkpoint_manager=self.checkpoint_manager,
+            )
+            if self.arguments.save_steps is None and self.arguments.do_last_save:
+                shard_fns, gather_fns = make_shard_and_gather_fns(
+                    match_partition_rules(
+                        self.config.get_partition_rules(
+                            fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
+                        ) if self.arguments.custom_rule is None else self.arguments.custom_rule,
+                        jax.eval_shape(lambda: self.model_state)
+                    ),
+                    dtype_specs=self.dtype
+                )  # You have to re-init the new shard and gather functions in order to be able to skip LoRA weight
+                # crashing errors and saving errors
+                filename = self._save_state(
+                    state=self.model_state,
+                    gather_fns=gather_fns
+                )
+                checkpoint_path = f"{str(self.arguments.get_path())}/{filename}"
+
+            # if self.arguments.do_eval:
+            #     self.eval(
+            #         self.model_state
+            #     )
+
+            output.checkpoint_path = checkpoint_path
+            output.last_save_file_name = filename
+            wandb.finish()
+
+        return output
 
     def eval(self):
         """
