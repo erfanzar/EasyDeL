@@ -102,13 +102,13 @@ def main():
         state = EasyDelState.from_pretrained(
             pretrained_model_name_or_path=model_name_or_path
         )
-        ref_state = EasyDelState.from_pretrained(
-            pretrained_model_name_or_path=model_name_or_path
-        )
+        # ref_state = EasyDelState.from_pretrained(
+        #     pretrained_model_name_or_path=model_name_or_path
+        # )
 
         dpo_trainer = EasyDeLDPOTrainer(
             state,
-            ref_state,
+            None,
             beta=0.1,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
