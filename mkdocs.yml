@@ -94,7 +94,6 @@ nav:
     - Models:
       - Modelling Casual Language Rl: generated-reinforcement_learning-models-modelling_casual_language_rl.md
     - Trainer:
-      - Base: generated-reinforcement_learning-trainer-base.md
       - Dpo Trainer: generated-reinforcement_learning-trainer-dpo_trainer.md
       - Partitioner Config: generated-reinforcement_learning-trainer-partitioner_config.md
       - Ppo Config: generated-reinforcement_learning-trainer-ppo_config.md
