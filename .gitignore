@@ -15,6 +15,7 @@ io.py
 # Distribution / packaging
 *.json
 .Python
+EasyDel-Checkpoints
 build/
 develop-eggs/
 memory.prof.new
