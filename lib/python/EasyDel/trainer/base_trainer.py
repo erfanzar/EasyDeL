@@ -1,5 +1,6 @@
 import abc
 import os
+import typing
 import warnings
 from abc import abstractmethod
 from typing import Union, Callable, Optional
@@ -230,7 +231,7 @@ class BaseTrainer:
     def create_collate_function(
             self,
             max_sequence_length: int,
-            is_left_padded: bool
+            truncation_mode: typing.Literal["keep_end", "keep_start"]
     ) -> Callable:
         raise NotImplementedError
 
@@ -261,7 +262,7 @@ class BaseTrainer:
             self.dataset_train,
             collate_fn=self.create_collate_function(
                 max_sequence_length=self.arguments.max_sequence_length,
-                is_left_padded=self.arguments.is_left_padded
+                truncation_mode=self.arguments.truncation_mode
             ),
             batch_size=self.arguments.total_batch_size,
             drop_last=True,
@@ -274,7 +275,7 @@ class BaseTrainer:
                 self.dataset_eval,
                 collate_fn=self.create_collate_function(
                     max_sequence_length=self.arguments.max_sequence_length,
-                    is_left_padded=self.arguments.is_left_padded
+                    truncation_mode=self.arguments.truncation_mode
                 ),
                 batch_size=self.arguments.total_batch_size,
                 drop_last=True

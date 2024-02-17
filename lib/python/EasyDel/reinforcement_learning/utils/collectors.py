@@ -48,7 +48,6 @@ class DPODataCollatorWithPadding:
                         padding_value = 0
                     else:
                         raise ValueError(f"Unexpected key in batch '{k}'")
-
                     padded_batch[k] = pad_sequence(to_pad, batch_first=True, padding_value=padding_value).astype("i4")
                     if "prompt" in k:
                         padded_batch[k] = jnp.flip(padded_batch[k], axis=[1])
@@ -56,4 +55,7 @@ class DPODataCollatorWithPadding:
                 padded_batch[k] = jnp.array([ex[k] for ex in features])
             else:
                 padded_batch[k] = [ex[k] for ex in features]
+
+        for k, v in padded_batch.items():
+            print(f"{k} : {v.shape}")
         return padded_batch

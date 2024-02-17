@@ -1,8 +1,8 @@
 import copy
-import dataclasses
 import os
 import sys
 import time
+import typing
 import warnings
 from abc import ABC
 from collections import defaultdict
@@ -49,7 +49,9 @@ class DPOStepOut:
 def create_concatenated_forward(
         is_encoder_decoder,
         label_pad_token_id,
-        padding_value
+        padding_value,
+        truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
+        fixed_max_length: int | None = None
 ):
     """
     The create_concatenated_forward function is a helper function that creates a forward pass function for the
@@ -59,6 +61,9 @@ def create_concatenated_forward(
     :param is_encoder_decoder: Determine whether the model is an encoder-decoder model or not
     :param label_pad_token_id: Pad the labels to the same length
     :param padding_value: Pad the inputs to the same length
+    :param truncation_mode: typing.Literal["keep_end","keep_start"]: where to pad and where to keep.
+    :param fixed_max_length : int|None: by providing fixed_max_length the func will always return a fixed sequence length
+    and won't use dynamic methods.
     :return: A function that takes in a apply_fn, params and a batch of inputs,
     """
 
@@ -76,11 +81,14 @@ def create_concatenated_forward(
         :param batch: Dict[str, Union[List, chex.Array]] : Pass the batch of data to the concatenated_forward function
         :return: The log_probs of the chosen and rejected labels, as well as their corresponding logits
         """
+        assert padding_value is not None, "`padding_value` can not be set as `None` it must be an integer."
         concatenated_batch = concatenated_inputs(
             batch,
             is_encoder_decoder=is_encoder_decoder,
             label_pad_token_id=label_pad_token_id,
             padding_value=padding_value,
+            truncation_mode=truncation_mode,
+            fixed_max_length=fixed_max_length
         )
         len_chosen = batch["chosen_labels"].shape[0]
         concatenated_batch["concatenated_input_ids"] = concatenated_batch["concatenated_input_ids"].reshape(
@@ -186,6 +194,8 @@ def concatenated_inputs(
         is_encoder_decoder: bool = False,
         label_pad_token_id: int = -100,
         padding_value: int = 0,
+        truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
+        fixed_max_length: int | None = None
 ) -> Dict[str, chex.Array]:
     """
     The concatenated_inputs function takes a batch of chosen and rejected examples,
@@ -199,15 +209,20 @@ def concatenated_inputs(
     :param is_encoder_decoder: bool: Determine whether the model is an encoder-decoder model
     :param label_pad_token_id: int: Pad the labels with a value of -100
     :param padding_value: int: Pad the input_ids and attention_mask arrays to the same length
+    :param truncation_mode: typing.Literal["keep_end", "keep_start"]: is left padded or not should it keep start of the
+    array or the end of the array?.
+    :param fixed_max_length : int|None: by providing fixed_max_length the func will always return a fixed sequence length
+    and won't use dynamic methods.
     :return: A dictionary of the concatenated inputs
     """
     concatenated_batch = {}
-
-    if is_encoder_decoder:
-        max_length = max(batch["chosen_labels"].shape[1], batch["rejected_labels"].shape[1])
+    if fixed_max_length is None:
+        if is_encoder_decoder:
+            max_length = max(batch["chosen_labels"].shape[-1], batch["rejected_labels"].shape[-1])
+        else:
+            max_length = max(batch["chosen_input_ids"].shape[-1], batch["rejected_input_ids"].shape[-1])
     else:
-        max_length = max(batch["chosen_input_ids"].shape[1], batch["rejected_input_ids"].shape[1])
-
+        max_length = fixed_max_length
     for k in batch:
         if k.startswith("chosen") and isinstance(batch[k], jax.Array):
             if "labels" in k or is_encoder_decoder:
@@ -225,20 +240,26 @@ def concatenated_inputs(
             if "labels" in k or is_encoder_decoder:
                 pad_value = label_pad_token_id
             elif k.endswith("_input_ids"):
+                assert padding_value is not None, "`padding_value` can not be set as `None`"
                 pad_value = padding_value
             elif k.endswith("_attention_mask"):
                 pad_value = 0
             else:
                 raise KeyError("couldn't find pad_value [Dataset Issue]")
             concatenated_key = k.replace("rejected", "concatenated")
+            v2d = lambda ar: ar.reshape(ar.shape[0], -1)
             concatenated_batch[concatenated_key] = jnp.concatenate(
                 (
-                    concatenated_batch[concatenated_key],
-                    pad_to_length(batch[k], max_length, pad_value=pad_value),
+                    v2d(concatenated_batch[concatenated_key]),
+                    pad_to_length(v2d(batch[k]), max_length, pad_value=pad_value),
                 ),
                 axis=0,
             )
-
+    for k in list(concatenated_batch.keys()):
+        val = concatenated_batch[k]
+        if val.ndim == 3:
+            # making 3d array 2d
+            concatenated_batch[k] = val.reshape(val.shape[0], -1)
     if is_encoder_decoder:
         concatenated_batch["concatenated_input_ids"] = batch["prompt_input_ids"].repeat(2, 1)
         concatenated_batch["concatenated_attention_mask"] = (
@@ -488,9 +509,6 @@ def create_dpo_train_function(
                             - reference_rejected_log_probs
                     )
             )
-            # jax.debug.print("{x}", x=chosen_rewards)
-            # jax.debug.print("{x}", x=rejected_rewards)
-            # jax.debug.print("{x}", x=losses)
             return losses[0], (chosen_rewards, rejected_rewards)
 
         grad_fn = jax.value_and_grad(calculate_loss, has_aux=True)
@@ -512,16 +530,15 @@ class DPOTrainer(BaseTrainer, ABC):
 
     def __init__(
             self,
+            arguments: TrainArguments,
             model_state: EasyDelState | str,
             ref_model_state: Optional[EasyDelState | str] = None,
             partitioner_config: Optional[PartitionerConfig] = PartitionerConfig(),
             beta: float = 0.1,
             label_smoothing: float = 0,
             loss_type: Literal["sigmoid", "hinge", "ipo", "kto"] = "sigmoid",
-            arguments: TrainArguments = None,
             label_pad_token_id: int = -100,
             padding_value: int = None,
-            truncation_mode: str = "keep_end",
             train_dataset: Optional[Dataset] = None,
             eval_dataset: Optional[Union[Dataset, Dict[str, Dataset]]] = None,
             tokenizer: Optional[PreTrainedTokenizerBase] = None,
@@ -552,7 +569,6 @@ class DPOTrainer(BaseTrainer, ABC):
         :param arguments: TrainArguments: Pass the arguments to the trainer
         :param label_pad_token_id: int: Pad the labels
         :param padding_value: int: Specify the value that is used for padding
-        :param truncation_mode: str: Truncate the input text
         :param train_dataset: Optional[Dataset]: Load the training dataset
         :param eval_dataset: Optional[Union[Dataset, Dict[str, Dataset]]] : Pass the evaluation dataset to the trainer
         :param tokenizer: Optional[PreTrainedTokenizerBase]: Pass the tokenizer to the trainer
@@ -616,9 +632,11 @@ class DPOTrainer(BaseTrainer, ABC):
         )
         self.max_length = max_length
         self.label_pad_token_id = label_pad_token_id
-        self.padding_value = padding_value if padding_value is not None else tokenizer.pad_token_id
+        padding_value = padding_value if padding_value is not None else tokenizer.pad_token_id
+        self.padding_value = padding_value
         self.max_prompt_length = max_prompt_length
-        self.truncation_mode = truncation_mode
+        self.truncation_mode = arguments.truncation_mode
+
         self.max_target_length = max_target_length
         self.tokenizer = tokenizer
         self.precompute_ref_log_probs = precompute_ref_log_probs
@@ -654,11 +672,12 @@ class DPOTrainer(BaseTrainer, ABC):
         self.model_state = model_state
         self._loggers_initialized = False
         self.mesh = self.arguments.get_mesh()
+        assert padding_value is not None, "`padding_value` can not be set as `None` it must be an integer."
 
         self.concatenated_forward = create_concatenated_forward(
             is_encoder_decoder=self.is_encoder_decoder,
             padding_value=padding_value,
-            label_pad_token_id=label_pad_token_id
+            label_pad_token_id=label_pad_token_id,
         )
         self.auto_shard_ref_model_state = auto_shard_ref_model_state
         self.auto_shard_model_state = auto_shard_model_state
@@ -772,7 +791,7 @@ class DPOTrainer(BaseTrainer, ABC):
     def create_collate_function(
             self,
             max_sequence_length: int,
-            is_left_padded: bool
+            truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> Callable:
         return self.data_collator
 
@@ -1133,7 +1152,11 @@ class DPOTrainer(BaseTrainer, ABC):
 
         if not isinstance(prompt, str):
             raise ValueError(f"prompt should be an str but got {type(prompt)} , {prompt}")
-        prompt_tokens = self.tokenizer(prompt, add_special_tokens=False)
+        prompt_tokens = self.tokenizer(
+            prompt,
+            add_special_tokens=False,
+            return_tensors="np",
+        )
         prompt_tokens = {f"prompt_{k}": v for k, v in prompt_tokens.items()}
 
         if not isinstance(chosen, str):
@@ -1143,20 +1166,53 @@ class DPOTrainer(BaseTrainer, ABC):
         if not isinstance(rejected, str):
             raise ValueError(f"rejected should be an str but got {type(rejected)}")
         rejected_tokens = self.build_tokenized_answer(prompt, rejected)
-        prompt_tokens["prompt_input_ids"] = [self.tokenizer.bos_token_id] + prompt_tokens["prompt_input_ids"]
-        chosen_tokens["prompt_input_ids"] = [self.tokenizer.bos_token_id] + chosen_tokens["prompt_input_ids"]
-        rejected_tokens["prompt_input_ids"] = [self.tokenizer.bos_token_id] + rejected_tokens["prompt_input_ids"]
+        v2d = lambda ar: ar.reshape(1, -1) if ar.ndim == 1 else ar
 
-        prompt_tokens["prompt_attention_mask"] = [1] + prompt_tokens["prompt_attention_mask"]
-        chosen_tokens["prompt_attention_mask"] = [1] + chosen_tokens["prompt_attention_mask"]
-        rejected_tokens["prompt_attention_mask"] = [1] + rejected_tokens["prompt_attention_mask"]
+        def add_tkn(n, ar):
+            return jnp.concatenate(
+                (
+                    jnp.array(n).reshape(1, 1),
+                    v2d(ar)
+                ), axis=-1
+            )
+
+        def add_post_tkn(n, ar):
+            return jnp.concatenate(
+                (
+                    v2d(ar),
+                    jnp.array(n).reshape(1, 1)
+                ), axis=-1
+            )
+
+        prompt_tokens["prompt_input_ids"] = add_tkn(
+            self.tokenizer.bos_token_id,
+            prompt_tokens["prompt_input_ids"]
+        )
+        chosen_tokens["prompt_input_ids"] = add_tkn(
+            self.tokenizer.bos_token_id,
+            chosen_tokens["prompt_input_ids"]
+        )
+        rejected_tokens["prompt_input_ids"] = add_tkn(
+            self.tokenizer.bos_token_id,
+            rejected_tokens["prompt_input_ids"]
+        )
+
+        prompt_tokens["prompt_attention_mask"] = add_tkn(
+            1, prompt_tokens["prompt_attention_mask"]
+        )
+        chosen_tokens["prompt_attention_mask"] = add_tkn(
+            1, chosen_tokens["prompt_attention_mask"]
+        )
+        rejected_tokens["prompt_attention_mask"] = add_tkn(
+            1, rejected_tokens["prompt_attention_mask"]
+        )
 
         # add EOS token to end of answer
-        chosen_tokens["input_ids"].append(self.tokenizer.eos_token_id)
-        chosen_tokens["attention_mask"].append(1)
+        chosen_tokens["input_ids"] = add_post_tkn(self.tokenizer.eos_token_id, chosen_tokens["input_ids"])
+        chosen_tokens["attention_mask"] = add_post_tkn(1, chosen_tokens["attention_mask"])
 
-        rejected_tokens["input_ids"].append(self.tokenizer.eos_token_id)
-        rejected_tokens["attention_mask"].append(1)
+        rejected_tokens["input_ids"] = add_post_tkn(self.tokenizer.eos_token_id, rejected_tokens["input_ids"])
+        rejected_tokens["attention_mask"] = add_post_tkn(1, rejected_tokens["attention_mask"])
 
         longer_response_length = max(len(chosen_tokens["input_ids"]), len(rejected_tokens["input_ids"]))
 
@@ -1180,20 +1236,27 @@ class DPOTrainer(BaseTrainer, ABC):
 
         # Create labels
         chosen_sequence_tokens = {
-            k: chosen_tokens[f"prompt_{k}"] + chosen_tokens[k] for k in ["input_ids", "attention_mask"]
+            k: jnp.concatenate(
+                (v2d(chosen_tokens[f"prompt_{k}"]), v2d(chosen_tokens[k])),
+                axis=-1
+            ) for k in ["input_ids", "attention_mask"]
         }
         rejected_sequence_tokens = {
-            k: rejected_tokens[f"prompt_{k}"] + rejected_tokens[k] for k in ["input_ids", "attention_mask"]
+            k: jnp.concatenate(
+                (v2d(rejected_tokens[f"prompt_{k}"]), v2d(rejected_tokens[k])),
+                axis=-1
+            ) for k in ["input_ids", "attention_mask"]
         }
         chosen_sequence_tokens["labels"] = chosen_sequence_tokens["input_ids"][:]
-        chosen_sequence_tokens["labels"][
-        : len(chosen_tokens["prompt_input_ids"])
-        ] = [self.label_pad_token_id] * len(chosen_tokens["prompt_input_ids"])
+        chosen_sequence_tokens["labels"] = chosen_sequence_tokens["labels"].at[
+                                           : len(chosen_tokens["prompt_input_ids"])
+                                           ].set([self.label_pad_token_id] * len(chosen_tokens["prompt_input_ids"]))
         rejected_sequence_tokens["labels"] = rejected_sequence_tokens["input_ids"][:]
-        rejected_sequence_tokens["labels"][: len(rejected_tokens["prompt_input_ids"])] = [
-                                                                                             self.label_pad_token_id
-                                                                                         ] * len(
-            rejected_tokens["prompt_input_ids"])
+        rejected_sequence_tokens["labels"] = rejected_sequence_tokens["labels"].at[
+                                             : len(rejected_tokens["prompt_input_ids"])
+                                             ].set(
+            ([self.label_pad_token_id] * len(rejected_tokens["prompt_input_ids"]))
+        )
 
         for k, tokens_ in {
             "chosen_": chosen_sequence_tokens,
@@ -1325,21 +1388,23 @@ class DPOTrainer(BaseTrainer, ABC):
                                     for device, info in get_capacity_matrix(dir_prefix=dir_prefix).items():
                                         information_queries[f"{device.replace('_', ' ')} ({key})"] = float(
                                             info[key].replace("%", "").replace("GB", ""))
-                            with jax.spmd_mode("allow_all"):
-                                self.wandb_runtime.log(
-                                    {
-                                        "loss": loss.tolist(),
-                                        "learning_rate": self.scheduler(
-                                            self.model_state.step.tolist()
-                                        ).tolist(),
-                                        "step": current_step,
-                                        "step time": total_time,
-                                        "perplexity": jnp.exp(loss).tolist(),
-                                        "accelerators": information_queries,
-                                        "epoch": epoch_index
-                                    }
-                                ),
-                                wandb.summary["captured_memory_log"] = mem_res
+
+                            if self.arguments.use_wandb:
+                                with jax.spmd_mode("allow_all"):
+                                    self.wandb_runtime.log(
+                                        {
+                                            "loss": loss.tolist(),
+                                            "learning_rate": self.scheduler(
+                                                self.model_state.step.tolist()
+                                            ).tolist(),
+                                            "step": current_step,
+                                            "step time": total_time,
+                                            "perplexity": jnp.exp(loss).tolist(),
+                                            "accelerators": information_queries,
+                                            "epoch": epoch_index
+                                        }
+                                    ),
+                                    wandb.summary["captured_memory_log"] = mem_res
 
                             if self.arguments.track_memory:
                                 IPython.display.clear_output(True)
@@ -1382,11 +1447,21 @@ class DPOTrainer(BaseTrainer, ABC):
                 self.model_state = self.model_state.replace(
                     params=self.rapture.merge_parameters(self.model_state.params)
                 )
+
+            shard_fns, gather_fns = make_shard_and_gather_fns(
+                partition_specs=match_partition_rules(
+                    rules=self.model_state.module.config.get_partition_rules(
+                        self.arguments.fully_sharded_data_parallel
+                    ),
+                    params=jax.eval_shape(lambda: self.model_state)
+                ),
+                dtype_specs=self.arguments.dtype
+            )
             output = TrainerOutput(
                 state=self.model_state,
                 mesh=self.mesh,
-                shard_fns=lambda x: x,  # TODO: fix this
-                gather_fns=lambda x: x,  # TODO: fix this
+                shard_fns=shard_fns,
+                gather_fns=gather_fns,
                 checkpoint_manager=self.checkpoint_manager,
             )
             if self.arguments.save_steps is None and self.arguments.do_last_save:
