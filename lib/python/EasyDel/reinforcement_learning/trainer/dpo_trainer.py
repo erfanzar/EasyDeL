@@ -535,13 +535,14 @@ class DPOTrainer(BaseTrainer, ABC):
             ref_model_state: Optional[EasyDelState | str] = None,
             partitioner_config: Optional[PartitionerConfig] = PartitionerConfig(),
             beta: float = 0.1,
-            label_smoothing: float = 0,
+            label_smoothing: float = .0,
             loss_type: Literal["sigmoid", "hinge", "ipo", "kto"] = "sigmoid",
             label_pad_token_id: int = -100,
             padding_value: int = None,
             train_dataset: Optional[Dataset] = None,
             eval_dataset: Optional[Union[Dataset, Dict[str, Dataset]]] = None,
             tokenizer: Optional[PreTrainedTokenizerBase] = None,
+            data_collator: Optional[Callable] = None,
             max_length: Optional[int] = None,
             max_prompt_length: Optional[int] = None,
             max_target_length: Optional[int] = None,
@@ -551,6 +552,7 @@ class DPOTrainer(BaseTrainer, ABC):
             reference_free: bool = False,
             auto_shard_model_state: bool = True,
             auto_shard_ref_model_state: bool = True,
+            is_encoder_decoder: Optional[bool] = False,
             _do_init_fns: bool = True,
     ):
 
@@ -575,6 +577,7 @@ class DPOTrainer(BaseTrainer, ABC):
         :param max_length: Optional[int]: Set the maximum length of the input sequence
         :param max_prompt_length: Optional[int]: Set the maximum length of the prompt
         :param max_target_length: Optional[int]: Truncate the target sequence
+        :param data_collator: Optional[Callable]: Function to be used for creating datasets.
         :param precompute_ref_log_probs: bool: Precompute the log probabilities of the reference model
         :param model_init_kwargs: Optional[Dict]: Pass in the model_kwargs to model for init process
         :param ref_model_init_kwargs: Optional[Dict]: Pass the ref_model_init_kwargs to ref_model for init process
@@ -629,10 +632,41 @@ class DPOTrainer(BaseTrainer, ABC):
             pad_token_id=tokenizer.pad_token_id,
             label_pad_token_id=label_pad_token_id,
             is_encoder_decoder=False,
-        )
+        ) if data_collator is None else data_collator
+
+        if loss_type in ["hinge", "ipo", "kto_pair"] and label_smoothing > 0:
+            warnings.warn(
+                "You are using a loss type that does not support label smoothing. Ignoring label_smoothing parameter."
+            )
+
+        if tokenizer is None:
+            raise ValueError("tokenizer must be specified to tokenize a DPO dataset.")
+        if max_length is None:
+            warnings.warn(
+                "`max_length` is not set in the DPOTrainer's init"
+                " it will default to `512` by default, but you should do it yourself in the future.",
+                UserWarning,
+            )
+            max_length = 512
+        if max_prompt_length is None:
+            warnings.warn(
+                "`max_prompt_length` is not set in the DPOTrainer's init"
+                " it will default to `128` by default, but you should do it yourself in the future.",
+                UserWarning,
+            )
+            max_prompt_length = 128
+
+        if max_target_length is None and is_encoder_decoder:
+            warnings.warn(
+                "When using an encoder decoder architecture, you should set `max_target_length` in the "
+                "DPOTrainer's init it will default to `128` by default, but you should do it yourself in the future.",
+                UserWarning,
+            )
+            max_target_length = 128
+
+        padding_value = padding_value if padding_value is not None else tokenizer.pad_token_id
         self.max_length = max_length
         self.label_pad_token_id = label_pad_token_id
-        padding_value = padding_value if padding_value is not None else tokenizer.pad_token_id
         self.padding_value = padding_value
         self.max_prompt_length = max_prompt_length
         self.truncation_mode = arguments.truncation_mode
@@ -644,11 +678,6 @@ class DPOTrainer(BaseTrainer, ABC):
         self.is_encoder_decoder = False
         self._precomputed_train_ref_log_probs = False
         self._precomputed_eval_ref_log_probs = False
-        if loss_type in ["hinge", "ipo", "kto_pair"] and label_smoothing > 0:
-            warnings.warn(
-                "You are using a loss type that does not support label smoothing. Ignoring label_smoothing parameter."
-            )
-
         self.beta = beta
         self.label_smoothing = label_smoothing
         self.loss_type = loss_type
@@ -1214,25 +1243,28 @@ class DPOTrainer(BaseTrainer, ABC):
         rejected_tokens["input_ids"] = add_post_tkn(self.tokenizer.eos_token_id, rejected_tokens["input_ids"])
         rejected_tokens["attention_mask"] = add_post_tkn(1, rejected_tokens["attention_mask"])
 
-        longer_response_length = max(len(chosen_tokens["input_ids"]), len(rejected_tokens["input_ids"]))
+        longer_response_length = max(chosen_tokens["input_ids"].shape[-1], rejected_tokens["input_ids"].shape[-1])
 
         # if combined sequence is too long, truncate the prompt
         for answer_tokens in [chosen_tokens, rejected_tokens, prompt_tokens]:
-            if len(answer_tokens["prompt_input_ids"]) + longer_response_length > self.max_length:
+            length_rn = answer_tokens["prompt_input_ids"].shape[-1] + longer_response_length
+            if length_rn > self.max_length:
+
                 if self.truncation_mode == "keep_start":
                     for k in ["prompt_input_ids", "prompt_attention_mask"]:
-                        answer_tokens[k] = answer_tokens[k][: self.max_prompt_length]
+                        answer_tokens[k] = answer_tokens[k][:, : self.max_prompt_length]
                 elif self.truncation_mode == "keep_end":
                     for k in ["prompt_input_ids", "prompt_attention_mask"]:
-                        answer_tokens[k] = answer_tokens[k][-self.max_prompt_length:]
+                        answer_tokens[k] = answer_tokens[k][:, -self.max_prompt_length:]
                 else:
                     raise ValueError(f"Unknown truncation mode: {self.truncation_mode}")
-
         # if that's still too long, truncate the response
         for answer_tokens in [chosen_tokens, rejected_tokens]:
-            if len(answer_tokens["prompt_input_ids"]) + longer_response_length > self.max_length:
+            if answer_tokens["prompt_input_ids"].shape[-1] + longer_response_length > self.max_length:
                 for k in ["input_ids", "attention_mask"]:
-                    answer_tokens[k] = answer_tokens[k][: self.max_length - self.max_prompt_length]
+                    answer_tokens[k] = answer_tokens[k][:, : self.max_length - self.max_prompt_length]
+
+        # TODO: Fix this one here, fixed padding need to be added.
 
         # Create labels
         chosen_sequence_tokens = {
@@ -1266,6 +1298,7 @@ class DPOTrainer(BaseTrainer, ABC):
             for type_key, tokens in tokens_.items():
                 if type_key == "token_type_ids":
                     continue
+                print(tokens.shape)
                 batch[f"{k}{type_key}"] = tokens
 
         return batch
