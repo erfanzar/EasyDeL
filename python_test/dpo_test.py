@@ -83,18 +83,19 @@ def main():
         arguments = TrainArguments(
             num_train_epochs=4,
             model_name="DPO_TEST",
-            total_batch_size=1,
+            total_batch_size=2,
             use_wandb=False
         )
 
         torch_dtype = torch.float32
-        max_length = 64
-        max_target_length = 256
-        max_prompt_length = 256
         # model_ref = None
         tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
+
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
 
         train_dataset = get_hh("train", sanity_check=True)
         eval_dataset = get_hh("test", sanity_check=True)
@@ -106,9 +107,13 @@ def main():
         #     pretrained_model_name_or_path=model_name_or_path
         # )
 
+        max_length = 64
+        max_target_length = 128
+        max_prompt_length = 128
+
         dpo_trainer = EasyDeLDPOTrainer(
-            state,
-            None,
+            model_state=state,
+            ref_model_state=None,
             beta=0.1,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
