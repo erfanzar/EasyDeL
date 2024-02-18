@@ -4,6 +4,7 @@ import functools
 import os
 import sys
 import time
+import typing
 
 import IPython.display
 import termcolor
@@ -167,13 +168,13 @@ class CausalLanguageModelTrainer(BaseTrainer):
     def create_collate_function(
             self,
             max_sequence_length: int,
-            is_left_padded: bool
+            truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> Callable:
         def collate_fn(batch):
             results = {}
             corrected_sequence = None
             for key in batch[0].keys():
-                if is_left_padded:
+                if truncation_mode == "keep_end":
                     corrected_sequence = [
                         jnp.array(f[key])[..., -max_sequence_length:] for f in batch
                     ]
@@ -557,7 +558,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                             "mean loss": loss_sum / (current_step - self.arguments.step_start_point),
                                             "accuracy": accuracy.tolist(),
                                             "mean accuracy": accuracy_sum / (
-                                                        current_step - self.arguments.step_start_point),
+                                                    current_step - self.arguments.step_start_point),
                                             "learning_rate": self.scheduler(
                                                 sharded_state.step.tolist()
                                             ).tolist(),

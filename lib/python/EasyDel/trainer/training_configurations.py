@@ -1,6 +1,7 @@
 import os.path
 import pathlib
 import re
+import typing
 from typing import OrderedDict, List, Union, Mapping, Optional, Tuple, Callable, Type
 
 import termcolor
@@ -89,7 +90,7 @@ class TrainArguments(
             track_memory: Optional[bool] = None,
             loss_re_mat: str = "",
             loss_chunk: int = 1024,
-            is_left_padded: bool = False,
+            truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
             warmup_steps: int = 500,
             init_input_shape: Tuple[int, int] = (1, 1),
             step_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp"),
@@ -155,7 +156,8 @@ class TrainArguments(
     :param track_memory: bool: Track the memory usage of the model
     :param loss_re_mat: str: Specify the regular expression to match the loss function name
     :param loss_chunk: int: Chunk the loss to avoid memory overflow
-    :param is_left_padded: bool: Determine if the input is left padded or not
+    :param truncation_mode: typing.Literal["keep_end", "keep_start"]: Determine if the input is left padded or not and
+    which side of the array should remain in case of using maximum padding.
     :param warmup_steps: int: Specify the number of steps to warm up the learning rate
     :param init_input_shape: Tuple[int, int]: Initialize the model with a shape that is not (batch_size, length)
     :param step_partition_spec: PartitionSpec: Partition the model for training
@@ -264,7 +266,7 @@ class TrainArguments(
         self.loss_chunk = loss_chunk
         self.loss_re_mat = loss_re_mat
         self.init_input_shape = init_input_shape
-        self.is_left_padded = is_left_padded
+        self.truncation_mode = truncation_mode
         self.step_partition_spec = step_partition_spec
         self.jax_distributed_config = jax_distributed_config
         self.log_all_workers = log_all_workers

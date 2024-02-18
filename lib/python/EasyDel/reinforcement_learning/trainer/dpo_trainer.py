@@ -523,259 +523,6 @@ def create_dpo_train_function(
     return dpo_step
 
 
-def create_dpo_eval_function(
-        concatenated_forward: Callable,
-        ref_state: EasyDelState = None,
-        beta: float = 0.1,
-        label_smoothing: float = 0,
-        loss_type: Literal["sigmoid", "hinge", "ipo", "kto"] = "sigmoid",
-        reference_free: bool = False,
-):
-    """
-    The create_dpo_eval_function function is a helper function that creates the DPO evaluating step.
-
-    :param concatenated_forward: Callable: Define the forward pass of the model
-    :param ref_state: EasyDelState: Specify the reference policy
-    :param beta: float: Scale the logits
-    :param label_smoothing: float: Smooth the labels
-    :param loss_type:  Literal["sigmoid", "hinge", "ipo", "kto"]: Determine the loss function
-    :param reference_free: bool: Indicate whether the reference policy is used or not
-    :return: A function that takes in a state and a batch
-    """
-
-    def _sigmoid_dpo_loss(
-            logits: chex.Array,
-            policy_chosen_log_probs: chex.Array = None,  # IGNORED
-            reference_chosen_log_probs: chex.Array = None,  # IGNORED
-            policy_rejected_log_probs: chex.Array = None,  # IGNORED
-            reference_rejected_log_probs: chex.Array = None  # IGNORED
-    ):
-
-        """
-        The _sigmoid_dpo_loss function is a helper function for the sigmoid_dpo_loss
-            function. It computes the loss of each example in a batch, given its logits
-            and (optionally) its chosen/rejected log probabilities under both policies.
-
-        :param logits: chex.Array: Compute the loss
-        :param policy_chosen_log_probs: chex.Array: Calculate the policy loss
-        :param # IGNORED
-                    reference_chosen_log_probs: chex.Array: Compute the loss for the reference policy
-        :param # IGNORED
-                    policy_rejected_log_probs: chex.Array: Calculate the loss for the rejected samples
-        :param # IGNORED
-                    reference_rejected_log_probs: chex.Array: Calculate the loss of rejected samples
-        :return: an array represent loss
-        """
-        losses = (
-                -jax.nn.log_sigmoid(beta * logits) * (1 - label_smoothing)
-                - jax.nn.log_sigmoid(-beta * logits) * label_smoothing
-        )
-        return losses
-
-    def _hinge_dpo_loss(
-            logits: chex.Array,
-            policy_chosen_log_probs: chex.Array,  # IGNORED
-            reference_chosen_log_probs: chex.Array,  # IGNORED
-            policy_rejected_log_probs: chex.Array,  # IGNORED
-            reference_rejected_log_probs: chex.Array  # IGNORED
-    ):
-
-        """
-        The _hinge_dpo_loss function is a helper function that computes the loss for DPO.
-
-        :param logits: chex.Array: Calculate the hinge loss
-        :param policy_chosen_log_probs: chex.Array: Compute the policy loss
-        :param # IGNORED
-                    reference_chosen_log_probs: chex.Array: Compute the loss
-        :param # IGNORED
-                    policy_rejected_log_probs: chex.Array: Calculate the loss
-        :param # IGNORED
-                    reference_rejected_log_probs: chex.Array  # IGNORED: Calculate the loss
-        :return: an array represent The hinge loss
-        """
-        return jax.relu(1 - beta * logits)
-
-    def _ipo_dpo_loss(
-            logits: chex.Array,
-            policy_chosen_log_probs: chex.Array,  # IGNORED
-            reference_chosen_log_probs: chex.Array,  # IGNORED
-            policy_rejected_log_probs: chex.Array,  # IGNORED
-            reference_rejected_log_probs: chex.Array  # IGNORED
-    ):
-        """
-         The _ipo_dpo_loss function is a helper function that calculates the loss for
-         the IPO-DPO algorithm. It takes in the logits, policy_chosen_log_probs,
-         reference_chosen_log_probs, policy rejected log probs and reference rejected
-         log probs as inputs. The output of this function is used to calculate the loss
-         for each batch of data.
-
-         :param logits: chex.Array: Calculate the loss
-         :param policy_chosen_log_probs: chex.Array: Compute the
-         :param # IGNORED
-                     reference_chosen_log_probs: chex.Array: Compute the loss
-         :param # IGNORED
-                     policy_rejected_log_probs: chex.Array: Calculate the probability of rejecting a policy
-         :param # IGNORED
-                     reference_rejected_log_probs: chex.Array  # IGNORED: Make sure that the function
-         :return: an array represent loss
-         """
-        return (logits - 1 / (2 * beta)) ** 2
-
-    def _kto_pair_dpo_loss(
-            logits: chex.Array,  # IGNORED
-            policy_chosen_log_probs: chex.Array,
-            reference_chosen_log_probs: chex.Array,
-            policy_rejected_log_probs: chex.Array,
-            reference_rejected_log_probs: chex.Array
-    ):
-
-        """
-        The _kto_pair_dpo_loss function is a helper function that computes the loss for
-        a single pair of trajectories. It takes in two sets of log probabilities, one from
-        the policy and one from the reference distribution. The first set are the log
-        probabilities for actions taken by each agent in a trajectory, while the second set
-        are those for actions not taken by each agent (i.e., rejected). The function then
-        computes KL divergences between these two sets of distributions and uses them to compute losses.
-
-        :param logits: chex.Array: Calculate the log_probs
-        :param # IGNORED
-                    policy_chosen_log_probs: chex.Array: Calculate the chosen_kl
-        :param reference_chosen_log_probs: chex.Array: Calculate the chosen_kl
-        :param policy_rejected_log_probs: chex.Array: Calculate the rejected_kl variable
-        :param reference_rejected_log_probs: chex.Array: Calculate the rejected_kl variable
-        :return: an array represent loss
-        """
-        chosen_kl = jax.lax.clamp(
-            min=0,
-            x=jnp.mean(policy_chosen_log_probs - reference_chosen_log_probs),
-            max=1e9
-        )
-        rejected_kl = jax.lax.clamp(
-            min=0,
-            x=jnp.mean(policy_rejected_log_probs - reference_rejected_log_probs),
-            max=1e9
-        )
-
-        chosen_log_ratios = policy_chosen_log_probs - reference_chosen_log_probs
-        rejected_log_ratios = policy_rejected_log_probs - reference_rejected_log_probs
-        losses = jnp.concatenate(
-            (
-                1 - jax.nn.sigmoid(beta * (chosen_log_ratios - rejected_kl)),
-                1 - jax.nn.sigmoid(beta * (chosen_kl - rejected_log_ratios)),
-            ),
-            0,
-        )
-
-        return losses
-
-    if loss_type == "sigmoid":
-        _loss_func = _sigmoid_dpo_loss
-    elif loss_type == "hinge":
-        _loss_func = _hinge_dpo_loss
-    elif loss_type == "ipo":
-        _loss_func = _ipo_dpo_loss
-    elif loss_type == "kto_pair":
-        _loss_func = _kto_pair_dpo_loss
-    else:
-        raise ValueError(f"UnKnown loss_type {loss_type}")
-
-    def dpo_step(
-            state: EasyDelState,
-            batch: dict
-    ) -> DPOStepOut:
-
-        """
-        The dpo_step function is the core of DPO. It takes a state and a batch,
-        and returns an updated state. The update is done by calculating the loss
-        for each example in the batch, then taking its gradient with respect to
-        the parameters of the policy network (which are stored in `state`). This
-        gradient is then used to update `state`.
-
-        :param state: EasyDelState: Store the parameters of the model
-        :param batch: dict: Pass the data to the model
-        :return: A `DPOStepOut` class
-        """
-
-        def calculate_loss(params: dict | flax.core.FrozenDict):
-            (
-                policy_chosen_log_probs,
-                policy_rejected_log_probs,
-                policy_chosen_logits,
-                policy_rejected_logits,
-            ) = concatenated_forward(
-                state.apply_fn,
-                params,
-                batch
-            )
-
-            if "reference_chosen_log_probs" in batch and "reference_rejected_log_probs" in batch:
-                reference_chosen_log_probs = batch["reference_chosen_log_probs"]
-                reference_rejected_log_probs = batch["reference_rejected_log_probs"]
-            else:
-                if ref_state is None:
-                    (
-                        reference_chosen_log_probs,
-                        reference_rejected_log_probs,
-                        _,
-                        _,
-                    ) = concatenated_forward(
-                        state.apply_fn,
-                        state.params,
-                        batch
-                    )
-                else:
-                    (
-                        reference_chosen_log_probs,
-                        reference_rejected_log_probs,
-                        _,
-                        _,
-                    ) = concatenated_forward(
-                        ref_state.apply_fn,
-                        ref_state.params,
-                        batch
-                    )
-
-            pi_log_ratios = policy_chosen_log_probs - policy_rejected_log_probs
-
-            if reference_free:
-                ref_log_ratios = 0
-            else:
-                ref_log_ratios = reference_chosen_log_probs - reference_rejected_log_probs
-
-            logits = pi_log_ratios - ref_log_ratios
-            losses = _loss_func(
-                logits,
-                policy_chosen_log_probs,
-                reference_chosen_log_probs,
-                policy_rejected_log_probs,
-                reference_rejected_log_probs
-            )
-            chosen_rewards = (
-                    beta
-                    * (
-                            policy_chosen_log_probs - reference_chosen_log_probs
-                    )
-            )
-            rejected_rewards = (
-                    beta
-                    * (
-                            policy_rejected_log_probs
-                            - reference_rejected_log_probs
-                    )
-            )
-            return losses[0], (chosen_rewards, rejected_rewards)
-
-        __loss, (__chosen_rewards, __rejected_rewards) = calculate_loss(state.params)
-
-        return DPOStepOut(
-            loss=__loss,
-            rejected_rewards=__rejected_rewards,
-            chosen_rewards=__chosen_rewards
-        )
-
-    return dpo_step
-
-
 class DPOTrainer(BaseTrainer, ABC):
     """
     EasyDel DPO Trainer Class
@@ -1073,7 +820,6 @@ class DPOTrainer(BaseTrainer, ABC):
             function_configurations.create_sharded_state_from_params_function
         )
         self.sharded_train_step_function = function_configurations.sharded_train_step_function
-        self.sharded_eval_step_function = function_configurations.sharded_eval_step_function
         self.mesh = function_configurations.mesh
         self.checkpoint_manager = function_configurations.checkpoint_manager
         self.initialize_state_function = function_configurations.initialize_state_function
@@ -1220,21 +966,6 @@ class DPOTrainer(BaseTrainer, ABC):
             out_shardings=(state_partition_spec, PartitionSpec()),
         )
 
-        eval_function = create_dpo_eval_function(
-            concatenated_forward=self.concatenated_forward,
-            ref_state=self.ref_model_state,
-            loss_type=self.loss_type,
-            reference_free=self.reference_free,
-            label_smoothing=self.label_smoothing,
-            beta=self.beta
-        )
-
-        sharded_eval_step_function = pjit(
-            eval_function,
-            in_shardings=(state_partition_spec, self.arguments.step_partition_spec),
-            out_shardings=(state_partition_spec, PartitionSpec()),
-        )
-
         self.arguments.ckpt_path_exists()
         self.state_partition_spec = state_partition_spec
         self.state_shape = state_shape
@@ -1245,8 +976,7 @@ class DPOTrainer(BaseTrainer, ABC):
             sharded_train_step_function=sharded_train_step_function,
             create_sharded_state_from_params_function=create_sharded_state_from_params_function,
             checkpoint_manager=checkpoint_manager,
-            mesh=mesh,
-            sharded_eval_step_function=sharded_eval_step_function
+            mesh=mesh
         )
 
     def configure_model(self) -> TrainerConfigureModelFuncOutput:
@@ -1883,10 +1613,10 @@ class DPOTrainer(BaseTrainer, ABC):
                 )
                 checkpoint_path = f"{str(self.arguments.get_path())}/{filename}"
 
-            if self.arguments.do_eval:
-                self.eval(
-                    self.model_state
-                )
+            # if self.arguments.do_eval:
+            #     self.eval(
+            #         self.model_state
+            #     )
 
             output.checkpoint_path = checkpoint_path
             output.last_save_file_name = filename
@@ -1894,86 +1624,12 @@ class DPOTrainer(BaseTrainer, ABC):
 
         return output
 
-    def eval(self, model_state: EasyDelState):
-        assert self.eval_dataset is not None, "`eval_dataset` is required by evaluator function."
-        with self.mesh:
-
-            dir_prefix: str = "/dev/shm" if sys.platform != "win32" else "."
-
-            if self.arguments.track_memory:
-                initialise_tracking(dir_prefix=dir_prefix)
-
-            pbar = tqdm(total=self.max_training_steps)
-            pbar.set_description("Evaluating")
-            current_step = 0
-            loss_sum = None
-            accuracy_sum = None
-            mem_res = "Tracking Option is OFF"
-
-            try:
-                for batch in self.eval_dataset:
-                    current_step += 1
-                    time_start = time.time()
-                    for key in self.arguments.ids_to_pop_from_dataset:
-                        _ = batch.pop(key, None)
-                    for key in list(batch.keys()):
-                        if not (
-                                key.endswith("_input_ids")
-                                or key.endswith("_attention_mask")
-                                or key.endswith("_labels")
-                        ):
-                            _ = batch.pop(key, None)
-
-                    metrics = self.sharded_eval_step_function(
-                        model_state,
-                        batch
-                    )
-                    total_time = time.time() - time_start
-                    (
-                        loss, chosen_rewards, rejected_rewards
-                    ) = metrics.loss, metrics.chosen_rewards[0], metrics.rejected_rewards[0]
-
-                    if self.arguments.track_memory:
-                        mem_res = get_mem(dir_prefix=dir_prefix)
-
-                    information_queries = {}
-                    if self.arguments.track_memory:
-                        for key in ["Used", "Usage Percent"]:
-                            for device, info in get_capacity_matrix(dir_prefix=dir_prefix).items():
-                                information_queries[f"{device.replace('_', ' ')} ({key})"] = float(
-                                    info[key].replace("%", "").replace("GB", ""))
-
-                    if self.arguments.use_wandb:
-                        with jax.spmd_mode("allow_all"):
-                            self.wandb_runtime.log(
-                                {
-                                    "eval_loss": loss.tolist(),
-                                    "eval_step": current_step,
-                                    "eval_step_time": total_time,
-                                    "eval_perplexity": jnp.exp(loss).tolist(),
-                                    "eval_accelerators": information_queries,
-                                }
-                            ),
-                            wandb.summary["eval_captured_memory_log"] = mem_res
-
-                    if self.arguments.track_memory:
-                        IPython.display.clear_output(True)
-                        pbar.display(mem_res)
-                    pbar.update(1)
-                    pbar.set_postfix(
-                        loss=loss,
-                        chosen_rewards=chosen_rewards,
-                        rejected_rewards=rejected_rewards,
-                        each_step_time=total_time,
-                        step=current_step
-                    )
-            except KeyboardInterrupt:
-                termcolor.cprint(
-                    "KeyboardInterrupt At Evaluation model Will return Nothing and just pass.",
-                    color="cyan",
-                    force_color=True
-                )
-        return ...
+    def eval(self):
+        """
+        Process is Under Progress ...
+        """
+        # TODO : Finish Eval Step
+        ...
 
     def __repr__(self):
 

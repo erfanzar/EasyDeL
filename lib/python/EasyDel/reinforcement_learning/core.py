@@ -40,21 +40,36 @@ def convert_to_scalar(stats):
     return tensorboard_stats
 
 
-def pad_sequence(sequences, batch_first=False, padding_value=0):
-    max_len = max(len(seq) for seq in sequences)
+def pad_sequence(
+        sequences,
+        batch_first=False,
+        padding_value=0,
+        max_len: int | None = None
+):
+    max_len = max(seq.shape[-1] for seq in sequences) if max_len is None else max_len
     padding_value = jnp.array(padding_value).reshape(1)
     if batch_first:
         padded_seqs = [
-            jnp.concatenate([
-                jnp.array([padding_value] * (max_len - len(seq))).reshape(-1, 1)
-                , seq.reshape(-1, 1)
-            ], axis=0).reshape(1, -1) for seq in sequences]
+            jnp.concatenate(
+                [
+                    seq.reshape(1, -1),
+                    jnp.ones((1, max_len - seq.shape[-1])) * padding_value
+                ],
+                axis=1
+            ) if seq.shape[-1] < max_len else seq.reshape(1, -1)
+            for seq in sequences
+        ]
     else:
         padded_seqs = [
-            jnp.concatenate([
-                seq.reshape(-1, 1),
-                jnp.array([padding_value] * (max_len - len(seq))).reshape(-1, 1)
-            ], axis=0).reshape(1, -1) for seq in sequences]
+            jnp.concatenate(
+                [
+                    jnp.ones((1, max_len - seq.shape[-1])) * padding_value,
+                    seq.reshape(1, -1)
+                ],
+                axis=1
+            ) if seq.shape[-1] < max_len else seq.reshape(1, -1)
+            for seq in sequences
+        ]
 
     return jnp.array(padded_seqs)
 
