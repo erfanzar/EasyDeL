@@ -513,8 +513,8 @@ def create_dpo_train_function(
 
         grad_fn = jax.value_and_grad(calculate_loss, has_aux=True)
         (__loss, (__chosen_rewards, __rejected_rewards)), grads = grad_fn(state.params)
-        state = state.apply_gradients(grads=grads)
-        return state, DPOStepOut(
+        new_state = state.apply_gradients(grads=grads)
+        return new_state, DPOStepOut(
             loss=__loss,
             rejected_rewards=__rejected_rewards,
             chosen_rewards=__chosen_rewards
@@ -553,6 +553,7 @@ class DPOTrainer(BaseTrainer, ABC):
             auto_shard_model_state: bool = True,
             auto_shard_ref_model_state: bool = True,
             is_encoder_decoder: Optional[bool] = False,
+            num_proc_dataset: Optional[int] = None,
             _do_init_fns: bool = True,
     ):
 
@@ -583,6 +584,7 @@ class DPOTrainer(BaseTrainer, ABC):
         :param ref_model_init_kwargs: Optional[Dict]: Pass the ref_model_init_kwargs to ref_model for init process
         :param auto_shard_model_state: bool: whenever to automaticly shard `model_state`
         :param auto_shard_ref_model_state: bool: whenever to automaticly shard `ref_model_state`
+        :param num_proc_dataset: Optional[int]: number of process to be used to modify the given eval and train dataset.
         :param _do_init_fns: bool : preferred to set ture to trainer will automaticly configure
         model with provided training Arguments
         :param : Set the padding value for the model
@@ -684,9 +686,15 @@ class DPOTrainer(BaseTrainer, ABC):
 
         self._stored_metrics = defaultdict(lambda: defaultdict(list))
 
-        train_dataset = train_dataset.map(self.tokenize_row, )
+        train_dataset = train_dataset.map(
+            self.tokenize_row,
+            num_proc=num_proc_dataset
+        )
         if eval_dataset is not None:
-            eval_dataset = eval_dataset.map(self.tokenize_row)
+            eval_dataset = eval_dataset.map(
+                self.tokenize_row,
+                num_proc=num_proc_dataset
+            )
 
         self.arguments = arguments
         self.hp_name = None
@@ -808,8 +816,9 @@ class DPOTrainer(BaseTrainer, ABC):
             self.timer.log(["Sharding Ref Model State"])
 
         function_configurations = self.configure_functions()
-        self.create_sharded_state_from_params_function = \
+        self.create_sharded_state_from_params_function = (
             function_configurations.create_sharded_state_from_params_function
+        )
         self.sharded_train_step_function = function_configurations.sharded_train_step_function
         self.mesh = function_configurations.mesh
         self.checkpoint_manager = function_configurations.checkpoint_manager
@@ -1298,9 +1307,94 @@ class DPOTrainer(BaseTrainer, ABC):
             for type_key, tokens in tokens_.items():
                 if type_key == "token_type_ids":
                     continue
-                print(tokens.shape)
-                batch[f"{k}{type_key}"] = tokens
 
+                b, s = tokens.shape
+
+                if self.max_prompt_length > s:
+                    if k == "chosen_":
+                        if type_key == "input_ids":
+                            tokens = pad_to_length(
+                                tokens,
+                                self.max_target_length,
+                                pad_value=self.padding_value,
+                                axis=-1
+                            )
+                        elif type_key == "attention_mask":
+                            tokens = pad_to_length(
+                                tokens,
+                                self.max_target_length,
+                                pad_value=0,
+                                axis=-1
+                            )
+                        elif type_key == "labels":
+                            tokens = pad_to_length(
+                                tokens,
+                                self.max_target_length,
+                                pad_value=self.padding_value,
+                                axis=-1
+                            )
+
+                        if tokens.shape[-1] != self.max_target_length:
+                            raise ValueError(
+                                f"there was an error in padding token with `type_key` of {type_key}"
+                                f". it must have sequence_length of {self.max_target_length} but we got {tokens.shape[-1]}"
+                            )
+                    elif k == "rejected_":
+                        if type_key == "input_ids":
+                            tokens = pad_to_length(
+                                tokens,
+                                self.max_target_length,
+                                pad_value=self.padding_value,
+                                axis=-1
+                            )
+                        elif type_key == "attention_mask":
+                            tokens = pad_to_length(
+                                tokens,
+                                self.max_target_length,
+                                pad_value=0,
+                                axis=-1
+                            )
+                        elif type_key == "labels":
+                            tokens = pad_to_length(
+                                tokens,
+                                self.max_target_length,
+                                pad_value=self.padding_value,
+                                axis=-1
+                            )
+
+                        if tokens.shape[-1] != self.max_target_length:
+                            raise ValueError(
+                                f"there was an error in padding token with `type_key` of {type_key}"
+                                f". it must have sequence_length of {self.max_target_length} but we got {tokens.shape[-1]}"
+                            )
+                    elif k == "":
+                        if type_key == "prompt_input_ids":
+                            tokens = pad_to_length(
+                                tokens,
+                                self.max_prompt_length,
+                                pad_value=self.padding_value,
+                                axis=-1
+                            )
+                        elif type_key == "prompt_attention_mask":
+                            tokens = pad_to_length(
+                                tokens,
+                                self.max_prompt_length,
+                                pad_value=0,
+                                axis=-1
+                            )
+                        elif type_key == "prompt_labels":
+                            tokens = pad_to_length(
+                                tokens,
+                                self.max_prompt_length,
+                                pad_value=self.padding_value,
+                                axis=-1
+                            )
+                        if tokens.shape[-1] != self.max_prompt_length:
+                            raise ValueError(
+                                f"there was an error in padding token with `type_key` of {type_key}"
+                                f". it must have sequence_length of {self.max_prompt_length} but we got {tokens.shape[-1]}"
+                            )
+                batch[f"{k}{type_key}"] = tokens
         return batch
 
     def compute_reference_log_probs(
@@ -1403,6 +1497,7 @@ class DPOTrainer(BaseTrainer, ABC):
                                         or key.endswith("_labels")
                                 ):
                                     _ = batch.pop(key, None)
+
                             self.model_state, metrics = self.sharded_train_step_function(
                                 self.model_state,
                                 batch

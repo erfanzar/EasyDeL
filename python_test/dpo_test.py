@@ -103,17 +103,17 @@ def main():
         state = EasyDelState.from_pretrained(
             pretrained_model_name_or_path=model_name_or_path
         )
-        # ref_state = EasyDelState.from_pretrained(
-        #     pretrained_model_name_or_path=model_name_or_path
-        # )
+        ref_state = EasyDelState.from_pretrained(
+            pretrained_model_name_or_path=model_name_or_path
+        )
 
         max_length = 64
-        max_target_length = 128
-        max_prompt_length = 128
+        max_target_length = 64
+        max_prompt_length = 60
 
         dpo_trainer = EasyDeLDPOTrainer(
             model_state=state,
-            ref_model_state=None,
+            ref_model_state=ref_state,
             beta=0.1,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
@@ -121,7 +121,8 @@ def main():
             arguments=arguments,
             max_length=max_length,
             max_target_length=max_target_length,
-            max_prompt_length=max_prompt_length
+            max_prompt_length=max_prompt_length,
+            num_proc_dataset=8
         )
 
         dpo_trainer.train()
