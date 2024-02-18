@@ -55,7 +55,4 @@ class DPODataCollatorWithPadding:
                 padded_batch[k] = jnp.array([ex[k] for ex in features])
             else:
                 padded_batch[k] = [ex[k] for ex in features]
-
-        for k, v in padded_batch.items():
-            print(f"{k} : {v.shape}")
         return padded_batch
