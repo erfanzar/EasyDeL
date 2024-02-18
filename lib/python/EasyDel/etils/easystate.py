@@ -13,6 +13,7 @@ import optax
 from .auto_tx import get_optimizer_and_scheduler
 from ..etils import AVAILABLE_SCHEDULERS, AVAILABLE_OPTIMIZERS, EasyDelRuntimeError
 from ..modules.easydel_modelling_utils import EasyDelFlaxPretrainedModel, EasyDelPretrainedConfig
+from jax.sharding import Mesh, PartitionSpec
 
 TYPE_SEP = "<*TYPE*>"
 VALUE_SEP = "<*VALUE*>"
@@ -371,16 +372,11 @@ class EasyDelState(struct.PyTreeNode):
             precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
             sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
             sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            query_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp",
-                                                                                          None),
-            key_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp",
-                                                                                        None),
-            value_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp",
-                                                                                          None),
-            bias_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, None,
-                                                                                         None),
-            attention_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp",
-                                                                                              "tp", None),
+            query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            key_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            value_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
+            attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             use_shard_map: bool = False,
             input_shape: Sequence[int] = (1, 1),
             backend: Optional[str] = None,
@@ -409,11 +405,11 @@ class EasyDelState(struct.PyTreeNode):
         :param precision: jax.lax.Precision: Control the precision of the calculation
         :param sharding_axis_dims: Sequence[int]: Specify the dimension of each axis
         :param sharding_axis_names: Sequence[str]: Specify the names of the axes in each shard
-        :param query_partition_spec: jax.sharding.PartitionSpec: Specify the partitioning of the query matrix
-        :param key_partition_spec: jax.sharding.PartitionSpec: Specify the partitioning of the key matrix
-        :param value_partition_spec: jax.sharding.PartitionSpec: Specify the partitioning of the value tensor
-        :param bias_partition_spec: jax.sharding.PartitionSpec: Specify the partitioning of the bias
-        :param attention_partition_spec: jax.sharding.PartitionSpec: Partition the attention weights
+        :param query_partition_spec: PartitionSpec: Specify the partitioning of the query matrix
+        :param key_partition_spec: PartitionSpec: Specify the partitioning of the key matrix
+        :param value_partition_spec: PartitionSpec: Specify the partitioning of the value tensor
+        :param bias_partition_spec: PartitionSpec: Specify the partitioning of the bias
+        :param attention_partition_spec: PartitionSpec: Partition the attention weights
         :param use_shard_map: bool: Determine whether to use shard_map or not
         :param input_shape: Sequence[int]: Specify the shape of the input to be used for training
         :param backend: Optional[str]: Specify the backend used for the model
@@ -492,8 +488,8 @@ class EasyDelState(struct.PyTreeNode):
             fully_sharded_data_parallel: bool = True,
             shard_fns: Optional[Mapping[str, Callable]] = None,
             dtype: jax.numpy.dtype | str = "bf16",
-            mesh: Optional[jax.sharding.Mesh] = None,
-            rules: Optional[Sequence[Mapping[str, jax.sharding.PartitionSpec]]] = None
+            mesh: Optional[Mesh] = None,
+            rules: Optional[Sequence[Mapping[str, PartitionSpec]]] = None
     ):
         dtype = fjformer.get_dtype(dtype)
         if shard_fns is None and self.module_config is None and rules is None:
