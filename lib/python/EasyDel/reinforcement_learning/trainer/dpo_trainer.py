@@ -851,12 +851,16 @@ class DPOTrainer(BaseTrainer, ABC):
         dataloader_train = self.get_train_dataloader()
         max_evaluation_steps = None
         dataloader_eval = None
+
+        max_training_steps = self.arguments.num_train_epochs * len(
+            dataloader_train
+        ) if self.arguments.max_training_steps is None else self.arguments.max_training_steps
         if self.eval_dataset is not None:
             dataloader_eval = self.get_eval_dataloader(self.eval_dataset)
             max_evaluation_steps = len(dataloader_eval)
         return TrainerConfigureDataloaderFuncOutput(
             dataloader_train=dataloader_train,
-            max_training_steps=len(dataloader_train),
+            max_training_steps=max_training_steps,
             dataloader_eval=dataloader_eval,
             max_evaluation_steps=max_evaluation_steps
         )
@@ -1537,7 +1541,7 @@ class DPOTrainer(BaseTrainer, ABC):
                             if self.arguments.track_memory:
                                 IPython.display.clear_output(True)
                                 pbar.display(mem_res)
-
+                            current_step += 1
                             pbar.update(1)
                             pbar.set_postfix(
                                 loss=loss,
