@@ -104,7 +104,8 @@ def main():
             pretrained_model_name_or_path=model_name_or_path
         )
         ref_state = EasyDelState.from_pretrained(
-            pretrained_model_name_or_path=model_name_or_path
+            pretrained_model_name_or_path=model_name_or_path,
+
         )
 
         max_length = 64
