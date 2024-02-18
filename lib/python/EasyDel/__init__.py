@@ -124,6 +124,14 @@ from .trainer import (
     create_casual_language_model_train_step as create_casual_language_model_train_step,
 )
 
+from .reinforcement_learning import (
+    create_dpo_eval_function as create_dpo_eval_function,
+    create_dpo_train_function as create_dpo_train_function,
+    DPOTrainer as DPOTrainer,
+    create_concatenated_forward as create_concatenated_forward,
+    AutoRLModelForCasualLMWithValueHead as AutoRLModelForCasualLMWithValueHead
+)
+
 from .smi import (
     run as smi_run,
     initialise_tracking as initialise_tracking,

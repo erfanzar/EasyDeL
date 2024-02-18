@@ -44,6 +44,7 @@ class TrainerConfigureFunctionFuncOutput:
     mesh: Mesh
     checkpoint_manager: CheckpointManager
     initialize_state_function: Callable
+    sharded_eval_step_function: Optional[Callable] = None
 
 
 class BaseTrainer:
@@ -106,6 +107,7 @@ class BaseTrainer:
         # PJit functions
         self.create_sharded_state_from_params_function = None
         self.sharded_train_step_function = None
+        self.sharded_eval_step_function = None
         self.initialize_state_function = None
         self.mesh = None
 
