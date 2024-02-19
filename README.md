@@ -223,6 +223,11 @@ for response, tokens_used in server.process(
 everything works just fine, and you can consider it the first DPO Trainer in JAX/Flax let have an example and see how
 you can fine-tune your own model with DPOTrainer
 
+> [!TIP]
+> In case that you want a better script to learn about `DPOTrainer` you can see examples
+> at [here](https://github.com/erfanzar/EasyDeL/blob/main/examples/training/dpo/dpo_training_example.py) which contain
+> DPO Tuning a Mixtral model with Intel DPO dataset.
+
 ```python
 from EasyDel import (
     TrainArguments,
