@@ -3,8 +3,10 @@ import os
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 
 import jax
-from lib.python.EasyDel.reinforcement_learning.trainer.dpo_trainer import DPOTrainer as EasyDeLDPOTrainer, \
+from lib.python.EasyDel.reinforcement_learning.trainer.dpo_trainer import (
+    DPOTrainer as DPOTrainer,
     TrainArguments
+)
 from lib.python.EasyDel import EasyDelState
 
 from dataclasses import dataclass, field
@@ -16,7 +18,7 @@ torch.cuda.is_available = lambda: False
 
 torch.set_default_device("cpu")
 from datasets import Dataset, load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
+from transformers import AutoTokenizer
 
 
 @dataclass
@@ -61,7 +63,7 @@ def get_hh(split: str, sanity_check: bool = False, silent: bool = False, cache_d
       \n\nHuman: <prompt>\n\nAssistant:
     Multiple turns are allowed, but the prompt should always start with \n\nHuman: and end with \n\nAssistant:.
     """
-    dataset = load_dataset("Anthropic/hh-rlhf", split=split, cache_dir=cache_dir)
+    dataset = load_dataset("Anthropic/hh-rlhf", split=split, cache_dir=cache_dir, )
     if sanity_check:
         dataset = dataset.select(range(min(len(dataset), 1000)))
 
@@ -83,7 +85,7 @@ def main():
         arguments = TrainArguments(
             num_train_epochs=4,
             model_name="DPO_TEST",
-            total_batch_size=2,
+            total_batch_size=4,
             use_wandb=False
         )
 
@@ -109,10 +111,10 @@ def main():
         )
 
         max_length = 64
-        max_target_length = 64
-        max_prompt_length = 60
+        max_target_length = 128
+        max_prompt_length = 128
 
-        dpo_trainer = EasyDeLDPOTrainer(
+        dpo_trainer = DPOTrainer(
             model_state=state,
             ref_model_state=ref_state,
             beta=0.1,

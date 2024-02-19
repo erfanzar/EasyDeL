@@ -1745,22 +1745,25 @@ class DPOTrainer(BaseTrainer, ABC):
             checkpoint_path = "SAVING_SKIPPED"
             if self.arguments.track_memory:
                 initialise_tracking(dir_prefix=dir_prefix)
-            step = 0
+
             pbar = tqdm(total=self.max_training_steps)
             pbar.set_description("Training")
             current_step = self.model_state.step.tolist() if isinstance(
                 self.model_state.step,
                 jax.Array
             ) else self.model_state.step
+
             loss_sum = None
-            accuracy_sum = None
+            chosen_rewards_sum = None
+            rejected_rewards_sum = None
+
             mem_res = "Tracking Option is OFF"
 
             try:
                 for epoch_index in range(self.arguments.num_train_epochs):
                     for batch in self.dataloader_train:
-                        step += 1
-                        if self.arguments.step_start_point > step:
+                        current_step += 1
+                        if self.arguments.step_start_point > current_step:
                             ...
                         elif current_step < self.max_training_steps:
                             time_start = time.time()
@@ -1784,6 +1787,18 @@ class DPOTrainer(BaseTrainer, ABC):
                                 loss, chosen_rewards, rejected_rewards
                             ) = metrics.loss, metrics.chosen_rewards[0], metrics.rejected_rewards[0]
 
+                            loss_sum = loss.tolist() if loss_sum is None else loss_sum + loss
+
+                            rejected_rewards_sum = (
+                                rejected_rewards.tolist() if (
+                                        rejected_rewards_sum is None
+                                ) else rejected_rewards_sum + rejected_rewards
+                            )
+                            chosen_rewards_sum = (
+                                chosen_rewards.tolist() if (
+                                        chosen_rewards_sum is None
+                                ) else chosen_rewards_sum + chosen_rewards
+                            )
                             if self.arguments.track_memory:
                                 mem_res = get_mem(dir_prefix=dir_prefix)
 
@@ -1793,35 +1808,39 @@ class DPOTrainer(BaseTrainer, ABC):
                                     for device, info in get_capacity_matrix(dir_prefix=dir_prefix).items():
                                         information_queries[f"{device.replace('_', ' ')} ({key})"] = float(
                                             info[key].replace("%", "").replace("GB", ""))
-
+                            train_metrics = {
+                                "loss": loss.tolist(),
+                                "mean_loss": loss_sum / (current_step - self.arguments.step_start_point),
+                                "mean_rejected_rewards": rejected_rewards_sum / (
+                                        current_step - self.arguments.step_start_point
+                                ),
+                                "mean_chosen_rewards": chosen_rewards_sum / (
+                                        current_step - self.arguments.step_start_point
+                                ),
+                                "learning_rate": self.scheduler(
+                                    self.model_state.step.tolist()
+                                ).tolist(),
+                                "step": current_step,
+                                "step_time": total_time,
+                                "perplexity": jnp.exp(loss).tolist(),
+                                "accelerators": information_queries,
+                                "epoch": epoch_index
+                            }
                             if self.arguments.use_wandb:
                                 with jax.spmd_mode("allow_all"):
                                     self.wandb_runtime.log(
-                                        {
-                                            "loss": loss.tolist(),
-                                            "learning_rate": self.scheduler(
-                                                self.model_state.step.tolist()
-                                            ).tolist(),
-                                            "step": current_step,
-                                            "step time": total_time,
-                                            "perplexity": jnp.exp(loss).tolist(),
-                                            "accelerators": information_queries,
-                                            "epoch": epoch_index
-                                        }
+                                        **train_metrics
                                     ),
                                     wandb.summary["captured_memory_log"] = mem_res
 
                             if self.arguments.track_memory:
                                 IPython.display.clear_output(True)
                                 pbar.display(mem_res)
-                            current_step += 1
                             pbar.update(1)
+                            log_metrics = copy.deepcopy(train_metrics)
+                            _ = log_metrics.pop("accelerators")
                             pbar.set_postfix(
-                                loss=loss,
-                                chosen_rewards=chosen_rewards,
-                                rejected_rewards=rejected_rewards,
-                                each_step_time=total_time,
-                                step=current_step
+                                **log_metrics
                             )
                         else:
                             break
@@ -1887,9 +1906,10 @@ class DPOTrainer(BaseTrainer, ABC):
                 checkpoint_path = f"{str(self.arguments.get_path())}/{filename}"
 
             if self.arguments.do_eval:
-                self.eval(
-                    self.model_state
-                )
+                for _ in self.eval(
+                        self.model_state
+                ):
+                    ...
 
             output.checkpoint_path = checkpoint_path
             output.last_save_file_name = filename
@@ -1897,8 +1917,9 @@ class DPOTrainer(BaseTrainer, ABC):
 
         return output
 
-    def eval(self, model_state: EasyDelState):
-        assert self.eval_dataset is not None, "`eval_dataset` is required by evaluator function."
+    def eval(self, model_state: EasyDelState) -> typing.Iterator[dict]:
+        """Evaluate the Given Model State and yield the eval metrics"""
+        assert self.eval_dataset is not None, "`dataloader_eval` is required by evaluator function."
         with self.mesh:
 
             dir_prefix: str = "/dev/shm" if sys.platform != "win32" else "."
@@ -1906,15 +1927,16 @@ class DPOTrainer(BaseTrainer, ABC):
             if self.arguments.track_memory:
                 initialise_tracking(dir_prefix=dir_prefix)
 
-            pbar = tqdm(total=self.max_training_steps)
+            pbar = tqdm(total=self.max_evaluation_steps)
             pbar.set_description("Evaluating")
             current_step = 0
             loss_sum = None
-            accuracy_sum = None
+            chosen_rewards_sum = None
+            rejected_rewards_sum = None
             mem_res = "Tracking Option is OFF"
 
             try:
-                for batch in self.eval_dataset:
+                for batch in self.dataloader_eval:
                     current_step += 1
                     time_start = time.time()
                     for key in self.arguments.ids_to_pop_from_dataset:
@@ -1936,6 +1958,17 @@ class DPOTrainer(BaseTrainer, ABC):
                         loss, chosen_rewards, rejected_rewards
                     ) = metrics.loss, metrics.chosen_rewards[0], metrics.rejected_rewards[0]
 
+                    loss_sum = loss.tolist() if loss_sum is None else loss_sum + loss
+                    rejected_rewards_sum = (
+                        rejected_rewards.tolist() if (
+                                rejected_rewards_sum is None
+                        ) else rejected_rewards_sum + rejected_rewards
+                    )
+                    chosen_rewards_sum = (
+                        chosen_rewards.tolist() if (
+                                chosen_rewards_sum is None
+                        ) else chosen_rewards_sum + chosen_rewards
+                    )
                     if self.arguments.track_memory:
                         mem_res = get_mem(dir_prefix=dir_prefix)
 
@@ -1945,17 +1978,24 @@ class DPOTrainer(BaseTrainer, ABC):
                             for device, info in get_capacity_matrix(dir_prefix=dir_prefix).items():
                                 information_queries[f"{device.replace('_', ' ')} ({key})"] = float(
                                     info[key].replace("%", "").replace("GB", ""))
-
+                    eval_metrics = {
+                        "eval_loss": loss.tolist(),
+                        "eval_mean_loss": loss_sum / (current_step - self.arguments.step_start_point),
+                        "eval_mean_rejected_rewards": rejected_rewards_sum / (
+                                current_step - self.arguments.step_start_point
+                        ),
+                        "eval_mean_chosen_rewards": chosen_rewards_sum / (
+                                current_step - self.arguments.step_start_point
+                        ),
+                        "eval_step": current_step,
+                        "eval_step_time": total_time,
+                        "eval_perplexity": jnp.exp(loss).tolist(),
+                        "eval_accelerators": information_queries,
+                    }
                     if self.arguments.use_wandb:
                         with jax.spmd_mode("allow_all"):
                             self.wandb_runtime.log(
-                                {
-                                    "eval_loss": loss.tolist(),
-                                    "eval_step": current_step,
-                                    "eval_step_time": total_time,
-                                    "eval_perplexity": jnp.exp(loss).tolist(),
-                                    "eval_accelerators": information_queries,
-                                }
+                                eval_metrics
                             ),
                             wandb.summary["eval_captured_memory_log"] = mem_res
 
@@ -1963,20 +2003,18 @@ class DPOTrainer(BaseTrainer, ABC):
                         IPython.display.clear_output(True)
                         pbar.display(mem_res)
                     pbar.update(1)
+                    log_metrics = copy.deepcopy(eval_metrics)
+                    _ = log_metrics.pop("eval_accelerators")
                     pbar.set_postfix(
-                        loss=loss,
-                        chosen_rewards=chosen_rewards,
-                        rejected_rewards=rejected_rewards,
-                        each_step_time=total_time,
-                        step=current_step
+                        **log_metrics
                     )
+                    yield eval_metrics
             except KeyboardInterrupt:
                 termcolor.cprint(
                     "KeyboardInterrupt At Evaluation model Will return Nothing and just pass.",
                     color="cyan",
                     force_color=True
                 )
-        return ...
 
     def __repr__(self):
 
@@ -1992,8 +2030,13 @@ class DPOTrainer(BaseTrainer, ABC):
         string = f"{self.__class__.__name__}(\n"
         for k, v in self.__dict__.items():
             if not k.startswith("_"):
-                repr_src = f"\t{k} : " + v.__str__().replace("\n", "\n\t") + "\n"
-                string += repr_src if len(repr_src) < 350 else f"\t{k} : " + f"{v.__class__.__name__}(...)" + "\n"
+                try:
+                    repr_src = f"\t{k} : " + v.__str__().replace("\n", "\n\t") + "\n"
+                    string += repr_src if len(repr_src) < 350 else f"\t{k} : " + f"{v.__class__.__name__}(...)" + "\n"
+                except:
+                    repr_src = f"\t{k} : " + "EasyDeLReadingError" + "\n"
+                    string += repr_src if len(repr_src) < 350 else f"\t{k} : " + f"{v.__class__.__name__}(...)" + "\n"
+
         return string + ")"
 
     def __str__(self):
