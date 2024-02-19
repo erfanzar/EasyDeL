@@ -134,6 +134,9 @@ def main():
         value_partition_spec=value_partition_spec,
         bias_partition_spec=bias_partition_spec,
         attention_partition_spec=attention_partition_spec,
+        config_kwargs=dict(
+            gradient_checkpointing="nothing_saveable"
+        )
     )
     print("Model State is Loaded.")
 
