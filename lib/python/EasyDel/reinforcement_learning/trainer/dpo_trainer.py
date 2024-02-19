@@ -809,7 +809,7 @@ class DPOTrainer(BaseTrainer, ABC):
             auto_shard_model_state: bool = True,
             auto_shard_ref_model_state: bool = True,
             is_encoder_decoder: Optional[bool] = False,
-            num_proc_dataset: Optional[int] = None,
+            dataset_map_arguments: Optional[dict] = None,
             _do_init_fns: bool = True,
     ):
 
@@ -838,10 +838,11 @@ class DPOTrainer(BaseTrainer, ABC):
         :param precompute_ref_log_probs: bool: Precompute the log probabilities of the reference model
         :param model_init_kwargs: Optional[Dict]: Pass in the model_kwargs to model for init process
         :param ref_model_init_kwargs: Optional[Dict]: Pass the ref_model_init_kwargs to ref_model for init process
-        :param auto_shard_model_state: bool: whenever to automaticly shard `model_state`
-        :param auto_shard_ref_model_state: bool: whenever to automaticly shard `ref_model_state`
-        :param num_proc_dataset: Optional[int]: number of process to be used to modify the given eval and train dataset.
-        :param _do_init_fns: bool : preferred to set ture to trainer will automaticly configure
+        :param auto_shard_model_state: bool: whenever to automatically shard `model_state`
+        :param auto_shard_ref_model_state: bool: whenever to automatically shard `ref_model_state`
+        :param dataset_map_arguments: Optional[dict]: arguments to be passed to train and eval datasets for
+        tokenizing process with `dataset.map`.
+        :param _do_init_fns: bool : preferred to set ture to trainer will automatically configure
         model with provided training Arguments
         :param : Set the padding value for the model
         """
@@ -941,15 +942,16 @@ class DPOTrainer(BaseTrainer, ABC):
         self.loss_type = loss_type
 
         self._stored_metrics = defaultdict(lambda: defaultdict(list))
-
+        if dataset_map_arguments is None:
+            dataset_map_arguments = {}
         train_dataset = train_dataset.map(
             self.tokenize_row,
-            num_proc=num_proc_dataset
+            **dataset_map_arguments
         )
         if eval_dataset is not None:
             eval_dataset = eval_dataset.map(
                 self.tokenize_row,
-                num_proc=num_proc_dataset
+                **dataset_map_arguments
             )
 
         self.arguments = arguments
