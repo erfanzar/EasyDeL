@@ -21,26 +21,6 @@ from datasets import Dataset, load_dataset
 from transformers import AutoTokenizer
 
 
-@dataclass
-class ScriptArguments:
-    beta: float = field(default=0.1, metadata={"help": "the beta parameter for DPO loss"})
-    max_length: int = field(default=512, metadata={"help": "max length of each sample"})
-    max_prompt_length: int = field(default=128, metadata={"help": "max length of each sample's prompt"})
-    max_target_length: int = field(
-        default=128, metadata={"help": "Only used for encoder decoder model. Max target of each sample's prompt"}
-    )
-    sanity_check: bool = field(default=True, metadata={"help": "only train on 1000 samples"})
-    ignore_bias_buffers: bool = field(
-        default=False,
-        metadata={
-            "help": "debug argument for distributed training;"
-                    "fix for DDP issues with LM bias/mask buffers - invalid scalar type,`inplace operation. See"
-                    "https://github.com/huggingface/transformers/issues/22482#issuecomment-1595790992"
-        },
-    )
-    generate_during_eval: bool = field(default=False, metadata={"help": "Generate during evaluation"})
-
-
 def extract_anthropic_prompt(prompt_and_response):
     """Extract the anthropic prompt from a prompt and response pair."""
     search_term = "\n\nAssistant:"
@@ -125,7 +105,9 @@ def main():
             max_length=max_length,
             max_target_length=max_target_length,
             max_prompt_length=max_prompt_length,
-            num_proc_dataset=8
+            dataset_map_arguments={
+                "num_proc": 8,
+            }
         )
 
         dpo_trainer.train()
