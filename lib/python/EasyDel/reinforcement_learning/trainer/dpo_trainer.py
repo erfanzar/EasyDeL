@@ -1779,7 +1779,9 @@ class DPOTrainer(BaseTrainer, ABC):
                                         or key.endswith("_labels")
                                 ):
                                     _ = batch.pop(key, None)
-
+                            for k in list(batch.keys()):
+                                v = batch[k]
+                                batch[k] = v.reshape(v.shape[0], -1)
                             self.model_state, metrics = self.sharded_train_step_function(
                                 self.model_state,
                                 batch

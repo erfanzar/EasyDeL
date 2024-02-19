@@ -17,6 +17,7 @@ Some of the key features provided by EasyDeL include:
 - DPOTrainer and SFTTrainer(Beta Stage)
 - And various other features to enhance the training process and optimize performance.
 - LoRA: Low-Rank Adaptation of Large Language Models
+- RingAttention (Near to infinite context length) (soon)
 
 > [!NOTE]
 > EasyDel Will only support JAX>=0.4.22 Due to miss computations being happened in older version and also not bein able

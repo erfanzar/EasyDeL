@@ -90,23 +90,23 @@ def main():
 
         )
 
-        max_length = 64
-        max_target_length = 128
-        max_prompt_length = 128
+        max_length = 1536
+        max_target_length = 1024
+        max_prompt_length = 1024
 
         dpo_trainer = DPOTrainer(
             model_state=state,
             ref_model_state=ref_state,
             beta=0.1,
             train_dataset=train_dataset,
-            eval_dataset=eval_dataset,
+            # eval_dataset=eval_dataset,
             tokenizer=tokenizer,
             arguments=arguments,
             max_length=max_length,
             max_target_length=max_target_length,
             max_prompt_length=max_prompt_length,
             dataset_map_arguments={
-                "num_proc": 8,
+                "num_proc": os.cpu_count(),
             }
         )
 
