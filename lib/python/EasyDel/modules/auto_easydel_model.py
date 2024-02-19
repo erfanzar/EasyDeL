@@ -256,7 +256,7 @@ class AutoEasyDelModelForCausalLM:
             use_shard_map=use_shard_map,
         )
         if config_kwargs is not None:
-            for k, v in config_kwargs:
+            for k, v in config_kwargs.items():
                 setattr(cfg, k, v)
 
         ed_model = module(
