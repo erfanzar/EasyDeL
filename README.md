@@ -408,7 +408,11 @@ dpo_trainer = DPOTrainer(
     max_prompt_length=max_prompt_length,
     ref_model_init_kwargs=None,  # In case that you pass the ref_model_state a string you have to pass this one too
     model_init_kwargs=None,  # In case that you pass the model_state a string you have to pass this one too
-    #     num_proc_dataset=18,
+    dataset_map_arguments={
+        "num_proc": 8,
+        "batched": True,
+        "batch_size": 100,
+    },
     auto_shard_model_state=True,
     auto_shard_ref_model_state=True,
     loss_type="sigmoid",
