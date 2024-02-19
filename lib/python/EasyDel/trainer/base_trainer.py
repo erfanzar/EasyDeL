@@ -80,45 +80,50 @@ class BaseTrainer:
 
         """
         # Loggers
-        self.timer = None
-        self.wandb_runtime: Run | RunDisabled | None = None
+        self.timer = getattr(self, "timer", None)
+        self.wandb_runtime: Run | RunDisabled | None = getattr(self, "wandb_runtime", None)
 
         # Data
-        self.dataloader_train = None
-        self.dataloader_eval = None
-        self.max_training_steps = None
-        self.max_evaluation_steps = None
+        self.dataloader_train = getattr(self, "dataloader_train", None)
+        self.dataloader_eval = getattr(self, "dataloader_eval", None)
+        self.max_training_steps = getattr(self, "max_training_steps", None)
+        self.max_evaluation_steps = getattr(self, "max_evaluation_steps", None)
         self.dataset_train = dataset_train
         self.dataset_eval = dataset_eval
 
         # Model Related
-        self.model = None
-        self.config = None
-        self.scheduler = None
-        self.tx = None
+        self.model = getattr(self, "model", None)
+        self.config = getattr(self, "config", None)
+        self.scheduler = getattr(self, "scheduler", None)
+        self.tx = getattr(self, "tx", None)
+        self.model_state = getattr(self, "model_state", None)
 
         # LoRA Related
         self.rapture = arguments.rapture
-        self.lora_parameters = None
-        self.lora_model = None
-        self.lora_tx = None
-        self.lora_opt_state = None
-        self.lora_apply_fn = None
+        self.lora_parameters = getattr(self, "lora_parameters", None)
+        self.lora_model = getattr(self, "lora_model", None)
+        self.lora_tx = getattr(self, "lora_tx", None)
+        self.lora_opt_state = getattr(self, "lora_opt_state", None)
+        self.lora_apply_fn = getattr(self, "lora_apply_fn", None)
 
         # PJit functions
-        self.create_sharded_state_from_params_function = None
-        self.sharded_train_step_function = None
-        self.sharded_eval_step_function = None
-        self.initialize_state_function = None
-        self.mesh = None
+        self.create_sharded_state_from_params_function = getattr(
+            self,
+            "create_sharded_state_from_params_function",
+            None
+        )
+        self.sharded_train_step_function = getattr(self, "sharded_train_step_function", None)
+        self.sharded_eval_step_function = getattr(self, "sharded_eval_step_function", None)
+        self.initialize_state_function = getattr(self, "initialize_state_function", None)
+        self.mesh = getattr(self, "mesh", None)
 
         # Checkpoint Managers
-        self.checkpoint_manager: fjformer.CheckpointManager | None = None
+        self.checkpoint_manager: fjformer.CheckpointManager | None = getattr(self, "checkpoint_manager", None)
 
         # EasyState
-        self.state_shape = None
-        self.state_partition_spec = None
-        self.sharded_state = None
+        self.state_shape = getattr(self, "state_shape", None)
+        self.state_partition_spec = getattr(self, "state_partition_spec", None)
+        self.sharded_state = getattr(self, "sharded_state", None)
 
         # Rest
 

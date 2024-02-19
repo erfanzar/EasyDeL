@@ -286,6 +286,12 @@ __all__ = (
     "create_casual_language_model_evaluation_step",
     "create_casual_language_model_train_step",
 
+    "create_dpo_eval_function",
+    "create_dpo_train_function",
+    "DPOTrainer",
+    "create_concatenated_forward",
+    "AutoRLModelForCasualLMWithValueHead",
+
     # SMI Modules
     "smi_run",
     "initialise_tracking",
