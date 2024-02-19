@@ -384,6 +384,7 @@ class EasyDelState(struct.PyTreeNode):
             free_optimizer_state: bool = True,
             verbose: bool = True,
             state_shard_fns: Optional[Mapping[str, Callable]] = None,
+            config_kwargs: Optional[Mapping[str, Any]] = None,
             **kwargs
     ) -> "EasyDelState":
 
@@ -418,6 +419,7 @@ class EasyDelState(struct.PyTreeNode):
         :param verbose: bool: Print the progress of loading the model
         :param state_shard_fns: Optional[Mapping[str,Callable]]: Specify the function to use for sharding the state
         :param kwargs: Pass keyword arguments to the function
+        :param config_kwargs: Optional[Mapping[str, Any]]: Config kwargs to be added to config before creating module
         :return: An `EasyDelState` object
         """
         if free_optimizer_state and init_optimizer_state:
@@ -444,6 +446,7 @@ class EasyDelState(struct.PyTreeNode):
                 use_shard_map=use_shard_map,
                 input_shape=input_shape,
                 backend=backend,
+                config_kwargs=config_kwargs,
                 **kwargs
             )
             if tx_init is None:
