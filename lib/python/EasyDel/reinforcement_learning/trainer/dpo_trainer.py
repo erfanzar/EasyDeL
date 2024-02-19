@@ -1831,7 +1831,7 @@ class DPOTrainer(BaseTrainer, ABC):
                             if self.arguments.use_wandb:
                                 with jax.spmd_mode("allow_all"):
                                     self.wandb_runtime.log(
-                                        **train_metrics
+                                        train_metrics
                                     ),
                                     wandb.summary["captured_memory_log"] = mem_res
 
