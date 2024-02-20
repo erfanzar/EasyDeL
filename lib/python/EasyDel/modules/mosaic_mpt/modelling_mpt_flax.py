@@ -130,12 +130,17 @@ class FlaxMptAttention(nn.Module):
             query_partition_spec=self.config.query_partition_spec,
             value_partition_spec=self.config.value_partition_spec,
             mesh=self.config.jax_mesh(),
-            sm_scale=1 # TOBE CHANGED
+            sm_scale=1 / math.sqrt(self.config.n_heads)
         )
         if self.config.qk_ln:
             self.q_ln = nn.LayerNorm(use_bias=self.config.use_norm_bias)
             self.k_ln = nn.LayerNorm(use_bias=self.config.use_norm_bias)
-        self.causal_mask = nn.make_causal_mask(jnp.ones((1, self.config.max_seq_len)))
+        self.causal_mask = nn.make_causal_mask(
+            jnp.ones(
+                (1, self.config.max_seq_len),
+                dtype="bool"
+            ), dtype="bool"
+        )
 
     @nn.compact
     def _concatenate_to_cache(self, key, query, value, attention_mask):

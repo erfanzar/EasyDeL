@@ -70,7 +70,7 @@ class FlaxGPTNeoXAttention(nn.Module):
         )
 
         self.factor = jnp.sqrt(jnp.asarray(self.head_size, dtype=jnp.float32))
-        self.bias = nn.make_causal_mask(jnp.ones((1, self.config.max_position_embeddings)))
+        self.bias = nn.make_causal_mask(jnp.ones((1, getattr(self.config, "c_max_position_embeddings", self.config.max_position_embeddings))))
 
     def __call__(self,
                  hidden_states: chex.Array,

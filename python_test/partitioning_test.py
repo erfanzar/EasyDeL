@@ -36,9 +36,9 @@ def main():
         ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec("sp", ("fsdp", "tp"))),
         ("self_attn/o_proj/kernel", PartitionSpec(("fsdp", "tp"))),
 
-        ("mlp/gate_proj/kernel", PartitionSpec('tp', "fsdp")),
-        ("mlp/down_proj/kernel", PartitionSpec("fsdp", 'tp')),
-        ("mlp/up_proj/kernel", PartitionSpec('tp', "fsdp")),
+        ("mlp/gate_proj/kernel", PartitionSpec("tp", "fsdp")),
+        ("mlp/down_proj/kernel", PartitionSpec("fsdp", "tp")),
+        ("mlp/up_proj/kernel", PartitionSpec("tp", "fsdp")),
 
         ("input_layernorm/kernel", PartitionSpec(("fsdp", "tp"))),
         ("post_attention_layernorm/kernel", PartitionSpec(("fsdp", "tp"))),
