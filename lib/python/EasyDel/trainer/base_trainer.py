@@ -1,17 +1,17 @@
 import abc
 import os
-import typing
 import warnings
 from abc import abstractmethod
-from typing import Union, Callable, Optional
+from typing import Union, Callable, Optional, Any, Literal, Mapping
 
 import fjformer
+import jax
+import termcolor
 import wandb
 from datasets import Dataset
 from torch.utils.data import DataLoader
 from wandb.sdk.lib import RunDisabled
 from wandb.sdk.wandb_run import Run
-from jax import numpy as jnp
 from .training_configurations import TrainArguments
 from ..utils.utils import prefix_print, Timers
 from dataclasses import dataclass
@@ -238,7 +238,7 @@ class BaseTrainer:
     def create_collate_function(
             self,
             max_sequence_length: int,
-            truncation_mode: typing.Literal["keep_end", "keep_start"]
+            truncation_mode: Literal["keep_end", "keep_start"]
     ) -> Callable:
         raise NotImplementedError
 
@@ -356,3 +356,44 @@ class BaseTrainer:
             scheduler=scheduler,
             config=config
         )
+
+    def _save_state(
+            self,
+            state: "EasyDelState",
+            gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
+            milestone: bool = False
+    ) -> str:
+        step = int(
+            jax.device_get(
+                state.step
+            )
+        ) + self.arguments.step_start_point if self.arguments.step_start_point is not None else int(
+            jax.device_get(
+                state.step
+            )
+        )
+        checkpoint_name = f"{self.arguments.model_name}-S{step}"
+        filename = f"{checkpoint_name}_{step}" if milestone else f"{checkpoint_name}"
+        filename += ".easy"
+        termcolor.cprint(f"Saving Model {filename}.", color="cyan", force_color=True)
+        state.save_state(
+            filename=filename,
+            checkpoint_dir=os.path.join(self.arguments.save_dir, self.arguments.model_name),
+            gather_fns=gather_fns,
+            float_dtype=self.dtype,
+            verbose=self.arguments.verbose,
+            save_optimizer=self.arguments.save_optimizer_state,
+        )
+        return filename
+
+    @abc.abstractmethod
+    def train(self):
+        """
+        abstract of Train Function to train model
+        """
+
+    @abc.abstractmethod
+    def eval(self, state):
+        """
+        abstract of Eval Function to evaluate model
+        """

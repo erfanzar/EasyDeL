@@ -62,7 +62,11 @@ def main():
         shard, _ = make_shard_and_gather_fns(partition_specs, jnp.float32)
 
         params = jax.tree_map(lambda p, f: f(p), params, shard)
-
+        config.add_basic_configurations(
+            attn_mechanism="normal",
+            block_k=64,
+            block_q=64
+        )
         flax_model = FlaxLlamaForCausalLM(
             config=config,
             dtype=jnp.float32,
@@ -76,9 +80,10 @@ def main():
             train=False
         )
         res = jnp.allclose(torch_output.logits.cpu().detach().numpy(), flax_output.logits, atol=1e-5)
+
+        print("LLama Huggingface Predictions :\n", torch_output.logits.cpu().detach().numpy(),
+              "\nEasyDel Predictions: \n", flax_output.logits)
         if res:  # A Little Bit of humor
-            print("LLama Huggingface Predictions :\n", torch_output.logits.cpu().detach().numpy(),
-                  "\nEasyDel Predictions: \n", flax_output.logits)
             print("\033[1;36mTest Passed Unfortunately 🥳")
         else:
             print("\033[1;31mTest Failed Successfully  🤕")

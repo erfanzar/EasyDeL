@@ -302,7 +302,8 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
             )
             query_sequence_partition = None if query_states.shape[1] == 1 else "sp"
             ring_attention_sharded = shard_map(
-                partial(ring_attention_standard, axis_name="sp"), mesh=self.mesh,
+                partial(ring_attention_standard, axis_name="sp"),
+                mesh=self.mesh,
                 in_specs=(
                     PartitionSpec(("dp", "fsdp"), query_sequence_partition, "tp", None),
                     PartitionSpec(("dp", "fsdp"), "sp", "tp", None),

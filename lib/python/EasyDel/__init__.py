@@ -122,6 +122,10 @@ from .trainer import (
     TrainArguments as TrainArguments,
     create_casual_language_model_evaluation_step as create_casual_language_model_evaluation_step,
     create_casual_language_model_train_step as create_casual_language_model_train_step,
+    create_vision_casual_language_model_train_step as create_vision_casual_language_model_train_step,
+    create_vision_casual_language_model_evaluation_step as create_vision_casual_language_model_evaluation_step,
+    VisionCausalLanguageModelTrainer as VisionCausalLanguageModelTrainer,
+    VisionCausalLanguageModelStepOutput as VisionCausalLanguageModelStepOutput
 )
 
 from .reinforcement_learning import (
@@ -285,6 +289,11 @@ __all__ = (
     "TrainArguments",
     "create_casual_language_model_evaluation_step",
     "create_casual_language_model_train_step",
+
+    "VisionCausalLanguageModelStepOutput",
+    "VisionCausalLanguageModelTrainer",
+    "create_vision_casual_language_model_evaluation_step",
+    "create_vision_casual_language_model_train_step",
 
     "create_dpo_eval_function",
     "create_dpo_train_function",
