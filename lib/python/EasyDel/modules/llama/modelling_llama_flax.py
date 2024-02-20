@@ -21,7 +21,7 @@ from ..flax_modelling_utils import (
     repeat_kv_bnsh,
     apply_rotary_pos_emb,
     precompute_freq_cis,
-    get_dot_general_by_bits
+    get_dot_general_by_bits, BaseJAXAttentionModule
 )
 from ..easy_attention import AttentionOutput, EasyAttention
 
@@ -81,7 +81,7 @@ class RMSNorm(nn.Module):
         return output * weight
 
 
-class FlaxLlamaAttention(nn.Module):
+class FlaxLlamaAttention(BaseJAXAttentionModule):
     config: LlamaConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
