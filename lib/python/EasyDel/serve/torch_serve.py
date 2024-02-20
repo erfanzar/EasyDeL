@@ -24,7 +24,7 @@ class PytorchServerConfig:
     :param port: Specify the port number that will be used by the server
     :param batch_size: Determine the number of samples to be generated in a single batch
     :param contains_auto_format: Determine whether the input text contains auto_formatting
-    :param max_length: Set the maximum length of a sentence
+    :param max_sequence_length: Set the maximum length of a sentence
     :param max_new_tokens: Limit the number of new tokens that can be generated in a single batch
     :param temperature: Control the randomness of the generated text
     :param top_p: Control the probability of sampling from the top candidates
@@ -39,7 +39,7 @@ class PytorchServerConfig:
     port: int = 2059
     batch_size: int = 1
     contains_auto_format: bool = True
-    max_length: int = 2048
+    max_sequence_length: int = 2048
     max_new_tokens: int = 2048
     temperature: float = 0.8
     top_p: float = 0.95
@@ -172,7 +172,7 @@ class PyTorchServer(GradioUserInference):
         )
         response = self.process(
             string=string,
-            max_length=self.config.max_length,
+            max_sequence_length=self.config.max_sequence_length,
             temperature=data.temperature,
             stream=False,
             top_k=self.config.top_k,
@@ -199,7 +199,7 @@ class PyTorchServer(GradioUserInference):
         )
         response = self.process(
             string=string,
-            max_length=self.config.max_length,
+            max_sequence_length=self.config.max_sequence_length,
             temperature=data.temperature,
             stream=False,
             top_k=self.config.top_k,
@@ -244,7 +244,7 @@ class PyTorchServer(GradioUserInference):
             self,
             string: str,
             max_new_tokens: int = None,
-            max_length: int = None,
+            max_sequence_length: int = None,
             temperature: float = 0.6,
             top_k=50,
             top_p=0.9,
@@ -257,7 +257,7 @@ class PyTorchServer(GradioUserInference):
         :param self: Represent the instance of the class
         :param string: str: Pass the string to be generated
         :param max_new_tokens: int: Limit the number of new tokens that can be generated
-        :param max_length: int: Set the maximum length of the generated text
+        :param max_sequence_length: int: Set the maximum length of the generated text
         :param temperature: float: Control the randomness of the text generation
         :param top_k: Filter out the top k tokens with the highest probability
         :param top_p: Control the probability of sampling from the top n tokens
@@ -289,7 +289,7 @@ class PyTorchServer(GradioUserInference):
                     bos_token_id=self.tokenizer.bos_token_id,
                     eos_token_id=self.tokenizer.eos_token_id,
                     pad_token_id=self.tokenizer.pad_token_id,
-                    max_length=max_length or self.config.max_length,
+                    max_length=max_sequence_length or self.config.max_sequence_length,
                     temperature=temperature,
                     top_k=top_k,
                     top_p=top_p,
@@ -313,7 +313,7 @@ class PyTorchServer(GradioUserInference):
                     bos_token_id=self.tokenizer.bos_token_id,
                     eos_token_id=self.tokenizer.eos_token_id,
                     pad_token_id=self.tokenizer.pad_token_id,
-                    max_length=max_length or self.config.max_length,
+                    max_length=max_sequence_length or self.config.max_sequence_length,
                     temperature=temperature,
                     top_k=top_k,
                     top_p=top_p,
@@ -359,7 +359,7 @@ class PyTorchServer(GradioUserInference):
             history: List[List[str]],
             system_prompt: str | None,
             mode: str,
-            max_length: int,
+            max_sequence_length: int,
             max_new_tokens: int,
             max_compile_tokens: int,
             greedy: bool,
@@ -388,7 +388,7 @@ class PyTorchServer(GradioUserInference):
                 string=string,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
-                max_length=max_length,
+                max_sequence_length=max_sequence_length,
                 top_p=top_p,
                 top_k=top_k,
                 stream=True
@@ -400,7 +400,7 @@ class PyTorchServer(GradioUserInference):
     def gradio_inference(self):
         return self.build_inference(
             sample_func=self.process_gradio,
-            max_length=self.config.max_length,
+            max_sequence_length=self.config.max_sequence_length,
             max_new_tokens=self.config.max_new_tokens,
             max_compile_tokens=1,
         )

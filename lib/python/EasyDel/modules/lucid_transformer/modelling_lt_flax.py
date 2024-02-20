@@ -15,7 +15,7 @@ from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLM
 
 import chex
 from .lt_configuration import FlaxLTConfig
-
+from ..flax_modelling_utils import BaseJAXAttentionModule
 
 ACT2CLS = {
     "gelu": nn.gelu,
@@ -28,7 +28,7 @@ ACT2CLS = {
 }
 
 
-class LTSelfAttention(nn.Module):
+class LTSelfAttention(BaseJAXAttentionModule):
     config: FlaxLTConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32

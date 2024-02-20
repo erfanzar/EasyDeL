@@ -1,7 +1,7 @@
 import copy
 import functools
 import os
-from typing import Sequence, Tuple, Optional, Mapping, Callable, Dict
+from typing import Sequence, Tuple, Optional, Mapping, Callable, Dict, Any
 
 import flax.core
 import gradio as gr
@@ -18,7 +18,7 @@ from jax import numpy as jnp
 from jax.experimental import mesh_utils
 from flax.serialization import from_bytes
 from fjformer.checkpoint import get_dtype
-from jax.sharding import Mesh, PartitionSpec as Ps
+from jax.sharding import Mesh, PartitionSpec
 from transformers import GenerationConfig
 import logging
 from ..utils.utils import RNG, prefix_print
@@ -46,7 +46,7 @@ class JAXServerConfig:
     :param max_sequence_length: int: Set the maximum length of the text that can be generated
     :param max_new_tokens: int: Determine how many tokens can be added to the vocabulary
     :param max_compile_tokens: int: Set the maximum number of tokens that can be streamed at a time
-    :param generation_ps: jax.sharding.PartitionSpec : PartitionSpec to use for sharding data
+    :param generation_ps: PartitionSpec : PartitionSpec to use for sharding data
     :param temperature: float: Control the randomness of the output
     :param top_p: float: Control the diversity of the text generated
     :param top_k: int: Limit the number of tokens that can be generated
@@ -74,7 +74,7 @@ class JAXServerConfig:
     logging: bool = True
     mesh_axes_names: Sequence[str] = ("dp", "fsdp", "tp", "sp")
     mesh_axes_shape: Sequence[int] = (1, -1, 1, 1)
-    generation_ps: jax.sharding.PartitionSpec = Ps("dp", "fsdp")
+    generation_ps: PartitionSpec = PartitionSpec("dp", "fsdp")
     dtype: str = "fp16"
     stream_tokens_for_gradio: bool = True
     use_prefix_tokenizer: bool = True
@@ -202,8 +202,8 @@ class JAXServer(GradioUserInference):
 
         @functools.partial(
             pjit,
-            in_shardings=(self.partition_specs, Ps(), Ps()),
-            out_shardings=(Ps())
+            in_shardings=(self.partition_specs, PartitionSpec(), PartitionSpec()),
+            out_shardings=(PartitionSpec())
         )
         def greedy_generate(parameters, input_ids, attention_mask):
             input_ids = with_sharding_constraint(input_ids, self.config.generation_ps)
@@ -226,8 +226,8 @@ class JAXServer(GradioUserInference):
 
         @functools.partial(
             pjit,
-            in_shardings=(self.partition_specs, Ps(), Ps()),
-            out_shardings=(Ps())
+            in_shardings=(self.partition_specs, PartitionSpec(), PartitionSpec()),
+            out_shardings=(PartitionSpec())
         )
         def generate(parameters, input_ids, attention_mask):
             input_ids = with_sharding_constraint(input_ids, self.config.generation_ps)
@@ -390,22 +390,18 @@ class JAXServer(GradioUserInference):
             precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
             sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
             sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            query_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp",
-                                                                                          None),
-            key_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp",
-                                                                                        None),
-            value_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp",
-                                                                                          None),
-            bias_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, None,
-                                                                                         None),
-            attention_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp",
-                                                                                              "tp", None),
+            query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            key_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            value_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
+            attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             use_shard_map: bool = False,
             input_shape: Sequence[int] = (1, 1),
             shard_fns: Optional[Mapping[tuple, Callable]] = None,
             backend: Optional[str] = None,
             add_params_field: bool = True,
             do_memory_log: bool = False,
+            model_config_kwargs: Optional[Mapping[str, Any]] = None,
             verbose: bool = True,
             **kwargs
     ):
@@ -427,6 +423,7 @@ class JAXServer(GradioUserInference):
             shard_fns=shard_fns,
             input_shape=input_shape,
             backend=backend,
+            config_kwargs=model_config_kwargs,
             **kwargs
         )
 
