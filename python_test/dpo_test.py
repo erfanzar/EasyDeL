@@ -99,7 +99,7 @@ def main():
             ref_model_state=ref_state,
             beta=0.1,
             train_dataset=train_dataset,
-            # eval_dataset=eval_dataset,
+            eval_dataset=eval_dataset,
             tokenizer=tokenizer,
             arguments=arguments,
             max_length=max_length,

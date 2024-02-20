@@ -183,44 +183,76 @@ class FlaxPhiAttention(nn.Module):
     @nn.compact
     def _concatenate_to_cache(self, key, value, query, attention_mask):
         """
-        The _concatenate_to_cache function is used to concatenate the key and value vectors
-        of a query with those of previous queries. This allows for the attention mechanism to
-        look at all previous queries when computing its output. The function takes in three
-        arguments: key, value, and query. It also uses two variables that are stored in the cache:
-        cached_key and cached_value.
+                The _concatenate_to_cache function is used to concatenate the key and value vectors
+                of a query with those of previous queries. This allows for the attention mechanism to
+                look at all previous queries when computing its output. The function takes in three
+                arguments: key, value, and query. It also uses two variables that are stored in the cache:
+                cached_key and cached_value.
 
-        :param self: Access the variables stored in the cache
-        :param key: Store the keys of the encoder-decoder attention
-        :param value: Initialize the cached_value variable
-        :param query: Determine the number of cache vectors to update
-        :param attention_mask: Mask out the padded vectors in the cache
-        :return: The key, value and attention_mask
+                :param self: Access the variables stored in the cache
+                :param key: Store the keys of the encoder-decoder attention
+                :param value: Initialize the cached_value variable
+                :param query: Determine the number of cache vectors to update
+                :param attention_mask: Mask out the padded vectors in the cache
+                :return: The key, value and attention_mask
+
         """
         is_initialized = self.has_variable("cache", "cached_key")
-        cached_key = self.variable(
-            "cache", "cached_key", jnp.zeros, key.shape, key.dtype)
-        cached_value = self.variable(
-            "cache", "cached_value", jnp.zeros, value.shape, value.dtype)
-        cache_index = self.variable(
-            "cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32))
+        cached_key = self.variable("cache", "cached_key", jnp.zeros, key.shape, key.dtype)
+        cached_value = self.variable("cache", "cached_value", jnp.zeros, value.shape, value.dtype)
+        cache_index = self.variable("cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32))
 
         if is_initialized:
             *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
             cur_index = cache_index.value
-            indices = (0,) * len(batch_dims) + (cur_index, 0, 0)
-            key = lax.dynamic_update_slice(cached_key.value, key, indices)
-            value = lax.dynamic_update_slice(
-                cached_value.value, value, indices)
+            if query.shape[1] == 1:
+                mesh = self.config.jax_mesh()
+
+                def fn(
+                        _cached_key,
+                        _cached_value,
+                        _key,
+                        _value,
+                        _cur_index
+                ):
+                    assert _key.shape[1] == 1 and _value.shape[1] == 1, (_key.shape, _value.shape)
+                    sp_size = max_length // mesh.shape["sp"]
+                    axis_index = jax.lax.axis_index("sp")
+                    _cur_index = _cur_index - axis_index * sp_size
+                    _key, _value = jax.lax.cond(
+                        jnp.logical_and(cur_index >= 0, _cur_index < sp_size),
+                        lambda: (
+                            _cached_key.at[:, cur_index].set(_key[:, -1]),
+                            _cached_value.at[:, cur_index].set(_value[:, -1]),
+                        ),
+                        lambda: (_cached_key, _cached_value),
+                    )
+                    return _key, _value
+
+                fn = shard_map(
+                    fn, mesh=mesh,
+                    in_specs=(
+                        PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+                        PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+                        PartitionSpec(("dp", "fsdp"), None, "tp", None),
+                        PartitionSpec(("dp", "fsdp"), None, "tp", None),
+                        PartitionSpec()
+                    ),
+                    out_specs=(
+                        PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+                        PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
+                    ),
+                    check_rep=False
+                )
+                key, value = fn(cached_key.value, cached_value.value, key, value, cur_index)
+            else:
+                indices = (0,) * len(batch_dims) + (cur_index, 0, 0)
+                key = lax.dynamic_update_slice(cached_key.value, key, indices)
+                value = lax.dynamic_update_slice(cached_value.value, value, indices)
             cached_key.value = key
             cached_value.value = value
             num_updated_cache_vectors = query.shape[1]
             cache_index.value = cache_index.value + num_updated_cache_vectors
-
-            pad_mask = jnp.broadcast_to(
-                jnp.arange(max_length) < cur_index + num_updated_cache_vectors,
-                tuple(batch_dims) + (1, num_updated_cache_vectors, max_length),
-            )
-            attention_mask = combine_masks(pad_mask, attention_mask)
         return key, value, attention_mask
 
     @staticmethod
@@ -387,12 +419,8 @@ class FlaxPhiAttention(nn.Module):
             jnp.full(attention_mask.shape, jnp.finfo(
                 self.dtype).min).astype(self.dtype),
         )
-        query_states, key_states, value_states = map(
-            lambda a: a.transpose(0, 2, 1, 3),
-            [query_states, key_states, value_states]
-        )
 
-        query_length, key_length = query_states.shape[-2], key_states.shape[-2]
+        query_length, key_length = query_states.shape[1], key_states.shape[1]
 
         attentions = self.attention_performer.__call__(
             query_states=query_states,
@@ -407,7 +435,7 @@ class FlaxPhiAttention(nn.Module):
             key_value_sequence_length=key_length,
             uses_cache=self.has_variable("cache", "cached_key") or init_cache,
         )
-        attentions.attention_outputs = attentions.attention_outputs.transpose(0, 2, 1, 3)
+        attentions.attention_outputs = attentions.attention_outputs
         attn_output = self._merge_heads(attentions.attention_outputs)
         attn_output = self.dense(attn_output)
 
@@ -600,10 +628,11 @@ class FlaxPhiModule(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype
         )
-        self.causal_mask = make_causal_mask(
+        self.causal_mask = nn.make_causal_mask(
             jnp.ones(
-                (1, config.max_position_embeddings)
-            )
+                (1, getattr(self.config, "c_max_position_embeddings", self.config.max_position_embeddings)),
+                dtype="bool"
+            ), dtype="bool"
         )
 
         initial_rope_kwargs = dict(

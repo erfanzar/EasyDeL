@@ -266,10 +266,12 @@ class FlaxPalmModule(nn.Module):
             param_dtype=self.param_dtype,
             eps=self.config.eps
         )
-        self.causal_mask = nn.make_causal_mask(jnp.ones(
-            1, self.config.max_length
-        ))
-
+        self.causal_mask = nn.make_causal_mask(
+            jnp.ones(
+                (1, self.config.max_length),
+                dtype="bool"
+            ), dtype="bool"
+        )
     def make_causal_mask(self, attention_mask=None):
         assert attention_mask is not None
         b, s = attention_mask.shape

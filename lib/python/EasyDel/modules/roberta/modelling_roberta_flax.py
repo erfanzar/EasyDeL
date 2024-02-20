@@ -8,6 +8,7 @@ from flax.core import FrozenDict, freeze
 from flax.linen.attention import make_attention_mask, make_causal_mask, combine_masks, dot_product_attention_weights
 from flax.linen.partitioning import remat
 from flax.traverse_util import flatten_dict, unflatten_dict
+from jax.experimental.shard_map import shard_map
 from transformers.modeling_flax_outputs import FlaxBaseModelOutputWithPastAndCrossAttentions, FlaxMaskedLMOutput, \
     FlaxSequenceClassifierOutput, FlaxMultipleChoiceModelOutput, FlaxTokenClassifierOutput, \
     FlaxQuestionAnsweringModelOutput, FlaxCausalLMOutputWithCrossAttentions, \
@@ -15,6 +16,7 @@ from transformers.modeling_flax_outputs import FlaxBaseModelOutputWithPastAndCro
 
 from .roberta_configuration import RobertaConfig
 import jax
+from jax.sharding import PartitionSpec
 from jax import lax, numpy as jnp
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 from ..easy_attention import EasyAttention
@@ -128,7 +130,8 @@ class FlaxRobertaSelfAttention(nn.Module):
 
         if self.causal:
             self.causal_mask = make_causal_mask(
-                jnp.ones((1, self.config.max_position_embeddings), dtype="bool"), dtype="bool"
+                jnp.ones((1, getattr(self.config, "c_max_position_embeddings", self.config.max_position_embeddings)),
+                         dtype="bool"), dtype="bool"
             )
 
     def _split_heads(self, hidden_states):
@@ -139,7 +142,21 @@ class FlaxRobertaSelfAttention(nn.Module):
 
     @nn.compact
     def _concatenate_to_cache(self, key, value, query, attention_mask):
-        # detect if we're initializing by absence of existing cache data.
+        """
+                The _concatenate_to_cache function is used to concatenate the key and value vectors
+                of a query with those of previous queries. This allows for the attention mechanism to
+                look at all previous queries when computing its output. The function takes in three
+                arguments: key, value, and query. It also uses two variables that are stored in the cache:
+                cached_key and cached_value.
+
+                :param self: Access the variables stored in the cache
+                :param key: Store the keys of the encoder-decoder attention
+                :param value: Initialize the cached_value variable
+                :param query: Determine the number of cache vectors to update
+                :param attention_mask: Mask out the padded vectors in the cache
+                :return: The key, value and attention_mask
+
+        """
         is_initialized = self.has_variable("cache", "cached_key")
         cached_key = self.variable("cache", "cached_key", jnp.zeros, key.shape, key.dtype)
         cached_value = self.variable("cache", "cached_value", jnp.zeros, value.shape, value.dtype)
@@ -147,20 +164,55 @@ class FlaxRobertaSelfAttention(nn.Module):
 
         if is_initialized:
             *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
-            # update key, value caches with our new 1d spatial slices
             cur_index = cache_index.value
-            indices = (0,) * len(batch_dims) + (cur_index, 0, 0)
-            key = lax.dynamic_update_slice(cached_key.value, key, indices)
-            value = lax.dynamic_update_slice(cached_value.value, value, indices)
+            if query.shape[1] == 1:
+                mesh = self.config.jax_mesh()
+
+                def fn(
+                        _cached_key,
+                        _cached_value,
+                        _key,
+                        _value,
+                        _cur_index
+                ):
+                    assert _key.shape[1] == 1 and _value.shape[1] == 1, (_key.shape, _value.shape)
+                    sp_size = max_length // mesh.shape["sp"]
+                    axis_index = jax.lax.axis_index("sp")
+                    _cur_index = _cur_index - axis_index * sp_size
+                    _key, _value = jax.lax.cond(
+                        jnp.logical_and(cur_index >= 0, _cur_index < sp_size),
+                        lambda: (
+                            _cached_key.at[:, cur_index].set(_key[:, -1]),
+                            _cached_value.at[:, cur_index].set(_value[:, -1]),
+                        ),
+                        lambda: (_cached_key, _cached_value),
+                    )
+                    return _key, _value
+
+                fn = shard_map(
+                    fn, mesh=mesh,
+                    in_specs=(
+                        PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+                        PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+                        PartitionSpec(("dp", "fsdp"), None, "tp", None),
+                        PartitionSpec(("dp", "fsdp"), None, "tp", None),
+                        PartitionSpec()
+                    ),
+                    out_specs=(
+                        PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+                        PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
+                    ),
+                    check_rep=False
+                )
+                key, value = fn(cached_key.value, cached_value.value, key, value, cur_index)
+            else:
+                indices = (0,) * len(batch_dims) + (cur_index, 0, 0)
+                key = lax.dynamic_update_slice(cached_key.value, key, indices)
+                value = lax.dynamic_update_slice(cached_value.value, value, indices)
             cached_key.value = key
             cached_value.value = value
             num_updated_cache_vectors = query.shape[1]
             cache_index.value = cache_index.value + num_updated_cache_vectors
-            pad_mask = jnp.broadcast_to(
-                jnp.arange(max_length) < cur_index + num_updated_cache_vectors,
-                tuple(batch_dims) + (1, num_updated_cache_vectors, max_length),
-            )
-            attention_mask = combine_masks(pad_mask, attention_mask)
         return key, value, attention_mask
 
     def __call__(
@@ -227,9 +279,9 @@ class FlaxRobertaSelfAttention(nn.Module):
             dropout_rng = self.make_rng("dropout")
         if layer_head_mask is None:
             out = self.attention_performer.__call__(
-                query_states=query_states.transpose(0, 2, 1, 3),
-                key_states=key_states.transpose(0, 2, 1, 3),
-                value_states=value_states.transpose(0, 2, 1, 3),
+                query_states=query_states,
+                key_states=key_states,
+                value_states=value_states,
                 dropout_rng=dropout_rng,
                 deterministic=deterministic,
                 causal=False,
@@ -239,7 +291,7 @@ class FlaxRobertaSelfAttention(nn.Module):
                 key_value_sequence_length=key_states.shape[1]
             )
             attn_weights = out.attention_weights
-            attn_output = out.attention_outputs.transpose(0, 2, 1, 3)
+            attn_output = out.attention_outputs
         else:
 
             attn_weights = dot_product_attention_weights(
@@ -1044,6 +1096,7 @@ class FlaxRobertaForSequenceClassificationModule(nn.Module):
     dtype: jnp.dtype = jnp.float32  # the dtype of the computation
     param_dtype: jnp.dtype = jnp.float32
     precision: Optional[lax.Precision] = None
+
     def setup(self):
         self.roberta = FlaxRobertaModule(
             config=self.config,
@@ -1199,7 +1252,7 @@ class FlaxRobertaForTokenClassificationModule(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
-            **get_dot_general_by_bits(bits=self.config.bits,mode=self.config.easy_method)
+            **get_dot_general_by_bits(bits=self.config.bits, mode=self.config.easy_method)
 
         )
 

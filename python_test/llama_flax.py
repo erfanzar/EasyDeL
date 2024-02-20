@@ -43,6 +43,7 @@ def main():
     torch_model = LlamaForCausalLM(
         config=copy.deepcopy(config)
     )
+    torch_model.eval()
     params = {"params": llama_convert_hf_to_flax(torch_model.state_dict(), config, device=jax.devices("cpu")[0])}
     batch_size = len(jax.devices())
     np_random_input_ids = np.random.randint(0, config.vocab_size, (batch_size, seq_len))
@@ -72,7 +73,7 @@ def main():
         flax_output = flax_model(
             input_ids=flax_input_ids,
             params=params,
-
+            train=False
         )
         res = jnp.allclose(torch_output.logits.cpu().detach().numpy(), flax_output.logits, atol=1e-5)
         if res:  # A Little Bit of humor

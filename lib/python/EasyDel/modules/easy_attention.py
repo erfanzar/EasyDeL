@@ -1,3 +1,4 @@
+import warnings
 from functools import partial
 
 import jax
@@ -9,8 +10,15 @@ from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec, Mesh
 from fjformer.pallas_operations.flash_attention import gpu as flash_attn_gpu
 from fjformer.pallas_operations.flash_attention import tpu as flash_attn_tpu
+from fjformer.pallas_operations.ring_attention import (
+    ring_flash_attention_tpu,
+    ring_attention_standard,
+    ring_attention
+)
 from typing import Tuple, Callable, Type, Any, Optional, Literal
 from dataclasses import dataclass
+
+from lib.python.EasyDel.modules.flax_modelling_utils import get_gradient_checkpoint_policy
 
 
 @dataclass
@@ -42,7 +50,9 @@ class EasyAttention:
     def __init__(
             self,
             attn_type: Literal["normal", "alibi"],
-            attn_mechanism: Literal["normal", "flash", "splash"],
+            attn_mechanism: Literal[
+                "normal", "flash", "splash", "ring"
+            ],
             block_k: int,
             block_q: int,
             block_b: int,
@@ -63,6 +73,8 @@ class EasyAttention:
             value_partition_spec: PartitionSpec,
             bias_partition_spec: PartitionSpec,
             attention_partition_spec: PartitionSpec,
+            scan_ring_attention: bool = True,
+            scan_attention_layers: bool = False,
             attention_dropout: float = 0.0,
             dtype: jnp.dtype = jnp.float32,
             precision: lax.Precision = lax.Precision("fastest"),
@@ -75,6 +87,7 @@ class EasyAttention:
             raise NotImplementedError("Splash Attention is not Supported YET !")
         if attn_mechanism == "flash" and platform not in ["gpu", "tpu"]:
             raise NotImplementedError("Flash Attention is only supported for GPU/TPU.")
+        self.platform = platform
         self.attn_type = attn_type
         self.attn_mechanism = attn_mechanism
         self.block_k = block_k
@@ -102,6 +115,8 @@ class EasyAttention:
         self.precision = precision
         self.force_float32_tpu = force_float32_tpu
         self.use_shard_map = use_shard_map
+        self.scan_ring_attention = scan_ring_attention
+        self.scan_attention_layers = scan_attention_layers
         self.assertion_mkv_err = f"""
 query_states, key_states, value_states and bias shapes must be like
 query_states Shape : [batch_size, num_attention_heads({self.num_attention_heads}), q_seq_len,  head_dims({self.head_dims})]
@@ -128,26 +143,26 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
             query_sequence_length: int,
             key_value_sequence_length: int,
             bias: Optional[Array] = None,
+            segment_ids: Optional[Array] = None,
             causal: bool = False,
             deterministic: bool = False,
             dropout_rng: Optional[random.PRNGKey] = None,
             use_pjit_attention_force: bool = False,
             uses_cache: bool = False
-
     ):
         with self.mesh:
             batch_size = query_states.shape[0]
             assert batch_size == key_states.shape[0] == value_states.shape[0], "Batch Size for q,k,v wont match"
             k_v_req_shape = (
                 batch_size,
-                self.num_attention_heads,
                 key_value_sequence_length,
+                self.num_attention_heads,
                 self.head_dims
             )
             q_shape = (
                 batch_size,
-                self.num_attention_heads,
                 query_sequence_length,
+                self.num_attention_heads,
                 self.head_dims
             )
             assert query_states.shape == q_shape, self.assertion_mkv_err + (
@@ -166,6 +181,11 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
             if self.attn_type == "normal":
 
                 if self.attn_mechanism == "flash":
+
+                    query_states = query_states.transpose(0, 2, 1, 3)
+                    key_states = key_states.transpose(0, 2, 1, 3)
+                    value_states = value_states.transpose(0, 2, 1, 3)
+
                     attentions = self._qkv_normal_flash_op(
                         query_states=query_states,
                         key_states=key_states,
@@ -178,11 +198,10 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
                         query_sequence_length=query_sequence_length,
                         key_value_sequence_length=key_value_sequence_length,
                     )
-                elif self.attn_mechanism == "normal":
 
-                    query_states = query_states.transpose(0, 2, 1, 3)
-                    key_states = key_states.transpose(0, 2, 1, 3)
-                    value_states = value_states.transpose(0, 2, 1, 3)
+                    attentions.attention_outputs = attentions.attention_outputs.transpose(0, 2, 1, 3)
+
+                elif self.attn_mechanism == "normal":
 
                     attentions = self._qkv_normal_op(
                         query_states=query_states,
@@ -196,7 +215,21 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
                         query_sequence_length=query_sequence_length,
                         key_value_sequence_length=key_value_sequence_length,
                     )
-                    attentions.attention_outputs = attentions.attention_outputs.transpose(0, 2, 1, 3)
+                elif self.attn_mechanism == "ring":
+                    attentions = self._qkv_ring_op(
+                        query_states=query_states,
+                        key_states=key_states,
+                        value_states=value_states,
+                        bias=bias,
+                        dropout_rng=dropout_rng,
+                        use_pjit_attention_force=use_pjit_attention_force,
+                        causal=causal,
+                        deterministic=deterministic,
+                        query_sequence_length=query_sequence_length,
+                        key_value_sequence_length=key_value_sequence_length,
+                        segment_ids=segment_ids,
+                    )
+
                 elif self.attn_mechanism == "splash":
                     raise NotImplementedError("Splash Attention is not Implemented YET!")
                 else:
@@ -206,6 +239,86 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
                 raise NotImplementedError("Not Implemented Yet i guess!")
             else:
                 raise ValueError(f"Unknown Attention Type of {self.attn_type}")
+
+    def _qkv_ring_op(
+            self,
+            query_states: Array,
+            key_states: Array,
+            value_states: Array,
+            query_sequence_length: int,
+            key_value_sequence_length: int,
+            bias: Optional[Array] = None,
+            causal: bool = False,
+            deterministic: bool = False,
+            dropout_rng: Optional[random.PRNGKey] = None,
+            use_pjit_attention_force: bool = False,
+            segment_ids: Optional[Array] = None
+    ):
+        if segment_ids is None:
+            segment_ids = jnp.zeros((query_states.shape[0], query_sequence_length), dtype="i4")
+        if self.scan_ring_attention and query_states.shape[1] > max(
+                self.block_q,
+                self.block_k
+        ):
+            if self.platform == "tpu":
+                ring_attention_fn = ring_flash_attention_tpu
+            else:
+                ring_attention_fn = ring_attention
+            ring_attention_sharded = shard_map(
+                partial(
+                    ring_attention_fn,
+                    axis_name="sp",
+                    float32_logits=True,
+                    blockwise_kwargs=dict(
+                        deterministic=deterministic,
+                        dropout_rng=dropout_rng,
+                        attn_pdrop=self.attention_dropout,
+                        causal=True,
+                        query_chunk_size=self.block_q,
+                        key_chunk_size=self.block_k,
+                        dtype=self.dtype,
+                        policy=get_gradient_checkpoint_policy('nothing_saveable'),
+                        precision=self.precision,
+                        prevent_cse=not self.scan_attention_layers,
+                    )
+                ),
+                mesh=self.mesh,
+                in_specs=(
+                    self.query_partition_spec,
+                    self.key_partition_spec,
+                    self.value_partition_spec,
+                    self.bias_partition_spec,
+                    PartitionSpec(("dp", "fsdp"), None),
+                ),
+                out_specs=self.attention_partition_spec,
+                check_rep=False
+            )
+            attn_output = ring_attention_sharded(query_states, key_states, value_states, bias, segment_ids)
+            attn_output = with_sharding_constraint(attn_output, self.attention_partition_spec)
+        else:
+            warnings.warn(
+                "Using Ring attention on CPUs or GPUs are not recommended due to miss computations at the moment. "
+                "please refer to other types of attention mechanism."
+            )
+            query_sequence_partition = None if query_states.shape[1] == 1 else "sp"
+            ring_attention_sharded = shard_map(
+                partial(ring_attention_standard, axis_name="sp"), mesh=self.mesh,
+                in_specs=(
+                    PartitionSpec(("dp", "fsdp"), query_sequence_partition, "tp", None),
+                    PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+                    PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+                    PartitionSpec(("dp", "fsdp"), None, query_sequence_partition, None)
+                ),
+                out_specs=PartitionSpec(("dp", "fsdp"), query_sequence_partition, "tp", None),
+                check_rep=False
+            )
+            attn_output = ring_attention_sharded(
+                query_states, key_states, value_states, bias
+            )
+        return AttentionOutput(
+            attention_weights=None,
+            attention_outputs=attn_output
+        )
 
     def _qkv_normal_op(
             self,

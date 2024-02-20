@@ -9,6 +9,8 @@ from typing import Sequence, Union, Optional, Literal
 from dataclasses import dataclass
 from jax.sharding import PartitionSpec, Mesh
 
+AVAILABLE_ATTENTION_MECHANISMS = Literal["normal", "flash", "splash", "ring"]
+
 
 @dataclass
 class EasyMethod:
@@ -48,7 +50,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             self,
             axis_dims: Sequence[int] = (1, -1, 1, 1),
             axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            attn_mechanism: Literal["normal", "flash", "splash"] = "normal",
+            attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = "normal",
             block_k: int = 128,
             block_q: int = 128,
             block_b: int = 1,
@@ -60,25 +62,17 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             block_k_major_dq: int | None = None,
             block_k_dq: int | None = None,
             block_q_dq: int | None = None,
-            query_partition_spec: PartitionSpec = PartitionSpec(
-                ("dp", "fsdp"), "sp", "tp", None
-            ),
-            key_partition_spec: PartitionSpec = PartitionSpec(
-                ("dp", "fsdp"), "sp", "tp", None
-            ),
-            value_partition_spec: PartitionSpec = PartitionSpec(
-                ("dp", "fsdp"), "sp", "tp", None
-            ),
-            bias_partition_spec: PartitionSpec = PartitionSpec(
-                ("dp", "fsdp"), None, None, None
-            ),
-            attention_partition_spec: PartitionSpec = PartitionSpec(
-                ("dp", "fsdp"), "sp", "tp", None
-            ),
+            query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            key_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            value_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
+            attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             use_shard_map: bool = False,
             backend: Optional[None] = jax.default_backend(),
             easy_method: Literal["train", "serve", "convert"] = EasyMethod.TRAIN,
             bits: Optional[int] = None,
+            scan_ring_attention: bool = True,
+            scan_attention_layers: bool = False,
             **kwargs
     ):
         self.query_partition_spec = query_partition_spec
@@ -104,6 +98,8 @@ class EasyDelPretrainedConfig(PretrainedConfig):
         self.block_k_dq = block_k_dq or block_k
         self.block_q_dq = block_q_dq or block_q
         self.bits = bits
+        self.scan_attention_layers = scan_attention_layers
+        self.scan_ring_attention = scan_ring_attention
         super().__init__(**kwargs)
 
     @staticmethod
@@ -196,7 +192,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             self,
             axis_dims: Sequence[int] = (1, -1, 1, 1),
             axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            attn_mechanism: Literal["normal", "flash", "splash"] = "normal",
+            attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = "normal",
             block_k: int = 128,
             block_q: int = 128,
             block_b: int = 1,
@@ -208,25 +204,17 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             block_k_major_dq: int | None = None,
             block_k_dq: int | None = None,
             block_q_dq: int | None = None,
-            query_partition_spec: PartitionSpec = PartitionSpec(
-                ("dp", "fsdp"), "sp", "tp", None
-            ),
-            key_partition_spec: PartitionSpec = PartitionSpec(
-                ("dp", "fsdp"), "sp", "tp", None
-            ),
-            value_partition_spec: PartitionSpec = PartitionSpec(
-                ("dp", "fsdp"), "sp", "tp", None
-            ),
-            bias_partition_spec: PartitionSpec = PartitionSpec(
-                ("dp", "fsdp"), None, None, None
-            ),
-            attention_partition_spec: PartitionSpec = PartitionSpec(
-                ("dp", "fsdp"), "sp", "tp", None
-            ),
+            query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            key_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            value_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
+            attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             use_shard_map: bool = False,
             backend: Optional[None] = jax.default_backend(),
             easy_method: Literal["train", "serve", "convert"] = EasyMethod.TRAIN,
             bits: Optional[int] = None,
+            scan_ring_attention: bool = True,
+            scan_attention_layers: bool = False,
     ):
         """
             It initializes all the attributes of an object, and it's called when you create a new instance of that class.
@@ -237,6 +225,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             :param block_k: int: block size of key_states
             :param block_q: int: block size of query_states
             :param block_b: int: block size of bias
+            :param block_k_major: int: block size if key major
             :param block_q_major_dkv: int: block size of block_q_major_dkv
             :param block_k_major_dkv: int: block size of block_k_major_dkv
             :param block_k_dkv: int: block size of block_k_dkv
@@ -253,6 +242,8 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             :param backend: Optional[None]: Specify the backend to use
             :param easy_method: Literal["train", "serve", "convert"]: EasyDel Quantization Method to be applied for
             :param bits: Optional[int]: Model bits for quantization
+            :param scan_ring_attention: bool: Whether to use can for ring attention
+            :param scan_attention_layers: bool: Whether to use can for attention layers
         """
         self.axis_dims = axis_dims
         self.axis_names = axis_names
@@ -277,6 +268,8 @@ class EasyDelPretrainedConfig(PretrainedConfig):
         self.block_q_dq = block_q_dq or block_q
         self.easy_method = easy_method
         self.bits = bits
+        self.scan_attention_layers = scan_attention_layers
+        self.scan_ring_attention = scan_ring_attention
 
     def __repr__(self):
 
