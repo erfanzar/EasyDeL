@@ -417,7 +417,7 @@ class FlaxT5Attention(BaseJAXAttentionModule):
         return outputs
 
 
-class FlaxT5LayerSelfAttention(nn.Module):
+class FlaxT5LayerSelfAttention(BaseJAXAttentionModule):
     config: T5Config
     has_relative_attention_bias: bool = False
     dtype: jnp.dtype = jnp.bfloat16  # the dtype of the computation
@@ -455,7 +455,7 @@ class FlaxT5LayerSelfAttention(nn.Module):
         return outputs
 
 
-class FlaxT5LayerCrossAttention(nn.Module):
+class FlaxT5LayerCrossAttention(BaseJAXAttentionModule):
     config: T5Config
     dtype: jnp.dtype = jnp.bfloat16  # the dtype of the computation
 

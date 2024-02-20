@@ -10,7 +10,7 @@ from jax.sharding import PartitionSpec
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput
 from einops import rearrange
 from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
-    with_sharding_constraint, ACT2FN
+    with_sharding_constraint, ACT2FN, BaseJAXAttentionModule
 import chex
 from .gpt_neo_x_configuration import GPTNeoXConfig
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
@@ -49,7 +49,7 @@ def apply_rotary_emb(
     return xq_out.astype(dtype), xk_out.astype(dtype)
 
 
-class FlaxGPTNeoXAttention(nn.Module):
+class FlaxGPTNeoXAttention(BaseJAXAttentionModule):
     config: GPTNeoXConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
