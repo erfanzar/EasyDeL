@@ -1,11 +1,10 @@
 import chex
-from fjformer import with_sharding_constraint
-from fjformer.func.loss_func import cross_entropy_loss_and_accuracy
+import flax
 from jax.experimental.mesh_utils import create_device_mesh
 from transformers import PretrainedConfig, FlaxPreTrainedModel
 import jax
 from jax import numpy as jnp
-from typing import Sequence, Union, Optional, Literal
+from typing import Sequence, Union, Optional, Literal, Tuple
 from dataclasses import dataclass
 from jax.sharding import PartitionSpec, Mesh
 
@@ -305,6 +304,25 @@ class EasyDelPretrainedConfig(PretrainedConfig):
 
 
 class EasyDelFlaxPretrainedModel(FlaxPreTrainedModel):
+    def __init__(
+            self,
+            config: PretrainedConfig,
+            module: flax.linen.Module,
+            input_shape: Tuple = (1, 1),
+            seed: int = 0,
+            dtype: jnp.dtype = jnp.float32,
+            param_dtype: jnp.dtype = jnp.float32,  # Ignored
+            precision: Optional[Union[jax.lax.Precision, str]] = None,  # Ignored
+            _do_init: bool = True,
+    ):
+        super().__init__(
+            config=config,
+            module=module,
+            input_shape=input_shape,
+            seed=seed,
+            dtype=dtype,
+            _do_init=_do_init
+        )
 
     def get_input_embeddings(self):
         """

@@ -386,8 +386,6 @@ class FlaxMixtralAttention(nn.Module):
             key_value_sequence_length=key_length,
             uses_cache=self.has_variable("cache", "cached_key") or init_cache,
         )
-        attentions.attention_outputs = attentions.attention_outputs.transpose(
-            0, 2, 1, 3)
 
         attn_output = self._merge_heads(attentions.attention_outputs)
         attn_output = self.o_proj(attn_output)

@@ -580,7 +580,7 @@ class FlaxFalconCollection(nn.Module):
             block = nn.remat(
                 block,
                 policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
-                static_argnums=(-2, -1)
+                static_argnums=(5, 6, 7, 8)
             )
         self.layers = [
             block(
@@ -607,16 +607,26 @@ class FlaxFalconCollection(nn.Module):
                  deterministic: bool = True
                  ):
         for layer in self.layers:
+            # hidden_states: chex.Array
+            # alibi: chex.Array
+            # attention_mask: chex.Array
+            # freq_cis: Tuple[chex.Array, chex.Array]
+            # position_ids: chex.Array
+            # causal_mask: chex.Array
+            # init_cache: bool = False
+            # output_attentions: bool = False
+            # deterministic: bool = True
+
             out = layer(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                alibi=alibi,
-                freq_cis=freq_cis,
-                position_ids=position_ids,
-                causal_mask=causal_mask,
-                deterministic=deterministic,
-                init_cache=init_cache,
-                output_attentions=output_attentions
+                hidden_states,
+                alibi,
+                attention_mask,
+                freq_cis,
+                position_ids,
+                causal_mask,
+                init_cache,
+                output_attentions if self.config.gradient_checkpointing == "" else False,
+                deterministic,
             )
             hidden_states = out[0]
         return hidden_states

@@ -22,7 +22,7 @@
 """ GPT-J model configuration"""
 import math
 from functools import partial
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 from einops import einops
 from fjformer import with_sharding_constraint
@@ -81,6 +81,8 @@ def apply_rotary_pos_emb(tensor, sincos):
 class FlaxGPTJAttention(nn.Module):
     config: GPTJConfig
     dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[Union[str, jax.lax.Precision]] = None
     causal: bool = True
     is_cross_attention: bool = False
 
@@ -106,7 +108,9 @@ class FlaxGPTJAttention(nn.Module):
             use_bias=False,
             dtype=self.dtype,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-            dot_general=dot_general_cls
+            dot_general=dot_general_cls,
+            param_dtype=self.dtype,
+            precision=self.precision
         )
 
         self.q_proj, self.k_proj, self.v_proj = dense(), dense(), dense()
@@ -331,6 +335,8 @@ class FlaxGPTJMLP(nn.Module):
     config: GPTJConfig
     intermediate_size: int
     dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[Union[str, jax.lax.Precision]] = None
 
     def setup(self):
         embed_dim = self.config.hidden_size
@@ -347,12 +353,16 @@ class FlaxGPTJMLP(nn.Module):
         self.fc_in = nn.Dense(
             self.intermediate_size,
             dtype=self.dtype,
+            param_dtype=self.dtype,
+            precision=self.precision,
             kernel_init=kernel_init,
             dot_general=dot_general_cls
         )
         self.fc_out = nn.Dense(
             embed_dim,
             dtype=self.dtype,
+            param_dtype=self.dtype,
+            precision=self.precision,
             kernel_init=kernel_init,
             dot_general=dot_general_cls
         )
@@ -371,15 +381,32 @@ class FlaxGPTJMLP(nn.Module):
 class FlaxGPTJBlock(nn.Module):
     config: GPTJConfig
     dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[Union[str, jax.lax.Precision]] = None
 
     def setup(self):
         hidden_size = self.config.hidden_size
         inner_dim = self.config.n_inner if self.config.n_inner is not None else 4 * hidden_size
 
-        self.ln_1 = nn.LayerNorm(epsilon=self.config.layer_norm_epsilon, dtype=self.dtype)
-        self.attn = FlaxGPTJAttention(self.config, dtype=self.dtype)
+        self.ln_1 = nn.LayerNorm(
+            epsilon=self.config.layer_norm_epsilon,
+            dtype=self.dtype,
+            param_dtype=self.dtype,
+        )
+        self.attn = FlaxGPTJAttention(
+            self.config,
+            dtype=self.dtype,
+            param_dtype=self.dtype,
+            precision=self.precision
+        )
 
-        self.mlp = FlaxGPTJMLP(self.config, inner_dim, dtype=self.dtype)
+        self.mlp = FlaxGPTJMLP(
+            self.config,
+            inner_dim,
+            dtype=self.dtype,
+            param_dtype=self.dtype,
+            precision=self.precision
+        )
 
     def __call__(
             self,
@@ -420,10 +447,18 @@ class FlaxGPTJPreTrainedModel(EasyDelFlaxPretrainedModel):
             input_shape: Tuple = (1, 1),
             seed: int = 0,
             dtype: jnp.dtype = jnp.float32,
+            param_dtype: jnp.dtype = jnp.float32,
+            precision: Optional[Union[str, jax.lax.Precision]] = None,
             _do_init: bool = True,
             **kwargs,
     ):
-        module = self.module_class(config=config, dtype=dtype, **kwargs)
+        module = self.module_class(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            **kwargs
+        )
         super().__init__(config, module, input_shape=input_shape, seed=seed, dtype=dtype, _do_init=_do_init)
 
     def init_weights(self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None) -> FrozenDict:
@@ -540,10 +575,18 @@ class FlaxGPTJPreTrainedModel(EasyDelFlaxPretrainedModel):
 class FlaxGPTJBlockCollection(nn.Module):
     config: GPTJConfig
     dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[Union[str, jax.lax.Precision]] = None
 
     def setup(self):
         self.blocks = [
-            FlaxGPTJBlock(self.config, name=str(i), dtype=self.dtype) for i in range(self.config.num_hidden_layers)
+            FlaxGPTJBlock(
+                self.config,
+                name=str(i),
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+                precision=self.precision
+            ) for i in range(self.config.num_hidden_layers)
         ]
 
     def __call__(
@@ -585,18 +628,29 @@ class FlaxGPTJBlockCollection(nn.Module):
 class FlaxGPTJModule(nn.Module):
     config: GPTJConfig
     dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[Union[str, jax.lax.Precision]] = None
 
     def setup(self):
         self.embed_dim = self.config.hidden_size
-
         self.wte = nn.Embed(
             self.config.vocab_size,
             self.config.hidden_size,
-            embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
         )
         self.dropout = nn.Dropout(rate=self.config.embd_pdrop)
-        self.h = FlaxGPTJBlockCollection(self.config, dtype=self.dtype)
-        self.ln_f = nn.LayerNorm(epsilon=self.config.layer_norm_epsilon, dtype=self.dtype)
+        self.h = FlaxGPTJBlockCollection(
+            self.config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision
+        )
+        self.ln_f = nn.LayerNorm(
+            epsilon=self.config.layer_norm_epsilon,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+        )
 
     def __call__(
             self,
@@ -656,6 +710,8 @@ class FlaxGPTJModel(FlaxGPTJPreTrainedModel):
 class FlaxGPTJForCausalLMModule(nn.Module):
     config: GPTJConfig
     dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[Union[str, jax.lax.Precision]] = None
 
     def setup(self):
         if self.config.bits is not None:
@@ -667,12 +723,19 @@ class FlaxGPTJForCausalLMModule(nn.Module):
             _dot_general_cls = None
 
         dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
-        self.transformer = FlaxGPTJModule(self.config, dtype=self.dtype)
+        self.transformer = FlaxGPTJModule(
+            self.config,
+            dtype=self.dtype,
+            param_dtype=self.dtype,
+            precision=self.precision
+        )
         self.lm_head = nn.Dense(
             self.config.vocab_size,
             dtype=self.dtype,
             kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
-            dot_general=dot_general_cls
+            dot_general=dot_general_cls,
+            param_dtype=self.dtype,
+            precision=self.precision
         )
 
     def __call__(

@@ -98,6 +98,7 @@ nav:
       - Partitioner Config: generated-reinforcement_learning-trainer-partitioner_config.md
       - Ppo Config: generated-reinforcement_learning-trainer-ppo_config.md
       - Ppo Trainer: generated-reinforcement_learning-trainer-ppo_trainer.md
+      - Stf Trainer: generated-reinforcement_learning-trainer-stf_trainer.md
       - Training Configs: generated-reinforcement_learning-trainer-training_configs.md
       - Utils: generated-reinforcement_learning-trainer-utils.md
     - Utils:
@@ -126,6 +127,7 @@ nav:
     - Causal Language Model Trainer: generated-trainer-causal_language_model_trainer.md
     - Training Configurations: generated-trainer-training_configurations.md
     - Utils: generated-trainer-utils.md
+    - Vision Causal Language Model Trainer: generated-trainer-vision_causal_language_model_trainer.md
   - Transform:
     - Easydel Transform: generated-transform-easydel_transform.md
     - Falcon: generated-transform-falcon.md
