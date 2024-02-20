@@ -18,7 +18,7 @@ from fjformer.pallas_operations.ring_attention import (
 from typing import Tuple, Callable, Type, Any, Optional, Literal
 from dataclasses import dataclass
 
-from lib.python.EasyDel.modules.flax_modelling_utils import get_gradient_checkpoint_policy
+from .flax_modelling_utils import get_gradient_checkpoint_policy
 
 
 @dataclass
