@@ -67,6 +67,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
             attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             use_shard_map: bool = False,
+            use_sharded_kv_caching: bool = True,
             backend: Optional[None] = jax.default_backend(),
             easy_method: Literal["train", "serve", "convert"] = EasyMethod.TRAIN,
             bits: Optional[int] = None,
@@ -99,6 +100,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
         self.bits = bits
         self.scan_attention_layers = scan_attention_layers
         self.scan_ring_attention = scan_ring_attention
+        self.use_sharded_kv_caching = use_sharded_kv_caching
         super().__init__(**kwargs)
 
     @staticmethod
@@ -209,6 +211,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
             attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             use_shard_map: bool = False,
+            use_sharded_kv_caching: bool = True,
             backend: Optional[None] = jax.default_backend(),
             easy_method: Literal["train", "serve", "convert"] = EasyMethod.TRAIN,
             bits: Optional[int] = None,
@@ -238,6 +241,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             :param bias_partition_spec: PartitionSpec: Specify the Attention Bias partition spec
             :param attention_partition_spec: PartitionSpec: Specify the partitioning of the attention weights
             :param use_shard_map: bool: whenever to use shard_map for attention
+            :param use_sharded_kv_caching: bool: whenever to use shard_map and sharding for key and value
             :param backend: Optional[None]: Specify the backend to use
             :param easy_method: Literal["train", "serve", "convert"]: EasyDel Quantization Method to be applied for
             :param bits: Optional[int]: Model bits for quantization
@@ -253,6 +257,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
         self.attention_partition_spec = attention_partition_spec
         self.backend = backend
         self.use_shard_map = use_shard_map
+        self.use_sharded_kv_caching = use_sharded_kv_caching
         self.attn_mechanism = attn_mechanism
         self.block_b = block_b
         self.block_k = block_k
