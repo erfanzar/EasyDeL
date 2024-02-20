@@ -120,7 +120,7 @@ class GradioUserInference:
             history,
             system_prompt,
             mode,
-            max_length,
+            max_sequence_length,
             max_new_tokens,
             max_compile_tokens,
             greedy,
@@ -149,7 +149,7 @@ class GradioUserInference:
             history: List[List[str]],
             system_prompt: str | None,
             mode: str,
-            max_length: int,
+            max_sequence_length: int,
             max_new_tokens: int,
             max_compile_tokens: int,
             greedy: bool,
@@ -162,7 +162,7 @@ class GradioUserInference:
     def build_inference(
             self,
             sample_func: typing.Callable,
-            max_length: int,
+            max_sequence_length: int,
             max_new_tokens: int,
             max_compile_tokens: int
     ) -> gr.Blocks:
@@ -176,7 +176,7 @@ class GradioUserInference:
         ) as block:
             self.chat_interface_components(
                 sample_func=sample_func,
-                max_length=max_length,
+                max_sequence_length=max_sequence_length,
                 max_new_tokens=max_new_tokens,
                 max_compile_tokens=max_compile_tokens
             )
