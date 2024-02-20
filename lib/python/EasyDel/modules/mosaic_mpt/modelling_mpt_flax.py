@@ -15,7 +15,7 @@ from ..flax_modelling_utils import (
     get_gradient_checkpoint_policy,
     with_sharding_constraint,
     ACT2FN,
-    get_dot_general_by_bits
+    get_dot_general_by_bits, BaseJAXAttentionModule
 )
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 import chex
@@ -78,7 +78,7 @@ class FlaxMptMLP(nn.Module):
         return self.down(self.act(self.up(hidden_states)))
 
 
-class FlaxMptAttention(nn.Module):
+class FlaxMptAttention(BaseJAXAttentionModule):
     config: MptConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -141,30 +141,6 @@ class FlaxMptAttention(nn.Module):
                 dtype="bool"
             ), dtype="bool"
         )
-
-    @nn.compact
-    def _concatenate_to_cache(self, key, query, value, attention_mask):
-        is_initialized = self.has_variable('cache', 'key')
-        cache_key = self.variable('cache', 'key', jnp.zeros, key.shape, key.dtype)
-        cache_value = self.variable('cache', 'value', jnp.zeros, value.shape, value.dtype)
-        cache_index = self.variable('cache', 'index', lambda: jnp.array(0, dtype=jnp.int32))
-        if is_initialized:
-            *b, s, h, d = cache_key.value.shape
-            cur_index = cache_index.value
-            indices = (0,) * len(b) + (cur_index, 0, 0)
-            key = jax.lax.dynamic_update_slice(cache_key.value, key, indices)
-            value = jax.lax.dynamic_update_slice(cache_value.value, value, indices)
-            cache_value.value = value
-            cache_key.value = key
-            num_updated_vector = query.shape[1]
-            cache_index.value = cache_index.value + num_updated_vector
-            pad_mask = jnp.broadcast_to(
-                jnp.arange(s) < cur_index + num_updated_vector,
-                tuple(b) + (1, num_updated_vector, s),
-            )
-
-            attention_mask = nn.combine_masks(pad_mask, attention_mask)
-        return key, value, attention_mask
 
     def __call__(self,
                  hidden_states: chex.Array,
