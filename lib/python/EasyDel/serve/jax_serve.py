@@ -390,11 +390,16 @@ class JAXServer(GradioUserInference):
             precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
             sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
             sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            query_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            key_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            value_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            bias_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, None, None),
-            attention_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            query_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp",
+                                                                                          None),
+            key_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp",
+                                                                                        None),
+            value_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp",
+                                                                                          None),
+            bias_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, None,
+                                                                                         None),
+            attention_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp",
+                                                                                              "tp", None),
             use_shard_map: bool = False,
             input_shape: Sequence[int] = (1, 1),
             shard_fns: Optional[Mapping[tuple, Callable]] = None,
@@ -757,7 +762,7 @@ class JAXServer(GradioUserInference):
             history: List[List[str]],
             system_prompt: str | None,
             mode: str,
-            max_length: int,
+            max_sequence_length: int,
             max_new_tokens: int,
             max_compile_tokens: int,
             greedy: bool,
@@ -812,7 +817,7 @@ class JAXServer(GradioUserInference):
         
         """
 
-        fixed_pad = self.config.max_length - self.config.max_compile_tokens
+        fixed_pad = self.config.max_sequence_length - self.config.max_compile_tokens
         tokens = self.prefix_tokenizer(
             string,
             max_length=fixed_pad,
@@ -900,7 +905,7 @@ class JAXServer(GradioUserInference):
     def gradio_inference(self):
         return self.build_inference(
             sample_func=self.process_gradio,
-            max_length=self.config.max_length,
+            max_length=self.config.max_sequence_length,
             max_new_tokens=self.config.max_new_tokens,
             max_compile_tokens=self.config.max_compile_tokens,
         )
