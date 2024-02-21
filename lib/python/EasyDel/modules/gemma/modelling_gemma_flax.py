@@ -408,6 +408,29 @@ class FlaxGemmaPreTrainedModel(EasyDelFlaxPretrainedModel):
             _do_init=_do_init
         )
 
+    def init_cache(self, batch_size, max_length):
+        """
+        The init_cache function is used to initialize the cache for a given batch size and sequence length.
+        The cache is a dictionary that contains all the intermediate states from each layer in the model.
+        This allows us to run inference on multiple batches without having to re-run forward passes through every layer in
+        the model, which would be very slow.
+
+        :param self: Access the module
+        :param batch_size: Define the batch size of the input tensors
+        :param max_length: Set the length of the input sequence
+        :return: A dictionary with the following keys:
+
+        """
+        input_ids = jnp.ones((batch_size, max_length))
+        attention_mask = jnp.ones_like(input_ids)
+        position_ids = jnp.broadcast_to(jnp.arange(
+            jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape)
+
+        init_variables = self.module.init(
+            jax.random.PRNGKey(0), input_ids, attention_mask, position_ids, return_dict=False, init_cache=True
+        )
+        return init_variables["cache"]
+
     def init_weights(self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None) -> FrozenDict:
         # init input tensors
         input_ids = jnp.zeros(input_shape, dtype="i4")
