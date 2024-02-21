@@ -79,6 +79,12 @@ from .qwen2 import (
     Qwen2Config as Qwen2Config
 )
 
+from .gemma import (
+    FlaxGemmaModel as FlaxGemmaModel,
+    GemmaConfig as GemmaConfig,
+    FlaxGemmaForCausalLM as FlaxGemmaForCausalLM
+)
+
 from .auto_easydel_model import (
     AutoEasyDelModelForCausalLM as AutoEasyDelModelForCausalLM,
     AutoEasyDelConfig as AutoEasyDelConfig,

@@ -442,7 +442,9 @@ class FlaxPhiDecoderLayer(nn.Module):
                 hidden_states,
                 deterministic,
             )
-        feed_forward_hidden_states = self.resid_dropout(feed_forward_hidden_states)
+        feed_forward_hidden_states = self.resid_dropout(
+            feed_forward_hidden_states, deterministic=deterministic
+        )
         hidden_states = attn_outputs + feed_forward_hidden_states + residual
         outputs = (hidden_states,)
 
