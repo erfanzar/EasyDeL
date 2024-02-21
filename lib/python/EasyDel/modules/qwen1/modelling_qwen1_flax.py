@@ -542,7 +542,7 @@ class FlaxQwen1Block(nn.Module):
 
         feed_forward_input = self.ln_2(hidden_states)
 
-        if self.config.use_sacn_mlp:
+        if self.config.use_scan_mlp:
             feed_forward_input = einops.rearrange(
                 feed_forward_input,
                 '... (b s) d -> ... b s d',

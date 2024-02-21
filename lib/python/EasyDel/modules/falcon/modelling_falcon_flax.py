@@ -518,7 +518,7 @@ class FlaxFalconBlock(nn.Module):
                 mlp_layernorm_out = self.post_attention_layernorm(residual)
 
         outputs = attn_outputs[1:]
-        if self.config.use_sacn_mlp:
+        if self.config.use_scan_mlp:
             mlp_output = block_wise_ffn(
                 self.mlp,
                 mlp_layernorm_out,

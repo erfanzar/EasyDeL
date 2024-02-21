@@ -49,7 +49,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
     :param bias_partition_spec: PartitionSpec: Specify the Attention Bias partition spec
     :param attention_partition_spec: PartitionSpec: Specify the partitioning of the attention weights
     :param use_shard_map: bool: whenever to use shard_map for attention
-    :param use_sacn_mlp: bool: Determine whether to use scan_mlp or not
+    :param use_scan_mlp: bool: Determine whether to use scan_mlp or not
     :param backend: Optional[None]: Specify the backend to use
     """
 
@@ -81,7 +81,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             bits: Optional[int] = None,
             scan_ring_attention: bool = True,
             scan_attention_layers: bool = False,
-            use_sacn_mlp: bool = True,
+            use_scan_mlp: bool = True,
             scan_mlp_chunk_size: int = 1024,
             **kwargs
     ):
@@ -111,7 +111,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
         self.scan_attention_layers = scan_attention_layers
         self.scan_ring_attention = scan_ring_attention
         self.use_sharded_kv_caching = use_sharded_kv_caching
-        self.use_sacn_mlp = use_sacn_mlp
+        self.use_scan_mlp = use_scan_mlp
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         super().__init__(**kwargs)
 
@@ -229,7 +229,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             bits: Optional[int] = ...,
             scan_ring_attention: bool = ...,
             scan_attention_layers: bool = ...,
-            use_sacn_mlp: bool = ...,
+            use_scan_mlp: bool = ...,
             scan_mlp_chunk_size: int = ...
     ):
         """
@@ -261,7 +261,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
         :param bits: Optional[int]: Model bits for quantization
         :param scan_ring_attention: bool: Whether to use can for ring attention
         :param scan_attention_layers: bool: Whether to use can for attention layers
-        :param use_sacn_mlp: bool: Determine whether to use scan_mlp or not
+        :param use_scan_mlp: bool: Determine whether to use scan_mlp or not
         :param scan_mlp_chunk_size: int: Size of chunks in scan MLP.
         """
         set_attrs_smartly(self, "axis_dims", (1, -1, 1, 1), axis_dims)
@@ -303,7 +303,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
         set_attrs_smartly(self, "bits", None, bits)
         set_attrs_smartly(self, "scan_attention_layers", True, scan_attention_layers)
         set_attrs_smartly(self, "scan_ring_attention", False, scan_ring_attention)
-        set_attrs_smartly(self, "use_sacn_mlp", True, use_sacn_mlp)
+        set_attrs_smartly(self, "use_scan_mlp", True, use_scan_mlp)
         set_attrs_smartly(self, "scan_mlp_chunk_size", 1024, scan_mlp_chunk_size)
 
     def __repr__(self):

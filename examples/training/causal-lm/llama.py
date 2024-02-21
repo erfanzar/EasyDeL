@@ -39,9 +39,9 @@ flags.DEFINE_string(
 
 assert 0 != 0, "out of date"
 flags.DEFINE_bool(
-    name='use_sacn_mlp',
+    name='use_scan_mlp',
     default=False,
-    help='use_sacn_mlp or no'
+    help='use_scan_mlp or no'
 )
 
 flags.DEFINE_bool(

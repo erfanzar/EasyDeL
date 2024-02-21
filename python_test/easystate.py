@@ -12,7 +12,7 @@ def main():
         num_hidden_layers=1,
         num_attention_heads=8,
         num_key_value_heads=4,
-        use_sacn_mlp=False,
+        use_scan_mlp=False,
     )
 
     module = FlaxLlamaForCausalLM(
@@ -58,7 +58,7 @@ def eval_shape_create_test():
         num_hidden_layers=4,
         num_attention_heads=8,
         num_key_value_heads=4,
-        use_sacn_mlp=False,
+        use_scan_mlp=False,
     )
 
     module = FlaxLlamaForCausalLM(

@@ -9,13 +9,13 @@ from jax.sharding import PartitionSpec
 from transformers.modeling_flax_outputs import FlaxCausalLMOutput, FlaxBaseModelOutput
 import flax
 from einops import rearrange
-
+from flax.linen.partitioning import remat
 from ..easy_attention import EasyAttention
 from ..flax_modelling_utils import (
     get_gradient_checkpoint_policy,
     with_sharding_constraint,
     ACT2FN,
-    get_dot_general_by_bits, BaseJAXAttentionModule
+    get_dot_general_by_bits, BaseJAXAttentionModule, block_wise_ffn
 )
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 import chex
@@ -74,7 +74,11 @@ class FlaxMptMLP(nn.Module):
         )
         self.act = ACT2FN[self.config.act_fn]
 
-    def __call__(self, hidden_states: chex.Array):
+    def __call__(
+            self,
+            hidden_states: chex.Array,
+            e: bool = True  # Ignored
+    ):
         return self.down(self.act(self.up(hidden_states)))
 
 
@@ -220,10 +224,37 @@ class FlaxMptBlock(nn.Module):
     def setup(self) -> None:
         self.norm_1 = nn.LayerNorm(use_bias=self.config.use_norm_bias)
         self.norm_2 = nn.LayerNorm(use_bias=self.config.use_norm_bias)
-        self.attn = FlaxMptAttention(config=self.config, dtype=self.dtype, param_dtype=self.param_dtype,
-                                     precision=self.precision)
-        self.ffn = FlaxMptMLP(config=self.config, dtype=self.dtype, param_dtype=self.param_dtype,
-                              precision=self.precision)
+        attn_block = FlaxMptAttention
+        mlp_block = FlaxMptMLP
+        if self.config.gradient_checkpointing != "":
+            mlp_block = remat(
+                mlp_block,
+                policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
+                static_argnums=(1,)
+            )
+            # hidden_states: chex.Array
+            # attention_mask: chex.Array
+            # position_ids: chex.Array
+            # attn_bias: chex.Array = None
+            # init_cache: bool = False
+
+            attn_block = remat(
+                attn_block,
+                policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
+                static_argnums=(4,)
+            )
+        self.attn = attn_block(
+            config=self.config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision
+        )
+        self.ffn = mlp_block(
+            config=self.config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision
+        )
 
     def __call__(self,
                  hidden_states: chex.Array,
@@ -232,17 +263,36 @@ class FlaxMptBlock(nn.Module):
                  attn_bias: chex.Array = None,
                  init_cache: bool = False
                  ):
+
+        # hidden_states: chex.Array
+        # attention_mask: chex.Array
+        # position_ids: chex.Array
+        # attn_bias: chex.Array = None
+        # init_cache: bool = False
+
         hidden_states = (
                 self.attn(
                     self.norm_1(hidden_states),
-                    attn_bias=attn_bias,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    init_cache=init_cache
+                    attention_mask,
+                    position_ids,
+                    attn_bias,
+                    init_cache
                 ) + hidden_states
         )
-        hidden_states = self.ffn(self.norm_2(hidden_states)) + hidden_states
-        return hidden_states
+        ffn_input = self.norm_2(hidden_states)
+        if self.config.use_scan_mlp:
+            feed_forward_hidden_states = block_wise_ffn(
+                self.ffn,
+                hidden_states,
+                self.config.scan_mlp_chunk_size,
+                False
+            )
+        else:
+            feed_forward_hidden_states = self.ffn(
+                hidden_states,
+                False,
+            )
+        return feed_forward_hidden_states + hidden_states
 
 
 class FlaxMptCollection(nn.Module):
@@ -253,14 +303,6 @@ class FlaxMptCollection(nn.Module):
 
     def setup(self) -> None:
         block = FlaxMptBlock
-
-        if self.config.gradient_checkpointing != "":
-            block = flax.linen.remat(
-                block,
-                policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
-                static_argnums=(5,)
-            )
-
         self.blocks = [
             block(
                 config=self.config,

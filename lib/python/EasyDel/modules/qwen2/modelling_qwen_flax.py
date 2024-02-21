@@ -21,7 +21,7 @@ from ..flax_modelling_utils import (
     repeat_kv_bnsh,
     apply_rotary_pos_emb,
     precompute_freq_cis,
-    get_dot_general_by_bits, BaseJAXAttentionModule
+    get_dot_general_by_bits, BaseJAXAttentionModule, block_wise_ffn
 )
 from ..easy_attention import AttentionOutput, EasyAttention
 
@@ -438,7 +438,8 @@ class FlaxQwen2Block(nn.Module):
             mlp_block = nn_partitioning.remat(
                 FlaxQwen2MLP, static_argnums=(1,),
                 policy=get_gradient_checkpoint_policy(
-                    self.config.gradient_checkpointing)
+                    self.config.gradient_checkpointing
+                )
             )
 
         self.mlp = mlp_block(
@@ -509,28 +510,12 @@ class FlaxQwen2Block(nn.Module):
 
         feed_forward_input = self.post_attention_layernorm(hidden_states)
 
-        if self.config.use_sacn_mlp:
-            feed_forward_input = einops.rearrange(
+        if self.config.use_scan_mlp:
+            feed_forward_hidden_states = block_wise_ffn(
+                self.mlp,
                 feed_forward_input,
-                '... (b s) d -> ... b s d',
-                b=self.config.scan_mlp_chunk_size
-            )
-
-            def mlp_forward(mlp, carry, x):
-                return None, mlp(x, deterministic)
-
-            scan_axis = feed_forward_input.ndim - 3
-
-            _, feed_forward_hidden_states = nn.scan(
-                mlp_forward,
-                variable_broadcast="params",
-                split_rngs={"params": False, "dropout": True},
-                in_axes=scan_axis,
-                out_axes=scan_axis,
-            )(self.mlp, None, feed_forward_input)
-            feed_forward_hidden_states = einops.rearrange(
-                feed_forward_hidden_states,
-                '... b s d -> ... (b s) d'
+                self.config.scan_mlp_chunk_size,
+                deterministic
             )
         else:
             feed_forward_hidden_states = self.mlp(

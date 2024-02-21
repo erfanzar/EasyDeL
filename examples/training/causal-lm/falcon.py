@@ -28,9 +28,9 @@ flags.DEFINE_string(
 )
 
 flags.DEFINE_bool(
-    name='use_sacn_mlp',
+    name='use_scan_mlp',
     default=False,
-    help='use_sacn_mlp or no'
+    help='use_scan_mlp or no'
 )
 
 flags.DEFINE_bool(
@@ -150,11 +150,11 @@ def main(argv):
     if FLAGS.config_repo is not None:
         conf = None
         config = EasyDel.modules.FalconConfig.from_pretrained(FLAGS.config_repo, trust_remote_code=True)
-        config.use_sacn_mlp = FLAGS.use_sacn_mlp
+        config.use_scan_mlp = FLAGS.use_scan_mlp
     else:
         conf = EasyDel.configs.configs.falcon_configs[FLAGS.model_type]
         config = EasyDel.modules.FalconConfig(**conf, rotary_type=FLAGS.rotary_type)
-        config.use_sacn_mlp = FLAGS.use_sacn_mlp
+        config.use_scan_mlp = FLAGS.use_scan_mlp
         config.max_sequence_length = FLAGS.max_sequence_length
         config.max_sequence_length = FLAGS.max_sequence_length
         config.max_seq_len = FLAGS.max_sequence_length

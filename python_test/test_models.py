@@ -55,7 +55,7 @@ class EasyModelsTest(TestCase):
         self.fcm_max_ratio: float = -1
         self.use_pjit_attention_force: bool = False
         self.rope_scaling: Dict[str, Union[str, float]] = None
-        self.use_sacn_mlp: bool = False
+        self.use_scan_mlp: bool = False
         self.scan_mlp_chunk_size: int = 1024
         self.bits: Optional[int] = None
         self.hidden_act: str = "silu"
@@ -169,6 +169,20 @@ class EasyModelsTest(TestCase):
         self.assertTrue(
             res,
             f"Mixtral model Failed [ERROR {err}]"
+        )
+
+    def test_gp2(self):
+        res, err = self.create_test_for_models("gpt2", transformers.GPT2LMHeadModel)
+        self.assertTrue(
+            res,
+            f"GPT2 model Failed [ERROR {err}]"
+        )
+
+    def test_gptj(self):
+        res, err = self.create_test_for_models("gptj", transformers.GPTJForCausalLM)
+        self.assertTrue(
+            res,
+            f"GPT-J model Failed [ERROR {err}]"
         )
 
     def test_qwen2(self):

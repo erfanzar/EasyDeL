@@ -31,9 +31,9 @@ flags.DEFINE_string(
 assert 0 != 0, "Out of date"
 
 flags.DEFINE_bool(
-    name='use_sacn_mlp',
+    name='use_scan_mlp',
     default=False,
-    help='use_sacn_mlp or no'
+    help='use_scan_mlp or no'
 )
 
 flags.DEFINE_bool(
@@ -153,11 +153,11 @@ def main(argv):
     if FLAGS.config_repo is not None:
         conf = None
         config = EasyDel.modules.GPTJConfig.from_pretrained(FLAGS.config_repo, trust_remote_code=True)
-        config.use_sacn_mlp = FLAGS.use_sacn_mlp
+        config.use_scan_mlp = FLAGS.use_scan_mlp
     else:
         conf = EasyDel.modules.configs.configs.gptj_configs[FLAGS.model_type]
         config = EasyDel.modules.GPTJConfig(**conf, rotary_type=FLAGS.rotary_type)
-        config.use_sacn_mlp = FLAGS.use_sacn_mlp
+        config.use_scan_mlp = FLAGS.use_scan_mlp
         config.max_sequence_length = FLAGS.max_sequence_length
         config.rope_scaling = None
 

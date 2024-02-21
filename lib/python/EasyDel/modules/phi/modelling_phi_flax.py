@@ -20,7 +20,8 @@ from ..flax_modelling_utils import (
     get_gradient_checkpoint_policy,
     canonicalize_dtype,
     apply_rotary_pos_emb,
-    get_dot_general_by_bits, repeat_kv_bnsh, with_sharding_constraint, precompute_freq_cis, BaseJAXAttentionModule
+    get_dot_general_by_bits, repeat_kv_bnsh, with_sharding_constraint, precompute_freq_cis, BaseJAXAttentionModule,
+    block_wise_ffn
 )
 from .phi_configuration import PhiConfig
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
@@ -86,7 +87,11 @@ class FlaxPhiMLP(nn.Module):
         )
         self.act = ACT2FN[self.config.hidden_act]
 
-    def __call__(self, hidden_states: Array) -> Array:
+    def __call__(
+            self,
+            hidden_states: Array,
+            e: bool = False  # Ignored
+    ) -> Array:
         return self.fc2(self.act(self.fc1(hidden_states)))
 
 
@@ -424,7 +429,19 @@ class FlaxPhiDecoderLayer(nn.Module):
         attn_outputs, self_attn_weights = attn_out if len(attn_out) == 2 else attn_out[0], None
         attn_outputs = self.resid_dropout(attn_outputs, deterministic=deterministic)
 
-        feed_forward_hidden_states = self.resid_dropout(self.mlp(hidden_states), deterministic=deterministic)
+        if self.config.use_scan_mlp:
+            feed_forward_hidden_states = block_wise_ffn(
+                self.mlp,
+                hidden_states,
+                self.config.scan_mlp_chunk_size,
+                deterministic
+            )
+        else:
+            feed_forward_hidden_states = self.mlp(
+                hidden_states,
+                deterministic,
+            )
+        feed_forward_hidden_states = self.resid_dropout(feed_forward_hidden_states)
         hidden_states = attn_outputs + feed_forward_hidden_states + residual
         outputs = (hidden_states,)
 
