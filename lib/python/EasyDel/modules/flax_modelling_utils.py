@@ -425,22 +425,26 @@ class BaseJAXAttentionModule(nn.Module):
 
 
 def block_wise_ffn(remat_ffn, inputs, chunk_size: int, deterministic: bool):
-    inputs = rearrange(inputs, 'b (c n) d -> b c n d', c=chunk_size)
+    generating = inputs.shape[1] == 1
+    if generating:
+        return remat_ffn(inputs, deterministic)
+    else:
+        inputs = rearrange(inputs, 'b (c n) d -> b c n d', c=chunk_size)
 
-    def scan_ffn(remat_ffn_, carry, hidden_states):
-        outputs = remat_ffn_(hidden_states, deterministic=deterministic)
-        return carry, outputs
+        def scan_ffn(remat_ffn_, carry, hidden_states):
+            outputs = remat_ffn_(hidden_states, deterministic)
+            return carry, outputs
 
-    scan_axis = inputs.ndim - 2
-    _, output = nn.scan(
-        scan_ffn,
-        variable_broadcast="params",
-        split_rngs={"params": False, "dropout": True},
-        in_axes=scan_axis,
-        out_axes=scan_axis,
-    )(remat_ffn, None, inputs)
-    output = rearrange(output, 'b c n d -> b (c n) d')
-    return output
+        scan_axis = inputs.ndim - 2
+        _, output = nn.scan(
+            scan_ffn,
+            variable_broadcast="params",
+            split_rngs={"params": False, "dropout": True},
+            in_axes=scan_axis,
+            out_axes=scan_axis,
+        )(remat_ffn, None, inputs)
+        output = rearrange(output, 'b c n d -> b (c n) d')
+        return output
 
 
 def read_depth(

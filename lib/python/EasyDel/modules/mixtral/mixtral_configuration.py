@@ -34,7 +34,7 @@ class MixtralConfig(EasyDelPretrainedConfig):
             router_aux_loss_coef=0.001,
             gradient_checkpointing: str = 'nothing_saveable',
             use_pjit_attention_force: bool = False,
-            use_sacn_mlp: bool = False,
+            use_scan_mlp: bool = False,
             scan_mlp_chunk_size: int = 1024,
             number_rep_kv: int = 1,
             c_max_position_embeddings: int = 4096,
@@ -70,7 +70,7 @@ class MixtralConfig(EasyDelPretrainedConfig):
         :param sliding_window: Control the number of tokens that are processed in parallel
         :param gradient_checkpointing: str: Specify whether to use gradient checkpointing
         :param use_pjit_attention_force: bool: Force the use of pjit attention
-        :param use_sacn_mlp: bool: Determine whether or not to use the scan_mlp function
+        :param use_scan_mlp: bool: Determine whether or not to use the scan_mlp function
         :param scan_mlp_chunk_size: int: Specify the chunk size of the scan mlp
         :param number_rep_kv: int: Specify the number of times to repeat the key and value vectors
         :param c_max_position_embeddings: int: Set the maximum number of tokens in a sequence
@@ -118,7 +118,7 @@ class MixtralConfig(EasyDelPretrainedConfig):
         self.number_rep_kv = number_rep_kv
         self.gradient_checkpointing = gradient_checkpointing
         self.use_pjit_attention_force = use_pjit_attention_force
-        self.use_sacn_mlp = use_sacn_mlp
+        self.use_scan_mlp = use_scan_mlp
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.c_max_position_embeddings = c_max_position_embeddings
         self.freq_max_position_embeddings = freq_max_position_embeddings
@@ -182,7 +182,7 @@ class MixtralConfig(EasyDelPretrainedConfig):
             self,
             gradient_checkpointing: str = 'nothing_saveable',
             use_pjit_attention_force: bool = False,
-            use_sacn_mlp: bool = False,
+            use_scan_mlp: bool = False,
             scan_mlp_chunk_size: int = 1024,
             number_rep_kv: int = 1,
             c_max_position_embeddings: int = 4096,
@@ -200,7 +200,7 @@ class MixtralConfig(EasyDelPretrainedConfig):
         :param self: Bind the attributes and methods of a class to an instance of that class
         :param gradient_checkpointing: str: Determine whether to use gradient checkpointing
         :param use_pjit_attention_force: bool: Determine whether to use the pjit_attention_force function
-        :param use_sacn_mlp: bool: Determine whether to use the scan_mlp function or not
+        :param use_scan_mlp: bool: Determine whether to use the scan_mlp function or not
         :param scan_mlp_chunk_size: int: Chunk the input to the mlp
         :param number_rep_kv: int: Control the number of times that the key and value vectors are repeated
         :param c_max_position_embeddings: int: Set the maximum number of positional embeddings for the causal axis
@@ -220,7 +220,7 @@ class MixtralConfig(EasyDelPretrainedConfig):
         self.number_rep_kv = number_rep_kv
         self.gradient_checkpointing = gradient_checkpointing
         self.use_pjit_attention_force = use_pjit_attention_force
-        self.use_sacn_mlp = use_sacn_mlp
+        self.use_scan_mlp = use_scan_mlp
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.c_max_position_embeddings = c_max_position_embeddings
         self.freq_max_position_embeddings = freq_max_position_embeddings

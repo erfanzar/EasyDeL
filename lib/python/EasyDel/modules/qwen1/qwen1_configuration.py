@@ -31,7 +31,7 @@ class Qwen1Config(EasyDelPretrainedConfig):
             softmax_in_fp32=False,
             gradient_checkpointing: str = "nothing_saveable",
             use_pjit_attention_force: bool = False,
-            use_sacn_mlp: bool = False,
+            use_scan_mlp: bool = False,
             scan_mlp_chunk_size: int = 1024,
             bits: Optional[int] = None,
             scan_layers: bool = True,
@@ -62,7 +62,7 @@ class Qwen1Config(EasyDelPretrainedConfig):
         self.tie_word_embeddings = tie_word_embeddings
         self.gradient_checkpointing = gradient_checkpointing
         self.use_pjit_attention_force = use_pjit_attention_force
-        self.use_sacn_mlp = use_sacn_mlp
+        self.use_scan_mlp = use_scan_mlp
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.bits = bits
         super().__init__(
@@ -122,7 +122,7 @@ class Qwen1Config(EasyDelPretrainedConfig):
             self,
             gradient_checkpointing: str = "nothing_saveable",
             use_pjit_attention_force: bool = False,
-            use_sacn_mlp: bool = False,
+            use_scan_mlp: bool = False,
             scan_mlp_chunk_size: int = 1024,
             bits: Optional[int] = None,
             scan_layers: bool = True,
@@ -135,7 +135,7 @@ class Qwen1Config(EasyDelPretrainedConfig):
         :param self: Refer to the current object
         :param gradient_checkpointing: str: Control the amount of memory used by jax
         :param use_pjit_attention_force: bool: Determine if the attention force is used
-        :param use_sacn_mlp: bool: Determine whether to use the scan_mlp function or not
+        :param use_scan_mlp: bool: Determine whether to use the scan_mlp function or not
         :param scan_mlp_chunk_size: int: Set the chunk size for scan_mlp
         :param init_rope_cache_auto: bool: Whether to use the rope_cache_auto in model
         :param bits: Optional[int]: Determine the number of bits used in the quantization
@@ -146,7 +146,7 @@ class Qwen1Config(EasyDelPretrainedConfig):
         self.scan_layers = scan_layers
         self.gradient_checkpointing = gradient_checkpointing
         self.use_pjit_attention_force = use_pjit_attention_force
-        self.use_sacn_mlp = use_sacn_mlp
+        self.use_scan_mlp = use_scan_mlp
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.bits = bits
         self.init_rope_cache_auto = init_rope_cache_auto

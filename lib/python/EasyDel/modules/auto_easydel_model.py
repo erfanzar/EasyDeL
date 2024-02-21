@@ -80,7 +80,13 @@ def get_modules_by_type(model_type: str) -> Tuple[
         return (
             _GPTJConfig,
             _FlaxGPTJForCausalLM,
-            functools.partial(huggingface_to_easydel, embedding_layer_names="wte")
+            functools.partial(
+                huggingface_to_easydel,
+                embedding_layer_names="wte",
+                layer_norm_names=[
+                    "ln_1", "ln_2", "ln_f"
+                ]
+            )
         )
 
     elif model_type == "gpt_neox":

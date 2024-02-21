@@ -519,7 +519,7 @@ class FlaxLlamaBlock(nn.Module):
 
         feed_forward_input = self.post_attention_layernorm(hidden_states)
 
-        if self.config.use_sacn_mlp:
+        if self.config.use_scan_mlp:
             feed_forward_hidden_states = block_wise_ffn(
                 self.mlp,
                 feed_forward_input,

@@ -24,6 +24,7 @@ import math
 from functools import partial
 from typing import Optional, Tuple, Union
 
+import flax.linen.partitioning
 from einops import einops
 from fjformer import with_sharding_constraint
 from jax.experimental.shard_map import shard_map
@@ -43,7 +44,8 @@ from transformers.utils import logging
 from fjformer.pallas_operations.efficient_attention import efficient_attention
 
 from ..easy_attention import EasyAttention
-from ..flax_modelling_utils import with_sharding_constraint, ACT2FN, BaseJAXAttentionModule
+from ..flax_modelling_utils import with_sharding_constraint, ACT2FN, BaseJAXAttentionModule, \
+    get_gradient_checkpoint_policy, block_wise_ffn
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 import chex
 from fjformer.bits import config as q_config, q_flax
@@ -137,7 +139,7 @@ class FlaxGPTJAttention(BaseJAXAttentionModule):
             block_q_dq=self.config.block_q_dq,
             block_k_dq=self.config.block_k_dq,
             num_attention_heads=self.config.num_attention_heads,
-            attention_dropout=self.config.attention_dropout,
+            attention_dropout=self.config.attn_pdrop,
             head_dims=self.head_dim,
             attention_partition_spec=self.config.attention_partition_spec,
             use_shard_map=self.config.use_shard_map,
@@ -318,14 +320,36 @@ class FlaxGPTJBlock(nn.Module):
             dtype=self.dtype,
             param_dtype=self.dtype,
         )
-        self.attn = FlaxGPTJAttention(
+        attn_block = FlaxGPTJAttention
+
+        mlp_block = FlaxGPTJMLP
+
+        if self.config.gradient_checkpointing != "":
+            # hidden_states
+            # attention_mask
+            # position_ids
+            # deterministic: bool = True
+            # init_cache: bool = False
+            # output_attentions: bool = False
+            attn_block = flax.linen.partitioning.remat(
+                attn_block,
+                policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
+                static_argnums=(3, 4, 5)
+            )
+
+            mlp_block = flax.linen.partitioning.remat(
+                mlp_block,
+                policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
+                static_argnums=(1,)
+            )
+        self.attn = attn_block(
             self.config,
             dtype=self.dtype,
             param_dtype=self.dtype,
             precision=self.precision
         )
 
-        self.mlp = FlaxGPTJMLP(
+        self.mlp = mlp_block(
             self.config,
             inner_dim,
             dtype=self.dtype,
@@ -344,17 +368,30 @@ class FlaxGPTJBlock(nn.Module):
     ):
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)
+        # hidden_states
+        # attention_mask
+        # position_ids
+        # deterministic: bool = True
+        # init_cache: bool = False
+        # output_attentions: bool = False
         attn_outputs = self.attn(
             hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            deterministic=deterministic,
-            init_cache=init_cache,
-            output_attentions=output_attentions,
+            attention_mask,
+            position_ids,
+            deterministic,
+            init_cache,
+            output_attentions,
         )
         attn_output = attn_outputs[0]
-
-        feed_forward_hidden_states = self.mlp(hidden_states, deterministic=deterministic)
+        if self.config.use_scan_mlp:
+            feed_forward_hidden_states = block_wise_ffn(
+                self.mlp,
+                hidden_states,
+                self.config.scan_mlp_chunk_size,
+                deterministic
+            )
+        else:
+            feed_forward_hidden_states = self.mlp(hidden_states, deterministic)
         # residual connection
         hidden_states = attn_output + feed_forward_hidden_states + residual
 
@@ -392,10 +429,7 @@ class FlaxGPTJPreTrainedModel(EasyDelFlaxPretrainedModel):
         attention_mask = jnp.ones_like(input_ids)
         position_ids = jnp.broadcast_to(jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_shape)
         params_rng, dropout_rng = jax.random.split(rng)
-        rngs = {"dropout": dropout_rng}
-
-        if self.config.bits is not None:
-            rngs['params'] = jax.random.key(0)
+        rngs = {"params": params_rng, "dropout": dropout_rng}
         if params is None:
             if self.config.add_cross_attention:
                 encoder_hidden_states = jnp.zeros(input_shape + (self.config.n_embd,))
@@ -560,9 +594,10 @@ class FlaxGPTJModule(nn.Module):
         self.embed_dim = self.config.hidden_size
         self.wte = nn.Embed(
             self.config.vocab_size,
-            self.config.hidden_size,
+            self.embed_dim,
+            embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
             dtype=self.dtype,
-            param_dtype=self.param_dtype,
+            param_dtype=self.param_dtype
         )
         self.dropout = nn.Dropout(rate=self.config.embd_pdrop)
         self.h = FlaxGPTJBlockCollection(

@@ -38,6 +38,7 @@ class GPTJConfig(EasyDelPretrainedConfig):
             eos_token_id: int = 50256,
             tie_word_embeddings: bool = False,
             use_pjit_attention_force: bool = False,
+            gradient_checkpointing: str = "",
             bits: Optional[int] = None,
             **kwargs,
     ):
@@ -60,6 +61,7 @@ class GPTJConfig(EasyDelPretrainedConfig):
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
         self.from_pt = False
+        self.gradient_checkpointing = gradient_checkpointing
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
@@ -157,6 +159,7 @@ class GPTJConfig(EasyDelPretrainedConfig):
             tie_word_embeddings: bool = False,
             use_pjit_attention_force: bool = False,
             bits: Optional[int] = None,
+            gradient_checkpointing: str = "",
             **kwargs,
     ):
         basics = dict(
@@ -179,6 +182,7 @@ class GPTJConfig(EasyDelPretrainedConfig):
             eos_token_id=eos_token_id,
             tie_word_embeddings=tie_word_embeddings,
             use_pjit_attention_force=use_pjit_attention_force,
+            gradient_checkpointing=gradient_checkpointing,
         )
 
         for k, v in basics.items():

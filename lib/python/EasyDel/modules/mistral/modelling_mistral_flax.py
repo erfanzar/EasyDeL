@@ -536,7 +536,7 @@ class FlaxMistralDecoderLayer(nn.Module):
 
         hidden_states = attention_output[0] + residual
         ffd_inp = self.post_attention_layernorm(hidden_states)
-        if self.config.use_sacn_mlp:
+        if self.config.use_scan_mlp:
             feed_forward_hidden_states = block_wise_ffn(
                 self.mlp,
                 ffd_inp,
