@@ -760,7 +760,7 @@ class FlaxGemmaForCausalLM(FlaxGemmaPreTrainedModel):
         if self.config.tie_word_embeddings:
             random_params["lm_head"]["kernel"] = jnp.transpose(
                 random_params["model"]["embed_tokens"]["embedding"],
-                1, 0
+                (1, 0)
             )
 
         if params is not None:
