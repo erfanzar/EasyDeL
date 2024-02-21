@@ -51,13 +51,8 @@ class FlaxGemmaRotaryEmbedding(nn.Module):
     config: GemmaConfig
     dtype: jnp.dtype = jnp.float32
 
-    # Ignore copy
-    def setup(self):
-        head_dim = self.config.head_dim
-        self.sincos = create_sinusoidal_positions(self.config.max_position_embeddings, head_dim)
-
-    def __call__(self, key_state, query_state, position_ids):
-        sincos = self.sincos[position_ids]
+    def __call__(self, freq_cis, key_state, query_state, position_ids):
+        sincos = freq_cis[position_ids]
         sin_pos, cos_pos = jnp.split(sincos, 2, axis=-1)
 
         key_state = apply_rotary_pos_emb(key_state, sin_pos, cos_pos)
@@ -154,7 +149,7 @@ class FlaxGemmaAttention(BaseJAXAttentionModule):
             mesh=self.config.jax_mesh(),
             sm_scale=1 / math.sqrt(self.head_dim),
         )
-        self.causal_mask = make_causal_mask(jnp.ones((1, config.max_position_embeddings), dtype="bool"), dtype="bool")
+
         self.rotary_emb = FlaxGemmaRotaryEmbedding(config, dtype=self.dtype)
 
     def _merge_heads(self, hidden_states):
@@ -168,6 +163,8 @@ class FlaxGemmaAttention(BaseJAXAttentionModule):
             hidden_states: chex.Array,
             attention_mask: chex.Array,
             position_ids: chex.Array,
+            freq_cis: chex.Array,
+            causal_mask: chex.Array,
             deterministic: bool = True,
             init_cache: bool = False,
             output_attentions: bool = False,
@@ -182,7 +179,7 @@ class FlaxGemmaAttention(BaseJAXAttentionModule):
         key_state = self._split_heads(key_state, self.num_key_value_heads)
         value_state = self._split_heads(value_state, self.num_key_value_heads)
 
-        key_state, query_state = self.rotary_emb(key_state, query_state, position_ids)
+        key_state, query_state = self.rotary_emb(freq_cis, key_state, query_state, position_ids)
 
         query_length, key_length = query_state.shape[1], key_state.shape[1]
 
@@ -190,10 +187,10 @@ class FlaxGemmaAttention(BaseJAXAttentionModule):
             mask_shift = self.variables["cache"]["cache_index"]
             max_decoder_length = self.variables["cache"]["cached_key"].shape[1]
             causal_mask = lax.dynamic_slice(
-                self.causal_mask, (0, 0, mask_shift, 0), (1, 1, query_length, max_decoder_length)
+                causal_mask, (0, 0, mask_shift, 0), (1, 1, query_length, max_decoder_length)
             )
         else:
-            causal_mask = self.causal_mask[:, :, :query_length, :key_length]
+            causal_mask = causal_mask[:, :, :query_length, :key_length]
 
         batch_size = hidden_states.shape[0]
         causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
@@ -310,7 +307,7 @@ class FlaxGemmaDecoderLayer(nn.Module):
             attn_block = flax.linen.partitioning.remat(
                 attn_block,
                 policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
-                static_argnums=(3, 4, 5)
+                static_argnums=(3, 4, 5, 6, 7)
             )
         self.input_layernorm = FlaxGemmaRMSNorm(self.config, dtype=self.dtype)
         self.post_attention_layernorm = FlaxGemmaRMSNorm(self.config, dtype=self.dtype)
@@ -330,8 +327,10 @@ class FlaxGemmaDecoderLayer(nn.Module):
     def __call__(
             self,
             hidden_states: chex.Array,
-            attention_mask: Optional[chex.Array] = None,
-            position_ids: chex.Array = None,
+            attention_mask: chex.Array,
+            position_ids: chex.Array,
+            freq_cis: chex.Array,
+            causal_mask: chex.Array,
             deterministic: bool = True,
             init_cache: bool = False,
             output_attentions: bool = False,
@@ -342,6 +341,8 @@ class FlaxGemmaDecoderLayer(nn.Module):
             hidden_states,
             attention_mask,
             position_ids,
+            freq_cis,
+            causal_mask,
             deterministic,
             init_cache,
             output_attentions,
@@ -548,8 +549,10 @@ class FlaxGemmaLayerCollection(nn.Module):
     def __call__(
             self,
             hidden_states: chex.Array,
-            attention_mask: Optional[chex.Array] = None,
-            position_ids: Optional[chex.Array] = None,
+            attention_mask: chex.Array,
+            position_ids: chex.Array,
+            freq_cis: chex.Array,
+            causal_mask: chex.Array,
             deterministic: bool = True,
             init_cache: bool = False,
             output_attentions: bool = False,
@@ -566,6 +569,8 @@ class FlaxGemmaLayerCollection(nn.Module):
                 hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
+                freq_cis=freq_cis,
+                causal_mask=causal_mask,
                 deterministic=deterministic,
                 init_cache=init_cache,
                 output_attentions=output_attentions,
@@ -605,6 +610,14 @@ class FlaxGemmaModule(nn.Module):
             self.config,
             dtype=self.dtype,
         )
+        self.freq_cis = create_sinusoidal_positions(
+            self.config.max_position_embeddings,
+            self.config.head_dim
+        )
+        self.causal_mask = make_causal_mask(
+            jnp.ones((1, self.config.max_position_embeddings), dtype="bool"),
+            dtype="bool"
+        )
 
     # Ignore copy
     def __call__(
@@ -626,6 +639,8 @@ class FlaxGemmaModule(nn.Module):
             input_embeds,
             position_ids=position_ids,
             attention_mask=attention_mask,
+            freq_cis=self.freq_cis,
+            causal_mask=self.causal_mask,
             deterministic=deterministic,
             init_cache=init_cache,
             output_attentions=output_attentions,
