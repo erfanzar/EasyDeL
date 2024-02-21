@@ -1,6 +1,7 @@
 import functools
 
 import fjformer
+from einops import rearrange
 from fjformer.bits import config as q_config, q_flax
 from flax.linen import combine_masks
 from jax import lax, numpy as jnp
@@ -421,6 +422,25 @@ class BaseJAXAttentionModule(nn.Module):
             num_updated_cache_vectors = query.shape[1]
             cache_index.value = cache_index.value + num_updated_cache_vectors
         return key, value, attention_mask
+
+
+def block_wise_ffn(remat_ffn, inputs, chunk_size: int, deterministic: bool):
+    inputs = rearrange(inputs, 'b (c n) d -> b c n d', c=chunk_size)
+
+    def scan_ffn(remat_ffn_, carry, hidden_states):
+        outputs = remat_ffn_(hidden_states, deterministic=deterministic)
+        return carry, outputs
+
+    scan_axis = inputs.ndim - 2
+    _, output = nn.scan(
+        scan_ffn,
+        variable_broadcast="params",
+        split_rngs={"params": False, "dropout": True},
+        in_axes=scan_axis,
+        out_axes=scan_axis,
+    )(remat_ffn, None, inputs)
+    output = rearrange(output, 'b c n d -> b (c n) d')
+    return output
 
 
 def read_depth(

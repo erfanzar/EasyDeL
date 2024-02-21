@@ -4,11 +4,18 @@ from jax.experimental.mesh_utils import create_device_mesh
 from transformers import PretrainedConfig, FlaxPreTrainedModel
 import jax
 from jax import numpy as jnp
-from typing import Sequence, Union, Optional, Literal, Tuple
+from typing import Sequence, Union, Optional, Literal, Tuple, Any
 from dataclasses import dataclass
 from jax.sharding import PartitionSpec, Mesh
 
 AVAILABLE_ATTENTION_MECHANISMS = Literal["normal", "flash", "splash", "ring"]
+
+
+def set_attrs_smartly(self, attr_name: str, default: Any, new_attr: Any):
+    if not hasattr(self, attr_name):
+        setattr(self, attr_name, default)
+    if not new_attr == Ellipsis:
+        setattr(self, attr_name, new_attr)
 
 
 @dataclass
@@ -25,7 +32,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
     :param self: Refer to the instance of the class
     :param axis_dims: Sequence[int]: Specify the number of dimensions for each axis
     :param axis_names: Sequence[str]: Set the names of the axes
-    :param attn_mechanism: Literal["normal", "flash", "splash"]: attention mechanism to use
+    :param attn_mechanism: Literal["normal", "flash", "splash", "ring"]: attention mechanism to use
     :param block_k: int: block size of key_states
     :param block_q: int: block size of query_states
     :param block_b: int: block size of bias
@@ -42,6 +49,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
     :param bias_partition_spec: PartitionSpec: Specify the Attention Bias partition spec
     :param attention_partition_spec: PartitionSpec: Specify the partitioning of the attention weights
     :param use_shard_map: bool: whenever to use shard_map for attention
+    :param use_sacn_mlp: bool: Determine whether to use scan_mlp or not
     :param backend: Optional[None]: Specify the backend to use
     """
 
@@ -73,6 +81,8 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             bits: Optional[int] = None,
             scan_ring_attention: bool = True,
             scan_attention_layers: bool = False,
+            use_sacn_mlp: bool = True,
+            scan_mlp_chunk_size: int = 1024,
             **kwargs
     ):
         self.query_partition_spec = query_partition_spec
@@ -101,6 +111,8 @@ class EasyDelPretrainedConfig(PretrainedConfig):
         self.scan_attention_layers = scan_attention_layers
         self.scan_ring_attention = scan_ring_attention
         self.use_sharded_kv_caching = use_sharded_kv_caching
+        self.use_sacn_mlp = use_sacn_mlp
+        self.scan_mlp_chunk_size = scan_mlp_chunk_size
         super().__init__(**kwargs)
 
     @staticmethod
@@ -191,89 +203,108 @@ class EasyDelPretrainedConfig(PretrainedConfig):
 
     def add_basic_configurations(
             self,
-            axis_dims: Sequence[int] = (1, -1, 1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = "normal",
-            block_k: int = 128,
-            block_q: int = 128,
-            block_b: int = 1,
-            block_k_major: int = 128,
-            block_q_major_dkv: int | None = None,
-            block_k_major_dkv: int | None = None,
-            block_k_dkv: int | None = None,
-            block_q_dkv: int | None = None,
-            block_k_major_dq: int | None = None,
-            block_k_dq: int | None = None,
-            block_q_dq: int | None = None,
-            query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            key_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            value_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
-            attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            use_shard_map: bool = False,
-            use_sharded_kv_caching: bool = True,
-            backend: Optional[None] = jax.default_backend(),
-            easy_method: Literal["train", "serve", "convert"] = EasyMethod.TRAIN,
-            bits: Optional[int] = None,
-            scan_ring_attention: bool = True,
-            scan_attention_layers: bool = False,
+            axis_dims: Sequence[int] = ...,
+            axis_names: Sequence[str] = ...,
+            attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = ...,
+            block_k: int = ...,
+            block_q: int = ...,
+            block_b: int = ...,
+            block_k_major: int = ...,
+            block_q_major_dkv: int | None = ...,
+            block_k_major_dkv: int | None = ...,
+            block_k_dkv: int | None = ...,
+            block_q_dkv: int | None = ...,
+            block_k_major_dq: int | None = ...,
+            block_k_dq: int | None = ...,
+            block_q_dq: int | None = ...,
+            query_partition_spec: PartitionSpec = ...,
+            key_partition_spec: PartitionSpec = ...,
+            value_partition_spec: PartitionSpec = ...,
+            bias_partition_spec: PartitionSpec = ...,
+            attention_partition_spec: PartitionSpec = ...,
+            use_shard_map: bool = ...,
+            use_sharded_kv_caching: bool = ...,
+            backend: Optional[None] = ...,
+            easy_method: Literal["train", "serve", "convert"] = ...,
+            bits: Optional[int] = ...,
+            scan_ring_attention: bool = ...,
+            scan_attention_layers: bool = ...,
+            use_sacn_mlp: bool = ...,
+            scan_mlp_chunk_size: int = ...
     ):
         """
-            It initializes all the attributes of an object, and it's called when you create a new instance of that class.
-            :param self: Refer to the instance of the class
-            :param axis_dims: Sequence[int]: Specify the number of dimensions for each axis
-            :param axis_names: Sequence[str]: Set the names of the axes
-            :param attn_mechanism: Literal["normal", "flash", "splash"]: attention mechanism to use
-            :param block_k: int: block size of key_states
-            :param block_q: int: block size of query_states
-            :param block_b: int: block size of bias
-            :param block_k_major: int: block size if key major
-            :param block_q_major_dkv: int: block size of block_q_major_dkv
-            :param block_k_major_dkv: int: block size of block_k_major_dkv
-            :param block_k_dkv: int: block size of block_k_dkv
-            :param block_q_dkv: int: block size of block_q_dkv
-            :param block_k_major_dq: int: block size of block_k_major_dq
-            :param block_k_dq: int: block size of block_k_dq
-            :param block_q_dq: int: block size of block_q_dq
-            :param query_partition_spec: PartitionSpec: Specify the partitioning of the query tensor
-            :param key_partition_spec: PartitionSpec: Partition the key matrix
-            :param value_partition_spec: PartitionSpec: Specify the partitioning of the value tensor
-            :param bias_partition_spec: PartitionSpec: Specify the Attention Bias partition spec
-            :param attention_partition_spec: PartitionSpec: Specify the partitioning of the attention weights
-            :param use_shard_map: bool: whenever to use shard_map for attention
-            :param use_sharded_kv_caching: bool: whenever to use shard_map and sharding for key and value
-            :param backend: Optional[None]: Specify the backend to use
-            :param easy_method: Literal["train", "serve", "convert"]: EasyDel Quantization Method to be applied for
-            :param bits: Optional[int]: Model bits for quantization
-            :param scan_ring_attention: bool: Whether to use can for ring attention
-            :param scan_attention_layers: bool: Whether to use can for attention layers
+        It initializes all the attributes of an object, and it's called when you create a new instance of that class.
+        :param self: Refer to the instance of the class
+        :param axis_dims: Sequence[int]: Specify the number of dimensions for each axis
+        :param axis_names: Sequence[str]: Set the names of the axes
+        :param attn_mechanism: Literal["normal", "flash", "splash"]: attention mechanism to use
+        :param block_k: int: block size of key_states
+        :param block_q: int: block size of query_states
+        :param block_b: int: block size of bias
+        :param block_k_major: int: block size if key major
+        :param block_q_major_dkv: int: block size of block_q_major_dkv
+        :param block_k_major_dkv: int: block size of block_k_major_dkv
+        :param block_k_dkv: int: block size of block_k_dkv
+        :param block_q_dkv: int: block size of block_q_dkv
+        :param block_k_major_dq: int: block size of block_k_major_dq
+        :param block_k_dq: int: block size of block_k_dq
+        :param block_q_dq: int: block size of block_q_dq
+        :param query_partition_spec: PartitionSpec: Specify the partitioning of the query tensor
+        :param key_partition_spec: PartitionSpec: Partition the key matrix
+        :param value_partition_spec: PartitionSpec: Specify the partitioning of the value tensor
+        :param bias_partition_spec: PartitionSpec: Specify the Attention Bias partition spec
+        :param attention_partition_spec: PartitionSpec: Specify the partitioning of the attention weights
+        :param use_shard_map: bool: whenever to use shard_map for attention
+        :param use_sharded_kv_caching: bool: whenever to use shard_map and sharding for key and value
+        :param backend: Optional[None]: Specify the backend to use
+        :param easy_method: Literal["train", "serve", "convert"]: EasyDel Quantization Method to be applied for
+        :param bits: Optional[int]: Model bits for quantization
+        :param scan_ring_attention: bool: Whether to use can for ring attention
+        :param scan_attention_layers: bool: Whether to use can for attention layers
+        :param use_sacn_mlp: bool: Determine whether to use scan_mlp or not
+        :param scan_mlp_chunk_size: int: Size of chunks in scan MLP.
         """
-        self.axis_dims = axis_dims
-        self.axis_names = axis_names
-        self.query_partition_spec = query_partition_spec
-        self.key_partition_spec = key_partition_spec
-        self.value_partition_spec = value_partition_spec
-        self.bias_partition_spec = bias_partition_spec
-        self.attention_partition_spec = attention_partition_spec
-        self.backend = backend
-        self.use_shard_map = use_shard_map
-        self.use_sharded_kv_caching = use_sharded_kv_caching
-        self.attn_mechanism = attn_mechanism
-        self.block_b = block_b
-        self.block_k = block_k
-        self.block_q = block_q
-        self.block_k_major = block_k_major
-        self.block_q_major_dkv = block_q_major_dkv or block_q
-        self.block_k_major_dkv = block_k_major_dkv or block_k
-        self.block_k_dkv = block_k_dkv or block_k
-        self.block_q_dkv = block_q_dkv or block_q
-        self.block_k_major_dq = block_k_major_dq or block_k
-        self.block_k_dq = block_k_dq or block_k
-        self.block_q_dq = block_q_dq or block_q
-        self.easy_method = easy_method
-        self.bits = bits
-        self.scan_attention_layers = scan_attention_layers
-        self.scan_ring_attention = scan_ring_attention
+        set_attrs_smartly(self, "axis_dims", (1, -1, 1, 1), axis_dims)
+        set_attrs_smartly(self, "axis_names", ("dp", "fsdp", "tp", "sp"), axis_names)
+
+        set_attrs_smartly(self, "block_q", 128, block_q)
+        set_attrs_smartly(self, "block_k", 128, block_k)
+        set_attrs_smartly(self, "block_b", 1, block_b)
+
+        set_attrs_smartly(self, "query_partition_spec", PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+                          query_partition_spec)
+        set_attrs_smartly(self, "key_partition_spec", PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+                          key_partition_spec)
+        set_attrs_smartly(self, "value_partition_spec", PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+                          value_partition_spec)
+        set_attrs_smartly(self, "bias_partition_spec", PartitionSpec(("dp", "fsdp"), None, None, None),
+                          bias_partition_spec)
+        set_attrs_smartly(self, "attention_partition_spec", PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+                          attention_partition_spec)
+
+        set_attrs_smartly(self, "backend", jax.default_backend(), backend)
+        set_attrs_smartly(self, "use_shard_map", False, use_shard_map)
+        set_attrs_smartly(self, "use_sharded_kv_caching", True, use_sharded_kv_caching)
+        set_attrs_smartly(self, "attn_mechanism", "normal", attn_mechanism)
+
+        set_attrs_smartly(self, "block_k_dkv", block_k_dkv or self.block_k, block_k_dkv)
+        set_attrs_smartly(self, "block_q_dkv", block_q_dkv or self.block_q, block_q_dkv)
+
+        set_attrs_smartly(self, "block_q_major_dkv", block_q_major_dkv or self.block_q, block_q_major_dkv)
+        set_attrs_smartly(self, "block_k_major_dkv", block_k_major_dkv or self.block_k, block_k_major_dkv)
+
+        set_attrs_smartly(self, "block_k_major", block_k_major or self.block_k, block_k_major)
+        set_attrs_smartly(self, "block_k_major_dq", block_k_major_dq or self.block_k, block_k_major_dq)
+
+        set_attrs_smartly(self, "block_k_dq", block_k_dq or self.block_k, block_k_dq)
+        set_attrs_smartly(self, "block_q_dq", block_q_dq or self.block_q, block_q_dq)
+
+        set_attrs_smartly(self, "easy_method", EasyMethod.TRAIN, easy_method)
+        set_attrs_smartly(self, "bits", None, bits)
+        set_attrs_smartly(self, "scan_attention_layers", True, scan_attention_layers)
+        set_attrs_smartly(self, "scan_ring_attention", False, scan_ring_attention)
+        set_attrs_smartly(self, "use_sacn_mlp", True, use_sacn_mlp)
+        set_attrs_smartly(self, "scan_mlp_chunk_size", 1024, scan_mlp_chunk_size)
 
     def __repr__(self):
 

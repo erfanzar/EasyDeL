@@ -24,7 +24,7 @@ from ..flax_modelling_utils import (
     repeat_kv_bnsh,
     apply_rotary_pos_emb,
     precompute_freq_cis,
-    get_dot_general_by_bits, BaseJAXAttentionModule
+    get_dot_general_by_bits, BaseJAXAttentionModule, block_wise_ffn
 )
 import chex
 from .mistral_configuration import MistralConfig
@@ -111,8 +111,7 @@ class FlaxMistralMLP(nn.Module):
     config: MistralConfig
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[None, jax.lax.Precision]
-    ] = jax.lax.Precision("fastest")
+    precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
 
     def setup(self) -> None:
         dense = functools.partial(
@@ -129,7 +128,11 @@ class FlaxMistralMLP(nn.Module):
         self.down_proj = dense(self.config.hidden_size)
         self.act_fn = ACT2FN[self.config.hidden_act]
 
-    def __call__(self, x: chex.Array):
+    def __call__(
+            self,
+            x: chex.Array,
+            e: bool = False  # Ignored
+    ):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
@@ -427,13 +430,36 @@ class FlaxMistralDecoderLayer(nn.Module):
     precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
 
     def setup(self) -> None:
-        self.self_attn = FlaxMistralAttention(
+        attn_block = FlaxMistralAttention
+        mlp_block = FlaxMistralMLP
+
+        if self.config.gradient_checkpointing != "":
+            # hidden_states: chex.Array
+            # freq_cis: chex.Array
+            # attention_mask: chex.Array
+            # position_ids: chex.Array
+            # causal_mask: chex.Array
+            # deterministic: bool = True
+            # init_cache: bool = False
+            # output_attentions: bool = False
+            # fcm_mask = None
+            attn_block = re_mat(
+                attn_block,
+                policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
+                static_argnums=(4, 5, 6, 7, 8)
+            )
+            mlp_block = re_mat(
+                mlp_block,
+                policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
+                static_argnums=(1,)
+            )
+        self.self_attn = attn_block(
             config=self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.mlp = FlaxMistralMLP(
+        self.mlp = mlp_block(
             config=self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -484,22 +510,46 @@ class FlaxMistralDecoderLayer(nn.Module):
         :return: A tuple of hidden_states and attention_output
 
         """
+
+        # hidden_states: chex.Array
+        # freq_cis: chex.Array
+        # attention_mask: chex.Array
+        # position_ids: chex.Array
+        # causal_mask: chex.Array
+        # deterministic: bool = True
+        # init_cache: bool = False
+        # output_attentions: bool = False
+        # fcm_mask = None
+
         residual = hidden_states
         attention_output = self.self_attn(
-            hidden_states=self.input_layernorm(hidden_states),
-            freq_cis=freq_cis,
-            attention_mask=attention_mask,
-            causal_mask=causal_mask,
-            position_ids=position_ids,
-            deterministic=deterministic,
-            init_cache=init_cache,
-            output_attentions=output_attentions
+            self.input_layernorm(hidden_states),
+            freq_cis,
+            attention_mask,
+            position_ids,
+            causal_mask,
+            deterministic,
+            init_cache,
+            output_attentions,
+            None
         )
 
         hidden_states = attention_output[0] + residual
+        ffd_inp = self.post_attention_layernorm(hidden_states)
+        if self.config.use_sacn_mlp:
+            feed_forward_hidden_states = block_wise_ffn(
+                self.mlp,
+                ffd_inp,
+                self.config.scan_mlp_chunk_size,
+                deterministic,
+            )
+        else:
+            feed_forward_hidden_states = self.mlp(
+                ffd_inp,
+                deterministic,
+            )
 
-        hidden_states = self.mlp(
-            self.post_attention_layernorm(hidden_states)) + hidden_states
+        hidden_states = hidden_states + feed_forward_hidden_states
         outputs = (hidden_states,)
         if output_attentions:
             outputs += attention_output[1]
@@ -694,21 +744,12 @@ class FlaxMistralDecoratorCollection(nn.Module):
     config: MistralConfig
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[None, jax.lax.Precision]
+    precision: Optional[Union[str, jax.lax.Precision]
     ] = jax.lax.Precision("fastest")
 
     def setup(self) -> None:
-        block = FlaxMistralDecoderLayer
-        if self.config.gradient_checkpointing != "":
-            block = re_mat(
-                block,
-                static_argnums=(5, 6, 7),
-                policy=get_gradient_checkpoint_policy(
-                    self.config.gradient_checkpointing
-                )
-            )
         self.layers = [
-            block(
+            FlaxMistralDecoderLayer(
                 config=self.config,
                 dtype=self.dtype,
                 param_dtype=self.param_dtype,
