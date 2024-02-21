@@ -1,4 +1,6 @@
 import math
+
+import flax.linen.partitioning
 from flax import linen as nn
 from flax.core import FrozenDict, unfreeze, freeze
 from typing import Optional, Dict, Union, Tuple
@@ -7,11 +9,16 @@ from flax.linen import combine_masks
 from flax.traverse_util import unflatten_dict, flatten_dict
 from jax import numpy as jnp, lax
 import jax
-from jax.experimental.shard_map import shard_map
+
 from jax.sharding import PartitionSpec
 from transformers.modeling_flax_outputs import FlaxCausalLMOutput, FlaxBaseModelOutput
-from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
-    with_sharding_constraint, get_dot_general_by_bits, BaseJAXAttentionModule
+from ..flax_modelling_utils import (
+    get_gradient_checkpoint_policy,
+    with_sharding_constraint,
+    get_dot_general_by_bits,
+    BaseJAXAttentionModule,
+    block_wise_ffn
+)
 import chex
 from fjformer.func import transpose
 from .falcon_configuration import FalconConfig
@@ -164,6 +171,7 @@ class FlaxFalconAttention(BaseJAXAttentionModule):
                 self.config.new_decoder_architecture or not self.config.multi_query
         ) else 1
         self.num_heads = self.config.num_attention_heads
+
     @staticmethod
     def _t(query, key, value):
         return jnp.transpose(query, (0, 2, 1, 3)), jnp.transpose(key, (0, 2, 1, 3)), jnp.transpose(value, (0, 2, 1, 3))
@@ -412,13 +420,38 @@ class FlaxFalconBlock(nn.Module):
                                         dtype=self.dtype)
             self.ln_mlp = nn.LayerNorm(epsilon=config.layer_norm_epsilon,
                                        dtype=self.dtype)
-        self.mlp = FlaxFalconMlp(
+
+        # hidden_states: chex.Array
+        # attention_mask: chex.Array
+        # position_ids: chex.Array
+        # causal_mask: chex.Array = None
+        # alibi: chex.Array = None
+        # freq_cis: Tuple[chex.Array, chex.Array] = None
+        # init_cache: bool = False
+        # output_attentions: bool = False
+
+        attn_block = FlaxFalconAttention
+        mlp_block = FlaxFalconMlp
+        if self.config.gradient_checkpointing != "":
+            attn_block = flax.linen.partitioning.remat(
+                attn_block,
+                policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
+                static_argnums=(3, 5, 6, 7)
+            )
+
+            mlp_block = flax.linen.partitioning.remat(
+                mlp_block,
+                policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
+                static_argnums=(1,)
+            )
+
+        self.mlp = mlp_block(
             config=config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.self_attention = FlaxFalconAttention(
+        self.self_attention = attn_block(
             config=config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -449,15 +482,25 @@ class FlaxFalconBlock(nn.Module):
             attention_layernorm_out = self.input_layernorm(hidden_states)
 
         # Self attention.
+
+        # hidden_states: chex.Array
+        # attention_mask: chex.Array
+        # position_ids: chex.Array
+        # causal_mask: chex.Array = None
+        # alibi: chex.Array = None
+        # freq_cis: Tuple[chex.Array, chex.Array] = None
+        # init_cache: bool = False
+        # output_attentions: bool = False
+
         attn_outputs = self.self_attention(
-            hidden_states=attention_layernorm_out,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            causal_mask=causal_mask,
-            alibi=alibi,
-            freq_cis=freq_cis,
-            output_attentions=output_attentions,
-            init_cache=init_cache
+            attention_layernorm_out,
+            attention_mask,
+            position_ids,
+            causal_mask,
+            alibi,
+            freq_cis,
+            init_cache,
+            output_attentions,
         )
 
         attention_output = attn_outputs[0]
@@ -475,8 +518,18 @@ class FlaxFalconBlock(nn.Module):
                 mlp_layernorm_out = self.post_attention_layernorm(residual)
 
         outputs = attn_outputs[1:]
-
-        mlp_output = self.mlp(mlp_layernorm_out, deterministic=deterministic)
+        if self.config.use_sacn_mlp:
+            mlp_output = block_wise_ffn(
+                self.mlp,
+                mlp_layernorm_out,
+                self.config.scan_mlp_chunk_size,
+                deterministic,
+            )
+        else:
+            mlp_output = self.mlp(
+                mlp_layernorm_out,
+                deterministic,
+            )
 
         if self.config.new_decoder_architecture or self.config.parallel_attn:
             mlp_output += attention_output
@@ -500,12 +553,6 @@ class FlaxFalconCollection(nn.Module):
 
     def setup(self) -> None:
         block = FlaxFalconBlock
-        if self.config.gradient_checkpointing != "":
-            block = nn.remat(
-                block,
-                policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
-                static_argnums=(5, 6, 7, 8)
-            )
         self.layers = [
             block(
                 config=self.config,
@@ -658,7 +705,7 @@ class FlaxFalconPretrainedModel(EasyDelFlaxPretrainedModel):
                  dtype: jnp.dtype = jnp.float32,
                  param_dtype: jnp.dtype = jnp.float32,
                  input_shape: Tuple = (1, 1),
-                 precision: Optional[Union[None, jax.lax.Precision]] = jax.lax.Precision("fastest")
+                 precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
                  ):
         module = self.module_class(config=config, dtype=dtype, param_dtype=param_dtype, precision=precision)
         super().__init__(_do_init=_do_init, module=module, config=config, dtype=dtype, input_shape=input_shape)

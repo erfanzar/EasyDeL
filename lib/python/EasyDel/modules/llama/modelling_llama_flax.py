@@ -1,19 +1,21 @@
 import math
-from functools import partial
 from typing import Optional, Tuple, Union
 
-from einops import einops
+import chex
+import flax.linen as nn
 import jax
 import jax.numpy as jnp
+from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
+from flax.linen import combine_masks
+from flax.linen import partitioning as nn_partitioning
+from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax.sharding import PartitionSpec
-import flax.linen as nn
-from flax.traverse_util import flatten_dict, unflatten_dict
-from flax.linen import partitioning as nn_partitioning
-from jax.experimental.shard_map import shard_map
-from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
-from flax.linen import combine_masks, make_causal_mask
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput, FlaxSequenceClassifierOutput
+
+from .llama_configuration import LlamaConfig
+from ..easy_attention import EasyAttention
+from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 # EasyDel.modules
 from ..flax_modelling_utils import (
     with_sharding_constraint,
@@ -21,13 +23,8 @@ from ..flax_modelling_utils import (
     repeat_kv_bnsh,
     apply_rotary_pos_emb,
     precompute_freq_cis,
-    get_dot_general_by_bits, BaseJAXAttentionModule
+    get_dot_general_by_bits, BaseJAXAttentionModule, block_wise_ffn
 )
-from ..easy_attention import AttentionOutput, EasyAttention
-
-from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
-import chex
-from .llama_configuration import LlamaConfig
 
 
 class FlaxLlamaEmbedding(nn.Module):
@@ -523,27 +520,11 @@ class FlaxLlamaBlock(nn.Module):
         feed_forward_input = self.post_attention_layernorm(hidden_states)
 
         if self.config.use_sacn_mlp:
-            feed_forward_input = einops.rearrange(
+            feed_forward_hidden_states = block_wise_ffn(
+                self.mlp,
                 feed_forward_input,
-                '... (b s) d -> ... b s d',
-                b=self.config.scan_mlp_chunk_size
-            )
-
-            def mlp_forward(mlp, carry, x):
-                return None, mlp(x, deterministic)
-
-            scan_axis = feed_forward_input.ndim - 3
-
-            _, feed_forward_hidden_states = nn.scan(
-                mlp_forward,
-                variable_broadcast="params",
-                split_rngs={"params": False, "dropout": True},
-                in_axes=scan_axis,
-                out_axes=scan_axis,
-            )(self.mlp, None, feed_forward_input)
-            feed_forward_hidden_states = einops.rearrange(
-                feed_forward_hidden_states,
-                '... b s d -> ... (b s) d'
+                self.config.scan_mlp_chunk_size,
+                deterministic,
             )
         else:
             feed_forward_hidden_states = self.mlp(

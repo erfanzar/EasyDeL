@@ -67,6 +67,7 @@ class EasyModelsTest(TestCase):
         self.attn_mechanism: Literal["normal", "flash", "splash", "ring"] = "normal"
         self.block_k: int = 64
         self.block_q: int = 64
+        self.scan_mlp_chunk_size = self.sequence_length // 2
 
     def create_test_for_models(
             self,
@@ -81,7 +82,8 @@ class EasyModelsTest(TestCase):
             num_hidden_layers=self.num_hidden_layers,
             gradient_checkpointing=self.gradient_checkpointing,
             max_position_embeddings=self.max_position_embeddings,
-            num_key_value_heads=self.num_key_value_heads
+            num_key_value_heads=self.num_key_value_heads,
+            scan_mlp_chunk_size=self.scan_mlp_chunk_size
         )
 
         input_shape = (self.batch_size, self.sequence_length)
@@ -99,7 +101,8 @@ class EasyModelsTest(TestCase):
         }
         config.add_jax_args()
         config.add_basic_configurations(
-            use_shard_map=self.use_shard_map
+            use_shard_map=self.use_shard_map,
+            scan_mlp_chunk_size=self.scan_mlp_chunk_size
         )
         mesh = config.jax_mesh()
 

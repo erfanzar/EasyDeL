@@ -21,7 +21,9 @@ from ..flax_modelling_utils import (
     repeat_kv_bnsh,
     apply_rotary_pos_emb,
     precompute_freq_cis,
-    get_dot_general_by_bits, BaseJAXAttentionModule
+    get_dot_general_by_bits,
+    BaseJAXAttentionModule,
+    get_gradient_checkpoint_policy
 )
 import chex
 from .mixtral_configuration import MixtralConfig
@@ -108,8 +110,7 @@ class FlaxMixtralAttention(BaseJAXAttentionModule):
     layer_index: int
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[None, jax.lax.Precision]
-    ] = jax.lax.Precision("fastest")
+    precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
 
     def setup(self) -> None:
         config = self.config
@@ -443,7 +444,11 @@ class FlaxMixtralSparseMoeBlock(nn.Module):
             precision=self.precision
         )
 
-    def __call__(self, hidden_states: chex.Array) -> Tuple[chex.Array, chex.Array]:
+    def __call__(
+            self,
+            hidden_states: chex.Array,
+            e: bool = False  # Ignored
+    ) -> Tuple[chex.Array, chex.Array]:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.reshape(-1, hidden_dim)
 
@@ -488,18 +493,43 @@ class FlaxMixtralDecoderLayer(nn.Module):
     layer_index: int
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[None, jax.lax.Precision]
-    ] = jax.lax.Precision("fastest")
+    precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
 
     def setup(self) -> None:
-        self.self_attn = FlaxMixtralAttention(
+        # hidden_states: chex.Array
+        # freq_cis: chex.Array
+        # attention_mask: chex.Array
+        # causal_mask: chex.Array
+        # position_ids: chex.Array
+        # deterministic: bool = True
+        # init_cache: bool = False
+        # output_attentions: bool = True
+
+        attn_block = FlaxMixtralAttention
+        mlp_block = FlaxMixtralSparseMoeBlock
+        if self.config.gradient_checkpointing != "":
+            attn_block = re_mat(
+                attn_block,
+                policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
+                static_argnums=(
+                    3, 5, 6, 7
+                )
+            )
+            mlp_block = re_mat(
+                mlp_block,
+                policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
+                static_argnums=(
+                    1,
+                )
+            )
+        self.self_attn = attn_block(
             config=self.config,
             layer_index=self.layer_index,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.block_sparse_moe = FlaxMixtralSparseMoeBlock(
+        self.block_sparse_moe = mlp_block(
             config=self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -550,15 +580,25 @@ class FlaxMixtralDecoderLayer(nn.Module):
         """
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
+
+        # hidden_states: chex.Array
+        # freq_cis: chex.Array
+        # attention_mask: chex.Array
+        # causal_mask: chex.Array
+        # position_ids: chex.Array
+        # deterministic: bool = True
+        # init_cache: bool = False
+        # output_attentions: bool = True
+
         hidden_states, self_attn_weights = self.self_attn(
-            hidden_states=hidden_states,
-            freq_cis=freq_cis,
-            attention_mask=attention_mask,
-            causal_mask=causal_mask,
-            position_ids=position_ids,
-            deterministic=deterministic,
-            init_cache=init_cache,
-            output_attentions=output_attentions
+            hidden_states,
+            freq_cis,
+            attention_mask,
+            causal_mask,
+            position_ids,
+            deterministic,
+            init_cache,
+            output_attentions
         )
 
         hidden_states = residual + hidden_states
