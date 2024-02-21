@@ -509,11 +509,11 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                     self.arguments.max_sequence_length
                             )
                             information_queries = {}
-                                if self.arguments.track_memory:
-                                    for key in ["Used", "Usage Percent"]:
-                                        for device, info in get_capacity_matrix(dir_prefix=dir_prefix).items():
-                                            information_queries[f"{device.replace('_', ' ')} ({key})"] = float(
-                                                info[key].replace("%", "").replace("GB", ""))
+                            if self.arguments.track_memory:
+                                for key in ["Used", "Usage Percent"]:
+                                    for device, info in get_capacity_matrix(dir_prefix=dir_prefix).items():
+                                        information_queries[f"{device.replace('_', ' ')} ({key})"] = float(
+                                            info[key].replace("%", "").replace("GB", ""))
                             train_metrics = {
                                 "loss": loss.tolist(),
                                 "mean_loss": loss_sum / (current_step - self.arguments.step_start_point),
