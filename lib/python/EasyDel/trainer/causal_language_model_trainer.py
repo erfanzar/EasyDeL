@@ -460,6 +460,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
             loss_sum = None
             accuracy_sum = None
             pbar.update(sharded_state.step.tolist())
+            information_queries = {}
             learning_rates = []
             if self.wandb_runtime is not None:
                 model_parameters_number = sum(
