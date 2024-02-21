@@ -22,6 +22,7 @@ Some of the key features provided by EasyDeL include:
 - RingAttention, Flash Attention, BlockWise FFN, and Efficient Attention are supported for more than 90 % of models
   ([FJFormer](https://github.com/erfanzar/FJFormer) Backbone).
 - Serving and API Engines for Using and serving LLMs in JAX as efficiently as possible.
+- Automatic Converting Models from JAX-EasyDeL to PyTorch-HF and reverse
 
 > [!NOTE]
 > EasyDel Will only support JAX>=0.4.22 Due to miss computations being happened in older version and also not bein able
