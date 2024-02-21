@@ -7,17 +7,21 @@ rewritten for mojo as well.
 
 Some of the key features provided by EasyDeL include:
 
+- Serving and API Engines for Using and serving LLMs in JAX as efficiently as possible.
 - Support for 8, 6, and 4 BIT inference and training in JAX
-- Wide Range of models in Jax are supported which have never been implemented before such as _falcon, Qwen2, Phi2,
-  MPT ..._
+- A wide range of models in Jax is supported which have never been implemented before such as Falcon, Qwen2, Phi2,
+  Mixtral, and MPT ...
 - Integration of flashAttention in JAX for GPUs and TPUs
 - Automatic serving of LLMs with mid and high-level APIs in both JAX and PyTorch
 - LLM Trainer and fine-tuner in JAX
+- Video CLM Trainer and Fine-tunerFalcon, Qwen2, Phi2, Mixtral, and MPT ...
 - RLHF (Reinforcement Learning from Human Feedback) in Jax (Beta Stage)
-- DPOTrainer and SFTTrainer(Beta Stage)
-- And various other features to enhance the training process and optimize performance.
+- DPOTrainer(Supported) and SFTTrainer(Developing Stage)
+- Various other features to enhance the training process and optimize performance.
 - LoRA: Low-Rank Adaptation of Large Language Models
-- RingAttention (Near to infinite context length) (soon)
+- RingAttention, Flash Attention, BlockWise FFN, and Efficient Attention are supported for more than 90 % of models
+  ([FJFormer](https://github.com/erfanzar/FJFormer) Backbone).
+- Serving and API Engines for Using and serving LLMs in JAX as efficiently as possible.
 
 > [!NOTE]
 > EasyDel Will only support JAX>=0.4.22 Due to miss computations being happened in older version and also not bein able
