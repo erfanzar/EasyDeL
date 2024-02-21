@@ -104,6 +104,12 @@ from .modules.qwen2 import (
     Qwen2Config as Qwen2Config
 )
 
+from .modules.gemma import (
+    FlaxGemmaModel as FlaxGemmaModel,
+    GemmaConfig as GemmaConfig,
+    FlaxGemmaForCausalLM as FlaxGemmaForCausalLM
+)
+
 from .modules.auto_easydel_model import (
     AutoEasyDelModelForCausalLM as AutoEasyDelModelForCausalLM,
     AutoEasyDelConfig as AutoEasyDelConfig,
@@ -272,6 +278,11 @@ __all__ = (
     "FlaxQwen2ForCausalLM",
     "FlaxQwen2ForSequenceClassification",
     "Qwen2Config",
+
+    # Gemma Models
+    "FlaxGemmaModel",
+    "GemmaConfig",
+    "FlaxGemmaForCausalLM",
 
     # AutoModels Models
     "AutoEasyDelModelForCausalLM",

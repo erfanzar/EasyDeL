@@ -35,7 +35,7 @@ class EasyModelsTest(TestCase):
         self.hidden_size: int = 256
         self.intermediate_size: int = 512
         self.num_hidden_layers: int = 2
-        self.num_attention_heads: int = 4
+        self.num_attention_heads: int = 8
         self.number_rep_kv: int = 1
         self.num_key_value_heads: Optional[int] = 2
         self.max_position_embeddings: int = 2048
@@ -54,9 +54,8 @@ class EasyModelsTest(TestCase):
         self.fcm_min_ratio: float = -1
         self.fcm_max_ratio: float = -1
         self.use_pjit_attention_force: bool = False
-        self.rope_scaling: Dict[str, Union[str, float]] = None
+        self.rope_scaling: Optional[Dict[str, Union[str, float]]] = None
         self.use_scan_mlp: bool = False
-        self.scan_mlp_chunk_size: int = 1024
         self.bits: Optional[int] = None
         self.hidden_act: str = "silu"
         self.pretraining_tp: int = 1
@@ -197,6 +196,13 @@ class EasyModelsTest(TestCase):
         self.assertTrue(
             res,
             f"PHI 2 model Failed [ERROR {err}]"
+        )
+
+    def test_gemma(self):
+        res, err = self.create_test_for_models("gemma", transformers.GemmaForCausalLM)
+        self.assertTrue(
+            res,
+            f"Gemma model Failed [ERROR {err}]"
         )
 
     @staticmethod

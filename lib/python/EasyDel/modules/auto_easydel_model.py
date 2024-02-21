@@ -39,6 +39,15 @@ def get_modules_by_type(model_type: str) -> Tuple[
             _FlaxLlamaForCausalLM,
             functools.partial(huggingface_to_easydel, embedding_layer_names=["embed_tokens"])
         )
+    elif model_type == "gemma":
+
+        from .gemma import GemmaConfig as _GemmaConfig
+        from .gemma import FlaxGemmaForCausalLM as _FlaxGemmaForCausalLM
+        return (
+            _GemmaConfig,
+            _FlaxGemmaForCausalLM,
+            functools.partial(huggingface_to_easydel, embedding_layer_names=["embed_tokens"])
+        )
     elif model_type == "falcon":
         from .falcon import FlaxFalconForCausalLM as _FlaxFalconForCausalLM
         from .falcon import FalconConfig as _FalconConfig

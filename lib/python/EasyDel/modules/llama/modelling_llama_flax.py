@@ -449,7 +449,8 @@ class FlaxLlamaBlock(nn.Module):
             mlp_block = nn_partitioning.remat(
                 FlaxLlamaMLP, static_argnums=(1,),
                 policy=get_gradient_checkpoint_policy(
-                    self.config.gradient_checkpointing)
+                    self.config.gradient_checkpointing
+                )
             )
 
         self.mlp = mlp_block(
