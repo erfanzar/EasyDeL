@@ -12,7 +12,7 @@ from EasyDel import (
 )
 from datasets import load_dataset
 
-from flax.core import FrozenDict
+from flax.core import FrozenDict, unfreeze
 from transformers import AutoTokenizer
 from jax import numpy as jnp
 import jax
@@ -142,11 +142,18 @@ def main(use_lora=False):
         model_parameters=model_parameters,
         state=None
     )
+    params = {
+        "params": unfreeze(output.state.params)["params"] | {
+            "lm_head": {
+                "kernel": output.state.params["params"]["model"]["embed_tokens"]["embedding"].T}}
+    }
 
+    output.state = output.state.replace(params=FrozenDict(params))
+    output.state.save_state("Jupyter-State.easy")
     with jax.default_device(jax.devices("cpu")[0]):
         model = easystate_to_huggingface_model(
             state=EasyDelState.load_state(
-                output.checkpoint_path
+                "Jupyter-State.easy"
             ),
             base_huggingface_module=ModuleTorch,
             config=config
