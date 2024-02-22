@@ -63,12 +63,12 @@ def format_chat(history: typing.List[str], prompt: str, system: typing.Union[str
     raise NotImplementedError()
 ```
 
-`JAXServer` Contains a method named `.process` and with using `process` method you can generate text from text
+`JAXServer` Contains a method named `.sample` and with using `sample` method you can generate text from text
 
-what does this do and how this works ? here's the inputs that `process` function takes in
+what does this do and how this works ? here's the inputs that `sample` function takes in
 
 ```python
-def process(self,
+def sample(self,
             string,
             *,
             greedy: bool = False,
@@ -89,7 +89,7 @@ def process(self,
 you can use this function outside the class like this
 
 ```python
-for string, num_used_tokens in server.process(
+for string, num_used_tokens in server.sample(
         'im a string',
         greedy=False,
         max_new_tokens=256  # or None to use Maximum numbers passed in Config
@@ -106,12 +106,12 @@ if you want to change gradio response functions you can override them like this
 this is the default gradio functions and this is how it looks :
 
 ```python
-def process_gradio_chat(self, prompt, history, max_new_tokens, system, greedy):
+def sample_gradio_chat(self, prompt, history, max_new_tokens, system, greedy):
     string = self.chat_format(history=history, prompt=prompt, system=system)
 
     if not self.config.stream_tokens_for_gradio:
         response = ""
-        for response, _ in self.process(
+        for response, _ in self.sample(
                 string=string,
                 greedy=greedy,
                 max_new_tokens=max_new_tokens,
@@ -120,7 +120,7 @@ def process_gradio_chat(self, prompt, history, max_new_tokens, system, greedy):
         history.append([prompt, response])
     else:
         history.append([prompt, ""])
-        for response, _ in self.process(
+        for response, _ in self.sample(
                 string=string,
                 greedy=greedy,
                 max_new_tokens=max_new_tokens,
@@ -133,7 +133,7 @@ def process_gradio_chat(self, prompt, history, max_new_tokens, system, greedy):
 and here's a example of changing that in order to use Llama Models
 
 ```python
-def process_gradio_chat(self, prompt, history, max_new_tokens, system, greedy):
+def sample_gradio_chat(self, prompt, history, max_new_tokens, system, greedy):
     def prompt_llama2_model(message: str, chat_history,
                             system_prompt: str) -> str:
 
@@ -154,7 +154,7 @@ def process_gradio_chat(self, prompt, history, max_new_tokens, system, greedy):
     )
     if not self.config.stream_tokens_for_gradio:
         response = ""
-        for response, _ in self.process(
+        for response, _ in self.sample(
                 string=string,
                 greedy=greedy,
                 max_new_tokens=max_new_tokens,
@@ -163,7 +163,7 @@ def process_gradio_chat(self, prompt, history, max_new_tokens, system, greedy):
         history.append([prompt, response])
     else:
         history.append([prompt, ""])
-        for response, _ in self.process(
+        for response, _ in self.sample(
                 string=string,
                 greedy=greedy,
                 max_new_tokens=max_new_tokens
@@ -194,7 +194,7 @@ def forward_instruct(self, data: InstructRequest):
 
     string = self.config.instruct_format.format(instruct=data.prompt, system=data.system)
     response, used_tokens = [None] * 2
-    for response, used_tokens in self.process(
+    for response, used_tokens in self.sample(
             string=string,
             greedy=data.greedy,
             max_new_tokens=None

@@ -92,7 +92,7 @@ train_arguments = TrainArguments(
 )
 
 
-def ultra_chat_prompting_process(
+def ultra_chat_prompting_sample(
         data_chunk
 ):
     user_part = [
