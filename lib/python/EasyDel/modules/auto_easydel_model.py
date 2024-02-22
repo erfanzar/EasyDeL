@@ -253,17 +253,17 @@ class AutoEasyDelModelForCausalLM:
 
         """
 
-        logger.info(f"Downloading model config from {pretrained_model_name_or_path}")
+        logger.debug(f"Downloading model config from {pretrained_model_name_or_path}")
         config = AutoConfig.from_pretrained(pretrained_model_name_or_path)
         model_type = config.model_type
 
         cfg, module, trf = get_modules_by_type(model_type)
 
-        logger.info(f"Downloading model weights from {pretrained_model_name_or_path}")
+        logger.debug(f"Downloading model weights from {pretrained_model_name_or_path}")
         model = AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path, **kwargs)
         cfg = cfg.from_pretrained(pretrained_model_name_or_path)
-
-        logger.info(f"adding model basic EasyDeL configurations.")
+        state_dict = model.state_dict()
+        logger.debug(f"adding model basic EasyDeL configurations.")
         if hasattr(cfg, 'add_jax_args'):
             cfg.add_jax_args()
         cfg.add_basic_configurations(
@@ -281,7 +281,7 @@ class AutoEasyDelModelForCausalLM:
             for k, v in config_kwargs.items():
                 setattr(cfg, k, v)
 
-        logger.info("creating easydel model")
+        logger.debug("creating easydel model")
         ed_model = module(
             config=cfg,
             _do_init=False,
@@ -290,14 +290,25 @@ class AutoEasyDelModelForCausalLM:
             precision=precision,
             input_shape=input_shape
         )
+
+        needs = [
+            s.replace(".kernel", ".weight").replace(".scale", ".weight").replace(".embedding", ".weight") for s in
+            list(flax.traverse_util.flatten_dict(model.params_shape_tree, sep=".").keys())
+        ]
+        for k in list(state_dict.keys()):
+            if k not in needs:
+                logger.debug(f"removing {k} from weights as it was not needed by flax model")
+                del state_dict[k]
         if shard_fns is not None:
-            logger.info("sharding model parameters based on the given shard_fns.")
+            logger.debug("sharding model parameters based on the given shard_fns.")
             if not is_flatten(shard_fns):
                 shard_fns = flax.traverse_util.flatten_dict(shard_fns)
         with cfg.jax_mesh():
-            logger.info("converting huggingface-model to easydel-model.")
-            params = trf(model.state_dict(), config=config, device=device, shard_fns=shard_fns)
-        logger.info("deleting huggingface-model")
+            logger.debug("converting huggingface-model to easydel-model.")
+            params = trf(state_dict, config=config, device=device, shard_fns=shard_fns)
+        logger.debug("deleting huggingface-model")
+
+        del state_dict
         del model
         gc.collect()
 
