@@ -5,7 +5,7 @@ import gradio as gr
 import transformers
 import uvicorn
 from fastapi import FastAPI
-from typing import List
+from typing import List, Optional
 from transformers import TextIteratorStreamer
 import logging
 import multiprocessing as mp
@@ -16,17 +16,19 @@ from dataclasses import dataclass
 
 
 @dataclass
-class PytorchServerConfig:
+class PyTorchServerConfig:
     """
     It sets up the instance of the class, and defines all its attributes.
 
     :param host: Specify the ip address of the server
     :param port: Specify the port number that will be used by the server
     :param batch_size: Determine the number of samples to be generated in a single batch
-    :param contains_auto_format: Determine whether the input text contains auto_formatting
     :param max_sequence_length: Set the maximum length of a sentence
     :param max_new_tokens: Limit the number of new tokens that can be generated in a single batch
     :param temperature: Control the randomness of the generated text
+    :param pad_token_id: Optional[int]: The id of the Padding Token
+    :param bos_token_id: Optional[int]: The id of the Start of sentence Token
+    :param eos_token_id: Optional[int]: The id of the End of sentence Token
     :param top_p: Control the probability of sampling from the top candidates
     :param top_k: Limit the number of tokens that are considered for each token
     :param logging: Control whether the server will print out
@@ -38,29 +40,77 @@ class PytorchServerConfig:
     host: str = "0.0.0.0"
     port: int = 2059
     batch_size: int = 1
-    contains_auto_format: bool = True
-    max_sequence_length: int = 2048
-    max_new_tokens: int = 2048
+
+    max_sequence_length: int = 4096
+    max_new_tokens: int = 4096
+    max_compile_tokens: int = 1
     temperature: float = 0.8
     top_p: float = 0.95
     top_k: int = 50
+    sample: bool = True
+    repetition_penalty: float = 1.2
+
+    eos_token_id: Optional[int] = None
+    pad_token_id: Optional[int] = None
+    bos_token_id: Optional[int] = None
+
     logging: bool = True
+
     dtype: str = "fp16"
+
+    stream_tokens_for_gradio: bool = True
+    use_prefix_tokenizer: bool = True
+    pre_compile: bool = True
+
+    use_mxn_break_point: bool = True
     max_number_of_gpus: typing.Optional[int] = None
     max_gpu_perc_to_use: float = 0.95
-    max_compile_tokens: int = 1
+
+    def __repr__(self):
+
+        """
+        The __repr__ function is used to generate a string representation of an object.
+        This function should return a string that can be parsed by the Python interpreter
+        to recreate the object. The __repr__ function is called when you use print() on an
+        object, or when you type its name in the REPL.
+
+        :param self: Refer to the instance of the class
+        :return: A string representation of the object
+        """
+        string = f"{self.__class__.__name__}(\n"
+        for k, v in self.__dict__.items():
+            if not k.startswith("_"):
+
+                try:
+                    repr_src = f"\t{k} : " + v.__str__().replace("\n", "\n\t") + "\n"
+                    string += repr_src if len(repr_src) < 500 else f"\t{k} : " + f"{v.__class__.__name__}(...)" + "\n"
+                except TypeError:
+                    ...
+
+        return string + ")"
+
+    def __str__(self):
+
+        """
+        The __str__ function is called when you use the print function or when str() is used.
+        It should return a string representation of the object.
+
+        :param self: Refer to the instance of the class
+        :return: The object's string representation
+        """
+        return self.__repr__()
 
 
 class PyTorchServer(GradioUserInference):
 
-    def __init__(self, config: PytorchServerConfig):
+    def __init__(self, config: PyTorchServerConfig):
         """
         The __init__ function is called when the class is instantiated.
         It sets up the instance of the class, and defines all its attributes.
         The __init__ function can accept arguments, which are passed at instantiation.
 
         :param self: Represent the instance of the class
-        :param config: PytorchServerConfig: Pass the configuration parameters to the class
+        :param config: PyTorchServerConfig: Pass the configuration parameters to the class
         :return: The app, which is a fastapi object
         
         """
@@ -243,11 +293,12 @@ class PyTorchServer(GradioUserInference):
     def sample(
             self,
             string: str,
-            max_new_tokens: int = None,
-            max_sequence_length: int = None,
-            temperature: float = 0.6,
-            top_k=50,
-            top_p=0.9,
+            max_new_tokens: Optional[int] = None,
+            max_sequence_length: Optional[int] = None,
+            temperature: Optional[float] = 0.6,
+            top_k: Optional[int] = 50,
+            top_p: Optional[float] = 0.9,
+            repetition_penalty: Optional[float] = 1.2,
             stream: bool = True,
             sample: bool = True
     ):
@@ -256,13 +307,14 @@ class PyTorchServer(GradioUserInference):
 
         :param self: Represent the instance of the class
         :param string: str: Pass the string to be generated
-        :param max_new_tokens: int: Limit the number of new tokens that can be generated
-        :param max_sequence_length: int: Set the maximum length of the generated text
-        :param temperature: float: Control the randomness of the text generation
-        :param top_k: Filter out the top k tokens with the highest probability
-        :param top_p: Control the probability of sampling from the top n tokens
+        :param max_new_tokens: Optional[int]: Limit the number of new tokens that can be generated
+        :param max_sequence_length: Optional[int]: Set the maximum length of the generated text
+        :param temperature: Optional[float]: Control the randomness of the text generation
+        :param top_k:Optional[int]: Filter out the top k tokens with the highest probability
+        :param top_p:Optional[int]: Control the probability of sampling from the top n tokens
+        :param repetition_penalty: optional[float]: repetition penalty for generation
         :param stream: bool: Determine whether to stream the output or not
-        :param sample: bool: Indicate whether to sample from the distribution or take the argmax
+        :param sample: optional[bool]: Indicate whether to sample from the distribution or take the argmax
         :return: A generator
         
         """
@@ -286,9 +338,9 @@ class PyTorchServer(GradioUserInference):
                 attention_mask=attention_mask,
                 streamer=iterator_streamer,
                 generation_config=transformers.GenerationConfig(
-                    bos_token_id=self.tokenizer.bos_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                    pad_token_id=self.tokenizer.pad_token_id,
+                    bos_token_id=self.config.bos_token_id or self.tokenizer.bos_token_id,
+                    eos_token_id=self.config.eos_token_id or self.tokenizer.eos_token_id,
+                    pad_token_id=self.config.pad_token_id or self.tokenizer.pad_token_id,
                     max_length=max_sequence_length or self.config.max_sequence_length,
                     temperature=temperature,
                     top_k=top_k,
@@ -296,6 +348,7 @@ class PyTorchServer(GradioUserInference):
                     max_new_tokens=max_new_tokens or self.config.max_new_tokens,
                     num_beams=1,
                     do_sample=sample,
+                    repetition_penalty=repetition_penalty or self.config.repetition_penalty
                 )
             )
             thread_ = threading.Thread(
@@ -365,7 +418,8 @@ class PyTorchServer(GradioUserInference):
             greedy: bool,
             temperature: float,
             top_p: float,
-            top_k: int
+            top_k: int,
+            repetition_penalty: float
     ):
 
         if mode.lower() == "chat":
@@ -391,6 +445,7 @@ class PyTorchServer(GradioUserInference):
                 max_sequence_length=max_sequence_length,
                 top_p=top_p,
                 top_k=top_k,
+                repetition_penalty=repetition_penalty,
                 stream=True
         ):
             responses += response
