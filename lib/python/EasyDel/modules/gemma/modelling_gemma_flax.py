@@ -772,18 +772,6 @@ class FlaxGemmaForCausalLM(FlaxGemmaPreTrainedModel):
             return_dict=False
         )["params"]
 
-        if self.config.tie_word_embeddings:
-            et = {
-                "lm_head": {
-                    "kernel": jnp.transpose(
-                        random_params["model"]["embed_tokens"]["embedding"],
-                        (1, 0)
-                    )
-                }
-            }
-
-            random_params = random_params | et
-
         if params is not None:
             random_params = flatten_dict(unfreeze(random_params))
             params = flatten_dict(unfreeze(params))
