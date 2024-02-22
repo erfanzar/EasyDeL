@@ -82,6 +82,7 @@ def get_logger(name, level: int = logging.INFO) -> logging.Logger:
     )
 
     logger = logging.getLogger(name)
+    logger.setLevel(level)
 
     return logger
 
