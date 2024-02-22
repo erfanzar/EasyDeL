@@ -103,7 +103,7 @@ class Llama2JaxServer(JAXServer):
             chat_history=history or [],
             system_prompt=system or DEFAULT_SYSTEM_PROMPT
         )
-        if not self.config.stream_tokens_for_gradio:
+        if not self.server_config.stream_tokens_for_gradio:
             response = ""
             for response, _ in self.sample(
                     string=string,
@@ -126,7 +126,7 @@ class Llama2JaxServer(JAXServer):
 
     def sample_gradio_instruct(self, prompt, system, max_new_tokens, greedy):
         string = self.prompt_llama2_model(system_prompt=DEFAULT_SYSTEM_PROMPT, message=prompt, chat_history=[])
-        if not self.config.stream_tokens_for_gradio:
+        if not self.server_config.stream_tokens_for_gradio:
             response = ""
             for response, _ in self.sample(
                     string=string,
@@ -168,7 +168,7 @@ server = Llama2JaxServer.from_parameters(
     tokenizer=AutoTokenizer.from_pretrained('meta-llama/Llama-2-7b'),
     verbose=False,
     do_memory_log=True,
-    config=JAXServerConfig()
+    server_config=JAXServerConfig()
 )
 
 server.fire()  # Launch FastAPI functions

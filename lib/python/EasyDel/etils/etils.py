@@ -69,6 +69,12 @@ AVAILABLE_OPTIMIZERS = Literal[
 
 
 def get_logger(name, level: int = logging.INFO) -> logging.Logger:
+    """
+    Function to create and configure a logger.
+    :param name: str: The name of the logger.
+    :param level: int: The logging level. Defaults to logging.INFO.
+    :return logging.Logger: The configured logger instance.
+    """
     logger = logging.getLogger(name)
     logger.setLevel(level)
     console_handler = logging.StreamHandler()
@@ -77,3 +83,13 @@ def get_logger(name, level: int = logging.INFO) -> logging.Logger:
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
     return logger
+
+
+def set_loggers_level(level: int = logging.WARNING):
+    """
+    Function to set the logging level of all loggers to the specified level.
+    :param level: int: The logging level to set. Defaults to logging.WARNING.
+    """
+    logging.root.setLevel(level)
+    for handler in logging.root.handlers:
+        handler.setLevel(level)
