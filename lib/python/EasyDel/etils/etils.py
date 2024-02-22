@@ -77,13 +77,11 @@ def get_logger(name, level: int = logging.INFO) -> logging.Logger:
     """
     logger = logging.getLogger(name)
 
-    if not logger.handlers:
-        # Perform logging setup only if handlers are not already attached
-        logger.setLevel(logging.INFO)
-        formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-        console_handler = logging.StreamHandler()
-        console_handler.setFormatter(formatter)
-        logger.addHandler(console_handler)
+    logging.basicConfig(
+        format="%(asctime)s %(levelname)-8s [%(name)s] %(message)s",
+        level=level,
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
     return logger
 
