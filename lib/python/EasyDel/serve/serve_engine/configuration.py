@@ -35,6 +35,7 @@ class EasyServeConfig:
     temperature: float = 0.1
     top_p: float = 0.95
     top_k: int = 50
+    repetition_penalty: float = 1.2
     greedy: bool = False
 
     logging: bool = True

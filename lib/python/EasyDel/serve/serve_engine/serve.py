@@ -272,6 +272,7 @@ class EasyServe:
                     bos_token_id=serve_config.bos_token_id or tokenizer.bos_token_id,
 
                     temperature=serve_config.temperature,
+                    repetition_penalty=serve_config.repetition_penalty,
                     do_sample=True,
                     num_beams=1,
                     top_p=serve_config.top_p,
