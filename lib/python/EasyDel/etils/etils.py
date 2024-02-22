@@ -76,12 +76,15 @@ def get_logger(name, level: int = logging.INFO) -> logging.Logger:
     :return logging.Logger: The configured logger instance.
     """
     logger = logging.getLogger(name)
-    logger.setLevel(level)
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(level)
-    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
+
+    if not logger.handlers:
+        # Perform logging setup only if handlers are not already attached
+        logger.setLevel(logging.INFO)
+        formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+
     return logger
 
 
