@@ -528,7 +528,7 @@ class JAXServer(GradioUserInference):
                 logger.info("Compiling greedy generate function")
 
             r, a = [None] * 2
-            for r, a in self.process(
+            for r, a in self.sample(
                     string="",
                     max_new_tokens=self.config.max_compile_tokens,
                     greedy=True
@@ -536,7 +536,7 @@ class JAXServer(GradioUserInference):
                 ...
             if verbose:
                 logger.info("Compiling non-greedy generate function")
-            for r, a in self.process(
+            for r, a in self.sample(
                     string="",
                     max_new_tokens=self.config.max_compile_tokens,
                     greedy=False
@@ -615,7 +615,8 @@ class JAXServer(GradioUserInference):
         The prompt is the user"s input to be processed by the chatbot, while history
         is an array of previous inputs and outputs from both sides (user and bot).
         The forward_chat function then formats these inputs into one string that can be processed by our model.
-        This formatted string is then passed through our process() method, which returns an output response as well as how many tokens were used to generate it.
+        This formatted string is then passed through our sample() method, which returns an output response as well as
+        how many tokens were used to generate it.
 
         :param self: Access the attributes and methods of the class
         :param data: ChatRequest: Pass in the data from the request
@@ -634,7 +635,7 @@ class JAXServer(GradioUserInference):
         )
 
         response, used_tokens = [None] * 2
-        for response, used_tokens in self.process(
+        for response, used_tokens in self.sample(
                 string=string,
                 greedy=data.greedy,
                 max_new_tokens=None
@@ -665,9 +666,9 @@ class JAXServer(GradioUserInference):
         """
         The forward_instruct function is the main function of this class.
         It takes in a InstructRequest object, which contains the system and instruction to be processed.
-        The function then formats the input string using format_instruct, and passes it into process().
-        process() returns a tuple containing (response, used_tokens). The response is returned as part of
-        the response dictionary. If no valid responses are found by process(), None will be returned instead.
+        The function then formats the input string using format_instruct, and passes it into sample().
+        sample() returns a tuple containing (response, used_tokens). The response is returned as part of
+        the response dictionary. If no valid responses are found by sample(), None will be returned instead.
 
         :param self: Bind the method to the object
         :param data: InstructRequest: Pass the system and instruction to the function
@@ -684,7 +685,7 @@ class JAXServer(GradioUserInference):
             system=data.system,
             instruction=data.instruction
         )
-        for response, used_tokens in self.process(
+        for response, used_tokens in self.sample(
                 string=string,
                 greedy=data.greedy,
                 max_new_tokens=None
@@ -739,7 +740,7 @@ class JAXServer(GradioUserInference):
         )
         return self.forward_chat(data)
 
-    def process_gradio(
+    def sample_gradio(
             self,
             prompt: str,
             history: List[List[str]],
@@ -766,10 +767,10 @@ class JAXServer(GradioUserInference):
                 instruction=prompt
             )
         else:
-            raise ValueError("UnKnown Mode for process_gradio available modes are only Chat or Instruct")
+            raise ValueError("UnKnown Mode for sample_gradio available modes are only Chat or Instruct")
         history.append([prompt, ""])
         responses = ""
-        for response, _ in self.process(
+        for response, _ in self.sample(
                 string=string,
                 greedy=greedy,
                 max_new_tokens=max_new_tokens,
@@ -778,7 +779,7 @@ class JAXServer(GradioUserInference):
             history[-1][-1] = responses
             yield "", history
 
-    def process(self,
+    def sample(self,
                 string: str,
                 *,
                 greedy: bool = False,
@@ -786,8 +787,8 @@ class JAXServer(GradioUserInference):
                 **kwargs
                 ):
         """
-        The process function is the main function of a model. It takes in an input string and returns a list of strings
-        that are generated from that input string. The process function can be called multiple times with different inputs,
+        The sample function is the main function of a model. It takes in an input string and returns a list of strings
+        that are generated from that input string. The sample function can be called multiple times with different inputs,
         and each time it will return a new set of outputs based on those inputs.
 
         :param self: Access the class attributes
@@ -795,7 +796,7 @@ class JAXServer(GradioUserInference):
         :param *: Pass a variable number of arguments to a function
         :param greedy: bool: Determine whether to use the greedy or non-greedy version of the generate function
         :param max_new_tokens: int: Set the number of tokens to generate
-        :param kwargs: Pass any additional parameters to the process function
+        :param kwargs: Pass any additional parameters to the sample function
         :return: A generator that yields the predicted text and the number of tokens generated
         
         """
@@ -887,7 +888,7 @@ class JAXServer(GradioUserInference):
 
     def gradio_inference(self):
         return self.build_inference(
-            sample_func=self.process_gradio,
+            sample_func=self.sample_gradio,
             max_sequence_length=self.config.max_sequence_length,
             max_new_tokens=self.config.max_new_tokens,
             max_compile_tokens=self.config.max_compile_tokens,

@@ -399,7 +399,7 @@ class PyTorchServer(GradioUserInference):
 
     def gradio_inference(self):
         return self.build_inference(
-            sample_func=self.process_gradio,
+            sample_func=self.sample_gradio,
             max_sequence_length=self.config.max_sequence_length,
             max_new_tokens=self.config.max_new_tokens,
             max_compile_tokens=1,
