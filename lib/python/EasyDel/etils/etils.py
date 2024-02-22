@@ -75,13 +75,13 @@ def get_logger(name, level: int = logging.INFO) -> logging.Logger:
     :param level: int: The logging level. Defaults to logging.INFO.
     :return logging.Logger: The configured logger instance.
     """
-    logger = logging.getLogger(name)
-
     logging.basicConfig(
         format="%(asctime)s %(levelname)-8s [%(name)s] %(message)s",
         level=level,
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+
+    logger = logging.getLogger(name)
 
     return logger
 
