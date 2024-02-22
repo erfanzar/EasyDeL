@@ -102,7 +102,12 @@ class GradioUserInference:
                     label='Top K',
                     step=1
                 )
-
+                repetition_penalty = gr.Slider(
+                    value=1.2,
+                    maximum=5,
+                    minimum=0.1,
+                    label='Repetition Penalty'
+                )
                 greedy = gr.Radio(
                     value=True,
                     label="Do Sample or Greedy Generation"
@@ -126,7 +131,8 @@ class GradioUserInference:
             greedy,
             temperature,
             top_p,
-            top_k
+            top_k,
+            repetition_penalty
         ]
 
         clear.click(fn=lambda: [], outputs=[history])
