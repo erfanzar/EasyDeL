@@ -293,7 +293,7 @@ class AutoEasyDelModelForCausalLM:
 
         needs = [
             s.replace(".kernel", ".weight").replace(".scale", ".weight").replace(".embedding", ".weight") for s in
-            list(flax.traverse_util.flatten_dict(model.params_shape_tree, sep=".").keys())
+            list(flax.traverse_util.flatten_dict(ed_model.params_shape_tree, sep=".").keys())
         ]
         for k in list(state_dict.keys()):
             if k not in needs:
