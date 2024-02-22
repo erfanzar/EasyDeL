@@ -41,23 +41,29 @@ Some of the key features provided by EasyDeL include:
 
 ## Serving
 
-you can read docs or examples to see how `JAXServer` works but let me show you how you can simply host and serve a
-LLama2
-chat model (70B model is supported too)
+you can read docs or examples to see how `JAXServer` works but let me show you how you can simply host and serve any 
+model that supported by `EasyDeL` fo this example ill just use `gemma-7-it` by google but you can use any model
+that as you wish.
 
 ```shell
-python -m examples.serving.causal-lm.llama-2-chat \
-  --pretrained_model_name_or_path="meta-llama/Llama-2-7b-chat-hf" --max_length=4096 \
-  --max_new_tokens=2048 --max_compile_tokens=32 --temperature=0.6 \
-  --top_p=0.95 --top_k=50 \
-  --dtype="fp16" --use_prefix_tokenizer
-
+python -m examples.jax_serve_example \
+  --prompter_type="gemma" \ 
+  --share_gradio=True \ 
+  --sharding_axis_dims=1,1,1,-1 \
+  --attn_mechanism="normal" \
+  --scan_ring_attention=True \
+  --max_sequence_length=8192 \ 
+  --max_new_tokens_ratio=25 \
+  --max_compile_tokens=256 \ 
+  --block_k=128 \
+  --block_q=128 \
+  --pretrained_model_name_or_path="google/gemma-7b-it" \
+  --dtype="bf16"
 ```
 
 > [!NOTE]
-> you can use all the llama models not just "meta-llama/Llama-2-7b-chat-hf"
-> float16 or float32 , bfloat16 are supported dtype and make sure to use --use_prefix_tokenizer,
-> and you will get links or api to use model from gradio app chat/instruct or FastAPI apis
+> you can use `EasyServe` which is a Serve API Engine for production purpose sice that's more stable provide versioned
+> API and efficient.
 
 ## RLHF(Reinforcement Learning From Human Feedback)
 
@@ -124,8 +130,8 @@ train_arguments = TrainArguments(
     backend="tpu",  # default backed is set to cpu, so you must define you want to use tpu cpu or gpu
     max_length=max_length,  # Note that you have to change this in the model config too
     gradient_checkpointing=EasyDelGradientCheckPointers.NOTHING_SAVEABLE,
-    sharding_array=(1, -1, 1, 1),  # the way to shard model across gpu,cpu or TPUs using sharding array (1, -1, 1, 1)
-    # everything training will be in fully FSDP automatic and share data between devices
+    sharding_array=(1, 1, 1, -1),  # the way to shard model across gpu,cpu or TPUs using sharding array (1, 1, 1, -1)
+    # everything training will be in sequence and model parallel automatic and share data between devices
     use_pjit_attention_force=False,
     remove_ckpt_after_load=True,
     gradient_accumulation_steps=8,
@@ -203,7 +209,7 @@ model, params = AutoEasyDelModelForCausalLM.from_pretrained(
     jax.numpy.float16,
     jax.numpy.float16,
     jax.lax.Precision("fastest"),
-    (1, -1, 1, 1),
+    (1, 1, 1, -1),
     device_map="auto"
 )
 
@@ -266,7 +272,7 @@ model_name_or_path = "erfanzar/LinguaMatic-Tiny"
 ref_model_name_or_path = "teknium/OpenHermes-2.5-Mistral-7B"
 dtype = jnp.bfloat16
 
-sharding_axis_dims = (1, -1, 1, 1)
+sharding_axis_dims = (1, 1, 1, -1)
 sharding_axis_names = ("dp", "fsdp", "tp", "sp")
 query_partition_spec = PartitionSpec(
     ("dp", "fsdp"), "sp", "tp", None
@@ -487,7 +493,9 @@ state = EasyDelState.from_pretrained(
     dtype=jnp.bfloat16,
     param_dtype=jnp.bfloat16,
     precision=lax.Precision("fastest"),
-    sharding_axis_dims=(1, -1, 1, 1),
+    sharding_axis_dims=(1, 1, 1, -1),
+    # the way to shard model across gpu,cpu or TPUs using sharding array (1, 1, 1, -1)
+    # everything training will be in sequence and model parallel automatic and share data between devices
     sharding_axis_names=("dp", "fsdp", "tp", "sp"),
     query_partition_spec=jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
     key_partition_spec=jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
@@ -662,8 +670,8 @@ train_arguments = TrainArguments(
     backend="tpu",  # default backed is set to cpu, so you must define you want to use tpu cpu or gpu
     max_length=max_length,  # Note that you have to change this in the model config too
     gradient_checkpointing=EasyDelGradientCheckPointers.NOTHING_SAVEABLE,
-    sharding_array=(1, -1, 1, 1),  # the way to shard model across gpu,cpu or TPUs using sharding array (1, -1, 1, 1)
-    # everything training will be in fully FSDP automatic and share data between devices
+    sharding_array=(1, 1, 1, -1),  # the way to shard model across gpu,cpu or TPUs using sharding array (1, 1, 1, -1)
+    # everything training will be in sequence and model parallel automatic and share data between devices
     use_pjit_attention_force=False,
     remove_ckpt_after_load=True,
     gradient_accumulation_steps=1,

@@ -5,7 +5,7 @@ import gradio as gr
 import transformers
 import uvicorn
 from fastapi import FastAPI
-from typing import List
+from typing import List, Optional
 from transformers import TextIteratorStreamer
 import logging
 import multiprocessing as mp
@@ -16,17 +16,19 @@ from dataclasses import dataclass
 
 
 @dataclass
-class PytorchServerConfig:
+class PyTorchServerConfig:
     """
     It sets up the instance of the class, and defines all its attributes.
 
     :param host: Specify the ip address of the server
     :param port: Specify the port number that will be used by the server
     :param batch_size: Determine the number of samples to be generated in a single batch
-    :param contains_auto_format: Determine whether the input text contains auto_formatting
     :param max_sequence_length: Set the maximum length of a sentence
     :param max_new_tokens: Limit the number of new tokens that can be generated in a single batch
     :param temperature: Control the randomness of the generated text
+    :param pad_token_id: Optional[int]: The id of the Padding Token
+    :param bos_token_id: Optional[int]: The id of the Start of sentence Token
+    :param eos_token_id: Optional[int]: The id of the End of sentence Token
     :param top_p: Control the probability of sampling from the top candidates
     :param top_k: Limit the number of tokens that are considered for each token
     :param logging: Control whether the server will print out
@@ -38,43 +40,91 @@ class PytorchServerConfig:
     host: str = "0.0.0.0"
     port: int = 2059
     batch_size: int = 1
-    contains_auto_format: bool = True
-    max_sequence_length: int = 2048
-    max_new_tokens: int = 2048
+
+    max_sequence_length: int = 4096
+    max_new_tokens: int = 4096
+    max_compile_tokens: int = 1
     temperature: float = 0.8
     top_p: float = 0.95
     top_k: int = 50
+    sample: bool = True
+    repetition_penalty: float = 1.2
+
+    eos_token_id: Optional[int] = None
+    pad_token_id: Optional[int] = None
+    bos_token_id: Optional[int] = None
+
     logging: bool = True
+
     dtype: str = "fp16"
+
+    stream_tokens_for_gradio: bool = True
+    use_prefix_tokenizer: bool = True
+    pre_compile: bool = True
+
+    use_mxn_break_point: bool = True
     max_number_of_gpus: typing.Optional[int] = None
     max_gpu_perc_to_use: float = 0.95
-    max_compile_tokens: int = 1
+
+    def __repr__(self):
+
+        """
+        The __repr__ function is used to generate a string representation of an object.
+        This function should return a string that can be parsed by the Python interpreter
+        to recreate the object. The __repr__ function is called when you use print() on an
+        object, or when you type its name in the REPL.
+
+        :param self: Refer to the instance of the class
+        :return: A string representation of the object
+        """
+        string = f"{self.__class__.__name__}(\n"
+        for k, v in self.__dict__.items():
+            if not k.startswith("_"):
+
+                try:
+                    repr_src = f"\t{k} : " + v.__str__().replace("\n", "\n\t") + "\n"
+                    string += repr_src if len(repr_src) < 500 else f"\t{k} : " + f"{v.__class__.__name__}(...)" + "\n"
+                except TypeError:
+                    ...
+
+        return string + ")"
+
+    def __str__(self):
+
+        """
+        The __str__ function is called when you use the print function or when str() is used.
+        It should return a string representation of the object.
+
+        :param self: Refer to the instance of the class
+        :return: The object's string representation
+        """
+        return self.__repr__()
 
 
 class PyTorchServer(GradioUserInference):
 
-    def __init__(self, config: PytorchServerConfig):
+    def __init__(self, server_config: PyTorchServerConfig):
         """
         The __init__ function is called when the class is instantiated.
         It sets up the instance of the class, and defines all its attributes.
         The __init__ function can accept arguments, which are passed at instantiation.
 
         :param self: Represent the instance of the class
-        :param config: PytorchServerConfig: Pass the configuration parameters to the class
+        :param server_config: PyTorchServerConfig: Pass the configuration parameters to the class
         :return: The app, which is a fastapi object
         
         """
         self.model, self.tokenizer = [None] * 2
 
-        self.config = config
+        self.server_config = server_config
         self.process_uvicorn = None
         self.app = FastAPI()
         self.number_of_served_request_until_last_up_time = 0
-        self.device_rolling = self.get_gpu_memory(self.config.max_number_of_gpus)
+        self.device_rolling = self.get_gpu_memory(self.server_config.max_number_of_gpus)
         self.dict_max_memory_sharding = {
             i: str(
                 int(
-                    mem * self.config.max_gpu_perc_to_use
+                    mem * self.server_config.max_gpu_perc_to_use
                 )
             ) + "GiB" for i, mem in
             enumerate(self.device_rolling)
@@ -113,11 +163,11 @@ class PyTorchServer(GradioUserInference):
         :return: A dictionary with the following keys:
         
         """
-        if self.config.dtype == "fp16":
+        if self.server_config.dtype == "fp16":
             dtype = torch.float16
-        elif self.config.dtype == "fp32":
+        elif self.server_config.dtype == "fp32":
             dtype = torch.float32
-        elif self.config.dtype == "bf16":
+        elif self.server_config.dtype == "bf16":
             dtype = torch.bfloat16
         else:
             raise ValueError("unknown type available types are [fp32 fp16 bf16]")
@@ -132,7 +182,7 @@ class PyTorchServer(GradioUserInference):
 
         """
         The status function returns a dictionary with the following keys:
-            config: A dictionary of configuration parameters.
+            server_config: A dictionary of configuration parameters.
             devices: The number of GPUs available to the server.
             device_sharding: Whether device sharding is enabled. If True, then each request will be served by
             a different GPU (if multiple GPUs are available). If False, then all requests will be served by
@@ -145,7 +195,7 @@ class PyTorchServer(GradioUserInference):
         
         """
         return {
-            "config": {k: v for k, v in self.config.__dict__.items()},
+            "server_config": {k: v for k, v in self.server_config.__dict__.items()},
             "devices": f"{torch.cuda.device_count()}",
             "device_sharding": self.device_rolling,
             "max_memory": self.dict_max_memory_sharding,
@@ -158,7 +208,7 @@ class PyTorchServer(GradioUserInference):
         The forward_instruct_fast_api function is a ReST API endpoint that takes in an InstructRequest object and returns
         a response. The InstructRequest object contains the following fields:
             - system (str): A string representing the name of the system to be instructed. This should match one of the
-                systems defined in your config file, or else it will default to &quot;default&quot;. If you want to instruct multiple
+                systems defined in your server_config file, or else it will default to &quot;default&quot;. If you want to instruct multiple
                 systems at once, use forward_instruct_fast instead.
 
         :param self: Refer to the object itself
@@ -170,14 +220,14 @@ class PyTorchServer(GradioUserInference):
             system=data.system,
             instruction=data.instruction
         )
-        response = self.process(
+        response = self.sample(
             string=string,
-            max_sequence_length=self.config.max_sequence_length,
+            max_sequence_length=self.server_config.max_sequence_length,
             temperature=data.temperature,
             stream=False,
-            top_k=self.config.top_k,
-            top_p=self.config.top_p,
-            max_new_tokens=self.config.max_new_tokens
+            top_k=self.server_config.top_k,
+            top_p=self.server_config.top_p,
+            max_new_tokens=self.server_config.max_new_tokens
         )
         return {
             "response": response
@@ -197,14 +247,14 @@ class PyTorchServer(GradioUserInference):
             history=data.history,
             prompt=data.prompt,
         )
-        response = self.process(
+        response = self.sample(
             string=string,
-            max_sequence_length=self.config.max_sequence_length,
+            max_sequence_length=self.server_config.max_sequence_length,
             temperature=data.temperature,
             stream=False,
-            top_k=self.config.top_k,
-            top_p=self.config.top_p,
-            max_new_tokens=self.config.max_new_tokens
+            top_k=self.server_config.top_k,
+            top_p=self.server_config.top_p,
+            max_new_tokens=self.server_config.max_new_tokens
         )
         return {
             "response": response
@@ -240,29 +290,31 @@ class PyTorchServer(GradioUserInference):
         """
         raise NotImplementedError()
 
-    def process(
+    def sample(
             self,
             string: str,
-            max_new_tokens: int = None,
-            max_sequence_length: int = None,
-            temperature: float = 0.6,
-            top_k=50,
-            top_p=0.9,
+            max_new_tokens: Optional[int] = None,
+            max_sequence_length: Optional[int] = None,
+            temperature: Optional[float] = 0.6,
+            top_k: Optional[int] = 50,
+            top_p: Optional[float] = 0.9,
+            repetition_penalty: Optional[float] = 1.2,
             stream: bool = True,
             sample: bool = True
     ):
         """
-        The process function is the main function of this class. It takes a string as input and returns a generator that yields strings.
+        The sample function is the main function of this class. It takes a string as input and returns a generator that yields strings.
 
         :param self: Represent the instance of the class
         :param string: str: Pass the string to be generated
-        :param max_new_tokens: int: Limit the number of new tokens that can be generated
-        :param max_sequence_length: int: Set the maximum length of the generated text
-        :param temperature: float: Control the randomness of the text generation
-        :param top_k: Filter out the top k tokens with the highest probability
-        :param top_p: Control the probability of sampling from the top n tokens
+        :param max_new_tokens: Optional[int]: Limit the number of new tokens that can be generated
+        :param max_sequence_length: Optional[int]: Set the maximum length of the generated text
+        :param temperature: Optional[float]: Control the randomness of the text generation
+        :param top_k:Optional[int]: Filter out the top k tokens with the highest probability
+        :param top_p:Optional[int]: Control the probability of sampling from the top n tokens
+        :param repetition_penalty: optional[float]: repetition penalty for generation
         :param stream: bool: Determine whether to stream the output or not
-        :param sample: bool: Indicate whether to sample from the distribution or take the argmax
+        :param sample: optional[bool]: Indicate whether to sample from the distribution or take the argmax
         :return: A generator
         
         """
@@ -286,16 +338,17 @@ class PyTorchServer(GradioUserInference):
                 attention_mask=attention_mask,
                 streamer=iterator_streamer,
                 generation_config=transformers.GenerationConfig(
-                    bos_token_id=self.tokenizer.bos_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                    max_length=max_sequence_length or self.config.max_sequence_length,
+                    bos_token_id=self.server_config.bos_token_id or self.tokenizer.bos_token_id,
+                    eos_token_id=self.server_config.eos_token_id or self.tokenizer.eos_token_id,
+                    pad_token_id=self.server_config.pad_token_id or self.tokenizer.pad_token_id,
+                    max_length=max_sequence_length or self.server_config.max_sequence_length,
                     temperature=temperature,
                     top_k=top_k,
                     top_p=top_p,
-                    max_new_tokens=max_new_tokens or self.config.max_new_tokens,
+                    max_new_tokens=max_new_tokens or self.server_config.max_new_tokens,
                     num_beams=1,
                     do_sample=sample,
+                    repetition_penalty=repetition_penalty or self.server_config.repetition_penalty
                 )
             )
             thread_ = threading.Thread(
@@ -313,11 +366,11 @@ class PyTorchServer(GradioUserInference):
                     bos_token_id=self.tokenizer.bos_token_id,
                     eos_token_id=self.tokenizer.eos_token_id,
                     pad_token_id=self.tokenizer.pad_token_id,
-                    max_length=max_sequence_length or self.config.max_sequence_length,
+                    max_length=max_sequence_length or self.server_config.max_sequence_length,
                     temperature=temperature,
                     top_k=top_k,
                     top_p=top_p,
-                    max_new_tokens=max_new_tokens or self.config.max_new_tokens,
+                    max_new_tokens=max_new_tokens or self.server_config.max_new_tokens,
                     num_beams=1
                 )
             )
@@ -333,7 +386,7 @@ class PyTorchServer(GradioUserInference):
         :param self: Represent the instance of the class
         :param pretrained_model_name_or_path: str: Specify the name of the model to be loaded
         :param tokenizer_repo: str: Specify the repo id of the tokenizer
-        :param auto_config: bool: Determine whether the model should be loaded with a config file or not
+        :param auto_config: bool: Determine whether the model should be loaded with a server_config file or not
         :param kwargs: Pass a variable number of keyword arguments to the function
         :return: A tuple of model and tokenizer
         
@@ -353,7 +406,7 @@ class PyTorchServer(GradioUserInference):
         self.model = model
         self.tokenizer = tokenizer
 
-    def process_gradio(
+    def sample_gradio(
             self,
             prompt: str,
             history: List[List[str]],
@@ -365,7 +418,8 @@ class PyTorchServer(GradioUserInference):
             greedy: bool,
             temperature: float,
             top_p: float,
-            top_k: int
+            top_k: int,
+            repetition_penalty: float
     ):
 
         if mode.lower() == "chat":
@@ -381,16 +435,17 @@ class PyTorchServer(GradioUserInference):
                 instruction=prompt
             )
         else:
-            raise ValueError("UnKnown Mode for process_gradio available modes are only Chat or Instruct")
+            raise ValueError("UnKnown Mode for sample_gradio available modes are only Chat or Instruct")
         history.append([prompt, ""])
         responses = ""
-        for response in self.process(
+        for response in self.sample(
                 string=string,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 max_sequence_length=max_sequence_length,
                 top_p=top_p,
                 top_k=top_k,
+                repetition_penalty=repetition_penalty,
                 stream=True
         ):
             responses += response
@@ -399,9 +454,9 @@ class PyTorchServer(GradioUserInference):
 
     def gradio_inference(self):
         return self.build_inference(
-            sample_func=self.process_gradio,
-            max_sequence_length=self.config.max_sequence_length,
-            max_new_tokens=self.config.max_new_tokens,
+            sample_func=self.sample_gradio,
+            max_sequence_length=self.server_config.max_sequence_length,
+            max_new_tokens=self.server_config.max_new_tokens,
             max_compile_tokens=1,
         )
 
@@ -415,7 +470,7 @@ class PyTorchServer(GradioUserInference):
         """
 
         def run():
-            uvicorn.run(self.app, host=self.config.host, port=self.config.port)
+            uvicorn.run(self.app, host=self.server_config.host, port=self.server_config.port)
 
         self.process_uvicorn = mp.Process(target=run)
         self.process_uvicorn.start()

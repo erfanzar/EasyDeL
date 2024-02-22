@@ -36,8 +36,7 @@ class EasyModelsTest(TestCase):
         self.intermediate_size: int = 512
         self.num_hidden_layers: int = 2
         self.num_attention_heads: int = 8
-        self.number_rep_kv: int = 1
-        self.num_key_value_heads: Optional[int] = 2
+        self.num_key_value_heads: Optional[int] = 4
         self.max_position_embeddings: int = 2048
         self.rms_norm_eps: float = 1e-6
         self.initializer_range: float = 0.02
@@ -61,6 +60,7 @@ class EasyModelsTest(TestCase):
         self.pretraining_tp: int = 1
         self.scan_layers: bool = False
         self.use_shard_map: bool = False
+        self.rotary_dim = 32
         self.dtype: jax.numpy.dtype = jnp.float32
         self.precision = jax.lax.Precision("fastest")
         self.attn_mechanism: Literal["normal", "flash", "splash", "ring"] = "normal"
@@ -82,7 +82,8 @@ class EasyModelsTest(TestCase):
             gradient_checkpointing=self.gradient_checkpointing,
             max_position_embeddings=self.max_position_embeddings,
             num_key_value_heads=self.num_key_value_heads,
-            scan_mlp_chunk_size=self.scan_mlp_chunk_size
+            scan_mlp_chunk_size=self.scan_mlp_chunk_size,
+            rotary_dim=self.rotary_dim
         )
 
         input_shape = (self.batch_size, self.sequence_length)

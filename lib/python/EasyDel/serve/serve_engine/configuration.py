@@ -1,4 +1,4 @@
-from typing import Sequence
+from typing import Sequence, Optional
 from jax.sharding import PartitionSpec
 from dataclasses import dataclass
 
@@ -35,6 +35,7 @@ class EasyServeConfig:
     temperature: float = 0.1
     top_p: float = 0.95
     top_k: int = 50
+    repetition_penalty: float = 1.2
     greedy: bool = False
 
     logging: bool = True
@@ -44,10 +45,16 @@ class EasyServeConfig:
     generation_ps: PartitionSpec = PartitionSpec("dp", "fsdp")
     dtype: str = "fp16"
 
+    eos_token_id: Optional[int] = None
+    pad_token_id: Optional[int] = None
+    bos_token_id: Optional[int] = None
+
     use_prefix_tokenizer: bool = True
     pre_compile: bool = True
 
     verbose: bool = True
+
+    use_mxn_break_point: bool = True
 
     def __repr__(self):
 
@@ -63,11 +70,13 @@ class EasyServeConfig:
         string = f"{self.__class__.__name__}(\n"
         for k, v in self.__dict__.items():
             if not k.startswith("_"):
+
                 try:
                     repr_src = f"\t{k} : " + v.__str__().replace("\n", "\n\t") + "\n"
                     string += repr_src if len(repr_src) < 500 else f"\t{k} : " + f"{v.__class__.__name__}(...)" + "\n"
                 except TypeError:
                     ...
+
         return string + ")"
 
     def __str__(self):
