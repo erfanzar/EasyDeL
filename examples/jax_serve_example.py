@@ -11,7 +11,6 @@ from EasyDel.serve.prompters.base_prompter import BasePrompter
 FLAGS = flags.FLAGS
 flags.DEFINE_enum(
     "prompter_type",
-    required=True,
     enum_values=("gemma", "llama", "openchat", "qwen2"),
     help="Prompter to be used to prompt the model",
     default="gemma"
@@ -19,7 +18,6 @@ flags.DEFINE_enum(
 flags.DEFINE_string(
     "pretrained_model_name_or_path",
     default="google/gemma-7b-it",
-    required=True,
     help="The pretrained model path in huggingface.co/models"
 )
 flags.DEFINE_integer(
@@ -115,6 +113,8 @@ def main(argv):
         "qwen2": Qwen2Prompter()
     }
     prompter: BasePrompter = prompters[FLAGS.prompter_type]
+
+    FLAGS.sharding_axis_dims = tuple([int(s) for s in FLAGS.sharding_axis_dims])
 
     class JAXServerC(JAXServer):
         @staticmethod
