@@ -413,7 +413,7 @@ class EasyServe:
                 yield returns
 
                 if self.serve_config.use_mxn_break_point:
-                    if self.serve_config.max_compile_tokens != num_generated_tokens:
+                    if self.serve_config.max_compile_tokens != predicted_token.shape[-1]:
                         break
                 if (
                         predicted_token[0][-1] == (self.serve_config.eos_token_id or self.tokenizer.eos_token_id)
