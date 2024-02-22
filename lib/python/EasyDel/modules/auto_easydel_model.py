@@ -10,10 +10,13 @@ from fjformer import match_partition_rules, make_shard_and_gather_fns
 from flax.traverse_util import unflatten_dict
 from transformers import AutoConfig, AutoModelForCausalLM
 
+from ..etils.etils import get_logger
 from ..transform.easydel_transform import huggingface_to_easydel
 from .easydel_modelling_utils import EasyDelFlaxPretrainedModel, EasyDelPretrainedConfig
 from ..etils.errors import EasyDelRuntimeError
 from jax.sharding import PartitionSpec
+
+logger = get_logger(name=__name__)
 
 
 def get_modules_by_type(model_type: str) -> Tuple[
@@ -250,13 +253,17 @@ class AutoEasyDelModelForCausalLM:
 
         """
 
+        logger.info(f"Downloading model config from {pretrained_model_name_or_path}")
         config = AutoConfig.from_pretrained(pretrained_model_name_or_path)
         model_type = config.model_type
 
         cfg, module, trf = get_modules_by_type(model_type)
 
+        logger.info(f"Downloading model weights from {pretrained_model_name_or_path}")
         model = AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path, **kwargs)
         cfg = cfg.from_pretrained(pretrained_model_name_or_path)
+
+        logger.info(f"adding model basic EasyDeL configurations.")
         if hasattr(cfg, 'add_jax_args'):
             cfg.add_jax_args()
         cfg.add_basic_configurations(
@@ -274,6 +281,7 @@ class AutoEasyDelModelForCausalLM:
             for k, v in config_kwargs.items():
                 setattr(cfg, k, v)
 
+        logger.info("creating easydel model")
         ed_model = module(
             config=cfg,
             _do_init=False,
@@ -283,14 +291,18 @@ class AutoEasyDelModelForCausalLM:
             input_shape=input_shape
         )
         if shard_fns is not None:
+            logger.info("sharding model parameters based on the given shard_fns.")
             if not is_flatten(shard_fns):
                 shard_fns = flax.traverse_util.flatten_dict(shard_fns)
         with cfg.jax_mesh():
+            logger.info("converting huggingface-model to easydel-model.")
             params = trf(model.state_dict(), config=config, device=device, shard_fns=shard_fns)
-        del model,
+        logger.info("deleting huggingface-model")
+        del model
         gc.collect()
 
         if is_flatten(params):
+            logger.info("converted parameters are flatten making them unflatten ")
             params = unflatten_dict(params)
 
         return ed_model, params
