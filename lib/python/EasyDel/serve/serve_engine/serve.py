@@ -371,12 +371,10 @@ class EasyServe:
                 max_length=fixed_pad,
                 padding="max_length",
                 return_tensors="jax"
-            ) \
-                if self.serve_config.use_prefix_tokenizer else \
-                self.tokenizer(
-                    string,
-                    return_tensors="jax"
-                )
+            ) if self.serve_config.use_prefix_tokenizer else self.tokenizer(
+                string,
+                return_tensors="jax"
+            )
 
             input_ids = tokens.input_ids
             attention_mask = tokens.attention_mask
@@ -413,10 +411,14 @@ class EasyServe:
                 )
 
                 yield returns
+
+                if self.serve_config.use_mxn_break_point:
+                    if self.serve_config.max_compile_tokens != num_generated_tokens:
+                        break
                 if (
-                        predicted_token[0][-1] == self.tokenizer.eos_token_id
+                        predicted_token[0][-1] == (self.serve_config.eos_token_id or self.tokenizer.eos_token_id)
                         or
-                        predicted_token[0][-1] == self.prefix_tokenizer.eos_token_id
+                        predicted_token[0][-1] == (self.serve_config.eos_token_id or self.prefix_tokenizer.eos_token_id)
                 ):
                     break
 

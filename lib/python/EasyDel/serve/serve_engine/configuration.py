@@ -53,6 +53,8 @@ class EasyServeConfig:
 
     verbose: bool = True
 
+    use_mxn_break_point: bool = True
+
     def __repr__(self):
 
         """
