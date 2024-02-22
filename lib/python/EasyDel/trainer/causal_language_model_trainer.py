@@ -460,7 +460,6 @@ class CausalLanguageModelTrainer(BaseTrainer):
             loss_sum = None
             accuracy_sum = None
             pbar.update(sharded_state.step.tolist())
-            information_queries = {}
             learning_rates = []
             if self.wandb_runtime is not None:
                 model_parameters_number = sum(
@@ -670,11 +669,10 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                 accuracy_sum is None
                         ) else accuracy_sum + accuracy
                     )
-                    if self.arguments.track_memory:
-                        mem_res = get_mem(dir_prefix=dir_prefix)
-
                     information_queries = {}
                     if self.arguments.track_memory:
+
+                        mem_res = get_mem(dir_prefix=dir_prefix)
                         for key in ["Used", "Usage Percent"]:
                             for device, info in get_capacity_matrix(dir_prefix=dir_prefix).items():
                                 information_queries[f"{device.replace('_', ' ')} ({key})"] = float(

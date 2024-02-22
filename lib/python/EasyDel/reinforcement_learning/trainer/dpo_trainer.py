@@ -1804,11 +1804,10 @@ class DPOTrainer(BaseTrainer, ABC):
                                         chosen_rewards_sum is None
                                 ) else chosen_rewards_sum + chosen_rewards
                             )
+                            information_queries = {}
                             if self.arguments.track_memory:
                                 mem_res = get_mem(dir_prefix=dir_prefix)
 
-                            information_queries = {}
-                            if self.arguments.track_memory:
                                 for key in ["Used", "Usage Percent"]:
                                     for device, info in get_capacity_matrix(dir_prefix=dir_prefix).items():
                                         information_queries[f"{device.replace('_', ' ')} ({key})"] = float(
@@ -1974,11 +1973,10 @@ class DPOTrainer(BaseTrainer, ABC):
                                 chosen_rewards_sum is None
                         ) else chosen_rewards_sum + chosen_rewards
                     )
-                    if self.arguments.track_memory:
-                        mem_res = get_mem(dir_prefix=dir_prefix)
 
                     information_queries = {}
                     if self.arguments.track_memory:
+                        mem_res = get_mem(dir_prefix=dir_prefix)
                         for key in ["Used", "Usage Percent"]:
                             for device, info in get_capacity_matrix(dir_prefix=dir_prefix).items():
                                 information_queries[f"{device.replace('_', ' ')} ({key})"] = float(
