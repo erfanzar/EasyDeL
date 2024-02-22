@@ -35,7 +35,6 @@ class BasePrompter(abc.ABC):
     ) -> str:
         raise NotImplementedError("NotImplementedYet !")
 
-    @abstractmethod
     def content_finder(
             self,
             prompt: str,

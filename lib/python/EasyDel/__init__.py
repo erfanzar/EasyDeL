@@ -11,7 +11,7 @@ from .serve import (
     ChatRequest as ChatRequest,
     InstructRequest as InstructRequest,
     PyTorchServer as PyTorchServer,
-    PytorchServerConfig as PytorchServerConfig,
+    PyTorchServerConfig as PyTorchServerConfig,
     JAXServer as JAXServer,
     JAXServerConfig as JAXServerConfig
 )
@@ -195,7 +195,7 @@ __all__ = (
     "ChatRequest",
     "InstructRequest",
     "PyTorchServer",
-    "PytorchServerConfig",
+    "PyTorchServerConfig",
     "JAXServer",
     "JAXServerConfig",
 

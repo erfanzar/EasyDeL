@@ -1,3 +1,4 @@
+import logging
 from dataclasses import dataclass
 from typing import Literal
 
@@ -65,3 +66,36 @@ AVAILABLE_OPTIMIZERS = Literal[
     "lion",
     'adamw'
 ]
+
+
+def get_logger(name, level: int = logging.INFO) -> logging.Logger:
+    """
+    Function to create and configure a logger.
+    :param name: str: The name of the logger.
+    :param level: int: The logging level. Defaults to logging.INFO.
+    :return logging.Logger: The configured logger instance.
+    """
+    logger = logging.getLogger(name)
+    logger.propagate = False
+
+    # Set the logging level
+    logger.setLevel(level)
+
+    # Create a console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(level)
+
+    formatter = logging.Formatter("%(asctime)s %(levelname)-8s [%(name)s] %(message)s")
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+    return logger
+
+
+def set_loggers_level(level: int = logging.WARNING):
+    """
+    Function to set the logging level of all loggers to the specified level.
+    :param level: int: The logging level to set. Defaults to logging.WARNING.
+    """
+    logging.root.setLevel(level)
+    for handler in logging.root.handlers:
+        handler.setLevel(level)

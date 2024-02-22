@@ -3,13 +3,13 @@ import functools
 import logging
 import warnings
 
-import flax.core
 import jax
-import termcolor
 import uvicorn
 from fastapi import FastAPI
 from fjformer import with_sharding_constraint, match_partition_rules, make_shard_and_gather_fns, get_dtype
 from jax import numpy as jnp
+
+from ...etils.etils import get_logger
 from ...modules.easydel_modelling_utils import EasyDelFlaxPretrainedModel
 from flax.core import FrozenDict
 from transformers import PreTrainedTokenizerBase, GenerationConfig
@@ -19,6 +19,8 @@ from jax.sharding import PartitionSpec, Mesh
 from jax.experimental.pjit import pjit
 from dataclasses import dataclass
 from .dantics import GenerateAPIRequest, ConversationItem
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -235,9 +237,10 @@ class EasyServe:
                 params=parameters,
                 generation_config=GenerationConfig(
                     max_new_tokens=serve_config.max_compile_tokens,
-                    eos_token_id=tokenizer.eos_token_id,
-                    pad_token_id=tokenizer.pad_token_id,
-                    bos_token_id=tokenizer.bos_token_id,
+
+                    eos_token_id=serve_config.eos_token_id or tokenizer.eos_token_id,
+                    pad_token_id=serve_config.pad_token_id or tokenizer.pad_token_id,
+                    bos_token_id=serve_config.bos_token_id or tokenizer.bos_token_id,
 
                     do_sample=False,
                     num_beams=1,
@@ -264,11 +267,12 @@ class EasyServe:
                 generation_config=GenerationConfig(
                     max_new_tokens=serve_config.max_compile_tokens,
 
-                    eos_token_id=tokenizer.eos_token_id,
-                    pad_token_id=tokenizer.pad_token_id,
-                    bos_token_id=tokenizer.bos_token_id,
+                    eos_token_id=serve_config.eos_token_id or tokenizer.eos_token_id,
+                    pad_token_id=serve_config.pad_token_id or tokenizer.pad_token_id,
+                    bos_token_id=serve_config.bos_token_id or tokenizer.bos_token_id,
 
                     temperature=serve_config.temperature,
+                    repetition_penalty=serve_config.repetition_penalty,
                     do_sample=True,
                     num_beams=1,
                     top_p=serve_config.top_p,
@@ -368,12 +372,10 @@ class EasyServe:
                 max_length=fixed_pad,
                 padding="max_length",
                 return_tensors="jax"
-            ) \
-                if self.serve_config.use_prefix_tokenizer else \
-                self.tokenizer(
-                    string,
-                    return_tensors="jax"
-                )
+            ) if self.serve_config.use_prefix_tokenizer else self.tokenizer(
+                string,
+                return_tensors="jax"
+            )
 
             input_ids = tokens.input_ids
             attention_mask = tokens.attention_mask
@@ -410,10 +412,14 @@ class EasyServe:
                 )
 
                 yield returns
+
+                if self.serve_config.use_mxn_break_point:
+                    if self.serve_config.max_compile_tokens != predicted_token.shape[-1]:
+                        break
                 if (
-                        predicted_token[0][-1] == self.tokenizer.eos_token_id
+                        predicted_token[0][-1] == (self.serve_config.eos_token_id or self.tokenizer.eos_token_id)
                         or
-                        predicted_token[0][-1] == self.prefix_tokenizer.eos_token_id
+                        predicted_token[0][-1] == (self.serve_config.eos_token_id or self.prefix_tokenizer.eos_token_id)
                 ):
                     break
 
@@ -431,17 +437,7 @@ class EasyServe:
         """
         if self.serve_config.use_prefix_tokenizer:
             if verbose:
-                termcolor.cprint(
-                    "Compiling Model Forwards Greedy/Non-Greedy(Generate)",
-                    color="cyan",
-                    force_color=True
-                )
-                termcolor.cprint(
-                    "Compiling Greedy Functions",
-                    color="cyan",
-                    force_color=True
-                )
-
+                logger.info("Compiling greedy generate function")
             response, tokens = [None] * 2
             for response, tokens in self.sample(
                     string="",
@@ -450,11 +446,7 @@ class EasyServe:
             ):
                 ...
             if verbose:
-                termcolor.cprint(
-                    "Compiling Non-Greedy(Generate) Functions",
-                    color="cyan",
-                    force_color=True
-                )
+                logger.info("Compiling non-greedy generate function")
             for response, tokens in self.sample(
                     string="",
                     max_new_tokens=self.serve_config.max_compile_tokens,
@@ -463,10 +455,9 @@ class EasyServe:
                 ...
 
         else:
-            termcolor.cprint(
+            logger.warning(
                 "Skip Compiling the compiling process is useless "
                 "when you are not using prefix tokenizer",
-                color="red", force_color=True
             )
         return True
 
@@ -484,8 +475,11 @@ class EasyServe:
         string = f"{self.__class__.__name__}(\n"
         for k, v in self.__dict__.items():
             if not k.startswith("_"):
-                repr_src = f"\t{k} : " + v.__str__().replace("\n", "\n\t") + "\n"
-                string += repr_src if len(repr_src) < 500 else f"\t{k} : " + f"{v.__class__.__name__}(...)" + "\n"
+                try:
+                    repr_src = f"\t{k} : " + v.__str__().replace("\n", "\n\t") + "\n"
+                    string += repr_src if len(repr_src) < 500 else f"\t{k} : " + f"{v.__class__.__name__}(...)" + "\n"
+                except TypeError:
+                    ...
         return string + ")"
 
     def __str__(self):

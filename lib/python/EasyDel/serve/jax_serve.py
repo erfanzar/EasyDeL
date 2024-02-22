@@ -1,18 +1,19 @@
 import copy
 import functools
 import os
-from typing import Sequence, Tuple, Optional, Mapping, Callable, Dict, Any
+from typing import Optional, Mapping, Callable, Dict, Any
 
 import flax.core
 import gradio as gr
 import jax
 import msgpack
-import termcolor
 import tqdm
 import transformers
 import uvicorn
 from fastapi import FastAPI
 from fjformer import make_shard_and_gather_fns, match_partition_rules, with_sharding_constraint
+
+from ..etils.etils import get_logger
 from ..smi import get_mem, initialise_tracking
 from jax import numpy as jnp
 from jax.experimental import mesh_utils
@@ -20,29 +21,26 @@ from flax.serialization import from_bytes
 from fjformer.checkpoint import get_dtype
 from jax.sharding import Mesh, PartitionSpec
 from transformers import GenerationConfig
-import logging
-from ..utils.utils import RNG, prefix_print
+from ..utils.utils import RNG
 import multiprocessing as mp
 from typing import Union, Sequence, List
 import chex
-from .utils import InstructRequest, ChatRequest, seafoam
+from .utils import InstructRequest, ChatRequest
 from jax.experimental.pjit import pjit
 from .gradio_user_interface_base import GradioUserInference
 from ..modules.auto_easydel_model import AutoEasyDelModelForCausalLM
 from dataclasses import dataclass
+import logging
+
+logger = get_logger(__name__)
 
 
 @dataclass
 class JAXServerConfig:
     """
-    It sets up the attributes of an instance of this class, which are:
-            host: str = &quot;0.0.0.0&quot;
-                The IP address to listen on for incoming requests from clients
-
     :param host: str: Set the host address of the server
     :param port: int: Specify the port number that the server will run on
     :param batch_size: int: Set the batch size of the model
-    :param contains_auto_format: bool: Determine whether the input text contains auto-formatting
     :param max_sequence_length: int: Set the maximum length of the text that can be generated
     :param max_new_tokens: int: Determine how many tokens can be added to the vocabulary
     :param max_compile_tokens: int: Set the maximum number of tokens that can be streamed at a time
@@ -52,43 +50,85 @@ class JAXServerConfig:
     :param top_k: int: Limit the number of tokens that can be generated
     :param logging: bool: Print out the progress of the server
     :param mesh_axes_names: Sequence[str]: Specify the names of the axes in the mesh tensor
-    :param &quot;mp&quot;): Define the mesh_axes_names
     :param mesh_axes_shape: Sequence[int]: Specify the shape of the mesh
     :param dtype: str: Specify the data type of the model
     :param stream_tokens_for_gradio: bool: Determine whether the stream tokens
     :param use_prefix_tokenizer: bool: Determine if the tokenizer should be used to generate tokens
     :param pre_compile: bool: Pre-compile the model
-    :return: Nothing
-
     """
     host: str = "0.0.0.0"
     port: int = 2059
     batch_size: int = 1
-    contains_auto_format: bool = True
+
     max_sequence_length: int = 4096
     max_new_tokens: int = 4096
     max_compile_tokens: int = 64
     temperature: float = 0.1
     top_p: float = 0.95
     top_k: int = 50
+    repetition_penalty: float = 1.2
+
+    eos_token_id: Optional[int] = None
+    pad_token_id: Optional[int] = None
+    bos_token_id: Optional[int] = None
+
     logging: bool = True
+
     mesh_axes_names: Sequence[str] = ("dp", "fsdp", "tp", "sp")
     mesh_axes_shape: Sequence[int] = (1, -1, 1, 1)
     generation_ps: PartitionSpec = PartitionSpec("dp", "fsdp")
+
     dtype: str = "fp16"
+
     stream_tokens_for_gradio: bool = True
     use_prefix_tokenizer: bool = True
     pre_compile: bool = True
+
+    use_mxn_break_point: bool = True
 
     def __post_init__(self):
         assert self.max_new_tokens % self.max_compile_tokens == 0, (
             f"max_new_tokens should be divisible by max_compile_tokens  {self.max_new_tokens % self.max_compile_tokens}"
         )
 
+    def __repr__(self):
+
+        """
+        The __repr__ function is used to generate a string representation of an object.
+        This function should return a string that can be parsed by the Python interpreter
+        to recreate the object. The __repr__ function is called when you use print() on an
+        object, or when you type its name in the REPL.
+
+        :param self: Refer to the instance of the class
+        :return: A string representation of the object
+        """
+        string = f"{self.__class__.__name__}(\n"
+        for k, v in self.__dict__.items():
+            if not k.startswith("_"):
+
+                try:
+                    repr_src = f"\t{k} : " + v.__str__().replace("\n", "\n\t") + "\n"
+                    string += repr_src if len(repr_src) < 500 else f"\t{k} : " + f"{v.__class__.__name__}(...)" + "\n"
+                except TypeError:
+                    ...
+
+        return string + ")"
+
+    def __str__(self):
+
+        """
+        The __str__ function is called when you use the print function or when str() is used.
+        It should return a string representation of the object.
+
+        :param self: Refer to the instance of the class
+        :return: The object's string representation
+        """
+        return self.__repr__()
+
 
 class JAXServer(GradioUserInference):
 
-    def __init__(self, config=None):
+    def __init__(self, server_config=None):
 
         """
         The __init__ function is called when the class is instantiated.
@@ -96,7 +136,7 @@ class JAXServer(GradioUserInference):
 
 
         :param self: Refer to the current instance of a class
-        :param config: Pass the JAXServerConfig object
+        :param server_config: Pass the JAXServerConfig object
         :return: A fastapi object
         
         """
@@ -110,18 +150,19 @@ class JAXServer(GradioUserInference):
             self.generate_function,
             self.greedy_generate_function
         ) = [None] * 8
-        assert config is None or isinstance(config, JAXServerConfig), "config can be None or JAXServerConfig Type"
-        if config is None:
-            config = JAXServerConfig()
+        assert server_config is None or isinstance(server_config,
+                                                   JAXServerConfig), "server_config can be None or JAXServerConfig Type"
+        if server_config is None:
+            server_config = JAXServerConfig()
 
-        self.config = config
+        self.server_config = server_config
         self._funcs_generated = False
         self.number_of_served_request_until_last_up_time = 0
 
         self.rng_generator = RNG(42)
         initialise_tracking(0.5)
-        array = jnp.ones((len(jax.devices()), 1)).reshape(self.config.mesh_axes_shape)
-        self.mesh = Mesh(mesh_utils.create_device_mesh(array.shape), self.config.mesh_axes_names)
+        array = jnp.ones((len(jax.devices()), 1)).reshape(self.server_config.mesh_axes_shape)
+        self.mesh = Mesh(mesh_utils.create_device_mesh(array.shape), self.server_config.mesh_axes_names)
 
         self.app = FastAPI()
         self.app.post("/chat")(self.forward_chat)
@@ -132,7 +173,7 @@ class JAXServer(GradioUserInference):
     def status(self):
         """
         The status function returns a dictionary with the following keys:
-            config: A dictionary containing all the configuration parameters for this server.
+            server_config: A dictionary containing all the configuration parameters for this server.
             devices: A string describing which devices are available to JAX.
             number_of_backends: The number of backends available to JAX.  This is usually equal to the number of GPUs
             on your machine, but can be less if you have not installed CUDA or if you have disabled some GPUs in your
@@ -144,7 +185,7 @@ class JAXServer(GradioUserInference):
         
         """
         return {
-            "config": {k: v for k, v in self.config.__dict__.items()},
+            "server_config": {k: v for k, v in self.server_config.__dict__.items()},
             "devices": f"{jax.devices()}",
             "number_of_backends": len(jax.devices()),
             "status": "Ready",
@@ -189,10 +230,10 @@ class JAXServer(GradioUserInference):
             tokenizer.truncation_side = "right"
             self.tokenizer = copy.deepcopy(tokenizer)
         except:
-            prefix_print(
-                "Warning", f"The class Model of Tokenizer {type(tokenizer)} do not support deepcopy option "
+            logger.warning(
+                f"The class Model of Tokenizer {type(tokenizer)} do not support deepcopy option "
             )
-            if self.config.use_prefix_tokenizer:
+            if self.server_config.use_prefix_tokenizer:
                 tokenizer.padding_side = "left"
                 tokenizer.truncation_side = "left"
             else:
@@ -206,17 +247,18 @@ class JAXServer(GradioUserInference):
             out_shardings=(PartitionSpec())
         )
         def greedy_generate(parameters, input_ids, attention_mask):
-            input_ids = with_sharding_constraint(input_ids, self.config.generation_ps)
-            attention_mask = with_sharding_constraint(attention_mask, self.config.generation_ps)
+            input_ids = with_sharding_constraint(input_ids, self.server_config.generation_ps)
+            attention_mask = with_sharding_constraint(attention_mask, self.server_config.generation_ps)
             predict = model.generate(
                 input_ids,
                 attention_mask=attention_mask,
                 params=parameters,
                 generation_config=GenerationConfig(
-                    max_new_tokens=self.config.max_compile_tokens,
-                    eos_token_id=tokenizer.eos_token_id,
-                    pad_token_id=tokenizer.pad_token_id,
-                    bos_token_id=tokenizer.bos_token_id,
+                    max_new_tokens=self.server_config.max_compile_tokens,
+
+                    eos_token_id=self.server_config.eos_token_id or tokenizer.eos_token_id,
+                    pad_token_id=self.server_config.pad_token_id or tokenizer.pad_token_id,
+                    bos_token_id=self.server_config.bos_token_id or tokenizer.bos_token_id,
 
                     do_sample=False,
                     num_beams=1,
@@ -230,24 +272,25 @@ class JAXServer(GradioUserInference):
             out_shardings=(PartitionSpec())
         )
         def generate(parameters, input_ids, attention_mask):
-            input_ids = with_sharding_constraint(input_ids, self.config.generation_ps)
-            attention_mask = with_sharding_constraint(attention_mask, self.config.generation_ps)
+            input_ids = with_sharding_constraint(input_ids, self.server_config.generation_ps)
+            attention_mask = with_sharding_constraint(attention_mask, self.server_config.generation_ps)
             predict = model.generate(
                 input_ids,
                 attention_mask=attention_mask,
                 params=parameters,
                 generation_config=GenerationConfig(
-                    max_new_tokens=self.config.max_compile_tokens,
+                    max_new_tokens=self.server_config.max_compile_tokens,
 
-                    eos_token_id=tokenizer.eos_token_id,
-                    pad_token_id=tokenizer.pad_token_id,
-                    bos_token_id=tokenizer.bos_token_id,
+                    eos_token_id=self.server_config.eos_token_id or tokenizer.eos_token_id,
+                    pad_token_id=self.server_config.pad_token_id or tokenizer.pad_token_id,
+                    bos_token_id=self.server_config.bos_token_id or tokenizer.bos_token_id,
 
-                    temperature=self.config.temperature,
+                    temperature=self.server_config.temperature,
                     do_sample=True,
                     num_beams=1,
-                    top_p=self.config.top_p,
-                    top_k=self.config.top_k,
+                    top_p=self.server_config.top_p,
+                    top_k=self.server_config.top_k,
+                    repetition_penalty=self.server_config.repetition_penalty
                 )
             ).sequences[:, input_ids.shape[1]:]
             return predict
@@ -307,7 +350,7 @@ class JAXServer(GradioUserInference):
             config_model: transformers.PretrainedConfig,
             tokenizer: transformers.PreTrainedTokenizer,
             path: Union[str, os.PathLike],
-            config=None,
+            server_config=None,
             add_params_field: bool = True,
             init_shape: tuple = (1, 1),
             do_memory_log: bool = False,
@@ -321,7 +364,7 @@ class JAXServer(GradioUserInference):
         :param config_model: transformers.PretrainedConfig: Get the partition rules
         :param tokenizer: transformers.PreTrainedTokenizer: Load the tokenizer from the model
         :param path: Union[str, os.PathLike]: Specify the path to the checkpoint file
-        :param config: Configure the server
+        :param server_config: Configure the server
         :param add_params_field: bool: Add a params field to the server
         :param init_shape: tuple: Specify the shape of the input to be used for generating shard_fns
         :param do_memory_log: bool: Log the memory usage of the server
@@ -333,7 +376,7 @@ class JAXServer(GradioUserInference):
                        "init_weights"), "model must contain init_weights func in order to init params for shard_fns"
         assert hasattr(config_model,
                        "get_partition_rules"), "config_model must contain get_partition_rules functions"
-        server = cls(config=config)
+        server = cls(server_config=server_config)
         logging.info(
             "running _init() func in order to make shard_fns"
         )
@@ -348,7 +391,7 @@ class JAXServer(GradioUserInference):
         rules = match_partition_rules(params=shape, rules=config_model.get_partition_rules(True))
 
         with server.mesh:
-            shard_fns, _ = make_shard_and_gather_fns(rules, get_dtype(server.config.dtype))
+            shard_fns, _ = make_shard_and_gather_fns(rules, get_dtype(server.server_config.dtype))
             logging.info(
                 "loading checkpoints"
             )
@@ -375,7 +418,7 @@ class JAXServer(GradioUserInference):
         )
         server.configure_generate_functions(model, tokenizer)
 
-        if server.config.pre_compile:
+        if server.server_config.pre_compile:
             server.compile(verbose=verbose)
         return server
 
@@ -432,7 +475,7 @@ class JAXServer(GradioUserInference):
             config_model=model.config,
             tokenizer=transformers.AutoTokenizer.from_pretrained(pretrained_model_name_or_path),
             params=params,
-            config=server_config,
+            server_config=server_config,
             verbose=verbose,
             do_memory_log=do_memory_log,
             add_params_field=add_params_field
@@ -445,7 +488,7 @@ class JAXServer(GradioUserInference):
             config_model: transformers.PretrainedConfig,
             tokenizer: transformers.PreTrainedTokenizer,
             params: Dict,
-            config: JAXServerConfig = None,
+            server_config: JAXServerConfig = None,
             add_params_field: bool = True,
             do_memory_log: bool = False,
             verbose: bool = True
@@ -465,7 +508,7 @@ class JAXServer(GradioUserInference):
         :param config_model: transformers.PretrainedConfig: Get the partition rules
         :param tokenizer: transformers.PreTrainedTokenizer: Tokenize the input text
         :param params: Dict: Pass in the parameters of the model
-        :param config: Pass in the config file for the server
+        :param server_config: Pass in the server_config file for the server
         :param add_params_field: bool: Add a params field to the server
         :param do_memory_log: bool: Log the memory usage of the server
         :param verbose: bool: Print out the status of the compilation
@@ -478,14 +521,14 @@ class JAXServer(GradioUserInference):
         assert hasattr(config_model, "get_partition_rules"), (
             "config_model must contain get_partition_rules functions"
         )
-        server = cls(config=config)
+        server = cls(server_config=server_config)
 
         with server.mesh:
             logging.info(
                 "matching partition rules"
             )
             partition_specs = match_partition_rules(params=params, rules=config_model.get_partition_rules(True))
-            shard_fns, _ = make_shard_and_gather_fns(partition_specs, get_dtype(server.config.dtype))
+            shard_fns, _ = make_shard_and_gather_fns(partition_specs, get_dtype(server.server_config.dtype))
             logging.info(
                 "sharding parameters across all of the chosen backend(tpu/gpu/cpu)s"
             )
@@ -505,7 +548,7 @@ class JAXServer(GradioUserInference):
             "configuring generate functions for the server"
         )
         server.configure_generate_functions(model, tokenizer)
-        if server.config.pre_compile:
+        if server.server_config.pre_compile:
             server.compile(verbose=verbose)
         return server
 
@@ -523,44 +566,30 @@ class JAXServer(GradioUserInference):
         """
         assert self._funcs_generated, "funcs are not generated yet"
         assert self.partition_specs is not None, "rules should not be None"
-        if self.config.use_prefix_tokenizer:
+        if self.server_config.use_prefix_tokenizer:
             if verbose:
-                termcolor.cprint(
-                    "Compiling Model Forwards Greedy/Non-Greedy(Generate)",
-                    color="cyan",
-                    force_color=True
-                )
-                termcolor.cprint(
-                    "Compiling Greedy Functions",
-                    color="cyan",
-                    force_color=True
-                )
+                logger.info("Compiling greedy generate function")
 
             r, a = [None] * 2
-            for r, a in self.process(
+            for r, a in self.sample(
                     string="",
-                    max_new_tokens=self.config.max_compile_tokens,
+                    max_new_tokens=self.server_config.max_compile_tokens,
                     greedy=True
             ):
                 ...
             if verbose:
-                termcolor.cprint(
-                    "Compiling Non-Greedy(Generate) Functions",
-                    color="cyan",
-                    force_color=True
-                )
-            for r, a in self.process(
+                logger.info("Compiling non-greedy generate function")
+            for r, a in self.sample(
                     string="",
-                    max_new_tokens=self.config.max_compile_tokens,
+                    max_new_tokens=self.server_config.max_compile_tokens,
                     greedy=False
             ):
                 ...
 
         else:
-            termcolor.cprint(
+            logger.warning(
                 "Skip Compiling the compiling process is useless "
                 "when you are not using prefix tokenizer",
-                color="red", force_color=True
             )
         return True
 
@@ -612,7 +641,7 @@ class JAXServer(GradioUserInference):
             "the parameters will be sharded and ba saved inside server you can access them by ``JAXServer.params``")
         rules = match_partition_rules(params=params, rules=partition_rules)
         self.partition_specs = rules
-        shard_fns, _ = make_shard_and_gather_fns(rules, get_dtype(self.config.dtype))
+        shard_fns, _ = make_shard_and_gather_fns(rules, get_dtype(self.server_config.dtype))
 
         with self.mesh:
             self.params = jax.tree_map(
@@ -629,7 +658,8 @@ class JAXServer(GradioUserInference):
         The prompt is the user"s input to be processed by the chatbot, while history
         is an array of previous inputs and outputs from both sides (user and bot).
         The forward_chat function then formats these inputs into one string that can be processed by our model.
-        This formatted string is then passed through our process() method, which returns an output response as well as how many tokens were used to generate it.
+        This formatted string is then passed through our sample() method, which returns an output response as well as
+        how many tokens were used to generate it.
 
         :param self: Access the attributes and methods of the class
         :param data: ChatRequest: Pass in the data from the request
@@ -648,7 +678,7 @@ class JAXServer(GradioUserInference):
         )
 
         response, used_tokens = [None] * 2
-        for response, used_tokens in self.process(
+        for response, used_tokens in self.sample(
                 string=string,
                 greedy=data.greedy,
                 max_new_tokens=None
@@ -679,9 +709,9 @@ class JAXServer(GradioUserInference):
         """
         The forward_instruct function is the main function of this class.
         It takes in a InstructRequest object, which contains the system and instruction to be processed.
-        The function then formats the input string using format_instruct, and passes it into process().
-        process() returns a tuple containing (response, used_tokens). The response is returned as part of
-        the response dictionary. If no valid responses are found by process(), None will be returned instead.
+        The function then formats the input string using format_instruct, and passes it into sample().
+        sample() returns a tuple containing (response, used_tokens). The response is returned as part of
+        the response dictionary. If no valid responses are found by sample(), None will be returned instead.
 
         :param self: Bind the method to the object
         :param data: InstructRequest: Pass the system and instruction to the function
@@ -698,7 +728,7 @@ class JAXServer(GradioUserInference):
             system=data.system,
             instruction=data.instruction
         )
-        for response, used_tokens in self.process(
+        for response, used_tokens in self.sample(
                 string=string,
                 greedy=data.greedy,
                 max_new_tokens=None
@@ -753,7 +783,7 @@ class JAXServer(GradioUserInference):
         )
         return self.forward_chat(data)
 
-    def process_gradio(
+    def sample_gradio(
             self,
             prompt: str,
             history: List[List[str]],
@@ -765,7 +795,8 @@ class JAXServer(GradioUserInference):
             greedy: bool,
             temperature: float,
             top_p: float,
-            top_k: int
+            top_k: int,
+            repetition_penalty: float
     ):
         if mode.lower() == "chat":
             string = self.format_chat(
@@ -780,10 +811,10 @@ class JAXServer(GradioUserInference):
                 instruction=prompt
             )
         else:
-            raise ValueError("UnKnown Mode for process_gradio available modes are only Chat or Instruct")
+            raise ValueError("UnKnown Mode for sample_gradio available modes are only Chat or Instruct")
         history.append([prompt, ""])
         responses = ""
-        for response, _ in self.process(
+        for response, _ in self.sample(
                 string=string,
                 greedy=greedy,
                 max_new_tokens=max_new_tokens,
@@ -792,16 +823,16 @@ class JAXServer(GradioUserInference):
             history[-1][-1] = responses
             yield "", history
 
-    def process(self,
-                string: str,
-                *,
-                greedy: bool = False,
-                max_new_tokens: int = None,
-                **kwargs
-                ):
+    def sample(self,
+               string: str,
+               *,
+               greedy: bool = False,
+               max_new_tokens: int = None,
+               **kwargs
+               ):
         """
-        The process function is the main function of a model. It takes in an input string and returns a list of strings
-        that are generated from that input string. The process function can be called multiple times with different inputs,
+        The sample function is the main function of a model. It takes in an input string and returns a list of strings
+        that are generated from that input string. The sample function can be called multiple times with different inputs,
         and each time it will return a new set of outputs based on those inputs.
 
         :param self: Access the class attributes
@@ -809,29 +840,27 @@ class JAXServer(GradioUserInference):
         :param *: Pass a variable number of arguments to a function
         :param greedy: bool: Determine whether to use the greedy or non-greedy version of the generate function
         :param max_new_tokens: int: Set the number of tokens to generate
-        :param kwargs: Pass any additional parameters to the process function
+        :param kwargs: Pass any additional parameters to the sample function
         :return: A generator that yields the predicted text and the number of tokens generated
         
         """
 
-        fixed_pad = self.config.max_sequence_length - self.config.max_compile_tokens
+        fixed_pad = self.server_config.max_sequence_length - self.server_config.max_compile_tokens
         tokens = self.prefix_tokenizer(
             string,
             max_length=fixed_pad,
             padding="max_length",
             return_tensors="jax"
-        ) \
-            if self.config.use_prefix_tokenizer else \
-            self.tokenizer(
-                string,
-                return_tensors="jax"
-            )
+        ) if self.server_config.use_prefix_tokenizer else self.tokenizer(
+            string,
+            return_tensors="jax"
+        )
 
         input_ids = tokens.input_ids
         attention_mask = tokens.attention_mask
         num_generated_tokens = 0
 
-        for _ in range((max_new_tokens or self.config.max_new_tokens) // self.config.max_compile_tokens):
+        for _ in range((max_new_tokens or self.server_config.max_new_tokens) // self.server_config.max_compile_tokens):
             inputs_to_gen = dict(
                 params=self.params,
                 input_ids=input_ids,
@@ -840,7 +869,7 @@ class JAXServer(GradioUserInference):
             predicted_token = self.greedy_generate(**inputs_to_gen) if greedy else self.generate(**inputs_to_gen)
 
             num_generated_tokens += predicted_token.shape[-1]
-            plus_attn_mask = jnp.ones((len(attention_mask), self.config.max_compile_tokens), dtype=jnp.int32)
+            plus_attn_mask = jnp.ones((len(attention_mask), self.server_config.max_compile_tokens), dtype=jnp.int32)
 
             input_ids = jnp.concatenate(
                 (input_ids, predicted_token), axis=-1
@@ -857,10 +886,15 @@ class JAXServer(GradioUserInference):
             )
 
             yield returns
+
+            if self.server_config.use_mxn_break_point:
+                if predicted_token.shape[-1] != self.server_config.max_compile_tokens:
+                    break
+
             if (
-                    predicted_token[0][-1] == self.tokenizer.eos_token_id
+                    predicted_token[0][-1] == (self.server_config.eos_token_id or self.tokenizer.eos_token_id)
                     or
-                    predicted_token[0][-1] == self.prefix_tokenizer.eos_token_id
+                    predicted_token[0][-1] == (self.server_config.eos_token_id or self.prefix_tokenizer.eos_token_id)
             ):
                 break
 
@@ -880,7 +914,7 @@ class JAXServer(GradioUserInference):
                                       "with using ``configure_generate_functions``"
 
         def run():
-            uvicorn.run(self.app, host=self.config.host, port=self.config.port)
+            uvicorn.run(self.app, host=self.server_config.host, port=self.server_config.port)
 
         self.process_uvicorn = mp.Process(target=run)
         self.process_uvicorn.start()
@@ -901,8 +935,8 @@ class JAXServer(GradioUserInference):
 
     def gradio_inference(self):
         return self.build_inference(
-            sample_func=self.process_gradio,
-            max_sequence_length=self.config.max_sequence_length,
-            max_new_tokens=self.config.max_new_tokens,
-            max_compile_tokens=self.config.max_compile_tokens,
+            sample_func=self.sample_gradio,
+            max_sequence_length=self.server_config.max_sequence_length,
+            max_new_tokens=self.server_config.max_new_tokens,
+            max_compile_tokens=self.server_config.max_compile_tokens,
         )

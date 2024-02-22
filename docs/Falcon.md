@@ -98,7 +98,7 @@ server = FalconJaxServer.from_parameters(
   tokenizer=AutoTokenizer.from_pretrained('tiiuae/falcon-7b'),
   verbose=False,
   do_memory_log=True,
-  config=JAXServerConfig()
+  server_config=JAXServerConfig()
 )
 
 server.fire()  # Launch FastAPI functions
