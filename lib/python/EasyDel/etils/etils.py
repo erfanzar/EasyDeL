@@ -75,15 +75,19 @@ def get_logger(name, level: int = logging.INFO) -> logging.Logger:
     :param level: int: The logging level. Defaults to logging.INFO.
     :return logging.Logger: The configured logger instance.
     """
-    logging.basicConfig(
-        format="%(asctime)s %(levelname)-8s [%(name)s] %(message)s",
-        level=level,
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
     logger = logging.getLogger(name)
+    logger.propagate = False
+
+    # Set the logging level
     logger.setLevel(level)
 
+    # Create a console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(level)
+
+    formatter = logging.Formatter("%(asctime)s %(levelname)-8s [%(name)s] %(message)s")
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
     return logger
 
 
