@@ -170,7 +170,7 @@ class PyTorchServer(GradioUserInference):
             system=data.system,
             instruction=data.instruction
         )
-        response = self.process(
+        response = self.sample(
             string=string,
             max_sequence_length=self.config.max_sequence_length,
             temperature=data.temperature,
@@ -197,7 +197,7 @@ class PyTorchServer(GradioUserInference):
             history=data.history,
             prompt=data.prompt,
         )
-        response = self.process(
+        response = self.sample(
             string=string,
             max_sequence_length=self.config.max_sequence_length,
             temperature=data.temperature,
@@ -240,7 +240,7 @@ class PyTorchServer(GradioUserInference):
         """
         raise NotImplementedError()
 
-    def process(
+    def sample(
             self,
             string: str,
             max_new_tokens: int = None,
@@ -252,7 +252,7 @@ class PyTorchServer(GradioUserInference):
             sample: bool = True
     ):
         """
-        The process function is the main function of this class. It takes a string as input and returns a generator that yields strings.
+        The sample function is the main function of this class. It takes a string as input and returns a generator that yields strings.
 
         :param self: Represent the instance of the class
         :param string: str: Pass the string to be generated
@@ -353,7 +353,7 @@ class PyTorchServer(GradioUserInference):
         self.model = model
         self.tokenizer = tokenizer
 
-    def process_gradio(
+    def sample_gradio(
             self,
             prompt: str,
             history: List[List[str]],
@@ -381,10 +381,10 @@ class PyTorchServer(GradioUserInference):
                 instruction=prompt
             )
         else:
-            raise ValueError("UnKnown Mode for process_gradio available modes are only Chat or Instruct")
+            raise ValueError("UnKnown Mode for sample_gradio available modes are only Chat or Instruct")
         history.append([prompt, ""])
         responses = ""
-        for response in self.process(
+        for response in self.sample(
                 string=string,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,

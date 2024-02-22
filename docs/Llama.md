@@ -95,7 +95,7 @@ DEFAULT_SYSTEM_PROMPT = "You are a helpful, respectful and honest assistant and 
 
 
 class Llama2JaxServer(JAXServer):
-    def process_gradio_chat(self, prompt, history, max_new_tokens, system, greedy):
+    def sample_gradio_chat(self, prompt, history, max_new_tokens, system, greedy):
 
         system = None if system == "" else system
         string = self.prompt_llama2_model(
@@ -105,7 +105,7 @@ class Llama2JaxServer(JAXServer):
         )
         if not self.config.stream_tokens_for_gradio:
             response = ""
-            for response, _ in self.process(
+            for response, _ in self.sample(
                     string=string,
                     greedy=greedy,
                     max_new_tokens=max_new_tokens,
@@ -114,7 +114,7 @@ class Llama2JaxServer(JAXServer):
             history.append([prompt, response])
         else:
             history.append([prompt, ""])
-            for response, _ in self.process(
+            for response, _ in self.sample(
                     string=string,
                     greedy=greedy,
                     max_new_tokens=max_new_tokens
@@ -124,11 +124,11 @@ class Llama2JaxServer(JAXServer):
 
         return "", history
 
-    def process_gradio_instruct(self, prompt, system, max_new_tokens, greedy):
+    def sample_gradio_instruct(self, prompt, system, max_new_tokens, greedy):
         string = self.prompt_llama2_model(system_prompt=DEFAULT_SYSTEM_PROMPT, message=prompt, chat_history=[])
         if not self.config.stream_tokens_for_gradio:
             response = ""
-            for response, _ in self.process(
+            for response, _ in self.sample(
                     string=string,
                     greedy=greedy,
                     max_new_tokens=max_new_tokens,
@@ -136,7 +136,7 @@ class Llama2JaxServer(JAXServer):
                 pass
         else:
             response = ""
-            for response, _ in self.process(
+            for response, _ in self.sample(
                     string=string,
                     greedy=greedy,
                     max_new_tokens=max_new_tokens,

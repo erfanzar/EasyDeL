@@ -1,18 +1,19 @@
 import copy
 import functools
 import os
-from typing import Sequence, Tuple, Optional, Mapping, Callable, Dict, Any
+from typing import Optional, Mapping, Callable, Dict, Any
 
 import flax.core
 import gradio as gr
 import jax
 import msgpack
-import termcolor
 import tqdm
 import transformers
 import uvicorn
 from fastapi import FastAPI
 from fjformer import make_shard_and_gather_fns, match_partition_rules, with_sharding_constraint
+
+from ..etils.etils import get_logger
 from ..smi import get_mem, initialise_tracking
 from jax import numpy as jnp
 from jax.experimental import mesh_utils
@@ -20,25 +21,23 @@ from flax.serialization import from_bytes
 from fjformer.checkpoint import get_dtype
 from jax.sharding import Mesh, PartitionSpec
 from transformers import GenerationConfig
-import logging
-from ..utils.utils import RNG, prefix_print
+from ..utils.utils import RNG
 import multiprocessing as mp
 from typing import Union, Sequence, List
 import chex
-from .utils import InstructRequest, ChatRequest, seafoam
+from .utils import InstructRequest, ChatRequest
 from jax.experimental.pjit import pjit
 from .gradio_user_interface_base import GradioUserInference
 from ..modules.auto_easydel_model import AutoEasyDelModelForCausalLM
 from dataclasses import dataclass
+import logging
+
+logger = get_logger(__name__)
 
 
 @dataclass
 class JAXServerConfig:
     """
-    It sets up the attributes of an instance of this class, which are:
-            host: str = &quot;0.0.0.0&quot;
-                The IP address to listen on for incoming requests from clients
-
     :param host: str: Set the host address of the server
     :param port: int: Specify the port number that the server will run on
     :param batch_size: int: Set the batch size of the model
@@ -52,14 +51,11 @@ class JAXServerConfig:
     :param top_k: int: Limit the number of tokens that can be generated
     :param logging: bool: Print out the progress of the server
     :param mesh_axes_names: Sequence[str]: Specify the names of the axes in the mesh tensor
-    :param &quot;mp&quot;): Define the mesh_axes_names
     :param mesh_axes_shape: Sequence[int]: Specify the shape of the mesh
     :param dtype: str: Specify the data type of the model
     :param stream_tokens_for_gradio: bool: Determine whether the stream tokens
     :param use_prefix_tokenizer: bool: Determine if the tokenizer should be used to generate tokens
     :param pre_compile: bool: Pre-compile the model
-    :return: Nothing
-
     """
     host: str = "0.0.0.0"
     port: int = 2059
@@ -71,6 +67,9 @@ class JAXServerConfig:
     temperature: float = 0.1
     top_p: float = 0.95
     top_k: int = 50
+    eos_token_id: Optional[int] = None
+    pad_token_id: Optional[int] = None
+    bos_token_id: Optional[int] = None
     logging: bool = True
     mesh_axes_names: Sequence[str] = ("dp", "fsdp", "tp", "sp")
     mesh_axes_shape: Sequence[int] = (1, -1, 1, 1)
@@ -189,8 +188,8 @@ class JAXServer(GradioUserInference):
             tokenizer.truncation_side = "right"
             self.tokenizer = copy.deepcopy(tokenizer)
         except:
-            prefix_print(
-                "Warning", f"The class Model of Tokenizer {type(tokenizer)} do not support deepcopy option "
+            logger.warning(
+                f"The class Model of Tokenizer {type(tokenizer)} do not support deepcopy option "
             )
             if self.config.use_prefix_tokenizer:
                 tokenizer.padding_side = "left"
@@ -214,9 +213,10 @@ class JAXServer(GradioUserInference):
                 params=parameters,
                 generation_config=GenerationConfig(
                     max_new_tokens=self.config.max_compile_tokens,
-                    eos_token_id=tokenizer.eos_token_id,
-                    pad_token_id=tokenizer.pad_token_id,
-                    bos_token_id=tokenizer.bos_token_id,
+
+                    eos_token_id=self.config.eos_token_id or tokenizer.eos_token_id,
+                    pad_token_id=self.config.pad_token_id or tokenizer.pad_token_id,
+                    bos_token_id=self.config.bos_token_id or tokenizer.bos_token_id,
 
                     do_sample=False,
                     num_beams=1,
@@ -239,9 +239,9 @@ class JAXServer(GradioUserInference):
                 generation_config=GenerationConfig(
                     max_new_tokens=self.config.max_compile_tokens,
 
-                    eos_token_id=tokenizer.eos_token_id,
-                    pad_token_id=tokenizer.pad_token_id,
-                    bos_token_id=tokenizer.bos_token_id,
+                    eos_token_id=self.config.eos_token_id or tokenizer.eos_token_id,
+                    pad_token_id=self.config.pad_token_id or tokenizer.pad_token_id,
+                    bos_token_id=self.config.bos_token_id or tokenizer.bos_token_id,
 
                     temperature=self.config.temperature,
                     do_sample=True,
@@ -525,16 +525,7 @@ class JAXServer(GradioUserInference):
         assert self.partition_specs is not None, "rules should not be None"
         if self.config.use_prefix_tokenizer:
             if verbose:
-                termcolor.cprint(
-                    "Compiling Model Forwards Greedy/Non-Greedy(Generate)",
-                    color="cyan",
-                    force_color=True
-                )
-                termcolor.cprint(
-                    "Compiling Greedy Functions",
-                    color="cyan",
-                    force_color=True
-                )
+                logger.info("Compiling greedy generate function")
 
             r, a = [None] * 2
             for r, a in self.process(
@@ -544,11 +535,7 @@ class JAXServer(GradioUserInference):
             ):
                 ...
             if verbose:
-                termcolor.cprint(
-                    "Compiling Non-Greedy(Generate) Functions",
-                    color="cyan",
-                    force_color=True
-                )
+                logger.info("Compiling non-greedy generate function")
             for r, a in self.process(
                     string="",
                     max_new_tokens=self.config.max_compile_tokens,
@@ -557,10 +544,9 @@ class JAXServer(GradioUserInference):
                 ...
 
         else:
-            termcolor.cprint(
+            logger.warning(
                 "Skip Compiling the compiling process is useless "
                 "when you are not using prefix tokenizer",
-                color="red", force_color=True
             )
         return True
 

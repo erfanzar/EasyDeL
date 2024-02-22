@@ -143,7 +143,7 @@ class GradioUserInference:
             cancels=[txt_event, sub_event]
         )
 
-    def process_gradio(
+    def sample_gradio(
             self,
             prompt: str,
             history: List[List[str]],
