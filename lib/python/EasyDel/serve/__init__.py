@@ -1,5 +1,5 @@
 from .jax_serve import JAXServer, JAXServerConfig
-from .torch_serve import PyTorchServer, PytorchServerConfig
+from .torch_serve import PyTorchServer, PyTorchServerConfig
 from .utils import ChatRequest, InstructRequest
 from .gradio_user_interface_base import GradioUserInference
 
@@ -19,5 +19,5 @@ __all__ = (
     "GenerateAPIRequest", "ConversationItem", "ModelOutput",
     "BaseModel", "EasyClient", "GradioUserInference",
     "ChatRequest", "InstructRequest", "PyTorchServer",
-    "PytorchServerConfig", "JAXServer", "JAXServerConfig"
+    "PyTorchServerConfig", "JAXServer", "JAXServerConfig"
 )

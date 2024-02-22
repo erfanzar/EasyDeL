@@ -155,7 +155,8 @@ class GradioUserInference:
             greedy: bool,
             temperature: float,
             top_p: float,
-            top_k: int
+            top_k: int,
+            repetition_penalty: float
     ):
         raise NotImplementedError()
 

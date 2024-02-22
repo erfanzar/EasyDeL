@@ -41,7 +41,6 @@ class JAXServerConfig:
     :param host: str: Set the host address of the server
     :param port: int: Specify the port number that the server will run on
     :param batch_size: int: Set the batch size of the model
-    :param contains_auto_format: bool: Determine whether the input text contains auto-formatting
     :param max_sequence_length: int: Set the maximum length of the text that can be generated
     :param max_new_tokens: int: Determine how many tokens can be added to the vocabulary
     :param max_compile_tokens: int: Set the maximum number of tokens that can be streamed at a time
@@ -61,14 +60,13 @@ class JAXServerConfig:
     port: int = 2059
     batch_size: int = 1
 
-    contains_auto_format: bool = True
-
     max_sequence_length: int = 4096
     max_new_tokens: int = 4096
     max_compile_tokens: int = 64
     temperature: float = 0.1
     top_p: float = 0.95
     top_k: int = 50
+    repetition_penalty: float = 1.2
 
     eos_token_id: Optional[int] = None
     pad_token_id: Optional[int] = None
@@ -152,7 +150,8 @@ class JAXServer(GradioUserInference):
             self.generate_function,
             self.greedy_generate_function
         ) = [None] * 8
-        assert server_config is None or isinstance(server_config, JAXServerConfig), "server_config can be None or JAXServerConfig Type"
+        assert server_config is None or isinstance(server_config,
+                                                   JAXServerConfig), "server_config can be None or JAXServerConfig Type"
         if server_config is None:
             server_config = JAXServerConfig()
 
@@ -291,6 +290,7 @@ class JAXServer(GradioUserInference):
                     num_beams=1,
                     top_p=self.server_config.top_p,
                     top_k=self.server_config.top_k,
+                    repetition_penalty=self.server_config.repetition_penalty
                 )
             ).sequences[:, input_ids.shape[1]:]
             return predict
@@ -795,7 +795,8 @@ class JAXServer(GradioUserInference):
             greedy: bool,
             temperature: float,
             top_p: float,
-            top_k: int
+            top_k: int,
+            repetition_penalty: float
     ):
         if mode.lower() == "chat":
             string = self.format_chat(
