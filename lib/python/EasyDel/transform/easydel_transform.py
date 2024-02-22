@@ -87,6 +87,8 @@ def huggingface_to_easydel(
     _b = len(".bias")
     with jax.default_device(device):
         flax_dict = {}
+        pbar = tqdm(total=len(list(state_dict.keys())))
+        pbar.set_description("Converting Model")
         for key, tensor in state_dict.items():
             do_rc = True
             for embedding_layer_name in embedding_layer_names:
@@ -114,6 +116,7 @@ def huggingface_to_easydel(
             if shard_fns is not None:
                 tensor = shard_fns[key_names](tensor)
             flax_dict[key_names] = tensor
+            pbar.update(1)
         return flax.traverse_util.unflatten_dict(flax_dict)
 
 
