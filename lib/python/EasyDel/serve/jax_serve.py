@@ -887,7 +887,7 @@ class JAXServer(GradioUserInference):
             yield returns
 
             if self.server_config.use_mxn_break_point:
-                if num_generated_tokens != self.server_config.max_compile_tokens:
+                if predicted_token.shape[-1] != self.server_config.max_compile_tokens:
                     break
 
             if (
