@@ -4,7 +4,6 @@ import math
 import flax
 from flax.struct import dataclass
 from jax import numpy as jnp, lax
-from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec
 import jax
 from flax import linen as nn
@@ -168,7 +167,7 @@ class FlaxMixtralAttention(BaseJAXAttentionModule):
         )
 
     @staticmethod
-    def _t(query, key, value):
+    def _transpose_sequence_head(query, key, value):
         return jnp.transpose(query, (0, 2, 1, 3)), jnp.transpose(key, (0, 2, 1, 3)), jnp.transpose(value, (0, 2, 1, 3))
 
     def apply_rotary(self, batch_size, sequence_length, query, key, value, freq_cis, position_ids):
@@ -179,12 +178,12 @@ class FlaxMixtralAttention(BaseJAXAttentionModule):
         value = value.reshape(batch_size, sequence_length,
                               self.config.num_key_value_heads, self.head_dim)
 
-        query, key, value = self._t(query, key, value)
+        query, key, value = self._transpose_sequence_head(query, key, value)
         query, key = self.rotary(
             position_ids=position_ids, query=query, key=key, freq_cis=freq_cis)
         key = repeat_kv_bnsh(key, self.num_key_value_groups)
         value = repeat_kv_bnsh(value, self.num_key_value_groups)
-        return self._t(query, key, value)
+        return self._transpose_sequence_head(query, key, value)
 
     def _merge_heads(self, hidden_states):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
@@ -958,7 +957,11 @@ class FlaxMixtralModule(nn.Module):
                 rope_type=scaling_type
             )
         self.freq_cis = precompute_freq_cis(
-            max_position_embeddings=self.config.max_position_embeddings,
+            max_position_embeddings=getattr(
+                self.config,
+                "freq_max_position_embeddings",
+                self.config.max_position_embeddings
+            ),
             dim=self.config.hidden_size // self.config.num_attention_heads,
             base=self.config.rope_theta,
             **initial_rope_kwargs

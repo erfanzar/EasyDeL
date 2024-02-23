@@ -1,24 +1,21 @@
 import functools
 import math
-import warnings
-from typing import Optional, Tuple, Any, Union, Dict, Sequence, Callable
+from typing import Optional, Tuple, Any, Union
 import chex
 import flax.linen.partitioning
 import jax.lax
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput, FlaxMaskedLMOutput
 from flax.core import FrozenDict, freeze, unfreeze
-from flax.linen import combine_masks, dot_product_attention_weights, make_causal_mask
+from flax.linen import combine_masks
 from flax.traverse_util import unflatten_dict, flatten_dict
 from jax import numpy as jnp, lax
 from flax import linen as nn
 from chex import Array
-from jax.experimental.shard_map import shard_map
 
 from ..easy_attention import EasyAttention
 from ..flax_modelling_utils import (
     ACT2FN,
     get_gradient_checkpoint_policy,
-    canonicalize_dtype,
     apply_rotary_pos_emb,
     get_dot_general_by_bits, repeat_kv_bnsh, with_sharding_constraint, precompute_freq_cis, BaseJAXAttentionModule,
     block_wise_ffn
@@ -38,9 +35,9 @@ class FlaxPhiEmbedding(nn.Module):
         cos = cos[position_ids][:, None, :, :]
 
         key = apply_rotary_pos_emb(key, sin, cos)
-        query = apply_rotary_pos_emb(query, sin, cos)
+        query_states = apply_rotary_pos_emb(query, sin, cos)
 
-        return query.astype(self.dtype), key.astype(self.dtype)
+        return query_states.astype(self.dtype), key.astype(self.dtype)
 
 
 def repeat_kv(x: chex.Array, n_rep: int) -> chex.Array:
@@ -187,36 +184,36 @@ class FlaxPhiAttention(BaseJAXAttentionModule):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
 
     @staticmethod
-    def _t(query, key, value):
+    def _transpose_sequence_head(query_states, key, value):
         """
-        The _t function transposes the query, key and value matrices.
+        The _transpose_sequence_head function transposes the query_states, key and value matrices.
 
-        :param query: Get the attention weights for each of the heads
+        :param query_states: Get the attention weights for each of the heads
         :param key: Determine the number of heads
         :param value: Store the values of the input
-        :return: The transpose of the query, key and value matrices
+        :return: The transpose of the query_states, key and value matrices
 
         """
-        return jnp.transpose(query, (0, 2, 1, 3)), jnp.transpose(key, (0, 2, 1, 3)), jnp.transpose(value, (0, 2, 1, 3))
+        return jnp.transpose(query_states, (0, 2, 1, 3)), jnp.transpose(key, (0, 2, 1, 3)), jnp.transpose(value, (0, 2, 1, 3))
 
-    def apply_rotary(self, batch_size, sequence_length, query, key, value, freq_cis, position_ids):
+    def apply_rotary(self, batch_size, sequence_length, query_states, key, value, freq_cis, position_ids):
         """
         The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
         The main difference is that it takes in an additional argument, freq_cis, which are used to calculate
         the rotary attention weights. The other differences are minor and mostly related to reshaping tensors.
 
         :param self: Access variables that belong to the class
-        :param batch_size: Reshape the query, key and value tensors
-        :param sequence_length: Reshape the query, key and value tensors
-        :param query: Calculate the attention weights
+        :param batch_size: Reshape the query_states, key and value tensors
+        :param sequence_length: Reshape the query_states, key and value tensors
+        :param query_states: Calculate the attention weights
         :param key: Calculate the attention
         :param value: Compute the attention weights
         :param freq_cis: Calculate the frequency of each word in the vocabulary
         :param position_ids: Identify the position of each token in the sequence
-        :return: A tuple of 3 tensors: query, key and value
+        :return: A tuple of 3 tensors: query_states, key and value
 
         """
-        query = query.reshape(
+        query_states = query_states.reshape(
             batch_size,
             sequence_length,
             self.config.num_attention_heads,
@@ -235,13 +232,13 @@ class FlaxPhiAttention(BaseJAXAttentionModule):
             self.head_dim
         )
 
-        query, key, value = self._t(query, key, value)
-        query, key = self.rotary(
-            position_ids=position_ids, query=query, key=key, freq_cis=freq_cis
+        query_states, key, value = self._transpose_sequence_head(query_states, key, value)
+        query_states, key = self.rotary(
+            position_ids=position_ids, query_states=query_states, key=key, freq_cis=freq_cis
         )
         key = repeat_kv_bnsh(key, self.num_key_value_groups)
         value = repeat_kv_bnsh(value, self.num_key_value_groups)
-        return self._t(query, key, value)
+        return self._transpose_sequence_head(query_states, key, value)
 
     def __call__(
             self,
@@ -293,7 +290,7 @@ class FlaxPhiAttention(BaseJAXAttentionModule):
         )
 
         query_states, key_states, value_states = self.apply_rotary(
-            query=query_states,
+            query_states=query_states,
             key=key_states,
             value=value_states,
             position_ids=position_ids,
@@ -592,7 +589,11 @@ class FlaxPhiModule(nn.Module):
                     rope_type=scaling_type
                 )
         self.freq_cis = precompute_freq_cis(
-            max_position_embeddings=config.max_position_embeddings,
+            max_position_embeddings=getattr(
+                self.config,
+                "freq_max_position_embeddings",
+                self.config.max_position_embeddings
+            ),
             dim=config.hidden_size // config.num_attention_heads,
             base=config.rope_theta,
             **initial_rope_kwargs

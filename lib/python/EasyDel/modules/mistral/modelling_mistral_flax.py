@@ -227,9 +227,9 @@ class FlaxMistralAttention(BaseJAXAttentionModule):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
 
     @staticmethod
-    def _t(query, key, value):
+    def _transpose_sequence_head(query, key, value):
         """
-        The _t function transposes the query, key and value matrices.
+        The _transpose_sequence_head function transposes the query, key and value matrices.
 
         :param query: Get the attention weights for each of the heads
         :param key: Determine the number of heads
@@ -275,13 +275,13 @@ class FlaxMistralAttention(BaseJAXAttentionModule):
             self.head_dim
         )
 
-        query, key, value = self._t(query, key, value)
+        query, key, value = self._transpose_sequence_head(query, key, value)
         query, key = self.rotary(
             position_ids=position_ids, query=query, key=key, freq_cis=freq_cis
         )
         key = repeat_kv_bnsh(key, self.num_key_value_groups)
         value = repeat_kv_bnsh(value, self.num_key_value_groups)
-        return self._t(query, key, value)
+        return self._transpose_sequence_head(query, key, value)
 
     def __call__(
             self,
@@ -835,7 +835,11 @@ class FlaxMistralModule(nn.Module):
                 rope_type=scaling_type
             )
         self.freq_cis = precompute_freq_cis(
-            max_position_embeddings=self.config.max_position_embeddings,
+            max_position_embeddings=getattr(
+                self.config,
+                "freq_max_position_embeddings",
+                self.config.max_position_embeddings
+            ),
             dim=self.config.hidden_size // self.config.num_attention_heads,
             base=self.config.rope_theta,
             **initial_rope_kwargs

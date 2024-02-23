@@ -236,9 +236,9 @@ class FlaxQwen2Attention(BaseJAXAttentionModule):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
 
     @staticmethod
-    def _t(query, key, value):
+    def _transpose_sequence_head(query, key, value):
         """
-        The _t function transposes the query, key and value matrices.
+        The _transpose_sequence_head function transposes the query, key and value matrices.
 
         :param query: Get the attention weights for each of the heads
         :param key: Determine the number of heads
@@ -269,13 +269,13 @@ class FlaxQwen2Attention(BaseJAXAttentionModule):
         key = key.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
         value = value.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
 
-        query, key, value = self._t(query, key, value)
+        query, key, value = self._transpose_sequence_head(query, key, value)
         query, key = self.rotary(
             position_ids=position_ids, query=query, key=key, freq_cis=freq_cis
         )
         key = repeat_kv_bnsh(key, self.num_key_value_groups)
         value = repeat_kv_bnsh(value, self.num_key_value_groups)
-        return self._t(query, key, value)
+        return self._transpose_sequence_head(query, key, value)
 
     def __call__(
             self,

@@ -33,8 +33,6 @@ class MistralConfig(EasyDelPretrainedConfig):
             scan_mlp_chunk_size: int = 1024,
             number_rep_kv: int = 1,
             attention_dropout: float = 0.0,
-            c_max_position_embeddings: int = 4096,
-            freq_max_position_embeddings: int = 4096,
             bits: Optional[int] = None,
             attention_bias: bool = False,
             **kwargs,
@@ -68,8 +66,6 @@ class MistralConfig(EasyDelPretrainedConfig):
         :param scan_mlp_chunk_size: int: Specify the chunk size of the scan mlp
         :param number_rep_kv: int: Specify the number of times to repeat the key and value vectors
         :param attention_dropout: float: Set the dropout rate for the attention layer
-        :param c_max_position_embeddings: int: Set the maximum number of tokens in a sequence
-        :param freq_max_position_embeddings: int: Set the maximum number of frequency bins that can be used in the model
         :param bits: Optional[int]: Specify the number of bits used for quantization
         :param axis_dims: Sequence[int]: Specify the dimension of each axis
         :param axis_names: Sequence[str]: Specify the names of each axis in the tensor
@@ -106,8 +102,6 @@ class MistralConfig(EasyDelPretrainedConfig):
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
-        self.c_max_position_embeddings = c_max_position_embeddings
-        self.freq_max_position_embeddings = freq_max_position_embeddings
 
         super().__init__(
             pad_token_id=pad_token_id,
@@ -171,8 +165,6 @@ class MistralConfig(EasyDelPretrainedConfig):
             use_scan_mlp: bool = False,
             scan_mlp_chunk_size: int = 1024,
             number_rep_kv: int = 1,
-            c_max_position_embeddings: int = 4096,
-            freq_max_position_embeddings: int = None,
             bits: Optional[int] = None,
             attention_dropout: float = 0.0,
             rope_scaling: Dict[str, Union[str, float]] = None,
@@ -188,8 +180,6 @@ class MistralConfig(EasyDelPretrainedConfig):
         :param use_scan_mlp: bool: Determine whether to use the scan_mlp function or notn
         :param scan_mlp_chunk_size: int: Chunk the input to the mlp
         :param number_rep_kv: int: Control the number of times that the key and value vectors are repeated
-        :param c_max_position_embeddings: int: Set the maximum number of positional embeddings for the causal axis
-        :param freq_max_position_embeddings: int: Set the maximum length of the frequency axis
         :param bits: Optional[int]: Specify the number of bits to use for quantization
         :param attention_dropout: float: Set the dropout rate for the attention layer
         :param attention_bias: bool: when ever to use attention_bias
@@ -206,8 +196,6 @@ class MistralConfig(EasyDelPretrainedConfig):
         self.use_scan_mlp = use_scan_mlp
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.attention_dropout = attention_dropout
-        self.c_max_position_embeddings = c_max_position_embeddings
-        self.freq_max_position_embeddings = freq_max_position_embeddings
         self.bits = bits
 
     @staticmethod

@@ -342,18 +342,18 @@ class BaseJAXAttentionModule(nn.Module):
     config: "EasyDelPretrainedConfig"
 
     @nn.compact
-    def _concatenate_to_cache(self, key, value, query, attention_mask):
+    def _concatenate_to_cache(self, key, value, query_states, attention_mask):
         """
         The _concatenate_to_cache function is used to concatenate the key and value vectors
-        of a query with those of previous queries. This allows for the attention mechanism to
+        of a query_states with those of previous queries. This allows for the attention mechanism to
         look at all previous queries when computing its output. The function takes in three
-        arguments: key, value, and query. It also uses two variables that are stored in the cache:
+        arguments: key, value, and query_states. It also uses two variables that are stored in the cache:
         cached_key and cached_value.
 
         :param self: Access the variables stored in the cache
         :param key: Store the keys of the encoder-decoder attention
         :param value: Initialize the cached_value variable
-        :param query: Determine the number of cache vectors to update
+        :param query_states: Determine the number of cache vectors to update
         :param attention_mask: Mask out the padded vectors in the cache
         :return: The key, value and attention_mask
         """
@@ -365,7 +365,7 @@ class BaseJAXAttentionModule(nn.Module):
         if is_initialized:
             *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
             cur_index = cache_index.value
-            if query.shape[1] == 1 and self.config.use_sharded_kv_caching:
+            if query_states.shape[1] == 1 and self.config.use_sharded_kv_caching:
                 mesh = self.config.jax_mesh()
 
                 def fn(
@@ -411,7 +411,7 @@ class BaseJAXAttentionModule(nn.Module):
                 indices = (0,) * len(batch_dims) + (cur_index, 0, 0)
                 key = lax.dynamic_update_slice(cached_key.value, key, indices)
                 value = lax.dynamic_update_slice(cached_value.value, value, indices)
-                num_updated_cache_vectors = query.shape[1]
+                num_updated_cache_vectors = query_states.shape[1]
                 pad_mask = jnp.broadcast_to(
                     jnp.arange(max_length) < cur_index + num_updated_cache_vectors,
                     tuple(batch_dims) + (1, num_updated_cache_vectors, max_length),
@@ -419,7 +419,7 @@ class BaseJAXAttentionModule(nn.Module):
                 attention_mask = combine_masks(pad_mask, attention_mask)
             cached_key.value = key
             cached_value.value = value
-            num_updated_cache_vectors = query.shape[1]
+            num_updated_cache_vectors = query_states.shape[1]
             cache_index.value = cache_index.value + num_updated_cache_vectors
         return key, value, attention_mask
 
