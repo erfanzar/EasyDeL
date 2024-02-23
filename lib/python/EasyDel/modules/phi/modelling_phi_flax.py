@@ -196,7 +196,7 @@ class FlaxPhiAttention(BaseJAXAttentionModule):
         """
         return jnp.transpose(query_states, (0, 2, 1, 3)), jnp.transpose(key, (0, 2, 1, 3)), jnp.transpose(value, (0, 2, 1, 3))
 
-    def apply_rotary(self, batch_size, sequence_length, query_states, key, value, freq_cis, position_ids):
+    def apply_rotary(self, batch_size, sequence_length, query, key, value, freq_cis, position_ids):
         """
         The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
         The main difference is that it takes in an additional argument, freq_cis, which are used to calculate
@@ -205,7 +205,7 @@ class FlaxPhiAttention(BaseJAXAttentionModule):
         :param self: Access variables that belong to the class
         :param batch_size: Reshape the query_states, key and value tensors
         :param sequence_length: Reshape the query_states, key and value tensors
-        :param query_states: Calculate the attention weights
+        :param query: Calculate the attention weights
         :param key: Calculate the attention
         :param value: Compute the attention weights
         :param freq_cis: Calculate the frequency of each word in the vocabulary
@@ -213,7 +213,7 @@ class FlaxPhiAttention(BaseJAXAttentionModule):
         :return: A tuple of 3 tensors: query_states, key and value
 
         """
-        query_states = query_states.reshape(
+        query = query.reshape(
             batch_size,
             sequence_length,
             self.config.num_attention_heads,
@@ -232,13 +232,13 @@ class FlaxPhiAttention(BaseJAXAttentionModule):
             self.head_dim
         )
 
-        query_states, key, value = self._transpose_sequence_head(query_states, key, value)
-        query_states, key = self.rotary(
-            position_ids=position_ids, query_states=query_states, key=key, freq_cis=freq_cis
+        query, key, value = self._transpose_sequence_head(query, key, value)
+        query, key = self.rotary(
+            position_ids=position_ids, query=query, key=key, freq_cis=freq_cis
         )
         key = repeat_kv_bnsh(key, self.num_key_value_groups)
         value = repeat_kv_bnsh(value, self.num_key_value_groups)
-        return self._transpose_sequence_head(query_states, key, value)
+        return self._transpose_sequence_head(query, key, value)
 
     def __call__(
             self,
@@ -290,7 +290,7 @@ class FlaxPhiAttention(BaseJAXAttentionModule):
         )
 
         query_states, key_states, value_states = self.apply_rotary(
-            query_states=query_states,
+            query=query_states,
             key=key_states,
             value=value_states,
             position_ids=position_ids,
