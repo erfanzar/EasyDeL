@@ -42,8 +42,7 @@ Some of the key features provided by EasyDeL include:
 ## Serving
 
 you can read docs or examples to see how `JAXServer` works but let me show you how you can simply host and serve any 
-model that supported by `EasyDeL` fo this example ill just use `gemma-7-it` by google but you can use any model
-that as you wish.
+model that supported by `EasyDeL` fo this example ill just use `gemma-7-it` by google but you can use any model  as you wish.
 
 ```shell
 python -m examples.jax_serve_example \
