@@ -173,7 +173,7 @@ class FlaxFalconAttention(BaseJAXAttentionModule):
         self.num_heads = self.config.num_attention_heads
 
     @staticmethod
-    def _t(query, key, value):
+    def _transpose_sequence_head(query, key, value):
         return jnp.transpose(query, (0, 2, 1, 3)), jnp.transpose(key, (0, 2, 1, 3)), jnp.transpose(value, (0, 2, 1, 3))
 
     def split_head(self, qkv: chex.Array):

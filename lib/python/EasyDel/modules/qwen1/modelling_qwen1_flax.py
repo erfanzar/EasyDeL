@@ -270,9 +270,9 @@ class FlaxQwen1Attention(BaseJAXAttentionModule):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
 
     @staticmethod
-    def _t(query, key, value):
+    def _transpose_sequence_head(query, key, value):
         """
-        The _t function transposes the query, key and value matrices.
+        The _transpose_sequence_head function transposes the query, key and value matrices.
 
         :param query: Get the attention weights for each of the heads
         :param key: Determine the number of heads
@@ -291,18 +291,18 @@ class FlaxQwen1Attention(BaseJAXAttentionModule):
         :param self: Access variables that belong to the class
         :param batch_size: Reshape the query, key and value tensors
         :param sequence_length: Reshape the query, key and value tensors
-        :param query: Calculate the attention weights
+        :param query_states: Calculate the attention weights
         :param key: Calculate the attention
         :param value: Compute the attention weights
         :param rotary_pos_emb_list: Calculate the frequency of each word in the vocabulary
         :param position_ids: Identify the position of each token in the sequence
-        :return: A tuple of 3 tensors: query, key and value
+        :return: A tuple of 3 tensors: query_states, key and value
 
         """
-        query, key = self.rotary(
-            position_ids=position_ids, query=query, key=key, rotary_pos_emb_list=rotary_pos_emb_list
+        query_states, key = self.rotary(
+            position_ids=position_ids, query_states=query_states, key=key, rotary_pos_emb_list=rotary_pos_emb_list
         )
-        return query, key, value
+        return query_states, key, value
 
     def __call__(
             self,
@@ -352,7 +352,7 @@ class FlaxQwen1Attention(BaseJAXAttentionModule):
         value_state = value_state.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
 
         query_state, key_state, value_state = self.apply_rotary(
-            query=query_state,
+            query_states=query_state,
             key=key_state,
             value=value_state,
             position_ids=position_ids,

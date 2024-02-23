@@ -185,8 +185,8 @@ class FlaxMptAttention(BaseJAXAttentionModule):
         k = rearrange(k, 'b s (h d) -> b s h d', h=self.config.n_heads)
         v = rearrange(v, 'b s (h d) -> b s h d', h=self.config.n_heads)
         attention_mask = attention_mask.reshape(b, 1, 1, -1)
-        if self.has_variable('cache', 'key') or init_cache:
-            k, v, attention_mask = self._concatenate_to_cache(key=k, value=v, query=q, attention_mask=attention_mask)
+        if self.has_variable('cache', 'key_states') or init_cache:
+            k, v, attention_mask = self._concatenate_to_cache(key_states=k, value=v, query=q, attention_mask=attention_mask)
         # TODO: MPT WONT WORK CAUSE OF NEW ATTENTION MEC ON FJFORMER
         q_l = q.shape[1]
         k_l = k.shape[1]
