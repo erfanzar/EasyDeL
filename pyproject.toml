@@ -7,7 +7,7 @@ requires-python = ">=3.8"
 
 readme = "README.md"
 
-version = "0.0.51"
+version = "0.0.55"
 
 dependencies = [
     "chex~=0.1.84",
@@ -77,5 +77,7 @@ find = { where = ["lib/python"] }
 
 
 [project.urls]
+
 Homepage = "https://github.com/erfanzar/EasyDeL"
 Issues = "https://github.com/erfanzar/EasyDeL/issues"
+Documentation = "https://erfanzar.github.io/EasyDeL"

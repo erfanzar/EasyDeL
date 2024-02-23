@@ -2,6 +2,7 @@ import gc
 from unittest import TestCase
 import unittest
 
+import flax.traverse_util
 from fjformer import make_shard_and_gather_fns, match_partition_rules
 
 try:
@@ -130,6 +131,7 @@ class EasyModelsTest(TestCase):
                 input_ids=torch_input_ids,
                 attention_mask=torch.ones(*input_shape)
             )
+
             ed_output = ed_model(
                 input_ids=jax_input_ids,
                 params=params,
@@ -210,7 +212,11 @@ class EasyModelsTest(TestCase):
     def compare_torch_to_jax(to, jo, atol: float = 1e-4):
         to, jo = to.logits.cpu().detach().numpy(), jo.logits
         err = jnp.mean(to - jo)
-        return jnp.allclose(to, jo, atol=atol), err
+        assertation = jnp.allclose(to, jo, atol=atol)
+        if not assertation:
+            print(f"MAX P S : {jnp.argmax(to) == jnp.argmax(jo)}")
+            print(f"MIN P S : {jnp.argmax(to) == jnp.argmax(jo)}")
+        return assertation, err
 
     @staticmethod
     def make_input_id(

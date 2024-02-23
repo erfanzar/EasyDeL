@@ -738,7 +738,7 @@ merge them if they are suitable.
 
 ## License 📜
 
-EasyDeL is released under the Apache v2 license. Please see the LICENSE file in the root directory of this project for
+EasyDeL is an Fully Open-Source released under the Apache v2 license. Please see the LICENSE file in the root directory of this project for
 more information.
 
 ## Contact
