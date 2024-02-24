@@ -14,6 +14,10 @@ from .utils import ChatRequest, InstructRequest
 from .gradio_user_interface_base import GradioUserInference
 from dataclasses import dataclass
 
+from ..etils.etils import get_logger
+
+logger = get_logger(__name__)
+
 
 @dataclass
 class PyTorchServerConfig:
@@ -235,7 +239,8 @@ class PyTorchServer(GradioUserInference):
 
     def forward_chat_fast_api(self, data: ChatRequest):
         """
-        The forward_chat_fast_api function is a ReST API endpoint that takes in a ChatRequest object and returns the response from the model.
+        The forward_chat_fast_api function is a ReST API endpoint that takes in a ChatRequest object and returns the
+        response from the model.
 
         :param self: Refer to the object itself
         :param data: ChatRequest: Pass the data from the serve_engine to the function
@@ -488,3 +493,47 @@ class PyTorchServer(GradioUserInference):
             self.process_uvicorn.join()
         else:
             logging.warning("you have to fire server before ending that this command will be ignored")
+
+    @classmethod
+    def from_huggingface(
+            cls,
+            server_config: PyTorchServerConfig,
+            pretrained_model_name_or_path_model: str,
+            pretrained_model_name_or_path_tokenizer: Optional[str] = None,
+            model_kwarguments: Optional[dict] = None,
+            tokenizer_kwarguments: Optional[dict] = None,
+            auto_config: bool = True
+    ):
+
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        server = cls(server_config=server_config)
+
+        if model_kwarguments is None:
+            model_kwarguments = {}
+
+        if tokenizer_kwarguments is None:
+            tokenizer_kwarguments = {}
+
+        if pretrained_model_name_or_path_tokenizer is None:
+            pretrained_model_name_or_path_tokenizer = pretrained_model_name_or_path_model
+
+        if auto_config:
+            config_a = server.get_model_load_kwargs()
+            for k in list(model_kwarguments.keys()):
+                if k in list(config_a.keys()):
+                    _ = config_a.pop(k, None)
+                    logger.info(f"Key {k} is removed from AutoConfig [Using Given Value]")
+            model_kwarguments = model_kwarguments | config_a
+        model = AutoModelForCausalLM.from_pretrained(
+            pretrained_model_name_or_path_model,
+            **model_kwarguments
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            pretrained_model_name_or_path_tokenizer,
+            **tokenizer_kwarguments
+        )
+
+        server.model = model
+        server.tokenizer = tokenizer
+        return server
