@@ -21,7 +21,7 @@ Some of the key features provided by EasyDeL include:
 - LoRA: Low-Rank Adaptation of Large Language Models
 - RingAttention, Flash Attention, BlockWise FFN, and Efficient Attention are supported for more than 90 % of models
   ([FJFormer](https://github.com/erfanzar/FJFormer) Backbone).
-- Serving and API Engines for Using and serving LLMs in JAX as efficiently as possible.
+- Serving and API Engines for Using and serving LLMs in JAX as efficient as possible.
 - Automatic Converting Models from JAX-EasyDeL to PyTorch-HF and reverse
 
 > [!NOTE]
