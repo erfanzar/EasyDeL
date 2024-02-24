@@ -119,10 +119,10 @@ class EasyAttention:
         self.scan_attention_layers = scan_attention_layers
         self.assertion_mkv_err = f"""
 query_states, key_states, value_states and bias shapes must be like
-query_states Shape : [batch_size, num_attention_heads({self.num_attention_heads}), q_seq_len,  head_dims({self.head_dims})]
-key_states   Shape : [batch_size, num_attention_heads({self.num_attention_heads}), kv_seq_len, head_dims({self.head_dims})]
-value_states Shape : [batch_size, num_attention_heads({self.num_attention_heads}), kv_seq_len, head_dims({self.head_dims})]
-bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}), q_seq_len,  kv_seq_len]
+query_states Shape : [batch_size, q_seq_len , num_attention_heads({self.num_attention_heads}), head_dims({self.head_dims})]
+key_states   Shape : [batch_size, kv_seq_len, num_attention_heads({self.num_attention_heads}), head_dims({self.head_dims})]
+value_states Shape : [batch_size, kv_seq_len, num_attention_heads({self.num_attention_heads}), head_dims({self.head_dims})]
+bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}), q_seq_len , kv_seq_len]
     """
 
     def _qkv_check(
