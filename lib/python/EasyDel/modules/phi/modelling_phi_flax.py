@@ -194,7 +194,8 @@ class FlaxPhiAttention(BaseJAXAttentionModule):
         :return: The transpose of the query_states, key and value matrices
 
         """
-        return jnp.transpose(query_states, (0, 2, 1, 3)), jnp.transpose(key, (0, 2, 1, 3)), jnp.transpose(value, (0, 2, 1, 3))
+        return jnp.transpose(query_states, (0, 2, 1, 3)), jnp.transpose(key, (0, 2, 1, 3)), jnp.transpose(value,
+                                                                                                          (0, 2, 1, 3))
 
     def apply_rotary(self, batch_size, sequence_length, query, key, value, freq_cis, position_ids):
         """
@@ -298,6 +299,7 @@ class FlaxPhiAttention(BaseJAXAttentionModule):
             batch_size=batch_size,
             sequence_length=sequence_length
         )
+
         assert_msg = (
             "num_attention_heads repeat wont work likely\n"
             f"INFO :\n\trepeat_kv_bnsh Used with num_key_value_groups = {self.num_key_value_groups}\n\t"
@@ -355,7 +357,7 @@ class FlaxPhiAttention(BaseJAXAttentionModule):
             key_states=key_states,
             value_states=value_states,
             bias=attention_bias,
-            causal=False,
+            causal=True,
             use_pjit_attention_force=self.config.use_pjit_attention_force,
             dropout_rng=dropout_rng,
             deterministic=deterministic,

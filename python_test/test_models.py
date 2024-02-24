@@ -84,7 +84,7 @@ class EasyModelsTest(TestCase):
             max_position_embeddings=self.max_position_embeddings,
             num_key_value_heads=self.num_key_value_heads,
             scan_mlp_chunk_size=self.scan_mlp_chunk_size,
-            rotary_dim=self.rotary_dim
+            rotary_dim=self.rotary_dim,
         )
 
         input_shape = (self.batch_size, self.sequence_length)
