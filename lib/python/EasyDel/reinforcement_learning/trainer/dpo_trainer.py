@@ -24,6 +24,7 @@ from jax.experimental.pjit import pjit
 from datasets import Dataset
 from jax import numpy as jnp
 
+from ...etils.etils import get_logger
 from ...smi import get_capacity_matrix, initialise_tracking, get_mem
 from ...trainer.causal_language_model_trainer import TrainerOutput
 from ...trainer.training_configurations import TrainArguments
@@ -40,6 +41,16 @@ from jax.sharding import PartitionSpec
 
 from ...utils import Timers
 from flax.struct import dataclass
+from contextlib import contextmanager
+
+
+@contextmanager
+def leave_alone_context_manager():
+    # Perform setup actions (none in this case)
+    yield
+
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -810,6 +821,7 @@ class DPOTrainer(BaseTrainer, ABC):
             auto_shard_ref_model_state: bool = True,
             is_encoder_decoder: Optional[bool] = False,
             dataset_map_arguments: Optional[dict] = None,
+            low_mem_usage: bool = True,
             _do_init_fns: bool = True,
     ):
 
@@ -940,6 +952,7 @@ class DPOTrainer(BaseTrainer, ABC):
         self.beta = beta
         self.label_smoothing = label_smoothing
         self.loss_type = loss_type
+        self.low_mem_usage = low_mem_usage
 
         self._stored_metrics = defaultdict(lambda: defaultdict(list))
         if dataset_map_arguments is None:
@@ -976,6 +989,9 @@ class DPOTrainer(BaseTrainer, ABC):
         )
         self.auto_shard_ref_model_state = auto_shard_ref_model_state
         self.auto_shard_model_state = auto_shard_model_state
+        self._cached_p_l_s = None
+        self._cached_c_l_s = None
+        self._cached_r_l_s = None
         super().__init__(
             arguments=arguments,
             dataset_train=train_dataset,
@@ -1552,9 +1568,6 @@ class DPOTrainer(BaseTrainer, ABC):
                 for k in ["input_ids", "attention_mask"]:
                     answer_tokens[k] = answer_tokens[k][:, : self.max_length - self.max_prompt_length]
 
-        # TODO: Fix this one here, fixed padding need to be added.
-
-        # Create labels
         chosen_sequence_tokens = {
             k: jnp.concatenate(
                 (v2d(chosen_tokens[f"prompt_{k}"]), v2d(chosen_tokens[k])),
@@ -1742,182 +1755,203 @@ class DPOTrainer(BaseTrainer, ABC):
     def train(self):
         assert self.model_state is not None, "model_state can not be None for training purpose"
         with self.mesh:
+            with jax.default_device(jax.devices("cpu")[0]) if self.low_mem_usage else leave_alone_context_manager():
+                dir_prefix: str = "/dev/shm" if sys.platform != "win32" else "."
+                checkpoint_path = "SAVING_SKIPPED"
+                if self.arguments.track_memory:
+                    initialise_tracking(dir_prefix=dir_prefix)
 
-            dir_prefix: str = "/dev/shm" if sys.platform != "win32" else "."
-            checkpoint_path = "SAVING_SKIPPED"
-            if self.arguments.track_memory:
-                initialise_tracking(dir_prefix=dir_prefix)
+                pbar = tqdm(total=self.max_training_steps)
+                pbar.set_description("Training")
+                current_step = self.model_state.step.tolist() if isinstance(
+                    self.model_state.step,
+                    jax.Array
+                ) else self.model_state.step
 
-            pbar = tqdm(total=self.max_training_steps)
-            pbar.set_description("Training")
-            current_step = self.model_state.step.tolist() if isinstance(
-                self.model_state.step,
-                jax.Array
-            ) else self.model_state.step
+                loss_sum = None
+                chosen_rewards_sum = None
+                rejected_rewards_sum = None
 
-            loss_sum = None
-            chosen_rewards_sum = None
-            rejected_rewards_sum = None
+                mem_res = "Tracking Option is OFF"
 
-            mem_res = "Tracking Option is OFF"
+                try:
+                    for epoch_index in range(self.arguments.num_train_epochs):
+                        for batch in self.dataloader_train:
+                            current_step += 1
+                            if self.arguments.step_start_point > current_step:
+                                ...
+                            elif current_step < self.max_training_steps:
+                                time_start = time.time()
 
-            try:
-                for epoch_index in range(self.arguments.num_train_epochs):
-                    for batch in self.dataloader_train:
-                        current_step += 1
-                        if self.arguments.step_start_point > current_step:
-                            ...
-                        elif current_step < self.max_training_steps:
-                            time_start = time.time()
-
-                            for key in self.arguments.ids_to_pop_from_dataset:
-                                _ = batch.pop(key, None)
-                            for key in list(batch.keys()):
-                                if not (
-                                        key.endswith("_input_ids")
-                                        or key.endswith("_attention_mask")
-                                        or key.endswith("_labels")
-                                ):
+                                for key in self.arguments.ids_to_pop_from_dataset:
                                     _ = batch.pop(key, None)
-                            for k in list(batch.keys()):
-                                v = batch[k]
-                                batch[k] = v.reshape(v.shape[0], -1)
+                                for key in list(batch.keys()):
+                                    if not (
+                                            key.endswith("_input_ids")
+                                            or key.endswith("_attention_mask")
+                                            or key.endswith("_labels")
+                                    ):
+                                        _ = batch.pop(key, None)
+                                for k in list(batch.keys()):
+                                    v = batch[k]
+                                    batch[k] = v.reshape(v.shape[0], -1)
+                                try:
+                                    if self._cached_p_l_s is None:
+                                        self._cached_p_l_s = batch["prompt_input_ids"].shape
+                                    else:
+                                        assert self._cached_p_l_s == batch["prompt_input_ids"].shape
+                                    if self._cached_c_l_s is None:
+                                        self._cached_c_l_s = batch["chosen_input_ids"].shape
+                                    else:
+                                        assert self._cached_c_l_s == batch["chosen_input_ids"].shape
+                                    if self._cached_r_l_s is None:
+                                        self._cached_r_l_s = batch["rejected_input_ids"].shape
+                                    else:
+                                        assert self._cached_r_l_s == batch["rejected_input_ids"].shape
+                                except AssertionError as e:
+                                    warnings.warn(
+                                        "there's an issue with dataset and seems like compilation process will be much"
+                                        " slower and function (jax.jit) will be re-compiled and that should not happen "
+                                        "in case of seeing this error open an issue "
+                                        "https://github.com/erfanzar/EasyDeL/issues/new?assignees=&labels=&projects="
+                                        "&template=bug_report.md&title=\n"
+                                        f"Extra information error \n{e}"
+                                    )
+                                self.model_state, metrics = self.sharded_train_step_function(
+                                    self.model_state,
+                                    batch
+                                )
+                                total_time = time.time() - time_start
+                                (
+                                    loss, chosen_rewards, rejected_rewards
+                                ) = metrics.loss, metrics.chosen_rewards[0], metrics.rejected_rewards[0]
 
-                            self.model_state, metrics = self.sharded_train_step_function(
-                                self.model_state,
-                                batch
-                            )
-                            total_time = time.time() - time_start
-                            (
-                                loss, chosen_rewards, rejected_rewards
-                            ) = metrics.loss, metrics.chosen_rewards[0], metrics.rejected_rewards[0]
+                                loss_sum = loss.tolist() if loss_sum is None else loss_sum + loss
 
-                            loss_sum = loss.tolist() if loss_sum is None else loss_sum + loss
+                                rejected_rewards_sum = (
+                                    rejected_rewards.tolist() if (
+                                            rejected_rewards_sum is None
+                                    ) else rejected_rewards_sum + rejected_rewards
+                                )
+                                chosen_rewards_sum = (
+                                    chosen_rewards.tolist() if (
+                                            chosen_rewards_sum is None
+                                    ) else chosen_rewards_sum + chosen_rewards
+                                )
+                                information_queries = {}
+                                if self.arguments.track_memory:
+                                    mem_res = get_mem(dir_prefix=dir_prefix)
 
-                            rejected_rewards_sum = (
-                                rejected_rewards.tolist() if (
-                                        rejected_rewards_sum is None
-                                ) else rejected_rewards_sum + rejected_rewards
-                            )
-                            chosen_rewards_sum = (
-                                chosen_rewards.tolist() if (
-                                        chosen_rewards_sum is None
-                                ) else chosen_rewards_sum + chosen_rewards
-                            )
-                            information_queries = {}
-                            if self.arguments.track_memory:
-                                mem_res = get_mem(dir_prefix=dir_prefix)
-
-                                for key in ["Used", "Usage Percent"]:
-                                    for device, info in get_capacity_matrix(dir_prefix=dir_prefix).items():
-                                        information_queries[f"{device.replace('_', ' ')} ({key})"] = float(
-                                            info[key].replace("%", "").replace("GB", ""))
-                            train_metrics = {
-                                "loss": loss.tolist(),
-                                "mean_loss": loss_sum / (current_step - self.arguments.step_start_point),
-                                "mean_rejected_rewards": rejected_rewards_sum / (
-                                        current_step - self.arguments.step_start_point
-                                ),
-                                "mean_chosen_rewards": chosen_rewards_sum / (
-                                        current_step - self.arguments.step_start_point
-                                ),
-                                "learning_rate": self.scheduler(
-                                    self.model_state.step.tolist()
-                                ).tolist(),
-                                "step": current_step,
-                                "step_time": total_time,
-                                "perplexity": jnp.exp(loss).tolist(),
-                                "accelerators": information_queries,
-                                "epoch": epoch_index
-                            }
-                            if self.arguments.use_wandb:
-                                with jax.spmd_mode("allow_all"):
-                                    self.wandb_runtime.log(
-                                        train_metrics
+                                    for key in ["Used", "Usage Percent"]:
+                                        for device, info in get_capacity_matrix(dir_prefix=dir_prefix).items():
+                                            information_queries[f"{device.replace('_', ' ')} ({key})"] = float(
+                                                info[key].replace("%", "").replace("GB", ""))
+                                train_metrics = {
+                                    "loss": loss.tolist(),
+                                    "mean_loss": loss_sum / (current_step - self.arguments.step_start_point),
+                                    "mean_rejected_rewards": rejected_rewards_sum / (
+                                            current_step - self.arguments.step_start_point
                                     ),
-                                    wandb.summary["captured_memory_log"] = mem_res
+                                    "mean_chosen_rewards": chosen_rewards_sum / (
+                                            current_step - self.arguments.step_start_point
+                                    ),
+                                    "learning_rate": self.scheduler(
+                                        jax.device_get(self.model_state.step)
+                                    ).tolist(),
+                                    "step": current_step,
+                                    "step_time": total_time,
+                                    "perplexity": jnp.exp(loss).tolist(),
+                                    "accelerators": information_queries,
+                                    "epoch": epoch_index
+                                }
+                                if self.arguments.use_wandb:
+                                    with jax.spmd_mode("allow_all"):
+                                        self.wandb_runtime.log(
+                                            train_metrics
+                                        ),
+                                        wandb.summary["captured_memory_log"] = mem_res
 
-                            if self.arguments.track_memory:
-                                IPython.display.clear_output(True)
-                                pbar.display(mem_res)
-                            pbar.update(1)
-                            log_metrics = copy.deepcopy(train_metrics)
-                            _ = log_metrics.pop("accelerators")
-                            pbar.set_postfix(
-                                **log_metrics
-                            )
-                        else:
-                            break
-            except KeyboardInterrupt:
-                termcolor.cprint(
-                    "KeyboardInterrupt At training model Will return Current State of the Model with Parameters.",
-                    color="cyan",
-                    force_color=True
-                )
-
-            except EasyDelTimerError:
-                termcolor.cprint(
-                    "Training reached out maximum training Time Killing training Process "
-                    "and Will return Current State of the Model with Parameters.",
-                    color="cyan",
-                    force_color=True
-                )
-
-            if self.arguments.merge_lora_rapture_parameters and self.rapture is not None:
-                print(
-                    termcolor.colored(
-                        "Info : ", color="red", force_color=True
-                    ),
-                    termcolor.colored(
-                        "Merging LoRA Parameters.", color="white", force_color=True
+                                if self.arguments.track_memory:
+                                    IPython.display.clear_output(True)
+                                    pbar.display(mem_res)
+                                pbar.update(1)
+                                log_metrics = copy.deepcopy(train_metrics)
+                                _ = log_metrics.pop("accelerators")
+                                pbar.set_postfix(
+                                    **log_metrics
+                                )
+                            else:
+                                break
+                except KeyboardInterrupt:
+                    termcolor.cprint(
+                        "KeyboardInterrupt At training model Will return Current State of the Model with Parameters.",
+                        color="cyan",
+                        force_color=True
                     )
-                )
-                self.model_state = self.model_state.replace(
-                    params=self.rapture.merge_parameters(self.model_state.params)
-                )
 
-            shard_fns, gather_fns = make_shard_and_gather_fns(
-                partition_specs=match_partition_rules(
-                    rules=self.model_state.module.config.get_partition_rules(
-                        self.arguments.fully_sharded_data_parallel
-                    ),
-                    params=jax.eval_shape(lambda: self.model_state)
-                ),
-                dtype_specs=self.arguments.dtype
-            )
-            output = TrainerOutput(
-                state=self.model_state,
-                mesh=self.mesh,
-                shard_fns=shard_fns,
-                gather_fns=gather_fns,
-                checkpoint_manager=self.checkpoint_manager,
-            )
-            if self.arguments.save_steps is None and self.arguments.do_last_save:
+                except EasyDelTimerError:
+                    termcolor.cprint(
+                        "Training reached out maximum training Time Killing training Process "
+                        "and Will return Current State of the Model with Parameters.",
+                        color="cyan",
+                        force_color=True
+                    )
+
+                if self.arguments.merge_lora_rapture_parameters and self.rapture is not None:
+                    print(
+                        termcolor.colored(
+                            "Info : ", color="red", force_color=True
+                        ),
+                        termcolor.colored(
+                            "Merging LoRA Parameters.", color="white", force_color=True
+                        )
+                    )
+                    self.model_state = self.model_state.replace(
+                        params=self.rapture.merge_parameters(self.model_state.params)
+                    )
+
                 shard_fns, gather_fns = make_shard_and_gather_fns(
-                    match_partition_rules(
-                        self.config.get_partition_rules(
-                            fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
-                        ) if self.arguments.custom_rule is None else self.arguments.custom_rule,
-                        jax.eval_shape(lambda: self.model_state)
+                    partition_specs=match_partition_rules(
+                        rules=self.model_state.module.config.get_partition_rules(
+                            self.arguments.fully_sharded_data_parallel
+                        ),
+                        params=jax.eval_shape(lambda: self.model_state)
                     ),
-                    dtype_specs=self.dtype
-                )  # You have to re-init the new shard and gather functions in order to be able to skip LoRA weight
-                # crashing errors and saving errors
-                filename = self._save_state(
-                    state=self.model_state,
-                    gather_fns=gather_fns
+                    dtype_specs=self.arguments.dtype
                 )
-                checkpoint_path = f"{str(self.arguments.get_path())}/{filename}"
+                output = TrainerOutput(
+                    state=self.model_state,
+                    mesh=self.mesh,
+                    shard_fns=shard_fns,
+                    gather_fns=gather_fns,
+                    checkpoint_manager=self.checkpoint_manager,
+                )
+                if self.arguments.save_steps is None and self.arguments.do_last_save:
+                    shard_fns, gather_fns = make_shard_and_gather_fns(
+                        match_partition_rules(
+                            self.config.get_partition_rules(
+                                fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
+                            ) if self.arguments.custom_rule is None else self.arguments.custom_rule,
+                            jax.eval_shape(lambda: self.model_state)
+                        ),
+                        dtype_specs=self.dtype
+                    )  # You have to re-init the new shard and gather functions in order to be able to skip LoRA weight
+                    # crashing errors and saving errors
+                    filename = self._save_state(
+                        state=self.model_state,
+                        gather_fns=gather_fns
+                    )
+                    checkpoint_path = f"{str(self.arguments.get_path())}/{filename}"
 
-            if self.arguments.do_eval:
-                for _ in self.eval(
-                        self.model_state
-                ):
-                    ...
+                if self.arguments.do_eval:
+                    for _ in self.eval(
+                            self.model_state
+                    ):
+                        ...
 
-            output.checkpoint_path = checkpoint_path
-            output.last_save_file_name = filename
-            wandb.finish()
+                output.checkpoint_path = checkpoint_path
+                output.last_save_file_name = filename
+                wandb.finish()
 
         return output
 
