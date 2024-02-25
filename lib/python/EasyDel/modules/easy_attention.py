@@ -412,11 +412,6 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
                 bias = bias.repeat(
                     num_attention_heads, 1,
                 )
-                warnings.warn(
-                    f"the given bias had shape of {es} and it should be like"
-                    f" [{batch_size=},{num_attention_heads=},{query_sequence_length=},{key_value_sequence_length=}] "
-                    f"the algo will automatically repeat on head dim and produce shape of {bias.shape}"
-                )
         assert bias.shape == (
             batch_size,
             self.num_attention_heads,
