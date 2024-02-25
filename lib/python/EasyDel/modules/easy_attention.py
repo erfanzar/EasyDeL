@@ -404,14 +404,19 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
             dropout_rng: Optional[random.PRNGKey] = None,
             use_pjit_attention_force: bool = False
     ) -> AttentionOutput:
-        batch_size = query_states.shape[0]
-        num_attention_heads = query_states.shape[1]
+
+        batch_size, num_attention_heads, query_sequence_length, head_dims = query_states.shape
         if bias is not None:
             if bias.shape[1] != num_attention_heads:
+                es = bias.shape
                 bias = bias.repeat(
                     num_attention_heads, 1,
                 )
-
+                warnings.warn(
+                    f"the given bias had shape of {es} and it should be like"
+                    f" {batch_size=},{num_attention_heads=},{query_sequence_length=},{key_value_sequence_length=} "
+                    f"the algo will automatically repeat on head dim and produce shape of {bias.shape}"
+                )
         assert bias.shape == (
             batch_size,
             self.num_attention_heads,
