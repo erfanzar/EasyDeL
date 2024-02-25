@@ -40,18 +40,6 @@ class FlaxPhiEmbedding(nn.Module):
         return query_states.astype(self.dtype), key.astype(self.dtype)
 
 
-def repeat_kv(x: chex.Array, n_rep: int) -> chex.Array:
-    bs, s, n_kv_heads, head_dim = x.shape
-    if n_rep == 1:
-        return x
-    x = x[:, :, jnp.newaxis, :, :]
-    x = jnp.repeat(x, n_rep, axis=2)
-
-    return x.reshape(bs, s,
-                     n_kv_heads * n_rep,
-                     head_dim)
-
-
 class FlaxPhiMLP(nn.Module):
     config: PhiConfig
     layer_idx: Optional[int] = None

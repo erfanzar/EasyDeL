@@ -405,10 +405,11 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
             use_pjit_attention_force: bool = False
     ) -> AttentionOutput:
         batch_size = query_states.shape[0]
+        num_attention_heads = query_states.shape[1]
         if bias is not None:
-            if bias.shape[1] != self.num_attention_heads:
+            if bias.shape[1] != num_attention_heads:
                 bias = bias.repeat(
-                    self.num_attention_heads, 1,
+                    num_attention_heads, 1,
                 )
 
         assert bias.shape == (
