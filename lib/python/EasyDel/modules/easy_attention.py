@@ -341,11 +341,13 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
     ) -> AttentionOutput:
 
         attn_weights = None
+        dtype_c = jnp.promote_types(self.dtype, jnp.float32)
         if self.use_shard_map:
+            print("here")
             attn_weights = shard_map(
                 partial(
                     dot_product_attention_weights,
-                    dtype=jnp.promote_types(self.dtype, jnp.float32),
+                    dtype=dtype_c,
                     deterministic=deterministic,
                     dropout_rate=self.attention_dropout,
                     precision=self.precision,
@@ -367,7 +369,7 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
                 query=query_states,
                 key=key_states,
                 bias=bias,
-                dtype=jnp.promote_types(self.dtype, jnp.float32),
+                dtype=dtype_c,
                 deterministic=deterministic,
                 dropout_rate=self.attention_dropout,
                 precision=self.precision,
@@ -381,10 +383,10 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
 
         attn_output = jnp.einsum(
             "...hqk,...khd->...qhd",
-            attn_weights,
-            value_states,
+            attn_weights.astype(dtype_c),
+            value_states.astype(dtype_c),
             precision=self.precision
-        )
+        ).astype(dtype_c)
 
         return AttentionOutput(
             attention_outputs=attn_output,

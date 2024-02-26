@@ -35,7 +35,7 @@ class EasyModelsTest(TestCase):
         self.vocab_size: int = 32000
         self.hidden_size: int = 256
         self.intermediate_size: int = 512
-        self.num_hidden_layers: int = 2
+        self.num_hidden_layers: int = 4
         self.num_attention_heads: int = 8
         self.num_key_value_heads: Optional[int] = 4
         self.max_position_embeddings: int = 2048
@@ -50,7 +50,7 @@ class EasyModelsTest(TestCase):
         self.rope_theta: float = 10000.
         self.attention_bias: bool = False
         self.tie_word_embeddings: bool = False
-        self.gradient_checkpointing: str = "nothing_saveable"
+        self.gradient_checkpointing: str = "nothing_saveable"  #
         self.fcm_min_ratio: float = -1
         self.fcm_max_ratio: float = -1
         self.use_pjit_attention_force: bool = False
@@ -129,7 +129,7 @@ class EasyModelsTest(TestCase):
             torch_input_ids, jax_input_ids = self.make_input_id(self.vocab_size, input_shape)
             hf_output = hf_model(
                 input_ids=torch_input_ids,
-                attention_mask=torch.ones(*input_shape)
+                attention_mask=torch.ones(*input_shape),
             )
 
             ed_output = ed_model(
@@ -138,7 +138,6 @@ class EasyModelsTest(TestCase):
                 return_dict=True,
                 add_params_field=False,
                 train=False
-
             )
             del params
             del hf_model

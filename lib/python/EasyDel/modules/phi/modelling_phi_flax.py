@@ -121,7 +121,7 @@ class FlaxPhiAttention(BaseJAXAttentionModule):
         self.k_proj = dense_class(self.num_key_value_heads * self.head_dim)
         self.v_proj = dense_class(self.num_key_value_heads * self.head_dim)
         self.dense = dense_class(self.hidden_size)
-        self.rotary = FlaxPhiEmbedding(self.dtype)
+        self.rotary_emb_dim = int(self.config.partial_rotary_factor * self.head_dim)
         self.qk_layernorm = config.qk_layernorm
         if self.qk_layernorm:
             self.q_layernorm = nn.LayerNorm(
@@ -222,9 +222,27 @@ class FlaxPhiAttention(BaseJAXAttentionModule):
         )
 
         query, key, value = self._transpose_sequence_head(query, key, value)
-        query, key = self.rotary(
-            position_ids=position_ids, query=query, key=key, freq_cis=freq_cis
+
+        sin, cos = freq_cis
+
+        sin = sin[position_ids][:, None, :, :]
+        cos = cos[position_ids][:, None, :, :]
+
+        query_rot, query_pass = (
+            query[..., : self.rotary_emb_dim],
+            query[..., self.rotary_emb_dim:],
         )
+        key_rot, key_pass = (
+            key[..., : self.rotary_emb_dim],
+            key[..., self.rotary_emb_dim:],
+        )
+
+        key_rot = apply_rotary_pos_emb(key_rot, sin, cos)
+        query_rot = apply_rotary_pos_emb(query_rot, sin, cos)
+
+        query = jnp.concatenate((query_rot, query_pass), axis=-1)
+        key = jnp.concatenate((key_rot, key_pass), axis=-1)
+
         key = repeat_kv_bnsh(key, self.num_key_value_groups)
         value = repeat_kv_bnsh(value, self.num_key_value_groups)
         return self._transpose_sequence_head(query, key, value)
@@ -414,7 +432,8 @@ class FlaxPhiDecoderLayer(nn.Module):
             causal_mask=causal_mask,
             init_cache=init_cache,
         )
-        attn_outputs, self_attn_weights = attn_out if len(attn_out) == 2 else attn_out[0], None
+        attn_outputs, self_attn_weights = (attn_out[0], attn_out[1]) if len(attn_out) == 2 else (attn_out[0], None)
+
         attn_outputs = self.resid_dropout(attn_outputs, deterministic=deterministic)
 
         if self.config.use_scan_mlp:
@@ -584,7 +603,8 @@ class FlaxPhiModule(nn.Module):
                 "freq_max_position_embeddings",
                 self.config.max_position_embeddings
             ),
-            dim=config.hidden_size // config.num_attention_heads,
+            dim=int(config.partial_rotary_factor * (config.hidden_size // config.num_attention_heads)),
+            # dim=config.hidden_size // config.num_attention_heads,
             base=config.rope_theta,
             **initial_rope_kwargs
         )
