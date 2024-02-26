@@ -5,7 +5,10 @@ from absl import flags
 from EasyDel import JAXServer, JAXServerConfig
 import jax
 from fjformer import get_dtype
-from EasyDel.serve.prompters import GemmaPrompter, Llama2Prompter, OpenChatPrompter, Qwen2Prompter
+from EasyDel.serve.prompters import (
+    GemmaPrompter, 
+    Llama2Prompter, 
+    OpenChatPrompter, Qwen2Prompter, ZephyrPrompter)
 from EasyDel.serve.prompters.base_prompter import BasePrompter
 
 FLAGS = flags.FLAGS
@@ -110,7 +113,8 @@ def main(argv):
         "gemma": GemmaPrompter(),
         "llama": Llama2Prompter(),
         "openchat": OpenChatPrompter(),
-        "qwen2": Qwen2Prompter()
+        "qwen2": Qwen2Prompter(),
+         "zephyr": ZephyrPrompter(),
     }
     prompter: BasePrompter = prompters[FLAGS.prompter_type]
 
