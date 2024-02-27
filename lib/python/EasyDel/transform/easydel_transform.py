@@ -3,6 +3,7 @@ import gc
 import flax.traverse_util
 import jax
 import numpy
+from flax import traverse_util
 
 from flax.traverse_util import flatten_dict
 from flax.serialization import from_bytes, to_bytes, to_state_dict
@@ -54,6 +55,71 @@ def match_keywords(string, ts, ns):
     return True
 
 
+# def huggingface_to_easydel(
+#         state_dict,
+#         *,
+#         device,
+#         embedding_layer_names: Optional[List[str]] = None,
+#         layer_norm_names: Optional[List[str]] = None,
+#         shard_fns: Optional[Mapping[tuple, Callable]] = None,
+#         dtype: jax.numpy.dtype = jax.numpy.float16,
+#         **kwargs
+# ):
+#     """
+#     The huggingface_to_easydel function takes a huggingface model's state_dict and converts it to an easydel
+#     model's flax_dict. The function is designed to be used in conjunction with the load_huggingface function, which
+#     loads a huggingface model from disk. The embedding layer name must be specified as well as the device on which
+#     the conversion will take place.
+#
+#     :param state_dict: Load the weights from a huggingface model
+#     :param embedding_layer_names: List[str]: Identify the embedding layer in the huggingface model
+#     :param device: Determine which device the model will be loaded on
+#     :param layer_norm_names: Replaces weight or kernel with (scale)
+#     :param shard_fns: Optional[Mapping[tuple, Callable]]: Sharding Function to be used to shard model
+#     :param dtype: jax.numpy.dtype: Specify the data type of the tensors
+#     :return: A dictionary of the weights and biases in a format that can be used by flax (it's an UnFlattenDict)
+#
+#     """
+#     embedding_layer_names = embedding_layer_names or []
+#     layer_norm_names = layer_norm_names or []
+#     if isinstance(embedding_layer_names, str):
+#         embedding_layer_names = [embedding_layer_names]
+#     _l = len(".weight")
+#     _b = len(".bias")
+#     with jax.default_device(device):
+#         flax_dict = {}
+#         pbar = tqdm(total=len(list(state_dict.keys())))
+#         pbar.set_description("Converting Model")
+#         for key, tensor in state_dict.items():
+#             do_rc = True
+#             for embedding_layer_name in embedding_layer_names:
+#                 if embedding_layer_name in key:
+#                     key = key[:-_l] + ".embedding"
+#                     do_rc = False
+#             for layer_norm in layer_norm_names:
+#                 if layer_norm in key:
+#                     if key.endswith(".weight"):
+#                         key = key[:-_l] + ".scale"
+#                         do_rc = False
+#             if match_keywords(key, ["weight"], ["none"]) and do_rc:
+#                 if len(tensor.shape) == 2:
+#                     tensor = tensor.transpose(0, 1)
+#                 if key.endswith(".weight"):
+#                     key = key[:-_l] + ".kernel"
+#             key_tuple = key.split(".")
+#             key_names = ()
+#             numpy_tensor: numpy.array = tensor.detach().cpu().numpy()
+#             tensor = jax.numpy.array(numpy_tensor)
+#             del numpy_tensor
+#             gc.collect()
+#             for k in key_tuple:
+#                 key_names += k,
+#             if shard_fns is not None:
+#                 tensor = shard_fns[key_names](tensor)
+#             flax_dict[key_names] = tensor
+#             pbar.update(1)
+#         return flax.traverse_util.unflatten_dict(flax_dict)
+
 def huggingface_to_easydel(
         state_dict,
         *,
@@ -77,47 +143,47 @@ def huggingface_to_easydel(
     :param shard_fns: Optional[Mapping[tuple, Callable]]: Sharding Function to be used to shard model
     :param dtype: jax.numpy.dtype: Specify the data type of the tensors
     :return: A dictionary of the weights and biases in a format that can be used by flax (it's an UnFlattenDict)
-    
+
     """
-    embedding_layer_names = embedding_layer_names or []
-    layer_norm_names = layer_norm_names or []
-    if isinstance(embedding_layer_names, str):
-        embedding_layer_names = [embedding_layer_names]
+    embedding_layer_names = set(embedding_layer_names or [])
+    layer_norm_names = set(layer_norm_names or [])
     _l = len(".weight")
     _b = len(".bias")
+
     with jax.default_device(device):
         flax_dict = {}
-        pbar = tqdm(total=len(list(state_dict.keys())))
+        pbar = tqdm(total=len(state_dict))
         pbar.set_description("Converting Model")
+
         for key, tensor in state_dict.items():
-            do_rc = True
-            for embedding_layer_name in embedding_layer_names:
-                if embedding_layer_name in key:
-                    key = key[:-_l] + ".embedding"
-                    do_rc = False
-            for layer_norm in layer_norm_names:
-                if layer_norm in key:
-                    if key.endswith(".weight"):
-                        key = key[:-_l] + ".scale"
-                        do_rc = False
-            if match_keywords(key, ["weight"], ["none"]) and do_rc:
+            # Determine if renaming is necessary
+            new_key = key
+            if any(layer_name in key for layer_name in embedding_layer_names):
+                new_key = key[:-_l] + ".embedding"
+            elif any(layer_norm in key for layer_norm in layer_norm_names):
+                new_key = key.replace(".weight", ".scale")
+            elif "weight" in key:
                 if len(tensor.shape) == 2:
                     tensor = tensor.transpose(0, 1)
-                if key.endswith(".weight"):
-                    key = key[:-_l] + ".kernel"
-            key_tuple = key.split(".")
-            key_names = ()
-            numpy_tensor: numpy.array = tensor.detach().cpu().numpy()
-            tensor = jax.numpy.array(numpy_tensor)
-            del numpy_tensor
-            gc.collect()
-            for k in key_tuple:
-                key_names += k,
-            if shard_fns is not None:
-                tensor = shard_fns[key_names](tensor)
-            flax_dict[key_names] = tensor
-            pbar.update(1)
-        return flax.traverse_util.unflatten_dict(flax_dict)
+                new_key = key.replace(".weight", ".kernel")
+
+            key_tuple = tuple(new_key.split("."))
+            # Convert tensor to jax.numpy.array without detaching and moving to CPU
+            tensor = jax.device_put(jnp.array(tensor.numpy(), dtype=dtype), device)
+
+            # Apply sharding functions if provided
+            if shard_fns and key_tuple in shard_fns:
+                tensor = shard_fns[key_tuple](tensor)
+
+            flax_dict[key_tuple] = tensor
+
+            # Update progress bar less frequently to reduce overhead
+            if pbar.n % 10 == 0:
+                pbar.update(10)
+        pbar.close()
+
+        gc.collect()
+        return traverse_util.unflatten_dict(flax_dict)
 
 
 def read_ckpt(path: [str, os.PathLike], shard_fns=None, add_extra_past_fix: list = None):
