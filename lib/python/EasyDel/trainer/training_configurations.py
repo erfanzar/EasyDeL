@@ -63,6 +63,8 @@ class TrainArguments(
             learning_rate_end: Optional[float] = 5e-6,
             gradient_accumulation_steps: int = 1,
             weight_decay: float = 0.01,
+            label_smoothing_factor: float = 0.0,
+            z_loss: float = 0.0,
             gradient_checkpointing: AVAILABLE_GRADIENT_CHECKPOINTS = EasyDelGradientCheckPointers.NOTHING_SAVEABLE,
             max_sequence_length: Optional[int] = 4096,
             sharding_array: Union[tuple, int] = (1, -1, 1, 1),
@@ -70,6 +72,7 @@ class TrainArguments(
             do_train: bool = True,
             do_eval: bool = False,
             do_test: Optional[bool] = False,
+            train_on_inputs: bool = True,
             backend: Optional[str] = None,
             extra_optimizer_kwargs: dict = None,
             save_steps: Optional[int] = None,
@@ -129,6 +132,8 @@ class TrainArguments(
     :param learning_rate_end: Optional[float]: Set the learning rate at the end of training
     :param gradient_accumulation_steps: int: Accumulate gradients over multiple batches
     :param weight_decay: float: Specify the weight decay to be used by the optimizer
+    :param label_smoothing_factor: float: Set the label smoothing factor to be used by the loss function
+    :param z_loss: float: Set the z loss factor to be used by the loss function
     :param gradient_checkpointing: AVAILABLE_GRADIENT_CHECKPOINTS: Determine how to use gradient checkpointing
     :param max_sequence_length: Optional[int]: Set the maximum length of the input sequence
     :param sharding_array: Union[tuple,int]: Specify the mesh of devices to use for training
@@ -136,6 +141,7 @@ class TrainArguments(
     :param do_train: bool: Indicate whether to train the model or not
     :param do_eval: bool: Determine whether to run evaluation on the validation set after training
     :param do_test: Optional[bool]: Determine if the model should be tested
+    :param train_on_inputs: bool: Use input_ids instead of labels, overrides ignored (-100) tokens in the labels
     :param backend: Optional[str]: Specify the backend of jax
     :param extra_optimizer_kwargs: dict: Pass extra arguments to the optimizer
     :param save_steps: Optional[int]: Save the model after every n steps
@@ -236,6 +242,8 @@ class TrainArguments(
         self.learning_rate = learning_rate
         self.learning_rate_end = learning_rate_end
         self.weight_decay = weight_decay
+        self.label_smoothing_factor = label_smoothing_factor
+        self.z_loss = z_loss
         self.model_name = model_name
         self.gradient_checkpointing = gradient_checkpointing
         self.max_sequence_length = max_sequence_length
@@ -244,6 +252,7 @@ class TrainArguments(
         self.do_train = do_train
         self.do_eval = do_eval
         self.do_test = do_test
+        self.train_on_inputs = train_on_inputs
         self.save_steps = save_steps
         self.save_dir = save_dir
         self.use_pjit_attention_force = use_pjit_attention_force
