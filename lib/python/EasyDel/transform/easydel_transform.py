@@ -169,7 +169,7 @@ def huggingface_to_easydel(
 
             key_tuple = tuple(new_key.split("."))
             # Convert tensor to jax.numpy.array without detaching and moving to CPU
-            tensor = jax.device_put(jnp.array(tensor.numpy(), dtype=dtype), device)
+            tensor = jax.device_put(jnp.array(tensor.cpu().detach().numpy(), dtype=dtype), device)
 
             # Apply sharding functions if provided
             if shard_fns and key_tuple in shard_fns:
@@ -178,8 +178,7 @@ def huggingface_to_easydel(
             flax_dict[key_tuple] = tensor
 
             # Update progress bar less frequently to reduce overhead
-            if pbar.n % 10 == 0:
-                pbar.update(10)
+            pbar.update(1)
         pbar.close()
 
         gc.collect()
