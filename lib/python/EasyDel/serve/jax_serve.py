@@ -872,6 +872,8 @@ class JAXServer(GradioUserInference):
                         self.server_config.pad_token_id is None
                 ) else predicted_token != self.server_config.pad_token_id
             ]
+            if predicted_token.ndim == 1:
+                predicted_token = predicted_token.reshape(1, -1)
             num_generated_tokens += predicted_token.shape[-1]
             plus_attn_mask = jnp.ones((len(attention_mask), self.server_config.max_compile_tokens), dtype=jnp.int32)
 
