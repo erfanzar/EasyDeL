@@ -169,7 +169,7 @@ def huggingface_to_easydel(
 
             key_tuple = tuple(new_key.split("."))
             # Convert tensor to jax.numpy.array without detaching and moving to CPU
-            tensor = jax.device_put(jnp.array(tensor.cpu().detach().numpy(), dtype=dtype), device)
+            tensor = jnp.array(tensor.cpu().detach().numpy(), dtype=dtype)
 
             # Apply sharding functions if provided
             if shard_fns and key_tuple in shard_fns:
