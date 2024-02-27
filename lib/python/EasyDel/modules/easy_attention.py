@@ -343,7 +343,6 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
         attn_weights = None
         dtype_c = jnp.promote_types(self.dtype, jnp.float32)
         if self.use_shard_map:
-            print("here")
             attn_weights = shard_map(
                 partial(
                     dot_product_attention_weights,

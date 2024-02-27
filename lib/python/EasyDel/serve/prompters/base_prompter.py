@@ -91,10 +91,13 @@ class BasePrompter(abc.ABC):
         string = f"{self.__class__.__name__}(\n"
         for k, v in self.__dict__.items():
             if not k.startswith("_"):
-                repr_src = f"\t{k} : " + \
-                           v.__str__().replace("\n", "\n\t") + "\n"
-                string += repr_src if len(
-                    repr_src) < 500 else f"\t{k} : " + f"{v.__class__.__name__}(...)" + "\n"
+                try:
+                    repr_src = f"\t{k} : " + \
+                               v.__str__().replace("\n", "\n\t") + "\n"
+                    string += repr_src if len(
+                        repr_src) < 500 else f"\t{k} : " + f"{v.__class__.__name__}(...)" + "\n"
+                except TypeError:
+                    ...
         return string + ")"
 
     def __str__(self):
