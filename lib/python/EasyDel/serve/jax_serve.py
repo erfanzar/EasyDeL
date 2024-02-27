@@ -881,7 +881,7 @@ class JAXServer(GradioUserInference):
             )[:, -fixed_pad:]
 
             returns = (
-                self.tokenizer.decode(input_ids[0][-num_generated_tokens:], skip_special_tokens=True),
+                self.tokenizer.decode(input_ids[0][-num_generated_tokens:], skip_special_tokens=False),
                 num_generated_tokens
             )
 
