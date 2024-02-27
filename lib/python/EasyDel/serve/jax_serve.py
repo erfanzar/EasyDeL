@@ -867,7 +867,11 @@ class JAXServer(GradioUserInference):
                 attention_mask=attention_mask
             )
             predicted_token = self.greedy_generate(**inputs_to_gen) if greedy else self.generate(**inputs_to_gen)
-
+            predicted_token = predicted_token[
+                predicted_token != self.tokenizer.pad_token_id if (
+                        self.server_config.pad_token_id is None
+                ) else predicted_token != self.server_config.pad_token_id
+            ]
             num_generated_tokens += predicted_token.shape[-1]
             plus_attn_mask = jnp.ones((len(attention_mask), self.server_config.max_compile_tokens), dtype=jnp.int32)
 
@@ -881,7 +885,7 @@ class JAXServer(GradioUserInference):
             )[:, -fixed_pad:]
 
             returns = (
-                self.tokenizer.decode(input_ids[0][-num_generated_tokens:], skip_special_tokens=False),
+                self.tokenizer.decode(input_ids[0][-num_generated_tokens:], skip_special_tokens=True),
                 num_generated_tokens
             )
 
