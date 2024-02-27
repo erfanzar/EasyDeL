@@ -37,7 +37,7 @@ def match_keywords(string, ts, ns):
     """
     The match_keywords function takes a string, and two lists of strings.
     The first list is the &quot;must-have&quot; keywords, and the second list is the &quot;not-allowed&quot; keywords.
-    It returns True if all of the must-have keywords are in string, but none of not allowed are in it.
+    It returns True if all the must-have keywords are in string, but none of not allowed are in it.
 
     :param string: Pass in the text that is being searched
     :param ts: Specify the required keywords and ns is used to specify the non-required keywords

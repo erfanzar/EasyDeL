@@ -569,12 +569,14 @@ class EasyDelState(struct.PyTreeNode):
 
         def make_depth(mdl=None):
             if mdl is not None:
-                return mdl.__str__().replace(
-                    "\n",
-                    "\n\t"
-                    ""
-                ) if hasattr(mdl, "__str__") else None
-
+                try:
+                    return mdl.__str__().replace(
+                        "\n",
+                        "\n\t"
+                        ""
+                    ) if hasattr(mdl, "__str__") else None
+                except TypeError:
+                    ...
             return mdl
 
         optimizer = self.tx_init.get("optimizer", None)
