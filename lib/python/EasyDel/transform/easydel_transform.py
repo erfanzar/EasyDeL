@@ -175,7 +175,8 @@ def easystate_to_torch(
         dtype=jnp.float16,
         transpose_needed=None,
         transpose_not_needed=None,
-        select_params_field: bool = True
+        select_params_field: bool = True,
+
 ):
     import torch
 
@@ -209,7 +210,9 @@ def easystate_to_torch(
         if match_keywords(key, transpose_needed, transpose_not_needed):
             tensor = tensor.T
         tensor = tensor.astype(get_dtype(dtype))
-        torch_state_dict[key.replace(".kernel", ".weight").replace(".embedding", ".weight")] = torch.from_numpy(tensor)
+        torch_state_dict[
+            key.replace(".kernel", ".weight").replace(".embedding", ".weight").replace(".scale", ".weight")
+        ] = torch.from_numpy(tensor)
     return torch_state_dict
 
 
