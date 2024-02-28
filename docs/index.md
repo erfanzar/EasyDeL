@@ -7,15 +7,27 @@ rewritten for mojo as well.
 
 Some of the key features provided by EasyDeL include:
 
+- Serving and API Engines for Using and serving LLMs in JAX as efficiently as possible.
 - Support for 8, 6, and 4 BIT inference and training in JAX
+- A wide range of models in Jax is supported which have never been implemented before such as Falcon, Qwen2, Phi2,
+  Mixtral, and MPT ...
 - Integration of flashAttention in JAX for GPUs and TPUs
 - Automatic serving of LLMs with mid and high-level APIs in both JAX and PyTorch
 - LLM Trainer and fine-tuner in JAX
-- RLHF (Reinforcement Learning from Human Feedback) in Jax
-- And various other features to enhance the training process and optimize performance.
+- Video CLM Trainer and Fine-tunerFalcon, Qwen2, Phi2, Mixtral, and MPT ...
+- RLHF (Reinforcement Learning from Human Feedback) in Jax (Beta Stage)
+- DPOTrainer(Supported) and SFTTrainer(Developing Stage)
+- Various other features to enhance the training process and optimize performance.
+- LoRA: Low-Rank Adaptation of Large Language Models
+- RingAttention, Flash Attention, BlockWise FFN, and Efficient Attention are supported for more than 90 % of models
+  ([FJFormer](https://github.com/erfanzar/FJFormer) Backbone).
+- Serving and API Engines for Using and serving LLMs in JAX as efficiently as possible.
+- Automatic Converting Models from JAX-EasyDeL to PyTorch-HF and reverse
 
 > These features collectively aim to simplify and accelerate the training of machine learning models, making it more
 > efficient and accessible for developers working with Jax/Flax.
+
+> FlashAttention and Splash Attention are currently disabled for Falcon, MPT, PHI and GPTJ
 
 ## What Makes EasyDeL 🔮 Special
 
@@ -48,3 +60,24 @@ While JAX offers these benefits, it's important to note that PyTorch and TensorF
 extensive libraries, and a wide range of pre-trained models, which can be advantageous in certain scenarios.
 Additionally, the choice of framework often depends on the specific requirements of the project and the familiarity of
 the team with a particular toolset.
+
+## Documentation 💫
+
+> Documents and Examples are ready at [Here](https://erfanzar.github.io/EasyDeL)
+> Please have that in mind that EasyDel is in the loop of fast-development
+> so we might have API changes
+
+## Citing EasyDeL 🥶
+
+#### To cite this Project
+
+```misc
+@misc{Zare Chavoshi_2023,
+    title={EasyDeL, an open-source library, is specifically designed to enhance and streamline the training process of machine learning models. It focuses primarily on Jax/Flax and aims to provide convenient and effective solutions for training Flax/Jax Models on TPU/GPU for both Serving and Training purposes.},
+    url={https://github.com/erfanzar/EasyDel},
+    journal={EasyDeL Easy and Fast DeepLearning with JAX},
+    publisher={Erfan Zare Chavoshi},
+    author={Zare Chavoshi, Erfan},
+    year={2023}
+} 
+```

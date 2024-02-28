@@ -1,15 +1,24 @@
 import math
+
+import flax.linen.partitioning
 from flax import linen as nn
-from flax.core import FrozenDict, unfreeze
+from flax.core import FrozenDict, unfreeze, freeze
 from typing import Optional, Dict, Union, Tuple
 
 from flax.linen import combine_masks
+from flax.traverse_util import unflatten_dict, flatten_dict
 from jax import numpy as jnp, lax
 import jax
+
 from jax.sharding import PartitionSpec
 from transformers.modeling_flax_outputs import FlaxCausalLMOutput, FlaxBaseModelOutput
-from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
-    with_sharding_constraint, get_dot_general_by_bits
+from ..flax_modelling_utils import (
+    get_gradient_checkpoint_policy,
+    with_sharding_constraint,
+    get_dot_general_by_bits,
+    BaseJAXAttentionModule,
+    block_wise_ffn
+)
 import chex
 from fjformer.func import transpose
 from .falcon_configuration import FalconConfig
@@ -118,41 +127,18 @@ def dropout_add(linen_drop: nn.Dropout, x: chex.Array, residual: chex.Array, det
 class FlaxFalconRotaryEmbedding(nn.Module):
     dtype: jnp.dtype = jnp.float32
 
-    def __call__(self, key, query, freq_cis, position_ids):
+    def __call__(self, query, key, freq_cis, position_ids):
         sin, cos = freq_cis
 
         sin = sin[position_ids][:, :]
         cos = cos[position_ids][:, :]
 
-        _, sequence_length, _ = query.shape
-
-        # query_expansion_factor = int(query.shape[0] / cos.shape[0])
-        # key_expansion_factor = int(key.shape[0] / cos.shape[0])
-
-        query_expansion_factor = 1
-        key_expansion_factor = 1
-
-        if query_expansion_factor > 1:
-            query_cos = jnp.tile(cos, (query_expansion_factor,))
-            query_sin = jnp.tile(sin, (query_expansion_factor,))
-        else:
-            query_cos, query_sin = cos, sin
-
-        if key_expansion_factor > 1:
-            if key_expansion_factor != query_expansion_factor:
-                key_cos = jnp.tile(cos, (key_expansion_factor,))
-                key_sin = jnp.tile(sin, (key_expansion_factor,))
-            else:
-                key_cos, key_sin = query_cos, query_sin
-        else:
-            key_cos, key_sin = cos, sin
-
-        query = apply_rotary_pos_embedding(query, query_sin, query_cos)
-        key = apply_rotary_pos_embedding(key, key_sin, key_cos)
+        query = apply_rotary_pos_embedding(query, sin, cos)
+        key = apply_rotary_pos_embedding(key, sin, cos)
         return query.astype(self.dtype), key.astype(self.dtype)
 
 
-class FlaxFalconAttention(nn.Module):
+class FlaxFalconAttention(BaseJAXAttentionModule):
     config: FalconConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -181,53 +167,18 @@ class FlaxFalconAttention(nn.Module):
         self.maybe_rotary = FlaxFalconRotaryEmbedding(self.dtype) if not self.config.alibi else lambda q, k, a, s: (
             q, k)
         assert self.head_dim * self.config.num_attention_heads == self.config.hidden_size
-        if self.config.num_kv_heads is not None:
-
-            self.num_kv_heads = self.config.num_kv_heads if (
-                    self.config.new_decoder_architecture or not self.config.multi_query) else 1
-        else:
-            self.num_kv_heads = self.config.num_attention_heads
+        self.num_kv_heads = self.config.num_kv_heads if (
+                self.config.new_decoder_architecture or not self.config.multi_query
+        ) else 1
         self.num_heads = self.config.num_attention_heads
 
-    @nn.compact
-    def _concatenate_to_cache(self, key: chex.Array, value: chex.Array, query: chex.Array, attention_mask: chex.Array):
-        is_initialized = self.has_variable("cache", "cached_key")
-        cached_key = self.variable("cache", "cached_key", jnp.zeros, key.shape, key.dtype)
-        cached_value = self.variable("cache", "cached_value", jnp.zeros, value.shape, value.dtype)
-        cache_index = self.variable("cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32))
-        if is_initialized:
-            *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
-            cur_index = cache_index.value
-            indices = (0,) * len(batch_dims) + (int(cur_index), 0, 0)
-            key = lax.dynamic_update_slice(cached_key.value, key, indices)
-            value = lax.dynamic_update_slice(cached_value.value, value, indices)
-            cached_key.value = key
-            cached_value.value = value
-            num_updated_cache_vectors = query.shape[1]
-            cache_index.value = cache_index.value + num_updated_cache_vectors
-
-            pad_mask = jnp.broadcast_to(
-                jnp.arange(max_length) < cur_index + num_updated_cache_vectors,
-                tuple(batch_dims) + (1, num_updated_cache_vectors, max_length),
-            )
-            attention_mask = combine_masks(pad_mask, attention_mask)
-        return key, value, attention_mask
-
     @staticmethod
-    def _t(query, key, value):
+    def _transpose_sequence_head(query, key, value):
         return jnp.transpose(query, (0, 2, 1, 3)), jnp.transpose(key, (0, 2, 1, 3)), jnp.transpose(value, (0, 2, 1, 3))
-
-    def apply_maybe_rotary(self, batch_size, sequence_length, query, key, value, freq_cis, position_ids):
-        query = query.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
-        key = key.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
-        value = value.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
-
-        query, key, value = self._t(query, key, value)
-        query, key = self.rotary(position_ids=position_ids, query=query, key=key, freq_cis=freq_cis)
-        return self._t(query, key, value)
 
     def split_head(self, qkv: chex.Array):
         batch_size, sequence_length, _ = qkv.shape
+
         if self.config.new_decoder_architecture:
             batch, sequence_length, _ = qkv.shape
             qkv = qkv.reshape(batch, sequence_length, -1, self.num_heads // self.num_kv_heads + 2, self.head_dim)
@@ -265,7 +216,7 @@ class FlaxFalconAttention(nn.Module):
         batch_size = batch_size_and_num_heads // self.num_heads
         x = x.reshape(batch_size, self.config.num_attention_heads, seq_length, self.head_dim)
 
-        x = x.transpose(0, 2, 1, 3)
+        # x = x.transpose(0, 2, 1, 3)
         return x.reshape(batch_size, seq_length, self.config.num_attention_heads * self.head_dim)
 
     def __call__(
@@ -276,59 +227,109 @@ class FlaxFalconAttention(nn.Module):
             causal_mask: chex.Array = None,
             alibi: chex.Array = None,
             freq_cis: Tuple[chex.Array, chex.Array] = None,
+            init_cache: bool = False,
             output_attentions: bool = False,
     ):
+        # FLAX
         batch_size, sequence_length, _ = hidden_states.shape
-        num_kv_heads = self.num_kv_heads
-        query_layer, key_layer, value_layer = self.split_head(self.query_key_value(hidden_states))
+        num_kv_heads = self.num_heads if self.config.new_decoder_architecture else self.num_kv_heads
+        qkv = self.query_key_value(hidden_states)
+
+        query_layer, key_layer, value_layer = self.split_head(qkv)
+        query_length, key_length = query_layer.shape[1], key_layer.shape[1]
         query_layer = transpose(
             query_layer, 1, 2
         ).reshape(
-            batch_size * self.config.num_attention_heads,
-            sequence_length,
+            batch_size,
+            self.config.num_attention_heads,
+            query_length,
             self.head_dim
         )
         key_layer = transpose(
             key_layer, 1, 2
         ).reshape(
-            batch_size * num_kv_heads,
-            sequence_length,
+            batch_size,
+            num_kv_heads,
+            key_length,
             self.head_dim,
         )
         value_layer = transpose(
             value_layer, 1, 2
         ).reshape(
-            batch_size * num_kv_heads,
-            sequence_length,
+            batch_size,
+            num_kv_heads,
+            key_length,
             self.head_dim
         )
-        kv_length = key_layer.shape[1]
+        if self.has_variable("cache", "cached_key"):
+            mask_shift = self.variables["cache"]["cache_index"]
+            max_decoder_length = self.variables["cache"]["cached_key"].shape[1]
+            causal_mask = lax.dynamic_slice(
+                causal_mask, (
+                    0,
+                    0,
+                    mask_shift,
+                    0
+                ), (
+                    1,
+                    1,
+                    query_length,
+                    max_decoder_length
+                )
+            )
+        else:
+            causal_mask = causal_mask[:, :, :query_length, :key_length]
+
+        batch_size = hidden_states.shape[0]
+        causal_mask = jnp.broadcast_to(
+            causal_mask, (batch_size,) + causal_mask.shape[1:]
+        )
+        if attention_mask.ndim == 2:
+            attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
+        attention_mask = combine_masks(attention_mask, causal_mask)
+
         if not self.config.alibi:
             query_layer, key_layer = self.maybe_rotary(
-                query_layer,
-                key_layer,
-                freq_cis,
-                position_ids
+                position_ids=position_ids,
+                query=query_layer,
+                key=key_layer,
+                freq_cis=freq_cis
             )
-
+        if self.has_variable("cache", "cached_key") or init_cache:
+            key_layer, value_layer, attention_mask = self._concatenate_to_cache(
+                key_layer,
+                value_layer,
+                query_layer,
+                attention_mask
+            )
         float_min = jnp.finfo(query_layer.dtype).min
         attention_bias = lax.select(
             attention_mask > 0,
             jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
             jnp.full(attention_mask.shape, float_min).astype(self.dtype),
         )
+        dtype = jnp.promote_types(key_layer.dtype, jnp.float32)
 
-        query_layer_ = query_layer.reshape(batch_size, self.config.num_attention_heads, -1, self.head_dim)
-        key_layer_ = key_layer.reshape(batch_size, num_kv_heads, -1, self.head_dim)
-        value_layer_ = value_layer.reshape(batch_size, num_kv_heads, -1, self.head_dim)
+        (
+            query_layer,
+            key_layer,
+            value_layer,
+            attention_bias
+        ) = map(
+            lambda x: x.astype(dtype=dtype), (
+                query_layer,
+                key_layer,
+                value_layer,
+                attention_bias
+            )
+        )
 
-        dtype = jnp.promote_types(key_layer_.dtype, jnp.float32)
-
-        query_layer_, key_layer_, value_layer_, attention_bias = map(lambda x: x.astype(dtype=dtype), (
-            query_layer_, key_layer_, value_layer_, attention_bias))
-
-        attention_scores = jax.lax.batch_matmul(query_layer_, transpose(key_layer_, len(key_layer_.shape) - 2,
-                                                                        len(key_layer_.shape) - 1))
+        attention_scores = jnp.einsum(
+            "...qhd,...khd->...hqk",
+            query_layer.transpose(0, 2, 1, 3),
+            key_layer.transpose(0, 2, 1, 3),
+            precision=self.precision
+        )
         if alibi is None:
 
             attention_scores /= math.sqrt(self.head_dim)
@@ -336,11 +337,15 @@ class FlaxFalconAttention(nn.Module):
             attention_scores = jax.nn.softmax(
                 attention_scores + attention_bias, axis=-1
             )
-            attn_output = jax.lax.batch_matmul(attention_scores, value_layer_)
-            attn_output = attn_output.reshape(batch_size, self.num_heads, sequence_length, self.head_dim)
-            attn_output = transpose(attn_output, 2, 1)
-            attn_output = attn_output.reshape(batch_size, sequence_length, self.num_heads * self.head_dim)
-
+            attn_output = jnp.einsum(
+                "...hqk,...khd->...qhd",
+                attention_scores,
+                value_layer.transpose(0, 2, 1, 3),
+                precision=self.precision
+            )
+            attn_output = attn_output.reshape(batch_size, query_length, self.num_heads, self.head_dim)
+            # attn_output = transpose(attn_output, 2, 1)
+            attn_output = attn_output.reshape(batch_size, query_length, self.num_heads * self.head_dim)
             output_tensor = self.dense(attn_output)
 
             if output_attentions:
@@ -349,17 +354,17 @@ class FlaxFalconAttention(nn.Module):
                 return output_tensor,
         else:
 
-            attention_scores = attention_scores.reshape(batch_size, self.num_heads, sequence_length, kv_length)
+            attention_scores = attention_scores.reshape(batch_size, self.num_heads, query_length, key_length)
             attention_scores = attention_scores + alibi.reshape(batch_size, self.num_heads, 1, -1)
             attention_scores *= self.inv_norm_factor
             attention_scores = jax.nn.softmax(
                 attention_scores + attention_bias, axis=-1
             )
-            attention_scores = attention_scores.reshape(batch_size, self.num_heads, sequence_length, kv_length)
+            attention_scores = attention_scores.reshape(batch_size, self.num_heads, query_length, key_length)
 
             # matmul: [batch_size * num_heads, q_length, head_dim]
 
-            attn_output = jax.lax.batch_matmul(attention_scores, value_layer_)
+            attn_output = jax.lax.batch_matmul(attention_scores, value_layer)
             attn_output = attn_output.reshape((attn_output.shape[1] * attn_output.shape[0],) + attn_output.shape[2:])
             attn_output = self._merge_heads(attn_output)
 
@@ -415,13 +420,38 @@ class FlaxFalconBlock(nn.Module):
                                         dtype=self.dtype)
             self.ln_mlp = nn.LayerNorm(epsilon=config.layer_norm_epsilon,
                                        dtype=self.dtype)
-        self.mlp = FlaxFalconMlp(
+
+        # hidden_states: chex.Array
+        # attention_mask: chex.Array
+        # position_ids: chex.Array
+        # causal_mask: chex.Array = None
+        # alibi: chex.Array = None
+        # freq_cis: Tuple[chex.Array, chex.Array] = None
+        # init_cache: bool = False
+        # output_attentions: bool = False
+
+        attn_block = FlaxFalconAttention
+        mlp_block = FlaxFalconMlp
+        if self.config.gradient_checkpointing != "":
+            attn_block = flax.linen.partitioning.remat(
+                attn_block,
+                policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
+                static_argnums=(3, 5, 6, 7)
+            )
+
+            mlp_block = flax.linen.partitioning.remat(
+                mlp_block,
+                policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
+                static_argnums=(1,)
+            )
+
+        self.mlp = mlp_block(
             config=config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.self_attention = FlaxFalconAttention(
+        self.self_attention = attn_block(
             config=config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -439,6 +469,7 @@ class FlaxFalconBlock(nn.Module):
             freq_cis: Tuple[chex.Array, chex.Array],
             position_ids: chex.Array,
             causal_mask: chex.Array,
+            init_cache: bool = False,
             output_attentions: bool = False,
             deterministic: bool = True
     ):
@@ -451,14 +482,25 @@ class FlaxFalconBlock(nn.Module):
             attention_layernorm_out = self.input_layernorm(hidden_states)
 
         # Self attention.
+
+        # hidden_states: chex.Array
+        # attention_mask: chex.Array
+        # position_ids: chex.Array
+        # causal_mask: chex.Array = None
+        # alibi: chex.Array = None
+        # freq_cis: Tuple[chex.Array, chex.Array] = None
+        # init_cache: bool = False
+        # output_attentions: bool = False
+
         attn_outputs = self.self_attention(
-            hidden_states=attention_layernorm_out,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            causal_mask=causal_mask,
-            alibi=alibi,
-            freq_cis=freq_cis,
-            output_attentions=output_attentions,
+            attention_layernorm_out,
+            attention_mask,
+            position_ids,
+            causal_mask,
+            alibi,
+            freq_cis,
+            init_cache,
+            output_attentions,
         )
 
         attention_output = attn_outputs[0]
@@ -476,8 +518,18 @@ class FlaxFalconBlock(nn.Module):
                 mlp_layernorm_out = self.post_attention_layernorm(residual)
 
         outputs = attn_outputs[1:]
-
-        mlp_output = self.mlp(mlp_layernorm_out, deterministic=deterministic)
+        if self.config.use_scan_mlp:
+            mlp_output = block_wise_ffn(
+                self.mlp,
+                mlp_layernorm_out,
+                self.config.scan_mlp_chunk_size,
+                deterministic,
+            )
+        else:
+            mlp_output = self.mlp(
+                mlp_layernorm_out,
+                deterministic,
+            )
 
         if self.config.new_decoder_architecture or self.config.parallel_attn:
             mlp_output += attention_output
@@ -500,22 +552,7 @@ class FlaxFalconCollection(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
-        # hidden_states: chex.Array,
-        # alibi: chex.Array,
-        # attention_mask: chex.Array,
-        # freq_cis: Tuple[chex.Array, chex.Array],
-        # position_ids: chex.Array,
-        # causal_mask: chex.Array,
-        # output_attentions: bool = False,
-        # deterministic: bool = True
-
         block = FlaxFalconBlock
-        if self.config.gradient_checkpointing != "":
-            block = nn.remat(
-                block,
-                policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
-                static_argnums=(-2, -1)
-            )
         self.layers = [
             block(
                 config=self.config,
@@ -537,18 +574,30 @@ class FlaxFalconCollection(nn.Module):
                  position_ids: chex.Array,
                  causal_mask: chex.Array,
                  output_attentions: bool = False,
+                 init_cache: bool = False,
                  deterministic: bool = True
                  ):
         for layer in self.layers:
+            # hidden_states: chex.Array
+            # alibi: chex.Array
+            # attention_mask: chex.Array
+            # freq_cis: Tuple[chex.Array, chex.Array]
+            # position_ids: chex.Array
+            # causal_mask: chex.Array
+            # init_cache: bool = False
+            # output_attentions: bool = False
+            # deterministic: bool = True
+
             out = layer(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                alibi=alibi,
-                freq_cis=freq_cis,
-                position_ids=position_ids,
-                causal_mask=causal_mask,
-                deterministic=deterministic,
-                output_attentions=output_attentions
+                hidden_states,
+                alibi,
+                attention_mask,
+                freq_cis,
+                position_ids,
+                causal_mask,
+                init_cache,
+                output_attentions if self.config.gradient_checkpointing == "" else False,
+                deterministic,
             )
             hidden_states = out[0]
         return hidden_states
@@ -574,7 +623,12 @@ class FlaxFalconModule(nn.Module):
             precision=self.precision
         )
         self.ln_f = nn.LayerNorm(dtype=self.dtype, param_dtype=self.param_dtype, epsilon=self.config.layer_norm_epsilon)
-        self.causal_mask = nn.attention.make_causal_mask(jnp.ones((1, self.config.max_position_embeddings)))
+        self.causal_mask = nn.make_causal_mask(
+            jnp.ones(
+                (1, getattr(self.config, "c_max_position_embeddings", self.config.max_position_embeddings)),
+                dtype="bool"
+            ), dtype="bool"
+        )
         if not self.config.alibi:
             self.freq_cis: Tuple[chex.Array, chex.Array] = precompute_falcon_freq_cis(
                 max_position_embedding=self.config.max_position_embeddings,
@@ -583,20 +637,18 @@ class FlaxFalconModule(nn.Module):
         else:
             self.freq_cis = None
 
-    def __call__(self,
-                 input_ids: chex.Array,
-                 attention_mask: Optional[chex.Array] = None,
-                 position_ids: Optional[chex.Array] = None,
-                 output_attentions: bool = False,
-                 deterministic: bool = True,
-                 use_cache: Optional[bool] = None,
-                 return_dict: Optional[bool] = False
-                 ):
+    def __call__(
+            self,
+            input_ids: chex.Array,
+            attention_mask: Optional[chex.Array] = None,
+            head_mask: Optional[chex.Array] = None,
+            position_ids: Optional[chex.Array] = None,
+            output_attentions: bool = False,
+            deterministic: bool = True,
+            init_cache: bool = False,
+            return_dict: Optional[bool] = True
+    ):
         batch, sequence_length = input_ids.shape
-        if position_ids is None:
-            position_ids = jnp.arange(0, sequence_length).reshape(1, -1)
-        if attention_mask is None:
-            attention_mask = jnp.ones((batch, sequence_length))
 
         hidden_states = self.word_embeddings(
             inputs=input_ids.astype(jnp.int32)
@@ -605,6 +657,12 @@ class FlaxFalconModule(nn.Module):
         if self.config.alibi:
             alibi = built_bloom_alibi(attention_mask, self.config.num_attention_heads).astype(hidden_states.dtype)
 
+        else:
+            alibi = None
+            if position_ids is None:
+                position_ids = jnp.arange(0, sequence_length).reshape(1, -1)
+        if attention_mask is None:
+            attention_mask = jnp.ones((batch, sequence_length), dtype="i4")
         if attention_mask.ndim == 2:
             attention_mask = attention_mask[:, jnp.newaxis, jnp.newaxis, :]
 
@@ -616,7 +674,8 @@ class FlaxFalconModule(nn.Module):
             freq_cis=self.freq_cis,
             causal_mask=self.causal_mask,
             output_attentions=output_attentions,
-            deterministic=deterministic
+            deterministic=deterministic,
+            init_cache=init_cache
         )
 
         out = out_layers[0]
@@ -645,34 +704,77 @@ class FlaxFalconPretrainedModel(EasyDelFlaxPretrainedModel):
                  _do_init=False,
                  dtype: jnp.dtype = jnp.float32,
                  param_dtype: jnp.dtype = jnp.float32,
-                 input_shape: Tuple = (1, 1024),
-                 precision: Optional[Union[None, jax.lax.Precision]] = jax.lax.Precision("fastest")
+                 input_shape: Tuple = (1, 1),
+                 precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
                  ):
         module = self.module_class(config=config, dtype=dtype, param_dtype=param_dtype, precision=precision)
         super().__init__(_do_init=_do_init, module=module, config=config, dtype=dtype, input_shape=input_shape)
 
-    def init_weights(self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None) -> Dict:
-        if params is None:
-            params = self.module.init(
-                rngs=rng,
-                input_ids=jnp.ones(input_shape),
-                attention_mask=jnp.ones(input_shape)
-            )
-        return params['params']
+    def init_weights(self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None) -> FrozenDict:
+        """
+        The init_weights function is used to initialize the weights of a model.
 
-    def __call__(self,
-                 input_ids: chex.Array,
-                 attention_mask: Optional[chex.Array] = None,
-                 position_ids: Optional[chex.Array] = None,
-                 past_key_values: Optional[nn.Module] = None,
-                 output_attentions: bool = False,
-                 deterministic: bool = True,
-                 use_cache: Optional[bool] = None,
-                 return_dict: Optional[bool] = False,
-                 params: FrozenDict = None,
-                 add_params_field: bool = False,
-                 **kwargs
-                 ):
+        :param self: Access variables that belong to the class
+        :param rng: jax.random.PRNGKey: Initialize the weights of the model
+        :param input_shape: Tuple: Specify the shape of the input tensor
+        :param params: FrozenDict: Pass in the parameters of a pre-trained model
+        :return: A frozendict of parameters
+
+        """
+        input_ids = jnp.zeros(input_shape, dtype="i4")
+        attention_mask = jnp.ones_like(input_ids)
+        position_ids = jnp.broadcast_to(jnp.arange(
+            jnp.atleast_2d(input_ids).shape[-1]), input_shape)
+        params_rng, dropout_rng = jax.random.split(rng)
+        rngs = {"params": params_rng, "dropout": dropout_rng}
+
+        if self.config.add_cross_attention:
+            encoder_hidden_states = jnp.zeros(
+                input_shape + (self.config.hidden_size,))
+            encoder_attention_mask = attention_mask
+            module_init_outputs = self.module.init(
+                rngs,
+                input_ids,
+                attention_mask,
+                position_ids,
+                encoder_hidden_states,
+                encoder_attention_mask,
+                return_dict=False,
+            )
+        else:
+            module_init_outputs = self.module.init(
+                rngs,
+                input_ids,
+                attention_mask,
+                position_ids,
+                return_dict=False
+            )
+
+        random_params = module_init_outputs["params"]
+
+        if params is not None:
+            random_params = flatten_dict(unfreeze(random_params))
+            params = flatten_dict(unfreeze(params))
+            for missing_key in self._missing_keys:
+                params[missing_key] = random_params[missing_key]
+            self._missing_keys = set()
+            return freeze(unflatten_dict(params))
+        else:
+            return random_params
+
+    def __call__(
+            self,
+            input_ids: chex.Array,
+            attention_mask: Optional[chex.Array] = None,
+            position_ids: Optional[chex.Array] = None,
+            past_key_values: Optional[nn.Module] = None,
+            output_attentions: bool = False,
+            train: bool = True,
+            return_dict: Optional[bool] = True,
+            params: FrozenDict = None,
+            add_params_field: bool = False,
+            **kwargs
+    ):
         input_ids = jnp.asarray(input_ids, dtype=jnp.int32)
         inputs = {'params': params or self.params} if add_params_field else params or self.params
         if past_key_values:
@@ -699,8 +801,8 @@ class FlaxFalconPretrainedModel(EasyDelFlaxPretrainedModel):
             jnp.array(attention_mask, dtype="i4"),
             jnp.array(position_ids, dtype="i4"),
             output_attentions,
-            deterministic,
-            use_cache,
+            not train,
+            False,
             return_dict,
             mutable=mutable,
             rngs=rngs
@@ -786,7 +888,7 @@ class FlaxFalconForCausalLMModule(nn.Module):
                  position_ids: Optional[chex.Array] = None,
                  output_attentions: bool = False,
                  deterministic: bool = True,
-                 use_cache: Optional[bool] = None,
+                 init_cache: Optional[bool] = None,
                  return_dict: Optional[bool] = False
                  ):
         transformer_output = self.transformer(
@@ -794,7 +896,7 @@ class FlaxFalconForCausalLMModule(nn.Module):
             attention_mask=attention_mask,
             position_ids=position_ids,
             output_attentions=output_attentions,
-            use_cache=use_cache,
+            init_cache=init_cache,
             return_dict=return_dict
         )
         if return_dict:

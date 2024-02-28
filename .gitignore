@@ -7,14 +7,19 @@ __pycache__/
 .idea
 *.so
 env.ipynb
-pallas_env.py
 env.py
+pallas_env.py
+test_EasyDelState.py
 io.py
+*.easy
 # Distribution / packaging
 *.json
 .Python
+EasyDel-Checkpoints
 build/
 develop-eggs/
+memory.prof.new
+memory.prof
 dist/
 downloads/
 eggs/

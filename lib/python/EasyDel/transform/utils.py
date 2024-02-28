@@ -1,4 +1,4 @@
-from fjformer import StreamingCheckpointer, float_tensor_to_dtype
+from fjformer import CheckpointManager, float_tensor_to_dtype
 from flax.traverse_util import flatten_dict
 
 
@@ -14,7 +14,7 @@ def match_keywords(string, positives, negatives):
 
 def load_and_convert_checkpoint(path):
     import torch
-    _, flax_params = StreamingCheckpointer.load_trainstate_checkpoint(path)
+    _, flax_params = CheckpointManager.load_state_checkpoint(path)
     flax_params = flatten_dict(flax_params['params'], sep='.')
     torch_params = {}
     for key, tensor in flax_params.items():
@@ -23,3 +23,7 @@ def load_and_convert_checkpoint(path):
         tensor = float_tensor_to_dtype(tensor, 'fp16')
         torch_params[key] = torch.from_numpy(tensor)
     return torch_params
+
+
+def get_pytorch_model_and_config_by_type():
+    ...

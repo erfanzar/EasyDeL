@@ -1,13 +1,19 @@
-from .serve.torch_serve import (
+from .serve import (
+    EasyServe as EasyServe,
+    EasyServeConfig as EasyServeConfig,
+    LLMBaseReq as LLMBaseReq,
+    GenerateAPIRequest as GenerateAPIRequest,
+    ConversationItem as ConversationItem,
+    ModelOutput as ModelOutput,
+    BaseModel as BaseModel,
+    EasyClient as EasyClient,
+    GradioUserInference as GradioUserInference,
+    ChatRequest as ChatRequest,
+    InstructRequest as InstructRequest,
     PyTorchServer as PyTorchServer,
-    PytorchServerConfig as PytorchServerConfig
-)
-from .serve.jax_serve import (
+    PyTorchServerConfig as PyTorchServerConfig,
     JAXServer as JAXServer,
     JAXServerConfig as JAXServerConfig
-)
-from .serve.gradio_user_interface_base import (
-    GradioUserInference as GradioUserInference
 )
 
 from .modules.llama import (
@@ -79,78 +85,278 @@ from .modules.mixtral import (
     MixtralConfig as MixtralConfig
 )
 
+from .modules.phi import (
+    FlaxPhiForCausalLM as FlaxPhiForCausalLM,
+    PhiConfig as PhiConfig,
+    FlaxPhiModel as FlaxPhiModel
+)
+from .modules.qwen1 import (
+    FlaxQwen1Model as FlaxQwen1Model,
+    FlaxQwen1ForCausalLM as FlaxQwen1ForCausalLM,
+    FlaxQwen1ForSequenceClassification as FlaxQwen1ForSequenceClassification,
+    Qwen1Config as Qwen1Config
+)
+
+from .modules.qwen2 import (
+    FlaxQwen2Model as FlaxQwen2Model,
+    FlaxQwen2ForCausalLM as FlaxQwen2ForCausalLM,
+    FlaxQwen2ForSequenceClassification as FlaxQwen2ForSequenceClassification,
+    Qwen2Config as Qwen2Config
+)
+
+from .modules.gemma import (
+    FlaxGemmaModel as FlaxGemmaModel,
+    GemmaConfig as GemmaConfig,
+    FlaxGemmaForCausalLM as FlaxGemmaForCausalLM
+)
+from .modules.stablelm import (
+
+    StableLmConfig as StableLmConfig,
+    FlaxStableLmForCausalLM as FlaxStableLmForCausalLM,
+    FlaxStableLmModel as FlaxStableLmModel
+)
 from .modules.auto_easydel_model import (
     AutoEasyDelModelForCausalLM as AutoEasyDelModelForCausalLM,
+    AutoEasyDelConfig as AutoEasyDelConfig,
+    AutoShardAndGatherFunctions as AutoShardAndGatherFunctions,
     get_modules_by_type as get_modules_by_type
 )
 
 from .utils.utils import (
     get_mesh as get_mesh,
-    names_in_mesh as names_in_mesh,
-    get_names_from_partition_spec as get_names_from_partition_spec,
-    make_shard_and_gather_fns as make_shard_and_gather_fns,
-    with_sharding_constraint as with_sharding_constraint,
     RNG as RNG
 )
 
 from .trainer import (
-    CausalLanguageModelTrainer,
-    TrainArguments,
-    create_casual_language_model_evaluation_step,
-    create_casual_language_model_train_step,
+    CausalLanguageModelTrainer as CausalLanguageModelTrainer,
+    EasyDeLXRapTureConfig as EasyDeLXRapTureConfig,
+    TrainArguments as TrainArguments,
+    create_casual_language_model_evaluation_step as create_casual_language_model_evaluation_step,
+    create_casual_language_model_train_step as create_casual_language_model_train_step,
+    create_vision_casual_language_model_train_step as create_vision_casual_language_model_train_step,
+    create_vision_casual_language_model_evaluation_step as create_vision_casual_language_model_evaluation_step,
+    VisionCausalLanguageModelTrainer as VisionCausalLanguageModelTrainer,
+    VisionCausalLanguageModelStepOutput as VisionCausalLanguageModelStepOutput
 )
 
-from .linen import (
-    from_8bit as from_8bit,
-    Dense8Bit as Dense8Bit,
-    array_from_8bit as array_from_8bit,
-    array_to_bit8 as array_to_bit8,
-    to_8bit as to_8bit
+from .reinforcement_learning import (
+    create_dpo_eval_function as create_dpo_eval_function,
+    create_dpo_train_function as create_dpo_train_function,
+    DPOTrainer as DPOTrainer,
+    create_concatenated_forward as create_concatenated_forward,
+    AutoRLModelForCasualLMWithValueHead as AutoRLModelForCasualLMWithValueHead
 )
+
 from .smi import (
-    run as run,
+    run as smi_run,
     initialise_tracking as initialise_tracking,
     get_mem as get_mem
 )
 
-from .transform.llama import (
-    llama_from_pretrained as llama_from_pretrained,
-    llama_convert_flax_to_pt as llama_convert_flax_to_pt,
-    llama_convert_hf_to_flax_load as llama_convert_hf_to_flax_load,
-    llama_convert_hf_to_flax as llama_convert_hf_to_flax,
-    llama_easydel_to_hf as llama_easydel_to_hf
-)
-from .transform.mpt import (
-    mpt_convert_flax_to_pt_1b as mpt_convert_flax_to_pt_1b,
-    mpt_convert_pt_to_flax_1b as mpt_convert_pt_to_flax_1b,
-    mpt_convert_pt_to_flax_7b as mpt_convert_pt_to_flax_7b,
-    mpt_convert_flax_to_pt_7b as mpt_convert_flax_to_pt_7b,
-    mpt_from_pretrained as mpt_from_pretrained
-)
-
-from .transform.falcon import (
-    falcon_convert_pt_to_flax_7b as falcon_convert_pt_to_flax_7b,
+from .transform import (
+    huggingface_to_easydel as huggingface_to_easydel,
+    easystate_to_huggingface_model as easystate_to_huggingface_model,
+    easystate_to_torch as easystate_to_torch,
     falcon_convert_flax_to_pt_7b as falcon_convert_flax_to_pt_7b,
     falcon_from_pretrained as falcon_from_pretrained,
     falcon_convert_hf_to_flax as falcon_convert_hf_to_flax,
-    falcon_easydel_to_hf as falcon_easydel_to_hf
-)
-from .transform.mistral import (
-    mistral_convert_hf_to_flax as mistral_convert_hf_to_flax,
+    mpt_convert_pt_to_flax_1b as mpt_convert_pt_to_flax_1b,
+    mpt_convert_pt_to_flax_7b as mpt_convert_pt_to_flax_7b,
+    mpt_convert_flax_to_pt_7b as mpt_convert_flax_to_pt_7b,
+    mpt_from_pretrained as mpt_from_pretrained,
     mistral_convert_hf_to_flax_load as mistral_convert_hf_to_flax_load,
     mistral_convert_flax_to_pt as mistral_convert_flax_to_pt,
     mistral_from_pretrained as mistral_from_pretrained,
-    mistral_convert_pt_to_flax as mistral_convert_pt_to_flax,
-    mistral_easydel_to_hf as mistral_easydel_to_hf
-)
-
-from .transform.easydel_transform import (
-    huggingface_to_easydel as huggingface_to_easydel
+    falcon_convert_pt_to_flax_7b as falcon_convert_pt_to_flax_7b,
+    mistral_convert_hf_to_flax as mistral_convert_hf_to_flax,
+    mpt_convert_flax_to_pt_1b as mpt_convert_flax_to_pt_1b,
+    llama_convert_flax_to_pt as llama_convert_flax_to_pt,
+    llama_convert_hf_to_flax_load as llama_convert_hf_to_flax_load,
+    llama_convert_hf_to_flax as llama_convert_hf_to_flax,
+    llama_from_pretrained as llama_from_pretrained
 )
 from .etils import (
-    EasyDelOptimizers,
-    EasyDelSchedulers,
-    EasyDelGradientCheckPointers
+    EasyDelOptimizers as EasyDelOptimizers,
+    EasyDelSchedulers as EasyDelSchedulers,
+    EasyDelGradientCheckPointers as EasyDelGradientCheckPointers,
+    EasyDelState as EasyDelState,
+    EasyDelTimerError as EasyDelTimerError,
+    EasyDelRuntimeError as EasyDelRuntimeError,
+    EasyDelSyntaxRuntimeError as EasyDelSyntaxRuntimeError
 )
 
-__version__ = "0.0.41"
+__all__ = (
+    # API Serving Modules
+
+    "EasyServe",
+    "EasyServeConfig",
+    "LLMBaseReq",
+    "GenerateAPIRequest",
+    "ConversationItem",
+    "ModelOutput",
+    "BaseModel",
+    "EasyClient",
+    "GradioUserInference",
+    "ChatRequest",
+    "InstructRequest",
+    "PyTorchServer",
+    "PyTorchServerConfig",
+    "JAXServer",
+    "JAXServerConfig",
+
+    # Models
+
+    # LLama Models
+    "LlamaConfig",
+    "FlaxLlamaForCausalLM",
+    "FlaxLlamaForSequenceClassification",
+    "FlaxLlamaModel",
+
+    # GPT-J Models
+    "GPTJConfig",
+    "FlaxGPTJForCausalLM",
+    "FlaxGPTJModel",
+
+    # T5 Models
+    "T5Config",
+    "FlaxT5ForConditionalGeneration",
+    "FlaxT5Model",
+
+    # Falcon Models
+    "FalconConfig",
+    "FlaxFalconModel",
+    "FlaxFalconForCausalLM",
+
+    # OPT Models
+    "OPTConfig",
+    "FlaxOPTForCausalLM",
+    "FlaxOPTModel",
+
+    # Mistral Models
+    "MistralConfig",
+    "FlaxMistralForCausalLM",
+    "FlaxMistralModel",
+
+    # Palm Models
+    "FlaxPalmModel",
+    "PalmConfig",
+    "FlaxPalmForCausalLM",
+
+    # Mpt Models
+    "MptConfig",
+    "FlaxMptForCausalLM",
+    "FlaxMptModel",
+
+    # GPTNeoX Models
+    "GPTNeoXConfig",
+    "FlaxGPTNeoXModel",
+    "FlaxGPTNeoXForCausalLM",
+
+    # LucidTransformer Models
+    "FlaxLTModel",
+    "FlaxLTConfig",
+    "FlaxLTForCausalLM",
+
+    # GPT2 Models
+    "GPT2Config",
+    "FlaxGPT2LMHeadModel",
+    "FlaxGPT2Model",
+
+    # Mixtral Models
+    "FlaxMixtralForCausalLM",
+    "FlaxMixtralModel",
+    "MixtralConfig",
+
+    # PHI-2 Models
+    "FlaxPhiForCausalLM",
+    "PhiConfig",
+    "FlaxPhiModel",
+
+    # Qwen1 Models
+    "FlaxQwen1Model",
+    "FlaxQwen1ForCausalLM",
+    "FlaxQwen1ForSequenceClassification",
+    "Qwen1Config",
+
+    # Qwen2 Models
+    "FlaxQwen2Model",
+    "FlaxQwen2ForCausalLM",
+    "FlaxQwen2ForSequenceClassification",
+    "Qwen2Config",
+
+    # Gemma Models
+    "FlaxGemmaModel",
+    "GemmaConfig",
+    "FlaxGemmaForCausalLM",
+
+    # StableLM Models
+    "StableLmConfig",
+    "FlaxStableLmForCausalLM",
+    "FlaxStableLmModel",
+
+    # AutoModels Models
+    "AutoEasyDelModelForCausalLM",
+    "AutoEasyDelConfig",
+    "AutoShardAndGatherFunctions",
+    "get_modules_by_type",
+
+    # Utils
+    "get_mesh",
+    "RNG",
+
+    # Trainers
+    "CausalLanguageModelTrainer",
+    "EasyDeLXRapTureConfig",
+    "TrainArguments",
+    "create_casual_language_model_evaluation_step",
+    "create_casual_language_model_train_step",
+
+    "VisionCausalLanguageModelStepOutput",
+    "VisionCausalLanguageModelTrainer",
+    "create_vision_casual_language_model_evaluation_step",
+    "create_vision_casual_language_model_train_step",
+
+    "create_dpo_eval_function",
+    "create_dpo_train_function",
+    "DPOTrainer",
+    "create_concatenated_forward",
+    "AutoRLModelForCasualLMWithValueHead",
+
+    # SMI Modules
+    "smi_run",
+    "initialise_tracking",
+    "get_mem",
+
+    # Converters
+    "huggingface_to_easydel",
+    "easystate_to_huggingface_model",
+    "easystate_to_torch",
+    "falcon_convert_flax_to_pt_7b",
+    "falcon_from_pretrained",
+    "falcon_convert_hf_to_flax",
+    "mpt_convert_pt_to_flax_1b",
+    "mpt_convert_pt_to_flax_7b",
+    "mpt_convert_flax_to_pt_7b",
+    "mpt_from_pretrained",
+    "mistral_convert_hf_to_flax_load",
+    "mistral_convert_flax_to_pt",
+    'mistral_from_pretrained',
+    "falcon_convert_pt_to_flax_7b",
+    "mistral_convert_hf_to_flax",
+    "mpt_convert_flax_to_pt_1b",
+    "llama_convert_flax_to_pt",
+    "llama_convert_hf_to_flax_load",
+    "llama_convert_hf_to_flax",
+    "llama_from_pretrained",
+
+    # ETils Modules / ETils Errors
+    "EasyDelOptimizers",
+    "EasyDelSchedulers",
+    "EasyDelGradientCheckPointers",
+    "EasyDelState",
+    "EasyDelTimerError",
+    "EasyDelRuntimeError",
+    "EasyDelSyntaxRuntimeError"
+)
+
+__version__ = "0.0.55"

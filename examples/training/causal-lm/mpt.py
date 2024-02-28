@@ -3,7 +3,7 @@ from datasets import load_dataset
 from huggingface_hub import HfApi
 import EasyDel
 from absl import flags, app
-from fjformer.load._load import get_float_dtype_by_name
+from fjformer.checkpoint import get_dtype
 
 FLAGS = flags.FLAGS
 
@@ -27,16 +27,11 @@ flags.DEFINE_string(
     help='which model type of MPT 1 to train example [7b ,...] (default is 7b model)'
 )
 
-flags.DEFINE_bool(
-    name='use_flash_attention',
-    default=False,
-    help='use_flash_attention or no'
-)
 
 flags.DEFINE_bool(
-    name='use_sacn_mlp',
+    name='use_scan_mlp',
     default=False,
-    help='use_sacn_mlp or no'
+    help='use_scan_mlp or no'
 )
 
 flags.DEFINE_bool(
@@ -88,9 +83,9 @@ flags.DEFINE_integer(
 )
 
 flags.DEFINE_integer(
-    name='max_steps',
+    name='max_training_steps',
     default=None,
-    help='number of max_steps (have been set to None for max number of steps)'
+    help='number of max_training_steps (have been set to None for max number of steps)'
 )
 
 flags.DEFINE_string(
@@ -156,22 +151,20 @@ def main(argv):
     if FLAGS.config_repo is not None:
         conf = None
         config = EasyDel.modules.MptConfig.from_pretrained(FLAGS.config_repo, trust_remote_code=True)
-        config.use_flash_attention = FLAGS.use_flash_attention
-        config.use_sacn_mlp = FLAGS.use_sacn_mlp
+        config.use_scan_mlp = FLAGS.use_scan_mlp
     else:
         conf = EasyDel.modules.configs.mpt_configs[FLAGS.model_type]
         config = EasyDel.modules.MptConfig(**conf, rotary_type=FLAGS.rotary_type)
-        config.use_flash_attention = FLAGS.use_flash_attention
-        config.use_sacn_mlp = FLAGS.use_sacn_mlp
+        config.use_scan_mlp = FLAGS.use_scan_mlp
         config.max_sequence_length = FLAGS.max_sequence_length
-        config.max_length = FLAGS.max_sequence_length
+        config.max_sequence_length = FLAGS.max_sequence_length
         config.max_seq_len = FLAGS.max_sequence_length
         config.rope_scaling = None
 
     train_args = TrainArguments(
         model_class=EasyDel.modules.FlaxMptForCausalLM,
-        configs_to_init_model_class={'config': config, 'dtype': get_float_dtype_by_name(FLAGS.dtype),
-                                     'param_dtype': get_float_dtype_by_name(FLAGS.dtype)},
+        configs_to_initialize_model_class={'config': config, 'dtype': get_dtype(FLAGS.dtype),
+                                     'param_dtype': get_dtype(FLAGS.dtype)},
         custom_rule=config.get_partition_rules(True),
         model_name=FLAGS.project_name,
         num_train_epochs=FLAGS.num_train_epochs,
@@ -181,12 +174,12 @@ def main(argv):
         scheduler=FLAGS.scheduler,
         weight_decay=0.01,
         total_batch_size=FLAGS.batch_size,
-        max_steps=FLAGS.max_steps,
+        max_training_steps=FLAGS.max_training_steps,
         do_train=FLAGS.do_train,
         do_eval=FLAGS.do_eval,
         do_test=FLAGS.do_test,
         backend=FLAGS.backend,
-        max_length=FLAGS.max_sequence_length,
+        max_sequence_length=FLAGS.max_sequence_length,
         gradient_checkpointing='nothing_saveable',
         sharding_array=(1, -1, 1, 1),
         use_pjit_attention_force=False,

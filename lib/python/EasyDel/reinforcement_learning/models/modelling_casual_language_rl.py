@@ -6,7 +6,7 @@ import jax
 from jax.experimental import pjit
 from transformers import PretrainedConfig, GenerationConfig
 from flax import linen as nn
-from typing import Sequence, Optional, Type, Tuple, Any, Callable
+from typing import Sequence, Optional, Type, Tuple, Any, Callable, Mapping
 from jax import numpy as jnp
 from ...modules.auto_easydel_model import AutoEasyDelModelForCausalLM
 from ...modules.easydel_modelling_utils import EasyDelPretrainedConfig, EasyDelFlaxPretrainedModel
@@ -233,20 +233,21 @@ class AutoRLModelForCasualLMWithValueHead:
             device=jax.devices('cpu')[0],
             dtype: jax.numpy.dtype = jax.numpy.float32,
             param_dtype: jax.numpy.dtype = jax.numpy.float32,
-            precision: jax.lax.Precision = jax.lax.Precision("fastest"),
+            precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
             sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
             sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, None, None),
-            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            query_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            key_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            value_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            bias_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, None, None),
+            attention_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             use_shard_map: bool = False,
             input_shape: Tuple[int, int] = (1, 1),
             backend: Optional[str] = None,
             kernel_init: Callable = nn.initializers.orthogonal(),
             generation_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp"),
             generation_config: GenerationConfig = GenerationConfig(),
+            shard_fns: Optional[Mapping[tuple, Callable]] = None,
             seed: int = 42,
             summary_dropout_prob: float = 0.0,
             **kwargs
@@ -259,13 +260,14 @@ class AutoRLModelForCasualLMWithValueHead:
             precision=precision,
             sharding_axis_dims=sharding_axis_dims,
             sharding_axis_names=sharding_axis_names,
-            q_ps=q_ps,
-            k_ps=k_ps,
-            v_ps=v_ps,
-            b_ps=b_ps,
-            a_ps=a_ps,
+            query_partition_spec=query_partition_spec,
+            key_partition_spec=key_partition_spec,
+            value_partition_spec=value_partition_spec,
+            bias_partition_spec=bias_partition_spec,
+            attention_partition_spec=attention_partition_spec,
             use_shard_map=use_shard_map,
             input_shape=input_shape,
+            shard_fns=shard_fns,
             backend=backend,
             **kwargs
         )

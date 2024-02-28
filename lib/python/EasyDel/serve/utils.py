@@ -6,7 +6,7 @@ from flax.traverse_util import unflatten_dict
 from jax import numpy as jnp
 from jax.experimental import mesh_utils
 from pydantic import BaseModel
-from fjformer.load._load import get_float_dtype_by_name
+from fjformer.checkpoint import get_dtype
 from gradio.themes.base import Base
 from gradio.themes.utils import colors, fonts, sizes
 from typing import Union
@@ -111,7 +111,7 @@ seafoam = Seafoam()
 
 def get_dtype(dtype):
     if isinstance(dtype, str):
-        dtype = get_float_dtype_by_name(dtype)
+        dtype = get_dtype(dtype)
     return dtype
 
 

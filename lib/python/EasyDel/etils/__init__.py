@@ -20,5 +20,13 @@ from .etils import (
 from .errors import (
     EasyDelTimerError,
     EasyDelRuntimeError,
-    EasyDeSyntaxRuntimeError
+    EasyDelSyntaxRuntimeError
+)
+
+from .easystate import (
+    EasyDelState
+)
+
+from .auto_tx import (
+    get_optimizer_and_scheduler
 )

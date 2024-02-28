@@ -1,17 +1,22 @@
 import functools
 
-import fjformer.attention
+import fjformer
+from einops import rearrange
 from fjformer.bits import config as q_config, q_flax
+from flax.linen import combine_masks
+from jax import lax, numpy as jnp
+from jax.experimental.shard_map import shard_map
 from jax.interpreters import pxla
-from jax.experimental.pjit import with_sharding_constraint as wsc
 import jax
 from flax import linen as nn
 from functools import partial
 import chex
-from typing import Sequence, Optional
+from typing import Sequence, Optional, Literal
 from jax.experimental.mesh_utils import create_device_mesh
-from jax.experimental.shard_map import shard_map
 from .easydel_modelling_utils import EasyMethod
+from jax.sharding import PartitionSpec
+
+from ..etils.errors import EasyDelBlockWiseFFNError
 
 ACT2FN = {
     "gelu": partial(nn.gelu, approximate=False),
@@ -101,22 +106,7 @@ def names_in_mesh(*names):
     return set(names) <= set(pxla.thread_resources.env.physical_mesh.axis_names)
 
 
-def with_sharding_constraint(x, partition_specs):
-    """
-    The with_sharding_constraint function is used to ensure that the sharding of a tensor
-    is consistent with the sharding of its inputs.  This function should be called on any
-    tensor which has been created by an operation which does not automatically handle this,
-    such as tf.concat or tf.split.
-
-    :param x: Define the tensor that will be sharded
-    :param partition_specs: Specify the partitioning of the data
-    :return: The same tensor with the
-
-    """
-    axis_names = get_names_from_partition_spec(partition_specs)
-    if names_in_mesh(*axis_names):
-        x = wsc(x, partition_specs)
-    return x
+with_sharding_constraint = fjformer.with_sharding_constraint
 
 
 def get_gradient_checkpoint_policy(name):
@@ -187,7 +177,8 @@ def repeat_kv_bsnh(x: chex.Array, n_rep: int) -> chex.Array:
 
 
 def precompute_freq_cis(
-        dim, max_position_embeddings=2048, base=10000, scaling_factor=1.0, rope_type: str | None = None
+        dim, max_position_embeddings=2048, base=10000, scaling_factor=1.0, rope_type: str | None = None,
+        t_dtype: jnp.dtype = jnp.int32
 ):
     if rope_type == "none":
         rope_type = None
@@ -196,7 +187,9 @@ def precompute_freq_cis(
         "dynamic",
         None
     ], "wrong rope type has been given"
-    t = jax.numpy.arange(max_position_embeddings)
+    if t_dtype == jnp.int64:
+        jax.config.update("jax_enable_x64", True)
+    t = jax.numpy.arange(max_position_embeddings, dtype=t_dtype)
 
     if rope_type == "linear":
         t = t / scaling_factor
@@ -274,205 +267,6 @@ def get_ranks_and_size(mesh):
     return out
 
 
-def get_flash_attention():
-    """
-    return: FlashAttention FN, Upcast Needed to float32,do_shard_map
-    """
-    platform = jax.lib.xla_bridge.get_backend().platform
-    if platform == "gpu":
-        float32_logits = False
-        ring_attention_fn = fjformer.attention.ring_flash_attention_gpu
-        do_shard_map = True
-    elif platform == "tpu":
-        float32_logits = True
-        ring_attention_fn = fjformer.attention.tpu_flash_attention
-        do_shard_map = False
-    else:
-        raise ValueError(f"Unsupported platform {platform}")
-
-    return ring_attention_fn, float32_logits, do_shard_map
-
-
-def smart_flash_attention(
-        q: chex.Array,
-        k: chex.Array,
-        v: chex.Array,
-        bias: chex.Array,
-        q_ps: jax.sharding.PartitionSpec,
-        k_ps: jax.sharding.PartitionSpec,
-        v_ps: jax.sharding.PartitionSpec,
-        b_ps: jax.sharding.PartitionSpec,
-        a_ps: jax.sharding.PartitionSpec,
-        block_k: int,
-        block_q: int,
-        block_b: int,
-        q_seq_len: int,
-        kv_seq_len: int,
-        num_attention_heads: int,
-        head_dims: int,
-        causal: bool,
-        attn_pdrop: float,
-        mesh: jax.sharding.Mesh = None,
-        dtype: jax.numpy.dtype = jax.numpy.float32,
-        precision: jax.lax.Precision = jax.lax.Precision("fastest"),
-        dropout_rng: jax.random.PRNGKey = None,
-        force_float32_tpu: bool = True,
-        deterministic: bool = False
-) -> chex.Array:
-    """
-    Smart Flash Attention mechanism for efficient attention computation.
-
-    :param q: Query tensor with shape [batch_size, num_attention_heads, q_seq_len, head_dims].
-    :type q: tensor
-
-    :param k: Key tensor with shape [batch_size, num_attention_heads, kv_seq_len, head_dims].
-    :type k: tensor
-
-    :param v: Value tensor with shape [batch_size, num_attention_heads, kv_seq_len, head_dims].
-    :type v: tensor
-
-    :param bias: Bias tensor with shape [batch_size, num_attention_heads, q_seq_len, kv_seq_len].
-    :type bias: tensor
-
-    :param q_ps: jax.sharding.PartitionSpec: Specify the partitioning of the query tensor
-
-    :param k_ps: jax.sharding.PartitionSpec: Partition the key matrix
-
-    :param v_ps: jax.sharding.PartitionSpec: Specify the partitioning of the value tensor
-
-    :param b_ps: jax.sharding.PartitionSpec: Specify the Attention Bias partition spec
-
-    :param a_ps: jax.sharding.PartitionSpec: Specify the partitioning of the attention weights
-
-    :param block_k: Block size for key tensor reshaping.
-    :type block_k: int
-
-    :param block_q: Block size for query tensor reshaping.
-    :type block_q: int
-
-    :param block_b: Block size for bias tensor reshaping.
-    :type block_b: int
-
-    :param q_seq_len: Length of the query sequence.
-    :type q_seq_len: int
-
-    :param kv_seq_len: Length of the key-value sequence.
-    :type kv_seq_len: int
-
-    :param num_attention_heads: Number of attention heads.
-    :type num_attention_heads: int
-
-    :param head_dims: Dimensionality of each attention head.
-    :type head_dims: int
-
-    :param causal: If True, applies causal masking to the attention scores.
-    :type causal: bool
-
-    :param attn_pdrop: Dropout probability for attention weights.
-    :type attn_pdrop: float
-
-    :param mesh: Mesh specifying the data distribution for parallel computation.
-    :type mesh: mesh_type
-
-    :param dtype: Data type of the tensors.
-    :type dtype: data_type
-
-    :param precision: Precision mode for computation (default is 'fastest').
-    :type precision: str
-
-    :param dropout_rng: Random number generator key for dropout.
-    :type dropout_rng: rng_key
-
-    :param force_float32_tpu: If True, forces computation to use float32 on TPU.
-    :type force_float32_tpu: bool
-
-    :param deterministic: If True, ensures deterministic computation.
-    :type deterministic: bool
-
-    :return: chex.Array: Output tensor with the same shape as the input value tensor v.
-    :rtype: tensor
-
-    :raises ValueError: If the shapes of input tensors are not compatible for attention computation.
-    """
-    assertion_mkv_err = """
-    Q,K,V and bias shapes must be like
-    Q Shape : [batch_size, num_attention_heads, q_seq_len, head_dims]
-    K Shape : [batch_size, num_attention_heads, kv_seq_len, head_dims]
-    V Shape : [batch_size, num_attention_heads, kv_seq_len, head_dims]
-    bias Shape : [batch_size, num_attention_heads, q_seq_len, kv_seq_len]
-    """
-    batch_size = q.shape[0]
-    assert batch_size == k.shape[0] == v.shape[0], 'Batch Size for q,k,v wont match'
-
-    assert q.shape == (batch_size, num_attention_heads,
-                       q_seq_len, head_dims), assertion_mkv_err
-    assert k.shape == (batch_size, num_attention_heads,
-                       kv_seq_len, head_dims), assertion_mkv_err
-    assert v.shape == (batch_size, num_attention_heads,
-                       kv_seq_len, head_dims), assertion_mkv_err
-    assert bias.shape == (batch_size, num_attention_heads,
-                          q_seq_len, kv_seq_len), assertion_mkv_err
-
-    flash_attn_fn, f32_upcast, do_shard_map = get_flash_attention()
-
-    if do_shard_map:
-        q, k, v = map(lambda x: jax.numpy.transpose(
-            x, (0, 2, 1, 3)), [q, k, v])
-        assert mesh is not None, 'For Using Shard Map on GPUs you have to pass Mesh'
-        ring_attention_sharded = shard_map(
-            partial(
-                flash_attn_fn,
-                axis_name="sp",
-                float32_logits=f32_upcast,
-                blockwise_kwargs=dict(
-                    deterministic=deterministic,
-                    dropout_rng=dropout_rng,
-                    attn_pdrop=attn_pdrop,
-                    causal=causal,
-                    query_chunk_size=block_q,
-                    key_chunk_size=block_k,
-                    dtype=dtype,
-                    policy=jax.checkpoint_policies.nothing_saveable,
-                    precision=precision,
-                    prevent_cse=False,
-                )
-            ),
-            mesh=mesh,
-            in_specs=(
-                q_ps,
-                k_ps,
-                v_ps,
-                b_ps
-            ),
-            out_specs=a_ps,
-            check_rep=False
-        )
-        attn_output = ring_attention_sharded(q, k, v, bias)
-        attn_output = with_sharding_constraint(attn_output, a_ps)
-    else:
-        if force_float32_tpu or f32_upcast:
-            q, k, v = map(lambda x: x.astype(jax.numpy.float32), [q, k, v])
-        attn_output = fjformer.attention.jax_flash_attn_tpu.flash_attention(
-            q,
-            k,
-            v,
-            bias,
-            None,
-            causal=False,
-            sm_scale=1.0,
-            block_sizes=fjformer.attention.jax_flash_attn_tpu.BlockSizes(
-                block_b=block_b,
-                block_k=block_k,
-                block_q=block_q,
-                block_k_major=block_k
-            ),
-            debug=False,
-        )
-
-    attn_output = attn_output.astype(dtype)
-    return attn_output
-
-
 def create_mesh(
         axis_dims: Sequence[int] = (1, -1, 1, 1), axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"), backend=""
 ):
@@ -516,7 +310,7 @@ def add_start_docstrings(*docstr):
 
 def get_dot_general_by_bits(
         bits: Optional[int] = None,
-        mode: EasyMethod = EasyMethod.TRAIN
+        mode: Literal["train", "serve", "convert"] = EasyMethod.TRAIN
 ) -> dict:
     """
     The get_general_dot function is a helper function that returns a q_flax.QDotGeneral object
@@ -547,6 +341,123 @@ def get_dot_general_by_bits(
             )
         }
     return {}  # empty just in case of not getting any error
+
+
+class BaseJAXAttentionModule(nn.Module):
+    config: "EasyDelPretrainedConfig"
+
+    @nn.compact
+    def _concatenate_to_cache(self, key, value, query_states, attention_mask):
+        """
+        The _concatenate_to_cache function is used to concatenate the key and value vectors
+        of a query_states with those of previous queries. This allows for the attention mechanism to
+        look at all previous queries when computing its output. The function takes in three
+        arguments: key, value, and query_states. It also uses two variables that are stored in the cache:
+        cached_key and cached_value.
+
+        :param self: Access the variables stored in the cache
+        :param key: Store the keys of the encoder-decoder attention
+        :param value: Initialize the cached_value variable
+        :param query_states: Determine the number of cache vectors to update
+        :param attention_mask: Mask out the padded vectors in the cache
+        :return: The key, value and attention_mask
+        """
+        is_initialized = self.has_variable("cache", "cached_key")
+        cached_key = self.variable("cache", "cached_key", jnp.zeros, key.shape, key.dtype)
+        cached_value = self.variable("cache", "cached_value", jnp.zeros, value.shape, value.dtype)
+        cache_index = self.variable("cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32))
+
+        if is_initialized:
+            *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
+            cur_index = cache_index.value
+            if query_states.shape[1] == 1 and self.config.use_sharded_kv_caching:
+                mesh = self.config.jax_mesh()
+
+                def fn(
+                        _cached_key,
+                        _cached_value,
+                        _key,
+                        _value,
+                        _cur_index
+                ):
+                    assert _key.shape[1] == 1 and _value.shape[1] == 1, (_key.shape, _value.shape)
+                    sp_size = max_length // mesh.shape["sp"]
+                    axis_index = jax.lax.axis_index("sp")
+                    _cur_index = _cur_index - axis_index * sp_size
+                    _key, _value = jax.lax.cond(
+                        jnp.logical_and(cur_index >= 0, _cur_index < sp_size),
+                        lambda: (
+                            _cached_key.at[:, cur_index].set(_key[:, -1]),
+                            _cached_value.at[:, cur_index].set(_value[:, -1]),
+                        ),
+                        lambda: (_cached_key, _cached_value),
+                    )
+                    return _key, _value
+
+                fn = shard_map(
+                    fn, mesh=mesh,
+                    in_specs=(
+                        PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+                        PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+                        PartitionSpec(("dp", "fsdp"), None, "tp", None),
+                        PartitionSpec(("dp", "fsdp"), None, "tp", None),
+                        PartitionSpec()
+                    ),
+                    out_specs=(
+                        PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+                        PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
+                    ),
+                    check_rep=False
+                )
+                key, value = fn(cached_key.value, cached_value.value, key, value, cur_index)
+            else:
+                *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
+                cur_index = cache_index.value
+                indices = (0,) * len(batch_dims) + (cur_index, 0, 0)
+                key = lax.dynamic_update_slice(cached_key.value, key, indices)
+                value = lax.dynamic_update_slice(cached_value.value, value, indices)
+                num_updated_cache_vectors = query_states.shape[1]
+                pad_mask = jnp.broadcast_to(
+                    jnp.arange(max_length) < cur_index + num_updated_cache_vectors,
+                    tuple(batch_dims) + (1, num_updated_cache_vectors, max_length),
+                )
+                attention_mask = combine_masks(pad_mask, attention_mask)
+            cached_key.value = key
+            cached_value.value = value
+            num_updated_cache_vectors = query_states.shape[1]
+            cache_index.value = cache_index.value + num_updated_cache_vectors
+        return key, value, attention_mask
+
+
+def block_wise_ffn(remat_ffn, inputs, chunk_size: int, deterministic: bool):
+    generating = inputs.shape[1] == 1
+    try:
+        if generating:
+            return remat_ffn(inputs, deterministic)
+        else:
+            inputs = rearrange(inputs, 'b (c n) d -> b c n d', c=chunk_size)
+
+            def scan_ffn(remat_ffn_, carry, hidden_states):
+                outputs = remat_ffn_(hidden_states, deterministic)
+                return carry, outputs
+
+            scan_axis = inputs.ndim - 2
+            _, output = nn.scan(
+                scan_ffn,
+                variable_broadcast="params",
+                split_rngs={"params": False, "dropout": True},
+                in_axes=scan_axis,
+                out_axes=scan_axis,
+            )(remat_ffn, None, inputs)
+            output = rearrange(output, 'b c n d -> b (c n) d')
+            return output
+    except Exception as e:
+        raise EasyDelBlockWiseFFNError(
+            "You Are using BlockWise FFN from near-infinite-context length paper and you might be passing "
+            "input arguments in wrong way in case that you don't want to use this just pass `use_scan_mlp=False` in "
+            "model config or in config_kwargs in AutoEasyDeLModelForCausalLM or change `scan_mlp_chunk_size` "
+            f"in configs for more information read Docs.\nOriginal Error\n{e}"
+        )
 
 
 def read_depth(

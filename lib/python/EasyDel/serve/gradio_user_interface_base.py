@@ -9,7 +9,7 @@ class GradioUserInference:
     @staticmethod
     def chat_interface_components(
             sample_func: typing.Callable,
-            max_length: int,
+            max_sequence_length: int,
             max_new_tokens: int,
             max_compile_tokens: int
     ):
@@ -18,51 +18,69 @@ class GradioUserInference:
         a chat history, message box, buttons for submitting, stopping, and clearing the conversation,
         and sliders for advanced options.
         """
-        _max_length = max_length
+
+        _max_length = max_sequence_length
         _max_new_tokens = max_new_tokens
         _max_compile_tokens = max_compile_tokens
-        with gr.Row():
-            with gr.Column(scale=4):
-                history = gr.Chatbot(
-                    elem_id="EasyDel",
-                    label="EasyDel",
-                    container=True,
-                    height=800
+
+        with gr.Column("100%"):
+            gr.Markdown(
+                "# <h1><center style='color:white;'>Powered by "
+                "[EasyDeL](https://github.com/erfanzar/EasyDel)</center></h1>",
+            )
+            history = gr.Chatbot(
+                elem_id="EasyDel",
+                label="EasyDel",
+                container=True,
+                height="65vh",
+            )
+            prompt = gr.Textbox(
+                show_label=False, placeholder='Enter Your Prompt Here.', container=False
+            )
+            with gr.Row():
+                submit = gr.Button(
+                    value="Run",
+                    variant="primary"
                 )
-                prompt = gr.Textbox(placeholder='Message Box', container=False)
-            with gr.Column(scale=1):
-                gr.Markdown(
-                    "# <h1><center>Powered by [EasyDeL](https://github.com/erfanzar/EasyDel)</center></h1>"
+                stop = gr.Button(
+                    value='Stop'
                 )
+                clear = gr.Button(
+                    value='Clear Conversation'
+                )
+            with gr.Accordion(open=False, label="Advanced Options"):
                 system_prompt = gr.Textbox(
                     value="",
+                    show_label=False,
                     label="System Prompt",
                     placeholder='System Prompt',
                     container=False
                 )
-                max_length = gr.Slider(
+
+                max_sequence_length = gr.Slider(
                     value=_max_length,
+                    maximum=10000,
                     minimum=1,
-                    maximum=_max_length,
-                    step=1,
-                    label="Maximum Length"
+                    label='Max Tokens',
+                    step=1
                 )
 
                 max_new_tokens = gr.Slider(
                     value=_max_new_tokens,
-                    maximum=_max_length,
+                    maximum=10000,
                     minimum=_max_compile_tokens,
                     label='Max New Tokens',
                     step=_max_compile_tokens
                 )
 
                 max_compile_tokens = gr.Slider(
-                    value=max_compile_tokens,
-                    maximum=_max_new_tokens,
-                    minimum=max_compile_tokens,
-                    label='Max Compile Tokens (JAX)',
-                    step=max_compile_tokens,
+                    value=_max_compile_tokens,
+                    maximum=_max_compile_tokens,
+                    minimum=_max_compile_tokens,
+                    label='Max Compile Tokens',
+                    step=_max_compile_tokens
                 )
+
                 temperature = gr.Slider(
                     value=0.8,
                     maximum=1,
@@ -84,39 +102,37 @@ class GradioUserInference:
                     label='Top K',
                     step=1
                 )
-                mode = gr.Dropdown(
-                    choices=["Chat", "Instruction"],
-                    value="Chat",
-                    label="Mode",
-                    multiselect=False,
+                repetition_penalty = gr.Slider(
+                    value=1.2,
+                    maximum=5,
+                    minimum=0.1,
+                    label='Repetition Penalty'
                 )
-                greedy = gr.Checkbox(
-                    value=False,
-                    label="Greedy"
+                greedy = gr.Radio(
+                    value=True,
+                    label="Do Sample or Greedy Generation"
                 )
 
-                stop = gr.Button(
-                    value='Stop'
+                mode = gr.Dropdown(
+                    choices=["Chat", "Instruct"],
+                    value="Chat",
+                    label="Mode",
+                    multiselect=False
                 )
-                clear = gr.Button(
-                    value='Clear Conversation'
-                )
-                submit = gr.Button(
-                    value="Run",
-                    variant="primary"
-                )
+
         inputs = [
             prompt,
             history,
             system_prompt,
             mode,
-            max_length,
+            max_sequence_length,
             max_new_tokens,
             max_compile_tokens,
             greedy,
             temperature,
             top_p,
-            top_k
+            top_k,
+            repetition_penalty
         ]
 
         clear.click(fn=lambda: [], outputs=[history])
@@ -133,26 +149,27 @@ class GradioUserInference:
             cancels=[txt_event, sub_event]
         )
 
-    def process_gradio(
+    def sample_gradio(
             self,
             prompt: str,
             history: List[List[str]],
             system_prompt: str | None,
             mode: str,
-            max_length: int,
+            max_sequence_length: int,
             max_new_tokens: int,
             max_compile_tokens: int,
             greedy: bool,
             temperature: float,
             top_p: float,
-            top_k: int
+            top_k: int,
+            repetition_penalty: float
     ):
         raise NotImplementedError()
 
     def build_inference(
             self,
             sample_func: typing.Callable,
-            max_length: int,
+            max_sequence_length: int,
             max_new_tokens: int,
             max_compile_tokens: int
     ) -> gr.Blocks:
@@ -166,8 +183,42 @@ class GradioUserInference:
         ) as block:
             self.chat_interface_components(
                 sample_func=sample_func,
-                max_length=max_length,
+                max_sequence_length=max_sequence_length,
                 max_new_tokens=max_new_tokens,
                 max_compile_tokens=max_compile_tokens
             )
         return block
+
+    def __repr__(self):
+
+        """
+        The __repr__ function is used to generate a string representation of an object.
+        This function should return a string that can be parsed by the Python interpreter
+        to recreate the object. The __repr__ function is called when you use print() on an
+        object, or when you type its name in the REPL.
+
+        :param self: Refer to the instance of the class
+        :return: A string representation of the object
+        """
+        string = f"{self.__class__.__name__}(\n"
+        for k, v in self.__dict__.items():
+            if not k.startswith("_"):
+
+                try:
+                    repr_src = f"\t{k} : " + v.__str__().replace("\n", "\n\t") + "\n"
+                    string += repr_src if len(repr_src) < 500 else f"\t{k} : " + f"{v.__class__.__name__}(...)" + "\n"
+                except TypeError:
+                    ...
+
+        return string + ")"
+
+    def __str__(self):
+
+        """
+        The __str__ function is called when you use the print function or when str() is used.
+        It should return a string representation of the object.
+
+        :param self: Refer to the instance of the class
+        :return: The object's string representation
+        """
+        return self.__repr__()

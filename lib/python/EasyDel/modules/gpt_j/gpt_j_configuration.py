@@ -38,9 +38,7 @@ class GPTJConfig(EasyDelPretrainedConfig):
             eos_token_id: int = 50256,
             tie_word_embeddings: bool = False,
             use_pjit_attention_force: bool = False,
-            use_flash_attention: bool = False,
-            flash_attn_query_chunk_size: int = 1024,
-            flash_attn_key_chunk_size: int = 2048,
+            gradient_checkpointing: str = "",
             bits: Optional[int] = None,
             **kwargs,
     ):
@@ -62,10 +60,8 @@ class GPTJConfig(EasyDelPretrainedConfig):
         self.use_pjit_attention_force = use_pjit_attention_force
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
-        self.flash_attn_query_chunk_size = flash_attn_query_chunk_size
-        self.flash_attn_key_chunk_size = flash_attn_key_chunk_size
-        self.use_flash_attention = use_flash_attention
         self.from_pt = False
+        self.gradient_checkpointing = gradient_checkpointing
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
@@ -74,14 +70,15 @@ class GPTJConfig(EasyDelPretrainedConfig):
         )
 
     @staticmethod
-    def set_custom_partition(embedding_partition: PartitionSpec,
-                             kvq_partition: PartitionSpec,
-                             o_proj_partition: PartitionSpec,
-                             fc_out_partition: PartitionSpec,
-                             fc_in_partition: PartitionSpec,
-                             fc_lm_head_partition: PartitionSpec,
-                             rest_partitions: PartitionSpec = PartitionSpec(None)
-                             ):
+    def set_custom_partition(
+            embedding_partition: PartitionSpec,
+            kvq_partition: PartitionSpec,
+            o_proj_partition: PartitionSpec,
+            fc_out_partition: PartitionSpec,
+            fc_in_partition: PartitionSpec,
+            fc_lm_head_partition: PartitionSpec,
+            rest_partitions: PartitionSpec = PartitionSpec(None)
+    ):
         return (
             ("model/wte/embedding", embedding_partition),
 
@@ -116,7 +113,7 @@ class GPTJConfig(EasyDelPretrainedConfig):
 
                 ("lm_head/kernel", PartitionSpec(("fsdp", "tp"), )),
                 ("lm_head/bias", PartitionSpec(("fsdp", "tp"), )),
-                ('.*', PartitionSpec(None)),
+                (".*", PartitionSpec(None)),
             )
         else:
             rules = (
@@ -133,7 +130,7 @@ class GPTJConfig(EasyDelPretrainedConfig):
 
                 ("lm_head/kernel", PartitionSpec("tp", ("fsdp", "sp"), )),
                 ("lm_head/bias", PartitionSpec("tp", ("fsdp", "sp"), )),
-                ('.*', PartitionSpec(None)),
+                (".*", PartitionSpec(("fsdp", "sp"))),
             )
         return rules
 
@@ -161,10 +158,8 @@ class GPTJConfig(EasyDelPretrainedConfig):
             eos_token_id: int = 50256,
             tie_word_embeddings: bool = False,
             use_pjit_attention_force: bool = False,
-            use_flash_attention: bool = False,
-            flash_attn_query_chunk_size: int = 1024,
-            flash_attn_key_chunk_size: int = 2048,
             bits: Optional[int] = None,
+            gradient_checkpointing: str = "",
             **kwargs,
     ):
         basics = dict(
@@ -187,9 +182,7 @@ class GPTJConfig(EasyDelPretrainedConfig):
             eos_token_id=eos_token_id,
             tie_word_embeddings=tie_word_embeddings,
             use_pjit_attention_force=use_pjit_attention_force,
-            use_flash_attention=use_flash_attention,
-            flash_attn_query_chunk_size=flash_attn_query_chunk_size,
-            flash_attn_key_chunk_size=flash_attn_key_chunk_size,
+            gradient_checkpointing=gradient_checkpointing,
         )
 
         for k, v in basics.items():

@@ -1,393 +1,48 @@
-from dataclasses import field, dataclass
-from typing import Optional, Tuple, Any, Union, Dict, Sequence, Callable
-
+import functools
+import math
+from typing import Optional, Tuple, Any, Union
 import chex
+import flax.linen.partitioning
 import jax.lax
-import transformers
+from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput, FlaxMaskedLMOutput
 from flax.core import FrozenDict, freeze, unfreeze
-from flax.linen.normalization import _compute_stats, _canonicalize_axes
+from flax.linen import combine_masks
 from flax.traverse_util import unflatten_dict, flatten_dict
-from jax import numpy as jnp
+from jax import numpy as jnp, lax
 from flax import linen as nn
 from chex import Array
-from ..flax_modelling_utils import ACT2FN, get_gradient_checkpoint_policy, canonicalize_dtype
-from einops import repeat, rearrange
-from transformers.modeling_flax_outputs import FlaxCausalLMOutput
+
+from ..easy_attention import EasyAttention
+from ..flax_modelling_utils import (
+    ACT2FN,
+    get_gradient_checkpoint_policy,
+    apply_rotary_pos_emb,
+    get_dot_general_by_bits, repeat_kv_bnsh, with_sharding_constraint, precompute_freq_cis, BaseJAXAttentionModule,
+    block_wise_ffn
+)
 from .phi_configuration import PhiConfig
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
+from jax.sharding import PartitionSpec
 
 
-@dataclass
-class InferenceParams:
-    max_seq_len: int = field(
-        metadata={"help": "Maximum sequence length."}
-    )
+class FlaxPhiEmbedding(nn.Module):
+    dtype: jnp.dtype = jnp.float32
 
-    max_batch_size: int = field(
-        metadata={"help": "Maximum batch size."}
-    )
+    def __call__(self, query, key, freq_cis, position_ids):
+        sin, cos = freq_cis
 
-    seq_len_offset: int = field(
-        default=0,
-        metadata={"help": "Sequence length offset."}
-    )
+        sin = sin[position_ids][:, None, :, :]
+        cos = cos[position_ids][:, None, :, :]
 
-    batch_size_offset: int = field(
-        default=0,
-        metadata={"help": "Batch size offset."}
-    )
+        key = apply_rotary_pos_emb(key, sin, cos)
+        query_states = apply_rotary_pos_emb(query, sin, cos)
 
-    key_value_memory_dict: Dict[str, Any] = field(
-        default_factory=dict,
-        metadata={"help": "Key value memory dictionary."}
-    )
-
-    lengths_per_sample: Union[Array, None] = field(
-        default=None,
-        metadata={"help": "Lengths per sample."}
-    )
+        return query_states.astype(self.dtype), key.astype(self.dtype)
 
 
-def _normalize(
-        mdl: nn.Module,
-        x: Array,
-        mean: Array,
-        var: Array,
-        reduction_axes: int,
-        feature_axes: int,
-        dtype: chex.ArrayDType,
-        param_dtype: chex.ArrayDType,
-        epsilon: float,
-        use_bias: bool,
-        use_scale: bool,
-        bias_init: Callable[[jax.random.PRNGKey, chex.Shape, chex.ArrayDType], Array],
-        scale_init: Callable[[jax.random.PRNGKey, chex.Shape, chex.ArrayDType], Array],
-):
-    """Normalizes the input of a normalization layer and optionally applies a learned scale and bias.
-  
-    Arguments:
-      mdl: Module to apply the normalization in (normalization params will reside
-        in this module).
-      x: The input.
-      mean: Mean to use for normalization.
-      var: Variance to use for normalization.
-      reduction_axes: The axes in ``x`` to reduce.
-      feature_axes: int containing features. A separate bias and scale is learned
-        for each specified feature.
-      dtype: The dtype of the result (default: infer from input and params).
-      param_dtype: The dtype of the parameters.
-      epsilon: Normalization epsilon.
-      use_bias: If true, add a bias term to the output.
-      use_scale: If true, scale the output.
-      bias_init: Initialization function for the bias term.
-      scale_init: Initialization function for the scaling function.
-  
-    Returns:
-      The normalized input.
-    """
-    reduction_axes = _canonicalize_axes(x.ndim, reduction_axes)
-    feature_axes = _canonicalize_axes(x.ndim, feature_axes)
-    feature_shape = [1] * x.ndim
-    reduced_feature_shape = []
-    for ax in feature_axes:
-        feature_shape[ax] = x.shape[ax]
-        reduced_feature_shape.append(x.shape[ax])
-
-    mean = jnp.expand_dims(mean, reduction_axes)
-    var = jnp.expand_dims(var, reduction_axes)
-    y = x - mean
-    mul = jax.lax.rsqrt(var + epsilon)
-    args = [x]
-    if use_scale:
-        scale = mdl.param(
-            'weight', scale_init, reduced_feature_shape, param_dtype
-        ).reshape(feature_shape)
-        mul *= scale
-        args.append(scale)
-    y *= mul
-    if use_bias:
-        bias = mdl.param(
-            'bias', bias_init, reduced_feature_shape, param_dtype
-        ).reshape(feature_shape)
-        y += bias
-        args.append(bias)
-    dtype = canonicalize_dtype(*args, dtype=dtype)
-    return jnp.asarray(y, dtype)
-
-
-class LayerNorm(nn.Module):
-    """Layer normalization (https://arxiv.org/abs/1607.06450).
-  
-    LayerNorm normalizes the activations of the layer for each given example in a
-    batch independently, rather than across a batch like Batch Normalization.
-    i.e. applies a transformation that maintains the mean activation within
-    each example close to 0 and the activation standard deviation close to 1.
-  
-    Attributes:
-      epsilon: A small float added to variance to avoid dividing by zero.
-      dtype: the dtype of the result (default: infer from input and params).
-      param_dtype: the dtype passed to parameter initializers (default: float32).
-      use_bias:  If True, bias (beta) is added.
-      use_scale: If True, multiply by scale (gamma). When the next layer is linear
-        (also e.g. nn.relu), this can be disabled since the scaling will be done
-        by the next layer.
-      bias_init: Initializer for bias, by default, zero.
-      scale_init: Initializer for scale, by default, one.
-      reduction_axes: int for computing normalization statistics.
-      feature_axes: Feature axes for learned bias and scaling.
-      axis_name: the axis name used to combine batch statistics from multiple
-        devices. See `jax.pmap` for a description of axis names (default: None).
-        This is only needed if the model is subdivided across devices, i.e. the
-        array being normalized is sharded across devices within a pmap or shard
-        map. For SPMD jit, you do not need to manually synchronize. Just make sure
-        that the axes are correctly annotated and XLA:SPMD will insert the
-        necessary collectives.
-      axis_index_groups: groups of axis indices within that named axis
-        representing subsets of devices to reduce over (default: None). For
-        example, `[[0, 1], [2, 3]]` would independently batch-normalize over the
-        examples on the first two and last two devices. See `jax.lax.psum` for
-        more details.
-      use_fast_variance: If true, use a faster, but less numerically stable,
-        calculation for the variance.
-    """
-
-    epsilon: float = 1e-6
-    dtype: Optional[chex.ArrayDType] = None
-    param_dtype: chex.ArrayDType = jnp.float32
-    use_bias: bool = True
-    use_scale: bool = True
-    bias_init: Callable[[jax.random.PRNGKey, chex.Shape, chex.ArrayDType], Array] = nn.initializers.zeros
-    scale_init: Callable[[jax.random.PRNGKey, chex.Shape, chex.ArrayDType], Array] = nn.initializers.ones
-    reduction_axes: int = -1
-    feature_axes: int = -1
-    axis_name: Optional[str] = None
-    axis_index_groups: Any = None
-    use_fast_variance: bool = True
-
-    @nn.compact
-    def __call__(self, x):
-        """Applies layer normalization on the input.
-    
-        Args:
-          x: the inputs
-    
-        Returns:
-          Normalized inputs (the same shape as inputs).
-        """
-        mean, var = _compute_stats(
-            x,
-            self.reduction_axes,
-            self.dtype,
-            self.axis_name,
-            self.axis_index_groups,
-            use_fast_variance=self.use_fast_variance,
-        )
-
-        return _normalize(
-            self,
-            x,
-            mean,
-            var,
-            self.reduction_axes,
-            self.feature_axes,
-            self.dtype,
-            self.param_dtype,
-            self.epsilon,
-            self.use_bias,
-            self.use_scale,
-            self.bias_init,
-            self.scale_init,
-        )
-
-
-class EmbeddingFlax(nn.Module):
+class FlaxPhiMLP(nn.Module):
     config: PhiConfig
-
-    def setup(self) -> None:
-        self.wte = nn.Embed(self.config.vocab_size, self.config.n_embd)
-        self.drop = nn.Dropout(self.config.embd_pdrop)
-
-    def __call__(self, input_ids: Array, deterministic: bool = True) -> Array:
-        return self.drop(self.wte(input_ids.reshape(-1, input_ids.shape[-1])), deterministic=deterministic)
-
-
-def _apply_rotary_emb(
-        x: Array,
-        cos: Array,
-        sin: Array,
-) -> Array:
-    _, seq_len, _, _ = x.shape
-    _, rotary_dim = cos.shape
-    rotary_dim *= 2
-
-    x_rot = x[:, :, :, :rotary_dim]
-    x_pass = x[:, :, :, rotary_dim:]
-
-    x1, x2 = x_rot.chunk(2, axis=-1)
-    c, s = cos[:seq_len][:, jnp.newaxis, :], sin[:seq_len][:, jnp.newaxis, :]
-    x1, x2, c, s = [t.astype(dtype=jnp.float32) for t in [x1, x2, c, s]]
-
-    x_rot = jnp.concatenate([x1 * c - x2 * s, x1 * s + x2 * c], axis=-1).astype(x.dtype)
-
-    return jnp.concatenate([x_rot, x_pass], axis=-1)
-
-
-def _apply_rotary_emb_kv(
-        kv: Array,
-        cos: Array,
-        sin: Array,
-        cos_k: Optional[Array] = None,
-        sin_k: Optional[Array] = None,
-) -> Array:
-    _, seq_len, _, _, _ = kv.shape
-    _, rotary_dim = cos.shape
-    rotary_dim *= 2
-
-    k_rot = kv[:, :, 0, :, :rotary_dim]
-    k_pass = kv[:, :, 0, :, rotary_dim:]
-
-    k1, k2 = k_rot.chunk(2, axis=-1)
-    c, s = cos[:seq_len][:, jnp.newaxis, :], sin[:seq_len][:, jnp.newaxis, :]
-    k1, k2, c, s = [t.astype(dtype=jnp.float32) for t in [k1, k2, c, s]]
-
-    k_rot = jnp.concatenate([k1 * c - k2 * s, k1 * s + k2 * c], axis=-1).astype(kv.dtype)
-
-    return jnp.concatenate(
-        [
-            jnp.concatenate([k_rot, k_pass], axis=-1)[:, :, jnp.newaxis, :, :],
-            kv[:, :, 1:2, :, :],
-        ],
-        axis=2,
-    )
-
-
-def _apply_rotary_emb_qkv(
-        qkv: Array,
-        cos: Array,
-        sin: Array,
-        cos_k: Optional[Array] = None,
-        sin_k: Optional[Array] = None,
-) -> Array:
-    _, seq_len, _, _, _ = qkv.shape
-    _, rotary_dim = cos.shape
-    rotary_dim *= 2
-
-    q_rot = qkv[:, :, 0, :, :rotary_dim]
-    q_pass = qkv[:, :, 0, :, rotary_dim:]
-
-    k_rot = qkv[:, :, 1, :, :rotary_dim]
-    k_pass = qkv[:, :, 1, :, rotary_dim:]
-
-    q1, q2 = jnp.split(q_rot, 2, axis=-1)
-    k1, k2 = jnp.split(k_rot, 2, axis=-1)
-    c, s = cos[:seq_len][:, jnp.newaxis, :], sin[:seq_len][:, jnp.newaxis, :]
-    q1, q2, k1, k2, c, s = [t.astype(dtype=jnp.float32) for t in [q1, q2, k1, k2, c, s]]
-
-    q_rot = jnp.concatenate([q1 * c - q2 * s, q1 * s + q2 * c], axis=-1).astype(qkv.dtype)
-    k_rot = jnp.concatenate([k1 * c - k2 * s, k1 * s + k2 * c], axis=-1).astype(qkv.dtype)
-
-    return jnp.concatenate(
-        [
-            jnp.concatenate([q_rot, q_pass], axis=-1)[:, :, jnp.newaxis, :, :],
-            jnp.concatenate([k_rot, k_pass], axis=-1)[:, :, jnp.newaxis, :, :],
-            qkv[:, :, 2:3, :, :],
-        ],
-        axis=2,
-    )
-
-
-class RotaryEmbedding(nn.Module):
-    axis: int
-    base: int = 10000
-    scale_base: Optional[float] = None
-    pos_idx_in_fp32: bool = True
-    max_position_embeddings: int = 2048
-    """Rotary positional embedding (RoPE).
-    Reference:
-        RoFormer: Enhanced Transformer with Rotary Position Embedding.
-        https://arxiv.org/pdf/2104.09864.pdf.
-    """
-
-    def setup(
-            self
-    ) -> None:
-
-        if self.scale_base is not None:
-            raise NotImplementedError
-
-        inv_freq = self._compute_inv_freq()
-        self.inv_freq = inv_freq
-        scale = (
-            (jnp.arange(0, self.axis, 2, dtype=jnp.float32) + 0.4 * self.axis) / (1.4 * self.axis)
-            if self.scale_base is not None
-            else None
-        )
-        self.scale = scale
-        self._seq_len_cached = self.max_position_embeddings
-        seq_len = self.max_position_embeddings
-
-        if self.pos_idx_in_fp32:
-            t = jnp.arange(seq_len, dtype=jnp.float32)
-            if self.inv_freq.dtype != jnp.float32:
-                inv_freq = self._compute_inv_freq()
-            else:
-                inv_freq = self.inv_freq
-        else:
-            t = jnp.arange(seq_len, dtype=self.inv_freq.dtype)
-            inv_freq = self.inv_freq
-
-        freqs = jnp.outer(t, inv_freq)
-        if self.scale is None:
-            self._cos_cached = jnp.cos(freqs).astype(jnp.float32)
-            self._sin_cached = jnp.sin(freqs).astype(jnp.float32)
-        else:
-            power = (
-                            jnp.arange(seq_len, dtype=self.scale.dtype) - seq_len // 2
-                    ) / self.scale_base
-            scale = self.scale ** power[:, jnp.newaxis]
-
-            self._cos_cached = (jnp.cos(freqs) * scale).astype(jnp.float32)
-            self._sin_cached = (jnp.sin(freqs) * scale).astype(jnp.float32)
-            self._cos_k_cached = (jnp.cos(freqs) / scale).astype(jnp.float32)
-            self._sin_k_cached = (jnp.sin(freqs) / scale).astype(jnp.float32)
-
-    def _compute_inv_freq(self) -> Array:
-        return 1.0 / (self.base ** (jnp.arange(0, self.axis, 2, dtype=jnp.float32) / self.axis))
-
-    def __call__(
-            self,
-            qkv: Array,
-            kv: Optional[Array] = None,
-            seq_len_offset: int = 0,
-    ) -> Tuple[Array, Array]:
-        seq_start = seq_len_offset
-        seq_end = seq_start + qkv.shape[1]
-
-        if kv is None:
-            return _apply_rotary_emb_qkv(
-                qkv,
-                self._cos_cached[seq_start:seq_end],
-                self._sin_cached[seq_start:seq_end],
-            )
-        else:
-            q = _apply_rotary_emb(
-                qkv,
-                self._cos_cached[seq_start:seq_end],
-                self._sin_cached[seq_start:seq_end],
-            )
-            kv = _apply_rotary_emb_kv(
-                kv,
-                self._cos_cached[seq_start:seq_end],
-                self._sin_cached[seq_start:seq_end],
-            )
-
-            return q, kv
-
-
-class MLP(nn.Module):
-    config: PhiConfig
-    n_inner: Optional[int] = None
-    act_fn: Optional[str] = None
+    layer_idx: Optional[int] = None
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
     precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
@@ -401,13 +56,8 @@ class MLP(nn.Module):
     def setup(
             self
     ) -> None:
-        act_fn = self.config.activation_function if self.act_fn is None else self.act_fn
-
-        n_inner = getattr(self.config, "n_inner", None) if self.n_inner is None else self.n_inner
-        n_inner = n_inner if n_inner is not None else 4 * self.config.n_embd
-
         self.fc1 = nn.Dense(
-            n_inner,
+            self.config.intermediate_size,
             kernel_init=nn.initializers.normal(self.config.initializer_range),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -420,398 +70,682 @@ class MLP(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.act = ACT2FN[act_fn]
-
-    def __call__(self, hidden_states: Array) -> Array:
-        return self.fc2(self.act(self.fc1(hidden_states)))
-
-
-class SelfAttention(nn.Module):
-    causal: bool = True
-    softmax_scale: Optional[float] = None
-    attention_dropout: float = 0.0
-
-    """
-    Self-attention layer (compatible with JAX/FLAX).
-    """
-
-    def setup(
-            self
-    ) -> None:
-        self.drop = nn.Dropout(self.attention_dropout)
-
-    def __call__(
-            self,
-            qkv: Array,
-            causal: bool = None,
-            key_padding_mask: Optional[Array] = None,
-            deterministic: bool = True,
-            **kwargs,
-    ) -> Array:
-        batch_size, seq_len = qkv.shape[0], qkv.shape[1]
-        q, k, v = jnp.split(qkv, 3, axis=2)
-        q, k, v = map(lambda x: x.squeeze(2), [q, k, v])
-        q = q.astype(jnp.float32)
-        k = k.astype(jnp.float32)
-
-        causal = self.causal if causal is None else causal
-        softmax_scale = self.softmax_scale or jax.lax.rsqrt(jnp.array(q.shape[-1], dtype=jnp.float32))
-
-        scores = jnp.einsum("b t h d,b s h d->b h t s", q, k * softmax_scale)
-
-        if key_padding_mask is not None:
-            padding_mask = jnp.where(
-                key_padding_mask.astype(jnp.bool_), 0.0, -10000.0
-            )[:, jnp.newaxis, jnp.newaxis, :]
-
-            scores = scores + padding_mask
-
-        if causal:
-            causal_mask = jnp.triu(jnp.full((seq_len, seq_len), -10000.0), 1)
-            scores = scores + causal_mask.astype(dtype=scores.dtype)
-
-        attention = jax.nn.softmax(scores, axis=-1).astype(v.dtype)
-        attention = self.drop(attention, deterministic=deterministic)
-        output = jnp.einsum("b h t s,b s h d->b t h d", attention, v)
-        return output
-
-
-class CrossAttention(nn.Module):
-    causal: bool = True
-    softmax_scale: Optional[float] = None
-    attention_dropout: float = 0.0
-    """
-    Cross-attention layer (compatible with JAX/FLAX).
-    """
-
-    def setup(
-            self
-    ) -> None:
-        self.drop = nn.Dropout(self.attention_dropout)
-
-    def __call__(
-            self,
-            q: Array,
-            kv: Array,
-            causal: bool = None,
-            key_padding_mask: Optional[Array] = None,
-            deterministic: bool = True,
-            **kwargs,
-    ) -> Array:
-        batch_size, seq_len_q = q.shape[0], q.shape[1]
-        seq_len_k = kv.shape[1]
-
-        if kv.shape[3] != q.shape[2]:
-            kv = repeat(kv, "... hkv d -> ... (hkv g) d", g=q.shape[2] // kv.shape[3])
-        k, v = kv.unbind(axis=2)
-
-        q = q.astype(jnp.float32)
-        k = k.astype(jnp.float32)
-
-        causal = self.causal if causal is None else causal
-        softmax_scale = self.softmax_scale or jax.lax.rsqrt(q.shape[-1])
-
-        scores = jnp.einsum("bthd,bshd->bhts", q, k * softmax_scale)
-
-        if key_padding_mask is not None:
-            padding_mask = jax.lax.select(
-                key_padding_mask.astype(jnp.bool_), 0.0, -10000.0
-            )[:, jnp.newaxis, jnp.newaxis, :]
-
-            scores = scores + padding_mask
-
-        if causal:
-            rows = jnp.arange(seq_len_q, dtype=jnp.int32)[:, jnp.newaxis]
-            cols = jnp.arange(seq_len_k, dtype=jnp.int32)
-            causal_mask = cols > rows + seq_len_k - seq_len_q
-
-            scores = jax.lax.select(
-                causal_mask, scores, -10000.0
-            )
-
-        attention = jax.nn.softmax(scores, axis=-1).astype(v.dtype)
-        attention = self.drop(attention, deterministic=deterministic)
-
-        output = jnp.einsum("bhts,bshd->bthd", attention, v)
-
-        return output
-
-
-def _find_mha_dims(
-        config: PhiConfig,
-        n_head: Optional[int] = None,
-        n_head_kv: Optional[int] = None,
-        head_dim: Optional[int] = None,
-) -> Tuple[Union[int, Any], Union[int, None, Any], Union[int, Any]]:
-    if n_head is None and head_dim is None:
-        head_dim = config.n_embd // config.n_head
-        n_head = config.n_head
-    elif n_head is None or head_dim is None:
-        raise ValueError("`n_head` and `head_dim` must be both specified or `None`.")
-    if n_head_kv is None:
-        n_head_kv = getattr(config, "n_head_kv", None) or n_head
-
-    return n_head, n_head_kv, head_dim
-
-
-class MHA(nn.Module):
-    config: PhiConfig
-    dtype: Optional[jnp.dtype] = jnp.float32
-    param_dtype: Optional[jnp.dtype] = jnp.float32
-    precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
-    rotary_dim_: Optional[int] = None
-    rotary_base_: float = 10000.0
-    rotary_scale_base_: Optional[float] = None
-    n_head_: Optional[int] = None
-    n_head_kv_: Optional[int] = None
-    head_dim_: Optional[int] = None
-    bias_: bool = True
-    causal_: bool = True
-    softmax_scale_: Optional[float] = None
-    layer_idx_: Optional[int] = None
-    return_residual_: bool = False
-
-    def setup(
-            self
-    ) -> None:
-
-        self.bias = self.bias_
-        self.causal = self.causal_
-        self.softmax_scale = self.softmax_scale_
-        self.layer_idx = self.layer_idx_
-        self.rotary_dim = self.rotary_dim_ if self.rotary_dim_ is not None else getattr(self.config, "rotary_dim", 0)
-        self.rotary_base = self.rotary_base_
-        self.rotary_scale_base = self.rotary_scale_base_
-
-        if self.rotary_dim > 0:
-            self.rotary_emb = RotaryEmbedding(
-                self.rotary_dim,
-                base=self.rotary_base,
-                scale_base=self.rotary_scale_base,
-                max_position_embeddings=self.config.n_positions
-            )
-
-        # MLP
-        self.n_head, self.n_head_kv, self.head_dim = _find_mha_dims(
-            self.config,
-            n_head=self.n_head_,
-            n_head_kv=self.n_head_kv_,
-            head_dim=self.head_dim_
-        )
-        op_size = self.head_dim * (self.n_head + 2 * self.n_head_kv)
-        hidden_size = self.config.n_embd
-
-        self.Wqkv = nn.Dense(
-            op_size,
-            use_bias=self.bias,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            precision=self.precision,
-            kernel_init=nn.initializers.normal(self.config.initializer_range)
-        )
-        self.out_proj = nn.Dense(
-            hidden_size,
-            use_bias=self.bias,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            precision=self.precision,
-            kernel_init=nn.initializers.normal(self.config.initializer_range)
-        )
-
-        self.inner_attn = SelfAttention(
-            causal=self.causal,
-            softmax_scale=self.softmax_scale,
-            attention_dropout=self.config.attn_pdrop,
-        )
-        self.inner_cross_attn = CrossAttention(
-            causal=self.causal,
-            softmax_scale=self.softmax_scale,
-            attention_dropout=self.config.attn_pdrop,
-        )
-        self.flash_attn = False
-
-    def _forward_self_attn(
-            self,
-            x: Array,
-            key_padding_mask: Optional[Array],
-            deterministic: bool = True
-    ) -> Array:
-        qkv = self.Wqkv(x)
-        qkv = rearrange(qkv, "... (three h d) -> ... three h d", three=3, d=self.head_dim)
-
-        if self.rotary_dim > 0:
-            qkv = self.rotary_emb(qkv)
-
-        return self.inner_attn(
-            qkv,
-            key_padding_mask=key_padding_mask,
-            deterministic=deterministic
-        )
-
-    def _forward_cross_attn(
-            self,
-            x: Array,
-            key_padding_mask: Optional[Array],
-            position_ids: Optional[Array] = None,
-            deterministic: bool = True
-    ) -> Array:
-
-        # TODO: adding past_key_values
-        past_key_values = None
-
-        batch_size = x.shape[0]
-
-        qkv = self.Wqkv(x)
-
-        q = qkv[..., : self.n_head * self.head_dim]
-        q = rearrange(q, "... (h d) -> ... h d", d=self.head_dim)
-
-        kv = qkv[..., self.n_head * self.head_dim:]
-        kv = rearrange(kv, "... (two hkv d) -> ... two hkv d", two=2, d=self.head_dim)
-
-        seq_len_offset = position_ids[batch_size - 1, 0] if position_ids is not None else 0
-        causal = None if seq_len_offset == 0 else False
-        if self.self.rotary_dim > 0:
-            q, kv = self.rotary_emb(q, kv=kv, seq_len_offset=seq_len_offset)
-
-        if past_key_values is not None:
-            raise NotImplementedError("TODO ?")
-
-        return self.inner_cross_attn(
-            q,
-            kv,
-            key_padding_mask=key_padding_mask,
-            causal=causal,
-            deterministic=deterministic
-        )
-
-    def __call__(
-            self,
-            x: Array,
-            attention_mask: Array = None,
-            deterministic: bool = True,
-            **kwargs,
-    ) -> Tuple[Array, Array]:
-
-        attention_mask = attention_mask.astype(jnp.bool_)
-
-        # TODO: adding past_key_values
-        past_key_values = None
-        if self.n_head == self.n_head_kv:
-            if past_key_values is None:
-                attn_output = self._forward_self_attn(x, attention_mask, deterministic=deterministic)
-            else:
-                attn_output = self._forward_cross_attn(x, past_key_values, attention_mask, deterministic=deterministic)
-        else:
-            attn_output = self._forward_cross_attn(x, past_key_values, attention_mask, deterministic=deterministic)
-
-        output = rearrange(attn_output, "... h d -> ... (h d)")
-        output = self.out_proj(output)
-
-        return output if not self.return_residual_ else (output, x)
-
-
-class ParallelBlock(nn.Module):
-    """Parallel block.
-    This block applies parallel mixer and MLP layers to the input (used in GPT-J and CodeGen).
-    """
-    config: PhiConfig
-    block_idx: Optional[int] = None
-    dtype: Optional[jnp.dtype] = jnp.float32
-    param_dtype: Optional[jnp.dtype] = jnp.float32
-    precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
-
-    def setup(
-            self,
-    ) -> None:
-        self.ln = LayerNorm(
-            epsilon=self.config.layer_norm_epsilon,
-            dtype=self.dtype
-        )
-        self.resid_dropout = nn.Dropout(self.config.resid_pdrop)
-
-        self.mixer = MHA(
-            self.config,
-            layer_idx_=self.block_idx,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            precision=self.precision
-        )
-        self.mlp = MLP(
-            self.config,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            precision=self.precision
-        )
+        self.act = ACT2FN[self.config.hidden_act]
 
     def __call__(
             self,
             hidden_states: Array,
-            attention_mask: Optional[Array] = None,
-            deterministic: bool = True
+            e: bool = False  # Ignored
     ) -> Array:
-        residual = hidden_states
-        hidden_states = self.ln(hidden_states)
+        return self.fc2(self.act(self.fc1(hidden_states)))
 
-        attn_outputs = self.mixer(
-            hidden_states,
-            attention_mask=attention_mask,
-            deterministic=deterministic
+
+class FlaxPhiAttention(BaseJAXAttentionModule):
+    """Multi-headed attention from 'Attention Is All You Need' paper"""
+    config: PhiConfig
+    layer_idx: Optional[int] = None
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+
+    def setup(self):
+        config = self.config
+        self.attention_dropout = config.attention_dropout
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = self.hidden_size // self.num_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.max_position_embeddings = config.max_position_embeddings
+        self.rope_theta = config.rope_theta
+        self.partial_rotary_factor = config.partial_rotary_factor
+        self.is_causal = True
+
+        if (self.head_dim * self.num_heads) != self.hidden_size:
+            raise ValueError(
+                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
+                f" and `num_heads`: {self.num_heads})."
+            )
+
+        dense_class = functools.partial(
+            nn.Dense,
+            use_bias=True,
+            precision=self.precision,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            **get_dot_general_by_bits(self.config.bits)
         )
-        if isinstance(attn_outputs, tuple):
-            attn_outputs = attn_outputs[0]
+
+        self.q_proj = dense_class(self.num_heads * self.head_dim)
+        self.k_proj = dense_class(self.num_key_value_heads * self.head_dim)
+        self.v_proj = dense_class(self.num_key_value_heads * self.head_dim)
+        self.dense = dense_class(self.hidden_size)
+        self.rotary_emb_dim = int(self.config.partial_rotary_factor * self.head_dim)
+        self.qk_layernorm = config.qk_layernorm
+        if self.qk_layernorm:
+            self.q_layernorm = nn.LayerNorm(
+                epsilon=config.layer_norm_eps,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+                use_bias=True
+            )
+            self.k_layernorm = nn.LayerNorm(
+                epsilon=config.layer_norm_eps,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+                use_bias=True
+            )
+
+        self.attention_performer = EasyAttention(
+            attn_type="normal",
+            block_k_major=self.config.block_k_major,
+            block_b=self.config.block_b,
+            block_q=self.config.block_q,
+            block_k=self.config.block_k,
+            block_q_major_dkv=self.config.block_q_major_dkv,
+            block_k_major_dkv=self.config.block_k_major_dkv,
+            block_k_major_dq=self.config.block_k_major_dq,
+            block_k_dkv=self.config.block_k_dkv,
+            block_q_dkv=self.config.block_q_dkv,
+            block_q_dq=self.config.block_q_dq,
+            block_k_dq=self.config.block_k_dq,
+            num_attention_heads=self.config.num_attention_heads,
+            attention_dropout=self.config.attention_dropout,
+            head_dims=self.head_dim,
+            attention_partition_spec=self.config.attention_partition_spec,
+            use_shard_map=self.config.use_shard_map,
+            precision=self.precision,
+            force_float32_tpu=True,
+            attn_mechanism=self.config.attn_mechanism,
+            dtype=self.dtype,
+            bias_partition_spec=self.config.bias_partition_spec,
+            key_partition_spec=self.config.key_partition_spec,
+            query_partition_spec=self.config.query_partition_spec,
+            value_partition_spec=self.config.value_partition_spec,
+            scan_ring_attention=self.config.scan_ring_attention,
+            mesh=self.config.jax_mesh(),
+            sm_scale=1 / math.sqrt(self.head_dim)
+        )
+
+    def _merge_heads(self, hidden_states):
+        return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
+
+    @staticmethod
+    def _transpose_sequence_head(query_states, key, value):
+        """
+        The _transpose_sequence_head function transposes the query_states, key and value matrices.
+
+        :param query_states: Get the attention weights for each of the heads
+        :param key: Determine the number of heads
+        :param value: Store the values of the input
+        :return: The transpose of the query_states, key and value matrices
+
+        """
+        return jnp.transpose(query_states, (0, 2, 1, 3)), jnp.transpose(key, (0, 2, 1, 3)), jnp.transpose(value,
+                                                                                                          (0, 2, 1, 3))
+
+    def apply_rotary(self, batch_size, sequence_length, query, key, value, freq_cis, position_ids):
+        """
+        The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
+        The main difference is that it takes in an additional argument, freq_cis, which are used to calculate
+        the rotary attention weights. The other differences are minor and mostly related to reshaping tensors.
+
+        :param self: Access variables that belong to the class
+        :param batch_size: Reshape the query_states, key and value tensors
+        :param sequence_length: Reshape the query_states, key and value tensors
+        :param query: Calculate the attention weights
+        :param key: Calculate the attention
+        :param value: Compute the attention weights
+        :param freq_cis: Calculate the frequency of each word in the vocabulary
+        :param position_ids: Identify the position of each token in the sequence
+        :return: A tuple of 3 tensors: query_states, key and value
+
+        """
+        query = query.reshape(
+            batch_size,
+            sequence_length,
+            self.config.num_attention_heads,
+            self.head_dim
+        )
+        key = key.reshape(
+            batch_size,
+            sequence_length,
+            self.config.num_key_value_heads,
+            self.head_dim
+        )
+        value = value.reshape(
+            batch_size,
+            sequence_length,
+            self.config.num_key_value_heads,
+            self.head_dim
+        )
+
+        query, key, value = self._transpose_sequence_head(query, key, value)
+
+        sin, cos = freq_cis
+
+        sin = sin[position_ids][:, None, :, :]
+        cos = cos[position_ids][:, None, :, :]
+
+        query_rot, query_pass = (
+            query[..., : self.rotary_emb_dim],
+            query[..., self.rotary_emb_dim:],
+        )
+        key_rot, key_pass = (
+            key[..., : self.rotary_emb_dim],
+            key[..., self.rotary_emb_dim:],
+        )
+
+        key_rot = apply_rotary_pos_emb(key_rot, sin, cos)
+        query_rot = apply_rotary_pos_emb(query_rot, sin, cos)
+
+        query = jnp.concatenate((query_rot, query_pass), axis=-1)
+        key = jnp.concatenate((key_rot, key_pass), axis=-1)
+
+        key = repeat_kv_bnsh(key, self.num_key_value_groups)
+        value = repeat_kv_bnsh(value, self.num_key_value_groups)
+        return self._transpose_sequence_head(query, key, value)
+
+    def __call__(
+            self,
+            hidden_states: chex.Array,
+            freq_cis: Tuple[chex.Array, chex.Array],
+            attention_mask: Optional[chex.Array],
+            position_ids: Optional[chex.Array],
+            causal_mask: Optional[chex.Array],
+            deterministic: bool = True,
+            output_attentions: bool = False,
+            init_cache: bool = False,
+    ):
+        batch_size, sequence_length = hidden_states.shape[:2]
+        (
+            query_states,
+            key_states,
+            value_states
+        ) = self.q_proj(
+            hidden_states
+        ), self.k_proj(
+            hidden_states
+        ), self.v_proj(
+            hidden_states
+        )
+
+        if self.qk_layernorm:
+            query_states = self.q_layernorm(query_states)
+            key_states = self.k_layernorm(key_states)
+
+        if self.config.use_pjit_attention_force:
+            query_states = with_sharding_constraint(
+                query_states, PartitionSpec(("dp", "fsdp"), "sp", "tp")
+            )
+            key_states = with_sharding_constraint(
+                key_states, PartitionSpec(("dp", "fsdp"), "sp", "tp")
+            )
+            value_states = with_sharding_constraint(
+                value_states, PartitionSpec(("dp", "fsdp"), "sp", "tp")
+            )
+
+        query_states = query_states.reshape(
+            batch_size, sequence_length, self.config.num_attention_heads, self.head_dim
+        )
+        key_states = key_states.reshape(
+            batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim
+        )
+        value_states = value_states.reshape(
+            batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim
+        )
+
+        query_states, key_states, value_states = self.apply_rotary(
+            query=query_states,
+            key=key_states,
+            value=value_states,
+            position_ids=position_ids,
+            freq_cis=freq_cis,
+            batch_size=batch_size,
+            sequence_length=sequence_length
+        )
+
+        assert_msg = (
+            "num_attention_heads repeat wont work likely\n"
+            f"INFO :\n\trepeat_kv_bnsh Used with num_key_value_groups = {self.num_key_value_groups}\n\t"
+            f"NH : {self.config.num_attention_heads} KVH : {self.config.num_attention_heads}"
+        )
+
+        assert query_states.shape[-2] == self.config.num_attention_heads, assert_msg
+        assert key_states.shape[-2] == self.config.num_attention_heads, assert_msg
+        assert value_states.shape[-2] == self.config.num_attention_heads, assert_msg
+
+        query_length, key_length = query_states.shape[1], key_states.shape[1]
+
+        if self.has_variable("cache", "cached_key"):
+            mask_shift = self.variables["cache"]["cache_index"]
+            max_decoder_length = self.variables["cache"]["cached_key"].shape[1]
+            causal_mask = lax.dynamic_slice(
+                causal_mask, (0, 0, mask_shift, 0), (1, 1,
+                                                     query_length, max_decoder_length)
+            )
+        else:
+            causal_mask = causal_mask[:, :, :query_length, :key_length]
+
+        batch_size = hidden_states.shape[0]
+        causal_mask = jnp.broadcast_to(
+            causal_mask, (batch_size,) + causal_mask.shape[1:])
+        attention_mask = jnp.broadcast_to(jnp.expand_dims(
+            attention_mask, axis=(-3, -2)), causal_mask.shape)
+        attention_mask = combine_masks(attention_mask, causal_mask)
+        if attention_mask.ndim == 2:
+            attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
+
+        dropout_rng = None
+
+        if not deterministic and self.config.attention_dropout > 0.0:
+            dropout_rng = self.make_rng("dropout")
+
+        if self.has_variable("cache", "cached_key") or init_cache:
+            key_states, value_states, attention_mask = self._concatenate_to_cache(
+                key_states,
+                value_states,
+                query_states,
+                attention_mask
+            )
+        attention_bias = lax.select(
+            attention_mask > 0,
+            jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
+            jnp.full(attention_mask.shape, jnp.finfo(
+                self.dtype).min).astype(self.dtype),
+        )
+
+        query_length, key_length = query_states.shape[1], key_states.shape[1]
+
+        attentions = self.attention_performer.__call__(
+            query_states=query_states,
+            key_states=key_states,
+            value_states=value_states,
+            bias=attention_bias,
+            causal=True,
+            use_pjit_attention_force=self.config.use_pjit_attention_force,
+            dropout_rng=dropout_rng,
+            deterministic=deterministic,
+            query_sequence_length=query_length,
+            key_value_sequence_length=key_length,
+            uses_cache=self.has_variable("cache", "cached_key") or init_cache,
+        )
+        attentions.attention_outputs = attentions.attention_outputs
+        attn_output = self._merge_heads(attentions.attention_outputs)
+        attn_output = self.dense(attn_output)
+
+        outputs = (attn_output, attentions.attention_weights) if output_attentions else (attn_output,)
+        return outputs
+
+
+class FlaxPhiDecoderLayer(nn.Module):
+    config: PhiConfig
+    layer_idx: int
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+
+    def setup(self):
+        self.self_attn = FlaxPhiAttention(
+            config=self.config,
+            layer_idx=self.layer_idx,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision
+        )
+        self.mlp = FlaxPhiMLP(
+            config=self.config,
+            layer_idx=self.layer_idx,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision
+        )
+        self.input_layernorm = nn.LayerNorm(
+            epsilon=self.config.layer_norm_eps,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+        )
+        self.resid_dropout = nn.Dropout(self.config.resid_pdrop)
+
+    def __call__(
+            self,
+            hidden_states: chex.Array,
+            freq_cis: Tuple[chex.Array, chex.Array],
+            attention_mask: Optional[chex.Array],
+            position_ids: Optional[chex.Array],
+            causal_mask: Optional[chex.Array],
+            deterministic: bool = True,
+            output_attentions: bool = False,
+            init_cache: bool = False,
+    ):
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+
+        attn_out = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            output_attentions=output_attentions,
+            deterministic=deterministic,
+            freq_cis=freq_cis,
+            causal_mask=causal_mask,
+            init_cache=init_cache,
+        )
+        attn_outputs, self_attn_weights = (attn_out[0], attn_out[1]) if len(attn_out) == 2 else (attn_out[0], None)
 
         attn_outputs = self.resid_dropout(attn_outputs, deterministic=deterministic)
-        feed_forward_hidden_states = self.resid_dropout(self.mlp(hidden_states), deterministic=deterministic)
 
+        if self.config.use_scan_mlp:
+            feed_forward_hidden_states = block_wise_ffn(
+                self.mlp,
+                hidden_states,
+                self.config.scan_mlp_chunk_size,
+                deterministic
+            )
+        else:
+            feed_forward_hidden_states = self.mlp(
+                hidden_states,
+                deterministic,
+            )
+        feed_forward_hidden_states = self.resid_dropout(
+            feed_forward_hidden_states, deterministic=deterministic
+        )
         hidden_states = attn_outputs + feed_forward_hidden_states + residual
+        outputs = (hidden_states,)
 
-        return hidden_states
+        if output_attentions:
+            outputs += (self_attn_weights,)
+
+        return outputs
 
 
-class CausalLMHead(nn.Module):
+class FlaxPhiDecoderLayerCollection(nn.Module):
     config: PhiConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
     precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
-    """Causal Language Modeling head.
-    Reference:
-        Improving Language Understanding by Generative Pre-Training.
-        https://cdn.openai.com/research-covers/language-unsupervised/language_understanding_paper.pdf.
-    """
 
     def setup(self) -> None:
-        self.ln = LayerNorm(
-            epsilon=self.config.layer_norm_epsilon,
-            dtype=self.dtype
+        block = FlaxPhiDecoderLayer
+        if self.config.gradient_checkpointing != "":
+            # hidden_states: chex.Array,
+            # freq_cis: Tuple[chex.Array, chex.Array],
+            # attention_mask: Optional[chex.Array],
+            # position_ids: Optional[chex.Array],
+            # causal_mask: Optional[chex.Array],
+            # deterministic: bool = True,
+            # output_attentions: bool = False,
+            # init_cache: bool = False,
+
+            block = flax.linen.partitioning.remat(
+                block,
+                policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
+                static_argnums=(
+                    4, 5, 6, 7
+                )
+            )
+        self.layers = [
+
+            block(
+                config=self.config,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+                precision=self.precision,
+                name=str(idx),
+                layer_idx=idx
+            )
+            for idx in range(self.config.num_hidden_layers)
+        ]
+
+    def __call__(
+            self,
+            hidden_states: chex.Array,
+            freq_cis: Tuple[chex.Array, chex.Array],
+            attention_mask: Optional[chex.Array],
+            position_ids: Optional[chex.Array],
+            causal_mask: Optional[chex.Array],
+            deterministic: bool = True,
+            output_attentions: bool = False,
+            output_hidden_states: bool = False,
+            init_cache: bool = False,
+            return_dict: bool = True,
+    ) -> tuple[tuple, ...] | FlaxBaseModelOutput:
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attns = () if output_attentions else None
+        for decoder_layer in self.layers:
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+
+            # hidden_states: chex.Array,
+            # freq_cis: Tuple[chex.Array, chex.Array],
+            # attention_mask: Optional[chex.Array],
+            # position_ids: Optional[chex.Array],
+            # causal_mask: Optional[chex.Array],
+            # deterministic: bool = True,
+            # output_attentions: bool = False,
+            # init_cache: bool = False,
+            layer_outputs = decoder_layer(
+                hidden_states,
+                freq_cis,
+                attention_mask,
+                position_ids,
+                causal_mask,
+                deterministic,
+                output_attentions,
+                init_cache,
+            )
+
+            hidden_states = layer_outputs[0]
+
+            if output_attentions:
+                all_self_attns += (layer_outputs[1],)
+
+        if not return_dict:
+            return tuple(v for v in [hidden_states, all_hidden_states, all_self_attns] if v is not None)
+        return FlaxBaseModelOutput(
+            last_hidden_state=hidden_states,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attns,
         )
-        self.linear = nn.Dense(
-            self.config.vocab_size,
+
+
+class FlaxPhiModule(nn.Module):
+    config: PhiConfig
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+
+    def setup(self) -> None:
+        config = self.config
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+
+        self.embed_tokens = nn.Embed(
+            config.vocab_size,
+            config.hidden_size,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype
+        )
+        self.embed_dropout = nn.Dropout(config.embd_pdrop)
+        self.layers = FlaxPhiDecoderLayerCollection(
+            config=self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            precision=self.precision,
-            kernel_init=nn.initializers.normal(self.config.initializer_range)
+            precision=self.precision
+        )
+        self.final_layernorm = nn.LayerNorm(
+            epsilon=config.layer_norm_eps,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype
+        )
+        self.causal_mask = nn.make_causal_mask(
+            jnp.ones(
+                (1, getattr(self.config, "c_max_position_embeddings", self.config.max_position_embeddings)),
+                dtype="bool"
+            ), dtype="bool"
         )
 
-    def __call__(self, hidden_states: Array) -> Array:
-        return self.linear(self.ln(hidden_states)).astype(jnp.float32)
+        initial_rope_kwargs = dict(
+            rope_type="none"
+        )
+        if hasattr(config, "rope_scaling"):
+            if config.rope_scaling is not None:
+                scaling_type = config.rope_scaling["type"]
+                scaling_factor = config.rope_scaling["factor"]
+                initial_rope_kwargs = dict(
+                    scaling_factor=scaling_factor,
+                    rope_type=scaling_type
+                )
+        self.freq_cis = precompute_freq_cis(
+            max_position_embeddings=getattr(
+                self.config,
+                "freq_max_position_embeddings",
+                self.config.max_position_embeddings
+            ),
+            dim=int(config.partial_rotary_factor * (config.hidden_size // config.num_attention_heads)),
+            # dim=config.hidden_size // config.num_attention_heads,
+            base=config.rope_theta,
+            **initial_rope_kwargs
+        )
+
+    def __call__(
+            self,
+            input_ids: Optional[chex.Array] = None,
+            inputs_embeds: Optional[chex.Array] = None,
+            attention_mask: Optional[chex.Array] = None,
+            position_ids: Optional[chex.Array] = None,
+            extra_embedding: Optional[chex.Array] = None,
+            deterministic: bool = True,
+            output_attentions: bool = False,
+            output_hidden_states: bool = False,
+            init_cache: bool = False,
+            return_dict: bool = True,
+    ) -> tuple[tuple[Any, ...], ...] | FlaxBaseModelOutput:
+        if input_ids is None and inputs_embeds is None:
+            raise RuntimeError("Both `input_ids` and `inputs_embeds` can not be None !")
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
+        inputs_embeds = self.embed_dropout(inputs_embeds, deterministic=deterministic)
+        batch_size, sequence_length, _ = inputs_embeds.shape
+        if attention_mask is None:
+            attention_mask = jnp.ones((batch_size, sequence_length), dtype="i4")
+        if position_ids is None:
+            position_ids = (jnp.cumsum(attention_mask) - 1).reshape(batch_size, sequence_length).astype("i4")
+        assert sequence_length <= self.config.max_position_embeddings, "Maximum Position Embedding Reached !"
+        inputs_embeds = inputs_embeds + extra_embedding if extra_embedding is not None else inputs_embeds
+
+        outputs = self.layers(
+            hidden_states=inputs_embeds,
+            freq_cis=self.freq_cis,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            causal_mask=self.causal_mask,
+            deterministic=deterministic,
+            init_cache=init_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        hidden_states = outputs[0]
+        hidden_states = self.final_layernorm(hidden_states)
+
+        if output_hidden_states:
+            all_hidden_states = outputs[1] + (hidden_states,)
+            outputs = (hidden_states, all_hidden_states) + outputs[2:]
+        else:
+            outputs = (hidden_states,) + outputs[1:]
+
+        if not return_dict:
+            return tuple(v for v in outputs if v is not None)
+
+        return FlaxBaseModelOutput(
+            last_hidden_state=hidden_states,
+            hidden_states=outputs[1] if output_hidden_states else None,
+            attentions=outputs[-1] if output_attentions else None,
+        )
 
 
-class FlaxPhiPreTrainedModel(transformers.FlaxPreTrainedModel):
+class FlaxPhiForCausalLMModule(nn.Module):
+    config: PhiConfig
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+
+    def setup(self) -> None:
+        self.model = FlaxPhiModule(
+            config=self.config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision
+        )
+        self.vocab_size = self.config.vocab_size
+        self.lm_head = nn.Dense(
+            self.config.vocab_size,
+            use_bias=True,
+            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision
+        )
+
+    def __call__(
+            self,
+            input_ids: Optional[chex.Array] = None,
+            inputs_embeds: Optional[chex.Array] = None,
+            attention_mask: Optional[chex.Array] = None,
+            position_ids: Optional[chex.Array] = None,
+            extra_embedding: Optional[chex.Array] = None,
+            deterministic: bool = True,
+            output_attentions: bool = False,
+            output_hidden_states: bool = False,
+            init_cache: bool = False,
+            return_dict: bool = True,
+    ) -> tuple[Any, ...] | FlaxMaskedLMOutput:
+        res = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            init_cache=init_cache,
+            deterministic=deterministic,
+            extra_embedding=extra_embedding,
+            position_ids=position_ids,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True
+        )
+        outputs = (res.last_hidden_state, res.hidden_states, res.attentions)
+        if self.config.tie_word_embeddings:
+            shared_kernel = self.model.variables["params"]["embed_tokens"]["embedding"].T
+            lm_logits = self.lm_head.apply(
+                {"params": {"kernel": shared_kernel}}, res.last_hidden_state)
+        else:
+            lm_logits = self.lm_head(res.last_hidden_state)
+
+        lm_logits = lm_logits.astype(jnp.float32)
+
+        if not return_dict:
+            return (lm_logits,) + outputs[1:]
+
+        return FlaxCausalLMOutput(logits=lm_logits, hidden_states=res.hidden_states, attentions=res.attentions)
+
+
+class FlaxPhiPreTrainedModel(EasyDelFlaxPretrainedModel):
     """Phi pre-trained model."""
     module_class = None
     config_class = PhiConfig
     base_model_prefix = "transformer"
 
-    def __init__(self,
-                 config: PhiConfig,
-                 dtype: jnp.dtype = jnp.float32,
-                 param_dtype: jnp.dtype = jnp.float32,
-                 precision: jax.lax.Precision = jax.lax.Precision("fastest"),
-                 input_shape=(1, 1),
-                 seed: int = 42,
-                 _do_init: bool = False
-                 ) -> None:
+    def __init__(
+            self,
+            config: PhiConfig,
+            dtype: jnp.dtype = jnp.float32,
+            param_dtype: jnp.dtype = jnp.float32,
+            precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
+            input_shape=(1, 1),
+            seed: int = 42,
+            _do_init: bool = False
+    ) -> None:
         module = self.module_class(
             config=config,
             dtype=dtype,
@@ -826,38 +760,17 @@ class FlaxPhiPreTrainedModel(transformers.FlaxPreTrainedModel):
             seed=seed
         )
 
-    def prepare_inputs_for_generation(
-            self,
-            input_ids: Array,
-            attention_mask: Optional[Union[Array, Array]] = None,
-            **kwargs,
-    ) -> Dict[str, Any]:
-        # TODO: adding past_key_values
-        past_key_values = None
+    def init_cache(self, batch_size, max_length):
 
-        if input_ids.shape[1] > self.config.n_positions:
-            input_ids = input_ids[:, -self.config.n_positions:]
-            if attention_mask is not None:
-                attention_mask = attention_mask[:, -self.config.n_positions:]
+        input_ids = jnp.ones((batch_size, max_length))
+        attention_mask = jnp.ones_like(input_ids)
+        position_ids = jnp.broadcast_to(jnp.arange(
+            jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape)
 
-        if past_key_values is None or not (isinstance(past_key_values, InferenceParams)):
-            past_key_values = InferenceParams(
-                max_seq_len=self.config.n_positions,
-                max_batch_size=input_ids.shape[0],
-                seq_len_offset=0,
-                batch_size_offset=0,
-                key_value_memory_dict={},
-                lengths_per_sample=None,
-            )
-        else:
-            past_key_values.seq_len_offset = input_ids.shape[1] - 1
-            input_ids = input_ids[:, -1].unsqueeze(-1)
-
-        return {
-            "input_ids": input_ids,
-            "past_key_values": past_key_values,
-            "attention_mask": attention_mask,
-        }
+        init_variables = self.module.init(
+            jax.random.PRNGKey(0), input_ids, attention_mask, position_ids, return_dict=False, init_cache=True
+        )
+        return init_variables["cache"]
 
     def init_weights(self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None) -> FrozenDict:
         input_ids = jnp.zeros(input_shape, dtype="i4")
@@ -881,16 +794,19 @@ class FlaxPhiPreTrainedModel(transformers.FlaxPreTrainedModel):
 
     def __call__(
             self,
-            input_ids: Array,
-            attention_mask: Array = None,
+            input_ids: chex.Array,
+            attention_mask: chex.Array = None,
+            position_ids: chex.Array = None,
             params: dict = None,
-            deterministic: bool = True,
-            past_key_values: Array | Sequence[Array] = None,
+            past_key_values: dict = None,
             dropout_rng: jax.random.PRNGKey = None,
+            train: bool = False,
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
-            add_params_field: bool = False
+            return_dict: Optional[bool] = True,
+            extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+            add_params_field: bool = False,
+            **kwargs
     ):
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -901,10 +817,7 @@ class FlaxPhiPreTrainedModel(transformers.FlaxPreTrainedModel):
 
         batch_size, sequence_length = input_ids.shape
 
-        assert sequence_length <= self.config.max_position_embeddings, (f'Position out of range '
-                                                                        f'(Model Support '
-                                                                        f'{self.config.max_position_embeddings} got'
-                                                                        f' {sequence_length})')
+        assert sequence_length <= self.config.max_position_embeddings, "Maximum Position Embedding Reached !"
 
         if attention_mask is None:
             attention_mask = jnp.ones((batch_size, sequence_length))
@@ -926,8 +839,16 @@ class FlaxPhiPreTrainedModel(transformers.FlaxPreTrainedModel):
 
         outputs = self.module.apply(
             inputs,
-            jnp.array(input_ids, dtype="i4"),
-            deterministic,
+            input_ids=input_ids,
+            inputs_embeds=None,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            extra_embedding=extra_embedding,
+            deterministic=not train,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            init_cache=False,
+            return_dict=return_dict,
             rngs=rngs,
             mutable=mutable,
         )
@@ -943,139 +864,9 @@ class FlaxPhiPreTrainedModel(transformers.FlaxPreTrainedModel):
         return outputs
 
 
-class ParallelBlockCollection(nn.Module):
-    config: PhiConfig
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
-
-    def setup(self) -> None:
-        block = ParallelBlock
-        if self.config.gradient_checkpointing != "":
-            policy = get_gradient_checkpoint_policy(self.config.gradient_checkpointing)
-            block = nn.remat(
-                block,
-                policy=policy,
-                static_argnums=(-1)
-            )
-        self.layers = [
-            block(
-                self.config,
-                block_idx=i,
-                dtype=self.dtype,
-                param_dtype=self.param_dtype,
-                precision=self.precision,
-                name=str(i)
-            ) for i in range(self.config.n_layer)
-        ]
-
-    def __call__(
-            self,
-            hidden_states: Array,
-            attention_mask: Optional[Array] = None,
-            deterministic: bool = True
-    ) -> Array:
-        for layer in self.layers:
-            hidden_states = layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                deterministic=deterministic
-            )
-        return hidden_states
-
-
-class FlaxPhiModule(nn.Module):
-    """Phi model."""
-    config: PhiConfig
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
-
-    def setup(self) -> None:
-        self.embd = EmbeddingFlax(
-            config=self.config
-        )
-        self.h = ParallelBlockCollection(
-            config=self.config,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            precision=self.precision
-        )
-
-    def __call__(
-            self,
-            input_ids: Array,
-            attention_mask: Optional[Array] = None,
-            deterministic: bool = True
-    ) -> Array:
-        return self.h(
-            self.embd(input_ids, deterministic),
-            attention_mask=attention_mask,
-            deterministic=deterministic
-        )
-
-
-class FlaxPhiForCausalLMModule(nn.Module):
-    """Phi for Causal Language Modeling."""
-    config: PhiConfig
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
-
-    def setup(self) -> None:
-        self.transformer = FlaxPhiModule(
-            config=self.config,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            precision=self.precision
-        )
-        self.lm_head = CausalLMHead(
-            config=self.config,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            precision=self.precision
-        )
-
-    def __call__(
-            self,
-            input_ids: Array,
-            attention_mask: Optional[Array] = None,
-            deterministic: bool = True,
-            **kwargs,
-    ) -> FlaxCausalLMOutput:
-        hidden_states = self.transformer(input_ids, attention_mask=attention_mask, deterministic=deterministic)
-        lm_logits = self.lm_head(hidden_states)
-
-        return FlaxCausalLMOutput(logits=lm_logits)
+class FlaxPhiModel(FlaxPhiPreTrainedModel):
+    module_class = FlaxPhiModule
 
 
 class FlaxPhiForCausalLM(FlaxPhiPreTrainedModel):
     module_class = FlaxPhiForCausalLMModule
-
-    def get_input_embeddings(self):
-        return self.module.transformer.embd
-
-    def get_decoder(self):
-        return self.module.transformer
-
-    def set_input_embeddings(self, value):
-        self.module.transformer.embd = value
-
-    def set_decoder(self, decoder):
-        self.module.transformer = decoder
-
-    def set_output_embeddings(self, new_embeddings):
-        self.module.lm_head = new_embeddings
-
-    def get_output_embeddings(self):
-        return self.module.lm_head
-
-
-class FlaxPhiModel(FlaxPhiPreTrainedModel):
-    module_class = FlaxPhiModule
-
-    def get_input_embeddings(self):
-        return self.module.embd
-
-    def set_input_embeddings(self, value):
-        self.module.embd = value

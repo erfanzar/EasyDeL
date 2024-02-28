@@ -5,3 +5,5 @@ from .modelling_opt_flax import (
     FlaxOPTModel,
     FlaxOPTModule
 )
+
+__all__ = "FlaxOPTForCausalLM", "FlaxOPTModel", "OPTConfig"

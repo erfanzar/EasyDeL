@@ -29,15 +29,10 @@ class MistralConfig(EasyDelPretrainedConfig):
             sliding_window=4096,
             gradient_checkpointing: str = 'nothing_saveable',
             use_pjit_attention_force: bool = False,
-            use_flash_attention: bool = False,
-            use_sacn_mlp: bool = False,
-            flash_attn_query_chunk_size: int = 1024,
-            flash_attn_key_chunk_size: int = 1024,
+            use_scan_mlp: bool = False,
             scan_mlp_chunk_size: int = 1024,
             number_rep_kv: int = 1,
             attention_dropout: float = 0.0,
-            c_max_position_embeddings: int = 4096,
-            freq_max_position_embeddings: int = 4096,
             bits: Optional[int] = None,
             attention_bias: bool = False,
             **kwargs,
@@ -67,15 +62,10 @@ class MistralConfig(EasyDelPretrainedConfig):
         :param sliding_window: Control the number of tokens that are processed in parallel
         :param gradient_checkpointing: str: Specify whether to use gradient checkpointing
         :param use_pjit_attention_force: bool: Force the use of pjit attention
-        :param use_flash_attention: bool: Enable the flash attention mechanism
-        :param use_sacn_mlp: bool: Determine whether or not to use the scan_mlp function
-        :param flash_attn_query_chunk_size: int: Determine the number of rows in each chunk
-        :param flash_attn_key_chunk_size: int: Control the size of chunks that are used for the key matrix in flash attention
+        :param use_scan_mlp: bool: Determine whether or not to use the scan_mlp function
         :param scan_mlp_chunk_size: int: Specify the chunk size of the scan mlp
         :param number_rep_kv: int: Specify the number of times to repeat the key and value vectors
         :param attention_dropout: float: Set the dropout rate for the attention layer
-        :param c_max_position_embeddings: int: Set the maximum number of tokens in a sequence
-        :param freq_max_position_embeddings: int: Set the maximum number of frequency bins that can be used in the model
         :param bits: Optional[int]: Specify the number of bits used for quantization
         :param axis_dims: Sequence[int]: Specify the dimension of each axis
         :param axis_names: Sequence[str]: Specify the names of each axis in the tensor
@@ -105,18 +95,13 @@ class MistralConfig(EasyDelPretrainedConfig):
         self.use_cache = use_cache
         self.rope_theta = rope_theta
         self.rope_scaling = rope_scaling
-        self.use_flash_attention = use_flash_attention
         self.number_rep_kv = number_rep_kv
         self.gradient_checkpointing = gradient_checkpointing
         self.use_pjit_attention_force = use_pjit_attention_force
-        self.use_sacn_mlp = use_sacn_mlp
-        self.flash_attn_query_chunk_size = flash_attn_query_chunk_size
-        self.flash_attn_key_chunk_size = flash_attn_key_chunk_size
+        self.use_scan_mlp = use_scan_mlp
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
-        self.c_max_position_embeddings = c_max_position_embeddings
-        self.freq_max_position_embeddings = freq_max_position_embeddings
 
         super().__init__(
             pad_token_id=pad_token_id,
@@ -127,14 +112,14 @@ class MistralConfig(EasyDelPretrainedConfig):
         )
 
     @staticmethod
-    def get_partition_rules(fully_fsdp: bool = True):
+    def get_partition_rules(fully_sharded_data_parallel: bool = True):
         """
         The get_partition_rules function is used to define the partitioning scheme for a model.
         It returns a list of tuples, where each tuple contains two elements:
           1) A regex string that matches the name of one or more parameters in the model.
           2) A PartitionScheme object that defines how those parameters should be partitioned.
 
-        :param fully_fsdp: bool: Determine whether to use the fully_fsdp partitioning scheme or not
+        :param fully_sharded_data_parallel: bool: Determine whether to use the fully_sharded_data_parallel partitioning scheme or not
         :return: A list of tuples
 
         """
@@ -154,8 +139,8 @@ class MistralConfig(EasyDelPretrainedConfig):
 
             ("model/norm/kernel", PartitionSpec(None)),
             ("lm_head/kernel", PartitionSpec("fsdp", "dp")),
-            ('.*', PartitionSpec(None)),
-        ) if not fully_fsdp else (
+            (".*", PartitionSpec(None)),
+        ) if not fully_sharded_data_parallel else (
             ("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"))),
 
             ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"))),
@@ -170,21 +155,16 @@ class MistralConfig(EasyDelPretrainedConfig):
 
             ("model/norm/kernel", PartitionSpec(None)),
             ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
-            ('.*', PartitionSpec(("fsdp", "sp"))),
+            (".*", PartitionSpec(("fsdp", "sp"))),
         )
 
     def add_jax_args(
             self,
             gradient_checkpointing: str = 'nothing_saveable',
             use_pjit_attention_force: bool = False,
-            use_flash_attention: bool = False,
-            use_sacn_mlp: bool = False,
-            flash_attn_query_chunk_size: int = 1024,
-            flash_attn_key_chunk_size: int = 1024,
+            use_scan_mlp: bool = False,
             scan_mlp_chunk_size: int = 1024,
             number_rep_kv: int = 1,
-            c_max_position_embeddings: int = 4096,
-            freq_max_position_embeddings: int = None,
             bits: Optional[int] = None,
             attention_dropout: float = 0.0,
             rope_scaling: Dict[str, Union[str, float]] = None,
@@ -197,14 +177,9 @@ class MistralConfig(EasyDelPretrainedConfig):
         :param self: Bind the attributes and methods of a class to an instance of that class
         :param gradient_checkpointing: str: Determine whether to use gradient checkpointing
         :param use_pjit_attention_force: bool: Determine whether to use the pjit_attention_force function
-        :param use_flash_attention: bool: Determine if the flash attention module is used or not
-        :param use_sacn_mlp: bool: Determine whether to use the scan_mlp function or not
-        :param flash_attn_query_chunk_size: int: Specify the number of tokens that will be processed at a time
-        :param flash_attn_key_chunk_size: int: Chunk the keys for flash attention
+        :param use_scan_mlp: bool: Determine whether to use the scan_mlp function or notn
         :param scan_mlp_chunk_size: int: Chunk the input to the mlp
         :param number_rep_kv: int: Control the number of times that the key and value vectors are repeated
-        :param c_max_position_embeddings: int: Set the maximum number of positional embeddings for the causal axis
-        :param freq_max_position_embeddings: int: Set the maximum length of the frequency axis
         :param bits: Optional[int]: Specify the number of bits to use for quantization
         :param attention_dropout: float: Set the dropout rate for the attention layer
         :param attention_bias: bool: when ever to use attention_bias
@@ -215,17 +190,12 @@ class MistralConfig(EasyDelPretrainedConfig):
 
         self.attention_bias = attention_bias
         self.rope_scaling = rope_scaling
-        self.use_flash_attention = use_flash_attention
         self.number_rep_kv = number_rep_kv
         self.gradient_checkpointing = gradient_checkpointing
         self.use_pjit_attention_force = use_pjit_attention_force
-        self.use_sacn_mlp = use_sacn_mlp
-        self.flash_attn_query_chunk_size = flash_attn_query_chunk_size
-        self.flash_attn_key_chunk_size = flash_attn_key_chunk_size
+        self.use_scan_mlp = use_scan_mlp
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.attention_dropout = attention_dropout
-        self.c_max_position_embeddings = c_max_position_embeddings
-        self.freq_max_position_embeddings = freq_max_position_embeddings
         self.bits = bits
 
     @staticmethod

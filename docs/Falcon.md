@@ -90,7 +90,7 @@ class FalconJaxServer(JAXServer):
   # need read JaxServer Documents inorder to learn how
 
 
-server = FalconJaxServer.load_from_params(
+server = FalconJaxServer.from_parameters(
   params=params,
   model=model,
   config_model=model.config,
@@ -98,7 +98,7 @@ server = FalconJaxServer.load_from_params(
   tokenizer=AutoTokenizer.from_pretrained('tiiuae/falcon-7b'),
   verbose=False,
   do_memory_log=True,
-  config=JAXServerConfig()
+  server_config=JAXServerConfig()
 )
 
 server.fire()  # Launch FastAPI functions

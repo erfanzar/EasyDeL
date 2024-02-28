@@ -1,3 +1,6 @@
+import typing
+
+import termcolor
 from datasets import load_dataset, Dataset, DatasetDict
 from dataclasses import dataclass
 from typing import Optional, Union, List
@@ -9,7 +12,7 @@ from transformers import PreTrainedTokenizer
 class DataProcessorArguments:
     prompt_field: str
     max_position_embeddings: int
-    is_left_padded: Optional[bool] = True
+    truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end"
     use_deepcopy: bool = True
     with_indices: bool = False
     with_rank: bool = False
@@ -64,12 +67,13 @@ class DataProcessor:
                 map_kwargs[k] = v
 
         if tokenizer.pad_token is None:
-            print(
-                "\033[1;31mTokenizer Doesn't include the padding "
-                "token so i set `(tokenizer.pad_token = tokenizer.eos_token)`\033[1;0m"
+            termcolor.cprint(
+                "Tokenizer Doesn't include the padding "
+                "token so i set `(tokenizer.pad_token = tokenizer.eos_token)`",
+                color="red", force_color=True
             )
             tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.padding_side = 'left' if arguments.is_left_padded else 'right'
+        tokenizer.padding_side = 'left' if arguments.truncation_mode == "keep_end" else 'right'
         data = data.map(
             lambda x: tokenizer(
                 x[arguments.prompt_field],
@@ -81,4 +85,3 @@ class DataProcessor:
         )
 
         return DatasetDict({field: data})
-

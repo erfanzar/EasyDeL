@@ -1,10 +1,21 @@
 import chex
+import flax
 from jax.experimental.mesh_utils import create_device_mesh
 from transformers import PretrainedConfig, FlaxPreTrainedModel
 import jax
 from jax import numpy as jnp
-from typing import Sequence, Union, Optional
+from typing import Sequence, Union, Optional, Literal, Tuple, Any
 from dataclasses import dataclass
+from jax.sharding import PartitionSpec, Mesh
+
+AVAILABLE_ATTENTION_MECHANISMS = Literal["normal", "flash", "splash", "ring"]
+
+
+def set_attrs_smartly(self, attr_name: str, default: Any, new_attr: Any):
+    if not hasattr(self, attr_name):
+        setattr(self, attr_name, default)
+    if not new_attr == Ellipsis:
+        setattr(self, attr_name, new_attr)
 
 
 @dataclass
@@ -21,45 +32,87 @@ class EasyDelPretrainedConfig(PretrainedConfig):
     :param self: Refer to the instance of the class
     :param axis_dims: Sequence[int]: Specify the number of dimensions for each axis
     :param axis_names: Sequence[str]: Set the names of the axes
-    :param q_ps: jax.sharding.PartitionSpec: Specify the partitioning of the query tensor
-    :param k_ps: jax.sharding.PartitionSpec: Partition the key matrix
-    :param v_ps: jax.sharding.PartitionSpec: Specify the partitioning of the value tensor
-    :param b_ps: jax.sharding.PartitionSpec: Specify the Attention Bias partition spec
-    :param a_ps: jax.sharding.PartitionSpec: Specify the partitioning of the attention weights
+    :param attn_mechanism: Literal["normal", "flash", "splash", "ring"]: attention mechanism to use
+    :param block_k: int: block size of key_states
+    :param block_q: int: block size of query_states
+    :param block_b: int: block size of bias
+    :param block_q_major_dkv: int: block size of block_q_major_dkv
+    :param block_k_major_dkv: int: block size of block_k_major_dkv
+    :param block_k_dkv: int: block size of block_k_dkv
+    :param block_q_dkv: int: block size of block_q_dkv
+    :param block_k_major_dq: int: block size of block_k_major_dq
+    :param block_k_dq: int: block size of block_k_dq
+    :param block_q_dq: int: block size of block_q_dq
+    :param query_partition_spec: PartitionSpec: Specify the partitioning of the query tensor
+    :param key_partition_spec: PartitionSpec: Partition the key matrix
+    :param value_partition_spec: PartitionSpec: Specify the partitioning of the value tensor
+    :param bias_partition_spec: PartitionSpec: Specify the Attention Bias partition spec
+    :param attention_partition_spec: PartitionSpec: Specify the partitioning of the attention weights
     :param use_shard_map: bool: whenever to use shard_map for attention
+    :param use_scan_mlp: bool: Determine whether to use scan_mlp or not
     :param backend: Optional[None]: Specify the backend to use
-    :param easy_method: EasyMethod: Specify the use of model to init the QDot Method for (e.q TRAIN,SERVE,...)
     """
 
     def __init__(
             self,
             axis_dims: Sequence[int] = (1, -1, 1, 1),
             axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
-                ("dp", "fsdp"), "sp", "tp", None),
-            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
-                ("dp", "fsdp"), "sp", "tp", None),
-            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
-                ("dp", "fsdp"), "sp", "tp", None),
-            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
-                ("dp", "fsdp"), None, None, None),
-            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
-                ("dp", "fsdp"), "sp", "tp", None),
+            attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = "normal",
+            block_k: int = 128,
+            block_q: int = 128,
+            block_b: int = 1,
+            block_k_major: int = 128,
+            block_q_major_dkv: int | None = None,
+            block_k_major_dkv: int | None = None,
+            block_k_dkv: int | None = None,
+            block_q_dkv: int | None = None,
+            block_k_major_dq: int | None = None,
+            block_k_dq: int | None = None,
+            block_q_dq: int | None = None,
+            query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            key_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            value_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
+            attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             use_shard_map: bool = False,
-            backend: Optional[None] = None,
-            easy_method: EasyMethod = EasyMethod.TRAIN,
+            use_sharded_kv_caching: bool = True,
+            backend: Optional[None] = jax.default_backend(),
+            easy_method: Literal["train", "serve", "convert"] = EasyMethod.TRAIN,
+            bits: Optional[int] = None,
+            scan_ring_attention: bool = True,
+            scan_attention_layers: bool = False,
+            use_scan_mlp: bool = True,
+            scan_mlp_chunk_size: int = 1024,
             **kwargs
     ):
-        self.q_ps = q_ps
-        self.k_ps = k_ps
-        self.v_ps = v_ps
-        self.b_ps = b_ps
-        self.a_ps = a_ps
+        self.query_partition_spec = query_partition_spec
+        self.key_partition_spec = key_partition_spec
+        self.value_partition_spec = value_partition_spec
+        self.bias_partition_spec = bias_partition_spec
+        self.attention_partition_spec = attention_partition_spec
         self.use_shard_map = use_shard_map
         self.axis_dims = axis_dims
         self.axis_names = axis_names
         self.backend = backend if backend is not None else ""
         self.easy_method = easy_method
+        self.attn_mechanism = attn_mechanism
+        self.block_b = block_b
+        self.block_k = block_k
+        self.block_q = block_q
+        self.block_k_major = block_k_major
+        self.block_q_major_dkv = block_q_major_dkv or block_q
+        self.block_k_major_dkv = block_k_major_dkv or block_k
+        self.block_k_dkv = block_k_dkv or block_k
+        self.block_q_dkv = block_q_dkv or block_q
+        self.block_k_major_dq = block_k_major_dq or block_k
+        self.block_k_dq = block_k_dq or block_k
+        self.block_q_dq = block_q_dq or block_q
+        self.bits = bits
+        self.scan_attention_layers = scan_attention_layers
+        self.scan_ring_attention = scan_ring_attention
+        self.use_sharded_kv_caching = use_sharded_kv_caching
+        self.use_scan_mlp = use_scan_mlp
+        self.scan_mlp_chunk_size = scan_mlp_chunk_size
         super().__init__(**kwargs)
 
     @staticmethod
@@ -79,13 +132,13 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             (len(jax.devices() if backend == "" else jax.devices(backend)), 1))
         resh = array_devices.reshape(axis_dims).shape
 
-        return jax.sharding.Mesh(
+        return Mesh(
             create_device_mesh(resh), axis_names
         )
 
-    def jax_mesh(self) -> jax.sharding.Mesh:
+    def jax_mesh(self) -> Mesh:
         """
-        The jax_mesh function is a helper function that creates a jax.sharding.Mesh object from the
+        The jax_mesh function is a helper function that creates a Mesh object from the
         axis_dims and axis_names attributes of an object, which are assumed to be lists of integers and strings, respectively.
         The backend attribute is also used if it exists.
 
@@ -94,18 +147,27 @@ class EasyDelPretrainedConfig(PretrainedConfig):
 
         """
         return self.create_mesh(
-            axis_dims=self.axis_dims,
-            axis_names=self.axis_names,
+            axis_dims=[v for k, v in self.axis_dims.items()] if isinstance(self.axis_dims, dict) else self.axis_dims,
+            axis_names=[v for k, v in self.axis_names.items()] if isinstance(self.axis_names,
+                                                                             dict) else self.axis_names,
             backend=(self.backend if self.backend is not None else "") if hasattr(
                 self, 'backend') else ""
         )
 
-    def get_partition_rules(self, fully_fsdp: bool = True):
-        if not fully_fsdp:
-            raise NotImplementedError
+    def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
+
+        """
+        The get_partition_rules function is used to specify how the parameters of a model are partitioned across devices.
+
+        :param self: Access the attributes of the class
+        :param fully_sharded_data_parallel: bool: Determine whether the model is fully sharded or not
+        :return: A tuple of tuples
+        """
+        if not fully_sharded_data_parallel:
+            raise NotImplementedError()
         else:
             return (
-                ('.*', jax.sharding.PartitionSpec(("fsdp", "sp")))
+                ('.*', PartitionSpec(("fsdp", "sp")))
             )
 
     def get_axis_dims(self) -> Sequence[int]:
@@ -139,53 +201,164 @@ class EasyDelPretrainedConfig(PretrainedConfig):
         """
         return self.backend if not self.backend == "" else jax.lib.xla_bridge.get_backend().platform
 
-    def add_partitions(
+    def add_basic_configurations(
             self,
-            axis_dims: Sequence[int] = (1, -1, 1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            q_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
-                ("dp", "fsdp"), "sp", "tp", None
-            ),
-            k_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
-                ("dp", "fsdp"), "sp", "tp", None
-            ),
-            v_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
-                ("dp", "fsdp"), "sp", "tp", None
-            ),
-            b_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
-                ("dp", "fsdp"), None, None, None
-            ),
-            a_ps: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
-                ("dp", "fsdp"), "sp", "tp", None
-            ),
-            use_shard_map: bool = False,
-            backend: Optional[str] = None,
+            axis_dims: Sequence[int] = ...,
+            axis_names: Sequence[str] = ...,
+            attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = ...,
+            block_k: int = ...,
+            block_q: int = ...,
+            block_b: int = ...,
+            block_k_major: int = ...,
+            block_q_major_dkv: int | None = ...,
+            block_k_major_dkv: int | None = ...,
+            block_k_dkv: int | None = ...,
+            block_q_dkv: int | None = ...,
+            block_k_major_dq: int | None = ...,
+            block_k_dq: int | None = ...,
+            block_q_dq: int | None = ...,
+            query_partition_spec: PartitionSpec = ...,
+            key_partition_spec: PartitionSpec = ...,
+            value_partition_spec: PartitionSpec = ...,
+            bias_partition_spec: PartitionSpec = ...,
+            attention_partition_spec: PartitionSpec = ...,
+            use_shard_map: bool = ...,
+            use_sharded_kv_caching: bool = ...,
+            backend: Optional[None] = ...,
+            easy_method: Literal["train", "serve", "convert"] = ...,
+            bits: Optional[int] = ...,
+            scan_ring_attention: bool = ...,
+            scan_attention_layers: bool = ...,
+            use_scan_mlp: bool = ...,
+            scan_mlp_chunk_size: int = ...
     ):
         """
-            It initializes all the attributes of an object, and it's called when you create a new instance of that class.
-            :param self: Refer to the instance of the class
-            :param axis_dims: Sequence[int]: Specify the number of dimensions for each axis
-            :param axis_names: Sequence[str]: Set the names of the axes
-            :param q_ps: jax.sharding.PartitionSpec: Specify the partitioning of the query tensor
-            :param k_ps: jax.sharding.PartitionSpec: Partition the key matrix
-            :param v_ps: jax.sharding.PartitionSpec: Specify the partitioning of the value tensor
-            :param b_ps: jax.sharding.PartitionSpec: Specify the Attention Bias partition spec
-            :param a_ps: jax.sharding.PartitionSpec: Specify the partitioning of the attention weights
-            :param use_shard_map: bool: whenever to use shard_map for attention
-            :param backend: Optional[None]: Specify the backend to use
-            """
-        self.axis_dims = axis_dims
-        self.axis_names = axis_names
-        self.q_ps = q_ps
-        self.k_ps = k_ps
-        self.v_ps = v_ps
-        self.b_ps = b_ps
-        self.a_ps = a_ps
-        self.backend = backend
-        self.use_shard_map = use_shard_map
+        It initializes all the attributes of an object, and it's called when you create a new instance of that class.
+        :param self: Refer to the instance of the class
+        :param axis_dims: Sequence[int]: Specify the number of dimensions for each axis
+        :param axis_names: Sequence[str]: Set the names of the axes
+        :param attn_mechanism: Literal["normal", "flash", "splash"]: attention mechanism to use
+        :param block_k: int: block size of key_states
+        :param block_q: int: block size of query_states
+        :param block_b: int: block size of bias
+        :param block_k_major: int: block size if key major
+        :param block_q_major_dkv: int: block size of block_q_major_dkv
+        :param block_k_major_dkv: int: block size of block_k_major_dkv
+        :param block_k_dkv: int: block size of block_k_dkv
+        :param block_q_dkv: int: block size of block_q_dkv
+        :param block_k_major_dq: int: block size of block_k_major_dq
+        :param block_k_dq: int: block size of block_k_dq
+        :param block_q_dq: int: block size of block_q_dq
+        :param query_partition_spec: PartitionSpec: Specify the partitioning of the query tensor
+        :param key_partition_spec: PartitionSpec: Partition the key matrix
+        :param value_partition_spec: PartitionSpec: Specify the partitioning of the value tensor
+        :param bias_partition_spec: PartitionSpec: Specify the Attention Bias partition spec
+        :param attention_partition_spec: PartitionSpec: Specify the partitioning of the attention weights
+        :param use_shard_map: bool: whenever to use shard_map for attention
+        :param use_sharded_kv_caching: bool: whenever to use shard_map and sharding for key and value
+        :param backend: Optional[None]: Specify the backend to use
+        :param easy_method: Literal["train", "serve", "convert"]: EasyDel Quantization Method to be applied for
+        :param bits: Optional[int]: Model bits for quantization
+        :param scan_ring_attention: bool: Whether to use can for ring attention
+        :param scan_attention_layers: bool: Whether to use can for attention layers
+        :param use_scan_mlp: bool: Determine whether to use scan_mlp or not
+        :param scan_mlp_chunk_size: int: Size of chunks in scan MLP.
+        """
+        set_attrs_smartly(self, "axis_dims", (1, -1, 1, 1), axis_dims)
+        set_attrs_smartly(self, "axis_names", ("dp", "fsdp", "tp", "sp"), axis_names)
+
+        set_attrs_smartly(self, "block_q", 128, block_q)
+        set_attrs_smartly(self, "block_k", 128, block_k)
+        set_attrs_smartly(self, "block_b", 1, block_b)
+
+        set_attrs_smartly(self, "query_partition_spec", PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+                          query_partition_spec)
+        set_attrs_smartly(self, "key_partition_spec", PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+                          key_partition_spec)
+        set_attrs_smartly(self, "value_partition_spec", PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+                          value_partition_spec)
+        set_attrs_smartly(self, "bias_partition_spec", PartitionSpec(("dp", "fsdp"), None, None, None),
+                          bias_partition_spec)
+        set_attrs_smartly(self, "attention_partition_spec", PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+                          attention_partition_spec)
+
+        set_attrs_smartly(self, "backend", jax.default_backend(), backend)
+        set_attrs_smartly(self, "use_shard_map", False, use_shard_map)
+        set_attrs_smartly(self, "use_sharded_kv_caching", True, use_sharded_kv_caching)
+        set_attrs_smartly(self, "attn_mechanism", "normal", attn_mechanism)
+
+        set_attrs_smartly(self, "block_k_dkv", block_k_dkv or self.block_k, block_k_dkv)
+        set_attrs_smartly(self, "block_q_dkv", block_q_dkv or self.block_q, block_q_dkv)
+
+        set_attrs_smartly(self, "block_q_major_dkv", block_q_major_dkv or self.block_q, block_q_major_dkv)
+        set_attrs_smartly(self, "block_k_major_dkv", block_k_major_dkv or self.block_k, block_k_major_dkv)
+
+        set_attrs_smartly(self, "block_k_major", block_k_major or self.block_k, block_k_major)
+        set_attrs_smartly(self, "block_k_major_dq", block_k_major_dq or self.block_k, block_k_major_dq)
+
+        set_attrs_smartly(self, "block_k_dq", block_k_dq or self.block_k, block_k_dq)
+        set_attrs_smartly(self, "block_q_dq", block_q_dq or self.block_q, block_q_dq)
+
+        set_attrs_smartly(self, "easy_method", EasyMethod.TRAIN, easy_method)
+        set_attrs_smartly(self, "bits", None, bits)
+        set_attrs_smartly(self, "scan_attention_layers", True, scan_attention_layers)
+        set_attrs_smartly(self, "scan_ring_attention", False, scan_ring_attention)
+        set_attrs_smartly(self, "use_scan_mlp", True, use_scan_mlp)
+        set_attrs_smartly(self, "scan_mlp_chunk_size", 1024, scan_mlp_chunk_size)
+
+    def __repr__(self):
+
+        """
+        The __repr__ function is used to generate a string representation of an object.
+        This function should return a string that can be parsed by the Python interpreter
+        to recreate the object. The __repr__ function is called when you use print() on an
+        object, or when you type its name in the REPL.
+
+        :param self: Refer to the instance of the class
+        :return: A string representation of the object
+        """
+        string = f"{self.__class__.__name__}(\n"
+        for k, v in self.__dict__.items():
+            if not k.startswith("_"):
+                try:
+                    repr_src = f"\t{k} : " + v.__str__().replace("\n", "\n\t") + "\n"
+                    string += repr_src if len(repr_src) < 500 else f"\t{k} : " + f"{v.__class__.__name__}(...)" + "\n"
+                except TypeError:
+                    pass
+        return string + ")"
+
+    def __str__(self):
+
+        """
+        The __str__ function is called when you use the print function or when str() is used.
+        It should return a string representation of the object.
+
+        :param self: Refer to the instance of the class
+        :return: The object's string representation
+        """
+        return self.__repr__()
 
 
 class EasyDelFlaxPretrainedModel(FlaxPreTrainedModel):
+    def __init__(
+            self,
+            config: PretrainedConfig,
+            module: flax.linen.Module,
+            input_shape: Tuple = (1, 1),
+            seed: int = 0,
+            dtype: jnp.dtype = jnp.float32,
+            param_dtype: jnp.dtype = jnp.float32,  # Ignored
+            precision: Optional[Union[jax.lax.Precision, str]] = None,  # Ignored
+            _do_init: bool = True,
+    ):
+        super().__init__(
+            config=config,
+            module=module,
+            input_shape=input_shape,
+            seed=seed,
+            dtype=dtype,
+            _do_init=_do_init
+        )
 
     def get_input_embeddings(self):
         """
@@ -247,10 +420,43 @@ class EasyDelFlaxPretrainedModel(FlaxPreTrainedModel):
         """
         raise NotImplementedError()
 
-    def __str__(self):
-        padded_model = "\t" + "\n\t".join(self.module.__str__().split("\n"))
-        string = f"{self.__class__.__name__}(\n{padded_model}\n)"
-        return string
+    def init_cache(self, batch_size: int, max_length: int):
+        raise NotImplementedError("init_cache is not Implemented Yet!")
+
+    def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[chex.Array] = None):
+        """
+        The prepare_inputs_for_generation function is used to prepare the inputs for a generation task.
+
+        :param self: Access variables that belong to the class
+        :param input_ids: Pass in the input tokens
+        :param max_length: Set the length of the sequence to be generated
+        :param attention_mask: Optional[chex.Array]: Mask the attention weights
+        :return: A dictionary of the past_key_values, attention_mask and position ids
+
+        """
+        batch_size, seq_length = input_ids.shape
+
+        past_key_values = self.init_cache(batch_size, max_length)
+        extended_attention_mask = jnp.ones(
+            (batch_size, max_length), dtype="i4")
+        if attention_mask is not None:
+            position_ids = attention_mask.cumsum(axis=-1) - 1
+            extended_attention_mask = jax.lax.dynamic_update_slice(
+                extended_attention_mask, attention_mask, (0, 0))
+        else:
+            position_ids = jnp.broadcast_to(jnp.arange(seq_length, dtype="i4")[
+                                            None, :], (batch_size, seq_length))
+
+        return {
+            "past_key_values": past_key_values,
+            "attention_mask": extended_attention_mask,
+            "position_ids": position_ids,
+        }
+
+    def update_inputs_for_generation(self, model_outputs, model_kwargs):
+        model_kwargs["past_key_values"] = model_outputs.past_key_values
+        model_kwargs["position_ids"] = model_kwargs["position_ids"][:, -1:] + 1
+        return model_kwargs
 
     def __call__(
             self,
@@ -269,3 +475,35 @@ class EasyDelFlaxPretrainedModel(FlaxPreTrainedModel):
             **kwargs
     ):
         raise NotImplementedError("Not Implemented Yet")
+
+    def __repr__(self):
+
+        """
+        The __repr__ function is used to generate a string representation of an object.
+        This function should return a string that can be parsed by the Python interpreter
+        to recreate the object. The __repr__ function is called when you use print() on an
+        object, or when you type its name in the REPL.
+
+        :param self: Refer to the instance of the class
+        :return: A string representation of the object
+        """
+        string = f"{self.__class__.__name__}(\n"
+        for k, v in self.__dict__.items():
+            if not k.startswith("_"):
+                try:
+                    repr_src = f"\t{k} : " + v.__str__().replace("\n", "\n\t") + "\n"
+                    string += repr_src if len(repr_src) < 500 else f"\t{k} : " + f"{v.__class__.__name__}(...)" + "\n"
+                except TypeError:
+                    pass
+        return string + ")"
+
+    def __str__(self):
+
+        """
+        The __str__ function is called when you use the print function or when str() is used.
+        It should return a string representation of the object.
+
+        :param self: Refer to the instance of the class
+        :return: The object's string representation
+        """
+        return self.__repr__()

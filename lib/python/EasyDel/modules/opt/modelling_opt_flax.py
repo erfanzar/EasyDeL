@@ -26,6 +26,7 @@ from flax.linen import combine_masks, make_causal_mask
 from flax.linen.attention import dot_product_attention_weights
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
+from jax.experimental.shard_map import shard_map
 from jax.random import PRNGKey
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxMaskedLMOutput
 from transformers.modeling_flax_utils import ACT2FN
@@ -33,7 +34,7 @@ from jax.sharding import PartitionSpec
 from transformers import logging
 
 from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
-    with_sharding_constraint
+    with_sharding_constraint, BaseJAXAttentionModule
 
 import chex
 
@@ -44,7 +45,7 @@ logger = logging.get_logger(__name__)
 
 
 # Copied from transformers.models.bart.modeling_flax_bart.FlaxBartAttention with Bart->OPT
-class FlaxOPTAttention(nn.Module):
+class FlaxOPTAttention(BaseJAXAttentionModule):
     config: OPTConfig
     embed_dim: int
     num_heads: int
@@ -75,8 +76,11 @@ class FlaxOPTAttention(nn.Module):
         self.dropout_layer = nn.Dropout(rate=self.dropout)
 
         if self.causal:
-            self.causal_mask = make_causal_mask(
-                jnp.ones((1, self.config.max_position_embeddings), dtype="bool"), dtype="bool"
+            self.causal_mask = nn.make_causal_mask(
+                jnp.ones(
+                    (1, getattr(self.config, "c_max_position_embeddings", self.config.max_position_embeddings)),
+                    dtype="bool"
+                ), dtype="bool"
             )
 
     def _split_heads(self, hidden_states):
@@ -84,33 +88,6 @@ class FlaxOPTAttention(nn.Module):
 
     def _merge_heads(self, hidden_states):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.embed_dim,))
-
-    @nn.compact
-    def _concatenate_to_cache(self, key, value, query, attention_mask):
-
-        is_initialized = self.has_variable("cache", "cached_key")
-        cached_key = self.variable("cache", "cached_key", jnp.zeros, key.shape, key.dtype)
-        cached_value = self.variable("cache", "cached_value", jnp.zeros, value.shape, value.dtype)
-        cache_index = self.variable("cache", "cache_index", lambda: chex.Array(0, dtype=jnp.int32))
-
-        if is_initialized:
-            *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
-            # update key, value caches with our new 1d spatial slices
-            cur_index = cache_index.value
-            indices = (0,) * len(batch_dims) + (cur_index, 0, 0)
-            key = lax.dynamic_update_slice(cached_key.value, key, indices)
-            value = lax.dynamic_update_slice(cached_value.value, value, indices)
-            cached_key.value = key
-            cached_value.value = value
-            num_updated_cache_vectors = query.shape[1]
-            cache_index.value = cache_index.value + num_updated_cache_vectors
-            # causal mask for cached decoder self-attention: our single query position should only attend to those key positions that have already been generated and cached, not the remaining zero elements.
-            pad_mask = jnp.broadcast_to(
-                jnp.arange(max_length) < cur_index + num_updated_cache_vectors,
-                tuple(batch_dims) + (1, num_updated_cache_vectors, max_length),
-            )
-            attention_mask = combine_masks(pad_mask, attention_mask)
-        return key, value, attention_mask
 
     def __call__(
             self,

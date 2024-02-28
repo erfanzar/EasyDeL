@@ -49,7 +49,7 @@ class PalmConfig(EasyDelPretrainedConfig):
         return config
 
     @staticmethod
-    def get_partition_rules(fully_fsdp: bool = False):
+    def get_partition_rules(fully_sharded_data_parallel: bool = False):
         return (
             ('wi/kernel', PartitionSpec("fsdp")),
             ('attn_wo/kernel', PartitionSpec("fsdp", "dp")),
@@ -58,8 +58,8 @@ class PalmConfig(EasyDelPretrainedConfig):
             ('lm_head/kernel', PartitionSpec("fsdp")),
             ('post_norm/kernel', PartitionSpec("fsdp")),
             ('norm/kernel', PartitionSpec("fsdp", "dp")),
-            ('.*', PartitionSpec(None)),
-        ) if not fully_fsdp else (
+            (".*", PartitionSpec(("fsdp", "sp"))),
+        ) if not fully_sharded_data_parallel else (
             ('wi/kernel', PartitionSpec("fsdp")),
             ('attn_wo/kernel', PartitionSpec("fsdp")),
             ('ff_wo/kernel', PartitionSpec("fsdp")),

@@ -31,9 +31,6 @@ class MptConfig(EasyDelPretrainedConfig):
                  use_norm_bias: bool = False,
                  gradient_checkpointing: str = 'nothing_saveable',
                  use_pjit_attention_force: bool = False,
-                 use_flash_attention: bool = False,
-                 flash_attn_query_chunk_size: int = 1024,
-                 flash_attn_key_chunk_size: int = 2048,
                  bits: Optional[int] = None,
                  **kwargs
                  ):
@@ -60,9 +57,6 @@ class MptConfig(EasyDelPretrainedConfig):
         self.verbose = verbose
         self.embedding_fraction = embedding_fraction
         self.use_cache = use_cache
-        self.use_flash_attention = use_flash_attention
-        self.flash_attn_key_chunk_size = flash_attn_key_chunk_size
-        self.flash_attn_query_chunk_size = flash_attn_query_chunk_size
         self.bits = bits
 
         self.from_pt = False
@@ -82,7 +76,7 @@ class MptConfig(EasyDelPretrainedConfig):
         return config
 
     @staticmethod
-    def get_partition_rules(fully_fsdp: bool = False):
+    def get_partition_rules(fully_sharded_data_parallel: bool = False):
         return (
 
             ("transformer/wte/embedding", PartitionSpec("dp", "fsdp")),
@@ -106,8 +100,8 @@ class MptConfig(EasyDelPretrainedConfig):
             ("transformer/norm_f/bias", PartitionSpec(None)),
             ("lm_head/kernel", PartitionSpec("fsdp", "dp")),
             ("lm_head/bias", PartitionSpec("fsdp", "dp")),
-            ('.*', PartitionSpec(None)),
-        ) if not fully_fsdp else (
+            (".*", PartitionSpec(None)),
+        ) if not fully_sharded_data_parallel else (
 
             ("transformer/wte/embedding", PartitionSpec("fsdp")),
             ("transformer/wpe/embedding", PartitionSpec("fsdp")),
@@ -130,7 +124,7 @@ class MptConfig(EasyDelPretrainedConfig):
             ("transformer/norm_f/bias", PartitionSpec(None)),
             ("lm_head/kernel", PartitionSpec("fsdp")),
             ("lm_head/bias", PartitionSpec("fsdp")),
-            ('.*', PartitionSpec(None)),
+            (".*", PartitionSpec(("fsdp", "sp"))),
         )
 
     def add_jax_args(self,
@@ -156,9 +150,6 @@ class MptConfig(EasyDelPretrainedConfig):
                      use_norm_bias: bool = False,
                      gradient_checkpointing: str = 'nothing_saveable',
                      use_pjit_attention_force: bool = False,
-                     use_flash_attention: bool = False,
-                     flash_attn_query_chunk_size: int = 1024,
-                     flash_attn_key_chunk_size: int = 2048,
                      bits: Optional[int] = None,
                      **kwargs,
                      ):
@@ -189,9 +180,6 @@ class MptConfig(EasyDelPretrainedConfig):
             use_norm_bias=use_norm_bias,
             gradient_checkpointing=gradient_checkpointing,
             use_pjit_attention_force=use_pjit_attention_force,
-            use_flash_attention=use_flash_attention,
-            flash_attn_query_chunk_size=flash_attn_query_chunk_size,
-            flash_attn_key_chunk_size=flash_attn_key_chunk_size,
             **kwargs
         )
         for k, v in basics.items():

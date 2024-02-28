@@ -1,11 +1,14 @@
+import json
 import os
+import re
+
 import yaml
 
 cache = {}
 
 
 def unflatten_dict(xs, sep=None):
-    assert isinstance(xs, dict), f'input is not a dict; it is a {type(xs)}'
+    assert isinstance(xs, dict), f"input is not a dict; it is a {type(xs)}"
     result = {}
     for path, value in xs.items():
         if sep is not None:
@@ -33,9 +36,11 @@ def get_files(path: str):
             os.path.exists(os.path.join(path, o)) and not os.path.isdir(os.path.join(path, o))]
 
 
-def run(project_locations="lib/python/EasyDel", docs_file="docs/"):
+def run(project_locations="lib/python/EasyDel", docs_file="docs/", start_head="lib/python/EasyDel"):
     global cache
-
+    for current_file in get_inner(docs_file):
+        if current_file.startswith("generated-"):
+            os.remove(os.path.join(docs_file, current_file))
     try:
         for current_file in get_inner(project_locations):
             if not current_file.endswith(
@@ -46,22 +51,37 @@ def run(project_locations="lib/python/EasyDel", docs_file="docs/"):
                 ".py"
             ):
 
-                name = current_file.replace(".py", "").replace("/", ".")
+                doted = (
+                        start_head
+                        .replace(os.path.sep, ".")
+                        .replace("/", ".") + "."
+                )
 
-                replace_file_regex = "lib/python/EasyDel".replace("/", ".") + "."
-                markdown_documentation = f"# {name.replace(replace_file_regex, '')}\n::: {name}"
-                categorical_name = name.replace("lib.python.EasyDel.", "")
-                markdown_filename = categorical_name.replace(".", "-") + ".md"
+                name = (
+                    current_file
+                    .replace(".py", "")
+                    .replace(os.path.sep, ".")
+                    .replace("/", ".")
+                )
+
+                markdown_documentation = f"# {name.replace(doted, '')}\n::: {name}"
+                categorical_name = name.replace(doted, "")
+                markdown_filename = (
+                        "generated-" + name
+                        .replace(doted, "")
+                        .replace(".", "-")
+                        + ".md"
+                )
 
                 with open(docs_file + markdown_filename, "w") as buffer:
                     buffer.write(markdown_documentation)
                 category_tuple = tuple(categorical_name.split("."))
                 edited_category_tuple = ()
+
                 for key in category_tuple:
                     key = key.split("_")
                     capitalized_words = [word.capitalize() for word in key if word != ""]
-                    edited_category_tuple += (' '.join(capitalized_words),)
-
+                    edited_category_tuple += (" ".join(capitalized_words),)
                 cache[edited_category_tuple] = markdown_filename
             else:
                 run(current_file)
@@ -120,23 +140,33 @@ theme:
         ("install",): "Install.md",
         ("AvailableModels",): "AvailableModels.md",
         ("EasyBIT",): "Bits.md",
+        ("Examples", "EasyState"): "EasyStateExample.md",
+        ("Examples", "LoRA and Transfer Learning"): "LoRA-TransferLearningExample.md",
+        ("Examples", "Fine Tuning Example"): "FineTuningExample.md",
         ("Examples", "PytorchServer"): "PyTorchServer.md",
         ("Examples", "JAXServer"): "JAXServer.md",
         ("Examples", "DataProcessing"): "DataProcessing.md",
-        ("Examples", "TrainingExample"): "TrainingExample.md",
         ("Examples", "Falcon Models"): "Falcon.md",
         ("Examples", "Llama Models"): "Llama.md",
         ("Examples", "Llama2 Models"): "Llama2.md",
         ("Examples", "Mistral Models"): "Mistral.md",
         ("Examples", "MosaicMPT Models"): "MosaicMPT.md",
+        ("CONTRIBUTING",): "CONTRIBUTING.md"
+
     }
 
     cache = statics | cache
+    pages = unflatten_dict(cache)
     yaml_data = {
-        "nav": unflatten_dict(cache),
+        "nav": pages,
     }
     buff = open("mkdocs.yml", "w")
     yaml.safe_dump(yaml_data, buff)
+    chk = open("mkdocs.yml", "r")
+    wrote = chk.read()
+    output_string = re.sub(r'(\n\s*)(\w[^:\n]*:)(.*?)(?=\n\s*\w[^:\n]*:|\Z)', r'\1- \2\3', str(wrote), flags=re.DOTALL)
+    buff = open("mkdocs.yml", "w")
+    buff.write(output_string)
     buff.write(string_options)
 
 

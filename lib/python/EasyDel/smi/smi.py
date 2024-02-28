@@ -8,6 +8,7 @@ import jax
 import threading
 
 import os
+import re
 
 
 # Edited version of Jax-SMI from https://github.com/ayaka14732/jax-smi/
@@ -77,7 +78,7 @@ def get_mem(dir_prefix: str = '/dev/shm'):
     ).stdout.decode('utf-8')
 
 
-def initialise_tracking(interval: float = 1., dir_prefix: str = '/dev/shm') -> None:
+def initialise_tracking(interval: float = 0.5, dir_prefix: str = '/dev/shm') -> None:
     """
     The initialise_tracking function starts a daemon thread that periodically saves the current memory profile to disk.
 
@@ -95,3 +96,27 @@ def initialise_tracking(interval: float = 1., dir_prefix: str = '/dev/shm') -> N
 
     thread = threading.Thread(target=inner, daemon=True)
     thread.start()
+
+
+def get_capacity_matrix(dir_prefix: str = '/dev/shm'):
+    pattern = r'(\d+\.\d+\wB) \((\d+\.\d+%)\): (\w+)(\(.*?\))?'
+
+    def calculate_full_size(size, percent):
+        size_in_gb = float(re.search(r'(\d+\.\d+)GB', size).group(1))
+        percent_value = 100 / float(re.search(r'(\d+\.\d+)%', percent).group(1))
+        full_size = size_in_gb * percent_value
+        return full_size
+
+    matches = re.findall(pattern, get_mem(dir_prefix=dir_prefix))
+    information = {}
+    try:
+        for match in matches:
+            information[match[2]] = {
+                "Used": match[0],
+                "Usage Percent": match[1],
+                "Process": match[3][1:] if match[3] else "∞",
+                "Full Capacity": calculate_full_size(match[0], match[1])
+            }
+    except (ArithmeticError, AttributeError, KeyError, ValueError):
+        ...
+    return information

@@ -2,10 +2,13 @@ class EasyDelRuntimeError(Exception):
     ...
 
 
-class EasyDeSyntaxRuntimeError(Exception):
+class EasyDelSyntaxRuntimeError(Exception):
     ...
 
 
 class EasyDelTimerError(Exception):
     ...
 
+
+class EasyDelBlockWiseFFNError(Exception):
+    ...

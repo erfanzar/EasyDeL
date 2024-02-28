@@ -16,6 +16,7 @@
 from typing import Any, Optional, Tuple
 
 import flax.linen as nn
+import flax.linen.partitioning
 import jax
 import jax.numpy as jnp
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
@@ -23,13 +24,14 @@ from flax.linen import combine_masks, make_causal_mask
 from flax.linen.attention import dot_product_attention_weights
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
-
+from jax.experimental.shard_map import shard_map
+from jax.sharding import PartitionSpec
 from transformers.modeling_flax_outputs import (
     FlaxBaseModelOutputWithPastAndCrossAttentions,
     FlaxCausalLMOutputWithCrossAttentions,
 )
 from ..flax_modelling_utils import ACT2FN, with_sharding_constraint, \
-    get_dot_general_by_bits, ACT2FN
+    get_dot_general_by_bits, ACT2FN, BaseJAXAttentionModule, get_gradient_checkpoint_policy, block_wise_ffn
 from .gpt2_configuration import GPT2Config
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 
@@ -63,7 +65,7 @@ class FlaxConv1D(nn.Module):
         return y
 
 
-class FlaxGPT2Attention(nn.Module):
+class FlaxGPT2Attention(BaseJAXAttentionModule):
     config: GPT2Config
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -116,31 +118,6 @@ class FlaxGPT2Attention(nn.Module):
     def _merge_heads(self, hidden_states):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.embed_dim,))
 
-    @nn.compact
-    def _concatenate_to_cache(self, key, value, query, attention_mask):
-
-        is_initialized = self.has_variable("cache", "cached_key")
-        cached_key = self.variable("cache", "cached_key", jnp.zeros, key.shape, key.dtype)
-        cached_value = self.variable("cache", "cached_value", jnp.zeros, value.shape, value.dtype)
-        cache_index = self.variable("cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32))
-
-        if is_initialized:
-            *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
-            cur_index = cache_index.value
-            indices = (0,) * len(batch_dims) + (cur_index, 0, 0)
-            key = lax.dynamic_update_slice(cached_key.value, key, indices)
-            value = lax.dynamic_update_slice(cached_value.value, value, indices)
-            cached_key.value = key
-            cached_value.value = value
-            num_updated_cache_vectors = query.shape[1]
-            cache_index.value = cache_index.value + num_updated_cache_vectors
-            pad_mask = jnp.broadcast_to(
-                jnp.arange(max_length) < cur_index + num_updated_cache_vectors,
-                tuple(batch_dims) + (1, num_updated_cache_vectors, max_length),
-            )
-            attention_mask = combine_masks(pad_mask, attention_mask)
-        return key, value, attention_mask
-
     def __call__(
             self,
             hidden_states,
@@ -155,7 +132,6 @@ class FlaxGPT2Attention(nn.Module):
         # for the decoder
         is_cross_attention = key_value_states is not None
         batch_size = hidden_states.shape[0]
-
         if not is_cross_attention:
             qkv_out = self.c_attn(hidden_states)
             query, key, value = jnp.split(qkv_out, 3, axis=2)
@@ -168,6 +144,7 @@ class FlaxGPT2Attention(nn.Module):
         query = self._split_heads(query)
         key = self._split_heads(key)
         value = self._split_heads(value)
+
         if self.config.use_pjit_attention_force:
             query = with_sharding_constraint(query, jax.sharding.PartitionSpec(("dp", "fsdp"), None, "tp"))
             key = with_sharding_constraint(key, jax.sharding.PartitionSpec(("dp", "fsdp"), None, "tp"))
@@ -280,8 +257,34 @@ class FlaxGPT2Block(nn.Module):
         hidden_size = self.config.hidden_size
         inner_dim = self.config.n_inner if self.config.n_inner is not None else 4 * hidden_size
 
-        self.ln_1 = nn.LayerNorm(epsilon=self.config.layer_norm_epsilon, dtype=self.dtype)
-        self.attn = FlaxGPT2Attention(
+        self.ln_1 = nn.LayerNorm(
+            epsilon=self.config.layer_norm_epsilon,
+            dtype=self.dtype
+        )
+
+        attn_block = FlaxGPT2Attention
+        mlp_block = FlaxGPT2MLP
+        if self.config.gradient_checkpointing != "":
+            attn_block = flax.linen.partitioning.remat(
+                attn_block,
+                policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
+                static_argnums=(3, 4, 5, 6)
+            )
+
+            mlp_block = flax.linen.partitioning.remat(
+                mlp_block,
+                policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
+                static_argnums=(1,)
+            )
+        # hidden_states,
+        # key_value_states: Optional[jnp.ndarray] = None,
+        # attention_mask = None,
+        # casual_mask = None,
+        # deterministic: bool = True,
+        # init_cache: bool = False,
+        # output_attentions: bool = False,
+
+        self.attn = attn_block(
             self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -290,12 +293,18 @@ class FlaxGPT2Block(nn.Module):
         self.ln_2 = nn.LayerNorm(epsilon=self.config.layer_norm_epsilon, dtype=self.dtype)
 
         if self.config.add_cross_attention:
-            self.crossattention = FlaxGPT2Attention(
-                config=self.config, dtype=self.dtype, causal=False, is_cross_attention=True
+            self.crossattention = attn_block(
+                config=self.config,
+                dtype=self.dtype,
+                causal=False,
+                is_cross_attention=True
             )
-            self.ln_cross_attn = nn.LayerNorm(epsilon=self.config.layer_norm_epsilon, dtype=self.dtype)
+            self.ln_cross_attn = nn.LayerNorm(
+                epsilon=self.config.layer_norm_epsilon,
+                dtype=self.dtype
+            )
 
-        self.mlp = FlaxGPT2MLP(self.config, inner_dim, dtype=self.dtype)
+        self.mlp = mlp_block(self.config, inner_dim, dtype=self.dtype)
 
     def __call__(
             self,
@@ -310,13 +319,23 @@ class FlaxGPT2Block(nn.Module):
     ):
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)
+
+        # hidden_states
+        # key_value_states: Optional[jnp.ndarray] = None
+        # attention_mask = None
+        # casual_mask = None
+        # deterministic: bool = True
+        # init_cache: bool = False
+        # output_attentions: bool = False
+
         attn_outputs = self.attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            deterministic=deterministic,
-            casual_mask=casual_mask,
-            init_cache=init_cache,
-            output_attentions=output_attentions,
+            hidden_states,
+            None,
+            attention_mask,
+            casual_mask,
+            deterministic,
+            init_cache,
+            output_attentions,
         )
         attn_output = attn_outputs[0]
         outputs = attn_outputs[1:]
@@ -329,13 +348,22 @@ class FlaxGPT2Block(nn.Module):
                 )
             residual = hidden_states
             hidden_states = self.ln_cross_attn(hidden_states)
+            # hidden_states
+            # key_value_states: Optional[jnp.ndarray] = None
+            # attention_mask = None
+            # casual_mask = None
+            # deterministic: bool = True
+            # init_cache: bool = False
+            # output_attentions: bool = False
+
             cross_attn_outputs = self.crossattention(
                 hidden_states,
-                key_value_states=encoder_hidden_states,
-                casual_mask=casual_mask,
-                attention_mask=encoder_attention_mask,
-                deterministic=deterministic,
-                output_attentions=output_attentions,
+                encoder_hidden_states,
+                encoder_attention_mask,
+                casual_mask,
+                deterministic,
+                False,
+                output_attentions,
             )
             attn_output = cross_attn_outputs[0]
             # residual connection
@@ -344,7 +372,18 @@ class FlaxGPT2Block(nn.Module):
 
         residual = hidden_states
         hidden_states = self.ln_2(hidden_states)
-        feed_forward_hidden_states = self.mlp(hidden_states, deterministic=deterministic)
+        if self.config.use_scan_mlp:
+            feed_forward_hidden_states = block_wise_ffn(
+                self.mlp,
+                hidden_states,
+                self.config.scan_mlp_chunk_size,
+                deterministic
+            )
+        else:
+            feed_forward_hidden_states = self.mlp(
+                hidden_states,
+                deterministic,
+            )
         # residual connection
         hidden_states = residual + feed_forward_hidden_states
 
@@ -378,7 +417,8 @@ class FlaxGPT2PreTrainedModel(EasyDelFlaxPretrainedModel):
         position_ids = jnp.broadcast_to(jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_shape)
         params_rng, dropout_rng = jax.random.split(rng)
         rngs = {"params": params_rng, "dropout": dropout_rng}
-
+        tie_word_embeddings = self.module.config.tie_word_embeddings
+        self.module.config.tie_word_embeddings = False
         if self.config.add_cross_attention:
             encoder_hidden_states = jnp.zeros(input_shape + (self.config.n_embd,))
             encoder_attention_mask = attention_mask
@@ -393,7 +433,7 @@ class FlaxGPT2PreTrainedModel(EasyDelFlaxPretrainedModel):
             )
         else:
             module_init_outputs = self.module.init(rngs, input_ids, attention_mask, position_ids, return_dict=False)
-
+        self.module.config.tie_word_embeddings = tie_word_embeddings
         random_params = module_init_outputs["params"]
 
         if params is not None:
@@ -428,6 +468,7 @@ class FlaxGPT2PreTrainedModel(EasyDelFlaxPretrainedModel):
             past_key_values: dict = None,
             dropout_rng: jax.random.PRNGKey = None,
             train: bool = False,
+            add_params_field: bool = False,
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
@@ -457,8 +498,7 @@ class FlaxGPT2PreTrainedModel(EasyDelFlaxPretrainedModel):
         rngs = {}
         if dropout_rng is not None:
             rngs["dropout"] = dropout_rng
-
-        inputs = {"params": params or self.params}
+        inputs = {"params": params or self.params} if add_params_field is True else params or self.params
 
         if past_key_values:
             inputs["cache"] = past_key_values
@@ -576,7 +616,8 @@ class FlaxGPT2Module(nn.Module):
             dtype=self.dtype,
         )
         self.casual_mask = make_causal_mask(
-            jnp.ones((1, self.config.max_position_embeddings), dtype="bool"), dtype="bool"
+            jnp.ones((1, getattr(self.config, "c_max_position_embeddings", self.config.max_position_embeddings)),
+                     dtype="bool"), dtype="bool"
         )
         self.dropout = nn.Dropout(rate=self.config.embd_pdrop)
         self.h = FlaxGPT2BlockCollection(

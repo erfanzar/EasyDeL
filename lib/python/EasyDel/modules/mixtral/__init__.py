@@ -5,3 +5,5 @@ from .modelling_mixtral_flax import (
     FlaxMixtralModel,
     FlaxMixtralModule,
 )
+
+__all__ = "FlaxMixtralForCausalLM", "MixtralConfig", "FlaxMixtralModel"
