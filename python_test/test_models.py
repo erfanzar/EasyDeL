@@ -40,6 +40,7 @@ class EasyModelsTest(TestCase):
         self.num_key_value_heads: Optional[int] = 4
         self.max_position_embeddings: int = 2048
         self.rms_norm_eps: float = 1e-6
+        self.layer_norm_eps = self.rms_norm_eps
         self.initializer_range: float = 0.02
         self.use_cache: bool = True
         self.bos_token_id: int = 0
@@ -84,7 +85,10 @@ class EasyModelsTest(TestCase):
             max_position_embeddings=self.max_position_embeddings,
             num_key_value_heads=self.num_key_value_heads,
             scan_mlp_chunk_size=self.scan_mlp_chunk_size,
+            intermediate_size=self.intermediate_size,
             rotary_dim=self.rotary_dim,
+            rms_norm_eps=self.rms_norm_eps,
+            layer_norm_eps=self.layer_norm_eps
         )
 
         input_shape = (self.batch_size, self.sequence_length)

@@ -25,7 +25,7 @@ from ..flax_modelling_utils import (
     repeat_kv_bnsh,
     apply_rotary_pos_emb,
     precompute_freq_cis,
-    get_dot_general_by_bits, BaseJAXAttentionModule, block_wise_ffn
+    get_dot_general_by_bits, BaseJAXAttentionModule, block_wise_ffn, ACT2FN
 )
 
 
@@ -104,6 +104,7 @@ class FlaxStableLmMLP(nn.Module):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
+        self.act_fn = ACT2FN[config.hidden_act]
 
     def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
         """
@@ -114,11 +115,10 @@ class FlaxStableLmMLP(nn.Module):
         :param self: Represent the instance of the class
         :param x: jnp.ndarray: Pass in the input to the layer
         :param deterministic: bool: Determine whether to use dropout # Ignored
-        :return: A tensor that is the result of applying a dropout function to x
+        :return: A tensor that is the result of function to x
 
         """
-        x = self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
-        return x
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
 class FlaxStableLmAttention(BaseJAXAttentionModule):
@@ -541,7 +541,6 @@ class FlaxStableLmDecoderLayerCollection(nn.Module):
 
     def setup(self) -> None:
         self.layers = [
-
             FlaxStableLmDecoderLayer(
                 config=self.config,
                 dtype=self.dtype,
@@ -606,7 +605,6 @@ class FlaxStableLmDecoderLayerCollection(nn.Module):
 
 
 class FlaxStableLmModule(nn.Module):
-
     config: StableLmConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -681,7 +679,6 @@ class FlaxStableLmModule(nn.Module):
             raise RuntimeError("Both `input_ids` and `inputs_embeds` can not be None !")
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
-
 
         batch_size, sequence_length, _ = inputs_embeds.shape
         if attention_mask is None:
