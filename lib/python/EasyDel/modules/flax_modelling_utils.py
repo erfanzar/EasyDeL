@@ -177,7 +177,8 @@ def repeat_kv_bsnh(x: chex.Array, n_rep: int) -> chex.Array:
 
 
 def precompute_freq_cis(
-        dim, max_position_embeddings=2048, base=10000, scaling_factor=1.0, rope_type: str | None = None
+        dim, max_position_embeddings=2048, base=10000, scaling_factor=1.0, rope_type: str | None = None,
+        t_dtype: jnp.dtype = jnp.int32
 ):
     if rope_type == "none":
         rope_type = None
@@ -186,7 +187,9 @@ def precompute_freq_cis(
         "dynamic",
         None
     ], "wrong rope type has been given"
-    t = jax.numpy.arange(max_position_embeddings)
+    if t_dtype == jnp.int64:
+        jax.config.update("jax_enable_x64", True)
+    t = jax.numpy.arange(max_position_embeddings, dtype=t_dtype)
 
     if rope_type == "linear":
         t = t / scaling_factor
