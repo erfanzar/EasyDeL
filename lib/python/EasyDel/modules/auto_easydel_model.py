@@ -184,6 +184,19 @@ def get_modules_by_type(model_type: str) -> Tuple[
             _FlaxQwen2ForCausalLM,
             functools.partial(huggingface_to_easydel, embedding_layer_names=["embed_tokens"])
         )
+    if model_type == "stablelm":
+        from .stablelm import StableLmConfig as _StableLmConfig
+        from .stablelm import FlaxStableLmForCausalLM as _FlaxStableLmForCausalLM
+
+        return (
+            _StableLmConfig,
+            _FlaxStableLmForCausalLM,
+            functools.partial(
+                huggingface_to_easydel,
+                embedding_layer_names=["embed_tokens"],
+                layer_norm_names=["input_layernorm", "post_attention_layernorm", "norm"]
+            )
+        )
     else:
         raise EasyDelRuntimeError(f'Model Type ({model_type}) is not supported or is not found')
 

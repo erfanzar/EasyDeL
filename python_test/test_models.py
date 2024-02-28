@@ -207,6 +207,13 @@ class EasyModelsTest(TestCase):
             f"Gemma model Failed [ERROR {err}]"
         )
 
+    def test_stablelm(self):
+        res, err = self.create_test_for_models("stablelm", transformers.StableLmForCausalLM)
+        self.assertTrue(
+            res,
+            f"StableLM model Failed [ERROR {err}]"
+        )
+
     @staticmethod
     def compare_torch_to_jax(to, jo, atol: float = 1e-4):
         to, jo = to.logits.cpu().detach().numpy(), jo.logits

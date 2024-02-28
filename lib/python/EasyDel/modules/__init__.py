@@ -84,6 +84,11 @@ from .gemma import (
     GemmaConfig as GemmaConfig,
     FlaxGemmaForCausalLM as FlaxGemmaForCausalLM
 )
+from .stablelm import (
+    StableLmConfig as StableLmConfig,
+    FlaxStableLmForCausalLM as FlaxStableLmForCausalLM,
+    FlaxStableLmModel as FlaxStableLmModel
+)
 
 from .auto_easydel_model import (
     AutoEasyDelModelForCausalLM as AutoEasyDelModelForCausalLM,

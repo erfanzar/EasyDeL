@@ -109,7 +109,12 @@ from .modules.gemma import (
     GemmaConfig as GemmaConfig,
     FlaxGemmaForCausalLM as FlaxGemmaForCausalLM
 )
+from .modules.stablelm import (
 
+    StableLmConfig as StableLmConfig,
+    FlaxStableLmForCausalLM as FlaxStableLmForCausalLM,
+    FlaxStableLmModel as FlaxStableLmModel
+)
 from .modules.auto_easydel_model import (
     AutoEasyDelModelForCausalLM as AutoEasyDelModelForCausalLM,
     AutoEasyDelConfig as AutoEasyDelConfig,
@@ -283,6 +288,11 @@ __all__ = (
     "FlaxGemmaModel",
     "GemmaConfig",
     "FlaxGemmaForCausalLM",
+
+    # StableLM Models
+    "StableLmConfig",
+    "FlaxStableLmForCausalLM",
+    "FlaxStableLmModel",
 
     # AutoModels Models
     "AutoEasyDelModelForCausalLM",
