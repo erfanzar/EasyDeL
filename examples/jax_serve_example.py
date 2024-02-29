@@ -5,13 +5,13 @@ from absl import flags
 from EasyDel import JAXServer, JAXServerConfig
 import jax
 from fjformer import get_dtype
-from EasyDel.serve.prompters import GemmaPrompter, Llama2Prompter, OpenChatPrompter, Qwen2Prompter
+from EasyDel.serve.prompters import GemmaPrompter, Llama2Prompter, OpenChatPrompter, ChatMLPrompter, ZephyrPrompter
 from EasyDel.serve.prompters.base_prompter import BasePrompter
 
 FLAGS = flags.FLAGS
 flags.DEFINE_enum(
     "prompter_type",
-    enum_values=("gemma", "llama", "openchat", "qwen2"),
+    enum_values=("gemma", "llama", "openchat", "chatml", "zephyr"),
     help="Prompter to be used to prompt the model",
     default="gemma"
 )
@@ -110,7 +110,8 @@ def main(argv):
         "gemma": GemmaPrompter(),
         "llama": Llama2Prompter(),
         "openchat": OpenChatPrompter(),
-        "qwen2": Qwen2Prompter()
+        "chatml": ChatMLPrompter(),
+        "zephyr": ZephyrPrompter()
     }
     prompter: BasePrompter = prompters[FLAGS.prompter_type]
 
