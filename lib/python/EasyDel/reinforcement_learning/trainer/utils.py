@@ -6,7 +6,7 @@ import jax.numpy
 
 def pad_to_length(tensor: chex.Array, length: int, pad_value: Union[int, float], axis: int = -1) -> chex.Array:
     if tensor.shape[axis] >= length:
-        return tensor
+        return tensor[..., :length]
     else:
         pad_size = list(tensor.shape)
         pad_size[axis] = length - tensor.shape[axis]
