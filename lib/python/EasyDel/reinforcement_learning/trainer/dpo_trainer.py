@@ -1632,6 +1632,7 @@ class DPOTrainer(BaseTrainer, ABC):
                             raise ValueError(
                                 f"there was an error in padding token with `type_key` of {type_key}"
                                 f". it must have sequence_length of {self.max_target_length} but we got {tokens.shape[-1]}"
+                                f" From {k}{type_key}"
                             )
                         tokens = tokens[..., :self.max_target_length]
                     elif k == "rejected_":
@@ -1661,6 +1662,7 @@ class DPOTrainer(BaseTrainer, ABC):
                             raise ValueError(
                                 f"there was an error in padding token with `type_key` of {type_key}"
                                 f". it must have sequence_length of {self.max_target_length} but we got {tokens.shape[-1]}"
+                                f" From {k}{type_key}"
                             )
                     elif k == "":
                         if type_key == "prompt_input_ids":
@@ -1689,6 +1691,7 @@ class DPOTrainer(BaseTrainer, ABC):
                             raise ValueError(
                                 f"there was an error in padding token with `type_key` of {type_key}"
                                 f". it must have sequence_length of {self.max_prompt_length} but we got {tokens.shape[-1]}"
+                                f" From {k}{type_key}"
                             )
                 batch[f"{k}{type_key}"] = tokens
         return batch
