@@ -38,10 +38,6 @@ def get_files(path: str):
 
 def run(project_locations="lib/python/EasyDel", docs_file="docs/", start_head="lib/python/EasyDel"):
     global cache
-    for current_file in get_inner(docs_file):
-        if current_file.startswith(docs_file + "generated-"):
-            os.remove(current_file)
-            print("Removed Past generated file: " + current_file)
     try:
         for current_file in get_inner(project_locations):
             if not current_file.endswith(
@@ -92,6 +88,11 @@ def run(project_locations="lib/python/EasyDel", docs_file="docs/", start_head="l
 
 def main():
     global cache
+
+    for current_file in get_inner("docs/"):
+        if current_file.startswith("docs/generated-"):
+            os.remove(current_file)
+            print("Removed Past generated file: " + current_file)
     run()
     mkdocstrings_options = {
         "mkdocstrings": {
