@@ -1806,46 +1806,43 @@ class DPOTrainer(BaseTrainer, ABC):
                                 for k in list(batch.keys()):
                                     v = batch[k]
                                     batch[k] = v.reshape(v.shape[0], -1)
+                                if self.auto_fix_data:
+                                    batch["rejected_input_ids"] = batch["rejected_input_ids"][
+                                                                  ..., :self.max_target_length
+                                                                  ]
+                                    batch["rejected_attention_mask"] = batch["rejected_attention_mask"][
+                                                                       ..., :self.max_target_length
+                                                                       ]
+                                    batch["rejected_labels"] = batch["rejected_labels"][
+                                                               ..., :self.max_target_length
+                                                               ]
+                                    batch["chosen_input_ids"] = batch["chosen_input_ids"][
+                                                                ..., :self.max_target_length
+                                                                ]
+                                    batch["chosen_attention_mask"] = batch["chosen_attention_mask"][
+                                                                     ..., :self.max_target_length
+                                                                     ]
+                                    batch["chosen_labels"] = batch["chosen_labels"][
+                                                             ..., :self.max_target_length
+                                                             ]
+                                    batch["prompt_input_ids"] = batch["prompt_input_ids"][
+                                                                ..., :self.max_prompt_length
+                                                                ]
+                                    batch["prompt_attention_mask"] = batch["prompt_attention_mask"][
+                                                                     ..., :self.max_prompt_length
+                                                                     ]
                                 try:
                                     if self._cached_p_l_s is None:
                                         self._cached_p_l_s = batch["prompt_input_ids"].shape
                                     else:
-                                        if self.auto_fix_data:
-                                            batch["prompt_input_ids"] = batch["prompt_input_ids"][
-                                                                        ..., :self.max_prompt_length
-                                                                        ]
-                                            batch["prompt_attention_mask"] = batch["prompt_attention_mask"][
-                                                                             ..., :self.max_prompt_length
-                                                                             ]
                                         assert self._cached_p_l_s == batch["prompt_input_ids"].shape
                                     if self._cached_c_l_s is None:
                                         self._cached_c_l_s = batch["chosen_input_ids"].shape
                                     else:
-                                        if self.auto_fix_data:
-                                            batch["chosen_input_ids"] = batch["chosen_input_ids"][
-                                                                        ..., :self.max_target_length
-                                                                        ]
-                                            batch["chosen_attention_mask"] = batch["chosen_attention_mask"][
-                                                                             ..., :self.max_target_length
-                                                                             ]
-                                            batch["chosen_labels"] = batch["chosen_labels"][
-                                                                     ..., :self.max_target_length
-                                                                     ]
                                         assert self._cached_c_l_s == batch["chosen_input_ids"].shape
                                     if self._cached_r_l_s is None:
                                         self._cached_r_l_s = batch["rejected_input_ids"].shape
                                     else:
-
-                                        if self.auto_fix_data:
-                                            batch["rejected_input_ids"] = batch["rejected_input_ids"][
-                                                                          ..., :self.max_target_length
-                                                                          ]
-                                            batch["rejected_attention_mask"] = batch["rejected_attention_mask"][
-                                                                               ..., :self.max_target_length
-                                                                               ]
-                                            batch["rejected_labels"] = batch["rejected_labels"][
-                                                                       ..., :self.max_target_length
-                                                                       ]
                                         assert self._cached_r_l_s == batch["rejected_input_ids"].shape
                                 except AssertionError as e:
                                     warnings.warn(
@@ -1856,6 +1853,7 @@ class DPOTrainer(BaseTrainer, ABC):
                                         "&template=bug_report.md&title=\n or turn `auto_fix_data=True` in DPOTrainer"
                                         f"Extra information error \n{e}"
                                     )
+
                                 self.model_state, metrics = self.sharded_train_step_function(
                                     self.model_state,
                                     batch
