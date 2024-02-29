@@ -822,6 +822,7 @@ class DPOTrainer(BaseTrainer, ABC):
             is_encoder_decoder: Optional[bool] = False,
             dataset_map_arguments: Optional[dict] = None,
             low_mem_usage: bool = True,
+            auto_fix_data: bool = True,
             _do_init_fns: bool = True,
     ):
 
@@ -909,6 +910,7 @@ class DPOTrainer(BaseTrainer, ABC):
             warnings.warn(
                 "You are using a loss type that does not support label smoothing. Ignoring label_smoothing parameter."
             )
+        self.auto_fix_data = auto_fix_data
 
         if tokenizer is None:
             raise ValueError("tokenizer must be specified to tokenize a DPO dataset.")
@@ -1806,14 +1808,27 @@ class DPOTrainer(BaseTrainer, ABC):
                                     if self._cached_p_l_s is None:
                                         self._cached_p_l_s = batch["prompt_input_ids"].shape
                                     else:
+                                        if self.auto_fix_data:
+                                            batch["prompt_input_ids"] = batch["prompt_input_ids"][
+                                                ..., self.max_prompt_length
+                                            ]
                                         assert self._cached_p_l_s == batch["prompt_input_ids"].shape
                                     if self._cached_c_l_s is None:
                                         self._cached_c_l_s = batch["chosen_input_ids"].shape
                                     else:
+                                        if self.auto_fix_data:
+                                            batch["chosen_input_ids"] = batch["chosen_input_ids"][
+                                                ..., self.max_target_length
+                                            ]
                                         assert self._cached_c_l_s == batch["chosen_input_ids"].shape
                                     if self._cached_r_l_s is None:
                                         self._cached_r_l_s = batch["rejected_input_ids"].shape
                                     else:
+
+                                        if self.auto_fix_data:
+                                            batch["rejected_input_ids"] = batch["rejected_input_ids"][
+                                                ..., self.max_target_length
+                                            ]
                                         assert self._cached_r_l_s == batch["rejected_input_ids"].shape
                                 except AssertionError as e:
                                     warnings.warn(
@@ -1821,7 +1836,7 @@ class DPOTrainer(BaseTrainer, ABC):
                                         " slower and function (jax.jit) will be re-compiled and that should not happen "
                                         "in case of seeing this error open an issue "
                                         "https://github.com/erfanzar/EasyDeL/issues/new?assignees=&labels=&projects="
-                                        "&template=bug_report.md&title=\n"
+                                        "&template=bug_report.md&title=\n or turn `auto_fix_data=True` in DPOTrainer"
                                         f"Extra information error \n{e}"
                                     )
                                 self.model_state, metrics = self.sharded_train_step_function(
