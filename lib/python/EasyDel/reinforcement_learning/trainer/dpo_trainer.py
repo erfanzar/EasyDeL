@@ -1626,11 +1626,14 @@ class DPOTrainer(BaseTrainer, ABC):
                                 axis=-1
                             )
 
+                        tokens = tokens[..., :self.max_target_length]
+
                         if tokens.shape[-1] != self.max_target_length:
                             raise ValueError(
                                 f"there was an error in padding token with `type_key` of {type_key}"
                                 f". it must have sequence_length of {self.max_target_length} but we got {tokens.shape[-1]}"
                             )
+                        tokens = tokens[..., :self.max_target_length]
                     elif k == "rejected_":
                         if type_key == "input_ids":
                             tokens = pad_to_length(
@@ -1653,7 +1656,7 @@ class DPOTrainer(BaseTrainer, ABC):
                                 pad_value=self.padding_value,
                                 axis=-1
                             )
-
+                        tokens = tokens[..., :self.max_target_length]
                         if tokens.shape[-1] != self.max_target_length:
                             raise ValueError(
                                 f"there was an error in padding token with `type_key` of {type_key}"
@@ -1681,6 +1684,7 @@ class DPOTrainer(BaseTrainer, ABC):
                                 pad_value=self.padding_value,
                                 axis=-1
                             )
+                        tokens = tokens[..., :self.max_prompt_length]
                         if tokens.shape[-1] != self.max_prompt_length:
                             raise ValueError(
                                 f"there was an error in padding token with `type_key` of {type_key}"
