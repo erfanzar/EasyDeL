@@ -1810,7 +1810,7 @@ class DPOTrainer(BaseTrainer, ABC):
                                     else:
                                         if self.auto_fix_data:
                                             batch["prompt_input_ids"] = batch["prompt_input_ids"][
-                                                ..., self.max_prompt_length
+                                                ..., :self.max_prompt_length
                                             ]
                                         assert self._cached_p_l_s == batch["prompt_input_ids"].shape
                                     if self._cached_c_l_s is None:
@@ -1818,7 +1818,7 @@ class DPOTrainer(BaseTrainer, ABC):
                                     else:
                                         if self.auto_fix_data:
                                             batch["chosen_input_ids"] = batch["chosen_input_ids"][
-                                                ..., self.max_target_length
+                                                ..., :self.max_target_length
                                             ]
                                         assert self._cached_c_l_s == batch["chosen_input_ids"].shape
                                     if self._cached_r_l_s is None:
@@ -1827,7 +1827,7 @@ class DPOTrainer(BaseTrainer, ABC):
 
                                         if self.auto_fix_data:
                                             batch["rejected_input_ids"] = batch["rejected_input_ids"][
-                                                ..., self.max_target_length
+                                                ..., :self.max_target_length
                                             ]
                                         assert self._cached_r_l_s == batch["rejected_input_ids"].shape
                                 except AssertionError as e:
