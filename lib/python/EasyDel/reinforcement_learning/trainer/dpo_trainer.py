@@ -1815,9 +1815,6 @@ class DPOTrainer(BaseTrainer, ABC):
                                             batch["prompt_attention_mask"] = batch["prompt_attention_mask"][
                                                 ..., :self.max_prompt_length
                                             ]
-                                            batch["prompt_labels"] = batch["prompt_labels"][
-                                                ..., :self.max_prompt_length
-                                            ]
                                         assert self._cached_p_l_s == batch["prompt_input_ids"].shape
                                     if self._cached_c_l_s is None:
                                         self._cached_c_l_s = batch["chosen_input_ids"].shape
