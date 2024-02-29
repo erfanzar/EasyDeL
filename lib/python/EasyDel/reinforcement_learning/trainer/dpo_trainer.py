@@ -1304,6 +1304,7 @@ class DPOTrainer(BaseTrainer, ABC):
 
         return DataLoader(
             train_dataset,
+            drop_last=True,
             **dataloader_params
         )
 
@@ -1333,6 +1334,7 @@ class DPOTrainer(BaseTrainer, ABC):
 
         return DataLoader(
             eval_dataset,
+            drop_last=True,
             **dataloader_params
         )
 
@@ -1810,25 +1812,25 @@ class DPOTrainer(BaseTrainer, ABC):
                                     else:
                                         if self.auto_fix_data:
                                             batch["prompt_input_ids"] = batch["prompt_input_ids"][
-                                                ..., :self.max_prompt_length
-                                            ]
+                                                                        ..., :self.max_prompt_length
+                                                                        ]
                                             batch["prompt_attention_mask"] = batch["prompt_attention_mask"][
-                                                ..., :self.max_prompt_length
-                                            ]
+                                                                             ..., :self.max_prompt_length
+                                                                             ]
                                         assert self._cached_p_l_s == batch["prompt_input_ids"].shape
                                     if self._cached_c_l_s is None:
                                         self._cached_c_l_s = batch["chosen_input_ids"].shape
                                     else:
                                         if self.auto_fix_data:
                                             batch["chosen_input_ids"] = batch["chosen_input_ids"][
-                                                ..., :self.max_target_length
-                                            ]
+                                                                        ..., :self.max_target_length
+                                                                        ]
                                             batch["chosen_attention_mask"] = batch["chosen_attention_mask"][
-                                                ..., :self.max_target_length
-                                            ]
+                                                                             ..., :self.max_target_length
+                                                                             ]
                                             batch["chosen_labels"] = batch["chosen_labels"][
-                                                ..., :self.max_target_length
-                                            ]
+                                                                     ..., :self.max_target_length
+                                                                     ]
                                         assert self._cached_c_l_s == batch["chosen_input_ids"].shape
                                     if self._cached_r_l_s is None:
                                         self._cached_r_l_s = batch["rejected_input_ids"].shape
@@ -1836,14 +1838,14 @@ class DPOTrainer(BaseTrainer, ABC):
 
                                         if self.auto_fix_data:
                                             batch["rejected_input_ids"] = batch["rejected_input_ids"][
-                                                ..., :self.max_target_length
-                                            ]
+                                                                          ..., :self.max_target_length
+                                                                          ]
                                             batch["rejected_attention_mask"] = batch["rejected_attention_mask"][
-                                                ..., :self.max_target_length
-                                            ]
+                                                                               ..., :self.max_target_length
+                                                                               ]
                                             batch["rejected_labels"] = batch["rejected_labels"][
-                                                ..., :self.max_target_length
-                                            ]
+                                                                       ..., :self.max_target_length
+                                                                       ]
                                         assert self._cached_r_l_s == batch["rejected_input_ids"].shape
                                 except AssertionError as e:
                                     warnings.warn(
