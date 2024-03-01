@@ -1334,7 +1334,6 @@ class DPOTrainer(BaseTrainer, ABC):
 
         return DataLoader(
             eval_dataset,
-            drop_last=True,
             **dataloader_params
         )
 
@@ -1801,6 +1800,7 @@ class DPOTrainer(BaseTrainer, ABC):
                                             key.endswith("_input_ids")
                                             or key.endswith("_attention_mask")
                                             or key.endswith("_labels")
+                                            or key.endswith("_log_probs")
                                     ):
                                         _ = batch.pop(key, None)
                                 for k in list(batch.keys()):
