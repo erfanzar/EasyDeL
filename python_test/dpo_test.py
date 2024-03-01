@@ -3,13 +3,13 @@ import os
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 
 import jax
+from jax import numpy as jnp
 from lib.python.EasyDel.reinforcement_learning.trainer.dpo_trainer import (
     DPOTrainer as DPOTrainer,
     TrainArguments
 )
-from lib.python.EasyDel import EasyDelState
+from lib.python.EasyDel import EasyDelState, FlaxLlamaForCausalLM, LlamaConfig
 
-from dataclasses import dataclass, field
 from typing import Dict, Optional
 
 import torch
@@ -61,7 +61,15 @@ def get_hh(split: str, sanity_check: bool = False, silent: bool = False, cache_d
 def main():
     with jax.default_device(jax.devices("cpu")[0]):
         model_name_or_path = "erfanzar/LLamaStory-70M"
-
+        conf = LlamaConfig(
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=512,
+            use_scan_mlp=False
+        )
         arguments = TrainArguments(
             num_train_epochs=4,
             model_name="DPO_TEST",
@@ -82,17 +90,39 @@ def main():
         train_dataset = get_hh("train", sanity_check=True)
         eval_dataset = get_hh("test", sanity_check=True)
 
-        state = EasyDelState.from_pretrained(
-            pretrained_model_name_or_path=model_name_or_path
+        # state = EasyDelState.from_pretrained(
+        #     pretrained_model_name_or_path=model_name_or_path
+        # )
+        # ref_state = EasyDelState.from_pretrained(
+        #     pretrained_model_name_or_path=model_name_or_path,
+        #
+        # )
+        module = FlaxLlamaForCausalLM(
+            config=conf,
+            dtype=jnp.float32,
+            param_dtype=jnp.float32,
+            _do_init=True
         )
-        ref_state = EasyDelState.from_pretrained(
-            pretrained_model_name_or_path=model_name_or_path,
-
+        ref_module = FlaxLlamaForCausalLM(
+            config=conf,
+            dtype=jnp.float32,
+            param_dtype=jnp.float32,
+            _do_init=True
+        )
+        state = EasyDelState.load(
+            module=module,
+            apply_fn=module.__call__,
+            params={"params": module.params}
+        )
+        ref_state = EasyDelState.load(
+            module=ref_module,
+            apply_fn=ref_module.__call__,
+            params={"params": ref_module.params}
         )
 
-        max_length = 1536
-        max_target_length = 1024
-        max_prompt_length = 1024
+        max_length = 512
+        max_target_length = 256
+        max_prompt_length = 256
 
         dpo_trainer = DPOTrainer(
             model_state=state,
