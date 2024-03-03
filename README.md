@@ -25,6 +25,9 @@ Some of the key features provided by EasyDeL include:
 - Automatic Converting Models from JAX-EasyDeL to PyTorch-HF and reverse
 
 > [!NOTE]
+> In case of using EasyDel on Kaggle TPUs you need to upgrade tensorflow version too.
+
+> [!NOTE]
 > EasyDel Will only support JAX>=0.4.22 Due to miss computations being happened in older version and also not bein able
 > to run Flash Attention and Splash Attention (Splash Attention is still under Process)
 
@@ -41,8 +44,9 @@ Some of the key features provided by EasyDeL include:
 
 ## Serving
 
-you can read docs or examples to see how `JAXServer` works but let me show you how you can simply host and serve any 
-model that supported by `EasyDeL` fo this example ill just use `gemma-7-it` by google but you can use any model  as you wish.
+you can read docs or examples to see how `JAXServer` works but let me show you how you can simply host and serve any
+model that supported by `EasyDeL` fo this example ill just use `gemma-7-it` by google but you can use any model as you
+wish.
 
 ```shell
 python -m examples.jax_serve_example \
@@ -737,7 +741,8 @@ merge them if they are suitable.
 
 ## License 📜
 
-EasyDeL is an Fully Open-Source released under the Apache v2 license. Please see the LICENSE file in the root directory of this project for
+EasyDeL is an Fully Open-Source released under the Apache v2 license. Please see the LICENSE file in the root directory
+of this project for
 more information.
 
 ## Contact
