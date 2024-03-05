@@ -822,6 +822,7 @@ class DPOTrainer(BaseTrainer, ABC):
             is_encoder_decoder: Optional[bool] = False,
             dataset_map_arguments: Optional[dict] = None,
             low_mem_usage: bool = True,
+            auto_fix_data: bool = True,
             _do_init_fns: bool = True,
     ):
 
@@ -909,6 +910,7 @@ class DPOTrainer(BaseTrainer, ABC):
             warnings.warn(
                 "You are using a loss type that does not support label smoothing. Ignoring label_smoothing parameter."
             )
+        self.auto_fix_data = auto_fix_data
 
         if tokenizer is None:
             raise ValueError("tokenizer must be specified to tokenize a DPO dataset.")
@@ -1302,6 +1304,7 @@ class DPOTrainer(BaseTrainer, ABC):
 
         return DataLoader(
             train_dataset,
+            drop_last=True,
             **dataloader_params
         )
 
@@ -1626,11 +1629,15 @@ class DPOTrainer(BaseTrainer, ABC):
                                 axis=-1
                             )
 
+                        tokens = tokens[..., :self.max_target_length]
+
                         if tokens.shape[-1] != self.max_target_length:
                             raise ValueError(
                                 f"there was an error in padding token with `type_key` of {type_key}"
                                 f". it must have sequence_length of {self.max_target_length} but we got {tokens.shape[-1]}"
+                                f" From {k}{type_key}"
                             )
+                        tokens = tokens[..., :self.max_target_length]
                     elif k == "rejected_":
                         if type_key == "input_ids":
                             tokens = pad_to_length(
@@ -1653,11 +1660,12 @@ class DPOTrainer(BaseTrainer, ABC):
                                 pad_value=self.padding_value,
                                 axis=-1
                             )
-
+                        tokens = tokens[..., :self.max_target_length]
                         if tokens.shape[-1] != self.max_target_length:
                             raise ValueError(
                                 f"there was an error in padding token with `type_key` of {type_key}"
                                 f". it must have sequence_length of {self.max_target_length} but we got {tokens.shape[-1]}"
+                                f" From {k}{type_key}"
                             )
                     elif k == "":
                         if type_key == "prompt_input_ids":
@@ -1681,10 +1689,12 @@ class DPOTrainer(BaseTrainer, ABC):
                                 pad_value=self.padding_value,
                                 axis=-1
                             )
+                        tokens = tokens[..., :self.max_prompt_length]
                         if tokens.shape[-1] != self.max_prompt_length:
                             raise ValueError(
                                 f"there was an error in padding token with `type_key` of {type_key}"
                                 f". it must have sequence_length of {self.max_prompt_length} but we got {tokens.shape[-1]}"
+                                f" From {k}{type_key}"
                             )
                 batch[f"{k}{type_key}"] = tokens
         return batch
@@ -1790,11 +1800,37 @@ class DPOTrainer(BaseTrainer, ABC):
                                             key.endswith("_input_ids")
                                             or key.endswith("_attention_mask")
                                             or key.endswith("_labels")
+                                            or key.endswith("_log_probs")
                                     ):
                                         _ = batch.pop(key, None)
                                 for k in list(batch.keys()):
                                     v = batch[k]
                                     batch[k] = v.reshape(v.shape[0], -1)
+                                if self.auto_fix_data:
+                                    batch["rejected_input_ids"] = batch["rejected_input_ids"][
+                                                                  ..., :self.max_target_length
+                                                                  ]
+                                    batch["rejected_attention_mask"] = batch["rejected_attention_mask"][
+                                                                       ..., :self.max_target_length
+                                                                       ]
+                                    batch["rejected_labels"] = batch["rejected_labels"][
+                                                               ..., :self.max_target_length
+                                                               ]
+                                    batch["chosen_input_ids"] = batch["chosen_input_ids"][
+                                                                ..., :self.max_target_length
+                                                                ]
+                                    batch["chosen_attention_mask"] = batch["chosen_attention_mask"][
+                                                                     ..., :self.max_target_length
+                                                                     ]
+                                    batch["chosen_labels"] = batch["chosen_labels"][
+                                                             ..., :self.max_target_length
+                                                             ]
+                                    batch["prompt_input_ids"] = batch["prompt_input_ids"][
+                                                                ..., :self.max_prompt_length
+                                                                ]
+                                    batch["prompt_attention_mask"] = batch["prompt_attention_mask"][
+                                                                     ..., :self.max_prompt_length
+                                                                     ]
                                 try:
                                     if self._cached_p_l_s is None:
                                         self._cached_p_l_s = batch["prompt_input_ids"].shape
@@ -1814,9 +1850,10 @@ class DPOTrainer(BaseTrainer, ABC):
                                         " slower and function (jax.jit) will be re-compiled and that should not happen "
                                         "in case of seeing this error open an issue "
                                         "https://github.com/erfanzar/EasyDeL/issues/new?assignees=&labels=&projects="
-                                        "&template=bug_report.md&title=\n"
+                                        "&template=bug_report.md&title=\n or turn `auto_fix_data=True` in DPOTrainer"
                                         f"Extra information error \n{e}"
                                     )
+
                                 self.model_state, metrics = self.sharded_train_step_function(
                                     self.model_state,
                                     batch

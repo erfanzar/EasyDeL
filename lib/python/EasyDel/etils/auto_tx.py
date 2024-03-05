@@ -178,6 +178,6 @@ def get_optimizer_and_scheduler(
             )
     else:
         raise ValueError(
-            "seems like you have choose wrong type or unavailable optimizer"
+            f"seems like you have choose wrong type or unavailable optimizer {optimizer} and scheduler {scheduler}"
         )
     return tx, sc

@@ -36,6 +36,9 @@ nav:
       - Falcon Configuration: generated-modules-falcon-falcon_configuration.md
       - Modelling Falcon Flax: generated-modules-falcon-modelling_falcon_flax.md
     - Flax Modelling Utils: generated-modules-flax_modelling_utils.md
+    - Gemma:
+      - Gemma Configuration: generated-modules-gemma-gemma_configuration.md
+      - Modelling Gemma Flax: generated-modules-gemma-modelling_gemma_flax.md
     - Gpt J:
       - Gpt J Configuration: generated-modules-gpt_j-gpt_j_configuration.md
       - Modelling Gpt J Flax: generated-modules-gpt_j-modelling_gpt_j_flax.md
@@ -84,6 +87,9 @@ nav:
     - Roberta:
       - Modelling Roberta Flax: generated-modules-roberta-modelling_roberta_flax.md
       - Roberta Configuration: generated-modules-roberta-roberta_configuration.md
+    - Stablelm:
+      - Modelling Stablelm Flax: generated-modules-stablelm-modelling_stablelm_flax.md
+      - Stablelm Configuration: generated-modules-stablelm-stablelm_configuration.md
     - T5:
       - Modelling T5 Flax: generated-modules-t5-modelling_t5_flax.md
       - T5 Configuration: generated-modules-t5-t5_configuration.md
@@ -109,10 +115,12 @@ nav:
     - Prompters:
       - Base Prompter: generated-serve-prompters-base_prompter.md
       - Cargo Prompter: generated-serve-prompters-cargo_prompter.md
+      - Chatml Prompter: generated-serve-prompters-chatml_prompter.md
+      - Gemma Prompter: generated-serve-prompters-gemma_prompter.md
       - Guanaco Prompter: generated-serve-prompters-guanaco_prompter.md
       - Llama2 Prompter: generated-serve-prompters-llama2_prompter.md
       - Openchat Prompter: generated-serve-prompters-openchat_prompter.md
-      - Qwen2 Prompter: generated-serve-prompters-qwen2_prompter.md
+      - Zephyr Prompter: generated-serve-prompters-zephyr_prompter.md
     - Serve Engine:
       - Client: generated-serve-serve_engine-client.md
       - Configuration: generated-serve-serve_engine-configuration.md

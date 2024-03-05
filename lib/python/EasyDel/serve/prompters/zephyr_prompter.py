@@ -4,17 +4,19 @@ from .base_prompter import BasePrompter
 from typing import List, Optional
 
 
-class Qwen2Prompter(BasePrompter, ABC):
+class ZephyrPrompter(BasePrompter, ABC):
     def __init__(
             self,
+            end_of_turn_token="<|endoftext|>\n"
     ):
-        user_prefix = "<|im_start|>user\n"
-        assistant_prefix = "<|im_start|>assistant\n"
+
+        user_prefix = "<|user|>\n"
+        assistant_prefix = "<|assistant|>\n"
         super().__init__(
             user_message_token=user_prefix,
             assistant_message_token=assistant_prefix,
-            prompter_type="qwen2",
-            end_of_turn_token="<|im_end|>\n",
+            prompter_type="zephyr",
+            end_of_turn_token=end_of_turn_token,
         )
 
     def format_history_prefix(
@@ -22,7 +24,7 @@ class Qwen2Prompter(BasePrompter, ABC):
             history: list[list[str]],
             system_message: str,
     ):
-        prompt = "" if system_message is None else f"<|im_start|>system\n{system_message}{self.end_of_turn_token}"
+        prompt = ""
         for user, assistant in history:
             prompt += f"{self.user_message_token}{user} "
             prompt += f"{self.assistant_message_token}{assistant} "
@@ -36,13 +38,15 @@ class Qwen2Prompter(BasePrompter, ABC):
             system_message: Optional[str],
             prefix: Optional[str]
     ) -> str:
-        sys_pr = "" if system_message is None else f"<|im_start|>system\n{system_message}{self.end_of_turn_token}"
+
+        sys_pr = "" if system_message is None else f"<|system|>\n{system_message}{self.end_of_turn_token}"
         dialogs = prefix if prefix is not None else ""
         dialogs = sys_pr + dialogs
-        for user, assistant in history:
-            dialogs += f"{self.user_message_token}{user}{self.end_of_turn_token}"
-            dialogs += f"{self.assistant_message_token}{assistant}{self.end_of_turn_token}"
 
-        dialogs += f"{self.user_message_token}{prompt}{self.end_of_turn_token}"
+        for user, assistant in history:
+            dialogs += f"{self.user_message_token}{user}"
+            dialogs += f"{self.assistant_message_token}{assistant}"
+
+        dialogs += f"{self.user_message_token}{prompt}"
         dialogs += self.assistant_message_token
         return dialogs
