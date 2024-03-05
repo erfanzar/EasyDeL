@@ -368,7 +368,6 @@ class FlaxRwkvBlockCollection(nn.Module):
         ]
 
         self.layers_are_rescaled = False
-        from transformers import RwkvForCausalLM
 
     def __call__(
             self,
