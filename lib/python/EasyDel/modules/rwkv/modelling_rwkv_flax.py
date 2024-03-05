@@ -15,6 +15,10 @@ from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 from jax.sharding import PartitionSpec
 
 
+def init_to_value(x, dtype):
+    return lambda _: x.astype(dtype)
+
+
 @jax.jit
 def rwkv_linear_attention(time_decay, time_first, key, value, state=None, return_state=False):
     current_sequence_length = key.shape[1]
@@ -63,36 +67,45 @@ class FlaxRwkvSelfAttention(nn.Module):
     def setup(self) -> None:
         config = self.config
         hidden_size = config.hidden_size
+        num_hidden_layers = config.num_hidden_layers
+        layer_id = self.layer_id
+        hidden_size = self.config.hidden_size
         attention_hidden_size = (
             config.attention_hidden_size if config.attention_hidden_size is not None else hidden_size
         )
         self.attention_hidden_size = attention_hidden_size
 
+        ratio_0_to_1 = layer_id / (num_hidden_layers - 1)
+        ratio_1_to_almost_0 = 1.0 - (layer_id / num_hidden_layers)
+        zigzag = .5 * (jnp.arange(1, hidden_size + 1) % 3 - 1)
+        time_first = jnp.full(hidden_size, math.log(.3)) + zigzag
+        h = jnp.arange(0, hidden_size)
+        time_decay = -5 + 8 * (h / (hidden_size - 1)) ** (.7 + 1.3 * ratio_0_to_1)
+        x = jnp.arange(hidden_size) / hidden_size
+
+        time_mix_key = jnp.power(x, ratio_1_to_almost_0)
+        time_mix_value = time_mix_key + .3 * ratio_0_to_1
+        time_mix_receptance = jnp.power(x, .5 * ratio_1_to_almost_0)
+
         self.time_decay = self.param(
             "time_decay",
-            nn.initializers.zeros,
-            (attention_hidden_size,)
+            init_fn=init_to_value(time_decay, self.dtype),
         )
         self.time_first = self.param(
             "time_first",
-            nn.initializers.zeros,
-            (attention_hidden_size,)
+            init_fn=init_to_value(time_first, self.dtype),
         )
-
         self.time_mix_key = self.param(
             "time_mix_key",
-            nn.initializers.zeros,
-            (1, 1, hidden_size)
+            init_fn=init_to_value(time_mix_key, self.dtype),
         )
         self.time_mix_value = self.param(
             "time_mix_value",
-            nn.initializers.zeros,
-            (1, 1, hidden_size)
+            init_fn=init_to_value(time_mix_value, self.dtype),
         )
         self.time_mix_receptance = self.param(
             "time_mix_receptance",
-            nn.initializers.zeros,
-            (1, 1, hidden_size)
+            init_fn=init_to_value(time_mix_receptance, self.dtype),
         )
 
         self.key = nn.Dense(
@@ -186,19 +199,25 @@ class FlaxRwkvFeedForward(nn.Module):
     def setup(self):
         config = self.config
         hidden_size = config.hidden_size
+        layer_id = self.layer_id
+        num_hidden_layers = self.config.num_hidden_layers
         intermediate_size = (
             config.intermediate_size if config.intermediate_size is not None else 4 * config.hidden_size
         )
 
+        x = jnp.arange(hidden_size) / hidden_size
+
+        ratio_1_to_almost_0 = 1.0 - (layer_id / num_hidden_layers)
+        time_mix_key = jnp.power(x, ratio_1_to_almost_0)
+        time_mix_receptance = jnp.power(x, .5 * ratio_1_to_almost_0)
+
         self.time_mix_key = self.param(
             "time_mix_key",
-            nn.initializers.zeros,
-            (1, 1, hidden_size)
+            init_fn=init_to_value(time_mix_key, self.param_dtype)
         )
         self.time_mix_receptance = self.param(
             "time_mix_receptance",
-            nn.initializers.zeros,
-            (1, 1, hidden_size)
+            init_fn=init_to_value(time_mix_receptance, self.param_dtype)
         )
 
         self.key = nn.Dense(
@@ -349,6 +368,7 @@ class FlaxRwkvBlockCollection(nn.Module):
         ]
 
         self.layers_are_rescaled = False
+        from transformers import RwkvForCausalLM
 
     def __call__(
             self,
@@ -361,11 +381,9 @@ class FlaxRwkvBlockCollection(nn.Module):
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
     ):
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        use_cache = use_cache if use_cache is not None else (self.config.use_cache if not self.training else False)
+        all_hidden_states = ()
+        all_self_attentions = ()
+        use_cache = use_cache if use_cache is not None else (self.config.use_cache if not deterministic else False)
         for idx, block in enumerate(self.blocks):
 
             hidden_states, state, attentions = block(
@@ -384,3 +402,4 @@ class FlaxRwkvBlockCollection(nn.Module):
 
             if output_attentions:
                 all_self_attentions = all_self_attentions + (attentions,)
+        return hidden_states, all_hidden_states, all_hidden_states
