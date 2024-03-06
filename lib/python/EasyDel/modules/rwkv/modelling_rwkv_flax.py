@@ -4,7 +4,7 @@ from typing import Optional, Tuple, Any, Union, List
 import chex
 import flax.linen.partitioning
 import jax.lax
-from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput, FlaxMaskedLMOutput
+from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput, FlaxMaskedLMOutput, ModelOutput
 from flax.core import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks
 from flax.traverse_util import unflatten_dict, flatten_dict
@@ -13,6 +13,23 @@ from flax import linen as nn
 from .rwkv_configuration import RwkvConfig
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 from jax.sharding import PartitionSpec
+from flax.struct import dataclass
+
+
+@dataclass
+class RwkvOutput(ModelOutput):
+    last_hidden_state: chex.Array = None
+    state: Optional[Tuple[chex.Array, ...]] = None
+    hidden_states: Optional[Tuple[chex.Array, ...]] = None
+    attentions: Optional[Tuple[chex.Array, ...]] = None
+
+
+@dataclass
+class RwkvCausalLMOutput(ModelOutput):
+    logits: chex.Array = None
+    state: Optional[List[chex.Array]] = None
+    hidden_states: Optional[Tuple[chex.Array, ...]] = None
+    attentions: Optional[Tuple[chex.Array, ...]] = None
 
 
 def init_to_value(x, dtype):
@@ -401,4 +418,213 @@ class FlaxRwkvBlockCollection(nn.Module):
 
             if output_attentions:
                 all_self_attentions = all_self_attentions + (attentions,)
-        return hidden_states, all_hidden_states, all_hidden_states
+        return hidden_states, all_hidden_states, all_self_attentions
+
+
+class RwkvModule(nn.Module):
+    config: RwkvConfig
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[Union[str, jax.lax.Precision]] = None
+
+    def setup(self):
+        config = self.config
+        self.embeddings = nn.Embed(
+            config.vocab_size,
+            config.hidden_size,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype
+        )
+        self.blocks = FlaxRwkvBlockCollection(
+            config=self.config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision
+        )
+
+        self.ln_out = nn.LayerNorm(
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+        )
+
+    def __call__(
+            self,
+            input_ids: Optional[chex.Array] = None,
+            attention_mask: Optional[chex.Array] = None,  # noqa
+            inputs_embeds: Optional[chex.Array] = None,
+            state: Optional[List[chex.Array]] = None,
+            use_cache: Optional[bool] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            deterministic: bool = True,
+            return_dict: Optional[bool] = None,
+    ) -> Union[Tuple, RwkvOutput]:
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        use_cache = use_cache if use_cache is not None else (self.config.use_cache if not self.training else False)
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+        elif input_ids is None and inputs_embeds is None:
+            raise ValueError("You have to specify either input_ids or inputs_embeds")
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embeddings(input_ids)
+
+        if use_cache and state is None:
+            shape = (inputs_embeds.shape[0], self.config.hidden_size, self.config.num_hidden_layers)
+            state = [
+                jnp.zeros(
+                    *shape, dtype=inputs_embeds.dtype if i <= 1 else jnp.float32,
+                )
+                for i in range(5)
+            ]
+            state[4] -= 1e30
+
+        hidden_states = inputs_embeds
+
+        hidden_states, all_hidden_states, all_self_attentions = self.blocks(
+            hidden_states,
+            attention_mask,
+            state,
+            use_cache,
+            deterministic,
+            output_attentions,
+            output_hidden_states,
+            return_dict,
+        )
+
+        hidden_states = self.ln_out(hidden_states)
+
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + (hidden_states,)
+
+        if not return_dict:
+            return tuple(x for x in [hidden_states, state, all_hidden_states, all_self_attentions] if x is not None)
+
+        return RwkvOutput(
+            last_hidden_state=hidden_states,
+            state=state,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attentions,
+        )
+
+
+class RwkvForCausalLMModule(nn.Module):
+    config: RwkvConfig
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[Union[str, jax.lax.Precision]] = None
+
+    def setup(self):
+        config = self.config
+        self.rwkv = RwkvModule(
+            config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision
+        )
+        self.head = nn.Dense(
+            config.vocab_size,
+            use_bias=False,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision
+        )
+
+    def __call__(
+            self,
+            input_ids: Optional[chex.Array] = None,
+            attention_mask: Optional[chex.Array] = None,
+            inputs_embeds: Optional[chex.Array] = None,
+            state: Optional[List[chex.Array]] = None,
+            use_cache: Optional[bool] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+    ) -> Union[Tuple, RwkvCausalLMOutput]:
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        rwkv_outputs = self.rwkv(
+            input_ids,
+            inputs_embeds=inputs_embeds,
+            state=state,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        hidden_states = rwkv_outputs[0]
+
+        logits = self.head(hidden_states)
+
+        if not return_dict:
+            return (logits,) + rwkv_outputs[1:]
+
+        return RwkvCausalLMOutput(
+            logits=logits,
+            state=rwkv_outputs.state,
+            hidden_states=rwkv_outputs.hidden_states,
+            attentions=rwkv_outputs.attentions,
+        )
+
+
+class FlaxRwkvPretrainedModel(EasyDelFlaxPretrainedModel):
+    module_class: nn.Module
+    config_class = RwkvConfig
+
+    def __init__(
+            self,
+            config: RwkvConfig,
+            module: flax.linen.Module,
+            input_shape: Tuple = (1, 1),
+            seed: int = 0,
+            dtype: jnp.dtype = jnp.float32,
+            param_dtype: jnp.dtype = jnp.float32,
+            precision: Optional[Union[jax.lax.Precision, str]] = None,
+            _do_init: bool = True,
+            **kwargs
+    ):
+        super().__init__(
+            config=config,
+            module=module(
+                config=config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                **kwargs
+            ),
+            input_shape=input_shape,
+            seed=seed,
+            dtype=dtype,
+            _do_init=_do_init
+        )
+
+    def generate(self, *args, **kwargs):
+        try:
+            gen_output = super().generate(*args, **kwargs)
+        except AttributeError as exc:
+            if "past_key_values" in str(exc):
+                raise AttributeError(
+                    "You tried to call `generate` with a decoding strategy that manipulates `past_key_values`. RWKV "
+                    "doesn't have that attribute, try another generation strategy instead. For the available "
+                    "generation strategies, check this doc:"
+                    " https://huggingface.co/docs/transformers/en/generation_strategies#decoding-strategies"
+                )
+            else:
+                raise exc
+        return gen_output
+
+    def prepare_inputs_for_generation(self, input_ids, state=None, inputs_embeds=None, **kwargs):
+        if state is not None:
+            input_ids = input_ids[:, -1].unsqueeze(-1)
+        if inputs_embeds is not None and state is None:
+            model_inputs = {"inputs_embeds": inputs_embeds}
+        else:
+            model_inputs = {"input_ids": input_ids}
+
+        model_inputs["state"] = state
+        return model_inputs
