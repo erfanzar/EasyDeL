@@ -1,6 +1,6 @@
 import functools
 import math
-from typing import Optional, Tuple, Any, Union, List
+from typing import Optional, Tuple, Any, Union, List, Dict, Mapping
 import chex
 import flax.linen.partitioning
 import jax.lax
@@ -155,12 +155,12 @@ class FlaxRwkvSelfAttention(nn.Module):
         )
 
     def extract_key_value(self, hidden, state=None):
-        if hidden.size(1) == 1 and state is not None:
+        if hidden.shape[1] == 1 and state is not None:
             shifted = state[1][:, :, self.layer_id]
         else:
             shifted = jnp.pad(
                 hidden,
-                pad_width=((0, 0), (0, 0), (1, 0), (0, 1)),
+                pad_width=((0, 0), (1, 0), (0, 1)),
                 mode="constant",
                 constant_values=0
             )
@@ -264,7 +264,7 @@ class FlaxRwkvFeedForward(nn.Module):
             hidden,
             state=None
     ):
-        if hidden.size(1) == 1 and state is not None:
+        if hidden.shape[1] == 1 and state is not None:
             shifted = state[0][:, :, self.layer_id]
         else:
             shifted = jnp.pad(
@@ -421,7 +421,7 @@ class FlaxRwkvBlockCollection(nn.Module):
         return hidden_states, all_hidden_states, all_self_attentions
 
 
-class RwkvModule(nn.Module):
+class FlaxRwkvModule(nn.Module):
     config: RwkvConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -450,20 +450,20 @@ class RwkvModule(nn.Module):
     def __call__(
             self,
             input_ids: Optional[chex.Array] = None,
-            attention_mask: Optional[chex.Array] = None,  # noqa
+            attention_mask: Optional[chex.Array] = None,
             inputs_embeds: Optional[chex.Array] = None,
             state: Optional[List[chex.Array]] = None,
+            deterministic: bool = True,
             use_cache: Optional[bool] = None,
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
-            deterministic: bool = True,
             return_dict: Optional[bool] = None,
     ) -> Union[Tuple, RwkvOutput]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        use_cache = use_cache if use_cache is not None else (self.config.use_cache if not self.training else False)
+        use_cache = use_cache if use_cache is not None else (self.config.use_cache if not deterministic else False)
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if input_ids is not None and inputs_embeds is not None:
@@ -513,7 +513,7 @@ class RwkvModule(nn.Module):
         )
 
 
-class RwkvForCausalLMModule(nn.Module):
+class FlaxRwkvForCausalLMModule(nn.Module):
     config: RwkvConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -521,7 +521,7 @@ class RwkvForCausalLMModule(nn.Module):
 
     def setup(self):
         config = self.config
-        self.rwkv = RwkvModule(
+        self.rwkv = FlaxRwkvModule(
             config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -541,6 +541,7 @@ class RwkvForCausalLMModule(nn.Module):
             attention_mask: Optional[chex.Array] = None,
             inputs_embeds: Optional[chex.Array] = None,
             state: Optional[List[chex.Array]] = None,
+            deterministic: bool = True,
             use_cache: Optional[bool] = None,
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
@@ -556,6 +557,7 @@ class RwkvForCausalLMModule(nn.Module):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            deterministic=deterministic
         )
         hidden_states = rwkv_outputs[0]
 
@@ -579,7 +581,6 @@ class FlaxRwkvPretrainedModel(EasyDelFlaxPretrainedModel):
     def __init__(
             self,
             config: RwkvConfig,
-            module: flax.linen.Module,
             input_shape: Tuple = (1, 1),
             seed: int = 0,
             dtype: jnp.dtype = jnp.float32,
@@ -590,7 +591,7 @@ class FlaxRwkvPretrainedModel(EasyDelFlaxPretrainedModel):
     ):
         super().__init__(
             config=config,
-            module=module(
+            module=self.module_class(
                 config=config,
                 dtype=dtype,
                 param_dtype=param_dtype,
@@ -601,6 +602,85 @@ class FlaxRwkvPretrainedModel(EasyDelFlaxPretrainedModel):
             seed=seed,
             dtype=dtype,
             _do_init=_do_init
+        )
+
+    def init_weights(
+            self,
+            rng: jax.random.PRNGKey,
+            input_shape: Tuple,
+            params: FrozenDict = None) -> FrozenDict[Any, Any] | Mapping[str, Any] | Any:
+        input_ids = jnp.zeros(input_shape, dtype="i4")
+        attention_mask = jnp.ones_like(input_ids)
+        params_rng, dropout_rng = jax.random.split(rng)
+        rng_s = {"params": params_rng, "dropout": dropout_rng}
+        module_init_outputs = self.module.init(
+            rng_s, input_ids, attention_mask, return_dict=False
+        )
+
+        random_params = module_init_outputs["params"]
+
+        if params is not None:
+            random_params = flatten_dict(unfreeze(random_params))
+            params = flatten_dict(unfreeze(params))
+            for missing_key in self._missing_keys:
+                params[missing_key] = random_params[missing_key]
+            self._missing_keys = set()
+            return freeze(unflatten_dict(params))
+        else:
+            return random_params
+
+    def __call__(
+            self,
+            input_ids: Optional[chex.Array] = None,
+            attention_mask: Optional[chex.Array] = None,
+            inputs_embeds: Optional[chex.Array] = None,
+            state: Optional[List[chex.Array]] = None,
+            use_cache: Optional[bool] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+            params: dict = None,
+            dropout_rng: jax.random.PRNGKey = None,
+            train: bool = False,
+            extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+            add_params_field: bool = False,
+    ):
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.return_dict
+
+        batch_size, sequence_length = input_ids.shape
+
+        if attention_mask is None:
+            attention_mask = jnp.ones((batch_size, sequence_length))
+
+        rng_s = {}
+        if dropout_rng is not None:
+            rng_s["dropout"] = dropout_rng
+
+        inputs = {
+            "params": params or self.params} if add_params_field else params or self.params
+
+        if self.config.bits is not None:
+            rng_s['params'] = jax.random.key(0)
+
+        mutable = False
+
+        return self.module.apply(
+            inputs,
+            input_ids,
+            attention_mask,
+            inputs_embeds,
+            state,
+            use_cache,
+            train,
+            output_attentions,
+            output_hidden_states,
+            return_dict,
+            rngs=rng_s,
+            mutable=mutable,
         )
 
     def generate(self, *args, **kwargs):
@@ -628,3 +708,11 @@ class FlaxRwkvPretrainedModel(EasyDelFlaxPretrainedModel):
 
         model_inputs["state"] = state
         return model_inputs
+
+
+class FlaxRwkvModel(FlaxRwkvPretrainedModel):
+    module_class = FlaxRwkvModule
+
+
+class FlaxRwkvForCausalLM(FlaxRwkvPretrainedModel):
+    module_class = FlaxRwkvForCausalLMModule

@@ -67,7 +67,7 @@ class RwkvConfig(EasyDelPretrainedConfig):
 
     def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
         return (
-            (".*", PartitionSpec(None, ))
+            (".*", PartitionSpec(("sp", "fsdp"))),
         ) if fully_sharded_data_parallel else (
-            (".*", PartitionSpec(None, ))
+            (".*", PartitionSpec(("sp", "fsdp"))),
         )
