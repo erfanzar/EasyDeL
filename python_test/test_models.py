@@ -218,6 +218,13 @@ class EasyModelsTest(TestCase):
             f"StableLM model Failed [ERROR {err}]"
         )
 
+    def test_rwkv(self):
+        res, err = self.create_test_for_models("rwkv", transformers.RwkvForCausalLM)
+        self.assertTrue(
+            res,
+            f"RWKV model Failed [ERROR {err}]"
+        )
+
     @staticmethod
     def compare_torch_to_jax(to, jo, atol: float = 1e-4):
         to, jo = to.logits.cpu().detach().numpy(), jo.logits

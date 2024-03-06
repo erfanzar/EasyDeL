@@ -197,8 +197,19 @@ def get_modules_by_type(model_type: str) -> Tuple[
                 layer_norm_names=["input_layernorm", "post_attention_layernorm", "norm"]
             )
         )
-    else:
-        raise EasyDelRuntimeError(f'Model Type ({model_type}) is not supported or is not found')
+    if model_type == "rwkv":
+        from .rwkv import RwkvConfig as _RwkvConfig
+        from .rwkv import FlaxRwkvForCausalLM as _FlaxRwkvForCausalLM
+        return (
+            _RwkvConfig,
+            _FlaxRwkvForCausalLM,
+            functools.partial(
+                huggingface_to_easydel,
+                embedding_layer_names=["embeddings"],
+                layer_norm_names=["ln_out", "ln2", "ln1", "pre_ln"]
+            )
+        )
+    raise EasyDelRuntimeError(f'Model Type ({model_type}) is not supported or is not found')
 
 
 def is_flatten(pytree: dict):
