@@ -87,6 +87,9 @@ nav:
     - Roberta:
       - Modelling Roberta Flax: generated-modules-roberta-modelling_roberta_flax.md
       - Roberta Configuration: generated-modules-roberta-roberta_configuration.md
+    - Rwkv:
+      - Modelling Rwkv Flax: generated-modules-rwkv-modelling_rwkv_flax.md
+      - Rwkv Configuration: generated-modules-rwkv-rwkv_configuration.md
     - Stablelm:
       - Modelling Stablelm Flax: generated-modules-stablelm-modelling_stablelm_flax.md
       - Stablelm Configuration: generated-modules-stablelm-stablelm_configuration.md
