@@ -42,7 +42,7 @@ Some of the key features provided by EasyDeL include:
 > Please have that in mind that EasyDel is in the loop of fast-development
 > so we might have API changes.
 
-### Hands on Code Kaggle Examples
+### Hands on Code Kaggle Examples 
 
 1. [script](https://www.kaggle.com/citifer/easydel-causal-language-model-trainer-example) for mindset of using EasyDeL
    CausalLanguageModelTrainer on kaggle, but you can do much more.
