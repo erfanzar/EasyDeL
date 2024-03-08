@@ -206,7 +206,8 @@ def get_modules_by_type(model_type: str) -> Tuple[
             functools.partial(
                 huggingface_to_easydel,
                 embedding_layer_names=["embeddings"],
-                layer_norm_names=["ln_out", "ln2", "ln1", "pre_ln"]
+                layer_norm_names=["ln_out", "ln2", "ln1", "pre_ln"],
+                rnn_based_or_rwkv=True
             )
         )
     raise EasyDelRuntimeError(f'Model Type ({model_type}) is not supported or is not found')

@@ -36,6 +36,14 @@ def init_to_value(x, dtype):
     return lambda _: x.astype(dtype)
 
 
+def init_state(hidden_size):
+    zeros = jnp.zeros(hidden_size)
+    min_values = jnp.full(hidden_size, -jnp.inf)
+    time_mix_state = (zeros, zeros, zeros, min_values)
+    channel_mix_state = zeros
+    return time_mix_state, channel_mix_state
+
+
 @jax.jit
 def rwkv_linear_attention(time_decay, time_first, key, value, state=None, return_state=False):
     current_sequence_length = key.shape[1]
@@ -83,7 +91,6 @@ class FlaxRwkvSelfAttention(nn.Module):
 
     def setup(self) -> None:
         config = self.config
-        hidden_size = config.hidden_size
         num_hidden_layers = config.num_hidden_layers
         layer_id = self.layer_id
         hidden_size = self.config.hidden_size
@@ -103,6 +110,15 @@ class FlaxRwkvSelfAttention(nn.Module):
         time_mix_key = jnp.power(x, ratio_1_to_almost_0)
         time_mix_value = time_mix_key + .3 * ratio_0_to_1
         time_mix_receptance = jnp.power(x, .5 * ratio_1_to_almost_0)
+
+        # This makes it easier to convert torch model into easydel since we use automated/small translation between
+        # jax and torch
+
+        # time_decay = time_decay.reshape(1, 1, hidden_size)
+        # time_first = time_first.reshape(1, 1, hidden_size)
+        # time_mix_key = time_mix_key.reshape(1, 1, hidden_size)
+        # time_mix_value = time_mix_value.reshape(1, 1, hidden_size)
+        # time_mix_receptance = time_mix_receptance.reshape(1, 1, hidden_size)
 
         self.time_decay = self.param(
             "time_decay",
@@ -154,56 +170,52 @@ class FlaxRwkvSelfAttention(nn.Module):
             precision=self.precision
         )
 
-    def extract_key_value(self, hidden, state=None):
-        if hidden.shape[1] == 1 and state is not None:
-            shifted = state[1][:, :, self.layer_id]
-        else:
-            shifted = jnp.pad(
-                hidden,
-                pad_width=((0, 0), (1, 0), (0, 1)),
-                mode="constant",
-                constant_values=0
-            )
-            if state is not None:
-                shifted[:, 0] = state[1][:, :, self.layer_id]
-        key = hidden * self.time_mix_key + shifted * (1 - self.time_mix_key)
-        value = hidden * self.time_mix_value + shifted * (1 - self.time_mix_value)
-        receptance = hidden * self.time_mix_receptance + shifted * (1 - self.time_mix_receptance)
-
-        key = self.key(key)
-        value = self.value(value)
-        receptance = jax.nn.sigmoid(
-            self.receptance(
-                receptance
-            )
-        )
-        if state is not None:
-            state[1][:, :, self.layer_id] = hidden[:, -1]
-        return receptance, key, value, state
-
     def __call__(
             self,
-            hidden,
-            state=None,
-            use_cache=False
+            hidden: chex.Array,
+            state: Tuple[chex.Array, chex.Array, chex.Array, chex.Array],
     ):
-        receptance, key, value, state = self.extract_key_value(hidden, state=state)
-        layer_state = tuple(s[:, :, self.layer_id] for s in state[2:]) if state is not None else None
-        rwkv, layer_state = rwkv_linear_attention(
-            self.time_decay,
-            self.time_first,
-            key,
-            value,
-            state=layer_state,
-            return_state=use_cache,
+        sx, aa, bb, pp = state
+        c_x = jnp.concatenate(
+            (
+                jnp.expand_dims(sx, 0), hidden[:-1, :]
+            ),
         )
+        key_x = hidden * self.time_mix_key.reshape(-1) + c_x * (1 - self.time_mix_key.reshape(-1))
+        value_x = hidden * self.time_mix_value.reshape(-1) + c_x * (1 - self.time_mix_value.reshape(-1))
+        receptance_x = hidden * self.time_mix_receptance.reshape(-1) + c_x * (1 - self.time_mix_receptance.reshape(-1))
+        receptance_state = nn.sigmoid(self.receptance(receptance_x))
+        key_state = self.key(key_x)
+        value_state = self.value(value_x)
 
-        if layer_state is not None:
-            state[2][:, :, self.layer_id] = layer_state[0]
-            state[3][:, :, self.layer_id] = layer_state[1]
-            state[4][:, :, self.layer_id] = layer_state[2]
+        def step(in_state, kv):
+            (inner_aa, inner_bb, inner_p), (kk, vv) = in_state, kv
+            ww = self.time_first.reshape(-1) + kk
+            p = jnp.maximum(inner_p, ww)
+            e1 = jnp.exp(inner_p - p)
+            e2 = jnp.exp(ww - p)
+            next_c_x = (
+                    (e1 * inner_aa + e2 * vv) / (e1 * inner_bb + e2)
+            ).astype(dtype=receptance_state.dtype)
 
-        return self.output(receptance * rwkv), state
+            ww = -jnp.exp(self.time_decay.reshape(-1)) + inner_p
+            p = jnp.maximum(ww, kk)
+            e1 = jnp.exp(ww - p)
+            e2 = jnp.exp(kk - p)
+            inner_aa = e1 * inner_aa + e2 * vv
+            inner_bb = e1 * inner_bb + e2
+            inner_p = p
+            next_inner_state = (inner_aa, inner_bb, inner_p)
+            return next_inner_state, next_c_x
+
+        (aa, bb, pp), c_x = jax.lax.scan(
+            step,
+            (aa, bb, pp),
+            (key_state, value_state)
+        )
+        out = hidden + self.output(receptance_state * c_x)
+        next_state = (hidden[-1, :], aa, bb, pp)
+        return out, next_state
 
 
 class FlaxRwkvFeedForward(nn.Module):
@@ -227,6 +239,12 @@ class FlaxRwkvFeedForward(nn.Module):
         ratio_1_to_almost_0 = 1.0 - (layer_id / num_hidden_layers)
         time_mix_key = jnp.power(x, ratio_1_to_almost_0)
         time_mix_receptance = jnp.power(x, .5 * ratio_1_to_almost_0)
+
+        # This makes it easier to convert torch model into easydel since we use automated/small translation between
+        # jax and torch
+
+        # time_mix_key = time_mix_key.reshape(1, 1, -1)
+        # time_mix_receptance = time_mix_receptance.reshape(1, 1, -1)
 
         self.time_mix_key = self.param(
             "time_mix_key",
@@ -262,33 +280,19 @@ class FlaxRwkvFeedForward(nn.Module):
     def __call__(
             self,
             hidden,
-            state=None
+            state
     ):
-        if hidden.shape[1] == 1 and state is not None:
-            shifted = state[0][:, :, self.layer_id]
-        else:
-            shifted = jnp.pad(
-                hidden,
-                pad_width=((0, 0), (0, 0), (1, 0), (0, 1)),
-                mode='constant',
-                constant_values=0
-            )
-            if state is not None:
-                shifted[:, 0] = state[0][:, :, self.layer_id]
-        key = hidden * self.time_mix_key + shifted * (1 - self.time_mix_key)
-        receptance = hidden * self.time_mix_receptance + shifted * (1 - self.time_mix_receptance)
-
-        key = jnp.square(jax.nn.relu(self.key(key)))
-        value = self.value(key)
-        receptance = jax.nn.sigmoid(self.receptance(receptance))
-
-        if state is not None:
-            state[0][:, :, self.layer_id] = hidden[:, -1]
-
-        return receptance * value, state
+        sx = jnp.concatenate(
+            (jnp.expand_dims(state, 0), hidden[:-1, :])
+        )
+        xk = hidden * self.time_mix_key.reshape(-1) + sx * (1 - self.time_mix_key.reshape(-1))
+        xr = hidden * self.time_mix_receptance.reshape(-1) + sx * (1 - self.time_mix_receptance.reshape(-1))
+        r = nn.sigmoid(self.receptance(xr))
+        k = jnp.square(nn.relu(self.key(xk)))
+        return r * self.value(k), hidden[-1, :]
 
 
-class FlaxRwkvBlock(nn.Module):
+class SingleStandFlaxRwkvBlock(nn.Module):
     config: RwkvConfig
     layer_id: int
     dtype: jnp.dtype = jnp.float32
@@ -337,32 +341,44 @@ class FlaxRwkvBlock(nn.Module):
             self,
             hidden,
             state=None,
-            use_cache: bool = False,
             output_attentions: bool = False
     ):
+
+        if state is None:
+            state = init_state(self.config.hidden_size)
+
+        self_state, ffd_state = state
         if self.layer_id == 0:
             hidden = self.pre_ln(hidden)
 
-        attention, state = self.attention(
+        attention, self_state = self.attention(
             self.ln1(hidden),
-            state=state,
-            use_cache=use_cache
+            state=self_state,
         )
         hidden = hidden + attention
 
-        feed_forward, state = self.feed_forward(
+        feed_forward, ffd_state = self.feed_forward(
             self.ln2(hidden),
-            state=state
+            state=ffd_state
         )
         hidden = hidden + feed_forward
 
-        outputs = (hidden, state)
+        outputs = (hidden, (self_state, ffd_state))
         if output_attentions:
             outputs += (attention,)
         else:
             outputs += (None,)
 
         return outputs
+
+
+FlaxRwkvBlock = nn.vmap(
+    SingleStandFlaxRwkvBlock,
+    in_axes=0,
+    out_axes=0,
+    split_rngs={"params": False},
+    variable_axes={"params": None}
+)
 
 
 class FlaxRwkvBlockCollection(nn.Module):
@@ -403,7 +419,7 @@ class FlaxRwkvBlockCollection(nn.Module):
         for idx, block in enumerate(self.blocks):
 
             hidden_states, state, attentions = block(
-                hidden_states, state=state, use_cache=use_cache, output_attentions=output_attentions
+                hidden_states, state=state, output_attentions=output_attentions
             )
 
             if (

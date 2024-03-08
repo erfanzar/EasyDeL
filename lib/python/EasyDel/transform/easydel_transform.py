@@ -1,8 +1,10 @@
 import gc
+import warnings
 
 import flax.traverse_util
 import jax
 import numpy
+import transformers
 from flax import traverse_util
 
 from flax.traverse_util import flatten_dict
@@ -128,6 +130,7 @@ def huggingface_to_easydel(
         layer_norm_names: Optional[List[str]] = None,
         shard_fns: Optional[Mapping[tuple, Callable]] = None,
         dtype: jax.numpy.dtype = jax.numpy.float16,
+        rnn_based_or_rwkv: bool = False,
         **kwargs
 ):
     """
@@ -142,6 +145,8 @@ def huggingface_to_easydel(
     :param layer_norm_names: Replaces weight or kernel with (scale)
     :param shard_fns: Optional[Mapping[tuple, Callable]]: Sharding Function to be used to shard model
     :param dtype: jax.numpy.dtype: Specify the data type of the tensors
+    :param rnn_based_or_rwkv: bool: rnn_based_or_rwkv is a conditioner which decide whenever it finds a value in tree
+    that start with time_mix_ it will automatically reshape that for easydel use case
     :return: A dictionary of the weights and biases in a format that can be used by flax (it's an UnFlattenDict)
 
     """
@@ -160,6 +165,8 @@ def huggingface_to_easydel(
             new_key = key
             if any(layer_name in key for layer_name in embedding_layer_names):
                 new_key = key[:-_l] + ".embedding"
+            elif rnn_based_or_rwkv and ("time_mix_" in key or "time_" in key):
+                tensor = tensor.reshape(-1)
             elif any(layer_norm in key for layer_norm in layer_norm_names):
                 new_key = key.replace(".weight", ".scale")
             elif "weight" in key:
@@ -241,6 +248,7 @@ def easystate_to_torch(
         transpose_needed=None,
         transpose_not_needed=None,
         select_params_field: bool = True,
+        rnn_based_or_rwkv: bool = False
 
 ):
     import torch
@@ -274,7 +282,10 @@ def easystate_to_torch(
     for key, tensor in pbar:
         if match_keywords(key, transpose_needed, transpose_not_needed):
             tensor = tensor.T
+        elif rnn_based_or_rwkv and ("time_mix_" in key or "time_" in key):
+            tensor = tensor.reshape(1, 1, -1)
         tensor = tensor.astype(get_dtype(dtype))
+
         torch_state_dict[
             key.replace(".kernel", ".weight").replace(".embedding", ".weight").replace(".scale", ".weight")
         ] = torch.from_numpy(tensor)
@@ -284,13 +295,27 @@ def easystate_to_torch(
 def easystate_to_huggingface_model(
         state,
         config,
-        base_huggingface_module,
+        base_huggingface_module: transformers.PreTrainedModel,
         base_huggingface_module_kwarguments=None,
         dtype=jnp.float16,
         transpose_needed=None,
         transpose_not_needed=None,
-        select_params_field: bool = True
+        select_params_field: bool = True,
+        rnn_based_or_rwkv: bool = False,
+        auto_correct: bool = True
 ):
+    if not rnn_based_or_rwkv and auto_correct:
+        if isinstance(
+                base_huggingface_module,
+                transformers.RwkvForCausalLM
+        ) or isinstance(
+            base_huggingface_module,
+            transformers.RwkvModel
+        ):
+            warnings.warn(
+                "Rnn Based Model detected 'setting `rnn_based_or_rwkv = True`' for correct weight handling"
+            )
+            rnn_based_or_rwkv = True
     if base_huggingface_module_kwarguments is None:
         base_huggingface_module_kwarguments = {}
     state_dict = easystate_to_torch(
@@ -298,7 +323,8 @@ def easystate_to_huggingface_model(
         dtype=dtype,
         transpose_needed=transpose_needed,
         transpose_not_needed=transpose_not_needed,
-        select_params_field=select_params_field
+        select_params_field=select_params_field,
+        rnn_based_or_rwkv=rnn_based_or_rwkv
     )
     model = base_huggingface_module(
         config=config,
