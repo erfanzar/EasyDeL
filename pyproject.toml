@@ -10,7 +10,7 @@ readme = "README.md"
 version = "0.0.55"
 
 dependencies = [
-    "chex~=0.1.84",
+    "chex>=0.1.7",
     "typing~=3.7.4.3",
     "jax>=0.4.20",
     "jaxlib>=0.4.20",
