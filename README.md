@@ -40,7 +40,11 @@ Some of the key features provided by EasyDeL include:
 > [!IMPORTANT]
 > Documents and Examples are ready at [Here](https://erfanzar.github.io/EasyDeL)
 > Please have that in mind that EasyDel is in the loop of fast-development
-> so we might have API changes
+> so we might have API changes.
+>
+> [here's](https://www.kaggle.com/citifer/easydel-causal-language-model-trainer-example) an available script for mindset
+> of using EasyDeL on kaggle, but you can
+> do much more.
 
 ## Serving
 
