@@ -41,15 +41,17 @@ Some of the key features provided by EasyDeL include:
 > Documents and Examples are ready at [Here](https://erfanzar.github.io/EasyDeL)
 > Please have that in mind that EasyDel is in the loop of fast-development
 > so we might have API changes.
->
-> [here's](https://www.kaggle.com/citifer/easydel-causal-language-model-trainer-example) an available script for mindset
-> of using EasyDeL on kaggle, but you can
-> do much more.
+
+### Hands on Code Kaggle Examples
+
+1. [script](https://www.kaggle.com/citifer/easydel-causal-language-model-trainer-example) for mindset of using EasyDeL
+   CausalLanguageModelTrainer on kaggle, but you can do much more.
+2. [script](https://www.kaggle.com/code/citifer/easydel-serve-example-mixtral) for using and serving LLMs with EasyDeL JAXServer API (Mixtral Example).
 
 ## Serving
 
 you can read docs or examples to see how `JAXServer` works but let me show you how you can simply host and serve any
-model that supported by `EasyDeL` fo this example ill just use `gemma-7-it` by google but you can use any model as you
+model that supported by `EasyDeL` fo this example ill just use `gemma-7-it` by google, but you can use any model as you
 wish.
 
 ```shell
