@@ -121,6 +121,7 @@ class EasyModelsTest(TestCase):
                 block_k=self.block_k,
                 block_q=self.block_q
             )
+            prm = flax.traverse_util.flatten_dict(params, sep=".")
             ed_model = module_class(
                 config=config,
                 dtype=self.dtype,
