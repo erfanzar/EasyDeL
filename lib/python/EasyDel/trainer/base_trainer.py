@@ -228,6 +228,7 @@ class BaseTrainer:
         self.create_sharded_state_from_params_function = \
             function_configurations.create_sharded_state_from_params_function
         self.sharded_train_step_function = function_configurations.sharded_train_step_function
+        self.sharded_eval_step_function = function_configurations.sharded_eval_step_function
         self.mesh = function_configurations.mesh
         self.checkpoint_manager = function_configurations.checkpoint_manager
         self.initialize_state_function = function_configurations.initialize_state_function
