@@ -66,6 +66,7 @@ class StableLmConfig(EasyDelPretrainedConfig):
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
             tie_word_embeddings=tie_word_embeddings,
+            bits=bits,
             **kwargs
         )
 
