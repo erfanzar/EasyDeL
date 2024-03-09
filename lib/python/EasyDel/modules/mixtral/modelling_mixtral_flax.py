@@ -957,10 +957,10 @@ class FlaxMixtralModule(nn.Module):
                 rope_type=scaling_type
             )
         self.freq_cis = precompute_freq_cis(
-            max_position_embeddings=getattr(
-                self.config,
-                "freq_max_position_embeddings",
-                self.config.max_position_embeddings
+            max_position_embeddings=(
+                self.config.freq_max_position_embeddings
+                if self.config.freq_max_position_embeddings is not None
+                else self.config.max_position_embeddings
             ),
             dim=self.config.hidden_size // self.config.num_attention_heads,
             base=self.config.rope_theta,
