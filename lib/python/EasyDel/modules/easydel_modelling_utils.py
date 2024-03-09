@@ -327,6 +327,10 @@ class EasyDelPretrainedConfig(PretrainedConfig):
                     pass
         return string + ")"
 
+    def add_jax_args(self, **kwargs):
+        for k, v in kwargs.items():
+            set_attrs_smartly(self, "k", v, v)
+
     def __str__(self):
 
         """
