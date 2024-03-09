@@ -27,6 +27,7 @@ def main():
         intermediate_size=256,
         gradient_checkpointing="",
         max_position_embeddings=sequence_length,
+        use_scan_mlp=False,
     )
 
     model = FlaxQwen2ForCausalLM(config=config, _do_init=True)
