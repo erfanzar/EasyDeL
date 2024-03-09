@@ -883,7 +883,11 @@ class FlaxQwen2Module(nn.Module):
                 rope_type=scaling_type
             )
         self.freq_cis = precompute_freq_cis(
-            max_position_embeddings=getattr(config, "freq_max_position_embeddings", config.max_position_embeddings),
+            max_position_embeddings=(
+                self.config.freq_max_position_embeddings
+                if self.config.freq_max_position_embeddings is not None
+                else self.config.max_position_embeddings
+            ),
             dim=config.hidden_size // config.num_attention_heads,
             base=config.rope_theta,
             **initial_rope_kwargs
