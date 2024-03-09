@@ -76,6 +76,9 @@ class Qwen2Config(EasyDelPretrainedConfig):
         self.bits = bits
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,
+            use_scan_mlp=use_scan_mlp,
+            scan_mlp_chunk_size=scan_mlp_chunk_size,
+            bits=bits,
             **kwargs,
         )
 

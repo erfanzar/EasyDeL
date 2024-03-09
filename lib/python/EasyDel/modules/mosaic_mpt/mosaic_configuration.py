@@ -65,6 +65,7 @@ class MptConfig(EasyDelPretrainedConfig):
         if 'loss_fn' in kwargs:
             del kwargs['loss_fn']
         super().__init__(
+            bits=bits,
             **kwargs
         )
 

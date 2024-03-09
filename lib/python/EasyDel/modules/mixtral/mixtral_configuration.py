@@ -122,6 +122,9 @@ class MixtralConfig(EasyDelPretrainedConfig):
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
             tie_word_embeddings=tie_word_embeddings,
+            use_scan_mlp=use_scan_mlp,
+            scan_mlp_chunk_size=scan_mlp_chunk_size,
+            bits=bits,
             **kwargs,
         )
 

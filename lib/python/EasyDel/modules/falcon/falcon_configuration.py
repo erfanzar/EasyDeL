@@ -72,6 +72,7 @@ class FalconConfig(EasyDelPretrainedConfig):
             axis_names=axis_names,
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
+            bits=bits,
             **kwargs
         )
 
