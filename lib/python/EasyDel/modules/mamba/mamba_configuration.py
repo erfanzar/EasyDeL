@@ -7,7 +7,7 @@ from typing import Optional
 class MambaConfig(EasyDelPretrainedConfig):
     model_type = "mamba"
 
-    def __int__(
+    def __init__(
             self,
             vocab_size=50280,
             hidden_size=768,
@@ -60,7 +60,7 @@ class MambaConfig(EasyDelPretrainedConfig):
         self.residual_in_fp32 = residual_in_fp32
         self.use_cache = use_cache
         self.gradient_checkpointing = gradient_checkpointing
-        super().__int__(**kwargs)
+        super().__init__(**kwargs)
 
     def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
         return super().get_partition_rules(fully_sharded_data_parallel=fully_sharded_data_parallel)
@@ -70,4 +70,3 @@ class MambaConfig(EasyDelPretrainedConfig):
             gradient_checkpointing: str = "nothing_saveable"
     ):
         self.gradient_checkpointing = gradient_checkpointing
-

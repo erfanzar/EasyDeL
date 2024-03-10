@@ -88,7 +88,8 @@ class EasyModelsTest(TestCase):
             intermediate_size=self.intermediate_size,
             rotary_dim=self.rotary_dim,
             rms_norm_eps=self.rms_norm_eps,
-            layer_norm_eps=self.layer_norm_eps
+            layer_norm_eps=self.layer_norm_eps,
+            # residual_in_fp32=True
         )
 
         input_shape = (self.batch_size, self.sequence_length)
@@ -224,6 +225,14 @@ class EasyModelsTest(TestCase):
         self.assertTrue(
             res,
             f"RWKV model Failed [ERROR {err}]"
+        )
+
+    def test_mamba(self):
+        res, err = self.create_test_for_models("mamba", transformers.MambaForCausalLM)
+
+        self.assertTrue(
+            res,
+            f"MAMBA model Failed [ERROR {err}]"
         )
 
     @staticmethod

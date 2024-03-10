@@ -167,7 +167,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             raise NotImplementedError()
         else:
             return (
-                ('.*', PartitionSpec(("fsdp", "sp")))
+                ('.*', PartitionSpec(("fsdp", "sp"), ),),
             )
 
     def get_axis_dims(self) -> Sequence[int]:
