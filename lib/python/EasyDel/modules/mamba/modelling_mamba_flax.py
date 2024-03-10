@@ -9,12 +9,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from chex import PRNGKey, Shape, Array
+from einops import einsum
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import partitioning as nn_partitioning
-from flax.linen.linear import default_kernel_init, ConvGeneralDilatedT
+from flax.linen.dtypes import promote_dtype
+from flax.linen.linear import default_kernel_init, ConvGeneralDilatedT, PrecisionLike, Dtype, PaddingLike, \
+    canonicalize_padding, _conv_dimension_numbers
 from flax.traverse_util import flatten_dict, unflatten_dict
-from jax import lax
+from jax import lax, eval_shape
 import flax.struct
+from jax.interpreters.xla import ShapedArray
 from jax.sharding import PartitionSpec
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput
 
@@ -136,6 +140,51 @@ def create_tuple_parser(n: int) -> Callable[[Union[_T, Sequence[_T]]], tuple[_T,
 #             x = x + jnp.asarray(bias, dtype=self.dtype)
 #         return x
 
+def mamba_ssm(
+        u: jax.Array,
+        delta: jax.Array,
+        A: jax.Array,
+        B: jax.Array,
+        C: jax.Array,
+        D: Optional[jax.Array] = None,
+        delta_bias: Optional[jax.Array] = None,
+        delta_softplus: bool = False,
+        associative_scan: bool = True,
+) -> jax.Array:
+    if delta_bias is not None:
+        raise NotImplementedError("delta_bias not implemented yet.")
+
+    l, d_in = u.shape
+    n = A.shape[1]
+
+    delta = jnp.asarray(delta, dtype=jnp.float32)
+
+    if delta_softplus:
+        delta = jax.nn.softplus(delta)
+
+    delta_A = jnp.exp(einsum(delta, A, "l d_in, d_in n -> l d_in n"))
+    delta_B_u = einsum(delta, B, u, "l d_in, l n, l d_in -> l d_in n")
+
+    x = jnp.zeros((d_in, n))
+
+    def _scan_fn(x, params):
+        d_A, d_Bu, C = params
+
+        x = d_A * x + d_Bu
+        return x, einsum(x, C, "d_in n, n -> d_in")
+
+    def _associative_scan_fn(s, c):
+        return tuple((c[0] * s[0], c[0] * s[1] + c[1]))
+
+    if associative_scan:
+        _, y = jax.lax.associative_scan(_associative_scan_fn, (delta_A, delta_B_u))
+        y = einsum(y, C, "L d_in n, L n -> L d_in")
+    else:
+        _, y = jax.lax.scan(_scan_fn, init=x, xs=[delta_A, delta_B_u, C])
+
+    y = y + u * D
+    return y
+
 
 class MambaRMSNorm(nn.Module):
     dim: int
@@ -161,6 +210,199 @@ class MambaRMSNorm(nn.Module):
         return output * weight
 
 
+class Conv(nn.Module):
+    features: int
+    kernel_size: Sequence[int]
+    strides: Union[None, int, Sequence[int]] = 1
+    padding: PaddingLike = "SAME"
+    input_dilation: Union[None, int, Sequence[int]] = 1
+    kernel_dilation: Union[None, int, Sequence[int]] = 1
+    feature_group_count: int = 1
+    use_bias: bool = True
+    mask: Optional[Array] = None
+    dtype: Optional[Dtype] = None
+    param_dtype: Dtype = jnp.float32
+    precision: PrecisionLike = None
+    kernel_init: Callable[[PRNGKey, Shape, Dtype], Array] = default_kernel_init
+    bias_init: Callable[[PRNGKey, Shape, Dtype], Array] = nn.initializers.zeros_init()
+    conv_general_dilated: Optional[ConvGeneralDilatedT] = None
+    conv_general_dilated_cls: Any = None
+
+    @property
+    def shared_weights(self) -> bool:
+        return True
+
+    @nn.compact
+    def __call__(self, inputs: Array) -> Array:
+
+        if isinstance(self.kernel_size, int):
+            raise TypeError(
+                'Expected Conv kernel_size to be a'
+                ' tuple/list of integers (eg.: [3, 3]) but got'
+                f' {self.kernel_size}.'
+            )
+        else:
+            kernel_size = tuple(self.kernel_size)
+
+        def maybe_broadcast(
+                x: Optional[Union[int, Sequence[int]]]
+        ) -> Tuple[int, ...]:
+            if x is None:
+                # backward compatibility with using None as sentinel for
+                # broadcast 1
+                x = 1
+            if isinstance(x, int):
+                return (x,) * len(kernel_size)
+            return tuple(x)
+
+        # Combine all input batch dimensions into a single leading batch axis.
+        num_batch_dimensions = inputs.ndim - (len(kernel_size) + 1)
+        if num_batch_dimensions != 1:
+            input_batch_shape = inputs.shape[:num_batch_dimensions]
+            total_batch_size = int(np.prod(input_batch_shape))
+            flat_input_shape = (total_batch_size,) + inputs.shape[
+                                                     num_batch_dimensions:
+                                                     ]
+            inputs = jnp.reshape(inputs, flat_input_shape)
+
+        # self.strides or (1,) * (inputs.ndim - 2)
+        strides = maybe_broadcast(self.strides)
+        input_dilation = maybe_broadcast(self.input_dilation)
+        kernel_dilation = maybe_broadcast(self.kernel_dilation)
+
+        padding_lax = canonicalize_padding(self.padding, len(kernel_size))
+        if padding_lax == 'CIRCULAR':
+            kernel_size_dilated = [
+                (k - 1) * d + 1 for k, d in zip(kernel_size, kernel_dilation)
+            ]
+            zero_pad: List[Tuple[int, int]] = [(0, 0)]
+            pads = (
+                    zero_pad
+                    + [((k - 1) // 2, k // 2) for k in kernel_size_dilated]
+                    + [(0, 0)]
+            )
+            inputs = jnp.pad(inputs, pads, mode='wrap')
+            padding_lax = 'VALID'
+        elif padding_lax == 'CAUSAL':
+            if len(kernel_size) != 1:
+                raise ValueError(
+                    'Causal padding is only implemented for 1D convolutions.'
+                )
+            left_pad = kernel_dilation[0] * (kernel_size[0] - 1)
+            pads = [(0, 0), (left_pad, 0), (0, 0)]
+            inputs = jnp.pad(inputs, pads)
+            padding_lax = 'VALID'
+
+        dimension_numbers = _conv_dimension_numbers(inputs.shape)
+        in_features = jnp.shape(inputs)[-1]
+
+        if self.shared_weights:
+            # One shared convolutional kernel for all pixels in the output.
+
+            inf_f = in_features // self.feature_group_count
+            # inf_f = 1
+            kernel_shape = (self.features, inf_f,) + kernel_size
+
+        else:
+            if self.feature_group_count != 1:
+                raise NotImplementedError(
+                    '`lax.conv_general_dilated_local` does not support '
+                    f'`feature_group_count != 1`, got `{self.feature_group_count}`.'
+                )
+
+            # Need to know the spatial output shape of a standard convolution to
+            # create the unshared convolution kernel.
+            if self.conv_general_dilated_cls is not None:
+                conv_general_dilated = self.conv_general_dilated_cls()
+            elif self.conv_general_dilated is not None:
+                conv_general_dilated = self.conv_general_dilated
+            else:
+                conv_general_dilated = lax.conv_general_dilated
+            conv_output_shape = eval_shape(
+                lambda lhs, rhs: conv_general_dilated(  # pylint: disable=g-long-lambda
+                    lhs=lhs,
+                    rhs=rhs,
+                    window_strides=strides,
+                    padding=padding_lax,
+                    dimension_numbers=dimension_numbers,
+                    lhs_dilation=input_dilation,
+                    rhs_dilation=kernel_dilation,
+                ),
+                inputs,
+                ShapedArray(kernel_size + (in_features, self.features), inputs.dtype),
+            ).shape
+
+            # One (unshared) convolutional kernel per each pixel in the output.
+            kernel_shape = conv_output_shape[1:-1] + (
+                np.prod(kernel_size) * in_features,
+                self.features,
+            )
+
+        if self.mask is not None and self.mask.shape != kernel_shape:
+            raise ValueError(
+                'Mask needs to have the same shape as weights. '
+                f'Shapes are: {self.mask.shape}, {kernel_shape}'
+            )
+
+        kernel = self.param(
+            'kernel', self.kernel_init, kernel_shape, self.param_dtype
+        )
+        kernel = jnp.asarray(kernel.transpose(2, 1, 0), self.dtype)
+        if self.mask is not None:
+            kernel *= self.mask
+
+        if self.use_bias:
+            if self.shared_weights:
+                bias_shape = (self.features,)
+            else:
+                bias_shape = conv_output_shape[1:]
+
+            bias = self.param('bias', self.bias_init, bias_shape, self.param_dtype)
+        else:
+            bias = None
+
+        inputs, kernel, bias = promote_dtype(inputs, kernel, bias, dtype=self.dtype)
+        if self.shared_weights:
+            if self.conv_general_dilated_cls is not None:
+                conv_general_dilated = self.conv_general_dilated_cls()
+            elif self.conv_general_dilated is not None:
+                conv_general_dilated = self.conv_general_dilated
+            else:
+                conv_general_dilated = lax.conv_general_dilated
+            y = conv_general_dilated(
+                lhs=inputs,
+                rhs=kernel,
+                window_strides=strides,
+                padding=padding_lax,
+                lhs_dilation=input_dilation,
+                rhs_dilation=kernel_dilation,
+                dimension_numbers=dimension_numbers,
+                feature_group_count=self.feature_group_count,
+                precision=self.precision,
+            )
+        else:
+            y = lax.conv_general_dilated_local(
+                lhs=inputs,
+                rhs=kernel,
+                window_strides=strides,
+                padding=padding_lax,
+                filter_shape=kernel_size,
+                lhs_dilation=input_dilation,
+                rhs_dilation=kernel_dilation,
+                dimension_numbers=dimension_numbers,
+                precision=self.precision,
+            )
+
+        if self.use_bias:
+            bias = bias.reshape((1,) * (y.ndim - bias.ndim) + bias.shape)
+            y += bias
+
+        if num_batch_dimensions != 1:
+            output_shape = input_batch_shape + y.shape[1:]
+            y = jnp.reshape(y, output_shape)
+        return y
+
+
 class FlaxMambaMixer(nn.Module):
     config: MambaConfig
     layer_idx: int
@@ -175,27 +417,16 @@ class FlaxMambaMixer(nn.Module):
         intermediate_size = config.intermediate_size
         time_step_rank = config.time_step_rank
 
-        # features: int
-        # kernel_size: tuple[int, ...] = 1
-        # stride: tuple[int, ...] = 1
-        # padding: tuple[tuple[int, int], ...] = 0
-        # dilation: tuple[int, ...] = 1
-        # groups: int = 1
-        # use_bias: bool = True
-        # num_spatial_dims: int = 1
-        # dtype: jnp.dtype = jnp.float32
-        # param_dtype: jnp.dtype = jnp.float32
-        # precision: Optional[Union[str, lax.Precision]] = None
-
-        self.conv1d = nn.Conv(
+        self.conv1d = Conv(
             features=config.intermediate_size,
-            kernel_size=(self.config.conv_kernel,),
+            kernel_size=(config.conv_kernel,),
+            feature_group_count=config.intermediate_size,
             padding="SAME",
             strides=(1,),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
-            use_bias=self.config.use_conv_bias
+            use_bias=config.use_conv_bias,
         )
 
         self.activation = config.hidden_act
@@ -641,7 +872,7 @@ class FlaxMambaPretrainedModel(EasyDelFlaxPretrainedModel):
         super().__init__(
             config,
             module,
-            input_shape=input_shape,
+            input_shape=(input_shape[0], 1),
             seed=seed,
             dtype=dtype,
             _do_init=_do_init
