@@ -512,6 +512,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
                 wandb.summary["Number of Model Parameters (Billion)"] = model_parameters_number
             try:
                 for epoch in range(self.arguments.num_train_epochs):
+                    time_s = time.time()
                     for batch in self.dataloader_train:
                         current_step += 1
                         if (
@@ -521,6 +522,9 @@ class CausalLanguageModelTrainer(BaseTrainer):
                         ):
                             pbar.update(1)
                         elif current_step < self.max_training_steps:
+                            time_prev = time_s
+                            time_s = time.time()
+                            step_time = time_s - time_prev
                             batch["labels"] = (
                                 batch["labels"][..., 1:]
                                 if "labels" in batch and not self.arguments.train_on_inputs
@@ -528,12 +532,10 @@ class CausalLanguageModelTrainer(BaseTrainer):
                             )
                             for ssb in self.arguments.ids_to_pop_from_dataset:
                                 _ = batch.pop(ssb, None)
-                            time_s = time.time()
                             sharded_state, loss, accuracy = self.sharded_train_step_function(
                                 sharded_state,
                                 batch
                             )
-                            ttl_time = time.time() - time_s
                             loss_sum = loss.tolist() if loss_sum is None else loss_sum + loss
                             accuracy_sum = accuracy.tolist() if accuracy_sum is None else accuracy_sum + accuracy
                             learning_rates.append(self.scheduler(current_step).tolist())
@@ -564,7 +566,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                     int(jax.device_get(sharded_state.step))
                                 ).tolist(),
                                 "step": int(jax.device_get(sharded_state.step)),
-                                "step_time": ttl_time,
+                                "step_time": step_time,
                                 "perplexity": jnp.exp(loss).tolist(),
                                 "trained_tokens": trained_tokens,
                                 "accelerators": information_queries,
