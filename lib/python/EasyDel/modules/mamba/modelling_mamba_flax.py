@@ -1,25 +1,28 @@
 import functools
-from typing import Optional, Tuple, Union, List, Dict, Any
+import itertools
+import math
+from typing import Optional, Tuple, Union, List, Dict, Any, Callable, Sequence, TypeVar
 
 import chex
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
+import numpy as np
+from chex import PRNGKey, Shape, Array
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import partitioning as nn_partitioning
+from flax.linen.linear import default_kernel_init, ConvGeneralDilatedT
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 import flax.struct
 from jax.sharding import PartitionSpec
-from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput, FlaxSequenceClassifierOutput
+from transformers.modeling_flax_outputs import FlaxBaseModelOutput
 
 from .mamba_configuration import MambaConfig
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 from ..flax_modelling_utils import (
-    with_sharding_constraint,
     get_gradient_checkpoint_policy,
     get_dot_general_by_bits,
-    block_wise_ffn,
     ACT2FN
 )
 
@@ -65,25 +68,73 @@ class FlaxMambaCache:
         }
 
 
-class MambaConv1D(nn.Module):
-    features: int
-    config: MambaConfig
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[str, lax.Precision]] = None
+_T = TypeVar("_T")
 
-    @nn.compact
-    def __call__(self, x):
-        return nn.Conv(
-            self.features,
-            (self.config.conv_kernel,),
-            strides=(1,),
-            padding=self.config.conv_kernel - 1,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            precision=self.precision,
-            use_bias=self.config.use_conv_bias,
-        )(x)
+
+def create_tuple_parser(n: int) -> Callable[[Union[_T, Sequence[_T]]], tuple[_T, ...]]:
+    def parse(x: Union[_T, Sequence[_T]]) -> tuple[_T, ...]:
+        if isinstance(x, Sequence):
+            if len(x) == n:
+                return tuple(x)
+            else:
+                raise ValueError(
+                    f"x!=n ({x}!=({n}))"
+                )
+        else:
+            return tuple(itertools.repeat(x, n))
+
+    return parse
+
+
+# class Conv1D(nn.Module):
+#     features: int
+#     kernel_size: tuple[int, ...] = 1
+#     stride: tuple[int, ...] = 1
+#     padding: tuple[tuple[int, int], ...] = 0
+#     dilation: tuple[int, ...] = 1
+#     groups: int = 1
+#     use_bias: bool = True
+#     num_spatial_dims: int = 1
+#     dtype: jnp.dtype = jnp.float32
+#     param_dtype: jnp.dtype = jnp.float32
+#     precision: Optional[Union[str, lax.Precision]] = None
+#
+#     @nn.compact
+#     def __call__(self, x):
+#         parse = create_tuple_parser(self.num_spatial_dims)
+#         kernel_size = parse(self.kernel_size)
+#         stride = parse(self.stride)
+#         dilation = parse(self.dilation)
+#
+#         assert x.shape[-1] % self.groups == 0
+#
+#         grouped_in_channels = x.shape[-1] // self.groups
+#         kernel = self.param(
+#             "kernel",
+#             nn.initializers.lecun_normal(dtype=self.param_dtype),
+#             (self.features, grouped_in_channels) + kernel_size,
+#             self.param_dtype
+#         )
+#         # x = jnp.expand_dims(x, 0)
+#         print(kernel.shape)
+#         x = lax.conv_general_dilated(
+#             lhs=x,
+#             rhs=jnp.asarray(kernel, dtype=self.dtype),
+#             window_strides=stride,
+#             padding="SAME",
+#             rhs_dilation=dilation,
+#             feature_group_count=self.groups,
+#         )
+#         # x = jnp.squeeze(x, axis=0)
+#         if self.use_bias:
+#             bias = self.param(
+#                 "bias",
+#                 nn.initializers.zeros_init(),
+#                 (self.features,) + (1,) * self.num_spatial_dims,
+#                 self.param_dtype
+#             )
+#             x = x + jnp.asarray(bias, dtype=self.dtype)
+#         return x
 
 
 class MambaRMSNorm(nn.Module):
@@ -123,12 +174,28 @@ class FlaxMambaMixer(nn.Module):
         ssm_state_size = config.state_size
         intermediate_size = config.intermediate_size
         time_step_rank = config.time_step_rank
-        self.conv1d = MambaConv1D(
-            config.intermediate_size,
-            config=config,
+
+        # features: int
+        # kernel_size: tuple[int, ...] = 1
+        # stride: tuple[int, ...] = 1
+        # padding: tuple[tuple[int, int], ...] = 0
+        # dilation: tuple[int, ...] = 1
+        # groups: int = 1
+        # use_bias: bool = True
+        # num_spatial_dims: int = 1
+        # dtype: jnp.dtype = jnp.float32
+        # param_dtype: jnp.dtype = jnp.float32
+        # precision: Optional[Union[str, lax.Precision]] = None
+
+        self.conv1d = nn.Conv(
+            features=config.intermediate_size,
+            kernel_size=(self.config.conv_kernel,),
+            padding="SAME",
+            strides=(1,),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            precision=self.precision
+            precision=self.precision,
+            use_bias=self.config.use_conv_bias
         )
 
         self.activation = config.hidden_act
@@ -138,13 +205,13 @@ class FlaxMambaMixer(nn.Module):
         if self.config.time_step_init_scheme == "constant":
             init_kernel_dt = nn.initializers.constant(dt_init_std, dtype=self.param_dtype)
         elif self.config.time_step_init_scheme == "random":
-            def init_kernel_dt():
-                def init_r(key, _shape, _dtype):
-                    return jax.nn.initializers.uniform(
-                        maxval=dt_init_std * 2, dtype=self.param_dtype
-                    )(key, _shape, _dtype) - dt_init_std
+            # def init_kernel_dt():
+            def init_kernel_dt(key, _shape, _dtype):
+                return jax.nn.initializers.uniform(
+                    scale=dt_init_std * 2, dtype=self.param_dtype
+                )(key, _shape, _dtype) - dt_init_std
 
-                return init_r
+            # return init_r
         else:
             init_kernel_dt = nn.initializers.normal(self.config.initializer_range, self.param_dtype)
 
@@ -152,9 +219,9 @@ class FlaxMambaMixer(nn.Module):
             self.config.time_step_floor,
             jnp.exp(
                 jax.random.normal(
-                    jax.random.PRNGKey(self.make_rng("params")),
-                    self.config.intermediate_size,
-                    self.param_dtype
+                    key=self.make_rng("params"),
+                    shape=(self.config.intermediate_size,),
+                    dtype=self.param_dtype
                 )
                 * (jnp.log(self.config.time_step_max) - jnp.log(self.config.time_step_min))
                 + jnp.log(self.config.time_step_min)
@@ -178,25 +245,26 @@ class FlaxMambaMixer(nn.Module):
         )
         self.x_proj = dense_class(
             time_step_rank + ssm_state_size * 2,
-            use_bias=False)
+            use_bias=False
+        )
         self.dt_proj = dense_class(
             intermediate_size,
             use_bias=True,
             kernel_init=init_kernel_dt,
-            bias_init=lambda _: inv_dt
+            bias_init=lambda s1, s2, s3: inv_dt
         )
         self.out_proj = dense_class(
             hidden_size,
-            bias=config.use_bias
+            use_bias=config.use_bias
         )
 
         self.A_log = self.param(
             "A_log",
             init_to_value(
                 jnp.log(
-                    jnp.expand_dims(
+                    jnp.broadcast_to(
                         jnp.arange(1, ssm_state_size + 1, dtype=jnp.float32)[None, :],
-                        -1
+                        (intermediate_size, ssm_state_size)
                     )
                 ),
                 self.dtype
@@ -213,19 +281,20 @@ class FlaxMambaMixer(nn.Module):
         self.ssm_state_size = ssm_state_size
         self.intermediate_size = intermediate_size
         self.conv_kernel_size = self.config.conv_kernel
+        self.time_step_rank = self.config.time_step_rank
 
     def __call__(self, input_states, cache_params=None):
         batch_size, seq_len, _ = input_states.shape
         dtype = input_states.dtype
         projected_states = self.in_proj(input_states).transpose(0, 2, 1)
-        hidden_states, gate = projected_states.chunk(2, dim=1)
+        hidden_states, gate = jnp.split(projected_states, 2, axis=1)
 
         # 2. Convolution sequence transformation
         if cache_params is not None:
             ssm_state = cache_params.ssm_states[self.layer_idx]
             if cache_params.seqlen_offset > 0:
                 conv_state = cache_params.conv_states[self.layer_idx]  # [batch, intermediate_size, conv_kernel_size]
-                conv_state = jnp.roll(conv_state, shifts=-1, axis=-1)
+                conv_state = jnp.roll(conv_state, shift=-1, axis=-1)
                 conv_state = conv_state.at[:, :, -1].set(hidden_states[:, :, 0])
                 cache_params.conv_states[self.layer_idx].copy_(conv_state)
                 hidden_states = jnp.sum(conv_state * self.conv1d.variables["kernel"][:, 0, :], axis=-1)
@@ -247,21 +316,22 @@ class FlaxMambaMixer(nn.Module):
 
         ssm_parameters = self.x_proj(hidden_states.transpose(0, 2, 1))
         time_step, B, C = jnp.split(
-            ssm_parameters, [self.time_step_rank, self.ssm_state_size, self.ssm_state_size], axis=-1
+            ssm_parameters,
+            indices_or_sections=[self.time_step_rank, self.time_step_rank + self.ssm_state_size],
+            axis=-1
         )
         discrete_time_step = self.dt_proj(time_step)
         # [batch, seq_len, intermediate_size]
-
         discrete_time_step = jax.nn.softplus(discrete_time_step).transpose(0, 2, 1)
         # [batch, intermediate_size, seq_len]
-
         A = -jnp.exp(self.A_log.astype(jnp.float32))
         # [intermediate_size, ssm_state_size]
-
-        discrete_A = jnp.exp(A[jnp.newaxis, :, jnp.newaxis, :] * discrete_time_step[:, :, :, jnp.newaxis])
+        modified_a = jnp.expand_dims(jnp.expand_dims(A, axis=0), axis=2)
+        modified_time_step = jnp.expand_dims(discrete_time_step, axis=-1)
+        discrete_A = jnp.exp(modified_a * modified_time_step)
         # [batch, intermediate_size, seq_len, ssm_state_size]
 
-        discrete_B = discrete_time_step[:, :, :, jnp.newaxis] * B[:, jnp.newaxis, :, :].astype(jnp.float32)
+        discrete_B = modified_time_step * B[:, jnp.newaxis, :, :].astype(jnp.float32)
         # [batch, intermediate_size, seq_len, ssm_state_size]
 
         deltaB_u = discrete_B * hidden_states[:, :, :, jnp.newaxis].astype(jnp.float32)
@@ -333,7 +403,6 @@ class FlaxMambaBlock(nn.Module):
         )
         if self.residual_in_fp32:
             residual = residual.astype(jnp.float32)
-
         hidden_states = self.mixer(
             hidden_states,
             cache_params
@@ -612,60 +681,7 @@ class FlaxMambaPretrainedModel(EasyDelFlaxPretrainedModel):
             return random_params
 
     def init_cache(self, batch_size, max_length):
-        """
-        The init_cache function is used to initialize the cache for a given batch size and sequence length.
-        The cache is a dictionary that contains all the intermediate states from each layer in the model.
-        This allows us to run inference on multiple batches without having to re-run forward passes through every layer in
-        the model, which would be very slow.
-
-        :param self: Access the module
-        :param batch_size: Define the batch size of the input tensors
-        :param max_length: Set the length of the input sequence
-        :return: A dictionary with the following keys:
-
-        """
-        input_ids = jnp.ones((batch_size, max_length))
-        attention_mask = jnp.ones_like(input_ids)
-        position_ids = jnp.broadcast_to(jnp.arange(
-            jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape)
-
-        init_variables = self.module.init(
-            jax.random.PRNGKey(0),
-            input_ids,
-            attention_mask,
-            position_ids,
-            return_dict=False,
-            init_cache=True
-        )
-        return init_variables["cache"]
-
-    def update_inputs_for_generation(
-            self,
-            outputs: MambaOutput,
-            model_kwargs: Dict[str, Any],
-            **kwargs
-    ) -> Dict[str, Any]:
-        model_kwargs["cache_params"] = outputs["cache_params"]
-        return model_kwargs
-
-    def prepare_inputs_for_generation(
-            self,
-            input_ids,
-            cache_params=None,
-            inputs_embeds=None,
-            attention_mask=None,
-            **kwargs
-    ):
-        if cache_params is not None:
-            input_ids = input_ids[:, -1].unsqueeze(-1)
-
-        if inputs_embeds is not None and cache_params is None:
-            model_inputs = {"inputs_embeds": inputs_embeds}
-        else:
-            model_inputs = {"input_ids": input_ids}
-
-        model_inputs["cache_params"] = cache_params
-        return model_inputs
+        return None
 
     def __call__(
             self,
@@ -712,8 +728,7 @@ class FlaxMambaPretrainedModel(EasyDelFlaxPretrainedModel):
         if dropout_rng is not None:
             rngs["dropout"] = dropout_rng
 
-        if self.config.bits is not None:
-            rngs['params'] = jax.random.key(0)
+        rngs["params"] = jax.random.key(0)
 
         inputs = {
             "params": params or self.params
@@ -721,8 +736,8 @@ class FlaxMambaPretrainedModel(EasyDelFlaxPretrainedModel):
 
         # input_ids: Optional[chex.Array] = None,
         # inputs_embeds: Optional[chex.Array] = None,
+        # cache_params: Optional[chex.Array] = None,
         # deterministic: bool = True,
-        # cache_params: Optional[List[chex.Array]] = None,
         # use_cache: Optional[bool] = None,
         # output_hidden_states: Optional[bool] = None,
         # return_dict: Optional[bool] = None,
@@ -731,11 +746,47 @@ class FlaxMambaPretrainedModel(EasyDelFlaxPretrainedModel):
             inputs,
             input_ids,
             inputs_embeds,
-            train,
             cache_params,
+            train,
             False,
             output_hidden_states,
             return_dict,
             rngs=rngs,
             mutable=False,
         )
+
+
+class FlaxMambaModel(FlaxMambaPretrainedModel):
+    module_class = FlaxMambaModule
+
+
+class FlaxMambaForCausalLM(FlaxMambaPretrainedModel):
+    module_class = FlaxMambaForCausalLMModule
+
+    def update_inputs_for_generation(
+            self,
+            outputs: MambaOutput,
+            model_kwargs: Dict[str, Any],
+            **kwargs
+    ) -> Dict[str, Any]:
+        model_kwargs["cache_params"] = outputs["cache_params"]
+        return model_kwargs
+
+    def prepare_inputs_for_generation(
+            self,
+            input_ids,
+            cache_params=None,
+            inputs_embeds=None,
+            attention_mask=None,
+            **kwargs
+    ):
+        if cache_params is not None:
+            input_ids = input_ids[:, -1].unsqueeze(-1)
+
+        if inputs_embeds is not None and cache_params is None:
+            model_inputs = {"inputs_embeds": inputs_embeds}
+        else:
+            model_inputs = {"input_ids": input_ids}
+
+        model_inputs["cache_params"] = cache_params
+        return model_inputs

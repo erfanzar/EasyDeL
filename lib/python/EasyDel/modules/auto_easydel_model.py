@@ -1,6 +1,7 @@
 import functools
 import gc
 import warnings
+from functools import partial
 from typing import Sequence, Optional, Tuple, Mapping, Callable, Type, Any
 
 import flax.traverse_util
@@ -20,9 +21,7 @@ logger = get_logger(name=__name__)
 
 
 def get_modules_by_type(model_type: str) -> Tuple[
-    Type[EasyDelPretrainedConfig],
-    Type[EasyDelFlaxPretrainedModel],
-    Callable
+    Type[EasyDelPretrainedConfig], Type[EasyDelFlaxPretrainedModel] | Any, partial | Any
 ]:
     """
     The get_modules_by_type function is a helper function that returns the following:
@@ -40,7 +39,11 @@ def get_modules_by_type(model_type: str) -> Tuple[
         return (
             _LlamaConfig,
             _FlaxLlamaForCausalLM,
-            functools.partial(huggingface_to_easydel, embedding_layer_names=["embed_tokens"])
+            functools.partial(
+                huggingface_to_easydel,
+                embedding_layer_names=["embed_tokens"],
+                rnn_based_or_rwkv=False
+            )
         )
     elif model_type == "gemma":
 
@@ -49,7 +52,11 @@ def get_modules_by_type(model_type: str) -> Tuple[
         return (
             _GemmaConfig,
             _FlaxGemmaForCausalLM,
-            functools.partial(huggingface_to_easydel, embedding_layer_names=["embed_tokens"])
+            functools.partial(
+                huggingface_to_easydel,
+                embedding_layer_names=["embed_tokens"],
+                rnn_based_or_rwkv=False
+            )
         )
     elif model_type == "falcon":
         from .falcon import FlaxFalconForCausalLM as _FlaxFalconForCausalLM
@@ -66,7 +73,8 @@ def get_modules_by_type(model_type: str) -> Tuple[
                     "ln_attn",
                     "ln_mlp",
                     "post_attention_layernorm"
-                ]
+                ],
+                rnn_based_or_rwkv=False
             )
         )
     elif model_type == "mpt":
@@ -75,7 +83,11 @@ def get_modules_by_type(model_type: str) -> Tuple[
         return (
             _MptConfig,
             _FlaxMptForCausalLM,
-            functools.partial(huggingface_to_easydel, embedding_layer_names="wte")
+            functools.partial(
+                huggingface_to_easydel,
+                embedding_layer_names="wte",
+                rnn_based_or_rwkv=False
+            )
         )
 
     elif model_type == "mistral":
@@ -84,7 +96,11 @@ def get_modules_by_type(model_type: str) -> Tuple[
         return (
             _MistralConfig,
             _FlaxMistralForCausalLM,
-            functools.partial(huggingface_to_easydel, embedding_layer_names=["embed_tokens"])
+            functools.partial(
+                huggingface_to_easydel,
+                embedding_layer_names=["embed_tokens"],
+                rnn_based_or_rwkv=False
+            )
         )
     elif model_type == "gptj":
         from .gpt_j import FlaxGPTJForCausalLM as _FlaxGPTJForCausalLM
@@ -97,7 +113,8 @@ def get_modules_by_type(model_type: str) -> Tuple[
                 embedding_layer_names="wte",
                 layer_norm_names=[
                     "ln_1", "ln_2", "ln_f"
-                ]
+                ],
+                rnn_based_or_rwkv=False
             )
         )
 
@@ -108,7 +125,11 @@ def get_modules_by_type(model_type: str) -> Tuple[
         return (
             _GPTNeoXConfig,
             _FlaxGPTNeoXForCausalLM,
-            functools.partial(huggingface_to_easydel, embedding_layer_names="wte")
+            functools.partial(
+                huggingface_to_easydel,
+                embedding_layer_names="wte",
+                rnn_based_or_rwkv=False
+            )
         )
     elif model_type == "palm":
         from .palm import FlaxPalmForCausalLM as _FlaxPalmForCausalLM
@@ -116,7 +137,11 @@ def get_modules_by_type(model_type: str) -> Tuple[
         return (
             _PalmConfig,
             _FlaxPalmForCausalLM,
-            functools.partial(huggingface_to_easydel, embedding_layer_names="wte")
+            functools.partial(
+                huggingface_to_easydel,
+                embedding_layer_names="wte",
+                rnn_based_or_rwkv=False
+            )
         )
     elif model_type == "lt":
         from .lucid_transformer import FlaxLTForCausalLM as _FlaxLTForCausalLM
@@ -125,7 +150,11 @@ def get_modules_by_type(model_type: str) -> Tuple[
         return (
             _FlaxLTConfig,
             _FlaxLTForCausalLM,
-            functools.partial(huggingface_to_easydel, embedding_layer_names="wte")
+            functools.partial(
+                huggingface_to_easydel,
+                embedding_layer_names="wte",
+                rnn_based_or_rwkv=False
+            )
         )
     elif model_type == "gpt2":
         from .gpt2 import FlaxGPT2LMHeadModel as _FlaxGPT2LMHeadModel
@@ -139,17 +168,21 @@ def get_modules_by_type(model_type: str) -> Tuple[
                 embedding_layer_names=["wte", "wpe"],
                 layer_norm_names=[
                     "ln_1", "ln_2", "ln_f"
-                ]
+                ],
+                rnn_based_or_rwkv=False
             )
         )
-
     elif model_type == "mixtral":
         from .mixtral import FlaxMixtralForCausalLM as _FlaxMixtralForCausalLM
         from .mixtral import MixtralConfig as _MixtralConfig
         return (
             _MixtralConfig,
             _FlaxMixtralForCausalLM,
-            functools.partial(huggingface_to_easydel, embedding_layer_names=["embed_tokens"])
+            functools.partial(
+                huggingface_to_easydel,
+                embedding_layer_names=["embed_tokens"],
+                rnn_based_or_rwkv=False
+            )
         )
     elif model_type == "phi":
         from .phi import FlaxPhiForCausalLM as _FlaxPhiForCausalLM
@@ -165,26 +198,36 @@ def get_modules_by_type(model_type: str) -> Tuple[
                     "final_layernorm",
                     "q_layernorm",
                     "k_layernorm"
-                ])
+                ],
+                rnn_based_or_rwkv=False
+            )
         )
-    if model_type == "qwen":
+    elif model_type == "qwen":
         from .qwen1 import Qwen1Config as _Qwen1Config
-        from .qwen1 import FlaxQwenForCausalLM as _FlaxQwen1ForCausalLM
+        from .qwen1 import FlaxQwen1ForCausalLM as _FlaxQwen1ForCausalLM
         return (
             _Qwen1Config,
             _FlaxQwen1ForCausalLM,
-            functools.partial(huggingface_to_easydel, embedding_layer_names=["wte"])
+            functools.partial(
+                huggingface_to_easydel,
+                embedding_layer_names=["wte"],
+                rnn_based_or_rwkv=False
+            )
         )
 
-    if model_type == "qwen2":
+    elif model_type == "qwen2":
         from .qwen2 import Qwen2Config as _Qwen2Config
         from .qwen2 import FlaxQwen2ForCausalLM as _FlaxQwen2ForCausalLM
         return (
             _Qwen2Config,
             _FlaxQwen2ForCausalLM,
-            functools.partial(huggingface_to_easydel, embedding_layer_names=["embed_tokens"])
+            functools.partial(
+                huggingface_to_easydel,
+                embedding_layer_names=["embed_tokens"],
+                rnn_based_or_rwkv=False
+            )
         )
-    if model_type == "stablelm":
+    elif model_type == "stablelm":
         from .stablelm import StableLmConfig as _StableLmConfig
         from .stablelm import FlaxStableLmForCausalLM as _FlaxStableLmForCausalLM
 
@@ -194,10 +237,11 @@ def get_modules_by_type(model_type: str) -> Tuple[
             functools.partial(
                 huggingface_to_easydel,
                 embedding_layer_names=["embed_tokens"],
-                layer_norm_names=["input_layernorm", "post_attention_layernorm", "norm"]
+                layer_norm_names=["input_layernorm", "post_attention_layernorm", "norm"],
+                rnn_based_or_rwkv=False
             )
         )
-    if model_type == "rwkv":
+    elif model_type == "rwkv":
         from .rwkv import RwkvConfig as _RwkvConfig
         from .rwkv import FlaxRwkvForCausalLM as _FlaxRwkvForCausalLM
         return (
@@ -208,6 +252,18 @@ def get_modules_by_type(model_type: str) -> Tuple[
                 embedding_layer_names=["embeddings"],
                 layer_norm_names=["ln_out", "ln2", "ln1", "pre_ln"],
                 rnn_based_or_rwkv=True
+            )
+        )
+    elif model_type == "mamba":
+        from .mamba import MambaConfig as _MambaConfig
+        from .mamba import FlaxMambaForCausalLM as _FlaxMambaForCausalLM
+        return (
+            _MambaConfig,
+            _FlaxMambaForCausalLM,
+            functools.partial(
+                huggingface_to_easydel,
+                embedding_layer_names=["embeddings"],
+                rnn_based_or_rwkv=False
             )
         )
     raise EasyDelRuntimeError(f'Model Type ({model_type}) is not supported or is not found')
@@ -351,16 +407,11 @@ class AutoEasyDelConfig:
             pretrained_model_name_or_path: str,
             sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
             sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp",
-                                                                None),
-            key_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp",
-                                                              None),
-            value_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp",
-                                                                None),
-            bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None,
-                                                               None),
-            attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp",
-                                                                    "tp", None),
+            query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            key_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            value_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
+            attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             use_shard_map: bool = False,
             backend: Optional[str] = None,
             **kwargs
