@@ -115,6 +115,13 @@ from .modules.stablelm import (
     FlaxStableLmForCausalLM as FlaxStableLmForCausalLM,
     FlaxStableLmModel as FlaxStableLmModel
 )
+
+from .modules.mamba import (
+
+    FlaxMambaModel as FlaxMambaModel,
+    FlaxMambaForCausalLM as FlaxMambaForCausalLM,
+    MambaConfig as MambaConfig
+)
 from .modules.auto_easydel_model import (
     AutoEasyDelModelForCausalLM as AutoEasyDelModelForCausalLM,
     AutoEasyDelConfig as AutoEasyDelConfig,
@@ -293,6 +300,11 @@ __all__ = (
     "StableLmConfig",
     "FlaxStableLmForCausalLM",
     "FlaxStableLmModel",
+
+    # Mamba Models
+    "FlaxMambaModel",
+    "FlaxMambaForCausalLM",
+    "MambaConfig",
 
     # AutoModels Models
     "AutoEasyDelModelForCausalLM",
