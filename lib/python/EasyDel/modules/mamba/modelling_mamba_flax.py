@@ -90,55 +90,83 @@ def create_tuple_parser(n: int) -> Callable[[Union[_T, Sequence[_T]]], tuple[_T,
     return parse
 
 
-# class Conv1D(nn.Module):
-#     features: int
-#     kernel_size: tuple[int, ...] = 1
-#     stride: tuple[int, ...] = 1
-#     padding: tuple[tuple[int, int], ...] = 0
-#     dilation: tuple[int, ...] = 1
-#     groups: int = 1
-#     use_bias: bool = True
-#     num_spatial_dims: int = 1
-#     dtype: jnp.dtype = jnp.float32
-#     param_dtype: jnp.dtype = jnp.float32
-#     precision: Optional[Union[str, lax.Precision]] = None
-#
-#     @nn.compact
-#     def __call__(self, x):
-#         parse = create_tuple_parser(self.num_spatial_dims)
-#         kernel_size = parse(self.kernel_size)
-#         stride = parse(self.stride)
-#         dilation = parse(self.dilation)
-#
-#         assert x.shape[-1] % self.groups == 0
-#
-#         grouped_in_channels = x.shape[-1] // self.groups
-#         kernel = self.param(
-#             "kernel",
-#             nn.initializers.lecun_normal(dtype=self.param_dtype),
-#             (self.features, grouped_in_channels) + kernel_size,
-#             self.param_dtype
-#         )
-#         # x = jnp.expand_dims(x, 0)
-#         print(kernel.shape)
-#         x = lax.conv_general_dilated(
-#             lhs=x,
-#             rhs=jnp.asarray(kernel, dtype=self.dtype),
-#             window_strides=stride,
-#             padding="SAME",
-#             rhs_dilation=dilation,
-#             feature_group_count=self.groups,
-#         )
-#         # x = jnp.squeeze(x, axis=0)
-#         if self.use_bias:
-#             bias = self.param(
-#                 "bias",
-#                 nn.initializers.zeros_init(),
-#                 (self.features,) + (1,) * self.num_spatial_dims,
-#                 self.param_dtype
-#             )
-#             x = x + jnp.asarray(bias, dtype=self.dtype)
-#         return x
+class Conv1D(nn.Module):
+    features: int
+    kernel_size: int = 1
+    stride: int = 1
+    padding: int = 0
+    dilation: int = 1
+    groups: int = 1
+    use_bias: bool = True
+    num_spatial_dims: int = 1
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[Union[str, lax.Precision]] = None
+
+    @nn.compact
+    def __call__(self, x):
+
+        kernel = self.param(
+            "kernel",
+            nn.initializers.lecun_normal(dtype=self.param_dtype),
+            (self.features, 1, self.kernel_size),
+            self.param_dtype
+        )
+        unbatched_rank = self.num_spatial_dims + 2
+        if x.ndim != unbatched_rank:
+            raise ValueError(
+                f"Input to `Conv` needs to have rank {unbatched_rank},"
+                f" but input has shape {x.shape}.",
+            )
+
+        # def rava_run(input_rava):
+        #     input_rava = jnp.expand_dims(input_rava, 0)
+        #     input_rava = lax.conv_general_dilated(
+        #         lhs=input_rava,
+        #         rhs=jnp.asarray(kernel, dtype=self.dtype),
+        #         window_strides=stride,
+        #         padding=padding,
+        #         rhs_dilation=dilation,
+        #         feature_group_count=self.groups,
+        #     )
+        #     input_rava = jnp.squeeze(input_rava, axis=0)
+        #     if self.use_bias:
+        #         bias = self.param(
+        #             "bias",
+        #             nn.initializers.zeros_init(),
+        #             (self.features,) + (1,) * self.num_spatial_dims,
+        #             self.param_dtype
+        #         )
+        #         input_rava = input_rava + jnp.asarray(bias, dtype=self.dtype)
+        #     return input_rava
+
+        # return nn.vmap(
+        #     rava_run,
+        #     in_axes=0,
+        #     out_axes=0,
+        #     variable_axes={"params": 0},
+        #     split_rngs={"params": False}
+        # )(x)
+
+        # x = jnp.expand_dims(x, 0)
+        x = lax.conv_general_dilated(
+            lhs=x,
+            rhs=jnp.asarray(kernel, dtype=self.dtype),
+            window_strides=(self.stride,),
+            padding=((self.padding, self.padding),),
+            rhs_dilation=(self.dilation,),
+            feature_group_count=self.groups,
+        )
+        if self.use_bias:
+            bias = self.param(
+                "bias",
+                nn.initializers.zeros_init(),
+                (self.features,),
+                self.param_dtype
+            )
+            x = x + jnp.asarray(bias.reshape(1, -1, 1), dtype=self.dtype)
+        return x
+
 
 def mamba_ssm(
         u: jax.Array,
@@ -417,16 +445,26 @@ class FlaxMambaMixer(nn.Module):
         intermediate_size = config.intermediate_size
         time_step_rank = config.time_step_rank
 
-        self.conv1d = Conv(
+        self.conv1d = Conv1D(
+            # features=config.intermediate_size,
+            # kernel_size=(config.conv_kernel,),
+            # feature_group_count=config.intermediate_size,
+            # padding="SAME",
+            # strides=(1,),
+            # dtype=self.dtype,
+            # param_dtype=self.param_dtype,
+            # precision=self.precision,
+            # use_bias=config.use_conv_bias,
+            # #  ---- # #
             features=config.intermediate_size,
-            kernel_size=(config.conv_kernel,),
-            feature_group_count=config.intermediate_size,
-            padding="SAME",
-            strides=(1,),
+            kernel_size=config.conv_kernel,
+            groups=config.intermediate_size,
+            stride=1,
+            padding=config.conv_kernel - 1,
+            use_bias=config.use_conv_bias,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
-            use_bias=config.use_conv_bias,
         )
 
         self.activation = config.hidden_act
