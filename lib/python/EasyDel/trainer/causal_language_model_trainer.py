@@ -563,7 +563,6 @@ class CausalLanguageModelTrainer(BaseTrainer):
                             trained_tokens = (
                                     current_step *
                                     self.arguments.total_batch_size *
-                                    self.arguments.gradient_accumulation_steps *
                                     self.arguments.max_sequence_length
                             )
                             information_queries = {}

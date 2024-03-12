@@ -204,19 +204,34 @@ class EasyDelState(struct.PyTreeNode):
         tx_init["scheduler"] = cls.search("scheduler", tx_init, "none")
         tx_init["steps"] = cls.search("steps", tx_init, 1e6)
 
+        def fix_dict_types(input_dict):
+            fixed_dict = input_dict.copy()
+
+            # Fix extra_optimizer_kwargs
+            if 'extra_optimizer_kwargs' in fixed_dict:
+                fixed_dict['extra_optimizer_kwargs'] = eval(fixed_dict['extra_optimizer_kwargs'])
+
+            # Fix gradient_accumulation_steps
+            if 'gradient_accumulation_steps' in fixed_dict:
+                fixed_dict['gradient_accumulation_steps'] = int(fixed_dict['gradient_accumulation_steps'])
+
+            # Fix steps
+            if 'steps' in fixed_dict:
+                fixed_dict['steps'] = int(fixed_dict['steps'])
+
+            # Fix warmup_steps
+            if 'warmup_steps' in fixed_dict:
+                fixed_dict['warmup_steps'] = int(fixed_dict['warmup_steps'])
+
+            return fixed_dict
+
         try:
             tx, sc = get_optimizer_and_scheduler(
                 **tx_init
             )
         except TypeError:
-            termcolor.cprint(
-                "Couldn't load past optimizer State initializing new one with default Optimizer and Scheduler",
-                color="red", force_color=True
-            )
             tx, sc = get_optimizer_and_scheduler(
-                optimizer="adamw",
-                scheduler="none",
-                steps=10000,
+                **fix_dict_types(tx_init)
             )
         if hyperparameters is None:
             hyperparameters = {}
@@ -224,7 +239,7 @@ class EasyDelState(struct.PyTreeNode):
         if module_config is not None:
             hyperparameters = cls.create_hyperparameters(module_config.model_type)
             cls.safe_dict(module_config.__dict__)
-
+        # TODO:PBR
         return cls(
             step=step,
             apply_fn=apply_fn,
@@ -267,16 +282,33 @@ class EasyDelState(struct.PyTreeNode):
             shard_fns=state_shard_fns,
             verbose=verbose,
         )
-
         hyperparameters = checkpoint.get("hyperparameters")
         cfg, module, convertor = get_modules_by_type(model_type=cls.get_model_type(hyperparameters))
-        module_config = checkpoint.pop("module_config", None)
+        checkpoint.pop("module_config", None)
         if checkpoint["module_config_args"] is not None:
-            module_config = cfg.from_dict(checkpoint.get("module_config_args", {}))
-
+            cfg_behave = cls.unsafe_dict(checkpoint.get("module_config_args", {}))
+            cfg_behave.pop("id2label", None)
+            cfg_behave.pop("label2id", None)
+            cfg_behave.pop("torch_dtype", None)
+            for k, v in cfg_behave.items():
+                if v is None:
+                    cfg_behave.pop(k, None)
+                elif v == "None":
+                    cfg_behave[k] = None
+                elif isinstance(v, str):
+                    if v.startswith("{") or v.startswith("(") or v.startswith("PartitionSpec"):
+                        cfg_behave[k] = eval(v)
+            module_config = cfg.from_dict(cfg_behave)
+            module_in = module(
+                config=module_config
+            )
+        else:
+            raise TypeError(
+                "Om seems like i couldn't read model correctly ;("
+            )
         state = cls.load(
-            apply_fn=module.__call__,
-            module=module,
+            apply_fn=module_in.__call__,
+            module=module_in,
             module_config=module_config,
             **checkpoint
         )
@@ -319,6 +351,14 @@ class EasyDelState(struct.PyTreeNode):
             state = self.replace(
                 opt_state=None
             )
+        state = state.replace(
+            module_config_args={
+                k: v for k, v in state.module_config.__dict__.items() if
+                isinstance(
+                    v, (int, bool, float)
+                )
+            }
+        )
         fjformer.CheckpointManager.save_state_to_file(
             state=state,
             path=os.path.join(checkpoint_dir, filename) if checkpoint_dir is not None else filename,
@@ -550,9 +590,12 @@ class EasyDelState(struct.PyTreeNode):
     def unsafe_dict(dictionary: dict):
         result = {}
         for k in list(dictionary.keys()):
-            v = dictionary[k]
-            key, value = break_format(key=k, value=v)
-            result[key] = value
+            if VALUE_SEP in k and TYPE_SEP in k:
+                v = dictionary[k]
+                key, value = break_format(key=k, value=v)
+                result[key] = value
+            else:
+                result[k] = dictionary[k]
         return result
 
     def __str__(self):
