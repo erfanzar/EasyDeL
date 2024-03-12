@@ -392,6 +392,9 @@ class CausalLanguageModelTrainer(BaseTrainer):
                             init_optimizer_state=True,
                             checkpoint_path=self.checkpoint_path,
                         )
+                        sharded_state = sharded_state.replace(
+                            tx=self.tx,
+                        )
                     if self.arguments.remove_ckpt_after_load:
                         os.remove(self.checkpoint_path)
                 elif model_parameters is not None and self.checkpoint_path is None:
