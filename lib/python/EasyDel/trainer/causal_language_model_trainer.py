@@ -1,5 +1,6 @@
 import copy
 import dataclasses
+from glob import glob
 import os
 import sys
 import time
@@ -446,13 +447,23 @@ class CausalLanguageModelTrainer(BaseTrainer):
                 state.step
             )
         )
+
+        checkpoint_dir = os.path.join(self.arguments.save_dir, self.arguments.model_name)
+        filename_extension = ".easy"
+        if self.arguments.save_total_limit:
+            checkpoint_files = glob(os.path.join(checkpoint_dir, f"*{filename_extension}"))
+            checkpoint_files.sort(key=os.path.getmtime)
+            for old_checkpoint in checkpoint_files[:-self.arguments.save_total_limit]:
+                os.remove(old_checkpoint)
+                termcolor.cprint(f"Removed old checkpoint: {old_checkpoint}", color="red", force_color=True)
+
         checkpoint_name = f"{self.arguments.model_name}-S{step}"
         filename = f"{checkpoint_name}_{step}" if milestone else f"{checkpoint_name}"
         filename += ".easy"
         termcolor.cprint(f"Saving Model {filename}.", color="cyan", force_color=True)
         state.save_state(
             filename=filename,
-            checkpoint_dir=os.path.join(self.arguments.save_dir, self.arguments.model_name),
+            checkpoint_dir=checkpoint_dir,
             gather_fns=gather_fns,
             float_dtype=self.dtype,
             verbose=self.arguments.verbose,
@@ -649,7 +660,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
                 gather_fns=gather_fns,
                 checkpoint_manager=self.checkpoint_manager,
             )
-            if self.arguments.save_steps is None and self.arguments.do_last_save:
+            if self.arguments.save_steps is None or self.arguments.do_last_save:
                 shard_fns, gather_fns = make_shard_and_gather_fns(
                     match_partition_rules(
                         self.config.get_partition_rules(
