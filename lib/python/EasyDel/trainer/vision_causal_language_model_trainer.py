@@ -1,5 +1,6 @@
 import copy
 import dataclasses
+import os
 import sys
 import time
 import typing
@@ -28,6 +29,8 @@ from ..etils.easystate import EasyDelState
 from .base_trainer import TrainerConfigureFunctionFuncOutput
 from .causal_language_model_trainer import CausalLanguageModelTrainer
 from flax.struct import dataclass
+
+from ..utils import prefix_print
 
 
 @dataclass
@@ -355,6 +358,131 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
             checkpoint_manager=checkpoint_manager,
             initialize_state_function=initialize_state_function
         )
+
+    def initialize_state(
+            self,
+            model_parameters: Optional[flax.core.FrozenDict] = None,
+            state: Optional[EasyDelState] = None,
+    ) -> Tuple[EasyDelState, Mapping[str, Callable], Mapping[str, Callable]]:
+        if model_parameters is None and state is None and self.rapture is None and self.checkpoint_path is None:
+            raise RuntimeError(
+                "You are passing `model_parameters=None`, `state=None`, and `checkpoint_path=None` and also you are not"
+                " using LoRA, if you are "
+                "Using LoRA make sure to pass parameters and Rapture Config correctly otherwise pass the "
+                "model_parameters or state."
+            )
+        if model_parameters is None and state is None:
+            model_parameters = self.lora_parameters
+        with self.mesh:
+            shard_fns, gather_fns = make_shard_and_gather_fns(
+                self.state_partition_spec,
+                dtype_specs=self.dtype
+            )
+            if state is not None:
+                sharded_state = state
+                params = sharded_state.params if not self.arguments.do_shard_fns else jax.tree_util.tree_map(
+                    lambda f, x: f(x),
+                    shard_fns.params,
+                    sharded_state.params
+                )
+                sharded_state.params = params
+                if sharded_state.opt_state is None:
+                    prefix_print(
+                        "Action", "Optimizer State is not Found!, initializing one."
+                    )
+                    with jax.default_device(self.arguments.offload_device):
+                        sharded_state = sharded_state.init_opt_state()
+                        opt_state = sharded_state.opt_state if not self.arguments.do_shard_fns else jax.tree_util.tree_map(
+                            lambda f, x: f(x),
+                            shard_fns.opt_state,
+                            sharded_state.opt_state
+                        )
+                        sharded_state = sharded_state.replace(
+                            opt_state=opt_state
+                        )
+            elif self.finetune:
+
+                if model_parameters is None and self.checkpoint_path is not None:
+                    prefix_print(
+                        "Action", f"Loading Model From {self.checkpoint_path}"
+                    )
+                    with jax.default_device(self.arguments.offload_device):
+                        sharded_state = EasyDelState.load_state(
+                            verbose=self.arguments.verbose,
+                            state_shard_fns=shard_fns,
+                            init_optimizer_state=True,
+                            checkpoint_path=self.checkpoint_path,
+                        )
+                        sharded_state = sharded_state.replace(
+                            tx=self.tx,
+                        )
+                        state_shape = jax.eval_shape(lambda: sharded_state)
+                        state_partition_spec = match_partition_rules(
+                            self.config.get_partition_rules(
+                                fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
+                            ) if self.arguments.custom_rule is None else self.arguments.custom_rule,
+                            state_shape
+                        )
+                        sharded_train_step_function = pjit(
+                            create_vision_casual_language_model_train_step(
+                                partition_spec=self.arguments.step_partition_spec,
+                            ),
+                            in_shardings=(state_partition_spec, PartitionSpec()),
+                            out_shardings=(state_partition_spec, PartitionSpec(), PartitionSpec()),
+                            donate_argnums=(0, 0),
+                        )
+
+                        sharded_eval_step_function = pjit(
+                            create_vision_casual_language_model_evaluation_step(self.arguments.step_partition_spec),
+                            in_shardings=(state_partition_spec, PartitionSpec()),
+                            out_shardings=(PartitionSpec(), PartitionSpec()),
+                            donate_argnums=(0, 0),
+                        )
+
+                        self.state_partition_spec = state_partition_spec
+                        self.state_shape = state_shape
+                        self.sharded_train_step_function = sharded_train_step_function
+                        self.sharded_eval_step_function = sharded_eval_step_function
+
+                    if self.arguments.remove_ckpt_after_load:
+                        os.remove(self.checkpoint_path)
+                elif model_parameters is not None and self.checkpoint_path is None:
+                    prefix_print(
+                        "Action", f"Sharding Passed Parameters"
+                    )
+                    from flax.core import unfreeze
+                    if not isinstance(model_parameters, flax.core.FrozenDict):
+                        prefix_print(
+                            "Warning",
+                            "Model Parameters should be like FrozenDict({'params': params}) make sure to "
+                            "pass as type FrozenDict in case of not getting UnExcepted Errors "
+                        )
+
+                    model_parameters = model_parameters if not self.arguments.do_shard_fns else jax.tree_util.tree_map(
+                        lambda f, x: f(x),
+                        shard_fns.params,
+                        model_parameters,
+                    )
+                    sharded_state = self.create_sharded_state_from_params_function(model_parameters)
+                elif model_parameters is not None and self.checkpoint_path is not None:
+                    raise EasyDelTimerError(
+                        "You can't pass `model_parameters` and `checkpoint_path` at same time"
+                    )
+                else:
+                    raise EasyDelTimerError(
+                        "You should pass `model_parameters` or `checkpoint_path` to trainer in order to load model"
+                    )
+            else:
+                sharded_state = self.initialize_state_function()
+                params = sharded_state.params if not self.arguments.do_shard_fns else jax.tree_util.tree_map(
+                    lambda f, x: f(x),
+                    shard_fns.params,
+                    sharded_state.params
+                )
+                sharded_state.params = params
+
+            self.sharded_state = sharded_state
+            return sharded_state, shard_fns, gather_fns
 
     def train(
             self,

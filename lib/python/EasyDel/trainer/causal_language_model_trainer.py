@@ -54,7 +54,7 @@ def create_casual_language_model_train_step(
     :param gradient_accumulation_steps: int : gradient accumulation step size from arguments
     :return: A casual_language_model_train_step function that takes in the current state of the model,
     """
-    assert gradient_accumulation_steps > 0, "gradient_accumulation_steps must be greater than 0" # Ignore
+    assert gradient_accumulation_steps > 0, "gradient_accumulation_steps must be greater than 0"  # Ignore
 
     def casual_language_model_train_step(state, batch):
         """
@@ -395,6 +395,36 @@ class CausalLanguageModelTrainer(BaseTrainer):
                         sharded_state = sharded_state.replace(
                             tx=self.tx,
                         )
+                        state_shape = jax.eval_shape(lambda: sharded_state)
+                        state_partition_spec = match_partition_rules(
+                            self.config.get_partition_rules(
+                                fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
+                            ) if self.arguments.custom_rule is None else self.arguments.custom_rule,
+                            state_shape
+                        )
+                        sharded_train_step_function = pjit(
+                            create_casual_language_model_train_step(
+                                partition_spec=self.arguments.step_partition_spec,
+                                label_smoothing_factor=self.arguments.label_smoothing_factor,
+                                z_loss=self.arguments.z_loss,
+                            ),
+                            in_shardings=(state_partition_spec, PartitionSpec()),
+                            out_shardings=(state_partition_spec, PartitionSpec(), PartitionSpec()),
+                            donate_argnums=(0, 0),
+                        )
+
+                        sharded_eval_step_function = pjit(
+                            create_casual_language_model_evaluation_step(self.arguments.step_partition_spec),
+                            in_shardings=(state_partition_spec, PartitionSpec()),
+                            out_shardings=(PartitionSpec(), PartitionSpec()),
+                            donate_argnums=(0, 0),
+                        )
+
+                        self.state_partition_spec = state_partition_spec
+                        self.state_shape = state_shape
+                        self.sharded_train_step_function = sharded_train_step_function
+                        self.sharded_eval_step_function = sharded_eval_step_function
+
                     if self.arguments.remove_ckpt_after_load:
                         os.remove(self.checkpoint_path)
                 elif model_parameters is not None and self.checkpoint_path is None:
