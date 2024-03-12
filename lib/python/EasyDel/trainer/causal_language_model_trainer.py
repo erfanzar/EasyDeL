@@ -338,9 +338,10 @@ class CausalLanguageModelTrainer(BaseTrainer):
             model_parameters: Optional[flax.core.FrozenDict] = None,
             state: Optional[EasyDelState] = None,
     ) -> Tuple[EasyDelState, Mapping[str, Callable], Mapping[str, Callable]]:
-        if model_parameters is None and state is None and self.rapture is None:
+        if model_parameters is None and state is None and self.rapture is None and self.checkpoint_path is None:
             raise RuntimeError(
-                "You are passing `model_parameters=None` and `state=None` and also you are not using LoRA if you are "
+                "You are passing `model_parameters=None`, `state=None`, and `checkpoint_path=None` and also you are not"
+                " using LoRA, if you are "
                 "Using LoRA make sure to pass parameters and Rapture Config correctly otherwise pass the "
                 "model_parameters or state."
             )
