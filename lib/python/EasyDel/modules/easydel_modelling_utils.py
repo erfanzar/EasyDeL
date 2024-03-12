@@ -113,6 +113,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
         self.use_sharded_kv_caching = use_sharded_kv_caching
         self.use_scan_mlp = use_scan_mlp
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
+        
         super().__init__(**kwargs)
 
     @staticmethod
