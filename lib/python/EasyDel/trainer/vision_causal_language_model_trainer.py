@@ -363,7 +363,7 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
             self,
             model_parameters: Optional[flax.core.FrozenDict] = None,
             state: Optional[EasyDelState] = None,
-    ) -> Tuple[EasyDelState, Mapping[str, Callable], Mapping[str, Callable]]:
+    ) -> typing.Tuple[EasyDelState, Mapping[str, Callable], Mapping[str, Callable]]:
         if model_parameters is None and state is None and self.rapture is None and self.checkpoint_path is None:
             raise RuntimeError(
                 "You are passing `model_parameters=None`, `state=None`, and `checkpoint_path=None` and also you are not"
@@ -413,9 +413,9 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
                             init_optimizer_state=True,
                             checkpoint_path=self.checkpoint_path,
                         )
-                        sharded_state = sharded_state.replace(
-                            tx=self.tx,
-                        )
+                        # sharded_state = sharded_state.replace(
+                        #     tx=self.tx,
+                        # )
                         state_shape = jax.eval_shape(lambda: sharded_state)
                         state_partition_spec = match_partition_rules(
                             self.config.get_partition_rules(
