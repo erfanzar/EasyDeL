@@ -111,6 +111,7 @@ class TrainArguments(
             merge_lora_rapture_parameters: bool = True,
             state_apply_fn_kwarguments_to_model: Optional[dict] = None,
             remove_unused_columns: bool = True,
+            force_batch_and_gradient_accumulation_steps_calculation: bool = False,
             **kwargs
     ):
         """
@@ -127,8 +128,7 @@ class TrainArguments(
     :param max_training_steps: Optional[int]: Set the maximum number of steps to train for
     :param optimizer: AVAILABLE_OPTIMIZERS: Specify the optimizer used to train the model
     :param scheduler: AVAILABLE_SCHEDULERS: Set the learning rate scheduler
-    :param learning_rate: Union[int: Set the learning rate for the optimizer
-    :param float]: Set the learning rate
+    :param learning_rate: Union[int, float] : Set the learning rate for the optimizer
     :param learning_rate_end: Optional[float]: Set the learning rate at the end of training
     :param gradient_accumulation_steps: int: Accumulate gradients over multiple batches
     :param weight_decay: float: Specify the weight decay to be used by the optimizer
@@ -183,6 +183,8 @@ class TrainArguments(
     :param state_apply_fn_kwarguments_to_model: Optional[dict]: state_apply_fn_kwarguments_to_model is a dictionary that
     be used to apply the parameters and extra things that you want to deliver to model.
     :param remove_unused_columns: bool: when ever to remove the unused data columns from dataset
+    :param force_batch_and_gradient_accumulation_steps_calculation: bool: whether to force batch and gradient to be
+    applied as total batch_size (e.g total_batch_size = total_batch_size * gradient_accumulation_steps be applied)
     :param **kwargs: Pass keyword, variable-length argument list
     :return: Nothing
         """
@@ -222,13 +224,15 @@ class TrainArguments(
             track_memory = False
 
         available_backends = len(jax.devices(backend))
-
-        total_batch_size *= gradient_accumulation_steps
+        if force_batch_and_gradient_accumulation_steps_calculation:
+            total_batch_size *= gradient_accumulation_steps  # Changed and will be handled inside FJFormer
 
         array_devices = jnp.ones((available_backends, 1)).reshape(sharding_array)
 
         JaxDistributedConfig.initialize(jax_distributed_config)
-
+        self.force_batch_and_gradient_accumulation_steps_calculation = (
+            force_batch_and_gradient_accumulation_steps_calculation
+        )
         self.available_backends = available_backends
         self.array_devices_shape = array_devices.shape
         self.model_huggingface_repo_id = model_huggingface_repo_id
