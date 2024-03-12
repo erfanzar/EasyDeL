@@ -30,14 +30,16 @@ from fjformer import (
     with_sharding_constraint
 )
 from ..etils.errors import EasyDelTimerError
-import chex
-from typing import Any, Optional, Union, Tuple, Callable, Mapping
+from typing import Any, Optional, Tuple, Callable, Mapping
 from ..etils.easystate import EasyDelState
 from .base_trainer import BaseTrainer, TrainerConfigureFunctionFuncOutput
 
 
 def create_casual_language_model_train_step(
-    partition_spec=PartitionSpec(("dp", "fsdp"), "sp"), label_smoothing_factor=0.0, z_loss=0.0
+        partition_spec=PartitionSpec(("dp", "fsdp"), "sp"),
+        label_smoothing_factor=0.0,
+        z_loss=0.0,
+        gradient_accumulation_steps: int = 1
 ):
     """
     The create_casual_language_model_train_step function is a training step function that takes in the current state
@@ -48,8 +50,10 @@ def create_casual_language_model_train_step(
     :param label_smoothing_factor: A float in [0, 1] specifying the amount of label smoothing to apply,
            where 0 means no smoothing.
     :param z_loss: A regularization term that adds a penalty for large weights, where 0 means no regularization.
+    :param gradient_accumulation_steps: int : gradient accumulation step size from arguments
     :return: A casual_language_model_train_step function that takes in the current state of the model,
     """
+    assert gradient_accumulation_steps > 0, "gradient_accumulation_steps must be greater than 0" # Ignore
 
     def casual_language_model_train_step(state, batch):
         """
