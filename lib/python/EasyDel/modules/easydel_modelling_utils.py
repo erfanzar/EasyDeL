@@ -1,3 +1,5 @@
+import warnings
+
 import chex
 import flax
 from jax.experimental.mesh_utils import create_device_mesh
@@ -113,7 +115,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
         self.use_sharded_kv_caching = use_sharded_kv_caching
         self.use_scan_mlp = use_scan_mlp
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
-        
+
         super().__init__(**kwargs)
 
     @staticmethod
@@ -131,6 +133,20 @@ class EasyDelPretrainedConfig(PretrainedConfig):
         """
         array_devices = jax.numpy.ones(
             (len(jax.devices() if backend == "" else jax.devices(backend)), 1))
+        if isinstance(axis_dims, str):
+            axis_dims = eval(axis_dims)
+            warnings.warn(
+                "axis_dims argument is not a Sequence of int and it's an string. "
+                "(backbone Warning in EasyDeLModuleConfig)\n"
+                f"\tchanged to {axis_dims}"
+            )
+        if isinstance(axis_names, str):
+            axis_names = eval(axis_names)
+            warnings.warn(
+                "axis_names argument is not a Sequence of strings and it's an string class. "
+                "(backbone Warning in EasyDeLModuleConfig)\n"
+                f"\tchanged to {axis_names}"
+            )
         resh = array_devices.reshape(axis_dims).shape
 
         return Mesh(
@@ -148,9 +164,14 @@ class EasyDelPretrainedConfig(PretrainedConfig):
 
         """
         return self.create_mesh(
-            axis_dims=[v for k, v in self.axis_dims.items()] if isinstance(self.axis_dims, dict) else self.axis_dims,
-            axis_names=[v for k, v in self.axis_names.items()] if isinstance(self.axis_names,
-                                                                             dict) else self.axis_names,
+            axis_dims=[v for k, v in self.axis_dims.items()] if isinstance(
+                self.axis_dims,
+                dict
+            ) else self.axis_dims,
+            axis_names=[v for k, v in self.axis_names.items()] if isinstance(
+                self.axis_names,
+                dict
+            ) else self.axis_names,
             backend=(self.backend if self.backend is not None else "") if hasattr(
                 self, 'backend') else ""
         )
