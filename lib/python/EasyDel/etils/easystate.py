@@ -1,6 +1,6 @@
 import copy
 import os
-from typing import Any, Callable, Optional, Mapping, Sequence, Tuple
+from typing import Any, Callable, Optional, Mapping, Sequence, Tuple, Union
 
 import fjformer
 import jax.tree_util
@@ -14,6 +14,7 @@ from .auto_tx import get_optimizer_and_scheduler
 from ..etils import AVAILABLE_SCHEDULERS, AVAILABLE_OPTIMIZERS, EasyDelRuntimeError
 from ..modules.easydel_modelling_utils import EasyDelFlaxPretrainedModel, EasyDelPretrainedConfig
 from jax.sharding import Mesh, PartitionSpec
+from jax import numpy as jnp
 
 TYPE_SEP = "<*TYPE*>"
 VALUE_SEP = "<*VALUE*>"
@@ -239,7 +240,6 @@ class EasyDelState(struct.PyTreeNode):
         if module_config is not None:
             hyperparameters = cls.create_hyperparameters(module_config.model_type)
             cls.safe_dict(module_config.__dict__)
-        # TODO:PBR
         return cls(
             step=step,
             apply_fn=apply_fn,
@@ -258,9 +258,13 @@ class EasyDelState(struct.PyTreeNode):
     def load_state(
             cls,
             checkpoint_path: str | os.PathLike,
+            dtype: jnp.dtype = jnp.float32,
+            param_dtype: jnp.dtype = jnp.float32,
+            precision: Optional[Union[str, jax.lax.Precision]] = None,
             init_optimizer_state: bool = False,
             state_shard_fns: Optional[Mapping[str, Callable]] = None,
-            verbose: bool = False
+            verbose: bool = False,
+
     ):
 
         """    
@@ -268,6 +272,9 @@ class EasyDelState(struct.PyTreeNode):
         
         :param cls: Create an instance of the class
         :param checkpoint_path: str | os.PathLike: Specify the path to the checkpoint file
+        :param dtype: jnp.dtype: The dtype of the model
+        :param param_dtype: jnp.dtype: The dtype of the model parameters
+        :param precision: Optional[Union[str, jax.lax.Precision]]: precision of the model
         :param init_optimizer_state: bool: Initialize the optimizer if it's not Initialized yet (if it Initialized the option
         will be ignored )
         :param state_shard_fns: Optional[Mapping[str,Callable]]: Specify the function that will be used 
@@ -300,7 +307,10 @@ class EasyDelState(struct.PyTreeNode):
                         cfg_behave[k] = eval(v)
             module_config = cfg.from_dict(cfg_behave)
             module_in = module(
-                config=module_config
+                config=module_config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision
             )
         else:
             raise TypeError(
@@ -518,7 +528,10 @@ class EasyDelState(struct.PyTreeNode):
                     checkpoint_path=checkpoint_path,
                     init_optimizer_state=init_optimizer_state,
                     verbose=verbose,
-                    state_shard_fns=state_shard_fns
+                    state_shard_fns=state_shard_fns,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision
                 )
         if init_optimizer_state:
             with jax.default_device(device):
