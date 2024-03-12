@@ -115,78 +115,77 @@ class TrainArguments(
             **kwargs
     ):
         """
-    The __init__ function is called when the class is instantiated.
-    It sets up the attributes of an object, which are sometimes called fields or properties.
-    The __init__ function can accept arguments, just like a normal function.
+The __init__ function is called when the class is instantiated.
+It sets up the attributes of an object, which are sometimes called fields or properties.
+The __init__ function can accept arguments, just like a normal function.
 
-    :param self: Represent the instance of the class
-    :param model_name: str: Specify the model name
-    :param num_train_epochs: int: Set the number of epochs for training
-    :param model_huggingface_repo_id: Optional[str]: Load a pretrained model from the huggingface model hub
-    :param model_class: Optional[EasyDelFlaxPretrainedModel]: Pass a model class to the trainer
-    :param total_batch_size: int: Set the batch size of the model
-    :param max_training_steps: Optional[int]: Set the maximum number of steps to train for
-    :param optimizer: AVAILABLE_OPTIMIZERS: Specify the optimizer used to train the model
-    :param scheduler: AVAILABLE_SCHEDULERS: Set the learning rate scheduler
-    :param learning_rate: Union[int, float] : Set the learning rate for the optimizer
-    :param learning_rate_end: Optional[float]: Set the learning rate at the end of training
-    :param gradient_accumulation_steps: int: Accumulate gradients over multiple batches
-    :param weight_decay: float: Specify the weight decay to be used by the optimizer
-    :param label_smoothing_factor: float: Set the label smoothing factor to be used by the loss function
-    :param z_loss: float: Set the z loss factor to be used by the loss function
-    :param gradient_checkpointing: AVAILABLE_GRADIENT_CHECKPOINTS: Determine how to use gradient checkpointing
-    :param max_sequence_length: Optional[int]: Set the maximum length of the input sequence
-    :param sharding_array: Union[tuple,int]: Specify the mesh of devices to use for training
-    :param is_fine_tuning: bool: Tell the model whether or not to initialize the weights of
-    :param do_train: bool: Indicate whether to train the model or not
-    :param do_eval: bool: Determine whether to run evaluation on the validation set after training
-    :param do_test: Optional[bool]: Determine if the model should be tested
-    :param train_on_inputs: bool: Use input_ids instead of labels, overrides ignored (-100) tokens in the labels
-    :param backend: Optional[str]: Specify the backend of jax
-    :param extra_optimizer_kwargs: dict: Pass extra arguments to the optimizer
-    :param save_steps: Optional[int]: Save the model after every n steps
-    :param save_dir: str: Define the directory where the checkpoints will be saved
-    :param use_pjit_attention_force: bool: Force the use of pjit for attention layers
-    :param dtype: jnp.dtype: Set the dtype of the model parameters
-    :param param_dtype: jnp.dtype: Specify the data type of the model parameters
-    :param fully_sharded_data_parallel: bool: Determine if the model should be fully fsdp or not
-    :param use_wandb: bool: Enable or disable the wandb logging
-    :param custom_rule: Mapping[str, PartitionSpec]: Specify the partitioning rules of the model
-    :param extra_configs: Optional[dict]: Pass extra configurations to the model class
-    :param ids_to_pop_from_dataset: Optional[list]: Remove some of the ids from the dataset
-    :param remove_ckpt_after_load: bool: Remove the checkpoint after loading it
-    :param configs_to_initialize_model_class: Optional[dict]: Pass extra configurations to the model class
-    :param do_last_save: bool: Save the model after training is complete
-    :param model_parameters: Optional[dict]: Pass the model parameters to the model class
-    :param do_shard_fns: bool: Shard the model functions across devices
-    :param track_memory: bool: Track the memory usage of the model
-    :param loss_re_mat: str: Specify the regular expression to match the loss function name
-    :param loss_chunk: int: Chunk the loss to avoid memory overflow
-    :param truncation_mode: typing.Literal["keep_end", "keep_start"]: Determine if the input is left padded or not and
-    which side of the array should remain in case of using maximum padding.
-    :param warmup_steps: int: Specify the number of steps to warm up the learning rate
-    :param init_input_shape: Tuple[int, int]: Initialize the model with a shape that is not (batch_size, length)
-    :param step_partition_spec: PartitionSpec: Partition the model for training
-    :param training_time: Optional[str]: Set a time limit for the training process
-    :param dataloader_num_workers: Optional[int]: Set the number of workers used by pytorch's
-    :param dataloader_pin_memory: Optional[bool]: Pin the memory of the dataloader
-    :param jax_distributed_config: Optional[dict]: Configure the jax distributed backend
-    :param log_all_workers: bool: Log all workers in wandb,
-    :param wandb_entity: Optional[str]: Specify the entity to use when logging to weights &amp; biases
-    :param save_optimizer_state : bool: when ever to save optimizer state and other args in checkpoint
-    :param step_start_point: Optional[int]: start training from given step for example instead of starting training from
-    step 0 it will start from 20000 and leave the data behind
-    :param verbose: bool: when ever to turn verbose mode of or on
-    :param offload_device: jax.Device: device to be used to offload parameters on
-    :param rapture_config: Optional[EasyDeLXRaptureConfig]: LoRA Config for models
-    :param merge_lora_rapture_parameters: bool: whenever to merge lora parameters with original parameters before saving
-    :param state_apply_fn_kwarguments_to_model: Optional[dict]: state_apply_fn_kwarguments_to_model is a dictionary that
-    be used to apply the parameters and extra things that you want to deliver to model.
-    :param remove_unused_columns: bool: when ever to remove the unused data columns from dataset
-    :param force_batch_and_gradient_accumulation_steps_calculation: bool: whether to force batch and gradient to be
-    applied as total batch_size (e.g total_batch_size = total_batch_size * gradient_accumulation_steps be applied)
-    :param **kwargs: Pass keyword, variable-length argument list
-    :return: Nothing
+:param self: Represent the instance of the class
+:param model_name: str: Specify the model name
+:param num_train_epochs: int: Set the number of epochs for training
+:param model_huggingface_repo_id: Optional[str]: Load a pretrained model from the huggingface model hub
+:param model_class: Optional[EasyDelFlaxPretrainedModel]: Pass a model class to the trainer
+:param total_batch_size: int: Set the batch size of the model
+:param max_training_steps: Optional[int]: Set the maximum number of steps to train for
+:param optimizer: AVAILABLE_OPTIMIZERS: Specify the optimizer used to train the model
+:param scheduler: AVAILABLE_SCHEDULERS: Set the learning rate scheduler
+:param learning_rate: Union[int, float] : Set the learning rate for the optimizer
+:param learning_rate_end: Optional[float]: Set the learning rate at the end of training
+:param gradient_accumulation_steps: int: Accumulate gradients over multiple batches
+:param weight_decay: float: Specify the weight decay to be used by the optimizer
+:param label_smoothing_factor: float: Set the label smoothing factor to be used by the loss function
+:param z_loss: float: Set the z loss factor to be used by the loss function
+:param gradient_checkpointing: AVAILABLE_GRADIENT_CHECKPOINTS: Determine how to use gradient checkpointing
+:param max_sequence_length: Optional[int]: Set the maximum length of the input sequence
+:param sharding_array: Union[tuple,int]: Specify the mesh of devices to use for training
+:param is_fine_tuning: bool: Tell the model whether or not to initialize the weights of
+:param do_train: bool: Indicate whether to train the model or not
+:param do_eval: bool: Determine whether to run evaluation on the validation set after training
+:param do_test: Optional[bool]: Determine if the model should be tested
+:param train_on_inputs: bool: Use input_ids instead of labels, overrides ignored (-100) tokens in the labels
+:param backend: Optional[str]: Specify the backend of jax
+:param extra_optimizer_kwargs: dict: Pass extra arguments to the optimizer
+:param save_steps: Optional[int]: Save the model after every n steps
+:param save_dir: str: Define the directory where the checkpoints will be saved
+:param use_pjit_attention_force: bool: Force the use of pjit for attention layers
+:param dtype: jnp.dtype: Set the dtype of the model parameters
+:param param_dtype: jnp.dtype: Specify the data type of the model parameters
+:param fully_sharded_data_parallel: bool: Determine if the model should be fully fsdp or not
+:param use_wandb: bool: Enable or disable the wandb logging
+:param custom_rule: Mapping[str, PartitionSpec]: Specify the partitioning rules of the model
+:param extra_configs: Optional[dict]: Pass extra configurations to the model class
+:param ids_to_pop_from_dataset: Optional[list]: Remove some of the ids from the dataset
+:param remove_ckpt_after_load: bool: Remove the checkpoint after loading it
+:param configs_to_initialize_model_class: Optional[dict]: Pass extra configurations to the model class
+:param do_last_save: bool: Save the model after training is complete
+:param model_parameters: Optional[dict]: Pass the model parameters to the model class
+:param do_shard_fns: bool: Shard the model functions across devices
+:param track_memory: bool: Track the memory usage of the model
+:param loss_re_mat: str: Specify the regular expression to match the loss function name
+:param loss_chunk: int: Chunk the loss to avoid memory overflow
+:param truncation_mode: typing.Literal["keep_end", "keep_start"]: Determine if the input is left padded or not and
+which side of the array should remain in case of using maximum padding.
+:param warmup_steps: int: Specify the number of steps to warm up the learning rate
+:param init_input_shape: Tuple[int, int]: Initialize the model with a shape that is not (batch_size, length)
+:param step_partition_spec: PartitionSpec: Partition the model for training
+:param training_time: Optional[str]: Set a time limit for the training process
+:param dataloader_num_workers: Optional[int]: Set the number of workers used by pytorch's
+:param dataloader_pin_memory: Optional[bool]: Pin the memory of the dataloader
+:param jax_distributed_config: Optional[dict]: Configure the jax distributed backend
+:param log_all_workers: bool: Log all workers in wandb,
+:param wandb_entity: Optional[str]: Specify the entity to use when logging to weights &amp; biases
+:param save_optimizer_state : bool: when ever to save optimizer state and other args in checkpoint
+:param step_start_point: Optional[int]: start training from given step for example instead of starting training from
+step 0 it will start from 20000 and leave the data behind
+:param verbose: bool: when ever to turn verbose mode of or on
+:param offload_device: jax.Device: device to be used to offload parameters on
+:param rapture_config: Optional[EasyDeLXRaptureConfig]: LoRA Config for models
+:param merge_lora_rapture_parameters: bool: whenever to merge lora parameters with original parameters before saving
+:param state_apply_fn_kwarguments_to_model: Optional[dict]: state_apply_fn_kwarguments_to_model is a dictionary that
+be used to apply the parameters and extra things that you want to deliver to model.
+:param remove_unused_columns: bool: when ever to remove the unused data columns from dataset
+:param force_batch_and_gradient_accumulation_steps_calculation: bool: whether to force batch and gradient to be
+applied as total batch_size (e.g total_batch_size = total_batch_size * gradient_accumulation_steps be applied)
+:param **kwargs: Pass keyword, variable-length argument list
         """
         super().__init__()
 
