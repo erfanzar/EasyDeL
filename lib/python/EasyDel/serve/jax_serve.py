@@ -78,7 +78,7 @@ class JAXServerConfig:
     mesh_axes_shape: Sequence[int] = (1, -1, 1, 1)
     generation_ps: PartitionSpec = PartitionSpec("dp", "fsdp")
 
-    dtype: str = "fp16"
+    dtype: jnp.dtype | str = "fp16"
 
     stream_tokens_for_gradio: bool = True
     use_prefix_tokenizer: bool = True

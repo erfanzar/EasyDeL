@@ -757,6 +757,7 @@ class FlaxMambaModule(nn.Module):
             return_dict: Optional[bool] = None,
             **kwargs,
     ) -> Union[Tuple, MambaOutput]:
+
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
@@ -965,6 +966,8 @@ class FlaxMambaPretrainedModel(EasyDelFlaxPretrainedModel):
             return_dict: Optional[bool] = None,
             extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
             add_params_field: bool = False,
+            attention_mask: Optional[chex.Array] = None,  # Ignored(we are using an SSM model not attention)
+            use_cache: bool = False,
             **kwargs
     ):
         """
@@ -992,7 +995,8 @@ class FlaxMambaPretrainedModel(EasyDelFlaxPretrainedModel):
         batch_size, sequence_length = input_ids.shape
 
         assert sequence_length <= self.config.max_position_embeddings, "Maximum Position Embedding Reached !"
-
+        if cache_params is not None:
+            assert isinstance(cache_params, FlaxMambaCache), f"Wrong cache input_type of {type(cache_params)}"
         rngs = {}
         if dropout_rng is not None:
             rngs["dropout"] = dropout_rng
@@ -1017,7 +1021,7 @@ class FlaxMambaPretrainedModel(EasyDelFlaxPretrainedModel):
             inputs_embeds,
             cache_params,
             train,
-            False,
+            use_cache,
             output_hidden_states,
             return_dict,
             rngs=rngs,
@@ -1038,24 +1042,15 @@ class FlaxMambaForCausalLM(FlaxMambaPretrainedModel):
             model_kwargs: Dict[str, Any],
             **kwargs
     ) -> Dict[str, Any]:
-        model_kwargs["cache_params"] = outputs["cache_params"]
+        model_kwargs["cache_params"] = outputs.get("cache_params", None)
         return model_kwargs
 
     def prepare_inputs_for_generation(
             self,
             input_ids,
-            cache_params=None,
-            inputs_embeds=None,
-            attention_mask=None,
+            max_length,
             **kwargs
     ):
-        if cache_params is not None:
-            input_ids = input_ids[:, -1].unsqueeze(-1)
-
-        if inputs_embeds is not None and cache_params is None:
-            model_inputs = {"inputs_embeds": inputs_embeds}
-        else:
-            model_inputs = {"input_ids": input_ids}
-
-        model_inputs["cache_params"] = cache_params
-        return model_inputs
+        return {
+            "cache_params": kwargs.get("cache_params", None)
+        }
