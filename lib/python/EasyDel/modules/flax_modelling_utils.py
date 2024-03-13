@@ -19,7 +19,7 @@ from jax.sharding import PartitionSpec
 from ..etils.errors import EasyDelBlockWiseFFNError
 
 ACT2FN = {
-    "gelu": partial(nn.gelu, approximate=True),
+    "gelu": partial(nn.gelu, approximate=False),
     "relu": nn.relu,
     "silu": nn.swish,
     "swish": nn.swish,
