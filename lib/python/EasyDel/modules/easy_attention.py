@@ -69,6 +69,7 @@ class EasyAttention:
             head_dims: int,
             mesh: Mesh,
             query_partition_spec: PartitionSpec,
+            generation_query_partition_spec: PartitionSpec,
             key_partition_spec: PartitionSpec,
             value_partition_spec: PartitionSpec,
             bias_partition_spec: PartitionSpec,
@@ -117,6 +118,7 @@ class EasyAttention:
         self.use_shard_map = use_shard_map
         self.scan_ring_attention = scan_ring_attention
         self.scan_attention_layers = scan_attention_layers
+        self.generation_query_partition_spec = generation_query_partition_spec
         self.assertion_mkv_err = f"""
 query_states, key_states, value_states and bias shapes must be like
 query_states Shape : [batch_size, q_seq_len , num_attention_heads({self.num_attention_heads}), head_dims({self.head_dims})]
@@ -425,6 +427,9 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
                 lambda s: s.astype(jnp.float32),
                 (query_states, key_states, value_states)
             )
+
+        query_sequence_partition = self.generation_query_partition_spec if query_states.shape[
+                                                                               1] == 1 else self.query_partition_spec
         attention_o = shard_map(
             partial(
                 flash_func,
@@ -446,7 +451,7 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
                 debug=False
             ),
             in_specs=(
-                self.query_partition_spec,
+                query_sequence_partition,
                 self.key_partition_spec,
                 self.value_partition_spec,
                 self.bias_partition_spec

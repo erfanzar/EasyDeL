@@ -72,6 +72,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             block_k_dq: int | None = None,
             block_q_dq: int | None = None,
             query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            generation_query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, "tp", None),
             key_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             value_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
@@ -88,6 +89,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             **kwargs
     ):
         self.query_partition_spec = query_partition_spec
+        self.generation_query_partition_spec = generation_query_partition_spec
         self.key_partition_spec = key_partition_spec
         self.value_partition_spec = value_partition_spec
         self.bias_partition_spec = bias_partition_spec
@@ -240,6 +242,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             block_k_dq: int | None = ...,
             block_q_dq: int | None = ...,
             query_partition_spec: PartitionSpec = ...,
+            generation_query_partition_spec: PartitionSpec = ...,
             key_partition_spec: PartitionSpec = ...,
             value_partition_spec: PartitionSpec = ...,
             bias_partition_spec: PartitionSpec = ...,
@@ -295,6 +298,8 @@ class EasyDelPretrainedConfig(PretrainedConfig):
 
         set_attrs_smartly(self, "query_partition_spec", PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
                           query_partition_spec)
+        set_attrs_smartly(self, "generation_query_partition_spec", PartitionSpec(("dp", "fsdp"), None, "tp", None),
+                          generation_query_partition_spec)
         set_attrs_smartly(self, "key_partition_spec", PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
                           key_partition_spec)
         set_attrs_smartly(self, "value_partition_spec", PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
