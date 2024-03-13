@@ -5,6 +5,7 @@ from dataclasses import dataclass
 @dataclass
 class EasyDelPartitions:
     query_partition_spec: PartitionSpec
+    generation_query_partition_spec: PartitionSpec
     key_partition_spec: PartitionSpec
     value_partition_spec: PartitionSpec
     bias_partition_spec: PartitionSpec
@@ -15,7 +16,6 @@ def get_partitions(
         jax_attn_format: bool = True,
         fsdp_on_batch: bool = True
 ) -> EasyDelPartitions:
-
     """
     The get_partitions function is a helper function that returns an EasyDelPartitions object.
     The EasyDelPartitions object contains the PartitionSpec objects for each of the five tensors in
@@ -31,12 +31,14 @@ def get_partitions(
     if jax_attn_format:
         if fsdp_on_batch:
             query_partition_spec = PartitionSpec("fsdp", None, "sp", None)
+            generation_query_partition_spec = PartitionSpec(("dp", "fsdp"), "tp", None, None)
             key_partition_spec = PartitionSpec("fsdp", None, "sp", None)
             value_partition_spec = PartitionSpec("fsdp", None, "sp", None)
             bias_partition_spec = PartitionSpec("fsdp", None, "sp", None)
             attention_partition_spec = PartitionSpec("fsdp", None, "sp", None)
         else:
             query_partition_spec = PartitionSpec("dp", "fsdp", "tp", "sp", None)
+            generation_query_partition_spec = PartitionSpec(("dp", "fsdp"), "tp", None, None)
             key_partition_spec = PartitionSpec("dp", "fsdp", "tp", "sp", None)
             value_partition_spec = PartitionSpec("dp", "fsdp", "tp", "sp", None)
             bias_partition_spec = PartitionSpec("dp", None, "fsdp", None)
@@ -44,12 +46,14 @@ def get_partitions(
     else:
         if fsdp_on_batch:
             query_partition_spec = PartitionSpec("fsdp", "sp", None, None)
+            generation_query_partition_spec = PartitionSpec(("dp", "fsdp"), "tp", None, None)
             key_partition_spec = PartitionSpec("fsdp", "sp", None, None)
             value_partition_spec = PartitionSpec("fsdp", "sp", None, None)
             bias_partition_spec = PartitionSpec("fsdp", "sp", None, None)
             attention_partition_spec = PartitionSpec("fsdp", "sp", None, None)
         else:
             query_partition_spec = PartitionSpec("dp", "sp", "fsdp", None)
+            generation_query_partition_spec = PartitionSpec(("dp", "fsdp"), "tp", None, None)
             key_partition_spec = PartitionSpec("dp", "sp", "fsdp", None)
             value_partition_spec = PartitionSpec("dp", "sp", "fsdp", None)
             bias_partition_spec = PartitionSpec("dp", "fsdp", None, None)
@@ -59,5 +63,6 @@ def get_partitions(
         key_partition_spec=key_partition_spec,
         value_partition_spec=value_partition_spec,
         bias_partition_spec=bias_partition_spec,
-        attention_partition_spec=attention_partition_spec
+        attention_partition_spec=attention_partition_spec,
+        generation_query_partition_spec=generation_query_partition_spec
     )
