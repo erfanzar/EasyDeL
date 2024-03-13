@@ -250,7 +250,7 @@ class FlaxGemmaMLP(nn.Module):
         inner_dim = self.config.intermediate_size if self.config.intermediate_size is not None else 4 * embed_dim
 
         kernel_init = jax.nn.initializers.normal(self.config.initializer_range)
-        self.act = ACT2FN[self.config.hidden_act if self.config.hidden_act != "gelu" else jax.nn.gelu]
+        self.act = ACT2FN[self.config.hidden_act if self.config.hidden_act != "gelu" else "gelu_new"]
 
         self.gate_proj = nn.Dense(
             inner_dim,
