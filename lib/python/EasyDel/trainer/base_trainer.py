@@ -152,7 +152,10 @@ class BaseTrainer:
     def __str__(self):
         string = f"{self.__class__.__name__}("
         for key, value in self.__dict__.items():
-            string += value.__str__().replace("\n", "\n\t")
+            try:
+                string += value.__str__().replace("\n", "\n\t")
+            except TypeError:
+                ...
         string += ")"
         return string
 
