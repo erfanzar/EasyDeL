@@ -427,9 +427,14 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
                 lambda s: s.astype(jnp.float32),
                 (query_states, key_states, value_states)
             )
+        is_generating = query_states.shape[1] == 1
+        query_sequence_partition = self.generation_query_partition_spec if is_generating else self.query_partition_spec
 
-        query_sequence_partition = self.generation_query_partition_spec if query_states.shape[
-                                                                               1] == 1 else self.query_partition_spec
+        block_q = 1 if is_generating else self.block_q
+        block_q_major_dkv = 1 if is_generating else self.block_q_major_dkv
+        block_q_dkv = 1 if is_generating else self.block_q_dkv
+        block_q_dq = 1 if is_generating else self.block_q_dq
+
         attention_o = shard_map(
             partial(
                 flash_func,
@@ -438,15 +443,15 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
                 block_sizes=flash_attn_tpu.BlockSizes(
                     block_b=self.block_b,
                     block_k=self.block_k,
-                    block_q=self.block_q,
+                    block_q=block_q,
                     block_k_major=self.block_k_major,
                     block_k_dq=self.block_k_dq,
-                    block_q_dq=self.block_q_dq,
+                    block_q_dq=block_q_dq,
                     block_k_dkv=self.block_k_dkv,
-                    block_q_dkv=self.block_q_dkv,
+                    block_q_dkv=block_q_dkv,
                     block_k_major_dq=self.block_k_major_dq,
                     block_k_major_dkv=self.block_k_major_dkv,
-                    block_q_major_dkv=self.block_q_major_dkv,
+                    block_q_major_dkv=block_q_major_dkv,
                 ),
                 debug=False
             ),
