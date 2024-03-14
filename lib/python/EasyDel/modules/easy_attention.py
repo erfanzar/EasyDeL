@@ -429,7 +429,7 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
                 lambda s: s.astype(jnp.float32),
                 (query_states, key_states, value_states)
             )
-        is_generating = query_states.shape[1] == 1
+        is_generating = query_states.shape[2] == 1
         query_sequence_partition = self.generation_query_partition_spec if is_generating else self.query_partition_spec
         bias_partition_spec = self.generation_bias_partition_spec if is_generating else self.bias_partition_spec
         block_q = 1 if is_generating else self.block_q
