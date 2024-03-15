@@ -9,6 +9,7 @@ class EasyDelPartitions:
     key_partition_spec: PartitionSpec
     value_partition_spec: PartitionSpec
     bias_partition_spec: PartitionSpec
+    generation_bias_partition_spec: PartitionSpec
     attention_partition_spec: PartitionSpec
 
 
@@ -36,6 +37,7 @@ def get_partitions(
             value_partition_spec = PartitionSpec("fsdp", None, "sp", None)
             bias_partition_spec = PartitionSpec("fsdp", None, "sp", None)
             attention_partition_spec = PartitionSpec("fsdp", None, "sp", None)
+            generation_bias_partition_spec = PartitionSpec(("dp", "fsdp"), None, None, None),
         else:
             query_partition_spec = PartitionSpec("dp", "fsdp", "tp", "sp", None)
             generation_query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "tp", None, None)
@@ -43,6 +45,8 @@ def get_partitions(
             value_partition_spec = PartitionSpec("dp", "fsdp", "tp", "sp", None)
             bias_partition_spec = PartitionSpec("dp", None, "fsdp", None)
             attention_partition_spec = PartitionSpec("dp", "fsdp", "tp", "sp", None)
+
+            generation_bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None)
     else:
         if fsdp_on_batch:
             query_partition_spec = PartitionSpec("fsdp", "sp", None, None)
@@ -51,6 +55,8 @@ def get_partitions(
             value_partition_spec = PartitionSpec("fsdp", "sp", None, None)
             bias_partition_spec = PartitionSpec("fsdp", "sp", None, None)
             attention_partition_spec = PartitionSpec("fsdp", "sp", None, None)
+
+            generation_bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None)
         else:
             query_partition_spec = PartitionSpec("dp", "sp", "fsdp", None)
             generation_query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "tp", None, None)
@@ -58,11 +64,13 @@ def get_partitions(
             value_partition_spec = PartitionSpec("dp", "sp", "fsdp", None)
             bias_partition_spec = PartitionSpec("dp", "fsdp", None, None)
             attention_partition_spec = PartitionSpec("dp", "sp", "fsdp", None)
+            generation_bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None)
     return EasyDelPartitions(
         query_partition_spec=query_partition_spec,
         key_partition_spec=key_partition_spec,
         value_partition_spec=value_partition_spec,
         bias_partition_spec=bias_partition_spec,
         attention_partition_spec=attention_partition_spec,
-        generation_query_partition_spec=generation_query_partition_spec
+        generation_query_partition_spec=generation_query_partition_spec,
+        generation_bias_partition_spec=generation_bias_partition_spec
     )
