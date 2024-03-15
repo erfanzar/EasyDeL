@@ -3,6 +3,7 @@ import itertools
 import math
 from typing import Optional, Tuple, Union, List, Dict, Any, Callable, Sequence, TypeVar
 
+from jax.core import ShapedArray
 import chex
 import flax.linen as nn
 import jax
@@ -13,13 +14,18 @@ from einops import einsum
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import partitioning as nn_partitioning
 from flax.linen.dtypes import promote_dtype
-from flax.linen.linear import default_kernel_init, ConvGeneralDilatedT, PrecisionLike, Dtype, PaddingLike, \
-    canonicalize_padding, _conv_dimension_numbers
+from flax.linen.linear import (
+    default_kernel_init,
+    ConvGeneralDilatedT,
+    PrecisionLike,
+    Dtype,
+    PaddingLike,
+    canonicalize_padding,
+    _conv_dimension_numbers
+)
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax, eval_shape
 import flax.struct
-from jax.interpreters.xla import ShapedArray
-from jax.sharding import PartitionSpec
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput
 
 from .mamba_configuration import MambaConfig
@@ -498,6 +504,7 @@ class FlaxMambaMixer(nn.Module):
             self.config.time_step_max
         )
         inv_dt = dt + jnp.log(-jnp.expm1(-dt))
+
         dense_class = functools.partial(
             nn.Dense,
             dtype=self.dtype,
