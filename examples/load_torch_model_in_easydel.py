@@ -13,7 +13,7 @@ def load_model(
         sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
         sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
         query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-        generation_query_partition_spec = PartitionSpec(("dp", "fsdp"), "tp", None, None),
+        generation_query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "tp", None, None),
         key_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
         value_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
         bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),

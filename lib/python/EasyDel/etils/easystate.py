@@ -424,7 +424,7 @@ class EasyDelState(struct.PyTreeNode):
             sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
             sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
             query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            generation_query_partition_spec = PartitionSpec(("dp", "fsdp"), "tp", None, None),
+            generation_query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "tp", None, None),
             key_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             value_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
@@ -459,7 +459,8 @@ class EasyDelState(struct.PyTreeNode):
         :param sharding_axis_dims: Sequence[int]: Specify the dimension of each axis
         :param sharding_axis_names: Sequence[str]: Specify the names of the axes in each shard
         :param query_partition_spec: PartitionSpec: Specify the partitioning of the query matrix
-        :param key_partition_spec: PartitionSpec: Specify the partitioning of the key matrix
+        :param generation_query_partition_spec: PartitionSpec: Specify the partitioning of the query tensor in
+        generation process:param key_partition_spec: PartitionSpec: Specify the partitioning of the key matrix
         :param value_partition_spec: PartitionSpec: Specify the partitioning of the value tensor
         :param bias_partition_spec: PartitionSpec: Specify the partitioning of the bias
         :param attention_partition_spec: PartitionSpec: Partition the attention weights

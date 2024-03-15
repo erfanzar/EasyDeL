@@ -31,14 +31,14 @@ def get_partitions(
     if jax_attn_format:
         if fsdp_on_batch:
             query_partition_spec = PartitionSpec("fsdp", None, "sp", None)
-            generation_query_partition_spec = PartitionSpec(("dp", "fsdp"), "tp", None, None)
+            generation_query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "tp", None, None)
             key_partition_spec = PartitionSpec("fsdp", None, "sp", None)
             value_partition_spec = PartitionSpec("fsdp", None, "sp", None)
             bias_partition_spec = PartitionSpec("fsdp", None, "sp", None)
             attention_partition_spec = PartitionSpec("fsdp", None, "sp", None)
         else:
             query_partition_spec = PartitionSpec("dp", "fsdp", "tp", "sp", None)
-            generation_query_partition_spec = PartitionSpec(("dp", "fsdp"), "tp", None, None)
+            generation_query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "tp", None, None)
             key_partition_spec = PartitionSpec("dp", "fsdp", "tp", "sp", None)
             value_partition_spec = PartitionSpec("dp", "fsdp", "tp", "sp", None)
             bias_partition_spec = PartitionSpec("dp", None, "fsdp", None)
@@ -46,14 +46,14 @@ def get_partitions(
     else:
         if fsdp_on_batch:
             query_partition_spec = PartitionSpec("fsdp", "sp", None, None)
-            generation_query_partition_spec = PartitionSpec(("dp", "fsdp"), "tp", None, None)
+            generation_query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "tp", None, None)
             key_partition_spec = PartitionSpec("fsdp", "sp", None, None)
             value_partition_spec = PartitionSpec("fsdp", "sp", None, None)
             bias_partition_spec = PartitionSpec("fsdp", "sp", None, None)
             attention_partition_spec = PartitionSpec("fsdp", "sp", None, None)
         else:
             query_partition_spec = PartitionSpec("dp", "sp", "fsdp", None)
-            generation_query_partition_spec = PartitionSpec(("dp", "fsdp"), "tp", None, None)
+            generation_query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "tp", None, None)
             key_partition_spec = PartitionSpec("dp", "sp", "fsdp", None)
             value_partition_spec = PartitionSpec("dp", "sp", "fsdp", None)
             bias_partition_spec = PartitionSpec("dp", "fsdp", None, None)
