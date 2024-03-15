@@ -17,6 +17,7 @@ def load_model(
         key_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
         value_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
         bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
+        generation_bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
         attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
         use_shard_map: bool = False,
         input_shape: Sequence[int] = (1, 1),
@@ -32,6 +33,7 @@ def load_model(
         sharding_axis_dims=sharding_axis_dims,
         query_partition_spec=query_partition_spec,
         generation_query_partition_spec=generation_query_partition_spec,
+        generation_bias_partition_spec=generation_bias_partition_spec,
         key_partition_spec=key_partition_spec,
         value_partition_spec=value_partition_spec,
         bias_partition_spec=bias_partition_spec,
@@ -41,4 +43,3 @@ def load_model(
         backend=backend
 
     )
-

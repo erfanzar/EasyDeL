@@ -73,6 +73,7 @@ class EasyAttention:
             key_partition_spec: PartitionSpec,
             value_partition_spec: PartitionSpec,
             bias_partition_spec: PartitionSpec,
+            generation_bias_partition_spec: PartitionSpec,
             attention_partition_spec: PartitionSpec,
             scan_ring_attention: bool = True,
             scan_attention_layers: bool = False,
@@ -119,6 +120,7 @@ class EasyAttention:
         self.scan_ring_attention = scan_ring_attention
         self.scan_attention_layers = scan_attention_layers
         self.generation_query_partition_spec = generation_query_partition_spec
+        self.generation_bias_partition_spec = generation_bias_partition_spec
         self.assertion_mkv_err = f"""
 query_states, key_states, value_states and bias shapes must be like
 query_states Shape : [batch_size, q_seq_len , num_attention_heads({self.num_attention_heads}), head_dims({self.head_dims})]
