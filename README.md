@@ -42,11 +42,12 @@ Some of the key features provided by EasyDeL include:
 > Please have that in mind that EasyDel is in the loop of fast-development
 > so we might have API changes.
 
-### Hands on Code Kaggle Examples 
+### Hands on Code Kaggle Examples
 
 1. [script](https://www.kaggle.com/citifer/easydel-causal-language-model-trainer-example) for mindset of using EasyDeL
    CausalLanguageModelTrainer on kaggle, but you can do much more.
-2. [script](https://www.kaggle.com/code/citifer/easydel-serve-example-mixtral) for using and serving LLMs with EasyDeL JAXServer API (Mixtral Example).
+2. [script](https://www.kaggle.com/code/citifer/easydel-serve-example-mixtral) for using and serving LLMs with EasyDeL
+   JAXServer API (Mixtral Example).
 
 ## Serving
 
@@ -598,6 +599,18 @@ config.add_basic_configurations(
 ```
 
 _Flash Attention works on TPU with ease but for gpu there are still some improvements in process._
+
+> [!TIP]
+> use these partition specs in case of not using custom sharding_axis_names and using sequence sharding with flash
+> flash attention
+> ```python
+>query_partition_spec=PartitionSpec(("dp", "fsdp"), None, "sp", "tp"),
+>generation_query_partition_spec=PartitionSpec(("dp", "fsdp"), None, None, "tp"),
+>key_partition_spec=PartitionSpec(("dp", "fsdp"), None, "sp", "tp"),
+>value_partition_spec=PartitionSpec(("dp", "fsdp"), None, "sp", "tp"),
+>bias_partition_spec=PartitionSpec(("dp", "fsdp"), None, "sp", "sp"),
+>attention_partition_spec=PartitionSpec(("dp", "fsdp"), None,"sp", "tp"),
+> ```
 
 ## EasyDeLXRapTure for layer tuning and LoRA
 

@@ -295,7 +295,7 @@ class AutoEasyDelModelForCausalLM:
             sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
             sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
             query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            generation_query_partition_spec = PartitionSpec(("dp", "fsdp"), None, "tp", None),
+            generation_query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, "tp", None),
             key_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             value_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
@@ -321,6 +321,8 @@ class AutoEasyDelModelForCausalLM:
         :param sharding_axis_dims: typing.Sequence[int]: Specify the dimension of each axis in the sharded model
         :param sharding_axis_names: typing.Sequence[str]: Specify the order of sharding
         :param query_partition_spec: PartitionSpec: Specify the partitioning of the query tensor
+        :param generation_query_partition_spec: PartitionSpec: Specify the partitioning of the query tensor in
+        generation process
         :param key_partition_spec: PartitionSpec: Partition the key matrix
         :param value_partition_spec: PartitionSpec: Specify the partitioning of the value tensor
         :param bias_partition_spec: PartitionSpec: Specify the Attention Bias partition spec
@@ -410,7 +412,7 @@ class AutoEasyDelConfig:
             sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
             sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
             query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            generation_query_partition_spec = PartitionSpec(("dp", "fsdp"), "sp", None, None),
+            generation_query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", None, None),
             key_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             value_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
@@ -429,7 +431,8 @@ class AutoEasyDelConfig:
         :param sharding_axis_dims: Sequence[int]: Specify the dimension of each axis in the sharded model
         :param sharding_axis_names: Sequence[str]: Specify the order of sharding
         :param query_partition_spec: PartitionSpec: Specify the partitioning of the query tensor
-        :param key_partition_spec: PartitionSpec: Partition the key matrix
+        :param generation_query_partition_spec: PartitionSpec: Specify the partitioning of the query tensor in
+        generation process:param key_partition_spec: PartitionSpec: Partition the key matrix
         :param value_partition_spec: PartitionSpec: Specify the partitioning of the value tensor
         :param bias_partition_spec: PartitionSpec: Specify the Attention Bias partition spec
         :param attention_partition_spec: PartitionSpec: Specify the partitioning of the attention weights
