@@ -431,7 +431,7 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
             )
         is_generating = query_states.shape[1] == 1
         query_sequence_partition = self.generation_query_partition_spec if is_generating else self.query_partition_spec
-
+        bias_partition_spec = self.generation_bias_partition_spec if is_generating else self.bias_partition_spec
         block_q = 1 if is_generating else self.block_q
         block_q_major_dkv = 1 if is_generating else self.block_q_major_dkv
         block_q_dkv = 1 if is_generating else self.block_q_dkv
@@ -461,7 +461,7 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
                 query_sequence_partition,
                 self.key_partition_spec,
                 self.value_partition_spec,
-                self.bias_partition_spec
+                bias_partition_spec
             ),
             out_specs=(
                 self.attention_partition_spec
