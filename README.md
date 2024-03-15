@@ -608,7 +608,6 @@ _Flash Attention works on TPU with ease but for gpu there are still some improve
 >generation_query_partition_spec=PartitionSpec(("dp", "fsdp"), None, None, "tp"),
 >key_partition_spec=PartitionSpec(("dp", "fsdp"), None, "sp", "tp"),
 >value_partition_spec=PartitionSpec(("dp", "fsdp"), None, "sp", "tp"),
->bias_partition_spec=PartitionSpec(("dp", "fsdp"), None, "sp", "sp"),
 >attention_partition_spec=PartitionSpec(("dp", "fsdp"), None,"sp", "tp"),
 > ```
 
