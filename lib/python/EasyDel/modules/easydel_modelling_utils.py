@@ -497,8 +497,8 @@ class EasyDelFlaxPretrainedModel(FlaxPreTrainedModel):
     def __call__(
             self,
             input_ids: chex.Array,
-            attention_mask: chex.Array = None,
-            position_ids: chex.Array = None,
+            attention_mask: Optional[chex.Array] = None,
+            position_ids: Optional[chex.Array] = None,
             params: dict = None,
             past_key_values: dict = None,
             dropout_rng: jax.random.PRNGKey = None,
@@ -508,6 +508,7 @@ class EasyDelFlaxPretrainedModel(FlaxPreTrainedModel):
             return_dict: Optional[bool] = None,
             extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
             add_params_field: bool = False,
+            vision_mask: Optional[chex.Array] = None,
             **kwargs
     ):
         raise NotImplementedError("Not Implemented Yet")
