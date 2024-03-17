@@ -225,7 +225,10 @@ class FlaxMixtralAttention(BaseJAXAttentionModule):
 
         if self.config.use_pjit_attention_force:
             query_state = with_sharding_constraint(
-                query_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
+                query_state, PartitionSpec(("dp", "fsdp"), "sp", "tp")
+            ) if query_state.shape[1] != 1 else with_sharding_constraint(
+                query_state, PartitionSpec(("dp", "fsdp"), None, "tp")
+            )
             key_state = with_sharding_constraint(
                 key_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
             value_state = with_sharding_constraint(

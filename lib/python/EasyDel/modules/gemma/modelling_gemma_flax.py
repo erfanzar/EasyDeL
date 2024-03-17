@@ -6,7 +6,9 @@ import flax.linen as nn
 import flax.linen.partitioning
 import jax
 import jax.numpy as jnp
+from jax.sharding import PartitionSpec
 import numpy as np
+from fjformer import with_sharding_constraint
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks, make_causal_mask
 from flax.linen.attention import dot_product_attention_weights
@@ -176,7 +178,16 @@ class FlaxGemmaAttention(BaseJAXAttentionModule):
             key_state,
             value_state
         ) = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(hidden_states)
-
+        if self.config.use_pjit_attention_force:
+            query_state = with_sharding_constraint(
+                query_state, PartitionSpec(("dp", "fsdp"), "sp", "tp")
+            ) if query_state.shape[1] != 1 else with_sharding_constraint(
+                query_state, PartitionSpec(("dp", "fsdp"), None, "tp")
+            )
+            key_state = with_sharding_constraint(
+                key_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
+            value_state = with_sharding_constraint(
+                value_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
         query_state = self._split_heads(query_state, self.num_heads)
         key_state = self._split_heads(key_state, self.num_key_value_heads)
         value_state = self._split_heads(value_state, self.num_key_value_heads)

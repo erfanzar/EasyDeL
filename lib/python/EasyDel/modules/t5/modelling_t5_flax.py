@@ -313,9 +313,13 @@ class FlaxT5Attention(BaseJAXAttentionModule):
         key_states = self.k(hidden_states) if key_value_states is None else self.k(key_value_states)
         value_states = self.v(hidden_states) if key_value_states is None else self.v(key_value_states)
         if self.config.use_pjit_attention_force:
-            query_states = with_sharding_constraint(query_states, PartitionSpec(("dp", "fsdp"), None, "sp"))
-            key_states = with_sharding_constraint(key_states, PartitionSpec(("dp", "fsdp"), None, "sp"))
-            value_states = with_sharding_constraint(value_states, PartitionSpec(("dp", "fsdp"), None, "sp"))
+            query_states = with_sharding_constraint(
+                query_states, PartitionSpec(("dp", "fsdp"), "sp", "tp")
+            ) if query_states.shape[1] != 1 else with_sharding_constraint(
+                query_states, PartitionSpec(("dp", "fsdp"), None, "tp")
+            )
+            key_states = with_sharding_constraint(key_states, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
+            value_states = with_sharding_constraint(value_states, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
 
         # reshape to (batch_size, seq_length, n_heads, head_dim)
         query_states = self._split_heads(query_states)
