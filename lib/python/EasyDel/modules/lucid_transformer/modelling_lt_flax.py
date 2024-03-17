@@ -51,13 +51,11 @@ class LTSelfAttention(BaseJAXAttentionModule):
         wq, wk, wv = self.q_proj(hidden_state), self.k_proj(hidden_state), self.v_proj(hidden_state)
 
         if self.config.fsdp:
-            wk = with_sharding_constraint(wk, PartitionSpec(("dp", "fsdp"), "sp", "tp")
-            wq = with_sharding_constraint(
-                wq, PartitionSpec(("dp", "fsdp"), "sp", "tp")
-            ) if wq.shape[1] != 1 else with_sharding_constraint(
-                wq, PartitionSpec(("dp", "fsdp"), None, "tp")
-            )
-            wv = with_sharding_constraint(wv, PartitionSpec(("dp", "fsdp"), "sp", "tp")
+            wk = with_sharding_constraint(wk, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
+            wv = with_sharding_constraint(wv, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
+            wq = with_sharding_constraint(wq, PartitionSpec(("dp", "fsdp"), "sp", "tp")) \
+                if wq.shape[1] != 1 else (
+                with_sharding_constraint(wq, PartitionSpec(("dp", "fsdp"), None, "tp")))
 
         wq = rearrange(wq, 'b s (h d) -> b h s d', h=self.config.num_attention_heads)
         wk = rearrange(wk, 'b s (h d) -> b h d s', h=self.config.num_attention_heads)
