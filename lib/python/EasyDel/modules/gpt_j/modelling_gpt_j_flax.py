@@ -179,9 +179,13 @@ class FlaxGPTJAttention(BaseJAXAttentionModule):
 
         # Force A local Sharding
         if self.config.use_pjit_attention_force:
-            query = with_sharding_constraint(query, PartitionSpec(("dp", "fsdp"), None, "sp"))
-            key = with_sharding_constraint(key, PartitionSpec(("dp", "fsdp"), None, "sp"))
-            value = with_sharding_constraint(value, PartitionSpec(("dp", "fsdp"), None, "sp"))
+            query = with_sharding_constraint(
+                query, PartitionSpec(("dp", "fsdp"), "sp", "tp")
+            ) if query.shape[1] != 1 else with_sharding_constraint(
+                query, PartitionSpec(("dp", "fsdp"), None, "tp")
+            )
+            key = with_sharding_constraint(key, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
+            value = with_sharding_constraint(value, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
 
         query = self._split_heads(query)
         key = self._split_heads(key)

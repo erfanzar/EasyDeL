@@ -300,14 +300,15 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
             attn_output = ring_attention_sharded(query_states, key_states, value_states, bias, segment_ids)
             attn_output = with_sharding_constraint(attn_output, self.attention_partition_spec)
         else:
-
-            warnings.warn(
-                "Using Ring attention on CPUs or GPUs are not recommended due to miss computations at the moment. "
-                "please refer to other types of attention mechanism.your are bing fell back on `ring_attention_sharded`"
-                f" Usage conditions was\nscan_ring_attention = {self.scan_ring_attention} [MUST BE TRUE]"
-                f"\nquery_states.shape[1]({query_states.shape[1]}) > max({self.block_q},{self.block_k})"
-                f"({max(self.block_q, self.block_k)})"
-            )
+            if self.platform != "tpu":
+                warnings.warn(
+                    "Using Ring attention on CPUs or GPUs are not recommended due to miss computations at the moment. "
+                    "please refer to other types of attention mechanism.your are bing fell back on "
+                    "`ring_attention_sharded`"
+                    f" Usage conditions was\nscan_ring_attention = {self.scan_ring_attention} [MUST BE TRUE]"
+                    f"\nquery_states.shape[1]({query_states.shape[1]}) > max({self.block_q},{self.block_k})"
+                    f"({max(self.block_q, self.block_k)})"
+                )
             query_sequence_partition = None if query_states.shape[1] == 1 else "sp"
             ring_attention_sharded = shard_map(
                 partial(ring_attention_standard, axis_name="sp"),

@@ -111,9 +111,9 @@ class FlaxOPTAttention(BaseJAXAttentionModule):
             value_states = self.v_proj(hidden_states)
 
         if self.config.use_pjit_attention_force:
-            value_states = with_sharding_constraint(value_states, PartitionSpec(("dp", "fsdp"), None, "sp"))
-            key_states = with_sharding_constraint(key_states, PartitionSpec(("dp", "fsdp"), None, "sp"))
-            query_states = with_sharding_constraint(query_states, PartitionSpec(("dp", "fsdp"), None, "sp"))
+            value_states = with_sharding_constraint(value_states, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
+            key_states = with_sharding_constraint(key_states, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
+            query_states = with_sharding_constraint(query_states, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
         query_states = self._split_heads(query_states)
         key_states = self._split_heads(key_states)
         value_states = self._split_heads(value_states)

@@ -180,9 +180,13 @@ class FlaxMptAttention(BaseJAXAttentionModule):
             q = self.q_ln(q)
             k = self.k_ln(k)
         if self.config.use_pjit_attention_force:
-            q = with_sharding_constraint(q, PartitionSpec(("dp", "fsdp"), None, "sp"))
-            k = with_sharding_constraint(k, PartitionSpec(("dp", "fsdp"), None, "sp"))
-            v = with_sharding_constraint(v, PartitionSpec(("dp", "fsdp"), None, "sp"))
+            q = with_sharding_constraint(
+                q, PartitionSpec(("dp", "fsdp"), "sp", "tp")
+            ) if q.shape[1] != 1 else with_sharding_constraint(
+                q, PartitionSpec(("dp", "fsdp"), None, "tp")
+            )
+            k = with_sharding_constraint(k, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
+            v = with_sharding_constraint(v, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
         q = rearrange(q, 'b s (h d) -> b s h d', h=self.config.n_heads)
         k = rearrange(k, 'b s (h d) -> b s h d', h=self.config.n_heads)
         v = rearrange(v, 'b s (h d) -> b s h d', h=self.config.n_heads)

@@ -1,6 +1,7 @@
 import math
 
 import jax.nn.initializers
+from fjformer import with_sharding_constraint
 from jax import numpy as jnp
 
 from functools import partial
@@ -50,9 +51,13 @@ class LTSelfAttention(BaseJAXAttentionModule):
         wq, wk, wv = self.q_proj(hidden_state), self.k_proj(hidden_state), self.v_proj(hidden_state)
 
         if self.config.fsdp:
-            wk = with_sharding_constraint(wk, PartitionSpec(("dp", "fsdp"), None, "sp"))
-            wq = with_sharding_constraint(wq, PartitionSpec(("dp", "fsdp"), None, "sp"))
-            wv = with_sharding_constraint(wv, PartitionSpec(("dp", "fsdp"), None, "sp"))
+            wk = with_sharding_constraint(wk, PartitionSpec(("dp", "fsdp"), "sp", "tp")
+            wq = with_sharding_constraint(
+                wq, PartitionSpec(("dp", "fsdp"), "sp", "tp")
+            ) if wq.shape[1] != 1 else with_sharding_constraint(
+                wq, PartitionSpec(("dp", "fsdp"), None, "tp")
+            )
+            wv = with_sharding_constraint(wv, PartitionSpec(("dp", "fsdp"), "sp", "tp")
 
         wq = rearrange(wq, 'b s (h d) -> b h s d', h=self.config.num_attention_heads)
         wk = rearrange(wk, 'b s (h d) -> b h d s', h=self.config.num_attention_heads)
