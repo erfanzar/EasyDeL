@@ -17,10 +17,12 @@ from .serve import (
 )
 
 from .modules.llama import (
-    LlamaConfig as LlamaConfig,
+    FlaxLlamaModel as FlaxLlamaModel,
     FlaxLlamaForCausalLM as FlaxLlamaForCausalLM,
     FlaxLlamaForSequenceClassification as FlaxLlamaForSequenceClassification,
-    FlaxLlamaModel as FlaxLlamaModel
+    LlamaConfig as LlamaConfig,
+    FlaxVisionLlamaForCausalLM as FlaxVisionLlamaForCausalLM,
+    VisionLlamaConfig as VisionLlamaConfig
 )
 from .modules.gpt_j import (
     GPTJConfig as GPTJConfig,
@@ -45,7 +47,9 @@ from .modules.opt import (
 from .modules.mistral import (
     MistralConfig as MistralConfig,
     FlaxMistralForCausalLM as FlaxMistralForCausalLM,
-    FlaxMistralModel as FlaxMistralModel
+    FlaxMistralModel as FlaxMistralModel,
+    FlaxVisionMistralForCausalLM as FlaxVisionMistralForCausalLM,
+    VisionMistralConfig as VisionMistralConfig
 )
 from .modules.palm import (
     FlaxPalmModel as FlaxPalmModel,
@@ -215,9 +219,11 @@ __all__ = (
 
     # LLama Models
     "LlamaConfig",
+    "VisionLlamaConfig",
     "FlaxLlamaForCausalLM",
     "FlaxLlamaForSequenceClassification",
     "FlaxLlamaModel",
+    "FlaxVisionMistralForCausalLM",
 
     # GPT-J Models
     "GPTJConfig",
@@ -241,8 +247,10 @@ __all__ = (
 
     # Mistral Models
     "MistralConfig",
+    "VisionMistralConfig",
     "FlaxMistralForCausalLM",
     "FlaxMistralModel",
+    "FlaxVisionLlamaForCausalLM",
 
     # Palm Models
     "FlaxPalmModel",
