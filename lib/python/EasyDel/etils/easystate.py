@@ -538,7 +538,8 @@ class EasyDelState(struct.PyTreeNode):
                     state_shard_fns=state_shard_fns,
                     dtype=dtype,
                     param_dtype=param_dtype,
-                    precision=precision
+                    precision=precision,
+                    input_shape=input_shape
                 )
         if init_optimizer_state:
             with jax.default_device(device):
