@@ -264,7 +264,7 @@ class EasyDelState(struct.PyTreeNode):
             init_optimizer_state: bool = False,
             state_shard_fns: Optional[Mapping[str, Callable]] = None,
             verbose: bool = False,
-
+            input_shape: Tuple = (1, 1),
     ):
 
         """    
@@ -280,6 +280,7 @@ class EasyDelState(struct.PyTreeNode):
         :param state_shard_fns: Optional[Mapping[str,Callable]]: Specify the function that will be used 
         to shard the loaded state
         :param verbose: bool: Print out the progress of loading
+        :param input_shape: Tuple: input_shape to init module
         :return: A state object
         """
         from ..modules.auto_easydel_model import get_modules_by_type
@@ -310,7 +311,8 @@ class EasyDelState(struct.PyTreeNode):
                 config=module_config,
                 dtype=dtype,
                 param_dtype=param_dtype,
-                precision=precision
+                precision=precision,
+                input_shape=input_shape
             )
         else:
             raise TypeError(
