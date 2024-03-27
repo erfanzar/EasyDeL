@@ -15,6 +15,13 @@ from fjformer.pallas_operations.ring_attention import (
     ring_attention_standard,
     ring_attention
 )
+from fjformer.pallas_operations.splash_attention.tpu.splash_attention_kernel import (
+    make_splash_mha,
+    make_splash_mqa,
+    SegmentIds,
+    BlockSizes as SplashBlockSizes
+)
+from fjformer.pallas_operations.splash_attention.tpu.splash_attention_mask import CausalMask, MultiHeadMask
 from typing import Tuple, Callable, Type, Any, Optional, Literal
 from dataclasses import dataclass
 
@@ -186,10 +193,6 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
 
                 if self.attn_mechanism == "flash":
 
-                    query_states = query_states.transpose(0, 2, 1, 3)
-                    key_states = key_states.transpose(0, 2, 1, 3)
-                    value_states = value_states.transpose(0, 2, 1, 3)
-
                     attentions = self._qkv_normal_flash_op(
                         query_states=query_states,
                         key_states=key_states,
@@ -202,8 +205,6 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
                         query_sequence_length=query_sequence_length,
                         key_value_sequence_length=key_value_sequence_length,
                     )
-
-                    attentions.attention_outputs = attentions.attention_outputs.transpose(0, 2, 1, 3)
 
                 elif self.attn_mechanism == "normal":
 
@@ -235,7 +236,19 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
                     )
 
                 elif self.attn_mechanism == "splash":
-                    raise NotImplementedError("Splash Attention is not Implemented YET!")
+                    attentions = self._qkv_normal_splash_op(
+                        query_states=query_states,
+                        key_states=key_states,
+                        value_states=value_states,
+                        bias=bias,
+                        dropout_rng=dropout_rng,
+                        use_pjit_attention_force=use_pjit_attention_force,
+                        causal=causal,
+                        deterministic=deterministic,
+                        query_sequence_length=query_sequence_length,
+                        key_value_sequence_length=key_value_sequence_length,
+                        segment_ids=segment_ids,
+                    )
                 else:
                     raise ValueError(f"Unknown Attention mechanism of {self.attn_mechanism}")
                 return attentions
@@ -411,6 +424,10 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
             use_pjit_attention_force: bool = False
     ) -> AttentionOutput:
 
+        query_states = query_states.transpose(0, 2, 1, 3)
+        key_states = key_states.transpose(0, 2, 1, 3)
+        value_states = value_states.transpose(0, 2, 1, 3)
+
         batch_size, num_attention_heads, query_sequence_length, head_dims = query_states.shape
         if bias is not None:
             if bias.shape[1] != num_attention_heads:
@@ -475,6 +492,110 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
             value_states,
             bias,
         )
+
+        attention_o = attention_o.transpose(0, 2, 1, 3)
+        return AttentionOutput(
+            attention_outputs=attention_o,
+            attention_weights=None
+        )
+
+    def _qkv_normal_splash_op(
+            self,
+            query_states: Array,
+            key_states: Array,
+            value_states: Array,
+            query_sequence_length: int,
+            key_value_sequence_length: int,
+            segment_ids: Optional[Array] = None,
+            causal: bool = False,
+            deterministic: bool = False,
+            dropout_rng: Optional[random.PRNGKey] = None,
+            use_pjit_attention_force: bool = False,
+    ) -> AttentionOutput:
+
+        query_states = query_states.transpose(0, 2, 1, 3)
+        key_states = key_states.transpose(0, 2, 1, 3)
+        value_states = value_states.transpose(0, 2, 1, 3)
+        batch_size, num_attention_heads, query_sequence_length, head_dims = query_states.shape
+
+        if self.platform != "tpu":
+            raise OSError(f"Splash attention only supports on TPUs and right now we don't support {self.platform}")
+
+        query_states, key_states, value_states = map(
+            lambda s: s.astype(jnp.float32),
+            (query_states, key_states, value_states)
+        )
+        is_generating = query_states.shape[2] == 1
+        query_sequence_partition = self.generation_query_partition_spec if is_generating else self.query_partition_spec
+        bias_partition_spec = self.generation_bias_partition_spec if is_generating else self.bias_partition_spec
+        block_q = 1 if is_generating else self.block_q
+        block_q_major_dkv = 1 if is_generating else self.block_q_major_dkv
+        block_q_dkv = 1 if is_generating else self.block_q_dkv
+        block_q_dq = 1 if is_generating else self.block_q_dq
+
+        def sfa(
+                in_query_states,
+                in_key_states,
+                in_value_states,
+                in_segment_ids,
+        ):
+            block_sizes = flash_attn_tpu.BlockSizes(
+                block_b=self.block_b,
+                block_k=self.block_k,
+                block_q=block_q,
+                block_k_major=self.block_k_major,
+                block_k_dq=self.block_k_dq,
+                block_q_dq=block_q_dq,
+                block_k_dkv=self.block_k_dkv,
+                block_q_dkv=block_q_dkv,
+                block_k_major_dq=self.block_k_major_dq,
+                block_k_major_dkv=self.block_k_major_dkv,
+                block_q_major_dkv=block_q_major_dkv,
+            )
+            multi_head_mask = MultiHeadMask(
+                masks=[
+                    CausalMask(
+                        shape=(in_query_states.shape[2], in_query_states.shape[2])
+                    ) for _ in range(
+                        in_query_states.shape[1]
+                    )
+                ]
+            )
+            splash_kernel = make_splash_mha(
+                mask=multi_head_mask,
+                head_shards=1,
+                q_seq_shards=1,
+                block_sizes=block_sizes
+            )
+
+            return jax.vmap(splash_kernel)(
+                in_query_states,
+                in_key_states,
+                in_value_states,
+                segment_ids=in_segment_ids
+            )
+
+        attention_o = shard_map(
+            sfa,
+            in_specs=(
+                query_sequence_partition,
+                self.key_partition_spec,
+                self.value_partition_spec,
+                bias_partition_spec
+            ),
+            out_specs=(
+                self.attention_partition_spec
+            ),
+            mesh=self.mesh,
+            check_rep=False,
+        )(
+            query_states,
+            key_states,
+            value_states,
+            segment_ids,
+        )
+
+        attention_o = attention_o.transpose(0, 2, 1, 3)
         return AttentionOutput(
             attention_outputs=attention_o,
             attention_weights=None
