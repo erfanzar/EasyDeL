@@ -15,13 +15,14 @@ from fjformer.pallas_operations.ring_attention import (
     ring_attention_standard,
     ring_attention
 )
-from fjformer.pallas_operations.splash_attention.tpu.splash_attention_kernel import (
+from fjformer.pallas_operations.splash_attention import (
     make_splash_mha,
     make_splash_mqa,
     SegmentIds,
-    BlockSizes as SplashBlockSizes
+    BlockSizes as SplashBlockSizes,
+    CausalMask,
+    MultiHeadMask
 )
-from fjformer.pallas_operations.splash_attention.tpu.splash_attention_mask import CausalMask, MultiHeadMask
 from typing import Tuple, Callable, Type, Any, Optional, Literal
 from dataclasses import dataclass
 
@@ -58,7 +59,11 @@ class EasyAttention:
             self,
             attn_type: Literal["normal", "alibi"],
             attn_mechanism: Literal[
-                "normal", "flash", "splash", "ring"
+                "normal",
+                "flash",
+                "splash",
+                "ring",
+                "cudnn"
             ],
             block_k: int,
             block_q: int,
@@ -198,11 +203,7 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
                         key_states=key_states,
                         value_states=value_states,
                         bias=bias,
-                        dropout_rng=dropout_rng,
-                        use_pjit_attention_force=use_pjit_attention_force,
                         causal=causal,
-                        deterministic=deterministic,
-                        query_sequence_length=query_sequence_length,
                         key_value_sequence_length=key_value_sequence_length,
                     )
 
@@ -215,10 +216,7 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
                         bias=bias,
                         dropout_rng=dropout_rng,
                         use_pjit_attention_force=use_pjit_attention_force,
-                        causal=causal,
                         deterministic=deterministic,
-                        query_sequence_length=query_sequence_length,
-                        key_value_sequence_length=key_value_sequence_length,
                     )
                 elif self.attn_mechanism == "ring":
                     attentions = self._qkv_ring_op(
@@ -227,11 +225,8 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
                         value_states=value_states,
                         bias=bias,
                         dropout_rng=dropout_rng,
-                        use_pjit_attention_force=use_pjit_attention_force,
-                        causal=causal,
                         deterministic=deterministic,
                         query_sequence_length=query_sequence_length,
-                        key_value_sequence_length=key_value_sequence_length,
                         segment_ids=segment_ids,
                     )
 
@@ -240,14 +235,17 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
                         query_states=query_states,
                         key_states=key_states,
                         value_states=value_states,
+                        segment_ids=segment_ids,
+                    )
+                elif self.attn_mechanism == "cudnn":
+                    attentions = self._qkv_normal_cudnn_flash_op(
+                        query_states=query_states,
+                        key_states=key_states,
+                        value_states=value_states,
                         bias=bias,
-                        dropout_rng=dropout_rng,
-                        use_pjit_attention_force=use_pjit_attention_force,
                         causal=causal,
                         deterministic=deterministic,
-                        query_sequence_length=query_sequence_length,
-                        key_value_sequence_length=key_value_sequence_length,
-                        segment_ids=segment_ids,
+                        key_value_sequence_length=key_value_sequence_length
                     )
                 else:
                     raise ValueError(f"Unknown Attention mechanism of {self.attn_mechanism}")
@@ -259,16 +257,14 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
 
     def _qkv_ring_op(
             self,
+            *,  # it's Kwarg Only
             query_states: Array,
             key_states: Array,
             value_states: Array,
             query_sequence_length: int,
-            key_value_sequence_length: int,
             bias: Optional[Array] = None,
-            causal: bool = False,
             deterministic: bool = False,
             dropout_rng: Optional[random.PRNGKey] = None,
-            use_pjit_attention_force: bool = False,
             segment_ids: Optional[Array] = None
     ):
         if segment_ids is None:
@@ -349,10 +345,7 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
             query_states: Array,
             key_states: Array,
             value_states: Array,
-            query_sequence_length: int,
-            key_value_sequence_length: int,
             bias: Optional[Array] = None,
-            causal: bool = False,
             deterministic: bool = False,
             dropout_rng: Optional[random.PRNGKey] = None,
             use_pjit_attention_force: bool = False
@@ -412,16 +405,13 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
 
     def _qkv_normal_flash_op(
             self,
+            *,  # it's Kwarg Only
             query_states: Array,
             key_states: Array,
             value_states: Array,
-            query_sequence_length: int,
             key_value_sequence_length: int,
             bias: Optional[Array] = None,
             causal: bool = False,
-            deterministic: bool = False,
-            dropout_rng: Optional[random.PRNGKey] = None,
-            use_pjit_attention_force: bool = False
     ) -> AttentionOutput:
 
         query_states = query_states.transpose(0, 2, 1, 3)
@@ -504,22 +494,15 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
             query_states: Array,
             key_states: Array,
             value_states: Array,
-            query_sequence_length: int,
-            key_value_sequence_length: int,
             segment_ids: Optional[Array] = None,
-            causal: bool = False,
-            deterministic: bool = False,
-            dropout_rng: Optional[random.PRNGKey] = None,
-            use_pjit_attention_force: bool = False,
     ) -> AttentionOutput:
+
+        if self.platform != "tpu":
+            raise OSError(f"Splash attention only supports on TPUs and right now we don't support {self.platform}")
 
         query_states = query_states.transpose(0, 2, 1, 3)
         key_states = key_states.transpose(0, 2, 1, 3)
         value_states = value_states.transpose(0, 2, 1, 3)
-        batch_size, num_attention_heads, query_sequence_length, head_dims = query_states.shape
-
-        if self.platform != "tpu":
-            raise OSError(f"Splash attention only supports on TPUs and right now we don't support {self.platform}")
 
         query_states, key_states, value_states = map(
             lambda s: s.astype(jnp.float32),
@@ -599,4 +582,72 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
         return AttentionOutput(
             attention_outputs=attention_o,
             attention_weights=None
+        )
+
+    def _qkv_normal_cudnn_flash_op(
+            self,
+            *,  # it's Kwarg Only
+            query_states: Array,
+            key_states: Array,
+            value_states: Array,
+            key_value_sequence_length: int,
+            bias: Optional[Array] = None,
+            causal: bool = False,
+            deterministic: bool = True
+    ) -> AttentionOutput:
+        """CUDNN Flash Attention with Transformer Engine."""
+        try:
+            import transformer_engine.jax.fused_attn as fused_attn
+            from transformer_engine.jax.fused_attn import AttnBiasType, AttnMaskType, QKVLayout
+            from transformer_engine.jax.fused_attn import is_fused_attn_kernel_available
+        except (ModuleNotFoundError, ImportError) as err:
+            raise RuntimeError(
+                "Please install transformer_engine first. you can install that by running "
+                f"`pip install git+https://github.com/NVIDIA/transformer_engine`"
+                f"\nhere's extra information on error\n{err}"
+            )
+        batch, query_sequence_length, num_attention_heads, head_dim = query_states.shape
+
+        qkv_layout = QKVLayout.BS3HD
+        attn_mask_type = AttnMaskType.CAUSAL_MASK
+        attn_bias_type = AttnBiasType.NO_BIAS
+
+        has_fused_attn_kernel = is_fused_attn_kernel_available(
+            self.dtype, self.dtype, qkv_layout,
+            attn_bias_type,
+            attn_mask_type,
+            self.attention_dropout,
+            self.num_attention_heads,
+            key_states.shape[2],
+            query_sequence_length,
+            key_value_sequence_length,
+            head_dim
+        )
+
+        if not has_fused_attn_kernel:
+            raise ValueError(
+                "Flash attention kernel is not supported for current requested arrays"
+                " for details check this repo https://github.com/NVIDIA/TransformerEngine/"
+            )
+
+        return AttentionOutput(
+            attention_weights=None,
+            attention_outputs=fused_attn.self_fused_attn(
+                qkv=jnp.concatenate(
+                    (
+                        jnp.reshape(query_states, (*query_states.shape[:2], 1, *query_states.shape[-2:])),
+                        jnp.reshape(key_states, (*query_states.shape[:2], 1, *query_states.shape[-2:])),
+                        jnp.reshape(value_states, (*query_states.shape[:2], 1, *query_states.shape[-2:]))
+                    ),
+                    axis=2
+                ),
+                bias=bias,
+                mask=jnp.zeros((batch, 1, query_sequence_length, key_value_sequence_length)) if causal else None,
+                seed=None,
+                attn_bias_type=attn_bias_type,
+                attn_mask_type=attn_mask_type,
+                scaling_factor=self.sm_scale,
+                dropout_probability=self.attention_dropout,
+                is_training=deterministic
+            )
         )

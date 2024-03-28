@@ -149,6 +149,7 @@ class FlaxRobertaSelfAttention(BaseJAXAttentionModule):
             hidden_states,
             attention_mask,
             layer_head_mask,
+            segment_ids: Optional[chex.Array] = None,
             key_value_states: Optional[jnp.array] = None,
             init_cache: bool = False,
             deterministic=True,
@@ -217,7 +218,8 @@ class FlaxRobertaSelfAttention(BaseJAXAttentionModule):
                 bias=attention_bias,
                 uses_cache=False,
                 query_sequence_length=query_states.shape[1],
-                key_value_sequence_length=key_states.shape[1]
+                key_value_sequence_length=key_states.shape[1],
+                segment_ids=segment_ids
             )
             attn_weights = out.attention_weights
             attn_output = out.attention_outputs

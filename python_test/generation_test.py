@@ -66,7 +66,7 @@ class EasyModelsGenerationTest(TestCase):
         self.rotary_dim = 32
         self.dtype: jax.numpy.dtype = jnp.float32
         self.precision = jax.lax.Precision("fastest")
-        self.attn_mechanism: Literal["normal", "flash", "splash", "ring"] = "normal"
+        self.attn_mechanism: Literal["normal", "flash", "splash", "ring", "cudnn"] = "normal"
         self.block_k: int = 64
         self.block_q: int = 64
         self.scan_mlp_chunk_size = self.sequence_length // 2
