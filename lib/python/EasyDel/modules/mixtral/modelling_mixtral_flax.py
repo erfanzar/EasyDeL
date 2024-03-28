@@ -197,6 +197,7 @@ class FlaxMixtralAttention(BaseJAXAttentionModule):
             attention_mask: chex.Array,
             causal_mask: chex.Array,
             position_ids: chex.Array,
+            segment_ids: Optional[chex.Array] = None,
             deterministic: bool = True,
             init_cache: bool = False,
             output_attentions: bool = True
@@ -316,6 +317,7 @@ class FlaxMixtralAttention(BaseJAXAttentionModule):
             query_sequence_length=query_length,
             key_value_sequence_length=key_length,
             uses_cache=self.has_variable("cache", "cached_key") or init_cache,
+            segment_ids=segment_ids
         )
 
         attn_output = self._merge_heads(attentions.attention_outputs)

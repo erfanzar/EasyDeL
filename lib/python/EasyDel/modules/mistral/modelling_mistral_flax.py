@@ -292,6 +292,7 @@ class FlaxMistralAttention(BaseJAXAttentionModule):
             attention_mask: chex.Array,
             position_ids: chex.Array,
             causal_mask: chex.Array,
+            segment_ids: Optional[chex.Array] = None,
             deterministic: bool = True,
             init_cache: bool = False,
             output_attentions: bool = False,
@@ -416,6 +417,7 @@ class FlaxMistralAttention(BaseJAXAttentionModule):
             query_sequence_length=query_length,
             key_value_sequence_length=key_length,
             uses_cache=self.has_variable("cache", "cached_key") or init_cache,
+            segment_ids=segment_ids
         )
         attentions.attention_outputs = attentions.attention_outputs
 

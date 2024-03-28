@@ -169,6 +169,7 @@ class FlaxGemmaAttention(BaseJAXAttentionModule):
             position_ids: chex.Array,
             freq_cis: chex.Array,
             causal_mask: chex.Array,
+            segment_ids: Optional[chex.Array] = None,
             deterministic: bool = True,
             init_cache: bool = False,
             output_attentions: bool = False,
@@ -242,6 +243,7 @@ class FlaxGemmaAttention(BaseJAXAttentionModule):
             query_sequence_length=query_length,
             key_value_sequence_length=key_length,
             uses_cache=self.has_variable("cache", "cached_key") or init_cache,
+            segment_ids=segment_ids
         )
         attn_output = self._merge_heads(attentions.attention_outputs)
         attn_output = self.o_proj(attn_output)

@@ -313,6 +313,7 @@ class FlaxQwen1Attention(BaseJAXAttentionModule):
             attention_mask: chex.Array,
             position_ids: chex.Array,
             causal_mask: chex.Array,
+            segment_ids:Optional[chex.Array]=None,
             deterministic: bool = True,
             init_cache: bool = False,
             output_attentions: bool = False,
@@ -354,7 +355,7 @@ class FlaxQwen1Attention(BaseJAXAttentionModule):
         value_state = value_state.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
 
         query_state, key_state, value_state = self.apply_rotary(
-            query_states=query_state,
+            query=query_state,
             key=key_state,
             value=value_state,
             position_ids=position_ids,
@@ -417,6 +418,7 @@ class FlaxQwen1Attention(BaseJAXAttentionModule):
             query_sequence_length=query_length,
             key_value_sequence_length=key_length,
             uses_cache=self.has_variable("cache", "cached_key") or init_cache,
+            segment_ids=segment_ids
         )
         attentions.attention_outputs = attentions.attention_outputs
 
