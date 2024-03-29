@@ -538,7 +538,6 @@ class FlaxMistralDecoderLayer(nn.Module):
             attention_mask,
             position_ids,
             causal_mask,
-
             segment_ids,
             deterministic,
             init_cache,
@@ -564,7 +563,7 @@ class FlaxMistralDecoderLayer(nn.Module):
         hidden_states = hidden_states + feed_forward_hidden_states
         outputs = (hidden_states,)
         if output_attentions:
-            outputs += attention_output[1]
+            outputs += attention_output[1],
         return outputs
 
 
