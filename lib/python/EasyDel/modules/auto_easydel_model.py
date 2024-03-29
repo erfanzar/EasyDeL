@@ -266,6 +266,18 @@ def get_modules_by_type(model_type: str) -> Tuple[
                 rnn_based_or_rwkv=False
             )
         )
+    elif model_type == "grok-1":
+        from .grok_1 import Grok1Config as _Grok1Config
+        from .grok_1 import FlaxGrok1ForCausalLM as _FlaxGrok1ForCausalLM
+        return (
+            _Grok1Config,
+            _FlaxGrok1ForCausalLM,
+            functools.partial(
+                huggingface_to_easydel,
+                embedding_layer_names=["embed_tokens"],
+                rnn_based_or_rwkv=False
+            )
+        )
     raise EasyDelRuntimeError(f'Model Type ({model_type}) is not supported or is not found')
 
 
