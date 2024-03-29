@@ -78,7 +78,7 @@ class RMSNorm(nn.Module):
         return output * weight
 
 
-class FlaxLlamaAttention(BaseJAXAttentionModule):
+class FlaxDbrxAttention(BaseJAXAttentionModule):
     config: DbrxConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32

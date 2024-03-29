@@ -3,6 +3,8 @@
 import math
 from gc import unfreeze
 from typing import Optional, Tuple
+
+import chex
 from flax import linen as nn
 from flax.core import FrozenDict, freeze
 from flax.linen.attention import make_attention_mask, make_causal_mask, combine_masks, dot_product_attention_weights

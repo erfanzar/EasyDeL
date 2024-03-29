@@ -313,7 +313,7 @@ class FlaxQwen1Attention(BaseJAXAttentionModule):
             attention_mask: chex.Array,
             position_ids: chex.Array,
             causal_mask: chex.Array,
-            segment_ids:Optional[chex.Array]=None,
+            segment_ids: Optional[chex.Array] = None,
             deterministic: bool = True,
             init_cache: bool = False,
             output_attentions: bool = False,
@@ -443,7 +443,7 @@ class FlaxQwen1Block(nn.Module):
         attn_block = FlaxQwen1Attention
         if self.config.gradient_checkpointing != "":
             attn_block = nn_partitioning.remat(
-                FlaxQwen1Attention, static_argnums=(5, 6, 7),
+                FlaxQwen1Attention, static_argnums=(1, 3, 4, 6, 7, 8, 9, 10, 11),
                 policy=get_gradient_checkpoint_policy(
                     self.config.gradient_checkpointing)
             )
@@ -490,6 +490,7 @@ class FlaxQwen1Block(nn.Module):
             attention_mask: chex.Array,
             position_ids: chex.Array,
             causal_mask: chex.Array,
+            segment_ids: Optional[chex.Array] = None,
             deterministic: bool = True,
             init_cache: bool = False,
             output_attentions: bool = False,
@@ -535,6 +536,7 @@ class FlaxQwen1Block(nn.Module):
             attention_mask,
             position_ids,
             causal_mask,
+            segment_ids,
             deterministic,
             init_cache,
             output_attentions,

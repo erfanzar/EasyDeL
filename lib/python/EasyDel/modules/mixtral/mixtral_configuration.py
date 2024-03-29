@@ -147,9 +147,9 @@ class MixtralConfig(EasyDelPretrainedConfig):
             ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec("fsdp", "sp")),
             ("self_attn/o_proj/kernel", PartitionSpec("sp", "fsdp")),
 
-            ("mlp/w1/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("mlp/w2/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("mlp/w3/kernel", PartitionSpec(("fsdp", "sp"))),
+            ("w1/kernel", PartitionSpec(("fsdp", "sp"))),
+            ("w2/kernel", PartitionSpec(("fsdp", "sp"))),
+            ("w3/kernel", PartitionSpec(("fsdp", "sp"))),
 
             ("input_layernorm/kernel", PartitionSpec(None)),
             ("post_attention_layernorm/kernel", PartitionSpec(None)),
@@ -163,9 +163,9 @@ class MixtralConfig(EasyDelPretrainedConfig):
             ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"))),
             ("self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"))),
 
-            ("mlp/w1/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("mlp/w2/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("mlp/w3/kernel", PartitionSpec(("fsdp", "sp"))),
+            ("w1/kernel", PartitionSpec(("fsdp", "sp"))),
+            ("w2/kernel", PartitionSpec(("fsdp", "sp"))),
+            ("w3/kernel", PartitionSpec(("fsdp", "sp"))),
 
             ("input_layernorm/kernel", PartitionSpec(None)),
             ("post_attention_layernorm/kernel", PartitionSpec(None)),

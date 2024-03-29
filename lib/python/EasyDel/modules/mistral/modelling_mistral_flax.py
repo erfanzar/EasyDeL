@@ -455,7 +455,7 @@ class FlaxMistralDecoderLayer(nn.Module):
             attn_block = re_mat(
                 attn_block,
                 policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
-                static_argnums=(4, 5, 6, 7, 8)
+                static_argnums=(1, 3, 4, 6, 7, 8)
             )
             mlp_block = re_mat(
                 mlp_block,
@@ -494,6 +494,7 @@ class FlaxMistralDecoderLayer(nn.Module):
             attention_mask: chex.Array,
             causal_mask: chex.Array,
             position_ids: chex.Array,
+            segment_ids: Optional[chex.Array] = None,
             deterministic: bool = True,
             init_cache: bool = False,
             output_attentions: bool = True
@@ -537,6 +538,8 @@ class FlaxMistralDecoderLayer(nn.Module):
             attention_mask,
             position_ids,
             causal_mask,
+
+            segment_ids,
             deterministic,
             init_cache,
             output_attentions,

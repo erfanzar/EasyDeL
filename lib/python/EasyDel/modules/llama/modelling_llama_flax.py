@@ -439,7 +439,7 @@ class FlaxLlamaBlock(nn.Module):
         attn_block = FlaxLlamaAttention
         if self.config.gradient_checkpointing != "":
             attn_block = nn_partitioning.remat(
-                FlaxLlamaAttention, static_argnums=(5, 6, 7),
+                FlaxLlamaAttention, static_argnums=(1, 3, 4, 6, 7, 8),
                 policy=get_gradient_checkpoint_policy(
                     self.config.gradient_checkpointing)
             )
@@ -487,6 +487,7 @@ class FlaxLlamaBlock(nn.Module):
             attention_mask: chex.Array,
             position_ids: chex.Array,
             causal_mask: chex.Array,
+            segment_ids: Optional[chex.Array] = None,
             deterministic: bool = True,
             init_cache: bool = False,
             output_attentions: bool = False,
@@ -518,6 +519,7 @@ class FlaxLlamaBlock(nn.Module):
             attention_mask,
             position_ids,
             causal_mask,
+            segment_ids,
             deterministic,
             init_cache,
             output_attentions,
