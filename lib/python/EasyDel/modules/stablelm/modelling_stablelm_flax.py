@@ -458,7 +458,7 @@ class FlaxStableLmDecoderLayer(nn.Module):
             # fcm_mask=None,
             attn_block = flax.linen.partitioning.remat(
                 attn_block,
-                static_argnums=(2, 5, 6, 7, 8),
+                static_argnums=(1, 3, 4, 6, 7, 8),
                 policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing)
             )
         self.self_attn = attn_block(
@@ -492,6 +492,7 @@ class FlaxStableLmDecoderLayer(nn.Module):
             attention_mask: Optional[chex.Array],
             position_ids: Optional[chex.Array],
             causal_mask: Optional[chex.Array],
+            segment_ids: Optional[chex.Array] = None,
             deterministic: bool = True,
             output_attentions: bool = False,
             init_cache: bool = False,
@@ -503,6 +504,7 @@ class FlaxStableLmDecoderLayer(nn.Module):
             attention_mask,
             position_ids,
             causal_mask,
+            segment_ids,
             deterministic,
             init_cache,
             output_attentions,

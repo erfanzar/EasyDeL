@@ -94,6 +94,12 @@ from .stablelm import (
     FlaxStableLmModel as FlaxStableLmModel
 )
 
+from .grok_1 import (
+    Grok1Config as Grok1Config,
+    FlaxGrok1Model as FlaxGrok1Model,
+    FlaxGrok1ForCausalLM as FlaxGrok1ForCausalLM
+)
+
 from .auto_easydel_model import (
     AutoEasyDelModelForCausalLM as AutoEasyDelModelForCausalLM,
     AutoEasyDelConfig as AutoEasyDelConfig,
@@ -108,21 +114,34 @@ __all__ = (
     "VisionMistralConfig", "FlaxVisionMistralForCausalLM",
 
     "FlaxGPTJModel", "FlaxGPTJForCausalLM", "GPTJConfig",
+
     "FlaxGPT2Model", "FlaxGPT2LMHeadModel", "GPT2Config",
+
     "FlaxLTModel", "FlaxLTForCausalLM", "FlaxLTConfig",
+
     "FlaxMptModel", "FlaxMptForCausalLM", "MptConfig",
+
     "FlaxFalconModel", "FlaxFalconForCausalLM", "FalconConfig",
+
     "FlaxGPTNeoXModel", "FlaxGPTNeoXForCausalLM", "GPTNeoXConfig",
+
     "FlaxPalmModel", "FlaxPalmForCausalLM", "PalmConfig",
+
     "FlaxT5Model", "FlaxT5ForConditionalGeneration", "T5Config",
+
     "FlaxOPTModel", "FlaxOPTForCausalLM", "OPTConfig",
 
     "FlaxMixtralModel", "FlaxMixtralForCausalLM", "MixtralConfig",
-    "FlaxPhiForCausalLM", "PhiConfig", "FlaxPhiModel",
-    "FlaxQwen1Model", "FlaxQwen1ForCausalLM",
-    "FlaxQwen1ForSequenceClassification", "Qwen1Config", "FlaxQwen2Model", "FlaxQwen2ForCausalLM",
-    "FlaxQwen2ForSequenceClassification", "Qwen2Config", "AutoEasyDelModelForCausalLM",
 
+    "FlaxPhiForCausalLM", "PhiConfig", "FlaxPhiModel",
+
+    "FlaxQwen1Model", "FlaxQwen1ForCausalLM", "FlaxQwen1ForSequenceClassification", "Qwen1Config",
+
+    "FlaxQwen2Model", "FlaxQwen2ForCausalLM", "FlaxQwen2ForSequenceClassification", "Qwen2Config",
+
+    "Grok1Config", "FlaxGrok1Model", "FlaxGrok1ForCausalLM",
+
+    "AutoEasyDelModelForCausalLM",
     "AutoEasyDelConfig",
     "AutoShardAndGatherFunctions",
 

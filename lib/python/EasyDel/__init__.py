@@ -126,6 +126,12 @@ from .modules.mamba import (
     FlaxMambaForCausalLM as FlaxMambaForCausalLM,
     MambaConfig as MambaConfig
 )
+
+from .modules.grok_1 import (
+    Grok1Config as Grok1Config,
+    FlaxGrok1Model as FlaxGrok1Model,
+    FlaxGrok1ForCausalLM as FlaxGrok1ForCausalLM
+)
 from .modules.auto_easydel_model import (
     AutoEasyDelModelForCausalLM as AutoEasyDelModelForCausalLM,
     AutoEasyDelConfig as AutoEasyDelConfig,
@@ -313,6 +319,11 @@ __all__ = (
     "FlaxMambaModel",
     "FlaxMambaForCausalLM",
     "MambaConfig",
+
+    # Grok-1 Models
+    "Grok1Config",
+    "FlaxGrok1Model",
+    "FlaxGrok1ForCausalLM",
 
     # AutoModels Models
     "AutoEasyDelModelForCausalLM",

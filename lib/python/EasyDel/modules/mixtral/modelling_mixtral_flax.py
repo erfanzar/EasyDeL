@@ -45,24 +45,56 @@ class MoeCausalLMOutput(FlaxMaskedLMOutput):
     router_logits: Optional[Tuple[chex.Array]] = None
 
 
-def jax_load_balancing_loss_func(gate_logits: chex.Array, num_experts: chex.Array = None, top_k: int = 2) -> float:
+@flax.struct.dataclass
+class LoadBalancingLossOutput:
+    loss: float
+
+
+def load_balancing_loss_func(
+        gate_logits: Tuple[jnp.ndarray], num_experts: Optional[int] = None, top_k=2
+) -> LoadBalancingLossOutput:
+    """
+    Computes auxiliary load balancing loss as in Switch Transformer - implemented in JAX.
+    See Switch Transformer (https://arxiv.org/abs/2101.03961) for more details. This function implements the loss
+    function presented in equations (4) - (6) of the paper. It aims at penalizing cases where the routing between
+    experts is too unbalanced.
+    Args:
+        gate_logits (Union[`torch.Tensor`, Tuple[torch.Tensor]]):
+            Logits from the `gate`, should be a tuple of tensors. Shape: [batch_size, sequence_length, num_experts].
+        num_experts (`int`, *optional*):
+            Number of experts
+    Returns:
+        The auxiliary loss.
+    """
     if gate_logits is None:
-        return 0
+        return LoadBalancingLossOutput(loss=0.0)
+
     if isinstance(gate_logits, tuple):
-        gate_logits = jnp.concatenate([gate for gate in gate_logits], axis=0)
+        gate_logits = jnp.concatenate(gate_logits, axis=0)
+
     routing_weights, selected_experts = jax.lax.top_k(gate_logits, top_k)
     routing_weights = jax.nn.softmax(routing_weights, axis=-1)
-    if selected_experts.dtype != jnp.int64:
-        selected_experts = selected_experts.astype(jnp.int64)
+
+    # cast the expert indices to int64, otherwise one-hot encoding will fail
+    selected_experts = jnp.int64(selected_experts)
+
     if len(selected_experts.shape) == 2:
         selected_experts = selected_experts[:, :, jnp.newaxis]
-    expert_mask = jnp.max(jax.nn.one_hot(
-        selected_experts, num_experts), axis=-2)
-    tokens_per_group_and_expert = jnp.mean(
-        expert_mask.astype(jnp.float32), axis=-2)
+
+    expert_mask = jax.nn.one_hot(selected_experts, num_experts)
+
+    # For a given token, determine if it was routed to a given expert.
+    expert_mask = jnp.max(expert_mask, axis=-2)
+
+    # cast to float32 otherwise mean will fail
+    expert_mask = expert_mask.astype(jnp.float32)
+    tokens_per_group_and_expert = jnp.mean(expert_mask, axis=-2)
+
     router_prob_per_group_and_expert = jnp.mean(routing_weights, axis=-1)
-    return jnp.mean(tokens_per_group_and_expert * jnp.expand_dims(router_prob_per_group_and_expert, axis=-1)) * (
-            num_experts ** 2)
+    loss = jnp.mean(
+        tokens_per_group_and_expert * router_prob_per_group_and_expert[:, :, jnp.newaxis]
+    ) * (num_experts ** 2)
+    return LoadBalancingLossOutput(loss=loss)
 
 
 class MixtralRMSNorm(nn.Module):
@@ -381,12 +413,36 @@ class FlaxMixtralBlocKSparesTop2MLPCollection(nn.Module):
             hidden_dim: int
     ) -> chex.Array:
         final_hidden_state = jnp.zeros_like(hidden_states)
+
         for index in range(self.config.num_local_experts):
-            router_mul = jnp.multiply(selected_experts == index, routing_weights)
-            router_weights_exp = jnp.sum(router_mul, axis=-1)
             expert_layer_output = self.layers[index](hidden_states)
-            expert_layer_output_exp = router_weights_exp[:, :, None] * expert_layer_output
+            expert_layer_output_exp = jnp.sum(
+                jnp.multiply(
+                    selected_experts == index, routing_weights
+                ), axis=-1
+            )[:, :, None] * expert_layer_output
             final_hidden_state += expert_layer_output_exp
+
+        # def expert_aggregation(mdl, carry, inputs):
+        #     out_a, current_index = carry
+        #     i_hidden_states, i_selected_experts, i_routing_weights = inputs
+        #     idx = jax.lax.dynamic_index_in_dim(jnp.arange(self.config.num_local_experts), current_index)
+        #     i_expert_layer_output = mdl.layers[idx](i_hidden_states)
+        #     i_expert_layer_output_exp = jnp.sum(
+        #         jnp.multiply(
+        #             i_selected_experts == current_index, routing_weights
+        #         ), axis=-1
+        #     )[:, :, None] * i_expert_layer_output
+        #     return (out_a + i_expert_layer_output_exp, current_index + 1), None
+        #
+        # (final_hidden_state, _), _ = nn.scan(
+        #     expert_aggregation,
+        #     split_rngs={"params": False}, in_axes=0, out_axes=0,
+        # )(
+        #     self,
+        #     (final_hidden_state, 0),
+        #     (hidden_states, selected_experts, routing_weights)
+        # )
         return final_hidden_state
 
 
@@ -479,7 +535,7 @@ class FlaxMixtralDecoderLayer(nn.Module):
                 attn_block,
                 policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
                 static_argnums=(
-                    3, 5, 6, 7
+                    1, 3, 4, 6, 7, 8, 9
                 )
             )
             mlp_block = re_mat(
@@ -522,6 +578,7 @@ class FlaxMixtralDecoderLayer(nn.Module):
             attention_mask: chex.Array,
             causal_mask: chex.Array,
             position_ids: chex.Array,
+            segment_ids: Optional[chex.Array] = None,
             deterministic: bool = True,
             init_cache: bool = False,
             output_attentions: bool = True,
@@ -553,6 +610,7 @@ class FlaxMixtralDecoderLayer(nn.Module):
         # attention_mask: chex.Array
         # causal_mask: chex.Array
         # position_ids: chex.Array
+        # segment_ids: Optional[chex.Array] = None
         # deterministic: bool = True
         # init_cache: bool = False
         # output_attentions: bool = True
@@ -563,6 +621,7 @@ class FlaxMixtralDecoderLayer(nn.Module):
             attention_mask,
             causal_mask,
             position_ids,
+            segment_ids,
             deterministic,
             init_cache,
             output_attentions
@@ -818,7 +877,6 @@ class MixtralPreTrainedModel(EasyDelFlaxPretrainedModel):
 
         """
 
-        # TODO: Here needs to be fixed
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1068,7 +1126,7 @@ class FlaxMixtralForCausalLMModule(nn.Module):
         logits = self.lm_head(outputs.last_hidden_state)
         aux_loss = None
         if output_router_logits and outputs.router_logits is not None:
-            aux_loss = jax_load_balancing_loss_func(
+            aux_loss = load_balancing_loss_func(
                 outputs.router_logits, self.num_experts, self.num_experts_per_tok
             )
 
@@ -1076,6 +1134,8 @@ class FlaxMixtralForCausalLMModule(nn.Module):
             outputs = (logits,) + tuple(
                 v
                 for v in [
+                    aux_loss,
+                    logits,
                     outputs.hidden_states,
                     outputs.attentions,
                     outputs.router_logits

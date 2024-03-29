@@ -322,7 +322,7 @@ class FlaxGemmaDecoderLayer(nn.Module):
             attn_block = flax.linen.partitioning.remat(
                 attn_block,
                 policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
-                static_argnums=(3, 4, 5, 6, 7)
+                static_argnums=(3, 4, 6, 7, 8)
             )
         self.input_layernorm = FlaxGemmaRMSNorm(self.config, dtype=self.dtype)
         self.post_attention_layernorm = FlaxGemmaRMSNorm(self.config, dtype=self.dtype)
@@ -346,6 +346,7 @@ class FlaxGemmaDecoderLayer(nn.Module):
             position_ids: chex.Array,
             freq_cis: chex.Array,
             causal_mask: chex.Array,
+            segment_ids: Optional[chex.Array] = None,
             deterministic: bool = True,
             init_cache: bool = False,
             output_attentions: bool = False,
@@ -358,6 +359,7 @@ class FlaxGemmaDecoderLayer(nn.Module):
             position_ids,
             freq_cis,
             causal_mask,
+            segment_ids,
             deterministic,
             init_cache,
             output_attentions,

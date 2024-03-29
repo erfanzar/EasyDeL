@@ -419,6 +419,7 @@ class FlaxPhiDecoderLayer(nn.Module):
             attention_mask: Optional[chex.Array],
             position_ids: Optional[chex.Array],
             causal_mask: Optional[chex.Array],
+            segment_ids: Optional[chex.Array] = None,
             deterministic: bool = True,
             output_attentions: bool = False,
             init_cache: bool = False,
@@ -435,6 +436,7 @@ class FlaxPhiDecoderLayer(nn.Module):
             freq_cis=freq_cis,
             causal_mask=causal_mask,
             init_cache=init_cache,
+            segment_ids=segment_ids
         )
         attn_outputs, self_attn_weights = (attn_out[0], attn_out[1]) if len(attn_out) == 2 else (attn_out[0], None)
 
@@ -478,6 +480,7 @@ class FlaxPhiDecoderLayerCollection(nn.Module):
             # attention_mask: Optional[chex.Array],
             # position_ids: Optional[chex.Array],
             # causal_mask: Optional[chex.Array],
+            # segment_ids: Optional[chex.Array] = None,
             # deterministic: bool = True,
             # output_attentions: bool = False,
             # init_cache: bool = False,
@@ -486,7 +489,7 @@ class FlaxPhiDecoderLayerCollection(nn.Module):
                 block,
                 policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
                 static_argnums=(
-                    4, 5, 6, 7
+                    1, 3, 4, 6, 7, 8
                 )
             )
         self.layers = [
@@ -509,6 +512,7 @@ class FlaxPhiDecoderLayerCollection(nn.Module):
             attention_mask: Optional[chex.Array],
             position_ids: Optional[chex.Array],
             causal_mask: Optional[chex.Array],
+            segment_ids: Optional[chex.Array] = None,
             deterministic: bool = True,
             output_attentions: bool = False,
             output_hidden_states: bool = False,
@@ -526,6 +530,7 @@ class FlaxPhiDecoderLayerCollection(nn.Module):
             # attention_mask: Optional[chex.Array],
             # position_ids: Optional[chex.Array],
             # causal_mask: Optional[chex.Array],
+            # segment_ids: Optional[chex.Array] = None,
             # deterministic: bool = True,
             # output_attentions: bool = False,
             # init_cache: bool = False,
@@ -535,6 +540,7 @@ class FlaxPhiDecoderLayerCollection(nn.Module):
                 attention_mask,
                 position_ids,
                 causal_mask,
+                segment_ids,
                 deterministic,
                 output_attentions,
                 init_cache,
