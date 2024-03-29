@@ -112,7 +112,7 @@ def get_modules_by_type(model_type: str) -> Tuple[
                 huggingface_to_easydel,
                 embedding_layer_names="wte",
                 layer_norm_names=[
-                    "ln_1", "ln_2", "ln_f"
+                    "ln_1", "ln_2", "ln_f",
                 ],
                 rnn_based_or_rwkv=False
             )
