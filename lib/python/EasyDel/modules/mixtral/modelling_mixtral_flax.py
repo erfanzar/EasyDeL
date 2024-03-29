@@ -373,47 +373,21 @@ class FlaxMixtralBlocKSparesTop2MLPCollection(nn.Module):
 
     def __call__(
             self,
-            expert_mask: chex.Array,
+            selected_experts: chex.Array,
             hidden_states: chex.Array,
             routing_weights: chex.Array,
             batch_size: int,
             sequence_length: int,
             hidden_dim: int
     ) -> chex.Array:
-        assert hidden_states.ndim == 2
-        final_hidden_states = jnp.zeros(
-            ((batch_size * sequence_length) + 1, hidden_dim), dtype=hidden_states.dtype
-        )
-
-        for expert_idx in range(self.config.num_local_experts):
-            selected_mask = expert_mask[expert_idx]
-            idx, top_x = jnp.nonzero(selected_mask, size=sequence_length, fill_value=-1)
-
-            def true_fn(mdl, input_final_hidden_states):
-                expert_layer_output = mdl.layers[expert_idx](
-                    hidden_states[top_x]
-                )
-                current_hidden_states = expert_layer_output * routing_weights[top_x, idx, None]
-
-                input_final_hidden_states = input_final_hidden_states.at[top_x].set(
-                    current_hidden_states + input_final_hidden_states[top_x]
-                )
-                return input_final_hidden_states
-
-            def false_fn(mdl, input_final_hidden_states):
-                return input_final_hidden_states
-
-            final_hidden_states = true_fn(self, final_hidden_states)
-            # final_hidden_states = nn.cond(
-            #     # jnp.max(idx) == -1,
-            #     True,
-            #     true_fn,
-            #     false_fn,
-            #     self,
-            #     final_hidden_states
-            # )
-        final_hidden_states = final_hidden_states[:-1]
-        return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+        final_hidden_state = jnp.zeros_like(hidden_states)
+        for index in range(self.config.num_local_experts):
+            router_mul = jnp.multiply(selected_experts == index, routing_weights)
+            router_weights_exp = jnp.sum(router_mul, axis=-1)
+            expert_layer_output = self.layers[index](hidden_states)
+            expert_layer_output_exp = router_weights_exp[:, :, None] * expert_layer_output
+            final_hidden_state += expert_layer_output_exp
+        return final_hidden_state
 
 
 class FlaxMixtralSparseMoeBlock(nn.Module):
@@ -457,36 +431,22 @@ class FlaxMixtralSparseMoeBlock(nn.Module):
             e: bool = False  # Ignored
     ) -> Tuple[chex.Array, chex.Array]:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.reshape(-1, hidden_dim)
 
         router_logits = self.gate(hidden_states).astype(
             jnp.promote_types(self.dtype, jnp.float32)
         )
-
-        routing_weights = jax.nn.softmax(
-            router_logits.astype(
-                jnp.promote_types(self.dtype, jnp.float32)
-            ), axis=1
-        )
         routing_weights, selected_experts = jax.lax.top_k(
-            routing_weights,
+            router_logits,
             k=self.config.num_experts_per_tok
         )
-        routing_weights /= jnp.sum(
-            routing_weights,
-            axis=-1,
-            keepdims=True
+        routing_weights = jax.nn.softmax(
+            routing_weights.astype(
+                jnp.promote_types(self.dtype, jnp.float32)
+            ), axis=-1
         )
-        routing_weights = routing_weights.astype(
-            hidden_states.dtype
-        )
-        expert_mask = jax.nn.one_hot(
-            selected_experts,
-            num_classes=self.config.num_local_experts
-        ).transpose(2, 1, 0)
 
         return self.experts(
-            expert_mask=expert_mask,
+            selected_experts=selected_experts,
             batch_size=batch_size,
             sequence_length=sequence_length,
             hidden_dim=hidden_dim,
