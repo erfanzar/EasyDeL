@@ -7,6 +7,7 @@ import jax
 from chex import Array
 from fjformer import with_sharding_constraint
 from flax.linen import dot_product_attention_weights
+from flax.linen.dtypes import promote_dtype
 from jax import numpy as jnp, lax, random
 from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec, Mesh
@@ -25,7 +26,7 @@ from fjformer.pallas_operations.splash_attention import (
     CausalMask,
     MultiHeadMask
 )
-from typing import Tuple, Callable, Type, Any, Optional, Literal
+from typing import Tuple, Callable, Type, Any, Optional, Literal, Union
 from dataclasses import dataclass
 
 from .flax_modelling_utils import get_gradient_checkpoint_policy
@@ -138,6 +139,79 @@ def attention_production_static(
     return attention
 
 
+def static_sharded_dot_product_attention(
+        query: Array,
+        key: Array,
+        value: Array,
+        bias: Optional[Array] = None,
+        mask: Optional[Array] = None,
+        broadcast_dropout: bool = True,
+        dropout_rng: Optional[jax.random.PRNGKey] = None,
+        dropout_rate: float = 0.0,
+        deterministic: bool = False,
+        dtype: Optional[jnp.dtype] = None,
+        precision: Optional[Union[str, lax.Precision]] = None,
+):
+    is_generating = query.shape[1] == 1
+    sequence_sharding_axis_name = None if is_generating else "sp"
+
+    query, key, value = promote_dtype(query, key, value, dtype=dtype)
+    dtype = query.dtype
+
+    query, key, value = promote_dtype(query, key, value, dtype=dtype)
+    query = with_sharding_constraint(
+        query, PartitionSpec(("dp", "fsdp"), sequence_sharding_axis_name, "tp", None)
+    )
+
+    key = with_sharding_constraint(
+        key, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
+    )
+
+    value = with_sharding_constraint(
+        value, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
+    )
+
+    assert query.ndim == key.ndim, "q, k must have same rank."
+    assert query.shape[:-3] == key.shape[:-3], "q, k batch dims must match."
+    assert query.shape[-2] == key.shape[-2], "q, k num_heads must match."
+    assert query.shape[-1] == key.shape[-1], "q, k depths must match."
+
+    depth = query.shape[-1]
+    query = query / jnp.sqrt(depth).astype(dtype)
+    attn_weights = jnp.einsum(
+        "...qhd,...khd->...hqk",
+        query, key, precision=precision
+    )
+    attn_weights = with_sharding_constraint(
+        attn_weights, PartitionSpec(("dp", "fsdp"), None, "sp", None)
+    )
+
+    print(attn_weights.shape)
+    if bias is not None:
+        attn_weights = attn_weights + bias
+    if mask is not None:
+        big_neg = jnp.finfo(dtype).min
+        attn_weights = jnp.where(mask, attn_weights, big_neg)
+    attn_weights = jax.nn.softmax(attn_weights).astype(dtype)
+    if not deterministic and dropout_rate > 0.0:
+        keep_prob = 1.0 - dropout_rate
+        if broadcast_dropout:
+            dropout_shape = tuple([1] * (key.ndim - 2)) + attn_weights.shape[-2:]
+            keep = random.bernoulli(dropout_rng, keep_prob, dropout_shape)  # type: ignore
+        else:
+            keep = random.bernoulli(dropout_rng, keep_prob, attn_weights.shape)  # type: ignore
+        multiplier = keep.astype(dtype) / jnp.asarray(keep_prob, dtype=dtype)
+        attn_weights = attn_weights * multiplier
+    attention = jnp.einsum(
+        "...hqk,...khd->...qhd",
+        attn_weights, value, precision=precision
+    )
+    attention = with_sharding_constraint(
+        attention, PartitionSpec(("dp", "fsdp"), sequence_sharding_axis_name, "tp", None)
+    )
+    return attention
+
+
 def get_flash_attention() -> Tuple[Callable, bool, bool]:
     """
     return: FlashAttention FN, Upcast Needed to float32,do_shard_map
@@ -190,6 +264,7 @@ class EasyAttention:
             bias_partition_spec: PartitionSpec,
             generation_bias_partition_spec: PartitionSpec,
             attention_partition_spec: PartitionSpec,
+            generation_attention_partition_spec: PartitionSpec,
             scan_ring_attention: bool = True,
             scan_attention_layers: bool = False,
             attention_dropout: float = 0.0,
@@ -236,6 +311,7 @@ class EasyAttention:
         self.scan_attention_layers = scan_attention_layers
         self.generation_query_partition_spec = generation_query_partition_spec
         self.generation_bias_partition_spec = generation_bias_partition_spec
+        self.generation_attention_partition_spec = generation_attention_partition_spec
         self.assertion_mkv_err = f"""
 query_states, key_states, value_states and bias shapes must be like
 query_states Shape : [batch_size, q_seq_len , num_attention_heads({self.num_attention_heads}), head_dims({self.head_dims})]
@@ -392,7 +468,7 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
                         query_chunk_size=self.block_q,
                         key_chunk_size=self.block_k,
                         dtype=self.dtype,
-                        policy=get_gradient_checkpoint_policy('nothing_saveable'),
+                        policy=get_gradient_checkpoint_policy("nothing_saveable"),
                         precision=self.precision,
                         prevent_cse=not self.scan_attention_layers,
                     )
@@ -456,41 +532,63 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
             lambda s: s.astype(dtype_c),
             (query_states, key_states, value_states)
         )
+        is_generating = query_states.shape[1] == 1
+        if is_generating:
+            query_partition_spec = self.generation_query_partition_spec
+            bias_partition_spec = self.generation_bias_partition_spec
+            attention_partition_spec = self.generation_attention_partition_spec
+
+        else:
+            query_partition_spec = self.query_partition_spec
+            bias_partition_spec = self.bias_partition_spec
+            attention_partition_spec = self.attention_partition_spec
         if self.use_shard_map:
             attention_output = shard_map(
-                attention_production,
+                partial(
+                    flax.linen.attention.dot_product_attention,
+                    dtype=jnp.float32,
+                    precision=None,
+                ),
                 mesh=self.mesh,
                 in_specs=(
-                    self.query_partition_spec,
+                    query_partition_spec,
                     self.key_partition_spec,
-                    self.query_partition_spec,
-                    self.bias_partition_spec,
+                    self.value_partition_spec,
+                    bias_partition_spec,
                     PartitionSpec(),
                     PartitionSpec(),
-                    PartitionSpec()
+                    PartitionSpec(),
+                    PartitionSpec(),
+                    PartitionSpec(),
                 ),
                 out_specs=(
-                    self.attention_partition_spec
+                    attention_partition_spec
                 )
             )(
                 query_states,
                 key_states,
                 value_states,
                 bias,
+                None,
                 deterministic,
                 dropout_rng,
-                self.attention_dropout
+                self.attention_dropout,
+                True,
             )
         else:
             with self.mesh:
-                attention_output = attention_production_static(
+                attention_output = static_sharded_dot_product_attention(
                     query_states,
                     key_states,
                     value_states,
                     bias,
-                    deterministic,
+                    None,
+                    True,
                     dropout_rng,
-                    self.attention_dropout
+                    self.attention_dropout,
+                    deterministic,
+                    self.dtype,
+                    self.precision
                 )
         return AttentionOutput(
             attention_outputs=attention_output,

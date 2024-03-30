@@ -78,6 +78,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
             generation_bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
             attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            generation_attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, "tp", None),
             use_shard_map: bool = False,
             use_sharded_kv_caching: bool = True,
             backend: Optional[None] = jax.default_backend(),
@@ -96,6 +97,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
         self.bias_partition_spec = bias_partition_spec
         self.generation_bias_partition_spec = generation_bias_partition_spec
         self.attention_partition_spec = attention_partition_spec
+        self.generation_attention_partition_spec = generation_attention_partition_spec
         self.use_shard_map = use_shard_map
         self.axis_dims = axis_dims
         self.axis_names = axis_names
@@ -250,6 +252,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             bias_partition_spec: PartitionSpec = ...,
             attention_partition_spec: PartitionSpec = ...,
             generation_bias_partition_spec: PartitionSpec = ...,
+            generation_attention_partition_spec: PartitionSpec = ...,
             use_shard_map: bool = ...,
             use_sharded_kv_caching: bool = ...,
             backend: Optional[None] = ...,
@@ -282,6 +285,12 @@ class EasyDelPretrainedConfig(PretrainedConfig):
         :param value_partition_spec: PartitionSpec: Specify the partitioning of the value tensor
         :param bias_partition_spec: PartitionSpec: Specify the Attention Bias partition spec
         :param attention_partition_spec: PartitionSpec: Specify the partitioning of the attention weights
+        :param generation_attention_partition_spec: : PartitionSpec: Specify the partitioning of the attention weights
+        in generation process
+        :param generation_bias_partition_spec: : PartitionSpec: Specify the partitioning of the Attention Bias
+         partition spec in generation process
+        :param generation_query_partition_spec: : PartitionSpec: Specify the partitioning of the query tensor
+        in generation process
         :param use_shard_map: bool: whenever to use shard_map for attention
         :param use_sharded_kv_caching: bool: whenever to use shard_map and sharding for key and value
         :param backend: Optional[None]: Specify the backend to use
@@ -299,20 +308,54 @@ class EasyDelPretrainedConfig(PretrainedConfig):
         set_attrs_smartly(self, "block_k", 128, block_k)
         set_attrs_smartly(self, "block_b", 1, block_b)
 
-        set_attrs_smartly(self, "query_partition_spec", PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-                          query_partition_spec)
-        set_attrs_smartly(self, "generation_query_partition_spec", PartitionSpec(("dp", "fsdp"), None, "tp", None),
-                          generation_query_partition_spec)
-        set_attrs_smartly(self, "generation_bias_partition_spec", PartitionSpec(("dp", "fsdp"), None, None, None),
-                          generation_bias_partition_spec)
-        set_attrs_smartly(self, "key_partition_spec", PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-                          key_partition_spec)
-        set_attrs_smartly(self, "value_partition_spec", PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-                          value_partition_spec)
-        set_attrs_smartly(self, "bias_partition_spec", PartitionSpec(("dp", "fsdp"), None, None, None),
-                          bias_partition_spec)
-        set_attrs_smartly(self, "attention_partition_spec", PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-                          attention_partition_spec)
+        set_attrs_smartly(
+            self,
+            "query_partition_spec",
+            PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            query_partition_spec
+        )
+        set_attrs_smartly(
+            self,
+            "generation_query_partition_spec",
+            PartitionSpec(("dp", "fsdp"), None, "tp", None),
+            generation_query_partition_spec
+        )
+        set_attrs_smartly(
+            self,
+            "generation_bias_partition_spec",
+            PartitionSpec(("dp", "fsdp"), None, None, None),
+            generation_bias_partition_spec
+        )
+        set_attrs_smartly(
+            self,
+            "key_partition_spec",
+            PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            key_partition_spec
+        )
+        set_attrs_smartly(
+            self,
+            "value_partition_spec",
+            PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            value_partition_spec
+        )
+        set_attrs_smartly(
+            self,
+            "bias_partition_spec",
+            PartitionSpec(("dp", "fsdp"), None, None, None),
+            bias_partition_spec
+        )
+        set_attrs_smartly(
+            self,
+            "attention_partition_spec",
+            PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            attention_partition_spec
+        )
+        set_attrs_smartly(
+            self,
+            "generation_attention_partition_spec",
+            PartitionSpec(("dp", "fsdp"), None, "tp", None),
+            generation_attention_partition_spec
+        )
 
         set_attrs_smartly(self, "backend", jax.default_backend(), backend)
         set_attrs_smartly(self, "use_shard_map", False, use_shard_map)
