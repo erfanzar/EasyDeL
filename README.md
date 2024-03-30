@@ -10,11 +10,11 @@ Some of the key features provided by EasyDeL include:
 - Serving and API Engines for Using and serving LLMs in JAX as efficiently as possible.
 - Support for 8, 6, and 4 BIT inference and training in JAX
 - A wide range of models in Jax is supported which have never been implemented before such as Falcon, Qwen2, Phi2,
-  Mixtral, and MPT ...
+  Mixtral, Qwen2Moe,and MPT ...
 - Integration of flashAttention in JAX for GPUs and TPUs
 - Automatic serving of LLMs with mid and high-level APIs in both JAX and PyTorch
 - LLM Trainer and fine-tuner in JAX
-- Video CLM Trainer and Fine-tunerFalcon, Qwen2, Phi2, Mixtral, and MPT ...
+- Video CLM Trainer and Fine-tuner for Models such Falcon, Qwen2, Phi2, MPT, Mixtral, Grok-1, and Qwen2Moe ...
 - RLHF (Reinforcement Learning from Human Feedback) in Jax (Beta Stage)
 - DPOTrainer(Supported) and SFTTrainer(Developing Stage)
 - Various other features to enhance the training process and optimize performance.
