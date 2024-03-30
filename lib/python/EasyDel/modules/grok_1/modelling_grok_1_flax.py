@@ -26,7 +26,8 @@ from ..flax_modelling_utils import (
     apply_rotary_pos_emb,
     precompute_freq_cis,
     get_dot_general_by_bits,
-    BaseJAXAttentionModule
+    BaseJAXAttentionModule,
+    block_wise_ffn
 )
 
 re_mat = flax.linen.partitioning.remat
@@ -475,7 +476,12 @@ class FlaxGrok1BlocKSparesTop2MLPCollection(nn.Module):
         final_hidden_state = jnp.zeros_like(hidden_states)
 
         for index in range(self.config.num_experts):
-            expert_layer_output = self.layers[index](hidden_states)
+            expert_layer_output = block_wise_ffn(
+                self.layers[index],
+                hidden_states,
+                self.config.scan_mlp_chunk_size,
+                False
+            ) if self.config.use_scan_mlp else self.layers[index](hidden_states)
             expert_layer_output_exp = jnp.sum(
                 jnp.multiply(
                     selected_experts == index, routing_weights
