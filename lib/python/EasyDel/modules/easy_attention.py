@@ -1,6 +1,8 @@
+import math
 import warnings
 from functools import partial
 
+import flax.linen.attention
 import jax
 from chex import Array
 from fjformer import with_sharding_constraint
@@ -33,6 +35,107 @@ from .flax_modelling_utils import get_gradient_checkpoint_policy
 class AttentionOutput:
     attention_weights: Optional[Array] = None
     attention_outputs: Optional[Array] = None
+
+
+def attention_production(
+        query_states: jax.Array,
+        key_states: jax.Array,
+        value_states: jax.Array,
+        attention_bias: jax.Array | None = None,
+        deterministic: bool = True,
+        dropout_rng: jax.random.PRNGKey = jax.random.PRNGKey(0),
+        dropout_rate: float = 0.0
+):
+    batch, q_sequence_length, q_num_head, head_dim = query_states.shape
+    _, kv_sequence_length, kv_num_head, _ = key_states.shape
+    assert q_num_head % kv_num_head == 0, (
+        f"`query_states` {q_num_head} must be a multiple of `key_states` "
+        f"and `value_states` heads {kv_num_head}"
+    )
+    query_states = jnp.reshape(query_states,
+                               (batch, q_sequence_length, kv_num_head, q_num_head // kv_num_head, head_dim))
+    attention_score = jnp.einsum(
+        "...thHd,...Thd->...hHtT",
+        query_states,
+        key_states
+    ).astype(
+        jnp.float32
+    )
+    attention_score *= 1 / math.sqrt(head_dim)
+    max_attention_value = jnp.array(30.0, dtype=attention_score.dtype)
+    attention_score = max_attention_value * jnp.tanh(attention_score / max_attention_value)
+    attention_score = attention_score + attention_bias[:, :, None, :, :]
+    attention_weights = jax.nn.softmax(attention_score).astype(query_states.dtype)
+    if not deterministic and dropout_rate > 0.0:
+        keep_prob = 1.0 - dropout_rate
+        dropout_shape = tuple([1] * (key_states.ndim - 2)) + attention_weights.shape[-2:]
+        keep = random.bernoulli(dropout_rng, keep_prob, dropout_shape)  # type: ignore
+        multiplier = keep.astype(query_states.dtype) / jnp.asarray(keep_prob, dtype=query_states.dtype)
+        attention_weights = attention_weights * multiplier
+
+    attention = jnp.einsum("...hHtT,...Thd->...thHd", attention_weights, value_states).reshape(
+        batch, q_sequence_length, q_num_head, head_dim
+    )
+    return attention
+
+
+def attention_production_static(
+        query_states: jax.Array,
+        key_states: jax.Array,
+        value_states: jax.Array,
+        attention_bias: jax.Array | None = None,
+        deterministic: bool = True,
+        dropout_rng: jax.random.PRNGKey = jax.random.PRNGKey(0),
+        dropout_rate: float = 0.0
+):
+    gen_seq_p = None if query_states.shape[1] == 1 else "sp"
+    query_states = with_sharding_constraint(query_states, PartitionSpec(("dp", "fsdp"), gen_seq_p, None, "tp"))
+    key_states = with_sharding_constraint(key_states, PartitionSpec(("dp", "fsdp"), "sp", None, "tp"))
+    value_states = with_sharding_constraint(value_states, PartitionSpec(("dp", "fsdp"), "sp", None, "tp"))
+
+    batch, q_sequence_length, q_num_head, head_dim = query_states.shape
+    _, kv_sequence_length, kv_num_head, _ = key_states.shape
+
+    assert q_num_head % kv_num_head == 0, (
+        f"`query_states` {q_num_head} must be a multiple of"
+        f" `key_states` and `value_states` heads {kv_num_head}"
+    )
+
+    query_states = jnp.reshape(
+        query_states,
+        (batch, q_sequence_length, kv_num_head, q_num_head // kv_num_head, head_dim)
+    )
+
+    query_states = with_sharding_constraint(
+        query_states, PartitionSpec(("dp", "fsdp"), gen_seq_p, None, None, "tp")
+    )
+
+    attention_score = jnp.einsum(
+        "...thHd,...Thd->...hHtT",
+        query_states, key_states
+    ).astype(jnp.float32)
+
+    attention_score *= 1 / math.sqrt(head_dim)
+
+    max_attention_value = jnp.array(30.0, dtype=attention_score.dtype)
+    attention_score = max_attention_value * jnp.tanh(attention_score / max_attention_value)
+    attention_score = attention_score + attention_bias[:, :, None, :, :]
+
+    attention_weights = jax.nn.softmax(attention_score).astype(query_states.dtype)
+    if not deterministic and dropout_rate > 0.0:
+        keep_prob = 1.0 - dropout_rate
+        dropout_shape = tuple([1] * (key_states.ndim - 2)) + attention_weights.shape[-2:]
+        keep = random.bernoulli(dropout_rng, keep_prob, dropout_shape)  # type: ignore
+        multiplier = keep.astype(query_states.dtype) / jnp.asarray(keep_prob, dtype=query_states.dtype)
+        attention_weights = attention_weights * multiplier
+
+    attention = jnp.einsum("...hHtT,...Thd->...thHd", attention_weights, value_states).reshape(
+        batch, q_sequence_length, q_num_head, head_dim
+    )
+
+    attention = with_sharding_constraint(attention, PartitionSpec(("dp", "fsdp"), gen_seq_p, None, "tp"))
+
+    return attention
 
 
 def get_flash_attention() -> Tuple[Callable, bool, bool]:
@@ -215,7 +318,6 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
                         value_states=value_states,
                         bias=bias,
                         dropout_rng=dropout_rng,
-                        use_pjit_attention_force=use_pjit_attention_force,
                         deterministic=deterministic,
                     )
                 elif self.attn_mechanism == "ring":
@@ -348,59 +450,51 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
             bias: Optional[Array] = None,
             deterministic: bool = False,
             dropout_rng: Optional[random.PRNGKey] = None,
-            use_pjit_attention_force: bool = False
     ) -> AttentionOutput:
-
-        attn_weights = None
         dtype_c = jnp.promote_types(self.dtype, jnp.float32)
+        query_states, key_states, value_states = map(
+            lambda s: s.astype(dtype_c),
+            (query_states, key_states, value_states)
+        )
         if self.use_shard_map:
-            attn_weights = shard_map(
-                partial(
-                    dot_product_attention_weights,
-                    dtype=dtype_c,
-                    deterministic=deterministic,
-                    dropout_rate=self.attention_dropout,
-                    precision=self.precision,
-                    dropout_rng=dropout_rng
-                ),
+            attention_output = shard_map(
+                attention_production,
                 mesh=self.mesh,
                 in_specs=(
                     self.query_partition_spec,
                     self.key_partition_spec,
-                    self.bias_partition_spec
+                    self.query_partition_spec,
+                    self.bias_partition_spec,
+                    PartitionSpec(),
+                    PartitionSpec(),
+                    PartitionSpec()
                 ),
-                out_specs=PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-                check_rep=False
+                out_specs=(
+                    self.attention_partition_spec
+                )
             )(
-                query_states, key_states, bias
+                query_states,
+                key_states,
+                value_states,
+                bias,
+                deterministic,
+                dropout_rng,
+                self.attention_dropout
             )
         else:
-            attn_weights = dot_product_attention_weights(
-                query=query_states,
-                key=key_states,
-                bias=bias,
-                dtype=dtype_c,
-                deterministic=deterministic,
-                dropout_rate=self.attention_dropout,
-                precision=self.precision,
-                dropout_rng=dropout_rng
-            )
-
-        if use_pjit_attention_force:
-            attn_weights = with_sharding_constraint(
-                attn_weights, self.attention_partition_spec
-            )
-
-        attn_output = jnp.einsum(
-            "...hqk,...khd->...qhd",
-            attn_weights.astype(dtype_c),
-            value_states.astype(dtype_c),
-            precision=self.precision
-        ).astype(dtype_c)
-
+            with self.mesh:
+                attention_output = attention_production_static(
+                    query_states,
+                    key_states,
+                    value_states,
+                    bias,
+                    deterministic,
+                    dropout_rng,
+                    self.attention_dropout
+                )
         return AttentionOutput(
-            attention_outputs=attn_output,
-            attention_weights=attn_weights
+            attention_outputs=attention_output,
+            attention_weights=None
         )
 
     def _qkv_normal_flash_op(
