@@ -186,7 +186,6 @@ def static_sharded_dot_product_attention(
         attn_weights, PartitionSpec(("dp", "fsdp"), None, "sp", None)
     )
 
-    print(attn_weights.shape)
     if bias is not None:
         attn_weights = attn_weights + bias
     if mask is not None:
