@@ -89,6 +89,7 @@ class Grok1Config(EasyDelPretrainedConfig):
             ("linear/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
             ("linear_1/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
             ("linear_v/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+            ("gate/kernel", PartitionSpec(("fsdp", "sp"))),
 
             ("post_attn_norm/kernel", PartitionSpec(None)),
             ("pre_attn_norm/kernel", PartitionSpec(None)),
@@ -108,6 +109,7 @@ class Grok1Config(EasyDelPretrainedConfig):
             ("linear/kernel", PartitionSpec(("fsdp", "sp"))),
             ("linear_1/kernel", PartitionSpec(("fsdp", "sp"))),
             ("linear_v/kernel", PartitionSpec(("fsdp", "sp"))),
+            ("gate/kernel", PartitionSpec(("fsdp", "sp"))),
 
             ("post_attn_norm/kernel", PartitionSpec(("fsdp", "sp"))),
             ("pre_attn_norm/kernel", PartitionSpec(("fsdp", "sp"))),

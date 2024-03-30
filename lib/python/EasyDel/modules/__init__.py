@@ -100,6 +100,11 @@ from .grok_1 import (
     FlaxGrok1ForCausalLM as FlaxGrok1ForCausalLM
 )
 
+from .qwen2_moe import (
+    Qwen2MoeConfig as Qwen2MoeConfig,
+    FlaxQwen2MoeModel as FlaxQwen2MoeModel,
+    FlaxQwen2MoeForCausalLM as FlaxQwen2MoeForCausalLM
+)
 from .auto_easydel_model import (
     AutoEasyDelModelForCausalLM as AutoEasyDelModelForCausalLM,
     AutoEasyDelConfig as AutoEasyDelConfig,
@@ -140,6 +145,8 @@ __all__ = (
     "FlaxQwen2Model", "FlaxQwen2ForCausalLM", "FlaxQwen2ForSequenceClassification", "Qwen2Config",
 
     "Grok1Config", "FlaxGrok1Model", "FlaxGrok1ForCausalLM",
+
+    "Qwen2MoeConfig", "FlaxQwen2MoeModel", "FlaxQwen2MoeForCausalLM",
 
     "AutoEasyDelModelForCausalLM",
     "AutoEasyDelConfig",

@@ -150,6 +150,91 @@ class EasyModelsTest(TestCase):
             gc.collect()
             return self.compare_torch_to_jax(hf_output, ed_output)
 
+    def create_moe_test_for_models(
+            self,
+            module_name: str,
+            hf_module_class
+    ):
+        module_config, module_class, transform_function = ed.get_modules_by_type(module_name)
+        config = module_config(
+            vocab_size=self.vocab_size,
+            hidden_size=self.hidden_size,
+            num_attention_heads=self.num_attention_heads,
+            num_hidden_layers=self.num_hidden_layers,
+            gradient_checkpointing=self.gradient_checkpointing,
+            max_position_embeddings=self.max_position_embeddings,
+            num_key_value_heads=self.num_key_value_heads,
+            scan_mlp_chunk_size=self.scan_mlp_chunk_size,
+            intermediate_size=self.intermediate_size,
+            rotary_dim=self.rotary_dim,
+            rms_norm_eps=self.rms_norm_eps,
+            layer_norm_eps=self.layer_norm_eps,
+            # residual_in_fp32=True
+        )
+
+        input_shape = (self.batch_size, self.sequence_length)
+
+        hf_model = hf_module_class(
+            config=copy.deepcopy(config)
+        )
+        hf_model.eval()
+        params = {
+            "params":
+                transform_function(
+                    state_dict=hf_model.state_dict(),
+                    device=jax.devices("cpu")[0],
+                )
+        }
+        config.add_jax_args()
+        config.add_basic_configurations(
+            use_shard_map=self.use_shard_map,
+            scan_mlp_chunk_size=self.scan_mlp_chunk_size
+        )
+        mesh = config.jax_mesh()
+
+        with mesh:
+            partition_specs = match_partition_rules(config.get_partition_rules(True), params)
+            shard, _ = make_shard_and_gather_fns(partition_specs, jnp.float32)
+
+            params = jax.tree_map(lambda p, f: f(p), params, shard)
+            config.add_basic_configurations(
+                attn_mechanism=self.attn_mechanism,
+                block_k=self.block_k,
+                block_q=self.block_q
+            )
+            prm = flax.traverse_util.flatten_dict(params, sep=".")
+            ed_model = module_class(
+                config=config,
+                dtype=self.dtype,
+                param_dtype=self.dtype,
+                precision=self.precision,
+                _do_init=False,
+                input_shape=input_shape
+            )
+
+            torch_input_ids, jax_input_ids = self.make_input_id(self.vocab_size, input_shape)
+            hf_output = hf_model(
+                input_ids=torch_input_ids,
+                attention_mask=torch.ones(*input_shape),
+                return_dict=True,
+                output_router_logits=True
+            )
+
+            ed_output = ed_model(
+                input_ids=jax_input_ids,
+                params=params,
+                return_dict=True,
+                add_params_field=False,
+                train=False,
+                output_router_logits=True
+            )
+            del params
+            del hf_model
+            gc.collect()
+            print(f"\nHF AUX LOSS : {hf_output.aux_loss.detach().cpu().numpy()}")
+            print(f"ED AUX LOSS : {ed_output.aux_loss}")
+            return jnp.allclose(hf_output.aux_loss.detach().cpu().numpy(), ed_output.aux_loss)
+
     def test_llama(self):
         res, err = self.create_test_for_models("llama", transformers.LlamaForCausalLM)
         self.assertTrue(
@@ -234,6 +319,22 @@ class EasyModelsTest(TestCase):
             res,
             f"MAMBA model Failed [ERROR {err}]"
         )
+
+    def test_qwen2_moe(self):
+        res, err = self.create_test_for_models("qwen2_moe", transformers.Qwen2MoeForCausalLM)
+
+        self.assertTrue(
+            res,
+            f"MAMBA model Failed [ERROR {err}]"
+        )
+
+    def test_moe_mixtral(self):
+        res = self.create_moe_test_for_models("mixtral", transformers.MixtralForCausalLM)
+        self.assertTrue(res)
+
+    def test_moe_qwen2_moe(self):
+        res = self.create_moe_test_for_models("qwen2_moe", transformers.Qwen2MoeForCausalLM)
+        self.assertTrue(res)
 
     @staticmethod
     def compare_torch_to_jax(to, jo, atol: float = 1e-4):

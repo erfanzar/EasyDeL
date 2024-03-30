@@ -71,7 +71,9 @@ def create_casual_language_model_train_step(
 
         def calculate_loss(params):
             labels = batch.pop("labels")  # already shifted left
-            logits = state.apply_fn(params=params, **batch, return_dict=True).logits
+            model_outputs = state.apply_fn(params=params, **batch, return_dict=True)
+            logits = model_outputs.logits
+            aux_loss = getattr(model_outputs, "aux_loss", None)
             loss_normalizing_factor = (
                 SpecialLossNormalizingFactor.NUM_REAL_TARGET_TOKENS
             )
@@ -99,6 +101,8 @@ def create_casual_language_model_train_step(
                 z_loss=z_loss,
                 loss_normalizing_factor=lnf,
             )
+            if aux_loss is not None:
+                loss += aux_loss
             return loss, accuracy
 
         grad_fn = jax.value_and_grad(calculate_loss, has_aux=True)
@@ -149,9 +153,9 @@ def create_casual_language_model_evaluation_step(partition_spec=PartitionSpec(("
 
             """
             labels = batch_eval.pop("labels")
-            logits = state.apply_fn(
-                params=params, **batch_eval, return_dict=True
-            ).logits
+            model_outputs = state.apply_fn(params=params, **batch_eval, return_dict=True)
+            logits = model_outputs.logits
+            aux_loss = getattr(model_outputs, "aux_loss", None)
             valid = jnp.where(
                 (batch_eval["attention_mask"][:, 1:].astype(jnp.float32) != 0)
                 & (labels > 0),
@@ -163,6 +167,8 @@ def create_casual_language_model_evaluation_step(partition_spec=PartitionSpec(("
                 labels,
                 valid,
             )
+            if aux_loss is not None:
+                loss += aux_loss
             return loss, accuracy
 
         loss__, accuracy__ = calculate_loss(state.params)

@@ -150,6 +150,7 @@ class MixtralConfig(EasyDelPretrainedConfig):
             ("w1/kernel", PartitionSpec(("fsdp", "sp"))),
             ("w2/kernel", PartitionSpec(("fsdp", "sp"))),
             ("w3/kernel", PartitionSpec(("fsdp", "sp"))),
+            ("gate/kernel", PartitionSpec(("fsdp", "sp"))),
 
             ("input_layernorm/kernel", PartitionSpec(None)),
             ("post_attention_layernorm/kernel", PartitionSpec(None)),
@@ -166,6 +167,7 @@ class MixtralConfig(EasyDelPretrainedConfig):
             ("w1/kernel", PartitionSpec(("fsdp", "sp"))),
             ("w2/kernel", PartitionSpec(("fsdp", "sp"))),
             ("w3/kernel", PartitionSpec(("fsdp", "sp"))),
+            ("gate/kernel", PartitionSpec(("fsdp", "sp"))),
 
             ("input_layernorm/kernel", PartitionSpec(None)),
             ("post_attention_layernorm/kernel", PartitionSpec(None)),
