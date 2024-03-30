@@ -96,11 +96,10 @@ def create_vision_casual_language_model_train_step(partition_spec=PartitionSpec(
         def calculate_loss(params):
             labels = batch.pop("labels")
             label_vision_mask = batch.pop("label_vision_mask")
-            logits = state.apply_fn(
-                params=params,
-                **batch,
-                return_dict=True
-            ).logits
+
+            model_outputs = state.apply_fn(params=params, **batch, return_dict=True)
+            logits = model_outputs.logits
+            aux_loss = getattr(model_outputs, "aux_loss", None)
 
             vision_loss, vision_accuracy = cross_entropy_loss_and_accuracy(
                 logits[:, :-1, :],
@@ -113,7 +112,7 @@ def create_vision_casual_language_model_train_step(partition_spec=PartitionSpec(
                 batch["attention_mask"].astype(jnp.float32)[:, 1:] * (1.0 - label_vision_mask)
             )
 
-            loss = 0.5 * (vision_loss + text_loss)
+            loss = 0.5 * (vision_loss + text_loss + (aux_loss if aux_loss is not None else 0.))
 
             return loss, VisionCausalLanguageModelStepOutput(
                 loss=loss,
@@ -163,11 +162,9 @@ def create_vision_casual_language_model_evaluation_step(partition_spec=Partition
         def calculate_loss(params):
             labels = batch.pop("labels")
             label_vision_mask = batch.pop("label_vision_mask")
-            logits = state.apply_fn(
-                params=params,
-                **batch,
-                return_dict=True
-            ).logits
+            model_outputs = state.apply_fn(params=params, **batch, return_dict=True)
+            logits = model_outputs.logits
+            aux_loss = getattr(model_outputs, "aux_loss", None)
 
             vision_loss, vision_accuracy = cross_entropy_loss_and_accuracy(
                 logits[:, :-1, :],
@@ -180,7 +177,7 @@ def create_vision_casual_language_model_evaluation_step(partition_spec=Partition
                 batch["attention_mask"].astype(jnp.float32)[:, 1:] * (1.0 - label_vision_mask)
             )
 
-            loss = 0.5 * (vision_loss + text_loss)
+            loss = 0.5 * (vision_loss + text_loss + (aux_loss if aux_loss is not None else 0.))
 
             return loss, VisionCausalLanguageModelStepOutput(
                 loss=loss,

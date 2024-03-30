@@ -4,8 +4,10 @@ from typing import Optional, Tuple, Union
 import chex
 import flax.linen as nn
 import flax.linen.partitioning
+import flax.struct
 import jax
 import jax.numpy as jnp
+from fjformer.func import auxiliary_load_balancing_loss_func
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks
 from flax.traverse_util import flatten_dict, unflatten_dict
@@ -26,61 +28,8 @@ from ..flax_modelling_utils import (
     get_dot_general_by_bits,
     BaseJAXAttentionModule
 )
-import flax.struct
 
 re_mat = flax.linen.partitioning.remat
-
-
-@flax.struct.dataclass
-class LoadBalancingLossOutput:
-    loss: float
-
-
-def load_balancing_loss_func(
-        gate_logits: Tuple[jnp.ndarray], num_experts: Optional[int] = None, top_k=2
-) -> LoadBalancingLossOutput:
-    """
-    Computes auxiliary load balancing loss as in Switch Transformer - implemented in JAX.
-    See Switch Transformer (https://arxiv.org/abs/2101.03961) for more details. This function implements the loss
-    function presented in equations (4) - (6) of the paper. It aims at penalizing cases where the routing between
-    experts is too unbalanced.
-    Args:
-        gate_logits (Union[`torch.Tensor`, Tuple[torch.Tensor]]):
-            Logits from the `gate`, should be a tuple of tensors. Shape: [batch_size, sequence_length, num_experts].
-        num_experts (`int`, *optional*):
-            Number of experts
-    Returns:
-        The auxiliary loss.
-    """
-    if gate_logits is None:
-        return LoadBalancingLossOutput(loss=0.0)
-
-    if isinstance(gate_logits, tuple):
-        gate_logits = jnp.concatenate(gate_logits, axis=0)
-
-    routing_weights, selected_experts = jax.lax.top_k(gate_logits, top_k)
-    routing_weights = jax.nn.softmax(routing_weights, axis=-1)
-
-    # cast the expert indices to int64, otherwise one-hot encoding will fail
-    selected_experts = jnp.int64(selected_experts)
-
-    if len(selected_experts.shape) == 2:
-        selected_experts = selected_experts[:, :, jnp.newaxis]
-
-    expert_mask = jax.nn.one_hot(selected_experts, num_experts)
-
-    # For a given token, determine if it was routed to a given expert.
-    expert_mask = jnp.max(expert_mask, axis=-2)
-
-    # cast to float32 otherwise mean will fail
-    expert_mask = expert_mask.astype(jnp.float32)
-    tokens_per_group_and_expert = jnp.mean(expert_mask, axis=-2)
-
-    router_prob_per_group_and_expert = jnp.mean(routing_weights, axis=-1)
-    loss = jnp.mean(
-        tokens_per_group_and_expert * router_prob_per_group_and_expert[:, :, jnp.newaxis]
-    ) * (num_experts ** 2)
-    return LoadBalancingLossOutput(loss=loss)
 
 
 @flax.struct.dataclass
@@ -1211,18 +1160,21 @@ class FlaxGrok1ForCausalLMModule(nn.Module):
         )
         logits = self.lm_head(outputs.last_hidden_state)
         logits = logits * self.output_multiplier_scale
+        batch_size, seq_length, hd = logits.shape
         aux_loss = None
         if output_router_logits and outputs.router_logits is not None:
-            aux_loss = load_balancing_loss_func(
-                outputs.router_logits, self.num_experts, self.num_experts_per_tok
+            aux_loss = auxiliary_load_balancing_loss_func(
+                gate_logits=tuple([logit.reshape(batch_size * seq_length, -1) for logit in outputs.router_logits]),
+                num_experts=self.num_experts,
+                top_k=self.num_experts_per_tok,
+                attention_mask=attention_mask
             )
-
+            aux_loss = aux_loss * self.config.router_aux_loss_coef
         if not return_dict:
             outputs = (logits,) + tuple(
                 v
                 for v in [
                     aux_loss,
-                    logits,
                     outputs.hidden_states,
                     outputs.attentions,
                     outputs.router_logits
