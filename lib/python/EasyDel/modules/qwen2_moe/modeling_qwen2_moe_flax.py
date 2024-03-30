@@ -27,7 +27,7 @@ from ..flax_modelling_utils import (
     BaseJAXAttentionModule,
     block_wise_ffn
 )
-from ..easy_attention import AttentionOutput, EasyAttention
+from ..easy_attention import EasyAttention
 
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 import chex
