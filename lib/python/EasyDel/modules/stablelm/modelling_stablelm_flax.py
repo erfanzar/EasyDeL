@@ -591,6 +591,7 @@ class FlaxStableLmDecoderLayerCollection(nn.Module):
                 attention_mask,
                 position_ids,
                 causal_mask,
+                None,
                 deterministic,
                 output_attentions,
                 init_cache,
