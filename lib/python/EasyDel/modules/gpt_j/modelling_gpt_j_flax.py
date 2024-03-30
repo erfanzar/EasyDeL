@@ -343,7 +343,7 @@ class FlaxGPTJBlock(nn.Module):
             attn_block = flax.linen.partitioning.remat(
                 attn_block,
                 policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
-                static_argnums=(3, 4, 5)
+                static_argnums=(1, 3,)
             )
 
             mlp_block = flax.linen.partitioning.remat(
@@ -387,6 +387,7 @@ class FlaxGPTJBlock(nn.Module):
             hidden_states,
             attention_mask,
             position_ids,
+            None,
             deterministic,
             init_cache,
             output_attentions,

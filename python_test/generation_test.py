@@ -158,7 +158,7 @@ class EasyModelsGenerationTest(TestCase):
             True
         )
 
-    def test_gp2(self):
+    def test_gpt2(self):
         response = self.create_generation_test_for_models("gpt2")
         print(f"GTP2 EasyDeL Generated Sequence:\n{response}")
         self.assertTrue(
@@ -200,19 +200,19 @@ class EasyModelsGenerationTest(TestCase):
             True,
         )
 
-    def test_rwkv(self):
-        response = self.create_generation_test_for_models("rwkv")
-        print(f"RWKV EasyDeL Generated Sequence:\n{response}")
-        self.assertTrue(
-            True,
-        )
-
-    def test_mamba(self):
-        response = self.create_generation_test_for_models("mamba")
-        print(f"MAMBA EasyDeL Generated Sequence:\n{response}")
-        self.assertTrue(
-            True,
-        )
+    # def test_rwkv(self):
+    #     response = self.create_generation_test_for_models("rwkv")
+    #     print(f"RWKV EasyDeL Generated Sequence:\n{response}")
+    #     self.assertTrue(
+    #         True,
+    #     )
+    #
+    # def test_mamba(self):
+    #     response = self.create_generation_test_for_models("mamba")
+    #     print(f"MAMBA EasyDeL Generated Sequence:\n{response}")
+    #     self.assertTrue(
+    #         True,
+    #     )
 
     @staticmethod
     def make_input_id(

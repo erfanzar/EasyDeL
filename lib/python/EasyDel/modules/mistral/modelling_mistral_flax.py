@@ -387,7 +387,6 @@ class FlaxMistralAttention(BaseJAXAttentionModule):
 
         if not deterministic and self.config.attention_dropout > 0.0:
             dropout_rng = self.make_rng("dropout")
-
         if self.has_variable("cache", "cached_key") or init_cache:
             key_state, value_state, attention_mask = self._concatenate_to_cache(
                 key_state,
@@ -443,15 +442,16 @@ class FlaxMistralDecoderLayer(nn.Module):
         mlp_block = FlaxMistralMLP
 
         if self.config.gradient_checkpointing != "":
-            # hidden_states: chex.Array
-            # freq_cis: chex.Array
-            # attention_mask: chex.Array
-            # position_ids: chex.Array
-            # causal_mask: chex.Array
-            # deterministic: bool = True
-            # init_cache: bool = False
-            # output_attentions: bool = False
-            # fcm_mask = None
+            # hidden_states: chex.Array,
+            # freq_cis: chex.Array,
+            # attention_mask: chex.Array,
+            # position_ids: chex.Array,
+            # causal_mask: chex.Array,
+            # segment_ids: Optional[chex.Array] = None,
+            # deterministic: bool = True,
+            # init_cache: bool = False,
+            # output_attentions: bool = False,
+            # fcm_mask = None,
             attn_block = re_mat(
                 attn_block,
                 policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
@@ -521,16 +521,16 @@ class FlaxMistralDecoderLayer(nn.Module):
 
         """
 
-        # hidden_states: chex.Array
-        # freq_cis: chex.Array
-        # attention_mask: chex.Array
-        # position_ids: chex.Array
-        # causal_mask: chex.Array
-        # deterministic: bool = True
-        # init_cache: bool = False
-        # output_attentions: bool = False
-        # fcm_mask = None
-
+        # hidden_states: chex.Array,
+        # freq_cis: chex.Array,
+        # attention_mask: chex.Array,
+        # position_ids: chex.Array,
+        # causal_mask: chex.Array,
+        # segment_ids: Optional[chex.Array] = None,
+        # deterministic: bool = True,
+        # init_cache: bool = False,
+        # output_attentions: bool = False,
+        # fcm_mask = None,
         residual = hidden_states
         attention_output = self.self_attn(
             self.input_layernorm(hidden_states),
@@ -648,7 +648,12 @@ class FlaxMistralPretrainedModel(EasyDelFlaxPretrainedModel):
             jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape)
 
         init_variables = self.module.init(
-            jax.random.PRNGKey(0), input_ids, attention_mask, position_ids, return_dict=False, init_cache=True
+            jax.random.PRNGKey(0),
+            input_ids,
+            attention_mask,
+            position_ids,
+            return_dict=False,
+            init_cache=True
         )
         return init_variables["cache"]
 
@@ -786,12 +791,24 @@ class FlaxMistralDecoratorCollection(nn.Module):
         for layer in self.layers:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
+
+            # hidden_states: chex.Array,
+            # freq_cis: chex.Array,
+            # attention_mask: chex.Array,
+            # causal_mask: chex.Array,
+            # position_ids: chex.Array,
+            # segment_ids: Optional[chex.Array] = None,
+            # deterministic: bool = True,
+            # init_cache: bool = False,
+            # output_attentions: bool = True
+
             output = layer(
                 hidden_states,
                 freq_cis,
                 attention_mask,
                 causal_mask,
                 position_ids,
+                None,
                 deterministic,
                 init_cache,
                 output_attentions
