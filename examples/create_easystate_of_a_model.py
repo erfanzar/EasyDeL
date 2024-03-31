@@ -19,7 +19,7 @@ def load_model(
         bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
         generation_bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
         attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-        use_shard_map: bool = False,
+        shard_attention_computation: bool = True,
         input_shape: Sequence[int] = (1, 1),
         backend: Optional[str] = None,
 ):
@@ -38,7 +38,7 @@ def load_model(
         value_partition_spec=value_partition_spec,
         bias_partition_spec=bias_partition_spec,
         attention_partition_spec=attention_partition_spec,
-        use_shard_map=use_shard_map,
+        shard_attention_computation=shard_attention_computation,
         input_shape=input_shape,
         backend=backend,
     )

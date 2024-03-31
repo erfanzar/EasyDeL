@@ -71,7 +71,7 @@ class LlamaConfig(EasyDelPretrainedConfig):
         :param rope_scaling: Dict[str: Define the scaling of the rope
         :param Union[str: Specify the type of the parameter
         :param float]]: Specify the type of the parameter
-        :param use_shard_map: bool: when ever to use shard_map for attention
+        :param shard_attention_computation: bool: when ever to use shard_map for attention
         :param bits: Optional[int]: Specify the number of bits used to quantize the weights
         :param rope_theta: float : rope_theta for compute rope
         :param attention_bias: bool : whenever to use attention bias or no
