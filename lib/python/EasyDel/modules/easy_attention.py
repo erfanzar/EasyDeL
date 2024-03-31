@@ -182,10 +182,6 @@ def static_sharded_dot_product_attention(
         "...qhd,...khd->...hqk",
         query, key, precision=precision
     )
-    attn_weights = with_sharding_constraint(
-        attn_weights, PartitionSpec(("dp", "fsdp"), None, "sp", None)
-    )
-
     if bias is not None:
         attn_weights = attn_weights + bias
     if mask is not None:
