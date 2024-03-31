@@ -84,7 +84,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             backend: Optional[None] = jax.default_backend(),
             easy_method: Literal["train", "serve", "convert"] = EasyMethod.TRAIN,
             bits: Optional[int] = None,
-            scan_ring_attention: bool = True,
+            scan_ring_attention: bool = False,
             scan_attention_layers: bool = False,
             use_scan_mlp: bool = True,
             scan_mlp_chunk_size: int = 1024,
