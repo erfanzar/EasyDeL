@@ -89,7 +89,7 @@ def static_sharded_attention_production(
         dropout_rng: jax.random.PRNGKey = jax.random.PRNGKey(0),
         dropout_rate: float = 0.0
 ):
-    assert key_states.shape[1] == value_states.shape[1], "miss match on key and value sequence length"
+    assert key_states.shape[1] == value_states.shape[1], "miss match on key_states and value_states sequence length"
     is_generating = query_states.shape[1] == 1 or query_states.shape[1] != key_states.shape[1]
     sequence_sharding_axis_name = None if is_generating else "sp"
     tensor_sharding_axis_name = "sp" if is_generating else "tp"
@@ -181,9 +181,9 @@ def static_sharded_attention_production(
 
 
 def static_sharded_dot_product_attention(
-        query: Array,
-        key: Array,
-        value: Array,
+        query_states: Array,
+        key_states: Array,
+        value_states: Array,
         bias: Optional[Array] = None,
         mask: Optional[Array] = None,
         broadcast_dropout: bool = True,
@@ -192,57 +192,98 @@ def static_sharded_dot_product_attention(
         deterministic: bool = False,
         dtype: Optional[jnp.dtype] = jnp.float32,
         precision: Optional[Union[str, lax.Precision]] = None,
-        use_sharding_constraint: bool = False
+        shard_attention_computation: bool = True
 ):
-    assert key.shape[1] == value.shape[1], "miss match on key and value sequence length"
-    is_generating = query.shape[1] == 1 or query.shape[1] != key.shape[1]
-    sequence_sharding_axis_name = None if is_generating else "sp"
-    tensor_sharding_axis_name = "sp" if is_generating else "tp"
-    query, key, value = promote_dtype(query, key, value, dtype=dtype)
-    if use_sharding_constraint:
-        query = with_sharding_constraint(
-            query, PartitionSpec(("dp", "fsdp"), sequence_sharding_axis_name, tensor_sharding_axis_name, None)
+    assert key_states.shape[1] == value_states.shape[1], "miss match on key_states and value_states sequence length"
+    assert query_states.ndim == key_states.ndim, "q, k must have same rank."
+    assert query_states.shape[:-3] == key_states.shape[:-3], "q, k batch dims must match."
+    assert query_states.shape[-2] == key_states.shape[-2], "q, k num_heads must match."
+    assert query_states.shape[-1] == key_states.shape[-1], "q, k depths must match."
+
+    query_states, key_states, value_states = promote_dtype(query_states, key_states, value_states, dtype=dtype)
+
+    if query_states.shape[1] == 1:
+        sequence_sharding_axis_name = None
+        tensor_sharding_axis_name = "sp"
+    elif query_states.shape[1] != key_states.shape[1]:
+        sequence_sharding_axis_name = None
+        tensor_sharding_axis_name = None
+    else:
+        sequence_sharding_axis_name = "sp"
+        tensor_sharding_axis_name = "tp"
+
+    if shard_attention_computation:
+        query_states = with_sharding_constraint(
+            query_states, PartitionSpec(
+                ("dp", "fsdp"),
+                sequence_sharding_axis_name,
+                tensor_sharding_axis_name,
+                None
+            )
         )
 
-        key = with_sharding_constraint(
-            key, PartitionSpec(("dp", "fsdp"), sequence_sharding_axis_name, tensor_sharding_axis_name, None)
+        key_states = with_sharding_constraint(
+            key_states, PartitionSpec(
+                ("dp", "fsdp"),
+                sequence_sharding_axis_name,
+                tensor_sharding_axis_name,
+                None
+            )
         )
 
-        value = with_sharding_constraint(
-            value, PartitionSpec(("dp", "fsdp"), sequence_sharding_axis_name, tensor_sharding_axis_name, None)
+        value_states = with_sharding_constraint(
+            value_states, PartitionSpec(
+                ("dp", "fsdp"),
+                sequence_sharding_axis_name,
+                tensor_sharding_axis_name,
+                None
+            )
         )
 
-    assert query.ndim == key.ndim, "q, k must have same rank."
-    assert query.shape[:-3] == key.shape[:-3], "q, k batch dims must match."
-    assert query.shape[-2] == key.shape[-2], "q, k num_heads must match."
-    assert query.shape[-1] == key.shape[-1], "q, k depths must match."
-
-    depth = query.shape[-1]
-    query = query / jnp.sqrt(depth).astype(dtype)
-    attn_weights = jnp.einsum(
+    depth = query_states.shape[-1]
+    query_states = query_states / jnp.sqrt(depth).astype(dtype)
+    attention_weight = jnp.einsum(
         "...qhd,...khd->...hqk",
-        query, key, precision=precision
+        query_states, key_states, precision=precision
     )
+    if shard_attention_computation:
+        attention_weight = with_sharding_constraint(
+            attention_weight, PartitionSpec(
+                ("dp", "fsdp"),
+                None,
+                sequence_sharding_axis_name,
+                None
+            )
+        )
+        if bias is not None:
+            bias = with_sharding_constraint(
+                bias, PartitionSpec(
+                    ("dp", "fsdp"),
+                    None,
+                    sequence_sharding_axis_name,
+                    None
+                )
+            )
     if bias is not None:
-        attn_weights = attn_weights + bias
+        attention_weight = attention_weight + bias
     if mask is not None:
         big_neg = jnp.finfo(dtype).min
-        attn_weights = jnp.where(mask, attn_weights, big_neg)
-    attn_weights = jax.nn.softmax(attn_weights).astype(dtype)
+        attention_weight = jnp.where(mask, attention_weight, big_neg)
+    attention_weight = jax.nn.softmax(attention_weight).astype(dtype)
     if not deterministic and dropout_rate > 0.0:
         keep_prob = 1.0 - dropout_rate
         if broadcast_dropout:
-            dropout_shape = tuple([1] * (key.ndim - 2)) + attn_weights.shape[-2:]
+            dropout_shape = tuple([1] * (key_states.ndim - 2)) + attention_weight.shape[-2:]
             keep = random.bernoulli(dropout_rng, keep_prob, dropout_shape)  # type: ignore
         else:
-            keep = random.bernoulli(dropout_rng, keep_prob, attn_weights.shape)  # type: ignore
+            keep = random.bernoulli(dropout_rng, keep_prob, attention_weight.shape)  # type: ignore
         multiplier = keep.astype(dtype) / jnp.asarray(keep_prob, dtype=dtype)
-        attn_weights = attn_weights * multiplier
+        attention_weight = attention_weight * multiplier
     attention = jnp.einsum(
         "...hqk,...khd->...qhd",
-        attn_weights, value, precision=precision
+        attention_weight, value_states, precision=precision
     )
-    if use_sharding_constraint:
+    if shard_attention_computation:
         attention = with_sharding_constraint(
             attention, PartitionSpec(("dp", "fsdp"), sequence_sharding_axis_name, tensor_sharding_axis_name, None)
         )
@@ -559,49 +600,102 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
             deterministic: bool = False,
             dropout_rng: Optional[random.PRNGKey] = None,
     ) -> AttentionOutput:
-        dtype_c = jnp.promote_types(self.dtype, jnp.float32)
-        attention_weight = None
-        if self.shard_attention_computation:
-            with self.mesh:
-                attention_output = static_sharded_dot_product_attention(
-                    query_states,
-                    key_states,
-                    value_states,
-                    bias,
-                    None,
-                    True,
-                    dropout_rng,
-                    self.attention_dropout,
-                    deterministic,
-                    dtype_c,
-                    self.precision,
-                    not self.use_sharding_constraint
+        dtype = jnp.promote_types(self.dtype, jnp.float32)
+        with self.mesh:
+            assert key_states.shape[1] == value_states.shape[1], (
+                "miss match on key_states and value_states sequence length"
+            )
+            assert query_states.ndim == key_states.ndim, "q, k must have same rank."
+            assert query_states.shape[:-3] == key_states.shape[:-3], "q, k batch dims must match."
+            assert query_states.shape[-2] == key_states.shape[-2], "q, k num_heads must match."
+            assert query_states.shape[-1] == key_states.shape[-1], "q, k depths must match."
+
+            query_states, key_states, value_states = promote_dtype(query_states, key_states, value_states, dtype=dtype)
+
+            if query_states.shape[1] == 1:
+                sequence_sharding_axis_name = None
+                tensor_sharding_axis_name = "sp"
+            elif query_states.shape[1] != key_states.shape[1]:
+                sequence_sharding_axis_name = None
+                tensor_sharding_axis_name = None
+            else:
+                sequence_sharding_axis_name = "sp"
+                tensor_sharding_axis_name = "tp"
+
+            if self.shard_attention_computation:
+                query_states = with_sharding_constraint(
+                    query_states, PartitionSpec(
+                        ("dp", "fsdp"),
+                        sequence_sharding_axis_name,
+                        tensor_sharding_axis_name,
+                        None
+                    )
                 )
-        else:
-            attention_weight = flax.linen.attention.dot_product_attention_weights(
-                query_states,
-                key_states,
-                bias,
-                None,
-                True,
-                dropout_rng,
-                self.attention_dropout,
-                deterministic,
-                dtype_c,
-                self.precision
+
+                key_states = with_sharding_constraint(
+                    key_states, PartitionSpec(
+                        ("dp", "fsdp"),
+                        sequence_sharding_axis_name,
+                        tensor_sharding_axis_name,
+                        None
+                    )
+                )
+
+                value_states = with_sharding_constraint(
+                    value_states, PartitionSpec(
+                        ("dp", "fsdp"),
+                        sequence_sharding_axis_name,
+                        tensor_sharding_axis_name,
+                        None
+                    )
+                )
+
+            depth = query_states.shape[-1]
+            query_states = query_states / jnp.sqrt(depth).astype(dtype)
+            attention_weight = jnp.einsum(
+                "...qhd,...khd->...hqk",
+                query_states, key_states, precision=self.precision
             )
-            attention_output = jnp.einsum(
-                "...hqk,...khd->...qhd", attention_weight, value_states, precision=self.precision
-            )
-            if self.use_sharding_constraint:
-                with self.mesh:
-                    attention_output = with_sharding_constraint(
-                        attention_output, PartitionSpec(
-                            ("dp", "fsdp"), "sp", "tp", None
+            if self.shard_attention_computation:
+                attention_weight = with_sharding_constraint(
+                    attention_weight, PartitionSpec(
+                        ("dp", "fsdp"),
+                        None,
+                        sequence_sharding_axis_name,
+                        None
+                    )
+                )
+                if bias is not None:
+                    bias = with_sharding_constraint(
+                        bias, PartitionSpec(
+                            ("dp", "fsdp"),
+                            None,
+                            sequence_sharding_axis_name,
+                            None
                         )
                     )
+
+            if bias is not None:
+                attention_weight = attention_weight + bias
+            attention_weight = jax.nn.softmax(attention_weight).astype(dtype)
+            if not deterministic and self.attention_dropout > 0.0:
+                keep_prob = 1.0 - self.attention_dropout
+                dropout_shape = tuple([1] * (key_states.ndim - 2)) + attention_weight.shape[-2:]
+                keep = random.bernoulli(dropout_rng, keep_prob, dropout_shape)  # type: ignore
+
+                multiplier = keep.astype(dtype) / jnp.asarray(keep_prob, dtype=dtype)
+                attention_weight = attention_weight * multiplier
+            attention = jnp.einsum(
+                "...hqk,...khd->...qhd",
+                attention_weight, value_states, precision=self.precision
+            )
+            if self.shard_attention_computation:
+                attention = with_sharding_constraint(
+                    attention,
+                    PartitionSpec(("dp", "fsdp"), sequence_sharding_axis_name, tensor_sharding_axis_name, None)
+                )
         return AttentionOutput(
-            attention_outputs=attention_output,
+            attention_outputs=attention,
             attention_weights=attention_weight
         )
 

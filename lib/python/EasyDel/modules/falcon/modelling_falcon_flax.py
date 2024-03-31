@@ -296,12 +296,12 @@ class FlaxFalconAttention(BaseJAXAttentionModule):
             )
         float_min = jnp.finfo(query_layer.dtype).min
 
-        if self.config.use_sharding_constraint:
-            query_layer = with_sharding_constraint(
-                query_layer, PartitionSpec(("dp", "fsdp"), "sp" if query_layer.shape != [1] else None, "tp", None)
-            )
-            key_layer = with_sharding_constraint(key_layer, PartitionSpec(("dp", "fsdp"), "sp", "tp", None))
-            value_layer = with_sharding_constraint(value_layer, PartitionSpec(("dp", "fsdp"), "sp", "tp", None))
+        # if self.config.use_sharding_constraint:
+        #     query_layer = with_sharding_constraint(
+        #         query_layer, PartitionSpec(("dp", "fsdp"), "sp" if query_layer.shape != [1] else None, "tp", None)
+        #     )
+        #     key_layer = with_sharding_constraint(key_layer, PartitionSpec(("dp", "fsdp"), "sp", "tp", None))
+        #     value_layer = with_sharding_constraint(value_layer, PartitionSpec(("dp", "fsdp"), "sp", "tp", None))
         attention_bias = lax.select(
             attention_mask > 0,
             jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
