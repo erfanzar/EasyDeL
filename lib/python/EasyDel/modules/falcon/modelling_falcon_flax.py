@@ -182,36 +182,25 @@ class FlaxFalconAttention(BaseJAXAttentionModule):
         if self.config.new_decoder_architecture:
             batch, sequence_length, _ = qkv.shape
             qkv = qkv.reshape(batch, sequence_length, -1, self.num_heads // self.num_kv_heads + 2, self.head_dim)
-            query_state = qkv[:, :, :, :-2]
-            key_state = qkv[:, :, :, [-2]]
-            value_state = qkv[:, :, :, [-1]]
-            key_state = jnp.broadcast_to(key_state, query_state.shape)
-            value_state = jnp.broadcast_to(value_state, query_state.shape)
+            query_states = qkv[:, :, :, :-2]
+            key_states = qkv[:, :, :, [-2]]
+            value_states = qkv[:, :, :, [-1]]
+            key_states = jnp.broadcast_to(key_states, query_states.shape)
+            value_states = jnp.broadcast_to(value_states, query_states.shape)
 
-            query_state, key_state, value_state = [x.reshape(x.shape[:-2] + (x.shape[-2] * x.shape[-1],)) for x in
-                                                   (query_state, key_state, value_state)]
+            query_states, key_states, value_states = [x.reshape(x.shape[:-2] + (x.shape[-2] * x.shape[-1],)) for x in
+                                                      (query_states, key_states, value_states)]
 
-            query_state = with_sharding_constraint(
-                query_state, PartitionSpec(("dp", "fsdp"), "sp" if query_state.shape[1] != 1 else None, "tp")
-            )
-            key_state = with_sharding_constraint(key_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
-            value_state = with_sharding_constraint(value_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
-            return query_state, key_state, value_state
+            return query_states, key_states, value_states
         if self.config.multi_query:
             qkv = qkv.reshape(
                 batch_size, sequence_length, self.config.num_attention_heads + 2, -1
             )
-            query_state, key_state, value_state = qkv[..., :-2, :], qkv[..., [-2], :], qkv[..., [-1], :]
+            query_states, key_states, value_states = qkv[..., :-2, :], qkv[..., [-2], :], qkv[..., [-1], :]
 
         else:
-            query_state, key_state, value_state = jnp.split(qkv, 3, -1)
-
-            query_state = with_sharding_constraint(
-                query_state, PartitionSpec(("dp", "fsdp"), "sp" if query_state.shape[1] != 1 else None, "tp")
-            )
-            key_state = with_sharding_constraint(key_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
-            value_state = with_sharding_constraint(value_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
-        return query_state, key_state, value_state
+            query_states, key_states, value_states = jnp.split(qkv, 3, -1)
+        return query_states, key_states, value_states
 
     def _merge_heads(self, x: chex.Array) -> chex.Array:
 
@@ -306,6 +295,13 @@ class FlaxFalconAttention(BaseJAXAttentionModule):
                 attention_mask
             )
         float_min = jnp.finfo(query_layer.dtype).min
+
+        if self.config.use_sharding_constraint:
+            query_layer = with_sharding_constraint(
+                query_layer, PartitionSpec(("dp", "fsdp"), "sp" if query_layer.shape != [1] else None, "tp", None)
+            )
+            key_layer = with_sharding_constraint(key_layer, PartitionSpec(("dp", "fsdp"), "sp", "tp", None))
+            value_layer = with_sharding_constraint(value_layer, PartitionSpec(("dp", "fsdp"), "sp", "tp", None))
         attention_bias = lax.select(
             attention_mask > 0,
             jnp.full(attention_mask.shape, 0.0).astype(self.dtype),

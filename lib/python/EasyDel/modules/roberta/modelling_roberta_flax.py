@@ -81,7 +81,7 @@ class FlaxRobertaSelfAttention(BaseJAXAttentionModule):
                 "                   : {self.config.num_attention_heads}"
             )
         self.attention_performer = EasyAttention(
-
+            use_sharding_constraint=self.config.use_sharding_constraint,
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,
             block_q=self.config.block_q,

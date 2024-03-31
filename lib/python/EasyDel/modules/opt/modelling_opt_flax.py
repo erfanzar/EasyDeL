@@ -110,15 +110,15 @@ class FlaxOPTAttention(BaseJAXAttentionModule):
             key_states = self.k_proj(hidden_states)
             value_states = self.v_proj(hidden_states)
 
-        value_states = with_sharding_constraint(value_states, PartitionSpec(("dp", "fsdp"),
-                                                                            "sp" if query_states.shape != [1] else None,
-                                                                            "tp"))
-        key_states = with_sharding_constraint(key_states, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
-        query_states = with_sharding_constraint(query_states, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
         query_states = self._split_heads(query_states)
         key_states = self._split_heads(key_states)
         value_states = self._split_heads(value_states)
-
+        if self.config.use_sharding_constraint:
+            query_states = with_sharding_constraint(
+                query_states, PartitionSpec(("dp", "fsdp"), "sp" if query_states.shape != [1] else None, "tp", None)
+            )
+            key_states = with_sharding_constraint(key_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None))
+            value_states = with_sharding_constraint(value_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None))
         if self.causal:
             query_length, key_length = query_states.shape[1], key_states.shape[1]
             if self.has_variable("cache", "cached_key"):

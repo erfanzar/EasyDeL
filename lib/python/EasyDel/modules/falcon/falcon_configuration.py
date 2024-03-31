@@ -164,8 +164,8 @@ class FalconConfig(EasyDelPretrainedConfig):
             new_decoder_architecture=new_decoder_architecture,
             **kwargs
         )
-        for key_state, value_state in basics.items():
-            if not hasattr(self, key_state):
-                setattr(self, key_state, value_state)
+        for key_states, value_states in basics.items():
+            if not hasattr(self, key_states):
+                setattr(self, key_states, value_states)
 
         self.from_pt = False

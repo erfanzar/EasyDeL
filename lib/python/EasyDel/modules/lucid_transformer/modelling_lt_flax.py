@@ -50,14 +50,6 @@ class LTSelfAttention(BaseJAXAttentionModule):
         b, t, c = hidden_state.shape
         wq, wk, wv = self.q_proj(hidden_state), self.k_proj(hidden_state), self.v_proj(hidden_state)
 
-        if self.config.fsdp:
-            wk = with_sharding_constraint(wk, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
-            wv = with_sharding_constraint(wv, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
-            wq = with_sharding_constraint(wq, PartitionSpec(("dp", "fsdp"), "sp", "tp")) \
-                if wq.shape[1] != 1 else (
-                with_sharding_constraint(wq, PartitionSpec(("dp", "fsdp"), None, "tp"))
-            )
-
         wq = rearrange(wq, 'b s (h d) -> b h s d', h=self.config.num_attention_heads)
         wk = rearrange(wk, 'b s (h d) -> b h d s', h=self.config.num_attention_heads)
         wv = rearrange(wv, 'b s (h d) -> b h s d', h=self.config.num_attention_heads)
@@ -67,9 +59,6 @@ class LTSelfAttention(BaseJAXAttentionModule):
         # attention_mask batch,head_size,seq,seq
         if attention_mask is not None:
             attn_weights = jnp.add(attention_mask, attn_weights)
-
-        if self.config.fsdp:
-            attn_weights = with_sharding_constraint(attn_weights, PartitionSpec("fsdp", "sp", None, None))
 
         attn_weights = jax.nn.softmax(attn_weights, axis=-1)
         value = jnp.matmul(attn_weights, wv).reshape(b, t, c)

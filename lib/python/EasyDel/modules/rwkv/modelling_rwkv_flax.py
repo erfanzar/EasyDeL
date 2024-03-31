@@ -185,8 +185,8 @@ class FlaxRwkvSelfAttention(nn.Module):
         value_x = hidden * self.time_mix_value.reshape(-1) + c_x * (1 - self.time_mix_value.reshape(-1))
         receptance_x = hidden * self.time_mix_receptance.reshape(-1) + c_x * (1 - self.time_mix_receptance.reshape(-1))
         receptance_state = nn.sigmoid(self.receptance(receptance_x))
-        key_state = self.key(key_x)
-        value_state = self.value(value_x)
+        key_states = self.key(key_x)
+        value_states = self.value(value_x)
 
         def step(in_state, kv):
             (inner_aa, inner_bb, inner_p), (kk, vv) = in_state, kv
@@ -211,7 +211,7 @@ class FlaxRwkvSelfAttention(nn.Module):
         (aa, bb, pp), c_x = jax.lax.scan(
             step,
             (aa, bb, pp),
-            (key_state, value_state)
+            (key_states, value_states)
         )
         out = hidden + self.output(receptance_state * c_x)
         next_state = (hidden[-1, :], aa, bb, pp)
