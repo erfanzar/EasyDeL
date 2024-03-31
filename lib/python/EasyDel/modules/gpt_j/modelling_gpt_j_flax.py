@@ -211,16 +211,16 @@ class FlaxGPTJAttention(BaseJAXAttentionModule):
             )
         else:
             causal_mask = self.causal_mask[:, :, :query_length, :key_length]
-        if self.config.use_sharding_constraint:
-            query = with_sharding_constraint(
-                query, PartitionSpec(("dp", "fsdp"), "sp" if query.shape[1] != 1 else None, "tp", None)
-            )
-            key = with_sharding_constraint(
-                key, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
-            )
-            value = with_sharding_constraint(
-                value, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
-            )
+        # if self.config.use_sharding_constraint:
+        #     query = with_sharding_constraint(
+        #         query, PartitionSpec(("dp", "fsdp"), "sp" if query.shape[1] != 1 else None, "tp", None)
+        #     )
+        #     key = with_sharding_constraint(
+        #         key, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
+        #     )
+        #     value = with_sharding_constraint(
+        #         value, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
+        #     )
         batch_size = hidden_states.shape[0]
         causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
 

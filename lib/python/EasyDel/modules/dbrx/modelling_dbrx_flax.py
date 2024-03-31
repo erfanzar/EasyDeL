@@ -266,12 +266,12 @@ class FlaxDbrxAttention(BaseJAXAttentionModule):
             sequence_length=sequence_length
         )
 
-        if self.config.use_sharding_constraint:
-            query_states = with_sharding_constraint(
-                query_states, PartitionSpec(("dp", "fsdp"), "sp" if query_states.shape != [1] else None, "tp", None)
-            )
-            key_states = with_sharding_constraint(key_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None))
-            value_states = with_sharding_constraint(value_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None))
+        # if self.config.use_sharding_constraint:
+        #     query_states = with_sharding_constraint(
+        #         query_states, PartitionSpec(("dp", "fsdp"), "sp" if query_states.shape != [1] else None, "tp", None)
+        #     )
+        #     key_states = with_sharding_constraint(key_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None))
+        #     value_states = with_sharding_constraint(value_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None))
 
         assert_msg = (
             "num_attention_heads repeat wont work likely\n"

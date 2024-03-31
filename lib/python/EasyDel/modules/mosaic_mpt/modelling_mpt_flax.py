@@ -190,12 +190,12 @@ class FlaxMptAttention(BaseJAXAttentionModule):
                                                               attention_mask=attention_mask)
         # TODO: MPT WONT WORK CAUSE OF NEW ATTENTION MEC ON FJFORMER
 
-        if self.config.use_sharding_constraint:
-            q = with_sharding_constraint(
-                q, jax.sharding.PartitionSpec(("dp", "fsdp"), "sp" if q.shape[1] != 1 else None, "tp",None)
-            )
-            k = with_sharding_constraint(k, jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None))
-            v = with_sharding_constraint(v, jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp",None))
+        # if self.config.use_sharding_constraint:
+        #     q = with_sharding_constraint(
+        #         q, jax.sharding.PartitionSpec(("dp", "fsdp"), "sp" if q.shape[1] != 1 else None, "tp",None)
+        #     )
+        #     k = with_sharding_constraint(k, jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None))
+        #     v = with_sharding_constraint(v, jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp",None))
         q_l = q.shape[1]
         k_l = k.shape[1]
         dropout_rng = None

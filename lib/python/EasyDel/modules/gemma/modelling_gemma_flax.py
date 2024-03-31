@@ -199,16 +199,16 @@ class FlaxGemmaAttention(BaseJAXAttentionModule):
         else:
             causal_mask = causal_mask[:, :, :query_length, :key_length]
 
-        if self.config.use_sharding_constraint:
-            query_states = with_sharding_constraint(
-                query_states, PartitionSpec(("dp", "fsdp"), "sp" if query_states.shape[1] != 1 else None, "tp", None)
-            )
-            key_states = with_sharding_constraint(
-                key_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
-            )
-            value_states = with_sharding_constraint(
-                value_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
-            )
+        # if self.config.use_sharding_constraint:
+        #     query_states = with_sharding_constraint(
+        #         query_states, PartitionSpec(("dp", "fsdp"), "sp" if query_states.shape[1] != 1 else None, "tp", None)
+        #     )
+        #     key_states = with_sharding_constraint(
+        #         key_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
+        #     )
+        #     value_states = with_sharding_constraint(
+        #         value_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
+        #     )
         batch_size = hidden_states.shape[0]
         causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
 

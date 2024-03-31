@@ -383,16 +383,16 @@ class FlaxMistralAttention(BaseJAXAttentionModule):
                 query_states,
                 attention_mask
             )
-        if self.config.use_sharding_constraint:
-            query_states = with_sharding_constraint(
-                query_states, PartitionSpec(("dp", "fsdp"), "sp" if query_states.shape[1] != 1 else None, "tp", None)
-            )
-            key_states = with_sharding_constraint(
-                key_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
-            )
-            value_states = with_sharding_constraint(
-                value_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
-            )
+        # if self.config.use_sharding_constraint:
+        #     query_states = with_sharding_constraint(
+        #         query_states, PartitionSpec(("dp", "fsdp"), "sp" if query_states.shape[1] != 1 else None, "tp", None)
+        #     )
+        #     key_states = with_sharding_constraint(
+        #         key_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
+        #     )
+        #     value_states = with_sharding_constraint(
+        #         value_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
+        #     )
         attention_bias = lax.select(
             attention_mask > 0,
             jnp.full(attention_mask.shape, 0.0).astype(self.dtype),

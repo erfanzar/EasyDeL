@@ -175,12 +175,12 @@ class FlaxGPT2Attention(BaseJAXAttentionModule):
         if self.causal and (self.has_variable("cache", "cached_key") or init_cache):
             key, value, attention_mask = self._concatenate_to_cache(key, value, query, attention_mask)
 
-        if self.config.use_sharding_constraint:
-            query = with_sharding_constraint(
-                query, jax.sharding.PartitionSpec(("dp", "fsdp"), "sp" if query.shape[1] != 1 else None, "tp", None)
-            )
-            key = with_sharding_constraint(key, jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None))
-            value = with_sharding_constraint(value, jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None))
+        # if self.config.use_sharding_constraint:
+        #     query = with_sharding_constraint(
+        #         query, jax.sharding.PartitionSpec(("dp", "fsdp"), "sp" if query.shape[1] != 1 else None, "tp", None)
+        #     )
+        #     key = with_sharding_constraint(key, jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None))
+        #     value = with_sharding_constraint(value, jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None))
         # transform boolean mask into float mask
         if attention_mask is not None:
             attention_bias = lax.select(
