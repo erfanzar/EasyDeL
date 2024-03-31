@@ -82,7 +82,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             generation_attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, "tp", None),
             shard_attention_computation: bool = True,
             use_sharded_kv_caching: bool = True,
-            use_sharding_constraint: bool = True,
+            use_sharding_constraint: bool = False,
             backend: Optional[None] = jax.default_backend(),
             easy_method: Literal["train", "serve", "convert"] = EasyMethod.TRAIN,
             bits: Optional[int] = None,
@@ -361,7 +361,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             PartitionSpec(("dp", "fsdp"), None, "tp", None),
             generation_attention_partition_spec
         )
-        set_attrs_smartly(self, "use_sharding_constraint", True, use_sharding_constraint)
+        set_attrs_smartly(self, "use_sharding_constraint", False, use_sharding_constraint)
         set_attrs_smartly(self, "backend", jax.default_backend(), backend)
         set_attrs_smartly(self, "shard_attention_computation", True, shard_attention_computation)
         set_attrs_smartly(self, "use_sharded_kv_caching", True, use_sharded_kv_caching)
