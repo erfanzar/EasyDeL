@@ -104,7 +104,6 @@ train_args = TrainArguments(
     max_sequence_length=max_sequence_length,
     gradient_checkpointing=EasyDelGradientCheckPointers.NOTHING_SAVEABLE,
     sharding_array=(1, -1, 1, 1),
-    use_pjit_attention_force=False,
     gradient_accumulation_steps=8,
     remove_ckpt_after_load=True,
     ids_to_pop_from_dataset=['token_type_ids'],

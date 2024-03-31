@@ -279,16 +279,15 @@ class FlaxPhiAttention(BaseJAXAttentionModule):
             query_states = self.q_layernorm(query_states)
             key_states = self.k_layernorm(key_states)
 
-        if self.config.use_pjit_attention_force:
-            query_states = with_sharding_constraint(
-                query_states, PartitionSpec(("dp", "fsdp"), "sp", "tp")
-            )
-            key_states = with_sharding_constraint(
-                key_states, PartitionSpec(("dp", "fsdp"), "sp", "tp")
-            )
-            value_states = with_sharding_constraint(
-                value_states, PartitionSpec(("dp", "fsdp"), "sp", "tp")
-            )
+        query_states = with_sharding_constraint(
+            query_states, PartitionSpec(("dp", "fsdp"), "sp" if query_states.shape[1] != 1 else None, "tp")
+        )
+        key_states = with_sharding_constraint(
+            key_states, PartitionSpec(("dp", "fsdp"), "sp", "tp")
+        )
+        value_states = with_sharding_constraint(
+            value_states, PartitionSpec(("dp", "fsdp"), "sp", "tp")
+        )
 
         query_states = query_states.reshape(
             batch_size, sequence_length, self.config.num_attention_heads, self.head_dim
@@ -368,7 +367,6 @@ class FlaxPhiAttention(BaseJAXAttentionModule):
             value_states=value_states,
             bias=attention_bias,
             causal=True,
-            use_pjit_attention_force=self.config.use_pjit_attention_force,
             dropout_rng=dropout_rng,
             deterministic=deterministic,
             query_sequence_length=query_length,

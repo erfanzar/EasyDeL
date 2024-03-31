@@ -380,7 +380,6 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
             causal: bool = False,
             deterministic: bool = False,
             dropout_rng: Optional[random.PRNGKey] = None,
-            use_pjit_attention_force: bool = False,
             uses_cache: bool = False
     ):
         with self.mesh:

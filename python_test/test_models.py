@@ -54,7 +54,6 @@ class EasyModelsTest(TestCase):
         self.gradient_checkpointing: str = "nothing_saveable"  #
         self.fcm_min_ratio: float = -1
         self.fcm_max_ratio: float = -1
-        self.use_pjit_attention_force: bool = False
         self.rope_scaling: Optional[Dict[str, Union[str, float]]] = None
         self.use_scan_mlp: bool = False
         self.bits: Optional[int] = None

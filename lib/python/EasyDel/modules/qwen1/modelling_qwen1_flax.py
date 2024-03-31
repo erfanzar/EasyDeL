@@ -346,10 +346,11 @@ class FlaxQwen1Attention(BaseJAXAttentionModule):
         mixed_x_layer: chex.Array = self.c_attn(hidden_states)
         query_state, key_state, value_state = jnp.split(mixed_x_layer, 3, 2)
 
-        if self.config.use_pjit_attention_force:
-            query_state = with_sharding_constraint(query_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
-            key_state = with_sharding_constraint(key_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
-            value_state = with_sharding_constraint(value_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
+        query_state = with_sharding_constraint(query_state, PartitionSpec(("dp", "fsdp"),
+                                                                          "sp" if query_state.shape[1] != 1 else None,
+                                                                          "tp"))
+        key_state = with_sharding_constraint(key_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
+        value_state = with_sharding_constraint(value_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
 
         query_state = query_state.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
         key_state = key_state.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
@@ -413,7 +414,6 @@ class FlaxQwen1Attention(BaseJAXAttentionModule):
             value_states=value_state,
             bias=attention_bias,
             causal=False,
-            use_pjit_attention_force=self.config.use_pjit_attention_force,
             dropout_rng=dropout_rng,
             deterministic=deterministic,
             query_sequence_length=query_length,

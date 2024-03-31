@@ -34,7 +34,6 @@ class Qwen2MoeConfig(EasyDelPretrainedConfig):
             output_router_logits=False,
             router_aux_loss_coef=0.001,
             gradient_checkpointing: str = "nothing_saveable",
-            use_pjit_attention_force: bool = False,
             bits: Optional[int] = None,
             **kwargs,
     ):
@@ -66,7 +65,6 @@ class Qwen2MoeConfig(EasyDelPretrainedConfig):
         self.output_router_logits = output_router_logits
         self.router_aux_loss_coef = router_aux_loss_coef
         self.gradient_checkpointing = gradient_checkpointing
-        self.use_pjit_attention_force = use_pjit_attention_force
         self.bits = bits
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,
@@ -127,7 +125,6 @@ class Qwen2MoeConfig(EasyDelPretrainedConfig):
     def add_jax_args(
             self,
             gradient_checkpointing: str = "nothing_saveable",
-            use_pjit_attention_force: bool = False,
             bits: Optional[int] = None,
             **kwargs,
     ):
@@ -137,13 +134,11 @@ class Qwen2MoeConfig(EasyDelPretrainedConfig):
         :param self: Refer to the current object
 
         :param gradient_checkpointing: str: Control the amount of memory used by jax
-        :param use_pjit_attention_force: bool: Determine if the attention force is used
         :param bits: Optional[int]: Determine the number of bits used in the quantization
         :return: The following:
 
         """
         self.gradient_checkpointing = gradient_checkpointing
-        self.use_pjit_attention_force = use_pjit_attention_force
         self.bits = bits
 
     @staticmethod

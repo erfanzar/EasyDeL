@@ -32,7 +32,6 @@ class LlamaConfig(EasyDelPretrainedConfig):
             gradient_checkpointing: str = "nothing_saveable",
             fcm_min_ratio: float = -1,
             fcm_max_ratio: float = -1,
-            use_pjit_attention_force: bool = False,
             rope_scaling: Dict[str, Union[str, float]] = None,
             scan_mlp_chunk_size: int = 1024,
             bits: Optional[int] = None,
@@ -67,7 +66,6 @@ class LlamaConfig(EasyDelPretrainedConfig):
         :param gradient_checkpointing: str: Specify how to checkpoint the gradients
         :param fcm_min_ratio: float: Set the minimum ratio of the number of elements in a tensor to be processed by flash
         :param fcm_max_ratio: float: Determine the maximum ratio of
-        :param use_pjit_attention_force: bool: Determine whether to use the pytorch jit compiler
         :param rope_scaling: Dict[str: Define the scaling of the rope
         :param Union[str: Specify the type of the parameter
         :param float]]: Specify the type of the parameter
@@ -104,7 +102,6 @@ class LlamaConfig(EasyDelPretrainedConfig):
         self.embd_pdrop = embd_pdrop
         self.attention_dropout = attention_dropout
         self.gradient_checkpointing = gradient_checkpointing
-        self.use_pjit_attention_force = use_pjit_attention_force
         self.fcm_min_ratio = fcm_min_ratio
         self.hidden_act = hidden_act
         self.fcm_max_ratio = fcm_max_ratio
@@ -176,7 +173,6 @@ class LlamaConfig(EasyDelPretrainedConfig):
             gradient_checkpointing: str = 'nothing_saveable',
             fcm_min_ratio: float = 0.0,
             fcm_max_ratio: float = 0.0,
-            use_pjit_attention_force: bool = False,
             number_rep_kv: int = 1,
             bits: Optional[int] = None,
             rope_theta: float = 10000.,
@@ -196,7 +192,6 @@ class LlamaConfig(EasyDelPretrainedConfig):
         :param gradient_checkpointing: str: Control the amount of memory used by jax
         :param fcm_min_ratio: float: Control the minimum ratio of the number of chunks to be used in flash-based computation
         :param fcm_max_ratio: float: Set the maximum ratio of the number of input tokens to output tokens
-        :param use_pjit_attention_force: bool: Determine if the attention force is used
         :param number_rep_kv: int: Determine how many times the key and value vectors are repeated
         :param bits: Optional[int]: Determine the number of bits used in the quantization
         :param rope_theta: float : rope_theta for compute rope
@@ -216,7 +211,6 @@ class LlamaConfig(EasyDelPretrainedConfig):
         self.gradient_checkpointing = gradient_checkpointing
         self.fcm_min_ratio = fcm_min_ratio
         self.fcm_max_ratio = fcm_max_ratio
-        self.use_pjit_attention_force = use_pjit_attention_force
         self.bits = bits
 
     @staticmethod

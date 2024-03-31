@@ -42,7 +42,6 @@ class PhiConfig(EasyDelPretrainedConfig):
             eos_token_id=2,
             bits: Optional[int] = None,
             gradient_checkpointing: str = "nothing_saveable",
-            use_pjit_attention_force: bool = False,
             **kwargs
     ) -> None:
         self.vocab_size = vocab_size
@@ -69,7 +68,6 @@ class PhiConfig(EasyDelPretrainedConfig):
         self.qk_layernorm = qk_layernorm
         self.bits = bits
         self.gradient_checkpointing = gradient_checkpointing
-        self.use_pjit_attention_force = use_pjit_attention_force
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
@@ -82,12 +80,10 @@ class PhiConfig(EasyDelPretrainedConfig):
             self,
             bits: Optional[int] = None,
             gradient_checkpointing: str = "nothing_saveable",
-            use_pjit_attention_force: bool = False,
             **kwargs
     ):
         self.bits = bits
         self.gradient_checkpointing = gradient_checkpointing
-        self.use_pjit_attention_force = use_pjit_attention_force
         for k, v in kwargs.items():
             if not hasattr(self, k):
                 setattr(self, k, v)

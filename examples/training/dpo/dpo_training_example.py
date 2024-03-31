@@ -106,7 +106,6 @@ def main():
         max_sequence_length=max_length,
         gradient_checkpointing=EasyDelGradientCheckPointers.NOTHING_SAVEABLE,
         sharding_array=(1, -1, 1, 1),
-        use_pjit_attention_force=False,
         gradient_accumulation_steps=1,
         dtype=dtype,
         param_dtype=dtype,

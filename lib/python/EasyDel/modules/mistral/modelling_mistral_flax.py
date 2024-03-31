@@ -323,17 +323,15 @@ class FlaxMistralAttention(BaseJAXAttentionModule):
         query_state, key_state, value_state = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(
             hidden_states)
 
-        if self.config.use_pjit_attention_force:
-            if self.config.use_pjit_attention_force:
-                query_state = with_sharding_constraint(
-                    query_state, PartitionSpec(("dp", "fsdp"), "sp", "tp")
-                ) if query_state.shape[1] != 1 else with_sharding_constraint(
-                    query_state, PartitionSpec(("dp", "fsdp"), None, "tp")
-                )
-                key_state = with_sharding_constraint(
-                    key_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
-                value_state = with_sharding_constraint(
-                    value_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
+        query_state = with_sharding_constraint(
+            query_state, PartitionSpec(("dp", "fsdp"), "sp", "tp")
+        ) if query_state.shape[1] != 1 else with_sharding_constraint(
+            query_state, PartitionSpec(("dp", "fsdp"), None, "tp")
+        )
+        key_state = with_sharding_constraint(
+            key_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
+        value_state = with_sharding_constraint(
+            value_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
 
         query_state = query_state.reshape(
             batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
@@ -411,7 +409,6 @@ class FlaxMistralAttention(BaseJAXAttentionModule):
             value_states=value_state,
             bias=attention_bias,
             causal=False,
-            use_pjit_attention_force=self.config.use_pjit_attention_force,
             dropout_rng=dropout_rng,
             deterministic=deterministic,
             query_sequence_length=query_length,

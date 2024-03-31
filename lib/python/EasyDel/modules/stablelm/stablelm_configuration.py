@@ -35,7 +35,6 @@ class StableLmConfig(EasyDelPretrainedConfig):
             eos_token_id=0,
             bits: Optional[int] = None,
             gradient_checkpointing: str = "nothing_saveable",
-            use_pjit_attention_force: bool = False,
             **kwargs
     ) -> None:
         self.vocab_size = vocab_size
@@ -61,7 +60,6 @@ class StableLmConfig(EasyDelPretrainedConfig):
         self.partial_rotary_factor = partial_rotary_factor
         self.bits = bits
         self.gradient_checkpointing = gradient_checkpointing
-        self.use_pjit_attention_force = use_pjit_attention_force
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
@@ -74,12 +72,10 @@ class StableLmConfig(EasyDelPretrainedConfig):
             self,
             bits: Optional[int] = None,
             gradient_checkpointing: str = "nothing_saveable",
-            use_pjit_attention_force: bool = False,
             **kwargs
     ):
         self.bits = bits
         self.gradient_checkpointing = gradient_checkpointing
-        self.use_pjit_attention_force = use_pjit_attention_force
         for k, v in kwargs.items():
             if not hasattr(self, k):
                 setattr(self, k, v)

@@ -30,7 +30,6 @@ class T5Config(EasyDelPretrainedConfig):
             pad_token_id=0,
             eos_token_id=1,
             gradient_checkpointing: str = 'nothing_saveable',
-            use_pjit_attention_force: bool = False,
             **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -39,7 +38,6 @@ class T5Config(EasyDelPretrainedConfig):
         self.d_ff = d_ff
         self.num_layers = num_layers
         self.gradient_checkpointing = gradient_checkpointing
-        self.use_pjit_attention_force = use_pjit_attention_force
         self.num_decoder_layers = (
             num_decoder_layers if num_decoder_layers is not None else self.num_layers
         )  # default = symmetry

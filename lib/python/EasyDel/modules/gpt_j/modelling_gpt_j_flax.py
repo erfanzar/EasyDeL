@@ -180,14 +180,13 @@ class FlaxGPTJAttention(BaseJAXAttentionModule):
         value = self.v_proj(hidden_states)
 
         # Force A local Sharding
-        if self.config.use_pjit_attention_force:
-            query = with_sharding_constraint(
-                query, PartitionSpec(("dp", "fsdp"), "sp", "tp")
-            ) if query.shape[1] != 1 else with_sharding_constraint(
-                query, PartitionSpec(("dp", "fsdp"), None, "tp")
-            )
-            key = with_sharding_constraint(key, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
-            value = with_sharding_constraint(value, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
+        query = with_sharding_constraint(
+            query, PartitionSpec(("dp", "fsdp"), "sp", "tp")
+        ) if query.shape[1] != 1 else with_sharding_constraint(
+            query, PartitionSpec(("dp", "fsdp"), None, "tp")
+        )
+        key = with_sharding_constraint(key, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
+        value = with_sharding_constraint(value, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
 
         query = self._split_heads(query)
         key = self._split_heads(key)
@@ -252,7 +251,6 @@ class FlaxGPTJAttention(BaseJAXAttentionModule):
             value_states=value,
             bias=attention_bias,
             causal=False,
-            use_pjit_attention_force=self.config.use_pjit_attention_force,
             dropout_rng=dropout_rng,
             deterministic=deterministic,
             query_sequence_length=query_length,
