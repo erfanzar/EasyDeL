@@ -87,7 +87,7 @@ class Qwen2MoeConfig(EasyDelPretrainedConfig):
             ("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
 
             ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("self_attn/o_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+            ("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
 
             ("gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
             ("down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
@@ -105,8 +105,8 @@ class Qwen2MoeConfig(EasyDelPretrainedConfig):
 
             ("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
 
-            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+            ("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
 
             ("gate_proj/kernel", PartitionSpec(("fsdp", "sp"))),
             ("down_proj/kernel", PartitionSpec(("fsdp", "sp"))),

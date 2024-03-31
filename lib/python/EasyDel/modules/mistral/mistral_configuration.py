@@ -7,6 +7,7 @@ from ..easydel_modelling_utils import EasyDelPretrainedConfig
 
 class MistralConfig(EasyDelPretrainedConfig):
     model_type = "mistral"
+
     def __init__(
             self,
             vocab_size=32000,
@@ -125,26 +126,26 @@ class MistralConfig(EasyDelPretrainedConfig):
         """
         return (
 
-            ("model/embed_tokens/embedding", PartitionSpec("dp", "fsdp")),
+            ("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"))),
 
-            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec("fsdp", "dp")),
-            ("self_attn/o_proj/kernel", PartitionSpec("dp", "fsdp")),
+            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+            ("self_attn/o_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
 
-            ("mlp/gate_proj/kernel", PartitionSpec("fsdp", "dp")),
-            ("mlp/down_proj/kernel", PartitionSpec("dp", "fsdp")),
-            ("mlp/up_proj/kernel", PartitionSpec("fsdp", "dp")),
+            ("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+            ("mlp/down_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+            ("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"))),
 
             ("input_layernorm/kernel", PartitionSpec(None)),
             ("post_attention_layernorm/kernel", PartitionSpec(None)),
 
             ("model/norm/kernel", PartitionSpec(None)),
-            ("lm_head/kernel", PartitionSpec("fsdp", "dp")),
-            (".*", PartitionSpec(None)),
+            ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
+            (".*", PartitionSpec(("fsdp", "sp"))),
         ) if not fully_sharded_data_parallel else (
             ("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"))),
 
-            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+            ("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
 
             ("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"))),
             ("mlp/down_proj/kernel", PartitionSpec(("fsdp", "sp"))),
