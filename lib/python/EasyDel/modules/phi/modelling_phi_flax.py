@@ -366,6 +366,7 @@ class FlaxPhiAttention(BaseJAXAttentionModule):
             key_states=key_states,
             value_states=value_states,
             bias=attention_bias,
+            attention_mask=attention_mask,
             causal=True,
             dropout_rng=dropout_rng,
             deterministic=deterministic,

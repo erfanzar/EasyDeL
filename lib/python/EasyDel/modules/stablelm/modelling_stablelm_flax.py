@@ -414,6 +414,7 @@ class FlaxStableLmAttention(BaseJAXAttentionModule):
             key_states=key_state,
             value_states=value_state,
             bias=use_qkv_bias,
+            attention_mask=attention_mask,
             causal=False,
             dropout_rng=dropout_rng,
             deterministic=deterministic,

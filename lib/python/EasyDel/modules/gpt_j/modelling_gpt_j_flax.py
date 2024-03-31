@@ -250,6 +250,7 @@ class FlaxGPTJAttention(BaseJAXAttentionModule):
             key_states=key,
             value_states=value,
             bias=attention_bias,
+            attention_mask=attention_mask,
             causal=False,
             dropout_rng=dropout_rng,
             deterministic=deterministic,
