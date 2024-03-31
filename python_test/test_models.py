@@ -59,7 +59,7 @@ class EasyModelsTest(TestCase):
         self.hidden_act: str = "silu"
         self.pretraining_tp: int = 1
         self.scan_layers: bool = False
-        self.shard_attention_computation: bool = False
+        self.shard_attention_computation: bool = True
         self.rotary_dim = 32
         self.dtype: jax.numpy.dtype = jnp.float32
         self.precision = jax.lax.Precision("fastest")
@@ -109,6 +109,7 @@ class EasyModelsTest(TestCase):
         config.add_jax_args()
         config.add_basic_configurations(
             shard_attention_computation=self.shard_attention_computation,
+            use_sharding_constraint=self.use_sharding_constraint,
             scan_mlp_chunk_size=self.scan_mlp_chunk_size
         )
         mesh = config.jax_mesh()
@@ -170,6 +171,7 @@ class EasyModelsTest(TestCase):
             rotary_dim=self.rotary_dim,
             rms_norm_eps=self.rms_norm_eps,
             layer_norm_eps=self.layer_norm_eps,
+            router_aux_loss_coef=1
             # residual_in_fp32=True
         )
 
@@ -346,7 +348,7 @@ class EasyModelsTest(TestCase):
         is_close = jnp.isclose(to, jo, atol=atol, rtol=rtol)
         if not all_close:
             print(f"\n{name} LAST F HF : ", to[:, -1, -5:])
-            print(f"{name} LAST F ED : ", jo[:, -1, -5:])
+            print(f"{name} LAST F ED : ", jo[..., -1, -5:])
             print(f"{name} CORRECT % : ", jnp.mean(jnp.where(is_close, 1, 0).reshape(-1)))
         return all_close, err
 

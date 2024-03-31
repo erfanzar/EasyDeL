@@ -192,7 +192,7 @@ def static_sharded_dot_product_attention(
         deterministic: bool = False,
         dtype: Optional[jnp.dtype] = jnp.float32,
         precision: Optional[Union[str, lax.Precision]] = None,
-        use_sharding_constraint: bool = True
+        use_sharding_constraint: bool = False
 ):
     assert key.shape[1] == value.shape[1], "miss match on key and value sequence length"
     is_generating = query.shape[1] == 1 or query.shape[1] != key.shape[1]
@@ -308,7 +308,7 @@ class EasyAttention:
             precision: lax.Precision = lax.Precision("fastest"),
             force_float32_tpu: bool = True,
             shard_attention_computation: bool = True,
-            use_sharding_constraint: Optional[bool] = True,
+            use_sharding_constraint: Optional[bool] = False,
     ):
         platform = jax.lib.xla_bridge.get_backend().platform
         if attn_mechanism == "splash":
