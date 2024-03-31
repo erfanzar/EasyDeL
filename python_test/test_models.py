@@ -337,7 +337,7 @@ class EasyModelsTest(TestCase):
         self.assertTrue(res)
 
     @staticmethod
-    def compare_torch_to_jax(name, to, jo, atol: float = 1e-05, rtol: float = 1e-08):
+    def compare_torch_to_jax(name, to, jo, atol: float = 1e-035, rtol: float = 1e-08):
         to, jo = to.logits.cpu().detach().numpy(), jo.logits
         err = jnp.mean(to - jo)
         all_close = jnp.allclose(to, jo, atol=atol, rtol=rtol)
