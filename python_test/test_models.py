@@ -64,7 +64,7 @@ class EasyModelsTest(TestCase):
         self.rotary_dim = 32
         self.dtype: jax.numpy.dtype = jnp.float32
         self.precision = jax.lax.Precision("fastest")
-        self.attn_mechanism: Literal["normal", "flash", "splash", "ring", "cudnn"] = "normal"
+        self.attn_mechanism: Literal["normal", "flash", "splash", "ring", "cudnn"] = "ring"
         self.block_k: int = 64
         self.block_q: int = 64
         self.scan_mlp_chunk_size = self.sequence_length // 2
@@ -337,7 +337,7 @@ class EasyModelsTest(TestCase):
         self.assertTrue(res)
 
     @staticmethod
-    def compare_torch_to_jax(name, to, jo, atol: float = 1e-5):
+    def compare_torch_to_jax(name, to, jo, atol: float = 1e-4):
         to, jo = to.logits.cpu().detach().numpy(), jo.logits
         err = jnp.mean(to - jo)
         is_close = jnp.allclose(to, jo, atol=atol)

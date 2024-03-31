@@ -376,6 +376,7 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
             query_sequence_length: int,
             key_value_sequence_length: int,
             bias: Optional[Array] = None,
+            attention_mask: Optional[Array] = None,
             segment_ids: Optional[Array] = None,
             causal: bool = False,
             deterministic: bool = False,
@@ -443,6 +444,7 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
                         deterministic=deterministic,
                         query_sequence_length=query_sequence_length,
                         segment_ids=segment_ids,
+                        attention_mask=attention_mask
                     )
 
                 elif self.attn_mechanism == "splash":
@@ -478,6 +480,7 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
             value_states: Array,
             query_sequence_length: int,
             bias: Optional[Array] = None,
+            attention_mask: Optional[Array] = None,
             deterministic: bool = False,
             dropout_rng: Optional[random.PRNGKey] = None,
             segment_ids: Optional[Array] = None
@@ -547,7 +550,7 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
                 check_rep=False
             )
             attn_output = ring_attention_sharded(
-                query_states, key_states, value_states, bias
+                query_states, key_states, value_states, attention_mask
             )
         return AttentionOutput(
             attention_weights=None,

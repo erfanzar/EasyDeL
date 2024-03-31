@@ -219,6 +219,7 @@ class FlaxRobertaSelfAttention(BaseJAXAttentionModule):
                 deterministic=deterministic,
                 causal=False,
                 bias=attention_bias,
+                attention_mask=attention_mask,
                 uses_cache=False,
                 query_sequence_length=query_states.shape[1],
                 key_value_sequence_length=key_states.shape[1],

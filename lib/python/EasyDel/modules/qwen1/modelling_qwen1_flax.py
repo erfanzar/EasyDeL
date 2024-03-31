@@ -413,6 +413,7 @@ class FlaxQwen1Attention(BaseJAXAttentionModule):
             key_states=key_state,
             value_states=value_state,
             bias=attention_bias,
+            attention_mask=attention_mask,
             causal=False,
             dropout_rng=dropout_rng,
             deterministic=deterministic,
