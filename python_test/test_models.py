@@ -30,7 +30,7 @@ torch.manual_seed(42)
 class EasyModelsTest(TestCase):
 
     def setUp(self) -> None:
-        self.batch_size: int = len(jax.devices())
+        self.batch_size: int = 10
         self.vocab_size: int = 32000
         self.hidden_size: int = 256
         self.intermediate_size: int = 512
@@ -63,9 +63,9 @@ class EasyModelsTest(TestCase):
         self.dtype: jax.numpy.dtype = jnp.float32
         self.precision = jax.lax.Precision("fastest")
         self.attn_mechanism: Literal["normal", "flash", "splash", "ring", "cudnn"] = "normal"
-        self.block_k: int = 64
-        self.block_q: int = 64
-        self.sequence_length = self.block_q * len(jax.devices())
+        self.block_k: int = 32
+        self.block_q: int = 32
+        self.sequence_length = 2048
         self.scan_mlp_chunk_size = self.sequence_length // 2
 
         self.max_position_embeddings: int = self.sequence_length
