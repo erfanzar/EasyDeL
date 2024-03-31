@@ -51,7 +51,7 @@ class EasyModelsTest(TestCase):
         self.rope_theta: float = 10000.
         self.attention_bias: bool = False
         self.tie_word_embeddings: bool = False
-        self.gradient_checkpointing: str = "nothing_saveable"  #
+        self.gradient_checkpointing: str = "nothing_saveable"
         self.fcm_min_ratio: float = -1
         self.fcm_max_ratio: float = -1
         self.rope_scaling: Optional[Dict[str, Union[str, float]]] = None
@@ -148,7 +148,7 @@ class EasyModelsTest(TestCase):
             del params
             del hf_model
             gc.collect()
-            return self.compare_torch_to_jax(hf_output, ed_output)
+            return self.compare_torch_to_jax(module_name, hf_output, ed_output)
 
     def create_moe_test_for_models(
             self,
@@ -337,14 +337,14 @@ class EasyModelsTest(TestCase):
         self.assertTrue(res)
 
     @staticmethod
-    def compare_torch_to_jax(to, jo, atol: float = 1e-4):
+    def compare_torch_to_jax(name, to, jo, atol: float = 1e-5):
         to, jo = to.logits.cpu().detach().numpy(), jo.logits
         err = jnp.mean(to - jo)
-        assertation = jnp.allclose(to, jo, atol=atol)
-        if not assertation:
-            print(f"MAX P S : {jnp.argmax(to) == jnp.argmax(jo)}")
-            print(f"MIN P S : {jnp.argmax(to) == jnp.argmax(jo)}")
-        return assertation, err
+        is_close = jnp.allclose(to, jo, atol=atol)
+        if not is_close:
+            print(f"\n{name} LAST F HF : ", to[:, 0, :5])
+            print(f"{name} LAST F ED : ", jo[:, 0, :5])
+        return is_close, err
 
     @staticmethod
     def make_input_id(

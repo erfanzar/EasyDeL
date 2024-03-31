@@ -29,7 +29,7 @@ class MptConfig(EasyDelPretrainedConfig):
                  qk_ln: bool = False,
                  use_lm_head: bool = False,
                  use_norm_bias: bool = False,
-                 gradient_checkpointing: str = 'nothing_saveable',
+                 gradient_checkpointing: str = "nothing_saveable",
                  bits: Optional[int] = None,
                  **kwargs
                  ):
@@ -147,7 +147,7 @@ class MptConfig(EasyDelPretrainedConfig):
                      qk_ln: bool = True,
                      use_lm_head: bool = False,
                      use_norm_bias: bool = False,
-                     gradient_checkpointing: str = 'nothing_saveable',
+                     gradient_checkpointing: str = "nothing_saveable",
                      bits: Optional[int] = None,
                      **kwargs,
                      ):

@@ -170,7 +170,7 @@ class LlamaConfig(EasyDelPretrainedConfig):
             embd_pdrop: float = 0.0,
             attention_dropout: float = 0.0,
             tie_word_embeddings: bool = False,
-            gradient_checkpointing: str = 'nothing_saveable',
+            gradient_checkpointing: str = "nothing_saveable",
             fcm_min_ratio: float = 0.0,
             fcm_max_ratio: float = 0.0,
             number_rep_kv: int = 1,

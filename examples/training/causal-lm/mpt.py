@@ -180,7 +180,7 @@ def main(argv):
         do_test=FLAGS.do_test,
         backend=FLAGS.backend,
         max_sequence_length=FLAGS.max_sequence_length,
-        gradient_checkpointing='nothing_saveable',
+        gradient_checkpointing="nothing_saveable",
         sharding_array=(1, -1, 1, 1),
         extra_configs=conf,
         gradient_accumulation_steps=FLAGS.gradient_accumulation_steps,

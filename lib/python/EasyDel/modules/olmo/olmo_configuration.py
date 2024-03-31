@@ -107,7 +107,7 @@ class OLMoConfig(EasyDelPretrainedConfig):
 
     def add_jax_args(
             self,
-            gradient_checkpointing: str = 'nothing_saveable'
+            gradient_checkpointing: str = "nothing_saveable"
     ):
         if not hasattr(self, "gradient_checkpointing"):
             self.gradient_checkpointing = gradient_checkpointing

@@ -32,7 +32,7 @@ class MixtralConfig(EasyDelPretrainedConfig):
             num_local_experts=8,
             output_router_logits=False,
             router_aux_loss_coef=0.001,
-            gradient_checkpointing: str = 'nothing_saveable',
+            gradient_checkpointing: str = "nothing_saveable",
             use_scan_mlp: bool = False,
             scan_mlp_chunk_size: int = 1024,
             number_rep_kv: int = 1,
@@ -176,7 +176,7 @@ class MixtralConfig(EasyDelPretrainedConfig):
 
     def add_jax_args(
             self,
-            gradient_checkpointing: str = 'nothing_saveable',
+            gradient_checkpointing: str = "nothing_saveable",
             use_scan_mlp: bool = False,
             scan_mlp_chunk_size: int = 1024,
             number_rep_kv: int = 1,

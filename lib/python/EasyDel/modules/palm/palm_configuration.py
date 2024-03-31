@@ -17,7 +17,7 @@ class PalmConfig(EasyDelPretrainedConfig):
                  max_length: int = 8196,  # Easydel trained palm with length of 8196
                  bos_token_id: int = 0,
                  eos_token_id: int = 1,
-                 gradient_checkpointing='nothing_saveable',
+                 gradient_checkpointing="nothing_saveable",
                  use_tie_word_embedding: bool = True,
                  **kwargs
                  ):
