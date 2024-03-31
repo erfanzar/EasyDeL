@@ -164,11 +164,11 @@ def static_sharded_dot_product_attention(
     )
 
     key = with_sharding_constraint(
-        key, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
+        key, PartitionSpec(("dp", "fsdp"), sequence_sharding_axis_name, "tp", None)
     )
 
     value = with_sharding_constraint(
-        value, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
+        value, PartitionSpec(("dp", "fsdp"), sequence_sharding_axis_name, "tp", None)
     )
 
     assert query.ndim == key.ndim, "q, k must have same rank."
