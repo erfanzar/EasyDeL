@@ -59,7 +59,7 @@ class EasyModelsTest(TestCase):
         self.hidden_act: str = "silu"
         self.pretraining_tp: int = 1
         self.scan_layers: bool = False
-        self.shard_attention_computation: bool = True
+        self.shard_attention_computation: bool = False
         self.rotary_dim = 32
         self.dtype: jax.numpy.dtype = jnp.float32
         self.precision = jax.lax.Precision("fastest")
