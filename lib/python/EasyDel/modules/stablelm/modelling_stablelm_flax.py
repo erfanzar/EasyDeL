@@ -183,7 +183,7 @@ class FlaxStableLmAttention(BaseJAXAttentionModule):
 
         self.rotary_emb_dim = int(self.config.partial_rotary_factor * self.head_dim)
         self.attention_performer = EasyAttention(
-            attn_type="normal",
+
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,
             block_q=self.config.block_q,

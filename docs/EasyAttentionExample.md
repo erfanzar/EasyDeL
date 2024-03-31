@@ -72,7 +72,7 @@ q, k, v, attention_mask, causal_mask, attention_bias = make_fake_input_data(
 )
 
 flash_attention = EasyAttention(
-    attn_type="normal",
+    
     block_k_major=config.block_k_major,
     block_b=config.block_b,
     block_q=config.block_q,
@@ -105,7 +105,7 @@ flash_attention = EasyAttention(
 )
 
 normal_attention = EasyAttention(
-    attn_type="normal",
+    
     block_k_major=config.block_k_major,
     block_b=config.block_b,
     block_q=config.block_q,

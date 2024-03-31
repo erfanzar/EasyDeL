@@ -193,7 +193,7 @@ class FlaxMistralAttention(BaseJAXAttentionModule):
 
         self.rotary = FlaxMistralRotaryEmbedding(self.dtype)
         self.attention_performer = EasyAttention(
-            attn_type="normal",
+
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,
             block_q=self.config.block_q,
@@ -418,7 +418,6 @@ class FlaxMistralAttention(BaseJAXAttentionModule):
             segment_ids=segment_ids
         )
         attentions.attention_outputs = attentions.attention_outputs
-
         attn_output = self._merge_heads(attentions.attention_outputs)
         attn_output = self.o_proj(attn_output)
 
