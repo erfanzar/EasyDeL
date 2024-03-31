@@ -80,7 +80,7 @@ def attention_production(
     return attention
 
 
-def attention_production_static(
+def static_sharded_attention_production(
         query_states: jax.Array,
         key_states: jax.Array,
         value_states: jax.Array,
@@ -89,10 +89,37 @@ def attention_production_static(
         dropout_rng: jax.random.PRNGKey = jax.random.PRNGKey(0),
         dropout_rate: float = 0.0
 ):
-    gen_seq_p = None if query_states.shape[1] == 1 else "sp"
-    query_states = with_sharding_constraint(query_states, PartitionSpec(("dp", "fsdp"), gen_seq_p, None, "tp"))
-    key_states = with_sharding_constraint(key_states, PartitionSpec(("dp", "fsdp"), "sp", None, "tp"))
-    value_states = with_sharding_constraint(value_states, PartitionSpec(("dp", "fsdp"), "sp", None, "tp"))
+    assert key_states.shape[1] == value_states.shape[1], "miss match on key and value sequence length"
+    is_generating = query_states.shape[1] == 1 or query_states.shape[1] != key_states.shape[1]
+    sequence_sharding_axis_name = None if is_generating else "sp"
+    tensor_sharding_axis_name = "sp" if is_generating else "tp"
+    query_states = with_sharding_constraint(
+        query_states,
+        PartitionSpec(
+            ("dp", "fsdp"),
+            sequence_sharding_axis_name,
+            tensor_sharding_axis_name,
+            None
+        )
+    )
+    key_states = with_sharding_constraint(
+        key_states,
+        PartitionSpec(
+            ("dp", "fsdp"),
+            sequence_sharding_axis_name,
+            tensor_sharding_axis_name,
+            None
+        )
+    )
+    value_states = with_sharding_constraint(
+        value_states,
+        PartitionSpec(
+            ("dp", "fsdp"),
+            sequence_sharding_axis_name,
+            tensor_sharding_axis_name,
+            None
+        )
+    )
 
     batch, q_sequence_length, q_num_head, head_dim = query_states.shape
     _, kv_sequence_length, kv_num_head, _ = key_states.shape
@@ -108,7 +135,13 @@ def attention_production_static(
     )
 
     query_states = with_sharding_constraint(
-        query_states, PartitionSpec(("dp", "fsdp"), gen_seq_p, None, None, "tp")
+        query_states, PartitionSpec(
+            ("dp", "fsdp"),
+            sequence_sharding_axis_name,
+            tensor_sharding_axis_name,
+            None,
+            None
+        )
     )
 
     attention_score = jnp.einsum(
@@ -134,7 +167,15 @@ def attention_production_static(
         batch, q_sequence_length, q_num_head, head_dim
     )
 
-    attention = with_sharding_constraint(attention, PartitionSpec(("dp", "fsdp"), gen_seq_p, None, "tp"))
+    attention = with_sharding_constraint(
+        attention,
+        PartitionSpec(
+            ("dp", "fsdp"),
+            sequence_sharding_axis_name,
+            tensor_sharding_axis_name,
+            None,
+        )
+    )
 
     return attention
 
@@ -152,23 +193,25 @@ def static_sharded_dot_product_attention(
         dtype: Optional[jnp.dtype] = None,
         precision: Optional[Union[str, lax.Precision]] = None,
 ):
-    is_generating = query.shape[1] == 1
+    assert key.shape[1] == value.shape[1], "miss match on key and value sequence length"
+    is_generating = query.shape[1] == 1 or query.shape[1] != key.shape[1]
     sequence_sharding_axis_name = None if is_generating else "sp"
+    tensor_sharding_axis_name = "sp" if is_generating else "tp"
 
     query, key, value = promote_dtype(query, key, value, dtype=dtype)
     dtype = query.dtype
 
     query, key, value = promote_dtype(query, key, value, dtype=dtype)
     query = with_sharding_constraint(
-        query, PartitionSpec(("dp", "fsdp"), sequence_sharding_axis_name, "tp", None)
+        query, PartitionSpec(("dp", "fsdp"), sequence_sharding_axis_name, tensor_sharding_axis_name, None)
     )
 
     key = with_sharding_constraint(
-        key, PartitionSpec(("dp", "fsdp"), sequence_sharding_axis_name, "tp", None)
+        key, PartitionSpec(("dp", "fsdp"), sequence_sharding_axis_name, tensor_sharding_axis_name, None)
     )
 
     value = with_sharding_constraint(
-        value, PartitionSpec(("dp", "fsdp"), sequence_sharding_axis_name, "tp", None)
+        value, PartitionSpec(("dp", "fsdp"), sequence_sharding_axis_name, tensor_sharding_axis_name, None)
     )
 
     assert query.ndim == key.ndim, "q, k must have same rank."
@@ -202,7 +245,7 @@ def static_sharded_dot_product_attention(
         attn_weights, value, precision=precision
     )
     attention = with_sharding_constraint(
-        attention, PartitionSpec(("dp", "fsdp"), sequence_sharding_axis_name, "tp", None)
+        attention, PartitionSpec(("dp", "fsdp"), sequence_sharding_axis_name, tensor_sharding_axis_name, None)
     )
     return attention
 
