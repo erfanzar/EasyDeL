@@ -303,7 +303,7 @@ class EasyAttention:
             generation_bias_partition_spec: PartitionSpec,
             attention_partition_spec: PartitionSpec,
             generation_attention_partition_spec: PartitionSpec,
-            scan_ring_attention: bool = True,
+            scan_ring_attention: bool = False,
             scan_attention_layers: bool = False,
             attention_dropout: float = 0.0,
             dtype: jnp.dtype = jnp.float32,
