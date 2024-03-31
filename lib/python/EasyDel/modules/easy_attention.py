@@ -272,7 +272,6 @@ def get_flash_attention() -> Tuple[Callable, bool, bool]:
 class EasyAttention:
     def __init__(
             self,
-            attn_type: Literal["normal", "alibi"],
             attn_mechanism: Literal[
                 "normal",
                 "flash",
@@ -318,7 +317,6 @@ class EasyAttention:
         if attn_mechanism == "flash" and platform not in ["gpu", "tpu"]:
             raise NotImplementedError("Flash Attention is only supported for GPU/TPU.")
         self.platform = platform
-        self.attn_type = attn_type
         self.attn_mechanism = attn_mechanism
         self.block_k = block_k
         self.block_q = block_q
@@ -411,66 +409,60 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
                 f"required Shape {k_v_req_shape}"
             )
 
-            if self.attn_type == "normal":
+            if self.attn_mechanism == "flash":
 
-                if self.attn_mechanism == "flash":
+                attentions = self._qkv_normal_flash_op(
+                    query_states=query_states,
+                    key_states=key_states,
+                    value_states=value_states,
+                    bias=bias,
+                    causal=causal,
+                    key_value_sequence_length=key_value_sequence_length,
+                )
 
-                    attentions = self._qkv_normal_flash_op(
-                        query_states=query_states,
-                        key_states=key_states,
-                        value_states=value_states,
-                        bias=bias,
-                        causal=causal,
-                        key_value_sequence_length=key_value_sequence_length,
-                    )
+            elif self.attn_mechanism == "normal":
 
-                elif self.attn_mechanism == "normal":
+                attentions = self._qkv_normal_op(
+                    query_states=query_states,
+                    key_states=key_states,
+                    value_states=value_states,
+                    bias=bias,
+                    dropout_rng=dropout_rng,
+                    deterministic=deterministic,
+                )
+            elif self.attn_mechanism == "ring":
+                attentions = self._qkv_ring_op(
+                    query_states=query_states,
+                    key_states=key_states,
+                    value_states=value_states,
+                    bias=bias,
+                    dropout_rng=dropout_rng,
+                    deterministic=deterministic,
+                    query_sequence_length=query_sequence_length,
+                    segment_ids=segment_ids,
+                    attention_mask=attention_mask
+                )
 
-                    attentions = self._qkv_normal_op(
-                        query_states=query_states,
-                        key_states=key_states,
-                        value_states=value_states,
-                        bias=bias,
-                        dropout_rng=dropout_rng,
-                        deterministic=deterministic,
-                    )
-                elif self.attn_mechanism == "ring":
-                    attentions = self._qkv_ring_op(
-                        query_states=query_states,
-                        key_states=key_states,
-                        value_states=value_states,
-                        bias=bias,
-                        dropout_rng=dropout_rng,
-                        deterministic=deterministic,
-                        query_sequence_length=query_sequence_length,
-                        segment_ids=segment_ids,
-                        attention_mask=attention_mask
-                    )
-
-                elif self.attn_mechanism == "splash":
-                    attentions = self._qkv_normal_splash_op(
-                        query_states=query_states,
-                        key_states=key_states,
-                        value_states=value_states,
-                        segment_ids=segment_ids,
-                    )
-                elif self.attn_mechanism == "cudnn":
-                    attentions = self._qkv_normal_cudnn_flash_op(
-                        query_states=query_states,
-                        key_states=key_states,
-                        value_states=value_states,
-                        bias=bias,
-                        causal=causal,
-                        deterministic=deterministic,
-                        key_value_sequence_length=key_value_sequence_length
-                    )
-                else:
-                    raise ValueError(f"Unknown Attention mechanism of {self.attn_mechanism}")
-                return attentions
-            elif self.attn_type == "alibi":
-                raise NotImplementedError("Not Implemented Yet i guess!")
+            elif self.attn_mechanism == "splash":
+                attentions = self._qkv_normal_splash_op(
+                    query_states=query_states,
+                    key_states=key_states,
+                    value_states=value_states,
+                    segment_ids=segment_ids,
+                )
+            elif self.attn_mechanism == "cudnn":
+                attentions = self._qkv_normal_cudnn_flash_op(
+                    query_states=query_states,
+                    key_states=key_states,
+                    value_states=value_states,
+                    bias=bias,
+                    causal=causal,
+                    deterministic=deterministic,
+                    key_value_sequence_length=key_value_sequence_length
+                )
             else:
-                raise ValueError(f"Unknown Attention Type of {self.attn_type}")
+                raise ValueError(f"Unknown Attention mechanism of {self.attn_mechanism}")
+            return attentions
 
     def _qkv_ring_op(
             self,
@@ -568,11 +560,7 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
             dropout_rng: Optional[random.PRNGKey] = None,
     ) -> AttentionOutput:
         dtype_c = jnp.promote_types(self.dtype, jnp.float32)
-        query_states, key_states, value_states = map(
-            lambda s: s.astype(dtype_c),
-            (query_states, key_states, value_states)
-        )
-
+        attention_weight = None
         if self.shard_attention_computation:
             # is_generating = query_states.shape[1] == 1
             # if is_generating:
@@ -627,26 +615,33 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
                     dropout_rng,
                     self.attention_dropout,
                     deterministic,
-                    self.dtype,
+                    dtype_c,
                     self.precision
                 )
         else:
-            attention_output = flax.linen.attention.dot_product_attention(
+            attention_weight = flax.linen.attention.dot_product_attention_weights(
                 query_states,
                 key_states,
-                value_states,
                 bias,
                 None,
                 True,
                 dropout_rng,
                 self.attention_dropout,
                 deterministic,
-                self.dtype,
+                dtype_c,
                 self.precision
+            )
+            attention_weight = with_sharding_constraint(
+                attention_weight, PartitionSpec(
+                    ("dp", "fsdp"), "tp", "sp", None
+                )
+            )
+            attention_output = jnp.einsum(
+                "...hqk,...khd->...qhd", attention_weight, value_states, precision=self.precision
             )
         return AttentionOutput(
             attention_outputs=attention_output,
-            attention_weights=None
+            attention_weights=attention_weight
         )
 
     def _qkv_normal_flash_op(

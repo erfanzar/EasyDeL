@@ -58,7 +58,7 @@ def main():
     )
 
     flash_attention = EasyAttention(
-        attn_type="normal",
+
         block_k_major=config.block_k_major,
         block_b=config.block_b,
         block_q=config.block_q,
@@ -91,7 +91,7 @@ def main():
     )
 
     normal_attention = EasyAttention(
-        attn_type="normal",
+
         block_k_major=config.block_k_major,
         block_b=config.block_b,
         block_q=config.block_q,

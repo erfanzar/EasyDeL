@@ -138,7 +138,6 @@ class FlaxPhiAttention(BaseJAXAttentionModule):
             )
 
         self.attention_performer = EasyAttention(
-            attn_type="normal",
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,
             block_q=self.config.block_q,

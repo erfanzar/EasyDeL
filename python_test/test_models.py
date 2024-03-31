@@ -63,7 +63,7 @@ class EasyModelsTest(TestCase):
         self.rotary_dim = 32
         self.dtype: jax.numpy.dtype = jnp.float32
         self.precision = jax.lax.Precision("fastest")
-        self.attn_mechanism: Literal["normal", "flash", "splash", "ring", "cudnn"] = "ring"
+        self.attn_mechanism: Literal["normal", "flash", "splash", "ring", "cudnn"] = "normal"
         self.block_k: int = 64
         self.block_q: int = 64
         self.sequence_length = self.block_q * len(jax.devices())
@@ -337,14 +337,16 @@ class EasyModelsTest(TestCase):
         self.assertTrue(res)
 
     @staticmethod
-    def compare_torch_to_jax(name, to, jo, atol: float = 1e-4):
+    def compare_torch_to_jax(name, to, jo, atol: float = 1e-05, rtol: float = 1e-08):
         to, jo = to.logits.cpu().detach().numpy(), jo.logits
         err = jnp.mean(to - jo)
-        is_close = jnp.allclose(to, jo, atol=atol)
-        if not is_close:
-            print(f"\n{name} LAST F HF : ", to[:, 0, :5])
-            print(f"{name} LAST F ED : ", jo[:, 0, :5])
-        return is_close, err
+        all_close = jnp.allclose(to, jo, atol=atol, rtol=rtol)
+        is_close = jnp.isclose(to, jo, atol=atol, rtol=rtol)
+        if not all_close:
+            print(f"\n{name} LAST F HF : ", to[:, -1, -5:])
+            print(f"{name} LAST F ED : ", jo[:, -1, -5:])
+            print(f"{name} CORRECT % : ", jnp.mean(jnp.where(is_close, 1, 0).reshape(-1)))
+        return all_close, err
 
     @staticmethod
     def make_input_id(

@@ -219,7 +219,7 @@ class FlaxQwen2MoeAttention(BaseJAXAttentionModule):
 
         self.rotary = FlaxQwen2MoeEmbedding(self.dtype)
         self.attention_performer = EasyAttention(
-            attn_type="normal",
+
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,
             block_q=self.config.block_q,
