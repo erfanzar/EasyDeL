@@ -37,7 +37,6 @@ class EasyModelsTest(TestCase):
         self.num_hidden_layers: int = 4
         self.num_attention_heads: int = 8
         self.num_key_value_heads: Optional[int] = 4
-        self.max_position_embeddings: int = 2048
         self.rms_norm_eps: float = 1e-6
         self.layer_norm_eps = self.rms_norm_eps
         self.initializer_range: float = 0.02
@@ -68,6 +67,8 @@ class EasyModelsTest(TestCase):
         self.block_q: int = 64
         self.sequence_length = self.block_q * len(jax.devices())
         self.scan_mlp_chunk_size = self.sequence_length // 2
+
+        self.max_position_embeddings: int = self.sequence_length
         self.use_sharding_constraint = False
 
     def create_test_for_models(
@@ -141,7 +142,6 @@ class EasyModelsTest(TestCase):
             hf_output = hf_model(
                 input_ids=torch_input_ids[:, :-1],
                 labels=torch_input_ids[:, 1:],
-                attention_mask=torch.ones(self.batch_size, self.sequence_length),
             )
 
             ed_output = ed_model(
@@ -234,7 +234,6 @@ class EasyModelsTest(TestCase):
             hf_output = hf_model(
                 input_ids=torch_input_ids[:, :-1],
                 labels=torch_input_ids[:, 1:],
-                attention_mask=torch.ones(self.batch_size, self.sequence_length),
                 output_router_logits=True
             )
 
@@ -254,7 +253,6 @@ class EasyModelsTest(TestCase):
             del params
             del hf_model
             gc.collect()
-            from transformers import MixtralForCausalLM
             print(f"\nHF MoE LOSS : {hf_output.loss.detach().cpu().numpy()}")
             print(f"ED MoE LOSS : {loss}")
             return jnp.allclose(hf_output.loss.detach().cpu().numpy(), loss)
