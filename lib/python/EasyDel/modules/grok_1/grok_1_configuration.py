@@ -29,7 +29,7 @@ class Grok1Config(EasyDelPretrainedConfig):
             num_experts=8,
             output_router_logits=False,
             router_aux_loss_coef=0.001,
-            gradient_checkpointing: str = 'nothing_saveable',
+            gradient_checkpointing: str = "nothing_saveable",
             bits: Optional[int] = None,
             **kwargs
     ):
@@ -122,7 +122,7 @@ class Grok1Config(EasyDelPretrainedConfig):
     def add_jax_args(
             self,
             tie_word_embeddings: bool = False,
-            gradient_checkpointing: str = 'nothing_saveable',
+            gradient_checkpointing: str = "nothing_saveable",
             bits: Optional[int] = None,
             **kwargs,
     ):

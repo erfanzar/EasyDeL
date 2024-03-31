@@ -117,7 +117,7 @@ class GemmaConfig(EasyDelPretrainedConfig):
 
     def add_jax_args(
             self,
-            gradient_checkpointing: str = 'nothing_saveable',
+            gradient_checkpointing: str = "nothing_saveable",
             bits: Optional[int] = None,
             **kwargs,
     ):

@@ -27,7 +27,7 @@ class MistralConfig(EasyDelPretrainedConfig):
             rope_theta=10000.0,
             rope_scaling: Dict[str, Union[str, float]] = None,
             sliding_window=4096,
-            gradient_checkpointing: str = 'nothing_saveable',
+            gradient_checkpointing: str = "nothing_saveable",
             use_scan_mlp: bool = False,
             scan_mlp_chunk_size: int = 1024,
             number_rep_kv: int = 1,
@@ -160,7 +160,7 @@ class MistralConfig(EasyDelPretrainedConfig):
 
     def add_jax_args(
             self,
-            gradient_checkpointing: str = 'nothing_saveable',
+            gradient_checkpointing: str = "nothing_saveable",
             use_scan_mlp: bool = False,
             scan_mlp_chunk_size: int = 1024,
             number_rep_kv: int = 1,

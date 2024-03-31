@@ -5,6 +5,10 @@ learning models. It focuses primarily on Jax/Flax and aims to provide convenient
 Flax/Jax Models on TPU/GPU for both Serving and Training purposes. Additionally, EasyDeL will support mojo and will be
 rewritten for mojo as well.
 
+
+> [!NOTE]
+> EasyDeL is not Stable Right now due too changes are being made in Attention Mechanism and New Sharding strategies.
+
 Some of the key features provided by EasyDeL include:
 
 - Serving and API Engines for Using and serving LLMs in JAX as efficiently as possible.
