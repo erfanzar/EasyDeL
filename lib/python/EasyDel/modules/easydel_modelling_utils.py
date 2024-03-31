@@ -10,7 +10,7 @@ from typing import Sequence, Union, Optional, Literal, Tuple, Any
 from dataclasses import dataclass
 from jax.sharding import PartitionSpec, Mesh
 
-AVAILABLE_ATTENTION_MECHANISMS = Literal["normal", "flash", "splash", "ring"]
+AVAILABLE_ATTENTION_MECHANISMS = Literal["normal", "flash", "splash", "ring", "cudnn"]
 
 
 def set_attrs_smartly(self, attr_name: str, default: Any, new_attr: Any):
