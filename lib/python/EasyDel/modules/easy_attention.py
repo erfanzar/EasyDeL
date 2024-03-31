@@ -570,7 +570,7 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
             lambda s: s.astype(dtype_c),
             (query_states, key_states, value_states)
         )
-        if self.shard_attention_computation:
+        if False:
             # is_generating = query_states.shape[1] == 1
             # if is_generating:
             #     query_partition_spec = self.generation_query_partition_spec
