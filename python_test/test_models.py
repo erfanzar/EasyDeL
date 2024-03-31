@@ -68,6 +68,7 @@ class EasyModelsTest(TestCase):
         self.block_q: int = 64
         self.sequence_length = self.block_q * len(jax.devices())
         self.scan_mlp_chunk_size = self.sequence_length // 2
+        self.use_sharding_constraint = False
 
     def create_test_for_models(
             self,
@@ -188,7 +189,8 @@ class EasyModelsTest(TestCase):
         config.add_jax_args()
         config.add_basic_configurations(
             shard_attention_computation=self.shard_attention_computation,
-            scan_mlp_chunk_size=self.scan_mlp_chunk_size
+            scan_mlp_chunk_size=self.scan_mlp_chunk_size,
+            use_sharding_constraint=self.use_sharding_constraint
         )
         mesh = config.jax_mesh()
 
