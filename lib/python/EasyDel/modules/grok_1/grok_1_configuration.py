@@ -30,7 +30,6 @@ class Grok1Config(EasyDelPretrainedConfig):
             output_router_logits=False,
             router_aux_loss_coef=0.001,
             gradient_checkpointing: str = 'nothing_saveable',
-            use_pjit_attention_force: bool = False,
             bits: Optional[int] = None,
             **kwargs
     ):
@@ -59,7 +58,6 @@ class Grok1Config(EasyDelPretrainedConfig):
         self.router_aux_loss_coef = router_aux_loss_coef
         self.gradient_checkpointing = gradient_checkpointing
         self.bits = bits
-        self.use_pjit_attention_force = use_pjit_attention_force
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -125,7 +123,6 @@ class Grok1Config(EasyDelPretrainedConfig):
             self,
             tie_word_embeddings: bool = False,
             gradient_checkpointing: str = 'nothing_saveable',
-            use_pjit_attention_force: bool = False,
             bits: Optional[int] = None,
             **kwargs,
     ):
@@ -135,12 +132,10 @@ class Grok1Config(EasyDelPretrainedConfig):
         :param self: Refer to the current object
         :param tie_word_embeddings: bool: Tie the word embeddings to the decoder
         :param gradient_checkpointing: str: Control the amount of memory used by jax
-        :param use_pjit_attention_force: bool: Determine if the attention force is used
         :param bits: Optional[int]: Determine the number of bits used in the quantization
         """
         self.tie_word_embeddings = tie_word_embeddings
         self.gradient_checkpointing = gradient_checkpointing
-        self.use_pjit_attention_force = use_pjit_attention_force
         self.bits = bits
 
     @staticmethod

@@ -320,9 +320,6 @@ class BaseTrainer:
                     " pass custom_rule for partition rules "
                 )
 
-            self.arguments.configs_to_initialize_model_class[
-                "config"
-            ].use_pjit_attention_force = self.arguments.use_pjit_attention_force
 
             self.arguments.configs_to_initialize_model_class["config"].axis_dims = self.arguments.sharding_array
 
@@ -335,7 +332,6 @@ class BaseTrainer:
 
         else:
             extra_configs["gradient_checkpointing"] = self.arguments.gradient_checkpointing
-            extra_configs["use_pjit_attention_force"] = self.arguments.use_pjit_attention_force
 
             model = AutoEasyDelModelForCausalLM.from_pretrained(
                 self.arguments.model_huggingface_repo_id,

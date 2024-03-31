@@ -255,24 +255,23 @@ class FlaxDbrxAttention(BaseJAXAttentionModule):
             ],
             dim=2,
         )
-        if self.config.use_pjit_attention_force:
-            query_states = with_sharding_constraint(
-                query_states,
-                PartitionSpec(("dp", "fsdp"), "sp", "tp")
-            ) if query_states.shape[1] != 1 else with_sharding_constraint(
-                query_states,
-                PartitionSpec(("dp", "fsdp"), None, "tp")
-            )
+        query_states = with_sharding_constraint(
+            query_states,
+            PartitionSpec(("dp", "fsdp"), "sp", "tp")
+        ) if query_states.shape[1] != 1 else with_sharding_constraint(
+            query_states,
+            PartitionSpec(("dp", "fsdp"), None, "tp")
+        )
 
-            key_states = with_sharding_constraint(
-                key_states,
-                PartitionSpec(("dp", "fsdp"), "sp", "tp")
-            )
+        key_states = with_sharding_constraint(
+            key_states,
+            PartitionSpec(("dp", "fsdp"), "sp", "tp")
+        )
 
-            value_states = with_sharding_constraint(
-                value_states,
-                PartitionSpec(("dp", "fsdp"), "sp", "tp")
-            )
+        value_states = with_sharding_constraint(
+            value_states,
+            PartitionSpec(("dp", "fsdp"), "sp", "tp")
+        )
 
         query_states, key_states, value_states = self.apply_rotary(
             query=query_states,
@@ -344,7 +343,6 @@ class FlaxDbrxAttention(BaseJAXAttentionModule):
             value_states=value_states,
             bias=attention_bias,
             causal=False,
-            use_pjit_attention_force=self.config.use_pjit_attention_force,
             dropout_rng=dropout_rng,
             deterministic=deterministic,
             query_sequence_length=query_length,

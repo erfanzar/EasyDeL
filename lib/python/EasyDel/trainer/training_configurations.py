@@ -78,7 +78,6 @@ class TrainArguments(
             save_steps: Optional[int] = None,
             save_dir: str = "EasyDel-Checkpoints",
             save_total_limit: Optional[int] = None,
-            use_pjit_attention_force: bool = False,
             dtype: jnp.dtype = jnp.bfloat16,
             param_dtype: jnp.dtype = jnp.bfloat16,
             fully_sharded_data_parallel: bool = True,
@@ -148,7 +147,6 @@ The __init__ function can accept arguments, just like a normal function.
 :param save_steps: Optional[int]: Save the model after every n steps
 :param save_dir: str: Define the directory where the checkpoints will be saved
 :param save_total_limit: int: Set the maximum number of checkpoints to keep, older checkpoints will be deleted
-:param use_pjit_attention_force: bool: Force the use of pjit for attention layers
 :param dtype: jnp.dtype: Set the dtype of the model parameters
 :param param_dtype: jnp.dtype: Specify the data type of the model parameters
 :param fully_sharded_data_parallel: bool: Determine if the model should be fully fsdp or not
@@ -261,7 +259,6 @@ applied as total batch_size (e.g total_batch_size = total_batch_size * gradient_
         self.save_steps = save_steps
         self.save_dir = save_dir
         self.save_total_limit = save_total_limit
-        self.use_pjit_attention_force = use_pjit_attention_force
         self.dtype = dtype
         self.warmup_steps = warmup_steps
         self.param_dtype = param_dtype

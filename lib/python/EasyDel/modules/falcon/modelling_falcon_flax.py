@@ -190,14 +190,12 @@ class FlaxFalconAttention(BaseJAXAttentionModule):
 
             query_state, key_state, value_state = [x.reshape(x.shape[:-2] + (x.shape[-2] * x.shape[-1],)) for x in
                                                    (query_state, key_state, value_state)]
-            if self.config.use_pjit_attention_force:
-                query_state = with_sharding_constraint(
-                    query_state, PartitionSpec(("dp", "fsdp"), "sp", "tp")
-                ) if query_state.shape[1] != 1 else with_sharding_constraint(
-                    query_state, PartitionSpec(("dp", "fsdp"), None, "tp")
-                )
-                key_state = with_sharding_constraint(key_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
-                value_state = with_sharding_constraint(value_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
+
+            query_state = with_sharding_constraint(
+                query_state, PartitionSpec(("dp", "fsdp"), "sp" if query_state.shape[1] != 1 else None, "tp")
+            )
+            key_state = with_sharding_constraint(key_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
+            value_state = with_sharding_constraint(value_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
             return query_state, key_state, value_state
         if self.config.multi_query:
             qkv = qkv.reshape(
@@ -208,11 +206,8 @@ class FlaxFalconAttention(BaseJAXAttentionModule):
         else:
             query_state, key_state, value_state = jnp.split(qkv, 3, -1)
 
-        if self.config.use_pjit_attention_force:
             query_state = with_sharding_constraint(
-                query_state, PartitionSpec(("dp", "fsdp"), "sp", "tp")
-            ) if query_state.shape[1] != 1 else with_sharding_constraint(
-                query_state, PartitionSpec(("dp", "fsdp"), None, "tp")
+                query_state, PartitionSpec(("dp", "fsdp"), "sp" if query_state.shape[1] != 1 else None, "tp")
             )
             key_state = with_sharding_constraint(key_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
             value_state = with_sharding_constraint(value_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))

@@ -27,13 +27,11 @@ class RwkvConfig(EasyDelPretrainedConfig):
             use_cache=True,
             bits: Optional[int] = None,
             gradient_checkpointing: str = "nothing_saveable",
-            use_pjit_attention_force: bool = False,
             **kwargs
     ) -> None:
 
         self.bits = bits
         self.gradient_checkpointing = gradient_checkpointing
-        self.use_pjit_attention_force = use_pjit_attention_force
         self.vocab_size = vocab_size
         self.context_length = context_length
         self.hidden_size = hidden_size
@@ -59,12 +57,10 @@ class RwkvConfig(EasyDelPretrainedConfig):
             self,
             bits: Optional[int] = None,
             gradient_checkpointing: str = "nothing_saveable",
-            use_pjit_attention_force: bool = False,
             **kwargs
     ):
         self.bits = bits
         self.gradient_checkpointing = gradient_checkpointing
-        self.use_pjit_attention_force = use_pjit_attention_force
         for k, v in kwargs.items():
             if not hasattr(self, k):
                 setattr(self, k, v)

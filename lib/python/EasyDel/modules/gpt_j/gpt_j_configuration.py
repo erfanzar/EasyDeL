@@ -37,7 +37,6 @@ class GPTJConfig(EasyDelPretrainedConfig):
             bos_token_id: int = 50256,
             eos_token_id: int = 50256,
             tie_word_embeddings: bool = False,
-            use_pjit_attention_force: bool = False,
             gradient_checkpointing: str = "",
             bits: Optional[int] = None,
             **kwargs,
@@ -57,7 +56,6 @@ class GPTJConfig(EasyDelPretrainedConfig):
         self.layer_norm_epsilon = layer_norm_epsilon
         self.initializer_range = initializer_range
         self.use_cache = use_cache
-        self.use_pjit_attention_force = use_pjit_attention_force
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
         self.from_pt = False
@@ -158,7 +156,6 @@ class GPTJConfig(EasyDelPretrainedConfig):
             bos_token_id: int = 50256,
             eos_token_id: int = 50256,
             tie_word_embeddings: bool = False,
-            use_pjit_attention_force: bool = False,
             bits: Optional[int] = None,
             gradient_checkpointing: str = "",
             **kwargs,
@@ -182,7 +179,6 @@ class GPTJConfig(EasyDelPretrainedConfig):
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
             tie_word_embeddings=tie_word_embeddings,
-            use_pjit_attention_force=use_pjit_attention_force,
             gradient_checkpointing=gradient_checkpointing,
         )
 

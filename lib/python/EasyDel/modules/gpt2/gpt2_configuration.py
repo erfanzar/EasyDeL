@@ -41,7 +41,6 @@ class GPT2Config(EasyDelPretrainedConfig):
             scale_attn_by_inverse_layer_idx=False,
             reorder_and_upcast_attn=False,
             gradient_checkpointing: str = "nothing_saveable",
-            use_pjit_attention_force: bool = False,
             tie_word_embeddings: bool = False,
             bits: Optional[int] = None,
             **kwargs,
@@ -70,7 +69,6 @@ class GPT2Config(EasyDelPretrainedConfig):
 
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
-        self.use_pjit_attention_force = use_pjit_attention_force
         self.gradient_checkpointing = gradient_checkpointing
         self.bits = bits
         super().__init__(
@@ -84,12 +82,10 @@ class GPT2Config(EasyDelPretrainedConfig):
     def add_jax_args(
             self,
             gradient_checkpointing: str = "nothing_saveable",
-            use_pjit_attention_force: bool = False,
             bits: Optional[int] = None,
             **kwargs
     ):
         args = dict(
-            use_pjit_attention_force=use_pjit_attention_force,
             gradient_checkpointing=gradient_checkpointing,
             bits=bits,
             **kwargs

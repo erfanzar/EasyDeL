@@ -142,7 +142,6 @@ train_arguments = TrainArguments(
     gradient_checkpointing=EasyDelGradientCheckPointers.NOTHING_SAVEABLE,
     sharding_array=(1, 1, 1, -1),  # the way to shard model across gpu,cpu or TPUs using sharding array (1, 1, 1, -1)
     # everything training will be in sequence and model parallel automatic and share data between devices
-    use_pjit_attention_force=False,
     remove_ckpt_after_load=True,
     gradient_accumulation_steps=8,
     loss_re_mat="",
@@ -525,8 +524,6 @@ config = AutoEasyDelConfig.from_pretrained(
     huggingface_model_repo_id
 )
 
-config.use_pjit_attention_force = False
-
 tokenizer = AutoTokenizer.from_pretrained(
     huggingface_model_repo_id,
     trust_remote_code=True
@@ -693,7 +690,6 @@ train_arguments = TrainArguments(
     gradient_checkpointing=EasyDelGradientCheckPointers.NOTHING_SAVEABLE,
     sharding_array=(1, 1, 1, -1),  # the way to shard model across gpu,cpu or TPUs using sharding array (1, 1, 1, -1)
     # everything training will be in sequence and model parallel automatic and share data between devices
-    use_pjit_attention_force=False,
     remove_ckpt_after_load=True,
     gradient_accumulation_steps=1,
     loss_re_mat="",

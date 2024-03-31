@@ -32,7 +32,6 @@ class OPTConfig(EasyDelPretrainedConfig):
             enable_bias: bool = True,
             layer_norm_elementwise_affine: bool = True,
             gradient_checkpointing: str = 'nothing_saveable',
-            use_pjit_attention_force: bool = False,
             **kwargs,
     ):
         super().__init__(
@@ -42,7 +41,6 @@ class OPTConfig(EasyDelPretrainedConfig):
             **kwargs,
         )
         self.vocab_size = vocab_size
-        self.use_pjit_attention_force = use_pjit_attention_force
         self.gradient_checkpointing = gradient_checkpointing
         self.max_position_embeddings = max_position_embeddings
         self.num_attention_heads = num_attention_heads
@@ -93,7 +91,6 @@ class OPTConfig(EasyDelPretrainedConfig):
             enable_bias: bool = True,
             layer_norm_elementwise_affine: bool = True,
             gradient_checkpointing: str = 'nothing_saveable',
-            use_pjit_attention_force: bool = False,
             **kwargs,
     ):
         basics = dict(
@@ -118,7 +115,6 @@ class OPTConfig(EasyDelPretrainedConfig):
             enable_bias=enable_bias,
             layer_norm_elementwise_affine=layer_norm_elementwise_affine,
             gradient_checkpointing=gradient_checkpointing,
-            use_pjit_attention_force=use_pjit_attention_force,
             **kwargs
         )
         for k, v in basics.items():

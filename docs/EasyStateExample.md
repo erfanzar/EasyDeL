@@ -51,8 +51,6 @@ config = AutoEasyDelConfig.from_pretrained(
     huggingface_model_repo_id
 )
 
-config.use_pjit_attention_force = False
-
 tokenizer = AutoTokenizer.from_pretrained(
     huggingface_model_repo_id,
     trust_remote_code=True

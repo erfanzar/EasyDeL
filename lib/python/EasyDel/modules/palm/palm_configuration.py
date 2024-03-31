@@ -18,7 +18,6 @@ class PalmConfig(EasyDelPretrainedConfig):
                  bos_token_id: int = 0,
                  eos_token_id: int = 1,
                  gradient_checkpointing='nothing_saveable',
-                 use_pjit_attention_force: bool = False,
                  use_tie_word_embedding: bool = True,
                  **kwargs
                  ):
@@ -26,7 +25,6 @@ class PalmConfig(EasyDelPretrainedConfig):
         dim_head = dim_head if dim_head is not None else hidden_size // num_attention_heads
         self.dim_head = dim_head
         self.up_inner_dim = up_inner_dim
-        self.use_pjit_attention_force = use_pjit_attention_force
         self.gradient_checkpointing = gradient_checkpointing
         self.num_attention_heads = num_attention_heads
         self.use_tie_word_embedding = use_tie_word_embedding

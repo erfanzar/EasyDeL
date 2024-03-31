@@ -30,7 +30,6 @@ class GemmaConfig(EasyDelPretrainedConfig):
             attention_bias=False,
             attention_dropout=0.0,
             gradient_checkpointing: str = "nothing_saveable",
-            use_pjit_attention_force: bool = False,
             bits: Optional[int] = None,
             scan_layers: bool = False,
             **kwargs,
@@ -42,7 +41,6 @@ class GemmaConfig(EasyDelPretrainedConfig):
         """
 
         self.gradient_checkpointing = gradient_checkpointing
-        self.use_pjit_attention_force = use_pjit_attention_force
         self.bits = bits
         self.scan_layers = scan_layers
         self.vocab_size = vocab_size
@@ -120,7 +118,6 @@ class GemmaConfig(EasyDelPretrainedConfig):
     def add_jax_args(
             self,
             gradient_checkpointing: str = 'nothing_saveable',
-            use_pjit_attention_force: bool = False,
             bits: Optional[int] = None,
             **kwargs,
     ):
@@ -129,11 +126,9 @@ class GemmaConfig(EasyDelPretrainedConfig):
 
         :param self: Refer to the current object
         :param gradient_checkpointing: str: Control the amount of memory used by jax
-        :param use_pjit_attention_force: bool: Determine if the attention force is used
         :param bits: Optional[int]: Determine the number of bits used in the quantization
         """
         self.gradient_checkpointing = gradient_checkpointing
-        self.use_pjit_attention_force = use_pjit_attention_force
         self.bits = bits
 
     @staticmethod
