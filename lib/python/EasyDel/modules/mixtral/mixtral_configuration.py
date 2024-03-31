@@ -141,8 +141,8 @@ class MixtralConfig(EasyDelPretrainedConfig):
 
             ("model/embed_tokens/embedding", PartitionSpec("sp", "fsdp")),
 
-            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec("fsdp", "sp")),
-            ("self_attn/o_proj/kernel", PartitionSpec("sp", "fsdp")),
+            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+            ("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
 
             ("w1/kernel", PartitionSpec(("fsdp", "sp"))),
             ("w2/kernel", PartitionSpec(("fsdp", "sp"))),
@@ -158,8 +158,8 @@ class MixtralConfig(EasyDelPretrainedConfig):
         ) if not fully_sharded_data_parallel else (
             ("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"))),
 
-            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+            ("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
 
             ("w1/kernel", PartitionSpec(("fsdp", "sp"))),
             ("w2/kernel", PartitionSpec(("fsdp", "sp"))),

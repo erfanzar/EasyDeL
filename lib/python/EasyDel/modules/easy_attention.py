@@ -285,7 +285,12 @@ def static_sharded_dot_product_attention(
     )
     if shard_attention_computation:
         attention = with_sharding_constraint(
-            attention, PartitionSpec(("dp", "fsdp"), sequence_sharding_axis_name, tensor_sharding_axis_name, None)
+            attention, PartitionSpec(
+                ("dp", "fsdp"),
+                sequence_sharding_axis_name,
+                tensor_sharding_axis_name,
+                None
+            )
         )
     return attention
 

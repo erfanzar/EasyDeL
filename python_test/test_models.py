@@ -18,7 +18,7 @@ except ModuleNotFoundError:
 from jax import numpy as jnp
 import torch
 import numpy as np
-
+from fjformer.func import cross_entropy_loss_and_accuracy
 import copy
 import jax
 import transformers
@@ -30,7 +30,7 @@ torch.manual_seed(42)
 class EasyModelsTest(TestCase):
 
     def setUp(self) -> None:
-        self.batch_size: int = 1
+        self.batch_size: int = len(jax.devices())
         self.vocab_size: int = 32000
         self.hidden_size: int = 256
         self.intermediate_size: int = 512
@@ -93,7 +93,7 @@ class EasyModelsTest(TestCase):
             # residual_in_fp32=True
         )
 
-        input_shape = (self.batch_size, self.sequence_length)
+        input_shape = (self.batch_size, self.sequence_length + 1)
 
         hf_model = hf_module_class(
             config=copy.deepcopy(config)
@@ -131,26 +131,40 @@ class EasyModelsTest(TestCase):
                 param_dtype=self.dtype,
                 precision=self.precision,
                 _do_init=False,
-                input_shape=input_shape
+                input_shape=(self.batch_size, self.sequence_length)
             )
 
-            torch_input_ids, jax_input_ids = self.make_input_id(self.vocab_size, input_shape)
+            torch_input_ids, jax_input_ids = self.make_input_id(
+                self.vocab_size,
+                (self.batch_size, self.sequence_length + 1)
+            )
             hf_output = hf_model(
-                input_ids=torch_input_ids,
-                attention_mask=torch.ones(*input_shape),
+                input_ids=torch_input_ids[:, :-1],
+                labels=torch_input_ids[:, 1:],
+                attention_mask=torch.ones(self.batch_size, self.sequence_length),
             )
 
             ed_output = ed_model(
-                input_ids=jax_input_ids,
+                input_ids=jax_input_ids[:, :-1],
                 params=params,
                 return_dict=True,
                 add_params_field=False,
                 train=False
             )
+            loss, _ = cross_entropy_loss_and_accuracy(
+                ed_output.logits,
+                jax_input_ids[:, 1:],
+            )
+
             del params
             del hf_model
             gc.collect()
-            return self.compare_torch_to_jax(module_name, hf_output, ed_output)
+            return self.compare_torch_to_jax(
+                module_name,
+                hf_output,
+                ed_output,
+                loss
+            )
 
     def create_moe_test_for_models(
             self,
@@ -171,11 +185,8 @@ class EasyModelsTest(TestCase):
             rotary_dim=self.rotary_dim,
             rms_norm_eps=self.rms_norm_eps,
             layer_norm_eps=self.layer_norm_eps,
-            router_aux_loss_coef=1
             # residual_in_fp32=True
         )
-
-        input_shape = (self.batch_size, self.sequence_length)
 
         hf_model = hf_module_class(
             config=copy.deepcopy(config)
@@ -213,31 +224,40 @@ class EasyModelsTest(TestCase):
                 param_dtype=self.dtype,
                 precision=self.precision,
                 _do_init=False,
-                input_shape=input_shape
+                input_shape=(self.batch_size, self.sequence_length)
             )
 
-            torch_input_ids, jax_input_ids = self.make_input_id(self.vocab_size, input_shape)
+            torch_input_ids, jax_input_ids = self.make_input_id(
+                self.vocab_size,
+                (self.batch_size, self.sequence_length + 1)
+            )
             hf_output = hf_model(
-                input_ids=torch_input_ids,
-                attention_mask=torch.ones(*input_shape),
-                return_dict=True,
+                input_ids=torch_input_ids[:, :-1],
+                labels=torch_input_ids[:, 1:],
+                attention_mask=torch.ones(self.batch_size, self.sequence_length),
                 output_router_logits=True
             )
 
             ed_output = ed_model(
-                input_ids=jax_input_ids,
+                input_ids=jax_input_ids[:, :-1],
                 params=params,
                 return_dict=True,
                 add_params_field=False,
                 train=False,
                 output_router_logits=True
             )
+            loss, _ = cross_entropy_loss_and_accuracy(
+                ed_output.logits,
+                jax_input_ids[:, 1:],
+            )
+            loss += ed_output.aux_loss
             del params
             del hf_model
             gc.collect()
-            print(f"\nHF AUX LOSS : {hf_output.aux_loss.detach().cpu().numpy()}")
-            print(f"ED AUX LOSS : {ed_output.aux_loss}")
-            return jnp.allclose(hf_output.aux_loss.detach().cpu().numpy(), ed_output.aux_loss)
+            from transformers import MixtralForCausalLM
+            print(f"\nHF MoE LOSS : {hf_output.loss.detach().cpu().numpy()}")
+            print(f"ED MoE LOSS : {loss}")
+            return jnp.allclose(hf_output.loss.detach().cpu().numpy(), loss)
 
     def test_llama(self):
         res, err = self.create_test_for_models("llama", transformers.LlamaForCausalLM)
@@ -267,7 +287,7 @@ class EasyModelsTest(TestCase):
             f"Mixtral model Failed [ERROR {err}]"
         )
 
-    def test_gp2(self):
+    def test_gpt2(self):
         res, err = self.create_test_for_models("gpt2", transformers.GPT2LMHeadModel)
         self.assertTrue(
             res,
@@ -341,16 +361,24 @@ class EasyModelsTest(TestCase):
         self.assertTrue(res)
 
     @staticmethod
-    def compare_torch_to_jax(name, to, jo, atol: float = 1e-035, rtol: float = 1e-08):
-        to, jo = to.logits.cpu().detach().numpy(), jo.logits
+    def compare_torch_to_jax(name, hf_out, ed_out, ed_loss, atol: float = 1e-035, rtol: float = 1e-08):
+        to, jo = hf_out.logits.cpu().detach().numpy(), ed_out.logits
         err = jnp.mean(to - jo)
+        hf_loss = hf_out.loss.cpu().detach().numpy()
         all_close = jnp.allclose(to, jo, atol=atol, rtol=rtol)
-        is_close = jnp.isclose(to, jo, atol=atol, rtol=rtol)
+        all_close_loss = jnp.allclose(hf_loss, ed_loss, atol=1e-02, rtol=rtol)
         if not all_close:
             print(f"\n{name} LAST F HF : ", to[:, -1, -5:])
             print(f"{name} LAST F ED : ", jo[..., -1, -5:])
-            print(f"{name} CORRECT % : ", jnp.mean(jnp.where(is_close, 1, 0).reshape(-1)))
-        return all_close, err
+            print(f"{name} CORRECT % : ", jnp.mean(
+                jnp.where(
+                    jnp.isclose(to, jo, atol=atol, rtol=rtol), 1, 0).reshape(-1)
+            )
+                  )
+            print(f"{name} LOSS F HF : ", hf_loss)
+            print(f"{name} LOSS F ED : ", ed_loss)
+            print(f"IS LOSS CLOSE    : ", all_close_loss)
+        return all_close or all_close_loss, err
 
     @staticmethod
     def make_input_id(

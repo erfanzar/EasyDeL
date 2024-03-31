@@ -86,7 +86,7 @@ class StableLmConfig(EasyDelPretrainedConfig):
             ("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
 
             ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("self_attn/o_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+            ("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
 
             ("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
             ("mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
@@ -102,8 +102,8 @@ class StableLmConfig(EasyDelPretrainedConfig):
 
             ("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"))),
 
-            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+            ("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
 
             ("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"))),
             ("mlp/down_proj/kernel", PartitionSpec(("fsdp", "sp"))),

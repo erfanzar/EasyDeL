@@ -103,8 +103,8 @@ class Qwen1Config(EasyDelPretrainedConfig):
 
             ("model/wte/embedding", PartitionSpec(("fsdp", "sp"))),
 
-            ("self_attn/c_attn/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("self_attn/c_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+            ("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
 
             ("mlp/w1/kernel", PartitionSpec(("fsdp", "sp"))),
             ("mlp/w2/kernel", PartitionSpec(("fsdp", "sp"))),
