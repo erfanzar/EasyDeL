@@ -88,6 +88,7 @@ class EasyModelsTest(TestCase):
             rotary_dim=self.rotary_dim,
             rms_norm_eps=self.rms_norm_eps,
             layer_norm_eps=self.layer_norm_eps,
+            axis_dims=(1, 1, 1, -1)
             # residual_in_fp32=True
         )
 
