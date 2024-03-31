@@ -432,7 +432,7 @@ class EasyDelState(struct.PyTreeNode):
             bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
             generation_bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
             attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            use_shard_map: bool = False,
+            shard_attention_computation: bool = True,
             input_shape: Sequence[int] = (1, 1),
             backend: Optional[str] = None,
             init_optimizer_state: bool = False,
@@ -467,7 +467,7 @@ class EasyDelState(struct.PyTreeNode):
         :param value_partition_spec: PartitionSpec: Specify the partitioning of the value tensor
         :param bias_partition_spec: PartitionSpec: Specify the partitioning of the bias
         :param attention_partition_spec: PartitionSpec: Partition the attention weights
-        :param use_shard_map: bool: Determine whether to use shard_map or not
+        :param shard_attention_computation: bool: Determine whether to use shard_map or not
         :param input_shape: Sequence[int]: Specify the shape of the input to be used for training
         :param backend: Optional[str]: Specify the backend used for the model
         :param init_optimizer_state: bool: Initialize the optimizer state
@@ -501,7 +501,7 @@ class EasyDelState(struct.PyTreeNode):
                 value_partition_spec=value_partition_spec,
                 bias_partition_spec=bias_partition_spec,
                 attention_partition_spec=attention_partition_spec,
-                use_shard_map=use_shard_map,
+                shard_attention_computation=shard_attention_computation,
                 input_shape=input_shape,
                 backend=backend,
                 config_kwargs=config_kwargs,

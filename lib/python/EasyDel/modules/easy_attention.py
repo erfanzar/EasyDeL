@@ -309,7 +309,7 @@ class EasyAttention:
             dtype: jnp.dtype = jnp.float32,
             precision: lax.Precision = lax.Precision("fastest"),
             force_float32_tpu: bool = True,
-            use_shard_map: bool = False
+            shard_attention_computation: bool = True
 
     ):
         platform = jax.lib.xla_bridge.get_backend().platform
@@ -344,7 +344,7 @@ class EasyAttention:
         self.dtype = dtype
         self.precision = precision
         self.force_float32_tpu = force_float32_tpu
-        self.use_shard_map = use_shard_map
+        self.shard_attention_computation = shard_attention_computation
         self.scan_ring_attention = scan_ring_attention
         self.scan_attention_layers = scan_attention_layers
         self.generation_query_partition_spec = generation_query_partition_spec
@@ -570,50 +570,49 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
             lambda s: s.astype(dtype_c),
             (query_states, key_states, value_states)
         )
-        is_generating = query_states.shape[1] == 1
-        if is_generating:
-            query_partition_spec = self.generation_query_partition_spec
-            bias_partition_spec = self.generation_bias_partition_spec
-            attention_partition_spec = self.generation_attention_partition_spec
-
-        else:
-            query_partition_spec = self.query_partition_spec
-            bias_partition_spec = self.bias_partition_spec
-            attention_partition_spec = self.attention_partition_spec
-        if self.use_shard_map:
-            attention_output = shard_map(
-                partial(
-                    flax.linen.attention.dot_product_attention,
-                    dtype=jnp.float32,
-                    precision=None,
-                ),
-                mesh=self.mesh,
-                in_specs=(
-                    query_partition_spec,
-                    self.key_partition_spec,
-                    self.value_partition_spec,
-                    bias_partition_spec,
-                    PartitionSpec(),
-                    PartitionSpec(),
-                    PartitionSpec(),
-                    PartitionSpec(),
-                    PartitionSpec(),
-                ),
-                out_specs=(
-                    attention_partition_spec
-                )
-            )(
-                query_states,
-                key_states,
-                value_states,
-                bias,
-                None,
-                deterministic,
-                dropout_rng,
-                self.attention_dropout,
-                True,
-            )
-        else:
+        if self.shard_attention_computation:
+            # is_generating = query_states.shape[1] == 1
+            # if is_generating:
+            #     query_partition_spec = self.generation_query_partition_spec
+            #     bias_partition_spec = self.generation_bias_partition_spec
+            #     attention_partition_spec = self.generation_attention_partition_spec
+            #
+            # else:
+            #     query_partition_spec = self.query_partition_spec
+            #     bias_partition_spec = self.bias_partition_spec
+            #     attention_partition_spec = self.attention_partition_spec
+            # attention_output = shard_map(
+            #     partial(
+            #         flax.linen.attention.dot_product_attention,
+            #         dtype=jnp.float32,
+            #         precision=None,
+            #     ),
+            #     mesh=self.mesh,
+            #     in_specs=(
+            #         query_partition_spec,
+            #         self.key_partition_spec,
+            #         self.value_partition_spec,
+            #         bias_partition_spec,
+            #         PartitionSpec(),
+            #         PartitionSpec(),
+            #         PartitionSpec(),
+            #         PartitionSpec(),
+            #         PartitionSpec(),
+            #     ),
+            #     out_specs=(
+            #         attention_partition_spec
+            #     )
+            # )(
+            #     query_states,
+            #     key_states,
+            #     value_states,
+            #     bias,
+            #     None,
+            #     deterministic,
+            #     dropout_rng,
+            #     self.attention_dropout,
+            #     True,
+            # )
             with self.mesh:
                 attention_output = static_sharded_dot_product_attention(
                     query_states,
@@ -628,6 +627,20 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
                     self.dtype,
                     self.precision
                 )
+        else:
+            attention_output = flax.linen.attention.dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                bias,
+                None,
+                True,
+                dropout_rng,
+                self.attention_dropout,
+                deterministic,
+                self.dtype,
+                self.precision
+            )
         return AttentionOutput(
             attention_outputs=attention_output,
             attention_weights=None

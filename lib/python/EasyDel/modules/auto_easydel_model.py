@@ -325,7 +325,7 @@ class AutoEasyDelModelForCausalLM:
             bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
             generation_bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
             attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            use_shard_map: bool = False,
+            shard_attention_computation: bool = True,
             input_shape: Sequence[int] = (1, 1),
             shard_fns: Optional[Mapping[tuple, Callable] | dict] = None,
             backend: Optional[str] = None,
@@ -352,7 +352,7 @@ class AutoEasyDelModelForCausalLM:
         :param value_partition_spec: PartitionSpec: Specify the partitioning of the value tensor
         :param bias_partition_spec: PartitionSpec: Specify the Attention Bias partition spec
         :param attention_partition_spec: PartitionSpec: Specify the partitioning of the attention weights
-        :param use_shard_map: bool: whenever to use shard_map for attention
+        :param shard_attention_computation: bool: whenever to use shard_map for attention
         :param input_shape: typing.Sequence[int]: Specify the shape of the input to the model
         :param shard_fns: Optional[Mapping[tuple, Callable]]: Sharding Function to be used to shard model
         :param backend: typing.Optional[str]: backend to use for model
@@ -386,7 +386,7 @@ class AutoEasyDelModelForCausalLM:
             bias_partition_spec=bias_partition_spec,
             attention_partition_spec=attention_partition_spec,
             backend=backend,
-            use_shard_map=use_shard_map,
+            shard_attention_computation=shard_attention_computation,
         )
         if config_kwargs is not None:
             for k, v in config_kwargs.items():
@@ -444,7 +444,7 @@ class AutoEasyDelConfig:
             bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
             generation_bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
             attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            use_shard_map: bool = False,
+            shard_attention_computation: bool = True,
             backend: Optional[str] = None,
             **kwargs
     ) -> EasyDelPretrainedConfig:
@@ -463,7 +463,7 @@ class AutoEasyDelConfig:
         :param value_partition_spec: PartitionSpec: Specify the partitioning of the value tensor
         :param bias_partition_spec: PartitionSpec: Specify the Attention Bias partition spec
         :param attention_partition_spec: PartitionSpec: Specify the partitioning of the attention weights
-        :param use_shard_map: bool: whenever to use shard_map for attention
+        :param shard_attention_computation: bool: whenever to use shard_map for attention
         :param backend: Optional[str]: backend to use for model
         :param kwargs: Pass additional arguments to the model and config classes
         :return: A Model Config
@@ -488,7 +488,7 @@ class AutoEasyDelConfig:
             bias_partition_spec=bias_partition_spec,
             attention_partition_spec=attention_partition_spec,
             backend=backend,
-            use_shard_map=use_shard_map,
+            shard_attention_computation=shard_attention_computation,
         )
 
         return cfg

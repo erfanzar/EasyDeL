@@ -97,7 +97,7 @@ class FlaxRobertaSelfAttention(BaseJAXAttentionModule):
             attention_dropout=0.0,
             head_dims=self.head_dim,
             attention_partition_spec=self.config.attention_partition_spec,
-            use_shard_map=self.config.use_shard_map,
+            shard_attention_computation=self.config.shard_attention_computation,
             precision=self.precision,
             force_float32_tpu=True,
             attn_mechanism=self.config.attn_mechanism,

@@ -50,7 +50,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
     :param value_partition_spec: PartitionSpec: Specify the partitioning of the value tensor
     :param bias_partition_spec: PartitionSpec: Specify the Attention Bias partition spec
     :param attention_partition_spec: PartitionSpec: Specify the partitioning of the attention weights
-    :param use_shard_map: bool: whenever to use shard_map for attention
+    :param shard_attention_computation: bool: whenever to shard qkv b for attention
     :param use_scan_mlp: bool: Determine whether to use scan_mlp or not
     :param backend: Optional[None]: Specify the backend to use
     """
@@ -79,7 +79,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             generation_bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
             attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             generation_attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, "tp", None),
-            use_shard_map: bool = False,
+            shard_attention_computation: bool = True,
             use_sharded_kv_caching: bool = True,
             backend: Optional[None] = jax.default_backend(),
             easy_method: Literal["train", "serve", "convert"] = EasyMethod.TRAIN,
@@ -98,7 +98,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
         self.generation_bias_partition_spec = generation_bias_partition_spec
         self.attention_partition_spec = attention_partition_spec
         self.generation_attention_partition_spec = generation_attention_partition_spec
-        self.use_shard_map = use_shard_map
+        self.shard_attention_computation = shard_attention_computation
         self.axis_dims = axis_dims
         self.axis_names = axis_names
         self.backend = backend if backend is not None else ""
@@ -253,7 +253,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             attention_partition_spec: PartitionSpec = ...,
             generation_bias_partition_spec: PartitionSpec = ...,
             generation_attention_partition_spec: PartitionSpec = ...,
-            use_shard_map: bool = ...,
+            shard_attention_computation: bool = ...,
             use_sharded_kv_caching: bool = ...,
             backend: Optional[None] = ...,
             easy_method: Literal["train", "serve", "convert"] = ...,
@@ -291,7 +291,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
          partition spec in generation process
         :param generation_query_partition_spec: : PartitionSpec: Specify the partitioning of the query tensor
         in generation process
-        :param use_shard_map: bool: whenever to use shard_map for attention
+        :param shard_attention_computation: bool: whenever to use shard_map for attention
         :param use_sharded_kv_caching: bool: whenever to use shard_map and sharding for key and value
         :param backend: Optional[None]: Specify the backend to use
         :param easy_method: Literal["train", "serve", "convert"]: EasyDel Quantization Method to be applied for
@@ -358,7 +358,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
         )
 
         set_attrs_smartly(self, "backend", jax.default_backend(), backend)
-        set_attrs_smartly(self, "use_shard_map", False, use_shard_map)
+        set_attrs_smartly(self, "shard_attention_computation", True, shard_attention_computation)
         set_attrs_smartly(self, "use_sharded_kv_caching", True, use_sharded_kv_caching)
         set_attrs_smartly(self, "attn_mechanism", "normal", attn_mechanism)
 

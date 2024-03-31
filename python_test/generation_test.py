@@ -62,7 +62,7 @@ class EasyModelsGenerationTest(TestCase):
         self.hidden_act: str = "silu"
         self.pretraining_tp: int = 1
         self.scan_layers: bool = False
-        self.use_shard_map: bool = False
+        self.shard_attention_computation: bool = True
         self.rotary_dim = 32
         self.dtype: jax.numpy.dtype = jnp.float32
         self.precision = jax.lax.Precision("fastest")
@@ -96,7 +96,7 @@ class EasyModelsGenerationTest(TestCase):
 
         config.add_jax_args()
         config.add_basic_configurations(
-            use_shard_map=self.use_shard_map,
+            shard_attention_computation=self.shard_attention_computation,
             scan_mlp_chunk_size=self.scan_mlp_chunk_size
         )
 
