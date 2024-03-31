@@ -116,7 +116,7 @@ class FlaxDbrxAttention(BaseJAXAttentionModule):
 
         self.rotary = FlaxDbrxEmbedding(self.dtype)
         self.attention_performer = EasyAttention(
-
+            use_sharding_constraint=self.config.use_sharding_constraint,
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,
             block_q=self.config.block_q,
@@ -255,23 +255,6 @@ class FlaxDbrxAttention(BaseJAXAttentionModule):
             ],
             dim=2,
         )
-        query_states = with_sharding_constraint(
-            query_states,
-            PartitionSpec(("dp", "fsdp"), "sp", "tp")
-        ) if query_states.shape[1] != 1 else with_sharding_constraint(
-            query_states,
-            PartitionSpec(("dp", "fsdp"), None, "tp")
-        )
-
-        key_states = with_sharding_constraint(
-            key_states,
-            PartitionSpec(("dp", "fsdp"), "sp", "tp")
-        )
-
-        value_states = with_sharding_constraint(
-            value_states,
-            PartitionSpec(("dp", "fsdp"), "sp", "tp")
-        )
 
         query_states, key_states, value_states = self.apply_rotary(
             query=query_states,
@@ -282,6 +265,13 @@ class FlaxDbrxAttention(BaseJAXAttentionModule):
             batch_size=batch_size,
             sequence_length=sequence_length
         )
+
+        if self.config.use_sharding_constraint:
+            query_states = with_sharding_constraint(
+                query_states, PartitionSpec(("dp", "fsdp"), "sp" if query_states.shape != [1] else None, "tp", None)
+            )
+            key_states = with_sharding_constraint(key_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None))
+            value_states = with_sharding_constraint(value_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None))
 
         assert_msg = (
             "num_attention_heads repeat wont work likely\n"

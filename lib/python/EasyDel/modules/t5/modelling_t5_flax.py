@@ -312,17 +312,21 @@ class FlaxT5Attention(BaseJAXAttentionModule):
         query_states = self.q(hidden_states)  # (batch_size, n_heads, seq_length, dim_per_head)
         key_states = self.k(hidden_states) if key_value_states is None else self.k(key_value_states)
         value_states = self.v(hidden_states) if key_value_states is None else self.v(key_value_states)
-        query_states = with_sharding_constraint(
-            query_states, PartitionSpec(("dp", "fsdp"), "sp" if query_states.shape[1] != 1 else None, "tp")
-        )
-        key_states = with_sharding_constraint(key_states, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
-        value_states = with_sharding_constraint(value_states, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
 
         # reshape to (batch_size, seq_length, n_heads, head_dim)
         query_states = self._split_heads(query_states)
         key_states = self._split_heads(key_states)
         value_states = self._split_heads(value_states)
-
+        if self.config.use_sharding_constraint:
+            query_states = with_sharding_constraint(
+                query_states, PartitionSpec(("dp", "fsdp"), "sp" if query_states.shape[1] != 1 else None, "tp", None)
+            )
+            key_states = with_sharding_constraint(
+                key_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
+            )
+            value_states = with_sharding_constraint(
+                value_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
+            )
         # counter-act scaling in dot_product_attention_weights function
         query_states *= jnp.sqrt(query_states.shape[-1])
 

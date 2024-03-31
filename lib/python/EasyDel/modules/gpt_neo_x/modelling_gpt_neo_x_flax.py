@@ -80,13 +80,6 @@ class FlaxGPTNeoXAttention(BaseJAXAttentionModule):
         b, s, d = hidden_states.shape
         q, k, v = jnp.split(self.w_qkv(hidden_states), indices_or_sections=3, axis=-1)
         freq = self.freq_cis[:s].reshape(1, s, -1)
-        q = with_sharding_constraint(
-            q, PartitionSpec(("dp", "fsdp"), "sp", "tp")
-        ) if q.shape[1] != 1 else with_sharding_constraint(
-            q, PartitionSpec(("dp", "fsdp"), None, "tp")
-        )
-        k = with_sharding_constraint(k, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
-        v = with_sharding_constraint(v, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
 
         q = rearrange(q, 'b s (h d) -> b s h d', h=self.config.num_attention_heads)
         k = rearrange(k, 'b s (h d) -> b s h d', h=self.config.num_attention_heads)
@@ -97,6 +90,12 @@ class FlaxGPTNeoXAttention(BaseJAXAttentionModule):
                          )
         q, k = apply_rotary_emb(q, k, freqs_cis=freq, dtype=self.dtype)
 
+        if self.config.use_sharding_constraint:
+            q = with_sharding_constraint(
+                q, jax.sharding.PartitionSpec(("dp", "fsdp"), "sp" if q.shape[1] != 1 else None, "tp", None)
+            )
+            k = with_sharding_constraint(k, jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None))
+            v = with_sharding_constraint(v, jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None))
         attn = jnp.einsum(
             '...qhd,...khd->...hqk', q, k, precision=self.precision
         ) * self.factor

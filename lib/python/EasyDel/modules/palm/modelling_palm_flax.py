@@ -122,12 +122,14 @@ class ParallelPalmBlock(nn.Module):
         q = rearrange(q, '... n (h d) -> ... h n d', h=self.num_attention_heads) * self.scale
 
         sim = jnp.einsum('... h i d, ... j d -> ... h i j', q, k)
-        sim = with_sharding_constraint(sim, PartitionSpec(("dp", "fsdp"), "sp", None, None))
+        if self.config.use_sharding_constraint:
+            sim = with_sharding_constraint(sim, PartitionSpec(("dp", "fsdp"), "sp", None, None))
         mask_value = jnp.finfo(hidden_state).min
         attn = nn.softmax(np.where(causal_mask, sim, mask_value), axis=-1)
 
         out = jnp.einsum('... h i j, ... j d -> ... h i d', attn, v)
-        out = with_sharding_constraint(out, PartitionSpec(("dp", "fsdp"), "sp", None, None))
+        if self.config.use_sharding_constraint:
+            out = with_sharding_constraint(out, PartitionSpec(("dp", "fsdp"), "sp", None, None))
         attn_out = rearrange(out, '... h n hd -> ... n (h hd)') @ self.attn_wo
 
         ff_out = (ff * nn.swish(ff_gate)) @ self.ff_wo

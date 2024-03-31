@@ -51,6 +51,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
     :param bias_partition_spec: PartitionSpec: Specify the Attention Bias partition spec
     :param attention_partition_spec: PartitionSpec: Specify the partitioning of the attention weights
     :param shard_attention_computation: bool: whenever to shard qkv b for attention
+    :param use_sharding_constraint: bool: whether to use sharding constraint for the arrays
     :param use_scan_mlp: bool: Determine whether to use scan_mlp or not
     :param backend: Optional[None]: Specify the backend to use
     """
@@ -81,6 +82,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             generation_attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, "tp", None),
             shard_attention_computation: bool = True,
             use_sharded_kv_caching: bool = True,
+            use_sharding_constraint: bool = True,
             backend: Optional[None] = jax.default_backend(),
             easy_method: Literal["train", "serve", "convert"] = EasyMethod.TRAIN,
             bits: Optional[int] = None,
@@ -121,6 +123,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
         self.use_sharded_kv_caching = use_sharded_kv_caching
         self.use_scan_mlp = use_scan_mlp
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
+        self.use_sharding_constraint = use_sharding_constraint
 
         super().__init__(**kwargs)
 
@@ -260,6 +263,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             bits: Optional[int] = ...,
             scan_ring_attention: bool = ...,
             scan_attention_layers: bool = ...,
+            use_sharding_constraint: bool = ...,
             use_scan_mlp: bool = ...,
             scan_mlp_chunk_size: int = ...
     ):
@@ -296,6 +300,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
         :param backend: Optional[None]: Specify the backend to use
         :param easy_method: Literal["train", "serve", "convert"]: EasyDel Quantization Method to be applied for
         :param bits: Optional[int]: Model bits for quantization
+        :param use_sharding_constraint: bool: whether to use sharding constraint for the arrays
         :param scan_ring_attention: bool: Whether to use can for ring attention
         :param scan_attention_layers: bool: Whether to use can for attention layers
         :param use_scan_mlp: bool: Determine whether to use scan_mlp or not
@@ -356,7 +361,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             PartitionSpec(("dp", "fsdp"), None, "tp", None),
             generation_attention_partition_spec
         )
-
+        set_attrs_smartly(self, "use_sharding_constraint", True, use_sharding_constraint)
         set_attrs_smartly(self, "backend", jax.default_backend(), backend)
         set_attrs_smartly(self, "shard_attention_computation", True, shard_attention_computation)
         set_attrs_smartly(self, "use_sharded_kv_caching", True, use_sharded_kv_caching)

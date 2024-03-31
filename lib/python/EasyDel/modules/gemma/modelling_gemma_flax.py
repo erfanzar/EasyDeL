@@ -53,17 +53,17 @@ class FlaxGemmaRotaryEmbedding(nn.Module):
     config: GemmaConfig
     dtype: jnp.dtype = jnp.float32
 
-    def __call__(self, freq_cis, key_state, query_state, position_ids):
+    def __call__(self, freq_cis, key_states, query_states, position_ids):
         sincos = freq_cis[position_ids]
         sin_pos, cos_pos = jnp.split(sincos, 2, axis=-1)
 
-        key_state = apply_rotary_pos_emb(key_state, sin_pos, cos_pos)
-        query_state = apply_rotary_pos_emb(query_state, sin_pos, cos_pos)
+        key_states = apply_rotary_pos_emb(key_states, sin_pos, cos_pos)
+        query_states = apply_rotary_pos_emb(query_states, sin_pos, cos_pos)
 
-        key_state = jnp.asarray(key_state, dtype=self.dtype)
-        query_state = jnp.asarray(query_state, dtype=self.dtype)
+        key_states = jnp.asarray(key_states, dtype=self.dtype)
+        query_states = jnp.asarray(query_states, dtype=self.dtype)
 
-        return key_state, query_state
+        return key_states, query_states
 
 
 class FlaxGemmaAttention(BaseJAXAttentionModule):
@@ -122,7 +122,7 @@ class FlaxGemmaAttention(BaseJAXAttentionModule):
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
         self.attention_performer = EasyAttention(
-
+            use_sharding_constraint=self.config.use_sharding_constraint,
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,
             block_q=self.config.block_q,
@@ -176,26 +176,19 @@ class FlaxGemmaAttention(BaseJAXAttentionModule):
             output_attentions: bool = False,
     ):
         (
-            query_state,
-            key_state,
-            value_state
+            query_states,
+            key_states,
+            value_states
         ) = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(hidden_states)
-        query_state = with_sharding_constraint(
-            query_state, PartitionSpec(("dp", "fsdp"), "sp", "tp")
-        ) if query_state.shape[1] != 1 else with_sharding_constraint(
-            query_state, PartitionSpec(("dp", "fsdp"), None, "tp")
-        )
-        key_state = with_sharding_constraint(
-            key_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
-        value_state = with_sharding_constraint(
-            value_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
-        query_state = self._split_heads(query_state, self.num_heads)
-        key_state = self._split_heads(key_state, self.num_key_value_heads)
-        value_state = self._split_heads(value_state, self.num_key_value_heads)
 
-        key_state, query_state = self.rotary_emb(freq_cis, key_state, query_state, position_ids)
 
-        query_length, key_length = query_state.shape[1], key_state.shape[1]
+        query_states = self._split_heads(query_states, self.num_heads)
+        key_states = self._split_heads(key_states, self.num_key_value_heads)
+        value_states = self._split_heads(value_states, self.num_key_value_heads)
+
+        key_states, query_states = self.rotary_emb(freq_cis, key_states, query_states, position_ids)
+
+        query_length, key_length = query_states.shape[1], key_states.shape[1]
 
         if self.has_variable("cache", "cached_key"):
             mask_shift = self.variables["cache"]["cache_index"]
@@ -206,6 +199,16 @@ class FlaxGemmaAttention(BaseJAXAttentionModule):
         else:
             causal_mask = causal_mask[:, :, :query_length, :key_length]
 
+        if self.config.use_sharding_constraint:
+            query_states = with_sharding_constraint(
+                query_states, PartitionSpec(("dp", "fsdp"), "sp" if query_states.shape[1] != 1 else None, "tp", None)
+            )
+            key_states = with_sharding_constraint(
+                key_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
+            )
+            value_states = with_sharding_constraint(
+                value_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
+            )
         batch_size = hidden_states.shape[0]
         causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
 
@@ -217,7 +220,7 @@ class FlaxGemmaAttention(BaseJAXAttentionModule):
             dropout_rng = self.make_rng("dropout")
 
         if self.has_variable("cache", "cached_key") or init_cache:
-            key_state, value_state, attention_mask = self._concatenate_to_cache(key_state, value_state, query_state,
+            key_states, value_states, attention_mask = self._concatenate_to_cache(key_states, value_states, query_states,
                                                                                 attention_mask)
 
         attention_bias = lax.select(
@@ -226,15 +229,15 @@ class FlaxGemmaAttention(BaseJAXAttentionModule):
             jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
         )
 
-        key_state = jnp.repeat(key_state, repeats=self.num_key_value_groups, axis=2)
-        value_state = jnp.repeat(value_state, repeats=self.num_key_value_groups, axis=2)
+        key_states = jnp.repeat(key_states, repeats=self.num_key_value_groups, axis=2)
+        value_states = jnp.repeat(value_states, repeats=self.num_key_value_groups, axis=2)
 
-        query_length, key_length = query_state.shape[1], key_state.shape[1]
+        query_length, key_length = query_states.shape[1], key_states.shape[1]
 
         attentions = self.attention_performer.__call__(
-            query_states=query_state,
-            key_states=key_state,
-            value_states=value_state,
+            query_states=query_states,
+            key_states=key_states,
+            value_states=value_states,
             bias=attention_bias,
             attention_mask=attention_mask,
             causal=False,

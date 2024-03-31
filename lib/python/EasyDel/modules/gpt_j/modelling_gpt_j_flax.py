@@ -126,7 +126,7 @@ class FlaxGPTJAttention(BaseJAXAttentionModule):
         self.embed_positions = create_sinusoidal_positions(config.max_position_embeddings, pos_embd_dim)
 
         self.attention_performer = EasyAttention(
-
+            use_sharding_constraint=self.config.use_sharding_constraint,
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,
             block_q=self.config.block_q,
@@ -179,15 +179,6 @@ class FlaxGPTJAttention(BaseJAXAttentionModule):
         key = self.k_proj(hidden_states)
         value = self.v_proj(hidden_states)
 
-        # Force A local Sharding
-        query = with_sharding_constraint(
-            query, PartitionSpec(("dp", "fsdp"), "sp", "tp")
-        ) if query.shape[1] != 1 else with_sharding_constraint(
-            query, PartitionSpec(("dp", "fsdp"), None, "tp")
-        )
-        key = with_sharding_constraint(key, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
-        value = with_sharding_constraint(value, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
-
         query = self._split_heads(query)
         key = self._split_heads(key)
         value = self._split_heads(value)
@@ -220,7 +211,16 @@ class FlaxGPTJAttention(BaseJAXAttentionModule):
             )
         else:
             causal_mask = self.causal_mask[:, :, :query_length, :key_length]
-
+        if self.config.use_sharding_constraint:
+            query = with_sharding_constraint(
+                query, PartitionSpec(("dp", "fsdp"), "sp" if query.shape[1] != 1 else None, "tp", None)
+            )
+            key = with_sharding_constraint(
+                key, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
+            )
+            value = with_sharding_constraint(
+                value, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
+            )
         batch_size = hidden_states.shape[0]
         causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
 

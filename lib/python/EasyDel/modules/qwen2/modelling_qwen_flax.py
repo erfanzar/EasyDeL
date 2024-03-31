@@ -201,7 +201,7 @@ class FlaxQwen2Attention(BaseJAXAttentionModule):
 
         self.rotary = FlaxQwen2Embedding(self.dtype)
         self.attention_performer = EasyAttention(
-
+            use_sharding_constraint=self.config.use_sharding_constraint,
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,
             block_q=self.config.block_q,
@@ -314,21 +314,17 @@ class FlaxQwen2Attention(BaseJAXAttentionModule):
 
         """
         batch_size, sequence_length = hidden_states.shape[:2]
-        query_state, key_state, value_state = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(
+        query_states, key_states, value_states = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(
             hidden_states)
 
-        query_state = with_sharding_constraint(query_state, PartitionSpec(("dp", "fsdp"), "sp" if query_state.shape[1] != 1 else None, "tp"))
-        key_state = with_sharding_constraint(key_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
-        value_state = with_sharding_constraint(value_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
+        query_states = query_states.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
+        key_states = key_states.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
+        value_states = value_states.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
 
-        query_state = query_state.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
-        key_state = key_state.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
-        value_state = value_state.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
-
-        query_state, key_state, value_state = self.apply_rotary(
-            query=query_state,
-            key=key_state,
-            value=value_state,
+        query_states, key_states, value_states = self.apply_rotary(
+            query=query_states,
+            key=key_states,
+            value=value_states,
             position_ids=position_ids,
             freq_cis=freq_cis,
             batch_size=batch_size,
@@ -341,11 +337,11 @@ class FlaxQwen2Attention(BaseJAXAttentionModule):
             f"NH : {self.config.num_attention_heads} KVH : {self.config.num_attention_heads}"
         )
 
-        assert query_state.shape[-2] == self.config.num_attention_heads, assert_msg
-        assert key_state.shape[-2] == self.config.num_attention_heads, assert_msg
-        assert value_state.shape[-2] == self.config.num_attention_heads, assert_msg
+        assert query_states.shape[-2] == self.config.num_attention_heads, assert_msg
+        assert key_states.shape[-2] == self.config.num_attention_heads, assert_msg
+        assert value_states.shape[-2] == self.config.num_attention_heads, assert_msg
 
-        query_length, key_length = query_state.shape[1], key_state.shape[1]
+        query_length, key_length = query_states.shape[1], key_states.shape[1]
 
         if self.has_variable("cache", "cached_key"):
             mask_shift = self.variables["cache"]["cache_index"]
@@ -372,11 +368,21 @@ class FlaxQwen2Attention(BaseJAXAttentionModule):
             dropout_rng = self.make_rng("dropout")
 
         if self.has_variable("cache", "cached_key") or init_cache:
-            key_state, value_state, attention_mask = self._concatenate_to_cache(
-                key_state,
-                value_state,
-                query_state,
+            key_states, value_states, attention_mask = self._concatenate_to_cache(
+                key_states,
+                value_states,
+                query_states,
                 attention_mask
+            )
+        if self.config.use_sharding_constraint:
+            query_states = with_sharding_constraint(
+                query_states, PartitionSpec(("dp", "fsdp"), "sp" if query_states.shape[1] != 1 else None, "tp", None)
+            )
+            key_states = with_sharding_constraint(
+                key_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
+            )
+            value_states = with_sharding_constraint(
+                value_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
             )
 
         attention_bias = lax.select(
@@ -385,12 +391,12 @@ class FlaxQwen2Attention(BaseJAXAttentionModule):
             jnp.full(attention_mask.shape, jnp.finfo(
                 self.dtype).min).astype(self.dtype),
         )
-        query_length, key_length = query_state.shape[1], key_state.shape[1]
+        query_length, key_length = query_states.shape[1], key_states.shape[1]
 
         attentions = self.attention_performer.__call__(
-            query_states=query_state,
-            key_states=key_state,
-            value_states=value_state,
+            query_states=query_states,
+            key_states=key_states,
+            value_states=value_states,
             bias=attention_bias,
             attention_mask=attention_mask,
             causal=False,
