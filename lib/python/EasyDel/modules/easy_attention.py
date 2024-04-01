@@ -317,6 +317,7 @@ def get_flash_attention() -> Tuple[Callable, bool, bool]:
 class EasyAttention:
     def __init__(
             self,
+            mesh: Mesh,
             attn_mechanism: Literal[
                 "normal",
                 "flash",
@@ -324,29 +325,28 @@ class EasyAttention:
                 "ring",
                 "cudnn"
             ],
-            block_k: int,
-            block_q: int,
-            block_b: int,
-            block_k_major: int,
-            block_q_major_dkv: int,
-            block_k_major_dkv: int,
-            block_k_dkv: int,
-            block_q_dkv: int,
-            block_k_major_dq: int,
-            block_k_dq: int,
-            block_q_dq: int,
-            sm_scale: float,
             num_attention_heads: int,
             head_dims: int,
-            mesh: Mesh,
-            query_partition_spec: PartitionSpec,
-            generation_query_partition_spec: PartitionSpec,
-            key_partition_spec: PartitionSpec,
-            value_partition_spec: PartitionSpec,
-            bias_partition_spec: PartitionSpec,
-            generation_bias_partition_spec: PartitionSpec,
-            attention_partition_spec: PartitionSpec,
-            generation_attention_partition_spec: PartitionSpec,
+            block_k: int = 512,
+            block_q: int = 512,
+            block_b: int = 512,
+            block_k_major: int = 512,
+            block_q_major_dkv: int = 512,
+            block_k_major_dkv: int = 512,
+            block_k_dkv: int = 512,
+            block_q_dkv: int = 512,
+            block_k_major_dq: int = 512,
+            block_k_dq: int = 512,
+            block_q_dq: int = 512,
+            sm_scale: Optional[float] = None,
+            query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            generation_query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, "tp", None),
+            key_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            value_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, "sp", None),
+            generation_bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
+            attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            generation_attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, "tp", None),
             scan_ring_attention: bool = False,
             scan_attention_layers: bool = False,
             attention_dropout: float = 0.0,
@@ -396,10 +396,10 @@ class EasyAttention:
         self.generation_attention_partition_spec = generation_attention_partition_spec
         self.assertion_mkv_err = f"""
 query_states, key_states, value_states and bias shapes must be like
-query_states Shape : [batch_size, q_seq_len , num_attention_heads({self.num_attention_heads}), head_dims({self.head_dims})]
-key_states   Shape : [batch_size, kv_seq_len, num_attention_heads({self.num_attention_heads}), head_dims({self.head_dims})]
-value_states Shape : [batch_size, kv_seq_len, num_attention_heads({self.num_attention_heads}), head_dims({self.head_dims})]
-bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}), q_seq_len , kv_seq_len]
+query_states Shape : [batch_size, q_seq_len , {self.num_attention_heads=}, {self.head_dims=}]
+key_states   Shape : [batch_size, kv_seq_len, {self.num_attention_heads=}, {self.head_dims=}]
+value_states Shape : [batch_size, kv_seq_len, {self.num_attention_heads=}, {self.head_dims=}]
+bias         Shape : [batch_size, {self.num_attention_heads=}, q_seq_len , kv_seq_len]
     """
 
     def _qkv_check(
@@ -745,7 +745,8 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
         block_q_major_dkv = 1 if is_generating else self.block_q_major_dkv
         block_q_dkv = 1 if is_generating else self.block_q_dkv
         block_q_dq = 1 if is_generating else self.block_q_dq
-
+        if self.sm_scale is None:
+            self.sm_scale = 1 / math.sqrt(query_states[-1])
         attention_o = shard_map(
             partial(
                 flash_func,
@@ -913,6 +914,8 @@ bias         Shape : [batch_size, num_attention_heads({self.num_attention_heads}
         attn_mask_type = AttnMaskType.CAUSAL_MASK
         attn_bias_type = AttnBiasType.NO_BIAS
 
+        if self.sm_scale is None:
+            self.sm_scale = 1 / math.sqrt(head_dim)
         has_fused_attn_kernel = is_fused_attn_kernel_available(
             self.dtype, self.dtype, qkv_layout,
             attn_bias_type,
