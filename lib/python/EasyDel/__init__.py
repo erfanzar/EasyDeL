@@ -138,7 +138,12 @@ from .modules.qwen2_moe import (
     FlaxQwen2MoeModel as FlaxQwen2MoeModel,
     FlaxQwen2MoeForCausalLM as FlaxQwen2MoeForCausalLM
 )
-
+from .modules.whisper import (
+    FlaxWhisperForConditionalGeneration as FlaxWhisperForConditionalGeneration,
+    FlaxWhisperForAudioClassification as FlaxWhisperForAudioClassification,
+    FlaxWhisperTimeStampLogitsProcessor as FlaxWhisperTimeStampLogitsProcessor,
+    WhisperConfig as WhisperConfig
+)
 from .modules.auto_easydel_model import (
     AutoEasyDelModelForCausalLM as AutoEasyDelModelForCausalLM,
     AutoEasyDelConfig as AutoEasyDelConfig,
@@ -336,6 +341,12 @@ __all__ = (
     "Qwen2MoeConfig",
     "FlaxQwen2MoeModel",
     "FlaxQwen2MoeForCausalLM",
+
+    # Whisper
+    "WhisperConfig",
+    "FlaxWhisperTimeStampLogitsProcessor",
+    "FlaxWhisperForAudioClassification",
+    "FlaxWhisperForConditionalGeneration",
 
     # AutoModels Models
     "AutoEasyDelModelForCausalLM",
