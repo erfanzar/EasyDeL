@@ -11,10 +11,11 @@ import IPython
 import chex
 import flax.core
 import jax
+import tensorflow.data
+import tensorflow_datasets
 import termcolor
 import wandb
 from fjformer import match_partition_rules, make_shard_and_gather_fns
-from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from ..utils.collectors import DPODataCollatorWithPadding
@@ -1282,10 +1283,10 @@ class DPOTrainer(BaseTrainer, ABC):
             tx=tx
         )
 
-    def _get_train_dataloader(self) -> DataLoader:
+    def _get_train_dataloader(self) -> tensorflow.data.Dataset:
 
         """
-        The _get_train_dataloader function is used to create a DataLoader object for the training dataset.
+        The _get_train_dataloader function is used to create a tensorflow.data.Dataset object for the training dataset.
 
         :param self: Represent the instance of the class
         :return: A dataloader object
@@ -1295,22 +1296,20 @@ class DPOTrainer(BaseTrainer, ABC):
 
         train_dataset = self.train_dataset
         data_collator = self.data_collator
-        dataloader_params = {
-            "batch_size": self.arguments.total_batch_size,
-            "collate_fn": data_collator,
-            "num_workers": self.arguments.dataloader_num_workers,
-            "pin_memory": self.arguments.dataloader_pin_memory,
-        }
 
-        return DataLoader(
-            train_dataset,
-            drop_last=True,
-            **dataloader_params
+        return tensorflow_datasets.as_numpy(
+            train_dataset.to_tf_dataset(
+                batch_size=self.arguments.total_batch_size,
+                collate_fn=data_collator,
+                num_workers=self.arguments.dataloader_num_workers,
+                shuffle=True,
+                drop_remainder=True
+            )
         )
 
-    def _get_eval_dataloader(self, eval_dataset: Optional[Dataset] = None) -> DataLoader:
+    def _get_eval_dataloader(self, eval_dataset: Optional[Dataset] = None) -> tensorflow.data.Dataset:
         """
-        Returns the evaluation [`~torch.utils.data.DataLoader`].
+        Returns the evaluation [`~tensorflow.data.Dataset`].
 
         Subclass and override this method if you want to inject some custom behavior.
 
@@ -1323,37 +1322,34 @@ class DPOTrainer(BaseTrainer, ABC):
             raise ValueError("Trainer: evaluation requires an eval_dataset.")
         eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
 
-        dataloader_params = {
-            "batch_size": self.arguments.total_batch_size,
-            "collate_fn": self.data_collator,
-            "num_workers": self.arguments.dataloader_num_workers,
-            "pin_memory": self.arguments.dataloader_pin_memory,
-            "shuffle": False,
-            "drop_last": True,
-        }
-
-        return DataLoader(
-            eval_dataset,
-            **dataloader_params
+        return tensorflow_datasets.as_numpy(
+            eval_dataset.to_tf_dataset(
+                batch_size=self.arguments.total_batch_size,
+                collate_fn=self.data_collator,
+                num_workers=self.arguments.dataloader_num_workers,
+                shuffle=False,
+                drop_remainder=True
+            )
         )
 
     def get_train_dataloader(
             self,
-    ) -> DataLoader:
+    ) -> tensorflow.data.Dataset:
         """
-        Returns the training [`~torch.utils.data.DataLoader`].
+        Returns the training [`~tensorflow.data.Dataset`].
         """
 
         if self.precompute_ref_log_probs and not self._precomputed_train_ref_log_probs:
-            dataloader_params = {
-                "batch_size": self.arguments.total_batch_size,
-                "collate_fn": self.data_collator,
-                "num_workers": self.arguments.dataloader_num_workers,
-                "pin_memory": self.arguments.dataloader_pin_memory,
-                "shuffle": False,
-            }
 
-            data_loader = DataLoader(self.train_dataset, **dataloader_params)
+            data_loader = tensorflow_datasets.as_numpy(
+                self.train_dataset.to_tf_dataset(
+                    batch_size=self.arguments.total_batch_size,
+                    collate_fn=self.data_collator,
+                    num_workers=self.arguments.dataloader_num_workers,
+                    shuffle=False,
+                    drop_remainder=True
+                )
+            )
             reference_chosen_log_probs = []
             reference_rejected_log_probs = []
             for padded_batch in tqdm(iterable=data_loader, desc="Train dataset reference log probs"):
@@ -1361,8 +1357,8 @@ class DPOTrainer(BaseTrainer, ABC):
                     self.model_state,
                     padded_batch,
                 )
-                reference_chosen_log_probs.append(reference_chosen_logp.cpu())
-                reference_rejected_log_probs.append(reference_rejected_logp.cpu())
+                reference_chosen_log_probs.append(reference_chosen_logp)
+                reference_rejected_log_probs.append(reference_rejected_logp)
 
             all_reference_chosen_log_probs = jnp.concatenate(reference_chosen_log_probs)
             all_reference_rejected_log_probs = jnp.concatenate(reference_rejected_log_probs)
@@ -1376,25 +1372,26 @@ class DPOTrainer(BaseTrainer, ABC):
             self._precomputed_train_ref_log_probs = True
         return self._get_train_dataloader()
 
-    def get_eval_dataloader(self, eval_dataset: Optional[Dataset] = None) -> DataLoader:
+    def get_eval_dataloader(self, eval_dataset: Optional[Dataset] = None) -> tensorflow.data.Dataset:
         """
-        Returns the evaluation [`~torch.utils.data.DataLoader`].
+        Returns the evaluation [`~tensorflow.data.Dataset`].
         """
         if eval_dataset is None and self.eval_dataset is None:
             raise ValueError("Trainer: evaluation requires an eval_dataset.")
         eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
 
         if self.precompute_ref_log_probs and not self._precomputed_eval_ref_log_probs:
-            dataloader_params = {
-                "batch_size": self.arguments.total_batch_size,
-                "collate_fn": self.data_collator,
-                "num_workers": self.arguments.dataloader_num_workers,
-                "pin_memory": self.arguments.dataloader_pin_memory,
-                "shuffle": False,
-            }
 
             # prepare dataloader
-            data_loader = DataLoader(eval_dataset, **dataloader_params)
+            data_loader = tensorflow_datasets.as_numpy(
+                eval_dataset.to_tf_dataset(
+                    batch_size=self.arguments.total_batch_size,
+                    collate_fn=self.data_collator,
+                    num_workers=self.arguments.dataloader_num_workers,
+                    shuffle=False,
+                    drop_remainder=True
+                )
+            )
 
             reference_chosen_log_probs = []
             reference_rejected_log_probs = []

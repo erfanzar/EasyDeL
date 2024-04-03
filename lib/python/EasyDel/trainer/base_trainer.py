@@ -6,10 +6,11 @@ from typing import Union, Callable, Optional, Any, Literal, Mapping
 
 import fjformer
 import jax
+import tensorflow.data
+import tensorflow_datasets
 import termcolor
 import wandb
 from datasets import Dataset
-from torch.utils.data import DataLoader
 from wandb.sdk.lib import RunDisabled
 from wandb.sdk.wandb_run import Run
 from .training_configurations import TrainArguments
@@ -24,9 +25,9 @@ from jax.sharding import Mesh
 
 @dataclass
 class TrainerConfigureDataloaderFuncOutput:
-    dataloader_train: DataLoader
+    dataloader_train: tensorflow.data.Dataset
     max_training_steps: int
-    dataloader_eval: Optional[DataLoader] = None
+    dataloader_eval: Optional[tensorflow.data.Dataset] = None
     max_evaluation_steps: Optional[int] = None
 
 
@@ -269,27 +270,32 @@ class BaseTrainer:
 
         """
 
-        dataloader_train = DataLoader(
-            self.dataset_train,
-            collate_fn=self.create_collate_function(
-                max_sequence_length=self.arguments.max_sequence_length,
-                truncation_mode=self.arguments.truncation_mode
-            ),
-            batch_size=self.arguments.total_batch_size,
-            drop_last=True,
-        )
-        max_training_steps = self.arguments.num_train_epochs * len(
-            dataloader_train
-        ) if self.arguments.max_training_steps is None else self.arguments.max_training_steps
-        if self.dataset_eval is not None and self.arguments.do_eval:
-            dataloader_eval = DataLoader(
-                self.dataset_eval,
+        dataloader_train = tensorflow_datasets.as_numpy(
+            self.dataset_train.to_tf_dataset(
                 collate_fn=self.create_collate_function(
                     max_sequence_length=self.arguments.max_sequence_length,
                     truncation_mode=self.arguments.truncation_mode
                 ),
                 batch_size=self.arguments.total_batch_size,
-                drop_last=True
+                drop_remainder=True,
+                num_workers=self.arguments.dataloader_num_workers
+            )
+        )
+        max_training_steps = self.arguments.num_train_epochs * len(
+            dataloader_train
+        ) if self.arguments.max_training_steps is None else self.arguments.max_training_steps
+        if self.dataset_eval is not None and self.arguments.do_eval:
+            dataloader_eval = tensorflow_datasets.as_numpy(
+                self.dataset_eval.to_tf_dataset(
+                    collate_fn=self.create_collate_function(
+                        max_sequence_length=self.arguments.max_sequence_length,
+                        truncation_mode=self.arguments.truncation_mode
+                    ),
+                    batch_size=self.arguments.total_batch_size,
+                    drop_remainder=True,
+                    shuffle=True,
+                    num_workers=self.arguments.dataloader_num_workers
+                )
             )
             max_evaluation_steps = len(
                 dataloader_eval) if self.arguments.max_training_steps is None else self.arguments.max_training_steps
@@ -319,7 +325,6 @@ class BaseTrainer:
                     "if you are using custom model to init you must"
                     " pass custom_rule for partition rules "
                 )
-
 
             self.arguments.configs_to_initialize_model_class["config"].axis_dims = self.arguments.sharding_array
 

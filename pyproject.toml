@@ -33,7 +33,9 @@ dependencies = [
     "numpy~=1.26.2",
     "uvicorn~=0.23.2",
     "fastapi~=0.104.1",
-    "pydantic-core==2.14.6"
+    "pydantic-core==2.14.6",
+    "tensorflow_dataset~=4.9.4",
+    "tensorflow~=2.16.1"
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
