@@ -1,4 +1,5 @@
 import os
+import tensorflow_datasets as tfsd
 
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 import flax.core
@@ -14,7 +15,8 @@ from jax import numpy as jnp, random
 from datasets import Dataset
 
 SEQUENCE_LENGTH = 128
-DATA_ROW_SIZE = 10
+DATA_ROW_SIZE = 1000
+BATCH_SIZE = 32
 
 MODEL_CONFIG = LlamaConfig(
     hidden_size=128,
@@ -71,7 +73,6 @@ def train():
         ),
         dataset_train=example_data,
     )
-
     output = trainer.train(model_parameters=flax.core.FrozenDict({"params": params}))
     return output.checkpoint_path
 
