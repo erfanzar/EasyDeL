@@ -38,10 +38,10 @@ from .base_trainer import BaseTrainer, TrainerConfigureFunctionFuncOutput
 
 
 def create_casual_language_model_train_step(
-    partition_spec=PartitionSpec(("dp", "fsdp"), "sp"),
-    label_smoothing_factor=0.0,
-    z_loss=0.0,
-    gradient_accumulation_steps: int = 1,
+        partition_spec=PartitionSpec(("dp", "fsdp"), "sp"),
+        label_smoothing_factor=0.0,
+        z_loss=0.0,
+        gradient_accumulation_steps: int = 1,
 ):
     """
     The create_casual_language_model_train_step function is a training step function that takes in the current state
@@ -608,11 +608,16 @@ class CausalLanguageModelTrainer(BaseTrainer):
                             )
                             for ssb in self.arguments.ids_to_pop_from_dataset:
                                 _ = batch.pop(ssb, None)
+
+                            forward_backward_step_time_start = time.time()
                             (
                                 sharded_state,
                                 loss,
                                 metrics,
                             ) = self.sharded_train_step_function(sharded_state, batch)
+
+                            forward_backward_step_time_end = time.time()
+                            gathering_metrics_time_start = time.time()
                             learning_rates.append(self.scheduler(current_step).tolist())
                             if self.arguments.track_memory:
                                 mem_res = get_mem(dir_prefix=dir_prefix)
@@ -637,10 +642,10 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                 train_metrics = {
                                     "loss": loss.tolist(),
                                     "mean_loss": loss_sum
-                                    / (current_step - self.arguments.step_start_point),
+                                                 / (current_step - self.arguments.step_start_point),
                                     "accuracy": accuracy,
                                     "mean_accuracy": accuracy_sum
-                                    / (current_step - self.arguments.step_start_point),
+                                                     / (current_step - self.arguments.step_start_point),
                                     "learning_rate": self.scheduler(
                                         int(jax.device_get(sharded_state.step))
                                     ).tolist(),
@@ -664,7 +669,17 @@ class CausalLanguageModelTrainer(BaseTrainer):
                             if self.arguments.track_memory:
                                 IPython.display.clear_output(True)
                                 pbar.display(mem_res)
+
+                            gathering_metrics_time_end = time.time()
                             pbar.set_postfix(**log_metrics)
+                            train_metrics.update(
+                                {
+                                    "gathering_metrics_time": gathering_metrics_time_end - gathering_metrics_time_start,
+                                    "forward_backward_step_time": (
+                                            forward_backward_step_time_end - forward_backward_step_time_start
+                                    )
+                                }
+                            )
                             if self.wandb_runtime is not None:
                                 with jax.spmd_mode("allow_all"):
                                     self.wandb_runtime.log(train_metrics),
