@@ -30,12 +30,15 @@ torch.manual_seed(42)
 class EasyModelsTest(TestCase):
 
     def setUp(self) -> None:
-        self.batch_size: int = 10
+        self.batch_size: int = 1
         self.vocab_size: int = 32000
         self.hidden_size: int = 256
         self.intermediate_size: int = 512
-        self.num_hidden_layers: int = 4
+        self.num_hidden_layers: int = 32
         self.num_attention_heads: int = 8
+        self.num_experts_per_tok = 4
+        self.num_experts = 8
+        self.num_local_experts = self.num_experts
         self.num_key_value_heads: Optional[int] = 4
         self.rms_norm_eps: float = 1e-6
         self.layer_norm_eps = self.rms_norm_eps
@@ -65,11 +68,12 @@ class EasyModelsTest(TestCase):
         self.attn_mechanism: Literal["normal", "flash", "splash", "ring", "cudnn"] = "normal"
         self.block_k: int = 32
         self.block_q: int = 32
-        self.sequence_length = 2048
+        self.sequence_length = 64
         self.scan_mlp_chunk_size = self.sequence_length // 2
 
         self.max_position_embeddings: int = self.sequence_length
         self.use_sharding_constraint = False
+
 
     def create_test_for_models(
             self,
@@ -78,6 +82,9 @@ class EasyModelsTest(TestCase):
     ):
         module_config, module_class, transform_function = ed.get_modules_by_type(module_name)
         config = module_config(
+            num_experts_per_tok=self.num_experts_per_tok,
+            num_experts=self.num_experts,
+            num_local_experts=self.num_local_experts,
             vocab_size=self.vocab_size,
             hidden_size=self.hidden_size,
             num_attention_heads=self.num_attention_heads,
@@ -93,8 +100,6 @@ class EasyModelsTest(TestCase):
             axis_dims=(1, 1, 1, -1)
             # residual_in_fp32=True
         )
-
-        input_shape = (self.batch_size, self.sequence_length + 1)
 
         hf_model = hf_module_class(
             config=copy.deepcopy(config)
@@ -126,6 +131,7 @@ class EasyModelsTest(TestCase):
                 block_q=self.block_q
             )
             prm = flax.traverse_util.flatten_dict(params, sep=".")
+
             ed_model = module_class(
                 config=config,
                 dtype=self.dtype,
@@ -143,7 +149,6 @@ class EasyModelsTest(TestCase):
                 input_ids=torch_input_ids[:, :-1],
                 labels=torch_input_ids[:, 1:],
             )
-
             ed_output = ed_model(
                 input_ids=jax_input_ids[:, :-1],
                 params=params,
@@ -172,7 +177,11 @@ class EasyModelsTest(TestCase):
             hf_module_class
     ):
         module_config, module_class, transform_function = ed.get_modules_by_type(module_name)
+
         config = module_config(
+            num_experts_per_tok=self.num_experts_per_tok,
+            num_experts=self.num_experts,
+            num_local_experts=self.num_local_experts,
             vocab_size=self.vocab_size,
             hidden_size=self.hidden_size,
             num_attention_heads=self.num_attention_heads,
@@ -344,10 +353,9 @@ class EasyModelsTest(TestCase):
 
     def test_qwen2_moe(self):
         res, err = self.create_test_for_models("qwen2_moe", transformers.Qwen2MoeForCausalLM)
-
         self.assertTrue(
             res,
-            f"MAMBA model Failed [ERROR {err}]"
+            f"Qwen2Moe model Failed [ERROR {err}]"
         )
 
     def test_moe_mixtral(self):
@@ -365,9 +373,10 @@ class EasyModelsTest(TestCase):
         hf_loss = hf_out.loss.cpu().detach().numpy()
         all_close = jnp.allclose(to, jo, atol=atol, rtol=rtol)
         all_close_loss = jnp.allclose(hf_loss, ed_loss, atol=1e-02, rtol=rtol)
+
         if not all_close:
-            print(f"\n{name} LAST F HF : ", to[:, -1, -5:])
-            print(f"{name} LAST F ED : ", jo[..., -1, -5:])
+            print(f"\n{name} LAST F HF : ", to[0, -1, -5:])
+            print(f"{name} LAST F ED : ", jo[0, -1, -5:])
             print(f"{name} CORRECT % : ", jnp.mean(
                 jnp.where(
                     jnp.isclose(to, jo, atol=atol, rtol=rtol), 1, 0).reshape(-1)
@@ -385,8 +394,8 @@ class EasyModelsTest(TestCase):
     ):
         np_input_ids = np.random.randint(0, vocab_size, input_shape)
         return (
-            torch.from_numpy(np_input_ids).reshape(1, -1).to(torch.long),
-            jnp.asarray(np_input_ids, dtype="i4").reshape(1, -1)
+            torch.from_numpy(np_input_ids).to(torch.long),
+            jnp.asarray(np_input_ids, dtype="i4")
         )
 
 
