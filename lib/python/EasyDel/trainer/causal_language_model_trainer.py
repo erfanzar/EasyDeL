@@ -650,12 +650,6 @@ class CausalLanguageModelTrainer(BaseTrainer):
                             forward_backward_step_time_end = time.time()
 
                             pbar.update(1)
-                            trained_tokens = jnp.multiply(
-                                self.arguments.max_sequence_length, jnp.multiply(
-                                    current_step,
-                                    self.arguments.total_batch_size
-                                )
-                            )  # It's faster
 
                             gathering_metrics_time_start = time.time()
                             with jax.spmd_mode("allow_all"):
@@ -675,7 +669,6 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                     "step": int(jax.device_get(sharded_state.step)),
                                     "step_time": step_time,
                                     "perplexity": jnp.exp(loss).tolist(),
-                                    "trained_tokens": trained_tokens,
                                 }
                                 log_metrics = copy.deepcopy(train_metrics)
                                 train_metrics.update(
