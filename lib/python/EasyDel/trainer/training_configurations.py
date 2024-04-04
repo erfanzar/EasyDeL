@@ -305,6 +305,7 @@ applied as total batch_size (e.g total_batch_size = total_batch_size * gradient_
         self.rapture = None
         self.rapture_config = None
         self.remove_unused_columns = remove_unused_columns
+        self._stop_capturing_memory = False
         self.state_apply_fn_kwarguments_to_model = (
             state_apply_fn_kwarguments_to_model
         ) if state_apply_fn_kwarguments_to_model is not None else {}
@@ -495,3 +496,7 @@ applied as total batch_size (e.g total_batch_size = total_batch_size * gradient_
             comment=f"{self.model_name}",
             filename_suffix="easydel"
         )
+
+    @property
+    def stop_capturing_memory(self):
+        return self._stop_capturing_memory

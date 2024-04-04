@@ -79,7 +79,7 @@ class FlaxWhisperAttention(BaseJAXAttentionModule):
             param_dtype=self.param_dtype,
             precision=self.precision,
             kernel_init=jax.nn.initializers.normal(self.config.init_std),
-            **get_dot_general_by_bits(self.config.bits,self.config.easy_method)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
 
         self.q_proj = dense(use_bias=self.bias)
@@ -256,7 +256,7 @@ class FlaxWhisperEncoderLayer(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision,
             kernel_init=jax.nn.initializers.normal(self.config.init_std),
-            **get_dot_general_by_bits(self.config.bits,self.config.easy_method)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
         self.fc2 = nn.Dense(
             self.embed_dim,
@@ -264,7 +264,7 @@ class FlaxWhisperEncoderLayer(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision,
             kernel_init=jax.nn.initializers.normal(self.config.init_std),
-            **get_dot_general_by_bits(self.config.bits,self.config.easy_method)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
         self.final_layer_norm = nn.LayerNorm(dtype=self.dtype, epsilon=1e-05)
 
@@ -405,7 +405,7 @@ class FlaxWhisperDecoderLayer(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision,
             kernel_init=jax.nn.initializers.normal(self.config.init_std),
-            **get_dot_general_by_bits(self.config.bits,self.config.easy_method)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
         self.fc2 = nn.Dense(
             self.embed_dim,
@@ -413,7 +413,7 @@ class FlaxWhisperDecoderLayer(nn.Module):
             precision=self.precision,
             dtype=self.dtype,
             kernel_init=jax.nn.initializers.normal(self.config.init_std),
-            **get_dot_general_by_bits(self.config.bits,self.config.easy_method)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
         self.final_layer_norm = nn.LayerNorm(dtype=self.dtype, epsilon=1e-05)
 
@@ -1123,7 +1123,7 @@ class FlaxWhisperForConditionalGenerationModule(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision,
             kernel_init=jax.nn.initializers.normal(self.config.init_std),
-            **get_dot_general_by_bits(self.config.bits,self.config.easy_method)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
 
     def _get_encoder_module(self):
@@ -1414,14 +1414,14 @@ class FlaxWhisperForAudioClassificationModule(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits,self.config.easy_method)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
         self.classifier = nn.Dense(
             self.config.num_labels,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits,self.config.easy_method)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
 
     def __call__(
