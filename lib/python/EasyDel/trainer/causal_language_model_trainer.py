@@ -1,5 +1,7 @@
 import copy
 import dataclasses
+import threading
+import warnings
 from glob import glob
 import os
 import sys
@@ -521,6 +523,23 @@ class CausalLanguageModelTrainer(BaseTrainer):
         )
         return filename
 
+    def _start_capturing_memory(self, dir_prefix: str = "/dev/shm" if sys.platform != "win32" else "."):
+        def _start():
+            while True:
+                information_queries = {}
+                for key in ["Used", "Usage Percent"]:
+                    for device, info in get_capacity_matrix(dir_prefix=dir_prefix).items():
+                        information_queries[f"accelerators/{device.replace('_', ' ')} ({key})"] = float(
+                            info[key].replace("%", "").replace("GB", "")
+                        )
+                self.wandb_runtime.log(
+                    information_queries
+                )
+                if self.arguments.stop_capturing_memory:
+                    break
+
+        return threading.Thread(target=_start)
+
     def train(
             self,
             model_parameters: Optional[flax.core.FrozenDict] = None,
@@ -559,8 +578,18 @@ class CausalLanguageModelTrainer(BaseTrainer):
 
         dir_prefix: str = "/dev/shm" if sys.platform != "win32" else "."
         checkpoint_path = "SAVING_SKIPPED"
+
         if self.arguments.track_memory:
             initialise_tracking(dir_prefix=dir_prefix)
+            self.arguments._stop_capturing_memory = True
+            mem_tracker = self._start_capturing_memory(dir_prefix=dir_prefix)
+            if self.arguments.use_wandb:
+                mem_tracker.start()
+
+            else:
+                warnings.warn(
+                    "`track_memory` will be ignored since you are not using wandb"
+                )
         start_time = time.time()
         sharded_state, shard_fns, gather_fns = self.initialize_state(
             model_parameters=model_parameters,
@@ -570,11 +599,10 @@ class CausalLanguageModelTrainer(BaseTrainer):
         count_model_parameters(sharded_state.params)
         with self.mesh:
             pbar = tqdm(total=self.max_training_steps)
-            current_step = int(jax.device_get(sharded_state.step))
+            current_step = jax.device_get(sharded_state.step)
             loss_sum = None
             accuracy_sum = None
             pbar.update(sharded_state.step.tolist())
-            learning_rates = []
             if self.wandb_runtime is not None:
                 model_parameters_number = sum(
                     n.size for n in
@@ -598,9 +626,11 @@ class CausalLanguageModelTrainer(BaseTrainer):
                         ):
                             pbar.update(1)
                         elif current_step < self.max_training_steps:
+
                             time_prev = time_s
                             time_s = time.time()
                             step_time = time_s - time_prev
+
                             batch["labels"] = (
                                 batch["labels"][..., 1:]
                                 if "labels" in batch and not self.arguments.train_on_inputs
@@ -610,6 +640,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                 _ = batch.pop(ssb, None)
 
                             forward_backward_step_time_start = time.time()
+
                             (
                                 sharded_state,
                                 loss,
@@ -617,35 +648,27 @@ class CausalLanguageModelTrainer(BaseTrainer):
                             ) = self.sharded_train_step_function(sharded_state, batch)
 
                             forward_backward_step_time_end = time.time()
-                            gathering_metrics_time_start = time.time()
-                            learning_rates.append(self.scheduler(current_step).tolist())
-                            if self.arguments.track_memory:
-                                mem_res = get_mem(dir_prefix=dir_prefix)
-                            else:
-                                mem_res = "Tracking Option is OFF"
+
                             pbar.update(1)
-                            trained_tokens = (
-                                    current_step *
-                                    self.arguments.total_batch_size *
-                                    self.arguments.max_sequence_length
-                            )
-                            information_queries = {}
-                            if self.arguments.track_memory:
-                                for key in ["Used", "Usage Percent"]:
-                                    for device, info in get_capacity_matrix(dir_prefix=dir_prefix).items():
-                                        information_queries[f"{device.replace('_', ' ')} ({key})"] = float(
-                                            info[key].replace("%", "").replace("GB", ""))
+                            trained_tokens = jnp.multiply(
+                                self.arguments.max_sequence_length, jnp.multiply(
+                                    current_step,
+                                    self.arguments.total_batch_size
+                                )
+                            )  # It's faster
+
+                            gathering_metrics_time_start = time.time()
                             with jax.spmd_mode("allow_all"):
-                                loss_sum = loss.tolist() if loss_sum is None else loss_sum + loss.tolist()
-                                accuracy = metrics["accuracy"].tolist()
+                                loss_sum = loss if loss_sum is None else loss_sum + loss
+                                accuracy = metrics["accuracy"]
                                 accuracy_sum = accuracy if accuracy_sum is None else accuracy_sum + accuracy
                                 train_metrics = {
                                     "loss": loss.tolist(),
-                                    "mean_loss": loss_sum
-                                                 / (current_step - self.arguments.step_start_point),
+                                    "mean_loss": (loss_sum / (current_step - self.arguments.step_start_point)).tolist(),
                                     "accuracy": accuracy,
-                                    "mean_accuracy": accuracy_sum
-                                                     / (current_step - self.arguments.step_start_point),
+                                    "mean_accuracy": (
+                                            accuracy_sum / (current_step - self.arguments.step_start_point)
+                                    ).tolist(),
                                     "learning_rate": self.scheduler(
                                         int(jax.device_get(sharded_state.step))
                                     ).tolist(),
@@ -655,20 +678,18 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                     "trained_tokens": trained_tokens,
                                 }
                                 log_metrics = copy.deepcopy(train_metrics)
-                                train_metrics.update({
-                                    "accelerators": information_queries,
-                                    "max_grad_norm": metrics["max_grad_norm"].tolist(),
-                                    "mean_grad_norm": metrics["mean_grad_norm"].tolist(),
-                                    "regularization_z_loss": metrics["regularization_z_loss"].tolist(),
-                                    "epoch": epoch,
-                                })
+                                train_metrics.update(
+                                    {
+                                        "max_grad_norm": metrics["max_grad_norm"].tolist(),
+                                        "mean_grad_norm": metrics["mean_grad_norm"].tolist(),
+                                        "regularization_z_loss": metrics["regularization_z_loss"].tolist(),
+                                        "epoch": epoch,
+                                    }
+                                )
                                 train_metrics.update({
                                     f"grad_norm/{layer_name}": grad_norm.tolist()
                                     for layer_name, grad_norm in get_layer_names(metrics["grad_norms"]).items()
                                 })
-                            if self.arguments.track_memory:
-                                IPython.display.clear_output(True)
-                                pbar.display(mem_res)
 
                             gathering_metrics_time_end = time.time()
                             pbar.set_postfix(**log_metrics)
@@ -682,8 +703,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
                             )
                             if self.wandb_runtime is not None:
                                 with jax.spmd_mode("allow_all"):
-                                    self.wandb_runtime.log(train_metrics),
-                                    wandb.summary["captured_memory_log"] = mem_res
+                                    self.wandb_runtime.log(train_metrics)
                             if self.arguments.training_time is not None:
                                 if time.time() - start_time > self.arguments.training_time:
                                     raise EasyDelTimerError("Time Out")
@@ -765,6 +785,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
 
             output.checkpoint_path = checkpoint_path
             output.last_save_file_name = filename
+            self.arguments._stop_capturing_memory = True
             wandb.finish()
 
             return output
@@ -784,7 +805,6 @@ class CausalLanguageModelTrainer(BaseTrainer):
             current_step = 0
             loss_sum = None
             accuracy_sum = None
-            mem_res = "Tracking Option is OFF"
 
             try:
                 for batch in self.dataloader_eval:
@@ -812,14 +832,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                 accuracy_sum is None
                         ) else accuracy_sum + accuracy
                     )
-                    information_queries = {}
-                    if self.arguments.track_memory:
 
-                        mem_res = get_mem(dir_prefix=dir_prefix)
-                        for key in ["Used", "Usage Percent"]:
-                            for device, info in get_capacity_matrix(dir_prefix=dir_prefix).items():
-                                information_queries[f"{device.replace('_', ' ')} ({key})"] = float(
-                                    info[key].replace("%", "").replace("GB", ""))
                     eval_metrics = {
                         "eval_loss": loss.tolist(),
                         "eval_mean_loss": loss_sum / (current_step - self.arguments.step_start_point),
@@ -829,21 +842,15 @@ class CausalLanguageModelTrainer(BaseTrainer):
                         "eval_step": current_step,
                         "eval_step_time": total_time,
                         "eval_perplexity": jnp.exp(loss).tolist(),
-                        "eval_accelerators": information_queries,
                     }
                     if self.arguments.use_wandb:
                         with jax.spmd_mode("allow_all"):
                             self.wandb_runtime.log(
                                 eval_metrics
-                            ),
-                            wandb.summary["eval_captured_memory_log"] = mem_res
+                            )
 
-                    if self.arguments.track_memory:
-                        IPython.display.clear_output(True)
-                        pbar.display(mem_res)
                     pbar.update(1)
                     log_metrics = copy.deepcopy(eval_metrics)
-                    _ = log_metrics.pop("eval_accelerators")
                     pbar.set_postfix(
                         **log_metrics
                     )
