@@ -1,4 +1,5 @@
 import math
+import random
 from typing import Optional, Tuple, Union
 
 import chex
@@ -23,7 +24,7 @@ from ..flax_modelling_utils import (
     repeat_kv_bnsh,
     apply_rotary_pos_emb,
     precompute_freq_cis,
-    get_dot_general_by_bits, BaseJAXAttentionModule, block_wise_ffn
+    get_dot_general_by_bits, BaseJAXAttentionModule, block_wise_ffn, ACT2FN
 )
 
 
@@ -68,10 +69,10 @@ class RMSNorm(nn.Module):
             self.param_dtype,
         )
 
-    def _norm(self, x: jnp.ndarray) -> jnp.ndarray:
+    def _norm(self, x: chex.Array) -> chex.Array:
         return x * jax.lax.rsqrt(jnp.square(x).mean(-1, keepdims=True) + self.eps)
 
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, x: chex.Array) -> chex.Array:
         x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
         output = self._norm(x).astype(self.dtype)
         weight = jnp.asarray(self.weight, self.dtype)
@@ -349,3 +350,264 @@ class FlaxDbrxAttention(BaseJAXAttentionModule):
         attn_output = self.resid_dropout(attn_output, deterministic=deterministic)
         outputs = (attn_output, attentions.attention_weights) if output_attentions else (attn_output,)
         return outputs
+
+
+class DbrxNormAttentionNorm(nn.Module):
+    config: DbrxConfig
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[Union[jax.lax.Precision, str]] = None
+
+    def setup(self) -> None:
+        self.norm_1 = nn.LayerNorm(
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            use_bias=False
+        )
+        self.attn = FlaxDbrxAttention(
+            config=self.config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision
+        )
+        self.norm_2 = nn.LayerNorm(
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            use_bias=False
+        )
+
+        self.dropout = nn.Dropout(
+            self.config.resid_pdrop
+        )
+
+    def __call__(
+            self,
+            hidden_states: chex.Array,
+            freq_cis: chex.Array,
+            attention_mask: chex.Array,
+            position_ids: chex.Array,
+            causal_mask: chex.Array,
+            segment_ids: Optional[chex.Array] = None,
+            deterministic: bool = True,
+            init_cache: bool = False,
+            output_attentions: bool = False,
+            fcm_mask=None,
+    ):
+        residual_states = hidden_states
+        hidden_states = self.norm_1(hidden_states)
+
+        hidden_states, attn_weights, past_key_value = self.attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            output_attentions=output_attentions,
+            freq_cis=freq_cis,
+            causal_mask=causal_mask,
+            segment_ids=segment_ids,
+            init_cache=init_cache,
+            deterministic=deterministic,
+            fcm_mask=fcm_mask
+        )
+
+        hidden_states = self.dropout(
+            hidden_states,
+            deterministic=deterministic
+        )
+        hidden_states = hidden_states + residual_states
+
+        residual_states = hidden_states
+        hidden_states = self.norm_2(hidden_states)
+
+        return residual_states, hidden_states, attn_weights, past_key_value
+
+
+class DbrxExpertGLU(nn.Module):
+    config: DbrxConfig
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[Union[jax.lax.Precision, str]] = None
+
+    def setup(self) -> None:
+        shape = (
+            self.config.ffn_config.moe_num_experts * self.config.ffn_config.ffn_hidden_size,
+            self.config.d_model
+        )
+        init_fn = nn.initializers.normal(
+            dtype=self.dtype
+        )
+        self.w1 = self.param("w1", init_fn, shape, self.param_dtype)
+        self.v1 = self.param("w1", init_fn, shape, self.param_dtype)
+        self.w2 = self.param("w2", init_fn, shape, self.param_dtype)
+        self.activation_fn = ACT2FN[self.config.ffn_config.ffn_act_fn]
+
+    def __call__(self, x: chex.Array, expert_idx: int) -> chex.Array:
+        expert_shape = (
+            self.config.ffn_config.moe_num_experts,
+            self.config.ffn_config.ffn_hidden_size,
+            self.config.d_model
+        )
+        expert_w1 = self.w1.reshape(expert_shape)[expert_idx]
+        expert_v1 = self.v1.reshape(expert_shape)[expert_idx]
+        expert_w2 = self.w2.reshape(expert_shape)[expert_idx]
+
+        x1 = jax.lax.batch_matmul(
+            x,
+            expert_w1.T,
+            precision=self.precision
+        )
+        x2 = jax.lax.batch_matmul(
+            x,
+            expert_v1.T,
+            precision=self.precision
+        )
+        x1 = self.activation_fn(x1)
+        x1 = x1 * x2
+        x1 = jax.lax.batch_matmul(
+            x1,
+            expert_w2,
+            precision=self.precision
+        )
+        return x1
+
+
+class DbrxExperts(nn.Module):
+    config: DbrxConfig
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[Union[jax.lax.Precision, str]] = None
+
+    def setup(self) -> None:
+        self.mlp = DbrxExpertGLU(
+            config=self.config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision
+        )
+
+    def __call__(
+            self,
+            x: chex.Array,
+            weights: chex.Array,
+            top_weights: chex.Array,
+            top_experts: chex.Array
+    ):
+        final_hidden_state = jnp.zeros_like(x)
+        for index in range(self.config.ffn_config.moe_num_experts):
+            output_moe_layer = self.mlp(
+                x, index
+            )
+            final_hidden_state += jnp.sum(
+                jnp.multiply(
+                    index == top_experts, top_weights
+                ), axis=-1
+            )[:, :, None] * output_moe_layer
+        return final_hidden_state
+
+
+class DbrxRouter(nn.Module):
+    config: DbrxConfig
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[Union[jax.lax.Precision, str]] = None
+
+    def setup(self) -> None:
+        self.hidden_size = self.config.d_model
+        self.moe_num_experts = self.config.ffn_config.moe_num_experts
+        self.moe_top_k = self.config.ffn_config.moe_top_k
+        self.moe_jitter_eps = self.config.ffn_config.moe_jitter_eps
+        self.moe_normalize_expert_weights = self.config.ffn_config.moe_normalize_expert_weights
+        self.uniform_expert_assignment = self.config.ffn_config.uniform_expert_assignment
+
+        self.layer = nn.Dense(
+            self.moe_num_experts,
+            use_bias=False
+        )
+
+    def jitter(self, x: chex.Array) -> chex.Array:
+        if self.moe_jitter_eps is None:
+            raise RuntimeError('The router does not have moe_jitter_eps set.')
+        low = 1.0 - self.moe_jitter_eps
+        high = 1.0 + self.moe_jitter_eps
+        noise = jax.random.normal(
+            self.make_rng("params"),
+            x.shape,
+            dtype=x.dtype
+        )
+        return low + noise * (high - low)
+
+    def __call__(
+            self,
+            x: chex.Array,
+            deterministic: bool = True
+    ) -> Tuple[chex.Array, chex.Array, chex.Array]:
+        if not deterministic and self.moe_jitter_eps is not None:
+            x = x * self.jitter(x)
+
+        weights = self.layer(
+            x.astype(
+                jnp.promote_types(self.dtype, jnp.float32)
+            )
+        )
+        weights = jax.nn.softmax(
+            weights.astype(
+                jnp.promote_types(self.dtype, jnp.float32)
+            )
+        )
+        top_weights, top_experts = jax.lax.top_k(
+            weights,
+            self.moe_top_k
+        )
+
+        if self.moe_normalize_expert_weights:
+            top_weights = top_weights / jnp.linalg.norm(
+                top_weights,
+                ord=int(self.moe_normalize_expert_weights),
+                axis=-1,
+                keepdims=True
+            )
+
+        if self.uniform_expert_assignment:
+            top_experts = jax.lax.stop_gradient(
+                (
+                        jnp.arange(
+                            0,
+                            jnp.prod(jnp.asarray(top_experts.shape, dtype=jnp.int32), dtype=jnp.int32),
+                            dtype=top_experts.dtype
+                        ) % self.moe_num_experts
+                ).reshape(top_experts.shape)
+            )
+
+        weights = weights.astype(x.dtype)
+        top_weights = top_weights.astype(x.dtype)
+        return weights, top_weights, top_experts
+
+
+class DbrxFFN(nn.Module):
+    config: DbrxConfig
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[Union[jax.lax.Precision, str]] = None
+
+    def setup(self) -> None:
+        self.router = DbrxRouter(
+            config=self.config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision
+        )
+
+        self.experts = DbrxExperts(
+            config=self.config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision
+        )
+
+    def __call__(
+            self,
+            x: chex.Array,
+            deterministic: bool = False
+    ) -> Tuple[chex.Array, chex.Array]:
+        weights, top_weights, top_experts = self.router(x, deterministic=deterministic)
+        out = self.experts(x, weights, top_weights, top_experts)
+        return out, weights
