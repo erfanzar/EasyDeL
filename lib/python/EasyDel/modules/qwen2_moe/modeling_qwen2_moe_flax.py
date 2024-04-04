@@ -546,15 +546,20 @@ class FlaxQwen2MoeSparseMoeBlock(nn.Module):
         router_logits = self.gate(hidden_states).astype(
             jnp.promote_types(self.dtype, jnp.float32)
         )
-        routing_weights, selected_experts = jax.lax.top_k(
-            router_logits,
-            k=self.config.num_experts_per_tok
-        )
+
         routing_weights = jax.nn.softmax(
-            routing_weights.astype(
+            router_logits.astype(
                 jnp.promote_types(self.dtype, jnp.float32)
             ), axis=-1
         )
+
+        routing_weights, selected_experts = jax.lax.top_k(
+            routing_weights,
+            k=self.config.num_experts_per_tok
+        )
+
+        if self.config.norm_topk_prob:
+            routing_weights /= routing_weights.sum(axis=-1, keepdims=True)
         final_hidden_state = self.experts(
             selected_experts=selected_experts,
             batch_size=batch_size,
@@ -568,6 +573,7 @@ class FlaxQwen2MoeSparseMoeBlock(nn.Module):
             self.shared_expert_gate(hidden_states)
         ) * shared_expert_output
         final_hidden_state = final_hidden_state + shared_expert_output
+
         return (
             final_hidden_state,
             router_logits
@@ -595,7 +601,7 @@ class FlaxQwen2MoeBlock(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        mlp_block = FlaxQwen2MoeSparseMoeBlock if self.config.num_experts > 1 else FlaxQwen2MoeMLP
+        mlp_block = FlaxQwen2MoeSparseMoeBlock if self.config.num_experts > 0 else FlaxQwen2MoeMLP
 
         if self.config.gradient_checkpointing != "":
             mlp_block = nn_partitioning.remat(
@@ -632,12 +638,15 @@ class FlaxQwen2MoeBlock(nn.Module):
             attention_mask: chex.Array,
             position_ids: chex.Array,
             causal_mask: chex.Array,
-            segment_ids: Optional[chex.Array] = None,
             deterministic: bool = True,
             init_cache: bool = False,
-            output_attentions: bool = False,
+            output_attentions: Optional[bool] = False,
+            output_hidden_states: Optional[bool] = False,
             output_router_logits: Optional[bool] = None,
+            return_dict: bool = True,
+            segment_ids: Optional[chex.Array] = None,
             fcm_mask: Optional[jnp.ndarray] = None,
+
     ):
         """
         The __call__ function is the main function of a TransformerEncoderLayer.
@@ -681,7 +690,7 @@ class FlaxQwen2MoeBlock(nn.Module):
             deterministic,
         )
 
-        if self.config.num_experts > 1:
+        if self.config.num_experts > 0:
             feed_forward_hidden_states, router_logits = mlp_out
         else:
             feed_forward_hidden_states = mlp_out
