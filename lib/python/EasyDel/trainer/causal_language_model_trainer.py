@@ -585,7 +585,6 @@ class CausalLanguageModelTrainer(BaseTrainer):
             mem_tracker = self._start_capturing_memory(dir_prefix=dir_prefix)
             if self.arguments.use_wandb:
                 mem_tracker.start()
-
             else:
                 warnings.warn(
                     "`track_memory` will be ignored since you are not using wandb"
@@ -650,42 +649,29 @@ class CausalLanguageModelTrainer(BaseTrainer):
                             forward_backward_step_time_end = time.time()
 
                             pbar.update(1)
-
                             gathering_metrics_time_start = time.time()
-                            with jax.spmd_mode("allow_all"):
-                                loss_sum = loss if loss_sum is None else loss_sum + loss
-                                accuracy = metrics["accuracy"]
-                                accuracy_sum = accuracy if accuracy_sum is None else accuracy_sum + accuracy
-                                train_metrics = {
-                                    "loss": loss.tolist(),
-                                    "mean_loss": (loss_sum / (current_step - self.arguments.step_start_point)).tolist(),
-                                    "accuracy": accuracy,
-                                    "mean_accuracy": (
-                                            accuracy_sum / (current_step - self.arguments.step_start_point)
-                                    ).tolist(),
-                                    "learning_rate": self.scheduler(
-                                        int(jax.device_get(sharded_state.step))
-                                    ).tolist(),
-                                    "step": int(jax.device_get(sharded_state.step)),
-                                    "step_time": step_time,
-                                    "perplexity": jnp.exp(loss).tolist(),
+                            accuracy = metrics["accuracy"]
+                            train_metrics = {
+                                "loss": loss.tolist(),
+                                "accuracy": accuracy,
+                                "learning_rate": self.scheduler(
+                                    int(jax.device_get(sharded_state.step))
+                                ).tolist(),
+                                "step": int(jax.device_get(sharded_state.step)),
+                                "step_time": step_time,
+                                "perplexity": jnp.exp(loss).tolist(),
+                            }
+                            train_metrics.update(
+                                {
+                                    "max_grad_norm": metrics["max_grad_norm"].tolist(),
+                                    "mean_grad_norm": metrics["mean_grad_norm"].tolist(),
+                                    "regularization_z_loss": metrics["regularization_z_loss"].tolist(),
+                                    "epoch": epoch,
                                 }
-                                log_metrics = copy.deepcopy(train_metrics)
-                                train_metrics.update(
-                                    {
-                                        "max_grad_norm": metrics["max_grad_norm"].tolist(),
-                                        "mean_grad_norm": metrics["mean_grad_norm"].tolist(),
-                                        "regularization_z_loss": metrics["regularization_z_loss"].tolist(),
-                                        "epoch": epoch,
-                                    }
-                                )
-                                train_metrics.update({
-                                    f"grad_norm/{layer_name}": grad_norm.tolist()
-                                    for layer_name, grad_norm in get_layer_names(metrics["grad_norms"]).items()
-                                })
+                            )
 
                             gathering_metrics_time_end = time.time()
-                            pbar.set_postfix(**log_metrics)
+                            pbar.set_postfix(**train_metrics)
                             train_metrics.update(
                                 {
                                     "gathering_metrics_time": gathering_metrics_time_end - gathering_metrics_time_start,
