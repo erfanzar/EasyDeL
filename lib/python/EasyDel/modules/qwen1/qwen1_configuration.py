@@ -30,7 +30,6 @@ class Qwen1Config(EasyDelPretrainedConfig):
             tie_word_embeddings=False,
             softmax_in_fp32=False,
             gradient_checkpointing: str = "nothing_saveable",
-            use_pjit_attention_force: bool = False,
             use_scan_mlp: bool = False,
             scan_mlp_chunk_size: int = 1024,
             bits: Optional[int] = None,
@@ -61,12 +60,14 @@ class Qwen1Config(EasyDelPretrainedConfig):
         self.init_rope_cache_auto = init_rope_cache_auto
         self.tie_word_embeddings = tie_word_embeddings
         self.gradient_checkpointing = gradient_checkpointing
-        self.use_pjit_attention_force = use_pjit_attention_force
         self.use_scan_mlp = use_scan_mlp
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.bits = bits
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,
+            use_scan_mlp=use_scan_mlp,
+            scan_mlp_chunk_size=scan_mlp_chunk_size,
+            bits=bits,
             **kwargs,
         )
 
@@ -102,8 +103,8 @@ class Qwen1Config(EasyDelPretrainedConfig):
 
             ("model/wte/embedding", PartitionSpec(("fsdp", "sp"))),
 
-            ("self_attn/c_attn/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("self_attn/c_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+            ("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
 
             ("mlp/w1/kernel", PartitionSpec(("fsdp", "sp"))),
             ("mlp/w2/kernel", PartitionSpec(("fsdp", "sp"))),
@@ -121,7 +122,6 @@ class Qwen1Config(EasyDelPretrainedConfig):
     def add_jax_args(
             self,
             gradient_checkpointing: str = "nothing_saveable",
-            use_pjit_attention_force: bool = False,
             use_scan_mlp: bool = False,
             scan_mlp_chunk_size: int = 1024,
             bits: Optional[int] = None,
@@ -134,7 +134,6 @@ class Qwen1Config(EasyDelPretrainedConfig):
 
         :param self: Refer to the current object
         :param gradient_checkpointing: str: Control the amount of memory used by jax
-        :param use_pjit_attention_force: bool: Determine if the attention force is used
         :param use_scan_mlp: bool: Determine whether to use the scan_mlp function or not
         :param scan_mlp_chunk_size: int: Set the chunk size for scan_mlp
         :param init_rope_cache_auto: bool: Whether to use the rope_cache_auto in model
@@ -145,7 +144,6 @@ class Qwen1Config(EasyDelPretrainedConfig):
         """
         self.scan_layers = scan_layers
         self.gradient_checkpointing = gradient_checkpointing
-        self.use_pjit_attention_force = use_pjit_attention_force
         self.use_scan_mlp = use_scan_mlp
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.bits = bits

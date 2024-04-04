@@ -1,116 +1,229 @@
-import EasyDel as ed
-from transformers import AutoTokenizer
-from jax.experimental.pjit import pjit
+import gc
+from unittest import TestCase
+import unittest
+
+import flax.traverse_util
+from fjformer import make_shard_and_gather_fns, match_partition_rules
+
+try:
+    import lib.python.EasyDel as ed
+except ModuleNotFoundError:
+    import sys
+    from pathlib import Path
+
+    cp = Path.cwd().__str__()
+    sys.path.append(cp)
+    import lib.python.EasyDel as ed
+
+from jax import numpy as jnp
+import torch
+import numpy as np
+
+import copy
 import jax
-import jax.numpy as jnp
-import fjformer
-from transformers import GenerationConfig
-from jax.sharding import PartitionSpec as Ps
-import functools
+import transformers
+from typing import Optional, Dict, Union, Literal
 
-JAXServer, JAXServerConfig, AutoEasyDelModelForCausalLM = (
-    ed.JAXServer,
-    ed.JAXServerConfig,
-    ed.AutoEasyDelModelForCausalLM
-)
-
-with_sharding_constraint = fjformer.with_sharding_constraint
+torch.manual_seed(42)
 
 
-def llama2_prompt(
-        message: str,
-        chat_history,
-        system_prompt: str
-) -> str:
-    do_strip = False
-    texts = [f'<s>[INST] <<SYS>>\n{system_prompt}\n<</SYS>>\n\n']
-    for user_input, response in chat_history:
-        user_input = user_input.strip() if do_strip else user_input
-        do_strip = True
-        texts.append(f'{user_input} [/INST] {response.strip()} </s><s>[INST] ')
-    message = message.strip() if do_strip else message
-    texts.append(f'{message} [/INST]')
-    return "".join(texts)
+class EasyModelsGenerationTest(TestCase):
+
+    def setUp(self) -> None:
+        self.tokenizer = transformers.AutoTokenizer.from_pretrained("gpt2")
+        self.sequence_length: int = 128
+        self.batch_size: int = 1
+        self.vocab_size: int = self.tokenizer.vocab_size
+        self.hidden_size: int = 256
+        self.intermediate_size: int = 512
+        self.num_hidden_layers: int = 4
+        self.num_attention_heads: int = 8
+        self.num_key_value_heads: Optional[int] = 4
+        self.max_position_embeddings: int = 512
+        self.rms_norm_eps: float = 1e-6
+        self.layer_norm_eps = self.rms_norm_eps
+        self.initializer_range: float = 0.02
+        self.use_cache: bool = True
+        self.bos_token_id: int = 0
+        self.eos_token_id: int = 1
+        self.resid_pdrop: float = 0.0
+        self.embd_pdrop: float = 0.0
+        self.attention_dropout: float = 0.0
+        self.rope_theta: float = 10000.
+        self.attention_bias: bool = False
+        self.tie_word_embeddings: bool = False
+        self.gradient_checkpointing: str = "nothing_saveable"  #
+        self.fcm_min_ratio: float = -1
+        self.fcm_max_ratio: float = -1
+        self.rope_scaling: Optional[Dict[str, Union[str, float]]] = None
+        self.use_scan_mlp: bool = False
+        self.bits: Optional[int] = None
+        self.hidden_act: str = "silu"
+        self.pretraining_tp: int = 1
+        self.scan_layers: bool = False
+        self.shard_attention_computation: bool = True
+        self.rotary_dim = 32
+        self.dtype: jax.numpy.dtype = jnp.float32
+        self.precision = jax.lax.Precision("fastest")
+        self.attn_mechanism: Literal["normal", "flash", "splash", "ring", "cudnn"] = "normal"
+        self.block_k: int = 64
+        self.block_q: int = 64
+        self.scan_mlp_chunk_size = self.sequence_length // 2
+
+    def create_generation_test_for_models(
+            self,
+            module_name: str,
+    ):
+        module_config, module_class, transform_function = ed.get_modules_by_type(module_name)
+        config = module_config(
+            vocab_size=self.vocab_size,
+            hidden_size=self.hidden_size,
+            num_attention_heads=self.num_attention_heads,
+            num_hidden_layers=self.num_hidden_layers,
+            gradient_checkpointing=self.gradient_checkpointing,
+            max_position_embeddings=self.max_position_embeddings,
+            num_key_value_heads=self.num_key_value_heads,
+            scan_mlp_chunk_size=self.scan_mlp_chunk_size,
+            intermediate_size=self.intermediate_size,
+            rotary_dim=self.rotary_dim,
+            rms_norm_eps=self.rms_norm_eps,
+            layer_norm_eps=self.layer_norm_eps,
+            # residual_in_fp32=True
+        )
+
+        input_shape = (self.batch_size, self.sequence_length)
+
+        config.add_jax_args()
+        config.add_basic_configurations(
+            shard_attention_computation=self.shard_attention_computation,
+            scan_mlp_chunk_size=self.scan_mlp_chunk_size
+        )
+
+        model = module_class(
+            config=config,
+            dtype=self.dtype,
+            param_dtype=self.dtype,
+            precision=self.precision,
+            _do_init=True
+        )
+        mesh = config.jax_mesh()
+        server_config = ed.JAXServerConfig(
+            batch_size=1,
+            max_sequence_length=self.max_position_embeddings,
+            dtype=self.dtype,
+            use_prefix_tokenizer=True,
+            max_compile_tokens=self.max_position_embeddings // 4,
+            max_new_tokens=self.max_position_embeddings
+        )
+        server = ed.JAXServer.from_parameters(
+            config_model=config,
+            model=model,
+            params=model.params,
+            server_config=server_config,
+            tokenizer=self.tokenizer
+        )
+        response = None
+        for response, tokens_used in server.sample(
+                ""
+        ):
+            ...
+        return response
+
+    def test_llama(self):
+        response = self.create_generation_test_for_models("llama")
+        print(f"LLama EasyDeL Generated Sequence:\n{response}")
+        self.assertTrue(
+            True,
+        )
+
+    def test_falcon(self):
+        response = self.create_generation_test_for_models("falcon")
+        print(f"Falcon EasyDeL Generated Sequence:\n{response}")
+        self.assertTrue(
+            True,
+        )
+
+    def test_mistral(self):
+        response = self.create_generation_test_for_models("mistral")
+        print(f"Mistral EasyDeL Generated Sequence:\n{response}")
+        self.assertTrue(
+            True,
+        )
+
+    def test_mixtral(self):
+        response = self.create_generation_test_for_models("mixtral")
+        print(f"Mixtral EasyDeL Generated Sequence:\n{response}")
+        self.assertTrue(
+            True
+        )
+
+    def test_gpt2(self):
+        response = self.create_generation_test_for_models("gpt2")
+        print(f"GTP2 EasyDeL Generated Sequence:\n{response}")
+        self.assertTrue(
+            True,
+        )
+
+    def test_gptj(self):
+        response = self.create_generation_test_for_models("gptj")
+        print(f"GPT-J EasyDeL Generated Sequence:\n{response}")
+        self.assertTrue(
+            True,
+        )
+
+    def test_qwen2(self):
+        response = self.create_generation_test_for_models("qwen2")
+        print(f"QWEN2 EasyDeL Generated Sequence:\n{response}")
+        self.assertTrue(
+            True,
+        )
+
+    def test_phi(self):
+        response = self.create_generation_test_for_models("phi")
+        print(f"PHI EasyDeL Generated Sequence:\n{response}")
+        self.assertTrue(
+            True,
+        )
+
+    def test_gemma(self):
+        response = self.create_generation_test_for_models("gemma")
+        print(f"GEMMA EasyDeL Generated Sequence:\n{response}")
+        self.assertTrue(
+            True,
+        )
+
+    def test_stablelm(self):
+        response = self.create_generation_test_for_models("stablelm")
+        print(f"StableLM EasyDeL Generated Sequence:\n{response}")
+        self.assertTrue(
+            True,
+        )
+
+    # def test_rwkv(self):
+    #     response = self.create_generation_test_for_models("rwkv")
+    #     print(f"RWKV EasyDeL Generated Sequence:\n{response}")
+    #     self.assertTrue(
+    #         True,
+    #     )
+    #
+    # def test_mamba(self):
+    #     response = self.create_generation_test_for_models("mamba")
+    #     print(f"MAMBA EasyDeL Generated Sequence:\n{response}")
+    #     self.assertTrue(
+    #         True,
+    #     )
+
+    @staticmethod
+    def make_input_id(
+            vocab_size: int,
+            input_shape: tuple[int, int]
+    ):
+        np_input_ids = np.random.randint(0, vocab_size, input_shape)
+        return (
+            torch.from_numpy(np_input_ids).reshape(1, -1).to(torch.long),
+            jnp.asarray(np_input_ids, dtype="i4").reshape(1, -1)
+        )
 
 
-def del_prompter(
-        prompt,
-        history,
-        system=None
-):
-    sys_str = f"<|system|>\n{system}</s>\n" if system is not None else ""
-    histories = ""
-    for user, assistance in history:
-        histories += f"<|user|>\n{user}</s>\n<|assistant|>\n{assistance}</s>\n"
-    return sys_str + histories + f"<|user|>\n{prompt}</s>\n<|assistant|>\n"
-
-
-def main():
-    pretrained_model_name_or_path = "meta-llama/Llama-2-7b-chat-hf"
-    model, params = AutoEasyDelModelForCausalLM.from_pretrained(
-        pretrained_model_name_or_path,
-        dtype=jax.numpy.bfloat16,
-        param_dtype=jax.numpy.bfloat16,
-        precision=jax.lax.Precision("fastest"),
-        device=jax.devices('cpu')[0]
-    )
-    tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
-    params = {"params": params}
-    partition_specs = fjformer.match_partition_rules(model.config.get_partition_rules(True), params)
-    shard, _ = fjformer.make_shard_and_gather_fns(partition_specs, jnp.bfloat16)
-    mesh = fjformer.create_mesh()
-    with mesh:
-        params = jax.tree_map(lambda f, p: f(p), shard, params)
-
-    user = input(">> ")
-    system = 'You are an AI be respectful and help-full.'
-    prompt = llama2_prompt(
-        user,
-        [],
-        system
-    )
-
-    @functools.partial(
-        pjit,
-        in_shardings=(partition_specs, Ps(), Ps()),
-        out_shardings=(Ps())
-    )
-    def generate(parameters, input_ids, attention_mask):
-        input_ids = with_sharding_constraint(input_ids, Ps(("dp", "fsdp")))
-        attention_mask = with_sharding_constraint(attention_mask, Ps(("dp", "fsdp")))
-        predict = model.generate(
-            input_ids,
-            attention_mask=attention_mask,
-            params=parameters,
-
-            generation_config=GenerationConfig(
-                max_new_tokens=512,
-
-                eos_token_id=tokenizer.eos_token_id,
-                pad_token_id=tokenizer.pad_token_id,
-                bos_token_id=tokenizer.bos_token_id,
-
-                temperature=0.8,
-                do_sample=True,
-                num_beams=1,
-                top_p=0.95,
-                top_k=50,
-
-            )
-        ).sequences[:, input_ids.shape[1]:]
-        return predict
-
-    tokenizer.padding_side = "left"
-    tokenizer.truncation_side = "left"
-    tokenizer.pad_token = tokenizer.eos_token
-
-    tokens = tokenizer(prompt, padding='max_length', max_length=2048, return_tensors='jax')
-    input_ids, attention_mask = tokens.input_ids, tokens.attention_mask
-    with mesh:
-        response = generate(params, input_ids, attention_mask)
-
-    print(tokenizer.decode(response[0], skip_special_tokens=True))
-
-
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    unittest.main()

@@ -29,8 +29,7 @@ class MptConfig(EasyDelPretrainedConfig):
                  qk_ln: bool = False,
                  use_lm_head: bool = False,
                  use_norm_bias: bool = False,
-                 gradient_checkpointing: str = 'nothing_saveable',
-                 use_pjit_attention_force: bool = False,
+                 gradient_checkpointing: str = "nothing_saveable",
                  bits: Optional[int] = None,
                  **kwargs
                  ):
@@ -46,7 +45,6 @@ class MptConfig(EasyDelPretrainedConfig):
         self.resid_prob_drop = resid_prob_drop
         self.use_bias = use_bias
         self.emb_prob_drop = emb_prob_drop
-        self.use_pjit_attention_force = use_pjit_attention_force
         self.gradient_checkpointing = gradient_checkpointing
         self.learned_pos_emb = learned_pos_emb
         self.act_fn = act_fn
@@ -65,6 +63,7 @@ class MptConfig(EasyDelPretrainedConfig):
         if 'loss_fn' in kwargs:
             del kwargs['loss_fn']
         super().__init__(
+            bits=bits,
             **kwargs
         )
 
@@ -148,8 +147,7 @@ class MptConfig(EasyDelPretrainedConfig):
                      qk_ln: bool = True,
                      use_lm_head: bool = False,
                      use_norm_bias: bool = False,
-                     gradient_checkpointing: str = 'nothing_saveable',
-                     use_pjit_attention_force: bool = False,
+                     gradient_checkpointing: str = "nothing_saveable",
                      bits: Optional[int] = None,
                      **kwargs,
                      ):
@@ -179,7 +177,6 @@ class MptConfig(EasyDelPretrainedConfig):
             use_lm_head=use_lm_head,
             use_norm_bias=use_norm_bias,
             gradient_checkpointing=gradient_checkpointing,
-            use_pjit_attention_force=use_pjit_attention_force,
             **kwargs
         )
         for k, v in basics.items():

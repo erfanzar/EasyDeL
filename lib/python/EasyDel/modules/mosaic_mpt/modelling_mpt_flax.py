@@ -108,7 +108,7 @@ class FlaxMptAttention(BaseJAXAttentionModule):
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
         self.attention_performer = EasyAttention(
-            attn_type="normal",
+            use_sharding_constraint=self.config.use_sharding_constraint,
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,
             block_q=self.config.block_q,
@@ -124,7 +124,7 @@ class FlaxMptAttention(BaseJAXAttentionModule):
             attention_dropout=self.config.attention_dropout,
             head_dims=self.head_dim,
             attention_partition_spec=self.config.attention_partition_spec,
-            use_shard_map=self.config.use_shard_map,
+            shard_attention_computation=self.config.shard_attention_computation,
             precision=self.precision,
             force_float32_tpu=True,
             attn_mechanism=self.config.attn_mechanism,
@@ -132,6 +132,9 @@ class FlaxMptAttention(BaseJAXAttentionModule):
             bias_partition_spec=self.config.bias_partition_spec,
             key_partition_spec=self.config.key_partition_spec,
             query_partition_spec=self.config.query_partition_spec,
+            generation_query_partition_spec=self.config.generation_query_partition_spec,
+            generation_bias_partition_spec=self.config.generation_bias_partition_spec,
+            generation_attention_partition_spec=self.config.generation_attention_partition_spec,
             value_partition_spec=self.config.value_partition_spec,
             scan_ring_attention=self.config.scan_ring_attention,
             mesh=self.config.jax_mesh(),
@@ -177,17 +180,22 @@ class FlaxMptAttention(BaseJAXAttentionModule):
         if self.config.qk_ln:
             q = self.q_ln(q)
             k = self.k_ln(k)
-        if self.config.use_pjit_attention_force:
-            q = with_sharding_constraint(q, PartitionSpec(("dp", "fsdp"), None, "sp"))
-            k = with_sharding_constraint(k, PartitionSpec(("dp", "fsdp"), None, "sp"))
-            v = with_sharding_constraint(v, PartitionSpec(("dp", "fsdp"), None, "sp"))
+
         q = rearrange(q, 'b s (h d) -> b s h d', h=self.config.n_heads)
         k = rearrange(k, 'b s (h d) -> b s h d', h=self.config.n_heads)
         v = rearrange(v, 'b s (h d) -> b s h d', h=self.config.n_heads)
         attention_mask = attention_mask.reshape(b, 1, 1, -1)
         if self.has_variable('cache', 'key_states') or init_cache:
-            k, v, attention_mask = self._concatenate_to_cache(key_states=k, value=v, query=q, attention_mask=attention_mask)
+            k, v, attention_mask = self._concatenate_to_cache(key_states=k, value=v, query=q,
+                                                              attention_mask=attention_mask)
         # TODO: MPT WONT WORK CAUSE OF NEW ATTENTION MEC ON FJFORMER
+
+        # if self.config.use_sharding_constraint:
+        #     q = with_sharding_constraint(
+        #         q, jax.sharding.PartitionSpec(("dp", "fsdp"), "sp" if q.shape[1] != 1 else None, "tp",None)
+        #     )
+        #     k = with_sharding_constraint(k, jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None))
+        #     v = with_sharding_constraint(v, jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp",None))
         q_l = q.shape[1]
         k_l = k.shape[1]
         dropout_rng = None
@@ -198,8 +206,12 @@ class FlaxMptAttention(BaseJAXAttentionModule):
         d = q.shape[-1]
         attn_output = jnp.einsum('...qhd,...khd->...hqk', q, k, precision=self.precision) * jax.lax.rsqrt(
             jnp.asarray(d).astype(v.dtype))
-        if self.config.use_pjit_attention_force:
-            attn_output = with_sharding_constraint(attn_output, PartitionSpec(("dp", "fsdp"), "sp", None, None))
+        attn_output = with_sharding_constraint(attn_output, PartitionSpec(
+            ("dp", "fsdp"),
+            "sp" if attn_output.shape[1] != 1 else None,
+            None,
+            None)
+                                               )
         if attn_bias is not None:
             attn_output += attn_bias[:, :, :, :attn_output.shape[-1]]
         mask = jnp.where(self.causal_mask == 1, 0, jnp.finfo(attn_output).min)

@@ -12,7 +12,7 @@ from flax.core import freeze, unfreeze, FrozenDict
 from typing import Union, Optional, Tuple
 from flax.linen import partitioning as nn_partitioning, combine_masks
 from transformers.modeling_flax_outputs import FlaxMaskedLMOutput
-
+from fjformer.func import auxiliary_load_balancing_loss_func
 from ..easy_attention import EasyAttention
 from ..flax_modelling_utils import (
     ACT2FN,
@@ -22,7 +22,8 @@ from ..flax_modelling_utils import (
     precompute_freq_cis,
     get_dot_general_by_bits,
     BaseJAXAttentionModule,
-    get_gradient_checkpoint_policy
+    get_gradient_checkpoint_policy,
+    block_wise_ffn
 )
 import chex
 from .mixtral_configuration import MixtralConfig
@@ -43,26 +44,6 @@ class MoeModelOutput:
 class MoeCausalLMOutput(FlaxMaskedLMOutput):
     aux_loss: Optional[chex.Array] = None
     router_logits: Optional[Tuple[chex.Array]] = None
-
-
-def jax_load_balancing_loss_func(gate_logits: chex.Array, num_experts: chex.Array = None, top_k: int = 2) -> float:
-    if gate_logits is None:
-        return 0
-    if isinstance(gate_logits, tuple):
-        gate_logits = jnp.concatenate([gate for gate in gate_logits], axis=0)
-    routing_weights, selected_experts = jax.lax.top_k(gate_logits, top_k)
-    routing_weights = jax.nn.softmax(routing_weights, axis=-1)
-    if selected_experts.dtype != jnp.int64:
-        selected_experts = selected_experts.astype(jnp.int64)
-    if len(selected_experts.shape) == 2:
-        selected_experts = selected_experts[:, :, jnp.newaxis]
-    expert_mask = jnp.max(jax.nn.one_hot(
-        selected_experts, num_experts), axis=-2)
-    tokens_per_group_and_expert = jnp.mean(
-        expert_mask.astype(jnp.float32), axis=-2)
-    router_prob_per_group_and_expert = jnp.mean(routing_weights, axis=-1)
-    return jnp.mean(tokens_per_group_and_expert * jnp.expand_dims(router_prob_per_group_and_expert, axis=-1)) * (
-            num_experts ** 2)
 
 
 class MixtralRMSNorm(nn.Module):
@@ -136,7 +117,7 @@ class FlaxMixtralAttention(BaseJAXAttentionModule):
         self.o_proj = dense(self.hidden_size)
         self.rotary = FlaxMixtralRotaryEmbedding(self.dtype)
         self.attention_performer = EasyAttention(
-            attn_type="normal",
+            use_sharding_constraint=self.config.use_sharding_constraint,
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,
             block_q=self.config.block_q,
@@ -152,7 +133,7 @@ class FlaxMixtralAttention(BaseJAXAttentionModule):
             attention_dropout=self.config.attention_dropout,
             head_dims=self.head_dim,
             attention_partition_spec=self.config.attention_partition_spec,
-            use_shard_map=self.config.use_shard_map,
+            shard_attention_computation=self.config.shard_attention_computation,
             precision=self.precision,
             force_float32_tpu=True,
             attn_mechanism=self.config.attn_mechanism,
@@ -160,6 +141,9 @@ class FlaxMixtralAttention(BaseJAXAttentionModule):
             bias_partition_spec=self.config.bias_partition_spec,
             key_partition_spec=self.config.key_partition_spec,
             query_partition_spec=self.config.query_partition_spec,
+            generation_query_partition_spec=self.config.generation_query_partition_spec,
+            generation_bias_partition_spec=self.config.generation_bias_partition_spec,
+            generation_attention_partition_spec=self.config.generation_attention_partition_spec,
             value_partition_spec=self.config.value_partition_spec,
             scan_ring_attention=self.config.scan_ring_attention,
             mesh=self.config.jax_mesh(),
@@ -195,6 +179,7 @@ class FlaxMixtralAttention(BaseJAXAttentionModule):
             attention_mask: chex.Array,
             causal_mask: chex.Array,
             position_ids: chex.Array,
+            segment_ids: Optional[chex.Array] = None,
             deterministic: bool = True,
             init_cache: bool = False,
             output_attentions: bool = True
@@ -218,28 +203,20 @@ class FlaxMixtralAttention(BaseJAXAttentionModule):
 
         """
         batch_size, sequence_length = hidden_states.shape[:2]
-        query_state, key_state, value_state = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(
+        query_states, key_states, value_states = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(
             hidden_states)
 
-        if self.config.use_pjit_attention_force:
-            query_state = with_sharding_constraint(
-                query_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
-            key_state = with_sharding_constraint(
-                key_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
-            value_state = with_sharding_constraint(
-                value_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
-
-        query_state = query_state.reshape(
+        query_states = query_states.reshape(
             batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
-        key_state = key_state.reshape(
+        key_states = key_states.reshape(
             batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
-        value_state = value_state.reshape(
+        value_states = value_states.reshape(
             batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
 
-        query_state, key_state, value_state = self.apply_rotary(
-            query=query_state,
-            key=key_state,
-            value=value_state,
+        query_states, key_states, value_states = self.apply_rotary(
+            query=query_states,
+            key=key_states,
+            value=value_states,
             position_ids=position_ids,
             freq_cis=freq_cis,
             batch_size=batch_size,
@@ -252,11 +229,11 @@ class FlaxMixtralAttention(BaseJAXAttentionModule):
             f"NH : {self.config.num_attention_heads} KVH : {self.config.num_attention_heads}"
         )
 
-        assert query_state.shape[-2] == self.config.num_attention_heads, assert_msg
-        assert key_state.shape[-2] == self.config.num_attention_heads, assert_msg
-        assert value_state.shape[-2] == self.config.num_attention_heads, assert_msg
+        assert query_states.shape[-2] == self.config.num_attention_heads, assert_msg
+        assert key_states.shape[-2] == self.config.num_attention_heads, assert_msg
+        assert value_states.shape[-2] == self.config.num_attention_heads, assert_msg
 
-        query_length, key_length = query_state.shape[1], key_state.shape[1]
+        query_length, key_length = query_states.shape[1], key_states.shape[1]
 
         if self.has_variable("cache", "cached_key"):
             mask_shift = self.variables["cache"]["cache_index"]
@@ -283,13 +260,22 @@ class FlaxMixtralAttention(BaseJAXAttentionModule):
             dropout_rng = self.make_rng("dropout")
 
         if self.has_variable("cache", "cached_key") or init_cache:
-            key_state, value_state, attention_mask = self._concatenate_to_cache(
-                key_state,
-                value_state,
-                query_state,
+            key_states, value_states, attention_mask = self._concatenate_to_cache(
+                key_states,
+                value_states,
+                query_states,
                 attention_mask
             )
-
+        # if self.config.use_sharding_constraint:
+        #     query_states = with_sharding_constraint(
+        #         query_states, PartitionSpec(("dp", "fsdp"), "sp" if query_states.shape[1] != 1 else None, "tp", None)
+        #     )
+        #     key_states = with_sharding_constraint(
+        #         key_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
+        #     )
+        #     value_states = with_sharding_constraint(
+        #         value_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
+        #     )
         attention_bias = lax.select(
             attention_mask > 0,
             jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
@@ -297,20 +283,21 @@ class FlaxMixtralAttention(BaseJAXAttentionModule):
                 self.dtype).min).astype(self.dtype),
         )
 
-        query_length, key_length = query_state.shape[1], key_state.shape[1]
+        query_length, key_length = query_states.shape[1], key_states.shape[1]
 
         attentions = self.attention_performer.__call__(
-            query_states=query_state,
-            key_states=key_state,
-            value_states=value_state,
+            query_states=query_states,
+            key_states=key_states,
+            value_states=value_states,
             bias=attention_bias,
+            attention_mask=attention_mask,
             causal=False,
-            use_pjit_attention_force=self.config.use_pjit_attention_force,
             dropout_rng=dropout_rng,
             deterministic=deterministic,
             query_sequence_length=query_length,
             key_value_sequence_length=key_length,
             uses_cache=self.has_variable("cache", "cached_key") or init_cache,
+            segment_ids=segment_ids
         )
 
         attn_output = self._merge_heads(attentions.attention_outputs)
@@ -366,47 +353,30 @@ class FlaxMixtralBlocKSparesTop2MLPCollection(nn.Module):
 
     def __call__(
             self,
-            expert_mask: chex.Array,
+            selected_experts: chex.Array,
             hidden_states: chex.Array,
             routing_weights: chex.Array,
             batch_size: int,
             sequence_length: int,
             hidden_dim: int
     ) -> chex.Array:
-        assert hidden_states.ndim == 2
-        final_hidden_states = jnp.zeros(
-            ((batch_size * sequence_length) + 1, hidden_dim), dtype=hidden_states.dtype
-        )
+        final_hidden_state = jnp.zeros_like(hidden_states)
 
-        for expert_idx in range(self.config.num_local_experts):
-            selected_mask = expert_mask[expert_idx]
-            idx, top_x = jnp.nonzero(selected_mask, size=sequence_length, fill_value=-1)
+        for index in range(self.config.num_local_experts):
+            expert_layer_output = block_wise_ffn(
+                self.layers[index],
+                hidden_states,
+                self.config.scan_mlp_chunk_size,
+                False
+            ) if self.config.use_scan_mlp else self.layers[index](hidden_states)
+            expert_layer_output_exp = jnp.sum(
+                jnp.multiply(
+                    selected_experts == index, routing_weights
+                ), axis=-1
+            )[:, :, None] * expert_layer_output
+            final_hidden_state += expert_layer_output_exp
 
-            def true_fn(mdl, input_final_hidden_states):
-                expert_layer_output = mdl.layers[expert_idx](
-                    hidden_states[top_x]
-                )
-                current_hidden_states = expert_layer_output * routing_weights[top_x, idx, None]
-
-                input_final_hidden_states = input_final_hidden_states.at[top_x].set(
-                    current_hidden_states + input_final_hidden_states[top_x]
-                )
-                return input_final_hidden_states
-
-            def false_fn(mdl, input_final_hidden_states):
-                return input_final_hidden_states
-
-            final_hidden_states = true_fn(self, final_hidden_states)
-            # final_hidden_states = nn.cond(
-            #     # jnp.max(idx) == -1,
-            #     True,
-            #     true_fn,
-            #     false_fn,
-            #     self,
-            #     final_hidden_states
-            # )
-        final_hidden_states = final_hidden_states[:-1]
-        return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+        return final_hidden_state
 
 
 class FlaxMixtralSparseMoeBlock(nn.Module):
@@ -450,36 +420,22 @@ class FlaxMixtralSparseMoeBlock(nn.Module):
             e: bool = False  # Ignored
     ) -> Tuple[chex.Array, chex.Array]:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.reshape(-1, hidden_dim)
 
-        router_logits = self.gate(hidden_states).astype(
+        router_logits = self.gate(hidden_states).astype(  # no reshaping is needed
             jnp.promote_types(self.dtype, jnp.float32)
         )
-
-        routing_weights = jax.nn.softmax(
-            router_logits.astype(
-                jnp.promote_types(self.dtype, jnp.float32)
-            ), axis=1
-        )
         routing_weights, selected_experts = jax.lax.top_k(
-            routing_weights,
+            router_logits,
             k=self.config.num_experts_per_tok
         )
-        routing_weights /= jnp.sum(
-            routing_weights,
-            axis=-1,
-            keepdims=True
+        routing_weights = jax.nn.softmax(
+            routing_weights.astype(
+                jnp.promote_types(self.dtype, jnp.float32)
+            ), axis=-1
         )
-        routing_weights = routing_weights.astype(
-            hidden_states.dtype
-        )
-        expert_mask = jax.nn.one_hot(
-            selected_experts,
-            num_classes=self.config.num_local_experts
-        ).transpose(2, 1, 0)
 
         return self.experts(
-            expert_mask=expert_mask,
+            selected_experts=selected_experts,
             batch_size=batch_size,
             sequence_length=sequence_length,
             hidden_dim=hidden_dim,
@@ -512,7 +468,7 @@ class FlaxMixtralDecoderLayer(nn.Module):
                 attn_block,
                 policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
                 static_argnums=(
-                    3, 5, 6, 7
+                    1, 3, 4, 6, 7, 8, 9
                 )
             )
             mlp_block = re_mat(
@@ -555,6 +511,7 @@ class FlaxMixtralDecoderLayer(nn.Module):
             attention_mask: chex.Array,
             causal_mask: chex.Array,
             position_ids: chex.Array,
+            segment_ids: Optional[chex.Array] = None,
             deterministic: bool = True,
             init_cache: bool = False,
             output_attentions: bool = True,
@@ -586,6 +543,7 @@ class FlaxMixtralDecoderLayer(nn.Module):
         # attention_mask: chex.Array
         # causal_mask: chex.Array
         # position_ids: chex.Array
+        # segment_ids: Optional[chex.Array] = None
         # deterministic: bool = True
         # init_cache: bool = False
         # output_attentions: bool = True
@@ -596,6 +554,7 @@ class FlaxMixtralDecoderLayer(nn.Module):
             attention_mask,
             causal_mask,
             position_ids,
+            segment_ids,
             deterministic,
             init_cache,
             output_attentions
@@ -851,7 +810,6 @@ class MixtralPreTrainedModel(EasyDelFlaxPretrainedModel):
 
         """
 
-        # TODO: Here needs to be fixed
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -957,10 +915,8 @@ class FlaxMixtralModule(nn.Module):
                 rope_type=scaling_type
             )
         self.freq_cis = precompute_freq_cis(
-            max_position_embeddings=getattr(
-                self.config,
-                "freq_max_position_embeddings",
-                self.config.max_position_embeddings
+            max_position_embeddings=(
+                getattr(self.config, "freq_max_position_embeddings", self.config.max_position_embeddings)
             ),
             dim=self.config.hidden_size // self.config.num_attention_heads,
             base=self.config.rope_theta,
@@ -1101,16 +1057,22 @@ class FlaxMixtralForCausalLMModule(nn.Module):
             return_dict=True,
         )
         logits = self.lm_head(outputs.last_hidden_state)
+        batch_size, seq_length, hd = logits.shape
         aux_loss = None
         if output_router_logits and outputs.router_logits is not None:
-            aux_loss = jax_load_balancing_loss_func(
-                outputs.router_logits, self.num_experts, self.num_experts_per_tok
+            aux_loss = auxiliary_load_balancing_loss_func(
+                gate_logits=tuple([logit.reshape(batch_size * seq_length, -1) for logit in outputs.router_logits]),
+                num_experts=self.config.num_local_experts,
+                top_k=self.config.num_experts_per_tok,
+                attention_mask=attention_mask
             )
+            aux_loss = aux_loss * self.config.router_aux_loss_coef
 
         if not return_dict:
             outputs = (logits,) + tuple(
                 v
                 for v in [
+                    aux_loss,
                     outputs.hidden_states,
                     outputs.attentions,
                     outputs.router_logits

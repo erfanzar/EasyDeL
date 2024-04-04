@@ -138,7 +138,7 @@ class FlaxPhiAttention(BaseJAXAttentionModule):
             )
 
         self.attention_performer = EasyAttention(
-            attn_type="normal",
+            use_sharding_constraint=self.config.use_sharding_constraint,
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,
             block_q=self.config.block_q,
@@ -154,7 +154,7 @@ class FlaxPhiAttention(BaseJAXAttentionModule):
             attention_dropout=self.config.attention_dropout,
             head_dims=self.head_dim,
             attention_partition_spec=self.config.attention_partition_spec,
-            use_shard_map=self.config.use_shard_map,
+            shard_attention_computation=self.config.shard_attention_computation,
             precision=self.precision,
             force_float32_tpu=True,
             attn_mechanism=self.config.attn_mechanism,
@@ -162,6 +162,9 @@ class FlaxPhiAttention(BaseJAXAttentionModule):
             bias_partition_spec=self.config.bias_partition_spec,
             key_partition_spec=self.config.key_partition_spec,
             query_partition_spec=self.config.query_partition_spec,
+            generation_query_partition_spec=self.config.generation_query_partition_spec,
+            generation_bias_partition_spec=self.config.generation_bias_partition_spec,
+            generation_attention_partition_spec=self.config.generation_attention_partition_spec,
             value_partition_spec=self.config.value_partition_spec,
             scan_ring_attention=self.config.scan_ring_attention,
             mesh=self.config.jax_mesh(),
@@ -254,6 +257,7 @@ class FlaxPhiAttention(BaseJAXAttentionModule):
             attention_mask: Optional[chex.Array],
             position_ids: Optional[chex.Array],
             causal_mask: Optional[chex.Array],
+            segment_ids: Optional[chex.Array] = None,
             deterministic: bool = True,
             output_attentions: bool = False,
             init_cache: bool = False,
@@ -274,17 +278,6 @@ class FlaxPhiAttention(BaseJAXAttentionModule):
         if self.qk_layernorm:
             query_states = self.q_layernorm(query_states)
             key_states = self.k_layernorm(key_states)
-
-        if self.config.use_pjit_attention_force:
-            query_states = with_sharding_constraint(
-                query_states, PartitionSpec(("dp", "fsdp"), "sp", "tp")
-            )
-            key_states = with_sharding_constraint(
-                key_states, PartitionSpec(("dp", "fsdp"), "sp", "tp")
-            )
-            value_states = with_sharding_constraint(
-                value_states, PartitionSpec(("dp", "fsdp"), "sp", "tp")
-            )
 
         query_states = query_states.reshape(
             batch_size, sequence_length, self.config.num_attention_heads, self.head_dim
@@ -349,6 +342,16 @@ class FlaxPhiAttention(BaseJAXAttentionModule):
                 query_states,
                 attention_mask
             )
+        # if self.config.use_sharding_constraint:
+        #     query_states = with_sharding_constraint(
+        #         query_states, PartitionSpec(("dp", "fsdp"), "sp" if query_states.shape[1] != 1 else None, "tp", None)
+        #     )
+        #     key_states = with_sharding_constraint(
+        #         key_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
+        #     )
+        #     value_states = with_sharding_constraint(
+        #         value_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
+        #     )
         attention_bias = lax.select(
             attention_mask > 0,
             jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
@@ -363,13 +366,14 @@ class FlaxPhiAttention(BaseJAXAttentionModule):
             key_states=key_states,
             value_states=value_states,
             bias=attention_bias,
+            attention_mask=attention_mask,
             causal=True,
-            use_pjit_attention_force=self.config.use_pjit_attention_force,
             dropout_rng=dropout_rng,
             deterministic=deterministic,
             query_sequence_length=query_length,
             key_value_sequence_length=key_length,
             uses_cache=self.has_variable("cache", "cached_key") or init_cache,
+            segment_ids=segment_ids
         )
         attentions.attention_outputs = attentions.attention_outputs
         attn_output = self._merge_heads(attentions.attention_outputs)
@@ -415,6 +419,7 @@ class FlaxPhiDecoderLayer(nn.Module):
             attention_mask: Optional[chex.Array],
             position_ids: Optional[chex.Array],
             causal_mask: Optional[chex.Array],
+            segment_ids: Optional[chex.Array] = None,
             deterministic: bool = True,
             output_attentions: bool = False,
             init_cache: bool = False,
@@ -431,6 +436,7 @@ class FlaxPhiDecoderLayer(nn.Module):
             freq_cis=freq_cis,
             causal_mask=causal_mask,
             init_cache=init_cache,
+            segment_ids=segment_ids
         )
         attn_outputs, self_attn_weights = (attn_out[0], attn_out[1]) if len(attn_out) == 2 else (attn_out[0], None)
 
@@ -474,6 +480,7 @@ class FlaxPhiDecoderLayerCollection(nn.Module):
             # attention_mask: Optional[chex.Array],
             # position_ids: Optional[chex.Array],
             # causal_mask: Optional[chex.Array],
+            # segment_ids: Optional[chex.Array] = None,
             # deterministic: bool = True,
             # output_attentions: bool = False,
             # init_cache: bool = False,
@@ -482,7 +489,7 @@ class FlaxPhiDecoderLayerCollection(nn.Module):
                 block,
                 policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
                 static_argnums=(
-                    4, 5, 6, 7
+                    1, 3, 4, 6, 7, 8
                 )
             )
         self.layers = [
@@ -505,6 +512,7 @@ class FlaxPhiDecoderLayerCollection(nn.Module):
             attention_mask: Optional[chex.Array],
             position_ids: Optional[chex.Array],
             causal_mask: Optional[chex.Array],
+            segment_ids: Optional[chex.Array] = None,
             deterministic: bool = True,
             output_attentions: bool = False,
             output_hidden_states: bool = False,
@@ -522,6 +530,7 @@ class FlaxPhiDecoderLayerCollection(nn.Module):
             # attention_mask: Optional[chex.Array],
             # position_ids: Optional[chex.Array],
             # causal_mask: Optional[chex.Array],
+            # segment_ids: Optional[chex.Array] = None,
             # deterministic: bool = True,
             # output_attentions: bool = False,
             # init_cache: bool = False,
@@ -531,6 +540,7 @@ class FlaxPhiDecoderLayerCollection(nn.Module):
                 attention_mask,
                 position_ids,
                 causal_mask,
+                segment_ids,
                 deterministic,
                 output_attentions,
                 init_cache,
@@ -598,10 +608,8 @@ class FlaxPhiModule(nn.Module):
                     rope_type=scaling_type
                 )
         self.freq_cis = precompute_freq_cis(
-            max_position_embeddings=getattr(
-                self.config,
-                "freq_max_position_embeddings",
-                self.config.max_position_embeddings
+            max_position_embeddings=(
+                getattr(self.config, "freq_max_position_embeddings", self.config.max_position_embeddings)
             ),
             dim=int(config.partial_rotary_factor * (config.hidden_size // config.num_attention_heads)),
             # dim=config.hidden_size // config.num_attention_heads,

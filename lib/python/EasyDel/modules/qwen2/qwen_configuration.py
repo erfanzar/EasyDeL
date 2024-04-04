@@ -31,7 +31,6 @@ class Qwen2Config(EasyDelPretrainedConfig):
             gradient_checkpointing: str = "nothing_saveable",
             fcm_min_ratio: float = 0.0,
             fcm_max_ratio: float = 0.0,
-            use_pjit_attention_force: bool = False,
             use_scan_mlp: bool = False,
             scan_mlp_chunk_size: int = 1024,
             number_rep_kv: int = 1,
@@ -70,12 +69,14 @@ class Qwen2Config(EasyDelPretrainedConfig):
         self.gradient_checkpointing = gradient_checkpointing
         self.fcm_min_ratio = fcm_min_ratio
         self.fcm_max_ratio = fcm_max_ratio
-        self.use_pjit_attention_force = use_pjit_attention_force
         self.use_scan_mlp = use_scan_mlp
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.bits = bits
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,
+            use_scan_mlp=use_scan_mlp,
+            scan_mlp_chunk_size=scan_mlp_chunk_size,
+            bits=bits,
             **kwargs,
         )
 
@@ -111,8 +112,8 @@ class Qwen2Config(EasyDelPretrainedConfig):
 
             ("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
 
-            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+            ("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
 
             ("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"))),
             ("mlp/down_proj/kernel", PartitionSpec(("fsdp", "sp"))),
@@ -135,7 +136,6 @@ class Qwen2Config(EasyDelPretrainedConfig):
             gradient_checkpointing: str = "nothing_saveable",
             fcm_min_ratio: float = 0.0,
             fcm_max_ratio: float = 0.0,
-            use_pjit_attention_force: bool = False,
             use_scan_mlp: bool = False,
             scan_mlp_chunk_size: int = 1024,
             number_rep_kv: int = 1,
@@ -157,13 +157,11 @@ class Qwen2Config(EasyDelPretrainedConfig):
         :param gradient_checkpointing: str: Control the amount of memory used by jax
         :param fcm_min_ratio: float: Control the minimum ratio of the number of chunks to be used in flash-based computation
         :param fcm_max_ratio: float: Set the maximum ratio of the number of input tokens to output tokens
-        :param use_pjit_attention_force: bool: Determine if the attention force is used
         :param use_scan_mlp: bool: Determine whether to use the scan_mlp function or not
         :param scan_mlp_chunk_size: int: Set the chunk size for scan_mlp
         :param number_rep_kv: int: Determine how many times the key and value vectors are repeated
         :param bits: Optional[int]: Determine the number of bits used in the quantization
         :param rope_theta: float : rope_theta for compute rope
-        :param attention_bias: bool : whenever to use attention bias or no
         :param hidden_act: str : hidden_act for mlp
         :param scan_layers: bool: Determine whether to use scan layers or not
         :return: The following:
@@ -181,7 +179,6 @@ class Qwen2Config(EasyDelPretrainedConfig):
         self.gradient_checkpointing = gradient_checkpointing
         self.fcm_min_ratio = fcm_min_ratio
         self.fcm_max_ratio = fcm_max_ratio
-        self.use_pjit_attention_force = use_pjit_attention_force
 
         self.use_scan_mlp = use_scan_mlp
         self.scan_mlp_chunk_size = scan_mlp_chunk_size

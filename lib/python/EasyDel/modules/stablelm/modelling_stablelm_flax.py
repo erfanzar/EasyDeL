@@ -183,7 +183,7 @@ class FlaxStableLmAttention(BaseJAXAttentionModule):
 
         self.rotary_emb_dim = int(self.config.partial_rotary_factor * self.head_dim)
         self.attention_performer = EasyAttention(
-            attn_type="normal",
+            use_sharding_constraint=self.config.use_sharding_constraint,
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,
             block_q=self.config.block_q,
@@ -199,7 +199,7 @@ class FlaxStableLmAttention(BaseJAXAttentionModule):
             attention_dropout=self.config.attention_dropout,
             head_dims=self.head_dim,
             attention_partition_spec=self.config.attention_partition_spec,
-            use_shard_map=self.config.use_shard_map,
+            shard_attention_computation=self.config.shard_attention_computation,
             precision=self.precision,
             force_float32_tpu=True,
             attn_mechanism=self.config.attn_mechanism,
@@ -207,6 +207,9 @@ class FlaxStableLmAttention(BaseJAXAttentionModule):
             bias_partition_spec=self.config.bias_partition_spec,
             key_partition_spec=self.config.key_partition_spec,
             query_partition_spec=self.config.query_partition_spec,
+            generation_query_partition_spec=self.config.generation_query_partition_spec,
+            generation_bias_partition_spec=self.config.generation_bias_partition_spec,
+            generation_attention_partition_spec=self.config.generation_attention_partition_spec,
             value_partition_spec=self.config.value_partition_spec,
             scan_ring_attention=self.config.scan_ring_attention,
             mesh=self.config.jax_mesh(),
@@ -298,6 +301,7 @@ class FlaxStableLmAttention(BaseJAXAttentionModule):
             attention_mask: chex.Array,
             position_ids: chex.Array,
             causal_mask: chex.Array,
+            segment_ids: Optional[chex.Array] = None,
             deterministic: bool = True,
             init_cache: bool = False,
             output_attentions: bool = False,
@@ -324,28 +328,20 @@ class FlaxStableLmAttention(BaseJAXAttentionModule):
 
         """
         batch_size, sequence_length = hidden_states.shape[:2]
-        query_state, key_state, value_state = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(
+        query_states, key_states, value_states = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(
             hidden_states)
 
-        if self.config.use_pjit_attention_force:
-            query_state = with_sharding_constraint(
-                query_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
-            key_state = with_sharding_constraint(
-                key_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
-            value_state = with_sharding_constraint(
-                value_state, PartitionSpec(("dp", "fsdp"), "sp", "tp"))
-
-        query_state = query_state.reshape(
+        query_states = query_states.reshape(
             batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
-        key_state = key_state.reshape(
+        key_states = key_states.reshape(
             batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
-        value_state = value_state.reshape(
+        value_states = value_states.reshape(
             batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
 
-        query_state, key_state, value_state = self.apply_rotary(
-            query=query_state,
-            key=key_state,
-            value=value_state,
+        query_states, key_states, value_states = self.apply_rotary(
+            query=query_states,
+            key=key_states,
+            value=value_states,
             position_ids=position_ids,
             freq_cis=freq_cis,
             batch_size=batch_size,
@@ -358,11 +354,11 @@ class FlaxStableLmAttention(BaseJAXAttentionModule):
             f"NH : {self.config.num_attention_heads} KVH : {self.config.num_attention_heads}"
         )
 
-        assert query_state.shape[-2] == self.config.num_attention_heads, assert_msg
-        assert key_state.shape[-2] == self.config.num_attention_heads, assert_msg
-        assert value_state.shape[-2] == self.config.num_attention_heads, assert_msg
+        assert query_states.shape[-2] == self.config.num_attention_heads, assert_msg
+        assert key_states.shape[-2] == self.config.num_attention_heads, assert_msg
+        assert value_states.shape[-2] == self.config.num_attention_heads, assert_msg
 
-        query_length, key_length = query_state.shape[1], key_state.shape[1]
+        query_length, key_length = query_states.shape[1], key_states.shape[1]
 
         if self.has_variable("cache", "cached_key"):
             mask_shift = self.variables["cache"]["cache_index"]
@@ -390,13 +386,22 @@ class FlaxStableLmAttention(BaseJAXAttentionModule):
             dropout_rng = self.make_rng("dropout")
 
         if self.has_variable("cache", "cached_key") or init_cache:
-            key_state, value_state, attention_mask = self._concatenate_to_cache(
-                key_state,
-                value_state,
-                query_state,
+            key_states, value_states, attention_mask = self._concatenate_to_cache(
+                key_states,
+                value_states,
+                query_states,
                 attention_mask
             )
-
+        # if self.config.use_sharding_constraint:
+        #     query_states = with_sharding_constraint(
+        #         query_states, PartitionSpec(("dp", "fsdp"), "sp" if query_states.shape[1] != 1 else None, "tp", None)
+        #     )
+        #     key_states = with_sharding_constraint(
+        #         key_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
+        #     )
+        #     value_states = with_sharding_constraint(
+        #         value_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
+        #     )
         use_qkv_bias = lax.select(
             attention_mask > 0,
             jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
@@ -404,20 +409,21 @@ class FlaxStableLmAttention(BaseJAXAttentionModule):
                 self.dtype).min).astype(self.dtype),
         )
 
-        query_length, key_length = query_state.shape[1], key_state.shape[1]
+        query_length, key_length = query_states.shape[1], key_states.shape[1]
 
         attentions = self.attention_performer.__call__(
-            query_states=query_state,
-            key_states=key_state,
-            value_states=value_state,
+            query_states=query_states,
+            key_states=key_states,
+            value_states=value_states,
             bias=use_qkv_bias,
+            attention_mask=attention_mask,
             causal=False,
-            use_pjit_attention_force=self.config.use_pjit_attention_force,
             dropout_rng=dropout_rng,
             deterministic=deterministic,
             query_sequence_length=query_length,
             key_value_sequence_length=key_length,
             uses_cache=self.has_variable("cache", "cached_key") or init_cache,
+            segment_ids=segment_ids
         )
         attentions.attention_outputs = attentions.attention_outputs
 
@@ -454,7 +460,7 @@ class FlaxStableLmDecoderLayer(nn.Module):
             # fcm_mask=None,
             attn_block = flax.linen.partitioning.remat(
                 attn_block,
-                static_argnums=(2, 5, 6, 7, 8),
+                static_argnums=(1, 3, 4, 6, 7, 8),
                 policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing)
             )
         self.self_attn = attn_block(
@@ -488,6 +494,7 @@ class FlaxStableLmDecoderLayer(nn.Module):
             attention_mask: Optional[chex.Array],
             position_ids: Optional[chex.Array],
             causal_mask: Optional[chex.Array],
+            segment_ids: Optional[chex.Array] = None,
             deterministic: bool = True,
             output_attentions: bool = False,
             init_cache: bool = False,
@@ -499,6 +506,7 @@ class FlaxStableLmDecoderLayer(nn.Module):
             attention_mask,
             position_ids,
             causal_mask,
+            segment_ids,
             deterministic,
             init_cache,
             output_attentions,
@@ -585,6 +593,7 @@ class FlaxStableLmDecoderLayerCollection(nn.Module):
                 attention_mask,
                 position_ids,
                 causal_mask,
+                None,
                 deterministic,
                 output_attentions,
                 init_cache,
@@ -651,10 +660,8 @@ class FlaxStableLmModule(nn.Module):
                     rope_type=scaling_type
                 )
         self.freq_cis = precompute_freq_cis(
-            max_position_embeddings=getattr(
-                self.config,
-                "freq_max_position_embeddings",
-                self.config.max_position_embeddings
+            max_position_embeddings=(
+                getattr(self.config, "freq_max_position_embeddings", self.config.max_position_embeddings)
             ),
             dim=int(config.partial_rotary_factor * (config.hidden_size // config.num_attention_heads)),
             # dim=config.hidden_size // config.num_attention_heads,

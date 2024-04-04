@@ -2,7 +2,9 @@ from .llama import (
     FlaxLlamaModel as FlaxLlamaModel,
     FlaxLlamaForCausalLM as FlaxLlamaForCausalLM,
     FlaxLlamaForSequenceClassification as FlaxLlamaForSequenceClassification,
-    LlamaConfig as LlamaConfig
+    LlamaConfig as LlamaConfig,
+    FlaxVisionLlamaForCausalLM as FlaxVisionLlamaForCausalLM,
+    VisionLlamaConfig as VisionLlamaConfig
 )
 from .gpt_j import (
     FlaxGPTJModel as FlaxGPTJModel,
@@ -53,6 +55,8 @@ from .mistral import (
     FlaxMistralModel as FlaxMistralModel,
     FlaxMistralForCausalLM as FlaxMistralForCausalLM,
     MistralConfig as MistralConfig,
+    VisionMistralConfig as VisionMistralConfig,
+    FlaxVisionMistralForCausalLM as FlaxVisionMistralForCausalLM
 )
 from .mixtral import (
     FlaxMixtralModel as FlaxMixtralModel,
@@ -90,6 +94,24 @@ from .stablelm import (
     FlaxStableLmModel as FlaxStableLmModel
 )
 
+from .grok_1 import (
+    Grok1Config as Grok1Config,
+    FlaxGrok1Model as FlaxGrok1Model,
+    FlaxGrok1ForCausalLM as FlaxGrok1ForCausalLM
+)
+
+from .qwen2_moe import (
+    Qwen2MoeConfig as Qwen2MoeConfig,
+    FlaxQwen2MoeModel as FlaxQwen2MoeModel,
+    FlaxQwen2MoeForCausalLM as FlaxQwen2MoeForCausalLM
+)
+from .whisper import (
+    FlaxWhisperForConditionalGeneration as FlaxWhisperForConditionalGeneration,
+    FlaxWhisperForAudioClassification as FlaxWhisperForAudioClassification,
+    FlaxWhisperTimeStampLogitsProcessor as FlaxWhisperTimeStampLogitsProcessor,
+    WhisperConfig as WhisperConfig
+)
+
 from .auto_easydel_model import (
     AutoEasyDelModelForCausalLM as AutoEasyDelModelForCausalLM,
     AutoEasyDelConfig as AutoEasyDelConfig,
@@ -98,14 +120,46 @@ from .auto_easydel_model import (
 
 __all__ = (
     "FlaxLlamaModel", "FlaxLlamaForCausalLM", "FlaxLlamaForSequenceClassification", "LlamaConfig",
-    "FlaxGPTJModel", "FlaxGPTJForCausalLM", "GPTJConfig", "FlaxGPT2Model", "FlaxGPT2LMHeadModel", "GPT2Config",
-    "FlaxLTModel", "FlaxLTForCausalLM", "FlaxLTConfig", "FlaxMptModel", "FlaxMptForCausalLM", "MptConfig",
-    "FlaxFalconModel", "FlaxFalconForCausalLM", "FalconConfig", "FlaxGPTNeoXModel", "FlaxGPTNeoXForCausalLM",
-    "GPTNeoXConfig", "FlaxPalmModel", "FlaxPalmForCausalLM", "PalmConfig", "FlaxT5Model",
-    "FlaxT5ForConditionalGeneration", "T5Config", "FlaxOPTModel", "FlaxOPTForCausalLM", "OPTConfig", "FlaxMistralModel",
-    "FlaxMistralForCausalLM", "MistralConfig", "FlaxMixtralModel", "FlaxMixtralForCausalLM", "MixtralConfig",
-    "FlaxPhiForCausalLM", "PhiConfig", "FlaxPhiModel", "FlaxQwen1Model", "FlaxQwen1ForCausalLM",
-    "FlaxQwen1ForSequenceClassification", "Qwen1Config", "FlaxQwen2Model", "FlaxQwen2ForCausalLM",
-    "FlaxQwen2ForSequenceClassification", "Qwen2Config", "AutoEasyDelModelForCausalLM", "AutoEasyDelConfig",
-    "AutoShardAndGatherFunctions"
+    "VisionLlamaConfig", "FlaxVisionLlamaForCausalLM",
+
+    "FlaxMistralModel", "FlaxMistralForCausalLM", "MistralConfig",
+    "VisionMistralConfig", "FlaxVisionMistralForCausalLM",
+
+    "FlaxGPTJModel", "FlaxGPTJForCausalLM", "GPTJConfig",
+
+    "FlaxGPT2Model", "FlaxGPT2LMHeadModel", "GPT2Config",
+
+    "FlaxLTModel", "FlaxLTForCausalLM", "FlaxLTConfig",
+
+    "FlaxMptModel", "FlaxMptForCausalLM", "MptConfig",
+
+    "FlaxFalconModel", "FlaxFalconForCausalLM", "FalconConfig",
+
+    "FlaxGPTNeoXModel", "FlaxGPTNeoXForCausalLM", "GPTNeoXConfig",
+
+    "FlaxPalmModel", "FlaxPalmForCausalLM", "PalmConfig",
+
+    "FlaxT5Model", "FlaxT5ForConditionalGeneration", "T5Config",
+
+    "FlaxOPTModel", "FlaxOPTForCausalLM", "OPTConfig",
+
+    "FlaxMixtralModel", "FlaxMixtralForCausalLM", "MixtralConfig",
+
+    "FlaxPhiForCausalLM", "PhiConfig", "FlaxPhiModel",
+
+    "FlaxQwen1Model", "FlaxQwen1ForCausalLM", "FlaxQwen1ForSequenceClassification", "Qwen1Config",
+
+    "FlaxQwen2Model", "FlaxQwen2ForCausalLM", "FlaxQwen2ForSequenceClassification", "Qwen2Config",
+
+    "Grok1Config", "FlaxGrok1Model", "FlaxGrok1ForCausalLM",
+
+    "Qwen2MoeConfig", "FlaxQwen2MoeModel", "FlaxQwen2MoeForCausalLM",
+
+    "WhisperConfig", "FlaxWhisperTimeStampLogitsProcessor",
+    "FlaxWhisperForAudioClassification", "FlaxWhisperForConditionalGeneration",
+
+    "AutoEasyDelModelForCausalLM",
+    "AutoEasyDelConfig",
+    "AutoShardAndGatherFunctions",
+
 )

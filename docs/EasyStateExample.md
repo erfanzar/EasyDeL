@@ -38,7 +38,7 @@ state = EasyDelState.from_pretrained(
     value_partition_spec=jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
     bias_partition_spec=jax.sharding.PartitionSpec(("dp", "fsdp"), None, None, None),
     attention_partition_spec=jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-    use_shard_map=False,
+    shard_attention_computation=False,
     input_shape=(1, 1),
     backend=None,
     init_optimizer_state=False,
@@ -50,8 +50,6 @@ state = EasyDelState.from_pretrained(
 config = AutoEasyDelConfig.from_pretrained(
     huggingface_model_repo_id
 )
-
-config.use_pjit_attention_force = False
 
 tokenizer = AutoTokenizer.from_pretrained(
     huggingface_model_repo_id,

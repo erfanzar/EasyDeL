@@ -5,16 +5,17 @@ learning models. It focuses primarily on Jax/Flax and aims to provide convenient
 Flax/Jax Models on TPU/GPU for both Serving and Training purposes. Additionally, EasyDeL will support mojo and will be
 rewritten for mojo as well.
 
+
 Some of the key features provided by EasyDeL include:
 
 - Serving and API Engines for Using and serving LLMs in JAX as efficiently as possible.
 - Support for 8, 6, and 4 BIT inference and training in JAX
 - A wide range of models in Jax is supported which have never been implemented before such as Falcon, Qwen2, Phi2,
-  Mixtral, and MPT ...
+  Mixtral, Qwen2Moe,and MPT ...
 - Integration of flashAttention in JAX for GPUs and TPUs
 - Automatic serving of LLMs with mid and high-level APIs in both JAX and PyTorch
 - LLM Trainer and fine-tuner in JAX
-- Video CLM Trainer and Fine-tunerFalcon, Qwen2, Phi2, Mixtral, and MPT ...
+- Video CLM Trainer and Fine-tuner for Models such Falcon, Qwen2, Phi2, MPT, Mixtral, Grok-1, and Qwen2Moe ...
 - RLHF (Reinforcement Learning from Human Feedback) in Jax (Beta Stage)
 - DPOTrainer(Supported) and SFTTrainer(Developing Stage)
 - Various other features to enhance the training process and optimize performance.
@@ -40,12 +41,19 @@ Some of the key features provided by EasyDeL include:
 > [!IMPORTANT]
 > Documents and Examples are ready at [Here](https://erfanzar.github.io/EasyDeL)
 > Please have that in mind that EasyDel is in the loop of fast-development
-> so we might have API changes
+> so we might have API changes.
+
+### Hands on Code Kaggle Examples
+
+1. [script](https://www.kaggle.com/citifer/easydel-causal-language-model-trainer-example) for mindset of using EasyDeL
+   CausalLanguageModelTrainer on kaggle, but you can do much more.
+2. [script](https://www.kaggle.com/code/citifer/easydel-serve-example-mixtral) for using and serving LLMs with EasyDeL
+   JAXServer API (Mixtral Example).
 
 ## Serving
 
 you can read docs or examples to see how `JAXServer` works but let me show you how you can simply host and serve any
-model that supported by `EasyDeL` fo this example ill just use `gemma-7-it` by google but you can use any model as you
+model that supported by `EasyDeL` fo this example ill just use `gemma-7-it` by google, but you can use any model as you
 wish.
 
 ```shell
@@ -135,7 +143,6 @@ train_arguments = TrainArguments(
     gradient_checkpointing=EasyDelGradientCheckPointers.NOTHING_SAVEABLE,
     sharding_array=(1, 1, 1, -1),  # the way to shard model across gpu,cpu or TPUs using sharding array (1, 1, 1, -1)
     # everything training will be in sequence and model parallel automatic and share data between devices
-    use_pjit_attention_force=False,
     remove_ckpt_after_load=True,
     gradient_accumulation_steps=8,
     loss_re_mat="",
@@ -505,7 +512,7 @@ state = EasyDelState.from_pretrained(
     value_partition_spec=jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
     bias_partition_spec=jax.sharding.PartitionSpec(("dp", "fsdp"), None, None, None),
     attention_partition_spec=jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-    use_shard_map=False,
+    shard_attention_computation=True,
     input_shape=(1, 1),
     backend=None,
     init_optimizer_state=False,
@@ -517,8 +524,6 @@ state = EasyDelState.from_pretrained(
 config = AutoEasyDelConfig.from_pretrained(
     huggingface_model_repo_id
 )
-
-config.use_pjit_attention_force = False
 
 tokenizer = AutoTokenizer.from_pretrained(
     huggingface_model_repo_id,
@@ -592,6 +597,17 @@ config.add_basic_configurations(
 ```
 
 _Flash Attention works on TPU with ease but for gpu there are still some improvements in process._
+
+> [!TIP]
+> use these partition specs in case of not using custom sharding_axis_names and using sequence sharding with flash
+> flash attention
+> ```python
+>query_partition_spec=PartitionSpec(("dp", "fsdp"), None, "sp", "tp"),
+>generation_query_partition_spec=PartitionSpec(("dp", "fsdp"), None, None, "tp"),
+>key_partition_spec=PartitionSpec(("dp", "fsdp"), None, "sp", "tp"),
+>value_partition_spec=PartitionSpec(("dp", "fsdp"), None, "sp", "tp"),
+>attention_partition_spec=PartitionSpec(("dp", "fsdp"), None,"sp", "tp"),
+> ```
 
 ## EasyDeLXRapTure for layer tuning and LoRA
 
@@ -675,7 +691,6 @@ train_arguments = TrainArguments(
     gradient_checkpointing=EasyDelGradientCheckPointers.NOTHING_SAVEABLE,
     sharding_array=(1, 1, 1, -1),  # the way to shard model across gpu,cpu or TPUs using sharding array (1, 1, 1, -1)
     # everything training will be in sequence and model parallel automatic and share data between devices
-    use_pjit_attention_force=False,
     remove_ckpt_after_load=True,
     gradient_accumulation_steps=1,
     loss_re_mat="",

@@ -70,7 +70,8 @@ class FlaxGPTNeoXAttention(BaseJAXAttentionModule):
         )
 
         self.factor = jnp.sqrt(jnp.asarray(self.head_size, dtype=jnp.float32))
-        self.bias = nn.make_causal_mask(jnp.ones((1, getattr(self.config, "c_max_position_embeddings", self.config.max_position_embeddings))))
+        self.bias = nn.make_causal_mask(
+            jnp.ones((1, getattr(self.config, "c_max_position_embeddings", self.config.max_position_embeddings))))
 
     def __call__(self,
                  hidden_states: chex.Array,
@@ -79,9 +80,6 @@ class FlaxGPTNeoXAttention(BaseJAXAttentionModule):
         b, s, d = hidden_states.shape
         q, k, v = jnp.split(self.w_qkv(hidden_states), indices_or_sections=3, axis=-1)
         freq = self.freq_cis[:s].reshape(1, s, -1)
-        q = with_sharding_constraint(q, PartitionSpec(("dp", "fsdp"), None, "sp"))
-        k = with_sharding_constraint(k, PartitionSpec(("dp", "fsdp"), None, "sp"))
-        v = with_sharding_constraint(v, PartitionSpec(("dp", "fsdp"), None, "sp"))
 
         q = rearrange(q, 'b s (h d) -> b s h d', h=self.config.num_attention_heads)
         k = rearrange(k, 'b s (h d) -> b s h d', h=self.config.num_attention_heads)
@@ -92,6 +90,12 @@ class FlaxGPTNeoXAttention(BaseJAXAttentionModule):
                          )
         q, k = apply_rotary_emb(q, k, freqs_cis=freq, dtype=self.dtype)
 
+        # if self.config.use_sharding_constraint:
+        #     q = with_sharding_constraint(
+        #         q, jax.sharding.PartitionSpec(("dp", "fsdp"), "sp" if q.shape[1] != 1 else None, "tp", None)
+        #     )
+        #     k = with_sharding_constraint(k, jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None))
+        #     v = with_sharding_constraint(v, jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None))
         attn = jnp.einsum(
             '...qhd,...khd->...hqk', q, k, precision=self.precision
         ) * self.factor
@@ -174,7 +178,7 @@ class FlaxGPTNeoXBlock(nn.Module):
 def get_gradient_checkpoint_policy(name):
     return {
         'everything_saveable': jax.checkpoint_policies.everything_saveable,
-        'nothing_saveable': jax.checkpoint_policies.nothing_saveable,
+        "nothing_saveable": jax.checkpoint_policies.nothing_saveable,
         'checkpoint_dots': jax.checkpoint_policies.checkpoint_dots,
         'checkpoint_dots_with_no_batch_dims': jax.checkpoint_policies.checkpoint_dots_with_no_batch_dims,
     }[name]

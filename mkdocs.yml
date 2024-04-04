@@ -14,6 +14,7 @@ nav:
     - Lm Eval: generated-eval-lm_eval.md
   - Examples:
     - DataProcessing: DataProcessing.md
+    - Easy Attention: EasyAttentionExample.md
     - EasyState: EasyStateExample.md
     - Falcon Models: Falcon.md
     - Fine Tuning Example: FineTuningExample.md
@@ -30,6 +31,9 @@ nav:
     - Utils: generated-linen-utils.md
   - Modules:
     - Auto Easydel Model: generated-modules-auto_easydel_model.md
+    - Dbrx:
+      - Dbrx Configuration: generated-modules-dbrx-dbrx_configuration.md
+      - Modelling Dbrx Flax: generated-modules-dbrx-modelling_dbrx_flax.md
     - Easy Attention: generated-modules-easy_attention.md
     - Easydel Modelling Utils: generated-modules-easydel_modelling_utils.md
     - Falcon:
@@ -48,9 +52,14 @@ nav:
     - Gpt2:
       - Gpt2 Configuration: generated-modules-gpt2-gpt2_configuration.md
       - Modelling Gpt2 Flax: generated-modules-gpt2-modelling_gpt2_flax.md
+    - Grok 1:
+      - Grok 1 Configuration: generated-modules-grok_1-grok_1_configuration.md
+      - Modelling Grok 1 Flax: generated-modules-grok_1-modelling_grok_1_flax.md
     - Llama:
       - Llama Configuration: generated-modules-llama-llama_configuration.md
       - Modelling Llama Flax: generated-modules-llama-modelling_llama_flax.md
+      - Modelling Vision Llama Flax: generated-modules-llama-modelling_vision_llama_flax.md
+      - Vision Llama Configuration: generated-modules-llama-vision_llama_configuration.md
     - Lucid Transformer:
       - Lt Configuration: generated-modules-lucid_transformer-lt_configuration.md
       - Modelling Lt Flax: generated-modules-lucid_transformer-modelling_lt_flax.md
@@ -60,6 +69,8 @@ nav:
     - Mistral:
       - Mistral Configuration: generated-modules-mistral-mistral_configuration.md
       - Modelling Mistral Flax: generated-modules-mistral-modelling_mistral_flax.md
+      - Modelling Vision Mistral Flax: generated-modules-mistral-modelling_vision_mistral_flax.md
+      - Vision Mistral Configuration: generated-modules-mistral-vision_mistral_configuration.md
     - Mixtral:
       - Mixtral Configuration: generated-modules-mixtral-mixtral_configuration.md
       - Modelling Mixtral Flax: generated-modules-mixtral-modelling_mixtral_flax.md
@@ -87,6 +98,9 @@ nav:
     - Roberta:
       - Modelling Roberta Flax: generated-modules-roberta-modelling_roberta_flax.md
       - Roberta Configuration: generated-modules-roberta-roberta_configuration.md
+    - Rwkv:
+      - Modelling Rwkv Flax: generated-modules-rwkv-modelling_rwkv_flax.md
+      - Rwkv Configuration: generated-modules-rwkv-rwkv_configuration.md
     - Stablelm:
       - Modelling Stablelm Flax: generated-modules-stablelm-modelling_stablelm_flax.md
       - Stablelm Configuration: generated-modules-stablelm-stablelm_configuration.md

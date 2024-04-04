@@ -4,7 +4,6 @@ from contextlib import contextmanager
 import jax
 import numpy as np
 import jax.numpy as jnp
-from transformers import top_k_top_p_filtering
 
 try:
     from collections.abc import Mapping
@@ -215,6 +214,7 @@ def multinomial(logits, num_samples: int, replacement: bool = False):
 
 
 def respond_to_batch(model, queries, txt_len=20, top_k=0, top_p=1.0):
+    raise NotImplementedError("! respond_to_batch is not use able create an issue in github.")
     input_ids = queries
     for i in range(txt_len):
         outputs = model(input_ids)

@@ -1,6 +1,7 @@
 import curses
 import json
 import subprocess
+import sys
 import time
 
 import IPython.display
@@ -60,7 +61,7 @@ def run(note_book=None, interval: float = 1, dir_prefix: str = '/dev/shm', dpr=T
         curses.endwin()
 
 
-def get_mem(dir_prefix: str = '/dev/shm'):
+def get_mem(dir_prefix: str = "/dev/shm" if sys.platform != "win32" else "."):
     """
     The get_mem function is a wrapper around the go tool pprof command.
     It takes in an optional argument, dir_prefix, which defaults to /dev/shm.
@@ -78,7 +79,8 @@ def get_mem(dir_prefix: str = '/dev/shm'):
     ).stdout.decode('utf-8')
 
 
-def initialise_tracking(interval: float = 0.5, dir_prefix: str = '/dev/shm') -> None:
+def initialise_tracking(interval: float = 0.5,
+                        dir_prefix: str = "/dev/shm" if sys.platform != "win32" else ".") -> None:
     """
     The initialise_tracking function starts a daemon thread that periodically saves the current memory profile to disk.
 

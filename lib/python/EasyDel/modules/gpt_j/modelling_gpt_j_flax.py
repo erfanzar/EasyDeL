@@ -126,7 +126,7 @@ class FlaxGPTJAttention(BaseJAXAttentionModule):
         self.embed_positions = create_sinusoidal_positions(config.max_position_embeddings, pos_embd_dim)
 
         self.attention_performer = EasyAttention(
-            attn_type="normal",
+            use_sharding_constraint=self.config.use_sharding_constraint,
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,
             block_q=self.config.block_q,
@@ -142,7 +142,7 @@ class FlaxGPTJAttention(BaseJAXAttentionModule):
             attention_dropout=self.config.attn_pdrop,
             head_dims=self.head_dim,
             attention_partition_spec=self.config.attention_partition_spec,
-            use_shard_map=self.config.use_shard_map,
+            shard_attention_computation=self.config.shard_attention_computation,
             precision=self.precision,
             force_float32_tpu=True,
             attn_mechanism=self.config.attn_mechanism,
@@ -150,6 +150,9 @@ class FlaxGPTJAttention(BaseJAXAttentionModule):
             bias_partition_spec=self.config.bias_partition_spec,
             key_partition_spec=self.config.key_partition_spec,
             query_partition_spec=self.config.query_partition_spec,
+            generation_query_partition_spec=self.config.generation_query_partition_spec,
+            generation_bias_partition_spec=self.config.generation_bias_partition_spec,
+            generation_attention_partition_spec=self.config.generation_attention_partition_spec,
             value_partition_spec=self.config.value_partition_spec,
             scan_ring_attention=self.config.scan_ring_attention,
             mesh=self.config.jax_mesh(),
@@ -167,6 +170,7 @@ class FlaxGPTJAttention(BaseJAXAttentionModule):
             hidden_states,
             attention_mask,
             position_ids,
+            segment_ids: Optional[chex.Array] = None,
             deterministic: bool = True,
             init_cache: bool = False,
             output_attentions: bool = False,
@@ -174,12 +178,6 @@ class FlaxGPTJAttention(BaseJAXAttentionModule):
         query = self.q_proj(hidden_states)
         key = self.k_proj(hidden_states)
         value = self.v_proj(hidden_states)
-
-        # Force A local Sharding
-        if self.config.use_pjit_attention_force:
-            query = with_sharding_constraint(query, PartitionSpec(("dp", "fsdp"), None, "sp"))
-            key = with_sharding_constraint(key, PartitionSpec(("dp", "fsdp"), None, "sp"))
-            value = with_sharding_constraint(value, PartitionSpec(("dp", "fsdp"), None, "sp"))
 
         query = self._split_heads(query)
         key = self._split_heads(key)
@@ -213,7 +211,16 @@ class FlaxGPTJAttention(BaseJAXAttentionModule):
             )
         else:
             causal_mask = self.causal_mask[:, :, :query_length, :key_length]
-
+        # if self.config.use_sharding_constraint:
+        #     query = with_sharding_constraint(
+        #         query, PartitionSpec(("dp", "fsdp"), "sp" if query.shape[1] != 1 else None, "tp", None)
+        #     )
+        #     key = with_sharding_constraint(
+        #         key, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
+        #     )
+        #     value = with_sharding_constraint(
+        #         value, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
+        #     )
         batch_size = hidden_states.shape[0]
         causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
 
@@ -243,13 +250,14 @@ class FlaxGPTJAttention(BaseJAXAttentionModule):
             key_states=key,
             value_states=value,
             bias=attention_bias,
+            attention_mask=attention_mask,
             causal=False,
-            use_pjit_attention_force=self.config.use_pjit_attention_force,
             dropout_rng=dropout_rng,
             deterministic=deterministic,
             query_sequence_length=query_length,
             key_value_sequence_length=key_length,
             uses_cache=self.has_variable("cache", "cached_key") or init_cache,
+            segment_ids=segment_ids
         )
         attn_output = self._merge_heads(attentions.attention_outputs)
         attn_output = self.out_proj(attn_output)
@@ -335,7 +343,7 @@ class FlaxGPTJBlock(nn.Module):
             attn_block = flax.linen.partitioning.remat(
                 attn_block,
                 policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
-                static_argnums=(3, 4, 5)
+                static_argnums=(1, 3,)
             )
 
             mlp_block = flax.linen.partitioning.remat(
@@ -379,6 +387,7 @@ class FlaxGPTJBlock(nn.Module):
             hidden_states,
             attention_mask,
             position_ids,
+            None,
             deterministic,
             init_cache,
             output_attentions,

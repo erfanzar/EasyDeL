@@ -17,10 +17,12 @@ from .serve import (
 )
 
 from .modules.llama import (
-    LlamaConfig as LlamaConfig,
+    FlaxLlamaModel as FlaxLlamaModel,
     FlaxLlamaForCausalLM as FlaxLlamaForCausalLM,
     FlaxLlamaForSequenceClassification as FlaxLlamaForSequenceClassification,
-    FlaxLlamaModel as FlaxLlamaModel
+    LlamaConfig as LlamaConfig,
+    FlaxVisionLlamaForCausalLM as FlaxVisionLlamaForCausalLM,
+    VisionLlamaConfig as VisionLlamaConfig
 )
 from .modules.gpt_j import (
     GPTJConfig as GPTJConfig,
@@ -45,7 +47,9 @@ from .modules.opt import (
 from .modules.mistral import (
     MistralConfig as MistralConfig,
     FlaxMistralForCausalLM as FlaxMistralForCausalLM,
-    FlaxMistralModel as FlaxMistralModel
+    FlaxMistralModel as FlaxMistralModel,
+    FlaxVisionMistralForCausalLM as FlaxVisionMistralForCausalLM,
+    VisionMistralConfig as VisionMistralConfig
 )
 from .modules.palm import (
     FlaxPalmModel as FlaxPalmModel,
@@ -114,6 +118,31 @@ from .modules.stablelm import (
     StableLmConfig as StableLmConfig,
     FlaxStableLmForCausalLM as FlaxStableLmForCausalLM,
     FlaxStableLmModel as FlaxStableLmModel
+)
+
+from .modules.mamba import (
+
+    FlaxMambaModel as FlaxMambaModel,
+    FlaxMambaForCausalLM as FlaxMambaForCausalLM,
+    MambaConfig as MambaConfig
+)
+
+from .modules.grok_1 import (
+    Grok1Config as Grok1Config,
+    FlaxGrok1Model as FlaxGrok1Model,
+    FlaxGrok1ForCausalLM as FlaxGrok1ForCausalLM
+)
+
+from .modules.qwen2_moe import (
+    Qwen2MoeConfig as Qwen2MoeConfig,
+    FlaxQwen2MoeModel as FlaxQwen2MoeModel,
+    FlaxQwen2MoeForCausalLM as FlaxQwen2MoeForCausalLM
+)
+from .modules.whisper import (
+    FlaxWhisperForConditionalGeneration as FlaxWhisperForConditionalGeneration,
+    FlaxWhisperForAudioClassification as FlaxWhisperForAudioClassification,
+    FlaxWhisperTimeStampLogitsProcessor as FlaxWhisperTimeStampLogitsProcessor,
+    WhisperConfig as WhisperConfig
 )
 from .modules.auto_easydel_model import (
     AutoEasyDelModelForCausalLM as AutoEasyDelModelForCausalLM,
@@ -208,9 +237,11 @@ __all__ = (
 
     # LLama Models
     "LlamaConfig",
+    "VisionLlamaConfig",
     "FlaxLlamaForCausalLM",
     "FlaxLlamaForSequenceClassification",
     "FlaxLlamaModel",
+    "FlaxVisionMistralForCausalLM",
 
     # GPT-J Models
     "GPTJConfig",
@@ -234,8 +265,10 @@ __all__ = (
 
     # Mistral Models
     "MistralConfig",
+    "VisionMistralConfig",
     "FlaxMistralForCausalLM",
     "FlaxMistralModel",
+    "FlaxVisionLlamaForCausalLM",
 
     # Palm Models
     "FlaxPalmModel",
@@ -293,6 +326,27 @@ __all__ = (
     "StableLmConfig",
     "FlaxStableLmForCausalLM",
     "FlaxStableLmModel",
+
+    # Mamba Models
+    "FlaxMambaModel",
+    "FlaxMambaForCausalLM",
+    "MambaConfig",
+
+    # Grok-1 Models
+    "Grok1Config",
+    "FlaxGrok1Model",
+    "FlaxGrok1ForCausalLM",
+
+    # Qwen2Moe
+    "Qwen2MoeConfig",
+    "FlaxQwen2MoeModel",
+    "FlaxQwen2MoeForCausalLM",
+
+    # Whisper
+    "WhisperConfig",
+    "FlaxWhisperTimeStampLogitsProcessor",
+    "FlaxWhisperForAudioClassification",
+    "FlaxWhisperForConditionalGeneration",
 
     # AutoModels Models
     "AutoEasyDelModelForCausalLM",
@@ -359,4 +413,4 @@ __all__ = (
     "EasyDelSyntaxRuntimeError"
 )
 
-__version__ = "0.0.55"
+__version__ = "0.0.60"

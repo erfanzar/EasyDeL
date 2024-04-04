@@ -1,6 +1,6 @@
 import copy
 import os
-from typing import Any, Callable, Optional, Mapping, Sequence, Tuple
+from typing import Any, Callable, Optional, Mapping, Sequence, Tuple, Union
 
 import fjformer
 import jax.tree_util
@@ -14,6 +14,7 @@ from .auto_tx import get_optimizer_and_scheduler
 from ..etils import AVAILABLE_SCHEDULERS, AVAILABLE_OPTIMIZERS, EasyDelRuntimeError
 from ..modules.easydel_modelling_utils import EasyDelFlaxPretrainedModel, EasyDelPretrainedConfig
 from jax.sharding import Mesh, PartitionSpec
+from jax import numpy as jnp
 
 TYPE_SEP = "<*TYPE*>"
 VALUE_SEP = "<*VALUE*>"
@@ -204,19 +205,34 @@ class EasyDelState(struct.PyTreeNode):
         tx_init["scheduler"] = cls.search("scheduler", tx_init, "none")
         tx_init["steps"] = cls.search("steps", tx_init, 1e6)
 
+        def fix_dict_types(input_dict):
+            fixed_dict = input_dict.copy()
+
+            # Fix extra_optimizer_kwargs
+            if 'extra_optimizer_kwargs' in fixed_dict:
+                fixed_dict['extra_optimizer_kwargs'] = eval(fixed_dict['extra_optimizer_kwargs'])
+
+            # Fix gradient_accumulation_steps
+            if 'gradient_accumulation_steps' in fixed_dict:
+                fixed_dict['gradient_accumulation_steps'] = int(fixed_dict['gradient_accumulation_steps'])
+
+            # Fix steps
+            if 'steps' in fixed_dict:
+                fixed_dict['steps'] = int(fixed_dict['steps'])
+
+            # Fix warmup_steps
+            if 'warmup_steps' in fixed_dict:
+                fixed_dict['warmup_steps'] = int(fixed_dict['warmup_steps'])
+
+            return fixed_dict
+
         try:
             tx, sc = get_optimizer_and_scheduler(
                 **tx_init
             )
         except TypeError:
-            termcolor.cprint(
-                "Couldn't load past optimizer State initializing new one with default Optimizer and Scheduler",
-                color="red", force_color=True
-            )
             tx, sc = get_optimizer_and_scheduler(
-                optimizer="adamw",
-                scheduler="none",
-                steps=10000,
+                **fix_dict_types(tx_init)
             )
         if hyperparameters is None:
             hyperparameters = {}
@@ -224,7 +240,6 @@ class EasyDelState(struct.PyTreeNode):
         if module_config is not None:
             hyperparameters = cls.create_hyperparameters(module_config.model_type)
             cls.safe_dict(module_config.__dict__)
-
         return cls(
             step=step,
             apply_fn=apply_fn,
@@ -243,9 +258,13 @@ class EasyDelState(struct.PyTreeNode):
     def load_state(
             cls,
             checkpoint_path: str | os.PathLike,
+            dtype: jnp.dtype = jnp.float32,
+            param_dtype: jnp.dtype = jnp.float32,
+            precision: Optional[Union[str, jax.lax.Precision]] = None,
             init_optimizer_state: bool = False,
             state_shard_fns: Optional[Mapping[str, Callable]] = None,
-            verbose: bool = False
+            verbose: bool = False,
+            input_shape: Tuple = (1, 1),
     ):
 
         """    
@@ -253,11 +272,15 @@ class EasyDelState(struct.PyTreeNode):
         
         :param cls: Create an instance of the class
         :param checkpoint_path: str | os.PathLike: Specify the path to the checkpoint file
+        :param dtype: jnp.dtype: The dtype of the model
+        :param param_dtype: jnp.dtype: The dtype of the model parameters
+        :param precision: Optional[Union[str, jax.lax.Precision]]: precision of the model
         :param init_optimizer_state: bool: Initialize the optimizer if it's not Initialized yet (if it Initialized the option
         will be ignored )
         :param state_shard_fns: Optional[Mapping[str,Callable]]: Specify the function that will be used 
         to shard the loaded state
         :param verbose: bool: Print out the progress of loading
+        :param input_shape: Tuple: input_shape to init module
         :return: A state object
         """
         from ..modules.auto_easydel_model import get_modules_by_type
@@ -267,16 +290,37 @@ class EasyDelState(struct.PyTreeNode):
             shard_fns=state_shard_fns,
             verbose=verbose,
         )
-
         hyperparameters = checkpoint.get("hyperparameters")
         cfg, module, convertor = get_modules_by_type(model_type=cls.get_model_type(hyperparameters))
-        module_config = checkpoint.pop("module_config", None)
+        checkpoint.pop("module_config", None)
         if checkpoint["module_config_args"] is not None:
-            module_config = cfg.from_dict(checkpoint.get("module_config_args", {}))
-
+            cfg_behave = cls.unsafe_dict(checkpoint.get("module_config_args", {}))
+            cfg_behave.pop("id2label", None)
+            cfg_behave.pop("label2id", None)
+            cfg_behave.pop("torch_dtype", None)
+            for k, v in cfg_behave.items():
+                if v is None:
+                    cfg_behave.pop(k, None)
+                elif v == "None":
+                    cfg_behave[k] = None
+                elif isinstance(v, str):
+                    if v.startswith("{") or v.startswith("(") or v.startswith("PartitionSpec"):
+                        cfg_behave[k] = eval(v)
+            module_config = cfg.from_dict(cfg_behave)
+            module_in = module(
+                config=module_config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                input_shape=input_shape
+            )
+        else:
+            raise TypeError(
+                "Om seems like i couldn't read model correctly ;("
+            )
         state = cls.load(
-            apply_fn=module.__call__,
-            module=module,
+            apply_fn=module_in.__call__,
+            module=module_in,
             module_config=module_config,
             **checkpoint
         )
@@ -319,6 +363,14 @@ class EasyDelState(struct.PyTreeNode):
             state = self.replace(
                 opt_state=None
             )
+        state = state.replace(
+            module_config_args={
+                k: v for k, v in state.module_config.__dict__.items() if
+                isinstance(
+                    v, (int, bool, float)
+                )
+            }
+        )
         fjformer.CheckpointManager.save_state_to_file(
             state=state,
             path=os.path.join(checkpoint_dir, filename) if checkpoint_dir is not None else filename,
@@ -374,11 +426,13 @@ class EasyDelState(struct.PyTreeNode):
             sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
             sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
             query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            generation_query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "tp", None, None),
             key_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             value_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
+            generation_bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
             attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            use_shard_map: bool = False,
+            shard_attention_computation: bool = True,
             input_shape: Sequence[int] = (1, 1),
             backend: Optional[str] = None,
             init_optimizer_state: bool = False,
@@ -408,11 +462,12 @@ class EasyDelState(struct.PyTreeNode):
         :param sharding_axis_dims: Sequence[int]: Specify the dimension of each axis
         :param sharding_axis_names: Sequence[str]: Specify the names of the axes in each shard
         :param query_partition_spec: PartitionSpec: Specify the partitioning of the query matrix
-        :param key_partition_spec: PartitionSpec: Specify the partitioning of the key matrix
+        :param generation_query_partition_spec: PartitionSpec: Specify the partitioning of the query tensor in
+        generation process:param key_partition_spec: PartitionSpec: Specify the partitioning of the key matrix
         :param value_partition_spec: PartitionSpec: Specify the partitioning of the value tensor
         :param bias_partition_spec: PartitionSpec: Specify the partitioning of the bias
         :param attention_partition_spec: PartitionSpec: Partition the attention weights
-        :param use_shard_map: bool: Determine whether to use shard_map or not
+        :param shard_attention_computation: bool: Determine whether to use shard_map or not
         :param input_shape: Sequence[int]: Specify the shape of the input to be used for training
         :param backend: Optional[str]: Specify the backend used for the model
         :param init_optimizer_state: bool: Initialize the optimizer state
@@ -440,11 +495,13 @@ class EasyDelState(struct.PyTreeNode):
                 sharding_axis_dims=sharding_axis_dims,
                 sharding_axis_names=sharding_axis_names,
                 query_partition_spec=query_partition_spec,
+                generation_query_partition_spec=generation_query_partition_spec,
+                generation_bias_partition_spec=generation_bias_partition_spec,
                 key_partition_spec=key_partition_spec,
                 value_partition_spec=value_partition_spec,
                 bias_partition_spec=bias_partition_spec,
                 attention_partition_spec=attention_partition_spec,
-                use_shard_map=use_shard_map,
+                shard_attention_computation=shard_attention_computation,
                 input_shape=input_shape,
                 backend=backend,
                 config_kwargs=config_kwargs,
@@ -478,7 +535,11 @@ class EasyDelState(struct.PyTreeNode):
                     checkpoint_path=checkpoint_path,
                     init_optimizer_state=init_optimizer_state,
                     verbose=verbose,
-                    state_shard_fns=state_shard_fns
+                    state_shard_fns=state_shard_fns,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    input_shape=input_shape
                 )
         if init_optimizer_state:
             with jax.default_device(device):
@@ -550,9 +611,12 @@ class EasyDelState(struct.PyTreeNode):
     def unsafe_dict(dictionary: dict):
         result = {}
         for k in list(dictionary.keys()):
-            v = dictionary[k]
-            key, value = break_format(key=k, value=v)
-            result[key] = value
+            if VALUE_SEP in k and TYPE_SEP in k:
+                v = dictionary[k]
+                key, value = break_format(key=k, value=v)
+                result[key] = value
+            else:
+                result[k] = dictionary[k]
         return result
 
     def __str__(self):

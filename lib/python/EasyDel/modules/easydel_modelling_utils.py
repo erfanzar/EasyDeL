@@ -1,3 +1,5 @@
+import warnings
+
 import chex
 import flax
 from jax.experimental.mesh_utils import create_device_mesh
@@ -8,7 +10,7 @@ from typing import Sequence, Union, Optional, Literal, Tuple, Any
 from dataclasses import dataclass
 from jax.sharding import PartitionSpec, Mesh
 
-AVAILABLE_ATTENTION_MECHANISMS = Literal["normal", "flash", "splash", "ring"]
+AVAILABLE_ATTENTION_MECHANISMS = Literal["normal", "flash", "splash", "ring", "cudnn"]
 
 
 def set_attrs_smartly(self, attr_name: str, default: Any, new_attr: Any):
@@ -48,14 +50,15 @@ class EasyDelPretrainedConfig(PretrainedConfig):
     :param value_partition_spec: PartitionSpec: Specify the partitioning of the value tensor
     :param bias_partition_spec: PartitionSpec: Specify the Attention Bias partition spec
     :param attention_partition_spec: PartitionSpec: Specify the partitioning of the attention weights
-    :param use_shard_map: bool: whenever to use shard_map for attention
+    :param shard_attention_computation: bool: whenever to shard qkv b for attention
+    :param use_sharding_constraint: bool: whether to use sharding constraint for the arrays
     :param use_scan_mlp: bool: Determine whether to use scan_mlp or not
     :param backend: Optional[None]: Specify the backend to use
     """
 
     def __init__(
             self,
-            axis_dims: Sequence[int] = (1, -1, 1, 1),
+            axis_dims: Sequence[int] = (1, 1, 1, -1),
             axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
             attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = "normal",
             block_k: int = 128,
@@ -70,27 +73,34 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             block_k_dq: int | None = None,
             block_q_dq: int | None = None,
             query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            generation_query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, "tp", None),
             key_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             value_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
+            generation_bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
             attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            use_shard_map: bool = False,
+            generation_attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, "tp", None),
+            shard_attention_computation: bool = True,
             use_sharded_kv_caching: bool = True,
+            use_sharding_constraint: bool = False,
             backend: Optional[None] = jax.default_backend(),
             easy_method: Literal["train", "serve", "convert"] = EasyMethod.TRAIN,
             bits: Optional[int] = None,
-            scan_ring_attention: bool = True,
+            scan_ring_attention: bool = False,
             scan_attention_layers: bool = False,
             use_scan_mlp: bool = True,
             scan_mlp_chunk_size: int = 1024,
             **kwargs
     ):
         self.query_partition_spec = query_partition_spec
+        self.generation_query_partition_spec = generation_query_partition_spec
         self.key_partition_spec = key_partition_spec
         self.value_partition_spec = value_partition_spec
         self.bias_partition_spec = bias_partition_spec
+        self.generation_bias_partition_spec = generation_bias_partition_spec
         self.attention_partition_spec = attention_partition_spec
-        self.use_shard_map = use_shard_map
+        self.generation_attention_partition_spec = generation_attention_partition_spec
+        self.shard_attention_computation = shard_attention_computation
         self.axis_dims = axis_dims
         self.axis_names = axis_names
         self.backend = backend if backend is not None else ""
@@ -113,6 +123,8 @@ class EasyDelPretrainedConfig(PretrainedConfig):
         self.use_sharded_kv_caching = use_sharded_kv_caching
         self.use_scan_mlp = use_scan_mlp
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
+        self.use_sharding_constraint = use_sharding_constraint
+
         super().__init__(**kwargs)
 
     @staticmethod
@@ -130,6 +142,20 @@ class EasyDelPretrainedConfig(PretrainedConfig):
         """
         array_devices = jax.numpy.ones(
             (len(jax.devices() if backend == "" else jax.devices(backend)), 1))
+        if isinstance(axis_dims, str):
+            axis_dims = eval(axis_dims)
+            warnings.warn(
+                "axis_dims argument is not a Sequence of int and it's an string. "
+                "(backbone Warning in EasyDeLModuleConfig)\n"
+                f"\tchanged to {axis_dims}"
+            )
+        if isinstance(axis_names, str):
+            axis_names = eval(axis_names)
+            warnings.warn(
+                "axis_names argument is not a Sequence of strings and it's an string class. "
+                "(backbone Warning in EasyDeLModuleConfig)\n"
+                f"\tchanged to {axis_names}"
+            )
         resh = array_devices.reshape(axis_dims).shape
 
         return Mesh(
@@ -147,9 +173,14 @@ class EasyDelPretrainedConfig(PretrainedConfig):
 
         """
         return self.create_mesh(
-            axis_dims=[v for k, v in self.axis_dims.items()] if isinstance(self.axis_dims, dict) else self.axis_dims,
-            axis_names=[v for k, v in self.axis_names.items()] if isinstance(self.axis_names,
-                                                                             dict) else self.axis_names,
+            axis_dims=[v for k, v in self.axis_dims.items()] if isinstance(
+                self.axis_dims,
+                dict
+            ) else self.axis_dims,
+            axis_names=[v for k, v in self.axis_names.items()] if isinstance(
+                self.axis_names,
+                dict
+            ) else self.axis_names,
             backend=(self.backend if self.backend is not None else "") if hasattr(
                 self, 'backend') else ""
         )
@@ -167,7 +198,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             raise NotImplementedError()
         else:
             return (
-                ('.*', PartitionSpec(("fsdp", "sp")))
+                ('.*', PartitionSpec(("fsdp", "sp"), ),),
             )
 
     def get_axis_dims(self) -> Sequence[int]:
@@ -218,17 +249,21 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             block_k_dq: int | None = ...,
             block_q_dq: int | None = ...,
             query_partition_spec: PartitionSpec = ...,
+            generation_query_partition_spec: PartitionSpec = ...,
             key_partition_spec: PartitionSpec = ...,
             value_partition_spec: PartitionSpec = ...,
             bias_partition_spec: PartitionSpec = ...,
             attention_partition_spec: PartitionSpec = ...,
-            use_shard_map: bool = ...,
+            generation_bias_partition_spec: PartitionSpec = ...,
+            generation_attention_partition_spec: PartitionSpec = ...,
+            shard_attention_computation: bool = ...,
             use_sharded_kv_caching: bool = ...,
             backend: Optional[None] = ...,
             easy_method: Literal["train", "serve", "convert"] = ...,
             bits: Optional[int] = ...,
             scan_ring_attention: bool = ...,
             scan_attention_layers: bool = ...,
+            use_sharding_constraint: bool = ...,
             use_scan_mlp: bool = ...,
             scan_mlp_chunk_size: int = ...
     ):
@@ -254,11 +289,18 @@ class EasyDelPretrainedConfig(PretrainedConfig):
         :param value_partition_spec: PartitionSpec: Specify the partitioning of the value tensor
         :param bias_partition_spec: PartitionSpec: Specify the Attention Bias partition spec
         :param attention_partition_spec: PartitionSpec: Specify the partitioning of the attention weights
-        :param use_shard_map: bool: whenever to use shard_map for attention
+        :param generation_attention_partition_spec: : PartitionSpec: Specify the partitioning of the attention weights
+        in generation process
+        :param generation_bias_partition_spec: : PartitionSpec: Specify the partitioning of the Attention Bias
+         partition spec in generation process
+        :param generation_query_partition_spec: : PartitionSpec: Specify the partitioning of the query tensor
+        in generation process
+        :param shard_attention_computation: bool: whenever to use shard_map for attention
         :param use_sharded_kv_caching: bool: whenever to use shard_map and sharding for key and value
         :param backend: Optional[None]: Specify the backend to use
         :param easy_method: Literal["train", "serve", "convert"]: EasyDel Quantization Method to be applied for
         :param bits: Optional[int]: Model bits for quantization
+        :param use_sharding_constraint: bool: whether to use sharding constraint for the arrays
         :param scan_ring_attention: bool: Whether to use can for ring attention
         :param scan_attention_layers: bool: Whether to use can for attention layers
         :param use_scan_mlp: bool: Determine whether to use scan_mlp or not
@@ -271,19 +313,57 @@ class EasyDelPretrainedConfig(PretrainedConfig):
         set_attrs_smartly(self, "block_k", 128, block_k)
         set_attrs_smartly(self, "block_b", 1, block_b)
 
-        set_attrs_smartly(self, "query_partition_spec", PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-                          query_partition_spec)
-        set_attrs_smartly(self, "key_partition_spec", PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-                          key_partition_spec)
-        set_attrs_smartly(self, "value_partition_spec", PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-                          value_partition_spec)
-        set_attrs_smartly(self, "bias_partition_spec", PartitionSpec(("dp", "fsdp"), None, None, None),
-                          bias_partition_spec)
-        set_attrs_smartly(self, "attention_partition_spec", PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-                          attention_partition_spec)
-
+        set_attrs_smartly(
+            self,
+            "query_partition_spec",
+            PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            query_partition_spec
+        )
+        set_attrs_smartly(
+            self,
+            "generation_query_partition_spec",
+            PartitionSpec(("dp", "fsdp"), None, "tp", None),
+            generation_query_partition_spec
+        )
+        set_attrs_smartly(
+            self,
+            "generation_bias_partition_spec",
+            PartitionSpec(("dp", "fsdp"), None, None, None),
+            generation_bias_partition_spec
+        )
+        set_attrs_smartly(
+            self,
+            "key_partition_spec",
+            PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            key_partition_spec
+        )
+        set_attrs_smartly(
+            self,
+            "value_partition_spec",
+            PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            value_partition_spec
+        )
+        set_attrs_smartly(
+            self,
+            "bias_partition_spec",
+            PartitionSpec(("dp", "fsdp"), None, None, None),
+            bias_partition_spec
+        )
+        set_attrs_smartly(
+            self,
+            "attention_partition_spec",
+            PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            attention_partition_spec
+        )
+        set_attrs_smartly(
+            self,
+            "generation_attention_partition_spec",
+            PartitionSpec(("dp", "fsdp"), None, "tp", None),
+            generation_attention_partition_spec
+        )
+        set_attrs_smartly(self, "use_sharding_constraint", False, use_sharding_constraint)
         set_attrs_smartly(self, "backend", jax.default_backend(), backend)
-        set_attrs_smartly(self, "use_shard_map", False, use_shard_map)
+        set_attrs_smartly(self, "shard_attention_computation", True, shard_attention_computation)
         set_attrs_smartly(self, "use_sharded_kv_caching", True, use_sharded_kv_caching)
         set_attrs_smartly(self, "attn_mechanism", "normal", attn_mechanism)
 
@@ -326,6 +406,10 @@ class EasyDelPretrainedConfig(PretrainedConfig):
                 except TypeError:
                     pass
         return string + ")"
+
+    def add_jax_args(self, **kwargs):
+        for k, v in kwargs.items():
+            set_attrs_smartly(self, "k", v, v)
 
     def __str__(self):
 
@@ -461,8 +545,8 @@ class EasyDelFlaxPretrainedModel(FlaxPreTrainedModel):
     def __call__(
             self,
             input_ids: chex.Array,
-            attention_mask: chex.Array = None,
-            position_ids: chex.Array = None,
+            attention_mask: Optional[chex.Array] = None,
+            position_ids: Optional[chex.Array] = None,
             params: dict = None,
             past_key_values: dict = None,
             dropout_rng: jax.random.PRNGKey = None,
@@ -472,6 +556,7 @@ class EasyDelFlaxPretrainedModel(FlaxPreTrainedModel):
             return_dict: Optional[bool] = None,
             extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
             add_params_field: bool = False,
+            vision_mask: Optional[chex.Array] = None,
             **kwargs
     ):
         raise NotImplementedError("Not Implemented Yet")

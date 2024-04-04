@@ -46,7 +46,6 @@ def launch():
     config.freq_max_position_embeddings = config.max_position_embeddings
     config.max_position_embeddings = 2048
     config.c_max_position_embeddings = config.max_position_embeddings
-    config.use_pjit_attention_force = False
 
     tokenizer = AutoTokenizer.from_pretrained(
         pretrained_model_name_or_path,
@@ -96,7 +95,6 @@ def launch():
         max_sequence_length=max_sequence_length,
         gradient_checkpointing=EasyDelGradientCheckPointers.NOTHING_SAVEABLE,
         sharding_array=(1, -1, 1, 1),
-        use_pjit_attention_force=False,
         gradient_accumulation_steps=2,
         dtype=jnp.bfloat16,
         init_input_shape=(8, config.block_q),

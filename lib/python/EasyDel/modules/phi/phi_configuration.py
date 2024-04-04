@@ -42,7 +42,6 @@ class PhiConfig(EasyDelPretrainedConfig):
             eos_token_id=2,
             bits: Optional[int] = None,
             gradient_checkpointing: str = "nothing_saveable",
-            use_pjit_attention_force: bool = False,
             **kwargs
     ) -> None:
         self.vocab_size = vocab_size
@@ -69,11 +68,11 @@ class PhiConfig(EasyDelPretrainedConfig):
         self.qk_layernorm = qk_layernorm
         self.bits = bits
         self.gradient_checkpointing = gradient_checkpointing
-        self.use_pjit_attention_force = use_pjit_attention_force
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
             tie_word_embeddings=tie_word_embeddings,
+            bits=bits,
             **kwargs
         )
 
@@ -81,12 +80,10 @@ class PhiConfig(EasyDelPretrainedConfig):
             self,
             bits: Optional[int] = None,
             gradient_checkpointing: str = "nothing_saveable",
-            use_pjit_attention_force: bool = False,
             **kwargs
     ):
         self.bits = bits
         self.gradient_checkpointing = gradient_checkpointing
-        self.use_pjit_attention_force = use_pjit_attention_force
         for k, v in kwargs.items():
             if not hasattr(self, k):
                 setattr(self, k, v)
@@ -100,7 +97,7 @@ class PhiConfig(EasyDelPretrainedConfig):
             ("mlp/fc1/bias", PartitionSpec("tp", )),
             ("mlp/fc2/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
             ("mlp/fc2/bias", PartitionSpec(("fsdp", "sp"), )),
-            ("self_attn/dense/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+            ("self_attn/dense/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
             ("self_attn/dense/bias", PartitionSpec("tp")),
             ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
             ("self_attn/(q_proj|k_proj|v_proj)/bias", PartitionSpec("tp", )),
@@ -115,7 +112,7 @@ class PhiConfig(EasyDelPretrainedConfig):
             ("mlp/fc1/bias", PartitionSpec("tp", )),
             ("mlp/fc2/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
             ("mlp/fc2/bias", PartitionSpec(("fsdp", "sp"), )),
-            ("self_attn/dense/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+            ("self_attn/dense/kernel", PartitionSpec("tp", ("fsdp", "sp"), )),
             ("self_attn/dense/bias", PartitionSpec("tp")),
             ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
             ("self_attn/(q_proj|k_proj|v_proj)/bias", PartitionSpec("tp", )),

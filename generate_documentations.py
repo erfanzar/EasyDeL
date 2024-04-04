@@ -153,6 +153,7 @@ theme:
         ("Examples", "Llama2 Models"): "Llama2.md",
         ("Examples", "Mistral Models"): "Mistral.md",
         ("Examples", "MosaicMPT Models"): "MosaicMPT.md",
+        ("Examples", "Easy Attention"): "EasyAttentionExample.md",
         ("CONTRIBUTING",): "CONTRIBUTING.md"
 
     }

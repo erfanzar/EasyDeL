@@ -1,9 +1,9 @@
-chex~=0.1.84
+chex>=0.1.7
 typing~=3.7.4.3
 jax>=0.4.20
 jaxlib>=0.4.20
-flax~=0.7.5
-fjformer>=0.0.32
+flax>=0.7.5
+fjformer>=0.0.40
 transformers>=4.34.0
 einops~=0.6.1
 optax~=0.1.7
@@ -13,7 +13,7 @@ tqdm~=4.64.1
 pydantic==2.5.3
 datasets~=2.14.6
 setuptools~=68.1.2
-gradio~=4.12.0
+gradio~=4.25.0
 termcolor
 wandb>=0.15.9
 tensorboard
@@ -22,3 +22,5 @@ numpy~=1.26.2
 uvicorn~=0.23.2
 fastapi~=0.104.1
 pydantic-core==2.14.6
+tensorflow_datasets~=4.9.4
+tensorflow~=2.16.1

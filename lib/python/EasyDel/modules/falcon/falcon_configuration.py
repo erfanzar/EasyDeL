@@ -34,7 +34,6 @@ class FalconConfig(EasyDelPretrainedConfig):
             rope_scaling=None,
             bos_token_id: int = 11,
             eos_token_id: int = 11,
-            use_pjit_attention_force: bool = False,
             gradient_checkpointing: str = "",
             bits: Optional[int] = None,
             axis_dims: Sequence[int] = (1, -1, 1, 1),
@@ -55,7 +54,6 @@ class FalconConfig(EasyDelPretrainedConfig):
         self.hidden_dropout = hidden_dropout
         self.attention_dropout = attention_dropout
         self.bos_token_id = bos_token_id
-        self.use_pjit_attention_force = use_pjit_attention_force
         self.eos_token_id = eos_token_id
         self.multi_query = multi_query
         self.alibi = alibi
@@ -72,6 +70,7 @@ class FalconConfig(EasyDelPretrainedConfig):
             axis_names=axis_names,
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
+            bits=bits,
             **kwargs
         )
 
@@ -136,7 +135,6 @@ class FalconConfig(EasyDelPretrainedConfig):
                      rope_scaling=None,
                      bos_token_id: int = 11,
                      eos_token_id: int = 11,
-                     use_pjit_attention_force: bool = False,
                      gradient_checkpointing: str = "",
                      bits: Optional[int] = None,
                      **kwargs,
@@ -162,13 +160,12 @@ class FalconConfig(EasyDelPretrainedConfig):
             bias=bias,
             parallel_attn=parallel_attn,
             rope_scaling=rope_scaling,
-            use_pjit_attention_force=use_pjit_attention_force,
             gradient_checkpointing=gradient_checkpointing,
             new_decoder_architecture=new_decoder_architecture,
             **kwargs
         )
-        for key_state, value_state in basics.items():
-            if not hasattr(self, key_state):
-                setattr(self, key_state, value_state)
+        for key_states, value_states in basics.items():
+            if not hasattr(self, key_states):
+                setattr(self, key_states, value_states)
 
         self.from_pt = False

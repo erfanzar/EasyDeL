@@ -7,6 +7,7 @@ from ..easydel_modelling_utils import EasyDelPretrainedConfig
 
 class MistralConfig(EasyDelPretrainedConfig):
     model_type = "mistral"
+
     def __init__(
             self,
             vocab_size=32000,
@@ -27,8 +28,7 @@ class MistralConfig(EasyDelPretrainedConfig):
             rope_theta=10000.0,
             rope_scaling: Dict[str, Union[str, float]] = None,
             sliding_window=4096,
-            gradient_checkpointing: str = 'nothing_saveable',
-            use_pjit_attention_force: bool = False,
+            gradient_checkpointing: str = "nothing_saveable",
             use_scan_mlp: bool = False,
             scan_mlp_chunk_size: int = 1024,
             number_rep_kv: int = 1,
@@ -61,7 +61,6 @@ class MistralConfig(EasyDelPretrainedConfig):
         :param rope_theta: Control the number of tokens in a rope
         :param sliding_window: Control the number of tokens that are processed in parallel
         :param gradient_checkpointing: str: Specify whether to use gradient checkpointing
-        :param use_pjit_attention_force: bool: Force the use of pjit attention
         :param use_scan_mlp: bool: Determine whether or not to use the scan_mlp function
         :param scan_mlp_chunk_size: int: Specify the chunk size of the scan mlp
         :param number_rep_kv: int: Specify the number of times to repeat the key and value vectors
@@ -97,7 +96,6 @@ class MistralConfig(EasyDelPretrainedConfig):
         self.rope_scaling = rope_scaling
         self.number_rep_kv = number_rep_kv
         self.gradient_checkpointing = gradient_checkpointing
-        self.use_pjit_attention_force = use_pjit_attention_force
         self.use_scan_mlp = use_scan_mlp
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.attention_bias = attention_bias
@@ -108,6 +106,9 @@ class MistralConfig(EasyDelPretrainedConfig):
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
             tie_word_embeddings=tie_word_embeddings,
+            use_scan_mlp=use_scan_mlp,
+            scan_mlp_chunk_size=scan_mlp_chunk_size,
+            bits=bits,
             **kwargs,
         )
 
@@ -125,26 +126,26 @@ class MistralConfig(EasyDelPretrainedConfig):
         """
         return (
 
-            ("model/embed_tokens/embedding", PartitionSpec("dp", "fsdp")),
+            ("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"))),
 
-            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec("fsdp", "dp")),
-            ("self_attn/o_proj/kernel", PartitionSpec("dp", "fsdp")),
+            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+            ("self_attn/o_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
 
-            ("mlp/gate_proj/kernel", PartitionSpec("fsdp", "dp")),
-            ("mlp/down_proj/kernel", PartitionSpec("dp", "fsdp")),
-            ("mlp/up_proj/kernel", PartitionSpec("fsdp", "dp")),
+            ("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+            ("mlp/down_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+            ("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"))),
 
             ("input_layernorm/kernel", PartitionSpec(None)),
             ("post_attention_layernorm/kernel", PartitionSpec(None)),
 
             ("model/norm/kernel", PartitionSpec(None)),
-            ("lm_head/kernel", PartitionSpec("fsdp", "dp")),
-            (".*", PartitionSpec(None)),
+            ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
+            (".*", PartitionSpec(("fsdp", "sp"))),
         ) if not fully_sharded_data_parallel else (
             ("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"))),
 
-            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+            ("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
 
             ("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"))),
             ("mlp/down_proj/kernel", PartitionSpec(("fsdp", "sp"))),
@@ -160,8 +161,7 @@ class MistralConfig(EasyDelPretrainedConfig):
 
     def add_jax_args(
             self,
-            gradient_checkpointing: str = 'nothing_saveable',
-            use_pjit_attention_force: bool = False,
+            gradient_checkpointing: str = "nothing_saveable",
             use_scan_mlp: bool = False,
             scan_mlp_chunk_size: int = 1024,
             number_rep_kv: int = 1,
@@ -176,7 +176,6 @@ class MistralConfig(EasyDelPretrainedConfig):
 
         :param self: Bind the attributes and methods of a class to an instance of that class
         :param gradient_checkpointing: str: Determine whether to use gradient checkpointing
-        :param use_pjit_attention_force: bool: Determine whether to use the pjit_attention_force function
         :param use_scan_mlp: bool: Determine whether to use the scan_mlp function or notn
         :param scan_mlp_chunk_size: int: Chunk the input to the mlp
         :param number_rep_kv: int: Control the number of times that the key and value vectors are repeated
@@ -192,7 +191,6 @@ class MistralConfig(EasyDelPretrainedConfig):
         self.rope_scaling = rope_scaling
         self.number_rep_kv = number_rep_kv
         self.gradient_checkpointing = gradient_checkpointing
-        self.use_pjit_attention_force = use_pjit_attention_force
         self.use_scan_mlp = use_scan_mlp
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.attention_dropout = attention_dropout

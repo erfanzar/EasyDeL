@@ -78,7 +78,7 @@ class JAXServerConfig:
     mesh_axes_shape: Sequence[int] = (1, -1, 1, 1)
     generation_ps: PartitionSpec = PartitionSpec("dp", "fsdp")
 
-    dtype: str = "fp16"
+    dtype: jnp.dtype | str = "fp16"
 
     stream_tokens_for_gradio: bool = True
     use_prefix_tokenizer: bool = True
@@ -434,11 +434,13 @@ class JAXServer(GradioUserInference):
             sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
             sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
             query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            generation_query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, "tp", None),
             key_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             value_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
+            generation_bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
             attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            use_shard_map: bool = False,
+            shard_attention_computation: bool = True,
             input_shape: Sequence[int] = (1, 1),
             shard_fns: Optional[Mapping[tuple, Callable]] = None,
             backend: Optional[str] = None,
@@ -458,11 +460,13 @@ class JAXServer(GradioUserInference):
             sharding_axis_names=sharding_axis_names,
             sharding_axis_dims=sharding_axis_dims,
             query_partition_spec=query_partition_spec,
+            generation_query_partition_spec=generation_query_partition_spec,
+            generation_bias_partition_spec=generation_bias_partition_spec,
             attention_partition_spec=attention_partition_spec,
             value_partition_spec=value_partition_spec,
             key_partition_spec=key_partition_spec,
             bias_partition_spec=bias_partition_spec,
-            use_shard_map=use_shard_map,
+            shard_attention_computation=shard_attention_computation,
             shard_fns=shard_fns,
             input_shape=input_shape,
             backend=backend,

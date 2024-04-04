@@ -3,6 +3,8 @@
 import math
 from gc import unfreeze
 from typing import Optional, Tuple
+
+import chex
 from flax import linen as nn
 from flax.core import FrozenDict, freeze
 from flax.linen.attention import make_attention_mask, make_causal_mask, combine_masks, dot_product_attention_weights
@@ -79,7 +81,7 @@ class FlaxRobertaSelfAttention(BaseJAXAttentionModule):
                 "                   : {self.config.num_attention_heads}"
             )
         self.attention_performer = EasyAttention(
-            attn_type="normal",
+            use_sharding_constraint=self.config.use_sharding_constraint,
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,
             block_q=self.config.block_q,
@@ -95,7 +97,7 @@ class FlaxRobertaSelfAttention(BaseJAXAttentionModule):
             attention_dropout=0.0,
             head_dims=self.head_dim,
             attention_partition_spec=self.config.attention_partition_spec,
-            use_shard_map=self.config.use_shard_map,
+            shard_attention_computation=self.config.shard_attention_computation,
             precision=self.precision,
             force_float32_tpu=True,
             attn_mechanism=self.config.attn_mechanism,
@@ -103,6 +105,9 @@ class FlaxRobertaSelfAttention(BaseJAXAttentionModule):
             bias_partition_spec=self.config.bias_partition_spec,
             key_partition_spec=self.config.key_partition_spec,
             query_partition_spec=self.config.query_partition_spec,
+            generation_query_partition_spec=self.config.generation_query_partition_spec,
+            generation_bias_partition_spec=self.config.generation_bias_partition_spec,
+            generation_attention_partition_spec=self.config.generation_attention_partition_spec,
             value_partition_spec=self.config.value_partition_spec,
             scan_ring_attention=self.config.scan_ring_attention,
             mesh=self.config.jax_mesh(),
@@ -147,6 +152,7 @@ class FlaxRobertaSelfAttention(BaseJAXAttentionModule):
             hidden_states,
             attention_mask,
             layer_head_mask,
+            segment_ids: Optional[chex.Array] = None,
             key_value_states: Optional[jnp.array] = None,
             init_cache: bool = False,
             deterministic=True,
@@ -213,9 +219,11 @@ class FlaxRobertaSelfAttention(BaseJAXAttentionModule):
                 deterministic=deterministic,
                 causal=False,
                 bias=attention_bias,
+                attention_mask=attention_mask,
                 uses_cache=False,
                 query_sequence_length=query_states.shape[1],
-                key_value_sequence_length=key_states.shape[1]
+                key_value_sequence_length=key_states.shape[1],
+                segment_ids=segment_ids
             )
             attn_weights = out.attention_weights
             attn_output = out.attention_outputs
