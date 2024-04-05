@@ -17,8 +17,7 @@ from datasets import Dataset
 from wandb.sdk.lib import RunDisabled
 from wandb.sdk.wandb_run import Run
 from .training_configurations import TrainArguments
-from .. import initialise_tracking
-from ..smi import get_capacity_matrix
+from ..smi import get_capacity_matrix, initialise_tracking
 from ..utils.utils import prefix_print, Timers
 from dataclasses import dataclass
 from ..modules.auto_easydel_model import AutoEasyDelModelForCausalLM, AutoEasyDelConfig
