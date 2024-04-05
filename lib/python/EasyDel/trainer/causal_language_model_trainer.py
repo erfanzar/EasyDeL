@@ -523,24 +523,6 @@ class CausalLanguageModelTrainer(BaseTrainer):
         )
         return filename
 
-    def _start_capturing_memory(self, dir_prefix: str = "/dev/shm" if sys.platform != "win32" else "."):
-        def _start():
-            while True:
-                information_queries = {}
-                for key in ["Used", "Usage Percent"]:
-                    for device, info in get_capacity_matrix(dir_prefix=dir_prefix).items():
-                        information_queries[f"accelerators/{device.replace('_', ' ')} ({key})"] = float(
-                            info[key].replace("%", "").replace("GB", "")
-                        )
-                self.wandb_runtime.log(
-                    information_queries
-                )
-                if self.arguments.stop_capturing_memory:
-                    break
-                time.sleep(0.8)
-
-        return threading.Thread(target=_start)
-
     def train(
             self,
             model_parameters: Optional[flax.core.FrozenDict] = None,
@@ -586,17 +568,6 @@ class CausalLanguageModelTrainer(BaseTrainer):
                 color="red",
                 force_color=True
             )
-        if self.arguments.track_memory:
-            if not self.arguments.performance_mode:
-                initialise_tracking(dir_prefix=dir_prefix)
-                self.arguments._stop_capturing_memory = False
-                mem_tracker = self._start_capturing_memory(dir_prefix=dir_prefix)
-                if self.arguments.use_wandb:
-                    mem_tracker.start()
-                else:
-                    warnings.warn(
-                        "`track_memory` will be ignored since you are not using wandb"
-                    )
         start_time = time.time()
         sharded_state, shard_fns, gather_fns = self.initialize_state(
             model_parameters=model_parameters,
@@ -656,7 +627,6 @@ class CausalLanguageModelTrainer(BaseTrainer):
 
                             forward_backward_step_time_end = time.time()
 
-                            pbar.update(1)
                             trained_tokens = jnp.multiply(
                                 self.arguments.max_sequence_length, jnp.multiply(
                                     current_step,
@@ -725,7 +695,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                     }
 
                                     gathering_metrics_time_end = time.time()
-
+                            pbar.update(1)
                             pbar.set_postfix(**train_metrics)
                             if not self.arguments.performance_mode:
                                 train_metrics.update({
@@ -745,6 +715,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                         )
                                     }
                                 )
+                                train_metrics.update(self.arguments.captured_memory)
                             if self.wandb_runtime is not None and not self.arguments.performance_mode:
                                 with jax.spmd_mode("allow_all"):
                                     self.wandb_runtime.log(train_metrics)
@@ -887,6 +858,8 @@ class CausalLanguageModelTrainer(BaseTrainer):
                         "eval_step_time": total_time,
                         "eval_perplexity": jnp.exp(loss).tolist(),
                     }
+                    log_metrics = copy.deepcopy(eval_metrics)
+                    eval_metrics.update(self.arguments.captured_memory)
                     if self.arguments.use_wandb:
                         with jax.spmd_mode("allow_all"):
                             self.wandb_runtime.log(
@@ -894,11 +867,10 @@ class CausalLanguageModelTrainer(BaseTrainer):
                             )
 
                     pbar.update(1)
-                    log_metrics = copy.deepcopy(eval_metrics)
                     pbar.set_postfix(
                         **log_metrics
                     )
-                    yield eval_metrics
+                    yield log_metrics
             except KeyboardInterrupt:
                 termcolor.cprint(
                     "KeyboardInterrupt At Evaluation model Will return Nothing and just pass.",

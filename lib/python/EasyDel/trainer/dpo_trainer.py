@@ -18,29 +18,28 @@ import wandb
 from fjformer import match_partition_rules, make_shard_and_gather_fns
 from tqdm import tqdm
 
-from ..utils.collectors import DPODataCollatorWithPadding
+from EasyDel.reinforcement_learning.utils.collectors import DPODataCollatorWithPadding
 from typing import Optional, Literal, Dict, Union, Any, Tuple, List, Callable, Mapping
-from .utils import pad_to_length
+from EasyDel.reinforcement_learning.trainer.utils import pad_to_length
 from jax.experimental.pjit import pjit
 from datasets import Dataset
 from jax import numpy as jnp
 
-from ...etils.etils import get_logger
-from ...smi import get_capacity_matrix, initialise_tracking, get_mem
-from ...trainer.causal_language_model_trainer import TrainerOutput
-from ...trainer.training_configurations import TrainArguments
-from ...trainer.base_trainer import (
+from EasyDel.etils.etils import get_logger
+from ..smi import get_capacity_matrix, initialise_tracking, get_mem
+from .causal_language_model_trainer import TrainerOutput
+from .training_configurations import TrainArguments
+from .base_trainer import (
     BaseTrainer,
     TrainerConfigureFunctionFuncOutput,
     TrainerConfigureDataloaderFuncOutput,
     TrainerConfigureModelFuncOutput
 )
-from ...etils import EasyDelState, EasyDelTimerError
+from ..etils import EasyDelState, EasyDelTimerError
 from transformers import PreTrainedTokenizerBase
-from .partitioner_config import PartitionerConfig
 from jax.sharding import PartitionSpec
 
-from ...utils import Timers
+from ..utils import Timers
 from flax.struct import dataclass
 from contextlib import contextmanager
 
@@ -801,7 +800,6 @@ class DPOTrainer(BaseTrainer, ABC):
             arguments: TrainArguments,
             model_state: EasyDelState | str,
             ref_model_state: Optional[EasyDelState | str] = None,
-            partitioner_config: Optional[PartitionerConfig] = PartitionerConfig(),
             beta: float = 0.1,
             label_smoothing: float = .0,
             loss_type: Literal["sigmoid", "hinge", "ipo", "kto"] = "sigmoid",
@@ -835,7 +833,6 @@ class DPOTrainer(BaseTrainer, ABC):
         :param self: Refer to the object itself
         :param model_state: EasyDelState | str: Pass the model state to the trainer
         :param ref_model_state: Optional[EasyDelState | str]: Pass the reference model state
-        :param partitioner_config: Optional[PartitionerConfig]: Specify the partitioner configuration
         :param beta: float: Control the strength of the regularization term
         :param label_smoothing: float: Smooth the labels
         :param loss_type: Literal["sigmoid", "hinge", "ipo", "kto"] : Determine the loss function used
@@ -860,9 +857,6 @@ class DPOTrainer(BaseTrainer, ABC):
         model with provided training Arguments
         :param : Set the padding value for the model
         """
-        if partitioner_config is None:
-            partitioner_config = PartitionerConfig()
-        self.partitioner_config = partitioner_config
         assert arguments is not None, (
             "You Have to pass arguments that will be used for training but you have passed"
             "`arguments=None`"
@@ -992,6 +986,7 @@ class DPOTrainer(BaseTrainer, ABC):
         )
         self.auto_shard_ref_model_state = auto_shard_ref_model_state
         self.auto_shard_model_state = auto_shard_model_state
+
         self._cached_p_l_s = None
         self._cached_c_l_s = None
         self._cached_r_l_s = None
@@ -1278,7 +1273,7 @@ class DPOTrainer(BaseTrainer, ABC):
         tx, scheduler = self.arguments.get_optimizer_and_scheduler(self.max_training_steps)
         return TrainerConfigureModelFuncOutput(
             model=self.model_state.module,
-            config=config,
+            config=config,  # type-ignore
             scheduler=scheduler,
             tx=tx
         )
@@ -1765,8 +1760,6 @@ class DPOTrainer(BaseTrainer, ABC):
             with jax.default_device(jax.devices("cpu")[0]) if self.low_mem_usage else leave_alone_context_manager():
                 dir_prefix: str = "/dev/shm" if sys.platform != "win32" else "."
                 checkpoint_path = "SAVING_SKIPPED"
-                if self.arguments.track_memory:
-                    initialise_tracking(dir_prefix=dir_prefix)
 
                 pbar = tqdm(total=self.max_training_steps)
                 pbar.set_description("Training")
@@ -1778,8 +1771,6 @@ class DPOTrainer(BaseTrainer, ABC):
                 loss_sum = None
                 chosen_rewards_sum = None
                 rejected_rewards_sum = None
-
-                mem_res = "Tracking Option is OFF"
 
                 try:
                     for epoch_index in range(self.arguments.num_train_epochs):
@@ -1872,45 +1863,31 @@ class DPOTrainer(BaseTrainer, ABC):
                                             chosen_rewards_sum is None
                                     ) else chosen_rewards_sum + chosen_rewards
                                 )
-                                information_queries = {}
-                                if self.arguments.track_memory:
-                                    mem_res = get_mem(dir_prefix=dir_prefix)
-
-                                    for key in ["Used", "Usage Percent"]:
-                                        for device, info in get_capacity_matrix(dir_prefix=dir_prefix).items():
-                                            information_queries[f"{device.replace('_', ' ')} ({key})"] = float(
-                                                info[key].replace("%", "").replace("GB", ""))
                                 train_metrics = {
-                                    "loss": loss.tolist(),
-                                    "mean_loss": loss_sum / (current_step - self.arguments.step_start_point),
-                                    "mean_rejected_rewards": rejected_rewards_sum / (
+                                    "train/loss": loss.tolist(),
+                                    "train/mean_loss": loss_sum / (current_step - self.arguments.step_start_point),
+                                    "train/mean_rejected_rewards": rejected_rewards_sum / (
                                             current_step - self.arguments.step_start_point
                                     ),
-                                    "mean_chosen_rewards": chosen_rewards_sum / (
+                                    "train/mean_chosen_rewards": chosen_rewards_sum / (
                                             current_step - self.arguments.step_start_point
                                     ),
-                                    "learning_rate": self.scheduler(
+                                    "train/learning_rate": self.scheduler(
                                         jax.device_get(self.model_state.step)
                                     ).tolist(),
-                                    "step": current_step,
-                                    "step_time": total_time,
-                                    "perplexity": jnp.exp(loss).tolist(),
-                                    "accelerators": information_queries,
-                                    "epoch": epoch_index
+                                    "train/step": current_step,
+                                    "train/step_time": total_time,
+                                    "train/perplexity": jnp.exp(loss).tolist(),
+                                    "train/epoch": epoch_index
                                 }
+                                log_metrics = copy.deepcopy(train_metrics)
+                                train_metrics.update(self.arguments.captured_memory)
                                 if self.arguments.use_wandb:
                                     with jax.spmd_mode("allow_all"):
                                         self.wandb_runtime.log(
                                             train_metrics
-                                        ),
-                                        wandb.summary["captured_memory_log"] = mem_res
-
-                                if self.arguments.track_memory:
-                                    IPython.display.clear_output(True)
-                                    pbar.display(mem_res)
+                                        )
                                 pbar.update(1)
-                                log_metrics = copy.deepcopy(train_metrics)
-                                _ = log_metrics.pop("accelerators")
                                 pbar.set_postfix(
                                     **log_metrics
                                 )
@@ -2005,7 +1982,6 @@ class DPOTrainer(BaseTrainer, ABC):
             loss_sum = None
             chosen_rewards_sum = None
             rejected_rewards_sum = None
-            mem_res = "Tracking Option is OFF"
 
             try:
                 for batch in self.dataloader_eval:
@@ -2042,43 +2018,29 @@ class DPOTrainer(BaseTrainer, ABC):
                         ) else chosen_rewards_sum + chosen_rewards
                     )
 
-                    information_queries = {}
-                    if self.arguments.track_memory:
-                        mem_res = get_mem(dir_prefix=dir_prefix)
-                        for key in ["Used", "Usage Percent"]:
-                            for device, info in get_capacity_matrix(dir_prefix=dir_prefix).items():
-                                information_queries[f"{device.replace('_', ' ')} ({key})"] = float(
-                                    info[key].replace("%", "").replace("GB", ""))
                     eval_metrics = {
-                        "eval_loss": loss.tolist(),
-                        "eval_mean_loss": loss_sum / (current_step - self.arguments.step_start_point),
-                        "eval_mean_rejected_rewards": rejected_rewards_sum / (
+                        "eval/loss": loss.tolist(),
+                        "eval/mean_loss": loss_sum / (current_step - self.arguments.step_start_point),
+                        "eval/mean_rejected_rewards": rejected_rewards_sum / (
                                 current_step - self.arguments.step_start_point
                         ),
-                        "eval_mean_chosen_rewards": chosen_rewards_sum / (
+                        "eval/mean_chosen_rewards": chosen_rewards_sum / (
                                 current_step - self.arguments.step_start_point
                         ),
-                        "eval_step": current_step,
-                        "eval_step_time": total_time,
-                        "eval_perplexity": jnp.exp(loss).tolist(),
-                        "eval_accelerators": information_queries,
+                        "eval/step": current_step,
+                        "eval/step_time": total_time,
+                        "eval/perplexity": jnp.exp(loss).tolist(),
                     }
+                    log_metrics = copy.deepcopy(eval_metrics)
+                    eval_metrics.update(self.arguments.captured_memory)
                     if self.arguments.use_wandb:
                         with jax.spmd_mode("allow_all"):
                             self.wandb_runtime.log(
                                 eval_metrics
-                            ),
-                            wandb.summary["eval_captured_memory_log"] = mem_res
+                            )
 
-                    if self.arguments.track_memory:
-                        IPython.display.clear_output(True)
-                        pbar.display(mem_res)
                     pbar.update(1)
-                    log_metrics = copy.deepcopy(eval_metrics)
-                    _ = log_metrics.pop("eval_accelerators")
-                    pbar.set_postfix(
-                        **log_metrics
-                    )
+                    pbar.set_postfix(**log_metrics)
                     yield eval_metrics
             except KeyboardInterrupt:
                 termcolor.cprint(

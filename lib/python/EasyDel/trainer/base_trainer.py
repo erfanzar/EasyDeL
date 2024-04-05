@@ -1,5 +1,8 @@
 import abc
 import os
+import sys
+import threading
+import time
 import warnings
 from abc import abstractmethod
 from typing import Union, Callable, Optional, Any, Literal, Mapping
@@ -14,6 +17,8 @@ from datasets import Dataset
 from wandb.sdk.lib import RunDisabled
 from wandb.sdk.wandb_run import Run
 from .training_configurations import TrainArguments
+from .. import initialise_tracking
+from ..smi import get_capacity_matrix
 from ..utils.utils import prefix_print, Timers
 from dataclasses import dataclass
 from ..modules.auto_easydel_model import AutoEasyDelModelForCausalLM, AutoEasyDelConfig
@@ -133,7 +138,12 @@ class BaseTrainer:
         self.checkpoint_path = checkpoint_path
         self.dtype = arguments.dtype
         self.param_dtype = arguments.param_dtype
-
+        if self.arguments.track_memory:
+            if not self.arguments.performance_mode:
+                initialise_tracking()
+                self.arguments._stop_capturing_memory = False
+                mem_tracker = self._start_capturing_memory()
+                mem_tracker.start()
         if finetune:
             if checkpoint_path is None:
                 prefix_print(
@@ -173,6 +183,22 @@ class BaseTrainer:
 
         """
         wandb.finish()
+
+    def _start_capturing_memory(self, dir_prefix: str = "/dev/shm" if sys.platform != "win32" else "."):
+        def _start():
+            while True:
+                information_queries = {}
+                for key in ["Used", "Usage Percent"]:
+                    for device, info in get_capacity_matrix(dir_prefix=dir_prefix).items():
+                        information_queries[f"accelerators/{device.replace('_', ' ')} ({key})"] = float(
+                            info[key].replace("%", "").replace("GB", "")
+                        )
+                self.arguments._captured_memory = information_queries
+                if self.arguments.stop_capturing_memory:
+                    break
+                time.sleep(1.5)
+
+        return threading.Thread(target=_start)
 
     def initialize_trainer_utils(self):
         """
