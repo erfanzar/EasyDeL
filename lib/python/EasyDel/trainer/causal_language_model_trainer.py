@@ -683,6 +683,19 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                     "epoch": epoch,
                                 }
                                 gathering_metrics_time_end = time.time()
+                                train_metrics.update(
+                                    {
+                                        "gathering_metrics_time": (
+                                                gathering_metrics_time_end - gathering_metrics_time_start
+                                        ),
+                                        "forward_backward_step_time": (
+                                                forward_backward_step_time_end - forward_backward_step_time_start
+                                        ),
+                                        "calculating_metrics_step_time": (
+                                                calculating_metrics_end - calculating_metrics_start
+                                        )
+                                    }
+                                )
 
                             else:
                                 with jax.spmd_mode("allow_all"):
@@ -719,19 +732,19 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                     f"grad_norm/{layer_name}": grad_norm.tolist()
                                     for layer_name, grad_norm in get_layer_names(metrics["grad_norms"]).items()
                                 })
-                            train_metrics.update(
-                                {
-                                    "time_cal/gathering_metrics_time": (
-                                            gathering_metrics_time_end - gathering_metrics_time_start
-                                    ),
-                                    "time_cal/forward_backward_step_time": (
-                                            forward_backward_step_time_end - forward_backward_step_time_start
-                                    ),
-                                    "time_cal/calculating_metrics": (
-                                            calculating_metrics_end - calculating_metrics_start
-                                    )
-                                }
-                            )
+                                train_metrics.update(
+                                    {
+                                        "time_cal/gathering_metrics_time": (
+                                                gathering_metrics_time_end - gathering_metrics_time_start
+                                        ),
+                                        "time_cal/forward_backward_step_time": (
+                                                forward_backward_step_time_end - forward_backward_step_time_start
+                                        ),
+                                        "time_cal/calculating_metrics_step_time": (
+                                                calculating_metrics_end - calculating_metrics_start
+                                        )
+                                    }
+                                )
                             if self.wandb_runtime is not None and not self.arguments.performance_mode:
                                 with jax.spmd_mode("allow_all"):
                                     self.wandb_runtime.log(train_metrics)
