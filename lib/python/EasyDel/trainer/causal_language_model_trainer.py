@@ -600,7 +600,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
         count_model_parameters(sharded_state.params)
         with self.mesh:
             pbar = tqdm(total=self.max_training_steps)
-            current_step = jax.device_get(sharded_state.step)
+            current_step = int(jax.device_get(sharded_state.step))
             loss_sum = None
             accuracy_sum = None
             pbar.update(sharded_state.step.tolist())
