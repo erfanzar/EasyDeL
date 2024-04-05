@@ -713,12 +713,12 @@ class CausalLanguageModelTrainer(BaseTrainer):
 
                                     gathering_metrics_time_end = time.time()
 
-                                pbar.set_postfix(**train_metrics)
-                                if not self.arguments.performance_mode:
-                                    train_metrics.update({
-                                        f"grad_norm/{layer_name}": grad_norm.tolist()
-                                        for layer_name, grad_norm in get_layer_names(metrics["grad_norms"]).items()
-                                    })
+                            pbar.set_postfix(**train_metrics)
+                            if not self.arguments.performance_mode:
+                                train_metrics.update({
+                                    f"grad_norm/{layer_name}": grad_norm.tolist()
+                                    for layer_name, grad_norm in get_layer_names(metrics["grad_norms"]).items()
+                                })
                             train_metrics.update(
                                 {
                                     "time_cal/gathering_metrics_time": (
