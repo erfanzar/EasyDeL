@@ -155,20 +155,24 @@ from .utils.utils import (
     get_mesh as get_mesh,
     RNG as RNG
 )
-
 from .trainer import (
-    CausalLanguageModelTrainer as CausalLanguageModelTrainer,
-    EasyDeLXRapTureConfig as EasyDeLXRapTureConfig,
     TrainArguments as TrainArguments,
+    EasyDeLXRapTureConfig as EasyDeLXRapTureConfig,
     create_casual_language_model_evaluation_step as create_casual_language_model_evaluation_step,
     create_casual_language_model_train_step as create_casual_language_model_train_step,
-    create_vision_casual_language_model_train_step as create_vision_casual_language_model_train_step,
-    create_vision_casual_language_model_evaluation_step as create_vision_casual_language_model_evaluation_step,
+    CausalLanguageModelTrainer as CausalLanguageModelTrainer,
+    VisionCausalLanguageModelStepOutput as VisionCausalLanguageModelStepOutput,
     VisionCausalLanguageModelTrainer as VisionCausalLanguageModelTrainer,
-    VisionCausalLanguageModelStepOutput as VisionCausalLanguageModelStepOutput
+    create_vision_casual_language_model_evaluation_step as create_vision_casual_language_model_evaluation_step,
+    create_vision_casual_language_model_train_step as create_vision_casual_language_model_train_step,
+    DPOTrainer as DPOTrainer,
+    create_dpo_eval_function as create_dpo_eval_function,
+    create_concatenated_forward as create_concatenated_forward,
+    create_dpo_train_function as create_dpo_train_function,
+    concatenated_dpo_inputs as concatenated_dpo_inputs
 )
 
-from .trainer.dpo_trainer import (
+from EasyDel.trainer.dpo.dpo_trainer import (
     create_dpo_eval_function as create_dpo_eval_function,
     create_dpo_train_function as create_dpo_train_function,
     DPOTrainer as DPOTrainer,
@@ -358,11 +362,23 @@ __all__ = (
     "RNG",
 
     # Trainers
-    "CausalLanguageModelTrainer",
-    "EasyDeLXRapTureConfig",
     "TrainArguments",
+    "EasyDeLXRapTureConfig",
+
     "create_casual_language_model_evaluation_step",
     "create_casual_language_model_train_step",
+    "CausalLanguageModelTrainer",
+
+    "VisionCausalLanguageModelStepOutput",
+    "VisionCausalLanguageModelTrainer",
+    "create_vision_casual_language_model_evaluation_step",
+    "create_vision_casual_language_model_train_step",
+
+    "DPOTrainer",
+    "create_dpo_eval_function",
+    "create_concatenated_forward",
+    "create_dpo_train_function",
+    "concatenated_dpo_inputs",
 
     "VisionCausalLanguageModelStepOutput",
     "VisionCausalLanguageModelTrainer",

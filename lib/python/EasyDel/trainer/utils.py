@@ -4,7 +4,10 @@ from ml_collections.config_dict import placeholder
 
 
 class JaxDistributedConfig(object):
-    """ Utility class for initializing JAX distributed. """
+    """
+    From EasyLM
+    Utility class for initializing JAX distributed.
+    """
 
     @staticmethod
     def get_default_config(updates=None):
