@@ -112,6 +112,7 @@ class TrainArguments(
             state_apply_fn_kwarguments_to_model: Optional[dict] = None,
             remove_unused_columns: bool = True,
             force_batch_and_gradient_accumulation_steps_calculation: bool = False,
+            performance_mode: bool = False,
             **kwargs
     ):
         """
@@ -185,6 +186,8 @@ be used to apply the parameters and extra things that you want to deliver to mod
 :param remove_unused_columns: bool: when ever to remove the unused data columns from dataset
 :param force_batch_and_gradient_accumulation_steps_calculation: bool: whether to force batch and gradient to be
 applied as total batch_size (e.g total_batch_size = total_batch_size * gradient_accumulation_steps be applied)
+:param performance_mode: bool: whether to optimize the whole training process this will cut off some logging options
+and optimize training process.
 :param **kwargs: Pass keyword, variable-length argument list
         """
         super().__init__()
@@ -288,6 +291,7 @@ applied as total batch_size (e.g total_batch_size = total_batch_size * gradient_
         self.step_start_point = step_start_point if step_start_point is not None else 0
         self.verbose = verbose
         self.offload_device = offload_device
+        self.performance_mode = performance_mode
         self.optimizer_kwargs = dict(
             learning_rate=self.learning_rate,
             learning_rate_end=self.learning_rate_end,

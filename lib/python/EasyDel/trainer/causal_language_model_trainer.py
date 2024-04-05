@@ -537,6 +537,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
                 )
                 if self.arguments.stop_capturing_memory:
                     break
+                time.sleep(0.8)
 
         return threading.Thread(target=_start)
 
@@ -581,7 +582,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
 
         if self.arguments.track_memory:
             initialise_tracking(dir_prefix=dir_prefix)
-            self.arguments._stop_capturing_memory = True
+            self.arguments._stop_capturing_memory = False
             mem_tracker = self._start_capturing_memory(dir_prefix=dir_prefix)
             if self.arguments.use_wandb:
                 mem_tracker.start()
@@ -657,27 +658,27 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                 )
                             )  # It's faster
 
-                            gathering_metrics_time_start = time.time()
                             with jax.spmd_mode("allow_all"):
+                                gathering_metrics_time_start = time.time()
+                                calculating_metrics_start = time.time()
                                 loss_sum = loss if loss_sum is None else loss_sum + loss
                                 accuracy = metrics["accuracy"]
                                 accuracy_sum = accuracy if accuracy_sum is None else accuracy_sum + accuracy
+                                mean_loss = loss_sum / (current_step - self.arguments.step_start_point)
+                                mean_accuracy = accuracy_sum / (current_step - self.arguments.step_start_point)
+                                perplexity = jnp.exp(loss)
+                                calculating_metrics_end = time.time()
                                 train_metrics = {
                                     "loss": loss.tolist(),
-                                    "mean_loss": (loss_sum / (current_step - self.arguments.step_start_point)).tolist(),
+                                    "mean_loss": mean_loss.tolist(),
                                     "accuracy": accuracy,
-                                    "mean_accuracy": (
-                                            accuracy_sum / (current_step - self.arguments.step_start_point)
-                                    ).tolist(),
-                                    "learning_rate": self.scheduler(
-                                        int(jax.device_get(sharded_state.step))
-                                    ).tolist(),
-                                    "step": int(jax.device_get(sharded_state.step)),
+                                    "mean_accuracy": mean_accuracy.tolist(),
+                                    "learning_rate": self.scheduler(current_step).tolist(),
+                                    "step": current_step,
                                     "step_time": step_time,
-                                    "perplexity": jnp.exp(loss).tolist(),
+                                    "perplexity": perplexity.tolist(),
                                     "trained_tokens": trained_tokens,
                                 }
-                                log_metrics = copy.deepcopy(train_metrics)
                                 train_metrics.update(
                                     {
                                         "max_grad_norm": metrics["max_grad_norm"].tolist(),
@@ -686,18 +687,24 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                         "epoch": epoch,
                                     }
                                 )
-                                train_metrics.update({
-                                    f"grad_norm/{layer_name}": grad_norm.tolist()
-                                    for layer_name, grad_norm in get_layer_names(metrics["grad_norms"]).items()
-                                })
 
-                            gathering_metrics_time_end = time.time()
-                            pbar.set_postfix(**log_metrics)
+                                gathering_metrics_time_end = time.time()
+
+                            pbar.set_postfix(**train_metrics)
+                            train_metrics.update({
+                                f"grad_norm/{layer_name}": grad_norm.tolist()
+                                for layer_name, grad_norm in get_layer_names(metrics["grad_norms"]).items()
+                            })
                             train_metrics.update(
                                 {
-                                    "gathering_metrics_time": gathering_metrics_time_end - gathering_metrics_time_start,
-                                    "forward_backward_step_time": (
+                                    "time_cal/gathering_metrics_time": (
+                                            gathering_metrics_time_end - gathering_metrics_time_start
+                                    ),
+                                    "time_cal/forward_backward_step_time": (
                                             forward_backward_step_time_end - forward_backward_step_time_start
+                                    ),
+                                    "time_cal/calculating_metrics": (
+                                            calculating_metrics_end - calculating_metrics_start
                                     )
                                 }
                             )
