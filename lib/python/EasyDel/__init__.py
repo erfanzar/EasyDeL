@@ -168,12 +168,11 @@ from .trainer import (
     VisionCausalLanguageModelStepOutput as VisionCausalLanguageModelStepOutput
 )
 
-from .reinforcement_learning import (
+from .trainer.dpo_trainer import (
     create_dpo_eval_function as create_dpo_eval_function,
     create_dpo_train_function as create_dpo_train_function,
     DPOTrainer as DPOTrainer,
     create_concatenated_forward as create_concatenated_forward,
-    AutoRLModelForCasualLMWithValueHead as AutoRLModelForCasualLMWithValueHead
 )
 
 from .smi import (
@@ -374,7 +373,6 @@ __all__ = (
     "create_dpo_train_function",
     "DPOTrainer",
     "create_concatenated_forward",
-    "AutoRLModelForCasualLMWithValueHead",
 
     # SMI Modules
     "smi_run",

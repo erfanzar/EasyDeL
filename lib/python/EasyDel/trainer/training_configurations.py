@@ -312,6 +312,7 @@ and optimize training process.
         self.rapture_config = None
         self.remove_unused_columns = remove_unused_columns
         self._stop_capturing_memory = False
+        self._captured_memory = {}
         self.state_apply_fn_kwarguments_to_model = (
             state_apply_fn_kwarguments_to_model
         ) if state_apply_fn_kwarguments_to_model is not None else {}
@@ -506,3 +507,7 @@ and optimize training process.
     @property
     def stop_capturing_memory(self):
         return self._stop_capturing_memory
+
+    @property
+    def captured_memory(self):
+        return self._captured_memory
