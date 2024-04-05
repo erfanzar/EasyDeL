@@ -4,7 +4,7 @@ os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 
 import jax
 from jax import numpy as jnp
-from EasyDel.trainer.dpo_trainer import (
+from EasyDel.trainer.dpo.dpo_trainer import (
     DPOTrainer as DPOTrainer,
     TrainArguments
 )

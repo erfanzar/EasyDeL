@@ -1,210 +1,37 @@
 import copy
-import dataclasses
+from glob import glob
 import os
 import sys
 import time
 import typing
 
-import IPython.display
+from flax.core import FrozenDict
 import termcolor
-from fjformer.func.loss_func import cross_entropy_loss_and_accuracy
 import wandb
 
 import jax
 import flax
 from tqdm import tqdm
-from ..smi import initialise_tracking, get_mem, get_capacity_matrix
 from jax.experimental.pjit import pjit
 from jax.sharding import PartitionSpec
 from jax import numpy as jnp
 from fjformer import (
     match_partition_rules,
-    make_shard_and_gather_fns,
-    with_sharding_constraint
+    make_shard_and_gather_fns
 )
-from ..etils.errors import EasyDelTimerError
-import chex
-from typing import Any, Optional, Callable, Mapping
-from ..etils.easystate import EasyDelState
-from .base_trainer import TrainerConfigureFunctionFuncOutput
-from .causal_language_model_trainer import CausalLanguageModelTrainer
-from flax.struct import dataclass
-
-from ..utils import prefix_print
-
-
-@dataclass
-class VisionCausalLanguageModelStepOutput:
-    loss: chex.Array
-
-    text_loss: chex.Array
-    text_accuracy: chex.Array
-
-    vision_loss: chex.Array
-    vision_accuracy: chex.Array
+from typing import Any, Optional, Tuple, Callable, Mapping
+from ...etils.easystate import EasyDelState
+from ...trainer.base_trainer import BaseTrainer, TrainerConfigureFunctionFuncOutput
+from ...etils.errors import EasyDelTimerError
+from ...utils.utils import prefix_print
+from .modeling_output import CausalLMTrainerOutput
+from .fwd_bwd_functions import (
+    create_casual_language_model_train_step,
+    create_casual_language_model_evaluation_step
+)
 
 
-def calculate_accuracy(predictions: chex.Array, targets: chex.Array):
-    """
-    The calculate_accuracy function takes in two arrays, predictions and targets.
-    The function then calculates the accuracy of the model by comparing the predicted classes to
-    the target classes. The predicted class is determined by taking argmax along axis - 1 of predictions.
-    The correct_predictions variable is an array containing True or False values depending on whether or not
-    the prediction was correct for each example in a batch. The total number of examples that were correctly
-    predicted are summed up and divided by the total number of examples to get an accuracy value between 0 and 1.
-
-    :param predictions: chex.Array: Pass in the predictions from the model
-    :param targets: chex.Array: Calculate the accuracy of the model
-    :return: A single value, the accuracy
-
-    """
-    predicted_classes = jnp.argmax(predictions, axis=-1)
-    correct_predictions = (predicted_classes == targets).sum()
-    total_predictions = targets.shape[0]
-    accuracy = correct_predictions / total_predictions
-    return accuracy
-
-
-def create_vision_casual_language_model_train_step(partition_spec=PartitionSpec(("dp", "fsdp"), "sp")):
-    """
-    The create_vision_casual_language_model_train_step function is a training step function that takes in the current state
-    of the model,and a batch of data. It then calculates the loss and accuracy for this batch, and returns
-    an updated state with new parameters based on these gradients.
-
-    :param partition_spec: Specify which devices the model will be split across
-    :return: A casual_language_model_train_step function that takes in the current state of the model,
-
-    """
-
-    def vision_casual_language_model_train_step(state, batch) -> [
-        EasyDelState,
-        chex.Array,
-        VisionCausalLanguageModelStepOutput
-    ]:
-        """
-        The vision_casual_language_model_train_step function is a training step function that takes in the current state
-        of the model and a batch of data. It then calculates the loss and accuracy for this batch,
-        and returns an updated state with new parameters based on these gradients.
-
-        :param state: Store the model parameters
-        :param batch: Pass the data to the model
-        :return: A tuple of (state, loss, VisionCausalLanguageModelStepOutput)
-
-        """
-        batch = with_sharding_constraint(batch, partition_spec)
-
-        def calculate_loss(params):
-            labels = batch.pop("labels")
-            label_vision_mask = batch.pop("label_vision_mask")
-
-            model_outputs = state.apply_fn(params=params, **batch, return_dict=True)
-            logits = model_outputs.logits
-            aux_loss = getattr(model_outputs, "aux_loss", None)
-
-            vision_loss, vision_accuracy = cross_entropy_loss_and_accuracy(
-                logits[:, :-1, :],
-                jnp.where(label_vision_mask, labels, 0),
-                batch["attention_mask"].astype(jnp.float32)[:, 1:] * label_vision_mask
-            )
-            text_loss, text_accuracy = cross_entropy_loss_and_accuracy(
-                logits[:, :-1, :],
-                jnp.where(label_vision_mask, 0, labels),
-                batch["attention_mask"].astype(jnp.float32)[:, 1:] * (1.0 - label_vision_mask)
-            )
-
-            loss = 0.5 * (vision_loss + text_loss + (aux_loss if aux_loss is not None else 0.))
-
-            return loss, VisionCausalLanguageModelStepOutput(
-                loss=loss,
-                text_accuracy=text_accuracy,
-                vision_accuracy=vision_accuracy,
-                text_loss=text_loss,
-                vision_loss=vision_loss
-            )
-
-        grad_fn = jax.value_and_grad(calculate_loss, has_aux=True)
-        (loss__, metrics), grad = grad_fn(state.params)
-        state = state.apply_gradients(grads=grad)
-        return state, loss__, metrics
-
-    return vision_casual_language_model_train_step
-
-
-def create_vision_casual_language_model_evaluation_step(partition_spec=PartitionSpec(("dp", "fsdp"), "sp")):
-    """
-    The create_vision_casual_language_model_evaluation_step function is used to create a function that calculates the loss
-     and accuracy of a model. It takes in a set of parameters, which are then passed into the state.apply_fn function
-    to generate logits for each token in the batch. The cross entropy loss and accuracy are then calculated from these
-    logits.
-
-    :param partition_spec: Specify the partitioning of the model parameters
-    :return: A function that can be used to calculate the loss and accuracy of a model
-
-    """
-
-    def vision_casual_language_model_evaluation_step(state, batch) -> [
-        EasyDelState,
-        chex.Array,
-        VisionCausalLanguageModelStepOutput
-    ]:
-        """
-        The vision_casual_language_model_train_step function is a training step function that takes in the current state
-        of the model and a batch of data. It then calculates the loss and accuracy for this batch,
-        and returns an updated state with new parameters based on these gradients.
-
-        :param state: Store the model parameters
-        :param batch: Pass the data to the model
-        :return: A tuple of (state, loss, VisionCausalLanguageModelStepOutput)
-
-        """
-        batch = with_sharding_constraint(batch, partition_spec)
-
-        def calculate_loss(params):
-            labels = batch.pop("labels")
-            label_vision_mask = batch.pop("label_vision_mask")
-            model_outputs = state.apply_fn(params=params, **batch, return_dict=True)
-            logits = model_outputs.logits
-            aux_loss = getattr(model_outputs, "aux_loss", None)
-
-            vision_loss, vision_accuracy = cross_entropy_loss_and_accuracy(
-                logits[:, :-1, :],
-                jnp.where(label_vision_mask, labels, 0),
-                batch["attention_mask"].astype(jnp.float32)[:, 1:] * label_vision_mask
-            )
-            text_loss, text_accuracy = cross_entropy_loss_and_accuracy(
-                logits[:, :-1, :],
-                jnp.where(label_vision_mask, 0, labels),
-                batch["attention_mask"].astype(jnp.float32)[:, 1:] * (1.0 - label_vision_mask)
-            )
-
-            loss = 0.5 * (vision_loss + text_loss + (aux_loss if aux_loss is not None else 0.))
-
-            return loss, VisionCausalLanguageModelStepOutput(
-                loss=loss,
-                text_accuracy=text_accuracy,
-                vision_accuracy=vision_accuracy,
-                text_loss=text_loss,
-                vision_loss=vision_loss
-            )
-
-        loss__, metrics = calculate_loss(state.params)
-        return loss__, metrics
-
-    return vision_casual_language_model_evaluation_step
-
-
-@dataclasses.dataclass
-class TrainerOutput:
-    state: EasyDelState
-    mesh: Optional[jax.sharding.Mesh]
-    checkpoint_manager: Any
-    gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]] = None
-    shard_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]] = None
-    last_save_file_name: Optional[str] = None
-    checkpoint_path: Optional[str] = None
-
-
-class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
+class CausalLanguageModelTrainer(BaseTrainer):
 
     def create_collate_function(
             self,
@@ -213,7 +40,6 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
     ) -> Callable:
         def collate_fn(batch):
             results = {}
-            corrected_sequence = None
             for key in batch[0].keys():
                 if truncation_mode == "keep_end":
                     corrected_sequence = [
@@ -328,14 +154,18 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
             donate_argnums=(0,)
         )
         sharded_train_step_function = pjit(
-            create_vision_casual_language_model_train_step(self.arguments.step_partition_spec),
+            create_casual_language_model_train_step(
+                partition_spec=self.arguments.step_partition_spec,
+                label_smoothing_factor=self.arguments.label_smoothing_factor,
+                z_loss=self.arguments.z_loss,
+            ),
             in_shardings=(state_partition_spec, PartitionSpec()),
             out_shardings=(state_partition_spec, PartitionSpec(), PartitionSpec()),
             donate_argnums=(0, 0),
         )
 
         sharded_eval_step_function = pjit(
-            create_vision_casual_language_model_evaluation_step(self.arguments.step_partition_spec),
+            create_casual_language_model_evaluation_step(self.arguments.step_partition_spec),
             in_shardings=(state_partition_spec, PartitionSpec()),
             out_shardings=(PartitionSpec(), PartitionSpec()),
             donate_argnums=(0, 0),
@@ -360,7 +190,7 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
             self,
             model_parameters: Optional[flax.core.FrozenDict] = None,
             state: Optional[EasyDelState] = None,
-    ) -> typing.Tuple[EasyDelState, Mapping[str, Callable], Mapping[str, Callable]]:
+    ) -> Tuple[EasyDelState, Mapping[str, Callable], Mapping[str, Callable]]:
         if model_parameters is None and state is None and self.rapture is None and self.checkpoint_path is None:
             raise RuntimeError(
                 "You are passing `model_parameters=None`, `state=None`, and `checkpoint_path=None` and also you are not"
@@ -410,9 +240,6 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
                             init_optimizer_state=True,
                             checkpoint_path=self.checkpoint_path,
                         )
-                        # sharded_state = sharded_state.replace(
-                        #     tx=self.tx,
-                        # )
                         state_shape = jax.eval_shape(lambda: sharded_state)
                         state_partition_spec = match_partition_rules(
                             self.config.get_partition_rules(
@@ -421,8 +248,10 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
                             state_shape
                         )
                         sharded_train_step_function = pjit(
-                            create_vision_casual_language_model_train_step(
+                            create_casual_language_model_train_step(
                                 partition_spec=self.arguments.step_partition_spec,
+                                label_smoothing_factor=self.arguments.label_smoothing_factor,
+                                z_loss=self.arguments.z_loss,
                             ),
                             in_shardings=(state_partition_spec, PartitionSpec()),
                             out_shardings=(state_partition_spec, PartitionSpec(), PartitionSpec()),
@@ -430,7 +259,7 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
                         )
 
                         sharded_eval_step_function = pjit(
-                            create_vision_casual_language_model_evaluation_step(self.arguments.step_partition_spec),
+                            create_casual_language_model_evaluation_step(self.arguments.step_partition_spec),
                             in_shardings=(state_partition_spec, PartitionSpec()),
                             out_shardings=(PartitionSpec(), PartitionSpec()),
                             donate_argnums=(0, 0),
@@ -481,24 +310,73 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
             self.sharded_state = sharded_state
             return sharded_state, shard_fns, gather_fns
 
+    def _save_state(
+            self,
+            state: EasyDelState,
+            gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
+            milestone: bool = False
+    ) -> str:
+        step = int(
+            jax.device_get(
+                state.step
+            )
+        ) + self.arguments.step_start_point if self.arguments.step_start_point is not None else int(
+            jax.device_get(
+                state.step
+            )
+        )
+
+        checkpoint_dir = os.path.join(self.arguments.save_dir, self.arguments.model_name)
+        filename_extension = ".easy"
+        if self.arguments.save_total_limit:
+            checkpoint_files = glob(os.path.join(checkpoint_dir, f"*{filename_extension}"))
+            checkpoint_files.sort(key=os.path.getmtime)
+            for old_checkpoint in checkpoint_files[:-self.arguments.save_total_limit]:
+                os.remove(old_checkpoint)
+                termcolor.cprint(f"Removed old checkpoint: {old_checkpoint}", color="red", force_color=True)
+
+        checkpoint_name = f"{self.arguments.model_name}-S{step}"
+        filename = f"{checkpoint_name}_{step}" if milestone else f"{checkpoint_name}"
+        filename += ".easy"
+        termcolor.cprint(f"Saving Model {filename}.", color="cyan", force_color=True)
+        state.save_state(
+            filename=filename,
+            checkpoint_dir=checkpoint_dir,
+            gather_fns=gather_fns,
+            float_dtype=self.dtype,
+            verbose=self.arguments.verbose,
+            save_optimizer=self.arguments.save_optimizer_state,
+        )
+        return filename
+
     def train(
             self,
             model_parameters: Optional[flax.core.FrozenDict] = None,
             state: Optional[EasyDelState] = None
-    ) -> TrainerOutput:
+    ) -> CausalLMTrainerOutput:
         """
         The train function is the main function of this module.
         It takes a model_parameters argument which can be used to load a pretrained model and finetune it.
-        The train function returns an TrainerOutput object that contains the last saved file name, predict func,
+        The train function returns an CausalLMTrainerOutput object that contains the last saved file name, predict func,
         train state, mesh and checkpoint streamer.
 
 
         :param self: Make the class methods aware of other methods and attributes within the class
         :param model_parameters: flax.core.FrozenDict: Load a pre-trained model
         :param state: Optional[EasyDelState]: Ready to Use State
-        :return: An object of type "TrainerOutput"
+        :return: An object of type "CausalLMTrainerOutput"
 
         """
+
+        def get_layer_names(frozen_dict, prefix=""):
+            layer_names = {}
+            for key, value in frozen_dict.items():
+                if isinstance(value, FrozenDict):
+                    layer_names.update(get_layer_names(value, prefix=f"{prefix}_{key}"))
+                else:
+                    layer_name = f"{prefix}_{key}".lstrip("/")
+                    layer_names[layer_name] = value
+            return layer_names
 
         def count_model_parameters(_p):
             termcolor.cprint(
@@ -507,10 +385,14 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
                 color="red", force_color=True
             )
 
-        dir_prefix: str = "/dev/shm" if sys.platform != "win32" else "."
         checkpoint_path = "SAVING_SKIPPED"
-        if self.arguments.track_memory:
-            initialise_tracking(dir_prefix=dir_prefix)
+        if self.arguments.performance_mode:
+            termcolor.cprint(
+                "Performance Mode is ON, we will ignore the Memory Tracking, WANDB Logging, and extra information "
+                "Process.",
+                color="red",
+                force_color=True
+            )
         start_time = time.time()
         sharded_state, shard_fns, gather_fns = self.initialize_state(
             model_parameters=model_parameters,
@@ -521,14 +403,9 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
         with self.mesh:
             pbar = tqdm(total=self.max_training_steps)
             current_step = int(jax.device_get(sharded_state.step))
-
             loss_sum = None
-            vision_loss_sum = None
-            vision_accuracy_sum = None
-            text_loss_sum = None
-            text_accuracy_sum = None
-            pbar.update(sharded_state.step.tolist())
-            learning_rates = []
+            accuracy_sum = None
+            pbar.update(sharded_state.step.tolist())  # type-ignore
             if self.wandb_runtime is not None:
                 model_parameters_number = sum(
                     n.size for n in
@@ -542,6 +419,7 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
                 wandb.summary["Number of Model Parameters (Billion)"] = model_parameters_number
             try:
                 for epoch in range(self.arguments.num_train_epochs):
+                    time_s = time.time()
                     for batch in self.dataloader_train:
                         current_step += 1
                         if (
@@ -552,97 +430,120 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
                             pbar.update(1)
                         elif current_step < self.max_training_steps:
 
-                            batch["labels"] = batch["input_ids"][..., 1:]
+                            time_prev = time_s
+                            time_s = time.time()
+                            step_time = time_s - time_prev
+
+                            batch["labels"] = (
+                                batch["labels"][..., 1:]
+                                if "labels" in batch and not self.arguments.train_on_inputs
+                                else batch["input_ids"][..., 1:]
+                            )
                             for ssb in self.arguments.ids_to_pop_from_dataset:
                                 _ = batch.pop(ssb, None)
-                            time_s = time.time()
-                            outputs_and_metrics: tuple[
-                                EasyDelState, chex.Array, VisionCausalLanguageModelStepOutput
-                            ] = self.sharded_train_step_function(
+
+                            forward_backward_step_time_start = time.time()
+
+                            (
                                 sharded_state,
-                                batch
-                            )
-                            sharded_state, loss, information_and_accuracies = outputs_and_metrics
-                            ttl_time = time.time() - time_s
-                            loss_sum = loss.tolist() if loss_sum is None else loss_sum + loss
-                            vision_loss = information_and_accuracies.vision_loss
-                            vision_accuracy = information_and_accuracies.vision_accuracy
-                            text_loss = information_and_accuracies.text_loss
-                            text_accuracy = information_and_accuracies.text_accuracy
+                                loss,
+                                metrics,
+                            ) = self.sharded_train_step_function(sharded_state, batch)
 
-                            loss_sum = loss.tolist() if loss_sum is None else loss_sum + loss
-                            vision_accuracy_sum = vision_accuracy.tolist() if vision_accuracy_sum is None else (
-                                    vision_accuracy_sum + vision_accuracy
-                            )
-                            vision_loss_sum = vision_loss.tolist() if vision_loss_sum is None else (
-                                    vision_loss_sum + vision_loss
-                            )
-                            text_loss_sum = text_loss.tolist() if text_loss_sum is None else text_loss_sum + text_loss
-                            text_accuracy_sum = text_accuracy.tolist() if text_accuracy_sum is None else (
-                                    text_accuracy_sum + text_accuracy
-                            )
-                            learning_rates.append(self.scheduler(current_step).tolist())
-                            if self.arguments.track_memory:
-                                mem_res = get_mem(dir_prefix=dir_prefix)
+                            forward_backward_step_time_end = time.time()
+
+                            trained_tokens = jnp.multiply(
+                                self.arguments.max_sequence_length, jnp.multiply(
+                                    current_step,
+                                    self.arguments.total_batch_size
+                                )
+                            )  # It's faster
+                            if self.arguments.performance_mode:
+                                gathering_metrics_time_start = time.time()
+                                calculating_metrics_start = time.time()
+                                accuracy = metrics["accuracy"]
+                                perplexity = jnp.exp(loss)
+                                calculating_metrics_end = time.time()
+                                train_metrics = {
+                                    "loss": loss.tolist(),
+                                    "accuracy": accuracy,
+                                    "learning_rate": self.scheduler(current_step).tolist(),
+                                    "step": current_step,
+                                    "step_time": step_time,
+                                    "perplexity": perplexity.tolist(),
+                                    "trained_tokens": trained_tokens,
+                                    "max_grad_norm": metrics["max_grad_norm"].tolist(),
+                                    "mean_grad_norm": metrics["mean_grad_norm"].tolist(),
+                                    "regularization_z_loss": metrics["regularization_z_loss"].tolist(),
+                                    "epoch": epoch,
+                                }
+                                gathering_metrics_time_end = time.time()
+                                train_metrics.update(
+                                    {
+                                        "gathering_metrics_time": (
+                                                gathering_metrics_time_end - gathering_metrics_time_start
+                                        ),
+                                        "forward_backward_step_time": (
+                                                forward_backward_step_time_end - forward_backward_step_time_start
+                                        ),
+                                        "calculating_metrics_step_time": (
+                                                calculating_metrics_end - calculating_metrics_start
+                                        )
+                                    }
+                                )
+
                             else:
-                                mem_res = "Tracking Option is OFF"
-                            pbar.update(1)
-                            trained_tokens = (
-                                    current_step *
-                                    self.arguments.total_batch_size *
-                                    self.arguments.gradient_accumulation_steps *
-                                    self.arguments.max_sequence_length
-                            )
-
-                            total_roved_steps = (current_step - self.arguments.step_start_point)
-
-                            train_metrics = {
-
-                                "loss": loss.tolist(),
-                                "mean_loss": loss_sum / total_roved_steps,
-
-                                "vision_accuracy": vision_accuracy,
-                                "vision_loss": vision_loss,
-                                "text_loss": text_loss,
-                                "text_accuracy": text_accuracy,
-
-                                "mean_vision_accuracy": vision_accuracy_sum / total_roved_steps,
-                                "mean_vision_loss": vision_loss_sum / total_roved_steps,
-                                "mean_text_loss": text_loss_sum / total_roved_steps,
-                                "mean_text_accuracy": text_accuracy_sum / total_roved_steps,
-
-                                "learning_rate": self.scheduler(int(jax.device_get(sharded_state.step))).tolist(),
-                                "step": int(jax.device_get(sharded_state.step)),
-                                "step_time": ttl_time,
-                                "perplexity": jnp.exp(loss).tolist(),
-                                "trained_tokens": trained_tokens,
-                                "accelerators": information_queries,
-                                "epoch": epoch
-                            }
-                            if self.wandb_runtime is not None:
-
-                                information_queries = {}
-                                if self.arguments.track_memory:
-                                    for key in ["Used", "Usage Percent"]:
-                                        for device, info in get_capacity_matrix(dir_prefix=dir_prefix).items():
-                                            information_queries[f"{device.replace('_', ' ')} ({key})"] = float(
-                                                info[key].replace("%", "").replace("GB", ""))
-
                                 with jax.spmd_mode("allow_all"):
-                                    self.wandb_runtime.log(
-                                        train_metrics
-                                    ),
-                                    wandb.summary["captured_memory_log"] = mem_res
+                                    gathering_metrics_time_start = time.time()
+                                    calculating_metrics_start = time.time()
+                                    loss_sum = loss if loss_sum is None else loss_sum + loss
+                                    accuracy = metrics["accuracy"]
+                                    accuracy_sum = accuracy if accuracy_sum is None else accuracy_sum + accuracy
+                                    mean_loss = loss_sum / (current_step - self.arguments.step_start_point)
+                                    mean_accuracy = accuracy_sum / (current_step - self.arguments.step_start_point)
+                                    perplexity = jnp.exp(loss)
+                                    calculating_metrics_end = time.time()
+                                    train_metrics = {
+                                        "loss": loss.tolist(),
+                                        "mean_loss": mean_loss.tolist(),
+                                        "accuracy": accuracy,
+                                        "mean_accuracy": mean_accuracy.tolist(),
+                                        "learning_rate": self.scheduler(current_step).tolist(),
+                                        "step": current_step,
+                                        "step_time": step_time,
+                                        "perplexity": perplexity.tolist(),
+                                        "trained_tokens": trained_tokens,
+                                        "max_grad_norm": metrics["max_grad_norm"].tolist(),
+                                        "mean_grad_norm": metrics["mean_grad_norm"].tolist(),
+                                        "regularization_z_loss": metrics["regularization_z_loss"].tolist(),
+                                        "epoch": epoch,
+                                    }
 
-                            if self.arguments.track_memory:
-                                IPython.display.clear_output(True)
-                                pbar.display(mem_res)
-
-                            log_metrics = copy.deepcopy(train_metrics)
-                            _ = log_metrics.pop("accelerators")
-                            pbar.set_postfix(
-                                **log_metrics
-                            )
+                                    gathering_metrics_time_end = time.time()
+                            pbar.update(1)
+                            pbar.set_postfix(**train_metrics)
+                            if not self.arguments.performance_mode:
+                                train_metrics.update({
+                                    f"grad_norm/{layer_name}": grad_norm.tolist()
+                                    for layer_name, grad_norm in get_layer_names(metrics["grad_norms"]).items()
+                                })
+                                train_metrics.update(
+                                    {
+                                        "time_cal/gathering_metrics_time": (
+                                                gathering_metrics_time_end - gathering_metrics_time_start
+                                        ),
+                                        "time_cal/forward_backward_step_time": (
+                                                forward_backward_step_time_end - forward_backward_step_time_start
+                                        ),
+                                        "time_cal/calculating_metrics_step_time": (
+                                                calculating_metrics_end - calculating_metrics_start
+                                        )
+                                    }
+                                )
+                                train_metrics.update(self.arguments.captured_memory)
+                            if self.wandb_runtime is not None and not self.arguments.performance_mode:
+                                with jax.spmd_mode("allow_all"):
+                                    self.wandb_runtime.log(train_metrics)
                             if self.arguments.training_time is not None:
                                 if time.time() - start_time > self.arguments.training_time:
                                     raise EasyDelTimerError("Time Out")
@@ -692,14 +593,14 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
                 sharded_state = sharded_state.replace(
                     params=self.rapture.merge_parameters(sharded_state.params)
                 )
-            output = TrainerOutput(
+            output = CausalLMTrainerOutput(
                 state=sharded_state,
                 mesh=self.mesh,
                 shard_fns=shard_fns,
                 gather_fns=gather_fns,
                 checkpoint_manager=self.checkpoint_manager,
             )
-            if self.arguments.save_steps is None and self.arguments.do_last_save:
+            if self.arguments.save_steps is None or self.arguments.do_last_save:
                 shard_fns, gather_fns = make_shard_and_gather_fns(
                     match_partition_rules(
                         self.config.get_partition_rules(
@@ -724,6 +625,7 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
 
             output.checkpoint_path = checkpoint_path
             output.last_save_file_name = filename
+            self.arguments._stop_capturing_memory = True
             wandb.finish()
 
             return output
@@ -732,21 +634,11 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
         """Evaluate the Given Model State and yield the eval metrics"""
         assert self.dataloader_eval is not None, "`dataloader_eval` is required by evaluator function."
         with self.mesh:
-
-            dir_prefix: str = "/dev/shm" if sys.platform != "win32" else "."
-
-            if self.arguments.track_memory:
-                initialise_tracking(dir_prefix=dir_prefix)
-
             pbar = tqdm(total=self.max_evaluation_steps)
             pbar.set_description("Evaluating")
             current_step = 0
             loss_sum = None
-            vision_loss_sum = None
-            vision_accuracy_sum = None
-            text_loss_sum = None
-            text_accuracy_sum = None
-            mem_res = "Tracking Option is OFF"
+            accuracy_sum = None
 
             try:
                 for batch in self.dataloader_eval:
@@ -754,79 +646,50 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
                     time_start = time.time()
                     for key in self.arguments.ids_to_pop_from_dataset:
                         _ = batch.pop(key, None)
-
-                    metrics: tuple[chex.Array, VisionCausalLanguageModelStepOutput] = self.sharded_eval_step_function(
+                    batch["labels"] = (
+                        batch["labels"][..., 1:]
+                        if "labels" in batch and not self.arguments.train_on_inputs
+                        else batch["input_ids"][..., 1:]
+                    )
+                    metrics = self.sharded_eval_step_function(
                         model_state,
                         batch
                     )
                     total_time = time.time() - time_start
                     (
-                        loss, information_and_accuracies
+                        loss, accuracy
                     ) = metrics
 
-                    vision_loss = information_and_accuracies.vision_loss
-                    vision_accuracy = information_and_accuracies.vision_accuracy
-                    text_loss = information_and_accuracies.text_loss
-                    text_accuracy = information_and_accuracies.text_accuracy
-
                     loss_sum = loss.tolist() if loss_sum is None else loss_sum + loss
-                    vision_accuracy_sum = vision_accuracy.tolist() if vision_accuracy_sum is None else (
-                            vision_accuracy_sum + vision_accuracy
+                    accuracy_sum = (
+                        accuracy.tolist() if (
+                                accuracy_sum is None
+                        ) else accuracy_sum + accuracy
                     )
-                    vision_loss_sum = vision_loss.tolist() if vision_loss_sum is None else vision_loss_sum + vision_loss
-                    text_loss_sum = text_loss.tolist() if text_loss_sum is None else text_loss_sum + text_loss
-                    text_accuracy_sum = text_accuracy.tolist() if text_accuracy_sum is None else (
-                            text_accuracy_sum + text_accuracy
-                    )
-
-                    if self.arguments.track_memory:
-                        mem_res = get_mem(dir_prefix=dir_prefix)
-
-                    information_queries = {}
-                    if self.arguments.track_memory:
-                        for key in ["Used", "Usage Percent"]:
-                            for device, info in get_capacity_matrix(dir_prefix=dir_prefix).items():
-                                information_queries[f"{device.replace('_', ' ')} ({key})"] = float(
-                                    info[key].replace("%", "").replace("GB", ""))
-
-                    total_roved_steps = (current_step - self.arguments.step_start_point)
 
                     eval_metrics = {
                         "eval_loss": loss.tolist(),
-                        "eval_mean_loss": loss_sum / total_roved_steps,
-
-                        "eval_vision_accuracy": vision_accuracy,
-                        "eval_vision_loss": vision_loss,
-                        "eval_text_loss": text_loss,
-                        "eval_text_accuracy": text_accuracy,
-
-                        "eval_mean_vision_accuracy": vision_accuracy_sum / total_roved_steps,
-                        "eval_mean_vision_loss": vision_loss_sum / total_roved_steps,
-                        "eval_mean_text_loss": text_loss_sum / total_roved_steps,
-                        "eval_mean_text_accuracy": text_accuracy_sum / total_roved_steps,
-
+                        "eval_mean_loss": loss_sum / (current_step - self.arguments.step_start_point),
+                        "eval_mean_accuracy_sum": accuracy_sum / (
+                                current_step - self.arguments.step_start_point
+                        ),
                         "eval_step": current_step,
                         "eval_step_time": total_time,
                         "eval_perplexity": jnp.exp(loss).tolist(),
-                        "eval_accelerators": information_queries,
                     }
+                    log_metrics = copy.deepcopy(eval_metrics)
+                    eval_metrics.update(self.arguments.captured_memory)
                     if self.arguments.use_wandb:
                         with jax.spmd_mode("allow_all"):
                             self.wandb_runtime.log(
                                 eval_metrics
-                            ),
-                            wandb.summary["eval_captured_memory_log"] = mem_res
+                            )
 
-                    if self.arguments.track_memory:
-                        IPython.display.clear_output(True)
-                        pbar.display(mem_res)
                     pbar.update(1)
-                    log_metrics = copy.deepcopy(eval_metrics)
-                    _ = log_metrics.pop("eval_accelerators")
                     pbar.set_postfix(
                         **log_metrics
                     )
-                    yield eval_metrics
+                    yield log_metrics
             except KeyboardInterrupt:
                 termcolor.cprint(
                     "KeyboardInterrupt At Evaluation model Will return Nothing and just pass.",

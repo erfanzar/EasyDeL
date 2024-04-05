@@ -18,32 +18,32 @@ from fjformer import match_partition_rules, make_shard_and_gather_fns
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from ..utils.collectors import DPODataCollatorWithPadding
+from EasyDel.reinforcement_learning.utils.collectors import DPODataCollatorWithPadding
 from typing import Optional, Literal, Dict, Union, Any, Tuple, List, Callable, Mapping
-from .utils import pad_to_length
+from EasyDel.reinforcement_learning.trainer.utils import pad_to_length
 from jax.experimental.pjit import pjit
 from datasets import Dataset
 from jax import numpy as jnp
 
-from ...smi import get_capacity_matrix, initialise_tracking, get_mem
-from ...trainer.causal_language_model_trainer import TrainerOutput
-from ...trainer.training_configurations import TrainArguments
-from ...trainer.base_trainer import (
+from EasyDel.smi import get_capacity_matrix, initialise_tracking, get_mem
+from EasyDel.trainer.causal_language_model_trainer import TrainerOutput
+from EasyDel.trainer.training_configurations import TrainArguments
+from EasyDel.trainer.base_trainer import (
     BaseTrainer,
     TrainerConfigureFunctionFuncOutput,
     TrainerConfigureDataloaderFuncOutput,
     TrainerConfigureModelFuncOutput
 )
-from ...etils import EasyDelState, EasyDelTimerError
+from EasyDel.etils import EasyDelState, EasyDelTimerError
 from transformers import PreTrainedTokenizerBase
-from .partitioner_config import PartitionerConfig
+from EasyDel.reinforcement_learning.trainer.partitioner_config import PartitionerConfig
 from jax.sharding import PartitionSpec
 
-from ...utils import Timers
+from EasyDel.utils import Timers
 from flax.struct import dataclass
 
 
-class SFTTrainer(BaseTrainer):
+class SFTTrainer(BaseTrainer, ABC):
     _tag_names = ["trl", "sft"]
 
     def __init__(
@@ -52,7 +52,6 @@ class SFTTrainer(BaseTrainer):
             args: TrainArguments,
             train_dataset: Dataset,
             data_collator: Optional[Callable] = None,
-
             eval_dataset: Optional[Union[Dataset, Dict[str, Dataset]]] = None,
             tokenizer: Optional[PreTrainedTokenizerBase] = None,
             dataset_text_field: Optional[str] = None,
@@ -135,6 +134,7 @@ class SFTTrainer(BaseTrainer):
     ):
         use_formatting_func = formatting_func is not None and dataset_text_field is None
         self._dataset_sanity_checked = False
+
         def tokenize(element):
             outputs = tokenizer(
                 element[dataset_text_field] if not use_formatting_func else formatting_func(element),

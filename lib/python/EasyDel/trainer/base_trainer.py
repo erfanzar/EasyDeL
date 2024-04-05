@@ -141,8 +141,7 @@ class BaseTrainer:
             if not self.arguments.performance_mode:
                 initialise_tracking()
                 self.arguments._stop_capturing_memory = False
-                mem_tracker = self._start_capturing_memory()
-                mem_tracker.start()
+                self._start_capturing_memory().start()
         if finetune:
             if checkpoint_path is None:
                 prefix_print(
