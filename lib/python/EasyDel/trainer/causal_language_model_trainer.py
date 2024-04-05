@@ -579,18 +579,24 @@ class CausalLanguageModelTrainer(BaseTrainer):
 
         dir_prefix: str = "/dev/shm" if sys.platform != "win32" else "."
         checkpoint_path = "SAVING_SKIPPED"
-
+        if self.arguments.performance_mode:
+            termcolor.cprint(
+                "Performance Mode is ON, we will ignore the Memory Tracking, WANDB Logging, and extra information "
+                "Process.",
+                color="red",
+                force_color=True
+            )
         if self.arguments.track_memory:
-            initialise_tracking(dir_prefix=dir_prefix)
-            self.arguments._stop_capturing_memory = False
-            mem_tracker = self._start_capturing_memory(dir_prefix=dir_prefix)
-            if self.arguments.use_wandb:
-                mem_tracker.start()
-
-            else:
-                warnings.warn(
-                    "`track_memory` will be ignored since you are not using wandb"
-                )
+            if not self.arguments.performance_mode:
+                initialise_tracking(dir_prefix=dir_prefix)
+                self.arguments._stop_capturing_memory = False
+                mem_tracker = self._start_capturing_memory(dir_prefix=dir_prefix)
+                if self.arguments.use_wandb:
+                    mem_tracker.start()
+                else:
+                    warnings.warn(
+                        "`track_memory` will be ignored since you are not using wandb"
+                    )
         start_time = time.time()
         sharded_state, shard_fns, gather_fns = self.initialize_state(
             model_parameters=model_parameters,
@@ -657,44 +663,62 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                     self.arguments.total_batch_size
                                 )
                             )  # It's faster
-
-                            with jax.spmd_mode("allow_all"):
+                            if self.arguments.performance_mode:
                                 gathering_metrics_time_start = time.time()
                                 calculating_metrics_start = time.time()
-                                loss_sum = loss if loss_sum is None else loss_sum + loss
                                 accuracy = metrics["accuracy"]
-                                accuracy_sum = accuracy if accuracy_sum is None else accuracy_sum + accuracy
-                                mean_loss = loss_sum / (current_step - self.arguments.step_start_point)
-                                mean_accuracy = accuracy_sum / (current_step - self.arguments.step_start_point)
                                 perplexity = jnp.exp(loss)
                                 calculating_metrics_end = time.time()
                                 train_metrics = {
                                     "loss": loss.tolist(),
-                                    "mean_loss": mean_loss.tolist(),
                                     "accuracy": accuracy,
-                                    "mean_accuracy": mean_accuracy.tolist(),
                                     "learning_rate": self.scheduler(current_step).tolist(),
                                     "step": current_step,
                                     "step_time": step_time,
                                     "perplexity": perplexity.tolist(),
                                     "trained_tokens": trained_tokens,
+                                    "max_grad_norm": metrics["max_grad_norm"].tolist(),
+                                    "mean_grad_norm": metrics["mean_grad_norm"].tolist(),
+                                    "regularization_z_loss": metrics["regularization_z_loss"].tolist(),
+                                    "epoch": epoch,
                                 }
-                                train_metrics.update(
-                                    {
+                                gathering_metrics_time_end = time.time()
+
+                            else:
+                                with jax.spmd_mode("allow_all"):
+                                    gathering_metrics_time_start = time.time()
+                                    calculating_metrics_start = time.time()
+                                    loss_sum = loss if loss_sum is None else loss_sum + loss
+                                    accuracy = metrics["accuracy"]
+                                    accuracy_sum = accuracy if accuracy_sum is None else accuracy_sum + accuracy
+                                    mean_loss = loss_sum / (current_step - self.arguments.step_start_point)
+                                    mean_accuracy = accuracy_sum / (current_step - self.arguments.step_start_point)
+                                    perplexity = jnp.exp(loss)
+                                    calculating_metrics_end = time.time()
+                                    train_metrics = {
+                                        "loss": loss.tolist(),
+                                        "mean_loss": mean_loss.tolist(),
+                                        "accuracy": accuracy,
+                                        "mean_accuracy": mean_accuracy.tolist(),
+                                        "learning_rate": self.scheduler(current_step).tolist(),
+                                        "step": current_step,
+                                        "step_time": step_time,
+                                        "perplexity": perplexity.tolist(),
+                                        "trained_tokens": trained_tokens,
                                         "max_grad_norm": metrics["max_grad_norm"].tolist(),
                                         "mean_grad_norm": metrics["mean_grad_norm"].tolist(),
                                         "regularization_z_loss": metrics["regularization_z_loss"].tolist(),
                                         "epoch": epoch,
                                     }
-                                )
 
-                                gathering_metrics_time_end = time.time()
+                                    gathering_metrics_time_end = time.time()
 
-                            pbar.set_postfix(**train_metrics)
-                            train_metrics.update({
-                                f"grad_norm/{layer_name}": grad_norm.tolist()
-                                for layer_name, grad_norm in get_layer_names(metrics["grad_norms"]).items()
-                            })
+                                pbar.set_postfix(**train_metrics)
+                                if not self.arguments.performance_mode:
+                                    train_metrics.update({
+                                        f"grad_norm/{layer_name}": grad_norm.tolist()
+                                        for layer_name, grad_norm in get_layer_names(metrics["grad_norms"]).items()
+                                    })
                             train_metrics.update(
                                 {
                                     "time_cal/gathering_metrics_time": (
@@ -708,7 +732,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                     )
                                 }
                             )
-                            if self.wandb_runtime is not None:
+                            if self.wandb_runtime is not None and not self.arguments.performance_mode:
                                 with jax.spmd_mode("allow_all"):
                                     self.wandb_runtime.log(train_metrics)
                             if self.arguments.training_time is not None:

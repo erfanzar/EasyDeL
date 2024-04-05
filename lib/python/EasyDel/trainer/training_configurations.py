@@ -292,6 +292,8 @@ and optimize training process.
         self.verbose = verbose
         self.offload_device = offload_device
         self.performance_mode = performance_mode
+        if use_wandb and performance_mode:
+            self.use_wandb = False
         self.optimizer_kwargs = dict(
             learning_rate=self.learning_rate,
             learning_rate_end=self.learning_rate_end,
@@ -375,7 +377,7 @@ and optimize training process.
             project=f"EasyDeL-{self.model_name}",
             config=self(),
             tags=[
-                "Easy Del",
+                "EasyDeL",
                 "FJFormer",
                 "OST-OpenSourceTransformers",
                 "Jax/Flax"
