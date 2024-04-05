@@ -411,11 +411,12 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
                             )
                             learning_rates.append(self.scheduler(current_step).tolist())
                             pbar.update(1)
-                            trained_tokens = (
-                                    current_step *
-                                    self.arguments.total_batch_size *
-                                    self.arguments.gradient_accumulation_steps *
-                                    self.arguments.max_sequence_length
+
+                            trained_tokens = jnp.multiply(
+                                self.arguments.max_sequence_length, jnp.multiply(
+                                    current_step,
+                                    self.arguments.total_batch_size
+                                )
                             )
 
                             total_roved_steps = (current_step - self.arguments.step_start_point)
