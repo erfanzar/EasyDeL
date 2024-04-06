@@ -49,7 +49,11 @@ def create_vision_casual_language_model_train_step(partition_spec=PartitionSpec(
         batch = with_sharding_constraint(batch, partition_spec)
 
         def calculate_loss(params):
-            labels = batch.pop("labels")
+            labels = batch.get("labels", None)
+            if labels is None:
+                labels = batch["input_ids"][..., 1:]
+            else:
+                labels = labels[..., 1:]
             label_vision_mask = batch.pop("label_vision_mask")
 
             model_outputs = state.apply_fn(params=params, **batch, return_dict=True)
@@ -115,7 +119,11 @@ def create_vision_casual_language_model_evaluation_step(partition_spec=Partition
         batch = with_sharding_constraint(batch, partition_spec)
 
         def calculate_loss(params):
-            labels = batch.pop("labels")
+            labels = batch.get("labels", None)
+            if labels is None:
+                labels = batch["input_ids"][..., 1:]
+            else:
+                labels = labels[..., 1:]
             label_vision_mask = batch.pop("label_vision_mask")
             model_outputs = state.apply_fn(params=params, **batch, return_dict=True)
             logits = model_outputs.logits

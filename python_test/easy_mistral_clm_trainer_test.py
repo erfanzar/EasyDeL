@@ -2,13 +2,10 @@ import os
 
 import flax.core
 
-from EasyDel import Qwen2Config
-
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 
 from lib.python.EasyDel import (
     CausalLanguageModelTrainer,
-    AutoEasyDelModelForCausalLM,
     TrainArguments,
     FlaxMistralForCausalLM,
     MistralConfig

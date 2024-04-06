@@ -113,6 +113,7 @@ class TrainArguments(
             remove_unused_columns: bool = True,
             force_batch_and_gradient_accumulation_steps_calculation: bool = False,
             performance_mode: bool = False,
+            neftune_noise_alpha: Optional[float] = None,
             **kwargs
     ):
         """
@@ -164,7 +165,7 @@ The __init__ function can accept arguments, just like a normal function.
 :param loss_re_mat: str: Specify the regular expression to match the loss function name
 :param loss_chunk: int: Chunk the loss to avoid memory overflow
 :param truncation_mode: typing.Literal["keep_end", "keep_start"]: Determine if the input is left padded or not and
-which side of the array should remain in case of using maximum padding.
+    which side of the array should remain in case of using maximum padding.
 :param warmup_steps: int: Specify the number of steps to warm up the learning rate
 :param init_input_shape: Tuple[int, int]: Initialize the model with a shape that is not (batch_size, length)
 :param step_partition_spec: PartitionSpec: Partition the model for training
@@ -176,18 +177,20 @@ which side of the array should remain in case of using maximum padding.
 :param wandb_entity: Optional[str]: Specify the entity to use when logging to weights &amp; biases
 :param save_optimizer_state : bool: when ever to save optimizer state and other args in checkpoint
 :param step_start_point: Optional[int]: start training from given step for example instead of starting training from
-step 0 it will start from 20000 and leave the data behind
+    step 0 it will start from 20000 and leave the data behind
 :param verbose: bool: when ever to turn verbose mode of or on
 :param offload_device: jax.Device: device to be used to offload parameters on
 :param rapture_config: Optional[EasyDeLXRaptureConfig]: LoRA Config for models
 :param merge_lora_rapture_parameters: bool: whenever to merge lora parameters with original parameters before saving
 :param state_apply_fn_kwarguments_to_model: Optional[dict]: state_apply_fn_kwarguments_to_model is a dictionary that
-be used to apply the parameters and extra things that you want to deliver to model.
+    be used to apply the parameters and extra things that you want to deliver to model.
 :param remove_unused_columns: bool: when ever to remove the unused data columns from dataset
 :param force_batch_and_gradient_accumulation_steps_calculation: bool: whether to force batch and gradient to be
-applied as total batch_size (e.g total_batch_size = total_batch_size * gradient_accumulation_steps be applied)
+    applied as total batch_size (e.g total_batch_size = total_batch_size * gradient_accumulation_steps be applied)
 :param performance_mode: bool: whether to optimize the whole training process this will cut off some logging options
-and optimize training process.
+    and optimize training process.
+:param neftune_noise_alpha: Optional[float]: If not `None`, this will activate NEFTune noise embeddings. This has been
+    proven to drastically improve model performances for instruction fine-tuning.
 :param **kwargs: Pass keyword, variable-length argument list
         """
         super().__init__()
@@ -292,6 +295,7 @@ and optimize training process.
         self.verbose = verbose
         self.offload_device = offload_device
         self.performance_mode = performance_mode
+        self.neftune_noise_alpha = neftune_noise_alpha
         if use_wandb and performance_mode:
             self.use_wandb = False
         self.optimizer_kwargs = dict(

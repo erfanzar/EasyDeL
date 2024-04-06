@@ -380,7 +380,6 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
                             pbar.update(1)
                         elif current_step < self.max_training_steps:
 
-                            batch["labels"] = batch["input_ids"][..., 1:]
                             for ssb in self.arguments.ids_to_pop_from_dataset:
                                 _ = batch.pop(ssb, None)
                             time_s = time.time()

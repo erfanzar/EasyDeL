@@ -24,6 +24,14 @@ from .dpo import (
     concatenated_inputs as concatenated_dpo_inputs
 )
 
+from .sft import SFTTrainer as SFTTrainer
+from .utils import (
+    create_constant_length_dataset as create_constant_length_dataset,
+    get_formatting_func_from_dataset as get_formatting_func_from_dataset,
+    conversations_formatting_function as conversations_formatting_function,
+    instructions_formatting_function as instructions_formatting_function
+)
+
 __all__ = (
     "TrainArguments",
     "EasyDeLXRapTureConfig",
@@ -44,4 +52,10 @@ __all__ = (
     "create_concatenated_forward",
     "create_dpo_train_function",
     "concatenated_dpo_inputs",
+
+    "SFTTrainer",
+    "create_constant_length_dataset",
+    "get_formatting_func_from_dataset",
+    "conversations_formatting_function",
+    "instructions_formatting_function"
 )

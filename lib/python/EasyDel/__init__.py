@@ -169,7 +169,12 @@ from .trainer import (
     create_dpo_eval_function as create_dpo_eval_function,
     create_concatenated_forward as create_concatenated_forward,
     create_dpo_train_function as create_dpo_train_function,
-    concatenated_dpo_inputs as concatenated_dpo_inputs
+    concatenated_dpo_inputs as concatenated_dpo_inputs,
+    SFTTrainer as SFTTrainer,
+    create_constant_length_dataset as create_constant_length_dataset,
+    get_formatting_func_from_dataset as get_formatting_func_from_dataset,
+    conversations_formatting_function as conversations_formatting_function,
+    instructions_formatting_function as instructions_formatting_function
 )
 
 from .smi import (
@@ -373,10 +378,11 @@ __all__ = (
     "create_dpo_train_function",
     "concatenated_dpo_inputs",
 
-    "VisionCausalLanguageModelStepOutput",
-    "VisionCausalLanguageModelTrainer",
-    "create_vision_casual_language_model_evaluation_step",
-    "create_vision_casual_language_model_train_step",
+    "SFTTrainer",
+    "create_constant_length_dataset",
+    "get_formatting_func_from_dataset",
+    "conversations_formatting_function",
+    "instructions_formatting_function",
 
     # SMI Modules
     "smi_run",

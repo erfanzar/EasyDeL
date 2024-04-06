@@ -5,9 +5,9 @@ learning models. It focuses primarily on Jax/Flax and aims to provide convenient
 Flax/Jax Models on TPU/GPU for both Serving and Training purposes. Additionally, EasyDeL will support mojo and will be
 rewritten for mojo as well.
 
-
 Some of the key features provided by EasyDeL include:
 
+- DPOTrainer, SFTTrainer, and VideoCLM Trainers
 - Serving and API Engines for Using and serving LLMs in JAX as efficiently as possible.
 - Support for 8, 6, and 4 BIT inference and training in JAX
 - A wide range of models in Jax is supported which have never been implemented before such as Falcon, Qwen2, Phi2,
@@ -17,7 +17,6 @@ Some of the key features provided by EasyDeL include:
 - LLM Trainer and fine-tuner in JAX
 - Video CLM Trainer and Fine-tuner for Models such Falcon, Qwen2, Phi2, MPT, Mixtral, Grok-1, and Qwen2Moe ...
 - RLHF (Reinforcement Learning from Human Feedback) in Jax (Beta Stage)
-- DPOTrainer(Supported) and SFTTrainer(Developing Stage)
 - Various other features to enhance the training process and optimize performance.
 - LoRA: Low-Rank Adaptation of Large Language Models
 - RingAttention, Flash Attention, BlockWise FFN, and Efficient Attention are supported for more than 90 % of models
@@ -82,6 +81,107 @@ python -m examples.jax_serve_example \
 > under heavy development , because I don't have enough experience with Reinforcement Learning at the moment so its
 > still in beta version but it's works and ill soon release a Tutorial For that
 
+## Supervised Fine-Tuning with EasyDeL
+
+EasyDeL supports both DPO and SFT Trainers, so dealing with LLMs in jax is a lot easier right now
+let have an example of using Supervised Fine-Tuner in JAX with EasyDeL
+
+```python
+from EasyDel import (
+    TrainArguments,
+    AutoEasyDelModelForCausalLM,
+    EasyDelOptimizers,
+    EasyDelSchedulers,
+    EasyDelGradientCheckPointers,
+    SFTTrainer,
+    conversations_formatting_function  # i have added this one for newcomers so if they 
+    # don't know what's going on they can use this pre created prompter
+)
+from datasets import load_dataset
+import flax
+from jax import numpy as jnp
+from transformers import AutoTokenizer
+
+huggingface_repo_id_or_path = "mistralai/Mistral-7B-Instruct-v0.2"
+
+model, params = AutoEasyDelModelForCausalLM.from_pretrained(huggingface_repo_id_or_path, )
+
+max_length = 4096
+tokenizer = AutoTokenizer.from_pretrained(
+    huggingface_repo_id_or_path,
+    trust_remote_code=True
+)
+tokenizer.pad_token = tokenizer.eos_token
+configs_to_initialize_model_class = {
+    "config": model.config,
+    "dtype": jnp.bfloat16,
+    "param_dtype": jnp.bfloat16,
+    "input_shape": (1, 1)
+}
+
+train_arguments = TrainArguments(
+    model_class=type(model),
+    model_name="SFT-EasyDeL",
+    num_train_epochs=3,
+    configs_to_initialize_model_class=configs_to_initialize_model_class,
+    learning_rate=5e-5,
+    learning_rate_end=1e-6,
+    optimizer=EasyDelOptimizers.ADAMW,
+    scheduler=EasyDelSchedulers.WARM_UP_COSINE,
+    weight_decay=0.01,
+    total_batch_size=32,
+    max_training_steps=None,  # None to let trainer Decide
+    do_train=True,
+    do_eval=False,  # it's optional but supported 
+    backend="tpu",  # default backed is set to cpu, so you must define you want to use tpu cpu or gpu
+    max_length=max_length,  # Note that you have to change this in the model config too
+    gradient_checkpointing=EasyDelGradientCheckPointers.NOTHING_SAVEABLE,
+    sharding_array=(1, -1, 1, 1),  # the way to shard model across gpu,cpu or TPUs using sharding array (1, 1, 1, -1)
+    # everything training will be in sequence and model parallel automatic and share data between devices
+    remove_ckpt_after_load=True,
+    gradient_accumulation_steps=8,
+    loss_re_mat="",
+    dtype=jnp.bfloat16
+)
+
+
+def create_prompt_creator():
+    def _tr(field):
+        return [
+            {"role": "user", "content": field["conversation"][0]["input"]},
+            {"role": "assistant", "content": field["conversation"][0]["output"]}
+        ]
+
+    def _pc(
+            sample
+    ):
+        sample = conversations_formatting_function(tokenizer, messages_field="conversation")(  # type: ignore
+            {"conversation": _tr(sample)}
+        )
+        return [sample]
+
+    return _pc
+
+
+dove = load_dataset("LDJnr/Pure-Dove", )  # We use Dove from LDJnr since this one i a little bit tricky to ues.
+trainer = SFTTrainer(
+    arguments=train_arguments,
+    train_dataset=dove["train"],
+    eval_dataset=dove["train"],  # we don't have eval dataset rn :)
+    tokenizer=tokenizer,
+    dataset_text_field=None,
+    formatting_func=create_prompt_creator(),
+    packing=False,
+    num_of_sequences=1024,
+)
+
+output = trainer.train(flax.core.FrozenDict({"params": params}))
+print(f"Hey ! , here's where your model saved {output.checkpoint_path}")
+```
+
+> [!NOTE]
+> You Can use Lora too, both for DPO and SFT Trainers.
+
 ## FineTuning
 
 with using EasyDel FineTuning LLM (CausalLanguageModels) are easy as much as possible with using Jax and Flax
@@ -92,7 +192,6 @@ Days Has Been Passed and now using easydel in Jax is way more similar to HF/PyTo
 now it's time to finetune our model
 
 ```python
-import jax.numpy
 from EasyDel import (
     TrainArguments,
     CausalLanguageModelTrainer,
