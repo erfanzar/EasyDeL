@@ -3,7 +3,7 @@ import jax
 
 from typing import Optional, Dict, Union, Any, List
 from jax import numpy as jnp
-from flax.struct import dataclass
+from dataclasses import dataclass
 from contextlib import contextmanager
 
 
@@ -33,10 +33,13 @@ class DPODataCollatorWithPadding:
     :param label_pad_token_id: int: The label used for masking.
     :param is_encoder_decoder: Optional[bool]: Whether you model has an encoder_decoder architecture
     """
-
+    max_prompt_length: int
+    max_target_length: int
     pad_token_id: int = 0
     label_pad_token_id: int = -100
     is_encoder_decoder: Optional[bool] = False
+    ids_to_pop_from_dataset: Optional[dict] = None
+    auto_fix_data: bool = True
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
         padded_batch = {}
@@ -74,6 +77,36 @@ class DPODataCollatorWithPadding:
                 padded_batch[k] = jnp.array([ex[k] for ex in features])
             else:
                 padded_batch[k] = [ex[k] for ex in features]
+        if self.ids_to_pop_from_dataset:
+            for key in self.ids_to_pop_from_dataset:
+                _ = padded_batch.pop(key, None)
+        for key in list(padded_batch.keys()):
+            if not (
+                    key.endswith("_input_ids")
+                    or key.endswith("_attention_mask")
+                    or key.endswith("_labels")
+                    or key.endswith("_log_probs")
+            ):
+                _ = padded_batch.pop(key, None)
+        for k in list(padded_batch.keys()):
+            v = padded_batch[k]
+            padded_batch[k] = v.reshape(v.shape[0], -1)
+        if self.auto_fix_data:
+            padded_batch["rejected_input_ids"] = padded_batch["rejected_input_ids"][..., :self.max_target_length]
+            padded_batch[
+                "rejected_attention_mask"
+            ] = padded_batch["rejected_attention_mask"][..., :self.max_target_length]
+            padded_batch["rejected_labels"] = padded_batch["rejected_labels"][..., :self.max_target_length]
+
+            padded_batch["chosen_input_ids"] = padded_batch["chosen_input_ids"][..., :self.max_target_length]
+            padded_batch["chosen_attention_mask"] = padded_batch["chosen_attention_mask"][..., :self.max_target_length]
+            padded_batch["chosen_labels"] = padded_batch["chosen_labels"][..., :self.max_target_length]
+
+            padded_batch["prompt_input_ids"] = padded_batch["prompt_input_ids"][..., :self.max_prompt_length]
+            padded_batch[
+                "prompt_attention_mask"
+            ] = padded_batch["prompt_attention_mask"][..., :self.max_prompt_length]
+
         return padded_batch
 
 

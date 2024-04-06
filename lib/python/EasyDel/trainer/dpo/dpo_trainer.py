@@ -154,12 +154,6 @@ class DPOTrainer(BaseTrainer, ABC):
                 **ref_model_init_kwargs
             )
 
-        data_collator = DPODataCollatorWithPadding(
-            pad_token_id=tokenizer.pad_token_id,
-            label_pad_token_id=label_pad_token_id,
-            is_encoder_decoder=False,
-        ) if data_collator is None else data_collator
-
         if loss_type in ["hinge", "ipo", "kto_pair"] and label_smoothing > 0:
             warnings.warn(
                 "You are using a loss type that does not support label smoothing. Ignoring label_smoothing parameter."
@@ -209,7 +203,13 @@ class DPOTrainer(BaseTrainer, ABC):
         self.label_smoothing = label_smoothing
         self.loss_type = loss_type
         self.low_mem_usage = low_mem_usage
-
+        data_collator = DPODataCollatorWithPadding(
+            max_prompt_length=self.max_prompt_length,
+            max_target_length=self.max_target_length,
+            pad_token_id=tokenizer.pad_token_id,
+            label_pad_token_id=label_pad_token_id,
+            is_encoder_decoder=False,
+        ) if data_collator is None else data_collator
         self._stored_metrics = defaultdict(lambda: defaultdict(list))
         if dataset_map_arguments is None:
             dataset_map_arguments = {}
@@ -1039,67 +1039,6 @@ class DPOTrainer(BaseTrainer, ABC):
                                 ...
                             elif current_step < self.max_training_steps:
                                 time_start = time.time()
-
-                                for key in self.arguments.ids_to_pop_from_dataset:
-                                    _ = batch.pop(key, None)
-                                for key in list(batch.keys()):
-                                    if not (
-                                            key.endswith("_input_ids")
-                                            or key.endswith("_attention_mask")
-                                            or key.endswith("_labels")
-                                            or key.endswith("_log_probs")
-                                    ):
-                                        _ = batch.pop(key, None)
-                                for k in list(batch.keys()):
-                                    v = batch[k]
-                                    batch[k] = v.reshape(v.shape[0], -1)
-                                if self.auto_fix_data:
-                                    batch["rejected_input_ids"] = batch["rejected_input_ids"][
-                                                                  ..., :self.max_target_length
-                                                                  ]
-                                    batch["rejected_attention_mask"] = batch["rejected_attention_mask"][
-                                                                       ..., :self.max_target_length
-                                                                       ]
-                                    batch["rejected_labels"] = batch["rejected_labels"][
-                                                               ..., :self.max_target_length
-                                                               ]
-                                    batch["chosen_input_ids"] = batch["chosen_input_ids"][
-                                                                ..., :self.max_target_length
-                                                                ]
-                                    batch["chosen_attention_mask"] = batch["chosen_attention_mask"][
-                                                                     ..., :self.max_target_length
-                                                                     ]
-                                    batch["chosen_labels"] = batch["chosen_labels"][
-                                                             ..., :self.max_target_length
-                                                             ]
-                                    batch["prompt_input_ids"] = batch["prompt_input_ids"][
-                                                                ..., :self.max_prompt_length
-                                                                ]
-                                    batch["prompt_attention_mask"] = batch["prompt_attention_mask"][
-                                                                     ..., :self.max_prompt_length
-                                                                     ]
-                                try:
-                                    if self._cached_p_l_s is None:
-                                        self._cached_p_l_s = batch["prompt_input_ids"].shape
-                                    else:
-                                        assert self._cached_p_l_s == batch["prompt_input_ids"].shape
-                                    if self._cached_c_l_s is None:
-                                        self._cached_c_l_s = batch["chosen_input_ids"].shape
-                                    else:
-                                        assert self._cached_c_l_s == batch["chosen_input_ids"].shape
-                                    if self._cached_r_l_s is None:
-                                        self._cached_r_l_s = batch["rejected_input_ids"].shape
-                                    else:
-                                        assert self._cached_r_l_s == batch["rejected_input_ids"].shape
-                                except AssertionError as e:
-                                    warnings.warn(
-                                        "there's an issue with dataset and seems like compilation process will be much"
-                                        " slower and function (jax.jit) will be re-compiled and that should not happen "
-                                        "in case of seeing this error open an issue "
-                                        "https://github.com/erfanzar/EasyDeL/issues/new?assignees=&labels=&projects="
-                                        "&template=bug_report.md&title=\n or turn `auto_fix_data=True` in DPOTrainer"
-                                        f"Extra information error \n{e}"
-                                    )
 
                                 self.model_state, metrics = self.sharded_train_step_function(
                                     self.model_state,
