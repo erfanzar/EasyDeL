@@ -210,7 +210,9 @@ class BaseTrainer:
         :return: A tuple of functions
 
         """
-        self.wandb_runtime = self.arguments.get_wandb_init() if self.arguments.use_wandb else None
+        self.wandb_runtime = None
+        if self.arguments.use_wandb:
+            self.wandb_runtime = self.arguments.get_wandb_init()
         self.timer = Timers(
             use_wandb=False,
             tensorboard_writer=self.arguments.get_board()

@@ -405,7 +405,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
             current_step = int(jax.device_get(sharded_state.step))
             loss_sum = None
             accuracy_sum = None
-            pbar.update(sharded_state.step.tolist())  # type-ignore
+            pbar.update(sharded_state.step.tolist())  # type: ignore
             if self.wandb_runtime is not None:
                 model_parameters_number = sum(
                     n.size for n in
@@ -434,11 +434,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
                             time_s = time.time()
                             step_time = time_s - time_prev
 
-                            batch["labels"] = (
-                                batch["labels"][..., 1:]
-                                if "labels" in batch and not self.arguments.train_on_inputs
-                                else batch["input_ids"][..., 1:]
-                            )
+
                             for ssb in self.arguments.ids_to_pop_from_dataset:
                                 _ = batch.pop(ssb, None)
 
@@ -646,11 +642,6 @@ class CausalLanguageModelTrainer(BaseTrainer):
                     time_start = time.time()
                     for key in self.arguments.ids_to_pop_from_dataset:
                         _ = batch.pop(key, None)
-                    batch["labels"] = (
-                        batch["labels"][..., 1:]
-                        if "labels" in batch and not self.arguments.train_on_inputs
-                        else batch["input_ids"][..., 1:]
-                    )
                     metrics = self.sharded_eval_step_function(
                         model_state,
                         batch

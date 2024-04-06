@@ -45,7 +45,11 @@ def create_casual_language_model_train_step(
         batch = with_sharding_constraint(batch, partition_spec)
 
         def calculate_loss(params):
-            labels = batch.pop("labels")  # already shifted left
+            labels = batch.get("labels", None)
+            if labels is None:
+                labels = batch["input_ids"][..., 1:]
+            else:
+                labels = labels[..., 1:]
             model_outputs = state.apply_fn(params=params, **batch, return_dict=True)
             logits = model_outputs.logits
             aux_loss = getattr(model_outputs, "aux_loss", None)
@@ -142,7 +146,11 @@ def create_casual_language_model_evaluation_step(
             :return: The loss and the accuracy
 
             """
-            labels = batch_eval.pop("labels")
+            labels = batch_eval.get("labels", None)
+            if labels is None:
+                labels = batch_eval["input_ids"][..., 1:]
+            else:
+                labels = labels[..., 1:]
             model_outputs = state.apply_fn(params=params, **batch_eval, return_dict=True)
             logits = model_outputs.logits
             aux_loss = getattr(model_outputs, "aux_loss", None)

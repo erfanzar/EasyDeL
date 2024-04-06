@@ -532,7 +532,7 @@ class DPOTrainer(BaseTrainer, ABC):
         tx, scheduler = self.arguments.get_optimizer_and_scheduler(self.max_training_steps)
         return TrainerConfigureModelFuncOutput(
             model=self.model_state.module,
-            config=config,  # type-ignore
+            config=config,  # type: ignore
             scheduler=scheduler,
             tx=tx
         )
