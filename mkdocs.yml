@@ -95,6 +95,9 @@ nav:
     - Qwen2:
       - Modelling Qwen Flax: generated-modules-qwen2-modelling_qwen_flax.md
       - Qwen Configuration: generated-modules-qwen2-qwen_configuration.md
+    - Qwen2 Moe:
+      - Configuration Qwen2 Moe: generated-modules-qwen2_moe-configuration_qwen2_moe.md
+      - Modeling Qwen2 Moe Flax: generated-modules-qwen2_moe-modeling_qwen2_moe_flax.md
     - Roberta:
       - Modelling Roberta Flax: generated-modules-roberta-modelling_roberta_flax.md
       - Roberta Configuration: generated-modules-roberta-roberta_configuration.md
@@ -107,6 +110,9 @@ nav:
     - T5:
       - Modelling T5 Flax: generated-modules-t5-modelling_t5_flax.md
       - T5 Configuration: generated-modules-t5-t5_configuration.md
+    - Whisper:
+      - Modelling Whisper Flax: generated-modules-whisper-modelling_whisper_flax.md
+      - Whisper Configuration: generated-modules-whisper-whisper_configuration.md
   - Partitioning:
     - Partitioner: generated-partitioning-partitioner.md
   - Reinforcement Learning:
@@ -114,11 +120,9 @@ nav:
     - Models:
       - Modelling Casual Language Rl: generated-reinforcement_learning-models-modelling_casual_language_rl.md
     - Trainer:
-      - Dpo Trainer: generated-reinforcement_learning-trainer-dpo_trainer.md
       - Partitioner Config: generated-reinforcement_learning-trainer-partitioner_config.md
       - Ppo Config: generated-reinforcement_learning-trainer-ppo_config.md
       - Ppo Trainer: generated-reinforcement_learning-trainer-ppo_trainer.md
-      - Stf Trainer: generated-reinforcement_learning-trainer-stf_trainer.md
       - Training Configs: generated-reinforcement_learning-trainer-training_configs.md
       - Utils: generated-reinforcement_learning-trainer-utils.md
     - Utils:
@@ -146,10 +150,23 @@ nav:
     - Smi: generated-smi-smi.md
   - Trainer:
     - Base Trainer: generated-trainer-base_trainer.md
-    - Causal Language Model Trainer: generated-trainer-causal_language_model_trainer.md
+    - Causal Language Model Trainer:
+      - Causal Language Model Trainer: generated-trainer-causal_language_model_trainer-causal_language_model_trainer.md
+      - Fwd Bwd Functions: generated-trainer-causal_language_model_trainer-fwd_bwd_functions.md
+      - Modeling Output: generated-trainer-causal_language_model_trainer-modeling_output.md
+    - Dpo:
+      - Dpo Trainer: generated-trainer-dpo-dpo_trainer.md
+      - Fwd Bwd Functions: generated-trainer-dpo-fwd_bwd_functions.md
+      - Modelling Output: generated-trainer-dpo-modelling_output.md
+      - Utils: generated-trainer-dpo-utils.md
+    - Sft:
+      - Stf Trainer: generated-trainer-sft-stf_trainer.md
     - Training Configurations: generated-trainer-training_configurations.md
     - Utils: generated-trainer-utils.md
-    - Vision Causal Language Model Trainer: generated-trainer-vision_causal_language_model_trainer.md
+    - Vision Causal Language Model Trainer:
+      - Fwd Bwd Functions: generated-trainer-vision_causal_language_model_trainer-fwd_bwd_functions.md
+      - Modelling Output: generated-trainer-vision_causal_language_model_trainer-modelling_output.md
+      - Vision Causal Language Model Trainer: generated-trainer-vision_causal_language_model_trainer-vision_causal_language_model_trainer.md
   - Transform:
     - Easydel Transform: generated-transform-easydel_transform.md
     - Falcon: generated-transform-falcon.md

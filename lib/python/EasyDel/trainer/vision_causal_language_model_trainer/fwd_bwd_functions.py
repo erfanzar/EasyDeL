@@ -7,7 +7,7 @@ from fjformer import (
     with_sharding_constraint
 )
 import chex
-from EasyDel.etils.easystate import EasyDelState
+from ...etils.easystate import EasyDelState
 from flax.struct import dataclass
 
 
