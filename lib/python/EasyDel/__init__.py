@@ -172,13 +172,6 @@ from .trainer import (
     concatenated_dpo_inputs as concatenated_dpo_inputs
 )
 
-from EasyDel.trainer.dpo.dpo_trainer import (
-    create_dpo_eval_function as create_dpo_eval_function,
-    create_dpo_train_function as create_dpo_train_function,
-    DPOTrainer as DPOTrainer,
-    create_concatenated_forward as create_concatenated_forward,
-)
-
 from .smi import (
     run as smi_run,
     initialise_tracking as initialise_tracking,
@@ -384,11 +377,6 @@ __all__ = (
     "VisionCausalLanguageModelTrainer",
     "create_vision_casual_language_model_evaluation_step",
     "create_vision_casual_language_model_train_step",
-
-    "create_dpo_eval_function",
-    "create_dpo_train_function",
-    "DPOTrainer",
-    "create_concatenated_forward",
 
     # SMI Modules
     "smi_run",

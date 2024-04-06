@@ -6,7 +6,7 @@ import jax
 from typing import Literal, Dict, Union, Tuple, List, Callable
 
 from jax import numpy as jnp
-from EasyDel.etils import EasyDelState
+from ...etils import EasyDelState
 from flax.struct import dataclass
 from .utils import pad_to_length
 

@@ -21,11 +21,11 @@ from fjformer import (
 from typing import Any, Optional, Callable, Mapping
 import chex
 
-from EasyDel.etils.errors import EasyDelTimerError
-from EasyDel.etils.easystate import EasyDelState
-from EasyDel.trainer.base_trainer import TrainerConfigureFunctionFuncOutput
-from EasyDel.trainer.causal_language_model_trainer import CausalLanguageModelTrainer
-from EasyDel.utils import prefix_print
+from ...etils.errors import EasyDelTimerError
+from ...etils.easystate import EasyDelState
+from ..base_trainer import TrainerConfigureFunctionFuncOutput
+from ..causal_language_model_trainer import CausalLanguageModelTrainer
+from ...utils import prefix_print
 
 from .fwd_bwd_functions import (
     create_vision_casual_language_model_evaluation_step,

@@ -4,11 +4,8 @@ os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 
 import jax
 from jax import numpy as jnp
-from EasyDel.trainer.dpo.dpo_trainer import (
-    DPOTrainer as DPOTrainer,
-    TrainArguments
-)
-from lib.python.EasyDel import EasyDelState, FlaxLlamaForCausalLM, LlamaConfig
+
+from lib.python.EasyDel import EasyDelState, FlaxLlamaForCausalLM, LlamaConfig, DPOTrainer, TrainArguments
 
 from typing import Dict, Optional
 
