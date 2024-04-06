@@ -365,7 +365,7 @@ class EasyDelState(struct.PyTreeNode):
             )
         state = state.replace(
             module_config_args={
-                k: v for k, v in state.module_config.__dict__.items() if
+                k: v for k, v in state.module.config.__dict__.items() if
                 isinstance(
                     v, (int, bool, float)
                 )
