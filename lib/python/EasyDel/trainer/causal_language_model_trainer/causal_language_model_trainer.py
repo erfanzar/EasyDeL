@@ -422,7 +422,11 @@ class CausalLanguageModelTrainer(BaseTrainer):
                 for epoch in range(self.arguments.num_train_epochs):
                     time_s = time.time()
                     for _ in range(self.max_training_steps // self.arguments.num_train_epochs):
-                        batch = next(train_iter)
+                        try:
+                            batch = next(train_iter)
+                        except StopIteration:
+                            train_iter = iter(self.dataloader_train)
+                            batch = next(train_iter)
                         current_step += 1
                         if (
                                 self.arguments.step_start_point is not None
@@ -435,7 +439,6 @@ class CausalLanguageModelTrainer(BaseTrainer):
                             time_prev = time_s
                             time_s = time.time()
                             step_time = time_s - time_prev
-
 
                             for ssb in self.arguments.ids_to_pop_from_dataset:
                                 _ = batch.pop(ssb, None)
@@ -641,7 +644,11 @@ class CausalLanguageModelTrainer(BaseTrainer):
             try:
                 eval_iter = iter(self.dataloader_eval)
                 for _ in range(self.max_evaluation_steps):
-                    batch = next(eval_iter)
+                    try:
+                        batch = next(eval_iter)
+                    except StopIteration:
+                        eval_iter = iter(self.dataloader_eval)
+                        batch = next(eval_iter)
                     current_step += 1
                     time_start = time.time()
                     for key in self.arguments.ids_to_pop_from_dataset:
