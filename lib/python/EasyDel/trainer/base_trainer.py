@@ -5,15 +5,15 @@ import threading
 import time
 import warnings
 from abc import abstractmethod
-from typing import Union, Callable, Optional, Any, Literal, Mapping
+from typing import Union, Callable, Optional, Any, Literal, Mapping, Iterator
 
 import fjformer
 import jax
-import tensorflow.data
-import tensorflow_datasets
+import tensorflow as tf
 import termcolor
 import wandb
-from datasets import Dataset
+from numpy import ndarray
+from datasets import Dataset, IterableDataset
 from wandb.sdk.lib import RunDisabled
 from wandb.sdk.wandb_run import Run
 from .training_configurations import TrainArguments
@@ -29,9 +29,9 @@ from jax.sharding import Mesh
 
 @dataclass
 class TrainerConfigureDataloaderFuncOutput:
-    dataloader_train: tensorflow.data.Dataset
+    dataloader_train: Iterator[ndarray[Any, Any]]
     max_training_steps: int
-    dataloader_eval: Optional[tensorflow.data.Dataset] = None
+    dataloader_eval: Optional[Iterator[ndarray[Any, Any]]] = None
     max_evaluation_steps: Optional[int] = None
 
 
@@ -287,7 +287,6 @@ class BaseTrainer:
         raise NotImplementedError
 
     def configure_dataloader(self) -> TrainerConfigureDataloaderFuncOutput:
-
         """
         The configure_dataloader function is used to configure the dataloader for training and evaluation.
 
@@ -295,36 +294,64 @@ class BaseTrainer:
         :return: A TrainerConfigureDataloaderFuncOutput object
 
         """
-
-        dataloader_train = tensorflow_datasets.as_numpy(
-            self.dataset_train.to_tf_dataset(
-                collate_fn=self.create_collate_function(
-                    max_sequence_length=self.arguments.max_sequence_length,
-                    truncation_mode=self.arguments.truncation_mode
-                ),
-                batch_size=self.arguments.total_batch_size,
-                drop_remainder=True,
-                num_workers=self.arguments.dataloader_num_workers
-            )
-        )
-        max_training_steps = self.arguments.num_train_epochs * len(
-            dataloader_train
-        ) if self.arguments.max_training_steps is None else self.arguments.max_training_steps
-        if self.dataset_eval is not None and self.arguments.do_eval:
-            dataloader_eval = tensorflow_datasets.as_numpy(
-                self.dataset_eval.to_tf_dataset(
+        def create_tf_dataset(dataset: Dataset, is_train: bool) -> Iterator[ndarray[Any, Any]]:
+            return (
+                dataset.to_tf_dataset(
                     collate_fn=self.create_collate_function(
                         max_sequence_length=self.arguments.max_sequence_length,
                         truncation_mode=self.arguments.truncation_mode
                     ),
                     batch_size=self.arguments.total_batch_size,
                     drop_remainder=True,
-                    shuffle=True,
+                    shuffle=not is_train,
                     num_workers=self.arguments.dataloader_num_workers
                 )
+                .repeat(self.arguments.num_train_epochs if is_train else 1)
+                .prefetch(tf.data.experimental.AUTOTUNE)
+                .as_numpy_iterator()
             )
-            max_evaluation_steps = len(
-                dataloader_eval) if self.arguments.max_training_steps is None else self.arguments.max_training_steps
+
+        def create_tf_dataset_from_iterable(dataset: IterableDataset, is_train: bool) -> Iterator[ndarray[Any, Any]]:
+            return (
+                tf.data.Dataset.from_generator(
+                    lambda: dataset,
+                    output_signature={
+                        col: tf.TensorSpec(shape=(self.arguments.max_sequence_length,), dtype=tf.int32)
+                        for col in next(iter(dataset)).keys()
+                    }
+                )
+                .repeat(self.arguments.num_train_epochs if is_train else 1)
+                .batch(self.arguments.total_batch_size, drop_remainder=False)
+                .prefetch(tf.data.experimental.AUTOTUNE)
+                .as_numpy_iterator()
+            )
+
+        def calculate_steps(dataset: Union[Dataset, IterableDataset], is_train: bool):
+            """
+            Return total number of steps to train or evaluate on.
+            """
+            if hasattr(dataset, "__len__"):
+                num_steps = len(dataset) * (self.arguments.num_train_epochs if is_train else 1)
+                max_steps = self.arguments.max_training_steps if is_train else self.arguments.max_evaluation_steps
+                return min(num_steps, max_steps) if max_steps else num_steps
+            else:
+                num_steps = self.arguments.max_training_steps if is_train else self.arguments.max_evaluation_steps
+                if not num_steps:
+                    raise ValueError(f"Specify the number of {'training' if is_train else 'evaluation'} steps for a generator/streaming dataset.")
+                return num_steps
+
+        def to_tf_dataloader(dataset: Union[Dataset, IterableDataset], is_train: bool):
+            if hasattr(dataset, "__len__"):
+                return create_tf_dataset(dataset, is_train)
+            else:
+                return create_tf_dataset_from_iterable(dataset, is_train)
+
+        max_training_steps = calculate_steps(self.dataset_train, is_train=True)
+        dataloader_train = to_tf_dataloader(self.dataset_train, is_train=True)
+
+        if self.dataset_eval is not None and self.arguments.do_eval:
+            max_evaluation_steps = calculate_steps(self.dataset_eval, is_train=False)
+            dataloader_eval = to_tf_dataloader(self.dataset_eval, is_train=False)
         else:
             dataloader_eval, max_evaluation_steps = None, 0
 
