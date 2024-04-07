@@ -145,32 +145,19 @@ train_arguments = TrainArguments(
 )
 
 
-def create_prompt_creator():
-    def _tr(field):
-        return [
-            {"role": "user", "content": field["conversation"][0]["input"]},
-            {"role": "assistant", "content": field["conversation"][0]["output"]}
-        ]
-
-    def _pc(
-            sample
-    ):
-        sample = conversations_formatting_function(tokenizer, messages_field="conversation")(  # type: ignore
-            {"conversation": _tr(sample)}
-        )
-        return [sample]
-
-    return _pc
+def prompter(sample):
+    return [conversations_formatting_function(tokenizer, messages_field="messages")(sample)]
 
 
-dove = load_dataset("LDJnr/Pure-Dove", )  # We use Dove from LDJnr since this one i a little bit tricky to ues.
+train_dataset = load_dataset("HuggingFaceH4/deita-10k-v0-sft", split="train_sft")
 trainer = SFTTrainer(
     arguments=train_arguments,
-    train_dataset=dove["train"],
-    eval_dataset=dove["train"],  # we don't have eval dataset rn :)
+    train_dataset=train_dataset,
+    eval_dataset=None,  # we don't have eval dataset rn :)
     tokenizer=tokenizer,
     dataset_text_field=None,
-    formatting_func=create_prompt_creator(),
+    
+    formatting_func=prompter,
     packing=False,
     num_of_sequences=1024,
 )
@@ -668,7 +655,7 @@ with jax.default_device(jax.devices("cpu")[0]):
         state=EasyDelState.load_state(
             "PATH_TO_CKPT"
         ),  # You can Pass EasyDelState here
-        base_huggingface_module=MistralForCausalLM,
+        base_huggingface_module=MistralForCausalLM,  # type: ignore
         config=config
     )
 
