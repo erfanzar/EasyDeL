@@ -24,6 +24,7 @@ ACT2FN = {
     "silu": nn.swish,
     "swish": nn.swish,
     "gelu_new": partial(nn.gelu, approximate=True),
+    "gelu_pytorch_tanh": partial(nn.gelu, approximate=True),
     "tanh": nn.tanh,
     "sigmoid": nn.sigmoid,
     "leaky_relu": partial(nn.leaky_relu, negative_slope=0.01),
