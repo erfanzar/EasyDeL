@@ -57,6 +57,7 @@ class TrainArguments(
             model_huggingface_repo_id: Optional[str] = None,
             total_batch_size: int = 32,
             max_training_steps: Optional[int] = None,
+            max_evaluation_steps: Optional[int] = None,
             optimizer: AVAILABLE_OPTIMIZERS = EasyDelOptimizers.ADAMW,
             scheduler: AVAILABLE_SCHEDULERS = EasyDelSchedulers.NONE,
             learning_rate: Union[int, float] = 5e-5,
@@ -127,7 +128,8 @@ The __init__ function can accept arguments, just like a normal function.
 :param model_huggingface_repo_id: Optional[str]: Load a pretrained model from the huggingface model hub
 :param model_class: Optional[EasyDelFlaxPretrainedModel]: Pass a model class to the trainer
 :param total_batch_size: int: Set the batch size of the model
-:param max_training_steps: Optional[int]: Set the maximum number of steps to train for
+:param max_training_steps: Optional[int]: Set the maximum total number of training steps across all epochs
+:param max_evaluation_steps: Optional[int]: Set the maximum number of steps to evaluate for
 :param optimizer: AVAILABLE_OPTIMIZERS: Specify the optimizer used to train the model
 :param scheduler: AVAILABLE_SCHEDULERS: Set the learning rate scheduler
 :param learning_rate: Union[int, float] : Set the learning rate for the optimizer
@@ -245,6 +247,7 @@ The __init__ function can accept arguments, just like a normal function.
         self.wandb_entity = wandb_entity
         self.total_batch_size = total_batch_size
         self.max_training_steps = max_training_steps
+        self.max_evaluation_steps = max_evaluation_steps
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.extra_optimizer_kwargs = extra_optimizer_kwargs

@@ -418,9 +418,11 @@ class CausalLanguageModelTrainer(BaseTrainer):
                 )
                 wandb.summary["Number of Model Parameters (Billion)"] = model_parameters_number
             try:
+                train_iter = iter(self.dataloader_train)
                 for epoch in range(self.arguments.num_train_epochs):
                     time_s = time.time()
-                    for batch in self.dataloader_train:
+                    for _ in range(self.max_training_steps // self.arguments.num_train_epochs):
+                        batch = next(train_iter)
                         current_step += 1
                         if (
                                 self.arguments.step_start_point is not None
@@ -637,7 +639,9 @@ class CausalLanguageModelTrainer(BaseTrainer):
             accuracy_sum = None
 
             try:
-                for batch in self.dataloader_eval:
+                eval_iter = iter(self.dataloader_eval)
+                for _ in range(self.max_evaluation_steps):
+                    batch = next(eval_iter)
                     current_step += 1
                     time_start = time.time()
                     for key in self.arguments.ids_to_pop_from_dataset:
