@@ -1,5 +1,4 @@
 import os
-import tensorflow_datasets as tfsd
 
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 import flax.core
@@ -12,7 +11,7 @@ from lib.python.EasyDel import (
     LlamaConfig
 )
 from jax import numpy as jnp, random
-from datasets import Dataset
+from datasets import Dataset, IterableDataset
 
 SEQUENCE_LENGTH = 128
 DATA_ROW_SIZE = 1000
@@ -41,10 +40,10 @@ def train():
         for i in range(DATA_ROW_SIZE):
             yield {
                 "attention_mask": jnp.ones(
-                    (1, SEQUENCE_LENGTH), dtype="i4"
+                    SEQUENCE_LENGTH, dtype="i4"
                 ),
                 "input_ids": random.randint(
-                    random.PRNGKey(0), (1, SEQUENCE_LENGTH), 0, 32000, dtype="i4"
+                    random.PRNGKey(0), (SEQUENCE_LENGTH, ), 0, 32000, dtype="i4"
                 )
             }
 
@@ -69,7 +68,8 @@ def train():
             dtype=dtype,
             param_dtype=dtype,
             track_memory=False,
-            save_optimizer_state=True
+            save_optimizer_state=True,
+            max_training_steps=DATA_ROW_SIZE // BATCH_SIZE
         ),
         dataset_train=example_data,
     )
@@ -87,13 +87,14 @@ def re_train(checkpoint_path: str | os.PathLike):
         for i in range(DATA_ROW_SIZE):
             yield {
                 "attention_mask": jnp.ones(
-                    (1, SEQUENCE_LENGTH), dtype="i4"
+                    (SEQUENCE_LENGTH, ), dtype="i4"
                 ),
                 "input_ids": random.randint(
-                    random.PRNGKey(0), (1, SEQUENCE_LENGTH), 0, 32000, dtype="i4"
+                    random.PRNGKey(0), (SEQUENCE_LENGTH, ), 0, 32000, dtype="i4"
                 )
             }
 
+    # example_data = IterableDataset.from_generator(data_generator, )
     example_data = Dataset.from_generator(data_generator, )
     dtype = jnp.float32
     trainer = CausalLanguageModelTrainer(
@@ -114,7 +115,8 @@ def re_train(checkpoint_path: str | os.PathLike):
             },
             dtype=dtype,
             param_dtype=dtype,
-            track_memory=False
+            track_memory=False,
+            max_training_steps=DATA_ROW_SIZE // BATCH_SIZE
         ),
         dataset_train=example_data,
         checkpoint_path=checkpoint_path
