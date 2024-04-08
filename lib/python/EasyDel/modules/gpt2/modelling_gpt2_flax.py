@@ -204,6 +204,14 @@ class FlaxGPT2Attention(BaseJAXAttentionModule):
         )
         attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value)
         attn_output = self._merge_heads(attn_output)
+        if self.config.shard_attention_computation:
+            attn_output = with_sharding_constraint(
+                attn_output, PartitionSpec(
+                    ("dp", "fsdp"),
+                    "sp" if attn_output.shape[1] != 1 else None,
+                    "tp"
+                )
+            )
         attn_output = self.c_proj(attn_output)
         attn_output = self.resid_dropout(attn_output, deterministic=deterministic)
 
