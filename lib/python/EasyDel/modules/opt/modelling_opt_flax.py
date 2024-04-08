@@ -170,6 +170,14 @@ class FlaxOPTAttention(BaseJAXAttentionModule):
             )
             attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value_states)
             attn_output = self._merge_heads(attn_output)
+            if self.config.shard_attention_computation:
+                attn_output = with_sharding_constraint(
+                    attn_output, PartitionSpec(
+                        ("dp", "fsdp"),
+                        "sp" if attn_output.shape[1] != 1 else None,
+                        "tp"
+                    )
+                )
             attn_output = self.out_proj(attn_output)
 
         return attn_output, attn_weights

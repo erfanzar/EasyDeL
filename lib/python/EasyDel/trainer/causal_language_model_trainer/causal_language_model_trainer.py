@@ -1,7 +1,6 @@
 import copy
 from glob import glob
 import os
-import sys
 import time
 import typing
 
@@ -443,15 +442,11 @@ class CausalLanguageModelTrainer(BaseTrainer):
                             for ssb in self.arguments.ids_to_pop_from_dataset:
                                 _ = batch.pop(ssb, None)
 
-                            forward_backward_step_time_start = time.time()
-
                             (
                                 sharded_state,
                                 loss,
                                 metrics,
                             ) = self.sharded_train_step_function(sharded_state, batch)
-
-                            forward_backward_step_time_end = time.time()
 
                             trained_tokens = jnp.multiply(
                                 self.arguments.max_sequence_length, jnp.multiply(
@@ -460,33 +455,25 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                 )
                             )  # It's faster
                             if self.arguments.performance_mode:
-                                gathering_metrics_time_start = time.time()
                                 calculating_metrics_start = time.time()
                                 accuracy = metrics["accuracy"]
                                 perplexity = jnp.exp(loss)
                                 calculating_metrics_end = time.time()
                                 train_metrics = {
-                                    "loss": loss.tolist(),
-                                    "accuracy": accuracy,
-                                    "learning_rate": self.scheduler(current_step).tolist(),
-                                    "step": current_step,
-                                    "step_time": step_time,
-                                    "perplexity": perplexity.tolist(),
-                                    "trained_tokens": trained_tokens,
-                                    "max_grad_norm": metrics["max_grad_norm"].tolist(),
-                                    "mean_grad_norm": metrics["mean_grad_norm"].tolist(),
-                                    "regularization_z_loss": metrics["regularization_z_loss"].tolist(),
-                                    "epoch": epoch,
+                                    "train/loss": loss.tolist(),
+                                    "train/accuracy": accuracy,
+                                    "train/learning_rate": self.scheduler(current_step).tolist(),
+                                    "train/step": current_step,
+                                    "train/step_time": step_time,
+                                    "train/perplexity": perplexity.tolist(),
+                                    "train/trained_tokens": trained_tokens,
+                                    "train/max_grad_norm": metrics["max_grad_norm"].tolist(),
+                                    "train/mean_grad_norm": metrics["mean_grad_norm"].tolist(),
+                                    "train/regularization_z_loss": metrics["regularization_z_loss"].tolist(),
+                                    "train/epoch": epoch,
                                 }
-                                gathering_metrics_time_end = time.time()
                                 train_metrics.update(
                                     {
-                                        "gathering_metrics_time": (
-                                                gathering_metrics_time_end - gathering_metrics_time_start
-                                        ),
-                                        "forward_backward_step_time": (
-                                                forward_backward_step_time_end - forward_backward_step_time_start
-                                        ),
                                         "calculating_metrics_step_time": (
                                                 calculating_metrics_end - calculating_metrics_start
                                         )
@@ -495,7 +482,6 @@ class CausalLanguageModelTrainer(BaseTrainer):
 
                             else:
                                 with jax.spmd_mode("allow_all"):
-                                    gathering_metrics_time_start = time.time()
                                     calculating_metrics_start = time.time()
                                     loss_sum = loss if loss_sum is None else loss_sum + loss
                                     accuracy = metrics["accuracy"]
@@ -505,22 +491,21 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                     perplexity = jnp.exp(loss)
                                     calculating_metrics_end = time.time()
                                     train_metrics = {
-                                        "loss": loss.tolist(),
-                                        "mean_loss": mean_loss.tolist(),
-                                        "accuracy": accuracy,
-                                        "mean_accuracy": mean_accuracy.tolist(),
-                                        "learning_rate": self.scheduler(current_step).tolist(),
-                                        "step": current_step,
-                                        "step_time": step_time,
-                                        "perplexity": perplexity.tolist(),
-                                        "trained_tokens": trained_tokens,
-                                        "max_grad_norm": metrics["max_grad_norm"].tolist(),
-                                        "mean_grad_norm": metrics["mean_grad_norm"].tolist(),
-                                        "regularization_z_loss": metrics["regularization_z_loss"].tolist(),
-                                        "epoch": epoch,
+                                        "train/loss": loss.tolist(),
+                                        "train/mean_loss": mean_loss.tolist(),
+                                        "train/accuracy": accuracy,
+                                        "train/mean_accuracy": mean_accuracy.tolist(),
+                                        "train/learning_rate": self.scheduler(current_step).tolist(),
+                                        "train/step": current_step,
+                                        "train/step_time": step_time,
+                                        "train/perplexity": perplexity.tolist(),
+                                        "train/trained_tokens": trained_tokens,
+                                        "train/max_grad_norm": metrics["max_grad_norm"].tolist(),
+                                        "train/mean_grad_norm": metrics["mean_grad_norm"].tolist(),
+                                        "train/regularization_z_loss": metrics["regularization_z_loss"].tolist(),
+                                        "train/epoch": epoch,
                                     }
 
-                                    gathering_metrics_time_end = time.time()
                             pbar.update(1)
                             pbar.set_postfix(**train_metrics)
                             if not self.arguments.performance_mode:
@@ -530,12 +515,6 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                 })
                                 train_metrics.update(
                                     {
-                                        "time_cal/gathering_metrics_time": (
-                                                gathering_metrics_time_end - gathering_metrics_time_start
-                                        ),
-                                        "time_cal/forward_backward_step_time": (
-                                                forward_backward_step_time_end - forward_backward_step_time_start
-                                        ),
                                         "time_cal/calculating_metrics_step_time": (
                                                 calculating_metrics_end - calculating_metrics_start
                                         )
@@ -670,14 +649,14 @@ class CausalLanguageModelTrainer(BaseTrainer):
                     )
 
                     eval_metrics = {
-                        "eval_loss": loss.tolist(),
-                        "eval_mean_loss": loss_sum / (current_step - self.arguments.step_start_point),
-                        "eval_mean_accuracy_sum": accuracy_sum / (
+                        "eval/loss": loss.tolist(),
+                        "eval/mean_loss": loss_sum / (current_step - self.arguments.step_start_point),
+                        "eval/mean_accuracy_sum": accuracy_sum / (
                                 current_step - self.arguments.step_start_point
                         ),
-                        "eval_step": current_step,
-                        "eval_step_time": total_time,
-                        "eval_perplexity": jnp.exp(loss).tolist(),
+                        "eval/step": current_step,
+                        "eval/step_time": total_time,
+                        "eval/perplexity": jnp.exp(loss).tolist(),
                     }
                     log_metrics = copy.deepcopy(eval_metrics)
                     eval_metrics.update(self.arguments.captured_memory)
