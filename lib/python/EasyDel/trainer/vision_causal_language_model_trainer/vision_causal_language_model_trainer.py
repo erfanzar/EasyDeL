@@ -1,10 +1,7 @@
 import copy
 import os
-import sys
 import time
 import typing
-
-import IPython.display
 import termcolor
 import wandb
 
@@ -18,7 +15,7 @@ from fjformer import (
     match_partition_rules,
     make_shard_and_gather_fns,
 )
-from typing import Any, Optional, Callable, Mapping
+from typing import Optional, Callable, Mapping
 import chex
 
 from ...etils.errors import EasyDelTimerError
@@ -356,7 +353,7 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
             vision_accuracy_sum = None
             text_loss_sum = None
             text_accuracy_sum = None
-            pbar.update(sharded_state.step.tolist())
+            pbar.update(sharded_state.step.tolist())  # type: ignore
             learning_rates = []
             if self.wandb_runtime is not None:
                 model_parameters_number = sum(

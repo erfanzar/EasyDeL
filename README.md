@@ -48,7 +48,8 @@ Some of the key features provided by EasyDeL include:
    CausalLanguageModelTrainer on kaggle, but you can do much more.
 2. [script](https://www.kaggle.com/code/citifer/easydel-serve-example-mixtral) for using and serving LLMs with EasyDeL
    JAXServer API (Mixtral Example).
-
+3. [script](https://www.kaggle.com/code/citifer/easydel-sfttrainer-example) SuperVised Finetuning with EasyDeL.
+   
 ## Serving
 
 you can read docs or examples to see how `JAXServer` works but let me show you how you can simply host and serve any

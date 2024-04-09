@@ -84,6 +84,7 @@ def create_constant_length_dataset(
     max_buffer_size = seq_length * chars_per_token * num_of_sequences
 
     def constant_dataset_collect_fn():
+
         iterator = iter(dataset)
         more_examples = True
         while more_examples:
@@ -92,7 +93,10 @@ def create_constant_length_dataset(
                 if buffer_len >= max_buffer_size:
                     break
                 try:
-                    buffer.append(formatting_func(next(iterator)))
+                    prompt = formatting_func(next(iterator))
+                    if isinstance(prompt, list):
+                        prompt = "".join(p for p in prompt)
+                    buffer.append(prompt)
                     buffer_len += len(buffer[-1])
                 except StopIteration:
                     if infinite:
@@ -101,25 +105,34 @@ def create_constant_length_dataset(
                     else:
                         more_examples = False
                         break
-            tokenized_inputs = tokenizer(buffer, add_special_tokens=add_special_tokens, truncation=False)[
-                "input_ids"
-            ]
+            tokens = tokenizer(buffer, add_special_tokens=add_special_tokens, truncation=False)
+
+            tokenized_inputs = tokens["input_ids"]
+            attention_masks = tokens["attention_mask"]
+
             all_token_ids = []
-            for tokenized_input in tokenized_inputs:
+            all_attention_masks = []
+            for tokenized_input, attention_mask in zip(tokenized_inputs, attention_masks):
                 if append_concat_token:
                     tokenized_input = tokenized_input + [concat_token_id]
+                    attention_mask = attention_mask + [1]
                 all_token_ids.extend(tokenized_input)
+                all_attention_masks.extend(attention_mask)
+
             examples = []
+            examples_attention_masks = []
             for i in range(0, len(all_token_ids), seq_length):
                 input_ids = all_token_ids[i: i + seq_length]
+                org_attention_masks = all_attention_masks[i: i + seq_length]
                 if len(input_ids) == seq_length:
                     examples.append(input_ids)
+                    examples_attention_masks.append(org_attention_masks)
             if shuffle:
                 random.shuffle(examples)
-            for example in examples:
+            for example, example_attention_mask in zip(examples, examples_attention_masks):
                 yield {
                     "input_ids": jnp.asarray(example, dtype="i4"),
-                    "labels": jnp.asarray(example, dtype="i4"),
+                    "attention_mask": jnp.asarray(example_attention_mask, dtype="i4"),
                 }
 
     return constant_dataset_collect_fn
