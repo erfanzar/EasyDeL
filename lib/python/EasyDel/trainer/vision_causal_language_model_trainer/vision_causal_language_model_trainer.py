@@ -240,6 +240,7 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
                             state_shard_fns=shard_fns,
                             init_optimizer_state=True,
                             checkpoint_path=self.checkpoint_path,
+                            input_shape=self.arguments.init_input_shape
                         )
                         # sharded_state = sharded_state.replace(
                         #     tx=self.tx,
