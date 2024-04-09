@@ -367,6 +367,14 @@ class FlaxLlamaAttention(BaseJAXAttentionModule):
         attentions.attention_outputs = attentions.attention_outputs
 
         attn_output = self._merge_heads(attentions.attention_outputs)
+        if self.config.shard_attention_computation:
+            attn_output = with_sharding_constraint(
+                attn_output, PartitionSpec(
+                    ("dp", "fsdp"),
+                    "sp" if attn_output.shape[1] != 1 else None,
+                    "tp"
+                )
+            )
         attn_output = self.o_proj(attn_output)
 
         attn_output = self.resid_dropout(attn_output, deterministic=deterministic)

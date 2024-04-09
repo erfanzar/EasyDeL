@@ -366,6 +366,14 @@ class FlaxFalconAttention(BaseJAXAttentionModule):
             attn_output = jax.lax.batch_matmul(attention_scores, value_layer)
             attn_output = attn_output.reshape((attn_output.shape[1] * attn_output.shape[0],) + attn_output.shape[2:])
             attn_output = self._merge_heads(attn_output)
+            if self.config.shard_attention_computation:
+                attn_output = with_sharding_constraint(
+                    attn_output, PartitionSpec(
+                        ("dp", "fsdp"),
+                        "sp" if attn_output.shape[1] != 1 else None,
+                        "tp"
+                    )
+                )
 
             output_tensor = self.dense(attn_output)
 

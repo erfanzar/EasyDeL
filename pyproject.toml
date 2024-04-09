@@ -35,7 +35,7 @@ dependencies = [
     "fastapi~=0.104.1",
     "pydantic-core==2.14.6",
     "tensorflow~=2.16.1",
-    "tensorflow_datasets~=4.9.4",
+    "tensorflow_datasets<=4.9.0",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
