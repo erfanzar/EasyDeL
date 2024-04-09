@@ -1,7 +1,6 @@
+from typing import Optional
+
 import fjformer.optimizers
-import jax
-from ml_collections import ConfigDict
-from ml_collections.config_dict import placeholder
 from .etils import (
     EasyDelSchedulers,
     EasyDelOptimizers,
@@ -17,7 +16,7 @@ def get_optimizer_and_scheduler(
         learning_rate: float = 1e-5,
         learning_rate_end: float = 1e-5,
         gradient_accumulation_steps: int = 1,
-        extra_optimizer_kwargs: Union[dict, None] = None,
+        extra_optimizer_kwargs: Optional[dict] = None,
         weight_decay: float = 0.02,
         warmup_steps: int = 0
 ):
