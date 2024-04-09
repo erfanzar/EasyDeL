@@ -93,10 +93,11 @@ config = AutoEasyDelConfig.from_pretrained(
 with jax.default_device(jax.devices("cpu")[0]):
     model = easystate_to_huggingface_model(
         state=EasyDelState.load_state(
-            "PATH_TO_CKPT"
+            "PATH_TO_CKPT",
+            input_shape=(8, 2048)
         ),  # You can Pass EasyDelState here
         base_huggingface_module=MistralForCausalLM,
-        config=config
+        config=config,
     )
 
 model = model.half()  # it's a huggingface model now
