@@ -13,7 +13,7 @@ from ...etils.etils import get_logger
 from ...modules.easydel_modelling_utils import EasyDelFlaxPretrainedModel
 from flax.core import FrozenDict
 from transformers import PreTrainedTokenizerBase, GenerationConfig
-from typing import Callable, Mapping, Tuple, List
+from typing import Callable, Mapping, Tuple, List, Optional
 from .configuration import EasyServeConfig
 from jax.sharding import PartitionSpec, Mesh
 from jax.experimental.pjit import pjit
@@ -35,7 +35,7 @@ class EasyServe:
     def __init__(
             self,
             llm: EasyDelFlaxPretrainedModel,
-            params: FrozenDict | dict,
+            params: Union[FrozenDict, dict],
             tokenizer: PreTrainedTokenizerBase,
             prefix_tokenizer: PreTrainedTokenizerBase,
             greedy_generate_function: Callable,
@@ -105,8 +105,8 @@ class EasyServe:
         prompt = self.conversation_template(
             request.conversation
         )
-        response: str | None = None
-        num_token_generated: int | None = None
+        response: Optional[str] = None
+        num_token_generated: Optional[int] = None
         for response, num_token_generated in self.sample(
                 string=prompt,
                 max_new_tokens=request.max_new_tokens or self.serve_config.max_new_tokens,
@@ -124,7 +124,7 @@ class EasyServe:
     def create_shard_and_gather_functions(
             parameters: dict,
             partition_rules: Tuple[Tuple[str, PartitionSpec]],
-            dtype: jax.numpy.dtype | str = "fp16"
+            dtype: Union[jax.numpy.dtype, str] = "fp16"
     ):
 
         """
@@ -149,7 +149,7 @@ class EasyServe:
     @staticmethod
     def shard_parameters(
             mesh: Mesh,
-            params: FrozenDict | dict,
+            params: Union[FrozenDict, dict],
             partition_rules: Tuple[Tuple[str, PartitionSpec]],
             serve_config: EasyServeConfig,
     ):

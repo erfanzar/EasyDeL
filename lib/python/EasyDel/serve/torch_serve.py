@@ -415,7 +415,7 @@ class PyTorchServer(GradioUserInference):
             self,
             prompt: str,
             history: List[List[str]],
-            system_prompt: str | None,
+            system_prompt: Optional[str],
             mode: str,
             max_sequence_length: int,
             max_new_tokens: int,

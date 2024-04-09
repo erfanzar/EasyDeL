@@ -112,7 +112,7 @@ Color = typing.Literal[
 def prefix_print(
         prefix,
         string,
-        prefix_color: Color | None = "red"
+        prefix_color: typing.Optional[Color] = "red"
 ):
     print(
         termcolor.colored(

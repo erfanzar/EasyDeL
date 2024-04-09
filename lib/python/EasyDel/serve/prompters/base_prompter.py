@@ -41,7 +41,7 @@ class BasePrompter(abc.ABC):
             formatted_prompt: str,
             history: list[list[str]],
             system_message: str,
-            external_data: str | Any
+            external_data: Union[str, Any]
     ) -> str:
         raise NotImplementedError("NotImplementedYet !")
 

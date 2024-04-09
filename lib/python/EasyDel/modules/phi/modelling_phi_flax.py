@@ -526,7 +526,7 @@ class FlaxPhiDecoderLayerCollection(nn.Module):
             output_hidden_states: bool = False,
             init_cache: bool = False,
             return_dict: bool = True,
-    ) -> tuple[tuple, ...] | FlaxBaseModelOutput:
+    ) -> Union[tuple[tuple, ...], FlaxBaseModelOutput]:
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         for decoder_layer in self.layers:
@@ -637,7 +637,7 @@ class FlaxPhiModule(nn.Module):
             output_hidden_states: bool = False,
             init_cache: bool = False,
             return_dict: bool = True,
-    ) -> tuple[tuple[Any, ...], ...] | FlaxBaseModelOutput:
+    ) -> Union[tuple[tuple[Any, ...], ...], FlaxBaseModelOutput]:
         if input_ids is None and inputs_embeds is None:
             raise RuntimeError("Both `input_ids` and `inputs_embeds` can not be None !")
         if inputs_embeds is None:
@@ -718,7 +718,7 @@ class FlaxPhiForCausalLMModule(nn.Module):
             output_hidden_states: bool = False,
             init_cache: bool = False,
             return_dict: bool = True,
-    ) -> tuple[Any, ...] | FlaxMaskedLMOutput:
+    ) -> Union[tuple[Any, ...], FlaxMaskedLMOutput]:
         res = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,

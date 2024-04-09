@@ -111,7 +111,7 @@ class EasyDelState(struct.PyTreeNode):
             cls,
             *,
             apply_fn: Callable,
-            params: core.FrozenDict[str, Any] | Mapping[str, Any],
+            params: Union[core.FrozenDict[str, Any], Mapping[str, Any]],
             tx: optax.GradientTransformation,
             tx_init: Optional[dict] = None,
             hyperparameters: Optional[dict] = None,
@@ -165,7 +165,7 @@ class EasyDelState(struct.PyTreeNode):
             cls,
             *,
             apply_fn: Callable,
-            params: core.FrozenDict[str, Any] | Mapping[str, Any],
+            params: Union[core.FrozenDict[str, Any], Mapping[str, Any]],
             step: int = 0,
             opt_state: Optional[optax.OptState] = None,
             tx_init: Optional[dict] = None,
@@ -257,7 +257,7 @@ class EasyDelState(struct.PyTreeNode):
     @classmethod
     def load_state(
             cls,
-            checkpoint_path: str | os.PathLike,
+            checkpoint_path: Union[str, os.PathLike],
             dtype: jnp.dtype = jnp.float32,
             param_dtype: jnp.dtype = jnp.float32,
             precision: Optional[Union[str, jax.lax.Precision]] = None,
@@ -337,12 +337,12 @@ class EasyDelState(struct.PyTreeNode):
 
     def save_state(
             self,
-            filename: str | os.PathLike,
+            filename: Union[str, os.PathLike],
             save_optimizer: bool = False,
-            checkpoint_dir: Optional[str | os.PathLike] = None,
+            checkpoint_dir: Optional[Union[str, os.PathLike]] = None,
             verbose: bool = False,
             gather_fns: dict[Callable] = None,
-            float_dtype: str | jax.numpy.dtype = None,
+            float_dtype: Union[str, jax.numpy.dtype] = None,
     ):
 
         """
@@ -552,7 +552,7 @@ class EasyDelState(struct.PyTreeNode):
             self,
             fully_sharded_data_parallel: bool = True,
             shard_fns: Optional[Mapping[str, Callable]] = None,
-            dtype: jax.numpy.dtype | str = "bf16",
+            dtype: Union[jax.numpy.dtype, str] = "bf16",
             mesh: Optional[Mesh] = None,
             rules: Optional[Sequence[Mapping[str, PartitionSpec]]] = None
     ):
@@ -680,7 +680,7 @@ class EasyDelState(struct.PyTreeNode):
         return req or default
 
     @staticmethod
-    def find_key(key, dictionary: dict) -> str | None:
+    def find_key(key, dictionary: dict) -> Union[str, None]:
         result = None
         for k, v in dictionary.items():
             k_, v_ = break_format(key=k, value=v)
