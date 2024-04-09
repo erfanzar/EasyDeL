@@ -17,7 +17,7 @@ def get_optimizer_and_scheduler(
         learning_rate: float = 1e-5,
         learning_rate_end: float = 1e-5,
         gradient_accumulation_steps: int = 1,
-        extra_optimizer_kwargs: dict | None = None,
+        extra_optimizer_kwargs: Union[dict, None] = None,
         weight_decay: float = 0.02,
         warmup_steps: int = 0
 ):

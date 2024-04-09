@@ -78,7 +78,7 @@ class JAXServerConfig:
     mesh_axes_shape: Sequence[int] = (1, -1, 1, 1)
     generation_ps: PartitionSpec = PartitionSpec("dp", "fsdp")
 
-    dtype: jnp.dtype | str = "fp16"
+    dtype: Union[jnp.dtype, str] = "fp16"
 
     stream_tokens_for_gradio: bool = True
     use_prefix_tokenizer: bool = True
@@ -791,7 +791,7 @@ class JAXServer(GradioUserInference):
             self,
             prompt: str,
             history: List[List[str]],
-            system_prompt: str | None,
+            system_prompt: Union[str, None],
             mode: str,
             max_sequence_length: int,
             max_new_tokens: int,
