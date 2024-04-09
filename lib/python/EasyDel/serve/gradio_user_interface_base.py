@@ -153,7 +153,7 @@ class GradioUserInference:
             self,
             prompt: str,
             history: List[List[str]],
-            system_prompt: Union[str, None],
+            system_prompt: typing.Optional[str],
             mode: str,
             max_sequence_length: int,
             max_new_tokens: int,

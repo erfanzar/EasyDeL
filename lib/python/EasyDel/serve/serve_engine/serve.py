@@ -13,7 +13,7 @@ from ...etils.etils import get_logger
 from ...modules.easydel_modelling_utils import EasyDelFlaxPretrainedModel
 from flax.core import FrozenDict
 from transformers import PreTrainedTokenizerBase, GenerationConfig
-from typing import Callable, Mapping, Tuple, List, Optional
+from typing import Callable, Mapping, Tuple, List, Optional, Union
 from .configuration import EasyServeConfig
 from jax.sharding import PartitionSpec, Mesh
 from jax.experimental.pjit import pjit
