@@ -16,9 +16,10 @@
 """ Flax OPT model."""
 
 from functools import partial
+import flax.linen
 from typing import Optional, Tuple, Sequence
 
-import flax.linen as nn
+import fjformer.linen as nn
 import jax
 import jax.numpy as jnp
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
@@ -40,6 +41,7 @@ import chex
 
 from .opt_configuration import OPTConfig
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
+from fjformer.linen import Linear
 
 logger = logging.get_logger(__name__)
 
@@ -63,7 +65,7 @@ class FlaxOPTAttention(BaseJAXAttentionModule):
             )
 
         dense = partial(
-            nn.Dense,
+            Linear,
             self.embed_dim,
             use_bias=self.bias,
             dtype=self.dtype,
@@ -73,10 +75,10 @@ class FlaxOPTAttention(BaseJAXAttentionModule):
         self.q_proj, self.k_proj, self.v_proj = dense(), dense(), dense()
         self.out_proj = dense()
 
-        self.dropout_layer = nn.Dropout(rate=self.dropout)
+        self.dropout_layer = flax.linen.Dropout(rate=self.dropout)
 
         if self.causal:
-            self.causal_mask = nn.make_causal_mask(
+            self.causal_mask = flax.linen.make_causal_mask(
                 jnp.ones(
                     (1, getattr(self.config, "c_max_position_embeddings", self.config.max_position_embeddings)),
                     dtype="bool"
@@ -198,16 +200,16 @@ class FlaxOPTDecoderLayer(nn.Module):
             dtype=self.dtype,
         )
         self.do_layer_norm_before = self.config.do_layer_norm_before
-        self.dropout_layer = nn.Dropout(rate=self.config.dropout)
+        self.dropout_layer = flax.linen.Dropout(rate=self.config.dropout)
         self.activation_fn = ACT2FN[self.config.activation_function]
 
         self.self_attn_layer_norm = nn.LayerNorm(dtype=self.dtype, epsilon=1e-05)
-        self.fc1 = nn.Dense(
+        self.fc1 = Linear(
             self.config.ffn_dim,
             dtype=self.dtype,
             kernel_init=jax.nn.initializers.normal(self.config.init_std),
         )
-        self.fc2 = nn.Dense(
+        self.fc2 = Linear(
             self.embed_dim, dtype=self.dtype, kernel_init=jax.nn.initializers.normal(self.config.init_std)
         )
         self.final_layer_norm = nn.LayerNorm(dtype=self.dtype, epsilon=1e-05)
@@ -339,7 +341,7 @@ class FlaxOPTDecoder(nn.Module):
     offset: int = 2
 
     def setup(self):
-        self.dropout_layer = nn.Dropout(rate=self.config.dropout)
+        self.dropout_layer = flax.linen.Dropout(rate=self.config.dropout)
 
         embed_dim = self.config.hidden_size
         self.padding_idx = self.config.pad_token_id
@@ -360,8 +362,8 @@ class FlaxOPTDecoder(nn.Module):
         )
 
         if self.config.word_embed_proj_dim != self.config.hidden_size:
-            self.project_in = nn.Dense(self.config.hidden_size, use_bias=False)
-            self.project_out = nn.Dense(self.config.word_embed_proj_dim, use_bias=False)
+            self.project_in = Linear(self.config.hidden_size, use_bias=False)
+            self.project_out = Linear(self.config.word_embed_proj_dim, use_bias=False)
 
         else:
             self.project_in = None
@@ -604,7 +606,7 @@ class FlaxOPTForCausalLMModule(nn.Module):
 
     def setup(self):
         self.model = FlaxOPTModule(config=self.config, dtype=self.dtype)
-        self.lm_head = nn.Dense(
+        self.lm_head = Linear(
             self.config.vocab_size,
             use_bias=False,
             dtype=self.dtype,

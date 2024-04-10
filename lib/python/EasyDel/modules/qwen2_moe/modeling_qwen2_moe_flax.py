@@ -8,8 +8,9 @@ import jax.numpy as jnp
 from fjformer.func import auxiliary_load_balancing_loss_func
 from jax import lax
 from jax.experimental.shard_map import shard_map
+from fjformer.linen import Linear, LinearBitKernel, de_quantize
 from jax.sharding import PartitionSpec
-import flax.linen as nn
+import fjformer.linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
 from flax.linen import partitioning as nn_partitioning
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
@@ -96,7 +97,18 @@ class Qwen2MoeRMSNorm(nn.Module):
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
         output = self._norm(x).astype(self.dtype)
-        weight = jnp.asarray(self.weight, self.dtype)
+        kernel = self.weight
+        if isinstance(kernel, LinearBitKernel):
+            org_sharding = kernel.kernel.sharding
+            kernel = de_quantize(
+                kernel.kernel,
+                kernel.scale,
+                self.param_dtype,
+                .0
+            )
+
+            kernel = jax.device_put(kernel, org_sharding)
+        weight = jnp.asarray(kernel, self.dtype)
         return output * weight
 
 
@@ -110,7 +122,7 @@ class FlaxQwen2MoeMLP(nn.Module):
     def setup(self) -> None:
         config = self.config
         intermediate_size = self.intermediate_size if self.intermediate_size is not None else config.moe_intermediate_size
-        self.gate_proj = nn.Dense(
+        self.gate_proj = Linear(
             intermediate_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -121,7 +133,7 @@ class FlaxQwen2MoeMLP(nn.Module):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.down_proj = nn.Dense(
+        self.down_proj = Linear(
             config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -131,7 +143,7 @@ class FlaxQwen2MoeMLP(nn.Module):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.up_proj = nn.Dense(
+        self.up_proj = Linear(
             intermediate_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -154,7 +166,7 @@ class FlaxQwen2MoeMLP(nn.Module):
         :return: A tensor that is the result of applying a dropout function to x
 
         """
-        x = self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        x = self.down_proj(jax.nn.silu(self.gate_proj(x)) * self.up_proj(x))
         return x
 
 
@@ -172,7 +184,7 @@ class FlaxQwen2MoeAttention(BaseJAXAttentionModule):
 
         if self.num_key_value_groups == 1:
             assert self.config.num_attention_heads == self.config.num_key_value_heads
-        self.q_proj = nn.Dense(
+        self.q_proj = Linear(
             config.num_attention_heads * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -183,7 +195,7 @@ class FlaxQwen2MoeAttention(BaseJAXAttentionModule):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.k_proj = nn.Dense(
+        self.k_proj = Linear(
             config.num_key_value_heads * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -194,7 +206,7 @@ class FlaxQwen2MoeAttention(BaseJAXAttentionModule):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.v_proj = nn.Dense(
+        self.v_proj = Linear(
             config.num_key_value_heads * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -205,7 +217,7 @@ class FlaxQwen2MoeAttention(BaseJAXAttentionModule):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.o_proj = nn.Dense(
+        self.o_proj = Linear(
             config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -251,7 +263,7 @@ class FlaxQwen2MoeAttention(BaseJAXAttentionModule):
             mesh=self.config.jax_mesh(),
             sm_scale=1 / math.sqrt(self.head_dim)
         )
-        self.resid_dropout = nn.Dropout(rate=config.attention_dropout)
+        self.resid_dropout = flax.linen.Dropout(rate=config.attention_dropout)
 
     def _merge_heads(self, hidden_states):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
@@ -513,7 +525,7 @@ class FlaxQwen2MoeSparseMoeBlock(nn.Module):
     ] = jax.lax.Precision("fastest")
 
     def setup(self) -> None:
-        self.gate = nn.Dense(
+        self.gate = Linear(
             self.config.num_experts,
             use_bias=False,
             dtype=self.dtype,
@@ -536,7 +548,7 @@ class FlaxQwen2MoeSparseMoeBlock(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.shared_expert_gate = nn.Dense(
+        self.shared_expert_gate = Linear(
             1,
             use_bias=False,
             dtype=self.dtype,
@@ -1174,7 +1186,7 @@ class FlaxQwen2MoeForCausalLMModule(nn.Module):
             precision=self.precision,
         )
 
-        self.lm_head = nn.Dense(
+        self.lm_head = Linear(
             self.config.vocab_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -1339,7 +1351,7 @@ class FlaxQwen2MoeForSequenceClassificationModule(nn.Module):
         :return: A tuple of the model and the classifier
         """
         self.model = FlaxQwen2MoeModule(self.config, dtype=self.dtype)
-        self.classifier = nn.Dense(
+        self.classifier = Linear(
             self.num_classes,
             dtype=self.dtype,
             param_dtype=self.param_dtype,

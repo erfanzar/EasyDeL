@@ -40,6 +40,7 @@ class MixtralConfig(EasyDelPretrainedConfig):
             rope_scaling: Dict[str, Union[str, float]] = None,
             attention_bias: bool = False,
             initialization_of_moe: bool = False,
+            router_jitter_noise=0.0,
             **kwargs,
     ):
         """
@@ -113,7 +114,7 @@ class MixtralConfig(EasyDelPretrainedConfig):
         self.gradient_checkpointing = gradient_checkpointing
         self.use_scan_mlp = use_scan_mlp
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
-
+        self.router_jitter_noise = router_jitter_noise
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,

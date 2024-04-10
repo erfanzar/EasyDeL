@@ -15,6 +15,7 @@ import chex
 from .gpt_neo_x_configuration import GPTNeoXConfig
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 
+from fjformer.linen import Linear
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0,
                          dtype: jnp.dtype = jnp.bfloat16) -> jnp.ndarray:
@@ -62,15 +63,15 @@ class FlaxGPTNeoXAttention(BaseJAXAttentionModule):
             dim=self.head_size,
             end=self.config.max_position_embeddings
         )
-        self.w_qkv = nn.Dense(
+        self.w_qkv = Linear(
             3 * self.config.hidden_size
         )
-        self.w_o = nn.Dense(
+        self.w_o = Linear(
             self.config.hidden_size
         )
 
         self.factor = jnp.sqrt(jnp.asarray(self.head_size, dtype=jnp.float32))
-        self.bias = nn.make_causal_mask(
+        self.bias = flax.linen.make_causal_mask(
             jnp.ones((1, getattr(self.config, "c_max_position_embeddings", self.config.max_position_embeddings))))
 
     def __call__(self,
@@ -116,8 +117,8 @@ class FlaxGPTNeoXMlp(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
-        self.dense_h_to_4h = nn.Dense(self.config.intermediate_size)
-        self.dense_4h_to_h = nn.Dense(self.config.hidden_size)
+        self.dense_h_to_4h = Linear(self.config.intermediate_size)
+        self.dense_4h_to_h = Linear(self.config.hidden_size)
         self.act = ACT2FN[self.config.hidden_act]
 
     def __call__(self, x):
@@ -335,7 +336,7 @@ class FlaxGPTNeoXForCausalLMModule(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.lm_head = nn.Dense(
+        self.lm_head = Linear(
             self.config.vocab_size,
             use_bias=False
         )

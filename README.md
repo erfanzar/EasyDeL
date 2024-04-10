@@ -9,7 +9,8 @@ Some of the key features provided by EasyDeL include:
 
 - DPOTrainer, SFTTrainer, and VideoCLM Trainers
 - Serving and API Engines for Using and serving LLMs in JAX as efficiently as possible.
-- Support for 8, 6, and 4 BIT inference and training in JAX
+- Support Storing Params in 8Bit
+- Support for 8, 6, and 4 BIT Operation, for inference and training in JAX
 - A wide range of models in Jax is supported which have never been implemented before such as Falcon, Qwen2, Phi2,
   Mixtral, Qwen2Moe,and MPT ...
 - Integration of flashAttention in JAX for GPUs and TPUs
@@ -49,7 +50,7 @@ Some of the key features provided by EasyDeL include:
 2. [script](https://www.kaggle.com/code/citifer/easydel-serve-example-mixtral) for using and serving LLMs with EasyDeL
    JAXServer API (Mixtral Example).
 3. [script](https://www.kaggle.com/code/citifer/easydel-sfttrainer-example) SuperVised Finetuning with EasyDeL.
-   
+
 ## Serving
 
 you can read docs or examples to see how `JAXServer` works but let me show you how you can simply host and serve any
@@ -157,7 +158,7 @@ trainer = SFTTrainer(
     eval_dataset=None,  # we don't have eval dataset rn :)
     tokenizer=tokenizer,
     dataset_text_field=None,
-    
+
     formatting_func=prompter,
     packing=False,
     num_of_sequences=1024,

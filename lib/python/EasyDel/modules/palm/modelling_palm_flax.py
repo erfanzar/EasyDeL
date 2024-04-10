@@ -4,7 +4,7 @@ import jax.numpy as jnp
 import numpy as onp
 import transformers.modeling_flax_outputs
 from einops import rearrange
-import flax.linen as nn
+import fjformer.linen as nn
 from flax.core import FrozenDict
 from jax import numpy as np
 from transformers.modeling_flax_outputs import FlaxCausalLMOutput
@@ -13,6 +13,7 @@ from jax.sharding import PartitionSpec
 from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
     with_sharding_constraint
 import chex
+from fjformer.linen import Linear
 from .palm_configuration import PalmConfig
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 
@@ -266,7 +267,7 @@ class FlaxPalmModule(nn.Module):
             param_dtype=self.param_dtype,
             eps=self.config.eps
         )
-        self.causal_mask = nn.make_causal_mask(
+        self.causal_mask = flax.linen.make_causal_mask(
             jnp.ones(
                 (1, self.config.max_length),
                 dtype="bool"

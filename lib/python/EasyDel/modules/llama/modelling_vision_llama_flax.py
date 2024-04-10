@@ -8,7 +8,7 @@ import chex
 import jax
 import jax.numpy as jnp
 from jax import lax
-import flax.linen as nn
+import fjformer.linen as nn
 from flax.core.frozen_dict import unfreeze, freeze, FrozenDict
 from flax.traverse_util import flatten_dict, unflatten_dict
 
@@ -20,6 +20,7 @@ from transformers import GenerationConfig
 from .vision_llama_configuration import VisionLlamaConfig
 from .modelling_llama_flax import FlaxLlamaBlockCollection, RMSNorm
 from ..flax_modelling_utils import precompute_freq_cis
+from fjformer.linen import Linear
 
 
 class FlaxVisionLlamaPreTrainedModel(EasyDelFlaxPretrainedModel):
@@ -189,7 +190,7 @@ class FlaxVisionLlamaModule(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
         )
-        self.dropout = nn.Dropout(rate=config.embd_pdrop)
+        self.dropout = flax.linen.Dropout(rate=config.embd_pdrop)
         self.layers = FlaxLlamaBlockCollection(
             self.config,
             dtype=self.dtype,
@@ -202,7 +203,7 @@ class FlaxVisionLlamaModule(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype
         )
-        self.causal_mask = nn.make_causal_mask(
+        self.causal_mask = flax.linen.make_causal_mask(
             jnp.ones(
                 (1, getattr(self.config, "c_max_position_embeddings", self.config.max_position_embeddings)),
                 dtype="bool"
@@ -304,7 +305,7 @@ class FlaxVisionLlamaForCausalLMModule(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.vision_head = nn.Dense(
+        self.vision_head = Linear(
             self.config.vision_vocab_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -312,7 +313,7 @@ class FlaxVisionLlamaForCausalLMModule(nn.Module):
             kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
             precision=self.precision,
         )
-        self.lm_head = nn.Dense(
+        self.lm_head = Linear(
             self.config.vocab_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,

@@ -29,7 +29,7 @@ from einops import einops
 from fjformer import with_sharding_constraint
 from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec
-import flax.linen as nn
+import fjformer.linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -50,6 +50,7 @@ from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 import chex
 from fjformer.bits import config as q_config, q_flax
 from .gpt_j_configuration import GPTJConfig
+from fjformer.linen import Linear
 
 logger = logging.get_logger(__name__)
 
@@ -105,7 +106,7 @@ class FlaxGPTJAttention(BaseJAXAttentionModule):
 
         dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
         dense = partial(
-            nn.Dense,
+            Linear,
             self.embed_dim,
             use_bias=False,
             dtype=self.dtype,
@@ -118,7 +119,7 @@ class FlaxGPTJAttention(BaseJAXAttentionModule):
         self.q_proj, self.k_proj, self.v_proj = dense(), dense(), dense()
         self.out_proj = dense()
 
-        self.resid_dropout = nn.Dropout(rate=config.resid_pdrop)
+        self.resid_dropout = flax.linen.Dropout(rate=config.resid_pdrop)
 
         self.causal_mask = make_causal_mask(jnp.ones((1, config.max_position_embeddings), dtype="bool"), dtype="bool")
 
@@ -294,7 +295,7 @@ class FlaxGPTJMLP(nn.Module):
             _dot_general_cls = None
 
         dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
-        self.fc_in = nn.Dense(
+        self.fc_in = Linear(
             self.intermediate_size,
             dtype=self.dtype,
             param_dtype=self.dtype,
@@ -302,7 +303,7 @@ class FlaxGPTJMLP(nn.Module):
             kernel_init=kernel_init,
             dot_general=dot_general_cls
         )
-        self.fc_out = nn.Dense(
+        self.fc_out = Linear(
             embed_dim,
             dtype=self.dtype,
             param_dtype=self.dtype,
@@ -312,7 +313,7 @@ class FlaxGPTJMLP(nn.Module):
         )
 
         self.act = ACT2FN[self.config.activation_function]
-        self.dropout = nn.Dropout(rate=self.config.resid_pdrop)
+        self.dropout = flax.linen.Dropout(rate=self.config.resid_pdrop)
 
     def __call__(self, hidden_states, deterministic: bool = True):
         hidden_states = self.fc_in(hidden_states)
@@ -617,7 +618,7 @@ class FlaxGPTJModule(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype
         )
-        self.dropout = nn.Dropout(rate=self.config.embd_pdrop)
+        self.dropout = flax.linen.Dropout(rate=self.config.embd_pdrop)
         self.h = FlaxGPTJBlockCollection(
             self.config,
             dtype=self.dtype,
@@ -707,7 +708,7 @@ class FlaxGPTJForCausalLMModule(nn.Module):
             param_dtype=self.dtype,
             precision=self.precision
         )
-        self.lm_head = nn.Dense(
+        self.lm_head = Linear(
             self.config.vocab_size,
             dtype=self.dtype,
             kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),

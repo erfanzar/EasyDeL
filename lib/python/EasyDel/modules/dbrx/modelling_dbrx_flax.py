@@ -3,12 +3,12 @@ import random
 from typing import Optional, Tuple, Union
 
 import chex
-import flax.linen as nn
+import fjformer.linen as nn
 import jax
 import jax.numpy as jnp
-from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
+import flax.linen
 from flax.linen import combine_masks
-from flax.linen import partitioning as nn_partitioning
+from fjformer.linen import Linear, LinearBitKernel, de_quantize
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax.sharding import PartitionSpec
@@ -75,7 +75,18 @@ class RMSNorm(nn.Module):
     def __call__(self, x: chex.Array) -> chex.Array:
         x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
         output = self._norm(x).astype(self.dtype)
-        weight = jnp.asarray(self.weight, self.dtype)
+        kernel = self.weight
+        if isinstance(kernel, LinearBitKernel):
+            org_sharding = kernel.kernel.sharding
+            kernel = de_quantize(
+                kernel.kernel,
+                kernel.scale,
+                self.param_dtype,
+                .0
+            )
+
+            kernel = jax.device_put(kernel, org_sharding)
+        weight = jnp.asarray(kernel, self.dtype)
         return output * weight
 
 
@@ -93,7 +104,7 @@ class FlaxDbrxAttention(BaseJAXAttentionModule):
 
         if self.num_key_value_groups == 1:
             assert self.config.num_attention_heads == self.config.num_key_value_heads
-        self.Wqkv = nn.Dense(
+        self.Wqkv = Linear(
             self.hidden_size + 2 * self.config.num_key_value_heads * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -104,7 +115,7 @@ class FlaxDbrxAttention(BaseJAXAttentionModule):
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
 
-        self.out_proj = nn.Dense(
+        self.out_proj = Linear(
             config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -149,7 +160,7 @@ class FlaxDbrxAttention(BaseJAXAttentionModule):
             mesh=self.config.jax_mesh(),
             sm_scale=1 / math.sqrt(self.head_dim),
         )
-        self.resid_dropout = nn.Dropout(rate=config.resid_pdrop)
+        self.resid_dropout = flax.linen.Dropout(rate=config.resid_pdrop)
 
     def _merge_heads(self, hidden_states):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
@@ -384,7 +395,7 @@ class DbrxNormAttentionNorm(nn.Module):
             use_bias=False
         )
 
-        self.dropout = nn.Dropout(
+        self.dropout = flax.linen.Dropout(
             self.config.resid_pdrop
         )
 
@@ -526,7 +537,7 @@ class DbrxRouter(nn.Module):
         self.moe_normalize_expert_weights = self.config.ffn_config.moe_normalize_expert_weights
         self.uniform_expert_assignment = self.config.ffn_config.uniform_expert_assignment
 
-        self.layer = nn.Dense(
+        self.layer = Linear(
             self.moe_num_experts,
             use_bias=False
         )

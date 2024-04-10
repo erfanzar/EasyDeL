@@ -2,7 +2,7 @@ import math
 from typing import Optional, Tuple, Union
 
 import chex
-import flax.linen as nn
+import fjformer.linen as nn
 import flax.linen.partitioning
 import flax.struct
 import jax
@@ -29,6 +29,7 @@ from ..flax_modelling_utils import (
     BaseJAXAttentionModule,
     block_wise_ffn
 )
+from fjformer.linen import Linear, LinearBitKernel, de_quantize
 
 re_mat = flax.linen.partitioning.remat
 
@@ -94,7 +95,18 @@ class FlaxGrok1RMSNorm(nn.Module):
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
         output = self._norm(x).astype(self.dtype)
-        weight = jnp.asarray(self.weight, self.dtype)
+        kernel = self.weight
+        if isinstance(kernel, LinearBitKernel):
+            org_sharding = kernel.kernel.sharding
+            kernel = de_quantize(
+                kernel.kernel,
+                kernel.scale,
+                self.param_dtype,
+                .0
+            )
+
+            kernel = jax.device_put(kernel, org_sharding)
+        weight = jnp.asarray(kernel, self.dtype)
         return output * weight
 
 
@@ -112,7 +124,7 @@ class FlaxGrok1Attention(BaseJAXAttentionModule):
 
         if self.num_key_value_groups == 1:
             assert self.config.num_attention_heads == self.config.num_key_value_heads
-        self.q_proj = nn.Dense(
+        self.q_proj = Linear(
             config.num_attention_heads * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -122,7 +134,7 @@ class FlaxGrok1Attention(BaseJAXAttentionModule):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.k_proj = nn.Dense(
+        self.k_proj = Linear(
             config.num_key_value_heads * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -132,7 +144,7 @@ class FlaxGrok1Attention(BaseJAXAttentionModule):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.v_proj = nn.Dense(
+        self.v_proj = Linear(
             config.num_key_value_heads * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -142,7 +154,7 @@ class FlaxGrok1Attention(BaseJAXAttentionModule):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.o_proj = nn.Dense(
+        self.o_proj = Linear(
             config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -187,7 +199,7 @@ class FlaxGrok1Attention(BaseJAXAttentionModule):
             mesh=self.config.jax_mesh(),
             sm_scale=1 / math.sqrt(self.head_dim),
         )
-        self.resid_dropout = nn.Dropout(rate=config.resid_pdrop)
+        self.resid_dropout = flax.linen.Dropout(rate=config.resid_pdrop)
 
     def _merge_heads(self, hidden_states):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
@@ -408,7 +420,7 @@ class FlaxGrok1BLockSparseMLP(nn.Module):
     def setup(self) -> None:
         config = self.config
 
-        self.linear = nn.Dense(
+        self.linear = Linear(
             config.intermediate_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -418,7 +430,7 @@ class FlaxGrok1BLockSparseMLP(nn.Module):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.linear_1 = nn.Dense(
+        self.linear_1 = Linear(
             config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -428,7 +440,7 @@ class FlaxGrok1BLockSparseMLP(nn.Module):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.linear_v = nn.Dense(
+        self.linear_v = Linear(
             config.intermediate_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -518,7 +530,7 @@ class FlaxGrok1SparseMoeBlock(nn.Module):
     ] = jax.lax.Precision("fastest")
 
     def setup(self) -> None:
-        self.gate = nn.Dense(
+        self.gate = Linear(
             self.config.num_experts,
             use_bias=False,
             dtype=self.dtype,
@@ -1041,7 +1053,7 @@ class FlaxGrok1Module(nn.Module):
             base=self.config.rope_theta,
             **initial_rope_kwargs
         )
-        self.causal_mask = nn.make_causal_mask(
+        self.causal_mask = flax.linen.make_causal_mask(
             jnp.ones(
                 (1, getattr(self.config, "c_max_position_embeddings", self.config.max_position_embeddings)),
                 dtype="bool"
@@ -1135,7 +1147,7 @@ class FlaxGrok1ForCausalLMModule(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.lm_head = nn.Dense(
+        self.lm_head = Linear(
             self.config.vocab_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,

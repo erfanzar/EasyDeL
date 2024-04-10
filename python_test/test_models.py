@@ -70,10 +70,9 @@ class EasyModelsTest(TestCase):
         self.block_q: int = 32
         self.sequence_length = 64
         self.scan_mlp_chunk_size = self.sequence_length // 2
-
+        self.head_dim = 256
         self.max_position_embeddings: int = self.sequence_length
         self.use_sharding_constraint = False
-
 
     def create_test_for_models(
             self,
@@ -97,7 +96,8 @@ class EasyModelsTest(TestCase):
             rotary_dim=self.rotary_dim,
             rms_norm_eps=self.rms_norm_eps,
             layer_norm_eps=self.layer_norm_eps,
-            axis_dims=(1, 1, 1, -1)
+            axis_dims=(1, 1, 1, -1),
+            head_dim=self.head_dim
             # residual_in_fp32=True
         )
 
@@ -132,6 +132,14 @@ class EasyModelsTest(TestCase):
             )
             prm = flax.traverse_util.flatten_dict(params, sep=".")
 
+            torch_input_ids, jax_input_ids = self.make_input_id(
+                self.vocab_size,
+                (self.batch_size, self.sequence_length + 1)
+            )
+            hf_output = hf_model(
+                input_ids=torch_input_ids[:, :-1],
+                labels=torch_input_ids[:, 1:],
+            )
             ed_model = module_class(
                 config=config,
                 dtype=self.dtype,
@@ -141,14 +149,6 @@ class EasyModelsTest(TestCase):
                 input_shape=(self.batch_size, self.sequence_length)
             )
 
-            torch_input_ids, jax_input_ids = self.make_input_id(
-                self.vocab_size,
-                (self.batch_size, self.sequence_length + 1)
-            )
-            hf_output = hf_model(
-                input_ids=torch_input_ids[:, :-1],
-                labels=torch_input_ids[:, 1:],
-            )
             ed_output = ed_model(
                 input_ids=jax_input_ids[:, :-1],
                 params=params,
@@ -177,7 +177,6 @@ class EasyModelsTest(TestCase):
             hf_module_class
     ):
         module_config, module_class, transform_function = ed.get_modules_by_type(module_name)
-
         config = module_config(
             num_experts_per_tok=self.num_experts_per_tok,
             num_experts=self.num_experts,
@@ -194,6 +193,7 @@ class EasyModelsTest(TestCase):
             rotary_dim=self.rotary_dim,
             rms_norm_eps=self.rms_norm_eps,
             layer_norm_eps=self.layer_norm_eps,
+            head_dim=self.head_dim
             # residual_in_fp32=True
         )
 
