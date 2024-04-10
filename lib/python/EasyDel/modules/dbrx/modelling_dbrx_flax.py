@@ -8,7 +8,7 @@ import jax
 import jax.numpy as jnp
 import flax.linen
 from flax.linen import combine_masks
-from fjformer.linen import Linear, LinearBitKernel, de_quantize
+from fjformer.linen import Linear
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax.sharding import PartitionSpec
@@ -75,18 +75,7 @@ class RMSNorm(nn.Module):
     def __call__(self, x: chex.Array) -> chex.Array:
         x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
         output = self._norm(x).astype(self.dtype)
-        kernel = self.weight
-        if isinstance(kernel, LinearBitKernel):
-            org_sharding = kernel.kernel.sharding
-            kernel = de_quantize(
-                kernel.kernel,
-                kernel.scale,
-                self.param_dtype,
-                .0
-            )
-
-            kernel = jax.device_put(kernel, org_sharding)
-        weight = jnp.asarray(kernel, self.dtype)
+        weight = nn.linen.control_quantization(self.weight, self.dtype)
         return output * weight
 
 

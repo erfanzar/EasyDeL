@@ -19,7 +19,7 @@ from ..flax_modelling_utils import (
 )
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 import chex
-from fjformer.linen import Linear, LinearBitKernel, de_quantize
+from fjformer.linen import Linear
 
 from .mosaic_configuration import MptConfig
 
@@ -44,18 +44,8 @@ class RMSNorm(nn.Module):
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         x = x.astype(jnp.promote_types(self.dtype, jnp.bfloat16))
         output = self._norm(x).astype(self.dtype)
-        kernel = self.weight
-        if isinstance(kernel, LinearBitKernel):
-            org_sharding = kernel.kernel.sharding
-            kernel = de_quantize(
-                kernel.kernel,
-                kernel.scale,
-                self.param_dtype,
-                .0
-            )
 
-            kernel = jax.device_put(kernel, org_sharding)
-        weight = jnp.asarray(kernel, self.dtype)
+        weight = nn.linen.control_quantization(self.weight, self.dtype)
         return output * weight
 
 

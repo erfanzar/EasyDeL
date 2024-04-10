@@ -1,4 +1,6 @@
 from typing import Union, Optional, Tuple, Any, Mapping
+
+import fjformer
 import jax
 import jax.numpy as jnp
 import numpy as onp
@@ -39,7 +41,7 @@ class RMSNorm(nn.Module):
     def __call__(self, hidden_state: jnp.ndarray) -> jnp.ndarray:
         hidden_state = hidden_state.astype(jnp.promote_types(self.dtype, jnp.bfloat16))
         output = self._norm(hidden_state).astype(self.dtype)
-        weight = jnp.asarray(self.weight, self.dtype)
+        weight = fjformer.linen.linen.control_quantization(self.weight, self.dtype)
         return output * weight
 
 
@@ -80,27 +82,28 @@ class ParallelPalmBlock(nn.Module):
         self.fused_dims = (attn_inner_dim, self.config.dim_head, self.config.dim_head, ff_inner_dim, ff_inner_dim)
 
         # INPUT WEIGHTS
-        self.wi = self.param(
+        self.wi = fjformer.linen.linen.control_quantization(self.param(
             'kernel',
             nn.initializers.normal,
             (self.config.hidden_size, sum(self.fused_dims)),
             self.param_dtype,
-        )
+        ), self.param_dtype)
 
         # ATTENTION WEIGHT OUTPUT
-        self.attn_wo = self.param(
+        self.attn_wo = fjformer.linen.linen.control_quantization(self.param(
             'kernel',
             nn.initializers.normal,
             (attn_inner_dim, self.config.hidden_size),
             self.param_dtype,
+        ), self.param_dtype
         )
 
-        self.ff_wo = self.param(
+        self.ff_wo = fjformer.linen.linen.control_quantization(self.param(
             'kernel',
             nn.initializers.normal,
             (attn_inner_dim, self.config.hidden_size),
             self.param_dtype,
-        )
+        ), self.param_dtype)
 
         self.norm = RMSNorm(dim=self.config.hidden_size)
         self.post_norm = RMSNorm(dim=self.config.hidden_size)
@@ -273,6 +276,7 @@ class FlaxPalmModule(nn.Module):
                 dtype="bool"
             ), dtype="bool"
         )
+
     def make_causal_mask(self, attention_mask=None):
         assert attention_mask is not None
         b, s = attention_mask.shape
@@ -344,12 +348,12 @@ class FlaxPalmForCausalLMModule(nn.Module):
             precision=self.precision
         )
         if not self.config.use_tie_word_embedding:
-            self.lm_head = self.param(
+            self.lm_head = fjformer.linen.linen.control_quantization(self.param(
                 'kernel',
                 jax.nn.initializers.normal,
                 (self.config.hidden_size, self.config.vocab_size),
                 self.param_dtype
-            )
+            ), self.param_dtype)
 
     def __call__(self,
                  input_ids: chex.Array,

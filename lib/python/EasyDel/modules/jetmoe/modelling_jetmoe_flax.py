@@ -2,6 +2,7 @@ import functools
 import math
 import typing
 
+import fjformer
 import flax.core
 from jax import numpy as jnp, Array, lax
 from jax.experimental.shard_map import shard_map
@@ -14,7 +15,7 @@ from typing import Union, Optional, Tuple
 from flax.struct import dataclass
 from ..easy_attention import EasyAttention
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
-from fjformer.linen import Linear, LinearBitKernel, de_quantize
+from fjformer.linen import Linear
 from flax.linen import partitioning as nn_partitioning, combine_masks
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 
@@ -262,17 +263,7 @@ class FlaxMoE(nn.Module):
         y = zeros.at[0, self.batch_index].add(expert_outputs)
         y = y.view((bsz, length, self.input_size))
         if self.bias_kernel is not None:
-            bias = self.bias_kernel
-            if isinstance(bias, LinearBitKernel):
-                org_sharding = bias.kernel.sharding
-                bias = de_quantize(
-                    bias.kernel,
-                    bias.scale,
-                    self.param_dtype,
-                    .0
-                )
-
-                bias = jax.device_put(bias, org_sharding)
+            bias = fjformer.linen.linen.control_quantization(self.bias_kernel, self.dtype)
             y = y + bias
         return y, loss
 
