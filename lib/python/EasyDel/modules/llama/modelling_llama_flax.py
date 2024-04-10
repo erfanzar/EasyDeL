@@ -14,7 +14,7 @@ from jax.sharding import PartitionSpec
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput, FlaxSequenceClassifierOutput
 
 from .llama_configuration import LlamaConfig
-from fjformer.linen import Linear, LinearBitKernel, de_quantize
+from fjformer.linen import Linear
 from ..easy_attention import EasyAttention
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 import flax.linen
@@ -76,18 +76,7 @@ class RMSNorm(nn.Module):
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
         output = self._norm(x).astype(self.dtype)
-        kernel = self.weight
-        if isinstance(kernel, LinearBitKernel):
-            org_sharding = kernel.kernel.sharding
-            kernel = de_quantize(
-                kernel.kernel,
-                kernel.scale,
-                self.param_dtype,
-                .0
-            )
-
-            kernel = jax.device_put(kernel, org_sharding)
-        weight = jnp.asarray(kernel, self.dtype)
+        weight = nn.linen.control_quantization(self.weight, self.dtype)
         return output * weight
 
 

@@ -2,6 +2,7 @@ import math
 from typing import Optional, Tuple, Union, Any
 
 import chex
+import fjformer
 import fjformer.linen as nn
 import flax.linen.partitioning
 import jax
@@ -62,8 +63,8 @@ class RMSNorm(nn.Module):
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
         output = self._norm(x).astype(self.dtype)
-        weight = jnp.asarray(self.weight, self.dtype)
-        return output * weight
+
+        return output * fjformer.linen.linen.control_quantization(self.weight, self.dtype)
 
 
 class FlaxStableLmMLP(nn.Module):

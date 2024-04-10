@@ -7,10 +7,9 @@ import flax.linen.partitioning
 import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec
-import numpy as np
 from fjformer import with_sharding_constraint
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
-from fjformer.linen import Linear, LinearBitKernel, de_quantize
+from fjformer.linen import Linear
 from flax.linen import combine_masks, make_causal_mask
 
 from flax.traverse_util import flatten_dict, unflatten_dict
@@ -44,17 +43,7 @@ class FlaxGemmaRMSNorm(nn.Module):
         variance = jnp.power(variance, 2)
         variance = variance.mean(-1, keepdims=True)
         hidden_states = hidden_states / jnp.sqrt(variance + self.epsilon)
-        kernel = self.weight_kernel
-        if isinstance(kernel, LinearBitKernel):
-            org_sharding = kernel.kernel.sharding
-            kernel = de_quantize(
-                kernel.kernel,
-                kernel.scale,
-                self.param_dtype,
-                .0
-            )
-
-            kernel = jax.device_put(kernel, org_sharding)
+        kernel  = nn.linen.control_quantization(self.weight_kernel, self.dtype)
         return (1 + kernel) * jnp.asarray(hidden_states, dtype=self.dtype)
 
 

@@ -34,7 +34,7 @@ from ..flax_modelling_utils import ACT2FN, with_sharding_constraint, \
     get_dot_general_by_bits, ACT2FN, BaseJAXAttentionModule, get_gradient_checkpoint_policy, block_wise_ffn
 from .gpt2_configuration import GPT2Config
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
-from fjformer.linen import Linear, LinearBitKernel, de_quantize
+from fjformer.linen import Linear
 
 _CHECKPOINT_FOR_DOC = "gpt2"
 _CONFIG_FOR_DOC = "GPT2Config"
@@ -52,17 +52,8 @@ class FlaxConv1D(nn.Module):
     def __call__(self, inputs):
         inputs = jnp.asarray(inputs, self.dtype)
         kernel = self.param("kernel", jax.nn.initializers.normal(stddev=0.02), (self.features, inputs.shape[-1]))
-        if isinstance(kernel, LinearBitKernel):
-            org_sharding = kernel.kernel.sharding
-            kernel = de_quantize(
-                kernel.kernel,
-                kernel.scale,
-                self.param_dtype,
-                .0
-            )
 
-            kernel = jax.device_put(kernel, org_sharding)
-        kernel = jnp.asarray(kernel.transpose(), self.dtype)
+        kernel = nn.linen.control_quantization(kernel, self.dtype).transpose()
         if self.dot_general is not None:
             dot_general = self.dot_general
         else:

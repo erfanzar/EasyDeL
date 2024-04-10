@@ -1,6 +1,7 @@
 import functools
 import math
 
+import fjformer
 import flax
 from flax.struct import dataclass
 from jax import numpy as jnp, lax
@@ -14,7 +15,7 @@ from flax.linen import partitioning as nn_partitioning, combine_masks
 from transformers.modeling_flax_outputs import FlaxMaskedLMOutput
 from fjformer.func import auxiliary_load_balancing_loss_func
 from ..easy_attention import EasyAttention
-from fjformer.linen import Linear, LinearBitKernel, de_quantize
+from fjformer.linen import Linear
 from ..flax_modelling_utils import (
     ACT2FN,
     with_sharding_constraint,
@@ -67,18 +68,7 @@ class MixtralRMSNorm(nn.Module):
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
         output = self._norm(x).astype(self.dtype)
-        kernel = self.weight
-        if isinstance(kernel, LinearBitKernel):
-            org_sharding = kernel.kernel.sharding
-            kernel = de_quantize(
-                kernel.kernel,
-                kernel.scale,
-                self.param_dtype,
-                .0
-            )
-
-            kernel = jax.device_put(kernel, org_sharding)
-        weight = jnp.asarray(kernel, self.dtype)
+        weight = fjformer.linen.linen.control_quantization(self.weight, self.dtype)
         return output * weight
 
 

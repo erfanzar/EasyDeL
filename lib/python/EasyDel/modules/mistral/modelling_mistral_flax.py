@@ -2,6 +2,7 @@ import functools
 import math
 import typing
 
+import fjformer
 import flax.core
 from jax import numpy as jnp, Array, lax
 from jax.experimental.shard_map import shard_map
@@ -17,7 +18,7 @@ from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 from flax.linen import partitioning as nn_partitioning, combine_masks
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 
-from fjformer.linen import Linear, LinearBitKernel, de_quantize
+from fjformer.linen import Linear
 from ..flax_modelling_utils import (
     ACT2FN,
     with_sharding_constraint,
@@ -89,18 +90,8 @@ class MistralRMSNorm(nn.Module):
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
         output = self._norm(x).astype(self.dtype)
-        kernel = self.weight
-        if isinstance(kernel, LinearBitKernel):
-            org_sharding = kernel.kernel.sharding
-            kernel = de_quantize(
-                kernel.kernel,
-                kernel.scale,
-                self.param_dtype,
-                .0
-            )
 
-            kernel = jax.device_put(kernel, org_sharding)
-        weight = jnp.asarray(kernel, self.dtype)
+        weight = fjformer.linen.linen.control_quantization(self.weight, self.dtype)
         return output * weight
 
 

@@ -5,6 +5,7 @@ from gc import unfreeze
 from typing import Optional, Tuple
 
 import chex
+import fjformer
 from flax import linen as nn
 from flax.core import FrozenDict, freeze
 from flax.linen.attention import make_attention_mask, make_causal_mask, combine_masks, dot_product_attention_weights
@@ -25,7 +26,7 @@ from ..easy_attention import EasyAttention
 from ..flax_modelling_utils import get_gradient_checkpoint_policy, ACT2FN, get_dot_general_by_bits, \
     BaseJAXAttentionModule
 
-from fjformer.linen import Linear, LinearBitKernel, de_quantize
+from fjformer.linen import Linear
 
 
 class FlaxRobertaEmbeddings(nn.Module):
@@ -639,18 +640,7 @@ class FlaxRobertaLMHead(nn.Module):
         else:
             hidden_states = self.decoder(hidden_states)
 
-        bias = self.bias
-        if isinstance(bias, LinearBitKernel):
-            org_sharding = bias.kernel.sharding
-            bias = de_quantize(
-                bias.kernel,
-                bias.scale,
-                self.param_dtype,
-                .0
-            )
-
-            bias = jax.device_put(bias, org_sharding)
-        bias = jnp.asarray(bias, self.dtype)
+        bias = fjformer.linen.linen.control_quantization(self.bias, self.dtype)
         hidden_states += bias
         return hidden_states
 

@@ -17,6 +17,8 @@
 
 import copy
 from typing import Callable, Optional, Tuple
+
+import fjformer
 import flax.linen
 import fjformer.linen as nn
 import jax
@@ -77,7 +79,7 @@ class FlaxT5LayerNorm(nn.Module):
         variance = jnp.power(hidden_states.astype("f4"), 2).mean(axis=-1, keepdims=True)
         hidden_states = hidden_states / jnp.sqrt(variance + self.eps)
 
-        return self.weight * hidden_states
+        return fjformer.linen.linen.control_quantization(self.weight, self.dtype) * hidden_states
 
 
 class FlaxT5DenseActDense(nn.Module):

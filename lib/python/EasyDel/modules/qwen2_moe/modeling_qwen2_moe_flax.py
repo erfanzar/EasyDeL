@@ -8,7 +8,7 @@ import jax.numpy as jnp
 from fjformer.func import auxiliary_load_balancing_loss_func
 from jax import lax
 from jax.experimental.shard_map import shard_map
-from fjformer.linen import Linear, LinearBitKernel, de_quantize
+from fjformer.linen import Linear
 from jax.sharding import PartitionSpec
 import fjformer.linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
@@ -97,18 +97,7 @@ class Qwen2MoeRMSNorm(nn.Module):
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
         output = self._norm(x).astype(self.dtype)
-        kernel = self.weight
-        if isinstance(kernel, LinearBitKernel):
-            org_sharding = kernel.kernel.sharding
-            kernel = de_quantize(
-                kernel.kernel,
-                kernel.scale,
-                self.param_dtype,
-                .0
-            )
-
-            kernel = jax.device_put(kernel, org_sharding)
-        weight = jnp.asarray(kernel, self.dtype)
+        weight = nn.linen.control_quantization(self.weight, self.dtype)
         return output * weight
 
 
