@@ -1,18 +1,18 @@
 import math
 from functools import partial
 from typing import Optional, Tuple, Union
-
-from einops import einops
+import flax.linen
 import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec
-import flax.linen as nn
+import fjformer.linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
 from flax.linen import partitioning as nn_partitioning
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks, make_causal_mask
+from fjformer.linen import Linear
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput, FlaxSequenceClassifierOutput
 # EasyDel.modules
 from ..flax_modelling_utils import (
@@ -90,7 +90,7 @@ class FlaxQwen2MLP(nn.Module):
     def setup(self) -> None:
         config = self.config
 
-        self.gate_proj = nn.Dense(
+        self.gate_proj = Linear(
             config.intermediate_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -101,7 +101,7 @@ class FlaxQwen2MLP(nn.Module):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.down_proj = nn.Dense(
+        self.down_proj = Linear(
             config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -111,7 +111,7 @@ class FlaxQwen2MLP(nn.Module):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.up_proj = nn.Dense(
+        self.up_proj = Linear(
             config.intermediate_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -121,7 +121,7 @@ class FlaxQwen2MLP(nn.Module):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.dropout = nn.Dropout(rate=self.config.resid_pdrop)
+        self.dropout = flax.linen.Dropout(rate=self.config.resid_pdrop)
 
     def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
         """
@@ -135,7 +135,7 @@ class FlaxQwen2MLP(nn.Module):
         :return: A tensor that is the result of applying a dropout function to x
 
         """
-        x = self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        x = self.down_proj(jax.nn.silu(self.gate_proj(x)) * self.up_proj(x))
         x = self.dropout(x, deterministic=deterministic)
         return x
 
@@ -154,7 +154,7 @@ class FlaxQwen2Attention(BaseJAXAttentionModule):
 
         if self.num_key_value_groups == 1:
             assert self.config.num_attention_heads == self.config.num_key_value_heads
-        self.q_proj = nn.Dense(
+        self.q_proj = Linear(
             config.num_attention_heads * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -165,7 +165,7 @@ class FlaxQwen2Attention(BaseJAXAttentionModule):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.k_proj = nn.Dense(
+        self.k_proj = Linear(
             config.num_key_value_heads * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -176,7 +176,7 @@ class FlaxQwen2Attention(BaseJAXAttentionModule):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.v_proj = nn.Dense(
+        self.v_proj = Linear(
             config.num_key_value_heads * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -187,7 +187,7 @@ class FlaxQwen2Attention(BaseJAXAttentionModule):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.o_proj = nn.Dense(
+        self.o_proj = Linear(
             config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -233,7 +233,7 @@ class FlaxQwen2Attention(BaseJAXAttentionModule):
             mesh=self.config.jax_mesh(),
             sm_scale=1 / math.sqrt(self.head_dim)
         )
-        self.resid_dropout = nn.Dropout(rate=config.resid_pdrop)
+        self.resid_dropout = flax.linen.Dropout(rate=config.resid_pdrop)
 
     def _merge_heads(self, hidden_states):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
@@ -872,7 +872,7 @@ class FlaxQwen2Module(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
         )
-        self.dropout = nn.Dropout(rate=self.config.embd_pdrop)
+        self.dropout = flax.linen.Dropout(rate=self.config.embd_pdrop)
         self.layers = FlaxQwen2BlockCollection(
             self.config,
             dtype=self.dtype,
@@ -1011,7 +1011,7 @@ class FlaxQwen2ForCausalLMModule(nn.Module):
             precision=self.precision,
         )
 
-        self.lm_head = nn.Dense(
+        self.lm_head = Linear(
             self.config.vocab_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -1160,7 +1160,7 @@ class FlaxQwen2ForSequenceClassificationModule(nn.Module):
         :return: A tuple of the model and the classifier
         """
         self.model = FlaxQwen2Module(self.config, dtype=self.dtype)
-        self.classifier = nn.Dense(
+        self.classifier = Linear(
             self.num_classes,
             dtype=self.dtype,
             param_dtype=self.param_dtype,

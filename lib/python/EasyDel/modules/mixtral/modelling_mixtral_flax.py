@@ -14,6 +14,7 @@ from flax.linen import partitioning as nn_partitioning, combine_masks
 from transformers.modeling_flax_outputs import FlaxMaskedLMOutput
 from fjformer.func import auxiliary_load_balancing_loss_func
 from ..easy_attention import EasyAttention
+from fjformer.linen import Linear, LinearBitKernel, de_quantize
 from ..flax_modelling_utils import (
     ACT2FN,
     with_sharding_constraint,
@@ -66,7 +67,18 @@ class MixtralRMSNorm(nn.Module):
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
         output = self._norm(x).astype(self.dtype)
-        weight = jnp.asarray(self.weight, self.dtype)
+        kernel = self.weight
+        if isinstance(kernel, LinearBitKernel):
+            org_sharding = kernel.kernel.sharding
+            kernel = de_quantize(
+                kernel.kernel,
+                kernel.scale,
+                self.param_dtype,
+                .0
+            )
+
+            kernel = jax.device_put(kernel, org_sharding)
+        weight = jnp.asarray(kernel, self.dtype)
         return output * weight
 
 
@@ -102,7 +114,7 @@ class FlaxMixtralAttention(BaseJAXAttentionModule):
         self.max_position_embeddings = config.max_position_embeddings
 
         dense = functools.partial(
-            nn.Dense,
+            Linear,
             use_bias=getattr(self.config, "attention_bias", False),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -324,7 +336,7 @@ class FlaxMixtralBLockSparseTop2MLP(nn.Module):
 
     def setup(self) -> None:
         dense = functools.partial(
-            nn.Dense,
+            Linear,
             use_bias=False,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -406,7 +418,7 @@ class FlaxMixtralSparseMoeBlock(nn.Module):
     ] = jax.lax.Precision("fastest")
 
     def setup(self) -> None:
-        self.gate = nn.Dense(
+        self.gate = Linear(
             self.config.num_local_experts,
             use_bias=False,
             dtype=self.dtype,
@@ -930,7 +942,7 @@ class FlaxMixtralModule(nn.Module):
             base=self.config.rope_theta,
             **initial_rope_kwargs
         )
-        self.causal_mask = nn.make_causal_mask(
+        self.causal_mask = flax.linen.make_causal_mask(
             jnp.ones(
                 (1, getattr(self.config, "c_max_position_embeddings", self.config.max_position_embeddings)),
                 dtype="bool"
@@ -1029,7 +1041,7 @@ class FlaxMixtralForCausalLMModule(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.lm_head = nn.Dense(
+        self.lm_head = Linear(
             self.config.vocab_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,

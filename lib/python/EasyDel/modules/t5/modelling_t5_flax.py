@@ -17,8 +17,8 @@
 
 import copy
 from typing import Callable, Optional, Tuple
-
-import flax.linen as nn
+import flax.linen
+import fjformer.linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -27,8 +27,6 @@ from flax.linen import combine_masks, make_causal_mask
 from flax.linen import partitioning as nn_partitioning
 from flax.linen.attention import dot_product_attention_weights
 from flax.traverse_util import flatten_dict, unflatten_dict
-from jax import lax
-from jax.experimental.shard_map import shard_map
 from jax.random import PRNGKey
 
 from transformers.modeling_flax_outputs import (
@@ -49,6 +47,7 @@ from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
 import chex
 from .t5_configuration import T5Config
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
+from fjformer.linen import Linear
 
 remat = nn_partitioning.remat
 
@@ -89,19 +88,19 @@ class FlaxT5DenseActDense(nn.Module):
         wi_init_std = self.config.initializer_factor * (self.config.d_model ** -0.5)
         wo_init_std = self.config.initializer_factor * (self.config.d_ff ** -0.5)
 
-        self.wi = nn.Dense(
+        self.wi = Linear(
             self.config.d_ff,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(wi_init_std),
             dtype=self.dtype,
         )
-        self.wo = nn.Dense(
+        self.wo = Linear(
             self.config.d_model,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(wo_init_std),
             dtype=self.dtype,
         )
-        self.dropout = nn.Dropout(self.config.dropout_rate)
+        self.dropout = flax.linen.Dropout(self.config.dropout_rate)
         self.act = ACT2FN[self.config.dense_act_fn]
 
     def __call__(self, hidden_states, deterministic=True):
@@ -120,25 +119,25 @@ class FlaxT5DenseGatedActDense(nn.Module):
         wi_init_std = self.config.initializer_factor * (self.config.d_model ** -0.5)
         wo_init_std = self.config.initializer_factor * (self.config.d_ff ** -0.5)
 
-        self.wi_0 = nn.Dense(
+        self.wi_0 = Linear(
             self.config.d_ff,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(wi_init_std),
             dtype=self.dtype,
         )
-        self.wi_1 = nn.Dense(
+        self.wi_1 = Linear(
             self.config.d_ff,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(wi_init_std),
             dtype=self.dtype,
         )
-        self.wo = nn.Dense(
+        self.wo = Linear(
             self.config.d_model,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(wo_init_std),
             dtype=self.dtype,
         )
-        self.dropout = nn.Dropout(self.config.dropout_rate)
+        self.dropout = flax.linen.Dropout(self.config.dropout_rate)
         self.act = ACT2FN[self.config.dense_act_fn]
 
     def __call__(self, hidden_states, deterministic):
@@ -161,7 +160,7 @@ class FlaxT5LayerFF(nn.Module):
             self.DenseReluDense = FlaxT5DenseActDense(self.config, dtype=self.dtype)
 
         self.layer_norm = FlaxT5LayerNorm(self.config.d_model, eps=self.config.layer_norm_epsilon, dtype=self.dtype)
-        self.dropout = nn.Dropout(self.config.dropout_rate)
+        self.dropout = flax.linen.Dropout(self.config.dropout_rate)
 
     def __call__(self, hidden_states, deterministic=True):
         forwarded_states = self.layer_norm(hidden_states)
@@ -189,25 +188,25 @@ class FlaxT5Attention(BaseJAXAttentionModule):
         kv_init_std = self.config.initializer_factor * (self.inner_dim ** -0.5)
         o_init_std = self.config.initializer_factor * (self.inner_dim ** -0.5)
 
-        self.q = nn.Dense(
+        self.q = Linear(
             self.inner_dim,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(q_init_std),
             dtype=self.dtype,
         )
-        self.k = nn.Dense(
+        self.k = Linear(
             self.inner_dim,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(kv_init_std),
             dtype=self.dtype,
         )
-        self.v = nn.Dense(
+        self.v = Linear(
             self.inner_dim,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(kv_init_std),
             dtype=self.dtype,
         )
-        self.o = nn.Dense(
+        self.o = Linear(
             self.d_model,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(o_init_std),
@@ -441,7 +440,7 @@ class FlaxT5LayerSelfAttention(BaseJAXAttentionModule):
             dtype=self.dtype,
         )
         self.layer_norm = FlaxT5LayerNorm(self.config.d_model, eps=self.config.layer_norm_epsilon, dtype=self.dtype)
-        self.dropout = nn.Dropout(self.config.dropout_rate)
+        self.dropout = flax.linen.Dropout(self.config.dropout_rate)
 
     def __call__(
             self,
@@ -475,7 +474,7 @@ class FlaxT5LayerCrossAttention(BaseJAXAttentionModule):
             self.config, has_relative_attention_bias=False, causal=False, dtype=self.dtype
         )
         self.layer_norm = FlaxT5LayerNorm(self.config.d_model, eps=self.config.layer_norm_epsilon, dtype=self.dtype)
-        self.dropout = nn.Dropout(self.config.dropout_rate)
+        self.dropout = flax.linen.Dropout(self.config.dropout_rate)
 
     def __call__(
             self,
@@ -713,7 +712,7 @@ class FlaxT5Stack(nn.Module):
         self.final_layer_norm = FlaxT5LayerNorm(
             self.config.d_model, eps=self.config.layer_norm_epsilon, dtype=self.dtype
         )
-        self.dropout = nn.Dropout(self.config.dropout_rate)
+        self.dropout = flax.linen.Dropout(self.config.dropout_rate)
 
     def __call__(
             self,
@@ -1231,7 +1230,7 @@ class FlaxT5ForConditionalGenerationModule(nn.Module):
             decoder_config, self.shared, dtype=self.dtype, gradient_checkpointing=self.gradient_checkpointing
         )
 
-        self.lm_head = nn.Dense(
+        self.lm_head = Linear(
             self.config.vocab_size,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_factor),

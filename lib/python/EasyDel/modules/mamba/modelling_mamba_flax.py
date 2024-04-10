@@ -5,9 +5,10 @@ from typing import Optional, Tuple, Union, List, Dict, Any, Callable, Sequence, 
 
 from jax.core import ShapedArray
 import chex
-import flax.linen as nn
+import fjformer.linen as nn
 import jax
 import jax.numpy as jnp
+from fjformer.linen import Linear
 import numpy as np
 from chex import PRNGKey, Shape, Array
 from einops import einsum
@@ -506,7 +507,7 @@ class FlaxMambaMixer(nn.Module):
         inv_dt = dt + jnp.log(-jnp.expm1(-dt))
 
         dense_class = functools.partial(
-            nn.Dense,
+            Linear,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
@@ -821,7 +822,7 @@ class FlaxMambaForCausalLMModule(nn.Module):
             self.param_dtype,
             self.precision
         )
-        self.lm_head = nn.Dense(
+        self.lm_head = Linear(
             self.config.vocab_size,
             use_bias=False,
             dtype=self.dtype,

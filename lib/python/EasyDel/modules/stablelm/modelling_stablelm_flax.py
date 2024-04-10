@@ -2,12 +2,13 @@ import math
 from typing import Optional, Tuple, Union, Any
 
 import chex
-import flax.linen as nn
+import fjformer.linen as nn
 import flax.linen.partitioning
 import jax
 import jax.numpy as jnp
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks
+from fjformer.linen import Linear
 from flax.linen import partitioning as nn_partitioning
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
@@ -74,7 +75,7 @@ class FlaxStableLmMLP(nn.Module):
     def setup(self) -> None:
         config = self.config
 
-        self.gate_proj = nn.Dense(
+        self.gate_proj = Linear(
             config.intermediate_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -84,7 +85,7 @@ class FlaxStableLmMLP(nn.Module):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.down_proj = nn.Dense(
+        self.down_proj = Linear(
             config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -94,7 +95,7 @@ class FlaxStableLmMLP(nn.Module):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.up_proj = nn.Dense(
+        self.up_proj = Linear(
             config.intermediate_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -140,7 +141,7 @@ class FlaxStableLmAttention(BaseJAXAttentionModule):
 
         if self.num_key_value_groups == 1:
             assert self.config.num_attention_heads == self.config.num_key_value_heads
-        self.q_proj = nn.Dense(
+        self.q_proj = Linear(
             config.num_attention_heads * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -150,7 +151,7 @@ class FlaxStableLmAttention(BaseJAXAttentionModule):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.k_proj = nn.Dense(
+        self.k_proj = Linear(
             config.num_key_value_heads * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -160,7 +161,7 @@ class FlaxStableLmAttention(BaseJAXAttentionModule):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.v_proj = nn.Dense(
+        self.v_proj = Linear(
             config.num_key_value_heads * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -170,7 +171,7 @@ class FlaxStableLmAttention(BaseJAXAttentionModule):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.o_proj = nn.Dense(
+        self.o_proj = Linear(
             config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -493,7 +494,7 @@ class FlaxStableLmDecoderLayer(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
         )
-        self.dropout = nn.Dropout(self.config.hidden_dropout)
+        self.dropout = flax.linen.Dropout(self.config.hidden_dropout)
 
     def __call__(
             self,
@@ -649,7 +650,7 @@ class FlaxStableLmModule(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype
         )
-        self.causal_mask = nn.make_causal_mask(
+        self.causal_mask = flax.linen.make_causal_mask(
             jnp.ones(
                 (1, getattr(self.config, "c_max_position_embeddings", self.config.max_position_embeddings)),
                 dtype="bool"
@@ -749,7 +750,7 @@ class FlaxStableLmForCausalLMModule(nn.Module):
             precision=self.precision
         )
         self.vocab_size = self.config.vocab_size
-        self.lm_head = nn.Dense(
+        self.lm_head = Linear(
             self.config.vocab_size,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),

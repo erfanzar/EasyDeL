@@ -20,6 +20,7 @@ from ..flax_modelling_utils import (
     get_dot_general_by_bits, repeat_kv_bnsh, with_sharding_constraint, precompute_freq_cis, BaseJAXAttentionModule,
     block_wise_ffn
 )
+from fjformer.linen import Linear
 from .phi_configuration import PhiConfig
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 from jax.sharding import PartitionSpec
@@ -56,14 +57,14 @@ class FlaxPhiMLP(nn.Module):
     def setup(
             self
     ) -> None:
-        self.fc1 = nn.Dense(
+        self.fc1 = Linear(
             self.config.intermediate_size,
             kernel_init=nn.initializers.normal(self.config.initializer_range),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.fc2 = nn.Dense(
+        self.fc2 = Linear(
             self.config.n_embd,
             kernel_init=nn.initializers.normal(self.config.initializer_range),
             dtype=self.dtype,
@@ -108,7 +109,7 @@ class FlaxPhiAttention(BaseJAXAttentionModule):
             )
 
         dense_class = functools.partial(
-            nn.Dense,
+            Linear,
             use_bias=True,
             precision=self.precision,
             dtype=self.dtype,
@@ -418,7 +419,7 @@ class FlaxPhiDecoderLayer(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
         )
-        self.resid_dropout = nn.Dropout(self.config.resid_pdrop)
+        self.resid_dropout = flax.linen.Dropout(self.config.resid_pdrop)
 
     def __call__(
             self,
@@ -585,7 +586,7 @@ class FlaxPhiModule(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype
         )
-        self.embed_dropout = nn.Dropout(config.embd_pdrop)
+        self.embed_dropout = flax.linen.Dropout(config.embd_pdrop)
         self.layers = FlaxPhiDecoderLayerCollection(
             config=self.config,
             dtype=self.dtype,
@@ -597,7 +598,7 @@ class FlaxPhiModule(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype
         )
-        self.causal_mask = nn.make_causal_mask(
+        self.causal_mask = flax.linen.make_causal_mask(
             jnp.ones(
                 (1, getattr(self.config, "c_max_position_embeddings", self.config.max_position_embeddings)),
                 dtype="bool"
@@ -697,7 +698,7 @@ class FlaxPhiForCausalLMModule(nn.Module):
             precision=self.precision
         )
         self.vocab_size = self.config.vocab_size
-        self.lm_head = nn.Dense(
+        self.lm_head = Linear(
             self.config.vocab_size,
             use_bias=True,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),

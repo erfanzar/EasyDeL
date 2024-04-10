@@ -14,8 +14,8 @@
 # limitations under the License.
 
 from typing import Any, Optional, Tuple
-
-import flax.linen as nn
+import flax.linen
+import fjformer.linen as nn
 import flax.linen.partitioning
 import jax
 import jax.numpy as jnp
@@ -34,6 +34,7 @@ from ..flax_modelling_utils import ACT2FN, with_sharding_constraint, \
     get_dot_general_by_bits, ACT2FN, BaseJAXAttentionModule, get_gradient_checkpoint_policy, block_wise_ffn
 from .gpt2_configuration import GPT2Config
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
+from fjformer.linen import Linear, LinearBitKernel, de_quantize
 
 _CHECKPOINT_FOR_DOC = "gpt2"
 _CONFIG_FOR_DOC = "GPT2Config"
@@ -51,6 +52,16 @@ class FlaxConv1D(nn.Module):
     def __call__(self, inputs):
         inputs = jnp.asarray(inputs, self.dtype)
         kernel = self.param("kernel", jax.nn.initializers.normal(stddev=0.02), (self.features, inputs.shape[-1]))
+        if isinstance(kernel, LinearBitKernel):
+            org_sharding = kernel.kernel.sharding
+            kernel = de_quantize(
+                kernel.kernel,
+                kernel.scale,
+                self.param_dtype,
+                .0
+            )
+
+            kernel = jax.device_put(kernel, org_sharding)
         kernel = jnp.asarray(kernel.transpose(), self.dtype)
         if self.dot_general is not None:
             dot_general = self.dot_general
@@ -110,7 +121,7 @@ class FlaxGPT2Attention(BaseJAXAttentionModule):
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
 
-        self.resid_dropout = nn.Dropout(rate=config.resid_pdrop)
+        self.resid_dropout = flax.linen.Dropout(rate=config.resid_pdrop)
 
     def _split_heads(self, hidden_states):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.num_heads, self.head_dim))
@@ -243,7 +254,7 @@ class FlaxGPT2MLP(nn.Module):
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
         self.act = ACT2FN[self.config.activation_function]
-        self.dropout = nn.Dropout(rate=self.config.resid_pdrop)
+        self.dropout = flax.linen.Dropout(rate=self.config.resid_pdrop)
 
     def __call__(self, hidden_states, deterministic: bool = True):
         hidden_states = self.c_fc(hidden_states)
@@ -625,7 +636,7 @@ class FlaxGPT2Module(nn.Module):
             jnp.ones((1, getattr(self.config, "c_max_position_embeddings", self.config.max_position_embeddings)),
                      dtype="bool"), dtype="bool"
         )
-        self.dropout = nn.Dropout(rate=self.config.embd_pdrop)
+        self.dropout = flax.linen.Dropout(rate=self.config.embd_pdrop)
         self.h = FlaxGPT2BlockCollection(
             self.config,
             dtype=self.dtype,
@@ -709,7 +720,7 @@ class FlaxGPT2LMHeadModule(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision,
         )
-        self.lm_head = nn.Dense(
+        self.lm_head = Linear(
             self.config.vocab_size,
             use_bias=False,
             dtype=self.dtype,

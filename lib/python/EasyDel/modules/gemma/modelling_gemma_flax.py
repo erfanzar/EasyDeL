@@ -2,7 +2,7 @@ import math
 from typing import Optional, Tuple, Union
 
 import chex
-import flax.linen as nn
+import fjformer.linen as nn
 import flax.linen.partitioning
 import jax
 import jax.numpy as jnp
@@ -10,6 +10,7 @@ from jax.sharding import PartitionSpec
 import numpy as np
 from fjformer import with_sharding_constraint
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
+from fjformer.linen import Linear, LinearBitKernel, de_quantize
 from flax.linen import combine_masks, make_causal_mask
 
 from flax.traverse_util import flatten_dict, unflatten_dict
@@ -17,19 +18,17 @@ from jax import lax
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 
 from ..easy_attention import EasyAttention
-from ..flax_modelling_utils import apply_rotary_pos_emb, ACT2FN, BaseJAXAttentionModule, get_gradient_checkpoint_policy, \
-    get_dot_general_by_bits, block_wise_ffn
+from ..flax_modelling_utils import (
+    ACT2FN,
+    BaseJAXAttentionModule,
+    get_gradient_checkpoint_policy,
+    get_dot_general_by_bits,
+    block_wise_ffn,
+    precompute_freq_cis,
+    apply_rotary_pos_emb,
+)
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 from .gemma_configuration import GemmaConfig
-
-
-def create_sinusoidal_positions(num_pos, dim):
-    inv_freq = 1.0 / (10000 ** (np.arange(0, dim, 2)[: (dim // 2)] / dim))
-    freqs = np.einsum("i , j -> i j", np.arange(num_pos), inv_freq).astype("float32")
-
-    emb = np.concatenate((freqs, freqs), axis=-1)
-    out = np.concatenate((np.sin(emb)[:, None, :], np.cos(emb)[:, None, :]), axis=-1)
-    return jnp.array(out[:, :, :num_pos])
 
 
 class FlaxGemmaRMSNorm(nn.Module):
@@ -45,8 +44,18 @@ class FlaxGemmaRMSNorm(nn.Module):
         variance = jnp.power(variance, 2)
         variance = variance.mean(-1, keepdims=True)
         hidden_states = hidden_states / jnp.sqrt(variance + self.epsilon)
+        kernel = self.weight_kernel
+        if isinstance(kernel, LinearBitKernel):
+            org_sharding = kernel.kernel.sharding
+            kernel = de_quantize(
+                kernel.kernel,
+                kernel.scale,
+                self.param_dtype,
+                .0
+            )
 
-        return (1 + self.weight_kernel) * jnp.asarray(hidden_states, dtype=self.dtype)
+            kernel = jax.device_put(kernel, org_sharding)
+        return (1 + kernel) * jnp.asarray(hidden_states, dtype=self.dtype)
 
 
 class FlaxGemmaRotaryEmbedding(nn.Module):
@@ -54,11 +63,17 @@ class FlaxGemmaRotaryEmbedding(nn.Module):
     dtype: jnp.dtype = jnp.float32
 
     def __call__(self, freq_cis, key_states, query_states, position_ids):
-        sincos = freq_cis[position_ids]
-        sin_pos, cos_pos = jnp.split(sincos, 2, axis=-1)
-
-        key_states = apply_rotary_pos_emb(key_states, sin_pos, cos_pos)
-        query_states = apply_rotary_pos_emb(query_states, sin_pos, cos_pos)
+        sin_pos, cos_pos = freq_cis
+        key_states = apply_rotary_pos_emb(
+            key_states,
+            sin_pos[None, :, None, :],
+            cos_pos[None, :, None, :]
+        )
+        query_states = apply_rotary_pos_emb(
+            query_states,
+            sin_pos[None, :, None, :],
+            cos_pos[None, :, None, :]
+        )
 
         key_states = jnp.asarray(key_states, dtype=self.dtype)
         query_states = jnp.asarray(query_states, dtype=self.dtype)
@@ -85,7 +100,7 @@ class FlaxGemmaAttention(BaseJAXAttentionModule):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
 
         kernel = jax.nn.initializers.normal(self.config.initializer_range)
-        self.q_proj = nn.Dense(
+        self.q_proj = Linear(
             self.num_heads * self.head_dim,
             use_bias=config.attention_bias,
             dtype=self.dtype,
@@ -94,7 +109,7 @@ class FlaxGemmaAttention(BaseJAXAttentionModule):
             kernel_init=kernel,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.k_proj = nn.Dense(
+        self.k_proj = Linear(
             self.num_key_value_heads * self.head_dim,
             use_bias=config.attention_bias,
             dtype=self.dtype,
@@ -103,7 +118,7 @@ class FlaxGemmaAttention(BaseJAXAttentionModule):
             kernel_init=kernel,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.v_proj = nn.Dense(
+        self.v_proj = Linear(
             self.num_key_value_heads * self.head_dim,
             use_bias=config.attention_bias,
             dtype=self.dtype,
@@ -112,7 +127,7 @@ class FlaxGemmaAttention(BaseJAXAttentionModule):
             kernel_init=kernel,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.o_proj = nn.Dense(
+        self.o_proj = Linear(
             self.embed_dim,
             use_bias=config.attention_bias,
             dtype=self.dtype,
@@ -181,7 +196,6 @@ class FlaxGemmaAttention(BaseJAXAttentionModule):
             value_states
         ) = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(hidden_states)
 
-
         query_states = self._split_heads(query_states, self.num_heads)
         key_states = self._split_heads(key_states, self.num_key_value_heads)
         value_states = self._split_heads(value_states, self.num_key_value_heads)
@@ -220,8 +234,12 @@ class FlaxGemmaAttention(BaseJAXAttentionModule):
             dropout_rng = self.make_rng("dropout")
 
         if self.has_variable("cache", "cached_key") or init_cache:
-            key_states, value_states, attention_mask = self._concatenate_to_cache(key_states, value_states, query_states,
-                                                                                attention_mask)
+            key_states, value_states, attention_mask = self._concatenate_to_cache(
+                key_states,
+                value_states,
+                query_states,
+                attention_mask
+            )
 
         attention_bias = lax.select(
             attention_mask > 0,
@@ -278,7 +296,7 @@ class FlaxGemmaMLP(nn.Module):
         kernel_init = jax.nn.initializers.normal(self.config.initializer_range)
         self.act = ACT2FN[self.config.hidden_act if self.config.hidden_act != "gelu" else "gelu_new"]
 
-        self.gate_proj = nn.Dense(
+        self.gate_proj = Linear(
             inner_dim,
             use_bias=False,
             dtype=self.dtype,
@@ -287,7 +305,7 @@ class FlaxGemmaMLP(nn.Module):
             kernel_init=kernel_init,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.down_proj = nn.Dense(
+        self.down_proj = Linear(
             embed_dim,
             use_bias=False,
             dtype=self.dtype,
@@ -296,7 +314,7 @@ class FlaxGemmaMLP(nn.Module):
             kernel_init=kernel_init,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.up_proj = nn.Dense(
+        self.up_proj = Linear(
             inner_dim,
             use_bias=False,
             dtype=self.dtype,
@@ -638,9 +656,10 @@ class FlaxGemmaModule(nn.Module):
             self.config,
             dtype=self.dtype,
         )
-        self.freq_cis = create_sinusoidal_positions(
-            self.config.max_position_embeddings,
-            self.config.head_dim
+        self.freq_cis = precompute_freq_cis(
+            max_position_embeddings=self.config.max_position_embeddings,
+            dim=self.config.head_dim,
+            base=self.config.rope_theta
         )
         self.causal_mask = make_causal_mask(
             jnp.ones((1, self.config.max_position_embeddings), dtype="bool"),
@@ -712,7 +731,7 @@ class FlaxGemmaForCausalLMModule(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.lm_head = nn.Dense(
+        self.lm_head = Linear(
             self.config.vocab_size,
             use_bias=False,
             dtype=self.dtype,

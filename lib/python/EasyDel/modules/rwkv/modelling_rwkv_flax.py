@@ -15,6 +15,8 @@ from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 from jax.sharding import PartitionSpec
 from flax.struct import dataclass
 
+from fjformer.linen import Linear
+
 
 @dataclass
 class RwkvOutput(ModelOutput):
@@ -141,28 +143,28 @@ class FlaxRwkvSelfAttention(nn.Module):
             init_fn=init_to_value(time_mix_receptance, self.dtype),
         )
 
-        self.key = nn.Dense(
+        self.key = Linear(
             attention_hidden_size,
             use_bias=False,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.value = nn.Dense(
+        self.value = Linear(
             attention_hidden_size,
             use_bias=False,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.receptance = nn.Dense(
+        self.receptance = Linear(
             attention_hidden_size,
             use_bias=False,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.output = nn.Dense(
+        self.output = Linear(
             hidden_size,
             use_bias=False,
             dtype=self.dtype,
@@ -255,21 +257,21 @@ class FlaxRwkvFeedForward(nn.Module):
             init_fn=init_to_value(time_mix_receptance, self.param_dtype)
         )
 
-        self.key = nn.Dense(
+        self.key = Linear(
             intermediate_size,
             use_bias=False,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.receptance = nn.Dense(
+        self.receptance = Linear(
             hidden_size,
             use_bias=False,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.value = nn.Dense(
+        self.value = Linear(
             hidden_size,
             use_bias=False,
             dtype=self.dtype,
@@ -543,7 +545,7 @@ class FlaxRwkvForCausalLMModule(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.head = nn.Dense(
+        self.head = Linear(
             config.vocab_size,
             use_bias=False,
             dtype=self.dtype,

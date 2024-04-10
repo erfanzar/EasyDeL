@@ -6,10 +6,10 @@ import chex
 import jax
 import jax.numpy as jnp
 from jax import lax
-import flax.linen as nn
+import fjformer.linen as nn
 from flax.core.frozen_dict import unfreeze, freeze, FrozenDict
 from flax.traverse_util import flatten_dict, unflatten_dict
-
+import flax.linen
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 from transformers.generation.flax_utils import SampleState, FlaxLogitsProcessorList, FlaxSampleOutput, logger
@@ -17,6 +17,8 @@ from transformers import GenerationConfig
 from .vision_mistral_configuration import VisionMistralConfig
 from .modelling_mistral_flax import FlaxMistralDecoratorCollection, MistralRMSNorm
 from ..flax_modelling_utils import precompute_freq_cis
+
+from fjformer.linen import Linear
 
 
 class FlaxVisionMistralPreTrainedModel(EasyDelFlaxPretrainedModel):
@@ -186,7 +188,7 @@ class FlaxVisionMistralModule(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
         )
-        self.dropout = nn.Dropout(rate=config.embd_pdrop)
+        self.dropout = flax.linen.Dropout(rate=config.embd_pdrop)
         self.layers = FlaxMistralDecoratorCollection(
             self.config,
             dtype=self.dtype,
@@ -199,7 +201,7 @@ class FlaxVisionMistralModule(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype
         )
-        self.causal_mask = nn.make_causal_mask(
+        self.causal_mask = flax.linen.make_causal_mask(
             jnp.ones(
                 (1, getattr(self.config, "c_max_position_embeddings", self.config.max_position_embeddings)),
                 dtype="bool"
@@ -299,7 +301,7 @@ class FlaxVisionMistralForCausalLMModule(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.vision_head = nn.Dense(
+        self.vision_head = Linear(
             self.config.vision_vocab_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -307,7 +309,7 @@ class FlaxVisionMistralForCausalLMModule(nn.Module):
             kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
             precision=self.precision,
         )
-        self.lm_head = nn.Dense(
+        self.lm_head = Linear(
             self.config.vocab_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,

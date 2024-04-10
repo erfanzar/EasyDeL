@@ -14,6 +14,7 @@ from typing import Union, Optional, Tuple
 from flax.struct import dataclass
 from ..easy_attention import EasyAttention
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
+from fjformer.linen import Linear, LinearBitKernel, de_quantize
 from flax.linen import partitioning as nn_partitioning, combine_masks
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 
@@ -143,7 +144,7 @@ class TopKGating(nn.Module):
     precision: Optional[Union[str, lax.Precision]] = None
 
     def setup(self):
-        self.layer = nn.Dense(
+        self.layer = Linear(
             self.num_experts,
             use_bias=False,
             dtype=self.dtype,
@@ -261,7 +262,18 @@ class FlaxMoE(nn.Module):
         y = zeros.at[0, self.batch_index].add(expert_outputs)
         y = y.view((bsz, length, self.input_size))
         if self.bias_kernel is not None:
-            y = y + self.bias_kernel
+            bias = self.bias_kernel
+            if isinstance(bias, LinearBitKernel):
+                org_sharding = bias.kernel.sharding
+                bias = de_quantize(
+                    bias.kernel,
+                    bias.scale,
+                    self.param_dtype,
+                    .0
+                )
+
+                bias = jax.device_put(bias, org_sharding)
+            y = y + bias
         return y, loss
 
     def single_forward(self, x):
@@ -439,7 +451,7 @@ class FlaxJetMoEMLP(nn.Module):
 
     def setup(self) -> None:
         dense = functools.partial(
-            nn.Dense,
+            Linear,
             use_bias=False,
             dtype=self.dtype,
             param_dtype=self.param_dtype,

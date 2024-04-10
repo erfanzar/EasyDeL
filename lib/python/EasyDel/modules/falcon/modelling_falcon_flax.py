@@ -4,12 +4,12 @@ import flax.linen.partitioning
 from flax import linen as nn
 from flax.core import FrozenDict, unfreeze, freeze
 from typing import Optional, Dict, Union, Tuple
-
+import flax.linen
 from flax.linen import combine_masks
 from flax.traverse_util import unflatten_dict, flatten_dict
 from jax import numpy as jnp, lax
 import jax
-
+from fjformer.linen import Linear
 from jax.sharding import PartitionSpec
 from transformers.modeling_flax_outputs import FlaxCausalLMOutput, FlaxBaseModelOutput
 from ..flax_modelling_utils import (
@@ -104,7 +104,7 @@ def apply_rotary_pos_embedding(tensor, sin_, cos_):
     return (tensor * cos_) + (_rotate_half(tensor) * sin_)
 
 
-def dropout_add(linen_drop: nn.Dropout, x: chex.Array, residual: chex.Array, deterministic: bool) -> chex.Array:
+def dropout_add(linen_drop: flax.linen.Dropout, x: chex.Array, residual: chex.Array, deterministic: bool) -> chex.Array:
     """
     The dropout_add function is a helper function that adds the residual to the output of
     the dropout layer. This is necessary because we want to use deterministic=True when
@@ -112,7 +112,7 @@ def dropout_add(linen_drop: nn.Dropout, x: chex.Array, residual: chex.Array, det
     is that during training, we have two paths through our network: one with dropout and one without.
     The path without dropout (residual) allows us to backpropagate gradients through both paths at once.
 
-    :param linen_drop: nn.Dropout: Specify the dropout layer
+    :param linen_drop: flax.linen.Dropout: Specify the dropout layer
     :param x: chex.Array: Pass in the input to the dropout layer
     :param residual: chex.Array: Add the residual to the output of dropout_add
     :param deterministic: bool: Determine whether the dropout layer is active or not
@@ -147,7 +147,7 @@ class FlaxFalconAttention(BaseJAXAttentionModule):
     def setup(self) -> None:
         head_dim = self.config.hidden_size // self.config.num_attention_heads
 
-        self.query_key_value = nn.Dense(
+        self.query_key_value = Linear(
             features=3 * self.config.hidden_size if not self.config.multi_query else (
                     self.config.hidden_size + 2 * head_dim),
             dtype=self.dtype,
@@ -156,7 +156,7 @@ class FlaxFalconAttention(BaseJAXAttentionModule):
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
         self.inv_norm_factor = 1 / math.sqrt(head_dim)
-        self.dense = nn.Dense(
+        self.dense = Linear(
             features=self.config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -390,14 +390,14 @@ class FlaxFalconMlp(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
-        self.dense_h_to_4h = nn.Dense(
+        self.dense_h_to_4h = Linear(
             features=self.config.hidden_size * 4,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=self.config.bias,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.dense_4h_to_h = nn.Dense(
+        self.dense_4h_to_h = Linear(
             features=self.config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -465,8 +465,8 @@ class FlaxFalconBlock(nn.Module):
             precision=self.precision
         )
 
-        self.dropout = nn.Dropout(self.config.attention_dropout)
-        self.dropout_mlp = nn.Dropout(self.config.hidden_dropout)
+        self.dropout = flax.linen.Dropout(self.config.attention_dropout)
+        self.dropout_mlp = flax.linen.Dropout(self.config.hidden_dropout)
 
     def __call__(
             self,
@@ -630,7 +630,7 @@ class FlaxFalconModule(nn.Module):
             precision=self.precision
         )
         self.ln_f = nn.LayerNorm(dtype=self.dtype, param_dtype=self.param_dtype, epsilon=self.config.layer_norm_epsilon)
-        self.causal_mask = nn.make_causal_mask(
+        self.causal_mask = flax.linen.make_causal_mask(
             jnp.ones(
                 (1, getattr(self.config, "c_max_position_embeddings", self.config.max_position_embeddings)),
                 dtype="bool"
@@ -883,7 +883,7 @@ class FlaxFalconForCausalLMModule(nn.Module):
             precision=self.precision
         )
 
-        self.lm_head = nn.Dense(
+        self.lm_head = Linear(
             self.config.vocab_size,
             use_bias=False,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)

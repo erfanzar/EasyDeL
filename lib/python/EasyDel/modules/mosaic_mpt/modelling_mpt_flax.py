@@ -19,6 +19,7 @@ from ..flax_modelling_utils import (
 )
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 import chex
+from fjformer.linen import Linear, LinearBitKernel, de_quantize
 
 from .mosaic_configuration import MptConfig
 
@@ -43,7 +44,18 @@ class RMSNorm(nn.Module):
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         x = x.astype(jnp.promote_types(self.dtype, jnp.bfloat16))
         output = self._norm(x).astype(self.dtype)
-        weight = jnp.asarray(self.weight, self.dtype)
+        kernel = self.weight
+        if isinstance(kernel, LinearBitKernel):
+            org_sharding = kernel.kernel.sharding
+            kernel = de_quantize(
+                kernel.kernel,
+                kernel.scale,
+                self.param_dtype,
+                .0
+            )
+
+            kernel = jax.device_put(kernel, org_sharding)
+        weight = jnp.asarray(kernel, self.dtype)
         return output * weight
 
 
@@ -54,7 +66,7 @@ class FlaxMptMLP(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
-        self.up = nn.Dense(
+        self.up = Linear(
             self.config.d_model * self.config.expansion_ratio,
             kernel_init=jax.nn.initializers.normal(),
             use_bias=self.config.use_bias,
@@ -63,7 +75,7 @@ class FlaxMptMLP(nn.Module):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.down = nn.Dense(
+        self.down = Linear(
             self.config.d_model,
             kernel_init=jax.nn.initializers.normal(),
             use_bias=self.config.use_bias,
@@ -90,7 +102,7 @@ class FlaxMptAttention(BaseJAXAttentionModule):
 
     def setup(self) -> None:
 
-        self.w_qkv = nn.Dense(
+        self.w_qkv = Linear(
             self.config.d_model * 3,
             kernel_init=jax.nn.initializers.normal(),
             use_bias=self.config.use_bias,
@@ -98,7 +110,7 @@ class FlaxMptAttention(BaseJAXAttentionModule):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision)
-        self.wo = nn.Dense(
+        self.wo = Linear(
             self.config.d_model,
             kernel_init=jax.nn.initializers.normal(),
             use_bias=self.config.use_bias,
@@ -143,7 +155,7 @@ class FlaxMptAttention(BaseJAXAttentionModule):
         if self.config.qk_ln:
             self.q_ln = nn.LayerNorm(use_bias=self.config.use_norm_bias)
             self.k_ln = nn.LayerNorm(use_bias=self.config.use_norm_bias)
-        self.causal_mask = nn.make_causal_mask(
+        self.causal_mask = flax.linen.make_causal_mask(
             jnp.ones(
                 (1, self.config.max_seq_len),
                 dtype="bool"
@@ -555,7 +567,7 @@ class FlaxMptForCausalLMModule(nn.Module):
         )
 
         if self.config.use_lm_head:
-            self.lm_head = nn.Dense(self.config.vocab_size, kernel_init=jax.nn.initializers.normal(),
+            self.lm_head = Linear(self.config.vocab_size, kernel_init=jax.nn.initializers.normal(),
                                     use_bias=self.config.use_bias,
                                     dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision,
                                     **get_dot_general_by_bits(self.config.bits, self.config.easy_method))

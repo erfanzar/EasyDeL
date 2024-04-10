@@ -17,7 +17,7 @@ class GemmaConfig(EasyDelPretrainedConfig):
             num_attention_heads=16,
             num_key_value_heads=16,
             head_dim=256,
-            hidden_act="gelu",
+            hidden_act="gelu_pytorch_tanh",
             max_position_embeddings=8192,
             initializer_range=0.02,
             rms_norm_eps=1e-6,
@@ -32,6 +32,7 @@ class GemmaConfig(EasyDelPretrainedConfig):
             gradient_checkpointing: str = "nothing_saveable",
             bits: Optional[int] = None,
             scan_layers: bool = False,
+            hidden_activation=None,
             **kwargs,
     ):
         """
@@ -58,7 +59,7 @@ class GemmaConfig(EasyDelPretrainedConfig):
         self.rope_theta = rope_theta
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
-
+        self.hidden_activation = hidden_activation
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,

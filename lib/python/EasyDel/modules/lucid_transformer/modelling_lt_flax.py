@@ -7,6 +7,7 @@ from jax import numpy as jnp
 from functools import partial
 
 from flax import linen as nn
+from fjformer.linen import Linear
 from transformers import FlaxPreTrainedModel
 from jax.sharding import PartitionSpec
 import flax
@@ -23,7 +24,7 @@ ACT2CLS = {
     "relu": nn.relu,
     "relu6": nn.relu6,
     "sigmoid": nn.sigmoid,
-    "silu": nn.silu,
+    "silu": jax.nn.silu,
     "swish": nn.swish,
     "tanh": nn.tanh,
 }
@@ -35,7 +36,7 @@ class LTSelfAttention(BaseJAXAttentionModule):
     param_dtype: jnp.dtype = jnp.float32
 
     def setup(self) -> None:
-        dense = partial(nn.Dense,
+        dense = partial(Linear,
                         features=self.config.hidden_size,
                         use_bias=False,
                         kernel_init=jax.nn.initializers.normal(self.config.initializer_range)
@@ -71,14 +72,14 @@ class LTMlp(nn.Module):
     param_dtype: jnp.dtype = jnp.float32
 
     def setup(self) -> None:
-        self.up = nn.Dense(
+        self.up = Linear(
             self.config.intermediate_size,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(
                 self.config.initializer_range
             )
         )
-        self.down = nn.Dense(
+        self.down = Linear(
             self.config.hidden_size,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(
@@ -260,7 +261,7 @@ class FlaxLTModelForCausalLMModule(nn.Module):
         self.model = FlaxLTModule(
             config=self.config, dtype=self.dtype, param_dtype=self.param_dtype
         )
-        self.lm_head = nn.Dense(
+        self.lm_head = Linear(
             self.config.vocab_size,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range)

@@ -7,15 +7,16 @@ from einops import rearrange
 import jax
 import jax.numpy as jnp
 from jax import lax
-from jax.experimental.shard_map import shard_map
+import flax.linen
 from jax.sharding import PartitionSpec
-import flax.linen as nn
+import fjformer.linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
 from flax.linen import partitioning as nn_partitioning
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks, make_causal_mask
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput, FlaxSequenceClassifierOutput
 
+from fjformer.linen import Linear, LinearBitKernel, de_quantize
 from ..flax_modelling_utils import (
     with_sharding_constraint,
     get_gradient_checkpoint_policy,
@@ -129,7 +130,18 @@ class Qwen1RMSNorm(nn.Module):
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
         output = self._norm(x).astype(self.dtype)
-        weight = jnp.asarray(self.weight, self.dtype)
+        kernel = self.weight
+        if isinstance(kernel, LinearBitKernel):
+            org_sharding = kernel.kernel.sharding
+            kernel = de_quantize(
+                kernel.kernel,
+                kernel.scale,
+                self.param_dtype,
+                .0
+            )
+
+            kernel = jax.device_put(kernel, org_sharding)
+        weight = jnp.asarray(kernel, self.dtype)
         return output * weight
 
 
@@ -142,7 +154,7 @@ class FlaxQwen1MLP(nn.Module):
     def setup(self) -> None:
         config = self.config
 
-        self.w1 = nn.Dense(
+        self.w1 = Linear(
             config.intermediate_size // 2,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -153,7 +165,7 @@ class FlaxQwen1MLP(nn.Module):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.w2 = nn.Dense(
+        self.w2 = Linear(
             config.intermediate_size // 2,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -163,7 +175,7 @@ class FlaxQwen1MLP(nn.Module):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.c_proj = nn.Dense(
+        self.c_proj = Linear(
             config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -186,7 +198,7 @@ class FlaxQwen1MLP(nn.Module):
         :return: A tensor that is the result of applying a dropout function to x
 
         """
-        x = self.c_proj(nn.silu(self.w2(x)) * self.w1(x))
+        x = self.c_proj(jax.nn.silu(self.w2(x)) * self.w1(x))
         return x
 
 
@@ -205,7 +217,7 @@ class FlaxQwen1Attention(BaseJAXAttentionModule):
         assert self.projection_size % config.num_attention_heads == 0
         self.hidden_size_per_attention_head = self.projection_size // config.num_attention_heads
 
-        self.c_attn = nn.Dense(
+        self.c_attn = Linear(
             self.projection_size * 3,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -217,7 +229,7 @@ class FlaxQwen1Attention(BaseJAXAttentionModule):
             **get_dot_general_by_bits(config.bits, config.easy_method)
         )
 
-        self.c_proj = nn.Dense(
+        self.c_proj = Linear(
             config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -983,7 +995,7 @@ class FlaxQwen1Module(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
         )
-        self.drop = nn.Dropout(rate=self.config.emb_dropout_prob)
+        self.drop = flax.linen.Dropout(rate=self.config.emb_dropout_prob)
         self.h = FlaxQwen1BlockCollection(
             self.config,
             dtype=self.dtype,
@@ -1140,7 +1152,7 @@ class FlaxQwen1ForCausalLMModule(nn.Module):
             precision=self.precision,
         )
 
-        self.lm_head = nn.Dense(
+        self.lm_head = Linear(
             self.config.vocab_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -1254,7 +1266,7 @@ class FlaxQwen1ForSequenceClassificationModule(nn.Module):
         :return: A tuple of the model and the classifier
         """
         self.model = FlaxQwen1Module(self.config, dtype=self.dtype)
-        self.classifier = nn.Dense(
+        self.classifier = Linear(
             self.num_classes,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
