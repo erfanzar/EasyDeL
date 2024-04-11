@@ -58,7 +58,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
 
     def __init__(
             self,
-            axis_dims: Sequence[int] = (1, 1, 1, -1),
+            axis_dims: Sequence[int] = (1, -1, 1, 1),
             axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
             attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = "normal",
             block_k: int = 128,

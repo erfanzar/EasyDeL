@@ -28,7 +28,7 @@ def main():
         device=jax.devices("cpu")[0],
         input_shape=(1, 1),
         device_map="auto",
-        sharding_axis_dims=(1, 1, 1, -1)
+        sharding_axis_dims=(1, -1, 1, 1)
     )
 
     model_parameters = FrozenDict({"params": params})
@@ -88,7 +88,7 @@ def main():
         total_batch_size=32,
         max_sequence_length=max_length,
         gradient_checkpointing=EasyDelGradientCheckPointers.NOTHING_SAVEABLE,
-        sharding_array=(1, 1, 1, -1),
+        sharding_array=(1, -1, 1, 1),
         gradient_accumulation_steps=4,
         init_input_shape=(1, max_length),
         dtype=dtype,

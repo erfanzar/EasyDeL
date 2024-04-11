@@ -206,7 +206,7 @@ class FlaxLTModule(nn.Module):
         self.ln = nn.LayerNorm(use_bias=False)
 
     def build_alibi(self, sequence_length: int):
-        mxl = jnp.arange(1 - sequence_length, 1).reshape(1, 1, 1, -1)
+        mxl = jnp.arange(1 - sequence_length, 1).reshape(1, -1, 1, 1)
         mxh = jnp.arange(1, 1 + self.config.num_attention_heads).reshape(1, -1, 1, 1)
         cp2 = 2 ** math.ceil(math.log2(self.config.num_attention_heads))
         base_mxl = mxh * (self.config.alibi_bias_max / cp2)
