@@ -138,7 +138,7 @@ train_arguments = TrainArguments(
     backend="tpu",  # default backed is set to cpu, so you must define you want to use tpu cpu or gpu
     max_length=max_length,  # Note that you have to change this in the model config too
     gradient_checkpointing=EasyDelGradientCheckPointers.NOTHING_SAVEABLE,
-    sharding_array=(1, -1, 1, 1),  # the way to shard model across gpu,cpu or TPUs using sharding array (1, 1, 1, -1)
+    sharding_array=(1, -1, 1, 1),  # the way to shard model across gpu,cpu or TPUs using sharding array (1, -1, 1, 1)
     # everything training will be in sequence and model parallel automatic and share data between devices
     remove_ckpt_after_load=True,
     gradient_accumulation_steps=8,
@@ -229,7 +229,7 @@ train_arguments = TrainArguments(
     backend="tpu",  # default backed is set to cpu, so you must define you want to use tpu cpu or gpu
     max_length=max_length,  # Note that you have to change this in the model config too
     gradient_checkpointing=EasyDelGradientCheckPointers.NOTHING_SAVEABLE,
-    sharding_array=(1, 1, 1, -1),  # the way to shard model across gpu,cpu or TPUs using sharding array (1, 1, 1, -1)
+    sharding_array=(1, -1, 1, 1),  # the way to shard model across gpu,cpu or TPUs using sharding array (1, -1, 1, 1)
     # everything training will be in sequence and model parallel automatic and share data between devices
     remove_ckpt_after_load=True,
     gradient_accumulation_steps=8,
@@ -307,7 +307,7 @@ model, params = AutoEasyDelModelForCausalLM.from_pretrained(
     jax.numpy.float16,
     jax.numpy.float16,
     jax.lax.Precision("fastest"),
-    (1, 1, 1, -1),
+    (1, -1, 1, 1),
     device_map="auto"
 )
 
@@ -370,7 +370,7 @@ model_name_or_path = "erfanzar/LinguaMatic-Tiny"
 ref_model_name_or_path = "teknium/OpenHermes-2.5-Mistral-7B"
 dtype = jnp.bfloat16
 
-sharding_axis_dims = (1, 1, 1, -1)
+sharding_axis_dims = (1, -1, 1, 1)
 sharding_axis_names = ("dp", "fsdp", "tp", "sp")
 query_partition_spec = PartitionSpec(
     ("dp", "fsdp"), "sp", "tp", None
@@ -591,8 +591,8 @@ state = EasyDelState.from_pretrained(
     dtype=jnp.bfloat16,
     param_dtype=jnp.bfloat16,
     precision=lax.Precision("fastest"),
-    sharding_axis_dims=(1, 1, 1, -1),
-    # the way to shard model across gpu,cpu or TPUs using sharding array (1, 1, 1, -1)
+    sharding_axis_dims=(1, -1, 1, 1),
+    # the way to shard model across gpu,cpu or TPUs using sharding array (1, -1, 1, 1)
     # everything training will be in sequence and model parallel automatic and share data between devices
     sharding_axis_names=("dp", "fsdp", "tp", "sp"),
     query_partition_spec=jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
@@ -777,7 +777,7 @@ train_arguments = TrainArguments(
     backend="tpu",  # default backed is set to cpu, so you must define you want to use tpu cpu or gpu
     max_length=max_length,  # Note that you have to change this in the model config too
     gradient_checkpointing=EasyDelGradientCheckPointers.NOTHING_SAVEABLE,
-    sharding_array=(1, 1, 1, -1),  # the way to shard model across gpu,cpu or TPUs using sharding array (1, 1, 1, -1)
+    sharding_array=(1, -1, 1, 1),  # the way to shard model across gpu,cpu or TPUs using sharding array (1, -1, 1, 1)
     # everything training will be in sequence and model parallel automatic and share data between devices
     remove_ckpt_after_load=True,
     gradient_accumulation_steps=1,
