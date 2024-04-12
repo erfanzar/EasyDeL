@@ -52,16 +52,17 @@ class FlaxGemmaRotaryEmbedding(nn.Module):
     dtype: jnp.dtype = jnp.float32
 
     def __call__(self, freq_cis, key_states, query_states, position_ids):
+        b,s,h,d =key_states.shape
         sin_pos, cos_pos = freq_cis
         key_states = apply_rotary_pos_emb(
             key_states,
-            sin_pos[None, :, None, :],
-            cos_pos[None, :, None, :]
+            sin_pos[None, :s, None, :],
+            cos_pos[None, :s, None, :]
         )
         query_states = apply_rotary_pos_emb(
             query_states,
-            sin_pos[None, :, None, :],
-            cos_pos[None, :, None, :]
+            sin_pos[None, :s, None, :],
+            cos_pos[None, :s, None, :]
         )
 
         key_states = jnp.asarray(key_states, dtype=self.dtype)
