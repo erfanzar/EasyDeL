@@ -72,12 +72,6 @@ python -m examples.jax_serve_example \
 > you can use `EasyServe` which is a Serve API Engine for production purpose sice that's more stable provide versioned
 > API and efficient.
 
-## RLHF(Reinforcement Learning From Human Feedback)
-
-> RLHF or Reinforcement Learning From Human Feedback is Available At the moment, but it's still
-> under heavy development , because I don't have enough experience with Reinforcement Learning at the moment so its
-> still in beta version but it's works and ill soon release a Tutorial For that
-
 ## Supervised Fine-Tuning with EasyDeL
 
 EasyDeL supports both DPO and SFT Trainers, so dealing with LLMs in jax is a lot easier right now
