@@ -3,21 +3,21 @@ from typing import Optional, Tuple, Union
 
 import chex
 from fjformer import linen as nn
+import flax.linen.partitioning
+import flax.struct
 import jax
 import jax.numpy as jnp
+from fjformer.func import auxiliary_load_balancing_loss_func
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks
-from flax.linen import partitioning as nn_partitioning
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax.sharding import PartitionSpec
-from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput, FlaxSequenceClassifierOutput
+from transformers.modeling_flax_outputs import FlaxMaskedLMOutput, FlaxCausalLMOutput, FlaxBaseModelOutput
 
-from .llama_configuration import LlamaConfig
-from fjformer.linen import Linear
+from .cohere_configuration import CohereConfig
 from ..easy_attention import EasyAttention
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
-import flax.linen
 # EasyDel.modules
 from ..flax_modelling_utils import (
     with_sharding_constraint,
@@ -25,11 +25,16 @@ from ..flax_modelling_utils import (
     repeat_kv_bnsh,
     apply_rotary_pos_emb,
     precompute_freq_cis,
-    get_dot_general_by_bits, BaseJAXAttentionModule, block_wise_ffn
+    get_dot_general_by_bits,
+    BaseJAXAttentionModule,
+    block_wise_ffn
 )
 
+re_mat = flax.linen.partitioning.remat
+from transformers import CohereForCausalLM
 
-class FlaxLlamaEmbedding(nn.Module):
+
+class FlaxCohereEmbedding(nn.Module):
     dtype: jnp.dtype = jnp.float32
 
     def __call__(self, query, key, freq_cis, position_ids):
@@ -80,8 +85,8 @@ class RMSNorm(nn.Module):
         return output * weight
 
 
-class FlaxLlamaAttention(BaseJAXAttentionModule):
-    config: LlamaConfig
+class FlaxCohereAttention(BaseJAXAttentionModule):
+    config: CohereConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]] = None
@@ -94,7 +99,7 @@ class FlaxLlamaAttention(BaseJAXAttentionModule):
 
         if self.num_key_value_groups == 1:
             assert self.config.num_attention_heads == self.config.num_key_value_heads
-        self.q_proj = Linear(
+        self.q_proj = nn.Linear(
             config.num_attention_heads * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -104,7 +109,7 @@ class FlaxLlamaAttention(BaseJAXAttentionModule):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.k_proj = Linear(
+        self.k_proj = nn.Linear(
             config.num_key_value_heads * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -114,7 +119,7 @@ class FlaxLlamaAttention(BaseJAXAttentionModule):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.v_proj = Linear(
+        self.v_proj = nn.Linear(
             config.num_key_value_heads * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -124,7 +129,7 @@ class FlaxLlamaAttention(BaseJAXAttentionModule):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.o_proj = Linear(
+        self.o_proj = nn.Linear(
             config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -135,7 +140,7 @@ class FlaxLlamaAttention(BaseJAXAttentionModule):
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
 
-        self.rotary = FlaxLlamaEmbedding(self.dtype)
+        self.rotary = FlaxCohereEmbedding(self.dtype)
         self.attention_performer = EasyAttention(
             use_sharding_constraint=self.config.use_sharding_constraint,
             block_k_major=self.config.block_k_major,
@@ -169,7 +174,6 @@ class FlaxLlamaAttention(BaseJAXAttentionModule):
             mesh=self.config.jax_mesh(),
             sm_scale=1 / math.sqrt(self.head_dim),
         )
-        self.resid_dropout = flax.linen.Dropout(rate=config.resid_pdrop)
 
     def _merge_heads(self, hidden_states):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
@@ -379,13 +383,12 @@ class FlaxLlamaAttention(BaseJAXAttentionModule):
             )
         attn_output = self.o_proj(attn_output)
 
-        attn_output = self.resid_dropout(attn_output, deterministic=deterministic)
         outputs = (attn_output, attentions.attention_weights) if output_attentions else (attn_output,)
         return outputs
 
 
-class FlaxLlamaMLP(nn.Module):
-    config: LlamaConfig
+class FlaxCohereMLP(nn.Module):
+    config: CohereConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]] = None
@@ -393,37 +396,39 @@ class FlaxLlamaMLP(nn.Module):
     def setup(self) -> None:
         config = self.config
 
-        self.gate_proj = Linear(
+        self.gate_proj = nn.Linear(
             config.intermediate_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(
-                self.config.initializer_range),
+                self.config.initializer_range
+            ),
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.down_proj = Linear(
+        self.down_proj = nn.Linear(
             config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(
-                self.config.initializer_range),
+                self.config.initializer_range
+            ),
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.up_proj = Linear(
+        self.up_proj = nn.Linear(
             config.intermediate_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(
-                self.config.initializer_range),
+                self.config.initializer_range
+            ),
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.dropout = flax.linen.Dropout(rate=self.config.resid_pdrop)
 
     def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
         """
@@ -438,21 +443,20 @@ class FlaxLlamaMLP(nn.Module):
 
         """
         x = self.down_proj(jax.nn.silu(self.gate_proj(x)) * self.up_proj(x))
-        x = self.dropout(x, deterministic=deterministic)
         return x
 
 
-class FlaxLlamaBlock(nn.Module):
-    config: LlamaConfig
+class FlaxCohereBlock(nn.Module):
+    config: CohereConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
-        attn_block = FlaxLlamaAttention
+        attn_block = FlaxCohereAttention
         if self.config.gradient_checkpointing != "":
-            attn_block = nn_partitioning.remat(
-                FlaxLlamaAttention, static_argnums=(1, 3, 4, 6, 7, 8),
+            attn_block = re_mat(
+                FlaxCohereAttention, static_argnums=(1, 3, 4, 6, 7, 8),
                 policy=get_gradient_checkpoint_policy(
                     self.config.gradient_checkpointing)
             )
@@ -463,11 +467,11 @@ class FlaxLlamaBlock(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        mlp_block = FlaxLlamaMLP
+        mlp_block = FlaxCohereMLP
 
         if self.config.gradient_checkpointing != "":
-            mlp_block = nn_partitioning.remat(
-                FlaxLlamaMLP, static_argnums=(1,),
+            mlp_block = re_mat(
+                FlaxCohereMLP, static_argnums=(1,),
                 policy=get_gradient_checkpoint_policy(
                     self.config.gradient_checkpointing
                 )
@@ -484,13 +488,6 @@ class FlaxLlamaBlock(nn.Module):
             eps=self.config.rms_norm_eps,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-        )
-        self.post_attention_layernorm = RMSNorm(
-            self.config.hidden_size,
-            eps=self.config.rms_norm_eps,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-
         )
 
     def __call__(
@@ -526,8 +523,10 @@ class FlaxLlamaBlock(nn.Module):
         :return: A tuple of two items
 
         """
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
         attn_outputs = self.self_attn(
-            self.input_layernorm(hidden_states),
+            hidden_states,
             freq_cis,
             attention_mask,
             position_ids,
@@ -539,9 +538,8 @@ class FlaxLlamaBlock(nn.Module):
             fcm_mask,
         )
         attn_output = attn_outputs[0]
-        hidden_states = hidden_states + attn_output
 
-        feed_forward_input = self.post_attention_layernorm(hidden_states)
+        feed_forward_input = hidden_states
 
         if self.config.use_scan_mlp:
             feed_forward_hidden_states = block_wise_ffn(
@@ -556,19 +554,19 @@ class FlaxLlamaBlock(nn.Module):
                 deterministic,
             )
 
-        hidden_states = hidden_states + feed_forward_hidden_states
+        hidden_states = attn_output + feed_forward_hidden_states + residual
 
         return (hidden_states,) + attn_outputs[1:]
 
 
-class FlaxLlamaPreTrainedModel(EasyDelFlaxPretrainedModel):
-    config_class = LlamaConfig
+class FlaxCoherePreTrainedModel(EasyDelFlaxPretrainedModel):
+    config_class = CohereConfig
     base_model_prefix = "model"
     module_class: nn.Module = None
 
     def __init__(
             self,
-            config: LlamaConfig,
+            config: CohereConfig,
             input_shape: Tuple = (1, 1),
             seed: int = 0,
             dtype: jnp.dtype = jnp.float32,
@@ -582,7 +580,7 @@ class FlaxLlamaPreTrainedModel(EasyDelFlaxPretrainedModel):
 
 
         :param self: Refer to the object itself
-        :param config: LlamaConfig: Pass the configuration to the module
+        :param config: CohereConfig: Pass the configuration to the module
         :param input_shape: Tuple: Specify the shape of the input to the model
         :param seed: int: Set the seed for random number generation
         :param dtype: jnp.dtype: Specify the data type of the input
@@ -769,15 +767,15 @@ class FlaxLlamaPreTrainedModel(EasyDelFlaxPretrainedModel):
         return outputs
 
 
-class FlaxLlamaBlockCollection(nn.Module):
-    config: LlamaConfig
+class FlaxCohereBlockCollection(nn.Module):
+    config: CohereConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self):
         self.blocks = [
-            FlaxLlamaBlock(
+            FlaxCohereBlock(
                 self.config,
                 name=str(i),
                 dtype=self.dtype,
@@ -867,8 +865,8 @@ class FlaxLlamaBlockCollection(nn.Module):
         return outputs
 
 
-class FlaxLlamaModule(nn.Module):
-    config: LlamaConfig
+class FlaxCohereModule(nn.Module):
+    config: CohereConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]] = None
@@ -883,9 +881,8 @@ class FlaxLlamaModule(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
         )
-        self.dropout = flax.linen.Dropout(rate=self.config.embd_pdrop)
-        self.layers = FlaxLlamaBlockCollection(self.config, dtype=self.dtype, param_dtype=self.param_dtype,
-                                               precision=self.precision)
+        self.layers = FlaxCohereBlockCollection(self.config, dtype=self.dtype, param_dtype=self.param_dtype,
+                                                precision=self.precision)
         self.norm = RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps, dtype=self.dtype,
                             param_dtype=self.param_dtype)
         config = self.config
@@ -899,7 +896,7 @@ class FlaxLlamaModule(nn.Module):
         initial_rope_kwargs = dict(
             rope_type="none"
         )
-        if config.rope_scaling is not None:
+        if getattr(config, "rope_scaling", None) is not None:
             scaling_type = config.rope_scaling["type"]
             scaling_factor = config.rope_scaling["factor"]
             initial_rope_kwargs = dict(
@@ -955,13 +952,10 @@ class FlaxLlamaModule(nn.Module):
         batch_size, sequence_length, _ = inputs_embeds.shape
 
         assert sequence_length <= self.config.max_position_embeddings, "Maximum Position Embedding Reached !"
-        inputs_embeds = inputs_embeds + \
-                        extra_embedding if extra_embedding is not None else inputs_embeds
-        hidden_states = self.dropout(
-            inputs_embeds, deterministic=deterministic)
+        inputs_embeds = inputs_embeds + extra_embedding if extra_embedding is not None else inputs_embeds
 
         outputs = self.layers(
-            hidden_states=hidden_states,
+            hidden_states=inputs_embeds,
             freq_cis=self.freq_cis,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -992,8 +986,8 @@ class FlaxLlamaModule(nn.Module):
         )
 
 
-class FlaxLlamaModel(FlaxLlamaPreTrainedModel):
-    module_class = FlaxLlamaModule
+class FlaxCohereModel(FlaxCoherePreTrainedModel):
+    module_class = FlaxCohereModule
 
     def set_input_embeddings(self, value):
         self.module.embed_tokens = value
@@ -1002,20 +996,21 @@ class FlaxLlamaModel(FlaxLlamaPreTrainedModel):
         return self.module.embed_tokens
 
 
-class FlaxLlamaForCausalLMModule(nn.Module):
-    config: LlamaConfig
+class FlaxCohereForCausalLMModule(nn.Module):
+    config: CohereConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self):
-        self.model = FlaxLlamaModule(self.config,
-                                     dtype=self.dtype,
-                                     param_dtype=self.param_dtype,
-                                     precision=self.precision,
-                                     )
+        self.model = FlaxCohereModule(
+            self.config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision,
+        )
 
-        self.lm_head = Linear(
+        self.lm_head = nn.Linear(
             self.config.vocab_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -1025,6 +1020,7 @@ class FlaxLlamaForCausalLMModule(nn.Module):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
+        self.logit_scale = self.config.logit_scale
 
     def __call__(
             self,
@@ -1084,7 +1080,7 @@ class FlaxLlamaForCausalLMModule(nn.Module):
         else:
             lm_logits = self.lm_head(hidden_states)
 
-        lm_logits = lm_logits.astype(jnp.float32)
+        lm_logits = (lm_logits * self.logit_scale).astype(jnp.float32)
 
         if not return_dict:
             return (lm_logits,) + outputs[1:]
@@ -1092,26 +1088,8 @@ class FlaxLlamaForCausalLMModule(nn.Module):
         return FlaxCausalLMOutput(logits=lm_logits, hidden_states=outputs.hidden_states, attentions=outputs.attentions)
 
 
-class FlaxLlamaForCausalLM(FlaxLlamaPreTrainedModel):
-    module_class = FlaxLlamaForCausalLMModule
-
-    def set_input_embeddings(self, value):
-        self.module.model.embed_tokens = value
-
-    def get_input_embeddings(self):
-        return self.module.model.embed_tokens
-
-    def set_decoder(self, decoder):
-        self.module.model = decoder
-
-    def get_decoder(self):
-        return self.module.model
-
-    def get_output_embeddings(self):
-        return self.module.lm_head
-
-    def set_output_embeddings(self, new_embeddings):
-        self.module.lm_head = new_embeddings
+class FlaxCohereForCausalLM(FlaxCoherePreTrainedModel):
+    module_class = FlaxCohereForCausalLMModule
 
     def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[chex.Array] = None):
         """
@@ -1147,97 +1125,3 @@ class FlaxLlamaForCausalLM(FlaxLlamaPreTrainedModel):
         model_kwargs["past_key_values"] = model_outputs.past_key_values
         model_kwargs["position_ids"] = model_kwargs["position_ids"][:, -1:] + 1
         return model_kwargs
-
-
-class FlaxLlamaForSequenceClassificationModule(nn.Module):
-    num_classes: int
-    config: LlamaConfig
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
-
-    def setup(self):
-        """
-        The setup function is called once at the beginning of training.
-        It initializes the model and optimizer, and sets up any other state that needs to be initialized.
-
-        :param self: Access variables that belong to the class
-        :return: A tuple of the model and the classifier
-        """
-        self.model = FlaxLlamaModule(self.config, dtype=self.dtype)
-        self.classifier = Linear(
-            self.num_classes,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(
-                stddev=self.config.initializer_range),
-            precision=self.precision,
-        )
-
-    def __call__(
-            self,
-            input_ids: chex.Array,
-            attention_mask: chex.Array = None,
-            position_ids: chex.Array = None,
-            deterministic: bool = True,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            output_hidden_states: bool = False,
-            return_dict: bool = True,
-            extra_embedding: Optional[Union[jnp.ndarray, None]] = None
-    ):
-        """
-        The __call__ function is the main function of a Flax module.
-        It takes in all the inputs to the model and returns all outputs from it.
-        The __call__ function can be called directly on an instance of a class, or by using parentheses after an instance:
-            &gt;&gt;&gt; my_model = MyModel()  # instantiate your model class
-            &gt;&gt;&gt; output = my_model(input)  # call your model with input data as arguments to __call__
-
-        :param self: Refer to the class instance
-        :param input_ids: chex.Array: Pass the input to the model
-        :param attention_mask: chex.Array: Specify which tokens are masked
-        :param position_ids: chex.Array: Specify the position of each token in the sequence
-        :param deterministic: bool: Control whether the model is run in deterministic or stochastic mode
-        :param init_cache: bool: Initialize the cache for the transformer
-        :param output_attentions: bool: Return the attention weights
-        :param output_hidden_states: bool: Return the hidden states of all layers
-        :param return_dict: bool: Return a dictionary of outputs
-        :param extra_embedding: Optional[Union[jnp.ndarray: Pass in the embedding of a new word
-        :param None]]: Pass the extra embedding to the model
-        :return: A tuple of logits and hidden_states
-
-        """
-        batch_size, seq_length = input_ids.shape
-        if attention_mask is None:
-            attention_mask = jnp.ones_like(input_ids)
-        if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
-                (batch_size, seq_length)
-            )
-        outputs = self.model(
-            input_ids,
-            attention_mask,
-            position_ids,
-            deterministic=deterministic,
-            init_cache=init_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            extra_embedding=extra_embedding
-        )
-
-        hidden_states = outputs[0]
-        prediction = self.classifier(hidden_states)
-        if return_dict:
-            return FlaxSequenceClassifierOutput(
-                logits=prediction,
-                hidden_states=hidden_states
-            )
-        else:
-            return prediction,
-
-
-class FlaxLlamaForSequenceClassification(FlaxLlamaPreTrainedModel):
-    module_class = FlaxLlamaForSequenceClassificationModule

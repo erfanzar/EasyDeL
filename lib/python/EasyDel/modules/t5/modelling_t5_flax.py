@@ -20,7 +20,7 @@ from typing import Callable, Optional, Tuple
 
 import fjformer
 import flax.linen
-import fjformer.linen as nn
+from fjformer import linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np

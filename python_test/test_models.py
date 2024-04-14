@@ -351,6 +351,14 @@ class EasyModelsTest(TestCase):
             f"MAMBA model Failed [ERROR {err}]"
         )
 
+    def test_cohere(self):
+        res, err = self.create_test_for_models("cohere", transformers.CohereForCausalLM)
+
+        self.assertTrue(
+            res,
+            f"MAMBA model Failed [ERROR {err}]"
+        )
+
     def test_qwen2_moe(self):
         res, err = self.create_test_for_models("qwen2_moe", transformers.Qwen2MoeForCausalLM)
         self.assertTrue(

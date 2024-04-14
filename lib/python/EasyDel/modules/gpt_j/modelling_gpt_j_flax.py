@@ -29,7 +29,7 @@ from einops import einops
 from fjformer import with_sharding_constraint
 from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec
-import fjformer.linen as nn
+from fjformer import linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np

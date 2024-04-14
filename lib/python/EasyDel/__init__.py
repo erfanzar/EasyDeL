@@ -144,6 +144,13 @@ from .modules.whisper import (
     FlaxWhisperTimeStampLogitsProcessor as FlaxWhisperTimeStampLogitsProcessor,
     WhisperConfig as WhisperConfig
 )
+
+from .modules.cohere import (
+    FlaxCohereModel as FlaxCohereModel,
+    CohereConfig as CohereConfig,
+    FlaxCohereForCausalLM as FlaxCohereForCausalLM
+)
+
 from .modules.auto_easydel_model import (
     AutoEasyDelModelForCausalLM as AutoEasyDelModelForCausalLM,
     AutoEasyDelConfig as AutoEasyDelConfig,
@@ -348,6 +355,11 @@ __all__ = (
     "FlaxWhisperTimeStampLogitsProcessor",
     "FlaxWhisperForAudioClassification",
     "FlaxWhisperForConditionalGeneration",
+
+    # Cohere
+    "FlaxCohereModel",
+    "CohereConfig",
+    "FlaxCohereForCausalLM",
 
     # AutoModels Models
     "AutoEasyDelModelForCausalLM",

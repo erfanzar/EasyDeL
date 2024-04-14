@@ -3,7 +3,7 @@ from typing import Optional, Tuple, Union, Any
 
 import chex
 import fjformer
-import fjformer.linen as nn
+from fjformer import linen as nn
 import flax.linen.partitioning
 import jax
 import jax.numpy as jnp

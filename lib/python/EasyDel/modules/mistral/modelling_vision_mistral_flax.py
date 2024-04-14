@@ -6,7 +6,7 @@ import chex
 import jax
 import jax.numpy as jnp
 from jax import lax
-import fjformer.linen as nn
+from fjformer import linen as nn
 from flax.core.frozen_dict import unfreeze, freeze, FrozenDict
 from flax.traverse_util import flatten_dict, unflatten_dict
 import flax.linen
