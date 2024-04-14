@@ -342,6 +342,7 @@ class AutoEasyDelModelForCausalLM:
             shard_fns: Optional[Mapping[tuple, Callable] | dict] = None,
             backend: Optional[str] = None,
             config_kwargs: Optional[Mapping[str, Any]] = None,
+            auto_shard_params: bool = False,
             **kwargs
     ) -> Tuple[EasyDelFlaxPretrainedModel, dict]:
         """
@@ -363,12 +364,14 @@ class AutoEasyDelModelForCausalLM:
         :param key_partition_spec: PartitionSpec: Partition the key matrix
         :param value_partition_spec: PartitionSpec: Specify the partitioning of the value tensor
         :param bias_partition_spec: PartitionSpec: Specify the Attention Bias partition spec
+        :param generation_bias_partition_spec: PartitionSpec: Specify the Attention Bias partition spec for generation
         :param attention_partition_spec: PartitionSpec: Specify the partitioning of the attention weights
         :param shard_attention_computation: bool: whenever to use shard_map for attention
         :param input_shape: typing.Sequence[int]: Specify the shape of the input to the model
         :param shard_fns: Optional[Mapping[tuple, Callable]]: Sharding Function to be used to shard model
         :param backend: typing.Optional[str]: backend to use for model
         :param config_kwargs: Optional[Mapping[str, Any]]: Config kwargs to be added to config before creating module
+        :param auto_shard_params: bool: whether to automaticly shard the model parameters
         :param kwargs: Pass additional arguments to the model and config classes
         :return: A model and parameters
 
@@ -423,9 +426,18 @@ class AutoEasyDelModelForCausalLM:
                 logger.debug(f"removing {k} from weights as it was not needed by flax model")
                 del state_dict[k]
         if shard_fns is not None:
+            if auto_shard_params:
+                warnings.warn(
+                    "`auto_shard_params` will be ignored since you are passing custom sharding functions"
+                )
             logger.debug("sharding model parameters based on the given shard_fns.")
             if not is_flatten(shard_fns):
                 shard_fns = flax.traverse_util.flatten_dict(shard_fns)
+        elif auto_shard_params:
+            shard_fns, _ = AutoShardAndGatherFunctions.from_pretrained(
+                pretrained_model_name_or_path=pretrained_model_name_or_path,
+                dtype_specs=param_dtype
+            )
         with cfg.jax_mesh():
             logger.debug("converting huggingface-model to easydel-model.")
             params = trf(state_dict, config=config, device=device, shard_fns=shard_fns)
@@ -512,7 +524,8 @@ class AutoShardAndGatherFunctions:
             cls,
             config: EasyDelPretrainedConfig,
             partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
-            flatten: bool = True
+            flatten: bool = True,
+            dtype_specs=jax.numpy.float16
     ):
         if partition_rules is None:
             warnings.warn("Using config partition rules from `get_partition_rules(fully_sharded_data_parallel=True)`")
@@ -529,7 +542,7 @@ class AutoShardAndGatherFunctions:
         )
         shard_fns, gather_fns = make_shard_and_gather_fns(
             partition_specs=partition_specs,
-            dtype_specs=jax.numpy.float16
+            dtype_specs=dtype_specs
         )
         if flatten and not is_flatten(shard_fns):
             gather_fns = flax.traverse_util.flatten_dict(gather_fns)
@@ -545,11 +558,13 @@ class AutoShardAndGatherFunctions:
             cls,
             pretrained_model_name_or_path: str,
             partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
-            flatten: bool = True
+            flatten: bool = True,
+            dtype_specs=jax.numpy.float16
     ):
         config = AutoEasyDelConfig.from_pretrained(pretrained_model_name_or_path)
         return cls.from_config(
             config=config,
             partition_rules=partition_rules,
-            flatten=flatten
+            flatten=flatten,
+            dtype_specs=dtype_specs
         )
