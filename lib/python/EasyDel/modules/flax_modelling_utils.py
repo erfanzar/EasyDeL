@@ -345,7 +345,7 @@ def get_dot_general_by_bits(
 
 
 class BaseJAXAttentionModule(nn.Module):
-    config: "EasyDelPretrainedConfig"
+    config: "EasyDelPretrainedConfig"  # type: ignore
 
     @nn.compact
     def _concatenate_to_cache(self, key, value, query_states, attention_mask):
@@ -371,7 +371,7 @@ class BaseJAXAttentionModule(nn.Module):
         if is_initialized:
             *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
             cur_index = cache_index.value
-            if query_states.shape[1] == 1 and self.config.use_sharded_kv_caching:
+            if query_states.shape[1] != 1 and self.config.use_sharded_kv_caching:
                 mesh = self.config.jax_mesh()
 
                 def fn(
