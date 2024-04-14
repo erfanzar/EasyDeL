@@ -131,6 +131,7 @@ def huggingface_to_easydel(
         shard_fns: Optional[Mapping[tuple, Callable]] = None,
         dtype: jax.numpy.dtype = jax.numpy.float16,
         rnn_based_or_rwkv: bool = False,
+        verbose: bool = True,
         **kwargs
 ):
     """
@@ -147,6 +148,7 @@ def huggingface_to_easydel(
     :param dtype: jax.numpy.dtype: Specify the data type of the tensors
     :param rnn_based_or_rwkv: bool: rnn_based_or_rwkv is a conditioner which decide whenever it finds a value in tree
     that start with time_mix_ it will automatically reshape that for easydel use case
+    :param verbose:bool: whenever to log sharding or converting process
     :return: A dictionary of the weights and biases in a format that can be used by flax (it's an UnFlattenDict)
 
     """
@@ -157,7 +159,7 @@ def huggingface_to_easydel(
 
     with jax.default_device(device):
         flax_dict = {}
-        pbar = tqdm(total=len(state_dict))
+        pbar = tqdm(total=len(state_dict), disable=not verbose)
         pbar.set_description("Converting Model")
 
         for key, tensor in state_dict.items():

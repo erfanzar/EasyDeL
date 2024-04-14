@@ -343,6 +343,7 @@ class AutoEasyDelModelForCausalLM:
             backend: Optional[str] = None,
             config_kwargs: Optional[Mapping[str, Any]] = None,
             auto_shard_params: bool = False,
+            partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
             **kwargs
     ) -> Tuple[EasyDelFlaxPretrainedModel, dict]:
         """
@@ -372,6 +373,8 @@ class AutoEasyDelModelForCausalLM:
         :param backend: typing.Optional[str]: backend to use for model
         :param config_kwargs: Optional[Mapping[str, Any]]: Config kwargs to be added to config before creating module
         :param auto_shard_params: bool: whether to automaticly shard the model parameters
+        :param partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]]: custom partition rules to create partition
+        specs required to shard model parameters
         :param kwargs: Pass additional arguments to the model and config classes
         :return: A model and parameters
 
@@ -436,7 +439,8 @@ class AutoEasyDelModelForCausalLM:
         elif auto_shard_params:
             shard_fns, _ = AutoShardAndGatherFunctions.from_pretrained(
                 pretrained_model_name_or_path=pretrained_model_name_or_path,
-                dtype_specs=param_dtype
+                dtype_specs=param_dtype,
+                partition_rules=partition_rules
             )
         with cfg.jax_mesh():
             logger.debug("converting huggingface-model to easydel-model.")
@@ -483,9 +487,11 @@ class AutoEasyDelConfig:
         :param sharding_axis_names: Sequence[str]: Specify the order of sharding
         :param query_partition_spec: PartitionSpec: Specify the partitioning of the query tensor
         :param generation_query_partition_spec: PartitionSpec: Specify the partitioning of the query tensor in
-        generation process:param key_partition_spec: PartitionSpec: Partition the key matrix
+        generation process
+        :param key_partition_spec: PartitionSpec: Partition the key matrix
         :param value_partition_spec: PartitionSpec: Specify the partitioning of the value tensor
         :param bias_partition_spec: PartitionSpec: Specify the Attention Bias partition spec
+        :param generation_bias_partition_spec: PartitionSpec: Specify the Attention Bias partition spec for generation
         :param attention_partition_spec: PartitionSpec: Specify the partitioning of the attention weights
         :param shard_attention_computation: bool: whenever to use shard_map for attention
         :param backend: Optional[str]: backend to use for model
