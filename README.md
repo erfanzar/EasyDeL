@@ -25,16 +25,11 @@ Some of the key features provided by EasyDeL include:
 - Serving and API Engines for Using and serving LLMs in JAX as efficient as possible.
 - Automatic Converting Models from JAX-EasyDeL to PyTorch-HF and reverse
 
-> [!NOTE]
-> In case of using EasyDel on Kaggle TPUs you need to upgrade tensorflow version too.
-
-> [!NOTE]
-> EasyDel Will only support JAX>=0.4.22 Due to miss computations being happened in older version and also not bein able
-> to run Flash Attention and Splash Attention (Splash Attention is still under Process)
-
-> [!NOTE]
-> These features collectively aim to simplify and accelerate the training of machine learning models, making it more
-> efficient and accessible for developers working with Jax/Flax.
+> **News**
+>
+> Cohere Model added [Apr 14 2024](https://github.com/erfanzar/EasyDeL/commit/06acb4a1afd7b67982a88b50840b90e73b1c9850)
+>
+> Parameter Quantization Bugs Are Fixed
 
 ## Documentation 💫
 
