@@ -31,6 +31,9 @@ nav:
     - Utils: generated-linen-utils.md
   - Modules:
     - Auto Easydel Model: generated-modules-auto_easydel_model.md
+    - Cohere:
+      - Cohere Configuration: generated-modules-cohere-cohere_configuration.md
+      - Modelling Cohere Flax: generated-modules-cohere-modelling_cohere_flax.md
     - Dbrx:
       - Dbrx Configuration: generated-modules-dbrx-dbrx_configuration.md
       - Modelling Dbrx Flax: generated-modules-dbrx-modelling_dbrx_flax.md
@@ -55,6 +58,9 @@ nav:
     - Grok 1:
       - Grok 1 Configuration: generated-modules-grok_1-grok_1_configuration.md
       - Modelling Grok 1 Flax: generated-modules-grok_1-modelling_grok_1_flax.md
+    - Jetmoe:
+      - Jetmoe Configuration: generated-modules-jetmoe-jetmoe_configuration.md
+      - Modelling Jetmoe Flax: generated-modules-jetmoe-modelling_jetmoe_flax.md
     - Llama:
       - Llama Configuration: generated-modules-llama-llama_configuration.md
       - Modelling Llama Flax: generated-modules-llama-modelling_llama_flax.md
@@ -161,6 +167,7 @@ nav:
       - Utils: generated-trainer-dpo-utils.md
     - Sft:
       - Stf Trainer: generated-trainer-sft-stf_trainer.md
+      - Utils: generated-trainer-sft-utils.md
     - Training Configurations: generated-trainer-training_configurations.md
     - Utils: generated-trainer-utils.md
     - Vision Causal Language Model Trainer:
