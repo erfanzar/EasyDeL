@@ -371,7 +371,7 @@ class BaseJAXAttentionModule(nn.Module):
         if is_initialized:
             *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
             cur_index = cache_index.value
-            if query_states.shape[1] != 1 and self.config.use_sharded_kv_caching:
+            if query_states.shape[1] == 1 and self.config.use_sharded_kv_caching:
                 mesh = self.config.jax_mesh()
 
                 def fn(
@@ -386,10 +386,10 @@ class BaseJAXAttentionModule(nn.Module):
                     axis_index = jax.lax.axis_index("sp")
                     _cur_index = _cur_index - axis_index * sp_size
                     _key, _value = jax.lax.cond(
-                        jnp.logical_and(cur_index >= 0, _cur_index < sp_size),
+                        jnp.logical_and(_cur_index >= 0, _cur_index < sp_size),
                         lambda: (
-                            _cached_key.at[:, cur_index].set(_key[:, -1]),
-                            _cached_value.at[:, cur_index].set(_value[:, -1]),
+                            _cached_key.at[:, _cur_index].set(_key[:, -1]),
+                            _cached_value.at[:, _cur_index].set(_value[:, -1]),
                         ),
                         lambda: (_cached_key, _cached_value),
                     )
