@@ -6,7 +6,7 @@ import jax.numpy as jnp
 import numpy as onp
 import transformers.modeling_flax_outputs
 from einops import rearrange
-import fjformer.linen as nn
+from fjformer import linen as nn
 from flax.core import FrozenDict
 from jax import numpy as np
 from transformers.modeling_flax_outputs import FlaxCausalLMOutput

@@ -9,7 +9,7 @@ import jax.numpy as jnp
 from jax import lax
 import flax.linen
 from jax.sharding import PartitionSpec
-import fjformer.linen as nn
+from fjformer import linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
 from flax.linen import partitioning as nn_partitioning
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze

@@ -19,7 +19,7 @@ from functools import partial
 import flax.linen
 from typing import Optional, Tuple, Sequence
 
-import fjformer.linen as nn
+from fjformer import linen as nn
 import jax
 import jax.numpy as jnp
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze

@@ -15,7 +15,7 @@
 
 from typing import Any, Optional, Tuple
 import flax.linen
-import fjformer.linen as nn
+from fjformer import linen as nn
 import flax.linen.partitioning
 import jax
 import jax.numpy as jnp
