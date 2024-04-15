@@ -508,7 +508,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                     }
 
                             pbar.update(1)
-                            pbar.set_postfix(**train_metrics)
+                            pbar.set_postfix(**{k.replace("train/", ""): v for k, v in train_metrics.items()})
                             if not self.arguments.performance_mode:
                                 train_metrics.update({
                                     f"grad_norm/{layer_name}": grad_norm.tolist()
@@ -668,9 +668,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
                             )
 
                     pbar.update(1)
-                    pbar.set_postfix(
-                        **log_metrics
-                    )
+                    pbar.set_postfix(**{k.replace("eval/", ""): v for k, v in log_metrics.items()})
                     yield log_metrics
             except KeyboardInterrupt:
                 termcolor.cprint(
