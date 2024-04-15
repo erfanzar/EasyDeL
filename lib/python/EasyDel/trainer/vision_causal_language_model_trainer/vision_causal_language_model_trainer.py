@@ -451,9 +451,7 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
                                         train_metrics
                                     )
 
-                            pbar.set_postfix(
-                                **log_metrics
-                            )
+                            pbar.set_postfix(**{k.replace("train/", ""): v for k, v in log_metrics.items()})
                             if self.arguments.training_time is not None:
                                 if time.time() - start_time > self.arguments.training_time:
                                     raise EasyDelTimerError("Time Out")
@@ -607,9 +605,7 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
                     log_metrics = copy.deepcopy(eval_metrics)
                     eval_metrics.update(**self.arguments.captured_memory)
                     pbar.update(1)
-                    pbar.set_postfix(
-                        **log_metrics
-                    )
+                    pbar.set_postfix(**{k.replace("eval/", ""): v for k, v in log_metrics.items()})
                     yield eval_metrics
             except KeyboardInterrupt:
                 termcolor.cprint(

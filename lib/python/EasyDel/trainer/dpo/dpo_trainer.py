@@ -1086,9 +1086,7 @@ class DPOTrainer(BaseTrainer, ABC):
                                             train_metrics
                                         )
                                 pbar.update(1)
-                                pbar.set_postfix(
-                                    **log_metrics
-                                )
+                                pbar.set_postfix(**{k.replace("train/", ""): v for k, v in log_metrics.items()})
                             else:
                                 break
                 except KeyboardInterrupt:
@@ -1232,7 +1230,7 @@ class DPOTrainer(BaseTrainer, ABC):
                             )
 
                     pbar.update(1)
-                    pbar.set_postfix(**log_metrics)
+                    pbar.set_postfix(**{k.replace("eval/", ""): v for k, v in log_metrics.items()})
                     yield eval_metrics
             except KeyboardInterrupt:
                 termcolor.cprint(
