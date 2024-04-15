@@ -27,6 +27,8 @@ Some of the key features provided by EasyDeL include:
 
 > **News**
 >
+> Sharing Key and Value Cache for Large Sequence Length across devices are now Fixed (Attention Models).
+>
 > Cohere Model added [Apr 14 2024](https://github.com/erfanzar/EasyDeL/commit/06acb4a1afd7b67982a88b50840b90e73b1c9850)
 >
 > Parameter Quantization Bugs Are Fixed
