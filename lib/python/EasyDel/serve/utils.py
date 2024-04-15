@@ -1,6 +1,8 @@
+import chex
+import fjformer.linen
 import jax
 from fjformer import make_shard_and_gather_fns, match_partition_rules, with_sharding_constraint
-from typing import Optional, List
+from typing import Optional, List, Callable, Any
 from flax.core import freeze
 from flax.traverse_util import unflatten_dict
 from jax import numpy as jnp
@@ -151,13 +153,41 @@ def shard_params(
 def create_generate_function(
         model: EasyDelFlaxPretrainedModel,
         generation_config: GenerationConfig,
-        params: dict | jax.tree_util.PyTreeDef,
+        params: Union[dict, jax.tree_util.PyTreeDef],
         generation_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp"),
         output_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp"),
-        logits_processor: LogitsProcessor = None,
+        logits_processor: Optional[LogitsProcessor] = None,
         return_prediction_only: bool = True
-):
-    def generate_fn(parameters, input_ids, attention_mask):
+) -> Callable[[Union[dict, jax.tree_util.PyTreeDef], chex.Array, chex.Array], chex.Array]:
+    """Create a sharded function for text generation using a Flax model.
+
+        :param model :EasyDelFlaxPretrainedModel: The Flax model used for text generation.
+        :param generation_config :GenerationConfig: Configuration for text generation.
+        :param params :dict or jax.tree_util.PyTreeDef: Parameters of the model or a PyTree representing the model's
+            parameters.
+        :param generation_partition_spec :PartitionSpec: Sharding specification for generation inputs. Defaults to
+            PartitionSpec(("dp", "fsdp"), "sp").
+        :param output_partition_spec: PartitionSpec: Sharding specification for output sequences. Defaults to
+            PartitionSpec(("dp", "fsdp"), "sp").
+        :param logits_processor :LogitsProcessor: Processor for model logits. Defaults to None.
+        :param return_prediction_only :bool: Whether to return only the generated sequences. Defaults to True.
+
+    :return :Callable[[Any, chex.Array, chex.Array], chex.Array]: Sharded function for text generation.
+
+    """
+
+    def generate_fn(
+            parameters: Union[dict, jax.tree_util.PyTreeDef],
+            input_ids: chex.Array,
+            attention_mask: chex.Array
+    ) -> chex.Array:
+        """Generate text sequences using the provided model and parameters.
+
+        :param parameters:Union[dict, jax.tree_util.PyTreeDef]: Model parameters.
+        :param input_ids: chex.Array: Input token IDs.
+        :param attention_mask:chex.Array: Attention mask.
+        :return: Generated array sequences.
+        """
         input_ids = with_sharding_constraint(
             input_ids,
             generation_partition_spec
@@ -172,14 +202,26 @@ def create_generate_function(
             params=parameters,
             generation_config=generation_config,
             logits_processor=logits_processor
-
         )
         return predict.sequences[:, input_ids.shape[1]:] if return_prediction_only else predict.sequences
+
+    def get_partitions(tree):
+        """Retrieve sharding specifications for model parameters."""
+        if not isinstance(tree, fjformer.linen.LinearBitKernel):
+            return getattr(tree.sharding, "spec", PartitionSpec(None))
+        else:
+            kernel_sharding = getattr(tree.kernel.sharding, "spec", PartitionSpec(None))
+            scale_sharding = getattr(tree.scale.sharding, "spec", PartitionSpec(None))
+            return fjformer.linen.LinearBitKernel(
+                kernel=kernel_sharding,
+                scale=scale_sharding,
+                _is_quantized=PartitionSpec(None)  # type:ignore
+            )
 
     return pjit(
         generate_fn,
         in_shardings=(
-            jax.tree_util.tree_map(lambda tree: getattr(tree.sharding, "spec", PartitionSpec(None)), params),
+            jax.tree_util.tree_map(get_partitions, params),
             generation_partition_spec,
             generation_partition_spec
         ),
