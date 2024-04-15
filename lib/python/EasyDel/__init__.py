@@ -13,7 +13,8 @@ from .serve import (
     PyTorchServer as PyTorchServer,
     PyTorchServerConfig as PyTorchServerConfig,
     JAXServer as JAXServer,
-    JAXServerConfig as JAXServerConfig
+    JAXServerConfig as JAXServerConfig,
+    create_generate_function as create_generate_function
 )
 
 from .modules.llama import (
@@ -240,6 +241,7 @@ __all__ = (
     "PyTorchServerConfig",
     "JAXServer",
     "JAXServerConfig",
+    "create_generate_function",
 
     # Models
 
