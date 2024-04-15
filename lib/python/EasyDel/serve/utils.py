@@ -1,5 +1,5 @@
 import jax
-from fjformer import make_shard_and_gather_fns, match_partition_rules
+from fjformer import make_shard_and_gather_fns, match_partition_rules, with_sharding_constraint
 from typing import Optional, List
 from flax.core import freeze
 from flax.traverse_util import unflatten_dict
@@ -10,6 +10,12 @@ from fjformer.checkpoint import get_dtype
 from gradio.themes.base import Base
 from gradio.themes.utils import colors, fonts, sizes
 from typing import Union
+
+from transformers import GenerationConfig, LogitsProcessor
+
+from ..modules.easydel_modelling_utils import EasyDelFlaxPretrainedModel
+from jax.sharding import PartitionSpec
+from jax.experimental.pjit import pjit
 
 
 class InstructRequest(BaseModel):
@@ -115,11 +121,14 @@ def get_dtype(dtype):
     return dtype
 
 
-def shard_params(params, partition_rules,
-                 shard_mesh_shape=(1, -1, 1, 1),
-                 backend='gpu',
-                 shard_mesh=("dp", "fsdp", "tp", "sp"), do_unf=True,
-                 dtype='fp16'):
+def shard_params(
+        params,
+        partition_rules,
+        shard_mesh_shape=(1, -1, 1, 1),
+        backend='gpu',
+        shard_mesh=("dp", "fsdp", "tp", "sp"), do_unf=True,
+        dtype='fp16'
+):
     dtype = get_dtype(dtype)
     params = unflatten_dict(params) if do_unf else params
     params = freeze(params)
@@ -137,3 +146,42 @@ def shard_params(params, partition_rules,
         )
         params = jax.tree_util.tree_map(lambda fn, x: fn(x), shard_fns, params)
     return params, mesh
+
+
+def create_generate_function(
+        model: EasyDelFlaxPretrainedModel,
+        generation_config: GenerationConfig,
+        params: dict | jax.tree_util.PyTreeDef,
+        generation_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp"),
+        output_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp"),
+        logits_processor: LogitsProcessor = None,
+        return_prediction_only: bool = True
+):
+    def generate_fn(parameters, input_ids, attention_mask):
+        input_ids = with_sharding_constraint(
+            input_ids,
+            generation_partition_spec
+        )
+        attention_mask = with_sharding_constraint(
+            attention_mask,
+            generation_partition_spec
+        )
+        predict = model.generate(
+            input_ids,
+            attention_mask=attention_mask,
+            params=parameters,
+            generation_config=generation_config,
+            logits_processor=logits_processor
+
+        )
+        return predict.sequences[:, input_ids.shape[1]:] if return_prediction_only else predict.sequences
+
+    return pjit(
+        generate_fn,
+        in_shardings=(
+            jax.tree_util.tree_map(lambda tree: getattr(tree.sharding, "spec", PartitionSpec(None)), params),
+            generation_partition_spec,
+            generation_partition_spec
+        ),
+        out_shardings=output_partition_spec
+    )
