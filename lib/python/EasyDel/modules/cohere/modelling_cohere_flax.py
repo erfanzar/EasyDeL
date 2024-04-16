@@ -31,7 +31,6 @@ from ..flax_modelling_utils import (
 )
 
 re_mat = flax.linen.partitioning.remat
-from transformers import CohereForCausalLM
 
 
 class FlaxCohereEmbedding(nn.Module):
