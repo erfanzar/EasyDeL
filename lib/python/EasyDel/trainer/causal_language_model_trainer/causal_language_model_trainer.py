@@ -166,7 +166,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
         sharded_eval_step_function = pjit(
             create_casual_language_model_evaluation_step(self.arguments.step_partition_spec),
             in_shardings=(state_partition_spec, PartitionSpec()),
-            out_shardings=(PartitionSpec(), PartitionSpec()),
+            out_shardings=(PartitionSpec(), PartitionSpec(), PartitionSpec()),
             donate_argnums=(0, 0),
         )
 
@@ -261,7 +261,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
                         sharded_eval_step_function = pjit(
                             create_casual_language_model_evaluation_step(self.arguments.step_partition_spec),
                             in_shardings=(state_partition_spec, PartitionSpec()),
-                            out_shardings=(PartitionSpec(), PartitionSpec()),
+                            out_shardings=(PartitionSpec(), PartitionSpec(), PartitionSpec()),
                             donate_argnums=(0, 0),
                         )
 
@@ -473,6 +473,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                     "train/regularization_z_loss": metrics["regularization_z_loss"].tolist(),
                                     "train/epoch": epoch,
                                 }
+
                                 train_metrics.update(
                                     {
                                         "calculating_metrics_step_time": (
@@ -506,7 +507,13 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                         "train/regularization_z_loss": metrics["regularization_z_loss"].tolist(),
                                         "train/epoch": epoch,
                                     }
-
+                            aux_loss = metrics["aux_loss"]
+                            if aux_loss is not None:
+                                train_metrics.update(
+                                    {
+                                        "train/aux_loss": aux_loss.tolist()
+                                    }
+                                )
                             pbar.update(1)
                             pbar.set_postfix(**{k.replace("train/", ""): v for k, v in train_metrics.items()})
                             if not self.arguments.performance_mode:
@@ -639,7 +646,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
                     )
                     total_time = time.time() - time_start
                     (
-                        loss, accuracy
+                        loss, accuracy, aux_loss
                     ) = metrics
 
                     loss_sum = loss.tolist() if loss_sum is None else loss_sum + loss
@@ -659,6 +666,10 @@ class CausalLanguageModelTrainer(BaseTrainer):
                         "eval/step_time": total_time,
                         "eval/perplexity": jnp.exp(loss).tolist(),
                     }
+                    if aux_loss is not None:
+                        eval_metrics.update(
+                            {"eval/aux_loss": aux_loss}
+                        )
                     log_metrics = copy.deepcopy(eval_metrics)
                     eval_metrics.update(self.arguments.captured_memory)
                     if self.arguments.use_wandb:

@@ -82,10 +82,10 @@ def create_casual_language_model_train_step(
             )
             if aux_loss is not None:
                 loss += aux_loss
-            return loss, (accuracy, z_loss_computed)
+            return loss, (accuracy, z_loss_computed, aux_loss)
 
         grad_fn = jax.value_and_grad(calculate_loss, has_aux=True)
-        (loss__, (accuracy__, z_loss_computed__)), grad = grad_fn(state.params)
+        (loss__, (accuracy__, z_loss_computed__, aux_loss__)), grad = grad_fn(state.params)
         state = state.apply_gradients(grads=grad)
 
         grad_norms = jax.tree_map(jnp.linalg.norm, grad)
@@ -93,7 +93,6 @@ def create_casual_language_model_train_step(
         mean_grad_norm = jax.tree_util.tree_reduce(
             jnp.add, jax.tree_map(jnp.sum, grad_norms)
         ) / jax.tree_util.tree_reduce(jnp.add, jax.tree_map(jnp.size, grad_norms))
-
         metrics = {
             "accuracy": accuracy__,
             "regularization_z_loss": z_loss_computed__,
@@ -101,7 +100,8 @@ def create_casual_language_model_train_step(
             "mean_grad_norm": mean_grad_norm,
             "grad_norms": grad_norms,
         }
-
+        if aux_loss__ is not None:
+            metrics.update({"aux_loss": aux_loss__})
         return state, loss__, metrics
 
     return casual_language_model_train_step
@@ -167,9 +167,9 @@ def create_casual_language_model_evaluation_step(
             )
             if aux_loss is not None:
                 loss += aux_loss
-            return loss, accuracy
+            return loss, (accuracy, aux_loss)
 
-        loss__, accuracy__ = calculate_loss(state.params)
-        return loss__, accuracy__
+        loss__, (accuracy__, aux_loss__) = calculate_loss(state.params)
+        return loss__, accuracy__, aux_loss__
 
     return casual_language_model_evaluation_step

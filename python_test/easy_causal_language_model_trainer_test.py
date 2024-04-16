@@ -5,19 +5,19 @@ import flax.core
 
 from lib.python.EasyDel import (
     CausalLanguageModelTrainer,
-    AutoEasyDelModelForCausalLM,
     TrainArguments,
-    FlaxLlamaForCausalLM,
-    LlamaConfig
+    FlaxMixtralForCausalLM,
+    MixtralConfig
 )
 from jax import numpy as jnp, random
-from datasets import Dataset, IterableDataset
+from datasets import Dataset
+from fjformer import GenerateRNG
 
 SEQUENCE_LENGTH = 128
-DATA_ROW_SIZE = 1000
+DATA_ROW_SIZE = 10000
 BATCH_SIZE = 32
 
-MODEL_CONFIG = LlamaConfig(
+MODEL_CONFIG = MixtralConfig(
     hidden_size=128,
     num_attention_heads=8,
     num_key_value_heads=4,
@@ -26,11 +26,16 @@ MODEL_CONFIG = LlamaConfig(
     gradient_checkpointing="",
     max_position_embeddings=SEQUENCE_LENGTH,
     use_scan_mlp=False,
+    num_local_experts=8,
+    num_experts_per_tok=2,
+    output_router_logits=True
 )
+
+RNG_GEN = GenerateRNG(seed=42)
 
 
 def train():
-    model = FlaxLlamaForCausalLM(
+    model = FlaxMixtralForCausalLM(
         config=MODEL_CONFIG,
         _do_init=True
     )
@@ -43,7 +48,7 @@ def train():
                     SEQUENCE_LENGTH, dtype="i4"
                 ),
                 "input_ids": random.randint(
-                    random.PRNGKey(0), (SEQUENCE_LENGTH, ), 0, 32000, dtype="i4"
+                    RNG_GEN.rng, (SEQUENCE_LENGTH,), 0, 32000, dtype="i4"
                 )
             }
 
@@ -69,7 +74,10 @@ def train():
             param_dtype=dtype,
             track_memory=False,
             save_optimizer_state=True,
-            max_training_steps=DATA_ROW_SIZE // BATCH_SIZE
+            max_training_steps=DATA_ROW_SIZE // BATCH_SIZE,
+            learning_rate=3e-4,
+            optimizer="adamw",
+            scheduler="cosine",
         ),
         dataset_train=example_data,
     )
@@ -78,7 +86,7 @@ def train():
 
 
 def re_train(checkpoint_path: str | os.PathLike):
-    model = FlaxLlamaForCausalLM(
+    model = FlaxMixtralForCausalLM(
         config=MODEL_CONFIG,
         _do_init=False
     )
@@ -87,10 +95,10 @@ def re_train(checkpoint_path: str | os.PathLike):
         for i in range(DATA_ROW_SIZE):
             yield {
                 "attention_mask": jnp.ones(
-                    (SEQUENCE_LENGTH, ), dtype="i4"
+                    (SEQUENCE_LENGTH,), dtype="i4"
                 ),
                 "input_ids": random.randint(
-                    random.PRNGKey(0), (SEQUENCE_LENGTH, ), 0, 32000, dtype="i4"
+                    RNG_GEN.rng, (SEQUENCE_LENGTH,), 0, 32000, dtype="i4"
                 )
             }
 
@@ -116,10 +124,13 @@ def re_train(checkpoint_path: str | os.PathLike):
             dtype=dtype,
             param_dtype=dtype,
             track_memory=False,
-            max_training_steps=DATA_ROW_SIZE // BATCH_SIZE
+            max_training_steps=DATA_ROW_SIZE // BATCH_SIZE,
+            learning_rate=3e-4,
+            optimizer="adamw",
+            scheduler="cosine",
         ),
         dataset_train=example_data,
-        checkpoint_path=checkpoint_path
+        checkpoint_path=checkpoint_path,
     )
 
     output = trainer.train()

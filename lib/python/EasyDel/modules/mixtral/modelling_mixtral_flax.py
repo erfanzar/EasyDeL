@@ -525,7 +525,7 @@ class FlaxMixtralDecoderLayer(nn.Module):
             deterministic: bool = True,
             init_cache: bool = False,
             output_attentions: bool = True,
-            output_router_logits: Optional[bool] = False,
+            output_router_logits: Optional[bool] = None,
     ):
         """
         The __call__ function is the main function of a TransformerEncoderLayer.
@@ -616,7 +616,7 @@ class FlaxMixtralDecoderLayerCollection(nn.Module):
             init_cache: bool = False,
             output_hidden_states: Optional[bool] = False,
             output_attentions: Optional[bool] = False,
-            output_router_logits: Optional[bool] = False,
+            output_router_logits: Optional[bool] = None,
     ):
         """
         The __call__ function is the main function of a TransformerEncoderLayer.
@@ -952,6 +952,8 @@ class FlaxMixtralModule(nn.Module):
             deterministic: bool = True,
             return_dict: bool = True,
     ) -> MoeModelOutput | Tuple:
+        if output_router_logits is None:
+            output_router_logits = self.config.output_router_logits
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError(
                 "You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time")
@@ -1054,6 +1056,9 @@ class FlaxMixtralForCausalLMModule(nn.Module):
             deterministic: bool = True,
             return_dict: bool = True,
     ) -> MoeCausalLMOutput | Tuple:
+
+        if output_router_logits is None:
+            output_router_logits = self.config.output_router_logits
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1077,7 +1082,6 @@ class FlaxMixtralForCausalLMModule(nn.Module):
                 attention_mask=attention_mask
             )
             aux_loss = aux_loss * self.config.router_aux_loss_coef
-
         if not return_dict:
             outputs = (logits,) + tuple(
                 v

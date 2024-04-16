@@ -1093,6 +1093,9 @@ class FlaxQwen2MoeModule(nn.Module):
             return_dict: bool = True,
             extra_embedding: Optional[Union[jnp.ndarray, None]] = None
     ) -> tuple | MoeModelOutput:
+
+        if output_router_logits is None:
+            output_router_logits = self.config.output_router_logits
         """
         The __call__ function is the main function of a Flax model. It takes in input_ids, attention_mask, and position_ids
         and returns the output of the model. The __call__ function also has optional arguments that can be used to control
@@ -1192,9 +1195,9 @@ class FlaxQwen2MoeForCausalLMModule(nn.Module):
             position_ids: chex.Array = None,
             deterministic: bool = True,
             init_cache: bool = False,
-            output_attentions: Optional[bool] = False,
-            output_hidden_states: Optional[bool] = False,
-            output_router_logits: Optional[bool] = False,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            output_router_logits: Optional[bool] = None,
             return_dict: bool = True,
             extra_embedding: Optional[Union[jnp.ndarray, None]] = None
     ):
@@ -1215,6 +1218,12 @@ class FlaxQwen2MoeForCausalLMModule(nn.Module):
         :return: The logits and the hidden states
 
         """
+        if output_router_logits is None:
+            output_router_logits = self.config.output_router_logits
+        if output_hidden_states is None:
+            output_hidden_states = self.config.output_hidden_states
+        if output_attentions is None:
+            output_attentions = self.config.output_attentions
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,

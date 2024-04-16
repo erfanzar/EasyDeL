@@ -1062,6 +1062,8 @@ class FlaxGrok1Module(nn.Module):
             deterministic: bool = True,
             return_dict: bool = True,
     ) -> MoeModelOutput | Tuple:
+        if output_router_logits is None:
+            output_router_logits = self.config.output_router_logits
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError(
                 "You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time")
@@ -1161,6 +1163,8 @@ class FlaxGrok1ForCausalLMModule(nn.Module):
             deterministic: bool = True,
             return_dict: bool = True,
     ) -> MoeCausalLMOutput | Tuple:
+        if output_router_logits is None:
+            output_router_logits = self.config.output_router_logits
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
