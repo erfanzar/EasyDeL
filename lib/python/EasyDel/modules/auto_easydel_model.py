@@ -1,5 +1,6 @@
 import functools
 import gc
+import re
 import warnings
 from functools import partial
 from typing import Sequence, Optional, Tuple, Mapping, Callable, Type, Any, List
@@ -449,7 +450,24 @@ class AutoEasyDelModelForCausalLM:
             )
         with cfg.jax_mesh():
             logger.debug("converting huggingface-model to easydel-model.")
-            params = trf(state_dict, config=config, device=device, shard_fns=shard_fns)
+            if load_in_8bit:
+                if bit_targeted_params is None:
+                    warnings.warn(
+                        "since `bit_targeted_params` is set to None, auto loader will convert all of"
+                        " kernels(weights) and embeddings to 8bit by default"
+                    )
+                    bit_targeted_params = [
+                        "kernel",
+                        "embedding"
+                    ]
+            params = trf(
+                state_dict,
+                config=config,
+                device=device,
+                shard_fns=shard_fns,
+                convert_to_8bit=load_in_8bit,
+                params_pattern_selection=re.compile("({})".format("|".join(bit_targeted_params)))
+            )
         logger.debug("deleting huggingface-model")
 
         del state_dict
@@ -459,21 +477,7 @@ class AutoEasyDelModelForCausalLM:
         if is_flatten(params):
             logger.info("converted parameters are flatten making them unflatten ")
             params = unflatten_dict(params)
-        if load_in_8bit:
-            if bit_targeted_params is None:
-                warnings.warn(
-                    "since `bit_targeted_params` is set to None, auto loader will convert all of"
-                    " kernels(weights) and embeddings to 8bit by default"
-                )
-                bit_targeted_params = [
-                    "kernel",
-                    "embedding"
-                ]
-            params = fjformer.linen.linen.quantize_parameters(
-                params=params,
-                filter_list_quantization=bit_targeted_params,
-                int_dtype=jax.numpy.int8
-            )
+
         return ed_model, params
 
 
