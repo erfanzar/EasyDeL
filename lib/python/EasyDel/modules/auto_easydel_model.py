@@ -2,8 +2,9 @@ import functools
 import gc
 import warnings
 from functools import partial
-from typing import Sequence, Optional, Tuple, Mapping, Callable, Type, Any
+from typing import Sequence, Optional, Tuple, Mapping, Callable, Type, Any, List
 
+import fjformer.linen.linen
 import flax.traverse_util
 import jax.numpy
 from fjformer import match_partition_rules, make_shard_and_gather_fns
@@ -343,7 +344,9 @@ class AutoEasyDelModelForCausalLM:
             backend: Optional[str] = None,
             config_kwargs: Optional[Mapping[str, Any]] = None,
             auto_shard_params: bool = False,
-            partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
+            partition_rules: Optional[Tuple[Tuple[str, PartitionSpec], ...]] = None,
+            load_in_8bit: bool = False,
+            bit_targeted_params: Optional[List[str]] = None,
             **kwargs
     ) -> Tuple[EasyDelFlaxPretrainedModel, dict]:
         """
@@ -375,6 +378,8 @@ class AutoEasyDelModelForCausalLM:
         :param auto_shard_params: bool: whether to automaticly shard the model parameters
         :param partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]]: custom partition rules to create partition
         specs required to shard model parameters
+        :param load_in_8bit: bool: whether to load model parameters and convert them into 8bit
+        :param bit_targeted_params: Optional[List[str]]: list of targeted parameters to be converted into 8bit
         :param kwargs: Pass additional arguments to the model and config classes
         :return: A model and parameters
 
@@ -454,7 +459,21 @@ class AutoEasyDelModelForCausalLM:
         if is_flatten(params):
             logger.info("converted parameters are flatten making them unflatten ")
             params = unflatten_dict(params)
-
+        if load_in_8bit:
+            if bit_targeted_params is None:
+                warnings.warn(
+                    "since `bit_targeted_params` is set to None, auto loader will convert all of"
+                    " kernels(weights) and embeddings to 8bit by default"
+                )
+                bit_targeted_params = [
+                    "kernel",
+                    "embedding"
+                ]
+            params = fjformer.linen.linen.quantize_parameters(
+                params=params,
+                filter_list_quantization=bit_targeted_params,
+                int_dtype=jax.numpy.int8
+            )
         return ed_model, params
 
 

@@ -3,6 +3,7 @@ import itertools
 import math
 from typing import Optional, Tuple, Union, List, Dict, Any, Callable, Sequence, TypeVar
 
+import fjformer
 from jax.core import ShapedArray
 import chex
 from fjformer import linen as nn
@@ -241,7 +242,7 @@ class MambaRMSNorm(nn.Module):
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
         output = self._norm(x).astype(self.dtype)
-        weight = jnp.asarray(self.weight, self.dtype)
+        weight = jnp.asarray(fjformer.linen.linen.control_quantization(self.weight, self.dtype))
         return output * weight
 
 

@@ -26,6 +26,8 @@ Some of the key features provided by EasyDeL include:
 - Automatic Converting Models from JAX-EasyDeL to PyTorch-HF and reverse
 
 > **News**
+> 
+> `load_in_8bit` is now available for all the models, and requires to upgrade _fjformer to 0.0.50_
 >
 > Sharing Key and Value Cache for Large Sequence Length across devices are now Fixed (Attention Models).
 >
