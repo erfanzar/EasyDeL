@@ -355,7 +355,7 @@ class JAXServer(GradioUserInference):
             init_shape: tuple = (1, 1),
             do_memory_log: bool = False,
             verbose: bool = True
-    ):
+    ) -> "JAXServer":
         """
         The load function is used to load a pretrained model from disk.
 
@@ -449,7 +449,7 @@ class JAXServer(GradioUserInference):
             model_config_kwargs: Optional[Mapping[str, Any]] = None,
             verbose: bool = True,
             **kwargs
-    ):
+    ) -> "JAXServer":
 
         model, params = AutoEasyDelModelForCausalLM.from_pretrained(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
@@ -498,7 +498,7 @@ class JAXServer(GradioUserInference):
             do_memory_log: bool = False,
             shard_parameters: bool = False,
             verbose: bool = True
-    ):
+    ) -> "JAXServer":
         """
         The from_parameters function is used to load a model from the parameters of a pretrained model.
         It takes in the following arguments:

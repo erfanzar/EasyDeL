@@ -41,7 +41,7 @@ in case of serving models or using them with `JAX` The Easiest and the best way 
 is EasyDeL (you can explore more if you want) you have 4 ways to use models
 
 1. Create The Pipeline and everything from scratch yourself.
-2. Use JAXServe API from EasyDeL.
+2. Use JAXServer API from EasyDeL.
 3. use ServeEngine from EasyDeL.
 4. use builtin generate method from HuggingFace Transformers and EasyDeL
 
@@ -131,4 +131,62 @@ pickle.dump((model, params, tokenizer), open("EasyDeL-Qwen7B-Chat", "wb"))
 
 (model, params, tokenizer) = pickle.load(open("EasyDeL-Qwen7B-Chat", "wb"))
 
+```
+
+### Using Quantized Model via JAXServer
+
+```python
+from jax import numpy as jnp
+from jax.sharding import PartitionSpec
+from EasyDel import JAXServer, JAXServerConfig
+
+import torch
+
+server_config = JAXServerConfig(
+    mesh_axes_shape=(1, 1, 1, -1),
+    generation_ps=PartitionSpec(("dp", "fsdp"), "sp"),
+    max_sequence_length=1024,
+    max_new_tokens=4096,
+    max_compile_tokens=128
+)
+
+server = JAXServer.from_torch_pretrained(
+    pretrained_model_name_or_path="Qwen/Qwen1.5-7B-Chat",
+    server_config=server_config,
+    sharding_axis_dims=(1, 1, 1, -1),
+    model_config_kwargs=dict(
+        gradient_checkpointing="",
+        use_scan_mlp=False,
+        shard_attention_computation=True,
+        use_sharded_kv_caching=True
+    ),
+    dtype=jnp.float16,
+    param_dtype=jnp.float16,
+    auto_shard_params=True,
+    load_in_8bit=True,
+    torch_dtype=torch.float16,
+    device_map="cpu"  # this one will be passed to transformers.AutoModelForCausalLM
+)
+
+conversation = []
+while True:
+    conversation.append({"role": "user", "content": input("\n## User: ")})
+    printed_response_length = 0
+    print("\n## Assistant : ", end="")
+    response = ""
+    for response, used_tokens in server.sample(
+            server.tokenizer.apply_chat_template(
+                conversation,
+                tokenize=False
+            )
+    ):
+        print(response[printed_response_length:], end="")
+        printed_response_length = len(response)
+    conversation.append({"role": "assistant", "content": response})
+
+```
+
+or you can launch it for serve 
+```python
+server.gradio_inference.launch()
 ```
