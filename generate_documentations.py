@@ -154,14 +154,20 @@ theme:
         ("Examples", "Mistral Models"): "Mistral.md",
         ("Examples", "MosaicMPT Models"): "MosaicMPT.md",
         ("Examples", "Easy Attention"): "EasyAttentionExample.md",
+        ("Examples", "Model Parameter Quantization"): "Parameter-Quantization.md",
         ("CONTRIBUTING",): "CONTRIBUTING.md"
 
     }
-
+    cache = {("APIs",) + k: v for k, v in cache.items()}
     cache = statics | cache
     pages = unflatten_dict(cache)
+
+    def custom_sort(page):
+        order = {'Home': 0, 'install': 1, "AvailableModels": 2, "Examples": 3}
+        return 0, order.get(page, 4), page
+
     yaml_data = {
-        "nav": pages,
+        "nav": {key: pages[key] for key in sorted(pages.keys(), key=custom_sort)},
     }
     buff = open("mkdocs.yml", "w")
     yaml.safe_dump(yaml_data, buff)
