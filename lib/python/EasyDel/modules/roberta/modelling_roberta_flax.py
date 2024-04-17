@@ -1013,6 +1013,7 @@ class FlaxRobertaForMaskedLMModule(nn.Module):
         hidden_states = outputs[0]
         if self.config.tie_word_embeddings:
             shared_embedding = self.roberta.variables["params"]["embeddings"]["word_embeddings"]["embedding"]
+            shared_embedding = fjformer.linen.linen.control_quantization(shared_embedding, self.param_dtype)
         else:
             shared_embedding = None
 
@@ -1361,6 +1362,7 @@ class FlaxRobertaForCausalLMModule(nn.Module):
         hidden_states = outputs[0]
         if self.config.tie_word_embeddings:
             shared_embedding = self.roberta.variables["params"]["embeddings"]["word_embeddings"]["embedding"]
+            shared_embedding = fjformer.linen.linen.control_quantization(shared_embedding, self.param_dtype)
         else:
             shared_embedding = None
 

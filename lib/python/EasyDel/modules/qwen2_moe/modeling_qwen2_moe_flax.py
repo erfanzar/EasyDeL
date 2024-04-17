@@ -2,6 +2,7 @@ import math
 from functools import partial
 from typing import Optional, Tuple, Union
 
+import fjformer
 from einops import einops
 import jax
 import jax.numpy as jnp
@@ -1237,7 +1238,8 @@ class FlaxQwen2MoeForCausalLMModule(nn.Module):
         )
         hidden_states = outputs.last_hidden_state
         if self.config.tie_word_embeddings:
-            shared_kernel = self.model.variables["params"]["embed_tokens"]["embedding"].T
+            shared_kernel = self.model.variables["params"]["embed_tokens"]["embedding"]
+            shared_kernel = fjformer.linen.linen.control_quantization(shared_kernel, self.param_dtype).T
             logits = self.lm_head.apply(
                 {"params": {"kernel": shared_kernel}}, hidden_states)
         else:

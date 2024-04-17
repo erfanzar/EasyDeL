@@ -1,5 +1,7 @@
 import random
 from functools import partial
+
+import fjformer
 from flax.linen import make_causal_mask
 from jax.random import PRNGKey
 import math
@@ -1159,7 +1161,9 @@ class FlaxWhisperForConditionalGenerationModule(nn.Module):
 
         if self.config.tie_word_embeddings:
             shared_embedding = self.model.decoder.embed_tokens.variables["params"]["embedding"]
-            lm_logits = self.lm_head.apply({"params": {"kernel": shared_embedding.T}}, hidden_states)
+
+            shared_embedding = fjformer.linen.linen.control_quantization(shared_embedding, self.param_dtype).T
+            lm_logits = self.lm_head.apply({"params": {"kernel": shared_embedding}}, hidden_states)
         else:
             lm_logits = self.lm_head(hidden_states)
 
@@ -1247,7 +1251,9 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
 
             if self.config.tie_word_embeddings:
                 shared_embedding = module.model.decoder.embed_tokens.variables["params"]["embedding"]
-                lm_logits = module.lm_head.apply({"params": {"kernel": shared_embedding.T}}, hidden_states)
+
+                shared_embedding = fjformer.linen.linen.control_quantization(shared_embedding, self.param_dtype).T
+                lm_logits = module.lm_head.apply({"params": {"kernel": shared_embedding}}, hidden_states)
             else:
                 lm_logits = module.lm_head(hidden_states)
 
