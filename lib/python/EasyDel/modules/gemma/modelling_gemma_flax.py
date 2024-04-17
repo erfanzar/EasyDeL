@@ -40,11 +40,12 @@ class FlaxGemmaRMSNorm(nn.Module):
         self.weight_kernel = self.param("kernel", lambda _, shape: jnp.ones(shape), self.config.hidden_size)
 
     def __call__(self, hidden_states):
-        variance = jnp.asarray(hidden_states, dtype=jnp.float32)
-        variance = jnp.power(variance, 2)
-        variance = variance.mean(-1, keepdims=True)
-        hidden_states = hidden_states / jnp.sqrt(variance + self.epsilon)
-        kernel  = nn.linen.control_quantization(self.weight_kernel, self.dtype)
+        hidden_states = hidden_states * (
+                1 / jnp.sqrt(jnp.power(
+            jnp.asarray(hidden_states, dtype=jnp.float32), 2
+        ).mean(-1, keepdims=True) + self.epsilon)
+        )
+        kernel = nn.linen.control_quantization(self.weight_kernel, self.dtype)
         return (1 + kernel) * jnp.asarray(hidden_states, dtype=self.dtype)
 
 
@@ -53,7 +54,7 @@ class FlaxGemmaRotaryEmbedding(nn.Module):
     dtype: jnp.dtype = jnp.float32
 
     def __call__(self, freq_cis, key_states, query_states, position_ids):
-        b,s,h,d =key_states.shape
+        b, s, h, d = key_states.shape
         sin_pos, cos_pos = freq_cis
         key_states = apply_rotary_pos_emb(
             key_states,
