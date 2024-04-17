@@ -859,14 +859,12 @@ class JAXServer(GradioUserInference):
         else:
             raise ValueError("UnKnown Mode for sample_gradio available modes are only Chat or Instruct")
         history.append([prompt, ""])
-        responses = ""
         for response, _ in self.sample(
                 string=string,
                 greedy=greedy,
                 max_new_tokens=max_new_tokens,
         ):
-            responses += response
-            history[-1][-1] = responses
+            history[-1][-1] = response
             yield "", history
 
     def sample(self,
