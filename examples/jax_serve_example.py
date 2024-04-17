@@ -118,8 +118,8 @@ def main(argv):
     FLAGS.sharding_axis_dims = tuple([int(s) for s in FLAGS.sharding_axis_dims])
 
     class JAXServerC(JAXServer):
-        @staticmethod
-        def format_chat(history: List[List[str]], prompt: str, system: Union[str, None]) -> str:
+
+        def format_chat(self, history: List[List[str]], prompt: str, system: Union[str, None]) -> str:
             return prompter.format_message(
                 history=history,
                 prompt=prompt,
@@ -127,8 +127,7 @@ def main(argv):
                 prefix=None
             )
 
-        @staticmethod
-        def format_instruct(system: str, instruction: str) -> str:
+        def format_instruct(self, system: str, instruction: str) -> str:
             return prompter.format_message(
                 prefix=None,
                 system_message=system,
