@@ -1284,7 +1284,8 @@ class FlaxT5ForConditionalGenerationModule(nn.Module):
 
         if self.config.tie_word_embeddings:
             shared_embedding = self.shared.variables["params"]["embedding"]
-            lm_logits = self.lm_head.apply({"params": {"kernel": shared_embedding.T}}, sequence_output)
+            shared_embedding = fjformer.linen.linen.control_quantization(shared_embedding, self.dtype).T
+            lm_logits = self.lm_head.apply({"params": {"kernel": shared_embedding}}, sequence_output)
         else:
             lm_logits = self.lm_head(sequence_output)
 
@@ -1364,7 +1365,8 @@ class FlaxT5ForConditionalGeneration(FlaxT5PreTrainedModel):
 
             if self.config.tie_word_embeddings:
                 shared_embedding = module.shared.variables["params"]["embedding"]
-                lm_logits = module.lm_head.apply({"params": {"kernel": shared_embedding.T}}, sequence_output)
+                shared_embedding = fjformer.linen.linen.control_quantization(shared_embedding, self.dtype).T
+                lm_logits = module.lm_head.apply({"params": {"kernel": shared_embedding}}, sequence_output)
             else:
                 lm_logits = module.lm_head(sequence_output)
 
