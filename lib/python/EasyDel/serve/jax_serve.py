@@ -701,19 +701,55 @@ class JAXServer(GradioUserInference):
             "tokens_used": used_tokens,
         }
 
-    @staticmethod
-    def format_instruct(system: str, instruction: str) -> str:
+    def format_instruct(self, system: str, instruction: str) -> str:
         """
         Here you will get the system and instruction from user, and you can apply your prompting style
         """
-        raise NotImplementedError()
+        conversation = []
+        if system is not None and system != "":
+            conversation.append({
+                "role": "system", "content": system
+            })
+        conversation.append({
+            "role": "user", "content": instruction
+        })
+        return self.tokenizer.apply_chat_template(
+            conversation,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
 
-    @staticmethod
-    def format_chat(history: List[List[str]], prompt: str, system: Union[str, None]) -> str:
+    def format_chat(self, history: List[List[str]], prompt: str, system: Union[str, None]) -> str:
         """
         Here you will get the system, prompt and history from user, and you can apply your prompting style
         """
-        raise NotImplementedError()
+        conversation = []
+        if system is not None and system != "":
+            conversation.append({
+                "role": "system", "content": system
+            })
+        for conv in history:
+            conversation.append(
+                {
+                    "role": "user", "content": conv[0]
+                }
+            )
+            conversation.append(
+                {
+                    "role": "assistant", "content": conv[1]
+                }
+            )
+
+        conversation.append(
+            {
+                "role": "user", "content": prompt
+            }
+        )
+        return self.tokenizer.apply_chat_template(
+            conversation,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
 
     def forward_instruct(self, data: InstructRequest):
         """

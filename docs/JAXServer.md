@@ -45,18 +45,19 @@ The config input is a dictionary that contains the following keys:
     * _Default Value has been set to  `True`_
 
 ## JAXServer Functions
+
 `JAXServer` has `format_chat` and `format_instruct` funcs that you have to implement them to prompt your model
 
 ```python
-@staticmethod
-def format_instruct(system: str, instruction: str)->str:
+
+def format_instruct(self, system: str, instruction: str) -> str:
     """
     Here you will get the system and instruction from user, and you can apply your prompting style
     """
     raise NotImplementedError()
 
-@staticmethod
-def format_chat(history: typing.List[str], prompt: str, system: typing.Union[str, None])->str:
+
+def format_chat(self, history: typing.List[str], prompt: str, system: typing.Union[str, None]) -> str:
     """
     Here you will get the system, prompt and history from user, and you can apply your prompting style
     """
@@ -69,12 +70,12 @@ what does this do and how this works ? here's the inputs that `sample` function 
 
 ```python
 def sample(self,
-            string,
-            *,
-            greedy: bool = False,
-            max_new_tokens: int = None,
-            **kwargs
-            ) -> [str, int]:
+           string,
+           *,
+           greedy: bool = False,
+           max_new_tokens: int = None,
+           **kwargs
+           ) -> [str, int]:
     ...
 ```
 
