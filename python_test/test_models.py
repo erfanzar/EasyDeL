@@ -110,6 +110,7 @@ class EasyModelsTest(TestCase):
                 transform_function(
                     state_dict=hf_model.state_dict(),
                     device=jax.devices("cpu")[0],
+                    remove_state_dict=True
                 )
         }
         config.add_jax_args()
