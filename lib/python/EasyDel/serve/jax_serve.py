@@ -63,7 +63,7 @@ class JAXServerConfig:
     max_sequence_length: int = 4096
     max_new_tokens: int = 4096
     max_compile_tokens: int = 64
-    temperature: float = 0.1
+    temperature: float = 0.4
     top_p: float = 0.95
     top_k: int = 50
     repetition_penalty: float = 1.2
@@ -75,8 +75,8 @@ class JAXServerConfig:
     logging: bool = True
 
     mesh_axes_names: Sequence[str] = ("dp", "fsdp", "tp", "sp")
-    mesh_axes_shape: Sequence[int] = (1, -1, 1, 1)
-    generation_ps: PartitionSpec = PartitionSpec("dp", "fsdp")
+    mesh_axes_shape: Sequence[int] = (1, 1, 1, -1)
+    generation_ps: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp")
 
     dtype: Union[jnp.dtype, str] = "fp16"
 
@@ -482,7 +482,8 @@ class JAXServer(GradioUserInference):
             server_config=server_config,
             verbose=verbose,
             do_memory_log=do_memory_log,
-            add_params_field=add_params_field
+            add_params_field=add_params_field,
+            shard_parameters=False
         )
 
     @classmethod
@@ -495,6 +496,7 @@ class JAXServer(GradioUserInference):
             server_config: JAXServerConfig = None,
             add_params_field: bool = True,
             do_memory_log: bool = False,
+            shard_parameters: bool = False,
             verbose: bool = True
     ):
         """
@@ -515,6 +517,7 @@ class JAXServer(GradioUserInference):
         :param server_config: Pass in the server_config file for the server
         :param add_params_field: bool: Add a params field to the server
         :param do_memory_log: bool: Log the memory usage of the server
+        :param shard_parameters:bool: whenever a shard model parameters.
         :param verbose: bool: Print out the status of the compilation
         :return: A server object
         
@@ -526,27 +529,28 @@ class JAXServer(GradioUserInference):
             "config_model must contain get_partition_rules functions"
         )
         server = cls(server_config=server_config)
+        if shard_parameters:
+            with server.mesh:
 
-        with server.mesh:
-            logging.info(
-                "matching partition rules"
-            )
-            partition_specs = match_partition_rules(params=params, rules=config_model.get_partition_rules(True))
-            shard_fns, _ = make_shard_and_gather_fns(partition_specs, get_dtype(server.server_config.dtype))
-            logging.info(
-                "sharding parameters across all of the chosen backend(tpu/gpu/cpu)s"
-            )
-            params = flax.traverse_util.flatten_dict(params)
-            shard_fns = flax.traverse_util.flatten_dict(shard_fns)
-            pbar = tqdm.tqdm(params.keys())
-            for key in pbar:
-                key = tuple(key)
-                params[key] = shard_fns[key](params[key])
-                if do_memory_log:
-                    pbar.write(server.get_memory())
-                pbar.set_description("Sharding Params")
-            server.params = flax.traverse_util.unflatten_dict(params)
-            server.params = {"params": server.params} if add_params_field else server.params
+                logging.info(
+                    "matching partition rules"
+                )
+                partition_specs = match_partition_rules(params=params, rules=config_model.get_partition_rules(True))
+                shard_fns, _ = make_shard_and_gather_fns(partition_specs, get_dtype(server.server_config.dtype))
+                logging.info(
+                    "sharding parameters across all of the chosen backend(tpu/gpu/cpu)s"
+                )
+                params = flax.traverse_util.flatten_dict(params)
+                shard_fns = flax.traverse_util.flatten_dict(shard_fns)
+                pbar = tqdm.tqdm(params.keys())
+                for key in pbar:
+                    key = tuple(key)
+                    params[key] = shard_fns[key](params[key])
+                    if do_memory_log:
+                        pbar.write(server.get_memory())
+                    pbar.set_description("Sharding Params")
+                server.params = flax.traverse_util.unflatten_dict(params)
+                server.params = {"params": server.params} if add_params_field else server.params
         server.partition_specs = {"params": partition_specs} if add_params_field else partition_specs
         logging.info(
             "configuring generate functions for the server"

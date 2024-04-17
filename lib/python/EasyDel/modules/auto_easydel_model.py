@@ -466,7 +466,8 @@ class AutoEasyDelModelForCausalLM:
                 device=device,
                 shard_fns=shard_fns,
                 convert_to_8bit=load_in_8bit,
-                params_pattern_selection=re.compile("({})".format("|".join(bit_targeted_params)))
+                params_pattern_selection=re.compile("({})".format("|".join(bit_targeted_params))),
+                remove_state_dict=True
             )
         logger.debug("deleting huggingface-model")
 
