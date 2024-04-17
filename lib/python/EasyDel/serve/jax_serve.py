@@ -25,7 +25,7 @@ from ..utils.utils import RNG
 import multiprocessing as mp
 from typing import Union, Sequence, List
 import chex
-from .utils import InstructRequest, ChatRequest
+from .utils import InstructRequest, ChatRequest, get_partitions
 from jax.experimental.pjit import pjit
 from .gradio_user_interface_base import GradioUserInference
 from ..modules.auto_easydel_model import AutoEasyDelModelForCausalLM
@@ -549,8 +549,10 @@ class JAXServer(GradioUserInference):
                     if do_memory_log:
                         pbar.write(server.get_memory())
                     pbar.set_description("Sharding Params")
-                server.params = flax.traverse_util.unflatten_dict(params)
-                server.params = {"params": server.params} if add_params_field else server.params
+                params = flax.traverse_util.unflatten_dict(params)
+        else:
+            partition_specs = jax.tree_util.tree_map(get_partitions, params)
+        server.params = {"params": params} if add_params_field else params
         server.partition_specs = {"params": partition_specs} if add_params_field else partition_specs
         logging.info(
             "configuring generate functions for the server"
