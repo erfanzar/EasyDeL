@@ -9,10 +9,10 @@ Some of the key features provided by EasyDeL include:
 
 - DPOTrainer, SFTTrainer, and VideoCLM Trainers
 - Serving and API Engines for Using and serving LLMs in JAX as efficiently as possible.
-- Support Storing Params in 8Bit
+- Support Quantization Methods for all the Models.
 - Support for 8, 6, and 4 BIT Operation, for inference and training in JAX
 - A wide range of models in Jax is supported which have never been implemented before such as Falcon, Qwen2, Phi2,
-  Mixtral, Qwen2Moe,and MPT ...
+  Mixtral, Qwen2Moe, Cohere,and MPT ...
 - Integration of flashAttention in JAX for GPUs and TPUs
 - Automatic serving of LLMs with mid and high-level APIs in both JAX and PyTorch
 - LLM Trainer and fine-tuner in JAX
@@ -26,7 +26,7 @@ Some of the key features provided by EasyDeL include:
 - Automatic Converting Models from JAX-EasyDeL to PyTorch-HF and reverse
 
 > **News**
-> 
+>
 > `load_in_8bit` is now available for all the models, and requires to upgrade _fjformer to 0.0.50_
 >
 > Sharing Key and Value Cache for Large Sequence Length across devices are now Fixed (Attention Models).

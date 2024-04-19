@@ -25,7 +25,7 @@ from ..utils.utils import RNG
 import multiprocessing as mp
 from typing import Union, Sequence, List
 import chex
-from .utils import InstructRequest, ChatRequest
+from .utils import InstructRequest, ChatRequest, get_partitions
 from jax.experimental.pjit import pjit
 from .gradio_user_interface_base import GradioUserInference
 from ..modules.auto_easydel_model import AutoEasyDelModelForCausalLM
@@ -63,7 +63,7 @@ class JAXServerConfig:
     max_sequence_length: int = 4096
     max_new_tokens: int = 4096
     max_compile_tokens: int = 64
-    temperature: float = 0.1
+    temperature: float = 0.4
     top_p: float = 0.95
     top_k: int = 50
     repetition_penalty: float = 1.2
@@ -75,8 +75,8 @@ class JAXServerConfig:
     logging: bool = True
 
     mesh_axes_names: Sequence[str] = ("dp", "fsdp", "tp", "sp")
-    mesh_axes_shape: Sequence[int] = (1, -1, 1, 1)
-    generation_ps: PartitionSpec = PartitionSpec("dp", "fsdp")
+    mesh_axes_shape: Sequence[int] = (1, 1, 1, -1)
+    generation_ps: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp")
 
     dtype: Union[jnp.dtype, str] = "fp16"
 
@@ -355,7 +355,7 @@ class JAXServer(GradioUserInference):
             init_shape: tuple = (1, 1),
             do_memory_log: bool = False,
             verbose: bool = True
-    ):
+    ) -> "JAXServer":
         """
         The load function is used to load a pretrained model from disk.
 
@@ -449,7 +449,7 @@ class JAXServer(GradioUserInference):
             model_config_kwargs: Optional[Mapping[str, Any]] = None,
             verbose: bool = True,
             **kwargs
-    ):
+    ) -> "JAXServer":
 
         model, params = AutoEasyDelModelForCausalLM.from_pretrained(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
@@ -482,7 +482,8 @@ class JAXServer(GradioUserInference):
             server_config=server_config,
             verbose=verbose,
             do_memory_log=do_memory_log,
-            add_params_field=add_params_field
+            add_params_field=add_params_field,
+            shard_parameters=False
         )
 
     @classmethod
@@ -495,8 +496,9 @@ class JAXServer(GradioUserInference):
             server_config: JAXServerConfig = None,
             add_params_field: bool = True,
             do_memory_log: bool = False,
+            shard_parameters: bool = False,
             verbose: bool = True
-    ):
+    ) -> "JAXServer":
         """
         The from_parameters function is used to load a model from the parameters of a pretrained model.
         It takes in the following arguments:
@@ -515,6 +517,7 @@ class JAXServer(GradioUserInference):
         :param server_config: Pass in the server_config file for the server
         :param add_params_field: bool: Add a params field to the server
         :param do_memory_log: bool: Log the memory usage of the server
+        :param shard_parameters:bool: whenever a shard model parameters.
         :param verbose: bool: Print out the status of the compilation
         :return: A server object
         
@@ -526,27 +529,30 @@ class JAXServer(GradioUserInference):
             "config_model must contain get_partition_rules functions"
         )
         server = cls(server_config=server_config)
+        if shard_parameters:
+            with server.mesh:
 
-        with server.mesh:
-            logging.info(
-                "matching partition rules"
-            )
-            partition_specs = match_partition_rules(params=params, rules=config_model.get_partition_rules(True))
-            shard_fns, _ = make_shard_and_gather_fns(partition_specs, get_dtype(server.server_config.dtype))
-            logging.info(
-                "sharding parameters across all of the chosen backend(tpu/gpu/cpu)s"
-            )
-            params = flax.traverse_util.flatten_dict(params)
-            shard_fns = flax.traverse_util.flatten_dict(shard_fns)
-            pbar = tqdm.tqdm(params.keys())
-            for key in pbar:
-                key = tuple(key)
-                params[key] = shard_fns[key](params[key])
-                if do_memory_log:
-                    pbar.write(server.get_memory())
-                pbar.set_description("Sharding Params")
-            server.params = flax.traverse_util.unflatten_dict(params)
-            server.params = {"params": server.params} if add_params_field else server.params
+                logging.info(
+                    "matching partition rules"
+                )
+                partition_specs = match_partition_rules(params=params, rules=config_model.get_partition_rules(True))
+                shard_fns, _ = make_shard_and_gather_fns(partition_specs, get_dtype(server.server_config.dtype))
+                logging.info(
+                    "sharding parameters across all of the chosen backend(tpu/gpu/cpu)s"
+                )
+                params = flax.traverse_util.flatten_dict(params)
+                shard_fns = flax.traverse_util.flatten_dict(shard_fns)
+                pbar = tqdm.tqdm(params.keys())
+                for key in pbar:
+                    key = tuple(key)
+                    params[key] = shard_fns[key](params[key])
+                    if do_memory_log:
+                        pbar.write(server.get_memory())
+                    pbar.set_description("Sharding Params")
+                params = flax.traverse_util.unflatten_dict(params)
+        else:
+            partition_specs = jax.tree_util.tree_map(get_partitions, params)
+        server.params = {"params": params} if add_params_field else params
         server.partition_specs = {"params": partition_specs} if add_params_field else partition_specs
         logging.info(
             "configuring generate functions for the server"
@@ -695,19 +701,55 @@ class JAXServer(GradioUserInference):
             "tokens_used": used_tokens,
         }
 
-    @staticmethod
-    def format_instruct(system: str, instruction: str) -> str:
+    def format_instruct(self, system: str, instruction: str) -> str:
         """
         Here you will get the system and instruction from user, and you can apply your prompting style
         """
-        raise NotImplementedError()
+        conversation = []
+        if system is not None and system != "":
+            conversation.append({
+                "role": "system", "content": system
+            })
+        conversation.append({
+            "role": "user", "content": instruction
+        })
+        return self.tokenizer.apply_chat_template(
+            conversation,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
 
-    @staticmethod
-    def format_chat(history: List[List[str]], prompt: str, system: Union[str, None]) -> str:
+    def format_chat(self, history: List[List[str]], prompt: str, system: Union[str, None]) -> str:
         """
         Here you will get the system, prompt and history from user, and you can apply your prompting style
         """
-        raise NotImplementedError()
+        conversation = []
+        if system is not None and system != "":
+            conversation.append({
+                "role": "system", "content": system
+            })
+        for conv in history:
+            conversation.append(
+                {
+                    "role": "user", "content": conv[0]
+                }
+            )
+            conversation.append(
+                {
+                    "role": "assistant", "content": conv[1]
+                }
+            )
+
+        conversation.append(
+            {
+                "role": "user", "content": prompt
+            }
+        )
+        return self.tokenizer.apply_chat_template(
+            conversation,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
 
     def forward_instruct(self, data: InstructRequest):
         """
@@ -817,14 +859,12 @@ class JAXServer(GradioUserInference):
         else:
             raise ValueError("UnKnown Mode for sample_gradio available modes are only Chat or Instruct")
         history.append([prompt, ""])
-        responses = ""
         for response, _ in self.sample(
                 string=string,
                 greedy=greedy,
                 max_new_tokens=max_new_tokens,
         ):
-            responses += response
-            history[-1][-1] = responses
+            history[-1][-1] = response
             yield "", history
 
     def sample(self,

@@ -110,6 +110,7 @@ class EasyModelsTest(TestCase):
                 transform_function(
                     state_dict=hf_model.state_dict(),
                     device=jax.devices("cpu")[0],
+                    remove_state_dict=True
                 )
         }
         config.add_jax_args()
@@ -323,7 +324,10 @@ class EasyModelsTest(TestCase):
         )
 
     def test_gemma(self):
+        org = self.tie_word_embeddings
+        self.tie_word_embeddings = True
         res, err = self.create_test_for_models("gemma", transformers.GemmaForCausalLM)
+        self.tie_word_embeddings = org
         self.assertTrue(
             res,
             f"Gemma model Failed [ERROR {err}]"
@@ -331,6 +335,7 @@ class EasyModelsTest(TestCase):
 
     def test_stablelm(self):
         res, err = self.create_test_for_models("stablelm", transformers.StableLmForCausalLM)
+
         self.assertTrue(
             res,
             f"StableLM model Failed [ERROR {err}]"

@@ -450,6 +450,7 @@ class AutoEasyDelModelForCausalLM:
             )
         with cfg.jax_mesh():
             logger.debug("converting huggingface-model to easydel-model.")
+            params_pattern_selection = None
             if load_in_8bit:
                 if bit_targeted_params is None:
                     warnings.warn(
@@ -460,13 +461,17 @@ class AutoEasyDelModelForCausalLM:
                         "kernel",
                         "embedding"
                     ]
+
+                    params_pattern_selection = re.compile("({})".format("|".join(bit_targeted_params)))
+
             params = trf(
                 state_dict,
                 config=config,
                 device=device,
                 shard_fns=shard_fns,
                 convert_to_8bit=load_in_8bit,
-                params_pattern_selection=re.compile("({})".format("|".join(bit_targeted_params)))
+                params_pattern_selection=params_pattern_selection,
+                remove_state_dict=True
             )
         logger.debug("deleting huggingface-model")
 

@@ -2,6 +2,7 @@ import math
 from typing import Optional, Tuple, Union
 
 import chex
+import fjformer
 from fjformer import linen as nn
 import flax.linen.partitioning
 import flax.struct
@@ -1073,7 +1074,8 @@ class FlaxCohereForCausalLMModule(nn.Module):
         hidden_states = outputs[0]
 
         if self.config.tie_word_embeddings:
-            shared_kernel = self.model.variables["params"]["embed_tokens"]["embedding"].T
+            shared_kernel = self.model.variables["params"]["embed_tokens"]["embedding"]
+            shared_kernel = fjformer.linen.linen.control_quantization(shared_kernel, self.param_dtype).T
             lm_logits = self.lm_head.apply(
                 {"params": {"kernel": shared_kernel}}, hidden_states)
         else:

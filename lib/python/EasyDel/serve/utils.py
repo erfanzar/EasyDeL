@@ -117,10 +117,17 @@ class Seafoam(Base):
 seafoam = Seafoam()
 
 
-def get_dtype(dtype):
-    if isinstance(dtype, str):
-        dtype = get_dtype(dtype)
-    return dtype
+def get_partitions(tree):
+    """Retrieve sharding specifications for model parameters."""
+    if not isinstance(tree, fjformer.linen.LinearBitKernel):
+        return getattr(tree.sharding, "spec", PartitionSpec(None))
+    else:
+        kernel_sharding = getattr(tree.kernel.sharding, "spec", PartitionSpec(None))
+        scale_sharding = getattr(tree.scale.sharding, "spec", PartitionSpec(None))
+        return fjformer.linen.LinearBitKernel(
+            kernel=kernel_sharding,  # type:ignore
+            scale=scale_sharding,  # type:ignore
+        )
 
 
 def shard_params(
@@ -204,19 +211,6 @@ def create_generate_function(
             logits_processor=logits_processor
         )
         return predict.sequences[:, input_ids.shape[1]:] if return_prediction_only else predict.sequences
-
-    def get_partitions(tree):
-        """Retrieve sharding specifications for model parameters."""
-        if not isinstance(tree, fjformer.linen.LinearBitKernel):
-            return getattr(tree.sharding, "spec", PartitionSpec(None))
-        else:
-            kernel_sharding = getattr(tree.kernel.sharding, "spec", PartitionSpec(None))
-            scale_sharding = getattr(tree.scale.sharding, "spec", PartitionSpec(None))
-            return fjformer.linen.LinearBitKernel(
-                kernel=kernel_sharding,
-                scale=scale_sharding,
-                _is_quantized=PartitionSpec(None)  # type:ignore
-            )
 
     return pjit(
         generate_fn,

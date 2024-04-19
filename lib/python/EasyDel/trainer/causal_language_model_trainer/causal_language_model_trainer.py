@@ -507,7 +507,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                         "train/regularization_z_loss": metrics["regularization_z_loss"].tolist(),
                                         "train/epoch": epoch,
                                     }
-                            aux_loss = metrics["aux_loss"]
+                            aux_loss = metrics.get("aux_loss", None)
                             if aux_loss is not None:
                                 train_metrics.update(
                                     {
