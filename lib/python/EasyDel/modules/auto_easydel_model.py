@@ -458,6 +458,7 @@ class AutoEasyDelModelForCausalLM:
                 attention_partition_spec=attention_partition_spec,
                 shard_attention_computation=shard_attention_computation,
                 backend=backend,
+                input_shape=input_shape
             )
         with cfg.jax_mesh():
             logger.debug("converting huggingface-model to easydel-model.")
@@ -570,7 +571,8 @@ class AutoShardAndGatherFunctions:
             config: EasyDelPretrainedConfig,
             partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
             flatten: bool = True,
-            dtype_specs=jax.numpy.float16
+            dtype_specs=jax.numpy.float16,
+            input_shape: Tuple[int, int] = (1, 1),
     ):
         if partition_rules is None:
             warnings.warn("Using config partition rules from `get_partition_rules(fully_sharded_data_parallel=True)`")
@@ -578,7 +580,8 @@ class AutoShardAndGatherFunctions:
         _, module, _ = get_modules_by_type(config.model_type)
         model = module(
             config=config,
-            _do_init=False
+            _do_init=False,
+            input_shape=input_shape
         )
 
         partition_specs = match_partition_rules(
@@ -602,6 +605,7 @@ class AutoShardAndGatherFunctions:
     def from_pretrained(
             cls,
             pretrained_model_name_or_path: str,
+            input_shape: Tuple[int, int] = (1, 1),
             sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
             sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
             query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
@@ -635,5 +639,6 @@ class AutoShardAndGatherFunctions:
             config=config,
             partition_rules=partition_rules,
             flatten=flatten,
-            dtype_specs=dtype_specs
+            dtype_specs=dtype_specs,
+            input_shape=input_shape
         )
