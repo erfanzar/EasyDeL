@@ -328,7 +328,7 @@ def _ring_attention_standard_fwd(query, key, value, attn_bias, scale, axis_name,
         p_max_score, _numerator, _denominator, _key, _value = carry
         bias = lax.dynamic_slice_in_dim(
             lax.dynamic_slice_in_dim(
-                attn_bias, (lax.axis_index(axis_name) - idx) % axis_size * kv_len, kv_len, axis=-2
+                attn_bias, (lax.axis_index(axis_name) - idx) % axis_size * q_len, q_len, axis=-2
             ), (lax.axis_index(axis_name) - idx) % axis_size * kv_len, kv_len, axis=-1
         )
         attn_weights = jnp.einsum("bqhd,bkhd->bhqk", query, _key) / scale
@@ -368,7 +368,7 @@ def _ring_attention_standard_bwd(axis_name, float32_logits, res, g):
         _dq, _dk, _dv, _key, _value = carry
         bias = lax.dynamic_slice_in_dim(
             lax.dynamic_slice_in_dim(
-                attn_bias, (lax.axis_index(axis_name) - idx) % axis_size * kv_len, kv_len, axis=-2
+                attn_bias, (lax.axis_index(axis_name) - idx) % axis_size * q_len, q_len, axis=-2
             ), (lax.axis_index(axis_name) - idx) % axis_size * kv_len, kv_len, axis=-1
         )
         attn_weights = jnp.einsum("bqhd,bkhd->bhqk", query, _key) / scale
