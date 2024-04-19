@@ -83,7 +83,7 @@ flags.DEFINE_enum(
         "cudnn",
         "local_ring"
     ],
-    default="vanilla",
+    default="local_ring",
     help="The attention mechanism to be used in the model"
 )
 
