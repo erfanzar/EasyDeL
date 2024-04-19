@@ -152,6 +152,7 @@ def main():
         value_partition_spec=ref_model_value_partition_spec,
         bias_partition_spec=ref_model_bias_partition_spec,
         attention_partition_spec=ref_model_attention_partition_spec,
+        load_in_8bit=True
     )
     print("Ref Model State is Loaded.")
 
