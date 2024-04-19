@@ -672,7 +672,7 @@ here's a simple example about how can you use Flash Attention in EasyDeL
 ```python
 # Config is built in config for every model (EasyDelPretrainedConfig)
 config.add_basic_configurations(
-    attn_mechanism="flash",  # flash , normal or splash (not fully supported yet on GPU,TPU) 
+    attn_mechanism="flash",  # Any supported Attention Mechanism
     block_b=1,
     block_q=512,
     block_k=512,
