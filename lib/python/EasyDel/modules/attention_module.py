@@ -362,6 +362,7 @@ def _ring_attention_standard_bwd(axis_name, float32_logits, res, g):
     dq = jnp.zeros_like(query, dtype=jnp.float32)
     dk = jnp.zeros_like(key, dtype=jnp.float32)
     dv = jnp.zeros_like(value, dtype=jnp.float32)
+    q_len = query.shape[1]
     batch, kv_len, num_heads, dim_per_head = key.shape
 
     def scan_kv_block(carry, idx):
