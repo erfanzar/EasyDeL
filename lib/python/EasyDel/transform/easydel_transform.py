@@ -243,10 +243,11 @@ def easystate_to_torch(
         elif rnn_based_or_rwkv and ("time_mix_" in key or "time_" in key):
             tensor = tensor.reshape(1, 1, -1)
         tensor = tensor.astype(get_dtype(dtype))
-
-        torch_state_dict[
-            key.replace(".kernel", ".weight").replace(".embedding", ".weight").replace(".scale", ".weight")
-        ] = torch.from_numpy(tensor)
+        key = key.replace(".kernel", ".weight").replace(".embedding", ".weight").replace(".scale", ".weight")
+        try:
+            torch_state_dict[key] = torch.from_numpy(tensor)
+        except TypeError:
+            torch_state_dict[key] = torch.from_numpy(numpy.asarray(tensor))
     return torch_state_dict
 
 

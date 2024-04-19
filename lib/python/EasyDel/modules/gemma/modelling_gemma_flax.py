@@ -18,7 +18,7 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 
-from ..easy_attention import EasyAttention
+from ..attention_module import AttentionModule
 from ..flax_modelling_utils import (
     ACT2FN,
     BaseJAXAttentionModule,
@@ -168,7 +168,7 @@ class FlaxGemmaAttention(BaseJAXAttentionModule):
             kernel_init=kernel,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.attention_performer = EasyAttention(
+        self.attention_performer = AttentionModule(
             use_sharding_constraint=self.config.use_sharding_constraint,
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,

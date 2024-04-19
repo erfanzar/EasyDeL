@@ -1,8 +1,8 @@
-# EasyAttention
+# AttentionModule
 
-## what is `EasyAttention`
+## what is `AttentionModule`
 
-EasyAttention is a EasyDeL module that can perform attention operation with different strategies to help user achieve
+AttentionModule is a EasyDeL module that can perform attention operation with different strategies to help user achieve
 the best possible performance and numerical stability, here are some strategies supported right now.
 
 1. Flash Attention TPU known as "flash"
@@ -17,7 +17,7 @@ the best possible performance and numerical stability, here are some strategies 
 import jax
 import flax.linen.attention as flt
 from fjformer import GenerateRNG
-from EasyDel.modules.easy_attention import EasyAttention
+from EasyDel.modules.attention_module import AttentionModule
 from EasyDel.modules.easydel_modelling_utils import EasyDelPretrainedConfig
 from jax import numpy as jnp, random, lax
 import math
@@ -71,8 +71,8 @@ q, k, v, attention_mask, causal_mask, attention_bias = make_fake_input_data(
     HEAD_DIM
 )
 
-flash_attention = EasyAttention(
-    
+flash_attention = AttentionModule(
+
     block_k_major=config.block_k_major,
     block_b=config.block_b,
     block_q=config.block_q,
@@ -104,8 +104,8 @@ flash_attention = EasyAttention(
     sm_scale=1 / math.sqrt(q.shape[-1]),
 )
 
-normal_attention = EasyAttention(
-    
+normal_attention = AttentionModule(
+
     block_k_major=config.block_k_major,
     block_b=config.block_b,
     block_q=config.block_q,

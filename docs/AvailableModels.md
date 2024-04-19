@@ -1,6 +1,6 @@
 # Available Models
 
-| Model            | Video Model | CausalLM | EasyAttention | Parameters Quantization | Operation Bit Quantization |
+| Model            | Video Model | CausalLM | AttentionModule | Parameters Quantization | Operation Bit Quantization |
 |------------------|-------------|----------|---------------|-------------------------|----------------------------|
 | Gptj             | ❌           | ✅        | ✅             | ✅                       | ✅                          |
 | LucidTransformer | ❌           | ✅        | ✅             | ✅                       | ✅                          |

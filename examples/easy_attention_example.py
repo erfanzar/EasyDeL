@@ -5,7 +5,7 @@ import jax
 from fjformer import GenerateRNG
 from jax import numpy as jnp, random, lax
 
-from EasyDel.modules.easy_attention import EasyAttention
+from EasyDel.modules.attention_module import AttentionModule
 from EasyDel.modules.easydel_modelling_utils import EasyDelPretrainedConfig
 
 BATCH_SIZE = len(jax.devices())
@@ -57,7 +57,7 @@ def main():
         HEAD_DIM
     )
 
-    flash_attention = EasyAttention(
+    flash_attention = AttentionModule(
 
         block_k_major=config.block_k_major,
         block_b=config.block_b,
@@ -90,7 +90,7 @@ def main():
         sm_scale=1 / math.sqrt(q.shape[-1]),
     )
 
-    normal_attention = EasyAttention(
+    normal_attention = AttentionModule(
 
         block_k_major=config.block_k_major,
         block_b=config.block_b,
