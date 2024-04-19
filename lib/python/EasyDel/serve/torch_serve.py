@@ -265,35 +265,55 @@ class PyTorchServer(GradioUserInference):
             "response": response
         }
 
-    @staticmethod
-    def format_instruct(system: str, instruction: str) -> str:
+    def format_instruct(self, system: str, instruction: str) -> str:
         """
-        The format_instruct function is used to format the instruction string
-            for a particular system.  The function takes two arguments:
+        Here you will get the system and instruction from user, and you can apply your prompting style
+        """
+        conversation = []
+        if system is not None and system != "":
+            conversation.append({
+                "role": "system", "content": system
+            })
+        conversation.append({
+            "role": "user", "content": instruction
+        })
+        return self.tokenizer.apply_chat_template(
+            conversation,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
 
-        :param system: str: Determine which system the instruction is for
-        :param instruction: str: Store the instruction that is being passed in
-        :return: The instruction in the format of the system
-        
+    def format_chat(self, history: List[List[str]], prompt: str, system: typing.Union[str, None]) -> str:
         """
-        raise NotImplementedError()
+        Here you will get the system, prompt and history from user, and you can apply your prompting style
+        """
+        conversation = []
+        if system is not None and system != "":
+            conversation.append({
+                "role": "system", "content": system
+            })
+        for conv in history:
+            conversation.append(
+                {
+                    "role": "user", "content": conv[0]
+                }
+            )
+            conversation.append(
+                {
+                    "role": "assistant", "content": conv[1]
+                }
+            )
 
-    @staticmethod
-    def format_chat(history: List[List[str]], prompt: str, system: str = None) -> str:
-        """
-        The format_chat function takes a list of strings, representing the chat history,
-        and returns a string that is formatted in such a way that it can be printed to the screen.
-        The prompt argument is used to indicate which user's turn it currently is. The system argument
-        is used for messages from the system (e.g., &quot;You are now connected!&quot;). If no value for system
-        is provided, then this function should return None.
-
-        :param history: List[str]: Store the chat history
-        :param prompt: str: Display the prompt to the user
-        :param system: str: Add a system message to the chat history
-        :return: A string that contains the history of a chat
-        
-        """
-        raise NotImplementedError()
+        conversation.append(
+            {
+                "role": "user", "content": prompt
+            }
+        )
+        return self.tokenizer.apply_chat_template(
+            conversation,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
 
     def sample(
             self,

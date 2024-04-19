@@ -71,6 +71,7 @@ def huggingface_to_easydel(
         dtype: jax.numpy.dtype = jax.numpy.float16,
         rnn_based_or_rwkv: bool = False,
         verbose: bool = True,
+        remove_state_dict: bool = False,
         **kwargs
 ):
     """
@@ -91,6 +92,7 @@ def huggingface_to_easydel(
     :param rnn_based_or_rwkv: bool: rnn_based_or_rwkv is a conditioner which decide whenever it finds a value in tree
     that start with time_mix_ it will automatically reshape that for easydel use case
     :param verbose:bool: whenever to log sharding or converting process
+    :param remove_state_dict:bool : whether to remove state dict during the transforming process
     :return: A dictionary of the weights and biases in a format that can be used by flax (it's an UnFlattenDict)
 
     """
@@ -111,7 +113,7 @@ def huggingface_to_easydel(
 
         pbar.set_description("Converting Model")
 
-        for key, tensor in state_dict.items():
+        for key, tensor in list(state_dict.items()):
             # Determine if renaming is necessary
             new_key = key
             if any(layer_name in key for layer_name in embedding_layer_names):
@@ -127,22 +129,23 @@ def huggingface_to_easydel(
 
             key_tuple = tuple(new_key.split("."))
             # Convert tensor to jax.numpy.array without detaching and moving to CPU
-            tensor = jnp.array(tensor.cpu().detach().numpy(), dtype=dtype)
-
+            array = jnp.array(tensor.cpu().detach().numpy(), dtype=dtype)
+            if remove_state_dict:
+                del tensor
+                del state_dict[key]
             # Apply sharding functions if provided
             if shard_fns and key_tuple in shard_fns:
-                tensor = shard_fns[key_tuple](tensor)
+                array = shard_fns[key_tuple](array)
             if convert_to_8bit:
                 if params_pattern_selection.search("/".join(key_tuple)):
-                    tensor = fjformer.linen.linen.LinearBitKernel(
-                        *fjformer.linen.linen.quantize(tensor, int_dtype=jnp.int8)  # type: ignore
+                    array = fjformer.linen.linen.LinearBitKernel(
+                        *fjformer.linen.linen.quantize(array, int_dtype=jnp.int8)  # type: ignore
                     )
-            flax_dict[key_tuple] = tensor
+            flax_dict[key_tuple] = array
 
             # Update progress bar less frequently to reduce overhead
             pbar.update(1)
         pbar.close()
-
         gc.collect()
         return traverse_util.unflatten_dict(flax_dict)
 

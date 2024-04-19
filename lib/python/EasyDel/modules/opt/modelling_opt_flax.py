@@ -16,6 +16,8 @@
 """ Flax OPT model."""
 
 from functools import partial
+
+import fjformer
 import flax.linen
 from typing import Optional, Tuple, Sequence
 
@@ -638,8 +640,9 @@ class FlaxOPTForCausalLMModule(nn.Module):
         hidden_states = outputs[0]
 
         if self.config.tie_word_embeddings:
-            shared_embedding = self.model.variables["params"]["decoder"]["embed_tokens"]["embedding"]
-            lm_logits = self.lm_head.apply({"params": {"kernel": shared_embedding.T}}, hidden_states)
+            shared_kernel = self.model.variables["params"]["decoder"]["embed_tokens"]["embedding"]
+            shared_kernel = fjformer.linen.linen.control_quantization(shared_kernel, self.param_dtype).T
+            lm_logits = self.lm_head.apply({"params": {"kernel": shared_kernel}}, hidden_states)
         else:
             lm_logits = self.lm_head(hidden_states)
 
