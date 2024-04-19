@@ -159,6 +159,8 @@ from .modules.auto_easydel_model import (
     get_modules_by_type as get_modules_by_type
 )
 
+from .modules.attention_module import AttentionModule
+
 from .utils.utils import (
     get_mesh as get_mesh,
     RNG as RNG
@@ -369,6 +371,10 @@ __all__ = (
     "AutoShardAndGatherFunctions",
     "get_modules_by_type",
 
+    # Attention Module
+
+    "AttentionModule",
+
     # Utils
     "get_mesh",
     "RNG",
@@ -435,4 +441,4 @@ __all__ = (
     "EasyDelSyntaxRuntimeError"
 )
 
-__version__ = "0.0.61"
+__version__ = "0.0.62"

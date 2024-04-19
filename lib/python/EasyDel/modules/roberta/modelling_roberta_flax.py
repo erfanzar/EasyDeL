@@ -22,7 +22,7 @@ import jax
 from jax.sharding import PartitionSpec
 from jax import lax, numpy as jnp
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
-from ..easy_attention import EasyAttention
+from ..attention_module import AttentionModule
 from ..flax_modelling_utils import get_gradient_checkpoint_policy, ACT2FN, get_dot_general_by_bits, \
     BaseJAXAttentionModule
 
@@ -83,7 +83,7 @@ class FlaxRobertaSelfAttention(BaseJAXAttentionModule):
                 "`config.hidden_size`: {self.config.hidden_size} has to be a multiple of `config.num_attention_heads` "
                 "                   : {self.config.num_attention_heads}"
             )
-        self.attention_performer = EasyAttention(
+        self.attention_performer = AttentionModule(
             use_sharding_constraint=self.config.use_sharding_constraint,
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,

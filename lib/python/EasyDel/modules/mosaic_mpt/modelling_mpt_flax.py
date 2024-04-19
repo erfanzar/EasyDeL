@@ -10,7 +10,7 @@ from transformers.modeling_flax_outputs import FlaxCausalLMOutput, FlaxBaseModel
 import flax
 from einops import rearrange
 from flax.linen.partitioning import remat
-from ..easy_attention import EasyAttention
+from ..attention_module import AttentionModule
 from ..flax_modelling_utils import (
     get_gradient_checkpoint_policy,
     with_sharding_constraint,
@@ -109,7 +109,7 @@ class FlaxMptAttention(BaseJAXAttentionModule):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.attention_performer = EasyAttention(
+        self.attention_performer = AttentionModule(
             use_sharding_constraint=self.config.use_sharding_constraint,
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,

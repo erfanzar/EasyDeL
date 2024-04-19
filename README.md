@@ -27,6 +27,9 @@ Some of the key features provided by EasyDeL include:
 
 > **News**
 >
+> `local_ring` is Added which is Ring Attention but for TPU/GPU/CPU(s) and support attention bias instead of attention
+> mask, `normal` attention is renamed to `vanilla`.
+>
 > `load_in_8bit` is now available for all the models, and requires to upgrade _fjformer to 0.0.50_
 >
 > Sharing Key and Value Cache for Large Sequence Length across devices are now Fixed (Attention Models).
@@ -61,7 +64,7 @@ python -m examples.jax_serve_example \
   --prompter_type="gemma" \ 
   --share_gradio=True \ 
   --sharding_axis_dims=1,1,1,-1 \
-  --attn_mechanism="normal" \
+  --attn_mechanism="local_ring" \
   --scan_ring_attention=True \
   --max_sequence_length=8192 \ 
   --max_new_tokens_ratio=25 \

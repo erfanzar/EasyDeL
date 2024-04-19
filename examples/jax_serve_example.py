@@ -75,8 +75,15 @@ flags.DEFINE_bool(
 
 flags.DEFINE_enum(
     "attn_mechanism",
-    enum_values=["normal", "flash", "ring", "splash"],
-    default="normal",
+    enum_values=[
+        "vanilla",
+        "flash",
+        "splash",
+        "ring",
+        "cudnn",
+        "local_ring"
+    ],
+    default="vanilla",
     help="The attention mechanism to be used in the model"
 )
 

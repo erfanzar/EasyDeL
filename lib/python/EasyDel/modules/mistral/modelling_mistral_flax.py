@@ -13,7 +13,7 @@ from flax.traverse_util import unflatten_dict, flatten_dict
 from flax.core import freeze, unfreeze
 from typing import Union, Optional, Tuple
 
-from ..easy_attention import EasyAttention
+from ..attention_module import AttentionModule
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 from flax.linen import partitioning as nn_partitioning, combine_masks
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
@@ -195,7 +195,7 @@ class FlaxMistralAttention(BaseJAXAttentionModule):
         )
 
         self.rotary = FlaxMistralRotaryEmbedding(self.dtype)
-        self.attention_performer = EasyAttention(
+        self.attention_performer = AttentionModule(
             use_sharding_constraint=self.config.use_sharding_constraint,
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,

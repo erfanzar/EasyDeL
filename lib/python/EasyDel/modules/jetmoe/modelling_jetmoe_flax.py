@@ -13,7 +13,7 @@ from flax.traverse_util import unflatten_dict, flatten_dict
 from flax.core import freeze, unfreeze
 from typing import Union, Optional, Tuple
 from flax.struct import dataclass
-from ..easy_attention import EasyAttention
+from ..attention_module import AttentionModule
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 from fjformer.linen import Linear
 from flax.linen import partitioning as nn_partitioning, combine_masks

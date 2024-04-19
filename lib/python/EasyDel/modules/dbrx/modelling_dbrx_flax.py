@@ -15,7 +15,7 @@ from jax.sharding import PartitionSpec
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput, FlaxSequenceClassifierOutput
 
 from .dbrx_configuration import DbrxConfig, DbrxAttentionConfig, DbrxFFNConfig
-from ..easy_attention import EasyAttention
+from ..attention_module import AttentionModule
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 # EasyDel.modules
 from ..flax_modelling_utils import (
@@ -116,7 +116,7 @@ class FlaxDbrxAttention(BaseJAXAttentionModule):
         )
 
         self.rotary = FlaxDbrxEmbedding(self.dtype)
-        self.attention_performer = EasyAttention(
+        self.attention_performer = AttentionModule(
             use_sharding_constraint=self.config.use_sharding_constraint,
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,

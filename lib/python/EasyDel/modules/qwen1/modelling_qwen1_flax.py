@@ -23,7 +23,7 @@ from ..flax_modelling_utils import (
     get_gradient_checkpoint_policy,
     get_dot_general_by_bits, rotate_half, BaseJAXAttentionModule
 )
-from ..easy_attention import EasyAttention
+from ..attention_module import AttentionModule
 
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 import chex
@@ -237,7 +237,7 @@ class FlaxQwen1Attention(BaseJAXAttentionModule):
         logn_tensor = jnp.asarray(logn_list)[None, :, None, None]
         self.logn_tensor = logn_tensor
         self.rotary = FlaxQwen1EmbeddingApplyer(self.dtype)
-        self.attention_performer = EasyAttention(
+        self.attention_performer = AttentionModule(
             use_sharding_constraint=self.config.use_sharding_constraint,
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,
