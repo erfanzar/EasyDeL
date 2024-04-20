@@ -901,7 +901,7 @@ class JAXServer(GradioUserInference):
         )
 
         input_ids = tokens.input_ids
-        attention_mask = tokens.attention_mask.rep
+        attention_mask = tokens.attention_mask
         num_generated_tokens = 0
 
         for _ in range((max_new_tokens or self.server_config.max_new_tokens) // self.server_config.max_compile_tokens):
