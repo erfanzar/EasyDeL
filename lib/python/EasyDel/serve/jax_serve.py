@@ -864,7 +864,7 @@ class JAXServer(GradioUserInference):
                 greedy=greedy,
                 max_new_tokens=max_new_tokens,
         ):
-            history[-1][-1] = response
+            history[-1][-1] = response[0]
             yield "", history
 
     def sample(self,
@@ -917,7 +917,7 @@ class JAXServer(GradioUserInference):
                 ) else predicted_token != self.server_config.pad_token_id
             ]
             if predicted_token.ndim == 1:
-                predicted_token = predicted_token.reshape(1, -1)
+                predicted_token = predicted_token.reshape(self.server_config.batch_size, -1)
             num_generated_tokens += predicted_token.shape[-1]
             plus_attn_mask = jnp.ones((len(attention_mask), self.server_config.max_compile_tokens), dtype=jnp.int32)
 
@@ -931,7 +931,7 @@ class JAXServer(GradioUserInference):
             )[:, -fixed_pad:]
 
             returns = (
-                self.tokenizer.decode(input_ids[0][-num_generated_tokens:], skip_special_tokens=True),
+                self.tokenizer.batch_decode(input_ids[:, -num_generated_tokens:], skip_special_tokens=True),
                 num_generated_tokens
             )
 
