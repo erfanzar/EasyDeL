@@ -410,7 +410,7 @@ class FlaxT5Attention(BaseJAXAttentionModule):
 
         # bring back to (batch_size, seq_length, d_model)
         attn_output = self._merge_heads(attn_output)
-        if self.config.shard_attention_computation:
+        if self.config.shard_attention_computation and self.config.attn_mechanism == "vanilla":
             attn_output = with_sharding_constraint(
                 attn_output, PartitionSpec(
                     ("dp", "fsdp"),
