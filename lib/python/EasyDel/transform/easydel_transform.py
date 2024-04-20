@@ -129,13 +129,12 @@ def huggingface_to_easydel(
 
             key_tuple = tuple(new_key.split("."))
             # Convert tensor to jax.numpy.array without detaching and moving to CPU
-            array = jnp.array(tensor.cpu().detach().numpy(), dtype=dtype)
+            array = jax.lax.convert_element_type(jnp.asarray(tensor.cpu().detach().numpy()), dtype)
             if remove_state_dict:
                 del tensor
                 del state_dict[key]
             # Apply sharding functions if provided
-            if shard_fns and key_tuple in shard_fns:
-                array = shard_fns[key_tuple](array)
+            if shard_fns and key_tuple in shard_fns:                array = shard_fns[key_tuple](array)
             if convert_to_8bit:
                 if params_pattern_selection.search("/".join(key_tuple)):
                     array = fjformer.linen.linen.LinearBitKernel(
