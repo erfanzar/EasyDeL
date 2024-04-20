@@ -355,8 +355,9 @@ def _ring_attention_standard_fwd(query, key, value, attn_bias, scale, axis_name,
     return output.astype(value.dtype), (output, query, key, value, attn_bias, numerator, denominator, max_score, scale)
 
 
-def _ring_attention_standard_bwd(axis_name, float32_logits, res, g):
+def _ring_attention_standard_bwd(_scale, axis_name, float32_logits, res, g):
     del float32_logits
+    del _scale
     axis_size = lax.psum(1, axis_name)
     output, query, key, value, attn_bias, numerator, denominator, max_score, scale = res
     dq = jnp.zeros_like(query, dtype=jnp.float32)
