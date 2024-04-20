@@ -458,7 +458,8 @@ class AutoEasyDelModelForCausalLM:
                 attention_partition_spec=attention_partition_spec,
                 shard_attention_computation=shard_attention_computation,
                 backend=backend,
-                input_shape=input_shape
+                input_shape=input_shape,  # type:ignore
+                config_kwargs=config_kwargs
             )
         with cfg.jax_mesh():
             logger.debug("converting huggingface-model to easydel-model.")
@@ -619,7 +620,8 @@ class AutoShardAndGatherFunctions:
             backend: Optional[str] = None,
             partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
             flatten: bool = True,
-            dtype_specs=jax.numpy.float16
+            dtype_specs=jax.numpy.float16,
+            config_kwargs: Optional[Mapping[str, Any]] = None,
     ):
         config = AutoEasyDelConfig.from_pretrained(
             pretrained_model_name_or_path,
@@ -635,6 +637,9 @@ class AutoShardAndGatherFunctions:
             shard_attention_computation=shard_attention_computation,
             backend=backend,
         )
+        if config_kwargs is not None:
+            for k, v in config_kwargs.items():
+                setattr(config, k, v)
         return cls.from_config(
             config=config,
             partition_rules=partition_rules,
