@@ -315,7 +315,15 @@ def get_flash_attention() -> Tuple[Callable, bool, bool]:
     return ring_attention_fn, float32_logits, do_shard_map
 
 
-def _ring_attention_standard_fwd(query, key, value, attn_bias, scale, axis_name, float32_logits):
+def _ring_attention_standard_fwd(
+        query,
+        key,
+        value,
+        attn_bias,
+        scale,
+        axis_name,
+        float32_logits
+):
     if float32_logits:
         query, key = query.astype(jnp.float32), key.astype(jnp.float32)
     batch, q_len, num_heads, _ = query.shape
@@ -352,14 +360,19 @@ def _ring_attention_standard_fwd(query, key, value, attn_bias, scale, axis_name,
         xs=jnp.arange(0, axis_size)
     )
     output = numerator / rearrange(denominator, 'b h q -> b q h')[..., None]
-    return output.astype(value.dtype), (output, query, key, value, attn_bias, numerator, denominator, max_score, scale)
+    return output.astype(value.dtype), (output, query, key, value, attn_bias, numerator, denominator, max_score)
 
 
-def _ring_attention_standard_bwd(_scale, axis_name, float32_logits, res, g):
+def _ring_attention_standard_bwd(
+        scale,
+        axis_name,
+        float32_logits,
+        res,
+        g
+):
     del float32_logits
-    del _scale
     axis_size = lax.psum(1, axis_name)
-    output, query, key, value, attn_bias, numerator, denominator, max_score, scale = res
+    output, query, key, value, attn_bias, numerator, denominator, max_score = res
     dq = jnp.zeros_like(query, dtype=jnp.float32)
     dk = jnp.zeros_like(key, dtype=jnp.float32)
     dv = jnp.zeros_like(value, dtype=jnp.float32)
