@@ -208,7 +208,7 @@ class FlaxGPT2Attention(BaseJAXAttentionModule):
         )
         attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value)
         attn_output = self._merge_heads(attn_output)
-        if self.config.shard_attention_computation and self.config.attn_mechanism == "vanilla":
+        if self.config.shard_attention_computation:
             attn_output = with_sharding_constraint(
                 attn_output, PartitionSpec(
                     ("dp", "fsdp"),

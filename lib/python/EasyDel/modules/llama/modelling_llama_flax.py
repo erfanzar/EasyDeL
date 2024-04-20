@@ -370,7 +370,7 @@ class FlaxLlamaAttention(BaseJAXAttentionModule):
         attentions.attention_outputs = attentions.attention_outputs
 
         attn_output = self._merge_heads(attentions.attention_outputs)
-        if self.config.shard_attention_computation and self.config.attn_mechanism == "vanilla":
+        if self.config.shard_attention_computation:
             attn_output = with_sharding_constraint(
                 attn_output, PartitionSpec(
                     ("dp", "fsdp"),
