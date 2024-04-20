@@ -19,12 +19,12 @@ NUM_HEADS = 32
 IMG_LOSS = 0.5649852
 
 
-def call_vanilla(q, k, v, b):
-    attention_pred = dot_product_attention(q, k, v, b)
+def call_vanilla(params):
+    attention_pred = dot_product_attention(params["q"], params["k"], params["v"], params["b"])
     return IMG_LOSS, (attention_pred,)
 
 
-def call_ring(q, k, v, b):
+def call_ring(params):
     attention_pred = shard_map(
         partial(
             ring_attention_standard,
@@ -44,7 +44,7 @@ def call_ring(q, k, v, b):
         ),
         check_rep=False
     )(
-        q, k, v, b
+        params["q"], params["k"], params["v"], params["b"]
     )
     return IMG_LOSS, (attention_pred,)
 
@@ -63,11 +63,18 @@ def make_inputs():
 def main():
     has_aux = True
     q, k, v, b = make_inputs()
-    grad_fn_ring = jax.value_and_grad(call_ring, has_aux=True)
-    grad_fn_vanilla = jax.value_and_grad(call_vanilla, has_aux=True)
+    grad_fn_ring = jax.value_and_grad(call_ring, has_aux=has_aux)
+    grad_fn_vanilla = jax.value_and_grad(call_vanilla, has_aux=has_aux)
 
-    (_, (ring_attention_output,)), gradient_ring = grad_fn_ring(q, k, v, b)
-    (_, (vanilla_attention_output,)), gradient_vanilla = grad_fn_vanilla(q, k, v, b)
+    params = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "b": b
+    }
+
+    (_, (ring_attention_output,)), gradient_ring = grad_fn_ring(params)
+    (_, (vanilla_attention_output,)), gradient_vanilla = grad_fn_vanilla(params)
 
     print(f"VANILLA    : {vanilla_attention_output[0, 0, 0, :5]}")
     print(f"LOCAL RING : {ring_attention_output[0, 0, 0, :5]}")
