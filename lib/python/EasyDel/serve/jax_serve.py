@@ -891,17 +891,17 @@ class JAXServer(GradioUserInference):
 
         fixed_pad = self.server_config.max_sequence_length - self.server_config.max_compile_tokens
         tokens = self.prefix_tokenizer(
-            string,
+            [string] * self.server_config.batch_size,
             max_length=fixed_pad,
             padding="max_length",
             return_tensors="jax"
         ) if self.server_config.use_prefix_tokenizer else self.tokenizer(
-            string,
+            [string] * self.server_config.batch_size,
             return_tensors="jax"
         )
 
         input_ids = tokens.input_ids
-        attention_mask = tokens.attention_mask
+        attention_mask = tokens.attention_mask.rep
         num_generated_tokens = 0
 
         for _ in range((max_new_tokens or self.server_config.max_new_tokens) // self.server_config.max_compile_tokens):
