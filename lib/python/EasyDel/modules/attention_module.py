@@ -507,13 +507,42 @@ class AttentionModule:
         self.generation_bias_partition_spec = generation_bias_partition_spec
         self.generation_attention_partition_spec = generation_attention_partition_spec
         self.axis_name = axis_name
-        self.assertion_mkv_err = f"""
-query_states, key_states, value_states and bias shapes must be like
-query_states Shape : [batch_size, q_seq_len , {self.num_attention_heads=}, {self.head_dims=}]
-key_states   Shape : [batch_size, kv_seq_len, {self.num_attention_heads=}, {self.head_dims=}]
-value_states Shape : [batch_size, kv_seq_len, {self.num_attention_heads=}, {self.head_dims=}]
-bias         Shape : [batch_size, {self.num_attention_heads=}, q_seq_len , kv_seq_len]
-    """
+
+        ring_func = partial(
+            ring_attention_standard,
+            axis_name=self.axis_name,
+            scale=1 / self.sm_scale,
+            float32_logits=True,
+        )
+        self.local_ring_attention_generation_kernel = shard_map(
+            ring_func,
+            mesh=self.mesh,
+            in_specs=(
+                self.generation_query_partition_spec,
+                self.key_partition_spec,
+                self.value_partition_spec,
+                self.generation_bias_partition_spec
+            ),
+            out_specs=(
+                self.attention_partition_spec
+            ),
+            check_rep=False
+        )
+
+        self.local_ring_attention_kernel = shard_map(
+            ring_func,
+            mesh=self.mesh,
+            in_specs=(
+                self.query_partition_spec,
+                self.key_partition_spec,
+                self.value_partition_spec,
+                self.bias_partition_spec
+            ),
+            out_specs=(
+                self.attention_partition_spec
+            ),
+            check_rep=False
+        )
 
     def _check_states(
             self,
@@ -537,15 +566,24 @@ bias         Shape : [batch_size, {self.num_attention_heads=}, q_seq_len , kv_se
             self.num_attention_heads,
             self.head_dims
         )
-        assert query_states.shape == q_shape, self.assertion_mkv_err + (
+
+        assertion_mkv_err = f"""
+        query_states, key_states, value_states and bias shapes must be like
+        query_states Shape : [batch_size, q_seq_len , {self.num_attention_heads=}, {self.head_dims=}]
+        key_states   Shape : [batch_size, kv_seq_len, {self.num_attention_heads=}, {self.head_dims=}]
+        value_states Shape : [batch_size, kv_seq_len, {self.num_attention_heads=}, {self.head_dims=}]
+        bias         Shape : [batch_size, {self.num_attention_heads=}, q_seq_len , kv_seq_len]
+            """
+
+        assert query_states.shape == q_shape, assertion_mkv_err + (
             f"\nMiss Match {query_states.shape} and "
             f"required Shape {q_shape}"
         )
-        assert key_states.shape == k_v_req_shape, self.assertion_mkv_err + (
+        assert key_states.shape == k_v_req_shape, assertion_mkv_err + (
             f"\nMiss Match {key_states.shape} and "
             f"required Shape {k_v_req_shape}"
         )
-        assert value_states.shape == k_v_req_shape, self.assertion_mkv_err + (
+        assert value_states.shape == k_v_req_shape, assertion_mkv_err + (
             f"\nMiss Match {value_states.shape} and "
             f"required Shape {k_v_req_shape}"
         )
@@ -643,32 +681,12 @@ bias         Shape : [batch_size, {self.num_attention_heads=}, q_seq_len , kv_se
             bias: Optional[Array] = None,
     ):
         is_generating = query_states.shape[1] == 1
-
-        attn_output = shard_map(
-            partial(
-                ring_attention_standard,
-                axis_name=self.axis_name,
-                scale=1 / self.sm_scale,
-                float32_logits=True,
-            ),
-            mesh=self.mesh,
-            in_specs=(
-                self.generation_query_partition_spec if is_generating else self.query_partition_spec,
-                self.key_partition_spec,
-                self.value_partition_spec,
-                self.generation_bias_partition_spec if is_generating else self.bias_partition_spec
-            ),
-            out_specs=(
-                self.attention_partition_spec
-            ),
-            check_rep=False
-        )(
-            query_states, key_states, value_states, bias
-        )
-
+        func = self.local_ring_attention_generation_kernel if is_generating else self.local_ring_attention_kernel
         return AttentionOutput(
             attention_weights=None,
-            attention_outputs=attn_output
+            attention_outputs=func(
+                query_states, key_states, value_states, bias
+            )
         )
 
     def ring_attention(
