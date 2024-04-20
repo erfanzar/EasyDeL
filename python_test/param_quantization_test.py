@@ -73,7 +73,7 @@ class EasyModelsTest(TestCase):
             "ring",
             "cudnn",
             "local_ring"
-        ] = "local_ring"
+        ] = "vanilla"
         self.block_k: int = 32
         self.block_q: int = 32
         self.sequence_length = 64
