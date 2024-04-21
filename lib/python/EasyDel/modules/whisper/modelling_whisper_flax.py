@@ -209,7 +209,7 @@ class FlaxWhisperAttention(BaseJAXAttentionModule):
             uses_cache=self.has_variable("cache", "cached_key") or init_cache,
             segment_ids=None
         )
-        attentions.attention_outputs = attentions.attention_outputs
+
         attn_output = self._merge_heads(attentions.attention_outputs)
         if self.config.shard_attention_computation:
             attn_output = with_sharding_constraint(

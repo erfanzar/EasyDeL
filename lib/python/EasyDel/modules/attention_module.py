@@ -512,7 +512,10 @@ class AttentionModule:
                 attention_dropout=self.attention_dropout,
                 shard_attention_computation=self.shard_attention_computation,
             )
-            return AttentionOutput(o, w)
+            return AttentionOutput(
+                attention_weights=w,
+                attention_outputs=o
+            )
 
     def sharded_vanilla_attention(
             self,
@@ -546,9 +549,13 @@ class AttentionModule:
                     PartitionSpec(("dp", "fsdp"), None, None, None),
                 ),
                 out_specs=out_spec,
-            )
+            )(query_states, key_states, value_states, bias)
             output = fjformer.with_sharding_constraint(output, out_spec)
-            return AttentionOutput(output)
+
+            return AttentionOutput(
+                attention_weights=None,
+                attention_outputs=output
+            )
 
     def flash_attention(
             self,
