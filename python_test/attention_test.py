@@ -2,8 +2,9 @@ import math
 import os
 
 import fjformer
+import flax.linen.attention
 
-# os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
+os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 import jax.random
 from lib.python.EasyDel import MistralConfig
@@ -39,7 +40,7 @@ def call_vanilla(params):
 
 @partial(jax.value_and_grad, has_aux=True)
 def call_sharded_vanilla(params):
-    attention_pred, _ = shard_map(
+    attention_pred = shard_map(
         partial(
             shard_vanilla_attention,
             deterministic=True,
@@ -154,23 +155,30 @@ def make_inputs():
     q = jax.random.normal(rng.rng, (BATCH_SIZE, SEQUENCE_LENGTH, NUM_HEADS, HEAD_DIM), dtype="float32")
     k = jax.random.normal(rng.rng, (BATCH_SIZE, SEQUENCE_LENGTH, NUM_HEADS, HEAD_DIM), dtype="float32")
     v = jax.random.normal(rng.rng, (BATCH_SIZE, SEQUENCE_LENGTH, NUM_HEADS, HEAD_DIM), dtype="float32")
-    b = jnp.where(
-        jnp.tril(jnp.ones((BATCH_SIZE, 1, SEQUENCE_LENGTH, SEQUENCE_LENGTH))),
-        0, -jnp.inf,
+    c = flax.linen.attention.make_causal_mask(
+        jnp.ones((BATCH_SIZE, SEQUENCE_LENGTH))
     )
-    mask = jnp.tril(jnp.ones((BATCH_SIZE, SEQUENCE_LENGTH)))
-    return q, k, v, b, mask
+    a = jnp.ones((BATCH_SIZE, SEQUENCE_LENGTH))
+    a.at[:, SEQUENCE_LENGTH // 2:].set(0)
+    b = jnp.where(
+        flax.linen.attention.combine_masks(
+            jnp.expand_dims(jnp.expand_dims(a, 1), 1), c
+        ),
+        0,
+        -jnp.inf
+    )
+
+    return q, k, v, b
 
 
 def main():
-    q, k, v, b, mask = make_inputs()
+    q, k, v, b = make_inputs()
 
     params = {
         "q": q,
         "k": k,
         "v": v,
         "b": b,
-        "mask": mask
     }
 
     (_, (sharded_vanilla_attention_output,)), gradient_sharded_vanilla = call_sharded_vanilla(params)
