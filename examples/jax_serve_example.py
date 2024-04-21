@@ -81,7 +81,9 @@ flags.DEFINE_enum(
         "splash",
         "ring",
         "cudnn",
-        "local_ring"
+        "local_ring",
+        "sharded_vanilla",
+        "wise_ring"
     ],
     default="vanilla",
     help="The attention mechanism to be used in the model"

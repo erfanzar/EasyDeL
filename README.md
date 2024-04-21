@@ -27,6 +27,9 @@ Some of the key features provided by EasyDeL include:
 
 > **News**
 >
+> New Attention Types are added `sharded_vanilla`, `wise_ring`, `sharded_vanilla` is same as `vanilla` but 
+> uses shard_map which will make it a little faster and more efficent.
+> 
 > `local_ring` is Added which is Ring Attention but for TPU/GPU/CPU(s) and support attention bias instead of attention
 > mask, `normal` attention is renamed to `vanilla`.
 >
