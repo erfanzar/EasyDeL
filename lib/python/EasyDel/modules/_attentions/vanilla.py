@@ -119,7 +119,7 @@ def shard_vanilla_attention(
         attention_weight = attention_weight * multiplier
     attention = jnp.einsum("...hqk,...khd->...qhd", attention_weight, value_states, precision=precision)
 
-    return attention, attention_weight
+    return attention
 
 
 def attention_production(

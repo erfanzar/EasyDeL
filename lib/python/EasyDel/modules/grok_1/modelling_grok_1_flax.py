@@ -382,7 +382,7 @@ class FlaxGrok1Attention(BaseJAXAttentionModule):
             uses_cache=self.has_variable("cache", "cached_key") or init_cache,
             segment_ids=segment_ids
         )
-        attentions.attention_outputs = attentions.attention_outputs
+
 
         attn_output = self._merge_heads(attentions.attention_outputs)
         if self.config.shard_attention_computation:
