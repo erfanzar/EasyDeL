@@ -368,6 +368,8 @@ class DPOTrainer(BaseTrainer, ABC):
     def shard_states(self, state, rules):
         with self.arguments.get_mesh():
             partition_spec = match_partition_rules(rules=rules, params=jax.eval_shape(lambda: state))
+            print(partition_spec.params)
+            print(partition_spec.opt_state)
 
             def _shard(x):
                 return x
@@ -391,7 +393,7 @@ class DPOTrainer(BaseTrainer, ABC):
             dataloader_eval = self.get_eval_dataloader(self.eval_dataset)
             max_evaluation_steps = len(dataloader_eval)
         return TrainerConfigureDataloaderFuncOutput(
-            dataloader_train=dataloader_train,
+            dataloader_train=dataloader_train,  # type:ignore
             max_training_steps=max_training_steps,
             dataloader_eval=dataloader_eval,
             max_evaluation_steps=max_evaluation_steps

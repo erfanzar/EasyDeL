@@ -2,298 +2,45 @@ import math
 import warnings
 from functools import partial
 
-import flax.linen.attention
+import fjformer
 import jax
 from chex import Array
-from einops import rearrange
 from fjformer import with_sharding_constraint
-from flax.linen import dot_product_attention_weights
-from flax.linen.dtypes import promote_dtype
 from jax import numpy as jnp, lax, random
 from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec, Mesh
 from fjformer.pallas_operations.flash_attention import gpu as flash_attn_gpu
 from fjformer.pallas_operations.flash_attention import tpu as flash_attn_tpu
-from fjformer.pallas_operations.ring_attention import (
-    ring_flash_attention_tpu,
-    ring_attention_standard as fj_ring_attention_standard,
-    ring_attention
-)
+from fjformer.pallas_operations.ring_attention import ring_flash_attention_tpu
+
 from fjformer.pallas_operations.splash_attention import (
     make_splash_mha,
-    make_splash_mqa,
-    SegmentIds,
-    BlockSizes as SplashBlockSizes,
     CausalMask,
     MultiHeadMask
 )
-from typing import Tuple, Callable, Type, Any, Optional, Literal, Union
-from dataclasses import dataclass
+from typing import Tuple, Callable, Optional, Literal
+from flax.struct import dataclass
 
 from .flax_modelling_utils import get_gradient_checkpoint_policy
+from ._attentions import (
+    vanilla_attention,
+    flash_attention,
+    attention_production,
+    static_sharded_attention_production,
+    static_sharded_dot_product_attention,
+    ring_attention_standard,
+    wise_ring_attention,
+    shard_vanilla_attention
+)
+
+DEFAULT_K_BLOCK = 1024
+DEFAULT_Q_BLOCK = 1024
 
 
 @dataclass
 class AttentionOutput:
     attention_weights: Optional[Array] = None
     attention_outputs: Optional[Array] = None
-
-
-def attention_production(
-        query_states: jax.Array,
-        key_states: jax.Array,
-        value_states: jax.Array,
-        attention_bias: jax.Array | None = None,
-        deterministic: bool = True,
-        dropout_rng: jax.random.PRNGKey = jax.random.PRNGKey(0),
-        dropout_rate: float = 0.0
-):
-    batch, q_sequence_length, q_num_head, head_dim = query_states.shape
-    _, kv_sequence_length, kv_num_head, _ = key_states.shape
-    assert q_num_head % kv_num_head == 0, (
-        f"`query_states` {q_num_head} must be a multiple of `key_states` "
-        f"and `value_states` heads {kv_num_head}"
-    )
-    query_states = jnp.reshape(query_states,
-                               (batch, q_sequence_length, kv_num_head, q_num_head // kv_num_head, head_dim))
-    attention_score = jnp.einsum(
-        "...thHd,...Thd->...hHtT",
-        query_states,
-        key_states
-    ).astype(
-        jnp.float32
-    )
-    attention_score *= 1 / math.sqrt(head_dim)
-    max_attention_value = jnp.array(30.0, dtype=attention_score.dtype)
-    attention_score = max_attention_value * jnp.tanh(attention_score / max_attention_value)
-    attention_score = attention_score + attention_bias[:, :, None, :, :]
-    attention_weights = jax.nn.softmax(attention_score).astype(query_states.dtype)
-    if not deterministic and dropout_rate > 0.0:
-        keep_prob = 1.0 - dropout_rate
-        dropout_shape = tuple([1] * (key_states.ndim - 2)) + attention_weights.shape[-2:]
-        keep = random.bernoulli(dropout_rng, keep_prob, dropout_shape)  # type: ignore
-        multiplier = keep.astype(query_states.dtype) / jnp.asarray(keep_prob, dtype=query_states.dtype)
-        attention_weights = attention_weights * multiplier
-
-    attention = jnp.einsum("...hHtT,...Thd->...thHd", attention_weights, value_states).reshape(
-        batch, q_sequence_length, q_num_head, head_dim
-    )
-    return attention
-
-
-def static_sharded_attention_production(
-        query_states: jax.Array,
-        key_states: jax.Array,
-        value_states: jax.Array,
-        attention_bias: jax.Array | None = None,
-        deterministic: bool = True,
-        dropout_rng: jax.random.PRNGKey = jax.random.PRNGKey(0),
-        dropout_rate: float = 0.0
-):
-    assert key_states.shape[1] == value_states.shape[1], "miss match on key_states and value_states sequence length"
-    is_generating = query_states.shape[1] == 1 or query_states.shape[1] != key_states.shape[1]
-    sequence_sharding_axis_name = None if is_generating else "sp"
-    tensor_sharding_axis_name = "sp" if is_generating else "tp"
-    query_states = with_sharding_constraint(
-        query_states,
-        PartitionSpec(
-            ("dp", "fsdp"),
-            sequence_sharding_axis_name,
-            tensor_sharding_axis_name,
-            None
-        )
-    )
-    key_states = with_sharding_constraint(
-        key_states,
-        PartitionSpec(
-            ("dp", "fsdp"),
-            sequence_sharding_axis_name,
-            tensor_sharding_axis_name,
-            None
-        )
-    )
-    value_states = with_sharding_constraint(
-        value_states,
-        PartitionSpec(
-            ("dp", "fsdp"),
-            sequence_sharding_axis_name,
-            tensor_sharding_axis_name,
-            None
-        )
-    )
-
-    batch, q_sequence_length, q_num_head, head_dim = query_states.shape
-    _, kv_sequence_length, kv_num_head, _ = key_states.shape
-
-    assert q_num_head % kv_num_head == 0, (
-        f"`query_states` {q_num_head} must be a multiple of"
-        f" `key_states` and `value_states` heads {kv_num_head}"
-    )
-
-    query_states = jnp.reshape(
-        query_states,
-        (batch, q_sequence_length, kv_num_head, q_num_head // kv_num_head, head_dim)
-    )
-
-    query_states = with_sharding_constraint(
-        query_states, PartitionSpec(
-            ("dp", "fsdp"),
-            sequence_sharding_axis_name,
-            tensor_sharding_axis_name,
-            None,
-            None
-        )
-    )
-
-    attention_score = jnp.einsum(
-        "...thHd,...Thd->...hHtT",
-        query_states, key_states
-    ).astype(jnp.float32)
-
-    attention_score *= 1 / math.sqrt(head_dim)
-
-    max_attention_value = jnp.array(30.0, dtype=attention_score.dtype)
-    attention_score = max_attention_value * jnp.tanh(attention_score / max_attention_value)
-    attention_score = attention_score + attention_bias[:, :, None, :, :]
-
-    attention_weights = jax.nn.softmax(attention_score).astype(query_states.dtype)
-    if not deterministic and dropout_rate > 0.0:
-        keep_prob = 1.0 - dropout_rate
-        dropout_shape = tuple([1] * (key_states.ndim - 2)) + attention_weights.shape[-2:]
-        keep = random.bernoulli(dropout_rng, keep_prob, dropout_shape)  # type: ignore
-        multiplier = keep.astype(query_states.dtype) / jnp.asarray(keep_prob, dtype=query_states.dtype)
-        attention_weights = attention_weights * multiplier
-
-    attention = jnp.einsum("...hHtT,...Thd->...thHd", attention_weights, value_states).reshape(
-        batch, q_sequence_length, q_num_head, head_dim
-    )
-
-    attention = with_sharding_constraint(
-        attention,
-        PartitionSpec(
-            ("dp", "fsdp"),
-            sequence_sharding_axis_name,
-            tensor_sharding_axis_name,
-            None,
-        )
-    )
-
-    return attention
-
-
-def static_sharded_dot_product_attention(
-        query_states: Array,
-        key_states: Array,
-        value_states: Array,
-        bias: Optional[Array] = None,
-        mask: Optional[Array] = None,
-        broadcast_dropout: bool = True,
-        dropout_rng: Optional[jax.random.PRNGKey] = None,
-        dropout_rate: float = 0.0,
-        deterministic: bool = False,
-        dtype: Optional[jnp.dtype] = jnp.float32,
-        precision: Optional[Union[str, lax.Precision]] = None,
-        shard_attention_computation: bool = True
-):
-    assert key_states.shape[1] == value_states.shape[1], "miss match on key_states and value_states sequence length"
-    assert query_states.ndim == key_states.ndim, "q, k must have same rank."
-    assert query_states.shape[:-3] == key_states.shape[:-3], "q, k batch dims must match."
-    assert query_states.shape[-2] == key_states.shape[-2], "q, k num_heads must match."
-    assert query_states.shape[-1] == key_states.shape[-1], "q, k depths must match."
-
-    query_states, key_states, value_states = promote_dtype(query_states, key_states, value_states, dtype=dtype)
-
-    if query_states.shape[1] == 1:
-        sequence_sharding_axis_name = None
-        tensor_sharding_axis_name = "sp"
-    elif query_states.shape[1] != key_states.shape[1]:
-        sequence_sharding_axis_name = None
-        tensor_sharding_axis_name = None
-    else:
-        sequence_sharding_axis_name = "sp"
-        tensor_sharding_axis_name = "tp"
-
-    if shard_attention_computation:
-        query_states = with_sharding_constraint(
-            query_states, PartitionSpec(
-                ("dp", "fsdp"),
-                sequence_sharding_axis_name,
-                tensor_sharding_axis_name,
-                None
-            )
-        )
-
-        key_states = with_sharding_constraint(
-            key_states, PartitionSpec(
-                ("dp", "fsdp"),
-                sequence_sharding_axis_name,
-                tensor_sharding_axis_name,
-                None
-            )
-        )
-
-        value_states = with_sharding_constraint(
-            value_states, PartitionSpec(
-                ("dp", "fsdp"),
-                sequence_sharding_axis_name,
-                tensor_sharding_axis_name,
-                None
-            )
-        )
-
-    depth = query_states.shape[-1]
-    query_states = query_states / jnp.sqrt(depth).astype(dtype)
-    attention_weight = jnp.einsum(
-        "...qhd,...khd->...hqk",
-        query_states, key_states, precision=precision
-    )
-    if shard_attention_computation:
-        attention_weight = with_sharding_constraint(
-            attention_weight, PartitionSpec(
-                ("dp", "fsdp"),
-                None,
-                sequence_sharding_axis_name,
-                None
-            )
-        )
-        if bias is not None:
-            bias = with_sharding_constraint(
-                bias, PartitionSpec(
-                    ("dp", "fsdp"),
-                    None,
-                    sequence_sharding_axis_name,
-                    None
-                )
-            )
-    if bias is not None:
-        attention_weight = attention_weight + bias
-    if mask is not None:
-        big_neg = jnp.finfo(dtype).min
-        attention_weight = jnp.where(mask, attention_weight, big_neg)
-    attention_weight = jax.nn.softmax(attention_weight).astype(dtype)
-    if not deterministic and dropout_rate > 0.0:
-        keep_prob = 1.0 - dropout_rate
-        if broadcast_dropout:
-            dropout_shape = tuple([1] * (key_states.ndim - 2)) + attention_weight.shape[-2:]
-            keep = random.bernoulli(dropout_rng, keep_prob, dropout_shape)  # type: ignore
-        else:
-            keep = random.bernoulli(dropout_rng, keep_prob, attention_weight.shape)  # type: ignore
-        multiplier = keep.astype(dtype) / jnp.asarray(keep_prob, dtype=dtype)
-        attention_weight = attention_weight * multiplier
-    attention = jnp.einsum(
-        "...hqk,...khd->...qhd",
-        attention_weight, value_states, precision=precision
-    )
-    if shard_attention_computation:
-        attention = with_sharding_constraint(
-            attention, PartitionSpec(
-                ("dp", "fsdp"),
-                sequence_sharding_axis_name,
-                tensor_sharding_axis_name,
-                None
-            )
-        )
-    return attention
 
 
 def get_flash_attention() -> Tuple[Callable, bool, bool]:
@@ -315,303 +62,6 @@ def get_flash_attention() -> Tuple[Callable, bool, bool]:
     return ring_attention_fn, float32_logits, do_shard_map
 
 
-def _ring_attention_standard_fwd(
-        query,
-        key,
-        value,
-        attn_bias,
-        scale,
-        axis_name,
-        float32_logits
-):
-    if float32_logits:
-        query, key = query.astype(jnp.float32), key.astype(jnp.float32)
-    batch, q_len, num_heads, _ = query.shape
-    batch, kv_len, num_heads, dim_per_head = key.shape
-    numerator = jnp.zeros((batch, q_len, num_heads, dim_per_head)).astype(query.dtype)
-    denominator = jnp.zeros((batch, num_heads, q_len)).astype(query.dtype)
-    axis_size = lax.psum(1, axis_name)
-
-    def scan_kv_block(carry, idx):
-        p_max_score, _numerator, _denominator, _key, _value = carry
-        bias = lax.dynamic_slice_in_dim(
-            lax.dynamic_slice_in_dim(
-                attn_bias, (lax.axis_index(axis_name) - idx) % axis_size * q_len, q_len, axis=-2
-            ), (lax.axis_index(axis_name) - idx) % axis_size * kv_len, kv_len, axis=-1
-        )
-        attn_weights = jnp.einsum("bqhd,bkhd->bhqk", query, _key) / scale
-        attn_weights = jnp.add(bias, attn_weights)
-        _max_score = jnp.maximum(p_max_score, jnp.max(attn_weights, axis=-1))
-        exp_weights = jnp.exp(attn_weights - _max_score[..., None])
-        correction = rearrange(jnp.exp(p_max_score - _max_score), "b h q -> b q h")[..., None]
-        _numerator = _numerator * correction + jnp.einsum("bhqk,bkhd->bqhd", exp_weights, _value)
-        _denominator = _denominator * jnp.exp(p_max_score - _max_score) + jnp.sum(exp_weights, axis=-1)
-
-        _key, _value = map(
-            lambda x: lax.ppermute(x, axis_name, perm=[(i, (i + 1) % axis_size) for i in range(axis_size)]),
-            (_key, _value)
-        )
-        return (_max_score, _numerator, _denominator, _key, value), None
-
-    prev_max_score = jnp.full((batch, num_heads, q_len), -jnp.inf).astype(query.dtype)
-    (max_score, numerator, denominator, _, _), _ = lax.scan(
-        scan_kv_block,
-        init=(prev_max_score, numerator, denominator, key, value),
-        xs=jnp.arange(0, axis_size)
-    )
-    output = numerator / rearrange(denominator, "b h q -> b q h")[..., None]
-    return output.astype(value.dtype), (output, query, key, value, attn_bias, numerator, denominator, max_score)
-
-
-def _ring_attention_standard_bwd(
-        scale,
-        axis_name,
-        float32_logits,
-        res,
-        g
-):
-    del float32_logits
-    axis_size = lax.psum(1, axis_name)
-    output, query, key, value, attn_bias, numerator, denominator, max_score = res
-    dq = jnp.zeros_like(query, dtype=jnp.float32)
-    dk = jnp.zeros_like(key, dtype=jnp.float32)
-    dv = jnp.zeros_like(value, dtype=jnp.float32)
-    q_len = query.shape[1]
-    batch, kv_len, num_heads, dim_per_head = key.shape
-
-    def scan_kv_block(carry, idx):
-        _dq, _dk, _dv, _key, _value = carry
-        bias = lax.dynamic_slice_in_dim(
-            lax.dynamic_slice_in_dim(
-                attn_bias, (lax.axis_index(axis_name) - idx) % axis_size * q_len, q_len, axis=-2
-            ), (lax.axis_index(axis_name) - idx) % axis_size * kv_len, kv_len, axis=-1
-        )
-        attn_weights = jnp.einsum("bqhd,bkhd->bhqk", query, _key) / scale
-        attn_weights = jnp.add(bias, attn_weights)
-        exp_weights = jnp.exp(attn_weights - max_score[..., None]) / denominator[..., None]
-        ds = jnp.einsum("bqhd,bkhd->bhqk", g, _value)
-        dl = (ds - jnp.einsum("bqhd,bqhd->bhq", g, output)[..., None]) * exp_weights
-        _dq = _dq + jnp.einsum("bhqk,bkhd->bqhd", dl, _key) / scale
-        _dk = _dk + jnp.einsum("bqhd,bhqk->bkhd", query, dl) / scale
-        _dv = _dv + jnp.einsum("bhqk,bqhd->bkhd", exp_weights, g)
-        _key, _value, _dk, _dv = map(
-            lambda x: lax.ppermute(x, axis_name, perm=[(i, (i + 1) % axis_size) for i in range(axis_size)]),
-            (_key, _value, _dk, _dv)
-        )
-        return (_dq, _dk, _dv, _key, _value), None
-
-    (dq, dk, dv, key, value), _ = lax.scan(
-        scan_kv_block, init=(dq, dk, dv, key, value), xs=jnp.arange(0, axis_size)
-    )
-    dq, dk, dv = dq.astype(query.dtype), dk.astype(key.dtype), dv.astype(value.dtype)
-    return dq, dk, dv, None
-
-
-@partial(jax.custom_vjp, nondiff_argnums=[4, 5, 6])
-def ring_attention_standard(query, key, value, attn_bias, scale, axis_name, float32_logits=True):
-    y, _ = _ring_attention_standard_fwd(
-        query,
-        key,
-        value,
-        attn_bias,
-        scale,
-        axis_name,
-        float32_logits
-    )
-    return y
-
-
-ring_attention_standard.defvjp(_ring_attention_standard_fwd, _ring_attention_standard_bwd)
-
-
-def _query_chunk_flash_attention(q, k, v, b, q_chunk_size, k_chunk_size, epsilon):
-    q_len, batch, heads, dim, = q.shape
-    k_len, v_dim = k.shape[0], v.shape[-1]
-    scale = 1 / jnp.sqrt(dim)
-    q_scaled = q * scale
-
-    def chunk_scanner(carries, _):
-        chunk_idx, out, row_sum, row_max = carries
-        k_chunk_sizes = min(k_chunk_size, k_len)
-
-        k_chunk = lax.dynamic_slice(k, (chunk_idx, 0, 0, 0), slice_sizes=(k_chunk_sizes, batch, heads, dim))
-        v_chunk = lax.dynamic_slice(v, (chunk_idx, 0, 0, 0), slice_sizes=(k_chunk_sizes, batch, heads, v_dim))
-        key_mask_chunk = lax.dynamic_slice(key_mask, (chunk_idx, 0), slice_sizes=(k_chunk_sizes, batch))
-
-        attn_weights = jnp.einsum("q ... d, k ... d -> q ... k", q_scaled, k_chunk)
-
-        key_mask_chunk = rearrange(key_mask_chunk, "j b -> 1 b 1 j")
-        attn_weights = jnp.where(key_mask_chunk, attn_weights, MASK_VALUE)
-
-        block_row_max = jnp.max(attn_weights, axis=-1, keepdims=True)
-
-        new_row_max = jnp.maximum(block_row_max, row_max)
-        exp_weights = jnp.exp(attn_weights - new_row_max)
-
-        exp_weights = jnp.where(key_mask_chunk, exp_weights, 0.)
-        block_row_sum = jnp.sum(exp_weights, axis=-1, keepdims=True) + exp_weights
-
-        exp_values = jnp.einsum("i ... j, j ... d -> i ... d", exp_weights, v_chunk)
-
-        exp_row_max_diff = jnp.exp(row_max - new_row_max)
-
-        new_row_sum = exp_row_max_diff * row_sum + block_row_sum
-
-        out = (row_sum / new_row_sum) * exp_row_max_diff * out + (1. / new_row_sum) * exp_values
-
-        return (chunk_idx + k_chunk_sizes, out, new_row_sum, new_row_max), None
-
-    out = jnp.zeros((q_len, batch, heads, dim))
-    row_sum = jnp.zeros((q_len, batch, heads, 1))
-    row_max = jnp.ones((q_len, batch, heads, 1)) * -1e6
-
-    (_, out, row_sum, row_max), _ = lax.scan(
-        chunk_scanner,
-        init=(0, out, row_sum, row_max), xs=None,
-        length=math.ceil(k_len / k_chunk_size)
-    )
-
-    row_sum = rearrange(row_sum, "n ... 1 -> n ...")
-    row_max = rearrange(row_max, "n ... 1 -> n ...")
-
-    lse = jnp.log(row_sum) + row_max
-
-    return out, lse
-
-
-def _flash_attention(q, k, v, b, q_chunk_size, k_chunk_size, epsilon):
-    q_len, batch, heads, dim, = q.shape
-
-    def chunk_scanner(chunk_idx, _):
-        chunk_sizes = min(q_chunk_size, q_len)
-
-        q_chunk = lax.dynamic_slice(q, (chunk_idx, 0, 0, 0), slice_sizes=(chunk_sizes, batch, heads, dim))
-
-        return (
-            chunk_idx + chunk_sizes,
-            _query_chunk_flash_attention(
-                q_chunk,
-                k,
-                v,
-                b,
-                q_chunk_size,
-                k_chunk_size,
-                epsilon
-            )
-        )
-
-    q, k, v = map(lambda t: rearrange(t, "b h n d -> n b h d"), (q, k, v))
-    b = rearrange(b, "b h q k -> q b h k")
-
-    _, (out, lse) = lax.scan(chunk_scanner, init=0, xs=None, length=math.ceil(q_len / q_chunk_size))
-
-    out = rearrange(out, "c n b h d -> b h (c n) d")
-    lse = rearrange(lse, "c n b h -> b h (c n)")
-
-    return out, lse
-
-
-@partial(jax.custom_vjp, nondiff_argnums=(4, 5, 6))
-def flash_attention(q, k, v, b, q_chunk_size, k_chunk_size, epsilon):
-    out, _ = _flash_attention(q, k, v, b, q_chunk_size, k_chunk_size, epsilon)
-    return out
-
-
-def _flash_attention_fwd(q, k, v, b, q_chunk_size, k_chunk_size, epsilon):
-    out, lse = _flash_attention(q, k, v, b, q_chunk_size, k_chunk_size, epsilon)
-    return out, (q, k, v, b, q_chunk_size, k_chunk_size, epsilon, out, lse)
-
-
-def _query_chunk_flash_attention_backward(q, k, v, b, q_chunk_size, k_chunk_size, epsilon, o, do, lse):
-    q_len, batch, heads, dim = q.shape
-    k_len, v_dim = v.shape[0], v.shape[-1]
-
-    scale = 1 / jnp.sqrt(dim)
-    q_scaled = q * scale
-
-    def chunk_scanner(carries, _):
-        chunk_idx, dq = carries
-        k_chunk_sizes = min(k_chunk_size, k_len)
-
-        k_chunk = lax.dynamic_slice(k, (chunk_idx, batch, heads, 0), slice_sizes=(k_chunk_sizes, batch, heads, dim))
-        v_chunk = lax.dynamic_slice(v, (chunk_idx, batch, heads, 0), slice_sizes=(k_chunk_sizes, batch, heads, v_dim))
-        bias_chunk = lax.dynamic_slice(b, (chunk_idx, batch, k_len, 0),
-                                       slice_sizes=(k_chunk_sizes, batch,))  # TODO: fix here
-
-        attn_weights = jnp.einsum("i ... d, j ... d -> i ... j", q_scaled, k_chunk)
-
-        p = jnp.exp(attn_weights - lse)
-
-        p = jnp.add(bias_chunk, p, )
-
-        dv_chunk = jnp.einsum("i ... j, i ... d -> j ... d", p, do)
-        dp = jnp.einsum("i ... d, j ... d -> i ... j", do, v_chunk)
-
-        D = jnp.sum(do * o, axis=-1, keepdims=True)
-        ds = p * scale * (dp - D)
-
-        dq_chunk = jnp.einsum("i ... j, j ... d -> i ... d", ds, k_chunk)
-        dk_chunk = jnp.einsum("i ... j, i ... d -> j ... d", ds, q)
-
-        return (chunk_idx + k_chunk_sizes, dq + dq_chunk), (dk_chunk, dv_chunk)
-
-    dq = jnp.zeros_like(q)
-
-    (_, dq), (dk, dv) = lax.scan(chunk_scanner, init=(0, dq), xs=None, length=math.ceil(k_len / k_chunk_size))
-
-    dk = rearrange(dk, "c n ... -> (c n) ...")
-    dv = rearrange(dv, "c n ... -> (c n) ...")
-    return dq, dk, dv
-
-
-def _flash_attention_bwd(q_chunk_size, k_chunk_size, epsilon, res, do):
-    q, k, v, key_mask, o, lse = res
-
-    batch, heads, q_len, dim = q.shape
-
-    lse = rearrange(lse, "b h n -> n b h 1")
-
-    q, k, v, o, do = map(lambda t: rearrange(t, "b h n d -> n b h d"), (q, k, v, o, do))
-    key_mask = rearrange(key_mask, "b j -> j b")
-
-    dk = jnp.zeros_like(k)
-    dv = jnp.zeros_like(v)
-
-    def chunk_scanner(carries, _):
-        chunk_idx, dk, dv = carries
-
-        chunk_sizes = min(q_chunk_size, q_len)
-
-        q_chunk = lax.dynamic_slice(q, (chunk_idx, batch, heads, 0),
-                                    slice_sizes=(chunk_sizes, batch, heads, q.shape[-1]))
-        lse_chunk = lax.dynamic_slice(lse, (chunk_idx, batch, heads, 0), slice_sizes=(chunk_sizes, batch, heads, 1))
-        o_chunk = lax.dynamic_slice(o, (chunk_idx, batch, heads, 0),
-                                    slice_sizes=(chunk_sizes, batch, heads, o.shape[-1]))
-        do_chunk = lax.dynamic_slice(do, (chunk_idx, batch, heads, 0),
-                                     slice_sizes=(chunk_sizes, batch, heads, do.shape[-1]))
-
-        dq_chunk, dk_chunk, dv_chunk = _query_chunk_flash_attention_backward(
-            q_chunk,
-            k,
-            v,
-            b,
-            o_chunk,
-            do_chunk,
-            lse_chunk
-        )
-        return (chunk_idx + chunk_sizes, dk + dk_chunk, dv + dv_chunk), dq_chunk
-
-    (_, dk, dv), dq = lax.scan(chunk_scanner, init=(0, dk, dv), xs=None, length=math.ceil(q_len / q_chunk_size))
-
-    dq = rearrange(dq, "c n b h d -> b h (c n) d")
-    dk, dv = map(lambda t: rearrange(t, "n b h d -> b h n d"), (dk, dv))
-
-    return dq, dk, dv, None
-
-
-flash_attention.defvjp(_flash_attention_fwd, _flash_attention_bwd)
-
-
 class AttentionModule:
     def __init__(
             self,
@@ -622,21 +72,23 @@ class AttentionModule:
                 "splash",
                 "ring",
                 "cudnn",
-                "local_ring"
+                "local_ring",
+                "sharded_vanilla",
+                "wise_ring"
             ],
             num_attention_heads: int,
             head_dims: int,
-            block_k: int = 512,
-            block_q: int = 512,
-            block_b: int = 512,
-            block_k_major: int = 512,
-            block_q_major_dkv: int = 512,
-            block_k_major_dkv: int = 512,
-            block_k_dkv: int = 512,
-            block_q_dkv: int = 512,
-            block_k_major_dq: int = 512,
-            block_k_dq: int = 512,
-            block_q_dq: int = 512,
+            block_k: int = DEFAULT_K_BLOCK,
+            block_q: int = DEFAULT_Q_BLOCK,
+            block_b: int = DEFAULT_Q_BLOCK,
+            block_k_major: int = DEFAULT_K_BLOCK,
+            block_q_major_dkv: int = DEFAULT_Q_BLOCK,
+            block_k_major_dkv: int = DEFAULT_K_BLOCK,
+            block_k_dkv: int = DEFAULT_K_BLOCK,
+            block_q_dkv: int = DEFAULT_Q_BLOCK,
+            block_k_major_dq: int = DEFAULT_K_BLOCK,
+            block_k_dq: int = DEFAULT_K_BLOCK,
+            block_q_dq: int = DEFAULT_Q_BLOCK,
             sm_scale: Optional[float] = None,
             query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             generation_query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, "tp", None),
@@ -702,6 +154,7 @@ class AttentionModule:
             scale=1 / self.sm_scale,
             float32_logits=True,
         )
+
         self.local_ring_attention_generation_kernel = shard_map(
             ring_func,
             mesh=self.mesh,
@@ -820,6 +273,15 @@ class AttentionModule:
                     dropout_rng=dropout_rng,
                     deterministic=deterministic,
                 )
+            elif self.attn_mechanism == "sharded_vanilla":
+                return self.sharded_vanilla_attention(
+                    query_states=query_states,
+                    key_states=key_states,
+                    value_states=value_states,
+                    bias=bias,
+                    dropout_rng=dropout_rng,
+                    deterministic=deterministic,
+                )
             elif self.attn_mechanism == "ring":
                 return self.ring_attention(
                     query_states=query_states,
@@ -856,6 +318,15 @@ class AttentionModule:
                     key_states=key_states,
                     value_states=value_states,
                     bias=bias
+                )
+            elif self.attn_mechanism == "wise_ring":
+                return self.wise_ring_attention(
+                    query_states=query_states,
+                    bias=bias,
+                    value_states=value_states,
+                    key_states=key_states,
+                    segment_ids=segment_ids,
+                    query_sequence_length=query_sequence_length
                 )
             else:
                 raise ValueError(f"Unknown Attention mechanism of {self.attn_mechanism}")
@@ -899,11 +370,11 @@ class AttentionModule:
             if self.platform == "tpu":
                 ring_attention_fn = ring_flash_attention_tpu
             else:
-                ring_attention_fn = ring_attention
+                ring_attention_fn = fjformer.pallas_operations.ring_attention
             ring_attention_sharded = shard_map(
                 partial(
                     ring_attention_fn,
-                    axis_name="sp",
+                    axis_name=self.axis_name,
                     float32_logits=True,
                     blockwise_kwargs=dict(
                         deterministic=deterministic,
@@ -962,6 +433,61 @@ class AttentionModule:
             attention_outputs=attn_output
         )
 
+    def wise_ring_attention(
+            self,
+            *,  # it's Kwarg Only
+            query_states: Array,
+            key_states: Array,
+            value_states: Array,
+            query_sequence_length: int,
+            bias: Optional[Array] = None,
+            deterministic: bool = False,
+            dropout_rng: Optional[random.PRNGKey] = None,
+            segment_ids: Optional[Array] = None
+    ):
+        if segment_ids is None:
+            segment_ids = jnp.zeros((query_states.shape[0], query_sequence_length), dtype="i4")
+        attn_out_spec = (
+            self.attention_partition_spec if query_sequence_length != 1 else self.generation_attention_partition_spec
+        )
+        ring_attention_sharded = shard_map(
+            partial(
+                wise_ring_attention,
+                axis_name=self.axis_name,
+                float32_logits=True,
+                block_wise_kwargs=dict(
+                    deterministic=deterministic,
+                    dropout_rng=dropout_rng,
+                    attn_pdrop=self.attention_dropout,
+                    causal=True,
+                    query_chunk_size=min(query_sequence_length, self.block_q),
+                    key_chunk_size=min(key_states.shape[1], self.block_k),
+                    dtype=self.dtype,
+                    policy=get_gradient_checkpoint_policy("nothing_saveable"),
+                    precision=self.precision,
+                    prevent_cse=not self.scan_attention_layers,
+                )
+            ),
+            mesh=self.mesh,
+            in_specs=(
+                self.query_partition_spec if query_sequence_length != 1 else self.generation_query_partition_spec,
+                self.key_partition_spec,
+                self.value_partition_spec,
+                self.bias_partition_spec if query_sequence_length != 1 else self.generation_bias_partition_spec,
+                PartitionSpec(("dp", "fsdp"), None if query_sequence_length != 1 else self.axis_name),
+            ),
+            out_specs=(
+                attn_out_spec
+            ),
+            check_rep=False
+        )
+        attn_output = ring_attention_sharded(query_states, key_states, value_states, bias, segment_ids)
+
+        return AttentionOutput(
+            attention_weights=None,
+            attention_outputs=attn_output
+        )
+
     def vanilla_attention(
             self,
             *,  # it's Kwarg Only
@@ -974,102 +500,55 @@ class AttentionModule:
     ) -> AttentionOutput:
         dtype = jnp.promote_types(self.dtype, jnp.float32)
         with self.mesh:
-            assert key_states.shape[1] == value_states.shape[1], (
-                "miss match on key_states and value_states sequence length"
+            o, w = vanilla_attention(
+                query_states=query_states,
+                key_states=key_states,
+                value_states=value_states,
+                bias=bias,
+                deterministic=deterministic,
+                dtype=dtype,
+                dropout_rng=dropout_rng,
+                precision=self.precision,
+                attention_dropout=self.attention_dropout,
+                shard_attention_computation=self.shard_attention_computation,
             )
-            assert query_states.ndim == key_states.ndim, "q, k must have same rank."
-            assert query_states.shape[:-3] == key_states.shape[:-3], "q, k batch dims must match."
-            assert query_states.shape[-2] == key_states.shape[-2], "q, k num_heads must match."
-            assert query_states.shape[-1] == key_states.shape[-1], "q, k depths must match."
+            return AttentionOutput(o, w)
 
-            query_states, key_states, value_states = promote_dtype(query_states, key_states, value_states, dtype=dtype)
-
-            if query_states.shape[1] == 1:
-                sequence_sharding_axis_name = None
-                tensor_sharding_axis_name = "sp"
-            elif query_states.shape[1] != key_states.shape[1]:
-                sequence_sharding_axis_name = None
-                tensor_sharding_axis_name = None
-            else:
-                sequence_sharding_axis_name = "sp"
-                tensor_sharding_axis_name = "tp"
-
-            if self.shard_attention_computation:
-                query_states = with_sharding_constraint(
-                    query_states, PartitionSpec(
-                        ("dp", "fsdp"),
-                        sequence_sharding_axis_name,
-                        tensor_sharding_axis_name,
-                        None
-                    )
-                )
-
-                key_states = with_sharding_constraint(
-                    key_states, PartitionSpec(
-                        ("dp", "fsdp"),
-                        sequence_sharding_axis_name,
-                        tensor_sharding_axis_name,
-                        None
-                    )
-                )
-
-                value_states = with_sharding_constraint(
-                    value_states, PartitionSpec(
-                        ("dp", "fsdp"),
-                        sequence_sharding_axis_name,
-                        tensor_sharding_axis_name,
-                        None
-                    )
-                )
-
-            depth = query_states.shape[-1]
-            query_states = query_states / jnp.sqrt(depth).astype(dtype)
-            attention_weight = jnp.einsum(
-                "...qhd,...khd->...hqk",
-                query_states, key_states, precision=self.precision
+    def sharded_vanilla_attention(
+            self,
+            *,  # it's Kwarg Only
+            query_states: Array,
+            key_states: Array,
+            value_states: Array,
+            bias: Optional[Array] = None,
+            deterministic: bool = False,
+            dropout_rng: Optional[random.PRNGKey] = None,
+    ) -> AttentionOutput:
+        dtype = jnp.promote_types(self.dtype, jnp.float32)
+        is_generating = query_states.shape[1] == 1
+        query_sequence_partition = self.generation_query_partition_spec if is_generating else self.query_partition_spec
+        out_spec = self.generation_attention_partition_spec if is_generating else self.attention_partition_spec
+        with self.mesh:
+            output = shard_map(
+                partial(
+                    shard_vanilla_attention,
+                    deterministic=deterministic,
+                    dropout_rng=dropout_rng,
+                    dtype=dtype,
+                    precision=self.precision,
+                    attention_dropout=self.attention_dropout
+                ),
+                mesh=self.mesh,
+                in_specs=(
+                    query_sequence_partition,
+                    self.key_partition_spec,
+                    self.value_partition_spec,
+                    PartitionSpec(("dp", "fsdp"), None, None, None),
+                ),
+                out_specs=out_spec,
             )
-            if self.shard_attention_computation:
-                attention_weight = with_sharding_constraint(
-                    attention_weight, PartitionSpec(
-                        ("dp", "fsdp"),
-                        None,
-                        sequence_sharding_axis_name,
-                        None
-                    )
-                )
-                if bias is not None:
-                    bias = with_sharding_constraint(
-                        bias, PartitionSpec(
-                            ("dp", "fsdp"),
-                            None,
-                            sequence_sharding_axis_name,
-                            None
-                        )
-                    )
-
-            if bias is not None:
-                attention_weight = attention_weight + bias
-            attention_weight = jax.nn.softmax(attention_weight).astype(dtype)
-            if not deterministic and self.attention_dropout > 0.0:
-                keep_prob = 1.0 - self.attention_dropout
-                dropout_shape = tuple([1] * (key_states.ndim - 2)) + attention_weight.shape[-2:]
-                keep = random.bernoulli(dropout_rng, keep_prob, dropout_shape)  # type: ignore
-
-                multiplier = keep.astype(dtype) / jnp.asarray(keep_prob, dtype=dtype)
-                attention_weight = attention_weight * multiplier
-            attention = jnp.einsum(
-                "...hqk,...khd->...qhd",
-                attention_weight, value_states, precision=self.precision
-            )
-            if self.shard_attention_computation:
-                attention = with_sharding_constraint(
-                    attention,
-                    PartitionSpec(("dp", "fsdp"), sequence_sharding_axis_name, tensor_sharding_axis_name, None)
-                )
-        return AttentionOutput(
-            attention_outputs=attention,
-            attention_weights=attention_weight
-        )
+            output = fjformer.with_sharding_constraint(output, out_spec)
+            return AttentionOutput(output)
 
     def flash_attention(
             self,

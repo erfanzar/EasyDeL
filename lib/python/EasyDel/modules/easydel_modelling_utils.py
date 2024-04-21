@@ -16,7 +16,9 @@ AVAILABLE_ATTENTION_MECHANISMS = Literal[
     "splash",
     "ring",
     "cudnn",
-    "local_ring"
+    "local_ring",
+    "sharded_vanilla",
+    "wise_ring"
 ]
 
 
@@ -316,9 +318,9 @@ class EasyDelPretrainedConfig(PretrainedConfig):
         set_attrs_smartly(self, "axis_dims", (1, -1, 1, 1), axis_dims)
         set_attrs_smartly(self, "axis_names", ("dp", "fsdp", "tp", "sp"), axis_names)
 
-        set_attrs_smartly(self, "block_q", 128, block_q)
-        set_attrs_smartly(self, "block_k", 128, block_k)
-        set_attrs_smartly(self, "block_b", 1, block_b)
+        set_attrs_smartly(self, "block_q", 1024, block_q)
+        set_attrs_smartly(self, "block_k", 1024, block_k)
+        set_attrs_smartly(self, "block_b", 1024, block_b)
 
         set_attrs_smartly(
             self,

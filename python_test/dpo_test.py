@@ -1,7 +1,8 @@
 import os
 
+os.environ["XLA_FLAGS"] = '--xla_force_host_platform_device_count=8'
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
-
+import fjformer.linen.linen
 import jax
 from jax import numpy as jnp
 
@@ -56,6 +57,7 @@ def get_hh(split: str, sanity_check: bool = False, silent: bool = False, cache_d
 
 
 def main():
+    assert len(jax.devices("cpu")) == 8, "XLA Device manipulation failed."
     with jax.default_device(jax.devices("cpu")[0]):
         model_name_or_path = "erfanzar/LLamaStory-70M"
         conf = LlamaConfig(
@@ -74,8 +76,6 @@ def main():
             use_wandb=False
         )
 
-        torch_dtype = torch.float32
-        # model_ref = None
         tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
 
         if tokenizer.pad_token is None:
@@ -87,24 +87,23 @@ def main():
         train_dataset = get_hh("train", sanity_check=True)
         eval_dataset = get_hh("test", sanity_check=True)
 
-        # state = EasyDelState.from_pretrained(
-        #     pretrained_model_name_or_path=model_name_or_path
-        # )
-        # ref_state = EasyDelState.from_pretrained(
-        #     pretrained_model_name_or_path=model_name_or_path,
-        #
-        # )
         module = FlaxLlamaForCausalLM(
             config=conf,
             dtype=jnp.float32,
             param_dtype=jnp.float32,
-            _do_init=True
+            _do_init=True,
+            input_shape=(8, 8)
         )
         ref_module = FlaxLlamaForCausalLM(
             config=conf,
             dtype=jnp.float32,
             param_dtype=jnp.float32,
-            _do_init=True
+            _do_init=True,
+            input_shape=(8, 8)
+        )
+        ref_module.params = fjformer.linen.linen.quantize_parameters(
+            ["kernel", "embedding"],
+            ref_module.params,
         )
         state = EasyDelState.load(
             module=module,
