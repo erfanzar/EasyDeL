@@ -28,7 +28,7 @@ from transformers.modeling_flax_outputs import (
 )
 
 from .whisper_configuration import WhisperConfig
-from ..easy_attention import EasyAttention
+from ..attention_module import AttentionModule
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 # EasyDel.modules
 from ..flax_modelling_utils import (
@@ -88,7 +88,7 @@ class FlaxWhisperAttention(BaseJAXAttentionModule):
         self.v_proj = dense(use_bias=self.bias)
         self.out_proj = dense(use_bias=self.bias)
 
-        self.attention_performer = EasyAttention(
+        self.attention_performer = AttentionModule(
             use_sharding_constraint=self.config.use_sharding_constraint,
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,

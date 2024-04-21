@@ -22,7 +22,7 @@ from ..flax_modelling_utils import (
     precompute_freq_cis,
     get_dot_general_by_bits
 )
-from ..easy_attention import AttentionOutput, EasyAttention
+from ..attention_module import AttentionOutput, AttentionModule
 
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 import chex

@@ -36,10 +36,10 @@ class EasyModelsTest(TestCase):
         self.intermediate_size: int = 512
         self.num_hidden_layers: int = 32
         self.num_attention_heads: int = 8
+        self.num_key_value_heads: Optional[int] = 4
         self.num_experts_per_tok = 4
         self.num_experts = 8
         self.num_local_experts = self.num_experts
-        self.num_key_value_heads: Optional[int] = 4
         self.rms_norm_eps: float = 1e-6
         self.layer_norm_eps = self.rms_norm_eps
         self.initializer_range: float = 0.02
@@ -65,7 +65,14 @@ class EasyModelsTest(TestCase):
         self.rotary_dim = 32
         self.dtype: jax.numpy.dtype = jnp.float32
         self.precision = jax.lax.Precision("fastest")
-        self.attn_mechanism: Literal["normal", "flash", "splash", "ring", "cudnn"] = "normal"
+        self.attn_mechanism: Literal[
+            "vanilla",
+            "flash",
+            "splash",
+            "ring",
+            "cudnn",
+            "local_ring"
+        ] = "vanilla"
         self.block_k: int = 32
         self.block_q: int = 32
         self.sequence_length = 64

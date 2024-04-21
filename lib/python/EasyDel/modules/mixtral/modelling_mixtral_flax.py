@@ -14,7 +14,7 @@ from typing import Union, Optional, Tuple
 from flax.linen import partitioning as nn_partitioning, combine_masks
 from transformers.modeling_flax_outputs import FlaxMaskedLMOutput
 from fjformer.func import auxiliary_load_balancing_loss_func
-from ..easy_attention import EasyAttention
+from ..attention_module import AttentionModule
 from fjformer.linen import Linear
 from ..flax_modelling_utils import (
     ACT2FN,
@@ -118,7 +118,7 @@ class FlaxMixtralAttention(BaseJAXAttentionModule):
         self.v_proj = dense(self.num_key_value_heads * self.head_dim)
         self.o_proj = dense(self.hidden_size)
         self.rotary = FlaxMixtralRotaryEmbedding(self.dtype)
-        self.attention_performer = EasyAttention(
+        self.attention_performer = AttentionModule(
             use_sharding_constraint=self.config.use_sharding_constraint,
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,

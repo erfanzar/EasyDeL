@@ -10,7 +10,14 @@ from typing import Sequence, Union, Optional, Literal, Tuple, Any
 from dataclasses import dataclass
 from jax.sharding import PartitionSpec, Mesh
 
-AVAILABLE_ATTENTION_MECHANISMS = Literal["normal", "flash", "splash", "ring", "cudnn"]
+AVAILABLE_ATTENTION_MECHANISMS = Literal[
+    "vanilla",
+    "flash",
+    "splash",
+    "ring",
+    "cudnn",
+    "local_ring"
+]
 
 
 def set_attrs_smartly(self, attr_name: str, default: Any, new_attr: Any):
@@ -34,7 +41,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
     :param self: Refer to the instance of the class
     :param axis_dims: Sequence[int]: Specify the number of dimensions for each axis
     :param axis_names: Sequence[str]: Set the names of the axes
-    :param attn_mechanism: Literal["normal", "flash", "splash", "ring"]: attention mechanism to use
+    :param attn_mechanism: Literal["vanilla", "flash", "splash", "ring"]: attention mechanism to use
     :param block_k: int: block size of key_states
     :param block_q: int: block size of query_states
     :param block_b: int: block size of bias
@@ -60,7 +67,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             self,
             axis_dims: Sequence[int] = (1, -1, 1, 1),
             axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = "normal",
+            attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = "vanilla",
             block_k: int = 128,
             block_q: int = 128,
             block_b: int = 1,
@@ -272,7 +279,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
         :param self: Refer to the instance of the class
         :param axis_dims: Sequence[int]: Specify the number of dimensions for each axis
         :param axis_names: Sequence[str]: Set the names of the axes
-        :param attn_mechanism: Literal["normal", "flash", "splash"]: attention mechanism to use
+        :param attn_mechanism: Literal["vanilla", "flash", "splash"]: attention mechanism to use
         :param block_k: int: block size of key_states
         :param block_q: int: block size of query_states
         :param block_b: int: block size of bias
@@ -365,7 +372,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
         set_attrs_smartly(self, "backend", jax.default_backend(), backend)
         set_attrs_smartly(self, "shard_attention_computation", True, shard_attention_computation)
         set_attrs_smartly(self, "use_sharded_kv_caching", True, use_sharded_kv_caching)
-        set_attrs_smartly(self, "attn_mechanism", "normal", attn_mechanism)
+        set_attrs_smartly(self, "attn_mechanism", "vanilla", attn_mechanism)
 
         set_attrs_smartly(self, "block_k_dkv", block_k_dkv or self.block_k, block_k_dkv)
         set_attrs_smartly(self, "block_q_dkv", block_q_dkv or self.block_q, block_q_dkv)

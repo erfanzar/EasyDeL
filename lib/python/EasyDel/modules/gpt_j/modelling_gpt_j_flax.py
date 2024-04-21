@@ -44,7 +44,7 @@ from transformers.utils import logging
 
 from fjformer.pallas_operations.efficient_attention import efficient_attention
 
-from ..easy_attention import EasyAttention
+from ..attention_module import AttentionModule
 from ..flax_modelling_utils import with_sharding_constraint, ACT2FN, BaseJAXAttentionModule, \
     get_gradient_checkpoint_policy, block_wise_ffn
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
@@ -127,7 +127,7 @@ class FlaxGPTJAttention(BaseJAXAttentionModule):
         pos_embd_dim = self.rotary_dim or self.embed_dim
         self.embed_positions = create_sinusoidal_positions(config.max_position_embeddings, pos_embd_dim)
 
-        self.attention_performer = EasyAttention(
+        self.attention_performer = AttentionModule(
             use_sharding_constraint=self.config.use_sharding_constraint,
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,
