@@ -85,7 +85,7 @@ flags.DEFINE_enum(
         "sharded_vanilla",
         "wise_ring"
     ],
-    default="vanilla",
+    default="sharded_vanilla",
     help="The attention mechanism to be used in the model"
 )
 

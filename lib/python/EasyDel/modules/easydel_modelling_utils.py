@@ -374,7 +374,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
         set_attrs_smartly(self, "backend", jax.default_backend(), backend)
         set_attrs_smartly(self, "shard_attention_computation", True, shard_attention_computation)
         set_attrs_smartly(self, "use_sharded_kv_caching", True, use_sharded_kv_caching)
-        set_attrs_smartly(self, "attn_mechanism", "vanilla", attn_mechanism)
+        set_attrs_smartly(self, "attn_mechanism", "sharded_vanilla", attn_mechanism)
 
         set_attrs_smartly(self, "block_k_dkv", block_k_dkv or self.block_k, block_k_dkv)
         set_attrs_smartly(self, "block_q_dkv", block_q_dkv or self.block_q, block_q_dkv)
