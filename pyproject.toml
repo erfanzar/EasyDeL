@@ -36,6 +36,7 @@ dependencies = [
     "pydantic-core==2.14.6",
     "tensorflow~=2.16.1",
     "tensorflow_datasets<=4.9.0",
+    "scipy==1.10.1"
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",

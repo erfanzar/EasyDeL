@@ -67,7 +67,7 @@ python -m examples.jax_serve_example \
   --prompter_type="gemma" \ 
   --share_gradio=True \ 
   --sharding_axis_dims=1,1,1,-1 \
-  --attn_mechanism="vanilla" \
+  --attn_mechanism="sharded_vanilla" \
   --scan_ring_attention=True \
   --max_sequence_length=8192 \ 
   --max_new_tokens_ratio=25 \
