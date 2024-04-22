@@ -414,7 +414,11 @@ class AttentionModule:
                 )
             query_sequence_partition = None if query_states.shape[1] == 1 else "sp"
             ring_attention_sharded = shard_map(
-                partial(ring_attention_standard, axis_name=self.axis_name),
+                partial(
+                    ring_attention_standard,
+                    axis_name=self.axis_name,
+                    scale=self.sm_scale
+                ),
                 mesh=self.mesh,
                 in_specs=(
                     PartitionSpec(("dp", "fsdp"), query_sequence_partition, "tp", None),
