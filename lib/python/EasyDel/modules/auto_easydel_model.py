@@ -304,6 +304,19 @@ def get_modules_by_type(model_type: str) -> Tuple[
                 rnn_based_or_rwkv=False
             )
         )
+    elif model_type == "dbrx":
+        from .dbrx import DbrxConfig as _DbrxConfig
+        from .dbrx import FlaxDbrxForCausalLM as _FlaxDbrxForCausalLM
+        return (
+            _DbrxConfig,
+            _FlaxDbrxForCausalLM,
+            functools.partial(
+                huggingface_to_easydel,
+                embedding_layer_names=["wte"],
+                rnn_based_or_rwkv=False
+            )
+        )
+
     raise EasyDelRuntimeError(f'Model Type ({model_type}) is not supported or is not found')
 
 
