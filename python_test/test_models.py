@@ -82,6 +82,7 @@ class EasyModelsTest(TestCase):
         self.head_dim = 256
         self.max_position_embeddings: int = self.sequence_length
         self.use_sharding_constraint = False
+        self.header_config = None
 
     def create_test_for_models(
             self,
@@ -89,26 +90,29 @@ class EasyModelsTest(TestCase):
             hf_module_class
     ):
         module_config, module_class, transform_function = ed.get_modules_by_type(module_name)
-        config = module_config(
-            num_experts_per_tok=self.num_experts_per_tok,
-            num_experts=self.num_experts,
-            num_local_experts=self.num_local_experts,
-            vocab_size=self.vocab_size,
-            hidden_size=self.hidden_size,
-            num_attention_heads=self.num_attention_heads,
-            num_hidden_layers=self.num_hidden_layers,
-            gradient_checkpointing=self.gradient_checkpointing,
-            max_position_embeddings=self.max_position_embeddings,
-            num_key_value_heads=self.num_key_value_heads,
-            scan_mlp_chunk_size=self.scan_mlp_chunk_size,
-            intermediate_size=self.intermediate_size,
-            rotary_dim=self.rotary_dim,
-            rms_norm_eps=self.rms_norm_eps,
-            layer_norm_eps=self.layer_norm_eps,
-            axis_dims=(1, -1, 1, 1),
-            head_dim=self.head_dim
-            # residual_in_fp32=True
-        )
+        if self.header_config is None:
+            config = module_config(
+                num_experts_per_tok=self.num_experts_per_tok,
+                num_experts=self.num_experts,
+                num_local_experts=self.num_local_experts,
+                vocab_size=self.vocab_size,
+                hidden_size=self.hidden_size,
+                num_attention_heads=self.num_attention_heads,
+                num_hidden_layers=self.num_hidden_layers,
+                gradient_checkpointing=self.gradient_checkpointing,
+                max_position_embeddings=self.max_position_embeddings,
+                num_key_value_heads=self.num_key_value_heads,
+                scan_mlp_chunk_size=self.scan_mlp_chunk_size,
+                intermediate_size=self.intermediate_size,
+                rotary_dim=self.rotary_dim,
+                rms_norm_eps=self.rms_norm_eps,
+                layer_norm_eps=self.layer_norm_eps,
+                axis_dims=(1, -1, 1, 1),
+                head_dim=self.head_dim
+                # residual_in_fp32=True
+            )
+        else:
+            config = self.header_config
 
         hf_model = hf_module_class(
             config=copy.deepcopy(config)
@@ -187,25 +191,28 @@ class EasyModelsTest(TestCase):
             hf_module_class
     ):
         module_config, module_class, transform_function = ed.get_modules_by_type(module_name)
-        config = module_config(
-            num_experts_per_tok=self.num_experts_per_tok,
-            num_experts=self.num_experts,
-            num_local_experts=self.num_local_experts,
-            vocab_size=self.vocab_size,
-            hidden_size=self.hidden_size,
-            num_attention_heads=self.num_attention_heads,
-            num_hidden_layers=self.num_hidden_layers,
-            gradient_checkpointing=self.gradient_checkpointing,
-            max_position_embeddings=self.max_position_embeddings,
-            num_key_value_heads=self.num_key_value_heads,
-            scan_mlp_chunk_size=self.scan_mlp_chunk_size,
-            intermediate_size=self.intermediate_size,
-            rotary_dim=self.rotary_dim,
-            rms_norm_eps=self.rms_norm_eps,
-            layer_norm_eps=self.layer_norm_eps,
-            head_dim=self.head_dim
-            # residual_in_fp32=True
-        )
+        if self.header_config is None:
+            config = module_config(
+                num_experts_per_tok=self.num_experts_per_tok,
+                num_experts=self.num_experts,
+                num_local_experts=self.num_local_experts,
+                vocab_size=self.vocab_size,
+                hidden_size=self.hidden_size,
+                num_attention_heads=self.num_attention_heads,
+                num_hidden_layers=self.num_hidden_layers,
+                gradient_checkpointing=self.gradient_checkpointing,
+                max_position_embeddings=self.max_position_embeddings,
+                num_key_value_heads=self.num_key_value_heads,
+                scan_mlp_chunk_size=self.scan_mlp_chunk_size,
+                intermediate_size=self.intermediate_size,
+                rotary_dim=self.rotary_dim,
+                rms_norm_eps=self.rms_norm_eps,
+                layer_norm_eps=self.layer_norm_eps,
+                head_dim=self.head_dim
+                # residual_in_fp32=True
+            )
+        else:
+            config = self.header_config
 
         hf_model = hf_module_class(
             config=copy.deepcopy(config)
@@ -342,6 +349,25 @@ class EasyModelsTest(TestCase):
             f"Gemma model Failed [ERROR {err}]"
         )
 
+    def test_dbrx(self):
+        self.header_config = ed.DbrxConfig(
+            d_model=self.hidden_size,
+            n_heads=self.num_attention_heads,
+            n_layers=self.num_hidden_layers,
+            ffn_config=ed.DbrxFFNConfig(
+                ffn_hidden_size=self.intermediate_size,
+                moe_top_k=self.num_experts_per_tok,
+                moe_num_experts=self.num_local_experts,
+            ),
+            attn_config=ed.DbrxAttentionConfig()
+        )
+
+        res, err = self.create_test_for_models("dbrx", transformers.DbrxForCausalLM)
+        self.assertTrue(
+            res,
+            f"DBRX model Failed [ERROR {err}]"
+        )
+
     def test_stablelm(self):
         res, err = self.create_test_for_models("stablelm", transformers.StableLmForCausalLM)
 
@@ -386,6 +412,21 @@ class EasyModelsTest(TestCase):
 
     def test_moe_qwen2_moe(self):
         res = self.create_moe_test_for_models("qwen2_moe", transformers.Qwen2MoeForCausalLM)
+        self.assertTrue(res)
+
+    def test_moe_dbrx_moe(self):
+        self.header_config = ed.DbrxConfig(
+            d_model=self.hidden_size,
+            n_heads=self.num_attention_heads,
+            n_layers=self.num_hidden_layers,
+            ffn_config=ed.DbrxFFNConfig(
+                ffn_hidden_size=self.intermediate_size,
+                moe_top_k=self.num_experts_per_tok,
+                moe_num_experts=self.num_local_experts,
+            ),
+            attn_config=ed.DbrxAttentionConfig()
+        )
+        res = self.create_moe_test_for_models("dbrx", transformers.DbrxForCausalLM)
         self.assertTrue(res)
 
     @staticmethod

@@ -118,6 +118,14 @@ from .cohere import (
     FlaxCohereForCausalLM as FlaxCohereForCausalLM
 )
 
+from .dbrx import (
+    DbrxConfig as DbrxConfig,
+    DbrxFFNConfig as DbrxFFNConfig,
+    DbrxAttentionConfig as DbrxAttentionConfig,
+    FlaxDbrxModel as FlaxDbrxModel,
+    FlaxDbrxForCausalLM as FlaxDbrxForCausalLM
+)
+
 from .auto_easydel_model import (
     AutoEasyDelModelForCausalLM as AutoEasyDelModelForCausalLM,
     AutoEasyDelConfig as AutoEasyDelConfig,
@@ -165,6 +173,9 @@ __all__ = (
     "FlaxWhisperForAudioClassification", "FlaxWhisperForConditionalGeneration",
 
     "CohereConfig", "FlaxCohereModel", "FlaxCohereForCausalLM",
+
+    "FlaxDbrxModel", "FlaxDbrxForCausalLM",
+    "DbrxConfig", "DbrxFFNConfig", "DbrxAttentionConfig",
 
     "AutoEasyDelModelForCausalLM",
     "AutoEasyDelConfig",
