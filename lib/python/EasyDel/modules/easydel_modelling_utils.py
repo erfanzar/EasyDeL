@@ -69,7 +69,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             self,
             axis_dims: Sequence[int] = (1, -1, 1, 1),
             axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = "vanilla",
+            attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = "sharded_vanilla",
             block_k: int = 128,
             block_q: int = 128,
             block_b: int = 1,
