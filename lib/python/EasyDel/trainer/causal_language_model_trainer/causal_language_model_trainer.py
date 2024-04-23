@@ -455,58 +455,36 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                     self.arguments.total_batch_size
                                 )
                             )  # It's faster
-                            if self.arguments.performance_mode:
+
+                            with jax.spmd_mode("allow_all"):
                                 calculating_metrics_start = time.time()
+                                loss_sum = loss if loss_sum is None else loss_sum + loss
                                 accuracy = metrics["accuracy"]
+                                accuracy_sum = accuracy if accuracy_sum is None else accuracy_sum + accuracy
+                                mean_loss = loss_sum / (current_step - self.arguments.step_start_point)
+                                mean_accuracy = accuracy_sum / (current_step - self.arguments.step_start_point)
                                 perplexity = jnp.exp(loss)
                                 calculating_metrics_end = time.time()
                                 train_metrics = {
                                     "train/loss": loss.tolist(),
+                                    "train/mean_loss": mean_loss.tolist(),
                                     "train/accuracy": accuracy,
+                                    "train/mean_accuracy": mean_accuracy.tolist(),
                                     "train/learning_rate": self.scheduler(current_step).tolist(),
                                     "train/step": current_step,
                                     "train/step_time": step_time,
                                     "train/perplexity": perplexity.tolist(),
                                     "train/trained_tokens": trained_tokens,
-                                    "train/max_grad_norm": metrics["max_grad_norm"].tolist(),
-                                    "train/mean_grad_norm": metrics["mean_grad_norm"].tolist(),
                                     "train/regularization_z_loss": metrics["regularization_z_loss"].tolist(),
                                     "train/epoch": epoch,
                                 }
-
+                            if self.arguments.log_grad_norms:
                                 train_metrics.update(
                                     {
-                                        "calculating_metrics_step_time": (
-                                                calculating_metrics_end - calculating_metrics_start
-                                        )
-                                    }
-                                )
-
-                            else:
-                                with jax.spmd_mode("allow_all"):
-                                    calculating_metrics_start = time.time()
-                                    loss_sum = loss if loss_sum is None else loss_sum + loss
-                                    accuracy = metrics["accuracy"]
-                                    accuracy_sum = accuracy if accuracy_sum is None else accuracy_sum + accuracy
-                                    mean_loss = loss_sum / (current_step - self.arguments.step_start_point)
-                                    mean_accuracy = accuracy_sum / (current_step - self.arguments.step_start_point)
-                                    perplexity = jnp.exp(loss)
-                                    calculating_metrics_end = time.time()
-                                    train_metrics = {
-                                        "train/loss": loss.tolist(),
-                                        "train/mean_loss": mean_loss.tolist(),
-                                        "train/accuracy": accuracy,
-                                        "train/mean_accuracy": mean_accuracy.tolist(),
-                                        "train/learning_rate": self.scheduler(current_step).tolist(),
-                                        "train/step": current_step,
-                                        "train/step_time": step_time,
-                                        "train/perplexity": perplexity.tolist(),
-                                        "train/trained_tokens": trained_tokens,
                                         "train/max_grad_norm": metrics["max_grad_norm"].tolist(),
                                         "train/mean_grad_norm": metrics["mean_grad_norm"].tolist(),
-                                        "train/regularization_z_loss": metrics["regularization_z_loss"].tolist(),
-                                        "train/epoch": epoch,
                                     }
+                                )
                             aux_loss = metrics.get("aux_loss", None)
                             if aux_loss is not None:
                                 train_metrics.update(
@@ -517,10 +495,11 @@ class CausalLanguageModelTrainer(BaseTrainer):
                             pbar.update(1)
                             pbar.set_postfix(**{k.replace("train/", ""): v for k, v in train_metrics.items()})
                             if not self.arguments.performance_mode:
-                                train_metrics.update({
-                                    f"grad_norm/{layer_name}": grad_norm.tolist()
-                                    for layer_name, grad_norm in get_layer_names(metrics["grad_norms"]).items()
-                                })
+                                if self.arguments.log_grad_norms:
+                                    train_metrics.update({
+                                        f"grad_norm/{layer_name}": grad_norm.tolist()
+                                        for layer_name, grad_norm in get_layer_names(metrics["grad_norms"]).items()
+                                    })
                                 train_metrics.update(
                                     {
                                         "time_cal/calculating_metrics_step_time": (

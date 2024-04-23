@@ -2,6 +2,7 @@ import os.path
 import pathlib
 import re
 import typing
+import warnings
 from typing import OrderedDict, List, Union, Mapping, Optional, Tuple, Callable, Type
 
 import termcolor
@@ -115,6 +116,7 @@ class TrainArguments(
             force_batch_and_gradient_accumulation_steps_calculation: bool = False,
             performance_mode: bool = False,
             neftune_noise_alpha: Optional[float] = None,
+            log_grad_norms: bool = True,
             **kwargs
     ):
         """
@@ -320,6 +322,12 @@ The __init__ function can accept arguments, just like a normal function.
         self.remove_unused_columns = remove_unused_columns
         self._stop_capturing_memory = False
         self._captured_memory = {}
+        self.log_grad_norms = log_grad_norms
+        if rapture_config is not None and log_grad_norms:
+            warnings.warn(
+                "setting `log_grad_norms` to off since using log grad norms while using LoRA is not Supported."
+            )
+            self.log_grad_norms = False
         self.state_apply_fn_kwarguments_to_model = (
             state_apply_fn_kwarguments_to_model
         ) if state_apply_fn_kwarguments_to_model is not None else {}
