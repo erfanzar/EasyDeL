@@ -26,6 +26,8 @@ Some of the key features provided by EasyDeL include:
 - Automatic Converting Models from JAX-EasyDeL to PyTorch-HF and reverse
 
 > **News**
+> 
+> Drbx Model is present Now [Apr 23 2024](https://github.com/erfanzar/EasyDeL/commit/4c1c5af099dad9334a82808eb04b03e7e567ddb7)
 >
 > New Attention Types are added `sharded_vanilla`, `wise_ring`, `sharded_vanilla` is same as `vanilla` but 
 > uses shard_map which will make it a little faster and more efficent.
