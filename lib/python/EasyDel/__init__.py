@@ -152,13 +152,13 @@ from .modules.cohere import (
     FlaxCohereForCausalLM as FlaxCohereForCausalLM
 )
 
-# from .modules.dbrx import (
-#     DbrxConfig as DbrxConfig,
-#     DbrxFFNConfig as DbrxFFNConfig,
-#     DbrxAttentionConfig as DbrxAttentionConfig,
-#     FlaxDbrxModel as FlaxDbrxModel,
-#     FlaxDbrxForCausalLM as FlaxDbrxForCausalLM
-# )
+from .modules.dbrx import (
+    DbrxConfig as DbrxConfig,
+    DbrxFFNConfig as DbrxFFNConfig,
+    DbrxAttentionConfig as DbrxAttentionConfig,
+    FlaxDbrxModel as FlaxDbrxModel,
+    FlaxDbrxForCausalLM as FlaxDbrxForCausalLM
+)
 
 from .modules.auto_easydel_model import (
     AutoEasyDelModelForCausalLM as AutoEasyDelModelForCausalLM,
@@ -375,11 +375,11 @@ __all__ = (
 
     # Dbrx
 
-    # "FlaxDbrxModel",
-    # "FlaxDbrxForCausalLM",
-    # "DbrxConfig",
-    # "DbrxFFNConfig",
-    # "DbrxAttentionConfig",
+    "FlaxDbrxModel",
+    "FlaxDbrxForCausalLM",
+    "DbrxConfig",
+    "DbrxFFNConfig",
+    "DbrxAttentionConfig",
 
     # AutoModels Models
     "AutoEasyDelModelForCausalLM",

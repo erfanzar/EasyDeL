@@ -269,17 +269,16 @@ class FlaxDbrxAttention(BaseJAXAttentionModule):
         batch_size, sequence_length = hidden_states.shape[:2]
         qkv_states = self.Wqkv(hidden_states)
         if self.config.attn_config.clip_qkv is not None:
-            qkv_states = qkv_states.clip(min=-self.self.config.attn_config.clip_qkv, max=self.clip_qkv)
+            qkv_states = qkv_states.clip(
+                min=-self.config.attn_config.clip_qkv,
+                max=self.config.attn_config.clip_qkv
+            )
 
-        query_states, key_states, value_states = jnp.split(
-            qkv_states,
-            [
-                self.hidden_size,
-                self.num_key_value_heads * self.head_dim,
-                self.num_key_value_heads * self.head_dim,
-            ],
-            axis=2,
-        )
+        query_size = self.hidden_size
+        key_size = self.num_key_value_heads * self.head_dim
+
+        query_states, key_value_states = jnp.split(qkv_states, [query_size], axis=2)
+        key_states, value_states = jnp.split(key_value_states, [key_size], axis=2)
 
         query_states, key_states, value_states = self.apply_rotary(
             query=query_states,
@@ -459,9 +458,9 @@ class FlaxDbrxExpertGLU(nn.Module):
             dtype=self.dtype
         )
         self.w1 = self.param("w1", init_fn, shape, self.param_dtype)
-        self.v1 = self.param("w1", init_fn, shape, self.param_dtype)
+        self.v1 = self.param("v1", init_fn, shape, self.param_dtype)
         self.w2 = self.param("w2", init_fn, shape, self.param_dtype)
-        self.activation_fn = ACT2FN[self.config.ffn_config.ffn_act_fn]
+        self.activation_fn = ACT2FN[self.config.ffn_config.ffn_act_fn["name"]]
 
     def __call__(self, x: chex.Array, expert_idx: int) -> chex.Array:
         expert_shape = (
@@ -475,19 +474,19 @@ class FlaxDbrxExpertGLU(nn.Module):
 
         x1 = jax.lax.batch_matmul(
             x,
-            expert_w1.T,
+            jnp.expand_dims(expert_w1.T, 0),
             precision=self.precision
         )
         x2 = jax.lax.batch_matmul(
             x,
-            expert_v1.T,
+            jnp.expand_dims(expert_v1.T, 0),
             precision=self.precision
         )
         x1 = self.activation_fn(x1)
         x1 = x1 * x2
         x1 = jax.lax.batch_matmul(
             x1,
-            expert_w2,
+            jnp.expand_dims(expert_w2, 0),
             precision=self.precision
         )
         return x1

@@ -14,7 +14,7 @@ class DbrxAttentionConfig(EasyDelPretrainedConfig):
     def __init__(
             self,
             attn_pdrop: float = 0,
-            clip_qkv: Optional[float] = None,
+            clip_qkv: Optional[float] = 8,
             kv_n_heads: int = 1,
             rope_theta: float = 10000.0,
             **kwargs: Any,

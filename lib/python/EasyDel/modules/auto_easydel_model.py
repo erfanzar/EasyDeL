@@ -313,7 +313,8 @@ def get_modules_by_type(model_type: str) -> Tuple[
             functools.partial(
                 huggingface_to_easydel,
                 embedding_layer_names=["wte"],
-                rnn_based_or_rwkv=False
+                rnn_based_or_rwkv=False,
+                layer_norm_names=["norm_1", "norm_2", "norm_f"]
             )
         )
 
