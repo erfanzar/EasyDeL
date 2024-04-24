@@ -29,6 +29,7 @@ class CohereConfig(EasyDelPretrainedConfig):
             rope_theta=10000.0,
             attention_bias=False,
             attention_dropout=0.0,
+            use_qk_norm: bool = False,
             gradient_checkpointing: str = "nothing_saveable",
             bits: Optional[int] = None,
             **kwargs,
@@ -40,7 +41,7 @@ class CohereConfig(EasyDelPretrainedConfig):
         self.intermediate_size = intermediate_size
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
-
+        self.use_qk_norm = use_qk_norm
         # for backward compatibility
         if num_key_value_heads is None:
             num_key_value_heads = num_attention_heads

@@ -317,7 +317,18 @@ def get_modules_by_type(model_type: str) -> Tuple[
                 layer_norm_names=["norm_1", "norm_2", "norm_f"]
             )
         )
-
+    elif model_type == "phi3":
+        from .phi3 import Phi3Config as _Phi3Config
+        from .phi3 import FlaxPhi3ForCausalLM as _FlaxPhi3ForCausalLM
+        return (
+            _Phi3Config,
+            _FlaxPhi3ForCausalLM,
+            functools.partial(
+                huggingface_to_easydel,
+                embedding_layer_names=["embed_tokens"],
+                rnn_based_or_rwkv=False
+            )
+        )
     raise EasyDelRuntimeError(f'Model Type ({model_type}) is not supported or is not found')
 
 
