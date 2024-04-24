@@ -26,12 +26,15 @@ Some of the key features provided by EasyDeL include:
 - Automatic Converting Models from JAX-EasyDeL to PyTorch-HF and reverse
 
 > **News**
-> 
-> Drbx Model is present Now [Apr 23 2024](https://github.com/erfanzar/EasyDeL/commit/4c1c5af099dad9334a82808eb04b03e7e567ddb7)
 >
-> New Attention Types are added `sharded_vanilla`, `wise_ring`, `sharded_vanilla` is same as `vanilla` but 
+> Phi3 Model is present Now Apr 24 2024
+>
+> Drbx Model is present
+> Now [Apr 23 2024](https://github.com/erfanzar/EasyDeL/commit/4c1c5af099dad9334a82808eb04b03e7e567ddb7)
+>
+> New Attention Types are added `sharded_vanilla`, `wise_ring`, `sharded_vanilla` is same as `vanilla` but
 > uses shard_map which will make it a little faster and more efficent.
-> 
+>
 > `local_ring` is Added which is Ring Attention but for TPU/GPU/CPU(s) and support attention bias instead of attention
 > mask, `normal` attention is renamed to `vanilla`.
 >
@@ -40,8 +43,6 @@ Some of the key features provided by EasyDeL include:
 > Sharing Key and Value Cache for Large Sequence Length across devices are now Fixed (Attention Models).
 >
 > Cohere Model added [Apr 14 2024](https://github.com/erfanzar/EasyDeL/commit/06acb4a1afd7b67982a88b50840b90e73b1c9850)
->
-> Parameter Quantization Bugs Are Fixed
 
 ## Documentation 💫
 

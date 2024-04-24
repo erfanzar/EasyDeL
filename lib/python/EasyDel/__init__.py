@@ -160,6 +160,12 @@ from .modules.dbrx import (
     FlaxDbrxForCausalLM as FlaxDbrxForCausalLM
 )
 
+from .modules.phi3 import (
+    Phi3Config as Phi3Config,
+    FlaxPhi3ForCausalLM as FlaxPhi3ForCausalLM,
+    FlaxPhi3Model as FlaxPhi3Model,
+)
+
 from .modules.auto_easydel_model import (
     AutoEasyDelModelForCausalLM as AutoEasyDelModelForCausalLM,
     AutoEasyDelConfig as AutoEasyDelConfig,
@@ -380,6 +386,10 @@ __all__ = (
     "DbrxConfig",
     "DbrxFFNConfig",
     "DbrxAttentionConfig",
+
+    # Phi3
+
+    "Phi3Config", "FlaxPhi3ForCausalLM", "FlaxPhi3Model",
 
     # AutoModels Models
     "AutoEasyDelModelForCausalLM",

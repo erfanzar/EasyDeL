@@ -1,4 +1,5 @@
 import functools
+import math
 
 import fjformer
 from einops import rearrange
@@ -11,7 +12,7 @@ import jax
 from flax import linen as nn
 from functools import partial
 import chex
-from typing import Sequence, Optional, Literal
+from typing import Sequence, Optional, Literal, List
 from jax.experimental.mesh_utils import create_device_mesh
 from .easydel_modelling_utils import EasyMethod
 from jax.sharding import PartitionSpec
@@ -178,37 +179,107 @@ def repeat_kv_bsnh(x: chex.Array, n_rep: int) -> chex.Array:
 
 
 def precompute_freq_cis(
-        dim, max_position_embeddings=2048, base=10000, scaling_factor=1.0, rope_type: str | None = None,
-        t_dtype: jnp.dtype = jnp.int32
+        dim,
+        max_position_embeddings=2048,
+        base=10000,
+        scaling_factor=1.0,
+        rope_type: Optional[Literal["none", "linear", "dynamic", "yarn", "su",]] = None,
+        t_dtype: jnp.dtype = jnp.int32,
+        original_max_position_embeddings: Optional[int] = None,
+        long_factor: Optional[List[float]] = None,
+        short_factor: Optional[List[float]] = None
 ):
-    if rope_type == "none":
-        rope_type = None
-    assert rope_type in [
-        "linear",
-        "dynamic",
-        None
-    ], "wrong rope type has been given"
+    def _calc_yarn_scaling_factor(scale):
+        if scale <= 1.0:
+            return 1.0
+        return math.sqrt(1 + math.log(scale) / math.log(original_max_position_embeddings))
+
+    def _calc_su_scaling_factor(scale):
+        if scale <= 1.0:
+            return 1.0
+        return math.sqrt(1 + math.log(scale) / math.log(original_max_position_embeddings))
+
     if t_dtype == jnp.int64:
         jax.config.update("jax_enable_x64", True)
-    t = jax.numpy.arange(max_position_embeddings, dtype=t_dtype)
 
-    if rope_type == "linear":
+    if rope_type is None or rope_type == "none":
+        t = jax.numpy.arange(max_position_embeddings, dtype=t_dtype)
+        inv_freq = 1.0 / (
+                base ** (jax.numpy.arange(0, dim, 2, dtype=jax.numpy.float32) / dim)
+        )
+        freq = jax.numpy.einsum("i , j -> i j", t, inv_freq).astype("float32")
+        embed = jax.numpy.concatenate((freq, freq), axis=-1)
+        return jax.numpy.sin(embed)[:, :], jax.numpy.cos(embed)[:, :]
+    elif rope_type == "linear":
+        t = jax.numpy.arange(max_position_embeddings, dtype=t_dtype)
         t = t / scaling_factor
+        inv_freq = 1.0 / (
+                base ** (jax.numpy.arange(0, dim, 2, dtype=jax.numpy.float32) / dim)
+        )
+        freq = jax.numpy.einsum(
+            "i , j -> i j", t, inv_freq
+        ).astype("float32")
 
-    if rope_type == "dynamic":
+        embed = jax.numpy.concatenate((freq, freq), axis=-1)
+        return jax.numpy.sin(embed)[:, :], jax.numpy.cos(embed)[:, :]
+    elif rope_type == "dynamic":
+        t = jax.numpy.arange(max_position_embeddings, dtype=t_dtype)
         base = base * (
                 scaling_factor - (scaling_factor - 1)
         ) ** (dim / (dim - 2))
+        inv_freq = 1.0 / (
+                base ** (jax.numpy.arange(0, dim, 2, dtype=jax.numpy.float32) / dim)
+        )
+        freq = jax.numpy.einsum(
+            "i , j -> i j", t, inv_freq
+        ).astype("float32")
 
-    inv_freq = 1.0 / (
-            base ** (jax.numpy.arange(0, dim, 2, dtype=jax.numpy.float32) / dim)
-    )
-    freq = jax.numpy.einsum(
-        "i , j -> i j", t, inv_freq
-    ).astype("float32")
+        embed = jax.numpy.concatenate((freq, freq), axis=-1)
+        return jax.numpy.sin(embed)[:, :], jax.numpy.cos(embed)[:, :]
+    elif rope_type == "su":
+        assert original_max_position_embeddings is not None, "No original max position embeddings is provided"
+        if max_position_embeddings > original_max_position_embeddings:
+            ext_factors = jnp.array(long_factor, dtype=jnp.float32)
+        else:
+            ext_factors = jnp.array(short_factor, dtype=jnp.float32)
 
-    embed = jax.numpy.concatenate((freq, freq), axis=-1)
-    return jax.numpy.sin(embed)[:, :], jax.numpy.cos(embed)[:, :]
+        inv_freq = 1.0 / (ext_factors * base ** (jnp.arange(0, dim, 2, dtype=t_dtype).astype(jnp.float32) / dim))[None,
+                         :, None]
+        position_ids = jnp.arange(
+            0, max_position_embeddings, dtype="i4"
+        ).reshape(1, -1)[:, None, :].astype("float32")
+        freqs = (inv_freq @ position_ids).transpose(0, 2, 1)
+        scaling_factor = _calc_su_scaling_factor(
+            max_position_embeddings / original_max_position_embeddings
+        )
+        emb = jnp.concatenate((freqs, freqs), axis=-1)
+        cos = jnp.cos(emb) * scaling_factor
+        sin = jnp.sin(emb) * scaling_factor
+        return sin[0], cos[0]
+    elif rope_type == "yarn":
+        assert original_max_position_embeddings is not None, "No original max position embeddings is provided"
+        if max_position_embeddings > original_max_position_embeddings:
+            ext_factors = jnp.array(long_factor, dtype=jnp.float32)
+        else:
+            ext_factors = jnp.array(short_factor, dtype=jnp.float32)
+
+        inv_freq = 1.0 / (
+                                 ext_factors
+                                 * base ** (jnp.arange(0, dim, 2, dtype=t_dtype).astype(jnp.float32) / dim)
+                         )[None, :, None]
+        position_ids = jnp.arange(
+            0, max_position_embeddings, dtype="i4"
+        ).reshape(1, -1)[:, None, :].astype("float32")
+        freqs = (inv_freq @ position_ids).transpose(0, 2, 1)
+        scaling_factor = _calc_yarn_scaling_factor(
+            max_position_embeddings / original_max_position_embeddings
+        )
+        emb = jnp.concatenate((freqs, freqs), axis=-1)
+        cos = jnp.cos(emb) * scaling_factor
+        sin = jnp.sin(emb) * scaling_factor
+        return sin[0], cos[0]
+    else:
+        raise "wrong rope type has been given"
 
 
 def rotate_half(x):
@@ -414,7 +485,7 @@ class BaseJAXAttentionModule(nn.Module):
             else:
                 *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
                 cur_index = cache_index.value
-                indices = (0,) * len(batch_dims) + (cur_index, 0, 0)
+                indices = (0,) * len(batch_dims) + (cur_index, 0, 0)  # type:ignore
                 key = lax.dynamic_update_slice(cached_key.value, key, indices)
                 value = lax.dynamic_update_slice(cached_value.value, value, indices)
                 num_updated_cache_vectors = query_states.shape[1]

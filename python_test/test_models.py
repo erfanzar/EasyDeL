@@ -376,6 +376,25 @@ class EasyModelsTest(TestCase):
             f"StableLM model Failed [ERROR {err}]"
         )
 
+    def test_phi3(self):
+        res, err = self.create_test_for_models(
+            "phi3",
+            type(
+                transformers.AutoModelForCausalLM.from_config(
+                    transformers.AutoConfig.from_pretrained(
+                        "microsoft/Phi-3-mini-128k-instruct",
+                        trust_remote_code=True
+                    ),
+                    trust_remote_code=True,
+                )
+            )
+        )
+
+        self.assertTrue(
+            res,
+            f"StableLM model Failed [ERROR {err}]"
+        )
+
     def test_rwkv(self):
         res, err = self.create_test_for_models("rwkv", transformers.RwkvForCausalLM)
         self.assertTrue(

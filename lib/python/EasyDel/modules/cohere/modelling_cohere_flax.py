@@ -62,16 +62,17 @@ def repeat_kv(x: chex.Array, n_rep: int) -> chex.Array:
 
 
 class RMSNorm(nn.Module):
-    dim: int
+    dim: Union[int, tuple]
     eps: float = 1e-6
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
+    do_t: bool = False
 
     def setup(self) -> None:
         self.weight = self.param(
             'kernel',
             nn.initializers.ones,
-            (self.dim,),
+            (self.dim,) if isinstance(self.dim, int) else self.dim,
             self.param_dtype,
         )
 
@@ -82,6 +83,8 @@ class RMSNorm(nn.Module):
         x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
         output = self._norm(x).astype(self.dtype)
         weight = nn.linen.control_quantization(self.weight, self.dtype)
+        if self.do_t:
+            weight = weight.T
         return output * weight
 
 
@@ -99,6 +102,22 @@ class FlaxCohereAttention(BaseJAXAttentionModule):
 
         if self.num_key_value_groups == 1:
             assert self.config.num_attention_heads == self.config.num_key_value_heads
+
+        if config.use_qk_norm:
+            self.q_norm = RMSNorm(
+                dim=(self.head_dim, self.config.num_attention_heads),
+                eps=config.layer_norm_eps,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+                do_t=True
+            )
+            self.k_norm = RMSNorm(
+                dim=(self.head_dim, self.config.num_key_value_heads,),
+                eps=config.layer_norm_eps,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+                do_t=True
+            )
         self.q_proj = nn.Linear(
             config.num_attention_heads * self.head_dim,
             dtype=self.dtype,
@@ -279,6 +298,9 @@ class FlaxCohereAttention(BaseJAXAttentionModule):
             batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
         key_states = key_states.reshape(
             batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
+        if self.config.use_qk_norm:
+            query_states = self.q_norm(query_states)
+            key_states = self.k_norm(key_states)
         value_states = value_states.reshape(
             batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
 
@@ -370,7 +392,6 @@ class FlaxCohereAttention(BaseJAXAttentionModule):
             uses_cache=self.has_variable("cache", "cached_key") or init_cache,
             segment_ids=segment_ids
         )
-
 
         attn_output = self._merge_heads(attentions.attention_outputs)
         if self.config.shard_attention_computation:
