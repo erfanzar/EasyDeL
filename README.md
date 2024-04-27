@@ -26,6 +26,8 @@ Some of the key features provided by EasyDeL include:
 - Automatic Converting Models from JAX-EasyDeL to PyTorch-HF and reverse
 
 > **News**
+> 
+> Phi3 Model bugs are fixed, Arctic Model is added.
 >
 > Phi3 Model is present Now Apr 24 2024
 >
