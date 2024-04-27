@@ -47,7 +47,7 @@ class FlaxPhi3RMSNorm(nn.Module):
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
         output = self._norm(x).astype(self.dtype)
-        weight = nn.linen.control_quantization(self.weight, self.dtype)
+        weight = fjformer.linen.linen.control_quantization(self.weight, self.dtype)
         return output * weight
 
 
@@ -83,7 +83,7 @@ class FlaxPhi3MLP(nn.Module):
             self
     ) -> None:
         self.gate_up_proj = Linear(
-            self.config.intermediate_size,
+            2 * self.config.intermediate_size,
             kernel_init=nn.initializers.normal(self.config.initializer_range),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -91,7 +91,7 @@ class FlaxPhi3MLP(nn.Module):
             use_bias=False
         )
         self.down_proj = Linear(
-            self.config.n_embd,
+            self.config.hidden_size,
             kernel_init=nn.initializers.normal(self.config.initializer_range),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -253,14 +253,14 @@ class FlaxPhi3Attention(BaseJAXAttentionModule):
     def __call__(
             self,
             hidden_states: chex.Array,
-            freq_cis: Tuple[chex.Array, chex.Array],
-            attention_mask: Optional[chex.Array],
-            position_ids: Optional[chex.Array],
-            causal_mask: Optional[chex.Array],
+            freq_cis: chex.Array,
+            attention_mask: chex.Array,
+            causal_mask: chex.Array,
+            position_ids: chex.Array,
             segment_ids: Optional[chex.Array] = None,
             deterministic: bool = True,
-            output_attentions: bool = False,
             init_cache: bool = False,
+            output_attentions: bool = True
     ):
         batch_size, sequence_length = hidden_states.shape[:2]
         qkv = self.qkv_proj(hidden_states)
@@ -355,7 +355,7 @@ class FlaxPhi3Attention(BaseJAXAttentionModule):
                     "tp"
                 )
             )
-        attn_output = self.dense(attn_output)
+        attn_output = self.o_proj(attn_output)
 
         outputs = (attn_output, attentions.attention_weights) if output_attentions else (attn_output,)
         return outputs
@@ -381,10 +381,21 @@ class FlaxPhi3DecoderLayer(nn.Module):
         attn_block = FlaxPhi3Attention
         mlp_block = FlaxPhi3MLP
         if self.config.gradient_checkpointing != "":
+            # hidden_states: chex.Array,
+            # freq_cis: Tuple[chex.Array, chex.Array],
+            # attention_mask: Optional[chex.Array],
+            # position_ids: Optional[chex.Array],
+            # causal_mask: Optional[chex.Array],
+            # segment_ids: Optional[chex.Array] = None,
+            # deterministic: bool = True,
+            # output_attentions: bool = False,
+            # init_cache: bool = False,
             attn_block = nn.remat(
                 attn_block,
                 policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
-                static_argnums=(1, 4, 6, 7, 8)
+                static_argnums=(
+                    1, 3, 4, 6, 7, 8, 9
+                )
             )
             mlp_block = nn.remat(
                 mlp_block,
@@ -437,15 +448,15 @@ class FlaxPhi3DecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         attn_out = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            output_attentions=output_attentions,
-            deterministic=deterministic,
-            freq_cis=freq_cis,
-            causal_mask=causal_mask,
-            init_cache=init_cache,
-            segment_ids=segment_ids
+            hidden_states,
+            freq_cis,  # type:ignore
+            attention_mask,
+            causal_mask,
+            position_ids,
+            segment_ids,
+            deterministic,
+            init_cache,
+            output_attentions
         )
         attn_outputs, self_attn_weights = (attn_out[0], attn_out[1]) if len(attn_out) == 2 else (attn_out[0], None)
 
@@ -686,7 +697,7 @@ class FlaxPhi3ForCausalLMModule(nn.Module):
         self.vocab_size = self.config.vocab_size
         self.lm_head = Linear(
             self.config.vocab_size,
-            use_bias=True,
+            use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             dtype=self.dtype,
             param_dtype=self.param_dtype,

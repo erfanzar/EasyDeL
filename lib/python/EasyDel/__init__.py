@@ -166,6 +166,12 @@ from .modules.phi3 import (
     FlaxPhi3Model as FlaxPhi3Model,
 )
 
+from .modules.arctic import (
+    FlaxArcticForCausalLM as FlaxArcticForCausalLM,
+    FlaxArcticModel as FlaxArcticModel,
+    ArcticConfig as ArcticConfig
+)
+
 from .modules.auto_easydel_model import (
     AutoEasyDelModelForCausalLM as AutoEasyDelModelForCausalLM,
     AutoEasyDelConfig as AutoEasyDelConfig,
@@ -389,7 +395,15 @@ __all__ = (
 
     # Phi3
 
-    "Phi3Config", "FlaxPhi3ForCausalLM", "FlaxPhi3Model",
+    "Phi3Config",
+    "FlaxPhi3ForCausalLM",
+    "FlaxPhi3Model",
+
+    # Arctic
+
+    "FlaxArcticForCausalLM",
+    "FlaxArcticModel",
+    "ArcticConfig",
 
     # AutoModels Models
     "AutoEasyDelModelForCausalLM",

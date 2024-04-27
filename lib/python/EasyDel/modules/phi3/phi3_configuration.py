@@ -89,9 +89,9 @@ class Phi3Config(EasyDelPretrainedConfig):
         return (
             ("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
 
-            ("norm/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("post_attention_layernorm/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("input_layernorm/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+            ("norm/kernel", PartitionSpec(("fsdp", "sp"), )),
+            ("post_attention_layernorm/kernel", PartitionSpec(("fsdp", "sp"), )),
+            ("input_layernorm/kernel", PartitionSpec(("fsdp", "sp"),)),
 
             ("mlp/gate_up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
             ("mlp/down_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
