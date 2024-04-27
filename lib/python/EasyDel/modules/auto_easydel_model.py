@@ -329,6 +329,19 @@ def get_modules_by_type(model_type: str) -> Tuple[
                 rnn_based_or_rwkv=False
             )
         )
+
+    elif model_type == "arctic":
+        from .arctic import ArcticConfig as _ArcticConfig
+        from .arctic import FlaxArcticForCausalLM as _FlaxArcticForCausalLM
+        return (
+            _ArcticConfig,
+            _FlaxArcticForCausalLM,
+            functools.partial(
+                huggingface_to_easydel,
+                embedding_layer_names=["embed_tokens"],
+                rnn_based_or_rwkv=False
+            )
+        )
     raise EasyDelRuntimeError(f'Model Type ({model_type}) is not supported or is not found')
 
 

@@ -130,6 +130,12 @@ from .phi3 import (
     FlaxPhi3ForCausalLM as FlaxPhi3ForCausalLM,
     FlaxPhi3Model as FlaxPhi3Model,
 )
+
+from .arctic import (
+    FlaxArcticForCausalLM as FlaxArcticForCausalLM,
+    FlaxArcticModel as FlaxArcticModel,
+    ArcticConfig as ArcticConfig
+)
 from .auto_easydel_model import (
     AutoEasyDelModelForCausalLM as AutoEasyDelModelForCausalLM,
     AutoEasyDelConfig as AutoEasyDelConfig,
@@ -182,6 +188,8 @@ __all__ = (
     "DbrxConfig", "DbrxFFNConfig", "DbrxAttentionConfig",
 
     "Phi3Config", "FlaxPhi3ForCausalLM", "FlaxPhi3Model",
+
+    "FlaxArcticForCausalLM", "FlaxArcticModel", "ArcticConfig",
 
     "AutoEasyDelModelForCausalLM",
     "AutoEasyDelConfig",

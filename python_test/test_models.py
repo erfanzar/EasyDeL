@@ -83,6 +83,7 @@ class EasyModelsTest(TestCase):
         self.max_position_embeddings: int = self.sequence_length
         self.use_sharding_constraint = False
         self.header_config = None
+        self.pad_token_id = None
 
     def create_test_for_models(
             self,
@@ -377,14 +378,42 @@ class EasyModelsTest(TestCase):
         )
 
     def test_phi3(self):
+        conf = transformers.AutoConfig.from_pretrained(
+            "microsoft/Phi-3-mini-128k-instruct",
+            trust_remote_code=True
+        )
+        for k, v in self.__dict__.items():
+            if isinstance(v, (bool, str, float, type(None), int,)):
+                setattr(conf, k, v)
         res, err = self.create_test_for_models(
             "phi3",
             type(
                 transformers.AutoModelForCausalLM.from_config(
-                    transformers.AutoConfig.from_pretrained(
-                        "microsoft/Phi-3-mini-128k-instruct",
-                        trust_remote_code=True
-                    ),
+                    conf,
+                    trust_remote_code=True,
+                )
+            )
+        )
+
+        self.assertTrue(
+            res,
+            f"StableLM model Failed [ERROR {err}]"
+        )
+
+    def test_arctic(self):
+
+        conf = transformers.AutoConfig.from_pretrained(
+            "Snowflake/snowflake-arctic-instruct",
+            trust_remote_code=True
+        )
+        for k, v in self.__dict__.items():
+            if isinstance(v, (bool, str, float, type(None), int,)):
+                setattr(conf, k, v)
+        res, err = self.create_test_for_models(
+            "arctic",
+            type(
+                transformers.AutoModelForCausalLM.from_config(
+                    conf,
                     trust_remote_code=True,
                 )
             )
