@@ -444,7 +444,7 @@ class EasyModelsTest(TestCase):
 
         self.assertTrue(
             res,
-            f"MAMBA model Failed [ERROR {err}]"
+            f"CoHERE model Failed [ERROR {err}]"
         )
 
     def test_qwen2_moe(self):
