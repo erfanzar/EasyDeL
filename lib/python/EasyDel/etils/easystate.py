@@ -265,6 +265,7 @@ class EasyDelState(struct.PyTreeNode):
             state_shard_fns: Optional[Mapping[str, Callable]] = None,
             verbose: bool = False,
             input_shape: Tuple = (1, 1),
+            config_kwargs: Optional[dict] = None
     ):
 
         """    
@@ -281,6 +282,7 @@ class EasyDelState(struct.PyTreeNode):
         to shard the loaded state
         :param verbose: bool: Print out the progress of loading
         :param input_shape: Tuple: input_shape to init module
+        :param config_kwargs: Optional[dict] : config kwargs to be passed to model config
         :return: A state object
         """
         from ..modules.auto_easydel_model import get_modules_by_type
@@ -307,6 +309,9 @@ class EasyDelState(struct.PyTreeNode):
                     if v.startswith("{") or v.startswith("(") or v.startswith("PartitionSpec"):
                         cfg_behave[k] = eval(v)
             module_config = cfg.from_dict(cfg_behave)
+            if config_kwargs is not None:
+                for k, v in config_kwargs.items():
+                    setattr(module_config, k, v)
             module_in = module(
                 config=module_config,
                 dtype=dtype,

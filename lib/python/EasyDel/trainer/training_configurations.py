@@ -117,6 +117,7 @@ class TrainArguments(
             performance_mode: bool = False,
             neftune_noise_alpha: Optional[float] = None,
             log_grad_norms: bool = True,
+            loaded_model_config_kwargs: Optional[dict] = None,
             **kwargs
     ):
         """
@@ -195,6 +196,8 @@ The __init__ function can accept arguments, just like a normal function.
     and optimize training process.
 :param neftune_noise_alpha: Optional[float]: If not `None`, this will activate NEFTune noise embeddings. This has been
     proven to drastically improve model performances for instruction fine-tuning.
+:param loaded_model_config_kwargs: Optional[dict]: config key arguments to be passed to the model while being loaded
+from checkpoint
 :param **kwargs: Pass keyword, variable-length argument list
         """
         super().__init__()
@@ -301,6 +304,7 @@ The __init__ function can accept arguments, just like a normal function.
         self.offload_device = offload_device
         self.performance_mode = performance_mode
         self.neftune_noise_alpha = neftune_noise_alpha
+        self.loaded_model_config_kwargs = loaded_model_config_kwargs
         if use_wandb and performance_mode:
             self.use_wandb = False
         self.optimizer_kwargs = dict(
@@ -341,7 +345,6 @@ The __init__ function can accept arguments, just like a normal function.
             )
             self.rapture_config = rapture_config
             self.rapture = XRapTure(config=rapture_config)
-
         self.__dict__.update(**kwargs)
 
     @staticmethod
