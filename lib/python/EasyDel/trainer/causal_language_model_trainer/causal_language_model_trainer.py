@@ -239,6 +239,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
                             init_optimizer_state=True,
                             checkpoint_path=self.checkpoint_path,
                             input_shape=self.arguments.init_input_shape,
+                            config_kwargs=self.arguments.loaded_model_config_kwargs
                         )
                         state_shape = jax.eval_shape(lambda: sharded_state)
                         state_partition_spec = match_partition_rules(
