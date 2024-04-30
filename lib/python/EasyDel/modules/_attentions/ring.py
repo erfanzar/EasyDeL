@@ -528,7 +528,6 @@ def wise_ring_attention(
         float32_logits,
         block_wise_kwargs
     )
-    print(out)
     return out
 
 
