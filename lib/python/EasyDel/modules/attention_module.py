@@ -1,5 +1,4 @@
 import math
-import warnings
 from functools import partial
 
 import fjformer
@@ -32,7 +31,9 @@ from ._attentions import (
     wise_ring_attention,
     shard_vanilla_attention
 )
+from ..etils.etils import get_logger
 
+logger = get_logger(__name__)
 DEFAULT_K_BLOCK = 1024
 DEFAULT_Q_BLOCK = 1024
 
@@ -109,6 +110,8 @@ class AttentionModule:
             axis_name: str = "sp",
     ):
         platform = jax.lib.xla_bridge.get_backend().platform
+        if sm_scale is None:
+            sm_scale = 1 / math.sqrt(head_dims)
         if attn_mechanism == "splash":
             raise NotImplementedError("Splash Attention is not Supported YET !")
         if attn_mechanism == "flash" and platform not in ["gpu", "tpu"]:
@@ -404,7 +407,7 @@ class AttentionModule:
             attn_output = with_sharding_constraint(attn_output, self.attention_partition_spec)
         else:
             if self.platform != "tpu":
-                warnings.warn(
+                logger.warning(
                     "Using Ring attention on CPUs or GPUs are not recommended due to miss computations at the moment. "
                     "please refer to other types of attention mechanism.your are bing fell back on "
                     "`ring_attention_sharded`"
@@ -451,46 +454,55 @@ class AttentionModule:
     ):
         if segment_ids is None:
             segment_ids = jnp.zeros((query_states.shape[0], query_sequence_length), dtype="i4")
-        attn_out_spec = (
-            self.attention_partition_spec if query_sequence_length != 1 else self.generation_attention_partition_spec
-        )
-        ring_attention_sharded = shard_map(
-            partial(
-                wise_ring_attention,
-                axis_name=self.axis_name,
-                float32_logits=True,
-                block_wise_kwargs=dict(
-                    deterministic=deterministic,
-                    dropout_rng=dropout_rng,
-                    attn_pdrop=self.attention_dropout,
-                    causal=True,
-                    query_chunk_size=min(query_sequence_length, self.block_q),
-                    key_chunk_size=min(key_states.shape[1], self.block_k),
-                    dtype=self.dtype,
-                    policy=get_gradient_checkpoint_policy("nothing_saveable"),
-                    precision=self.precision,
-                    prevent_cse=not self.scan_attention_layers,
-                )
-            ),
-            mesh=self.mesh,
-            in_specs=(
-                self.query_partition_spec if query_sequence_length != 1 else self.generation_query_partition_spec,
-                self.key_partition_spec,
-                self.value_partition_spec,
-                self.bias_partition_spec if query_sequence_length != 1 else self.generation_bias_partition_spec,
-                PartitionSpec(("dp", "fsdp"), None if query_sequence_length != 1 else self.axis_name),
-            ),
-            out_specs=(
-                attn_out_spec
-            ),
-            check_rep=False
-        )
-        attn_output = ring_attention_sharded(query_states, key_states, value_states, bias, segment_ids)
-        attn_output = with_sharding_constraint(attn_output, attn_out_spec)
-        return AttentionOutput(
-            attention_weights=None,
-            attention_outputs=attn_output
-        )
+        if self.scan_ring_attention and query_states.shape[1] > max(self.block_q, self.block_k):
+            ring_attention_sharded = shard_map(
+                partial(
+                    wise_ring_attention,
+                    axis_name=self.axis_name,
+                    float32_logits=True,
+                    block_wise_kwargs=dict(
+                        deterministic=deterministic,
+                        dropout_rng=dropout_rng,
+                        attn_pdrop=self.attention_dropout,
+                        causal=True,
+                        query_chunk_size=self.block_q,
+                        key_chunk_size=self.block_k,
+                        dtype=self.dtype,
+                        policy=get_gradient_checkpoint_policy("nothing_saveable"),
+                        precision=self.precision,
+                        prevent_cse=not self.scan_attention_layers,
+                    )
+                ),
+                mesh=self.mesh,
+                in_specs=(
+                    self.query_partition_spec,
+                    self.key_partition_spec,
+                    self.value_partition_spec,
+                    self.bias_partition_spec,
+                    PartitionSpec(("dp", "fsdp"), "sp"),
+                ),
+                out_specs=self.attention_partition_spec,
+                check_rep=False
+            )
+            attn_output = ring_attention_sharded(query_states, key_states, value_states, bias, segment_ids)
+            attn_output = with_sharding_constraint(attn_output, self.attention_partition_spec)
+            return AttentionOutput(
+                attention_weights=None,
+                attention_outputs=attn_output
+            )
+        else:
+            seq_length = query_states.shape[1]
+            chunk = seq_length > max(self.block_q, self.block_k)
+            logger.warning(
+                f"generation process detected, switching to local ring attention"
+                f" [CHUNK : {chunk}, SCAN : {self.scan_ring_attention}, {self.block_k=}, {self.block_q=}, {seq_length=}]"
+            )
+            return self.local_ring_attention(
+                query_states=query_states,
+                key_states=key_states,
+                value_states=value_states,
+                bias=bias,
+            )
 
     def vanilla_attention(
             self,

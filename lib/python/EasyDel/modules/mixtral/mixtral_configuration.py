@@ -6,7 +6,7 @@ from ..easydel_modelling_utils import EasyDelPretrainedConfig
 
 
 class MixtralConfig(EasyDelPretrainedConfig):
-    model_type = "mixtral"
+    model_type: str = "mixtral"
 
     def __init__(
             self,

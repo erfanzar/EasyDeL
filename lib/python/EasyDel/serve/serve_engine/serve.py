@@ -1,7 +1,6 @@
 import copy
 import functools
 import logging
-import warnings
 
 import jax
 import uvicorn
@@ -208,7 +207,7 @@ class EasyServe:
             tokenizer = copy.deepcopy(tokenizer)
 
         except:
-            warnings.warn(
+            logger.warning(
                 f"The class Model of Tokenizer {type(tokenizer)} do not support deepcopy option "
             )
             if serve_config.use_prefix_tokenizer:

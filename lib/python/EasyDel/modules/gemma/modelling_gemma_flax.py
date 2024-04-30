@@ -1,5 +1,3 @@
-import math
-import warnings
 from typing import Optional, Tuple, Union
 
 import chex
@@ -17,7 +15,7 @@ from flax.linen import combine_masks, make_causal_mask
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
-
+from ...etils.etils import get_logger
 from ..attention_module import AttentionModule
 from ..flax_modelling_utils import (
     ACT2FN,
@@ -30,6 +28,8 @@ from ..flax_modelling_utils import (
 )
 from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
 from .gemma_configuration import GemmaConfig
+
+logger = get_logger(__name__)
 
 
 def add_positional_embedding(
@@ -377,7 +377,7 @@ class FlaxGemmaMLP(nn.Module):
 
         kernel_init = jax.nn.initializers.normal(self.config.initializer_range)
         if self.config.hidden_activation is None:
-            warnings.warn(
+            logger.warning(
                 "Gemma's activation function should be approximate GeLU and not exact GeLU. "
                 "Changing the activation function to `gelu_pytorch_tanh`."
                 f"if you want to use the legacy `{self.config.hidden_act}`, "

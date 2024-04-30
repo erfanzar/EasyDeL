@@ -6,7 +6,7 @@ from ..easydel_modelling_utils import EasyDelPretrainedConfig
 
 
 class CohereConfig(EasyDelPretrainedConfig):
-    model_type = "cohere"
+    model_type: str = "cohere"
 
     def __init__(
             self,

@@ -5,7 +5,7 @@ from ..easydel_modelling_utils import EasyDelPretrainedConfig
 
 
 class Qwen1Config(EasyDelPretrainedConfig):
-    model_type = "qwen"
+    model_type: str = "qwen"
 
     def __init__(
             self,

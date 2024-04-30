@@ -6,7 +6,7 @@ from ..easydel_modelling_utils import EasyDelPretrainedConfig
 
 
 class FalconConfig(EasyDelPretrainedConfig):
-    model_type = "falcon"
+    model_type: str = "falcon"
     attribute_map = {
         "num_hidden_layers": "num_hidden_layers",
         "num_attention_heads": "num_attention_heads",

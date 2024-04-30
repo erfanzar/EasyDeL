@@ -1,9 +1,7 @@
 import gc
 import re
-import warnings
 
 import fjformer
-import flax.traverse_util
 import jax
 import numpy
 import transformers
@@ -17,6 +15,9 @@ from fjformer import get_dtype
 from jax import numpy as jnp
 from typing import List, Optional, Mapping, Callable
 from tqdm import tqdm
+from ..etils.etils import get_logger
+
+logger = get_logger(__name__)
 
 
 def float_tensor_to_dtype(tensor, dtype):
@@ -270,7 +271,7 @@ def easystate_to_huggingface_model(
             base_huggingface_module,
             transformers.RwkvModel
         ):
-            warnings.warn(
+            logger.warning(
                 "Rnn Based Model detected 'setting `rnn_based_or_rwkv = True`' for correct weight handling"
             )
             rnn_based_or_rwkv = True

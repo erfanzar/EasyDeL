@@ -1,5 +1,3 @@
-import warnings
-
 import chex
 import flax
 from jax.experimental.mesh_utils import create_device_mesh
@@ -9,7 +7,9 @@ from jax import numpy as jnp
 from typing import Sequence, Union, Optional, Literal, Tuple, Any
 from dataclasses import dataclass
 from jax.sharding import PartitionSpec, Mesh
+from ..etils.etils import get_logger
 
+logger = get_logger(__name__)
 AVAILABLE_ATTENTION_MECHANISMS = Literal[
     "vanilla",
     "flash",
@@ -154,14 +154,14 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             (len(jax.devices() if backend == "" else jax.devices(backend)), 1))
         if isinstance(axis_dims, str):
             axis_dims = eval(axis_dims)
-            warnings.warn(
+            logger.warning(
                 "axis_dims argument is not a Sequence of int and it's an string. "
                 "(backbone Warning in EasyDeLModuleConfig)\n"
                 f"\tchanged to {axis_dims}"
             )
         if isinstance(axis_names, str):
             axis_names = eval(axis_names)
-            warnings.warn(
+            logger.warning(
                 "axis_names argument is not a Sequence of strings and it's an string class. "
                 "(backbone Warning in EasyDeLModuleConfig)\n"
                 f"\tchanged to {axis_names}"

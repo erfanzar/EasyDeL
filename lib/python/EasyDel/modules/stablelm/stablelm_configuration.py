@@ -9,7 +9,7 @@ from ..easydel_modelling_utils import EasyDelPretrainedConfig
 class StableLmConfig(EasyDelPretrainedConfig):
     """Phi configuration."""
 
-    model_type = "stablelm"
+    model_type: str = "stablelm"
 
     def __init__(
             self,

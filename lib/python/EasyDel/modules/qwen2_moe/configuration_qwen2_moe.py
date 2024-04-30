@@ -4,7 +4,7 @@ from typing import Optional, Union
 
 
 class Qwen2MoeConfig(EasyDelPretrainedConfig):
-    model_type = "qwen2_moe"
+    model_type: str = "qwen2_moe"
 
     def __init__(
             self,

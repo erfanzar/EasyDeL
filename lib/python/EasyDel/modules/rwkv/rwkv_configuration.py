@@ -8,7 +8,7 @@ from ..easydel_modelling_utils import EasyDelPretrainedConfig
 class RwkvConfig(EasyDelPretrainedConfig):
     """RWKV configuration."""
 
-    model_type = "rwkv"
+    model_type: str = "rwkv"
     attribute_map = {"max_position_embeddings": "context_length"}
 
     def __init__(

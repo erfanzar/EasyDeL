@@ -6,7 +6,7 @@ from ..easydel_modelling_utils import EasyDelPretrainedConfig
 
 
 class GemmaConfig(EasyDelPretrainedConfig):
-    model_type = "gemma"
+    model_type: str = "gemma"
 
     def __init__(
             self,

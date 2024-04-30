@@ -3,7 +3,7 @@ from ..easydel_modelling_utils import EasyDelPretrainedConfig
 
 
 class RobertaConfig(EasyDelPretrainedConfig):
-    model_type = "roberta"
+    model_type: str = "roberta"
 
     def __init__(
             self,

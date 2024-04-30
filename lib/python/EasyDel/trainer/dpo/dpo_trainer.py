@@ -3,7 +3,6 @@ import os
 import sys
 import time
 import typing
-import warnings
 from abc import ABC
 from collections import defaultdict
 import flax.core
@@ -136,7 +135,7 @@ class DPOTrainer(BaseTrainer, ABC):
             )
 
         if isinstance(model_state, str):
-            warnings.warn(
+            logger.warning(
                 "You passed a model_id to the DPOTrainer. This will automatically create an "
                 "`AutoEasyDelModelForCausalLM` for you."
             )
@@ -145,7 +144,7 @@ class DPOTrainer(BaseTrainer, ABC):
                 **model_init_kwargs
             )
         if isinstance(ref_model_state, str):
-            warnings.warn(
+            logger.warning(
                 "You passed a ref model_id to the DPOTrainer. This will automatically create an "
                 "`AutoEasyDelModelForCausalLM`"
             )
@@ -155,7 +154,7 @@ class DPOTrainer(BaseTrainer, ABC):
             )
 
         if loss_type in ["hinge", "ipo", "kto_pair"] and label_smoothing > 0:
-            warnings.warn(
+            logger.warning(
                 "You are using a loss type that does not support label smoothing. Ignoring label_smoothing parameter."
             )
         self.auto_fix_data = auto_fix_data
@@ -163,14 +162,14 @@ class DPOTrainer(BaseTrainer, ABC):
         if tokenizer is None:
             raise ValueError("tokenizer must be specified to tokenize a DPO dataset.")
         if max_length is None:
-            warnings.warn(
+            logger.warning(
                 "`max_length` is not set in the DPOTrainer's init"
                 " it will default to `512` by default, but you should do it yourself in the future.",
                 UserWarning,
             )
             max_length = 512
         if max_prompt_length is None:
-            warnings.warn(
+            logger.warning(
                 "`max_prompt_length` is not set in the DPOTrainer's init"
                 " it will default to `128` by default, but you should do it yourself in the future.",
                 UserWarning,
@@ -178,7 +177,7 @@ class DPOTrainer(BaseTrainer, ABC):
             max_prompt_length = 128
 
         if max_target_length is None and is_encoder_decoder:
-            warnings.warn(
+            logger.warning(
                 "When using an encoder decoder architecture, you should set `max_target_length` in the "
                 "DPOTrainer's init it will default to `128` by default, but you should do it yourself in the future.",
                 UserWarning,
