@@ -391,7 +391,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
         set_attrs_smartly(self, "easy_method", EasyMethod.TRAIN, easy_method)
         set_attrs_smartly(self, "bits", None, bits)
         set_attrs_smartly(self, "scan_attention_layers", True, scan_attention_layers)
-        set_attrs_smartly(self, "scan_ring_attention", False, scan_ring_attention)
+        set_attrs_smartly(self, "scan_ring_attention", True, scan_ring_attention)
         set_attrs_smartly(self, "use_scan_mlp", True, use_scan_mlp)
         set_attrs_smartly(self, "scan_mlp_chunk_size", 1024, scan_mlp_chunk_size)
 
