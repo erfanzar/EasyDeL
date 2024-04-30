@@ -31,7 +31,7 @@ Some of the key features provided by EasyDeL include:
 >
 > Phi3 Model is present Now Apr 24 2024
 >
-> Drbx Model is present
+> Dbrx Model is present
 > Now [Apr 23 2024](https://github.com/erfanzar/EasyDeL/commit/4c1c5af099dad9334a82808eb04b03e7e567ddb7)
 >
 > New Attention Types are added `sharded_vanilla`, `wise_ring`, `sharded_vanilla` is same as `vanilla` but
