@@ -1,5 +1,5 @@
 # Adapted from https://github.com/LargeWorldModel/LWM/blob/main/lwm/vision_llama.py
-
+import warnings
 from typing import Any, Dict, List, Optional, Tuple, Union
 import copy
 
@@ -562,7 +562,7 @@ class FlaxVisionLlamaForCausalLM(FlaxVisionLlamaPreTrainedModel):
             ):
                 new_generation_config = GenerationConfig.from_model_config(self.config)
                 if new_generation_config != self.generation_config:
-                    logger.warning(
+                    warnings.warn(
                         "You have modified the pretrained model configuration to control generation. This is a"
                         " deprecated strategy to control generation and will be removed soon, in a future version."
                         " Please use and modify the model generation configuration (see"
@@ -584,14 +584,14 @@ class FlaxVisionLlamaForCausalLM(FlaxVisionLlamaPreTrainedModel):
 
         if generation_config.pad_token_id is None and generation_config.eos_token_id is not None:
             if model_kwargs.get("attention_mask") is None:
-                logger.warning(
+                warnings.warn(
                     "The attention mask and the pad token id were not set. As a consequence, you may observe "
                     "unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results."
                 )
             eos_token_id = generation_config.eos_token_id
             if isinstance(eos_token_id, list):
                 eos_token_id = eos_token_id[0]
-            logger.warning(f"Setting `pad_token_id` to `eos_token_id`:{eos_token_id} for open-end generation.")
+            warnings.warn(f"Setting `pad_token_id` to `eos_token_id`:{eos_token_id} for open-end generation.")
             generation_config.pad_token_id = eos_token_id
 
         if generation_config.decoder_start_token_id is None and self.config.is_encoder_decoder:
@@ -603,7 +603,7 @@ class FlaxVisionLlamaForCausalLM(FlaxVisionLlamaPreTrainedModel):
                     generation_config.pad_token_id is not None
                     and jnp.sum(input_ids[:, -1] == generation_config.pad_token_id) > 0
             ):
-                logger.warning(
+                warnings.warn(
                     "A decoder-only architecture is being used, but right-padding was detected! For correct "
                     "generation results, please set `padding_side='left'` when initializing the tokenizer."
                 )
@@ -627,7 +627,7 @@ class FlaxVisionLlamaForCausalLM(FlaxVisionLlamaPreTrainedModel):
         has_default_max_length = kwargs.get("max_length") is None and generation_config.max_length is not None
         if has_default_max_length and generation_config.max_new_tokens is None and generation_config.max_length == 20:
             # 20 is the default max_length of the generation config
-            logger.warning(
+            warnings.warn(
                 f"Using the model-agnostic default `max_length` (={generation_config.max_length}) "
                 "to control the generation length.  recommend setting `max_new_tokens` to control "
                 "the maximum length of the generation.",
@@ -635,7 +635,7 @@ class FlaxVisionLlamaForCausalLM(FlaxVisionLlamaPreTrainedModel):
             )
         elif generation_config.max_new_tokens is not None:
             if not has_default_max_length and generation_config.max_length is not None:
-                logger.warning(
+                warnings.warn(
                     f"Both `max_new_tokens` (={generation_config.max_new_tokens}) and `max_length`(="
                     f"{generation_config.max_length}) seem to have been set. `max_new_tokens` will take precedence. "
                     "Please refer to the documentation for more information. "
@@ -650,7 +650,7 @@ class FlaxVisionLlamaForCausalLM(FlaxVisionLlamaPreTrainedModel):
             )
         if input_ids_seq_length >= generation_config.max_length:
             input_ids_string = "decoder_input_ids" if self.config.is_encoder_decoder else "input_ids"
-            logger.warning(
+            warnings.warn(
                 f"Input length of {input_ids_string} is {input_ids_seq_length}, but `max_length` is set to"
                 f" {generation_config.max_length}. This can lead to unexpected behavior. You should consider"
                 " increasing`max_new_tokens`."

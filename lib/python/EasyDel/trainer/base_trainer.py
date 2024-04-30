@@ -3,6 +3,7 @@ import os
 import sys
 import threading
 import time
+import warnings
 from abc import abstractmethod
 from typing import Union, Callable, Optional, Any, Literal, Mapping, Iterator
 
@@ -408,7 +409,7 @@ class BaseTrainer:
                 config = model.config
             else:
                 config = None
-                logger.warning(
+                warnings.warn(
                     "Config is being set to None due to not detecting Model Configuration from taken Model "
                     "this will cause errors later."
                 )
