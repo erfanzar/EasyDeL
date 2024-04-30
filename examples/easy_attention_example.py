@@ -88,6 +88,7 @@ def main():
         scan_ring_attention=config.scan_ring_attention,
         mesh=config.jax_mesh(),
         sm_scale=1 / math.sqrt(q.shape[-1]),
+        axis_name=config.attention_axis_name
     )
 
     normal_attention = AttentionModule(
@@ -110,7 +111,7 @@ def main():
         shard_attention_computation=config.shard_attention_computation,
         precision=lax.Precision("fastest"),
         force_float32_tpu=True,
-        attn_mechanism="normal",
+        attn_mechanism="sharded_vanilla",
         dtype=jnp.float32,
         bias_partition_spec=config.bias_partition_spec,
         key_partition_spec=config.key_partition_spec,
@@ -121,6 +122,7 @@ def main():
         scan_ring_attention=config.scan_ring_attention,
         mesh=config.jax_mesh(),
         sm_scale=1 / math.sqrt(q.shape[-1]),
+        axis_name=config.attention_axis_name
     )
 
     with config.jax_mesh():

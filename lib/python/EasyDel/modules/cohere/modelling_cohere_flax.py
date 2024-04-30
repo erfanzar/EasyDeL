@@ -192,6 +192,7 @@ class FlaxCohereAttention(BaseJAXAttentionModule):
             scan_ring_attention=self.config.scan_ring_attention,
             mesh=self.config.jax_mesh(),
             sm_scale=1 / math.sqrt(self.head_dim),
+            axis_name=self.config.attention_axis_name
         )
 
     def _merge_heads(self, hidden_states):

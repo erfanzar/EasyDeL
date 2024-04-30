@@ -200,6 +200,7 @@ class FlaxGemmaAttention(BaseJAXAttentionModule):
             scan_ring_attention=self.config.scan_ring_attention,
             mesh=self.config.jax_mesh(),
             sm_scale=self.head_dim ** -0.5,
+            axis_name=self.config.attention_axis_name
         )
 
         self.rotary_emb = FlaxGemmaRotaryEmbedding(config, dtype=self.dtype)
