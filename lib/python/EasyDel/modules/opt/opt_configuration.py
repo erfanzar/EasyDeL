@@ -6,7 +6,7 @@ from ..easydel_modelling_utils import EasyDelPretrainedConfig
 
 
 class OPTConfig(EasyDelPretrainedConfig):
-    model_type = "opt"
+    model_type: str = "opt"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(

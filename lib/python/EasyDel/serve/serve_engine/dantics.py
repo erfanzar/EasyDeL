@@ -17,5 +17,4 @@ class GenerateAPIRequest(BaseModel):
 class ModelOutput(BaseModel):
     response: str
     tokens_used: Optional[int] = None
-    model_name: Optional[str] = None
     generation_time: Optional[float] = None

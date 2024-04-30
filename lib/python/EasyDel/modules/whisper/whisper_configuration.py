@@ -7,7 +7,7 @@ from ..easydel_modelling_utils import EasyDelPretrainedConfig
 
 
 class WhisperConfig(EasyDelPretrainedConfig):
-    model_type = "whisper"
+    model_type: str = "whisper"
     attribute_map = {
         "num_attention_heads": "encoder_attention_heads",
         "hidden_size": "d_model"

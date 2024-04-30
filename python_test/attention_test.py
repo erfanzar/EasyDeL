@@ -13,7 +13,8 @@ from lib.python.EasyDel.modules.attention_module import (
     flash_attention,
     vanilla_attention,
     wise_ring_attention,
-    shard_vanilla_attention
+    shard_vanilla_attention,
+    AttentionModule
 )
 from fjformer import GenerateRNG
 from jax import numpy as jnp, lax, random
@@ -23,13 +24,18 @@ from jax.experimental.shard_map import shard_map
 from functools import partial
 
 rng = GenerateRNG()
-config = MistralConfig(axis_dims=(1, 1, 1, -1))
 BATCH_SIZE = 8
 SEQUENCE_LENGTH = 256
 HEAD_DIM = 8
 NUM_HEADS = 32
 IMG_LOSS = 0.5649852
 CHUNK_WISE_RING = SEQUENCE_LENGTH // 8
+
+config = MistralConfig(
+    axis_dims=(1, 1, 1, -1),
+    block_q=CHUNK_WISE_RING,
+    block_k=CHUNK_WISE_RING
+)
 
 
 @partial(jax.value_and_grad, has_aux=True)
@@ -126,6 +132,28 @@ def call_flash(params):
 
 
 @partial(jax.value_and_grad, has_aux=True)
+def call_wise_ring(params):
+    attention_pred = AttentionModule(
+        attn_mechanism="wise_ring",
+        axis_name="sp",
+        dtype=jnp.float32,
+        mesh=config.jax_mesh(),
+        head_dims=params["q"].shape[-1],
+        num_attention_heads=params["q"].shape[-2],
+        block_q=config.block_q,
+        block_k=config.block_k
+    ).__call__(
+        query_states=params["q"],
+        key_states=params["k"],
+        value_states=params["v"],
+        bias=params["b"],
+        query_sequence_length=params["q"].shape[1],
+        key_value_sequence_length=params["k"].shape[1]
+    ).attention_outputs
+    return IMG_LOSS, (attention_pred,)
+
+
+@partial(jax.value_and_grad, has_aux=True)
 def call_ring(params):
     attention_pred = shard_map(
         partial(
@@ -186,8 +214,10 @@ def main():
     (_, (ring_attention_output,)), gradient_ring = call_ring(params)
     (_, (flash_attention_output,)), gradient_flash = call_flash(params)
     (_, (dot_p_attention_output,)), gradient_dot_p = call_dot_product(params)
+    (_, (wise_ring_attention_output,)), gradient_wise_ring = call_wise_ring(params)
 
     print(f"SHARD VAN  : {sharded_vanilla_attention_output[0, 0, 0, :5]}")
+    print(f"WISE RING  : {wise_ring_attention_output[0, 0, 0, :5]}")
     print(f"VANILLA    : {vanilla_attention_output[0, 0, 0, :5]}")
     print(f"LOCAL RING : {ring_attention_output[0, 0, 0, :5]}")
     print(f"DOT PROD F : {dot_p_attention_output[0, 0, 0, :5]}")

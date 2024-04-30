@@ -6,7 +6,7 @@ from ..easydel_modelling_utils import EasyDelPretrainedConfig
 
 
 class GPTNeoXConfig(EasyDelPretrainedConfig):
-    model_type = "gpt_neox"
+    model_type: str = "gpt_neox"
 
     def __init__(
             self,

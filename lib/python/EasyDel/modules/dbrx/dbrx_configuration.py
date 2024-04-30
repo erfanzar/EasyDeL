@@ -115,7 +115,7 @@ class DbrxFFNConfig(EasyDelPretrainedConfig):
 
 
 class DbrxConfig(EasyDelPretrainedConfig):
-    model_type = "dbrx"
+    model_type: str = "dbrx"
     attribute_map = {
         "num_attention_heads": "n_heads",
         "hidden_size": "d_model",

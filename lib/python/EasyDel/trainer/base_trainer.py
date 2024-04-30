@@ -3,7 +3,6 @@ import os
 import sys
 import threading
 import time
-import warnings
 from abc import abstractmethod
 from typing import Union, Callable, Optional, Any, Literal, Mapping, Iterator
 
@@ -25,6 +24,10 @@ from ..modules.easydel_modelling_utils import EasyDelFlaxPretrainedModel, EasyDe
 from optax import GradientTransformation, Schedule
 from fjformer import CheckpointManager
 from jax.sharding import Mesh
+
+from ..etils.etils import get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -294,6 +297,7 @@ class BaseTrainer:
         :return: A TrainerConfigureDataloaderFuncOutput object
 
         """
+
         def create_tf_dataset(dataset: Dataset, is_train: bool) -> Iterator[ndarray[Any, Any]]:
             return (
                 dataset.to_tf_dataset(
@@ -337,7 +341,8 @@ class BaseTrainer:
             else:
                 num_steps = self.arguments.max_training_steps if is_train else self.arguments.max_evaluation_steps
                 if not num_steps:
-                    raise ValueError(f"Specify the number of {'training' if is_train else 'evaluation'} steps for a generator/streaming dataset.")
+                    raise ValueError(
+                        f"Specify the number of {'training' if is_train else 'evaluation'} steps for a generator/streaming dataset.")
                 return num_steps
 
         def to_tf_dataloader(dataset: Union[Dataset, IterableDataset], is_train: bool):
@@ -403,7 +408,7 @@ class BaseTrainer:
                 config = model.config
             else:
                 config = None
-                warnings.warn(
+                logger.warning(
                     "Config is being set to None due to not detecting Model Configuration from taken Model "
                     "this will cause errors later."
                 )

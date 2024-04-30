@@ -2,7 +2,6 @@ import os.path
 import pathlib
 import re
 import typing
-import warnings
 from typing import OrderedDict, List, Union, Mapping, Optional, Tuple, Callable, Type
 
 import termcolor
@@ -29,8 +28,10 @@ from ..etils import (
     AVAILABLE_OPTIMIZERS
 )
 from ..modules.easydel_modelling_utils import EasyDelFlaxPretrainedModel
-
+from ..etils.etils import get_logger
 from jax.tree_util import PyTreeDef
+
+logger = get_logger(__name__)
 
 AVAILABLE_BACKENDS: List[str] = [
     "cpu", "gpu", "tpu", None
@@ -328,7 +329,7 @@ from checkpoint
         self._captured_memory = {}
         self.log_grad_norms = log_grad_norms
         if rapture_config is not None and log_grad_norms:
-            warnings.warn(
+            logger.warning(
                 "setting `log_grad_norms` to off since using log grad norms while using LoRA is not Supported."
             )
             self.log_grad_norms = False

@@ -7,7 +7,7 @@ logger = logging.get_logger(__name__)
 
 
 class ArcticConfig(EasyDelPretrainedConfig):
-    model_type = "arctic"
+    model_type: str = "arctic"
 
     def __init__(
             self,

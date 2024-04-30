@@ -10,7 +10,7 @@ from ..easydel_modelling_utils import EasyDelPretrainedConfig
 
 
 class GPTJConfig(EasyDelPretrainedConfig):
-    model_type = "gptj"
+    model_type: str = "gptj"
     attribute_map = {
         "max_position_embeddings": "n_positions",
         "hidden_size": "n_embd",

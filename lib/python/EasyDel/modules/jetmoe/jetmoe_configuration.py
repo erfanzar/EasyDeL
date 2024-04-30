@@ -4,7 +4,7 @@ from jax.sharding import PartitionSpec
 
 
 class JetMoEConfig(EasyDelPretrainedConfig):
-    model_type = "jetmoe"
+    model_type: str = "jetmoe"
 
     def __init__(
             self,

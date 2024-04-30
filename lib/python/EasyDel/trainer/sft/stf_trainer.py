@@ -1,5 +1,4 @@
 from typing import Union, Optional, Callable, Dict
-import warnings
 from abc import ABC
 
 from datasets.arrow_writer import SchemaInferenceError
@@ -13,7 +12,11 @@ from ..utils import (
     create_constant_length_dataset
 )
 from ..causal_language_model_trainer import CausalLanguageModelTrainer
+from ...etils.etils import get_logger
+
 import tensorflow_datasets as tfds
+
+logger = get_logger(__name__)
 
 
 class SFTTrainer(CausalLanguageModelTrainer, ABC):
@@ -49,7 +52,7 @@ class SFTTrainer(CausalLanguageModelTrainer, ABC):
 
         if neftune_noise_alpha is not None and self._trainer_supports_neftune:
             arguments.neftune_noise_alpha = neftune_noise_alpha
-            warnings.warn(
+            logger.warning(
                 "You passed a `neftune_noise_alpha` argument to the SFTTrainer, the value you passed will override "
                 "the one in the `TrainArguments`."
             )
@@ -103,7 +106,7 @@ class SFTTrainer(CausalLanguageModelTrainer, ABC):
             if not _multiple:
                 eval_dataset = _eval_datasets["singleton"]
         if tokenizer.padding_side is not None and tokenizer.padding_side != "right":
-            warnings.warn(
+            logger.warning(
                 "You passed a tokenizer with `padding_side` not equal to `right` to the SFTTrainer. This might lead "
                 "to some unexpected behaviour due to overflow issues when training a model in half-precision. "
                 "You might consider adding `tokenizer.padding_side = 'right'` to your code."
@@ -250,7 +253,7 @@ class SFTTrainer(CausalLanguageModelTrainer, ABC):
         extra_columns = list(set(dataset.column_names) - set(signature_columns))
 
         if not remove_unused_columns and len(extra_columns) > 0:
-            warnings.warn(
+            logger.warning(
                 "You passed `remove_unused_columns=False` on a non-packed dataset. This might create some issues with "
                 "the default collator and yield to errors. If you want to inspect dataset other columns "
                 f"(in this case {extra_columns}), you can subclass `DataCollatorForLanguageModeling` in case you "

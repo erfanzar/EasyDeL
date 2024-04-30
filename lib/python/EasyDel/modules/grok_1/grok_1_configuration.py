@@ -4,7 +4,7 @@ from jax.sharding import PartitionSpec
 
 
 class Grok1Config(EasyDelPretrainedConfig):
-    model_type = "grok-1"
+    model_type: str = "grok-1"
 
     def __init__(
             self,

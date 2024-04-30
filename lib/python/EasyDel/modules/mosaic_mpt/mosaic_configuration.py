@@ -6,7 +6,7 @@ from ..easydel_modelling_utils import EasyDelPretrainedConfig
 
 
 class MptConfig(EasyDelPretrainedConfig):
-    model_type = 'mpt'
+    model_type: str = 'mpt'
 
     def __init__(self,
                  d_model: int = 2048,

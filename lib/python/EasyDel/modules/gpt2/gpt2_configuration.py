@@ -6,7 +6,7 @@ from ..easydel_modelling_utils import EasyDelPretrainedConfig
 
 
 class GPT2Config(EasyDelPretrainedConfig):
-    model_type = "gpt2"
+    model_type: str = "gpt2"
     keys_to_ignore_at_inference = ["past_key_values"]
     attribute_map = {
         "hidden_size": "n_embd",

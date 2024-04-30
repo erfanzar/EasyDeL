@@ -9,7 +9,7 @@ from ..easydel_modelling_utils import EasyDelPretrainedConfig
 class Phi3Config(EasyDelPretrainedConfig):
     """Phi configuration."""
 
-    model_type = "phi3"
+    model_type: str = "phi3"
 
     def __init__(
             self,

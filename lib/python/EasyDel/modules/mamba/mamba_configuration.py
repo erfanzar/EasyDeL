@@ -5,7 +5,7 @@ from typing import Optional
 
 
 class MambaConfig(EasyDelPretrainedConfig):
-    model_type = "mamba"
+    model_type: str = "mamba"
 
     def __init__(
             self,

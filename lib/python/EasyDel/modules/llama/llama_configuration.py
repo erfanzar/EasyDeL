@@ -6,7 +6,7 @@ from ..easydel_modelling_utils import EasyDelPretrainedConfig
 
 
 class LlamaConfig(EasyDelPretrainedConfig):
-    model_type = "llama"
+    model_type: str = "llama"
 
     def __init__(
             self,
