@@ -99,6 +99,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             scan_attention_layers: bool = False,
             use_scan_mlp: bool = True,
             scan_mlp_chunk_size: int = 1024,
+            attention_axis_name: str = "sp",
             **kwargs
     ):
         self.query_partition_spec = query_partition_spec
@@ -133,7 +134,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
         self.use_scan_mlp = use_scan_mlp
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.use_sharding_constraint = use_sharding_constraint
-
+        self.attention_axis_name = attention_axis_name
         super().__init__(**kwargs)
 
     @staticmethod
@@ -274,7 +275,8 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             scan_attention_layers: bool = ...,
             use_sharding_constraint: bool = ...,
             use_scan_mlp: bool = ...,
-            scan_mlp_chunk_size: int = ...
+            scan_mlp_chunk_size: int = ...,
+            attention_axis_name: str = ...,
     ):
         """
         It initializes all the attributes of an object, and it's called when you create a new instance of that class.
@@ -314,6 +316,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
         :param scan_attention_layers: bool: Whether to use can for attention layers
         :param use_scan_mlp: bool: Determine whether to use scan_mlp or not
         :param scan_mlp_chunk_size: int: Size of chunks in scan MLP.
+        :param attention_axis_name: str: Name of the attention axis name
         """
         set_attrs_smartly(self, "axis_dims", (1, -1, 1, 1), axis_dims)
         set_attrs_smartly(self, "axis_names", ("dp", "fsdp", "tp", "sp"), axis_names)
@@ -394,6 +397,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
         set_attrs_smartly(self, "scan_ring_attention", True, scan_ring_attention)
         set_attrs_smartly(self, "use_scan_mlp", True, use_scan_mlp)
         set_attrs_smartly(self, "scan_mlp_chunk_size", 1024, scan_mlp_chunk_size)
+        set_attrs_smartly(self, "attention_axis_name", "sp", attention_axis_name)
 
     def __repr__(self):
 
