@@ -1,3 +1,5 @@
+import warnings
+
 import chex
 import flax
 from jax.experimental.mesh_utils import create_device_mesh
@@ -95,7 +97,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             backend: Optional[None] = jax.default_backend(),
             easy_method: Literal["train", "serve", "convert"] = EasyMethod.TRAIN,
             bits: Optional[int] = None,
-            scan_ring_attention: bool = False,
+            scan_ring_attention: bool = True,
             scan_attention_layers: bool = False,
             use_scan_mlp: bool = True,
             scan_mlp_chunk_size: int = 1024,
@@ -154,14 +156,14 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             (len(jax.devices() if backend == "" else jax.devices(backend)), 1))
         if isinstance(axis_dims, str):
             axis_dims = eval(axis_dims)
-            logger.warning(
+            warnings.warn(
                 "axis_dims argument is not a Sequence of int and it's an string. "
                 "(backbone Warning in EasyDeLModuleConfig)\n"
                 f"\tchanged to {axis_dims}"
             )
         if isinstance(axis_names, str):
             axis_names = eval(axis_names)
-            logger.warning(
+            warnings.warn(
                 "axis_names argument is not a Sequence of strings and it's an string class. "
                 "(backbone Warning in EasyDeLModuleConfig)\n"
                 f"\tchanged to {axis_names}"

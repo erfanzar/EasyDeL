@@ -2,6 +2,7 @@ import os.path
 import pathlib
 import re
 import typing
+import warnings
 from typing import OrderedDict, List, Union, Mapping, Optional, Tuple, Callable, Type
 
 import termcolor
@@ -329,7 +330,7 @@ from checkpoint
         self._captured_memory = {}
         self.log_grad_norms = log_grad_norms
         if rapture_config is not None and log_grad_norms:
-            logger.warning(
+            warnings.warn(
                 "setting `log_grad_norms` to off since using log grad norms while using LoRA is not Supported."
             )
             self.log_grad_norms = False

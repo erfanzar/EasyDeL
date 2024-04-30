@@ -1,6 +1,7 @@
 import copy
 import functools
 import os
+import warnings
 from typing import Optional, Mapping, Callable, Dict, Any
 
 import flax.core
@@ -230,7 +231,7 @@ class JAXServer(GradioUserInference):
             tokenizer.truncation_side = "right"
             self.tokenizer = copy.deepcopy(tokenizer)
         except:
-            logger.warning(
+            warnings.warn(
                 f"The class Model of Tokenizer {type(tokenizer)} do not support deepcopy option "
             )
             if self.server_config.use_prefix_tokenizer:
@@ -597,7 +598,7 @@ class JAXServer(GradioUserInference):
                 ...
 
         else:
-            logger.warning(
+            warnings.warn(
                 "Skip Compiling the compiling process is useless "
                 "when you are not using prefix tokenizer",
             )

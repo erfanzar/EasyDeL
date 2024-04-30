@@ -1,6 +1,7 @@
 import functools
 import gc
 import re
+import warnings
 from functools import partial
 from typing import Sequence, Optional, Tuple, Mapping, Callable, Type, Any, List
 
@@ -473,7 +474,7 @@ class AutoEasyDelModelForCausalLM:
                 del state_dict[k]
         if shard_fns is not None:
             if auto_shard_params:
-                logger.warning(
+                warnings.warn(
                     "`auto_shard_params` will be ignored since you are passing custom sharding functions"
                 )
             logger.debug("sharding model parameters based on the given shard_fns.")
@@ -503,7 +504,7 @@ class AutoEasyDelModelForCausalLM:
             params_pattern_selection = None
             if load_in_8bit:
                 if bit_targeted_params is None:
-                    logger.warning(
+                    warnings.warn(
                         "since `bit_targeted_params` is set to None, auto loader will convert all of"
                         " kernels(weights) and embeddings to 8bit by default"
                     )
@@ -613,7 +614,7 @@ class AutoShardAndGatherFunctions:
             input_shape: Tuple[int, int] = (1, 1),
     ):
         if partition_rules is None:
-            logger.warning("Using config partition rules from `get_partition_rules(fully_sharded_data_parallel=True)`")
+            warnings.warn("Using config partition rules from `get_partition_rules(fully_sharded_data_parallel=True)`")
             partition_rules = config.get_partition_rules(True)
         _, module, _ = get_modules_by_type(config.model_type)
         model = module(

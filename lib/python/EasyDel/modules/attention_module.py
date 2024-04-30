@@ -1,4 +1,5 @@
 import math
+import warnings
 from functools import partial
 
 import fjformer
@@ -407,7 +408,7 @@ class AttentionModule:
             attn_output = with_sharding_constraint(attn_output, self.attention_partition_spec)
         else:
             if self.platform != "tpu":
-                logger.warning(
+                warnings.warn(
                     "Using Ring attention on CPUs or GPUs are not recommended due to miss computations at the moment. "
                     "please refer to other types of attention mechanism.your are bing fell back on "
                     "`ring_attention_sharded`"
@@ -493,7 +494,7 @@ class AttentionModule:
         else:
             seq_length = query_states.shape[1]
             chunk = seq_length > max(self.block_q, self.block_k)
-            logger.warning(
+            warnings.warn(
                 f"generation process detected, switching to local ring attention"
                 f" [CHUNK : {chunk}, SCAN : {self.scan_ring_attention}, {self.block_k=}, {self.block_q=}, {seq_length=}]"
             )

@@ -1,3 +1,4 @@
+import warnings
 from typing import Optional, Tuple, Union
 
 import chex
@@ -377,7 +378,7 @@ class FlaxGemmaMLP(nn.Module):
 
         kernel_init = jax.nn.initializers.normal(self.config.initializer_range)
         if self.config.hidden_activation is None:
-            logger.warning(
+            warnings.warn(
                 "Gemma's activation function should be approximate GeLU and not exact GeLU. "
                 "Changing the activation function to `gelu_pytorch_tanh`."
                 f"if you want to use the legacy `{self.config.hidden_act}`, "

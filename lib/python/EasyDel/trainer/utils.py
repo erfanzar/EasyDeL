@@ -1,3 +1,5 @@
+import warnings
+
 import jax
 from ml_collections import ConfigDict
 from ml_collections.config_dict import placeholder
@@ -11,6 +13,7 @@ from datasets import Dataset, Value
 from ..etils.etils import get_logger
 
 logger = get_logger(__name__)
+
 
 class JaxDistributedConfig(object):
     """
@@ -77,10 +80,10 @@ def create_constant_length_dataset(
 
     if formatting_func is not None:
         if formatting_func.__code__.co_argcount > 1:
-            logger.warning(
+            warnings.warn(
                 "The passed formatting_func has more than one argument. Usually that function should have a "
                 "single argument `example` which corresponds to the dictionary returned by each element of the "
-                "dataset. Make sure you know what you are doing."
+                "dataset. Make sure you know what you are doing.",
             )
     max_buffer_size = seq_length * chars_per_token * num_of_sequences
 
@@ -102,7 +105,7 @@ def create_constant_length_dataset(
                 except StopIteration:
                     if infinite:
                         iterator = iter(dataset)
-                        logger.warning("The dataset reached end and the iterator is reset to the start.")
+                        warnings.warn("The dataset reached end and the iterator is reset to the start.")
                     else:
                         more_examples = False
                         break
@@ -215,7 +218,7 @@ class DataCollatorForCompletionOnlyLM:
             self.response_token_ids = response_template
 
         if not mlm and self.instruction_template and self.tokenizer.pad_token_id == self.tokenizer.eos_token_id:
-            logger.warning(
+            warnings.warn(
                 "The pad_token_id and eos_token_id values of this tokenizer are identical. "
                 "If you are planning for multi-turn training, "
                 "it can result in the model continuously generating questions and answers without eos token. "
@@ -226,7 +229,7 @@ class DataCollatorForCompletionOnlyLM:
 
     def _whole_word_mask(self, input_tokens: List[str], max_predictions=512):
         if not isinstance(self.tokenizer, (BertTokenizer, BertTokenizerFast)):
-            logger.warning(
+            warnings.warn(
                 "DataCollatorForWholeWordMask is only suitable for BertTokenizer-like tokenizers. "
                 "Please refer to the documentation for more information."
             )
@@ -340,7 +343,7 @@ class DataCollatorForCompletionOnlyLM:
                         response_token_ids_start_idx = idx
 
                 if response_token_ids_start_idx is None:
-                    logger.warning(
+                    warnings.warn(
                         f"Could not find response key `{self.response_template}` in the "
                         f'following instance: {self.tokenizer.decode(batch["input_ids"][i])} '
                         f"This instance will be ignored in loss calculation. "
@@ -364,7 +367,7 @@ class DataCollatorForCompletionOnlyLM:
                         response_token_ids_idxs.append(assistant_idx + len(self.response_token_ids))
 
                 if len(response_token_ids_idxs) == 0:
-                    logger.warning(
+                    warnings.warn(
                         f"Could not find response key `{self.response_template}` in the "
                         f'following instance: {self.tokenizer.decode(batch["input_ids"][i])} '
                         f"This instance will be ignored in loss calculation. "
@@ -378,7 +381,7 @@ class DataCollatorForCompletionOnlyLM:
                         human_token_ids_idxs.append(human_idx)
 
                 if len(human_token_ids_idxs) == 0:
-                    logger.warning(
+                    warnings.warn(
                         f"Could not find instruction key `{self.instruction_template}` in the "
                         f'following instance: {self.tokenizer.decode(batch["input_ids"][i])} '
                         f"This instance will be ignored in loss calculation. "
