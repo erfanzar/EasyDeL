@@ -98,8 +98,8 @@ class AttentionModule:
             generation_bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
             attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             generation_attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, "tp", None),
-            scan_ring_attention: bool = False,
-            scan_attention_layers: bool = False,
+            scan_ring_attention: bool = True,
+            scan_attention_layers: bool = True,
             attention_dropout: float = 0.0,
             dtype: jnp.dtype = jnp.float32,
             precision: lax.Precision = lax.Precision("fastest"),
@@ -486,7 +486,7 @@ class AttentionModule:
             check_rep=False
         )
         attn_output = ring_attention_sharded(query_states, key_states, value_states, bias, segment_ids)
-
+        attn_output = with_sharding_constraint(attn_output, attn_out_spec)
         return AttentionOutput(
             attention_weights=None,
             attention_outputs=attn_output
