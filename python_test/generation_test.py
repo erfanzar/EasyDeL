@@ -73,7 +73,8 @@ class EasyModelsGenerationTest(TestCase):
             "cudnn",
             "local_ring",
             "sharded_vanilla",
-            "wise_ring"
+            "wise_ring",
+            "blockwise"
         ] = "sharded_vanilla"
         self.block_k: int = 64
         self.block_q: int = 64

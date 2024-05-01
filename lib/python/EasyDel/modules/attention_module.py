@@ -30,7 +30,8 @@ from ._attentions import (
     static_sharded_dot_product_attention,
     ring_attention_standard,
     wise_ring_attention,
-    shard_vanilla_attention
+    shard_vanilla_attention,
+    blockwise_attn
 )
 from ..etils.etils import get_logger
 
@@ -76,7 +77,8 @@ class AttentionModule:
                 "cudnn",
                 "local_ring",
                 "sharded_vanilla",
-                "wise_ring"
+                "wise_ring",
+                "blockwise"
             ],
             num_attention_heads: int,
             head_dims: int,
@@ -306,6 +308,15 @@ class AttentionModule:
                     value_states=value_states,
                     segment_ids=segment_ids,
                 )
+            elif self.attn_mechanism == "blockwise":
+                return self.blockwise_attention(
+                    query_states=query_states,
+                    key_states=key_states,
+                    value_states=value_states,
+                    bias=bias,
+                    deterministic=deterministic,
+                    dropout_rng=dropout_rng
+                )
             elif self.attn_mechanism == "cudnn":
                 return self.cuddn_flash_attention(
                     query_states=query_states,
@@ -531,6 +542,53 @@ class AttentionModule:
             )
             return AttentionOutput(
                 attention_weights=w,
+                attention_outputs=o
+            )
+
+    def blockwise_attention(
+            self,
+            *,  # it's Kwarg Only
+            query_states: Array,
+            key_states: Array,
+            value_states: Array,
+            bias: Optional[Array] = None,
+            deterministic: bool = False,
+            dropout_rng: Optional[random.PRNGKey] = None,
+    ) -> AttentionOutput:
+        dtype = jnp.promote_types(self.dtype, jnp.float32)
+        is_generating = query_states.shape[2] == 1
+        query_sequence_partition = self.generation_query_partition_spec if is_generating else self.query_partition_spec
+        bias_partition_spec = self.generation_bias_partition_spec if is_generating else self.bias_partition_spec
+        block_q = 1 if is_generating else self.block_q
+        with self.mesh:
+            query_states = with_sharding_constraint(query_states, query_sequence_partition)
+            key_states = with_sharding_constraint(key_states, self.key_partition_spec)
+            value_states = with_sharding_constraint(value_states, self.value_partition_spec)
+            bias = with_sharding_constraint(bias, bias_partition_spec)
+
+            o = blockwise_attn(
+                query=query_states,
+                key=key_states,
+                value=value_states,
+                bias=bias,
+                deterministic=deterministic,
+                dtype=dtype,
+                dropout_rng=dropout_rng,
+                precision=self.precision,
+                attn_pdrop=self.attention_dropout,
+                key_chunk_size=self.block_k,
+                query_chunk_size=block_q,
+                prevent_cse=not self.scan_attention_layers,
+                causal=True,
+                float32_logits=True
+            )
+
+            o = with_sharding_constraint(
+                o,
+                self.attention_partition_spec if not is_generating else self.generation_attention_partition_spec
+            )
+            return AttentionOutput(
+                attention_weights=None,
                 attention_outputs=o
             )
 
