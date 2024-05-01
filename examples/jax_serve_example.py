@@ -83,7 +83,8 @@ flags.DEFINE_enum(
         "cudnn",
         "local_ring",
         "sharded_vanilla",
-        "wise_ring"
+        "wise_ring",
+        "blockwise"
     ],
     default="sharded_vanilla",
     help="The attention mechanism to be used in the model"

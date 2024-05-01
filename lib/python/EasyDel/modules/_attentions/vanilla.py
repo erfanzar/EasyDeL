@@ -80,7 +80,40 @@ def _chunk_bias(bias, axis_name, query_length, key_length):
     )
 
 
-def shard_vanilla_attention(
+# def _shard_vanilla_attention_bwd(
+#         deterministic,
+#         dropout_rng,
+#         dtype,
+#         precision,
+#         attention_dropout,
+#         res,
+#         g
+# ):
+#     attention, query_states, key_states, value_states, attention_weight, bias = res
+#
+#     dv = jnp.einsum("...qhk,...khd->...qhd", g, query_states, precision=precision)
+#     ex = jnp.exp(attention_weight)
+#     d_attention_weight = ex / (ex.sum(axis=-1, keepdims=True))
+#     dk = jnp.einsum("...hqk,...qhk->...khd", d_attention_weight, g, precision=precision)
+#     attention_weight_t = jnp.transpose(attention_weight, axes=(0, 2, 1, 3))  # (...qhk -> ...khq)
+#
+#     # d_attention_weight as mentioned above
+#     d_attention_weight = lax.softmax_derivative(attention_weight)
+#
+#     # Calculate dq using einsum
+#     dq = jnp.einsum("...khq,...khd->...qhd", d_attention_weight, value_states.transpose((0, 2, 1, 3)),
+#                     precision=precision)
+#
+#     db = None
+#     if bias is not None:
+#         batch_size, num_heads, query_length, key_length = attention_weight.shape
+#         g_reshaped = g.reshape(batch_size, num_heads, 1, 1)
+#         db = jnp.sum(g_reshaped, axis=(0, 2, 3))
+#
+#     return dq, dk, dv, db
+
+
+def _shard_vanilla_attention_fwd(
         query_states: Array,
         key_states: Array,
         value_states: Array,
@@ -102,13 +135,12 @@ def shard_vanilla_attention(
     depth = query_states.shape[-1]
     query_states = query_states / jnp.sqrt(depth).astype(dtype)
     attention_weight = jnp.einsum("...qhd,...khd->...hqk", query_states, key_states, precision=precision)
-    axis_size = lax.psum(1, "sp")
     index = lax.axis_index("sp")
     if bias is not None:
-        bias = lax.dynamic_slice(
+        chunk_b = lax.dynamic_slice(
             bias, (0, 0, index * query_length, index * key_length), (batch_size, 1, query_length, key_length)
         )
-        attention_weight = attention_weight + bias
+        attention_weight = attention_weight + chunk_b
     attention_weight = jax.nn.softmax(attention_weight).astype(dtype)
     if not deterministic and attention_dropout > 0.0:
         keep_prob = 1.0 - attention_dropout
@@ -120,6 +152,37 @@ def shard_vanilla_attention(
     attention = jnp.einsum("...hqk,...khd->...qhd", attention_weight, value_states, precision=precision)
 
     return attention
+    # , (attention, query_states, key_states, value_states, attention_weight, bias))
+
+
+# @partial(jax.custom_vjp, nondiff_argnums=(4, 5, 6, 7, 8))
+def shard_vanilla_attention(
+        query_states: Array,
+        key_states: Array,
+        value_states: Array,
+        bias: Optional[Array] = None,
+        deterministic: bool = True,
+        dropout_rng: Optional[random.PRNGKey] = None,
+        dtype: jnp.dtype = jnp.float32,
+        precision: Optional[jax.lax.Precision] = None,
+        attention_dropout: float = 0.0
+):
+    out = _shard_vanilla_attention_fwd(
+        query_states=query_states,
+        key_states=key_states,
+        value_states=value_states,
+        bias=bias,
+        dropout_rng=dropout_rng,
+        deterministic=deterministic,
+        dtype=dtype,
+        precision=precision,
+        attention_dropout=attention_dropout
+    )
+
+    return out
+
+
+# shard_vanilla_attention.defvjp(_shard_vanilla_attention_fwd, _shard_vanilla_attention_bwd)
 
 
 def attention_production(

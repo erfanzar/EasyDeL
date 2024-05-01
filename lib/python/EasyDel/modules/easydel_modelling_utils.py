@@ -20,7 +20,8 @@ AVAILABLE_ATTENTION_MECHANISMS = Literal[
     "cudnn",
     "local_ring",
     "sharded_vanilla",
-    "wise_ring"
+    "wise_ring",
+    "blockwise"
 ]
 
 
