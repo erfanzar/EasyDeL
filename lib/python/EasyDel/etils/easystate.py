@@ -12,7 +12,6 @@ from flax.linen.fp8_ops import OVERWRITE_WITH_GRADIENT
 import optax
 from .auto_tx import get_optimizer_and_scheduler
 from ..etils import AVAILABLE_SCHEDULERS, AVAILABLE_OPTIMIZERS, EasyDelRuntimeError
-from ..modules.easydel_modelling_utils import EasyDelFlaxPretrainedModel, EasyDelPretrainedConfig
 from jax.sharding import Mesh, PartitionSpec
 from jax import numpy as jnp
 
@@ -58,8 +57,8 @@ def break_format(key, value):
 
 class EasyDelState(struct.PyTreeNode):
     step: int
-    module: Optional[EasyDelFlaxPretrainedModel] = struct.field(pytree_node=False)
-    module_config: Optional[EasyDelPretrainedConfig] = struct.field(pytree_node=False)
+    module: Optional["EasyDelFlaxPretrainedModel"] = struct.field(pytree_node=False)  # type:ignore
+    module_config: Optional["EasyDelPretrainedConfig"] = struct.field(pytree_node=False)  # type:ignore
     module_config_args: Optional[dict] = struct.field(pytree_node=True)
     apply_fn: Callable = struct.field(pytree_node=False)
     params: core.FrozenDict[str, Any] = struct.field(pytree_node=True)
@@ -115,8 +114,8 @@ class EasyDelState(struct.PyTreeNode):
             tx: optax.GradientTransformation,
             tx_init: Optional[dict] = None,
             hyperparameters: Optional[dict] = None,
-            module: Optional[EasyDelFlaxPretrainedModel] = None,
-            module_config: Optional[EasyDelPretrainedConfig] = None,
+            module: Optional["EasyDelFlaxPretrainedModel"] = None,  # type:ignore
+            module_config: Optional["EasyDelPretrainedConfig"] = None,  # type:ignore
             module_config_args: Optional[dict] = None,
             **kwargs
     ):
@@ -170,8 +169,8 @@ class EasyDelState(struct.PyTreeNode):
             opt_state: Optional[optax.OptState] = None,
             tx_init: Optional[dict] = None,
             hyperparameters: Optional[dict] = None,
-            module: Optional[EasyDelFlaxPretrainedModel] = None,
-            module_config: Optional[EasyDelPretrainedConfig] = None,
+            module: Optional["EasyDelFlaxPretrainedModel"] = None,  # type:ignore
+            module_config: Optional["EasyDelPretrainedConfig"] = None,  # type:ignore
             module_config_args: Optional[dict] = None,
             **kwargs
     ):

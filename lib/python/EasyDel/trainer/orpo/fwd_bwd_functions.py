@@ -31,8 +31,7 @@ def pad_to_length(tensor: chex.Array, length: int, pad_value: Union[int, float],
 @dataclass
 class ORPOStepOut:
     loss: chex.Array
-    chosen_rewards: chex.Array
-    rejected_rewards: chex.Array
+    metrics: Dict[str, Union[chex.Array, str]]
 
 
 def create_concatenated_forward(
@@ -299,33 +298,26 @@ def odds_ratio_loss(
     )
 
 
-def create_dpo_train_function(
+def create_orpo_step_function(
         concatenated_forward: Callable,
-        ref_state: EasyDelState = None,
         beta: float = 0.1,
-        label_smoothing: float = 0,
-        loss_type: Literal["sigmoid", "hinge", "ipo", "kto"] = "sigmoid",
-        reference_free: bool = False,
+        mode: Literal["train", "eval"] = "train"
 ):
     """
-    The create_dpo_train_function function is a helper function that creates the DPO training step.
+    The create_orpo_step_function function is a helper function that creates the ORPO training step.
 
     :param concatenated_forward: Callable: Define the forward pass of the model
-    :param ref_state: EasyDelState: Specify the reference policy
     :param beta: float: Scale the logits
-    :param label_smoothing: float: Smooth the labels
-    :param loss_type:  Literal["sigmoid", "hinge", "ipo", "kto"]: Determine the loss function
-    :param reference_free: bool: Indicate whether the reference policy is used or not
+    :param mode: Literal["train", "eval"] : "train", "eval" function modes
     :return: A function that takes in a state and a batch
     """
 
-    def dpo_step(
+    def orpo_step(
             state: EasyDelState,
             batch: dict
     ) -> tuple[EasyDelState, ORPOStepOut]:
-
         """
-        The dpo_step function is the core of DPO. It takes a state and a batch,
+        The orpo_step function is the core of ORPO. It takes a state and a batch,
         and returns an updated state. The update is done by calculating the loss
         for each example in the batch, then taking its gradient with respect to
         the parameters of the policy network (which are stored in `state`). This
@@ -342,319 +334,45 @@ def create_dpo_train_function(
                 policy_rejected_log_probs,
                 policy_chosen_logits,
                 policy_rejected_logits,
+                policy_nll_loss
             ) = concatenated_forward(
                 state.apply_fn,
                 params,
                 batch
             )
 
-            if "reference_chosen_log_probs" in batch and "reference_rejected_log_probs" in batch:
-                reference_chosen_log_probs = batch["reference_chosen_log_probs"]
-                reference_rejected_log_probs = batch["reference_rejected_log_probs"]
-            else:
-                if ref_state is None:
-                    (
-                        reference_chosen_log_probs,
-                        reference_rejected_log_probs,
-                        _,
-                        _,
-                    ) = concatenated_forward(
-                        state.apply_fn,
-                        state.params,
-                        batch
-                    )
-                else:
-                    (
-                        reference_chosen_log_probs,
-                        reference_rejected_log_probs,
-                        _,
-                        _,
-                    ) = concatenated_forward(
-                        ref_state.apply_fn,
-                        ref_state.params,
-                        batch
-                    )
-
-            pi_log_ratios = policy_chosen_log_probs - policy_rejected_log_probs
-
-            if reference_free:
-                ref_log_ratios = 0
-            else:
-                ref_log_ratios = reference_chosen_log_probs - reference_rejected_log_probs
-
-            logits = pi_log_ratios - ref_log_ratios
-            losses = _loss_func(
-                logits,
-                policy_chosen_log_probs,
-                reference_chosen_log_probs,
-                policy_rejected_log_probs,
-                reference_rejected_log_probs
+            losses, chosen_rewards, rejected_rewards, log_odds_ratio, log_odds_chosen = odds_ratio_loss(
+                beta, policy_chosen_log_probs, policy_rejected_log_probs
             )
-            chosen_rewards = (
-                    beta
-                    * (
-                            policy_chosen_log_probs - reference_chosen_log_probs
-                    )
-            )
-            rejected_rewards = (
-                    beta
-                    * (
-                            policy_rejected_log_probs
-                            - reference_rejected_log_probs
-                    )
-            )
-            return losses[0], (chosen_rewards, rejected_rewards)
 
-        grad_fn = jax.value_and_grad(calculate_loss, has_aux=True)
-        (__loss, (__chosen_rewards, __rejected_rewards)), grads = grad_fn(state.params)
-        new_state = state.apply_gradients(grads=grads)
+            loss = policy_nll_loss - losses.mean()
+
+            reward_accuracies = (chosen_rewards > rejected_rewards).float()
+            metrics = {}
+            prefix = "eval_" if mode == "eval" else ""
+            metrics[f"{prefix}rewards/chosen"] = chosen_rewards.mean()
+            metrics[f"{prefix}rewards/rejected"] = rejected_rewards.mean()
+            metrics[f"{prefix}rewards/accuracies"] = reward_accuracies.mean()
+            metrics[f"{prefix}rewards/margins"] = (chosen_rewards - rejected_rewards).mean()
+            metrics[f"{prefix}logps/rejected"] = policy_rejected_log_probs.mean()
+            metrics[f"{prefix}logps/chosen"] = policy_chosen_log_probs.mean()
+            metrics[f"{prefix}logits/rejected"] = policy_rejected_logits.mean()
+            metrics[f"{prefix}logits/chosen"] = policy_chosen_logits.mean()
+            metrics[f"{prefix}nll_loss"] = policy_nll_loss.mean()
+            metrics[f"{prefix}log_odds_ratio"] = log_odds_ratio
+            metrics[f"{prefix}log_odds_chosen"] = log_odds_chosen
+            return loss, metrics
+
+        if mode == "train":
+            grad_fn = jax.value_and_grad(calculate_loss, has_aux=True)
+            (__loss, (__metrics)), grads = grad_fn(state.params)
+            new_state = state.apply_gradients(grads=grads)
+        else:
+            __loss, __metrics = calculate_loss(state.params)
+            new_state = state
         return new_state, ORPOStepOut(
             loss=__loss,
-            rejected_rewards=__rejected_rewards,
-            chosen_rewards=__chosen_rewards
+            metrics=__metrics
         )
 
-    return dpo_step
-
-
-def create_dpo_eval_function(
-        concatenated_forward: Callable,
-        ref_state: EasyDelState = None,
-        beta: float = 0.1,
-        label_smoothing: float = 0,
-        loss_type: Literal["sigmoid", "hinge", "ipo", "kto"] = "sigmoid",
-        reference_free: bool = False,
-):
-    """
-    The create_dpo_eval_function function is a helper function that creates the DPO evaluating step.
-
-    :param concatenated_forward: Callable: Define the forward pass of the model
-    :param ref_state: EasyDelState: Specify the reference policy
-    :param beta: float: Scale the logits
-    :param label_smoothing: float: Smooth the labels
-    :param loss_type:  Literal["sigmoid", "hinge", "ipo", "kto"]: Determine the loss function
-    :param reference_free: bool: Indicate whether the reference policy is used or not
-    :return: A function that takes in a state and a batch
-    """
-
-    def _sigmoid_dpo_loss(
-            logits: chex.Array,
-            policy_chosen_log_probs: chex.Array = None,  # IGNORED
-            reference_chosen_log_probs: chex.Array = None,  # IGNORED
-            policy_rejected_log_probs: chex.Array = None,  # IGNORED
-            reference_rejected_log_probs: chex.Array = None  # IGNORED
-    ):
-
-        """
-        The _sigmoid_dpo_loss function is a helper function for the sigmoid_dpo_loss
-            function. It computes the loss of each example in a batch, given its logits
-            and (optionally) its chosen/rejected log probabilities under both policies.
-
-        :param logits: chex.Array: Compute the loss
-        :param policy_chosen_log_probs: chex.Array: Calculate the policy loss
-        :param reference_chosen_log_probs: chex.Array: Compute the loss for the reference policy # IGNORED
-        :param policy_rejected_log_probs: chex.Array: Calculate the loss for the rejected samples # IGNORED
-        :param reference_rejected_log_probs: chex.Array: Calculate the loss of rejected samples # IGNORED
-        :return: an array represent loss
-        """
-        losses = (
-                -jax.nn.log_sigmoid(beta * logits) * (1 - label_smoothing)
-                - jax.nn.log_sigmoid(-beta * logits) * label_smoothing
-        )
-        return losses
-
-    def _hinge_dpo_loss(
-            logits: chex.Array,
-            policy_chosen_log_probs: chex.Array,  # IGNORED
-            reference_chosen_log_probs: chex.Array,  # IGNORED
-            policy_rejected_log_probs: chex.Array,  # IGNORED
-            reference_rejected_log_probs: chex.Array  # IGNORED
-    ):
-
-        """
-        The _hinge_dpo_loss function is a helper function that computes the loss for DPO.
-
-        :param logits: chex.Array: Calculate the hinge loss
-        :param policy_chosen_log_probs: chex.Array: Compute the policy loss
-        :param reference_chosen_log_probs: chex.Array: Compute the loss for the reference policy # IGNORED
-        :param policy_rejected_log_probs: chex.Array: Calculate the loss for the rejected samples # IGNORED
-        :param reference_rejected_log_probs: chex.Array: Calculate the loss of rejected samples # IGNORED
-        :return: an array represent The hinge loss
-        """
-        return jax.relu(1 - beta * logits)
-
-    def _ipo_dpo_loss(
-            logits: chex.Array,
-            policy_chosen_log_probs: chex.Array,  # IGNORED
-            reference_chosen_log_probs: chex.Array,  # IGNORED
-            policy_rejected_log_probs: chex.Array,  # IGNORED
-            reference_rejected_log_probs: chex.Array  # IGNORED
-    ):
-        """
-         The _ipo_dpo_loss function is a helper function that calculates the loss for
-         the IPO-DPO algorithm. It takes in the logits, policy_chosen_log_probs,
-         reference_chosen_log_probs, policy rejected log probs and reference rejected
-         log probs as inputs. The output of this function is used to calculate the loss
-         for each batch of data.
-
-        :param logits: chex.Array: Calculate the loss
-        :param policy_chosen_log_probs: chex.Array: Compute the
-        :param reference_chosen_log_probs: chex.Array: Compute the loss for the reference policy # IGNORED
-        :param policy_rejected_log_probs: chex.Array: Calculate the loss for the rejected samples # IGNORED
-        :param reference_rejected_log_probs: chex.Array: Calculate the loss of rejected samples # IGNORED
-        :return: an array represent loss
-         """
-        return (logits - 1 / (2 * beta)) ** 2
-
-    def _kto_pair_dpo_loss(
-            logits: chex.Array,  # IGNORED
-            policy_chosen_log_probs: chex.Array,
-            reference_chosen_log_probs: chex.Array,
-            policy_rejected_log_probs: chex.Array,
-            reference_rejected_log_probs: chex.Array
-    ):
-
-        """
-        The _kto_pair_dpo_loss function is a helper function that computes the loss for
-        a single pair of trajectories. It takes in two sets of log probabilities, one from
-        the policy and one from the reference distribution. The first set are the log
-        probabilities for actions taken by each agent in a trajectory, while the second set
-        are those for actions not taken by each agent (i.e., rejected). The function then
-        computes KL divergences between these two sets of distributions and uses them to compute losses.
-
-        :param logits: chex.Array: Calculate the log_probs
-        :param  policy_chosen_log_probs: chex.Array: Calculate the chosen_kl # IGNORED
-        :param reference_chosen_log_probs: chex.Array: Calculate the chosen_kl
-        :param policy_rejected_log_probs: chex.Array: Calculate the rejected_kl variable
-        :param reference_rejected_log_probs: chex.Array: Calculate the rejected_kl variable
-        :return: an array represent loss
-        """
-        chosen_kl = jax.lax.clamp(
-            min=0,
-            x=jnp.mean(policy_chosen_log_probs - reference_chosen_log_probs),
-            max=1e9
-        )
-        rejected_kl = jax.lax.clamp(
-            min=0,
-            x=jnp.mean(policy_rejected_log_probs - reference_rejected_log_probs),
-            max=1e9
-        )
-
-        chosen_log_ratios = policy_chosen_log_probs - reference_chosen_log_probs
-        rejected_log_ratios = policy_rejected_log_probs - reference_rejected_log_probs
-        losses = jnp.concatenate(
-            (
-                1 - jax.nn.sigmoid(beta * (chosen_log_ratios - rejected_kl)),
-                1 - jax.nn.sigmoid(beta * (chosen_kl - rejected_log_ratios)),
-            ),
-            0,
-        )
-
-        return losses
-
-    if loss_type == "sigmoid":
-        _loss_func = _sigmoid_dpo_loss
-    elif loss_type == "hinge":
-        _loss_func = _hinge_dpo_loss
-    elif loss_type == "ipo":
-        _loss_func = _ipo_dpo_loss
-    elif loss_type == "kto_pair":
-        _loss_func = _kto_pair_dpo_loss
-    else:
-        raise ValueError(f"UnKnown loss_type {loss_type}")
-
-    def dpo_step(
-            state: EasyDelState,
-            batch: dict
-    ) -> ORPOStepOut:
-
-        """
-        The dpo_step function is the core of DPO. It takes a state and a batch,
-        and returns an updated state. The update is done by calculating the loss
-        for each example in the batch, then taking its gradient with respect to
-        the parameters of the policy network (which are stored in `state`). This
-        gradient is then used to update `state`.
-
-        :param state: EasyDelState: Store the parameters of the model
-        :param batch: dict: Pass the data to the model
-        :return: A `ORPOStepOut` class
-        """
-
-        def calculate_loss(params: dict | flax.core.FrozenDict):
-            (
-                policy_chosen_log_probs,
-                policy_rejected_log_probs,
-                policy_chosen_logits,
-                policy_rejected_logits,
-            ) = concatenated_forward(
-                state.apply_fn,
-                params,
-                batch
-            )
-
-            if "reference_chosen_log_probs" in batch and "reference_rejected_log_probs" in batch:
-                reference_chosen_log_probs = batch["reference_chosen_log_probs"]
-                reference_rejected_log_probs = batch["reference_rejected_log_probs"]
-            else:
-                if ref_state is None:
-                    (
-                        reference_chosen_log_probs,
-                        reference_rejected_log_probs,
-                        _,
-                        _,
-                    ) = concatenated_forward(
-                        state.apply_fn,
-                        state.params,
-                        batch
-                    )
-                else:
-                    (
-                        reference_chosen_log_probs,
-                        reference_rejected_log_probs,
-                        _,
-                        _,
-                    ) = concatenated_forward(
-                        ref_state.apply_fn,
-                        ref_state.params,
-                        batch
-                    )
-
-            pi_log_ratios = policy_chosen_log_probs - policy_rejected_log_probs
-
-            if reference_free:
-                ref_log_ratios = 0
-            else:
-                ref_log_ratios = reference_chosen_log_probs - reference_rejected_log_probs
-
-            logits = pi_log_ratios - ref_log_ratios
-            losses = _loss_func(
-                logits,
-                policy_chosen_log_probs,
-                reference_chosen_log_probs,
-                policy_rejected_log_probs,
-                reference_rejected_log_probs
-            )
-            chosen_rewards = (
-                    beta
-                    * (
-                            policy_chosen_log_probs - reference_chosen_log_probs
-                    )
-            )
-            rejected_rewards = (
-                    beta
-                    * (
-                            policy_rejected_log_probs
-                            - reference_rejected_log_probs
-                    )
-            )
-            return losses[0], (chosen_rewards, rejected_rewards)
-
-        __loss, (__chosen_rewards, __rejected_rewards) = calculate_loss(state.params)
-
-        return ORPOStepOut(
-            loss=__loss,
-            rejected_rewards=__rejected_rewards,
-            chosen_rewards=__chosen_rewards
-        )
-
-    return dpo_step
+    return orpo_step

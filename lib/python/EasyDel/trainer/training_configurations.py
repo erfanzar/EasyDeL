@@ -216,7 +216,7 @@ from checkpoint
                 ) + termcolor.colored(
                     "You should at least pass model_class or model_huggingface_repo_id if you want to use "
                     "CasualLanguageModel Trainer But in case that you want to use "
-                    "DPOTrainer you can ignore this warning", color="white",
+                    "DPOTrainer or ORPOTrainer you can ignore this warning", color="white",
                     force_color=True
                 )
             )

@@ -10,6 +10,7 @@ from typing import Sequence, Union, Optional, Literal, Tuple, Any
 from dataclasses import dataclass
 from jax.sharding import PartitionSpec, Mesh
 from ..etils.etils import get_logger
+from ..etils.easystate import EasyDelState
 
 logger = get_logger(__name__)
 AVAILABLE_ATTENTION_MECHANISMS = Literal[
@@ -608,3 +609,18 @@ class EasyDelFlaxPretrainedModel(FlaxPreTrainedModel):
         :return: The object's string representation
         """
         return self.__repr__()
+
+    @property
+    def config(self) -> EasyDelPretrainedConfig:
+        return self._config  # type:ignore
+
+    def to_easydel_state(
+            self,
+            params: flax.core.FrozenDict,
+    ):
+        return EasyDelState.load(
+            apply_fn=self.__call__,
+            params=params,
+            opt_state=None,
+            module_config=self.config,
+        )
