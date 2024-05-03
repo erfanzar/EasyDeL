@@ -315,7 +315,8 @@ class SFTTrainer(CausalLanguageModelTrainer, ABC):
             except (DatasetGenerationError, SchemaInferenceError) as exc:
                 raise ValueError(
                     "Error occurred while packing the dataset. "
-                    "Make sure that your dataset has enough samples to at least yield one packed sequence."
+                    "Make sure that your dataset has enough samples to at least yield one packed sequence.\n"
+                    "External Information : {}".format(exc)
                 ) from exc
             return packed_dataset
         else:

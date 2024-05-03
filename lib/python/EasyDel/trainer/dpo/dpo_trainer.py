@@ -368,8 +368,6 @@ class DPOTrainer(BaseTrainer, ABC):
     def shard_states(self, state, rules):
         with self.arguments.get_mesh():
             partition_spec = match_partition_rules(rules=rules, params=jax.eval_shape(lambda: state))
-            print(partition_spec.params)
-            print(partition_spec.opt_state)
 
             def _shard(x):
                 return x
