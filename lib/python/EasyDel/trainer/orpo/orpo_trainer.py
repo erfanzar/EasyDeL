@@ -40,11 +40,10 @@ from ..dpo.utils import (
     leave_alone_context_manager
 )
 from .fwd_bwd_functions import (
-    create_dpo_train_function,
-    create_dpo_eval_function,
+    create_orpo_step_function,
     create_concatenated_forward,
 )
-from .modelling_output import DPOTrainerOutput
+from .modelling_output import ORPOTrainerOutput
 
 logger = get_logger(__name__)
 
@@ -73,7 +72,8 @@ class ORPOTrainer(BaseTrainer, ABC):
             tokenizer: Optional[PreTrainedTokenizerBase] = None,
             _do_init_fns: bool = True,
             model_init_kwargs: Optional[Dict[str, Any]] = None,
-            dataset_map_arguments: Optional[Dict[str, Any]] = None
+            dataset_map_arguments: Optional[Dict[str, Any]] = None,
+            low_mem_usage: bool = False,
     ):
 
         """
@@ -100,6 +100,10 @@ class ORPOTrainer(BaseTrainer, ABC):
         model with provided training Arguments
         :param : Set the padding value for the model
         """
+        warnings.warn(
+            "You are Using ORPOTrainer and this feature is still in beta mode except some BUGS!.",
+            UserWarning
+        )
         assert arguments is not None, (
             "You Have to pass arguments that will be used for training but you have passed"
             "`arguments=None`"
@@ -110,11 +114,11 @@ class ORPOTrainer(BaseTrainer, ABC):
         if model_init_kwargs is None:
             model_init_kwargs = {}
         elif not isinstance(model_state, str):
-            raise ValueError("You passed model_kwargs to the DPOTrainer. But your model is already instantiated.")
+            raise ValueError("You passed model_kwargs to the ORPOTrainer. But your model is already instantiated.")
 
         if isinstance(model_state, str):
             warnings.warn(
-                "You passed a model_id to the DPOTrainer. This will automatically create an "
+                "You passed a model_id to the ORPOTrainer. This will automatically create an "
                 "`AutoEasyDelModelForCausalLM` for you."
             )
             model_state = EasyDelState.from_pretrained(
@@ -123,26 +127,26 @@ class ORPOTrainer(BaseTrainer, ABC):
             )
 
         if tokenizer is None:
-            raise ValueError("tokenizer must be specified to tokenize a DPO dataset.")
+            raise ValueError("tokenizer must be specified to tokenize a ORPO dataset.")
         if max_length is None:
             warnings.warn(
-                "`max_length` is not set in the DPOTrainer's init"
+                "`max_length` is not set in the ORPOTrainer's init"
                 " it will default to `512` by default, but you should do it yourself in the future.",
                 UserWarning,
             )
             max_length = 512
         if max_prompt_length is None:
             warnings.warn(
-                "`max_prompt_length` is not set in the DPOTrainer's init"
+                "`max_prompt_length` is not set in the ORPOTrainer's init"
                 " it will default to `128` by default, but you should do it yourself in the future.",
                 UserWarning,
             )
             max_prompt_length = 128
 
-        if max_completion_length is None and is_encoder_decoder:
+        if max_completion_length is None:
             warnings.warn(
                 "When using an encoder decoder architecture, you should set `max_completion_length` in the "
-                "DPOTrainer's init it will default to `128` by default, but you should do it yourself in the future.",
+                "ORPOTrainer's init it will default to `128` by default, but you should do it yourself in the future.",
                 UserWarning,
             )
             max_completion_length = 128
@@ -157,9 +161,8 @@ class ORPOTrainer(BaseTrainer, ABC):
         self.max_completion_length = max_completion_length
         self.tokenizer = tokenizer
         self.is_encoder_decoder = False
-        self._precomputed_train_ref_log_probs = False
-        self._precomputed_eval_ref_log_probs = False
         self.auto_shard_model_state = auto_shard_model_state
+        self.low_mem_usage = low_mem_usage
         self.beta = beta
         data_collator = DPODataCollatorWithPadding(
             max_prompt_length=self.max_prompt_length,
@@ -710,13 +713,10 @@ class ORPOTrainer(BaseTrainer, ABC):
             out_shardings=state_partition_spec,
             donate_argnums=(0,)
         )
-        train_function = create_dpo_train_function(
+        train_function = create_orpo_step_function(
             concatenated_forward=self.concatenated_forward,
-            ref_state=self.ref_model_state,
-            loss_type=self.loss_type,
-            reference_free=self.reference_free,
-            label_smoothing=self.label_smoothing,
-            beta=self.beta
+            beta=self.beta,
+            mode="train"
         )
         sharded_train_step_function = pjit(
             train_function,
@@ -724,13 +724,10 @@ class ORPOTrainer(BaseTrainer, ABC):
             out_shardings=(state_partition_spec, PartitionSpec()),
         )
 
-        eval_function = create_dpo_eval_function(
+        eval_function = create_orpo_step_function(
             concatenated_forward=self.concatenated_forward,
-            ref_state=self.ref_model_state,
-            loss_type=self.loss_type,
-            reference_free=self.reference_free,
-            label_smoothing=self.label_smoothing,
-            beta=self.beta
+            beta=self.beta,
+            mode="eval"
         )
 
         sharded_eval_step_function = pjit(
@@ -818,38 +815,6 @@ class ORPOTrainer(BaseTrainer, ABC):
         """
         Returns the training [`~tensorflow.data.Dataset`].
         """
-
-        if self.precompute_ref_log_probs and not self._precomputed_train_ref_log_probs:
-
-            data_loader = tensorflow_datasets.as_numpy(
-                self.train_dataset.to_tf_dataset(
-                    batch_size=self.arguments.total_batch_size,
-                    collate_fn=self.data_collator,
-                    num_workers=self.arguments.dataloader_num_workers,
-                    shuffle=False,
-                    drop_remainder=True
-                )
-            )
-            reference_chosen_log_probs = []
-            reference_rejected_log_probs = []
-            for padded_batch in tqdm(iterable=data_loader, desc="Train dataset reference log probs"):
-                reference_chosen_logp, reference_rejected_logp = self.compute_reference_log_probs(
-                    self.model_state,
-                    padded_batch,
-                )
-                reference_chosen_log_probs.append(reference_chosen_logp)
-                reference_rejected_log_probs.append(reference_rejected_logp)
-
-            all_reference_chosen_log_probs = jnp.concatenate(reference_chosen_log_probs)
-            all_reference_rejected_log_probs = jnp.concatenate(reference_rejected_log_probs)
-            self.train_dataset = self.train_dataset.add_column(
-                name="reference_chosen_log_probs", column=all_reference_chosen_log_probs
-            )
-            self.train_dataset = self.train_dataset.add_column(
-                name="reference_rejected_log_probs", column=all_reference_rejected_log_probs
-            )
-
-            self._precomputed_train_ref_log_probs = True
         return self._get_train_dataloader()
 
     def get_eval_dataloader(self, eval_dataset: Optional[Dataset] = None) -> tensorflow.data.Dataset:
@@ -859,78 +824,7 @@ class ORPOTrainer(BaseTrainer, ABC):
         if eval_dataset is None and self.eval_dataset is None:
             raise ValueError("Trainer: evaluation requires an eval_dataset.")
         eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
-
-        if self.precompute_ref_log_probs and not self._precomputed_eval_ref_log_probs:
-
-            # prepare dataloader
-            data_loader = tensorflow_datasets.as_numpy(
-                eval_dataset.to_tf_dataset(
-                    batch_size=self.arguments.total_batch_size,
-                    collate_fn=self.data_collator,
-                    num_workers=self.arguments.dataloader_num_workers,
-                    shuffle=False,
-                    drop_remainder=True
-                )
-            )
-
-            reference_chosen_log_probs = []
-            reference_rejected_log_probs = []
-            for padded_batch in tqdm(iterable=data_loader, desc="Eval dataset reference log probs"):
-                reference_chosen_logp, reference_rejected_logp = self.compute_reference_log_probs(
-                    self.model_state,
-                    padded_batch
-                )
-                reference_chosen_log_probs.append(reference_chosen_logp.cpu())
-                reference_rejected_log_probs.append(reference_rejected_logp.cpu())
-
-            all_reference_chosen_log_probs = jnp.concatenate(reference_chosen_log_probs)
-            all_reference_rejected_log_probs = jnp.concatenate(reference_rejected_log_probs)
-
-            eval_dataset = eval_dataset.add_column(name="reference_chosen_log_probs",
-                                                   column=all_reference_chosen_log_probs)
-            eval_dataset = eval_dataset.add_column(
-                name="reference_rejected_log_probs", column=all_reference_rejected_log_probs
-            )
-
-            if self.eval_dataset is not None:
-                self.eval_dataset = eval_dataset
-            self._precomputed_eval_ref_log_probs = True
-
         return self._get_eval_dataloader(eval_dataset=eval_dataset)
-
-    def compute_reference_log_probs(
-            self,
-            state: EasyDelState,
-            padded_batch: Dict,
-    ) -> tuple[Any, Any]:
-        """
-        Computes log probabilities of the reference model for a single padded batch of a DPO specific dataset.
-        """
-
-        if self.ref_model_state is None:
-            (
-                reference_chosen_log_probs,
-                reference_rejected_log_probs,
-                _,
-                _,
-            ) = self.concatenated_forward(
-                apply_fn=state.apply_fn,
-                params=state.params,
-                batch=padded_batch,
-            )
-        else:
-            (
-                reference_chosen_log_probs,
-                reference_rejected_log_probs,
-                _,
-                _,
-            ) = self.concatenated_forward(
-                apply_fn=self.ref_model_state.apply_fn,
-                params=self.ref_model_state.params,
-                batch=padded_batch,
-            )
-
-        return reference_chosen_log_probs, reference_rejected_log_probs
 
     def _save_state(
             self,
@@ -961,7 +855,7 @@ class ORPOTrainer(BaseTrainer, ABC):
         )
         return filename
 
-    def train(self) -> DPOTrainerOutput:
+    def train(self) -> ORPOTrainerOutput:
         assert self.model_state is not None, "model_state can not be None for training purpose"
         with self.mesh:
             with jax.default_device(jax.devices("cpu")[0]) if self.low_mem_usage else leave_alone_context_manager:
@@ -976,8 +870,6 @@ class ORPOTrainer(BaseTrainer, ABC):
                 ) else self.model_state.step
 
                 loss_sum = None
-                chosen_rewards_sum = None
-                rejected_rewards_sum = None
 
                 try:
                     for epoch_index in range(self.arguments.num_train_epochs):
@@ -988,44 +880,26 @@ class ORPOTrainer(BaseTrainer, ABC):
                             elif current_step < self.max_training_steps:
                                 time_start = time.time()
 
-                                self.model_state, metrics = self.sharded_train_step_function(
+                                self.model_state, outputs = self.sharded_train_step_function(
                                     self.model_state,
                                     batch
                                 )
                                 total_time = time.time() - time_start
-                                (
-                                    loss, chosen_rewards, rejected_rewards
-                                ) = metrics.loss, metrics.chosen_rewards[0], metrics.rejected_rewards[0]
+                                (loss, metrics) = outputs.loss, outputs.metrics
 
                                 loss_sum = loss.tolist() if loss_sum is None else loss_sum + loss
 
-                                rejected_rewards_sum = (
-                                    rejected_rewards.tolist() if (
-                                            rejected_rewards_sum is None
-                                    ) else rejected_rewards_sum + rejected_rewards
-                                )
-                                chosen_rewards_sum = (
-                                    chosen_rewards.tolist() if (
-                                            chosen_rewards_sum is None
-                                    ) else chosen_rewards_sum + chosen_rewards
-                                )
                                 train_metrics = {
                                     "train/loss": loss.tolist(),
                                     "train/mean_loss": loss_sum / (current_step - self.arguments.step_start_point),
-                                    "train/mean_rejected_rewards": rejected_rewards_sum / (
-                                            current_step - self.arguments.step_start_point
-                                    ),
-                                    "train/mean_chosen_rewards": chosen_rewards_sum / (
-                                            current_step - self.arguments.step_start_point
-                                    ),
                                     "train/learning_rate": self.scheduler(
-                                        jax.device_get(self.model_state.step)
-                                    ).tolist(),
+                                        jax.device_get(self.model_state.step)).tolist(),
                                     "train/step": current_step,
                                     "train/step_time": total_time,
                                     "train/perplexity": jnp.exp(loss).tolist(),
                                     "train/epoch": epoch_index
                                 }
+                                train_metrics.update(metrics)
                                 log_metrics = copy.deepcopy(train_metrics)
                                 train_metrics.update(self.arguments.captured_memory)
                                 if self.arguments.use_wandb:
@@ -1074,7 +948,7 @@ class ORPOTrainer(BaseTrainer, ABC):
                     ),
                     dtype_specs=self.arguments.dtype
                 )
-                output = DPOTrainerOutput(
+                output = ORPOTrainerOutput(
                     state=self.model_state,
                     mesh=self.mesh,
                     shard_fns=shard_fns,
@@ -1118,9 +992,6 @@ class ORPOTrainer(BaseTrainer, ABC):
             pbar.set_description("Evaluating")
             current_step = 0
             loss_sum = None
-            chosen_rewards_sum = None
-            rejected_rewards_sum = None
-
             try:
                 for batch in self.dataloader_eval:
                     current_step += 1
@@ -1135,40 +1006,25 @@ class ORPOTrainer(BaseTrainer, ABC):
                         ):
                             _ = batch.pop(key, None)
 
-                    metrics = self.sharded_eval_step_function(
+                    _, outputs = self.sharded_eval_step_function(
                         model_state,
                         batch
                     )
                     total_time = time.time() - time_start
                     (
-                        loss, chosen_rewards, rejected_rewards
-                    ) = metrics.loss, metrics.chosen_rewards[0], metrics.rejected_rewards[0]
+                        loss, metrics
+                    ) = outputs.loss, outputs.metrics
 
                     loss_sum = loss.tolist() if loss_sum is None else loss_sum + loss
-                    rejected_rewards_sum = (
-                        rejected_rewards.tolist() if (
-                                rejected_rewards_sum is None
-                        ) else rejected_rewards_sum + rejected_rewards
-                    )
-                    chosen_rewards_sum = (
-                        chosen_rewards.tolist() if (
-                                chosen_rewards_sum is None
-                        ) else chosen_rewards_sum + chosen_rewards
-                    )
 
                     eval_metrics = {
                         "eval/loss": loss.tolist(),
                         "eval/mean_loss": loss_sum / (current_step - self.arguments.step_start_point),
-                        "eval/mean_rejected_rewards": rejected_rewards_sum / (
-                                current_step - self.arguments.step_start_point
-                        ),
-                        "eval/mean_chosen_rewards": chosen_rewards_sum / (
-                                current_step - self.arguments.step_start_point
-                        ),
                         "eval/step": current_step,
                         "eval/step_time": total_time,
                         "eval/perplexity": jnp.exp(loss).tolist(),
                     }
+                    eval_metrics.update(metrics)
                     log_metrics = copy.deepcopy(eval_metrics)
                     eval_metrics.update(self.arguments.captured_memory)
                     if self.arguments.use_wandb:
