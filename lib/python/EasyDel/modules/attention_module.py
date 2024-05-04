@@ -624,6 +624,7 @@ class AttentionModule:
                     PartitionSpec(("dp", "fsdp"), None, None, None),
                 ),
                 out_specs=out_spec,
+                check_rep=True
             )(query_states, key_states, value_states, bias)
             output = fjformer.with_sharding_constraint(output, out_spec)
 

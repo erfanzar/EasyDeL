@@ -6,6 +6,8 @@ import typing
 import warnings
 from abc import ABC
 from collections import defaultdict
+from glob import glob
+
 import flax.core
 import jax
 import tensorflow.data
@@ -13,9 +15,19 @@ import tensorflow_datasets
 import termcolor
 import wandb
 from fjformer import match_partition_rules, make_shard_and_gather_fns
+from flax.core import FrozenDict
 from tqdm import tqdm
 
-from typing import Optional, Literal, Dict, Union, Any, Callable, Mapping
+from typing import (
+    Optional,
+    Literal,
+    Dict,
+    Union,
+    Any,
+    Callable,
+    Mapping,
+    Tuple
+)
 
 from jax.experimental.pjit import pjit
 from datasets import Dataset
@@ -33,7 +45,7 @@ from ...etils import EasyDelState, EasyDelTimerError
 from transformers import PreTrainedTokenizerBase
 from jax.sharding import PartitionSpec
 
-from ...utils import Timers
+from ...utils import Timers, prefix_print
 from ..dpo.utils import (
     pad_to_length,
     DPODataCollatorWithPadding,
@@ -56,22 +68,19 @@ class ORPOTrainer(BaseTrainer, ABC):
     def __init__(
             self,
             arguments: TrainArguments,
-            model_state: EasyDelState | str,
             max_length: Optional[int] = None,
             max_prompt_length: Optional[int] = None,
             max_completion_length: Optional[int] = None,
             beta: float = 0.1,
             disable_dropout: bool = True,
             label_pad_token_id: int = -100,
+            is_encoder_decoder: bool = False,
             padding_value: int = None,
-            is_encoder_decoder: Optional[bool] = None,
-            auto_shard_model_state: bool = True,
             data_collator: Optional[DPODataCollatorWithPadding] = None,
             train_dataset: Optional[Dataset] = None,
             eval_dataset: Optional[Union[Dataset, Dict[str, Dataset]]] = None,
             tokenizer: Optional[PreTrainedTokenizerBase] = None,
             _do_init_fns: bool = True,
-            model_init_kwargs: Optional[Dict[str, Any]] = None,
             dataset_map_arguments: Optional[Dict[str, Any]] = None,
             low_mem_usage: bool = False,
     ):
@@ -82,7 +91,6 @@ class ORPOTrainer(BaseTrainer, ABC):
 
 
         :param self: Refer to the object itself
-        :param model_state: EasyDelState | str: Pass the model state to the trainer
         :param beta: float: Control the strength of the regularization term
         :param arguments: TrainArguments: Pass the arguments to the trainer
         :param label_pad_token_id: int: Pad the labels
@@ -95,7 +103,6 @@ class ORPOTrainer(BaseTrainer, ABC):
         :param max_completion_length: Optional[int]: Truncate the target sequence
         :param data_collator: Optional[Callable]: Function to be used for creating datasets.
         tokenizing process with `dataset.map`.
-        :param auto_shard_model_state: bool : whenever to automatically shard the model state.
         :param _do_init_fns: bool : preferred to set ture to trainer will automatically configure
         model with provided training Arguments
         :param : Set the padding value for the model
@@ -111,20 +118,6 @@ class ORPOTrainer(BaseTrainer, ABC):
         assert isinstance(arguments, TrainArguments), (
             f"arguments type must be `TrainArguments` but got {type(arguments)}"
         )
-        if model_init_kwargs is None:
-            model_init_kwargs = {}
-        elif not isinstance(model_state, str):
-            raise ValueError("You passed model_kwargs to the ORPOTrainer. But your model is already instantiated.")
-
-        if isinstance(model_state, str):
-            warnings.warn(
-                "You passed a model_id to the ORPOTrainer. This will automatically create an "
-                "`AutoEasyDelModelForCausalLM` for you."
-            )
-            model_state = EasyDelState.from_pretrained(
-                model_state,
-                **model_init_kwargs
-            )
 
         if tokenizer is None:
             raise ValueError("tokenizer must be specified to tokenize a ORPO dataset.")
@@ -160,8 +153,7 @@ class ORPOTrainer(BaseTrainer, ABC):
         self.disable_dropout = disable_dropout
         self.max_completion_length = max_completion_length
         self.tokenizer = tokenizer
-        self.is_encoder_decoder = False
-        self.auto_shard_model_state = auto_shard_model_state
+        self.is_encoder_decoder = is_encoder_decoder
         self.low_mem_usage = low_mem_usage
         self.beta = beta
         data_collator = DPODataCollatorWithPadding(
@@ -193,7 +185,6 @@ class ORPOTrainer(BaseTrainer, ABC):
         self.train_dataset = train_dataset
         self.eval_dataset = eval_dataset
         self.tokenizer = tokenizer
-        self.model_state = model_state
         self._loggers_initialized = False
         self.mesh = self.arguments.get_mesh()
         assert padding_value is not None, "`padding_value` can not be set as `None` it must be an integer."
@@ -495,6 +486,308 @@ class ORPOTrainer(BaseTrainer, ABC):
                 batch[f"{k}{type_key}"] = tokens
         return batch
 
+    def configure_functions(self) -> TrainerConfigureFunctionFuncOutput:
+        """
+        The configure_functions function is responsible for configuring the functions that will be used in training.
+        It does this by first defining a function called function_configurations, which initializes the model parameters
+         and returns
+        them as a EasyDelState object. The EasyDelState object contains all the information needed to train or evaluate
+        on a batch of data, including:
+        :param self: Access the class attributes
+        :return: A TrainerConfigureFunctionFuncOutput object
+
+        """
+
+        def initialize_state_function():
+            initialized_parameters = self.model.init_weights(
+                jax.random.PRNGKey(0),
+                self.arguments.init_input_shape
+            )
+
+            if self.arguments.dtype == jnp.bfloat16:
+                initialized_parameters = self.model.to_bf16(initialized_parameters)
+            elif self.arguments.dtype == jnp.float16:
+                initialized_parameters = self.model.to_fp16(initialized_parameters)
+
+            tx = self.tx
+            parameters = flax.core.freeze({"params": initialized_parameters})
+            tx_init = copy.deepcopy(self.arguments.optimizer_kwargs)
+
+            if self.rapture is not None:
+                lora_parameters = self.lora_parameters
+                if self.arguments.dtype == jnp.bfloat16:
+                    lora_parameters = self.model.to_bf16(lora_parameters)
+                elif self.arguments.dtype == jnp.float16:
+                    lora_parameters = self.model.to_fp16(lora_parameters)
+
+                return EasyDelState(
+                    step=0,
+                    apply_fn=self.lora_apply_fn,
+                    params=lora_parameters,
+                    tx=self.lora_tx,
+                    opt_state=self.lora_opt_state,
+                    tx_init=EasyDelState.safe_dict(tx_init),
+                    hyperparameters=EasyDelState.create_hyperparameters(self.model.config.model_type),
+                    module=self.lora_model,
+                    module_config=self.model.config,
+                    module_config_args=None,
+                )
+            else:
+                return EasyDelState.create(
+                    tx=tx,
+                    params=parameters,
+                    apply_fn=self.model.__call__,
+                    module_config=copy.deepcopy(self.model.config),
+                    tx_init=tx_init,
+                    hyperparameters=EasyDelState.create_hyperparameters(self.model.config.model_type),
+                    module=self.model,
+                    module_config_args=None
+                )
+
+        def create_state_from_params_function(parameters):
+            if self.rapture is None:
+                return EasyDelState.create(
+                    tx=self.tx,
+                    params=parameters,
+                    apply_fn=self.model.__call__,
+                    module_config=copy.deepcopy(self.model.config),
+                    tx_init=copy.deepcopy(self.arguments.optimizer_kwargs),
+                    hyperparameters=EasyDelState.create_hyperparameters(self.model.config.model_type),
+                    module=self.model,
+                    module_config_args=None
+                )
+            else:
+                return EasyDelState(
+                    step=0,
+                    apply_fn=self.lora_apply_fn,
+                    params=parameters,
+                    tx=self.lora_tx,
+                    opt_state=self.lora_opt_state,
+                    tx_init=EasyDelState.safe_dict(copy.deepcopy(self.arguments.optimizer_kwargs)),
+                    hyperparameters=EasyDelState.create_hyperparameters(self.model.config.model_type),
+                    module=self.lora_model,
+                    module_config=self.model.config,
+                    module_config_args=None,
+                )
+
+        state_shape = jax.eval_shape(initialize_state_function)
+        state_partition_spec = match_partition_rules(
+            self.config.get_partition_rules(
+                fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
+            ) if self.arguments.custom_rule is None else self.arguments.custom_rule,
+            state_shape
+        )
+        create_sharded_state_from_params_function = pjit(
+            create_state_from_params_function,
+            in_shardings=(state_partition_spec.params,),
+            out_shardings=state_partition_spec,
+            donate_argnums=(0,)
+        )
+        sharded_train_step_function = pjit(
+            create_orpo_step_function(
+                mode="train",
+                beta=self.beta,
+                concatenated_forward=self.concatenated_forward
+            ),
+            in_shardings=(state_partition_spec, PartitionSpec()),
+            out_shardings=(state_partition_spec, PartitionSpec(),),
+
+        )
+
+        sharded_eval_step_function = pjit(
+            create_orpo_step_function(
+                mode="eval",
+                beta=self.beta,
+                concatenated_forward=self.concatenated_forward
+            ),
+            in_shardings=(state_partition_spec, PartitionSpec()),
+            out_shardings=(state_partition_spec, PartitionSpec(),),
+
+        )
+
+        mesh = self.arguments.get_mesh()
+        self.arguments.ckpt_path_exists()
+        checkpoint_manager = self.arguments.get_streaming_checkpointer()
+        self.state_partition_spec = state_partition_spec
+        self.state_shape = state_shape
+
+        return TrainerConfigureFunctionFuncOutput(
+            create_sharded_state_from_params_function=create_sharded_state_from_params_function,
+            sharded_train_step_function=sharded_train_step_function,
+            sharded_eval_step_function=sharded_eval_step_function,
+            mesh=mesh,
+            checkpoint_manager=checkpoint_manager,
+            initialize_state_function=initialize_state_function
+        )
+
+    def initialize_state(
+            self,
+            model_parameters: Optional[flax.core.FrozenDict] = None,
+            state: Optional[EasyDelState] = None,
+    ) -> Tuple[EasyDelState, Mapping[str, Callable], Mapping[str, Callable]]:
+        if model_parameters is None and state is None and self.rapture is None and self.checkpoint_path is None:
+            raise RuntimeError(
+                "You are passing `model_parameters=None`, `state=None`, and `checkpoint_path=None` and also you are not"
+                " using LoRA, if you are "
+                "Using LoRA make sure to pass parameters and Rapture Config correctly otherwise pass the "
+                "model_parameters or state."
+            )
+        if model_parameters is None and state is None:
+            model_parameters = self.lora_parameters
+        with self.mesh:
+            shard_fns, gather_fns = make_shard_and_gather_fns(
+                self.state_partition_spec,
+                dtype_specs=self.dtype
+            )
+            if state is not None:
+                sharded_state = state
+                params = sharded_state.params if not self.arguments.do_shard_fns else jax.tree_util.tree_map(
+                    lambda f, x: f(x),
+                    shard_fns.params,
+                    sharded_state.params
+                )
+                sharded_state.params = params
+                if sharded_state.opt_state is None:
+                    prefix_print(
+                        "Action", "Optimizer State is not Found!, initializing one."
+                    )
+                    with jax.default_device(self.arguments.offload_device):
+                        sharded_state = sharded_state.init_opt_state()
+                        opt_state = sharded_state.opt_state if not self.arguments.do_shard_fns else jax.tree_util.tree_map(
+                            lambda f, x: f(x),
+                            shard_fns.opt_state,
+                            sharded_state.opt_state
+                        )
+                        sharded_state = sharded_state.replace(
+                            opt_state=opt_state
+                        )
+            elif self.finetune:
+
+                if model_parameters is None and self.checkpoint_path is not None:
+                    prefix_print(
+                        "Action", f"Loading Model From {self.checkpoint_path}"
+                    )
+                    with jax.default_device(self.arguments.offload_device):
+                        sharded_state = EasyDelState.load_state(
+                            verbose=self.arguments.verbose,
+                            state_shard_fns=shard_fns,
+                            init_optimizer_state=True,
+                            checkpoint_path=self.checkpoint_path,
+                            input_shape=self.arguments.init_input_shape,
+                            config_kwargs=self.arguments.loaded_model_config_kwargs
+                        )
+                        state_shape = jax.eval_shape(lambda: sharded_state)
+                        state_partition_spec = match_partition_rules(
+                            self.config.get_partition_rules(
+                                fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
+                            ) if self.arguments.custom_rule is None else self.arguments.custom_rule,
+                            state_shape
+                        )
+                        sharded_train_step_function = pjit(
+                            create_orpo_step_function(
+                                mode="train",
+                                beta=self.beta,
+                                concatenated_forward=self.concatenated_forward
+                            ),
+                            in_shardings=(state_partition_spec, PartitionSpec()),
+                            out_shardings=(state_partition_spec, PartitionSpec(),),
+
+                        )
+
+                        sharded_eval_step_function = pjit(
+                            create_orpo_step_function(
+                                mode="eval",
+                                beta=self.beta,
+                                concatenated_forward=self.concatenated_forward
+                            ),
+                            in_shardings=(state_partition_spec, PartitionSpec()),
+                            out_shardings=(state_partition_spec, PartitionSpec(),),
+                        )
+
+                        self.state_partition_spec = state_partition_spec
+                        self.state_shape = state_shape
+                        self.sharded_train_step_function = sharded_train_step_function
+                        self.sharded_eval_step_function = sharded_eval_step_function
+
+                    if self.arguments.remove_ckpt_after_load:
+                        os.remove(self.checkpoint_path)
+                elif model_parameters is not None and self.checkpoint_path is None:
+                    prefix_print(
+                        "Action", f"Sharding Passed Parameters"
+                    )
+                    from flax.core import unfreeze
+                    if not isinstance(model_parameters, flax.core.FrozenDict):
+                        prefix_print(
+                            "Warning",
+                            "Model Parameters should be like FrozenDict({'params': params}) make sure to "
+                            "pass as type FrozenDict in case of not getting UnExcepted Errors "
+                        )
+
+                    model_parameters = model_parameters if not self.arguments.do_shard_fns else jax.tree_util.tree_map(
+                        lambda f, x: f(x),
+                        shard_fns.params,
+                        model_parameters,
+                    )
+                    sharded_state = self.create_sharded_state_from_params_function(model_parameters)
+                elif model_parameters is not None and self.checkpoint_path is not None:
+                    raise EasyDelTimerError(
+                        "You can't pass `model_parameters` and `checkpoint_path` at same time"
+                    )
+                else:
+                    raise EasyDelTimerError(
+                        "You should pass `model_parameters` or `checkpoint_path` to trainer in order to load model"
+                    )
+            else:
+                sharded_state = self.initialize_state_function()
+                params = sharded_state.params if not self.arguments.do_shard_fns else jax.tree_util.tree_map(
+                    lambda f, x: f(x),
+                    shard_fns.params,
+                    sharded_state.params
+                )
+                sharded_state.params = params
+
+            self.sharded_state = sharded_state
+            return sharded_state, shard_fns, gather_fns
+
+    def _save_state(
+            self,
+            state: EasyDelState,
+            gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
+            milestone: bool = False
+    ) -> str:
+        step = int(
+            jax.device_get(
+                state.step
+            )
+        ) + self.arguments.step_start_point if self.arguments.step_start_point is not None else int(
+            jax.device_get(
+                state.step
+            )
+        )
+
+        checkpoint_dir = os.path.join(self.arguments.save_dir, self.arguments.model_name)
+        filename_extension = ".easy"
+        if self.arguments.save_total_limit:
+            checkpoint_files = glob(os.path.join(checkpoint_dir, f"*{filename_extension}"))
+            checkpoint_files.sort(key=os.path.getmtime)
+            for old_checkpoint in checkpoint_files[:-self.arguments.save_total_limit]:
+                os.remove(old_checkpoint)
+                termcolor.cprint(f"Removed old checkpoint: {old_checkpoint}", color="red", force_color=True)
+
+        checkpoint_name = f"{self.arguments.model_name}-S{step}"
+        filename = f"{checkpoint_name}_{step}" if milestone else f"{checkpoint_name}"
+        filename += ".easy"
+        termcolor.cprint(f"Saving Model {filename}.", color="cyan", force_color=True)
+        state.save_state(
+            filename=filename,
+            checkpoint_dir=checkpoint_dir,
+            gather_fns=gather_fns,
+            float_dtype=self.dtype,
+            verbose=self.arguments.verbose,
+            save_optimizer=self.arguments.save_optimizer_state,
+        )
+        return filename
+
     def initialize_trainer_utils(self):
         """
         The initialize_trainer_utils function is responsible for initializing the following:
@@ -551,30 +844,6 @@ class ORPOTrainer(BaseTrainer, ABC):
 
         self.timer("configure functions and sharding them").start()
 
-        if self.auto_shard_model_state:
-            self.timer("Sharding Model State").start()
-            self.model_state: EasyDelState = self.shard_states(
-                self.model_state,
-                self.model_state.module.config.get_partition_rules(self.arguments.fully_sharded_data_parallel)
-            )
-
-            termcolor.cprint("initializing TX and Schedulers for `model_state`", force_color=True, color="cyan")
-
-            params_with_opt = (
-                self.model_state.params[
-                    'params'
-                ] if '_overwrite_with_gradient' in self.model_state.params else self.model_state.params
-            )
-            opt_state = self.tx.init(params_with_opt)
-
-            self.model_state = self.model_state.replace(
-                opt_state=opt_state,
-                tx=self.tx
-            )
-
-            self.timer("Sharding Model State").stop()
-            self.timer.log(["Sharding Model State"])
-
         function_configurations = self.configure_functions()
         self.create_sharded_state_from_params_function = (
             function_configurations.create_sharded_state_from_params_function
@@ -624,140 +893,6 @@ class ORPOTrainer(BaseTrainer, ABC):
             max_training_steps=max_training_steps,
             dataloader_eval=dataloader_eval,
             max_evaluation_steps=max_evaluation_steps
-        )
-
-    def configure_functions(self) -> TrainerConfigureFunctionFuncOutput:
-        def initialize_state_function():
-            initialized_parameters = self.model.init_weights(
-                jax.random.PRNGKey(0),
-                self.arguments.init_input_shape
-            )
-
-            if self.arguments.dtype == jnp.bfloat16:
-                initialized_parameters = self.model.to_bf16(initialized_parameters)
-            elif self.arguments.dtype == jnp.float16:
-                initialized_parameters = self.model.to_fp16(initialized_parameters)
-
-            tx = self.tx
-            parameters = flax.core.freeze({"params": initialized_parameters})
-            tx_init = copy.deepcopy(self.arguments.optimizer_kwargs)
-
-            if self.rapture is not None:
-                lora_parameters = self.lora_parameters
-                if self.arguments.dtype == jnp.bfloat16:
-                    lora_parameters = self.model.to_bf16(lora_parameters)
-                elif self.arguments.dtype == jnp.float16:
-                    lora_parameters = self.model.to_fp16(lora_parameters)
-
-                return EasyDelState(
-                    step=0,
-                    apply_fn=self.lora_apply_fn,
-                    params=lora_parameters,
-                    tx=self.lora_tx,
-                    opt_state=self.lora_opt_state,
-                    tx_init=EasyDelState.safe_dict(tx_init),
-                    hyperparameters=EasyDelState.create_hyperparameters(self.model.config.model_type),
-                    module=self.lora_model,
-                    module_config=self.model_state.module.config,
-                    module_config_args=None,
-                )
-            else:
-                return EasyDelState.create(
-                    tx=tx,
-                    params=parameters,
-                    apply_fn=self.model.__call__,
-                    module_config=copy.deepcopy(self.model_state.module.config),
-                    tx_init=tx_init,
-                    hyperparameters=EasyDelState.create_hyperparameters(self.model.config.model_type),
-                    module=self.model,
-                    module_config_args=None
-                )
-
-        def create_state_from_params_function(parameters):
-            if self.rapture is None:
-                return EasyDelState.create(
-                    tx=self.tx,
-                    params=parameters,
-                    apply_fn=self.model.__call__,
-                    module_config=copy.deepcopy(self.model_state.module.config),
-                    tx_init=copy.deepcopy(self.arguments.optimizer_kwargs),
-                    hyperparameters=EasyDelState.create_hyperparameters(self.model.config.model_type),
-                    module=self.model,
-                    module_config_args=None
-                )
-            else:
-                return EasyDelState(
-                    step=0,
-                    apply_fn=self.lora_apply_fn,
-                    params=parameters,
-                    tx=self.lora_tx,
-                    opt_state=self.lora_opt_state,
-                    tx_init=EasyDelState.safe_dict(copy.deepcopy(self.arguments.optimizer_kwargs)),
-                    hyperparameters=EasyDelState.create_hyperparameters(self.model.config.model_type),
-                    module=self.lora_model,
-                    module_config=self.model_state.module.config,
-                    module_config_args=None,
-                )
-
-        state_shape = jax.eval_shape(lambda: self.model_state)
-
-        state_partition_spec = match_partition_rules(
-            self.config.get_partition_rules(
-                fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
-            ) if self.arguments.custom_rule is None else self.arguments.custom_rule,
-            state_shape
-        )
-        create_sharded_state_from_params_function = pjit(
-            create_state_from_params_function,
-            in_shardings=(state_partition_spec.params,),
-            out_shardings=state_partition_spec,
-            donate_argnums=(0,)
-        )
-        train_function = create_orpo_step_function(
-            concatenated_forward=self.concatenated_forward,
-            beta=self.beta,
-            mode="train"
-        )
-        sharded_train_step_function = pjit(
-            train_function,
-            in_shardings=(state_partition_spec, self.arguments.step_partition_spec),
-            out_shardings=(state_partition_spec, PartitionSpec()),
-        )
-
-        eval_function = create_orpo_step_function(
-            concatenated_forward=self.concatenated_forward,
-            beta=self.beta,
-            mode="eval"
-        )
-
-        sharded_eval_step_function = pjit(
-            eval_function,
-            in_shardings=(state_partition_spec, self.arguments.step_partition_spec),
-            out_shardings=(state_partition_spec, PartitionSpec()),
-        )
-
-        self.arguments.ckpt_path_exists()
-        self.state_partition_spec = state_partition_spec
-        self.state_shape = state_shape
-        checkpoint_manager = self.arguments.get_streaming_checkpointer()
-        mesh = self.arguments.get_mesh()
-        return TrainerConfigureFunctionFuncOutput(
-            initialize_state_function=initialize_state_function,
-            sharded_train_step_function=sharded_train_step_function,
-            create_sharded_state_from_params_function=create_sharded_state_from_params_function,
-            checkpoint_manager=checkpoint_manager,
-            mesh=mesh,
-            sharded_eval_step_function=sharded_eval_step_function
-        )
-
-    def configure_model(self) -> TrainerConfigureModelFuncOutput:
-        config = self.model_state.module.config
-        tx, scheduler = self.arguments.get_optimizer_and_scheduler(self.max_training_steps)
-        return TrainerConfigureModelFuncOutput(
-            model=self.model_state.module,
-            config=config,  # type: ignore
-            scheduler=scheduler,
-            tx=tx
         )
 
     def _get_train_dataloader(self) -> tensorflow.data.Dataset:
@@ -826,39 +961,44 @@ class ORPOTrainer(BaseTrainer, ABC):
         eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
         return self._get_eval_dataloader(eval_dataset=eval_dataset)
 
-    def _save_state(
+    def train(
             self,
-            state: EasyDelState,
-            gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
-            milestone: bool = False
-    ) -> str:
-        step = int(
-            jax.device_get(
-                state.step
-            )
-        ) + self.arguments.step_start_point if self.arguments.step_start_point is not None else int(
-            jax.device_get(
-                state.step
-            )
-        )
-        checkpoint_name = f"{self.arguments.model_name}-S{step}"
-        filename = f"{checkpoint_name}_{step}" if milestone else f"{checkpoint_name}"
-        filename += ".easy"
-        termcolor.cprint(f"Saving Model {filename}.", color="cyan", force_color=True)
-        state.save_state(
-            filename=filename,
-            checkpoint_dir=os.path.join(self.arguments.save_dir, self.arguments.model_name),
-            gather_fns=gather_fns,
-            float_dtype=self.dtype,
-            verbose=self.arguments.verbose,
-            save_optimizer=self.arguments.save_optimizer_state,
-        )
-        return filename
+            model_parameters: Optional[flax.core.FrozenDict] = None,
+            state: Optional[EasyDelState] = None
+    ) -> ORPOTrainerOutput:
+        def get_layer_names(frozen_dict, prefix=""):
+            layer_names = {}
+            for key, value in frozen_dict.items():
+                if isinstance(value, FrozenDict):
+                    layer_names.update(get_layer_names(value, prefix=f"{prefix}_{key}"))
+                else:
+                    layer_name = f"{prefix}_{key}".lstrip("/")
+                    layer_names[layer_name] = value
+            return layer_names
 
-    def train(self) -> ORPOTrainerOutput:
-        assert self.model_state is not None, "model_state can not be None for training purpose"
+        def count_model_parameters(_p):
+            termcolor.cprint(
+                f"Model Contain {sum(n.size for n in jax.tree_util.tree_flatten(flax.core.unfreeze(_p))[0]) / 1e9} "
+                f"Billion Parameters",
+                color="red", force_color=True
+            )
+
+        checkpoint_path = "SAVING_SKIPPED"
+        if self.arguments.performance_mode:
+            termcolor.cprint(
+                "Performance Mode is ON, we will ignore the Memory Tracking, WANDB Logging, and extra information "
+                "Process.",
+                color="red",
+                force_color=True
+            )
+        sharded_state, shard_fns, gather_fns = self.initialize_state(
+            model_parameters=model_parameters,
+            state=state
+        )
+        self.model_state = sharded_state
+        count_model_parameters(sharded_state.params)
         with self.mesh:
-            with jax.default_device(jax.devices("cpu")[0]) if self.low_mem_usage else leave_alone_context_manager:
+            with jax.default_device(jax.devices("cpu")[0]) if self.low_mem_usage else leave_alone_context_manager():
                 dir_prefix: str = "/dev/shm" if sys.platform != "win32" else "."
                 checkpoint_path = "SAVING_SKIPPED"
 

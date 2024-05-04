@@ -204,7 +204,12 @@ from .trainer import (
     create_constant_length_dataset as create_constant_length_dataset,
     get_formatting_func_from_dataset as get_formatting_func_from_dataset,
     conversations_formatting_function as conversations_formatting_function,
-    instructions_formatting_function as instructions_formatting_function
+    instructions_formatting_function as instructions_formatting_function,
+    ORPOTrainerOutput as ORPOTrainerOutput,
+    odds_ratio_loss as odds_ratio_loss,
+    ORPOTrainer as ORPOTrainer,
+    create_orpo_step_function as create_orpo_step_function,
+    create_orpo_concatenated_forward as create_orpo_concatenated_forward
 )
 
 from .smi import (
@@ -443,6 +448,12 @@ __all__ = (
     "get_formatting_func_from_dataset",
     "conversations_formatting_function",
     "instructions_formatting_function",
+
+    "ORPOTrainer",
+    "create_orpo_step_function",
+    "create_orpo_concatenated_forward",
+    "odds_ratio_loss",
+    "ORPOTrainerOutput",
 
     # SMI Modules
     "smi_run",
