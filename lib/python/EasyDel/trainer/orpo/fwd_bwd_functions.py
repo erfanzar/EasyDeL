@@ -103,11 +103,12 @@ def create_concatenated_forward(
             **model_kwargs,
         ).logits
 
-        def cross_entropy_loss(logits, labels):
+        def cross_entropy_loss(logits, labels, mask):
             if not is_encoder_decoder:
                 logits = logits[..., :-1, :]
                 labels = labels[..., 1:]
-            loss = fjformer.cross_entropy(labels, logits)
+                mask = mask[..., 1:]
+            loss = fjformer.cross_entropy_loss_and_accuracy(logits, labels, mask)[0]
             return loss
 
         if is_encoder_decoder:
@@ -115,8 +116,11 @@ def create_concatenated_forward(
         else:
             labels = concatenated_batch["concatenated_input_ids"]
 
-        chosen_nll_loss = cross_entropy_loss(all_logits[:len_chosen], labels[:len_chosen])
-
+        chosen_nll_loss = cross_entropy_loss(
+            all_logits[:len_chosen],
+            labels[:len_chosen],
+            concatenated_batch["concatenated_attention_mask"][:len_chosen]
+        )
         all_log_probs = get_batch_log_probs(
             all_logits,
             concatenated_batch["concatenated_labels"],
@@ -130,7 +134,6 @@ def create_concatenated_forward(
 
         chosen_logits = all_logits[:len_chosen]
         rejected_logits = all_logits[len_chosen:]
-
         return chosen_log_probs, rejected_log_probs, chosen_logits, rejected_logits, chosen_nll_loss
 
     return concatenated_forward
@@ -169,26 +172,17 @@ def get_batch_log_probs(
 
     batch, seq_len, dim = logits.shape
     loss_mask = labels != label_pad_token_id
-    labels = jax.lax.select(
-        labels == label_pad_token_id,
-        jnp.zeros(labels.shape, dtype=labels.dtype),
-        labels
-    )
-    logits_log_s = jax.nn.log_softmax(
-        logits, -1
-    )
-    per_token_log_probs = jnp.take_along_axis(
-        logits_log_s,
-        axis=2,
-        indices=labels[:, :, None]
+
+    labels = jnp.where(labels == label_pad_token_id, 0, labels)
+
+    per_token_logps = jnp.take_along_axis(
+        jax.nn.log_softmax(logits, axis=-1), axis=2, indices=labels[:, :, None]
     ).reshape(batch, seq_len)
 
     if average_log_prob:
-        log_prob = jnp.sum((per_token_log_probs * loss_mask), axis=-1) / jnp.sum(loss_mask, axis=-1)
+        return (per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1)
     else:
-        log_prob = jnp.sum((per_token_log_probs * loss_mask), axis=-1)
-
-    return log_prob
+        return (per_token_logps * loss_mask).sum(-1)
 
 
 def concatenated_inputs(
@@ -285,6 +279,12 @@ def odds_ratio_loss(
     sig_ratio = jax.nn.sigmoid(log_odds)
     ratio = jnp.log(sig_ratio)
     losses = beta * ratio
+    # jax.debug.print("policy_chosen_logps   : {x}", x=policy_chosen_logps)
+    # jax.debug.print("policy_rejected_logps : {x}", x=policy_rejected_logps)
+    # jax.debug.print("sig_ratio : {x}", x=sig_ratio)
+    # jax.debug.print("ratio     : {x}", x=ratio)
+    # jax.debug.print("log_odds  : {x}", x=log_odds)
+    # jax.debug.print("losses    : {x}", x=losses)
 
     chosen_rewards = beta * jax.lax.stop_gradient(policy_chosen_logps)
     rejected_rewards = beta * jax.lax.stop_gradient(policy_rejected_logps)
@@ -347,7 +347,7 @@ def create_orpo_step_function(
 
             loss = policy_nll_loss - losses.mean()
 
-            reward_accuracies = (chosen_rewards > rejected_rewards).float()
+            reward_accuracies = (chosen_rewards > rejected_rewards).astype("float32")
             metrics = {}
             prefix = "eval_" if mode == "eval" else ""
             metrics[f"{prefix}rewards/chosen"] = chosen_rewards.mean()

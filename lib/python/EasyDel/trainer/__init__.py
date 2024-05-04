@@ -32,6 +32,14 @@ from .utils import (
     instructions_formatting_function as instructions_formatting_function
 )
 
+from .orpo import (
+    ORPOTrainer as ORPOTrainer,
+    create_orpo_step_function as create_orpo_step_function,
+    create_concatenated_forward as create_orpo_concatenated_forward,
+    odds_ratio_loss as odds_ratio_loss,
+    ORPOTrainerOutput as ORPOTrainerOutput
+)
+
 __all__ = (
     "TrainArguments",
     "EasyDeLXRapTureConfig",
@@ -57,5 +65,11 @@ __all__ = (
     "create_constant_length_dataset",
     "get_formatting_func_from_dataset",
     "conversations_formatting_function",
-    "instructions_formatting_function"
+    "instructions_formatting_function",
+
+    "create_orpo_step_function",
+    "create_orpo_concatenated_forward",
+    "odds_ratio_loss",
+    "ORPOTrainerOutput",
+    "ORPOTrainer"
 )
