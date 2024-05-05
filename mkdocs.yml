@@ -11,7 +11,15 @@ nav:
     - Eval:
       - Lm Eval: generated-eval-lm_eval.md
     - Modules:
+      - Arctic:
+        - Arctic Configuration: generated-modules-arctic-arctic_configuration.md
+        - Modelling Arctic Flax: generated-modules-arctic-modelling_arctic_flax.md
       - Attention Module: generated-modules-attention_module.md
+      - Attentions:
+        - Blockwise Attn: generated-modules-_attentions-blockwise_attn.md
+        - Flash: generated-modules-_attentions-flash.md
+        - Ring: generated-modules-_attentions-ring.md
+        - Vanilla: generated-modules-_attentions-vanilla.md
       - Auto Easydel Model: generated-modules-auto_easydel_model.md
       - Cohere:
         - Cohere Configuration: generated-modules-cohere-cohere_configuration.md
@@ -76,6 +84,9 @@ nav:
       - Phi:
         - Modelling Phi Flax: generated-modules-phi-modelling_phi_flax.md
         - Phi Configuration: generated-modules-phi-phi_configuration.md
+      - Phi3:
+        - Modelling Phi3 Flax: generated-modules-phi3-modelling_phi3_flax.md
+        - Phi3 Configuration: generated-modules-phi3-phi3_configuration.md
       - Qwen1:
         - Modelling Qwen1 Flax: generated-modules-qwen1-modelling_qwen1_flax.md
         - Qwen1 Configuration: generated-modules-qwen1-qwen1_configuration.md
@@ -146,6 +157,11 @@ nav:
         - Fwd Bwd Functions: generated-trainer-dpo-fwd_bwd_functions.md
         - Modelling Output: generated-trainer-dpo-modelling_output.md
         - Utils: generated-trainer-dpo-utils.md
+      - Orpo:
+        - Fwd Bwd Functions: generated-trainer-orpo-fwd_bwd_functions.md
+        - Modelling Output: generated-trainer-orpo-modelling_output.md
+        - Orpo Trainer: generated-trainer-orpo-orpo_trainer.md
+        - Utils: generated-trainer-orpo-utils.md
       - Sft:
         - Stf Trainer: generated-trainer-sft-stf_trainer.md
         - Utils: generated-trainer-sft-utils.md
