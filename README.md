@@ -7,7 +7,7 @@ rewritten for mojo as well.
 
 Some of the key features provided by EasyDeL include:
 
-- DPOTrainer, ORPOTrainer (Beta But soon be added), SFTTrainer, and VideoCLM Trainers
+- DPOTrainer, ORPOTrainer, SFTTrainer, and VideoCLM Trainers
 - Serving and API Engines for Using and serving LLMs in JAX as efficiently as possible.
 - Support Quantization Methods for all the Models.
 - Support for 8, 6, and 4 BIT Operation, for inference and training in JAX
@@ -27,10 +27,8 @@ Some of the key features provided by EasyDeL include:
 
 > **News**
 >
-
-[//]: # (> `ORPOTrainer` is Added)
-
-[//]: # (>)
+> `ORPOTrainer` is Added
+>
 > Phi3 Model bugs are fixed, Arctic Model is added.
 >
 > Phi3 Model is present Now Apr 24 2024
