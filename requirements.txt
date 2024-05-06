@@ -3,7 +3,7 @@ typing~=3.7.4.3
 jax>=0.4.20
 jaxlib>=0.4.20
 flax>=0.7.5
-fjformer>=0.0.50
+fjformer>=0.0.51
 transformers>=4.34.0
 einops~=0.6.1
 optax~=0.1.7
@@ -13,7 +13,7 @@ tqdm~=4.64.1
 pydantic==2.5.3
 datasets~=2.14.6
 setuptools~=68.1.2
-gradio~=4.25.0
+gradio~=4.18.0
 termcolor
 wandb>=0.15.9
 tensorboard

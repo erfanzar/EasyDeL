@@ -111,7 +111,7 @@ def main():
         shard_attention_computation=config.shard_attention_computation,
         precision=lax.Precision("fastest"),
         force_float32_tpu=True,
-        attn_mechanism="sharded_vanilla",
+        attn_mechanism="local_ring",
         dtype=jnp.float32,
         bias_partition_spec=config.bias_partition_spec,
         key_partition_spec=config.key_partition_spec,

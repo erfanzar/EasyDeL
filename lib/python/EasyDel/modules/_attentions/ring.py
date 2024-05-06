@@ -101,7 +101,7 @@ def _block_wise_attention_fwd(
     numerator = jnp.moveaxis(numerator, 1, 0)
     denominator = denominator.reshape((batch, num_heads, num_q, query_chunk_size))
     max_score = max_score.reshape((batch, num_heads, num_q, query_chunk_size))
-    denominator, max_score = map(lambda x: rearrange(x, 'b h n c -> n b h c'), (denominator, max_score))
+    denominator, max_score = map(lambda x: rearrange(x, "b h n c -> n b h c"), (denominator, max_score))
 
     scale = jnp.sqrt(query_states.shape[-1])
     if not deterministic and attn_pdrop > 0.0:
@@ -111,8 +111,16 @@ def _block_wise_attention_fwd(
         attn_dropout = None
     _chunk_bias_fn = partial(
         _chunk_attention_bias,
-        query_chunk_size, key_chunk_size, bias, segment_ids, deterministic,
-        attn_dropout, attn_pdrop, causal, dtype)
+        query_chunk_size,
+        key_chunk_size,
+        bias,
+        segment_ids,
+        deterministic,
+        attn_dropout,
+        attn_pdrop,
+        causal,
+        dtype
+    )
 
     def scan_attention(_, scan):
         q_chunk, numerator_chunk, denominator_chunk, max_score_chunk, q_chunk_idx = scan
@@ -121,17 +129,19 @@ def _block_wise_attention_fwd(
         def scan_kv_block(_carry, _scan):
             k_chunk, value_chunk, k_chunk_idx = _scan
             _numerator_chunk, _denominator_chunk, _prev_max_score_chunk = _carry
-            attn_weights = jnp.einsum('bqhd,bkhd->bhqk', q_chunk, k_chunk, precision=precision) / scale
+            attn_weights = jnp.einsum("bqhd,bkhd->bhqk", q_chunk, k_chunk, precision=precision) / scale
             bias_chunk = _chunk_bias_fn(q_chunk_idx_start + q_chunk_idx, k_chunk_idx_start + k_chunk_idx)
             attn_weights = attn_weights + bias_chunk
 
             max_score_chunk = jnp.maximum(_prev_max_score_chunk, jnp.max(attn_weights, axis=-1))
             max_score_chunk = lax.stop_gradient(max_score_chunk)
             exp_weights = jnp.exp(attn_weights - max_score_chunk[..., None])
-            exp_values = jnp.einsum('bhqk,bkhd->bqhd', exp_weights, value_chunk, precision=precision)
-            correction = \
-                rearrange(jnp.exp(_prev_max_score_chunk - max_score_chunk), 'b h query_states -> b query_states h')[
-                    ..., None]
+            exp_values = jnp.einsum("bhqk,bkhd->bqhd", exp_weights, value_chunk, precision=precision)
+            correction = rearrange(
+                jnp.exp(
+                    _prev_max_score_chunk - max_score_chunk
+                ), "b h query_states -> b query_states h"
+            )[..., None]
             _numerator_chunk = _numerator_chunk * correction + exp_values
             _denominator_chunk = _denominator_chunk * jnp.exp(
                 _prev_max_score_chunk - max_score_chunk) + exp_weights.sum(
@@ -155,7 +165,7 @@ def _block_wise_attention_fwd(
             skip_upper_half, init=(numerator_chunk, denominator_chunk, max_score_chunk),
             xs=(key_states, value_states, jnp.arange(0, num_kv))
         )
-        output_chunk = numerator_chunk / rearrange(denominator_chunk, 'b h query_states -> b query_states h')[
+        output_chunk = numerator_chunk / rearrange(denominator_chunk, "b h query_states -> b query_states h")[
             ..., None].astype(dtype)
         return (), (output_chunk, numerator_chunk, denominator_chunk, max_score_chunk)
 
@@ -164,7 +174,7 @@ def _block_wise_attention_fwd(
 
     numerator = jnp.moveaxis(numerator, 1, 0)
     numerator = numerator.reshape((batch, q_len, num_heads, dim_per_head))
-    denominator, max_score = map(lambda x: rearrange(x, 'n b h c -> b h n c'), (denominator, max_score))
+    denominator, max_score = map(lambda x: rearrange(x, "n b h c -> b h n c"), (denominator, max_score))
     denominator = denominator.reshape((batch, num_heads, q_len))
     max_score = max_score.reshape((batch, num_heads, q_len))
 
@@ -208,7 +218,7 @@ def _block_wise_attention_bwd(
 
     denominator = denominator.reshape((batch, num_heads, num_q, query_chunk_size))
     max_score = max_score.reshape((batch, num_heads, num_q, query_chunk_size))
-    denominator, max_score = map(lambda x: rearrange(x, 'b h n c -> n b h c'), (denominator, max_score))
+    denominator, max_score = map(lambda x: rearrange(x, "b h n c -> n b h c"), (denominator, max_score))
 
     query_states = query_states.reshape((batch, num_q, query_chunk_size, num_heads, dim_per_head))
     key_states = key_states.reshape((batch, num_kv, key_chunk_size, num_heads, dim_per_head))
@@ -236,7 +246,7 @@ def _block_wise_attention_bwd(
         def scan_kv_block(carry, scan):
             k_chunk, value_chunk, k_chunk_idx = scan
             dq_chunk = carry
-            attn_weights = jnp.einsum('bqhd,bkhd->bhqk', q_chunk, k_chunk, precision=precision) / scale
+            attn_weights = jnp.einsum("bqhd,bkhd->bhqk", q_chunk, k_chunk, precision=precision) / scale
             bias_chunk = _chunk_bias_fn(q_chunk_idx_start + q_chunk_idx, k_chunk_idx_start + k_chunk_idx)
             attn_weights = attn_weights + bias_chunk
             exp_weights = jnp.exp(attn_weights - max_score_chunk[..., None]) / denominator_chunk[..., None]
@@ -318,7 +328,7 @@ def _ring_attention_standard_fwd(
             lambda x: lax.ppermute(x, axis_name, perm=[(i, (i + 1) % axis_size) for i in range(axis_size)]),
             (_key, _value)
         )
-        return (_max_score, _numerator, _denominator, _key, value), None
+        return (_max_score, _numerator, _denominator, _key, _value), None
 
     prev_max_score = jnp.full((batch, num_heads, q_len), -jnp.inf).astype(query.dtype)
     (max_score, numerator, denominator, _, _), _ = lax.scan(
@@ -441,7 +451,7 @@ def _wise_ring_attention_fwd(
         init=(prev_max_score, numerator, denominator, key_states, value_states),
         xs=jnp.arange(0, axis_size)
     )
-    reshaped_denominator = rearrange(denominator, 'b h query_states -> b query_states h')[..., None]
+    reshaped_denominator = rearrange(denominator, "b h query_states -> b query_states h")[..., None]
     output = numerator / reshaped_denominator
     return output.astype(value_states.dtype), (
         output,
@@ -496,7 +506,7 @@ def _wise_ring_attention_bwd(
             lambda x: lax.ppermute(x, axis_name, perm=[(i, (i + 1) % axis_size) for i in range(axis_size)]),
             (_key_states, _value_states, _dk, _dv)
         )
-        return (_dq, _dk, _dv, key_states, _value_states), None
+        return (_dq, _dk, _dv, _key_states, _value_states), None
 
     (dq, dk, dv, key_states, value_states), _ = lax.scan(
         scan_kv_block,

@@ -1,8 +1,10 @@
 import math
 import os
+import time
 
 import fjformer
 import flax.linen.attention
+import pandas
 
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
@@ -47,37 +49,15 @@ def diff(t1, t2):
 
 
 @value_and_grad_wrapper
-def call_vanilla(q, k, v, b):
-    attention_pred = AttentionModule(
-        attn_mechanism="vanilla",
-        axis_name="sp",
-        dtype=jnp.float32,
-        mesh=config.jax_mesh(),
-        head_dims=q.shape[-1],
-        num_attention_heads=q.shape[-2],
-        block_q=config.block_q,
-        block_k=config.block_k
-    ).__call__(
-        query_states=q,
-        key_states=k,
-        value_states=v,
-        bias=b,
-        query_sequence_length=q.shape[1],
-        key_value_sequence_length=k.shape[1]
-    ).attention_outputs
-    return attention_pred
-
-
-@value_and_grad_wrapper
 def call_dot_product(q, k, v, b):
     attention_pred = dot_product_attention(q, k, v, b)
     return attention_pred
 
 
 @value_and_grad_wrapper
-def call_wise_ring(q, k, v, b):
+def call_attention_module(q, k, v, b, attn_mechanism):
     attention_pred = AttentionModule(
-        attn_mechanism="wise_ring",
+        attn_mechanism=attn_mechanism,
         axis_name="sp",
         dtype=jnp.float32,
         mesh=config.jax_mesh(),
@@ -85,79 +65,11 @@ def call_wise_ring(q, k, v, b):
         num_attention_heads=q.shape[-2],
         block_q=config.block_q,
         block_k=config.block_k
-    ).__call__(
+    )(
         query_states=q,
         key_states=k,
         value_states=v,
         bias=b,
-        query_sequence_length=q.shape[1],
-        key_value_sequence_length=k.shape[1]
-    ).attention_outputs
-    return attention_pred
-
-
-@value_and_grad_wrapper
-def call_blockwise(q, k, v, b):
-    attention_pred = AttentionModule(
-        attn_mechanism="blockwise",
-        axis_name="sp",
-        dtype=jnp.float32,
-        mesh=config.jax_mesh(),
-        head_dims=q.shape[-1],
-        num_attention_heads=q.shape[-2],
-        block_q=config.block_q,
-        block_k=config.block_k
-    ).__call__(
-        query_states=q,
-        key_states=k,
-        value_states=v,
-        bias=b,
-        query_sequence_length=q.shape[1],
-        key_value_sequence_length=k.shape[1]
-    ).attention_outputs
-    return attention_pred
-
-
-@value_and_grad_wrapper
-def call_ring(q, k, v, b):
-    attention_pred = AttentionModule(
-        attn_mechanism="local_ring",
-        axis_name="sp",
-        dtype=jnp.float32,
-        mesh=config.jax_mesh(),
-        head_dims=q.shape[-1],
-        num_attention_heads=q.shape[-2],
-        block_q=config.block_q,
-        block_k=config.block_k
-    ).__call__(
-        query_states=q,
-        key_states=k,
-        value_states=v,
-        bias=b,
-        query_sequence_length=q.shape[1],
-        key_value_sequence_length=k.shape[1]
-    ).attention_outputs
-    return attention_pred
-
-
-@value_and_grad_wrapper
-def call_sharded_vanilla(q, k, v, b):
-    attention_pred = AttentionModule(
-        attn_mechanism="sharded_vanilla",
-        axis_name="sp",
-        dtype=jnp.float32,
-        mesh=config.jax_mesh(),
-        head_dims=q.shape[-1],
-        num_attention_heads=q.shape[-2],
-        block_q=config.block_q,
-        block_k=config.block_k
-    ).__call__(
-        query_states=q,
-        key_states=k,
-        value_states=v,
-        bias=b,
-        query_sequence_length=q.shape[1],
-        key_value_sequence_length=k.shape[1]
     ).attention_outputs
     return attention_pred
 
@@ -184,26 +96,54 @@ def make_inputs():
 
 def main():
     q, k, v, b = make_inputs()
-
     excepted_output, excepted_grads = call_dot_product(q, k, v, b)
+    test_attentions = [
+        "local_ring",
+        "blockwise",
+        "vanilla",
+        "wise_ring",
+        "sharded_vanilla",
+        "flash",
+        "splash",
+        "cudnn"
+    ]
     fns = {
-        "local_ring": call_ring,
-        "blockwise": call_blockwise,
-        "vanilla": call_vanilla,
-        "wise_ring": call_wise_ring,
-        "sharded_vanilla": call_sharded_vanilla
+        k: partial(call_attention_module, attn_mechanism=k) for k in test_attentions
     }
-    outs_and_grads = {nm: fn(q, k, v, b) for nm, fn in fns.items()}
+    outs_and_grads = {}
+    for nm, fn in fns.items():
+        try:
+            start = time.time()
+            out = jax.block_until_ready(fn(q, k, v, b))
+            end = time.time() - start
+            outs_and_grads[nm] = out + (end,)
+        except OSError:
+            outs_and_grads[nm] = (None, None, None)
+    frame_out = {}
+    for key, (out, grad, time_took) in outs_and_grads.items():
 
-    for key, (out, grad) in outs_and_grads.items():
-        output_diff = diff(excepted_output, out)
-        g_diff = [diff(*args) for args in zip(excepted_grads, grad)]
-        print(f"Comparing {key.upper()} and BASE ATTENTION")
-        print(f"OUTPUT DIFF : {output_diff}")
-        print(f"GRAD DIFF :\n\t", end="")
-        for i in range(len(g_diff)):
-            print(g_diff[i], end=" | ")
-        print("\n", "*" * 50)
+        if out is None and grad is None:
+            frame_out[key.upper()] = {
+                "OUT DIFF": "NA",
+                "GRADIENT DIFF SUM": "NA",
+                "TEST PASSED": "NA",
+                "TIME": "NA"
+            }
+        else:
+            output_diff = diff(excepted_output, out)
+            g_diff = [diff(*args) for args in zip(excepted_grads, grad)]
+            sum_g = sum(g_diff)
+            frame_out[key.upper()] = {
+                "OUT DIFF": output_diff,
+                "GRADIENT DIFF SUM": sum_g,
+                "TEST PASSED": sum_g < 1 and output_diff < 1e-2,
+                "TIME": time_took
+            }
+
+    result = pandas.DataFrame.from_dict(frame_out)
+    result = result.transpose()
+    result.to_csv("attention_output.csv")
+    print(result.to_string())
 
 
 if __name__ == "__main__":
