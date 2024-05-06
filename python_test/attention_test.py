@@ -1,4 +1,3 @@
-%%writefile python_test/attention_test.py
 import math
 import os
 import time
