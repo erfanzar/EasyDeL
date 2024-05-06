@@ -311,6 +311,7 @@ def _ring_attention_standard_fwd(
 
     def scan_kv_block(carry, idx):
         p_max_score, _numerator, _denominator, _key, _value = carry
+
         bias = lax.dynamic_slice_in_dim(
             lax.dynamic_slice_in_dim(
                 attn_bias, (lax.axis_index(axis_name) - idx) % axis_size * q_len, q_len, axis=-2

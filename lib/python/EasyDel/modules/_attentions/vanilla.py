@@ -258,8 +258,20 @@ def shard_vanilla_attention(
     depth = query_states.shape[-1]
     query_states = query_states / jnp.sqrt(depth).astype(dtype)
     attention_weight = jnp.einsum("...qhd,...khd->...hqk", query_states, key_states, precision=precision)
+    axis_size = lax.psum(1, "sp")
     if bias is not None:
-        attention_weight = attention_weight + bias[:, :, :, :key_length]
+        bias = lax.dynamic_slice_in_dim(
+            lax.dynamic_slice_in_dim(
+                bias,
+                lax.axis_index("sp") % axis_size * query_length,
+                query_length, axis=-2
+            ),
+            lax.axis_index("sp") % axis_size * key_length,
+            key_length,
+            axis=-1
+        )
+        attention_weight = jnp.add(attention_weight, bias)
+
     attention_weight = jax.nn.softmax(attention_weight).astype(dtype)
     if not deterministic and attention_dropout > 0.0:
         keep_prob = 1.0 - attention_dropout
