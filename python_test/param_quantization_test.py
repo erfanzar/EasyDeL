@@ -76,7 +76,7 @@ class EasyModelsTest(TestCase):
             "sharded_vanilla",
             "wise_ring",
             "blockwise"
-        ] = "sharded_vanilla"
+        ] = "local_ring"
         self.block_k: int = 32
         self.block_q: int = 32
         self.sequence_length = 64

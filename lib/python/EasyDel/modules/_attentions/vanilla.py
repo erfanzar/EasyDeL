@@ -80,6 +80,14 @@ def _chunk_bias(bias, axis_name, query_length, key_length):
     )
 
 
+def softmax_grad(X, output):  # output is the result of the softmax function
+    softmax_output = output  # Assuming output is provided from the softmax function
+    diag_softmax = jnp.diag(softmax_output)
+    outer_softmax = softmax_output[:, None] * softmax_output[None, :]
+    grad = diag_softmax - outer_softmax
+    return grad
+
+
 # def _shard_vanilla_attention_bwd(
 #         deterministic,
 #         dropout_rng,
@@ -89,36 +97,151 @@ def _chunk_bias(bias, axis_name, query_length, key_length):
 #         res,
 #         g
 # ):
+#     # FWD FUNC
+#     # batch_size, query_length, num_heads, dim = query_states.shape
+#     # key_length = key_states.shape[1]
+#     # assert query_states.ndim == key_states.ndim, "q, k must have same rank."
+#     # assert query_states.shape[:-3] == key_states.shape[:-3], "q, k batch dims must match."
+#     # assert query_states.shape[-2] == key_states.shape[-2], "q, k num_heads must match."
+#     # assert query_states.shape[-1] == key_states.shape[-1], "q, k depths must match."
+#     # query_states, key_states, value_states = promote_dtype(query_states, key_states, value_states, dtype=dtype)
+#     #
+#     # depth = query_states.shape[-1]
+#     # query_states = query_states / jnp.sqrt(depth).astype(dtype)
+#     # attention_weight = jnp.einsum("...qhd,...khd->...hqk", query_states, key_states, precision=precision)
+#     # index = lax.axis_index("sp")
+#     # if bias is not None:
+#     #     chunk_b = lax.dynamic_slice(
+#     #         bias, (0, 0, index * query_length, index * key_length), (batch_size, 1, query_length, key_length)
+#     #     )
+#     #     attention_weight = attention_weight + chunk_b
+#     # attention_weight = jax.nn.softmax(attention_weight).astype(dtype)
+#     # if not deterministic and attention_dropout > 0.0:
+#     #     keep_prob = 1.0 - attention_dropout
+#     #     dropout_shape = tuple([1] * (key_states.ndim - 2)) + attention_weight.shape[-2:]
+#     #     keep = random.bernoulli(dropout_rng, keep_prob, dropout_shape)  # type: ignore
+#     #
+#     #     multiplier = keep.astype(dtype) / jnp.asarray(keep_prob, dtype=dtype)
+#     #     attention_weight = attention_weight * multiplier
+#     # attention = jnp.einsum("...hqk,...khd->...qhd", attention_weight, value_states, precision=precision)
+#     #
+#     # return attention, (attention, query_states, key_states, value_states, attention_weight, bias)
 #     attention, query_states, key_states, value_states, attention_weight, bias = res
+#     dL_dA = jnp.einsum("...qhd,...khd->...hqk", g, value_states, precision=lax.Precision.HIGH)
+#     dL_dA = dL_dA * attention_weight * (1 - attention_weight)  # softmax derivative
 #
-#     dv = jnp.einsum("...qhk,...khd->...qhd", g, query_states, precision=precision)
-#     ex = jnp.exp(attention_weight)
-#     d_attention_weight = ex / (ex.sum(axis=-1, keepdims=True))
-#     dk = jnp.einsum("...hqk,...qhk->...khd", d_attention_weight, g, precision=precision)
-#     attention_weight_t = jnp.transpose(attention_weight, axes=(0, 2, 1, 3))  # (...qhk -> ...khq)
+#     # Query and key gradients
+#     dL_dQ = jnp.einsum("...hqk,...khd->...qhd", dL_dA, key_states, precision=lax.Precision.HIGH)
+#     dL_dK = jnp.einsum("...hqk,...qhd->...khd", dL_dA, query_states, precision=lax.Precision.HIGH)
 #
-#     # d_attention_weight as mentioned above
-#     d_attention_weight = lax.softmax_derivative(attention_weight)
+#     # Value gradients
+#     dL_dV = jnp.einsum("...hqk,...qhd->...khd", attention_weight, g, precision=lax.Precision.HIGH)
 #
-#     # Calculate dq using einsum
-#     dq = jnp.einsum("...khq,...khd->...qhd", d_attention_weight, value_states.transpose((0, 2, 1, 3)),
-#                     precision=precision)
+#     # Dropout
+#     if attention_dropout > 0.0:
+#         keep_prob = 1.0 - attention_dropout
+#         dropout_shape = tuple([1] * (key_states.ndim - 2)) + attention_weight.shape[-2:]
+#         keep = random.bernoulli(dropout_rng, keep_prob, dropout_shape)
+#         multiplier = keep.astype(query_states.dtype) / jnp.asarray(keep_prob, query_states.dtype)
+#         dL_dQ = dL_dQ * multiplier
+#         dL_dK = dL_dK * multiplier
+#         dL_dV = dL_dV * multiplier
 #
-#     db = None
+#     # Bias gradients (if applicable)
+#     # dL_dbias = None
+#     # if bias is not None:
+#     #     dL_dbias = jnp.einsum("...hqk->...", dL_dA, precision=lax.Precision.HIGH)
+#
+#     return dL_dQ, dL_dK, dL_dV, None
+#
+#
+# def _shard_vanilla_attention_fwd(
+#         query_states: Array,
+#         key_states: Array,
+#         value_states: Array,
+#         bias: Optional[Array] = None,
+#         deterministic: bool = False,
+#         dropout_rng: Optional[random.PRNGKey] = None,
+#         dtype: jnp.dtype = jnp.float32,
+#         precision: Optional[jax.lax.Precision] = None,
+#         attention_dropout: float = 0.0
+# ):
+#     batch_size, query_length, num_heads, dim = query_states.shape
+#     key_length = key_states.shape[1]
+#     assert query_states.ndim == key_states.ndim, "q, k must have same rank."
+#     assert query_states.shape[:-3] == key_states.shape[:-3], "q, k batch dims must match."
+#     assert query_states.shape[-2] == key_states.shape[-2], "q, k num_heads must match."
+#     assert query_states.shape[-1] == key_states.shape[-1], "q, k depths must match."
+#     query_states, key_states, value_states = promote_dtype(query_states, key_states, value_states, dtype=dtype)
+#
+#     depth = query_states.shape[-1]
+#     query_states = query_states / jnp.sqrt(depth).astype(dtype)
+#     attention_weight = jnp.einsum("...qhd,...khd->...hqk", query_states, key_states, precision=precision)
+#     index = lax.axis_index("sp")
 #     if bias is not None:
-#         batch_size, num_heads, query_length, key_length = attention_weight.shape
-#         g_reshaped = g.reshape(batch_size, num_heads, 1, 1)
-#         db = jnp.sum(g_reshaped, axis=(0, 2, 3))
+#         chunk_b = lax.dynamic_slice(
+#             bias, (
+#                 0,
+#                 0,
+#                 index * query_length,
+#                 index * key_length
+#             ),
+#             (
+#                 batch_size,
+#                 1,
+#                 query_length,
+#                 key_length
+#             )
+#         )
+#         attention_weight = attention_weight + chunk_b
+#     attention_weight = jax.nn.softmax(attention_weight).astype(dtype)
+#     if not deterministic and attention_dropout > 0.0:
+#         keep_prob = 1.0 - attention_dropout
+#         dropout_shape = tuple([1] * (key_states.ndim - 2)) + attention_weight.shape[-2:]
+#         keep = random.bernoulli(dropout_rng, keep_prob, dropout_shape)  # type: ignore
 #
-#     return dq, dk, dv, db
+#         multiplier = keep.astype(dtype) / jnp.asarray(keep_prob, dtype=dtype)
+#         attention_weight = attention_weight * multiplier
+#     attention = jnp.einsum("...hqk,...khd->...qhd", attention_weight, value_states, precision=precision)
+#
+#     return attention, (attention, query_states, key_states, value_states, attention_weight, bias)
+#
+#
+# @partial(jax.custom_vjp, nondiff_argnums=(4, 5, 6, 7, 8))
+# def shard_vanilla_attention(
+#         query_states: Array,
+#         key_states: Array,
+#         value_states: Array,
+#         bias: Optional[Array] = None,
+#         deterministic: bool = True,
+#         dropout_rng: Optional[random.PRNGKey] = None,
+#         dtype: jnp.dtype = jnp.float32,
+#         precision: Optional[jax.lax.Precision] = None,
+#         attention_dropout: float = 0.0
+# ):
+#     out, _ = _shard_vanilla_attention_fwd(
+#         query_states=query_states,
+#         key_states=key_states,
+#         value_states=value_states,
+#         bias=bias,
+#         dropout_rng=dropout_rng,
+#         deterministic=deterministic,
+#         dtype=dtype,
+#         precision=precision,
+#         attention_dropout=attention_dropout
+#     )
+#
+#     return out
 
 
-def _shard_vanilla_attention_fwd(
+# shard_vanilla_attention.defvjp(_shard_vanilla_attention_fwd, _shard_vanilla_attention_bwd)
+
+def shard_vanilla_attention(
         query_states: Array,
         key_states: Array,
         value_states: Array,
         bias: Optional[Array] = None,
-        deterministic: bool = False,
+        deterministic: bool = True,
         dropout_rng: Optional[random.PRNGKey] = None,
         dtype: jnp.dtype = jnp.float32,
         precision: Optional[jax.lax.Precision] = None,
@@ -135,12 +258,8 @@ def _shard_vanilla_attention_fwd(
     depth = query_states.shape[-1]
     query_states = query_states / jnp.sqrt(depth).astype(dtype)
     attention_weight = jnp.einsum("...qhd,...khd->...hqk", query_states, key_states, precision=precision)
-    index = lax.axis_index("sp")
     if bias is not None:
-        chunk_b = lax.dynamic_slice(
-            bias, (0, 0, index * query_length, index * key_length), (batch_size, 1, query_length, key_length)
-        )
-        attention_weight = attention_weight + chunk_b
+        attention_weight = attention_weight + bias[:, :, :, :key_length]
     attention_weight = jax.nn.softmax(attention_weight).astype(dtype)
     if not deterministic and attention_dropout > 0.0:
         keep_prob = 1.0 - attention_dropout
@@ -152,37 +271,6 @@ def _shard_vanilla_attention_fwd(
     attention = jnp.einsum("...hqk,...khd->...qhd", attention_weight, value_states, precision=precision)
 
     return attention
-    # , (attention, query_states, key_states, value_states, attention_weight, bias))
-
-
-# @partial(jax.custom_vjp, nondiff_argnums=(4, 5, 6, 7, 8))
-def shard_vanilla_attention(
-        query_states: Array,
-        key_states: Array,
-        value_states: Array,
-        bias: Optional[Array] = None,
-        deterministic: bool = True,
-        dropout_rng: Optional[random.PRNGKey] = None,
-        dtype: jnp.dtype = jnp.float32,
-        precision: Optional[jax.lax.Precision] = None,
-        attention_dropout: float = 0.0
-):
-    out = _shard_vanilla_attention_fwd(
-        query_states=query_states,
-        key_states=key_states,
-        value_states=value_states,
-        bias=bias,
-        dropout_rng=dropout_rng,
-        deterministic=deterministic,
-        dtype=dtype,
-        precision=precision,
-        attention_dropout=attention_dropout
-    )
-
-    return out
-
-
-# shard_vanilla_attention.defvjp(_shard_vanilla_attention_fwd, _shard_vanilla_attention_bwd)
 
 
 def attention_production(

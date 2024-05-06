@@ -86,7 +86,7 @@ flags.DEFINE_enum(
         "wise_ring",
         "blockwise"
     ],
-    default="sharded_vanilla",
+    default="local_ring",
     help="The attention mechanism to be used in the model"
 )
 

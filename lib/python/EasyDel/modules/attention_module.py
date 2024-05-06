@@ -1,43 +1,39 @@
 import math
 import warnings
 from functools import partial
+from typing import Tuple, Callable, Optional, Literal
 
 import fjformer
 import jax
 from chex import Array
 from fjformer import with_sharding_constraint
-from jax import numpy as jnp, lax, random
-from jax.experimental.shard_map import shard_map
-from jax.sharding import PartitionSpec, Mesh
 from fjformer.pallas_operations.flash_attention import gpu as flash_attn_gpu
 from fjformer.pallas_operations.flash_attention import tpu as flash_attn_tpu
 from fjformer.pallas_operations.ring_attention import ring_flash_attention_tpu
-
 from fjformer.pallas_operations.splash_attention import (
     make_splash_mha,
     CausalMask,
     MultiHeadMask
 )
-from typing import Tuple, Callable, Optional, Literal
 from flax.struct import dataclass
+from jax import numpy as jnp, lax, random
+from jax.experimental.shard_map import shard_map
+from jax.experimental.pjit import pjit
+from jax.sharding import PartitionSpec, Mesh
 
-from .flax_modelling_utils import get_gradient_checkpoint_policy
 from ._attentions import (
     vanilla_attention,
-    flash_attention,
-    attention_production,
-    static_sharded_attention_production,
-    static_sharded_dot_product_attention,
     ring_attention_standard,
     wise_ring_attention,
     shard_vanilla_attention,
     blockwise_attn
 )
+from .flax_modelling_utils import get_gradient_checkpoint_policy
 from ..etils.etils import get_logger
 
 logger = get_logger(__name__)
-DEFAULT_K_BLOCK = 1024
-DEFAULT_Q_BLOCK = 1024
+DEFAULT_K_BLOCK = 512
+DEFAULT_Q_BLOCK = 512
 
 
 @dataclass
@@ -115,10 +111,6 @@ class AttentionModule:
         platform = jax.lib.xla_bridge.get_backend().platform
         if sm_scale is None:
             sm_scale = 1 / math.sqrt(head_dims)
-        if attn_mechanism == "splash":
-            raise NotImplementedError("Splash Attention is not Supported YET !")
-        if attn_mechanism == "flash" and platform not in ["gpu", "tpu"]:
-            raise NotImplementedError("Flash Attention is only supported for GPU/TPU.")
         self.platform = platform
         self.attn_mechanism = attn_mechanism
         self.block_k = block_k
@@ -153,42 +145,58 @@ class AttentionModule:
         self.generation_bias_partition_spec = generation_bias_partition_spec
         self.generation_attention_partition_spec = generation_attention_partition_spec
         self.axis_name = axis_name
+        if attn_mechanism == "splash" and self.platform != "tpu":
+            raise OSError("splash attention is only supported on TPU.")
+        if attn_mechanism == "flash" and self.platform != "tpu":
+            error_msg = "flash attention is only supported on TPU"
+            if self.platform == "gpu":
+                error_msg += ", for GPUs flash attention you can use `cudnn`."
+            raise OSError(error_msg)
+        if attn_mechanism == "cudnn" and self.platform != "gpu":
+            raise OSError("flash attention is only supported on GPU.")
 
-        ring_func = partial(
-            ring_attention_standard,
-            axis_name=self.axis_name,
-            scale=1 / self.sm_scale,
-            float32_logits=True,
+    def get_block_size_splash_attn(self, q_seq, k_seq):
+        return fjformer.pallas_operations.splash_attention.BlockSizes(
+            block_q=min(self.block_q, q_seq),
+            block_kv_compute=min(self.block_k, k_seq),
+            block_kv=min(self.block_k, k_seq),
+            block_q_dkv=min(self.block_q_dkv, q_seq),
+            block_kv_dkv=min(self.block_k_dkv, k_seq),
+            block_kv_dkv_compute=min(self.block_k_dkv, q_seq),
+            block_q_dq=min(self.block_q_dq, q_seq),
+            block_kv_dq=min(self.block_k_dq, q_seq),
         )
 
-        self.local_ring_attention_generation_kernel = shard_map(
-            ring_func,
-            mesh=self.mesh,
-            in_specs=(
-                self.generation_query_partition_spec,
-                self.key_partition_spec,
-                self.value_partition_spec,
-                self.generation_bias_partition_spec
-            ),
-            out_specs=(
-                self.attention_partition_spec
-            ),
-            check_rep=False
+    def get_block_size_flash_attn(self, q_seq, k_seq):
+        return fjformer.pallas_operations.flash_attention.BlockSizes(
+            block_q=min(self.block_q, q_seq),
+            block_k=min(self.block_k, k_seq),
+            block_q_dkv=min(self.block_q_dkv, q_seq),
+            block_k_dq=min(self.block_k_dkv, k_seq),
+            block_k_dkv=min(self.block_k_dkv, q_seq),
+            block_q_dq=min(self.block_q_dq, q_seq),
+            block_b=min(self.block_b, 1),
+            block_k_major=min(self.block_k_major, q_seq),
+            block_k_major_dq=min(self.block_k_major_dq, q_seq),
+            block_k_major_dkv=min(self.block_k_major_dkv, q_seq),
+            block_q_major_dkv=min(self.block_q_major_dkv, q_seq)
         )
 
-        self.local_ring_attention_kernel = shard_map(
-            ring_func,
-            mesh=self.mesh,
-            in_specs=(
-                self.query_partition_spec,
-                self.key_partition_spec,
-                self.value_partition_spec,
-                self.bias_partition_spec
-            ),
-            out_specs=(
-                self.attention_partition_spec
-            ),
-            check_rep=False
+    def get_partition_specs(self, qs) -> Tuple[
+        PartitionSpec, PartitionSpec, PartitionSpec, PartitionSpec, PartitionSpec, bool
+    ]:
+        is_generating = qs == 1
+        query_sequence_partition = self.generation_query_partition_spec if is_generating else self.query_partition_spec
+        bias_partition_spec = self.generation_bias_partition_spec if is_generating else self.bias_partition_spec
+        attention_partition_spec = self.generation_attention_partition_spec if is_generating else self.attention_partition_spec
+
+        return (
+            query_sequence_partition,
+            self.key_partition_spec,
+            self.value_partition_spec,
+            bias_partition_spec,
+            attention_partition_spec,
+            is_generating
         )
 
     def _check_states(
@@ -240,8 +248,8 @@ class AttentionModule:
             query_states: Array,
             key_states: Array,
             value_states: Array,
-            query_sequence_length: int,
-            key_value_sequence_length: int,
+            query_sequence_length: Optional[int] = None,
+            key_value_sequence_length: Optional[int] = None,
             bias: Optional[Array] = None,
             attention_mask: Optional[Array] = None,
             segment_ids: Optional[Array] = None,
@@ -250,6 +258,10 @@ class AttentionModule:
             dropout_rng: Optional[random.PRNGKey] = None,
             uses_cache: bool = False
     ):
+        if query_sequence_length is None:
+            query_sequence_length = query_states.shape[1]
+        if key_value_sequence_length is None:
+            key_value_sequence_length = key_states.shape[1]
         with self.mesh:
             self._check_states(
                 query_states=query_states,
@@ -259,6 +271,16 @@ class AttentionModule:
                 key_value_sequence_length=key_value_sequence_length
             )
             if self.attn_mechanism == "flash":
+                if segment_ids is not None:
+                    warnings.warn(
+                        "Flash attention don't support `segment_ids` this argument will be ignored",
+                        UserWarning
+                    )
+                if self.attention_dropout != 0.0:
+                    warnings.warn(
+                        "Flash attention don't support `attention_dropout` this argument will be ignored",
+                        UserWarning
+                    )
 
                 return self.flash_attention(
                     query_states=query_states,
@@ -266,7 +288,8 @@ class AttentionModule:
                     value_states=value_states,
                     bias=bias,
                     causal=causal,
-                    key_value_sequence_length=key_value_sequence_length,
+                    query_sequence_length=query_sequence_length,
+                    key_value_sequence_length=key_value_sequence_length
                 )
 
             elif self.attn_mechanism == "vanilla":
@@ -278,6 +301,8 @@ class AttentionModule:
                     bias=bias,
                     dropout_rng=dropout_rng,
                     deterministic=deterministic,
+                    query_sequence_length=query_sequence_length,
+                    key_value_sequence_length=key_value_sequence_length
                 )
             elif self.attn_mechanism == "sharded_vanilla":
                 return self.sharded_vanilla_attention(
@@ -287,6 +312,8 @@ class AttentionModule:
                     bias=bias,
                     dropout_rng=dropout_rng,
                     deterministic=deterministic,
+                    query_sequence_length=query_sequence_length,
+                    key_value_sequence_length=key_value_sequence_length
                 )
             elif self.attn_mechanism == "ring":
                 return self.ring_attention(
@@ -296,26 +323,56 @@ class AttentionModule:
                     bias=bias,
                     dropout_rng=dropout_rng,
                     deterministic=deterministic,
-                    query_sequence_length=query_sequence_length,
                     segment_ids=segment_ids,
-                    attention_mask=attention_mask
+                    attention_mask=attention_mask,
+                    query_sequence_length=query_sequence_length,
+                    key_value_sequence_length=key_value_sequence_length
                 )
 
             elif self.attn_mechanism == "splash":
+                if segment_ids is not None:
+                    warnings.warn(
+                        "Splash attention don't support `segment_ids` this argument will be ignored",
+                        UserWarning
+                    )
+                if self.attention_dropout != 0.0:
+                    warnings.warn(
+                        "Splash attention don't support `attention_dropout` this argument will be ignored",
+                        UserWarning
+                    )
+                if bias is not None:
+                    warnings.warn(
+                        "Splash attention don't support `bias` this argument will be ignored",
+                        UserWarning
+                    )
+                if attention_mask is not None:
+                    warnings.warn(
+                        "Splash attention don't support `bias` this argument will be ignored",
+                        UserWarning
+                    )
+
                 return self.splash_attention(
                     query_states=query_states,
                     key_states=key_states,
                     value_states=value_states,
-                    segment_ids=segment_ids,
+                    query_sequence_length=query_sequence_length,
+                    key_value_sequence_length=key_value_sequence_length
                 )
             elif self.attn_mechanism == "blockwise":
+                if segment_ids is not None:
+                    warnings.warn(
+                        "BlockWise Attention don't support `segment_ids` this argument will be ignored",
+                        UserWarning
+                    )
                 return self.blockwise_attention(
                     query_states=query_states,
                     key_states=key_states,
                     value_states=value_states,
                     bias=bias,
                     deterministic=deterministic,
-                    dropout_rng=dropout_rng
+                    dropout_rng=dropout_rng,
+                    query_sequence_length=query_sequence_length,
+                    key_value_sequence_length=key_value_sequence_length
                 )
             elif self.attn_mechanism == "cudnn":
                 return self.cuddn_flash_attention(
@@ -325,23 +382,49 @@ class AttentionModule:
                     bias=bias,
                     causal=causal,
                     deterministic=deterministic,
+                    query_sequence_length=query_sequence_length,
                     key_value_sequence_length=key_value_sequence_length
                 )
             elif self.attn_mechanism == "local_ring":
+                if segment_ids is not None:
+                    warnings.warn(
+                        "LocalRing Attention don't support `segment_ids` this argument will be ignored",
+                        UserWarning
+                    )
+                if self.attention_dropout != 0.0:
+                    warnings.warn(
+                        "LocalRing Attention don't support `attention_dropout` this argument will be ignored",
+                        UserWarning
+                    )
+
                 return self.local_ring_attention(
                     query_states=query_states,
                     key_states=key_states,
                     value_states=value_states,
-                    bias=bias
+                    bias=bias,
+                    query_sequence_length=query_sequence_length,
+                    key_value_sequence_length=key_value_sequence_length
                 )
             elif self.attn_mechanism == "wise_ring":
+                if segment_ids is not None:
+                    warnings.warn(
+                        "WiseRing Attention don't support `segment_ids` this argument will be ignored",
+                        UserWarning
+                    )
+                if self.attention_dropout != 0.0:
+                    warnings.warn(
+                        "WiseRing Attention don't support `attention_dropout` this argument will be ignored",
+                        UserWarning
+                    )
+
                 return self.wise_ring_attention(
                     query_states=query_states,
                     bias=bias,
                     value_states=value_states,
                     key_states=key_states,
                     segment_ids=segment_ids,
-                    query_sequence_length=query_sequence_length
+                    query_sequence_length=query_sequence_length,
+                    key_value_sequence_length=key_value_sequence_length
                 )
             else:
                 raise ValueError(f"Unknown Attention mechanism of {self.attn_mechanism}")
@@ -352,15 +435,28 @@ class AttentionModule:
             query_states: Array,
             key_states: Array,
             value_states: Array,
+            query_sequence_length: int,
+            key_value_sequence_length: int,
             bias: Optional[Array] = None,
     ):
-        is_generating = query_states.shape[1] == 1
-        func = self.local_ring_attention_generation_kernel if is_generating else self.local_ring_attention_kernel
+        qps, kps, vps, bps, aps, _ = self.get_partition_specs(query_sequence_length)
+        attention_outputs = shard_map(
+            partial(
+                ring_attention_standard,
+                axis_name=self.axis_name,
+                scale=1 / self.sm_scale,
+                float32_logits=True,
+            ),
+            mesh=self.mesh,
+            in_specs=(qps, kps, vps, bps,),
+            out_specs=aps,
+            check_rep=False
+        )(
+            query_states, key_states, value_states, bias
+        )
         return AttentionOutput(
             attention_weights=None,
-            attention_outputs=func(
-                query_states, key_states, value_states, bias
-            )
+            attention_outputs=attention_outputs
         )
 
     def ring_attention(
@@ -370,11 +466,12 @@ class AttentionModule:
             key_states: Array,
             value_states: Array,
             query_sequence_length: int,
+            key_value_sequence_length: int,
             bias: Optional[Array] = None,
             attention_mask: Optional[Array] = None,
             deterministic: bool = False,
             dropout_rng: Optional[random.PRNGKey] = None,
-            segment_ids: Optional[Array] = None
+            segment_ids: Optional[Array] = None,
     ):
         if segment_ids is None:
             segment_ids = jnp.zeros((query_states.shape[0], query_sequence_length), dtype="i4")
@@ -459,6 +556,7 @@ class AttentionModule:
             key_states: Array,
             value_states: Array,
             query_sequence_length: int,
+            key_value_sequence_length: int,
             bias: Optional[Array] = None,
             deterministic: bool = False,
             dropout_rng: Optional[random.PRNGKey] = None,
@@ -514,6 +612,8 @@ class AttentionModule:
                 key_states=key_states,
                 value_states=value_states,
                 bias=bias,
+                query_sequence_length=query_sequence_length,
+                key_value_sequence_length=key_value_sequence_length
             )
 
     def vanilla_attention(
@@ -525,6 +625,8 @@ class AttentionModule:
             bias: Optional[Array] = None,
             deterministic: bool = False,
             dropout_rng: Optional[random.PRNGKey] = None,
+            query_sequence_length: int,
+            key_value_sequence_length: int,
     ) -> AttentionOutput:
         dtype = jnp.promote_types(self.dtype, jnp.float32)
         with self.mesh:
@@ -554,18 +656,17 @@ class AttentionModule:
             bias: Optional[Array] = None,
             deterministic: bool = False,
             dropout_rng: Optional[random.PRNGKey] = None,
+            query_sequence_length: int,
+            key_value_sequence_length: int,
     ) -> AttentionOutput:
         dtype = jnp.promote_types(self.dtype, jnp.float32)
-        is_generating = query_states.shape[2] == 1
-        query_sequence_partition = self.generation_query_partition_spec if is_generating else self.query_partition_spec
-        bias_partition_spec = self.generation_bias_partition_spec if is_generating else self.bias_partition_spec
-        block_q = 1 if is_generating else self.block_q
+        qps, kps, vps, bps, aps, is_gen = self.get_partition_specs(qs=query_sequence_length)
+        block_size = self.get_block_size_flash_attn(query_sequence_length, key_value_sequence_length)
         with self.mesh:
-            query_states = with_sharding_constraint(query_states, query_sequence_partition)
+            query_states = with_sharding_constraint(query_states, qps)
             key_states = with_sharding_constraint(key_states, self.key_partition_spec)
             value_states = with_sharding_constraint(value_states, self.value_partition_spec)
-            bias = with_sharding_constraint(bias, bias_partition_spec)
-
+            bias = with_sharding_constraint(bias, bps)
             o = blockwise_attn(
                 query=query_states,
                 key=key_states,
@@ -576,17 +677,14 @@ class AttentionModule:
                 dropout_rng=dropout_rng,
                 precision=self.precision,
                 attn_pdrop=self.attention_dropout,
-                key_chunk_size=self.block_k,
-                query_chunk_size=block_q,
+                key_chunk_size=block_size.block_k,
+                query_chunk_size=block_size.block_q,
                 prevent_cse=not self.scan_attention_layers,
                 causal=True,
                 float32_logits=True
             )
 
-            o = with_sharding_constraint(
-                o,
-                self.attention_partition_spec if not is_generating else self.generation_attention_partition_spec
-            )
+            o = with_sharding_constraint(o, aps)
             return AttentionOutput(
                 attention_weights=None,
                 attention_outputs=o
@@ -601,11 +699,12 @@ class AttentionModule:
             bias: Optional[Array] = None,
             deterministic: bool = False,
             dropout_rng: Optional[random.PRNGKey] = None,
+            query_sequence_length: int,
+            key_value_sequence_length: int,
     ) -> AttentionOutput:
         dtype = jnp.promote_types(self.dtype, jnp.float32)
-        is_generating = query_states.shape[1] == 1
-        query_sequence_partition = self.generation_query_partition_spec if is_generating else self.query_partition_spec
-        out_spec = self.generation_attention_partition_spec if is_generating else self.attention_partition_spec
+
+        qps, kps, vps, bps, aps, is_gen = self.get_partition_specs(qs=query_sequence_length)
         with self.mesh:
             output = shard_map(
                 partial(
@@ -616,17 +715,16 @@ class AttentionModule:
                     precision=self.precision,
                     attention_dropout=self.attention_dropout
                 ),
-                mesh=self.mesh,
                 in_specs=(
-                    query_sequence_partition,
-                    self.key_partition_spec,
-                    self.value_partition_spec,
-                    PartitionSpec(("dp", "fsdp"), None, None, None),
+                    qps,
+                    kps,
+                    vps,
+                    bps,
                 ),
-                out_specs=out_spec,
-                check_rep=True
+                out_specs=aps,
+                mesh=self.mesh
             )(query_states, key_states, value_states, bias)
-            output = fjformer.with_sharding_constraint(output, out_spec)
+            output = fjformer.with_sharding_constraint(output, aps)
 
             return AttentionOutput(
                 attention_weights=None,
@@ -639,11 +737,14 @@ class AttentionModule:
             query_states: Array,
             key_states: Array,
             value_states: Array,
+            query_sequence_length: int,
             key_value_sequence_length: int,
             bias: Optional[Array] = None,
             causal: bool = False,
     ) -> AttentionOutput:
 
+        qps, kps, vps, bps, aps, is_gen = self.get_partition_specs(qs=query_sequence_length)
+        block_size = self.get_block_size_flash_attn(query_sequence_length, key_value_sequence_length)
         query_states = query_states.transpose(0, 2, 1, 3)
         key_states = key_states.transpose(0, 2, 1, 3)
         value_states = value_states.transpose(0, 2, 1, 3)
@@ -651,29 +752,15 @@ class AttentionModule:
         batch_size, num_attention_heads, query_sequence_length, head_dims = query_states.shape
         if bias is not None:
             if bias.shape[1] != num_attention_heads:
-                es = bias.shape
-                bias = bias.repeat(
-                    num_attention_heads, 1,
-                )
-        assert bias.shape == (
-            batch_size,
-            self.num_attention_heads,
-            query_sequence_length,
-            key_value_sequence_length
-        ), self.assertion_mkv_err
+                bias = bias.repeat(num_attention_heads, 1, )
+
         flash_func, float32_logits, _ = get_flash_attention()
         if float32_logits:
             query_states, key_states, value_states = map(
                 lambda s: s.astype(jnp.float32),
                 (query_states, key_states, value_states)
             )
-        is_generating = query_states.shape[2] == 1
-        query_sequence_partition = self.generation_query_partition_spec if is_generating else self.query_partition_spec
-        bias_partition_spec = self.generation_bias_partition_spec if is_generating else self.bias_partition_spec
-        block_q = 1 if is_generating else self.block_q
-        block_q_major_dkv = 1 if is_generating else self.block_q_major_dkv
-        block_q_dkv = 1 if is_generating else self.block_q_dkv
-        block_q_dq = 1 if is_generating else self.block_q_dq
+
         if self.sm_scale is None:
             self.sm_scale = 1 / math.sqrt(query_states[-1])
         attention_o = shard_map(
@@ -681,30 +768,11 @@ class AttentionModule:
                 flash_func,
                 causal=causal,
                 sm_scale=self.sm_scale,
-                block_sizes=flash_attn_tpu.BlockSizes(
-                    block_b=self.block_b,
-                    block_k=self.block_k,
-                    block_q=block_q,
-                    block_k_major=self.block_k_major,
-                    block_k_dq=self.block_k_dq,
-                    block_q_dq=block_q_dq,
-                    block_k_dkv=self.block_k_dkv,
-                    block_q_dkv=block_q_dkv,
-                    block_k_major_dq=self.block_k_major_dq,
-                    block_k_major_dkv=self.block_k_major_dkv,
-                    block_q_major_dkv=block_q_major_dkv,
-                ),
+                block_sizes=block_size,
                 debug=False
             ),
-            in_specs=(
-                query_sequence_partition,
-                self.key_partition_spec,
-                self.value_partition_spec,
-                bias_partition_spec
-            ),
-            out_specs=(
-                self.attention_partition_spec
-            ),
+            in_specs=(qps, kps, vps, bps),
+            out_specs=aps,
             mesh=self.mesh,
             check_rep=False,
         )(
@@ -725,11 +793,11 @@ class AttentionModule:
             query_states: Array,
             key_states: Array,
             value_states: Array,
-            segment_ids: Optional[Array] = None,
+            query_sequence_length: int,
+            key_value_sequence_length: int,
     ) -> AttentionOutput:
 
-        if self.platform != "tpu":
-            raise OSError(f"Splash attention only supports on TPUs and right now we don't support {self.platform}")
+        qps, kps, vps, bps, aps, is_gen = self.get_partition_specs(qs=query_sequence_length)
 
         query_states = query_states.transpose(0, 2, 1, 3)
         key_states = key_states.transpose(0, 2, 1, 3)
@@ -739,75 +807,28 @@ class AttentionModule:
             lambda s: s.astype(jnp.float32),
             (query_states, key_states, value_states)
         )
-        is_generating = query_states.shape[2] == 1
-        query_sequence_partition = self.generation_query_partition_spec if is_generating else self.query_partition_spec
-        bias_partition_spec = self.generation_bias_partition_spec if is_generating else self.bias_partition_spec
-        block_q = 1 if is_generating else self.block_q
-        block_q_major_dkv = 1 if is_generating else self.block_q_major_dkv
-        block_q_dkv = 1 if is_generating else self.block_q_dkv
-        block_q_dq = 1 if is_generating else self.block_q_dq
 
-        def sfa(
-                in_query_states,
-                in_key_states,
-                in_value_states,
-                in_segment_ids,
-        ):
-            block_sizes = flash_attn_tpu.BlockSizes(
-                block_b=self.block_b,
-                block_k=self.block_k,
-                block_q=block_q,
-                block_k_major=self.block_k_major,
-                block_k_dq=self.block_k_dq,
-                block_q_dq=block_q_dq,
-                block_k_dkv=self.block_k_dkv,
-                block_q_dkv=block_q_dkv,
-                block_k_major_dq=self.block_k_major_dq,
-                block_k_major_dkv=self.block_k_major_dkv,
-                block_q_major_dkv=block_q_major_dkv,
-            )
-            multi_head_mask = MultiHeadMask(
-                masks=[
-                    CausalMask(
-                        shape=(in_query_states.shape[2], in_query_states.shape[2])
-                    ) for _ in range(
-                        in_query_states.shape[1]
-                    )
-                ]
-            )
+        @partial(
+            shard_map,
+            in_specs=(qps, kps, vps),
+            out_specs=qps,
+            mesh=self.mesh,
+            check_rep=False,
+        )
+        def splash_attention_call(q, k, v):
+            block_size = self.get_block_size_splash_attn(query_sequence_length, key_value_sequence_length)
+            masks = [CausalMask(shape=(q.shape[2], k.shape[2])) for _ in range(q.shape[1])]
+            multi_head_mask = MultiHeadMask(masks=masks)
             splash_kernel = make_splash_mha(
                 mask=multi_head_mask,
                 head_shards=1,
                 q_seq_shards=1,
-                block_sizes=block_sizes
+                block_sizes=block_size
             )
 
-            return jax.vmap(splash_kernel)(
-                in_query_states,
-                in_key_states,
-                in_value_states,
-                segment_ids=in_segment_ids
-            )
+            return jax.vmap(splash_kernel)(q, k, v, segment_ids=None)
 
-        attention_o = shard_map(
-            sfa,
-            in_specs=(
-                query_sequence_partition,
-                self.key_partition_spec,
-                self.value_partition_spec,
-                bias_partition_spec
-            ),
-            out_specs=(
-                self.attention_partition_spec
-            ),
-            mesh=self.mesh,
-            check_rep=False,
-        )(
-            query_states,
-            key_states,
-            value_states,
-            segment_ids,
-        )
+        attention_o = splash_attention_call(query_states, key_states, value_states)
 
         attention_o = attention_o.transpose(0, 2, 1, 3)
         return AttentionOutput(
@@ -821,10 +842,11 @@ class AttentionModule:
             query_states: Array,
             key_states: Array,
             value_states: Array,
-            key_value_sequence_length: int,
             bias: Optional[Array] = None,
             causal: bool = False,
-            deterministic: bool = True
+            deterministic: bool = True,
+            query_sequence_length: int,
+            key_value_sequence_length: int,
     ) -> AttentionOutput:
         """CUDNN Flash Attention with Transformer Engine."""
         try:

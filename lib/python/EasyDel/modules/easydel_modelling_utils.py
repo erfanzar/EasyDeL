@@ -73,7 +73,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
             self,
             axis_dims: Sequence[int] = (1, -1, 1, 1),
             axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = "sharded_vanilla",
+            attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = "local_ring",
             block_k: int = 128,
             block_q: int = 128,
             block_b: int = 1,
@@ -381,7 +381,7 @@ class EasyDelPretrainedConfig(PretrainedConfig):
         set_attrs_smartly(self, "backend", jax.default_backend(), backend)
         set_attrs_smartly(self, "shard_attention_computation", True, shard_attention_computation)
         set_attrs_smartly(self, "use_sharded_kv_caching", True, use_sharded_kv_caching)
-        set_attrs_smartly(self, "attn_mechanism", "sharded_vanilla", attn_mechanism)
+        set_attrs_smartly(self, "attn_mechanism", "local_ring", attn_mechanism)
 
         set_attrs_smartly(self, "block_k_dkv", block_k_dkv or self.block_k, block_k_dkv)
         set_attrs_smartly(self, "block_q_dkv", block_q_dkv or self.block_q, block_q_dkv)
