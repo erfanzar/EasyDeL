@@ -1,3 +1,4 @@
+%%writefile python_test/attention_test.py
 import math
 import os
 import time
@@ -23,14 +24,14 @@ from functools import partial
 
 rng = GenerateRNG()
 BATCH_SIZE = 8
-SEQUENCE_LENGTH = 256
-HEAD_DIM = 8
+SEQUENCE_LENGTH = 128 * 8 
+HEAD_DIM = 128
 NUM_HEADS = 32
 IMG_LOSS = 0.5649852
-CHUNK_WISE_RING = SEQUENCE_LENGTH // 8
+CHUNK_WISE_RING = 128
 
 config = MistralConfig(
-    axis_dims=(1, 1, 1, -1),
+    axis_dims=(1, -1, 1, 1),
     block_q=CHUNK_WISE_RING,
     block_k=CHUNK_WISE_RING
 )
