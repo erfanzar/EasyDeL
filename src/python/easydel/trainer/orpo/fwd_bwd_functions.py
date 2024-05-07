@@ -1,4 +1,6 @@
 import typing
+import warnings
+
 import chex
 import fjformer
 import flax.core
@@ -9,6 +11,7 @@ from typing import Literal, Dict, Union, Tuple, List, Callable
 from jax import numpy as jnp
 from ...etils import EasyDeLState
 from flax.struct import dataclass
+from jax.sharding import PartitionSpec
 
 
 def pad_to_length(tensor: chex.Array, length: int, pad_value: Union[int, float], axis: int = -1) -> chex.Array:
@@ -260,6 +263,7 @@ def concatenated_inputs(
             # making 3d array 2d
             concatenated_batch[k] = val.reshape(val.shape[0], -1)
     if is_encoder_decoder:
+        warnings.warn("`concatenated_input_ids` will be repeated (encoder decoder model detected)")
         concatenated_batch["concatenated_input_ids"] = batch["prompt_input_ids"].repeat(2, 1)
         concatenated_batch["concatenated_attention_mask"] = (
             batch["prompt_attention_mask"].repeat(2, 1)
@@ -301,7 +305,8 @@ def odds_ratio_loss(
 def create_orpo_step_function(
         concatenated_forward: Callable,
         beta: float = 0.1,
-        mode: Literal["train", "eval"] = "train"
+        mode: Literal["train", "eval"] = "train",
+        batch_partition_spec: PartitionSpec = PartitionSpec(("fsdp", "dp"), "sp")
 ):
     """
     The create_orpo_step_function function is a helper function that creates the ORPO training step.
@@ -309,6 +314,7 @@ def create_orpo_step_function(
     :param concatenated_forward: Callable: Define the forward pass of the model
     :param beta: float: Scale the logits
     :param mode: Literal["train", "eval"] : "train", "eval" function modes
+    :param batch_partition_spec: PartitionSpec: Batch PartitionSpec
     :return: A function that takes in a state and a batch
     """
 
@@ -327,6 +333,7 @@ def create_orpo_step_function(
         :param batch: dict: Pass the data to the model
         :return: A new state, which is a collection of the parameters and apply_fn
         """
+        batch = fjformer.with_sharding_constraint(batch, partition_specs=batch_partition_spec)
 
         def calculate_loss(params: dict | flax.core.FrozenDict):
             (
