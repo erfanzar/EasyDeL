@@ -2,13 +2,13 @@ from tqdm import tqdm
 import jax
 import jax.numpy as jnp
 import optax
-from lib.python.EasyDel import AutoEasyDelModelForCausalLM
+from src.python.easydel import AutoEasyDeLModelForCausalLM
 
 from fjformer.xrapture.xrapture import XRapTure, XRapTureConfig
 
 
 def main():
-    model, params = AutoEasyDelModelForCausalLM.from_pretrained('erfanzar/LLamaStory-70M')
+    model, params = AutoEasyDeLModelForCausalLM.from_pretrained('erfanzar/LLamaStory-70M')
 
     tx = optax.adamw(learning_rate=1e-4, weight_decay=1e-4)
     rab_config = XRapTureConfig(

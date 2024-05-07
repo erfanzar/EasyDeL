@@ -1,2 +1,2 @@
 # utils.prompters
-::: lib.python.EasyDel.utils.prompters
+::: src.python.EasyDeL.utils.prompters

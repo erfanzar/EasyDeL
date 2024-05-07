@@ -9,13 +9,13 @@ __pycache__/
 env.ipynb
 env.py
 pallas_env.py
-test_EasyDelState.py
+test_EasyDeLState.py
 io.py
 *.easy
 # Distribution / packaging
 *.json
 .Python
-EasyDel-Checkpoints
+EasyDeL-Checkpoints
 build/
 develop-eggs/
 memory.prof.new

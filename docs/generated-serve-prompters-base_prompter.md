@@ -1,2 +1,2 @@
 # serve.prompters.base_prompter
-::: lib.python.EasyDel.serve.prompters.base_prompter
+::: src.python.EasyDeL.serve.prompters.base_prompter

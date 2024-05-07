@@ -1,7 +1,7 @@
-from EasyDel import TrainArguments, CausalLanguageModelTrainer
+from easydel import TrainArguments, CausalLanguageModelTrainer
 from datasets import load_dataset
 from huggingface_hub import HfApi
-import EasyDel
+import easydel
 from absl import flags, app
 from fjformer.checkpoint import get_dtype
 
@@ -150,11 +150,11 @@ def main(argv):
 
     if FLAGS.config_repo is not None:
         conf = None
-        config = EasyDel.modules.MptConfig.from_pretrained(FLAGS.config_repo, trust_remote_code=True)
+        config = easydel.modules.MptConfig.from_pretrained(FLAGS.config_repo, trust_remote_code=True)
         config.use_scan_mlp = FLAGS.use_scan_mlp
     else:
-        conf = EasyDel.modules.configs.mpt_configs[FLAGS.model_type]
-        config = EasyDel.modules.MptConfig(**conf, rotary_type=FLAGS.rotary_type)
+        conf = easydel.modules.configs.mpt_configs[FLAGS.model_type]
+        config = easydel.modules.MptConfig(**conf, rotary_type=FLAGS.rotary_type)
         config.use_scan_mlp = FLAGS.use_scan_mlp
         config.max_sequence_length = FLAGS.max_sequence_length
         config.max_sequence_length = FLAGS.max_sequence_length
@@ -162,7 +162,7 @@ def main(argv):
         config.rope_scaling = None
 
     train_args = TrainArguments(
-        model_class=EasyDel.modules.FlaxMptForCausalLM,
+        model_class=easydel.modules.FlaxMptForCausalLM,
         configs_to_initialize_model_class={'config': config, 'dtype': get_dtype(FLAGS.dtype),
                                      'param_dtype': get_dtype(FLAGS.dtype)},
         custom_rule=config.get_partition_rules(True),

@@ -2,10 +2,10 @@ import os
 
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 
-from lib.python.EasyDel import (
+from src.python.easydel import (
     EasyDeLXRapTureConfig,
     CausalLanguageModelTrainer,
-    AutoEasyDelModelForCausalLM,
+    AutoEasyDeLModelForCausalLM,
     TrainArguments
 )
 from jax import numpy as jnp, random
@@ -14,7 +14,7 @@ from datasets import Dataset
 
 
 def main():
-    model, params = AutoEasyDelModelForCausalLM.from_pretrained('erfanzar/LLamaStory-70M')
+    model, params = AutoEasyDeLModelForCausalLM.from_pretrained('erfanzar/LLamaStory-70M')
     data_row_size = 1_000
     sequence_length = 128
     rab_config = EasyDeLXRapTureConfig(

@@ -1,2 +1,2 @@
 # data_preprocessing._processor
-::: lib.python.EasyDel.data_preprocessing._processor
+::: src.python.EasyDeL.data_preprocessing._processor

@@ -1,2 +1,2 @@
 # modules.cohere.cohere_configuration
-::: lib.python.EasyDel.modules.cohere.cohere_configuration
+::: src.python.EasyDeL.modules.cohere.cohere_configuration

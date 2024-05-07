@@ -1,2 +1,2 @@
 # reinforcement_learning.trainer.ppo_trainer
-::: lib.python.EasyDel.reinforcement_learning.trainer.ppo_trainer
+::: src.python.EasyDeL.reinforcement_learning.trainer.ppo_trainer

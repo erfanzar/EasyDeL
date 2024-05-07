@@ -50,29 +50,29 @@ including GLUE, SuperGLUE, and the Stanford Question Answering Dataset.
 applications.** If you are interested in using Mistral's LLMs, please visit the Mistral AI website: https://mistral.ai/
 for more information.
 
-# Mistral Model In EasyDel
+# Mistral Model In EasyDeL
 
-using Mistral Models are the same as all the other models in EasyDel Collection but let take a look at how can we train
+using Mistral Models are the same as all the other models in EasyDeL Collection but let take a look at how can we train
 or finetune a Mistral model
 
 ```python
-from EasyDel.trainer import TrainArguments, CausalLanguageModelTrainer
+from easydel.trainer import TrainArguments, CausalLanguageModelTrainer
 from datasets import load_dataset
 from transformers import AutoTokenizer
 from jax import numpy as jnp
 import flax
-import EasyDel
-from EasyDel import (
-    AutoEasyDelModelForCausalLM,
-    EasyDelOptimizers,
-    EasyDelSchedulers,
-    EasyDelGradientCheckPointers
+import easydel
+from easydel import (
+    AutoEasyDeLModelForCausalLM,
+    EasyDeLOptimizers,
+    EasyDeLSchedulers,
+    EasyDeLGradientCheckPointers
 )
 
 model_huggingface_repo_id = 'mistralai/Mistral-7B-v0.1'
 dataset_train = load_dataset('<TOKENIZED_MISTRAL_DATASET_AT_HUGGINGFACE>')
 tokenizer = AutoTokenizer.from_pretrained(model_huggingface_repo_id, trust_remote_code=True)
-model, params = AutoEasyDelModelForCausalLM.from_pretrained(model_huggingface_repo_id)
+model, params = AutoEasyDeLModelForCausalLM.from_pretrained(model_huggingface_repo_id)
 config = model.config
 config.freq_max_position_embeddings = config.max_position_embeddings  # 32768
 config.max_position_embeddings = 4096  # Let use context length of 4096 for training
@@ -81,7 +81,7 @@ config.c_max_position_embeddings = config.max_position_embeddings
 max_sequence_length = config.max_position_embeddings
 
 train_args = TrainArguments(
-    model_class=EasyDel.FlaxMistralForCausalLM,
+    model_class=easydel.FlaxMistralForCausalLM,
     configs_to_initialize_model_class={
         'config': config,
         'dtype': jnp.bfloat16,
@@ -93,8 +93,8 @@ train_args = TrainArguments(
     num_train_epochs=2,
     learning_rate=4e-5,
     learning_rate_end=5e-6,
-    optimizer=EasyDelOptimizers.ADAMW,
-    scheduler=EasyDelSchedulers.WARM_UP_COSINE,
+    optimizer=EasyDeLOptimizers.ADAMW,
+    scheduler=EasyDeLSchedulers.WARM_UP_COSINE,
     weight_decay=0.01,
     total_batch_size=32,
     max_training_steps=None,
@@ -102,7 +102,7 @@ train_args = TrainArguments(
     do_eval=False,
     backend='tpu',
     max_sequence_length=max_sequence_length,
-    gradient_checkpointing=EasyDelGradientCheckPointers.NOTHING_SAVEABLE,
+    gradient_checkpointing=EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
     sharding_array=(1, -1, 1, 1),
     gradient_accumulation_steps=8,
     remove_ckpt_after_load=True,
@@ -118,5 +118,5 @@ trainer = CausalLanguageModelTrainer(
 )
 
 output = trainer.train(flax.core.FrozenDict({'params': params}))
-# And Here were EasyDel goes brrrrrr and start training 
+# And Here were easydel goes brrrrrr and start training 
 ```
