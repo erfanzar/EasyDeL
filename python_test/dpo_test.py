@@ -6,7 +6,7 @@ import fjformer.linen.linen
 import jax
 from jax import numpy as jnp
 
-from lib.python.EasyDel import EasyDelState, FlaxLlamaForCausalLM, LlamaConfig, DPOTrainer, TrainArguments
+from src.python.EasyDel import EasyDelState, FlaxLlamaForCausalLM, LlamaConfig, DPOTrainer, TrainArguments
 
 from typing import Dict, Optional
 

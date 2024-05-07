@@ -2,7 +2,7 @@ import os
 
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 
-from lib.python.EasyDel import (
+from src.python.EasyDel import (
     EasyDeLXRapTureConfig,
     CausalLanguageModelTrainer,
     AutoEasyDelModelForCausalLM,

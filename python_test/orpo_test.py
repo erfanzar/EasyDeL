@@ -4,8 +4,8 @@ import jax.numpy
 from flax.core import FrozenDict
 
 from EasyDel import MistralConfig, FlaxMistralForCausalLM
-from lib.python.EasyDel.trainer.orpo import ORPOTrainer
-from lib.python.EasyDel import TrainArguments, EasyDelState
+from src.python.EasyDel.trainer.orpo import ORPOTrainer
+from src.python.EasyDel import TrainArguments, EasyDelState
 from transformers import AutoTokenizer
 from datasets import load_dataset
 from jax import numpy as jnp

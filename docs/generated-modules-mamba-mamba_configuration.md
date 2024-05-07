@@ -1,2 +1,2 @@
 # modules.mamba.mamba_configuration
-::: lib.python.EasyDel.modules.mamba.mamba_configuration
+::: src.python.EasyDel.modules.mamba.mamba_configuration

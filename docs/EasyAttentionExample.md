@@ -8,8 +8,11 @@ the best possible performance and numerical stability, here are some strategies 
 1. Flash Attention TPU known as "flash"
 2. Flash Attention GPU known as "cudnn"
 3. Ring Attention to Support higher context length such 1 Million or above known as "ring"
-4. Normal Attention which use flax.linen.attention with shard map known as "normal"
+4. Normal Attention which use flax.linen.attention with shard map known as "vanilla"
 5. Splash Attention on TPUs which is known as "splash"
+6. Local Ring attention via "local_ring"
+7. Wise Ring attention via "wise_ring"
+8. sharded Attention with shard map known as "sharded_vanilla"
 
 ## Example of Using Flash Attention on TPU
 

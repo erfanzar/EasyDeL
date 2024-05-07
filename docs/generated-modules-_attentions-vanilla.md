@@ -1,2 +1,2 @@
 # modules._attentions.vanilla
-::: lib.python.EasyDel.modules._attentions.vanilla
+::: src.python.EasyDel.modules._attentions.vanilla
