@@ -1,2 +1,2 @@
 # trainer.orpo.utils
-::: src.python.EasyDeL.trainer.orpo.utils
+::: src.python.easydel.trainer.orpo.utils

@@ -27,6 +27,9 @@ nav:
       - Dbrx:
         - Dbrx Configuration: generated-modules-dbrx-dbrx_configuration.md
         - Modelling Dbrx Flax: generated-modules-dbrx-modelling_dbrx_flax.md
+      - Deepseek V2:
+        - Deepseek Configuration: generated-modules-deepseek_v2-deepseek_configuration.md
+        - Modeling Deepseek Flax: generated-modules-deepseek_v2-modeling_deepseek_flax.md
       - Easydel Modelling Utils: generated-modules-easydel_modelling_utils.md
       - Falcon:
         - Falcon Configuration: generated-modules-falcon-falcon_configuration.md

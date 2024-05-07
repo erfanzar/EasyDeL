@@ -1,2 +1,2 @@
 # trainer.sft.utils
-::: src.python.EasyDeL.trainer.sft.utils
+::: src.python.easydel.trainer.sft.utils

@@ -1,2 +1,2 @@
 # utils.tensor_utils
-::: src.python.EasyDeL.utils.tensor_utils
+::: src.python.easydel.utils.tensor_utils

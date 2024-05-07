@@ -1,2 +1,2 @@
 # trainer.vision_causal_language_model_trainer.fwd_bwd_functions
-::: src.python.EasyDeL.trainer.vision_causal_language_model_trainer.fwd_bwd_functions
+::: src.python.easydel.trainer.vision_causal_language_model_trainer.fwd_bwd_functions
