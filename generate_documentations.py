@@ -35,7 +35,7 @@ def get_files(path: str):
             os.path.exists(os.path.join(path, o)) and not os.path.isdir(os.path.join(path, o))]
 
 
-def run(project_locations="lib/python/EasyDel", docs_file="docs/", start_head="lib/python/EasyDel"):
+def run(project_locations="src/python/EasyDel", docs_file="docs/", start_head="src/python/EasyDel"):
     global cache
     try:
         for current_file in get_inner(project_locations):

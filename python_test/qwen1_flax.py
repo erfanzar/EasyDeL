@@ -1,16 +1,16 @@
 import jax
 
 try:
-    from lib.python.EasyDel import Qwen1Config, FlaxQwen1ForCausalLM
-    from lib.python.EasyDel.transform.easydel_transform import huggingface_to_easydel
+    from src.python.EasyDel import Qwen1Config, FlaxQwen1ForCausalLM
+    from src.python.EasyDel.transform.easydel_transform import huggingface_to_easydel
 except ModuleNotFoundError:
     import sys
     from pathlib import Path
 
     cp = Path.cwd().__str__()
     sys.path.append(cp)
-    from lib.python.EasyDel import Qwen1Config, FlaxQwen1ForCausalLM
-    from lib.python.EasyDel.transform.easydel_transform import huggingface_to_easydel
+    from src.python.EasyDel import Qwen1Config, FlaxQwen1ForCausalLM
+    from src.python.EasyDel.transform.easydel_transform import huggingface_to_easydel
 from jax import numpy as jnp
 from transformers import AutoModelForCausalLM, AutoConfig
 import torch

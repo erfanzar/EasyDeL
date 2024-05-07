@@ -2,7 +2,7 @@ from tqdm import tqdm
 import jax
 import jax.numpy as jnp
 import optax
-from lib.python.EasyDel import AutoEasyDelModelForCausalLM
+from src.python.EasyDel import AutoEasyDelModelForCausalLM
 
 from fjformer.xrapture.xrapture import XRapTure, XRapTureConfig
 

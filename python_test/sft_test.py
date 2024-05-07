@@ -3,11 +3,11 @@ import os
 import flax.core
 from transformers import AutoTokenizer
 
-from lib.python.EasyDel.trainer import conversations_formatting_function
+from src.python.EasyDel.trainer import conversations_formatting_function
 
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
-from lib.python.EasyDel.trainer.sft import SFTTrainer
-from lib.python.EasyDel import (
+from src.python.EasyDel.trainer.sft import SFTTrainer
+from src.python.EasyDel import (
     TrainArguments,
     FlaxMistralForCausalLM,
     MistralConfig

@@ -1,2 +1,2 @@
 # modules.gemma.gemma_configuration
-::: lib.python.EasyDel.modules.gemma.gemma_configuration
+::: src.python.EasyDel.modules.gemma.gemma_configuration
