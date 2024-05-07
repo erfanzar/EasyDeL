@@ -1,2 +1,2 @@
 # transform.utils
-::: src.python.EasyDeL.transform.utils
+::: src.python.easydel.transform.utils

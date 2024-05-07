@@ -1,2 +1,2 @@
 # serve.serve_engine.dantics
-::: src.python.EasyDeL.serve.serve_engine.dantics
+::: src.python.easydel.serve.serve_engine.dantics

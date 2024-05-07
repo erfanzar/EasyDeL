@@ -1,2 +1,2 @@
 # transform.mpt
-::: src.python.EasyDeL.transform.mpt
+::: src.python.easydel.transform.mpt

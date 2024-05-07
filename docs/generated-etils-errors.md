@@ -1,2 +1,2 @@
 # etils.errors
-::: src.python.EasyDeL.etils.errors
+::: src.python.easydel.etils.errors

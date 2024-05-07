@@ -1,2 +1,2 @@
 # modules.arctic.arctic_configuration
-::: src.python.EasyDeL.modules.arctic.arctic_configuration
+::: src.python.easydel.modules.arctic.arctic_configuration

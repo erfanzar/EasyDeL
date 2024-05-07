@@ -1,2 +1,2 @@
 # transform.llama
-::: src.python.EasyDeL.transform.llama
+::: src.python.easydel.transform.llama
