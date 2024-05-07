@@ -51,6 +51,16 @@ of machine learning models, particularly in the domain of large language models 
 >
 > Phi3 Model bugs are fixed, Arctic Model is added.
 
+> [!TIP]
+>
+> use `ed.AttentionModule.test_attentions()` to find the best attention mechanism 
+> that works for you
+> ```python
+> import easydel as ed
+> ed.AttentionModule.test_attentions()
+> ```
+
+
 ## Documentation 💫
 
 > [!IMPORTANT]
