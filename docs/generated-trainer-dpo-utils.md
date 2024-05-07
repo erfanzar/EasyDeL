@@ -1,2 +1,2 @@
 # trainer.dpo.utils
-::: src.python.EasyDel.trainer.dpo.utils
+::: src.python.EasyDeL.trainer.dpo.utils

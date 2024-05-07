@@ -6,13 +6,13 @@ for LoRA fine-tuning section and use _EasyDeLXRapTure_ in for mistral models wit
 
 ```python
 from flax.core import FrozenDict
-from EasyDel import (
+from easydel import (
     TrainArguments,
     CausalLanguageModelTrainer,
-    AutoEasyDelModelForCausalLM,
-    EasyDelOptimizers,
-    EasyDelSchedulers,
-    EasyDelGradientCheckPointers,
+    AutoEasyDeLModelForCausalLM,
+    EasyDeLOptimizers,
+    EasyDeLSchedulers,
+    EasyDeLGradientCheckPointers,
     EasyDeLXRapTureConfig
 )
 from datasets import load_dataset
@@ -22,7 +22,7 @@ from transformers import AutoTokenizer
 
 huggingface_repo_id_or_path = "mistralai/Mistral-7B-Instruct-v0.1"
 
-model, params = AutoEasyDelModelForCausalLM.from_pretrained(huggingface_repo_id_or_path, )
+model, params = AutoEasyDeLModelForCausalLM.from_pretrained(huggingface_repo_id_or_path, )
 
 max_length = 8196
 model_parameters = FrozenDict({"params": params})
@@ -67,8 +67,8 @@ train_arguments = TrainArguments(
     configs_to_initialize_model_class=configs_to_initialize_model_class,
     learning_rate=1e-4,  # Using higher learning rate is recommended
     learning_rate_end=8e-5,
-    optimizer=EasyDelOptimizers.ADAMW,  # "adamw", "lion", "adafactor" are supported
-    scheduler=EasyDelSchedulers.LINEAR,
+    optimizer=EasyDeLOptimizers.ADAMW,  # "adamw", "lion", "adafactor" are supported
+    scheduler=EasyDeLSchedulers.LINEAR,
     # "linear","cosine", "none" ,"warm_up_cosine" and "warm_up_linear"  are supported
     weight_decay=0.01,
     total_batch_size=512,
@@ -77,7 +77,7 @@ train_arguments = TrainArguments(
     do_eval=False,  # it's optional but supported 
     backend="tpu",  # default backed is set to cpu, so you must define you want to use tpu cpu or gpu
     max_length=max_length,  # Note that you have to change this in the model config too
-    gradient_checkpointing=EasyDelGradientCheckPointers.NOTHING_SAVEABLE,
+    gradient_checkpointing=EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
     sharding_array=(1, -1, 1, 1),  # the way to shard model across gpu,cpu or TPUs using sharding array (1, -1, 1, 1)
     # everything training will be in fully FSDP automatic and share data between devices
     remove_ckpt_after_load=True,

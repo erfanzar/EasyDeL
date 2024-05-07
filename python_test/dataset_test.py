@@ -1,4 +1,4 @@
-from src.python.EasyDel.trainer.utils import (
+from src.python.easydel.trainer.utils import (
     create_constant_length_dataset,
     get_formatting_func_from_dataset,
     conversations_formatting_function,

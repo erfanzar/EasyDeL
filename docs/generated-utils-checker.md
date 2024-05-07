@@ -1,2 +1,2 @@
 # utils.checker
-::: src.python.EasyDel.utils.checker
+::: src.python.EasyDeL.utils.checker

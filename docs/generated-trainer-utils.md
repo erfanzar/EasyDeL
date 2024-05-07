@@ -1,2 +1,2 @@
 # trainer.utils
-::: src.python.EasyDel.trainer.utils
+::: src.python.EasyDeL.trainer.utils

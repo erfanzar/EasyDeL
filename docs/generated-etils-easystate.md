@@ -1,2 +1,2 @@
 # etils.easystate
-::: src.python.EasyDel.etils.easystate
+::: src.python.EasyDeL.etils.easystate

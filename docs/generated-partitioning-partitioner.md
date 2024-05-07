@@ -1,2 +1,2 @@
 # partitioning.partitioner
-::: src.python.EasyDel.partitioning.partitioner
+::: src.python.EasyDeL.partitioning.partitioner

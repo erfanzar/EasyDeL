@@ -6,14 +6,14 @@ import flax.traverse_util
 from fjformer import make_shard_and_gather_fns, match_partition_rules
 
 try:
-    import src.python.EasyDel as ed
+    import src.python.easydel as ed
 except ModuleNotFoundError:
     import sys
     from pathlib import Path
 
     cp = Path.cwd().__str__()
     sys.path.append(cp)
-    import src.python.EasyDel as ed
+    import src.python.easydel as ed
 
 from jax import numpy as jnp
 import torch

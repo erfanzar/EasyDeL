@@ -90,7 +90,7 @@ the team with a particular toolset.
 ```misc
 @misc{Zare Chavoshi_2023,
     title={EasyDeL, an open-source library, is specifically designed to enhance and streamline the training process of machine learning models. It focuses primarily on Jax/Flax and aims to provide convenient and effective solutions for training Flax/Jax Models on TPU/GPU for both Serving and Training purposes.},
-    url={https://github.com/erfanzar/EasyDel},
+    url={https://github.com/erfanzar/EasyDeL},
     journal={EasyDeL Easy and Fast DeepLearning with JAX},
     publisher={Erfan Zare Chavoshi},
     author={Zare Chavoshi, Erfan},

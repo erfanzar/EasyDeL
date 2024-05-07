@@ -1,7 +1,7 @@
 """
 The MIT License 
 Copyright (c) Erfan zare Chavoshi
-EasyDel Library [MOJO/UTILITIES]
+EasyDeL Library [MOJO/UTILITIES]
 """
 
 from .read import read_numerical_value, read_string_value, FileBuffer, read_file

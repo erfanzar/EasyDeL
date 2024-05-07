@@ -1,4 +1,4 @@
-from EasyDel import AutoEasyDelModelForCausalLM
+from easydel import AutoEasyDeLModelForCausalLM
 import jax
 from jax.sharding import PartitionSpec
 from typing import Sequence, Optional
@@ -23,7 +23,7 @@ def load_model(
         input_shape: Sequence[int] = (1, 1),
         backend: Optional[str] = None,
 ):
-    model, params = AutoEasyDelModelForCausalLM.from_pretrained(
+    model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
         pretrained_model_name_or_path=pretrained_model_name_or_path,
         device=device,
         dtype=dtype,

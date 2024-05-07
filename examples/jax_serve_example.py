@@ -2,11 +2,11 @@ from typing import List, Union
 
 from absl.app import run
 from absl import flags
-from EasyDel import JAXServer, JAXServerConfig
+from easydel import JAXServer, JAXServerConfig
 import jax
 from fjformer import get_dtype
-from EasyDel.serve.prompters import GemmaPrompter, Llama2Prompter, OpenChatPrompter, ChatMLPrompter, ZephyrPrompter
-from EasyDel.serve.prompters.base_prompter import BasePrompter
+from easydel.serve.prompters import GemmaPrompter, Llama2Prompter, OpenChatPrompter, ChatMLPrompter, ZephyrPrompter
+from easydel.serve.prompters.base_prompter import BasePrompter
 
 FLAGS = flags.FLAGS
 flags.DEFINE_enum(

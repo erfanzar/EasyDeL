@@ -1,2 +1,2 @@
 # transform.mistral
-::: src.python.EasyDel.transform.mistral
+::: src.python.EasyDeL.transform.mistral

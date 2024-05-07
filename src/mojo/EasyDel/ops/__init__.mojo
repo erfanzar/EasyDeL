@@ -1,7 +1,7 @@
 """
 The Apache v2.0 License 
 Copyright (c) Erfan zare Chavoshi
-EasyDel Library [MOJO/Matrix]
+EasyDeL Library [MOJO/Matrix]
 """
 
 from .forward import (

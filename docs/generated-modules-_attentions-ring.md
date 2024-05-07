@@ -1,2 +1,2 @@
 # modules._attentions.ring
-::: src.python.EasyDel.modules._attentions.ring
+::: src.python.EasyDeL.modules._attentions.ring

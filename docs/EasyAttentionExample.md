@@ -20,13 +20,13 @@ the best possible performance and numerical stability, here are some strategies 
 import jax
 import flax.linen.attention as flt
 from fjformer import GenerateRNG
-from EasyDel.modules.attention_module import AttentionModule
-from EasyDel.modules.easydel_modelling_utils import EasyDelPretrainedConfig
+from easydel.modules.attention_module import AttentionModule
+from easydel.modules.easydel_modelling_utils import EasyDeLPretrainedConfig
 from jax import numpy as jnp, random, lax
 import math
 
 rng_gen = GenerateRNG(seed=42)
-config = EasyDelPretrainedConfig(
+config = EasyDeLPretrainedConfig(
     axis_dims=(1, -1, 1, 1),
     axis_names=("dp", "fsdp", "tp", "sp"),
     block_q=512,

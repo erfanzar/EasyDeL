@@ -50,20 +50,20 @@ The Falcon models can be used for a variety of tasks, including:
 **Availability**
 
 The Falcon models are available through the Hugging Face Hub. The models are also available in the TensorFlow Hub and
-the PyTorch Hub ( and EasyDel).
+the PyTorch Hub ( and EasyDeL).
 
 **Conclusion**
 
 The Falcon models are a powerful family of LLMs that can be used for a variety of tasks. The models are open source and
 available for free, making them a valuable resource for researchers and developers.
 
-## How to Use/Load Them in EasyDel
+## How to Use/Load Them in EasyDeL
 
 ```python
 import jax
-from EasyDel import AutoEasyDelModelForCausalLM
+from easydel import AutoEasyDeLModelForCausalLM
 
-model, params = AutoEasyDelModelForCausalLM.from_pretrained(
+model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
     'tiiuae/falcon-7b',
     # other kwargs
 )
@@ -74,38 +74,38 @@ also keep that in mind that returned `config` includes `.get_partition_rules(fsd
 #### Use With JaxServer
 
 ```python
-from EasyDel.serve import JAXServer, JAXServerConfig
-from EasyDel import AutoEasyDelModelForCausalLM
+from easydel.serve import JAXServer, JAXServerConfig
+from easydel import AutoEasyDeLModelForCausalLM
 from transformers import AutoTokenizer
 
-model, params = AutoEasyDelModelForCausalLM.from_pretrained(
-  'tiiuae/falcon-7b',
-  # other kwargs
+model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
+    'tiiuae/falcon-7b',
+    # other kwargs
 )
 
 
 class FalconJaxServer(JAXServer):
-  ...
-  # You have to Custom this one yourself as you 
-  # need read JaxServer Documents inorder to learn how
+    ...
+    # You have to Custom this one yourself as you 
+    # need read JaxServer Documents inorder to learn how
 
 
 server = FalconJaxServer.from_parameters(
-  params=params,
-  model=model,
-  config_model=model.config,
-  add_params_field=True,
-  tokenizer=AutoTokenizer.from_pretrained('tiiuae/falcon-7b'),
-  verbose=False,
-  do_memory_log=True,
-  server_config=JAXServerConfig()
+    params=params,
+    model=model,
+    config_model=model.config,
+    add_params_field=True,
+    tokenizer=AutoTokenizer.from_pretrained('tiiuae/falcon-7b'),
+    verbose=False,
+    do_memory_log=True,
+    server_config=JAXServerConfig()
 )
 
 server.fire()  # Launch FastAPI functions
 
 shared_urls = server.launch(
-  share_chat=True,
-  share_inst=True
+    share_chat=True,
+    share_inst=True
 )
 ```
 

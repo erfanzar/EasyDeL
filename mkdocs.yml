@@ -211,10 +211,10 @@ plugins:
           options:
             docstring_style: sphinx
 
-repo_url: https://github.com/erfanzar/EasyDel
+repo_url: https://github.com/erfanzar/EasyDeL
 site_author: Erfan Zare Chavoshi
-site_name: EasyDel
-copyright: Erfan Zare Chavoshi-EasyDel
+site_name: easydel
+copyright: Erfan Zare Chavoshi-easydel
 
 theme:
   highlightjs: true

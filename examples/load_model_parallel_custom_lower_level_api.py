@@ -8,14 +8,14 @@ import jax
 import torch
 
 try:
-    from src.python.EasyDel import get_modules_by_type, AutoShardAndGatherFunctions
+    from src.python.easydel import get_modules_by_type, AutoShardAndGatherFunctions
 except ModuleNotFoundError:
     import sys
     from pathlib import Path
 
     cp = Path.cwd().__str__()
     sys.path.append(cp)
-    from src.python.EasyDel import get_modules_by_type, AutoShardAndGatherFunctions
+    from src.python.easydel import get_modules_by_type, AutoShardAndGatherFunctions
 
 from fjformer import make_shard_and_gather_fns, match_partition_rules
 from transformers import FalconForCausalLM
