@@ -1,10 +1,10 @@
-from EasyDel import (
+from easydel import (
     TrainArguments,
-    EasyDelOptimizers,
-    EasyDelSchedulers,
-    EasyDelGradientCheckPointers,
+    EasyDeLOptimizers,
+    EasyDeLSchedulers,
+    EasyDeLGradientCheckPointers,
     DPOTrainer,
-    EasyDelState
+    EasyDeLState
 )
 
 from datasets import load_dataset
@@ -99,12 +99,12 @@ def main():
         learning_rate=1.2e-4,
         learning_rate_end=4e-5,
         warmup_steps=200,
-        optimizer=EasyDelOptimizers.ADAMW,
-        scheduler=EasyDelSchedulers.LINEAR,
+        optimizer=EasyDeLOptimizers.ADAMW,
+        scheduler=EasyDeLSchedulers.LINEAR,
         weight_decay=0.02,
         total_batch_size=8 * 10,
         max_sequence_length=max_length,
-        gradient_checkpointing=EasyDelGradientCheckPointers.NOTHING_SAVEABLE,
+        gradient_checkpointing=EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
         sharding_array=(1, -1, 1, 1),
         gradient_accumulation_steps=1,
         dtype=dtype,
@@ -120,7 +120,7 @@ def main():
     tokenizer.pad_token = tokenizer.eos_token if tokenizer.pad_token is None else tokenizer.pad_token
     tokenizer.pad_token_id = tokenizer.eos_token_id if tokenizer.pad_token_id is None else tokenizer.pad_token_id
 
-    model_state = EasyDelState.from_pretrained(
+    model_state = EasyDeLState.from_pretrained(
         pretrained_model_name_or_path=model_name,
         dtype=dtype,
         param_dtype=dtype,
@@ -139,7 +139,7 @@ def main():
     )
     print("Model State is Loaded.")
 
-    ref_model_state = EasyDelState.from_pretrained(
+    ref_model_state = EasyDeLState.from_pretrained(
         pretrained_model_name_or_path=ref_model_name,
         dtype=dtype,
         param_dtype=dtype,

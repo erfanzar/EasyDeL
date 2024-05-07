@@ -10,8 +10,8 @@ os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 
 import jax.random
-from src.python.EasyDel import MistralConfig
-from src.python.EasyDel.modules.attention_module import (
+from src.python.easydel import MistralConfig
+from src.python.easydel.modules.attention_module import (
     AttentionModule
 )
 from fjformer import GenerateRNG

@@ -1,2 +1,2 @@
 # etils.etils
-::: src.python.EasyDel.etils.etils
+::: src.python.EasyDeL.etils.etils

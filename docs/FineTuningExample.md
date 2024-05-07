@@ -1,6 +1,6 @@
 ## FineTuning Causal Language Model 🥵
 
-with using EasyDel FineTuning LLM (CausalLanguageModels) are easy as much as possible with using Jax and Flax
+with using EasyDeL FineTuning LLM (CausalLanguageModels) are easy as much as possible with using Jax and Flax
 and having the benefit of `TPUs` for the best speed here's a simple code to use in order to finetune your
 own Model
 
@@ -9,13 +9,13 @@ now it's time to finetune our model_.
 
 ```python
 import jax.numpy
-from EasyDel import (
+from easydel import (
     TrainArguments,
     CausalLanguageModelTrainer,
-    AutoEasyDelModelForCausalLM,
-    EasyDelOptimizers,
-    EasyDelSchedulers,
-    EasyDelGradientCheckPointers
+    AutoEasyDeLModelForCausalLM,
+    EasyDeLOptimizers,
+    EasyDeLSchedulers,
+    EasyDeLGradientCheckPointers
 )
 from datasets import load_dataset
 import flax
@@ -24,7 +24,7 @@ from transformers import AutoTokenizer
 
 huggingface_repo_id_or_path = "TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T"
 
-model, params = AutoEasyDelModelForCausalLM.from_pretrained(huggingface_repo_id_or_path, )
+model, params = AutoEasyDeLModelForCausalLM.from_pretrained(huggingface_repo_id_or_path, )
 
 max_length = 2048
 tokenizer = AutoTokenizer.from_pretrained(
@@ -56,8 +56,8 @@ train_arguments = TrainArguments(
     configs_to_initialize_model_class=configs_to_initialize_model_class,
     learning_rate=5e-5,
     learning_rate_end=1e-6,
-    optimizer=EasyDelOptimizers.ADAMW,  # "adamw", "lion", "adafactor" are supported
-    scheduler=EasyDelSchedulers.LINEAR,
+    optimizer=EasyDeLOptimizers.ADAMW,  # "adamw", "lion", "adafactor" are supported
+    scheduler=EasyDeLSchedulers.LINEAR,
     # "linear","cosine", "none" ,"warm_up_cosine" and "warm_up_linear"  are supported
     weight_decay=0.01,
     total_batch_size=64,
@@ -66,7 +66,7 @@ train_arguments = TrainArguments(
     do_eval=False,  # it's optional but supported 
     backend="tpu",  # default backed is set to cpu, so you must define you want to use tpu cpu or gpu
     max_length=max_length,  # Note that you have to change this in the model config too
-    gradient_checkpointing=EasyDelGradientCheckPointers.NOTHING_SAVEABLE,
+    gradient_checkpointing=EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
     sharding_array=(1, -1, 1, 1),  # the way to shard model across gpu,cpu or TPUs using sharding array (1, -1, 1, 1)
     # everything training will be in fully FSDP automatic and share data between devices
     remove_ckpt_after_load=True,

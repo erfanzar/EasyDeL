@@ -65,11 +65,12 @@ Here is a table comparing the different sizes of Llama models:
 | Llama 65B | 65 billion |
 | Llama 70B | 70 billion |
 
-## How to Use/Load Them in EasyDel
+## How to Use/Load Them in EasyDeL
 
 ```python
-from EasyDel import AutoEasyDelModelForCausalLM
-model, params = AutoEasyDelModelForCausalLM.from_pretrained(
+from easydel import AutoEasyDeLModelForCausalLM
+
+model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
     'meta-llama/Llama-2-7b',
     # other kwargs
 )
@@ -80,13 +81,13 @@ also keep that in mind that returned `config` includes `.get_partition_rules(fsd
 #### Use With JaxServer
 
 ```python
-from EasyDel.serve import JAXServer, JAXServerConfig
+from easydel.serve import JAXServer, JAXServerConfig
 import jax
 from transformers import AutoTokenizer
 
-from EasyDel import AutoEasyDelModelForCausalLM
+from easydel import AutoEasyDeLModelForCausalLM
 
-model, params = AutoEasyDelModelForCausalLM.from_pretrained(
+model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
     'meta-llama/Llama-2-7b',
     # other kwargs
 )

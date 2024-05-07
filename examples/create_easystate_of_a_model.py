@@ -1,4 +1,4 @@
-from EasyDel import EasyDelState
+from easydel import EasyDeLState
 import jax
 from jax.sharding import PartitionSpec
 from typing import Sequence, Optional
@@ -23,7 +23,7 @@ def load_model(
         input_shape: Sequence[int] = (1, 1),
         backend: Optional[str] = None,
 ):
-    state = EasyDelState.from_pretrained(
+    state = EasyDeLState.from_pretrained(
         pretrained_model_name_or_path=pretrained_model_name_or_path,
         device=device,
         dtype=dtype,

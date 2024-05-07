@@ -1,6 +1,6 @@
 import transformers
 
-from src.python.EasyDel import EasyServe, EasyServeConfig, MixtralConfig, FlaxMixtralForCausalLM
+from src.python.easydel import EasyServe, EasyServeConfig, MixtralConfig, FlaxMixtralForCausalLM
 from jax import numpy as jnp, lax
 
 

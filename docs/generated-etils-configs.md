@@ -1,2 +1,2 @@
 # etils.configs
-::: src.python.EasyDel.etils.configs
+::: src.python.EasyDeL.etils.configs

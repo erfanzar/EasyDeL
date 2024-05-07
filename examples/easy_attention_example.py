@@ -5,8 +5,8 @@ import jax
 from fjformer import GenerateRNG
 from jax import numpy as jnp, random, lax
 
-from EasyDel.modules.attention_module import AttentionModule
-from EasyDel.modules.easydel_modelling_utils import EasyDelPretrainedConfig
+from easydel.modules.attention_module import AttentionModule
+from easydel.modules.easydel_modelling_utils import EasyDeLPretrainedConfig
 
 BATCH_SIZE = len(jax.devices())
 NUM_ATTN_HEADS = 32
@@ -16,7 +16,7 @@ HEAD_DIM = 256
 
 def main():
     rng_gen = GenerateRNG(seed=42)
-    config = EasyDelPretrainedConfig(
+    config = EasyDeLPretrainedConfig(
         axis_dims=(1, -1, 1, 1),
         axis_names=("dp", "fsdp", "tp", "sp"),
         block_q=512,

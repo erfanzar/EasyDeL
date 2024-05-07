@@ -1,4 +1,4 @@
-from EasyDel import EasyDelState
+from easydel import EasyDeLState
 import jax
 from jax.sharding import PartitionSpec
 from typing import Sequence, Optional
@@ -10,7 +10,7 @@ def load_model(
         state_shard_fns=None,  # You can pass that
         init_optimizer_state: bool = False
 ):
-    state = EasyDelState.load_state(
+    state = EasyDeLState.load_state(
         checkpoint_path=checkpoint_path,
         verbose=verbose,
         state_shard_fns=state_shard_fns,  # You can pass that

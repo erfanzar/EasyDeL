@@ -6,7 +6,7 @@ import fjformer.linen.linen
 import jax
 from jax import numpy as jnp
 
-from src.python.EasyDel import EasyDelState, FlaxLlamaForCausalLM, LlamaConfig, DPOTrainer, TrainArguments
+from src.python.easydel import EasyDeLState, FlaxLlamaForCausalLM, LlamaConfig, DPOTrainer, TrainArguments
 
 from typing import Dict, Optional
 
@@ -105,12 +105,12 @@ def main():
             ["kernel", "embedding"],
             ref_module.params,
         )
-        state = EasyDelState.load(
+        state = EasyDeLState.load(
             module=module,
             apply_fn=module.__call__,
             params={"params": module.params}
         )
-        ref_state = EasyDelState.load(
+        ref_state = EasyDeLState.load(
             module=ref_module,
             apply_fn=ref_module.__call__,
             params={"params": ref_module.params}

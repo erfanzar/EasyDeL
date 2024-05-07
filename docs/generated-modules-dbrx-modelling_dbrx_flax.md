@@ -1,2 +1,2 @@
 # modules.dbrx.modelling_dbrx_flax
-::: src.python.EasyDel.modules.dbrx.modelling_dbrx_flax
+::: src.python.EasyDeL.modules.dbrx.modelling_dbrx_flax

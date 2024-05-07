@@ -3,7 +3,7 @@ import os
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 import flax.core
 
-from src.python.EasyDel import (
+from src.python.easydel import (
     CausalLanguageModelTrainer,
     TrainArguments,
     FlaxMixtralForCausalLM,

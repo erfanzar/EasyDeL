@@ -1,10 +1,10 @@
-from EasyDel import (
-    AutoEasyDelModelForCausalLM,
+from easydel import (
+    AutoEasyDeLModelForCausalLM,
     TrainArguments,
     CausalLanguageModelTrainer,
-    EasyDelOptimizers,
-    EasyDelSchedulers,
-    EasyDelGradientCheckPointers,
+    EasyDeLOptimizers,
+    EasyDeLSchedulers,
+    EasyDeLGradientCheckPointers,
     get_modules_by_type
 )
 from datasets import load_dataset
@@ -23,7 +23,7 @@ def launch():
     pretrained_model_name_or_path = "openlm-research/open_llama_3b_v2"  # You can change this to any other models
     # that you want like falcon mistral gpt etc...
     device_num = len(jax.devices())
-    model, params = AutoEasyDelModelForCausalLM.from_pretrained(
+    model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
         pretrained_model_name_or_path,
         device=jax.devices('cpu')[0],
         input_shape=(device_num, 1),
@@ -88,12 +88,12 @@ def launch():
         learning_rate=8e-5,
         learning_rate_end=5e-05,
         warmup_steps=200,
-        optimizer=EasyDelOptimizers.ADAMW,
-        scheduler=EasyDelSchedulers.LINEAR,
+        optimizer=EasyDeLOptimizers.ADAMW,
+        scheduler=EasyDeLSchedulers.LINEAR,
         weight_decay=0.02,
         total_batch_size=16,
         max_sequence_length=max_sequence_length,
-        gradient_checkpointing=EasyDelGradientCheckPointers.NOTHING_SAVEABLE,
+        gradient_checkpointing=EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
         sharding_array=(1, -1, 1, 1),
         gradient_accumulation_steps=2,
         dtype=jnp.bfloat16,

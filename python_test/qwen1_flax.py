@@ -1,16 +1,16 @@
 import jax
 
 try:
-    from src.python.EasyDel import Qwen1Config, FlaxQwen1ForCausalLM
-    from src.python.EasyDel.transform.easydel_transform import huggingface_to_easydel
+    from src.python.easydel import Qwen1Config, FlaxQwen1ForCausalLM
+    from src.python.easydel.transform.easydel_transform import huggingface_to_easydel
 except ModuleNotFoundError:
     import sys
     from pathlib import Path
 
     cp = Path.cwd().__str__()
     sys.path.append(cp)
-    from src.python.EasyDel import Qwen1Config, FlaxQwen1ForCausalLM
-    from src.python.EasyDel.transform.easydel_transform import huggingface_to_easydel
+    from src.python.easydel import Qwen1Config, FlaxQwen1ForCausalLM
+    from src.python.easydel.transform.easydel_transform import huggingface_to_easydel
 from jax import numpy as jnp
 from transformers import AutoModelForCausalLM, AutoConfig
 import torch
@@ -76,7 +76,7 @@ def main():
     torch_output = torch_output.logits.cpu().detach().numpy()
     res = jnp.allclose(torch_output, flax_output.logits, atol=1e-5)
     print("Qwen 1 Huggingface Predictions :\n", torch_output,
-          "\nEasyDel Predictions: \n", flax_output.logits)
+          "\neasydel Predictions: \n", flax_output.logits)
     if res:
         print("\033[1;36mTest Passed Unfortunately 🥳")
     else:

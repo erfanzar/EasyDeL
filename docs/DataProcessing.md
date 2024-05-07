@@ -1,10 +1,10 @@
 ## Data Processing
 
-here in this case you will see an example data required by EasyDel to pre-train or fine-tune models
+here in this case you will see an example data required by EasyDeL to pre-train or fine-tune models
 
 ```python
 from datasets import load_dataset
-from EasyDel.data_preprocessing import DataProcessor, DataProcessorArguments
+from easydel.data_preprocessing import DataProcessor, DataProcessorArguments
 from transformers import LlamaTokenizerFast
 
 

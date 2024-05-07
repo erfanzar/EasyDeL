@@ -1,7 +1,7 @@
 """
 The Apache v2.0 License 
 Copyright (c) Erfan zare Chavoshi
-EasyDel Library [MOJO/EasyDel]
+EasyDeL Library [MOJO/EasyDeL]
 """
 
 from .in_out import File, BufReader

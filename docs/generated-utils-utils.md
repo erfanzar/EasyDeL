@@ -1,2 +1,2 @@
 # utils.utils
-::: src.python.EasyDel.utils.utils
+::: src.python.EasyDeL.utils.utils
