@@ -1,2 +1,2 @@
 # modules.mixtral.mixtral_configuration
-::: lib.python.EasyDel.modules.mixtral.mixtral_configuration
+::: src.python.EasyDeL.modules.mixtral.mixtral_configuration

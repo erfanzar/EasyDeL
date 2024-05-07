@@ -1,11 +1,11 @@
-from EasyDel import (
-    AutoEasyDelModelForCausalLM,
+from easydel import (
+    AutoEasyDeLModelForCausalLM,
     TrainArguments,
     CausalLanguageModelTrainer,
-    EasyDelOptimizers,
-    EasyDelSchedulers,
-    EasyDelGradientCheckPointers,
-    EasyDelState,
+    EasyDeLOptimizers,
+    EasyDeLSchedulers,
+    EasyDeLGradientCheckPointers,
+    EasyDeLState,
     EasyDeLXRapTureConfig,
     get_modules_by_type,
     easystate_to_huggingface_model
@@ -22,7 +22,7 @@ from transformers import GemmaForCausalLM as ModuleTorch
 def main(use_lora=False):
     pretrained_model_name_or_path = "google/gemma-2b-it"
 
-    model, params = AutoEasyDelModelForCausalLM.from_pretrained(
+    model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
         pretrained_model_name_or_path,
         device=jax.devices('cpu')[0],
         input_shape=(1, 1),
@@ -108,12 +108,12 @@ def main(use_lora=False):
         learning_rate=5e-5,
         learning_rate_end=7e-6,
         warmup_steps=200,
-        optimizer=EasyDelOptimizers.ADAMW,
-        scheduler=EasyDelSchedulers.LINEAR,
+        optimizer=EasyDeLOptimizers.ADAMW,
+        scheduler=EasyDeLSchedulers.LINEAR,
         weight_decay=0.02,
         total_batch_size=64,
         max_sequence_length=max_length,
-        gradient_checkpointing=EasyDelGradientCheckPointers.NOTHING_SAVEABLE,
+        gradient_checkpointing=EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
         sharding_array=(1, -1, 1, 1),
         gradient_accumulation_steps=1,
 
@@ -151,7 +151,7 @@ def main(use_lora=False):
     output.state.save_state("Jupyter-State.easy")
     with jax.default_device(jax.devices("cpu")[0]):
         model = easystate_to_huggingface_model(
-            state=EasyDelState.load_state(
+            state=EasyDeLState.load_state(
                 "Jupyter-State.easy"
             ),
             base_huggingface_module=ModuleTorch,

@@ -5,7 +5,7 @@
 import jax
 
 try:
-    from lib.python.EasyDel import AutoEasyDelModelForCausalLM, AutoEasyDelConfig, get_modules_by_type, \
+    from src.python.easydel import AutoEasyDeLModelForCausalLM, AutoEasyDeLConfig, get_modules_by_type, \
         AutoShardAndGatherFunctions
 except ModuleNotFoundError:
     import sys
@@ -13,7 +13,7 @@ except ModuleNotFoundError:
 
     cp = Path.cwd().__str__()
     sys.path.append(cp)
-    from lib.python.EasyDel import AutoEasyDelModelForCausalLM, AutoEasyDelConfig, get_modules_by_type, \
+    from src.python.easydel import AutoEasyDeLModelForCausalLM, AutoEasyDeLConfig, get_modules_by_type, \
         AutoShardAndGatherFunctions
 
 from fjformer import make_shard_and_gather_fns, match_partition_rules
@@ -21,7 +21,7 @@ from fjformer import make_shard_and_gather_fns, match_partition_rules
 
 def main():
     model_id = "erfanzar/LLamaStory-70M"
-    config = AutoEasyDelConfig.from_pretrained(
+    config = AutoEasyDeLConfig.from_pretrained(
         pretrained_model_name_or_path=model_id
     )
     _, module, _ = get_modules_by_type(
@@ -35,7 +35,7 @@ def main():
     shard_fns, gather_fns = AutoShardAndGatherFunctions.from_config(
         config=config
     )
-    model, params = AutoEasyDelModelForCausalLM.from_pretrained(model_id, shard_fns=shard_fns)
+    model, params = AutoEasyDeLModelForCausalLM.from_pretrained(model_id, shard_fns=shard_fns)
 
 
 if __name__ == "__main__":

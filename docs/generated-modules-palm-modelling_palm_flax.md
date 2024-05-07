@@ -1,2 +1,2 @@
 # modules.palm.modelling_palm_flax
-::: lib.python.EasyDel.modules.palm.modelling_palm_flax
+::: src.python.EasyDeL.modules.palm.modelling_palm_flax

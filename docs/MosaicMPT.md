@@ -56,13 +56,13 @@ The MosaicMPT models can be used for a variety of tasks, including:
 **Availability**
 
 The MosaicMPT models are available through the Hugging Face Hub. The models are also available in the TensorFlow Hub,
-the PyTorch Hub and EasyDel.
+the PyTorch Hub and EasyDeL.
 
 **Conclusion**
 
 The MosaicMPT models are a powerful family of LLMs that can be used for a variety of tasks. The models are open source
 and available for free, making them a valuable resource for researchers and developers.
 
-## How to Use/Load Them in EasyDel
+## How to Use/Load Them in EasyDeL
 
 ### Open an issue or a request to update this section 

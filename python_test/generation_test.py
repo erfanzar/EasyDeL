@@ -6,14 +6,14 @@ import flax.traverse_util
 from fjformer import make_shard_and_gather_fns, match_partition_rules
 
 try:
-    import lib.python.EasyDel as ed
+    import src.python.easydel as ed
 except ModuleNotFoundError:
     import sys
     from pathlib import Path
 
     cp = Path.cwd().__str__()
     sys.path.append(cp)
-    import lib.python.EasyDel as ed
+    import src.python.easydel as ed
 
 from jax import numpy as jnp
 import torch
@@ -75,7 +75,7 @@ class EasyModelsGenerationTest(TestCase):
             "sharded_vanilla",
             "wise_ring",
             "blockwise"
-        ] = "sharded_vanilla"
+        ] = "local_ring"
         self.block_k: int = 64
         self.block_q: int = 64
         self.scan_mlp_chunk_size = self.sequence_length // 2

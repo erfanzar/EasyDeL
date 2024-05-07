@@ -1,2 +1,2 @@
 # transform.easydel_transform
-::: lib.python.EasyDel.transform.easydel_transform
+::: src.python.EasyDeL.transform.easydel_transform

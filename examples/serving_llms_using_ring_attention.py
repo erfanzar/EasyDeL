@@ -1,4 +1,4 @@
-from EasyDel import JAXServer, JAXServerConfig
+from easydel import JAXServer, JAXServerConfig
 import jax
 from jax import numpy as jnp, lax
 

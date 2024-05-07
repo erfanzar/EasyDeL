@@ -1,4 +1,4 @@
-from EasyDel import AutoEasyDelModelForCausalLM
+from easydel import AutoEasyDeLModelForCausalLM
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import jax
 import torch

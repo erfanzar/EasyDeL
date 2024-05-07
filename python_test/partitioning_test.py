@@ -11,7 +11,7 @@ os.environ["XLA_FLAGS"] = '--xla_force_host_platform_device_count=8'
 
 import jax
 from fjformer import get_jax_mesh, get_mem, initialise_tracking, make_shard_and_gather_fns, match_partition_rules
-from EasyDel.modules import FlaxLlamaForCausalLM, LlamaConfig
+from easydel.modules import FlaxLlamaForCausalLM, LlamaConfig
 from typing import Union, Tuple, Sequence, Optional
 from jax.sharding import PartitionSpec
 

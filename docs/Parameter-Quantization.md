@@ -53,7 +53,7 @@ let assume we want to run `Qwen/Qwen1.5-7B-Chat`
 
 ```python
 from jax import numpy as jnp
-from EasyDel import AutoEasyDelModelForCausalLM, create_generate_function
+from easydel import AutoEasyDeLModelForCausalLM, create_generate_function
 
 from transformers import AutoTokenizer, GenerationConfig
 
@@ -61,7 +61,7 @@ import pickle
 import torch
 
 repo_id = "Qwen/Qwen1.5-7B-Chat"
-model, params = AutoEasyDelModelForCausalLM.from_pretrained(
+model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
     repo_id,
     sharding_axis_dims=(1, 1, 1, -1),
     config_kwargs=dict(
@@ -138,7 +138,7 @@ pickle.dump((model, params, tokenizer), open("EasyDeL-Qwen7B-Chat", "wb"))
 ```python
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
-from EasyDel import JAXServer, JAXServerConfig
+from easydel import JAXServer, JAXServerConfig
 
 import torch
 

@@ -1,2 +1,2 @@
 # trainer.sft.stf_trainer
-::: lib.python.EasyDel.trainer.sft.stf_trainer
+::: src.python.EasyDeL.trainer.sft.stf_trainer

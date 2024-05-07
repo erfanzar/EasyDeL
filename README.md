@@ -1,60 +1,71 @@
 # EasyDeL 🔮
 
-EasyDeL, an open-source library, is specifically designed to enhance and streamline the training process of machine
-learning models. It focuses primarily on Jax/Flax and aims to provide convenient and effective solutions for training
-Flax/Jax Models on TPU/GPU for both Serving and Training purposes. Additionally, EasyDeL will support mojo and will be
-rewritten for mojo as well.
+EasyDeL is an open-source framework designed to enhance and streamline the training process of machine learning models.
+With a primary focus on Jax/Flax, EasyDeL aims to provide convenient and effective solutions for training Flax/Jax
+models on TPU/GPU for both serving and training purposes.
 
-Some of the key features provided by EasyDeL include:
+## Key Features
 
-- DPOTrainer, ORPOTrainer (Beta But soon be added), SFTTrainer, and VideoCLM Trainers
-- Serving and API Engines for Using and serving LLMs in JAX as efficiently as possible.
-- Support Quantization Methods for all the Models.
-- Support for 8, 6, and 4 BIT Operation, for inference and training in JAX
-- A wide range of models in Jax is supported which have never been implemented before such as Falcon, Qwen2, Phi2,
-  Mixtral, Qwen2Moe, Cohere,and MPT ...
-- Integration of flashAttention in JAX for GPUs and TPUs
-- Automatic serving of LLMs with mid and high-level APIs in both JAX and PyTorch
-- LLM Trainer and fine-tuner in JAX
-- Video CLM Trainer and Fine-tuner for Models such Falcon, Qwen2, Phi2, MPT, Mixtral, Grok-1, and Qwen2Moe ...
-- RLHF (Reinforcement Learning from Human Feedback) in Jax (Beta Stage)
-- Various other features to enhance the training process and optimize performance.
-- LoRA: Low-Rank Adaptation of Large Language Models
-- RingAttention, Flash Attention, BlockWise FFN, and Efficient Attention are supported for more than 90 % of models
-  ([FJFormer](https://github.com/erfanzar/FJFormer) Backbone).
-- Serving and API Engines for Using and serving LLMs in JAX as efficient as possible.
-- Automatic Converting Models from JAX-EasyDeL to PyTorch-HF and reverse
+1. **Trainers**: EasyDeL offers a range of trainers, including DPOTrainer, ORPOTrainer, SFTTrainer, and VideoCLM
+   Trainer, tailored for specific training requirements.
+
+2. **Serving and API Engines**: EasyDeL provides serving and API engines for efficiently using and serving large
+   language models (LLMs) in JAX, enabling seamless integration into various applications.
+
+3. **Quantization Support**: EasyDeL supports quantization methods for all models, allowing for efficient inference and
+   training.
+
+4. **Bit Operation Support**: EasyDeL supports 8, 6, and 4-bit operations for inference and training in JAX, optimizing
+   performance and resource utilization.
+
+5. **Diverse Model Support**: EasyDeL offers a wide range of models in JAX that have never been implemented before, such
+   as Falcon, Qwen2, Phi2, Mixtral, Qwen2Moe, Cohere, Dbrx, Phi3, and MPT.
+
+6. **FlashAttention Integration**: EasyDeL integrates FlashAttention in JAX for GPUs and TPUs, enhancing performance and
+   efficiency.
+
+7. **Automatic LLM Serving**: EasyDeL enables automatic serving of LLMs with mid and high-level APIs in both JAX and
+   PyTorch, simplifying deployment and integration.
+
+8. **LLM Training and Fine-tuning**: EasyDeL provides LLM trainer and fine-tuner capabilities in JAX, allowing for
+   efficient training and customization of language models.
+
+9. **Video CLM Training and Fine-tuning**: EasyDeL supports Video CLM trainer and fine-tuner for models such as Falcon,
+   Qwen2, Phi2, MPT, Mixtral, Grok-1, and Qwen2Moe, enabling advanced video-related applications.
+
+10. **Performance Optimization**: EasyDeL provides various features to enhance the training process and optimize
+    performance, such as LoRA (Low-Rank Adaptation of Large Language Models), RingAttention, FlashAttention, BlockWise
+    FFN, and Efficient Attention support (through the FJFormer backbone).
+
+11. **Model Conversion**: EasyDeL supports automatic conversion of models from JAX-EasyDeL to PyTorch-HF and vice versa,
+    facilitating seamless integration with different frameworks.
+
+With its comprehensive set of features and tools, EasyDeL aims to streamline and accelerate the training and deployment
+of machine learning models, particularly in the domain of large language models and video-related applications.
 
 > **News**
 >
-
-[//]: # (> `ORPOTrainer` is Added)
-
-[//]: # (>)
+> EasyDeL project structure has changed now you have to import EasyDel as `easydel`.
+>
+> `ORPOTrainer` is Added
+>
 > Phi3 Model bugs are fixed, Arctic Model is added.
+
+> [!TIP]
 >
-> Phi3 Model is present Now Apr 24 2024
->
-> Dbrx Model is present
-> Now [Apr 23 2024](https://github.com/erfanzar/EasyDeL/commit/4c1c5af099dad9334a82808eb04b03e7e567ddb7)
->
-> New Attention Types are added `sharded_vanilla`, `wise_ring`, `sharded_vanilla` is same as `vanilla` but
-> uses shard_map which will make it a little faster and more efficent.
->
-> `local_ring` is Added which is Ring Attention but for TPU/GPU/CPU(s) and support attention bias instead of attention
-> mask, `normal` attention is renamed to `vanilla`.
->
-> `load_in_8bit` is now available for all the models, and requires to upgrade _fjformer to 0.0.50_
->
-> Sharing Key and Value Cache for Large Sequence Length across devices are now Fixed (Attention Models).
->
-> Cohere Model added [Apr 14 2024](https://github.com/erfanzar/EasyDeL/commit/06acb4a1afd7b67982a88b50840b90e73b1c9850)
+> use `ed.AttentionModule.test_attentions()` to find the best attention mechanism 
+> that works for you
+> ```python
+> import easydel as ed
+> ed.AttentionModule.test_attentions()
+> ```
+
 
 ## Documentation 💫
 
 > [!IMPORTANT]
 > Documents and Examples are ready at [Here](https://erfanzar.github.io/EasyDeL)
-> Please have that in mind that EasyDel is in the loop of fast-development
+> Please have that in mind that EasyDeL is in the loop of fast-development
 > so we might have API changes.
 
 ### Hands on Code Kaggle Examples
@@ -76,7 +87,7 @@ python -m examples.jax_serve_example \
   --prompter_type="gemma" \ 
   --share_gradio=True \ 
   --sharding_axis_dims=1,1,1,-1 \
-  --attn_mechanism="sharded_vanilla" \
+  --attn_mechanism="local_ring" \
   --scan_ring_attention=True \
   --max_sequence_length=8192 \ 
   --max_new_tokens_ratio=25 \
@@ -97,12 +108,12 @@ EasyDeL supports both DPO and SFT Trainers, so dealing with LLMs in jax is a lot
 let have an example of using Supervised Fine-Tuner in JAX with EasyDeL
 
 ```python
-from EasyDel import (
+from easydel import (
     TrainArguments,
-    AutoEasyDelModelForCausalLM,
-    EasyDelOptimizers,
-    EasyDelSchedulers,
-    EasyDelGradientCheckPointers,
+    AutoEasyDeLModelForCausalLM,
+    EasyDeLOptimizers,
+    EasyDeLSchedulers,
+    EasyDeLGradientCheckPointers,
     SFTTrainer,
     conversations_formatting_function  # i have added this one for newcomers so if they 
     # don't know what's going on they can use this pre created prompter
@@ -114,7 +125,7 @@ from transformers import AutoTokenizer
 
 huggingface_repo_id_or_path = "mistralai/Mistral-7B-Instruct-v0.2"
 
-model, params = AutoEasyDelModelForCausalLM.from_pretrained(huggingface_repo_id_or_path, )
+model, params = AutoEasyDeLModelForCausalLM.from_pretrained(huggingface_repo_id_or_path, )
 
 max_length = 4096
 tokenizer = AutoTokenizer.from_pretrained(
@@ -136,8 +147,8 @@ train_arguments = TrainArguments(
     configs_to_initialize_model_class=configs_to_initialize_model_class,
     learning_rate=5e-5,
     learning_rate_end=1e-6,
-    optimizer=EasyDelOptimizers.ADAMW,
-    scheduler=EasyDelSchedulers.WARM_UP_COSINE,
+    optimizer=EasyDeLOptimizers.ADAMW,
+    scheduler=EasyDeLSchedulers.WARM_UP_COSINE,
     weight_decay=0.01,
     total_batch_size=32,
     max_training_steps=None,  # None to let trainer Decide
@@ -145,7 +156,7 @@ train_arguments = TrainArguments(
     do_eval=False,  # it's optional but supported 
     backend="tpu",  # default backed is set to cpu, so you must define you want to use tpu cpu or gpu
     max_length=max_length,  # Note that you have to change this in the model config too
-    gradient_checkpointing=EasyDelGradientCheckPointers.NOTHING_SAVEABLE,
+    gradient_checkpointing=EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
     sharding_array=(1, -1, 1, 1),  # the way to shard model across gpu,cpu or TPUs using sharding array (1, -1, 1, 1)
     # everything training will be in sequence and model parallel automatic and share data between devices
     remove_ckpt_after_load=True,
@@ -166,10 +177,9 @@ trainer = SFTTrainer(
     eval_dataset=None,  # we don't have eval dataset rn :)
     tokenizer=tokenizer,
     dataset_text_field=None,
-
     formatting_func=prompter,
-    packing=False,
-    num_of_sequences=1024,
+    packing=True,
+    num_of_sequences=max_length,
 )
 
 output = trainer.train(flax.core.FrozenDict({"params": params}))
@@ -181,7 +191,7 @@ print(f"Hey ! , here's where your model saved {output.checkpoint_path}")
 
 ## FineTuning
 
-with using EasyDel FineTuning LLM (CausalLanguageModels) are easy as much as possible with using Jax and Flax
+with using EasyDeL FineTuning LLM (CausalLanguageModels) are easy as much as possible with using Jax and Flax
 and having the benefit of TPUs for the best speed here's a simple code to use in order to finetune your
 own Model
 
@@ -189,13 +199,13 @@ Days Has Been Passed and now using easydel in Jax is way more similar to HF/PyTo
 now it's time to finetune our model
 
 ```python
-from EasyDel import (
+from easydel import (
     TrainArguments,
     CausalLanguageModelTrainer,
-    AutoEasyDelModelForCausalLM,
-    EasyDelOptimizers,
-    EasyDelSchedulers,
-    EasyDelGradientCheckPointers
+    AutoEasyDeLModelForCausalLM,
+    EasyDeLOptimizers,
+    EasyDeLSchedulers,
+    EasyDeLGradientCheckPointers
 )
 from datasets import load_dataset
 import flax
@@ -204,7 +214,7 @@ from transformers import AutoTokenizer
 
 huggingface_repo_id_or_path = "TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T"
 
-model, params = AutoEasyDelModelForCausalLM.from_pretrained(huggingface_repo_id_or_path, )
+model, params = AutoEasyDeLModelForCausalLM.from_pretrained(huggingface_repo_id_or_path, )
 
 max_length = 2048
 tokenizer = AutoTokenizer.from_pretrained(
@@ -226,8 +236,8 @@ train_arguments = TrainArguments(
     configs_to_initialize_model_class=configs_to_initialize_model_class,
     learning_rate=5e-5,
     learning_rate_end=1e-6,
-    optimizer=EasyDelOptimizers.ADAMW,  # "adamw", "lion", "adafactor" are supported
-    scheduler=EasyDelSchedulers.LINEAR,
+    optimizer=EasyDeLOptimizers.ADAMW,  # "adamw", "lion", "adafactor" are supported
+    scheduler=EasyDeLSchedulers.LINEAR,
     # "linear","cosine", "none" ,"warm_up_cosine" and "warm_up_linear"  are supported
     weight_decay=0.01,
     total_batch_size=64,
@@ -236,7 +246,7 @@ train_arguments = TrainArguments(
     do_eval=False,  # it's optional but supported 
     backend="tpu",  # default backed is set to cpu, so you must define you want to use tpu cpu or gpu
     max_length=max_length,  # Note that you have to change this in the model config too
-    gradient_checkpointing=EasyDelGradientCheckPointers.NOTHING_SAVEABLE,
+    gradient_checkpointing=EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
     sharding_array=(1, -1, 1, 1),  # the way to shard model across gpu,cpu or TPUs using sharding array (1, -1, 1, 1)
     # everything training will be in sequence and model parallel automatic and share data between devices
     remove_ckpt_after_load=True,
@@ -301,15 +311,15 @@ To use EasyDeL in your project, you will need to import the library in your Pyth
 and classes. Here is an example of how to import EasyDeL and use its Model class:
 
 ```python
-from EasyDel.modules import AutoEasyDelModelForCausalLM
-from EasyDel.serve import JAXServer
+from easydel.modules import AutoEasyDeLModelForCausalLM
+from easydel.serve import JAXServer
 from transformers import AutoTokenizer
 import jax
 
 model_huggingface_repo_id = "meta-llama/Llama.md-2-7b-chat-hf"
 
 tokenizer = AutoTokenizer.from_pretrained(model_huggingface_repo_id, trust_remote_code=True)
-model, params = AutoEasyDelModelForCausalLM.from_pretrained(
+model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
     model_huggingface_repo_id,
     jax.devices("cpu")[0],
     jax.numpy.float16,
@@ -347,13 +357,13 @@ you can fine-tune your own model with DPOTrainer
 > DPO Tuning a Mixtral model with Intel DPO dataset.
 
 ```python
-from EasyDel import (
+from easydel import (
     TrainArguments,
-    EasyDelOptimizers,
-    EasyDelSchedulers,
-    EasyDelGradientCheckPointers,
+    EasyDeLOptimizers,
+    EasyDeLSchedulers,
+    EasyDeLGradientCheckPointers,
     DPOTrainer,
-    EasyDelState,
+    EasyDeLState,
     easystate_to_huggingface_model
 )
 
@@ -459,11 +469,11 @@ arguments = TrainArguments(
     learning_rate=1e-4,
     learning_rate_end=3e-5,
     warmup_steps=200,
-    optimizer=EasyDelOptimizers.ADAMW,
-    scheduler=EasyDelSchedulers.LINEAR,
+    optimizer=EasyDeLOptimizers.ADAMW,
+    scheduler=EasyDeLSchedulers.LINEAR,
     weight_decay=0.02,
     total_batch_size=128,
-    gradient_checkpointing=EasyDelGradientCheckPointers.NOTHING_SAVEABLE,
+    gradient_checkpointing=EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
     sharding_array=sharding_axis_dims,
     fully_sharded_data_parallel=True,
     gradient_accumulation_steps=2,
@@ -488,7 +498,7 @@ if tokenizer.pad_token_id is None:
 train_dataset = get_hh("train", sanity_check=True)
 eval_dataset = get_hh("test", sanity_check=True)
 
-state = EasyDelState.from_pretrained(
+state = EasyDeLState.from_pretrained(
     pretrained_model_name_or_path=model_name_or_path,
     dtype=dtype,
     param_dtype=dtype,
@@ -503,7 +513,7 @@ state = EasyDelState.from_pretrained(
     attention_partition_spec=attention_partition_spec,
 )
 
-ref_state = EasyDelState.from_pretrained(
+ref_state = EasyDeLState.from_pretrained(
     pretrained_model_name_or_path=ref_model_name_or_path,
     dtype=dtype,
     param_dtype=dtype,
@@ -548,7 +558,7 @@ easydel_jax_model = output.state  # Here's you EasyDeL Model
 
 with jax.default_device(jax.devices("cpu")[0]):
     model = easystate_to_huggingface_model(
-        state=EasyDelState.load_state(
+        state=EasyDeLState.load_state(
             output.checkpoint_path
         ),
         base_huggingface_module=module_pt,
@@ -565,22 +575,22 @@ now you have trained your first model Using DPOTrainer in JAX with EasyDeL.
 > The API of EasyDeL DPO Trainer is similar to DPO Trainer in TRL from HuggingFace so that means
 > you have freedom and have access to a hackable and changeable code.
 
-## EasyDelState
+## EasyDeLState
 
-EasyDelState is new and cool feature in EasyDeL and have a lot of options like
+EasyDeLState is new and cool feature in EasyDeL and have a lot of options like
 storing `Model Parameters`, _Optimizer State,
 Model Config, Model Type, Optimizer and Scheduler Configs_
 
-Let see and examples of using EasyDelState
+Let see and examples of using EasyDeLState
 
 ### Fine-tuning
 
 Fine-tuning from a previous State or a new state
 
 ```python
-from EasyDel import (
-    AutoEasyDelConfig,
-    EasyDelState
+from easydel import (
+    AutoEasyDeLConfig,
+    EasyDeLState
 )
 from transformers import AutoTokenizer
 from jax import numpy as jnp, lax
@@ -589,7 +599,7 @@ import jax
 huggingface_model_repo_id = "REPO_ID"
 checkpoint_name = "CKPT_NAME"
 
-state = EasyDelState.from_pretrained(
+state = EasyDeLState.from_pretrained(
     pretrained_model_name_or_path=huggingface_model_repo_id,
     filename=checkpoint_name,
     optimizer="adamw",
@@ -617,7 +627,7 @@ state = EasyDelState.from_pretrained(
     state_shard_fns=None,
 )
 
-config = AutoEasyDelConfig.from_pretrained(
+config = AutoEasyDeLConfig.from_pretrained(
     huggingface_model_repo_id
 )
 
@@ -636,35 +646,35 @@ configs_to_initialize_model_class = {
 }
 ```
 
-`EasyDelState` also has `.load_state()` and `.save_state()` with some other usable options like `.free_opt_state()`
+`EasyDeLState` also has `.load_state()` and `.save_state()` with some other usable options like `.free_opt_state()`
 which
 free optimizer state or `.shard_params()` which shard parameters you can read docs in order to find out more about these
 options.
 
 ### Converting to Huggingface and Pytorch
 
-Let see how you can convert a EasyDelMistral Model to Huggingface Pytorch Mistral Model from a trained State
+Let see how you can convert a EasyDeLMistral Model to Huggingface Pytorch Mistral Model from a trained State
 
 ```python
 
 from transformers import MistralForCausalLM
-from EasyDel import (
-    AutoEasyDelConfig,
-    EasyDelState,
+from easydel import (
+    AutoEasyDeLConfig,
+    EasyDeLState,
     easystate_to_huggingface_model
 )
 import jax
 
 huggingface_model_repo_id = "REPO_ID"
 
-config = AutoEasyDelConfig.from_pretrained(
+config = AutoEasyDeLConfig.from_pretrained(
     huggingface_model_repo_id
 )
 with jax.default_device(jax.devices("cpu")[0]):
     model = easystate_to_huggingface_model(
-        state=EasyDelState.load_state(
+        state=EasyDeLState.load_state(
             "PATH_TO_CKPT"
-        ),  # You can Pass EasyDelState here
+        ),  # You can Pass EasyDeLState here
         base_huggingface_module=MistralForCausalLM,  # type: ignore
         config=config
     )
@@ -674,7 +684,7 @@ model = model.half()  # it's a huggingface model now
 
 ### Other Use Cases
 
-`EasyDelState` have a general use you can use it everywhere in easydel for example for a stand-alone model
+`EasyDeLState` have a general use you can use it everywhere in easydel for example for a stand-alone model
 , serve, fine-tuning and many other features, it's up to you to test how creative you are 😇.
 
 ## Flash Attention and Splash Attention Are Here 🥵
@@ -682,7 +692,7 @@ model = model.half()  # it's a huggingface model now
 here's a simple example about how can you use Flash Attention in EasyDeL
 
 ```python
-# Config is built in config for every model (EasyDelPretrainedConfig)
+# Config is built in config for every model (EasyDeLPretrainedConfig)
 config.add_basic_configurations(
     attn_mechanism="flash",  # Any supported Attention Mechanism
     block_b=1,
@@ -713,13 +723,13 @@ for LoRA fine-tuning section and use _EasyDeLXRapTure_ in for mistral models wit
 
 ```python
 from flax.core import FrozenDict
-from EasyDel import (
+from easydel import (
     TrainArguments,
     CausalLanguageModelTrainer,
-    AutoEasyDelModelForCausalLM,
-    EasyDelOptimizers,
-    EasyDelSchedulers,
-    EasyDelGradientCheckPointers,
+    AutoEasyDeLModelForCausalLM,
+    EasyDeLOptimizers,
+    EasyDeLSchedulers,
+    EasyDeLGradientCheckPointers,
     EasyDeLXRapTureConfig
 )
 from datasets import load_dataset
@@ -729,7 +739,7 @@ from transformers import AutoTokenizer
 
 huggingface_repo_id_or_path = "mistralai/Mistral-7B-Instruct-v0.1"
 
-model, params = AutoEasyDelModelForCausalLM.from_pretrained(huggingface_repo_id_or_path, )
+model, params = AutoEasyDeLModelForCausalLM.from_pretrained(huggingface_repo_id_or_path, )
 
 max_length = 8196
 model_parameters = FrozenDict({"params": params})
@@ -774,8 +784,8 @@ train_arguments = TrainArguments(
     configs_to_initialize_model_class=configs_to_initialize_model_class,
     learning_rate=1e-4,  # Using higher learning rate is recommended
     learning_rate_end=8e-5,
-    optimizer=EasyDelOptimizers.ADAMW,  # "adamw", "lion", "adafactor" are supported
-    scheduler=EasyDelSchedulers.LINEAR,
+    optimizer=EasyDeLOptimizers.ADAMW,  # "adamw", "lion", "adafactor" are supported
+    scheduler=EasyDeLSchedulers.LINEAR,
     # "linear","cosine", "none" ,"warm_up_cosine" and "warm_up_linear"  are supported
     weight_decay=0.01,
     total_batch_size=512,
@@ -784,7 +794,7 @@ train_arguments = TrainArguments(
     do_eval=False,  # it's optional but supported 
     backend="tpu",  # default backed is set to cpu, so you must define you want to use tpu cpu or gpu
     max_length=max_length,  # Note that you have to change this in the model config too
-    gradient_checkpointing=EasyDelGradientCheckPointers.NOTHING_SAVEABLE,
+    gradient_checkpointing=EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
     sharding_array=(1, -1, 1, 1),  # the way to shard model across gpu,cpu or TPUs using sharding array (1, -1, 1, 1)
     # everything training will be in sequence and model parallel automatic and share data between devices
     remove_ckpt_after_load=True,
@@ -852,7 +862,7 @@ merge them if they are suitable.
 
 ## License 📜
 
-EasyDeL is an Fully Open-Source released under the Apache v2 license. Please see the LICENSE file in the root directory
+EasyDeL is a Fully Open-Source released under the Apache v2 license. Please see the LICENSE file in the root directory
 of this project for
 more information.
 
@@ -867,7 +877,7 @@ To cite this repository:
 ```misc
 @misc{Zare Chavoshi_2023,
     title={EasyDeL, an open-source library, is specifically designed to enhance and streamline the training process of machine learning models. It focuses primarily on Jax/Flax and aims to provide convenient and effective solutions for training Flax/Jax Models on TPU/GPU for both Serving and Training purposes.},
-    url={https://github.com/erfanzar/EasyDel},
+    url={https://github.com/erfanzar/EasyDeL},
     journal={EasyDeL Easy and Fast DeepLearning with JAX},
     publisher={Erfan Zare Chavoshi},
     author={Zare Chavoshi, Erfan},

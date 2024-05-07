@@ -2,7 +2,7 @@ import os
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
-from lib.python.EasyDel import JAXServer, JAXServerConfig
+from src.python.easydel import JAXServer, JAXServerConfig
 import jax
 
 

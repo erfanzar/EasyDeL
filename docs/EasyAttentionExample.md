@@ -8,8 +8,11 @@ the best possible performance and numerical stability, here are some strategies 
 1. Flash Attention TPU known as "flash"
 2. Flash Attention GPU known as "cudnn"
 3. Ring Attention to Support higher context length such 1 Million or above known as "ring"
-4. Normal Attention which use flax.linen.attention with shard map known as "normal"
+4. Normal Attention which use flax.linen.attention with shard map known as "vanilla"
 5. Splash Attention on TPUs which is known as "splash"
+6. Local Ring attention via "local_ring"
+7. Wise Ring attention via "wise_ring"
+8. sharded Attention with shard map known as "sharded_vanilla"
 
 ## Example of Using Flash Attention on TPU
 
@@ -17,13 +20,13 @@ the best possible performance and numerical stability, here are some strategies 
 import jax
 import flax.linen.attention as flt
 from fjformer import GenerateRNG
-from EasyDel.modules.attention_module import AttentionModule
-from EasyDel.modules.easydel_modelling_utils import EasyDelPretrainedConfig
+from easydel.modules.attention_module import AttentionModule
+from easydel.modules.easydel_modelling_utils import EasyDeLPretrainedConfig
 from jax import numpy as jnp, random, lax
 import math
 
 rng_gen = GenerateRNG(seed=42)
-config = EasyDelPretrainedConfig(
+config = EasyDeLPretrainedConfig(
     axis_dims=(1, -1, 1, 1),
     axis_names=("dp", "fsdp", "tp", "sp"),
     block_q=512,

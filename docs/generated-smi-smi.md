@@ -1,2 +1,2 @@
 # smi.smi
-::: lib.python.EasyDel.smi.smi
+::: src.python.EasyDeL.smi.smi

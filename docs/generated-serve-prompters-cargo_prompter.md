@@ -1,2 +1,2 @@
 # serve.prompters.cargo_prompter
-::: lib.python.EasyDel.serve.prompters.cargo_prompter
+::: src.python.EasyDeL.serve.prompters.cargo_prompter

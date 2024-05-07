@@ -1,29 +1,47 @@
-# EasyDeL 🔮
+## EasyDeL 🔮
 
-EasyDeL, an open-source library, is specifically designed to enhance and streamline the training process of machine
-learning models. It focuses primarily on Jax/Flax and aims to provide convenient and effective solutions for training
-Flax/Jax Models on TPU/GPU for both Serving and Training purposes. Additionally, EasyDeL will support mojo and will be
-rewritten for mojo as well.
+EasyDeL is an open-source framework designed to enhance and streamline the training process of machine learning models.
+With a primary focus on Jax/Flax, EasyDeL aims to provide convenient and effective solutions for training Flax/Jax
+models on TPU/GPU for both serving and training purposes.
 
-Some of the key features provided by EasyDeL include:
+## Key Features
 
-- DPOTrainer, SFTTrainer, and VideoCLM Trainers
-- Serving and API Engines for Using and serving LLMs in JAX as efficiently as possible.
-- Support Quantization Methods for all the Models.
-- Support for 8, 6, and 4 BIT Operation, for inference and training in JAX
-- A wide range of models in Jax is supported which have never been implemented before such as Falcon, Qwen2, Phi2,
-  Mixtral, Qwen2Moe, Cohere,and MPT ...
-- Integration of flashAttention in JAX for GPUs and TPUs
-- Automatic serving of LLMs with mid and high-level APIs in both JAX and PyTorch
-- LLM Trainer and fine-tuner in JAX
-- Video CLM Trainer and Fine-tuner for Models such Falcon, Qwen2, Phi2, MPT, Mixtral, Grok-1, and Qwen2Moe ...
-- RLHF (Reinforcement Learning from Human Feedback) in Jax (Beta Stage)
-- Various other features to enhance the training process and optimize performance.
-- LoRA: Low-Rank Adaptation of Large Language Models
-- RingAttention, Flash Attention, BlockWise FFN, and Efficient Attention are supported for more than 90 % of models
-  ([FJFormer](https://github.com/erfanzar/FJFormer) Backbone).
-- Serving and API Engines for Using and serving LLMs in JAX as efficient as possible.
-- Automatic Converting Models from JAX-EasyDeL to PyTorch-HF and reverse
+1. **Trainers**: EasyDeL offers a range of trainers, including DPOTrainer, ORPOTrainer, SFTTrainer, and VideoCLM
+   Trainer, tailored for specific training requirements.
+
+2. **Serving and API Engines**: EasyDeL provides serving and API engines for efficiently using and serving large
+   language models (LLMs) in JAX, enabling seamless integration into various applications.
+
+3. **Quantization Support**: EasyDeL supports quantization methods for all models, allowing for efficient inference and
+   training.
+
+4. **Bit Operation Support**: EasyDeL supports 8, 6, and 4-bit operations for inference and training in JAX, optimizing
+   performance and resource utilization.
+
+5. **Diverse Model Support**: EasyDeL offers a wide range of models in JAX that have never been implemented before, such
+   as Falcon, Qwen2, Phi2, Mixtral, Qwen2Moe, Cohere, Dbrx, Phi3, and MPT.
+
+6. **FlashAttention Integration**: EasyDeL integrates FlashAttention in JAX for GPUs and TPUs, enhancing performance and
+   efficiency.
+
+7. **Automatic LLM Serving**: EasyDeL enables automatic serving of LLMs with mid and high-level APIs in both JAX and
+   PyTorch, simplifying deployment and integration.
+
+8. **LLM Training and Fine-tuning**: EasyDeL provides LLM trainer and fine-tuner capabilities in JAX, allowing for
+   efficient training and customization of language models.
+
+9. **Video CLM Training and Fine-tuning**: EasyDeL supports Video CLM trainer and fine-tuner for models such as Falcon,
+   Qwen2, Phi2, MPT, Mixtral, Grok-1, and Qwen2Moe, enabling advanced video-related applications.
+
+10. **Performance Optimization**: EasyDeL provides various features to enhance the training process and optimize
+    performance, such as LoRA (Low-Rank Adaptation of Large Language Models), RingAttention, FlashAttention, BlockWise
+    FFN, and Efficient Attention support (through the FJFormer backbone).
+
+11. **Model Conversion**: EasyDeL supports automatic conversion of models from JAX-EasyDeL to PyTorch-HF and vice versa,
+    facilitating seamless integration with different frameworks.
+
+With its comprehensive set of features and tools, EasyDeL aims to streamline and accelerate the training and deployment
+of machine learning models, particularly in the domain of large language models and video-related applications.
 
 ## What Makes EasyDeL 🔮 Special
 
@@ -72,7 +90,7 @@ the team with a particular toolset.
 ```misc
 @misc{Zare Chavoshi_2023,
     title={EasyDeL, an open-source library, is specifically designed to enhance and streamline the training process of machine learning models. It focuses primarily on Jax/Flax and aims to provide convenient and effective solutions for training Flax/Jax Models on TPU/GPU for both Serving and Training purposes.},
-    url={https://github.com/erfanzar/EasyDel},
+    url={https://github.com/erfanzar/EasyDeL},
     journal={EasyDeL Easy and Fast DeepLearning with JAX},
     publisher={Erfan Zare Chavoshi},
     author={Zare Chavoshi, Erfan},

@@ -1,18 +1,18 @@
-## EasyDelState
+## EasyDeLState
 
-EasyDelState is a cool feature in easydel and have a lot of options like
+EasyDeLState is a cool feature in easydel and have a lot of options like
 storing `Model Parameters`, _Optimizer State, Model Config, Model Type, Optimizer and Scheduler Configs_
 
-Let see and examples of using EasyDelState
+Let see and examples of using EasyDeLState
 
 ### Fine-tuning
 
 Fine-tuning from a previous State or a new state
 
 ```python
-from EasyDel import (
-    AutoEasyDelConfig,
-    EasyDelState
+from easydel import (
+    AutoEasyDeLConfig,
+    EasyDeLState
 )
 from transformers import AutoTokenizer
 from jax import numpy as jnp, lax
@@ -21,7 +21,7 @@ import jax
 huggingface_model_repo_id = "REPO_ID"
 checkpoint_name = "CKPT_NAME"
 
-state = EasyDelState.from_pretrained(
+state = EasyDeLState.from_pretrained(
     pretrained_model_name_or_path=huggingface_model_repo_id,
     filename=checkpoint_name,
     optimizer="adamw",
@@ -47,7 +47,7 @@ state = EasyDelState.from_pretrained(
     state_shard_fns=None,
 )
 
-config = AutoEasyDelConfig.from_pretrained(
+config = AutoEasyDeLConfig.from_pretrained(
     huggingface_model_repo_id
 )
 
@@ -66,36 +66,36 @@ configs_to_initialize_model_class = {
 }
 ```
 
-`EasyDelState` also has `.load_state()` and `.save_state()` with some other usable options like `.free_opt_state()`
+`EasyDeLState` also has `.load_state()` and `.save_state()` with some other usable options like `.free_opt_state()`
 which
 free optimizer state or `.shard_params()` which shard parameters you can read docs in order to find out more about these
 options.
 
 ### Converting to Huggingface and Pytorch
 
-Let see how you can convert a EasyDelMistral Model to Huggingface Pytorch Mistral Model from a trained State
+Let see how you can convert a EasyDeLMistral Model to Huggingface Pytorch Mistral Model from a trained State
 
 ```python
 
 from transformers import MistralForCausalLM
-from EasyDel import (
-    AutoEasyDelConfig,
-    EasyDelState,
+from easydel import (
+    AutoEasyDeLConfig,
+    EasyDeLState,
     easystate_to_huggingface_model
 )
 import jax
 
 huggingface_model_repo_id = "REPO_ID"
 
-config = AutoEasyDelConfig.from_pretrained(
+config = AutoEasyDeLConfig.from_pretrained(
     huggingface_model_repo_id
 )
 with jax.default_device(jax.devices("cpu")[0]):
     model = easystate_to_huggingface_model(
-        state=EasyDelState.load_state(
+        state=EasyDeLState.load_state(
             "PATH_TO_CKPT",
             input_shape=(8, 2048)
-        ),  # You can Pass EasyDelState here
+        ),  # You can Pass EasyDeLState here
         base_huggingface_module=MistralForCausalLM,
         config=config,
     )
@@ -105,5 +105,5 @@ model = model.half()  # it's a huggingface model now
 
 ### Other Use Cases
 
-`EasyDelState` have a general use you can use it everywhere in easydel for example for a stand-alone model
+`EasyDeLState` have a general use you can use it everywhere in easydel for example for a stand-alone model
 , serve, fine-tuning and many other features, it's up to you to test how creative you are 😇.

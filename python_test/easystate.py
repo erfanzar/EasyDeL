@@ -1,8 +1,8 @@
 import jax
 
-from lib.python.EasyDel import LlamaConfig, FlaxLlamaForCausalLM
-from lib.python.EasyDel import EasyDelState
-from lib.python.EasyDel.etils.auto_tx import get_optimizer_and_scheduler
+from src.python.easydel import LlamaConfig, FlaxLlamaForCausalLM
+from src.python.easydel import EasyDeLState
+from src.python.easydel.etils.auto_tx import get_optimizer_and_scheduler
 
 
 def main():
@@ -30,12 +30,12 @@ def main():
     tx, sc = get_optimizer_and_scheduler(
         **tx_init
     )
-    state = EasyDelState.create(
+    state = EasyDeLState.create(
         params=module.params,
         apply_fn=module.__call__,
         tx=tx,
         tx_init=tx_init,
-        hyperparameters=EasyDelState.create_hyperparameters(
+        hyperparameters=EasyDeLState.create_hyperparameters(
             model_type="llama"
         ),
         module_config=config,
@@ -47,7 +47,7 @@ def main():
 
 
 def load():
-    state = EasyDelState.load_state("state.easy", init_optimizer_state=False, verbose=True)
+    state = EasyDeLState.load_state("state.easy", init_optimizer_state=False, verbose=True)
     print(jax.eval_shape(lambda: state))
 
 
@@ -75,13 +75,13 @@ def eval_shape_create_test():
     )
 
     def create_state():
-        state = EasyDelState.create(
+        state = EasyDeLState.create(
             module_config=config,
             params=module.params,
             tx_init=tx_init,
             apply_fn=module.__call__,
             tx=get_optimizer_and_scheduler(**tx_init)[0],
-            hyperparameters=EasyDelState.create_hyperparameters(model_type=config.model_type),
+            hyperparameters=EasyDeLState.create_hyperparameters(model_type=config.model_type),
             module=module,
             module_config_args=None
         )
