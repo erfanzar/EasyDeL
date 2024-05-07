@@ -584,7 +584,8 @@ class ORPOTrainer(BaseTrainer, ABC):
             create_orpo_step_function(
                 mode="train",
                 beta=self.beta,
-                concatenated_forward=self.concatenated_forward
+                concatenated_forward=self.concatenated_forward,
+                batch_partition_spec=self.arguments.step_partition_spec
             ),
             in_shardings=(state_partition_spec, PartitionSpec()),
             out_shardings=(state_partition_spec, PartitionSpec(),),
@@ -595,7 +596,8 @@ class ORPOTrainer(BaseTrainer, ABC):
             create_orpo_step_function(
                 mode="eval",
                 beta=self.beta,
-                concatenated_forward=self.concatenated_forward
+                concatenated_forward=self.concatenated_forward,
+                batch_partition_spec=self.arguments.step_partition_spec
             ),
             in_shardings=(state_partition_spec, PartitionSpec()),
             out_shardings=(state_partition_spec, PartitionSpec(),),
@@ -684,7 +686,8 @@ class ORPOTrainer(BaseTrainer, ABC):
                             create_orpo_step_function(
                                 mode="train",
                                 beta=self.beta,
-                                concatenated_forward=self.concatenated_forward
+                                concatenated_forward=self.concatenated_forward,
+                                batch_partition_spec=self.arguments.step_partition_spec
                             ),
                             in_shardings=(state_partition_spec, PartitionSpec()),
                             out_shardings=(state_partition_spec, PartitionSpec(),),
@@ -695,7 +698,8 @@ class ORPOTrainer(BaseTrainer, ABC):
                             create_orpo_step_function(
                                 mode="eval",
                                 beta=self.beta,
-                                concatenated_forward=self.concatenated_forward
+                                concatenated_forward=self.concatenated_forward,
+                                batch_partition_spec=self.arguments.step_partition_spec
                             ),
                             in_shardings=(state_partition_spec, PartitionSpec()),
                             out_shardings=(state_partition_spec, PartitionSpec(),),
