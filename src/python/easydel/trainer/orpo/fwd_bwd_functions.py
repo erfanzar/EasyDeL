@@ -81,7 +81,6 @@ def create_concatenated_forward(
             truncation_mode=truncation_mode,
             fixed_max_length=fixed_max_length
         )
-        print(f'{concatenated_batch["concatenated_input_ids"].shape=}')
         len_chosen = batch["chosen_labels"].shape[0]
         concatenated_batch["concatenated_input_ids"] = concatenated_batch["concatenated_input_ids"].reshape(
             concatenated_batch["concatenated_input_ids"].shape[0], -1
@@ -92,7 +91,6 @@ def create_concatenated_forward(
         concatenated_batch["concatenated_attention_mask"] = concatenated_batch["concatenated_attention_mask"].reshape(
             concatenated_batch["concatenated_attention_mask"].shape[0], -1
         )
-        print(f'{concatenated_batch["concatenated_input_ids"].shape=}')
         model_kwargs = (
             {
                 "labels": concatenated_batch["concatenated_labels"],

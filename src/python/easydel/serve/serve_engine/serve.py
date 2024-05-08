@@ -1,11 +1,14 @@
 import copy
 import functools
+import json
 import logging
+import time
 import warnings
 
 import jax
+import starlette.websockets
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket
 from fjformer import with_sharding_constraint, match_partition_rules, make_shard_and_gather_fns, get_dtype
 from jax import numpy as jnp
 
@@ -13,7 +16,7 @@ from ...etils.etils import get_logger
 from ...modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 from flax.core import FrozenDict
 from transformers import PreTrainedTokenizerBase, GenerationConfig
-from typing import Callable, Mapping, Tuple, List, Optional, Union
+from typing import Callable, Mapping, Tuple, List, Optional, Union, Dict
 from .configuration import EasyServeConfig
 from jax.sharding import PartitionSpec, Mesh
 from jax.experimental.pjit import pjit
@@ -51,22 +54,16 @@ class EasyServe:
         self.serve_config = serve_config
         if serve_config.pre_compile:
             self.compile(verbose=serve_config.verbose)
-        self.fast_api = FastAPI(
-            title="EasyDeL"
-        )
+        self.fast_api = FastAPI(title="EasyDeL")
         self.fast_api.post("/generate/v1/conversation")(self.api_generate_request)
+        self.fast_api.websocket("/stream/v1/conversation", )(self.websocket_generate_request_version_one)
 
     def get_generation_function(self, greedy: bool):
         return self.greedy_generate_function if greedy else self.non_greedy_generate_function
 
-    def conversation_template(
-            self, conversation: List[ConversationItem]
-    ) -> str:
+    def conversation_template(self, conversation: List[Dict]) -> str:
         """
         The conversation_template function takes a list of ConversationItem objects and returns a string.
-        The string is formatted as follows:
-            &lt;s&gt;[INST] &lt;&lt;SYS&gt;&gt;{system_message}&lt;&lt;/SYS&gt;&gt;\n\n{user_message} [/INST]
-            {assistant_message} &lt;/s&gt;&lt;s&gt;[INST] ...
         where system message, user message, and assistant message are the content fields of the ConversationItem objects.
         If there is no system message in the conversation, then it will be omitted from the template.
 
@@ -75,19 +72,56 @@ class EasyServe:
         :return: A string that is a concatenation of the messages in the conversation
 
         """
-        system = None
-        do_strip = False
-        for conv in conversation:
-            if conv.role == "system":
-                system = conv.content
-        messages = [f"<s>[INST] <<SYS>>\n{system}\n<</SYS>>\n\n"] if system is not None else ["<s>[INST] "]
-        for conv in conversation:
-            content = conv.content.strip() if do_strip else conv.content
-            role = conv.role
-            do_strip = True
-            if role == "user" or role == "assistant":
-                messages.append(f"{content} [/INST] " if role == "user" else f"{content} </s><s>[INST] ")
-        return ''.join(messages)
+        return self.tokenizer.apply_chat_template(
+            conversation=conversation,
+            add_generation_prompt=True,
+            tokenize=False
+        )
+
+    async def websocket_generate_request_version_one(self, websocket: WebSocket):
+
+        """
+        The api_generate_request function is the main function that will be called by the API.
+        It takes in a GenerateAPIRequest object, which contains all the information needed to generate a response.
+        The request object has two fields: conversation and max_new_tokens. The conversation field is an array of strings,
+        which are each one turn in a conversation (i.e., one person's utterance). The max_new_tokens field specifies
+         how many tokens can be generated at most for this response.
+
+        :param self: Access the attributes and methods of the class
+        :param websocket: WebSocket: Pass the request object to the api_generate_request function
+        :return: A dictionary with the following keys {"response", "num_token_generated", "greedy", "model_prompt"}
+        """
+        try:
+            await websocket.accept()
+            data = json.loads(await websocket.receive_text())
+            prompt = self.conversation_template(data["conversation"])
+            max_new_tokens = data.get("max_new_tokens", None) or self.serve_config.max_new_tokens
+            greedy = data.get("greedy", None) or self.serve_config.greedy
+            start = time.time()
+            send_data = {}
+            for response, num_token_generated in self.sample(
+                    string=prompt,
+                    max_new_tokens=max_new_tokens,
+                    greedy=greedy,
+
+            ):
+                generation_duration = time.time() - start
+                tokens_pre_second = num_token_generated / generation_duration
+                send_data = {
+                    "response": response,
+                    "num_token_generated": num_token_generated,
+                    "greedy": greedy,
+                    "model_prompt": prompt,
+                    "generation_duration": generation_duration,
+                    "tokens_pre_second": tokens_pre_second,
+                    "done": False
+                }
+                await websocket.send_text(json.dumps(send_data))
+            send_data["done"] = True
+            await websocket.send_text(json.dumps(send_data))
+            await websocket.close(reason="END")
+        except starlette.websockets.WebSocketDisconnect as e:
+            await websocket.close(reason="DISCONNECTED")
 
     def api_generate_request(self, request: GenerateAPIRequest):
 
@@ -102,9 +136,9 @@ class EasyServe:
         :param request: GenerateAPIRequest: Pass the request object to the api_generate_request function
         :return: A dictionary with the following keys {"response", "num_token_generated", "greedy", "model_prompt"}
         """
-        prompt = self.conversation_template(
-            request.conversation
-        )
+
+        conversation = [{"role": c.role, "content": c.content} for c in request.conversation]
+        prompt = self.conversation_template(conversation)
         response: Optional[str] = None
         num_token_generated: Optional[int] = None
         for response, num_token_generated in self.sample(
@@ -407,7 +441,10 @@ class EasyServe:
                 )[:, -fixed_pad:]
 
                 returns = (
-                    self.tokenizer.decode(input_ids[0][-num_generated_tokens:], skip_special_tokens=True),
+                    self.tokenizer.decode(
+                        input_ids[0][-num_generated_tokens:],  # type:ignore
+                        skip_special_tokens=True
+                    ),
                     num_generated_tokens
                 )
 

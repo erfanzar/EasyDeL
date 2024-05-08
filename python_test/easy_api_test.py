@@ -30,7 +30,7 @@ def main():
         verbose=True,
         dtype="fp16",
         pre_compile=False,
-        max_new_tokens=32,
+        max_new_tokens=128,
         max_compile_tokens=32,
         max_sequence_length=max_position_embeddings,
         use_prefix_tokenizer=False
@@ -42,9 +42,7 @@ def main():
     )
     server = EasyServe.from_parameters(
         llm=model,
-        params={
-            "params": params,
-        },
+        params={"params": params},
         serve_config=serve_config,
         tokenizer=tokenizer,
         partition_rules=config.get_partition_rules(True),
