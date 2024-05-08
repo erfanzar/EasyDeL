@@ -16,6 +16,7 @@ io.py
 *.json
 .Python
 EasyDeL-Checkpoints
+easydel-Checkpoints
 build/
 develop-eggs/
 memory.prof.new

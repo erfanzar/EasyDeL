@@ -80,7 +80,7 @@ class TrainArguments(
             backend: Optional[str] = None,
             extra_optimizer_kwargs: dict = None,
             save_steps: Optional[int] = None,
-            save_dir: str = "easydel-Checkpoints",
+            save_dir: str = "EasyDeL-Checkpoints",
             save_total_limit: Optional[int] = None,
             dtype: jnp.dtype = jnp.bfloat16,
             param_dtype: jnp.dtype = jnp.bfloat16,
