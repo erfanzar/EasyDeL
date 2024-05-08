@@ -7,17 +7,12 @@ from .serve_engine import (
     EasyServe as EasyServe,
     EasyServeConfig as EasyServeConfig,
     LLMBaseReq as LLMBaseReq,
-    GenerateAPIRequest as GenerateAPIRequest,
-    ConversationItem as ConversationItem,
-    ModelOutput as ModelOutput,
-    BaseModel as BaseModel,
     EasyClient as EasyClient
 )
 
 __all__ = (
     "EasyServe", "EasyServeConfig", "LLMBaseReq",
-    "GenerateAPIRequest", "ConversationItem", "ModelOutput",
-    "BaseModel", "EasyClient", "GradioUserInference",
+    "EasyClient", "GradioUserInference",
     "ChatRequest", "InstructRequest", "PyTorchServer",
     "PyTorchServerConfig", "JAXServer", "JAXServerConfig",
     "create_generate_function"
