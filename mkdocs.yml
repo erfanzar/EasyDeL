@@ -143,7 +143,6 @@ nav:
       - Serve Engine:
         - Client: generated-serve-serve_engine-client.md
         - Configuration: generated-serve-serve_engine-configuration.md
-        - Dantics: generated-serve-serve_engine-dantics.md
         - Serve: generated-serve-serve_engine-serve.md
       - Torch Serve: generated-serve-torch_serve.md
       - Utils: generated-serve-utils.md

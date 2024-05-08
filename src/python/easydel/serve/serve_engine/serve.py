@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import functools
 import json
@@ -6,9 +7,8 @@ import time
 import warnings
 
 import jax
-import starlette.websockets
-import uvicorn
-from fastapi import FastAPI, WebSocket
+import websocket
+import websockets
 from fjformer import with_sharding_constraint, match_partition_rules, make_shard_and_gather_fns, get_dtype
 from jax import numpy as jnp
 
@@ -16,12 +16,11 @@ from ...etils.etils import get_logger
 from ...modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 from flax.core import FrozenDict
 from transformers import PreTrainedTokenizerBase, GenerationConfig
-from typing import Callable, Mapping, Tuple, List, Optional, Union, Dict
+from typing import Callable, Tuple, List, Optional, Union, Dict
 from .configuration import EasyServeConfig
 from jax.sharding import PartitionSpec, Mesh
 from jax.experimental.pjit import pjit
 from dataclasses import dataclass
-from .dantics import GenerateAPIRequest, ConversationItem
 
 logger = get_logger(__name__)
 
@@ -54,9 +53,6 @@ class EasyServe:
         self.serve_config = serve_config
         if serve_config.pre_compile:
             self.compile(verbose=serve_config.verbose)
-        self.fast_api = FastAPI(title="EasyDeL")
-        self.fast_api.post("/generate/v1/conversation")(self.api_generate_request)
-        self.fast_api.websocket("/stream/v1/conversation", )(self.websocket_generate_request_version_one)
 
     def get_generation_function(self, greedy: bool):
         return self.greedy_generate_function if greedy else self.non_greedy_generate_function
@@ -78,81 +74,52 @@ class EasyServe:
             tokenize=False
         )
 
-    async def websocket_generate_request_version_one(self, websocket: WebSocket):
-
-        """
-        The api_generate_request function is the main function that will be called by the API.
-        It takes in a GenerateAPIRequest object, which contains all the information needed to generate a response.
-        The request object has two fields: conversation and max_new_tokens. The conversation field is an array of strings,
-        which are each one turn in a conversation (i.e., one person's utterance). The max_new_tokens field specifies
-         how many tokens can be generated at most for this response.
-
-        :param self: Access the attributes and methods of the class
-        :param websocket: WebSocket: Pass the request object to the api_generate_request function
-        :return: A dictionary with the following keys {"response", "num_token_generated", "greedy", "model_prompt"}
-        """
-        try:
-            await websocket.accept()
-            data = json.loads(await websocket.receive_text())
-            prompt = self.conversation_template(data["conversation"])
-            max_new_tokens = data.get("max_new_tokens", None) or self.serve_config.max_new_tokens
-            greedy = data.get("greedy", None) or self.serve_config.greedy
-            start = time.time()
-            send_data = {}
-            for response, num_token_generated in self.sample(
-                    string=prompt,
-                    max_new_tokens=max_new_tokens,
-                    greedy=greedy,
-
-            ):
-                generation_duration = time.time() - start
-                tokens_pre_second = num_token_generated / generation_duration
-                send_data = {
-                    "response": response,
-                    "num_token_generated": num_token_generated,
-                    "greedy": greedy,
-                    "model_prompt": prompt,
-                    "generation_duration": generation_duration,
-                    "tokens_pre_second": tokens_pre_second,
-                    "done": False
-                }
-                await websocket.send_text(json.dumps(send_data))
-            send_data["done"] = True
-            await websocket.send_text(json.dumps(send_data))
-            await websocket.close(reason="END")
-        except starlette.websockets.WebSocketDisconnect as e:
-            await websocket.close(reason="DISCONNECTED")
-
-    def api_generate_request(self, request: GenerateAPIRequest):
-
-        """
-        The api_generate_request function is the main function that will be called by the API.
-        It takes in a GenerateAPIRequest object, which contains all the information needed to generate a response.
-        The request object has two fields: conversation and max_new_tokens. The conversation field is an array of strings,
-        which are each one turn in a conversation (i.e., one person's utterance). The max_new_tokens field specifies
-         how many tokens can be generated at most for this response.
-
-        :param self: Access the attributes and methods of the class
-        :param request: GenerateAPIRequest: Pass the request object to the api_generate_request function
-        :return: A dictionary with the following keys {"response", "num_token_generated", "greedy", "model_prompt"}
-        """
-
-        conversation = [{"role": c.role, "content": c.content} for c in request.conversation]
-        prompt = self.conversation_template(conversation)
-        response: Optional[str] = None
-        num_token_generated: Optional[int] = None
+    async def generate(self, socket):
+        data = json.loads(await socket.recv())
+        prompt = self.conversation_template(data["conversation"])
+        max_new_tokens = data.get("max_new_tokens", None) or self.serve_config.max_new_tokens
+        greedy = data.get("greedy", None) or self.serve_config.greedy
+        start = time.time()
+        send_data = {}
+        prl_res = 0
         for response, num_token_generated in self.sample(
                 string=prompt,
-                max_new_tokens=request.max_new_tokens or self.serve_config.max_new_tokens,
-                greedy=request.greedy or self.serve_config.greedy
+                max_new_tokens=max_new_tokens,
+                greedy=greedy,
+
         ):
-            ...
-        return {
-            "response": response,
-            "num_token_generated": num_token_generated,
-            "greedy": request.greedy,
-            "model_prompt": prompt
-        }
+            generation_duration = time.time() - start
+            tokens_pre_second = num_token_generated / generation_duration
+
+            send_data = {
+                "response": response[prl_res:],
+                "num_token_generated": num_token_generated,
+                "greedy": greedy,
+                "model_prompt": prompt,
+                "generation_duration": generation_duration,
+                "tokens_pre_second": tokens_pre_second,
+                "done": False
+            }
+            prl_res += len(response)
+            await socket.send(json.dumps(send_data))
+
+        send_data["done"] = True
+        send_data["response"] = ""
+        await socket.send(json.dumps(send_data))
+
+    async def handle_client(self, socket: websocket.WebSocket, path: str):
+        try:
+            logger.info("connection open")
+            if path == "/stream/v1/conversation":
+                await self.generate(socket)
+            elif path == "/":
+                await socket.send(json.dumps({"status": "AgentX server is Running..."}))
+            else:
+                await socket.send(json.dumps({"error": f"invalid path {path}"}))
+        except websockets.ConnectionClosed:
+            logger.info("connection closed")
+        except Exception as e:
+            logger.warning(f"Error: {e}")
 
     @staticmethod
     def create_shard_and_gather_functions(
@@ -531,8 +498,9 @@ class EasyServe:
         return self.__repr__()
 
     def fire(self):
-        uvicorn.run(
-            self.fast_api,
-            host=self.serve_config.host,
-            port=self.serve_config.port,
-        )
+        async def run_engine():
+            async with websockets.serve(self.handle_client, self.serve_config.host, self.serve_config.port) as ws:
+                logger.info(f"Starting EasyDeL websocket server on {self.serve_config.host}:{self.serve_config.port}")
+                await ws.wait_closed()
+
+        asyncio.run(run_engine())
