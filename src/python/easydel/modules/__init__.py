@@ -136,6 +136,13 @@ from .arctic import (
     FlaxArcticModel as FlaxArcticModel,
     ArcticConfig as ArcticConfig
 )
+
+from .openelm import (
+    FlaxOpenELMModel as FlaxOpenELMModel,
+    FlaxOpenELMForCausalLM as FlaxOpenELMForCausalLM,
+    OpenELMConfig as OpenELMConfig
+)
+
 from .auto_easydel_model import (
     AutoEasyDeLModelForCausalLM as AutoEasyDeLModelForCausalLM,
     AutoEasyDeLConfig as AutoEasyDeLConfig,
@@ -190,6 +197,8 @@ __all__ = (
     "Phi3Config", "FlaxPhi3ForCausalLM", "FlaxPhi3Model",
 
     "FlaxArcticForCausalLM", "FlaxArcticModel", "ArcticConfig",
+
+    "FlaxOpenELMForCausalLM", "FlaxOpenELMModel", "OpenELMConfig",
 
     "AutoEasyDeLModelForCausalLM",
     "AutoEasyDeLConfig",

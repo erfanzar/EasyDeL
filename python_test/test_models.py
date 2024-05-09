@@ -1,6 +1,6 @@
 import gc
-from unittest import TestCase
 import unittest
+from unittest import TestCase
 
 import flax.traverse_util
 from fjformer import make_shard_and_gather_fns, match_partition_rules
@@ -398,7 +398,32 @@ class EasyModelsTest(TestCase):
 
         self.assertTrue(
             res,
-            f"StableLM model Failed [ERROR {err}]"
+            f"PHI3 model Failed [ERROR {err}]"
+        )
+
+    def test_openelm(self):
+        conf = transformers.AutoConfig.from_pretrained(
+            "apple/OpenELM-270M-Instruct",
+            trust_remote_code=True
+        )
+        from src.python.easydel import OpenELMConfig
+        conf_f = OpenELMConfig()
+        for k, v in conf.__dict__.items():
+            setattr(conf_f, k, v)
+        self.header_config = conf_f
+        res, err = self.create_test_for_models(
+            "openelm",
+            type(
+                transformers.AutoModelForCausalLM.from_config(
+                    conf,
+                    trust_remote_code=True,
+                )
+            )
+        )
+
+        self.assertTrue(
+            res,
+            f"OpenELM model Failed [ERROR {err}]"
         )
 
     def test_arctic(self):
@@ -422,7 +447,7 @@ class EasyModelsTest(TestCase):
 
         self.assertTrue(
             res,
-            f"StableLM model Failed [ERROR {err}]"
+            f"ARCTIC model Failed [ERROR {err}]"
         )
 
     def test_rwkv(self):

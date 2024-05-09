@@ -254,7 +254,7 @@ class FlaxGrok1Attention(BaseJAXAttentionModule):
     def __call__(
             self,
             hidden_states: chex.Array,
-            freq_cis: chex.Array,
+            freq_cis: Tuple[chex.Array, chex.Array],
             attention_mask: chex.Array,
             position_ids: chex.Array,
             causal_mask: chex.Array,
@@ -272,7 +272,7 @@ class FlaxGrok1Attention(BaseJAXAttentionModule):
 
         :param self: Access variables that belong to the class
         :param hidden_states: chex.Array: Pass the hidden states of the previous layer
-        :param freq_cis: chex.Array: Pass in the frequency coefficients for each position
+        :param freq_cis: Tuple[chex.Array, chex.Array],: Pass in the frequency coefficients for each position
         :param attention_mask: chex.Array: Mask out certain tokens in the input sequence
         :param position_ids: chex.Array: Determine the position of each token in a sequence
         :param causal_mask: chex.Array: Mask out the future tokens in the decoder
@@ -575,7 +575,7 @@ class FlaxGrok1DecoderLayer(nn.Module):
 
     def setup(self) -> None:
         # hidden_states: chex.Array
-        # freq_cis: chex.Array
+        # freq_cis: Tuple[chex.Array, chex.Array],
         # attention_mask: chex.Array
         # causal_mask: chex.Array
         # position_ids: chex.Array
@@ -641,7 +641,7 @@ class FlaxGrok1DecoderLayer(nn.Module):
     def __call__(
             self,
             hidden_states: chex.Array,
-            freq_cis: chex.Array,
+            freq_cis: Tuple[chex.Array, chex.Array],
             attention_mask: chex.Array,
             causal_mask: chex.Array,
             position_ids: chex.Array,
@@ -659,7 +659,7 @@ class FlaxGrok1DecoderLayer(nn.Module):
 
         :param self: Represent the instance of the class
         :param hidden_states: chex.Array: Represent the input to the encoder layer
-        :param freq_cis: chex.Array: Pass the frequency information to the attention layer
+        :param freq_cis: Tuple[chex.Array, chex.Array],: Pass the frequency information to the attention layer
         :param attention_mask: chex.Array: Mask out the attention weights for certain positions
         :param causal_mask: chex.Array: Mask the future tokens
         :param position_ids: chex.Array: Indicate the position of each token in the sequence
@@ -723,7 +723,7 @@ class FlaxGrok1DecoderLayerCollection(nn.Module):
     def __call__(
             self,
             hidden_states: chex.Array,
-            freq_cis: chex.Array,
+            freq_cis: Tuple[chex.Array, chex.Array],
             attention_mask: chex.Array,
             causal_mask: chex.Array,
             position_ids: chex.Array,
@@ -741,7 +741,7 @@ class FlaxGrok1DecoderLayerCollection(nn.Module):
 
         :param self: Represent the instance of the class
         :param hidden_states: chex.Array: Represent the input to the encoder layer
-        :param freq_cis: chex.Array: Pass the frequency information to the attention layer
+        :param freq_cis: Tuple[chex.Array, chex.Array],: Pass the frequency information to the attention layer
         :param attention_mask: chex.Array: Mask out the attention weights for certain positions
         :param causal_mask: chex.Array: Mask the future tokens
         :param position_ids: chex.Array: Indicate the position of each token in the sequence

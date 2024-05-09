@@ -254,7 +254,7 @@ class FlaxPhi3Attention(BaseJAXAttentionModule):
     def __call__(
             self,
             hidden_states: chex.Array,
-            freq_cis: chex.Array,
+            freq_cis: Tuple[chex.Array, chex.Array],
             attention_mask: chex.Array,
             causal_mask: chex.Array,
             position_ids: chex.Array,

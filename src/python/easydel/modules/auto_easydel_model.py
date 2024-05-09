@@ -342,6 +342,18 @@ def get_modules_by_type(model_type: str) -> Tuple[
                 rnn_based_or_rwkv=False
             )
         )
+    elif model_type == "openelm":
+        from .openelm import OpenELMConfig as _OpenELMConfig
+        from .openelm import FlaxOpenELMForCausalLM as _FlaxOpenELMForCausalLM
+        return (
+            _OpenELMConfig,
+            _FlaxOpenELMForCausalLM,
+            functools.partial(
+                huggingface_to_easydel,
+                embedding_layer_names=["token_embeddings"],
+                rnn_based_or_rwkv=False
+            )
+        )
     raise EasyDeLRuntimeError(f'Model Type ({model_type}) is not supported or is not found')
 
 

@@ -300,7 +300,7 @@ class FlaxStableLmAttention(BaseJAXAttentionModule):
     def __call__(
             self,
             hidden_states: chex.Array,
-            freq_cis: chex.Array,
+            freq_cis: Tuple[chex.Array, chex.Array],
             attention_mask: chex.Array,
             position_ids: chex.Array,
             causal_mask: chex.Array,
@@ -318,7 +318,7 @@ class FlaxStableLmAttention(BaseJAXAttentionModule):
 
         :param self: Access variables that belong to the class
         :param hidden_states: chex.Array: Pass the hidden states of the previous layer
-        :param freq_cis: chex.Array: Pass in the frequency coefficients for each position
+        :param freq_cis: Tuple[chex.Array, chex.Array],: Pass in the frequency coefficients for each position
         :param attention_mask: chex.Array: Mask out certain tokens in the input sequence
         :param position_ids: chex.Array: Determine the position of each token in a sequence
         :param causal_mask: chex.Array: Mask out the future tokens in the decoder
@@ -461,7 +461,7 @@ class FlaxStableLmDecoderLayer(nn.Module):
                 policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing)
             )
             # hidden_states: chex.Array,
-            # freq_cis: chex.Array,
+            # freq_cis: Tuple[chex.Array, chex.Array],
             # attention_mask: chex.Array,
             # position_ids: chex.Array,
             # causal_mask: chex.Array,
@@ -501,7 +501,7 @@ class FlaxStableLmDecoderLayer(nn.Module):
     def __call__(
             self,
             hidden_states: chex.Array,
-            freq_cis: chex.Array,
+            freq_cis: Tuple[chex.Array, chex.Array],
             attention_mask: Optional[chex.Array],
             position_ids: Optional[chex.Array],
             causal_mask: Optional[chex.Array],
@@ -573,7 +573,7 @@ class FlaxStableLmDecoderLayerCollection(nn.Module):
     def __call__(
             self,
             hidden_states: chex.Array,
-            freq_cis: chex.Array,
+            freq_cis: Tuple[chex.Array, chex.Array],
             attention_mask: Optional[chex.Array],
             position_ids: Optional[chex.Array],
             causal_mask: Optional[chex.Array],
@@ -590,7 +590,7 @@ class FlaxStableLmDecoderLayerCollection(nn.Module):
                 all_hidden_states += (hidden_states,)
 
             # hidden_states: chex.Array,
-            # freq_cis: chex.Array,
+            # freq_cis: Tuple[chex.Array, chex.Array],
             # attention_mask: Optional[chex.Array],
             # position_ids: Optional[chex.Array],
             # causal_mask: Optional[chex.Array],

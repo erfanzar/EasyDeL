@@ -168,6 +168,12 @@ from .modules.arctic import (
     ArcticConfig as ArcticConfig
 )
 
+from .modules.openelm import (
+    FlaxOpenELMModel as FlaxOpenELMModel,
+    FlaxOpenELMForCausalLM as FlaxOpenELMForCausalLM,
+    OpenELMConfig as OpenELMConfig
+)
+
 from .modules.auto_easydel_model import (
     AutoEasyDeLModelForCausalLM as AutoEasyDeLModelForCausalLM,
     AutoEasyDeLConfig as AutoEasyDeLConfig,
@@ -401,6 +407,12 @@ __all__ = (
     "FlaxArcticForCausalLM",
     "FlaxArcticModel",
     "ArcticConfig",
+
+    # OpenELM
+
+    "FlaxOpenELMForCausalLM",
+    "FlaxOpenELMModel",
+    "OpenELMConfig",
 
     # AutoModels Models
     "AutoEasyDeLModelForCausalLM",
