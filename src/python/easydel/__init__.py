@@ -174,6 +174,12 @@ from .modules.openelm import (
     OpenELMConfig as OpenELMConfig
 )
 
+from .modules.deepseek_v2 import (
+    FlaxDeepseekV2Model as FlaxDeepseekV2Model,
+    FlaxDeepseekV2ForCausalLM as FlaxDeepseekV2ForCausalLM,
+    DeepseekV2Config as DeepseekV2Config
+)
+
 from .modules.auto_easydel_model import (
     AutoEasyDeLModelForCausalLM as AutoEasyDeLModelForCausalLM,
     AutoEasyDeLConfig as AutoEasyDeLConfig,
@@ -413,6 +419,12 @@ __all__ = (
     "FlaxOpenELMForCausalLM",
     "FlaxOpenELMModel",
     "OpenELMConfig",
+
+    # DeepseekV2
+
+    "DeepseekV2Config",
+    "FlaxDeepseekV2Model",
+    "FlaxDeepseekV2ForCausalLM",
 
     # AutoModels Models
     "AutoEasyDeLModelForCausalLM",

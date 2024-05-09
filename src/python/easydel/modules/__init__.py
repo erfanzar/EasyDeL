@@ -142,7 +142,11 @@ from .openelm import (
     FlaxOpenELMForCausalLM as FlaxOpenELMForCausalLM,
     OpenELMConfig as OpenELMConfig
 )
-
+from .deepseek_v2 import (
+    FlaxDeepseekV2Model as FlaxDeepseekV2Model,
+    FlaxDeepseekV2ForCausalLM as FlaxDeepseekV2ForCausalLM,
+    DeepseekV2Config as DeepseekV2Config
+)
 from .auto_easydel_model import (
     AutoEasyDeLModelForCausalLM as AutoEasyDeLModelForCausalLM,
     AutoEasyDeLConfig as AutoEasyDeLConfig,
@@ -199,6 +203,8 @@ __all__ = (
     "FlaxArcticForCausalLM", "FlaxArcticModel", "ArcticConfig",
 
     "FlaxOpenELMForCausalLM", "FlaxOpenELMModel", "OpenELMConfig",
+
+    "DeepseekV2Config", "FlaxDeepseekV2Model", "FlaxDeepseekV2ForCausalLM",
 
     "AutoEasyDeLModelForCausalLM",
     "AutoEasyDeLConfig",

@@ -44,8 +44,10 @@ With its comprehensive set of features and tools, EasyDeL aims to streamline and
 of machine learning models, particularly in the domain of large language models and video-related applications.
 
 > **News**
+> 
+> DeepseekV2 Model is Added (beta mood).
 >
-> OpenELM Models are Added.
+> OpenELM Model is Added.
 >
 > EasyDeL project structure has changed now you have to import EasyDel as `easydel`.
 >
