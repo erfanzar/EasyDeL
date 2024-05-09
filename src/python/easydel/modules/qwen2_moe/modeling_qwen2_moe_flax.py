@@ -304,7 +304,7 @@ class FlaxQwen2MoeAttention(BaseJAXAttentionModule):
     def __call__(
             self,
             hidden_states: chex.Array,
-            freq_cis: chex.Array,
+            freq_cis: Tuple[chex.Array, chex.Array],
             attention_mask: chex.Array,
             position_ids: chex.Array,
             causal_mask: chex.Array,
@@ -322,7 +322,7 @@ class FlaxQwen2MoeAttention(BaseJAXAttentionModule):
 
         :param self: Access variables that belong to the class
         :param hidden_states: chex.Array: Pass the hidden states of the previous layer
-        :param freq_cis: chex.Array: Pass in the frequency coefficients for each position
+        :param freq_cis: Tuple[chex.Array, chex.Array],: Pass in the frequency coefficients for each position
         :param attention_mask: chex.Array: Mask out certain tokens in the input sequence
         :param position_ids: chex.Array: Determine the position of each token in a sequence
         :param causal_mask: chex.Array: Mask out the future tokens in the decoder
@@ -645,7 +645,7 @@ class FlaxQwen2MoeBlock(nn.Module):
     def __call__(
             self,
             hidden_states: chex.Array,
-            freq_cis: chex.Array,
+            freq_cis: Tuple[chex.Array, chex.Array],
             attention_mask: chex.Array,
             position_ids: chex.Array,
             causal_mask: chex.Array,
@@ -667,7 +667,7 @@ class FlaxQwen2MoeBlock(nn.Module):
 
         :param self: Refer to the class instance itself
         :param hidden_states: chex.Array: Pass in the hidden state of the previous layer
-        :param freq_cis: chex.Array: Pass in the frequency information
+        :param freq_cis: Tuple[chex.Array, chex.Array],: Pass in the frequency information
         :param attention_mask: chex.Array: Mask out the attention weights for padding tokens
         :param position_ids: chex.Array: Determine the position of each token in the sequence
         :param causal_mask: chex.Array: Mask the attention weights
@@ -945,7 +945,7 @@ class FlaxQwen2MoeBlockCollection(nn.Module):
     def __call__(
             self,
             hidden_states: chex.Array,
-            freq_cis: chex.Array,
+            freq_cis: Tuple[chex.Array, chex.Array],
             attention_mask: chex.Array,
             position_ids: chex.Array,
             causal_mask: chex.Array,
@@ -965,7 +965,7 @@ class FlaxQwen2MoeBlockCollection(nn.Module):
 
         :param self: Represent the instance of the class
         :param hidden_states: chex.Array: Pass the input tensor to the encoder
-        :param freq_cis: chex.Array: Pass in the frequency of each token
+        :param freq_cis: Tuple[chex.Array, chex.Array],: Pass in the frequency of each token
         :param attention_mask: chex.Array: Mask out certain tokens in the input sequence
         :param position_ids: chex.Array: Specify the position of each token in a sequence
         :param causal_mask: chex.Array: Mask the attention weights

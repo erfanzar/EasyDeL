@@ -178,7 +178,7 @@ class FlaxMixtralAttention(BaseJAXAttentionModule):
     def __call__(
             self,
             hidden_states: chex.Array,
-            freq_cis: chex.Array,
+            freq_cis: Tuple[chex.Array, chex.Array],
             attention_mask: chex.Array,
             causal_mask: chex.Array,
             position_ids: chex.Array,
@@ -195,7 +195,7 @@ class FlaxMixtralAttention(BaseJAXAttentionModule):
 
         :param self: Refer to the object itself
         :param hidden_states: chex.Array: Pass in the hidden state of the model
-        :param freq_cis: chex.Array: Create the apply_rotary variable
+        :param freq_cis: Tuple[chex.Array, chex.Array],: Create the apply_rotary variable
         :param attention_mask: chex.Array: Mask the attention weights
         :param causal_mask: chex.Array: Mask the attention weights
         :param position_ids: chex.Array: Specify the position of each token in a sequence
@@ -464,7 +464,7 @@ class FlaxMixtralDecoderLayer(nn.Module):
 
     def setup(self) -> None:
         # hidden_states: chex.Array
-        # freq_cis: chex.Array
+        # freq_cis: Tuple[chex.Array, chex.Array],
         # attention_mask: chex.Array
         # causal_mask: chex.Array
         # position_ids: chex.Array
@@ -518,7 +518,7 @@ class FlaxMixtralDecoderLayer(nn.Module):
     def __call__(
             self,
             hidden_states: chex.Array,
-            freq_cis: chex.Array,
+            freq_cis: Tuple[chex.Array, chex.Array],
             attention_mask: chex.Array,
             causal_mask: chex.Array,
             position_ids: chex.Array,
@@ -536,7 +536,7 @@ class FlaxMixtralDecoderLayer(nn.Module):
 
         :param self: Represent the instance of the class
         :param hidden_states: chex.Array: Represent the input to the encoder layer
-        :param freq_cis: chex.Array: Pass the frequency information to the attention layer
+        :param freq_cis: Tuple[chex.Array, chex.Array],: Pass the frequency information to the attention layer
         :param attention_mask: chex.Array: Mask out the attention weights for certain positions
         :param causal_mask: chex.Array: Mask the future tokens
         :param position_ids: chex.Array: Indicate the position of each token in the sequence
@@ -550,7 +550,7 @@ class FlaxMixtralDecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         # hidden_states: chex.Array
-        # freq_cis: chex.Array
+        # freq_cis: Tuple[chex.Array, chex.Array],
         # attention_mask: chex.Array
         # causal_mask: chex.Array
         # position_ids: chex.Array
@@ -609,7 +609,7 @@ class FlaxMixtralDecoderLayerCollection(nn.Module):
     def __call__(
             self,
             hidden_states: chex.Array,
-            freq_cis: chex.Array,
+            freq_cis: Tuple[chex.Array, chex.Array],
             attention_mask: chex.Array,
             causal_mask: chex.Array,
             position_ids: chex.Array,
@@ -627,7 +627,7 @@ class FlaxMixtralDecoderLayerCollection(nn.Module):
 
         :param self: Represent the instance of the class
         :param hidden_states: chex.Array: Represent the input to the encoder layer
-        :param freq_cis: chex.Array: Pass the frequency information to the attention layer
+        :param freq_cis: Tuple[chex.Array, chex.Array],: Pass the frequency information to the attention layer
         :param attention_mask: chex.Array: Mask out the attention weights for certain positions
         :param causal_mask: chex.Array: Mask the future tokens
         :param position_ids: chex.Array: Indicate the position of each token in the sequence

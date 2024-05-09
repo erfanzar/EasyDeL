@@ -6,9 +6,8 @@ import fjformer
 import flax
 from flax.struct import dataclass
 from jax import numpy as jnp, lax
-from jax.sharding import PartitionSpec
 import jax
-from flax import linen as nn
+from fjformer import linen as nn
 from flax.traverse_util import unflatten_dict, flatten_dict
 from flax.core import freeze, unfreeze, FrozenDict
 from typing import Union, Optional, Tuple
@@ -16,7 +15,6 @@ from flax.linen import partitioning as nn_partitioning, combine_masks
 from transformers.modeling_flax_outputs import FlaxMaskedLMOutput
 from fjformer.func import auxiliary_load_balancing_loss_func
 from ..attention_module import AttentionModule
-from fjformer.linen import Linear
 from ..flax_modelling_utils import (
     ACT2FN,
     with_sharding_constraint,
@@ -28,7 +26,7 @@ from ..flax_modelling_utils import (
 )
 import chex
 from .deepseek_configuration import DeepseekV2Config
-from ..easydel_modelling_utils import EasyDelFlaxPretrainedModel
+from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 
 re_mat = nn_partitioning.remat
 
@@ -214,7 +212,7 @@ class FlaxDeepseekV2MLP(nn.Module):
 
     def setup(self) -> None:
         dense = functools.partial(
-            Linear,
+            nn.Linear,
             use_bias=False,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -235,12 +233,250 @@ class FlaxDeepseekV2MLP(nn.Module):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
-class DeepseekV2PreTrainedModel(EasyDelFlaxPretrainedModel):
+class FlaxMoEGate(nn.Module):
+    config: DeepseekV2Config
+    dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.bfloat16
+    precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+
+    def setup(self) -> None:
+        config = self.config
+        self.top_k = config.num_experts_per_tok
+        self.n_routed_experts = config.n_routed_experts
+        self.routed_scaling_factor = config.routed_scaling_factor
+        self.scoring_func = config.scoring_func
+        self.alpha = config.aux_loss_alpha
+        self.seq_aux = config.seq_aux
+        self.topk_method = config.topk_method
+        self.n_group = config.n_group
+        self.topk_group = config.topk_group
+
+        self.norm_topk_prob = config.norm_topk_prob
+        self.gating_dim = config.hidden_size
+        self.weight = self.param(
+            "kernel",
+            nn.initializers.kaiming_uniform(dtype=self.param_dtype),
+            (self.n_routed_experts, self.gating_dim)
+        )
+
+    def __call__(self, hidden_states, deterministic: bool = True):
+        bsz, seq_len, h = hidden_states.shape
+        hidden_states = hidden_states.reshape(-1, h)
+        logits = jax.lax.batch_matmul(
+            hidden_states.astype(jnp.float32),
+            self.weight.astype(jnp.float32),
+            precision=self.precision
+        )
+        if self.scoring_func == "softmax":
+            scores = jax.nn.softmax(logits.astype(jnp.float32), axis=-1)
+        else:
+            raise NotImplementedError(
+                f"insupportable scoring function for MoE gating: {self.scoring_func}"
+            )
+
+        ### select top-k experts
+        if self.topk_method == "gready":
+            topk_weight, topk_idx = jax.lax.top_k(
+                scores, k=self.top_k
+            )
+        elif self.topk_method == "group_limited_greedy":
+            group_scores = scores.reshape(bsz * seq_len, self.n_group, -1).max(axis=-1)  # [n, n_group]
+
+            # Find the indices of the top k scores in each group
+            top_k_indices = lax.top_k(group_scores, self.topk_group)[1]  # [n, topk_group]
+
+            # Initialize a mask with zeros
+            group_mask = jnp.zeros_like(group_scores)  # [n, n_group]
+
+            # Update the mask: this is a bit tricky in JAX as there is no direct scatter function
+            n_indices = jnp.arange(group_mask.shape[0])[:, None]
+            group_mask = group_mask.at[n_indices, top_k_indices].set(1)  # [n, n_group]
+
+            # Expand and reshape the group_mask
+            score_mask = jnp.repeat(group_mask[:, :, None], self.n_routed_experts // self.n_group, axis=2)
+            score_mask = score_mask.reshape(bsz * seq_len, -1)  # [n, e]
+
+            # Apply the mask to scores
+            masked_scores = jnp.where(score_mask, scores, 0.0)  # [n, e]
+
+            # Compute the top k scores after masking
+            topk_weight, topk_idx = lax.top_k(masked_scores, self.top_k)
+        else:
+            raise ValueError()
+        ### norm gate to sum 1
+        if self.top_k > 1 and self.norm_topk_prob:
+            denominator = jnp.sum(topk_weight, axis=-1, keepdims=True) + 1e-20
+            topk_weight = topk_weight / denominator
+        else:
+            topk_weight = topk_weight * self.routed_scaling_factor
+        ### expert-level computation auxiliary loss
+        if not deterministic and self.alpha > 0.0:
+            scores_for_aux = scores
+            aux_topk = self.top_k
+            topk_idx_for_aux_loss = topk_idx.reshape(bsz, -1)
+            if self.seq_aux:
+                scores_for_seq_aux = scores_for_aux.reshape(bsz, seq_len, -1)
+                ce = jnp.zeros(bsz, self.n_routed_experts)
+                ce.at[1, topk_idx_for_aux_loss].add(
+                    jnp.ones(bsz, seq_len * aux_topk),
+                )
+                ce = jnp.divide(ce, (seq_len * aux_topk / self.n_routed_experts))
+                aux_loss = jnp.mean(jnp.sum((ce * jnp.mean(scores_for_seq_aux, axis=-1)), axis=1)) * self.alpha
+            else:
+                mask_ce = jax.nn.one_hot(
+                    topk_idx_for_aux_loss.reshape(-1), num_classes=self.n_routed_experts
+                )
+                ce = jnp.mean(mask_ce.astype("float32"), axis=0)
+                Pi = jnp.mean(scores_for_aux, axis=0)
+                fi = ce * self.n_routed_experts
+                aux_loss = jnp.sum(Pi * fi) * self.alpha
+        else:
+            aux_loss = None
+        return topk_idx, topk_weight, aux_loss
+
+
+class FlaxDeepseekV2MLPCollection(nn.Module):
+    config: DeepseekV2Config
+    dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.bfloat16
+    precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+
+    def setup(self) -> None:
+        self.experts = [
+            FlaxDeepseekV2MLP(
+                config=self.config,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+                precision=self.precision,
+                intermediate_size=self.config.moe_intermediate_size,
+                name=str(i)
+            )
+            for i in range(self.config.n_routed_experts)
+        ]
+
+    def __call__(self, hidden_states, flat_topk_idx):
+        y = jnp.empty_like(hidden_states)
+        for i, expert in enumerate(self.experts):
+            y[flat_topk_idx == i] = expert(hidden_states[flat_topk_idx == i])
+        return y
+
+
+class FlaxDeepseekV2MoE(nn.Module):
+    config: DeepseekV2Config
+    dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.bfloat16
+    precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+
+    def setup(self) -> None:
+        config = self.config
+        self.num_experts_per_tok = config.num_experts_per_tok
+
+        self.ep_size = 1
+        self.experts_per_rank = config.n_routed_experts
+        self.ep_rank = 0
+        self.experts = FlaxDeepseekV2MLPCollection(
+            config=self.config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision,
+        )
+        self.gate = FlaxMoEGate(
+            config=config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision,
+        )
+        if config.n_shared_experts is not None:
+            intermediate_size = config.moe_intermediate_size * config.n_shared_experts
+            self.shared_experts = FlaxDeepseekV2MoE(
+                config=self.config,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+                precision=self.precision,
+                intermediate_size=intermediate_size,
+            )
+
+    def __call__(self, hidden_states: chex.Array):
+
+        identity = hidden_states
+        orig_shape = hidden_states.shape
+        topk_idx, topk_weight, aux_loss = self.gate(hidden_states)
+        hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+        flat_topk_idx = topk_idx.reshape(-1)
+        hidden_states = hidden_states.repeat(self.num_experts_per_tok, axis=0)
+        y = self.experts(hidden_states=hidden_states, flat_topk_idx=flat_topk_idx)
+        y = (y.reshape(*topk_weight.shape, -1) * jnp.expand_dims(topk_weight, -1)).sum(axis=1)
+        y = y.reshape(*orig_shape)
+        if self.config.n_shared_experts is not None:
+            y = y + self.shared_experts(identity)
+        return y
+
+
+class FlaxDeepseekV2Attention(nn.Module):
+    config: DeepseekV2Config
+    layer_idx: int
+    dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.bfloat16
+    precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+
+    def setup(self) -> None:
+        config = self.config
+
+        self.attention_dropout = config.attention_dropout
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+
+        self.max_position_embeddings = config.max_position_embeddings
+        self.rope_theta = config.rope_theta
+        self.q_lora_rank = config.q_lora_rank
+        self.qk_rope_head_dim = config.qk_rope_head_dim
+        self.kv_lora_rank = config.kv_lora_rank
+        self.v_head_dim = config.v_head_dim
+        self.qk_nope_head_dim = config.qk_nope_head_dim
+        self.q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
+
+        self.is_causal = True
+
+        dense_class = functools.partial(
+            nn.Linear,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision,
+        )
+
+        self.q_a_proj = dense_class(config.q_lora_rank, use_bias=config.attention_bias)
+        self.q_a_layernorm = DeepseekV2RMSNorm(config.q_lora_rank)
+        self.q_b_proj = dense_class(self.num_heads * self.q_head_dim, use_bias=False)
+
+        self.kv_a_proj_with_mqa = dense_class(
+            config.kv_lora_rank + config.qk_rope_head_dim,
+            use_bias=config.attention_bias,
+        )
+        self.kv_a_layernorm = DeepseekV2RMSNorm(config.kv_lora_rank)
+        self.kv_b_proj = dense_class(
+            self.num_heads
+            * (self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim),
+            use_bias=False,
+        )
+
+        self.o_proj = dense_class(self.hidden_size, use_bias=config.attention_bias)
+
+        self.softmax_scale = self.q_head_dim ** (-0.5)
+        if self.config.rope_scaling is not None:
+            mscale_all_dim = self.config.rope_scaling.get("mscale_all_dim", 0)
+            scaling_factor = self.config.rope_scaling["factor"]
+            if mscale_all_dim:
+                mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
+                self.softmax_scale = self.softmax_scale * mscale * mscale
+
+    def __call__(self, *args, **kwargs):
+        ...
+
+
+class DeepseekV2PreTrainedModel(EasyDeLFlaxPretrainedModel):
     config_class: DeepseekV2Config = DeepseekV2Config
     module_class: nn.Module = None
     base_model_prefix = "model"
-
-    # main_input_name = "input_ids"
 
     def __init__(
             self,

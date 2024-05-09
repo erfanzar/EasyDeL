@@ -45,6 +45,8 @@ of machine learning models, particularly in the domain of large language models 
 
 > **News**
 >
+> OpenELM Models are Added.
+>
 > EasyDeL project structure has changed now you have to import EasyDel as `easydel`.
 >
 > `ORPOTrainer` is Added
@@ -53,13 +55,12 @@ of machine learning models, particularly in the domain of large language models 
 
 > [!TIP]
 >
-> use `ed.AttentionModule.test_attentions()` to find the best attention mechanism 
+> use `ed.AttentionModule.test_attentions()` to find the best attention mechanism
 > that works for you
 > ```python
 > import easydel as ed
 > ed.AttentionModule.test_attentions()
 > ```
-
 
 ## Documentation 💫
 
