@@ -79,8 +79,8 @@ class FlaxOpenELMRotaryEmbedding(nn.Module):
         )
         query = apply_rotary_pos_emb(
             query,
-            sin[..., key_len - query_len : key_len, :],
-            cos[..., key_len - query_len : key_len, :]
+            sin[..., key_len - query_len: key_len, :],
+            cos[..., key_len - query_len: key_len, :]
         )
 
         return query.astype(self.dtype), key.astype(self.dtype)
@@ -463,7 +463,7 @@ class FlaxOpenELMFeedForwardNetwork(nn.Module):
 
         self.act = ACT2FN[config.activation_fn_name]
 
-    def __call__(self, x: chex.Array) -> chex.Array:
+    def __call__(self, x: chex.Array, e: bool = False) -> chex.Array:
         if self.ffn_with_glu:
             y_12 = self.proj_1(x)
             y_1, y_2 = jnp.split(y_12, 2, axis=-1)
@@ -480,14 +480,39 @@ class FlaxOpenELMDecoderLayer(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
-        self.attn = FlaxOpenELMMultiHeadCausalAttention(
+
+        attn_block = FlaxOpenELMMultiHeadCausalAttention
+        mlp_block = FlaxOpenELMFeedForwardNetwork
+        if self.config.gradient_checkpointing != "":
+            # hidden_states: chex.Array,
+            # freq_cis: Tuple[chex.Array, chex.Array],
+            # attention_mask: chex.Array,
+            # position_ids: chex.Array,
+            # causal_mask: chex.Array,
+            # segment_ids: Optional[chex.Array] = None,
+            # deterministic: bool = True,
+            # init_cache: bool = False,
+            # output_attentions: bool = False,
+            # fcm_mask = None,
+            attn_block = re_mat(
+                attn_block,
+                policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
+                static_argnums=(1, 3, 4, 6, 7, 8)
+            )
+            mlp_block = re_mat(
+                mlp_block,
+                policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
+                static_argnums=(1,)
+            )
+
+        self.attn = attn_block(
             config=self.config,
             layer_idx=self.layer_idx,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.ffn = FlaxOpenELMFeedForwardNetwork(
+        self.ffn = mlp_block(
             config=self.config,
             layer_idx=self.layer_idx,
             dtype=self.dtype,
@@ -549,8 +574,19 @@ class FlaxOpenELMDecoderLayer(nn.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.ffn_norm(hidden_states)
-        hidden_states = self.ffn(hidden_states)
-        hidden_states = residual + hidden_states
+        if self.config.use_scan_mlp:
+            feed_forward_hidden_states = block_wise_ffn(
+                self.ffn,
+                hidden_states,
+                self.config.scan_mlp_chunk_size,
+                deterministic,
+            )
+        else:
+            feed_forward_hidden_states = self.ffn(
+                hidden_states,
+                deterministic,
+            )
+        hidden_states = residual + feed_forward_hidden_states
 
         outputs = (hidden_states,)
 

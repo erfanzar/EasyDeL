@@ -1,11 +1,12 @@
-from typing import Sequence, Optional, Dict, Union
+import warnings
+from typing import Optional, Dict, Union
 
 from jax.sharding import PartitionSpec
 
-from ..easydel_modelling_utils import EasyDelPretrainedConfig
+from ..easydel_modelling_utils import EasyDeLPretrainedConfig
 
 
-class DeepseekV2Config(EasyDelPretrainedConfig):
+class DeepseekV2Config(EasyDeLPretrainedConfig):
     model_type: str = "deepseek_v2"
 
     def __init__(
@@ -56,47 +57,10 @@ class DeepseekV2Config(EasyDelPretrainedConfig):
             rope_scaling: Dict[str, Union[str, float]] = None,
             **kwargs,
     ):
-        """
-        The __init__ function is called when the class is instantiated.
-        It allows the class to initialize the attributes of a class.
-        The self parameter is a reference to the current instance of the class, and is used to access variables that belong to the class.
-
-        :param self: Represent the instance of the class
-        :param vocab_size: Define the size of the vocabulary
-        :param hidden_size: Determine the size of the embedding layers
-        :param intermediate_size: Define the size of the intermediate layer in each transformer block
-        :param num_hidden_layers: Determine the number of layers in the encoder and decoder
-        :param num_attention_heads: Determine the number of attention heads in each layer
-        :param num_key_value_heads: Specify the number of heads for key and value
-        :param hidden_act: Specify the activation function used in the hidden layers
-        :param max_position_embeddings: Set the maximum length of the sequence
-        :param initializer_range: Initialize the weights of the model
-        :param rms_norm_eps: Avoid division by zero in the rms normalization
-        :param use_cache: Determine whether to use the cache in the decoder
-        :param pad_token_id: Specify the token id of the padding token
-        :param bos_token_id: Specify the beginning of sentence token id
-        :param eos_token_id: Specify the end of sentence token
-        :param tie_word_embeddings: Tie the word embeddings and the output layer
-        :param rope_theta: Control the number of tokens in a rope
-        :param sliding_window: Control the number of tokens that are processed in parallel
-        :param gradient_checkpointing: str: Specify whether to use gradient checkpointing
-        :param use_scan_mlp: bool: Determine whether or not to use the scan_mlp function
-        :param scan_mlp_chunk_size: int: Specify the chunk size of the scan mlp
-        :param number_rep_kv: int: Specify the number of times to repeat the key and value vectors
-        :param bits: Optional[int]: Specify the number of bits used for quantization
-        :param axis_dims: Sequence[int]: Specify the dimension of each axis
-        :param axis_names: Sequence[str]: Specify the names of each axis in the tensor
-        :param &quot;mp&quot;): Define the maximum position embeddings
-        :param kwargs: Pass a variable number of keyword arguments to a function
-        :param rope_scaling: Dict[str, Union[str, float]]: rope scaling information
-        :param attention_dropout: float: Set the dropout rate for the attention layer
-        :param initialization_of_moe: bool: initialization of moe needs to disable some dynamic part's this boolean
-         variable will turn them off.
-        :param attention_bias: bool: when ever to use attention_bias
-        :param : Define the number of layers in the model
-        :return: An instance of the class
-
-        """
+        warnings.warn(
+            "`DeepseekV2` is still in beta mode.",
+            UserWarning
+        )
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size

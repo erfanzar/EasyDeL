@@ -354,6 +354,19 @@ def get_modules_by_type(model_type: str) -> Tuple[
                 rnn_based_or_rwkv=False
             )
         )
+    elif model_type == "deepseek_v2":
+        from .deepseek_v2 import DeepseekV2Config as _DeepseekV2Config
+        from .deepseek_v2 import FlaxDeepseekV2ForCausalLM as _FlaxDeepseekV2ForCausalLM
+
+        return (
+            _DeepseekV2Config,
+            _FlaxDeepseekV2ForCausalLM,
+            functools.partial(
+                huggingface_to_easydel,
+                embedding_layer_names=["embed_tokens"],
+                rnn_based_or_rwkv=False
+            )
+        )
     raise EasyDeLRuntimeError(f'Model Type ({model_type}) is not supported or is not found')
 
 

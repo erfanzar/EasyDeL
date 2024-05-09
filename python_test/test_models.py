@@ -401,6 +401,30 @@ class EasyModelsTest(TestCase):
             f"PHI3 model Failed [ERROR {err}]"
         )
 
+    def test_deepseek_v2(self):
+        conf = transformers.AutoConfig.from_pretrained(
+            "deepseek-ai/DeepSeek-V2",
+            trust_remote_code=True
+        )
+        for k, v in self.__dict__.items():
+            if isinstance(v, (bool, str, float, type(None), int,)):
+                setattr(conf, k, v)
+        conf._attn_implementation = "eager"
+        res, err = self.create_test_for_models(
+            "deepseek_v2",
+            type(
+                transformers.AutoModelForCausalLM.from_config(
+                    conf,
+                    trust_remote_code=True,
+                )
+            )
+        )
+
+        self.assertTrue(
+            res,
+            f"PHI3 model Failed [ERROR {err}]"
+        )
+
     def test_openelm(self):
         conf = transformers.AutoConfig.from_pretrained(
             "apple/OpenELM-270M-Instruct",
