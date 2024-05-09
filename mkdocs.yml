@@ -78,6 +78,9 @@ nav:
       - Olmo:
         - Modelling Olmo Flax: generated-modules-olmo-modelling_olmo_flax.md
         - Olmo Configuration: generated-modules-olmo-olmo_configuration.md
+      - Openelm:
+        - Modelling Openelm Flax: generated-modules-openelm-modelling_openelm_flax.md
+        - Openelm Configuration: generated-modules-openelm-openelm_configuration.md
       - Opt:
         - Modelling Opt Flax: generated-modules-opt-modelling_opt_flax.md
         - Opt Configuration: generated-modules-opt-opt_configuration.md
