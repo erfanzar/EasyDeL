@@ -1,5 +1,6 @@
 from typing import List, Union
 
+import transformers
 from absl.app import run
 from absl import flags
 from easydel import JAXServer, JAXServerConfig
@@ -11,13 +12,13 @@ from easydel.serve.prompters.base_prompter import BasePrompter
 FLAGS = flags.FLAGS
 flags.DEFINE_enum(
     "prompter_type",
-    enum_values=("gemma", "llama", "openchat", "chatml", "zephyr"),
+    enum_values=("gemma", "llama", "openchat", "chatml", "zephyr", "auto"),
     help="Prompter to be used to prompt the model",
-    default="gemma"
+    default="auto"
 )
 flags.DEFINE_string(
     "pretrained_model_name_or_path",
-    default="google/gemma-7b-it",
+    default="apple/OpenELM-1_1B-Instruct",
     help="The pretrained model path in huggingface.co/models"
 )
 flags.DEFINE_integer(
@@ -121,29 +122,59 @@ def main(argv):
         "llama": Llama2Prompter(),
         "openchat": OpenChatPrompter(),
         "chatml": ChatMLPrompter(),
-        "zephyr": ZephyrPrompter()
+        "zephyr": ZephyrPrompter(),
+        "auto": None
     }
-    prompter: BasePrompter = prompters[FLAGS.prompter_type]
-
+    prompter: BasePrompter | None = prompters[FLAGS.prompter_type]
+    if prompter is None:
+        tokenizer = transformers.AutoTokenizer.from_pretrained(FLAGS.pretrained_model_name_or_path)
     FLAGS.sharding_axis_dims = tuple([int(s) for s in FLAGS.sharding_axis_dims])
 
     class JAXServerC(JAXServer):
 
         def format_chat(self, history: List[List[str]], prompt: str, system: Union[str, None]) -> str:
-            return prompter.format_message(
-                history=history,
-                prompt=prompt,
-                system_message=system,
-                prefix=None
-            )
+
+            if prompter is not None:
+                return prompter.format_message(
+                    history=history,
+                    prompt=prompt,
+                    system_message=system,
+                    prefix=None
+                )
+            else:
+                conv = []
+                if system is not None and system != "":
+                    conv.append({"role": "system", "content": system})
+                for h in history:
+                    conv.append({"role": "user", "content": h[0]})
+                    conv.append({"role": "assistant", "content": h[1]})
+
+                conv.append({"role": "user", "content": prompt})
+                tokenizer.apply_chat_template(
+                    conv,
+                    add_generation_prompt=True,
+                    tokenize=False
+                )
 
         def format_instruct(self, system: str, instruction: str) -> str:
-            return prompter.format_message(
-                prefix=None,
-                system_message=system,
-                prompt=instruction,
-                history=[]
-            )
+            if prompter is not None:
+                return prompter.format_message(
+                    history=[],
+                    prompt=instruction,
+                    system_message=system,
+                    prefix=None
+                )
+            else:
+                conv = []
+                if system is not None and system != "":
+                    conv.append({"role": "system", "content": system})
+
+                conv.append({"role": "user", "content": instruction})
+                tokenizer.apply_chat_template(
+                    conv,
+                    add_generation_prompt=True,
+                    tokenize=False
+                )
 
     server = JAXServerC.from_torch_pretrained(
         server_config=server_config,
@@ -164,7 +195,8 @@ def main(argv):
             block_k=FLAGS.block_k,
             block_q=FLAGS.block_q,
             use_sharded_kv_caching=FLAGS.use_sharded_kv_caching
-        )
+        ),
+        load_in_8bit=True
     )
 
     server.gradio_inference().launch(

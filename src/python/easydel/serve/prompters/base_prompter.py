@@ -1,5 +1,5 @@
 import abc
-from typing import List, Any, Optional
+from typing import List, Any, Optional, Union
 from datetime import datetime
 from abc import abstractmethod
 
