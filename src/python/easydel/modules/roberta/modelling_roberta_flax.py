@@ -221,13 +221,14 @@ class FlaxRobertaSelfAttention(BaseJAXAttentionModule):
                 value_states=value_states,
                 dropout_rng=dropout_rng,
                 deterministic=deterministic,
-                causal=False,
+                causal=True,
                 bias=attention_bias,
                 attention_mask=attention_mask,
                 uses_cache=False,
                 query_sequence_length=query_states.shape[1],
                 key_value_sequence_length=key_states.shape[1],
-                segment_ids=segment_ids
+                segment_ids=segment_ids,
+                causal_mask=causal_mask
             )
             attn_weights = out.attention_weights
             attn_output = out.attention_outputs
@@ -393,7 +394,7 @@ class FlaxRobertaLayer(nn.Module):
         if self.config.add_cross_attention:
             self.crossattention = FlaxRobertaAttention(
                 self.config,
-                causal=False,
+                causal=True,
                 dtype=self.dtype,
                 param_dtype=self.param_dtype,
                 precision=self.precision

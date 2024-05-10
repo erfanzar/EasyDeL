@@ -412,13 +412,14 @@ class FlaxMistralAttention(BaseJAXAttentionModule):
             value_states=value_states,
             bias=attention_bias,
             attention_mask=attention_mask,
-            causal=False,
+            causal=True,
             dropout_rng=dropout_rng,
             deterministic=deterministic,
             query_sequence_length=query_length,
             key_value_sequence_length=key_length,
             uses_cache=self.has_variable("cache", "cached_key") or init_cache,
-            segment_ids=segment_ids
+            segment_ids=segment_ids,
+            causal_mask=causal_mask
         )
 
         attn_output = self._merge_heads(attentions.attention_outputs)

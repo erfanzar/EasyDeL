@@ -208,7 +208,8 @@ class FlaxWhisperAttention(BaseJAXAttentionModule):
             query_sequence_length=query_length,
             key_value_sequence_length=key_length,
             uses_cache=self.has_variable("cache", "cached_key") or init_cache,
-            segment_ids=None
+            segment_ids=None,
+            causal_mask=causal_mask
         )
 
         attn_output = self._merge_heads(attentions.attention_outputs)
