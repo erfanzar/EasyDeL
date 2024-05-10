@@ -16,6 +16,7 @@ from fjformer.pallas_operations.splash_attention import (
     CausalMask,
     MultiHeadMask
 )
+from flax.linen.dtypes import promote_dtype
 from flax.struct import dataclass
 from jax import numpy as jnp, lax, random
 from jax.experimental.shard_map import shard_map
@@ -706,30 +707,50 @@ class AttentionModule:
         dtype = jnp.promote_types(self.dtype, jnp.float32)
 
         qps, kps, vps, bps, aps, is_gen = self.get_partition_specs(qs=query_sequence_length)
-        with self.mesh:
-            output = shard_map(
-                partial(
-                    shard_vanilla_attention,
-                    deterministic=deterministic,
-                    dropout_rng=dropout_rng,
-                    dtype=dtype,
-                    precision=self.precision,
-                    attention_dropout=self.attention_dropout
-                ),
-                in_specs=(
-                    qps,
-                    kps,
-                    vps,
-                    bps,
-                ),
-                out_specs=aps,
-                mesh=self.mesh
-            )(query_states, key_states, value_states, bias)
-            output = fjformer.with_sharding_constraint(output, aps)
 
+        with self.mesh:
+            query_states = fjformer.with_sharding_constraint(query_states, qps)
+            key_states = fjformer.with_sharding_constraint(key_states, kps)
+            value_states = fjformer.with_sharding_constraint(value_states, vps)
+
+            assert query_states.ndim == key_states.ndim, "q, k must have same rank."
+            assert query_states.shape[:-3] == key_states.shape[:-3], "q, k batch dims must match."
+            assert query_states.shape[-2] == key_states.shape[-2], "q, k num_heads must match."
+            assert query_states.shape[-1] == key_states.shape[-1], "q, k depths must match."
+            query_states, key_states, value_states = promote_dtype(
+                query_states, key_states, value_states,
+                dtype=dtype
+            )
+
+            depth = query_states.shape[-1]
+            query_states = query_states / jnp.sqrt(depth).astype(dtype)
+            attention_weight = jnp.einsum("...qhd,...khd->...hqk", query_states, key_states, precision=self.precision)
+            if bias is not None:
+                bias = fjformer.with_sharding_constraint(bias, bps)
+                attention_weight = jnp.add(attention_weight, bias)
+
+            attention_weight = jax.nn.softmax(
+                attention_weight.astype(jnp.float32)
+            ).astype(dtype)
+
+            if not deterministic and self.attention_dropout > 0.0:
+                keep_prob = 1.0 - self.attention_dropout
+                dropout_shape = tuple([1] * (key_states.ndim - 2)) + attention_weight.shape[-2:]
+                keep = random.bernoulli(dropout_rng, keep_prob, dropout_shape)  # type: ignore
+
+                multiplier = keep.astype(dtype) / jnp.asarray(keep_prob, dtype=dtype)
+                attention_weight = attention_weight * multiplier
+
+            attention = jnp.einsum(
+                "...hqk,...khd->...qhd",
+                attention_weight,
+                value_states,
+                precision=self.precision
+            )
+            attention = fjformer.with_sharding_constraint(attention, aps)
             return AttentionOutput(
-                attention_weights=None,
-                attention_outputs=output
+                attention_weights=attention_weight,
+                attention_outputs=attention
             )
 
     def flash_attention(

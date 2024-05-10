@@ -75,7 +75,7 @@ class EasyModelsGenerationTest(TestCase):
             "sharded_vanilla",
             "wise_ring",
             "blockwise"
-        ] = "local_ring"
+        ] = "sharded_vanilla"
         self.block_k: int = 64
         self.block_q: int = 64
         self.scan_mlp_chunk_size = self.sequence_length // 2
