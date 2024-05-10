@@ -209,7 +209,7 @@ def multinomial(logits, num_samples: int, replacement: bool = False):
         for _ in range(num_samples):
             sample = jax.random.categorical(logits, 1)
             samples.append(sample[0])
-            logits.at[sample[0]].set(-jnp.inf)
+            logits = logits.at[sample[0]].set(-jnp.inf)
         return jnp.array(samples)
 
 

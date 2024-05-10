@@ -82,7 +82,7 @@ def make_inputs():
         jnp.ones((BATCH_SIZE, SEQUENCE_LENGTH))
     )
     a = jnp.ones((BATCH_SIZE, SEQUENCE_LENGTH))
-    a.at[:, SEQUENCE_LENGTH // 2:].set(0)
+    a = a.at[:, SEQUENCE_LENGTH // 2:].set(0)
     b = jnp.where(
         flax.linen.attention.combine_masks(
             jnp.expand_dims(jnp.expand_dims(a, 1), 1), c

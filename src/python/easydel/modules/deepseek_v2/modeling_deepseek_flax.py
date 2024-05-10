@@ -318,7 +318,7 @@ class FlaxMoEGate(nn.Module):
             if self.seq_aux:
                 scores_for_seq_aux = scores_for_aux.reshape(bsz, seq_len, -1)
                 ce = jnp.zeros(bsz, self.n_routed_experts)
-                ce.at[1, topk_idx_for_aux_loss].add(
+                ce = ce.at[1, topk_idx_for_aux_loss].add(
                     jnp.ones(bsz, seq_len * aux_topk),
                 )
                 ce = jnp.divide(ce, (seq_len * aux_topk / self.n_routed_experts))
