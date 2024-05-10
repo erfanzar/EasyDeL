@@ -23,7 +23,7 @@ from functools import partial
 
 rng = GenerateRNG()
 BATCH_SIZE = 8
-SEQUENCE_LENGTH = 128 * 8 
+SEQUENCE_LENGTH = 128 * 8
 HEAD_DIM = 128
 NUM_HEADS = 32
 IMG_LOSS = 0.5649852
@@ -105,7 +105,8 @@ def main():
         "sharded_vanilla",
         "flash",
         "splash",
-        "cudnn"
+        "cudnn",
+        "pallas_flash"
     ]
     fns = {
         k: partial(call_attention_module, attn_mechanism=k) for k in test_attentions

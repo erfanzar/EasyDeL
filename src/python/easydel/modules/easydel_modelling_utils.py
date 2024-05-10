@@ -22,7 +22,8 @@ AVAILABLE_ATTENTION_MECHANISMS = Literal[
     "local_ring",
     "sharded_vanilla",
     "wise_ring",
-    "blockwise"
+    "blockwise",
+    "pallas_flash"
 ]
 
 

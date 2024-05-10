@@ -22,6 +22,7 @@ from jax import numpy as jnp, lax, random
 from jax.experimental.shard_map import shard_map
 from jax.experimental.pjit import pjit
 from jax.sharding import PartitionSpec, Mesh
+from jax.experimental.pallas.ops.attention import mha
 
 from ._attentions import (
     vanilla_attention,
@@ -42,6 +43,42 @@ DEFAULT_Q_BLOCK = 512
 class AttentionOutput:
     attention_weights: Optional[Array] = None
     attention_outputs: Optional[Array] = None
+
+
+def combine_flash_masks(causal_mask, segment_ids):
+    causal_mask = causal_mask.astype(jnp.bool_)
+    if causal_mask.ndim == 2:
+        query_sequence_length, key_sequence_length = causal_mask.shape
+        causal_mask = causal_mask.reshape(1, 1, query_sequence_length, key_sequence_length)
+    elif causal_mask.ndim == 4:
+        *_, query_sequence_length, key_sequence_length = causal_mask.shape
+    else:
+        raise ValueError("unexpected shape for `causal_mask`")
+    if segment_ids.ndim == 2:
+        b, seq_query_sequence_length = segment_ids.shape
+        seq_key_sequence_length = seq_query_sequence_length
+    elif segment_ids.ndim == 4:
+        b, _, _, seq_key_sequence_length = segment_ids.shape
+        seq_query_sequence_length = seq_key_sequence_length
+        segment_ids = segment_ids[:, 0, -1]  # taking final mask
+    else:
+        raise ValueError("unexpected shape for `segment_ids`")
+
+    assert seq_query_sequence_length == query_sequence_length, (
+        "`segment_ids` and `causal_mask` don't have same query axis length"
+    )
+    assert seq_key_sequence_length == key_sequence_length, (
+        "`segment_ids` and `causal_mask` don't have same key/value axis length"
+    )
+    assert segment_ids.ndim == 2, f"`segment_ids` don't have excepted shape {segment_ids.shape}"
+    segment_ids = jnp.expand_dims(
+        ~jnp.equal(
+            jnp.expand_dims(segment_ids, axis=2),
+            jnp.expand_dims(segment_ids, axis=1)
+        ).astype(jax.numpy.bool_),
+        1
+    )
+    return jnp.logical_or(~causal_mask, segment_ids)
 
 
 def get_flash_attention() -> Tuple[Callable, bool, bool]:
@@ -76,7 +113,8 @@ class AttentionModule:
                 "local_ring",
                 "sharded_vanilla",
                 "wise_ring",
-                "blockwise"
+                "blockwise",
+                "pallas_flash"
             ],
             num_attention_heads: int,
             head_dims: int,
@@ -250,12 +288,13 @@ class AttentionModule:
             query_states: Array,
             key_states: Array,
             value_states: Array,
+            causal_mask: Optional[Array] = None,
             query_sequence_length: Optional[int] = None,
             key_value_sequence_length: Optional[int] = None,
             bias: Optional[Array] = None,
             attention_mask: Optional[Array] = None,
             segment_ids: Optional[Array] = None,
-            causal: bool = False,
+            causal: bool = True,
             deterministic: bool = False,
             dropout_rng: Optional[random.PRNGKey] = None,
             uses_cache: bool = False
@@ -330,7 +369,16 @@ class AttentionModule:
                     query_sequence_length=query_sequence_length,
                     key_value_sequence_length=key_value_sequence_length
                 )
-
+            elif self.attn_mechanism == "pallas_flash":
+                return self.pallas_mha(
+                    query_states=query_states,
+                    key_states=key_states,
+                    value_states=value_states,
+                    query_sequence_length=query_sequence_length,
+                    attention_mask=attention_mask,
+                    bias=bias,
+                    causal=causal
+                )
             elif self.attn_mechanism == "splash":
                 if segment_ids is not None:
                     warnings.warn(
@@ -858,6 +906,61 @@ class AttentionModule:
             attention_weights=None
         )
 
+    def pallas_mha(
+            self,
+            *,
+            query_states: Array,
+            key_states: Array,
+            value_states: Array,
+            query_sequence_length: int = None,
+            attention_mask: Optional[Array] = None,
+            bias: Optional[Array] = None,
+            causal: bool = True,
+    ) -> AttentionOutput:
+        """
+        TIP: for using this attention module set bias_partition_spec to (("dp","fsdp",),"sp")
+        """
+        assert attention_mask is not None, "`attention_mask` is required for `pallas_mha`"
+        if attention_mask.ndim == 4:
+            attention_mask = attention_mask[:, 0, -1]
+        if query_sequence_length is None:
+            query_sequence_length = query_states.shape[1]
+        qps, kps, vps, bps, aps, is_gen = self.get_partition_specs(qs=query_sequence_length)
+
+        query_states, key_states, value_states = map(
+            lambda s: s.astype(jnp.float32),
+            (query_states, key_states, value_states)
+        )
+
+        wrapped_mha = shard_map(
+            partial(
+                mha,
+                sm_scale=self.sm_scale,
+                causal=causal,
+                block_k=self.block_k,
+                block_q=self.block_q
+            ),
+            in_specs=(
+                qps,
+                kps,
+                vps,
+                bps
+            ),
+            out_specs=aps,
+            mesh=self.mesh,
+            check_rep=False,
+        )
+        attention_outputs = wrapped_mha(
+            query_states,
+            key_states,
+            value_states,
+            attention_mask
+        )
+        return AttentionOutput(
+            attention_weights=None,
+            attention_outputs=attention_outputs
+        )
+
     def cuddn_flash_attention(
             self,
             *,  # it's Kwarg Only
@@ -1024,7 +1127,8 @@ class AttentionModule:
             "sharded_vanilla",
             "flash",
             "splash",
-            "cudnn"
+            "cudnn",
+            "pallas_flash"
         ]
         fns = {
             k: partial(call_attention_module, attn_mechanism=k) for k in test_attentions
