@@ -1003,7 +1003,7 @@ class AttentionModule:
                 jnp.ones((batch_size, sequence_length))
             )
             a = jnp.ones((batch_size, sequence_length))
-            a.at[:, sequence_length // 2:].set(0)
+            a = a.at[:, sequence_length // 2:].set(0)
             b = jnp.where(
                 flax.linen.attention.combine_masks(
                     jnp.expand_dims(jnp.expand_dims(a, 1), 1), c
