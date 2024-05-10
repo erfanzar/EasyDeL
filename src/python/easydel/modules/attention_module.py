@@ -1036,7 +1036,7 @@ class AttentionModule:
                 out = jax.block_until_ready(fn(q, k, v, b))
                 end = time.time() - start
                 outs_and_grads[nm] = out + (end,)
-            except OSError:
+            except:
                 outs_and_grads[nm] = (None, None, None)
         frame_out = {}
         for key, (out, grad, time_took) in outs_and_grads.items():
