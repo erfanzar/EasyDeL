@@ -14,7 +14,8 @@ from fjformer.pallas_operations.ring_attention import ring_flash_attention_tpu
 from fjformer.pallas_operations.splash_attention import (
     make_splash_mha,
     CausalMask,
-    MultiHeadMask
+    MultiHeadMask,
+    SegmentIds
 )
 from flax.linen.dtypes import promote_dtype
 from flax.struct import dataclass
@@ -395,18 +396,14 @@ class AttentionModule:
                         "Splash attention don't support `bias` this argument will be ignored",
                         UserWarning
                     )
-                if attention_mask is not None:
-                    warnings.warn(
-                        "Splash attention don't support `bias` this argument will be ignored",
-                        UserWarning
-                    )
 
                 return self.splash_attention(
                     query_states=query_states,
                     key_states=key_states,
                     value_states=value_states,
                     query_sequence_length=query_sequence_length,
-                    key_value_sequence_length=key_value_sequence_length
+                    key_value_sequence_length=key_value_sequence_length,
+                    attention_mask=attention_mask
                 )
             elif self.attn_mechanism == "blockwise":
                 if segment_ids is not None:
@@ -865,6 +862,7 @@ class AttentionModule:
             value_states: Array,
             query_sequence_length: int,
             key_value_sequence_length: int,
+            attention_mask
     ) -> AttentionOutput:
 
         qps, kps, vps, bps, aps, is_gen = self.get_partition_specs(qs=query_sequence_length)
@@ -877,15 +875,18 @@ class AttentionModule:
             lambda s: s.astype(jnp.float32),
             (query_states, key_states, value_states)
         )
+        if attention_mask.ndim == 4:
+            attention_mask = attention_mask[:, 0, -1]
+        attention_mask = SegmentIds(attention_mask, attention_mask)
 
         @partial(
             shard_map,
-            in_specs=(qps, kps, vps),
+            in_specs=(qps, kps, vps, bps),
             out_specs=qps,
             mesh=self.mesh,
             check_rep=False,
         )
-        def splash_attention_call(q, k, v):
+        def splash_attention_call(q, k, v, am):
             block_size = self.get_block_size_splash_attn(query_sequence_length, key_value_sequence_length)
             masks = [CausalMask(shape=(q.shape[2], k.shape[2])) for _ in range(q.shape[1])]
             multi_head_mask = MultiHeadMask(masks=masks)
@@ -896,9 +897,9 @@ class AttentionModule:
                 block_sizes=block_size
             )
 
-            return jax.vmap(splash_kernel)(q, k, v, segment_ids=None)
+            return jax.vmap(splash_kernel)(q, k, v, segment_ids=am)
 
-        attention_o = splash_attention_call(query_states, key_states, value_states)
+        attention_o = splash_attention_call(query_states, key_states, value_states, attention_mask)
 
         attention_o = attention_o.transpose(0, 2, 1, 3)
         return AttentionOutput(
