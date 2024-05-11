@@ -8,8 +8,8 @@ import fjformer
 import jax
 from chex import Array
 from fjformer import with_sharding_constraint
-from fjformer.pallas_operations.flash_attention import gpu as flash_attn_gpu
-from fjformer.pallas_operations.flash_attention import tpu as flash_attn_tpu
+from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention
+
 from fjformer.pallas_operations.ring_attention import ring_flash_attention_tpu
 from fjformer.pallas_operations.splash_attention import (
     make_splash_mha,
@@ -21,7 +21,6 @@ from flax.linen.dtypes import promote_dtype
 from flax.struct import dataclass
 from jax import numpy as jnp, lax, random
 from jax.experimental.shard_map import shard_map
-from jax.experimental.pjit import pjit
 from jax.sharding import PartitionSpec, Mesh
 from jax.experimental.pallas.ops.attention import mha
 
@@ -29,7 +28,6 @@ from ._attentions import (
     vanilla_attention,
     ring_attention_standard,
     wise_ring_attention,
-    shard_vanilla_attention,
     blockwise_attn
 )
 from .flax_modelling_utils import get_gradient_checkpoint_policy
@@ -88,12 +86,13 @@ def get_flash_attention() -> Tuple[Callable, bool, bool]:
     """
     platform = jax.lib.xla_bridge.get_backend().platform
     if platform == "gpu":
+        warnings.warn("for GPU backend use `cudnn` or `pallas_flash`")
         float32_logits = False
-        ring_attention_fn = flash_attn_gpu.mha
+        ring_attention_fn = mha
         do_shard_map = True
     elif platform == "tpu":
         float32_logits = True
-        ring_attention_fn = flash_attn_tpu.flash_attention
+        ring_attention_fn = flash_attention
         do_shard_map = False
     else:
         raise ValueError(f"Unsupported platform {platform}")
