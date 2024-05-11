@@ -11,7 +11,14 @@ from fjformer import with_sharding_constraint
 from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention
 
 from fjformer.pallas_operations.ring_attention import ring_flash_attention_tpu
-from fjformer.pallas_operations.splash_attention import (
+
+# from fjformer.pallas_operations.splash_attention import (
+#     make_splash_mha,
+#     CausalMask,
+#     MultiHeadMask,
+#     SegmentIds
+# ) # doesn't work on jax version 0.4.28
+from jax.experimental.pallas.ops.tpu.splash_attention import (
     make_splash_mha,
     CausalMask,
     MultiHeadMask,
@@ -196,7 +203,7 @@ class AttentionModule:
             raise OSError("flash attention is only supported on GPU.")
 
     def get_block_size_splash_attn(self, q_seq, k_seq):
-        return fjformer.pallas_operations.splash_attention.BlockSizes(
+        return jax.experimental.pallas.ops.tpu.splash_attention.BlockSizes(
             block_q=min(self.block_q, q_seq),
             block_kv_compute=min(self.block_k, k_seq),
             block_kv=min(self.block_k, k_seq),
@@ -208,7 +215,7 @@ class AttentionModule:
         )
 
     def get_block_size_flash_attn(self, q_seq, k_seq):
-        return fjformer.pallas_operations.flash_attention.BlockSizes(
+        return jax.experimental.pallas.ops.tpu.flash_attention.BlockSizes(
             block_q=min(self.block_q, q_seq),
             block_k=min(self.block_k, k_seq),
             block_q_dkv=min(self.block_q_dkv, q_seq),
