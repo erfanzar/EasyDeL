@@ -862,7 +862,7 @@ class AttentionModule:
             value_states: Array,
             query_sequence_length: int,
             key_value_sequence_length: int,
-            attention_mask
+            attention_mask: Array
     ) -> AttentionOutput:
 
         qps, kps, vps, bps, aps, is_gen = self.get_partition_specs(qs=query_sequence_length)
@@ -875,9 +875,12 @@ class AttentionModule:
             lambda s: s.astype(jnp.float32),
             (query_states, key_states, value_states)
         )
-        if attention_mask.ndim == 4:
-            attention_mask = attention_mask[:, 0, -1]
-        attention_mask = SegmentIds(attention_mask, attention_mask)
+        if attention_mask is not None:
+            if attention_mask.ndim == 4:
+                attention_mask = attention_mask[:, 0, -1]
+            attention_mask = SegmentIds(attention_mask, attention_mask)
+        else:
+            warnings.warn("`attention_mask` is not passed to SplashAttention. (except miss computation problem)")
 
         @partial(
             shard_map,
@@ -1073,12 +1076,12 @@ class AttentionModule:
             return jnp.max(jnp.abs(t1 - t2))
 
         @value_and_grad_wrapper
-        def call_dot_product(q, k, v, b):
-            attention_pred = flax.linen.dot_product_attention(q, k, v, b)
+        def call_dot_product(q, k, v, b, ):
+            attention_pred = flax.linen.dot_product_attention(q, k, v, b, )
             return attention_pred
 
         @value_and_grad_wrapper
-        def call_attention_module(q, k, v, b, attn_mechanism):
+        def call_attention_module(q, k, v, b, a, attn_mechanism):
             attention_pred = AttentionModule(
                 attn_mechanism=attn_mechanism,
                 axis_name="sp",
@@ -1093,6 +1096,7 @@ class AttentionModule:
                 key_states=k,
                 value_states=v,
                 bias=b,
+                attention_mask=a
             ).attention_outputs
             return attention_pred
 
@@ -1103,22 +1107,14 @@ class AttentionModule:
                                   dtype="float32")
             v = jax.random.normal(rng.rng, (batch_size, sequence_length, num_key_value_heads, head_dim),
                                   dtype="float32")
-            c = flax.linen.attention.make_causal_mask(
-                jnp.ones((batch_size, sequence_length))
-            )
+            c = flax.linen.attention.make_causal_mask(jnp.ones((batch_size, sequence_length)))
             a = jnp.ones((batch_size, sequence_length))
             a = a.at[:, sequence_length // 2:].set(0)
-            b = jnp.where(
-                flax.linen.attention.combine_masks(
-                    jnp.expand_dims(jnp.expand_dims(a, 1), 1), c
-                ),
-                0,
-                -jnp.inf
-            )
+            b = jnp.where(flax.linen.attention.combine_masks(jnp.expand_dims(jnp.expand_dims(a, 1), 1), c), 0, -jnp.inf)
 
-            return q, k, v, b
+            return q, k, v, b, a.astype("bool")
 
-        q, k, v, b = make_inputs()
+        q, k, v, b, a = make_inputs()
         excepted_output, excepted_grads = call_dot_product(q, k, v, b)
         test_attentions = [
             "local_ring",
@@ -1138,7 +1134,7 @@ class AttentionModule:
         for nm, fn in fns.items():
             try:
                 start = time.time()
-                out = jax.block_until_ready(fn(q, k, v, b))
+                out = jax.block_until_ready(fn(q, k, v, b, a))
                 end = time.time() - start
                 outs_and_grads[nm] = out + (end,)
             except:
