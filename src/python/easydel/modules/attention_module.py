@@ -881,7 +881,7 @@ class AttentionModule:
 
         @partial(
             shard_map,
-            in_specs=(qps, kps, vps, bps),
+            in_specs=(qps, kps, vps, PartitionSpec(qps[0], qps[2])),  # make it easier
             out_specs=qps,
             mesh=self.mesh,
             check_rep=False,
@@ -945,7 +945,7 @@ class AttentionModule:
                 qps,
                 kps,
                 vps,
-                bps
+                PartitionSpec(qps[0], qps[1])
             ),
             out_specs=aps,
             mesh=self.mesh,
