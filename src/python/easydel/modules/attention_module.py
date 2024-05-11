@@ -1118,7 +1118,7 @@ class AttentionModule:
             a = a.at[:, sequence_length // 2:].set(0)
             b = jnp.where(flax.linen.attention.combine_masks(jnp.expand_dims(jnp.expand_dims(a, 1), 1), c), 0, -jnp.inf)
 
-            return q, k, v, b, a.astype("bool")
+            return q, k, v, b, a
 
         q, k, v, b, a = make_inputs()
         excepted_output, excepted_grads = call_dot_product(q, k, v, b)
