@@ -8,22 +8,27 @@ import fjformer
 import jax
 from chex import Array
 from fjformer import with_sharding_constraint
-from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention
 
+try:
+    from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention
+except (ModuleNotFoundError, ImportError) as e:
+    from fjformer.pallas_operations.flash_attention.tpu import flash_attention
 from fjformer.pallas_operations.ring_attention import ring_flash_attention_tpu
 
-# from fjformer.pallas_operations.splash_attention import (
-#     make_splash_mha,
-#     CausalMask,
-#     MultiHeadMask,
-#     SegmentIds
-# ) # doesn't work on jax version 0.4.28
-from jax.experimental.pallas.ops.tpu.splash_attention import (
-    make_splash_mha,
-    CausalMask,
-    MultiHeadMask,
-    SegmentIds
-)
+try:
+    from jax.experimental.pallas.ops.tpu.splash_attention import (
+        make_splash_mha,
+        CausalMask,
+        MultiHeadMask,
+        SegmentIds
+    )
+except (ModuleNotFoundError, ImportError) as e:
+    from fjformer.pallas_operations.splash_attention import (
+        make_splash_mha,
+        CausalMask,
+        MultiHeadMask,
+        SegmentIds
+    )  # doesn't work on jax version 0.4.28
 from flax.linen.dtypes import promote_dtype
 from flax.struct import dataclass
 from jax import numpy as jnp, lax, random
