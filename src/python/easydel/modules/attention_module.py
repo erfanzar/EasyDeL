@@ -1169,8 +1169,10 @@ class AttentionModule:
                 output_diff = diff(excepted_output, out)
                 g_diff = [diff(*args) for args in zip(excepted_grads, grad)]
                 sum_g = sum(g_diff)
-                sum_g = jax.device_get(sum_g)
-                output_diff = jax.device_get(output_diff)
+                # TODO : Fix this
+                # XlaRuntimeError: FAILED_PRECONDITION: The program continuator has halted unexpectedly.
+                # sum_g = jax.device_get(sum_g)
+                # output_diff = jax.device_get(output_diff)
                 frame_out[key.upper()] = {
                     "OUT DIFF": output_diff,
                     "GRADIENT DIFF SUM": sum_g,
