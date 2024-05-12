@@ -80,6 +80,7 @@ class EasyModelsGenerationTest(TestCase):
         self.block_k: int = 64
         self.block_q: int = 64
         self.scan_mlp_chunk_size = self.sequence_length // 2
+        self.quantize_kv_cache = True
 
     def create_generation_test_for_models(
             self,
