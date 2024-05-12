@@ -434,10 +434,20 @@ class BaseJAXAttentionModule(nn.Module):
         :param attention_mask: Mask out the padded vectors in the cache
         :return: The key, value and attention_mask
         """
+        quantize_kv_cache = self.config.quantize_kv_cache
         is_initialized = self.has_variable("cache", "cached_key")
-        cached_key = self.variable("cache", "cached_key", jnp.zeros, key.shape, key.dtype)
-        cached_value = self.variable("cache", "cached_value", jnp.zeros, value.shape, value.dtype)
-        cache_index = self.variable("cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32))
+        if quantize_kv_cache:
+            cached_key = self.variable("cache", "cached_key", jnp.zeros, key.shape, jnp.int8)
+            cached_value = self.variable("cache", "cached_value", jnp.zeros, value.shape, jnp.int8)
+            cached_key_scale = self.variable("cache", "cached_key_scale", jnp.zeros, key.shape[0:-1], jnp.float32)
+            cached_value_scale = self.variable("cache", "cached_value_scale", jnp.zeros, value.shape[0:-1], jnp.float32)
+            cache_index = self.variable("cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32))
+        else:
+            cached_key_scale = None
+            cached_value_scale = None
+            cached_key = self.variable("cache", "cached_key", jnp.zeros, key.shape, key.dtype)
+            cached_value = self.variable("cache", "cached_value", jnp.zeros, value.shape, value.dtype)
+            cache_index = self.variable("cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32))
 
         if is_initialized:
             *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
@@ -486,16 +496,45 @@ class BaseJAXAttentionModule(nn.Module):
                 *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
                 cur_index = cache_index.value
                 indices = (0,) * len(batch_dims) + (cur_index, 0, 0)  # type:ignore
-                key = lax.dynamic_update_slice(cached_key.value, key, indices)
-                value = lax.dynamic_update_slice(cached_value.value, value, indices)
+                if quantize_kv_cache:
+                    key_val = fjformer.linen.linen.de_quantize(
+                        cached_key.value,
+                        cached_key_scale.value,
+                        key.dtype,
+                        .0
+                    )
+                    value_val = fjformer.linen.linen.de_quantize(
+                        cached_value.value,
+                        cached_value_scale.value,
+                        value.dtype,
+                        .0
+                    )
+                else:
+                    key_val = cached_key.value
+                    value_val = cached_value.value
+
+                key = lax.dynamic_update_slice(key_val, key, indices)
+                value = lax.dynamic_update_slice(value_val, value, indices)
                 num_updated_cache_vectors = query_states.shape[1]
                 pad_mask = jnp.broadcast_to(
                     jnp.arange(max_length) < cur_index + num_updated_cache_vectors,
                     tuple(batch_dims) + (1, num_updated_cache_vectors, max_length),
                 )
                 attention_mask = combine_masks(pad_mask, attention_mask)
-            cached_key.value = key
-            cached_value.value = value
+            if quantize_kv_cache:
+                kq, ks = fjformer.linen.linen.quantize(key)
+                vq, vs = fjformer.linen.linen.quantize(value)
+
+                cached_key.value = kq
+                cached_key_scale.value = ks
+
+                cached_value.value = vq
+                cached_value_scale.value = vs
+
+            else:
+                cached_key.value = key
+                cached_value.value = value
+
             num_updated_cache_vectors = query_states.shape[1]
             cache_index.value = cache_index.value + num_updated_cache_vectors
         return key, value, attention_mask
