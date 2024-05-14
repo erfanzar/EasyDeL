@@ -107,7 +107,7 @@ class EasyDeLPretrainedConfig(PretrainedConfig):
             scan_mlp_chunk_size: int = 1024,
             attention_axis_name: str = "sp",
             quantize_kv_cache: bool = False,
-            flash_attention_backward_pass_impl: Literal["triton", "xla"] = "xla",
+            flash_attention_backward_pass_impl: Literal["triton", "xla"] = "triton",
             **kwargs
     ):
         self.query_partition_spec = query_partition_spec
@@ -413,7 +413,7 @@ class EasyDeLPretrainedConfig(PretrainedConfig):
         set_attrs_smartly(self, "scan_mlp_chunk_size", 1024, scan_mlp_chunk_size)
         set_attrs_smartly(self, "attention_axis_name", "sp", attention_axis_name)
         set_attrs_smartly(self, "quantize_kv_cache", False, quantize_kv_cache)
-        set_attrs_smartly(self, "flash_attention_backward_pass_impl", "xla", flash_attention_backward_pass_impl)
+        set_attrs_smartly(self, "flash_attention_backward_pass_impl", "triton", flash_attention_backward_pass_impl)
 
     def __repr__(self):
 

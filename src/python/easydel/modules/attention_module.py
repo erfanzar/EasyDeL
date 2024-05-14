@@ -164,7 +164,7 @@ class AttentionModule:
             shard_attention_computation: bool = True,
             use_sharding_constraint: Optional[bool] = False,
             axis_name: str = "sp",
-            backward_pass_impl: Literal["triton", "xla"] = "xla"
+            backward_pass_impl: Literal["triton", "xla"] = "triton"
     ):
         platform = jax.lib.xla_bridge.get_backend().platform
         if sm_scale is None:
@@ -935,10 +935,6 @@ class AttentionModule:
             query_sequence_length: int = None,
             bias: Optional[Array] = None,
     ) -> AttentionOutput:
-        """
-        TIP: for using this attention module set bias_partition_spec to (("dp","fsdp",),"sp")
-        """
-
         if query_sequence_length is None:
             query_sequence_length = query_states.shape[1]
         qps, kps, vps, bps, aps, is_gen = self.get_partition_specs(qs=query_sequence_length)
@@ -988,7 +984,7 @@ class AttentionModule:
         except (ModuleNotFoundError, ImportError) as err:
             raise RuntimeError(
                 "Please install transformer_engine first. you can install that by running "
-                f"`pip install git+https://github.com/NVIDIA/transformer_engine`"
+                f"`pip install git+https://github.com/NVIDIA/TransformerEngine`"
                 f"\nhere's extra information on error\n{err}"
             )
         batch, query_sequence_length, num_attention_heads, head_dim = query_states.shape
