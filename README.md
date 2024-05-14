@@ -44,7 +44,9 @@ With its comprehensive set of features and tools, EasyDeL aims to streamline and
 of machine learning models, particularly in the domain of large language models and video-related applications.
 
 > **News**
-> 
+>
+> `pallas_flash` is now available for CPU/GPU/TPU with custom pallas kernel.
+>
 > DeepseekV2 Model is Added (beta mood).
 >
 > OpenELM Model is Added.
