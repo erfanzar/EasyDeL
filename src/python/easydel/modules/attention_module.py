@@ -39,7 +39,7 @@ from flax.struct import dataclass
 from jax import numpy as jnp, lax, random
 from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec, Mesh
-from jax.experimental.pallas.ops.attention import mha
+from fjformer.pallas_operations import flash_attention
 
 from ._attentions import (
     vanilla_attention,
@@ -943,6 +943,7 @@ class AttentionModule:
         assert attention_mask is not None, "`attention_mask` is required for `pallas_mha`"
         if attention_mask.ndim == 4:
             attention_mask = attention_mask[:, 0, -1]
+
         if query_sequence_length is None:
             query_sequence_length = query_states.shape[1]
         qps, kps, vps, bps, aps, is_gen = self.get_partition_specs(qs=query_sequence_length)
@@ -951,31 +952,21 @@ class AttentionModule:
             lambda s: s.astype(jnp.float32),
             (query_states, key_states, value_states)
         )
-
-        wrapped_mha = shard_map(
-            partial(
-                mha,
-                sm_scale=self.sm_scale,
-                causal=causal,
-                block_k=self.block_k,
-                block_q=self.block_q
-            ),
-            in_specs=(
-                qps,
-                kps,
-                vps,
-                PartitionSpec(qps[0], qps[1])
-            ),
-            out_specs=aps,
-            mesh=self.mesh,
-            check_rep=False,
-        )
-        attention_outputs = wrapped_mha(
+        query_states = with_sharding_constraint(query_states, qps)
+        key_states = with_sharding_constraint(key_states, kps)
+        value_states = with_sharding_constraint(value_states, vps)
+        attention_mask = with_sharding_constraint(attention_mask, PartitionSpec(qps[0], qps[1]))
+        attention_outputs = flash_attention(
             query_states,
             key_states,
             value_states,
-            attention_mask
+            attention_mask=attention_mask,
+            sm_scale=self.sm_scale,
+            causal=False,
+            block_k=self.block_k,
+            block_q=self.block_q
         )
+        attention_outputs = with_sharding_constraint(attention_outputs, aps)
         return AttentionOutput(
             attention_weights=None,
             attention_outputs=attention_outputs
@@ -1136,11 +1127,11 @@ class AttentionModule:
             "local_ring",
             "blockwise",
             "vanilla",
-            "wise_ring",
+            # "wise_ring",
             "sharded_vanilla",
-            "flash",
-            "splash",
-            "cudnn",
+            # "flash",
+            # "splash",
+            # "cudnn",
             "pallas_flash"
         ]
         fns = {
@@ -1153,7 +1144,8 @@ class AttentionModule:
                 out = jax.block_until_ready(fn(q, k, v, b, a))
                 end = time.time() - start
                 outs_and_grads[nm] = out + (end,)
-            except:
+            except Exception as e:
+                print(f"{nm} failled :\n\n{e}")
                 outs_and_grads[nm] = (None, None, None)
         frame_out = {}
         for key, (out, grad, time_took) in outs_and_grads.items():
