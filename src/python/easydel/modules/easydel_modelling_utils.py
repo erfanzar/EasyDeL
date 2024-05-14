@@ -68,6 +68,7 @@ class EasyDeLPretrainedConfig(PretrainedConfig):
     :param use_sharding_constraint: bool: whether to use sharding constraint for the arrays
     :param use_scan_mlp: bool: Determine whether to use scan_mlp or not
     :param backend: Optional[None]: Specify the backend to use
+    :param flash_attention_backward_pass_impl: Literal["triton", "xla"]: Specify the backward pass kernel for flash attention
     """
 
     def __init__(
@@ -106,6 +107,7 @@ class EasyDeLPretrainedConfig(PretrainedConfig):
             scan_mlp_chunk_size: int = 1024,
             attention_axis_name: str = "sp",
             quantize_kv_cache: bool = False,
+            flash_attention_backward_pass_impl: Literal["triton", "xla"] = "xla",
             **kwargs
     ):
         self.query_partition_spec = query_partition_spec
@@ -142,6 +144,7 @@ class EasyDeLPretrainedConfig(PretrainedConfig):
         self.use_sharding_constraint = use_sharding_constraint
         self.attention_axis_name = attention_axis_name
         self.quantize_kv_cache = quantize_kv_cache
+        self.flash_attention_backward_pass_impl = flash_attention_backward_pass_impl
         super().__init__(**kwargs)
 
     @staticmethod
@@ -284,7 +287,8 @@ class EasyDeLPretrainedConfig(PretrainedConfig):
             use_scan_mlp: bool = ...,
             scan_mlp_chunk_size: int = ...,
             attention_axis_name: str = ...,
-            quantize_kv_cache: bool = ...
+            quantize_kv_cache: bool = ...,
+            flash_attention_backward_pass_impl: Literal["triton", "xla"] = ...
     ):
         """
         It initializes all the attributes of an object, and it's called when you create a new instance of that class.
@@ -326,6 +330,7 @@ class EasyDeLPretrainedConfig(PretrainedConfig):
         :param scan_mlp_chunk_size: int: Size of chunks in scan MLP.
         :param attention_axis_name: str: Name of the attention axis name
         :param quantize_kv_cache: bool: Whether to quantize Key/Value in attention for generation process.
+        :param flash_attention_backward_pass_impl: Literal["triton", "xla"]: Specify the backward pass kernel for flash attention
         """
         set_attrs_smartly(self, "axis_dims", (1, -1, 1, 1), axis_dims)
         set_attrs_smartly(self, "axis_names", ("dp", "fsdp", "tp", "sp"), axis_names)
@@ -408,6 +413,7 @@ class EasyDeLPretrainedConfig(PretrainedConfig):
         set_attrs_smartly(self, "scan_mlp_chunk_size", 1024, scan_mlp_chunk_size)
         set_attrs_smartly(self, "attention_axis_name", "sp", attention_axis_name)
         set_attrs_smartly(self, "quantize_kv_cache", False, quantize_kv_cache)
+        set_attrs_smartly(self, "flash_attention_backward_pass_impl", "xla", flash_attention_backward_pass_impl)
 
     def __repr__(self):
 

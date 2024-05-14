@@ -164,6 +164,7 @@ class AttentionModule:
             shard_attention_computation: bool = True,
             use_sharding_constraint: Optional[bool] = False,
             axis_name: str = "sp",
+            backward_pass_impl: Literal["triton", "xla"] = "xla"
     ):
         platform = jax.lib.xla_bridge.get_backend().platform
         if sm_scale is None:
@@ -202,6 +203,7 @@ class AttentionModule:
         self.generation_bias_partition_spec = generation_bias_partition_spec
         self.generation_attention_partition_spec = generation_attention_partition_spec
         self.axis_name = axis_name
+        self.backward_pass_impl = backward_pass_impl
         if attn_mechanism == "splash" and self.platform != "tpu":
             raise OSError("splash attention is only supported on TPU.")
         if attn_mechanism == "flash" and self.platform != "tpu":
@@ -957,7 +959,8 @@ class AttentionModule:
             sm_scale=self.sm_scale,
             block_k=self.block_k,
             block_q=self.block_q,
-            interpret=True if self.platform == "cpu" else None  # auto-decide
+            interpret=True if self.platform == "cpu" else None,  # auto-decide
+            backward_pass_impl=self.backward_pass_impl
         )
         attention_outputs = with_sharding_constraint(attention_outputs, aps)
         return AttentionOutput(
@@ -1138,7 +1141,7 @@ class AttentionModule:
                 end = time.time() - start
                 outs_and_grads[nm] = out + (end,)
             except Exception as e:
-                print(f"{nm} failled :\n\n{e}")
+                print(f"{nm} is Failed :\n\n{e}")
                 outs_and_grads[nm] = (None, None, None)
         frame_out = {}
         for key, (out, grad, time_took) in outs_and_grads.items():

@@ -115,7 +115,8 @@ class FlaxRobertaSelfAttention(BaseJAXAttentionModule):
             scan_ring_attention=self.config.scan_ring_attention,
             mesh=self.config.jax_mesh(),
             sm_scale=1 / math.sqrt(self.head_dim),
-            axis_name=self.config.attention_axis_name
+            axis_name=self.config.attention_axis_name,
+            backward_pass_impl=self.config.flash_attention_backward_pass_impl
         )
         self.query = Linear(
             self.config.hidden_size,
