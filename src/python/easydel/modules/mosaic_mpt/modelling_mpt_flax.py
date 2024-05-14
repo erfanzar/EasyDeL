@@ -141,7 +141,8 @@ class FlaxMptAttention(BaseJAXAttentionModule):
             scan_ring_attention=self.config.scan_ring_attention,
             mesh=self.config.jax_mesh(),
             sm_scale=1 / math.sqrt(self.config.n_heads),
-            axis_name=self.config.attention_axis_name
+            axis_name=self.config.attention_axis_name,
+            backward_pass_impl=self.config.flash_attention_backward_pass_impl
         )
         if self.config.qk_ln:
             self.q_ln = nn.LayerNorm(use_bias=self.config.use_norm_bias)
