@@ -960,9 +960,9 @@ class AttentionModule:
             query_states,
             key_states,
             value_states,
-            attention_mask=attention_mask,
+            attention_mask=attention_mask.astype("int"),
             sm_scale=self.sm_scale,
-            causal=False,
+            causal=True,
             block_k=self.block_k,
             block_q=self.block_q
         )
