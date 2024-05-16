@@ -58,37 +58,43 @@ class MptConfig(EasyDeLPretrainedConfig):
         "num_hidden_layers": "n_layers",
     }
 
-    def __init__(self,
-                 d_model: int = 2048,
-                 n_heads: int = 16,
-                 n_layers: int = 24,
-                 expansion_ratio: int = 4,
-                 max_seq_len: int = 2048,
-                 vocab_size: int = 50368,
-                 resid_prob_drop: float = 0.0,
-                 layer_norm_epsilon: float = 1e-5,
-                 emb_prob_drop: float = 0.0,
-                 learned_pos_emb: bool = True,
-                 attn_config: MptAttentionConfig = None,
-                 init_device: str = "cpu",
-                 logit_scale: Optional[Union[float, str]] = None,
-                 no_bias: bool = True,
-                 verbose: int = 0,
-                 embedding_fraction: float = 1.0,
-                 norm_type: str = "low_precision_layernorm",
-                 use_cache: bool = False,
-                 initializer_range=0.02,
-                 alibi: bool = True,
-                 use_bias: bool = False,
-                 act_fn: str = "gelu",
-                 qk_ln: bool = False,
-                 use_lm_head: bool = False,
-                 use_norm_bias: bool = False,
-                 gradient_checkpointing: str = "nothing_saveable",
-                 bits: Optional[int] = None,
-                 **kwargs
-                 ):
-
+    def __init__(
+            self,
+            d_model: int = 2048,
+            n_heads: int = 16,
+            n_layers: int = 24,
+            expansion_ratio: int = 4,
+            max_seq_len: int = 2048,
+            vocab_size: int = 50368,
+            resid_prob_drop: float = 0.0,
+            layer_norm_epsilon: float = 1e-5,
+            emb_prob_drop: float = 0.0,
+            learned_pos_emb: bool = True,
+            attn_config: MptAttentionConfig = None,
+            init_device: str = "cpu",
+            logit_scale: Optional[Union[float, str]] = None,
+            no_bias: bool = True,
+            verbose: int = 0,
+            embedding_fraction: float = 1.0,
+            norm_type: str = "low_precision_layernorm",
+            use_cache: bool = False,
+            initializer_range=0.02,
+            alibi: bool = True,
+            use_bias: bool = False,
+            act_fn: str = "gelu",
+            qk_ln: bool = False,
+            use_lm_head: bool = False,
+            use_norm_bias: bool = False,
+            gradient_checkpointing: str = "nothing_saveable",
+            bits: Optional[int] = None,
+            **kwargs
+    ):
+        if attn_config is None:
+            self.attn_config = MptAttentionConfig()
+        elif isinstance(attn_config, dict):
+            self.attn_config = MptAttentionConfig(**attn_config)
+        else:
+            self.attn_config = attn_config
         self.d_model = d_model
         self.use_norm_bias = use_norm_bias
         self.use_lm_head = use_lm_head
@@ -116,7 +122,6 @@ class MptConfig(EasyDeLPretrainedConfig):
         self.bits = bits
         self.layer_norm_epsilon = layer_norm_epsilon
         self.from_pt = False
-        self.attn_config = attn_config
         super().__init__(
             bits=bits,
             **kwargs
@@ -131,52 +136,26 @@ class MptConfig(EasyDeLPretrainedConfig):
 
     def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
         return (
-
-            ("transformer/wte/embedding", PartitionSpec("dp", "fsdp")),
-            ("transformer/wpe/embedding", PartitionSpec("dp", "fsdp")),
-
-            ("attn/w_qkv/kernel", PartitionSpec("fsdp", "dp")),
-            ("attn/wo/kernel", PartitionSpec("dp", "fsdp")),
-            ("attn/w_qkv/bias", PartitionSpec("fsdp", "dp")),
-            ("attn/wo/bias", PartitionSpec("dp", "fsdp")),
-
-            ("ffn/down/kernel", PartitionSpec("fsdp", "dp")),
-            ("ffn/up/kernel", PartitionSpec("fsdp", "dp")),
-            ("ffn/down/kernel", PartitionSpec("fsdp", "dp")),
-            ("ffn/up/kernel", PartitionSpec("fsdp", "dp")),
-
-            ("attention_norm/kernel", PartitionSpec(None)),
-            ("norm_f/kernel", PartitionSpec(None)),
-            ("norm_f/bias", PartitionSpec(None)),
-
-            ("transformer/norm_f/kernel", PartitionSpec(None)),
-            ("transformer/norm_f/bias", PartitionSpec(None)),
-            ("lm_head/kernel", PartitionSpec("fsdp", "dp")),
-            ("lm_head/bias", PartitionSpec("fsdp", "dp")),
+            ("transformer/wte/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
+            ("attn/Wqkv/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+            ("attn/out_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+            ("ffn/down_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+            ("ffn/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+            ("transformer/norm_1/scale", PartitionSpec(None)),
+            ("transformer/norm_2/scale", PartitionSpec(None)),
+            ("transformer/norm_f/scale", PartitionSpec(None)),
+            ("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
             (".*", PartitionSpec(None)),
         ) if not fully_sharded_data_parallel else (
-
-            ("transformer/wte/embedding", PartitionSpec("fsdp")),
-            ("transformer/wpe/embedding", PartitionSpec("fsdp")),
-
-            ("attn/w_qkv/kernel", PartitionSpec("fsdp")),
-            ("attn/wo/kernel", PartitionSpec("fsdp")),
-            ("attn/w_qkv/bias", PartitionSpec("fsdp")),
-            ("attn/wo/bias", PartitionSpec("fsdp")),
-
-            ("ffn/down/kernel", PartitionSpec("fsdp")),
-            ("ffn/up/kernel", PartitionSpec("fsdp")),
-            ("ffn/down/kernel", PartitionSpec("fsdp")),
-            ("ffn/up/kernel", PartitionSpec("fsdp")),
-
-            ("attention_norm/kernel", PartitionSpec(None)),
-            ("norm_f/kernel", PartitionSpec(None)),
-            ("norm_f/bias", PartitionSpec(None)),
-
-            ("transformer/norm_f/kernel", PartitionSpec(None)),
-            ("transformer/norm_f/bias", PartitionSpec(None)),
-            ("lm_head/kernel", PartitionSpec("fsdp")),
-            ("lm_head/bias", PartitionSpec("fsdp")),
+            ("transformer/wte/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
+            ("attn/Wqkv/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+            ("attn/out_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+            ("ffn/down_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+            ("ffn/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+            ("transformer/norm_1/scale", PartitionSpec(("fsdp", "sp"))),
+            ("transformer/norm_2/scale", PartitionSpec(("fsdp", "sp"))),
+            ("transformer/norm_f/scale", PartitionSpec(("fsdp", "sp"))),
+            ("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
             (".*", PartitionSpec(("fsdp", "sp"))),
         )
 
