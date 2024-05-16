@@ -466,13 +466,11 @@ class FlaxMptPretrainedModel(EasyDeLFlaxPretrainedModel):
 
         input_ids = jnp.ones((batch_size, max_length), dtype="i4")
         attention_mask = jnp.ones_like(input_ids)
-        position_ids = jnp.broadcast_to(jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape)
 
         init_variables = self.module.init(
             jax.random.PRNGKey(0),
             input_ids=input_ids,
             attention_mask=attention_mask,
-            position_ids=position_ids,
             return_dict=False,
             init_cache=True
         )
