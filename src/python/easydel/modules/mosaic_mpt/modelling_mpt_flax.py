@@ -353,8 +353,7 @@ class FlaxMptDecoratorCollection(nn.Module):
 def build_mpt_alibi_tensor(num_heads, sequence_length, alibi_bias_max=8):
     alibi = jnp.arange(1 - sequence_length, 1, dtype="i4").reshape(1, 1, 1, sequence_length)
     num_heads_power_of_2 = 2 ** math.ceil(math.log2(num_heads))
-    jax.config.update("jax_enable_x64", True)
-    base = jnp.arange(1, num_heads_power_of_2 + 1, dtype=jnp.int64).astype("float32")
+    base = jnp.arange(1, num_heads_power_of_2 + 1, dtype=jnp.int32).astype("float32")
     base = base * (alibi_bias_max / num_heads_power_of_2)
 
     slopes = 1.0 / jnp.pow(2, base)
