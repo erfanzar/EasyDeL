@@ -332,9 +332,9 @@ class AttentionModule:
             block_kv=min(self.block_k, k_seq),
             block_q_dkv=min(self.block_q_dkv, q_seq),
             block_kv_dkv=min(self.block_k_dkv, k_seq),
-            block_kv_dkv_compute=min(self.block_k_dkv, q_seq),
+            block_kv_dkv_compute=min(self.block_k_dkv, k_seq),
             block_q_dq=min(self.block_q_dq, q_seq),
-            block_kv_dq=min(self.block_k_dq, q_seq),
+            block_kv_dq=min(self.block_k_dq, k_seq),
         )
 
     def get_block_size_flash_attn(self, q_seq, k_seq):
@@ -343,12 +343,12 @@ class AttentionModule:
             block_k=min(self.block_k, k_seq),
             block_q_dkv=min(self.block_q_dkv, q_seq),
             block_k_dq=min(self.block_k_dkv, k_seq),
-            block_k_dkv=min(self.block_k_dkv, q_seq),
+            block_k_dkv=min(self.block_k_dkv, k_seq),
             block_q_dq=min(self.block_q_dq, q_seq),
             block_b=min(self.block_b, 1),
-            block_k_major=min(self.block_k_major, q_seq),
-            block_k_major_dq=min(self.block_k_major_dq, q_seq),
-            block_k_major_dkv=min(self.block_k_major_dkv, q_seq),
+            block_k_major=min(self.block_k_major, k_seq),
+            block_k_major_dq=min(self.block_k_major_dq, k_seq),
+            block_k_major_dkv=min(self.block_k_major_dkv, k_seq),
             block_q_major_dkv=min(self.block_q_major_dkv, q_seq)
         )
 
