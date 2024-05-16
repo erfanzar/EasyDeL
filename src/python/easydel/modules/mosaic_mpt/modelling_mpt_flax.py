@@ -205,7 +205,7 @@ class FlaxMptAttention(BaseJAXAttentionModule):
         attention_mask = attention_mask.repeat(position_bias.shape[1], 1)
         attention_bias = lax.select(
             attention_mask.astype("bool"),
-            jnp.full(attention_mask.shape, 0.0).astype(self.dtype) + position_bias,
+            jnp.full(attention_mask.shape, 0.0).astype(self.dtype) + position_bias.astype(self.dtype),
             jnp.full(attention_mask.shape, jnp.finfo(
                 self.dtype).min).astype(self.dtype),
         )
