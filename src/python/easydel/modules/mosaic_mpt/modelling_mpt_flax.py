@@ -20,6 +20,7 @@ import chex
 from fjformer.linen import Linear
 from fjformer import linen as nn
 from .mosaic_configuration import MptConfig
+from ..attention_module import AttentionModule
 
 
 class RMSNorm(nn.Module):
@@ -118,6 +119,41 @@ class FlaxMptAttention(BaseJAXAttentionModule):
         if self.softmax_scale is None:
             self.softmax_scale = 1 / math.sqrt(self.hidden_size / self.n_heads)
 
+        self.attention_performer = AttentionModule(
+            use_sharding_constraint=self.config.use_sharding_constraint,
+            block_k_major=self.config.block_k_major,
+            block_b=self.config.block_b,
+            block_q=self.config.block_q,
+            block_k=self.config.block_k,
+            block_q_major_dkv=self.config.block_q_major_dkv,
+            block_k_major_dkv=self.config.block_k_major_dkv,
+            block_k_major_dq=self.config.block_k_major_dq,
+            block_k_dkv=self.config.block_k_dkv,
+            block_q_dkv=self.config.block_q_dkv,
+            block_q_dq=self.config.block_q_dq,
+            block_k_dq=self.config.block_k_dq,
+            num_attention_heads=self.config.num_attention_heads,
+            attention_dropout=self.config.attn_config.attn_pdrop,
+            head_dims=self.head_dim,
+            attention_partition_spec=self.config.attention_partition_spec,
+            shard_attention_computation=self.config.shard_attention_computation,
+            precision=self.precision,
+            force_float32_tpu=True,
+            attn_mechanism=self.config.attn_mechanism,
+            dtype=self.dtype,
+            bias_partition_spec=self.config.bias_partition_spec,
+            key_partition_spec=self.config.key_partition_spec,
+            query_partition_spec=self.config.query_partition_spec,
+            generation_query_partition_spec=self.config.generation_query_partition_spec,
+            generation_bias_partition_spec=self.config.generation_bias_partition_spec,
+            generation_attention_partition_spec=self.config.generation_attention_partition_spec,
+            value_partition_spec=self.config.value_partition_spec,
+            scan_ring_attention=self.config.scan_ring_attention,
+            mesh=self.config.jax_mesh(),
+            sm_scale=self.softmax_scale,
+            axis_name=self.config.attention_axis_name
+        )
+
     def __call__(
             self,
             hidden_states: chex.Array,
@@ -180,25 +216,6 @@ class FlaxMptAttention(BaseJAXAttentionModule):
                 query_states,
                 attention_mask
             )
-        attention_bias = lax.select(
-            attention_mask.astype("bool"),
-            jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-            jnp.full(attention_mask.shape, jnp.finfo(
-                self.dtype).min).astype(self.dtype),
-        )
-        qps = self.config.generation_query_partition_spec if query_length == 1 else self.config.query_partition_spec
-        kps = self.config.value_partition_spec
-        vps = self.config.key_partition_spec
-        bps = self.config.generation_bias_partition_spec if query_length == 1 else self.config.bias_partition_spec
-        aps = self.config.generation_attention_partition_spec if query_length == 1 else self.config.attention_partition_spec
-        query_states = with_sharding_constraint(query_states, qps)
-        key_states = with_sharding_constraint(key_states, kps)
-        value_states = with_sharding_constraint(value_states, vps)
-        attention_bias = with_sharding_constraint(attention_bias, bps)
-        attention_scores = jnp.einsum(
-            "bqhd,bkhd->bhqk", query_states, key_states, precision=self.precision
-        ) * self.softmax_scale
-
         if position_bias is not None:
             key_length = key_states.shape[1]
 
@@ -206,18 +223,61 @@ class FlaxMptAttention(BaseJAXAttentionModule):
             position_bias_key_index = max(0, position_bias.shape[3] - key_length)
 
             position_bias = position_bias[:, :, position_bias_query_index:, position_bias_key_index:]
-            attention_scores = attention_scores + position_bias
-        attn_weights = jax.nn.softmax((attention_scores + attention_bias).astype("float32"), axis=-1)
-        attn_weights = self.dropout(attn_weights, deterministic=deterministic)
-        context_states = with_sharding_constraint(
-            jnp.einsum(
-                "bhqk,bkhd->bqhd", attn_weights, value_states, precision=self.precision
-            ),
-            aps
+        attention_mask = attention_mask.repeat(position_bias.shape[1], 1)
+        attention_bias = lax.select(
+            attention_mask.astype("bool"),
+            jnp.full(attention_mask.shape, 0.0).astype(self.dtype) + position_bias,
+            jnp.full(attention_mask.shape, jnp.finfo(
+                self.dtype).min).astype(self.dtype),
         )
-        attn_output = self.out_proj(context_states.reshape(inp_shape))
+        # qps = self.config.generation_query_partition_spec if query_length == 1 else self.config.query_partition_spec
+        # kps = self.config.value_partition_spec
+        # vps = self.config.key_partition_spec
+        # bps = self.config.generation_bias_partition_spec if query_length == 1 else self.config.bias_partition_spec
+        # aps = self.config.generation_attention_partition_spec if query_length == 1 else self.config.attention_partition_spec
+        # query_states = with_sharding_constraint(query_states, qps)
+        # key_states = with_sharding_constraint(key_states, kps)
+        # value_states = with_sharding_constraint(value_states, vps)
+        # attention_bias = with_sharding_constraint(attention_bias, bps)
+        # attention_scores = jnp.einsum(
+        #     "bqhd,bkhd->bhqk", query_states, key_states, precision=self.precision
+        # ) * self.softmax_scale
+        #
+        # if position_bias is not None:
+        #     key_length = key_states.shape[1]
+        #
+        #     position_bias_query_index = max(0, position_bias.shape[2] - query_length)
+        #     position_bias_key_index = max(0, position_bias.shape[3] - key_length)
+        #
+        #     position_bias = position_bias[:, :, position_bias_query_index:, position_bias_key_index:]
+        #     attention_scores = attention_scores + position_bias
+        # attn_weights = jax.nn.softmax((attention_scores + attention_bias).astype("float32"), axis=-1)
+        # attn_weights = self.dropout(attn_weights, deterministic=deterministic)
+        # context_states = with_sharding_constraint(
+        #     jnp.einsum(
+        #         "bhqk,bkhd->bqhd", attn_weights, value_states, precision=self.precision
+        #     ),
+        #     aps
+        # )
 
-        return attn_output, attn_weights
+        attention = self.attention_performer.__call__(
+            query_states=query_states,
+            key_states=key_states,
+            value_states=value_states,
+            causal_mask=causal_mask,
+            attention_mask=attention_mask,
+            deterministic=deterministic,
+            segment_ids=None,
+            query_sequence_length=query_length,
+            key_value_sequence_length=key_length,
+            uses_cache=self.has_variable("cache", "cached_key") or init_cache,
+            bias=attention_bias,
+            causal=False,
+        )
+
+        attn_output = self.out_proj(attention.attention_outputs.reshape(inp_shape))
+
+        return attn_output, attention.attention_weights
 
 
 class FlaxMptBlock(nn.Module):
