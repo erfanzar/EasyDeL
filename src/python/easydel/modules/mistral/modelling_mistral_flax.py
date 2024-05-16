@@ -196,38 +196,17 @@ class FlaxMistralAttention(BaseJAXAttentionModule):
 
         self.rotary = FlaxMistralRotaryEmbedding(self.dtype)
         self.attention_performer = AttentionModule(
-            use_sharding_constraint=self.config.use_sharding_constraint,
-            block_k_major=self.config.block_k_major,
-            block_b=self.config.block_b,
-            block_q=self.config.block_q,
-            block_k=self.config.block_k,
-            block_q_major_dkv=self.config.block_q_major_dkv,
-            block_k_major_dkv=self.config.block_k_major_dkv,
-            block_k_major_dq=self.config.block_k_major_dq,
-            block_k_dkv=self.config.block_k_dkv,
-            block_q_dkv=self.config.block_q_dkv,
-            block_q_dq=self.config.block_q_dq,
-            block_k_dq=self.config.block_k_dq,
-            num_attention_heads=self.config.num_attention_heads,
             attention_dropout=self.config.attention_dropout,
+            num_attention_heads=self.config.num_attention_heads,
             head_dims=self.head_dim,
-            attention_partition_spec=self.config.attention_partition_spec,
-            shard_attention_computation=self.config.shard_attention_computation,
             precision=self.precision,
             force_float32_tpu=True,
             attn_mechanism=self.config.attn_mechanism,
             dtype=self.dtype,
-            bias_partition_spec=self.config.bias_partition_spec,
-            key_partition_spec=self.config.key_partition_spec,
-            query_partition_spec=self.config.query_partition_spec,
-            generation_query_partition_spec=self.config.generation_query_partition_spec,
-            generation_bias_partition_spec=self.config.generation_bias_partition_spec,
-            generation_attention_partition_spec=self.config.generation_attention_partition_spec,
-            value_partition_spec=self.config.value_partition_spec,
-            scan_ring_attention=self.config.scan_ring_attention,
             mesh=self.config.jax_mesh(),
             sm_scale=1 / math.sqrt(self.head_dim),
-            axis_name=self.config.attention_axis_name
+            axis_name=self.config.attention_axis_name,
+            base_module_class=self.config
         )
 
     def _merge_heads(self, hidden_states):

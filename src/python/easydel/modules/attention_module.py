@@ -2,12 +2,13 @@ import math
 import time
 import warnings
 from functools import partial
-from typing import Tuple, Callable, Optional, Literal
+from typing import Tuple, Callable, Optional, Literal, Any
 
 import fjformer
 import jax
 from chex import Array
 from fjformer import with_sharding_constraint
+from .easydel_modelling_utils import EasyDeLPretrainedConfig
 
 try:
     from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention as tpu_flash_attention
@@ -51,8 +52,19 @@ from .flax_modelling_utils import get_gradient_checkpoint_policy
 from ..etils.etils import get_logger
 
 logger = get_logger(__name__)
+
+# DEFAULT VALUES ...
+
 DEFAULT_K_BLOCK = 512
 DEFAULT_Q_BLOCK = 512
+DEFAULT_QPS = PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
+DEFAULT_KPS = PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
+DEFAULT_VPS = PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
+DEFAULT_BPS = PartitionSpec(("dp", "fsdp"), None, "sp", None)
+DEFAULT_APS = PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
+DEFAULT_G_QPS = PartitionSpec(("dp", "fsdp"), None, "tp", None)
+DEFAULT_G_BPS = PartitionSpec(("dp", "fsdp"), None, None, None)
+DEFAULT_G_APS = PartitionSpec(("dp", "fsdp"), None, "tp", None)
 
 
 @dataclass
@@ -117,6 +129,13 @@ def get_flash_attention() -> Tuple[Callable, bool, bool]:
     return ring_attention_fn, float32_logits, do_shard_map
 
 
+def set_attrs_smartly_with_prp(self, attr_name: str, default: Any, new_attr: Any, prp: EasyDeLPretrainedConfig = None):
+    if not hasattr(self, attr_name) or getattr(self, attr_name, ...) == Ellipsis:
+        setattr(self, attr_name, default if prp is None else getattr(prp, attr_name))
+    if not new_attr == Ellipsis:
+        setattr(self, attr_name, new_attr)
+
+
 class AttentionModule:
     def __init__(
             self,
@@ -133,77 +152,169 @@ class AttentionModule:
                 "blockwise",
                 "pallas_flash"
             ],
+            sm_scale: float,
             num_attention_heads: int,
             head_dims: int,
-            block_k: int = DEFAULT_K_BLOCK,
-            block_q: int = DEFAULT_Q_BLOCK,
-            block_b: int = DEFAULT_Q_BLOCK,
-            block_k_major: int = DEFAULT_K_BLOCK,
-            block_q_major_dkv: int = DEFAULT_Q_BLOCK,
-            block_k_major_dkv: int = DEFAULT_K_BLOCK,
-            block_k_dkv: int = DEFAULT_K_BLOCK,
-            block_q_dkv: int = DEFAULT_Q_BLOCK,
-            block_k_major_dq: int = DEFAULT_K_BLOCK,
-            block_k_dq: int = DEFAULT_K_BLOCK,
-            block_q_dq: int = DEFAULT_Q_BLOCK,
-            sm_scale: Optional[float] = None,
-            query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            generation_query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, "tp", None),
-            key_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            value_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, "sp", None),
-            generation_bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
-            attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            generation_attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, "tp", None),
-            scan_ring_attention: bool = True,
-            scan_attention_layers: bool = True,
+            block_k: int = ...,
+            block_q: int = ...,
+            block_b: int = ...,
+            block_k_major: int = ...,
+            block_q_major_dkv: int = ...,
+            block_k_major_dkv: int = ...,
+            block_k_dkv: int = ...,
+            block_q_dkv: int = ...,
+            block_k_major_dq: int = ...,
+            block_k_dq: int = ...,
+            block_q_dq: int = ...,
+            query_partition_spec: PartitionSpec = ...,
+            generation_query_partition_spec: PartitionSpec = ...,
+            key_partition_spec: PartitionSpec = ...,
+            value_partition_spec: PartitionSpec = ...,
+            bias_partition_spec: PartitionSpec = ...,
+            generation_bias_partition_spec: PartitionSpec = ...,
+            attention_partition_spec: PartitionSpec = ...,
+            generation_attention_partition_spec: PartitionSpec = ...,
+            scan_ring_attention: bool = ...,
+            scan_attention_layers: bool = ...,
             attention_dropout: float = 0.0,
             dtype: jnp.dtype = jnp.float32,
-            precision: lax.Precision = lax.Precision("fastest"),
-            force_float32_tpu: bool = True,
-            shard_attention_computation: bool = True,
-            use_sharding_constraint: Optional[bool] = False,
-            axis_name: str = "sp",
-            backward_pass_impl: Literal["triton", "xla"] = "triton"
+            precision: lax.Precision = ...,
+            force_float32_tpu: bool = ...,
+            shard_attention_computation: bool = ...,
+            use_sharding_constraint: Optional[bool] = ...,
+            axis_name: str = ...,
+            backward_pass_impl: Literal["triton", "xla"] = "triton",
+            base_module_class: Optional[EasyDeLPretrainedConfig] = None
     ):
-        platform = jax.lib.xla_bridge.get_backend().platform
-        if sm_scale is None:
-            sm_scale = 1 / math.sqrt(head_dims)
-        self.platform = platform
+
+        self.block_k: int = ...
+        self.block_q: int = ...
+        self.block_b: int = ...
+        self.block_k_major: int = ...
+        self.block_q_major_dkv: int = ...
+        self.block_k_major_dkv: int = ...
+        self.block_k_dkv: int = ...
+        self.block_q_dkv: int = ...
+        self.block_k_major_dq: int = ...
+        self.block_k_dq: int = ...
+        self.block_q_dq: int = ...
+        self.query_partition_spec: PartitionSpec = ...
+        self.generation_query_partition_spec: PartitionSpec = ...
+        self.key_partition_spec: PartitionSpec = ...
+        self.value_partition_spec: PartitionSpec = ...
+        self.bias_partition_spec: PartitionSpec = ...
+        self.generation_bias_partition_spec: PartitionSpec = ...
+        self.attention_partition_spec: PartitionSpec = ...
+        self.generation_attention_partition_spec: PartitionSpec = ...
+        self.scan_ring_attention: bool = ...
+        self.precision: lax.Precision = ...
+        self.force_float32_tpu: bool = ...
+        self.shard_attention_computation: bool = ...
+        self.use_sharding_constraint: Optional[bool] = ...
+        self.axis_name: str = ...
+
+        set_attrs_smartly_with_prp(self, "use_sharding_constraint", False, use_sharding_constraint, base_module_class)
+
+        set_attrs_smartly_with_prp(self, "block_k_major", DEFAULT_K_BLOCK, block_k_major, base_module_class)
+        set_attrs_smartly_with_prp(self, "block_b", 1, block_b, base_module_class)
+        set_attrs_smartly_with_prp(self, "block_q", DEFAULT_Q_BLOCK, block_q, base_module_class)
+        set_attrs_smartly_with_prp(self, "block_k", DEFAULT_K_BLOCK, block_k, base_module_class)
+        set_attrs_smartly_with_prp(self, "block_q_major_dkv", DEFAULT_Q_BLOCK, block_q_major_dkv, base_module_class)
+        set_attrs_smartly_with_prp(self, "block_k_major_dkv", DEFAULT_K_BLOCK, block_k_major_dkv, base_module_class)
+        set_attrs_smartly_with_prp(self, "block_k_major_dq", DEFAULT_K_BLOCK, block_k_major_dq, base_module_class)
+        set_attrs_smartly_with_prp(self, "block_k_dkv", DEFAULT_K_BLOCK, block_k_dkv, base_module_class)
+        set_attrs_smartly_with_prp(self, "block_q_dkv", DEFAULT_Q_BLOCK, block_q_dkv, base_module_class)
+        set_attrs_smartly_with_prp(self, "block_q_dq", DEFAULT_Q_BLOCK, block_q_dq, base_module_class)
+        set_attrs_smartly_with_prp(self, "block_k_dq", DEFAULT_K_BLOCK, block_k_dq, base_module_class)
+
+        set_attrs_smartly_with_prp(
+            self,
+            "shard_attention_computation",
+            True,
+            shard_attention_computation,
+            base_module_class
+        )
+        set_attrs_smartly_with_prp(
+            self,
+            "scan_ring_attention",
+            True,
+            scan_ring_attention,
+            base_module_class
+        )
+
+        set_attrs_smartly_with_prp(
+            self,
+            "query_partition_spec",
+            DEFAULT_QPS,
+            query_partition_spec,
+            base_module_class
+        )
+        set_attrs_smartly_with_prp(
+            self,
+            "key_partition_spec",
+            DEFAULT_KPS,
+            key_partition_spec,
+            base_module_class
+        )
+        set_attrs_smartly_with_prp(
+            self,
+            "value_partition_spec",
+            DEFAULT_VPS,
+            value_partition_spec,
+            base_module_class
+        )
+        set_attrs_smartly_with_prp(
+            self,
+            "bias_partition_spec",
+            DEFAULT_BPS,
+            bias_partition_spec,
+            base_module_class
+        )
+        set_attrs_smartly_with_prp(
+            self,
+            "attention_partition_spec",
+            DEFAULT_APS,
+            attention_partition_spec,
+            base_module_class
+        )
+        set_attrs_smartly_with_prp(
+            self,
+            "generation_query_partition_spec",
+            DEFAULT_G_QPS,
+            generation_query_partition_spec,
+            base_module_class
+        )
+        set_attrs_smartly_with_prp(
+            self,
+            "generation_bias_partition_spec",
+            DEFAULT_G_BPS,
+            generation_bias_partition_spec,
+            base_module_class
+        )
+        set_attrs_smartly_with_prp(
+            self,
+            "generation_attention_partition_spec",
+            DEFAULT_G_APS,
+            generation_attention_partition_spec,
+            base_module_class
+        )
+
+        set_attrs_smartly_with_prp(self, "precision", lax.Precision("fastest"), precision)  # DON'T READ FROM CONFIG
+        set_attrs_smartly_with_prp(self, "force_float32_tpu", True, force_float32_tpu)  # DON'T READ FROM CONFIG
+        set_attrs_smartly_with_prp(self, "axis_name", "sp", axis_name)  # DON'T READ FROM CONFIG
+
+        self.mesh = mesh
         self.attn_mechanism = attn_mechanism
-        self.block_k = block_k
-        self.block_q = block_q
-        self.block_b = block_b
-        self.block_k_major = block_k_major
-        self.block_q_major_dkv = block_q_major_dkv
-        self.block_k_major_dkv = block_k_major_dkv
-        self.block_k_dkv = block_k_dkv
-        self.block_q_dkv = block_q_dkv
-        self.block_k_major_dq = block_k_major_dq
-        self.block_k_dq = block_k_dq
-        self.block_q_dq = block_q_dq
+        self.platform = jax.lib.xla_bridge.get_backend().platform
+        self.sm_scale = sm_scale
         self.num_attention_heads = num_attention_heads
         self.head_dims = head_dims
-        self.sm_scale = sm_scale
-        self.mesh = mesh
-        self.query_partition_spec = query_partition_spec
-        self.key_partition_spec = key_partition_spec
-        self.value_partition_spec = value_partition_spec
-        self.bias_partition_spec = bias_partition_spec
-        self.attention_partition_spec = attention_partition_spec
+
+        self.scan_attention_layers = scan_attention_layers
         self.attention_dropout = attention_dropout
         self.dtype = dtype
-        self.precision = precision
-        self.force_float32_tpu = force_float32_tpu
-        self.shard_attention_computation = shard_attention_computation
-        self.use_sharding_constraint = use_sharding_constraint
-        self.scan_ring_attention = scan_ring_attention
-        self.scan_attention_layers = scan_attention_layers
-        self.generation_query_partition_spec = generation_query_partition_spec
-        self.generation_bias_partition_spec = generation_bias_partition_spec
-        self.generation_attention_partition_spec = generation_attention_partition_spec
-        self.axis_name = axis_name
         self.backward_pass_impl = backward_pass_impl
+
         if attn_mechanism == "splash" and self.platform != "tpu":
             raise OSError("splash attention is only supported on TPU.")
         if attn_mechanism == "flash" and self.platform != "tpu":
