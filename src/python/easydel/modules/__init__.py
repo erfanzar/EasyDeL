@@ -25,6 +25,7 @@ from .mosaic_mpt import (
     FlaxMptModel as FlaxMptModel,
     FlaxMptForCausalLM as FlaxMptForCausalLM,
     MptConfig as MptConfig,
+    MptAttentionConfig as MptAttentionConfig
 )
 from .falcon import (
     FlaxFalconModel as FlaxFalconModel,
@@ -166,7 +167,7 @@ __all__ = (
 
     "FlaxLTModel", "FlaxLTForCausalLM", "FlaxLTConfig",
 
-    "FlaxMptModel", "FlaxMptForCausalLM", "MptConfig",
+    "FlaxMptModel", "FlaxMptForCausalLM", "MptConfig", "MptAttentionConfig",
 
     "FlaxFalconModel", "FlaxFalconForCausalLM", "FalconConfig",
 

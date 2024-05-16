@@ -141,7 +141,7 @@ class EasyModelsTest(TestCase):
             partition_specs = match_partition_rules(config.get_partition_rules(True), params)
             shard, _ = make_shard_and_gather_fns(partition_specs, jnp.float32)
 
-            params = jax.tree_map(lambda p, f: f(p), params, shard)
+            params = jax.tree_util.tree_map(lambda p, f: f(p), params, shard)
             config.add_basic_configurations(
                 attn_mechanism=self.attn_mechanism,
                 block_k=self.block_k,
@@ -171,7 +171,8 @@ class EasyModelsTest(TestCase):
                 params=params,
                 return_dict=True,
                 add_params_field=False,
-                train=False
+                train=False,
+                determinstic=True
             )
             loss, _ = cross_entropy_loss_and_accuracy(
                 ed_output.logits,
@@ -291,6 +292,24 @@ class EasyModelsTest(TestCase):
         self.assertTrue(
             res,
             f"Llama model Failed [ERROR {err}]"
+        )
+
+    def test_mpt(self):
+        self.header_config = ed.MptConfig(
+            d_model=self.hidden_size,
+            n_heads=self.num_attention_heads,
+            n_layers=1,
+            ffn_config=ed.DbrxFFNConfig(
+                ffn_hidden_size=self.intermediate_size,
+                moe_top_k=self.num_experts_per_tok,
+                moe_num_experts=self.num_local_experts,
+            ),
+            attn_config=ed.MptAttentionConfig()
+        )
+        res, err = self.create_test_for_models("mpt", transformers.MptForCausalLM)
+        self.assertTrue(
+            res,
+            f"MPT model Failed [ERROR {err}]"
         )
 
     def test_falcon(self):

@@ -56,6 +56,7 @@ from .modules.palm import (
 
 from .modules.mosaic_mpt import (
     MptConfig as MptConfig,
+    MptAttentionConfig as MptAttentionConfig,
     FlaxMptForCausalLM as FlaxMptForCausalLM,
     FlaxMptModel as FlaxMptModel
 )
@@ -318,6 +319,7 @@ __all__ = (
 
     # Mpt Models
     "MptConfig",
+    "MptAttentionConfig",
     "FlaxMptForCausalLM",
     "FlaxMptModel",
 
