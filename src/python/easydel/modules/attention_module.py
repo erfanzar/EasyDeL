@@ -943,20 +943,30 @@ class AttentionModule:
             lambda s: s.astype(jnp.float32),
             (query_states, key_states, value_states)
         )
-        query_states = with_sharding_constraint(query_states, qps)
-        key_states = with_sharding_constraint(key_states, kps)
-        value_states = with_sharding_constraint(value_states, vps)
-        bias = with_sharding_constraint(bias, bps)
-        attention_outputs = flash_attention(
-            query_states,
-            key_states,
-            value_states,
-            bias=bias,
+        # query_states = with_sharding_constraint(query_states, qps)
+        # key_states = with_sharding_constraint(key_states, kps)
+        # value_states = with_sharding_constraint(value_states, vps)
+        # bias = with_sharding_constraint(bias, bps)
+        wrapped_fn = partial(
+            flash_attention,
             sm_scale=self.sm_scale,
             block_k=self.block_k,
             block_q=self.block_q,
             interpret=True if self.platform == "cpu" else None,  # auto-decide
-            backward_pass_impl=self.backward_pass_impl
+            backward_pass_impl=self.backward_pass_impl,
+            debug=False
+        )
+        attention_outputs = shard_map(
+            f=wrapped_fn,
+            in_specs=(qps, kps, vps, bps),
+            out_specs=aps,
+            mesh=self.mesh,
+            check_rep=False,
+        )(
+            query_states,
+            key_states,
+            value_states,
+            bias,
         )
         attention_outputs = with_sharding_constraint(attention_outputs, aps)
         return AttentionOutput(
