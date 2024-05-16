@@ -1,4 +1,7 @@
-from .mosaic_configuration import MptConfig
+from .mosaic_configuration import (
+    MptConfig as MptConfig,
+    MptAttentionConfig as MptAttentionConfig
+)
 from .modelling_mpt_flax import (
     FlaxMptForCausalLM,
     FlaxMptForCausalLMModule,
@@ -6,4 +9,4 @@ from .modelling_mpt_flax import (
     FlaxMptModule
 )
 
-__all__ = "FlaxMptModel", "FlaxMptForCausalLM", "MptConfig"
+__all__ = "FlaxMptModel", "FlaxMptForCausalLM", "MptConfig", "MptAttentionConfig"

@@ -370,7 +370,6 @@ class FlaxLlamaAttention(BaseJAXAttentionModule):
             causal_mask=causal_mask
         )
 
-
         attn_output = self._merge_heads(attentions.attention_outputs)
         if self.config.shard_attention_computation:
             attn_output = with_sharding_constraint(
@@ -1012,11 +1011,12 @@ class FlaxLlamaForCausalLMModule(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self):
-        self.model = FlaxLlamaModule(self.config,
-                                     dtype=self.dtype,
-                                     param_dtype=self.param_dtype,
-                                     precision=self.precision,
-                                     )
+        self.model = FlaxLlamaModule(
+            self.config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision,
+        )
 
         self.lm_head = Linear(
             self.config.vocab_size,
