@@ -1208,9 +1208,11 @@ class AttentionModule:
                 dtype=jnp.float32,
                 mesh=config.jax_mesh(),
                 head_dims=q.shape[-1],
+                sm_scale=1 / math.sqrt(q.shape[-1]),
                 num_attention_heads=q.shape[-2],
                 block_q=config.block_q,
-                block_k=config.block_k
+                block_k=config.block_k,
+                base_module_class=config,
             )(
                 query_states=q,
                 key_states=k,
@@ -1221,12 +1223,21 @@ class AttentionModule:
             return attention_pred
 
         def make_inputs():
-            q = jax.random.normal(rng.rng, (batch_size, sequence_length, num_attention_heads, head_dim),
-                                  dtype="float32")
-            k = jax.random.normal(rng.rng, (batch_size, sequence_length, num_key_value_heads, head_dim),
-                                  dtype="float32")
-            v = jax.random.normal(rng.rng, (batch_size, sequence_length, num_key_value_heads, head_dim),
-                                  dtype="float32")
+            q = jax.random.normal(
+                rng.rng,
+                (batch_size, sequence_length, num_attention_heads, head_dim),
+                dtype="float32"
+            )
+            k = jax.random.normal(
+                rng.rng,
+                (batch_size, sequence_length, num_key_value_heads, head_dim),
+                dtype="float32"
+            )
+            v = jax.random.normal(
+                rng.rng,
+                (batch_size, sequence_length, num_key_value_heads, head_dim),
+                dtype="float32"
+            )
             c = flax.linen.attention.make_causal_mask(jnp.ones((batch_size, sequence_length)))
             a = jnp.ones((batch_size, sequence_length))
             a = a.at[:, sequence_length // 2:].set(0)
