@@ -14,14 +14,15 @@ from jax.interpreters import pxla
 class Timer:
 
     def __init__(self, name):
-        """
-        The __init__ function is called when the class is instantiated.
+        """The __init__ function is called when the class is instantiated.
         It sets up the object with a name and initializes other variables.
 
-        :param self: Represent the instance of the class
-        :param name: Give the timer a name
-        :return: An instance of the class
-        
+        Args:
+            self: Represent the instance of the class
+            name: Give the timer a name
+
+        Returns:
+            An instance of the class
         """
         self.name_ = name
         self.elapsed_ = 0.0
@@ -29,53 +30,57 @@ class Timer:
         self.start_time = time.time()
 
     def start(self):
-        """
-        The start function starts the timer.
+        """The start function starts the timer.
                 Args:
                     None
 
-        :param self: Access the attributes and methods of the class in python
-        :return: Nothing
-        
+        Args:
+            self: Access the attributes and methods of the class in
+                python
+
+        Returns:
+            Nothing
         """
         assert not self.started_, "timer has already been started"
         self.start_time = time.time()
         self.started_ = True
 
     def stop(self):
-        """
-        The stop function stops the timer and adds the time elapsed since start was called to the total elapsed time.
+        """The stop function stops the timer and adds the time elapsed since start was called to the total elapsed time.
 
+        Args:
+            self: Represent the instance of the class
 
-        :param self: Represent the instance of the class
-        :return: The time elapsed since the start function was called
-        
+        Returns:
+            The time elapsed since the start function was called
         """
         assert self.started_, "timer is not started"
         self.elapsed_ += time.time() - self.start_time
         self.started_ = False
 
     def reset(self):
-        """
-        The reset function sets the elapsed time to 0.0 and the started flag to False.
+        """The reset function sets the elapsed time to 0.0 and the started flag to False.
 
-        :param self: Represent the instance of the class
-        :return: True if the timer was running, false otherwise
-        
+        Args:
+            self: Represent the instance of the class
+
+        Returns:
+            True if the timer was running, false otherwise
         """
         self.elapsed_ = 0.0
         self.started_ = False
 
     def elapsed(self, reset=True):
-        """
-        The elapsed function returns the elapsed time in seconds since the timer was started.
+        """The elapsed function returns the elapsed time in seconds since the timer was started.
         If reset is True, then it also resets the timer to zero and restarts it.
         If reset is False, then it leaves the timer running.
 
-        :param self: Represent the instance of the class
-        :param reset: Reset the timer
-        :return: The elapsed time in seconds
-        
+        Args:
+            self: Represent the instance of the class
+            reset: Reset the timer
+
+        Returns:
+            The elapsed time in seconds
         """
         started_ = self.started_
         if self.started_:
@@ -138,16 +143,18 @@ class Timers:
 
     def write(self, names, iteration, normalizer=1.0, reset=False):
 
-        """
-        The write function is used to write the elapsed time of a timer to Tensorboard and/or Weights &amp; Biases.
+        """The write function is used to write the elapsed time of a timer to Tensorboard and/or Weights &amp; Biases.
 
-        :param self: Make the function a method of the class
-        :param names: Specify which timer(s) to write
-        :param iteration: Keep track of the number of iterations
-        :param normalizer: Normalize the time elapsed by a certain value
-        :param reset: Reset the timer after it has been written to tensorboard
-        :return: Nothing
-        
+        Args:
+            self: Make the function a method of the class
+            names: Specify which timer(s) to write
+            iteration: Keep track of the number of iterations
+            normalizer: Normalize the time elapsed by a certain value
+            reset: Reset the timer after it has been written to
+                tensorboard
+
+        Returns:
+            Nothing
         """
         assert normalizer > 0.0
         for name in names:
@@ -160,15 +167,16 @@ class Timers:
                 wandb.log({f"timers/{name}": value}, step=iteration)
 
     def log(self, names, normalizer=1.0, reset=True):
-        """
-        The log function is used to print the time elapsed for a given function.
+        """The log function is used to print the time elapsed for a given function.
 
-        :param self: Represent the instance of the class
-        :param names: Specify the name of the timer that we want to log
-        :param normalizer: Normalize the time taken to run a function
-        :param reset: Reset the timer after logging
-        :return: The time taken for the given name
-        
+        Args:
+            self: Represent the instance of the class
+            names: Specify the name of the timer that we want to log
+            normalizer: Normalize the time taken to run a function
+            reset: Reset the timer after logging
+
+        Returns:
+            The time taken for the given name
         """
         assert normalizer > 0.0
 
@@ -207,13 +215,15 @@ def get_mesh(
         shape: typing.Sequence[int] = (1, -1, 1, 1),
         axis_names: typing.Sequence[str] = ("dp", "fsdp", "tp", "sp")
 ):
-    """
-    The get_mesh function is a helper function that creates a JAX Mesh object.
-    
-    :param shape: typing.Sequence[int]: Specify the shape of the array that is used to create the mesh
-    :param axis_names: typing.Sequence[int]: Specify the Axis Names in mesh
-    :return: A mesh object
-    
+    """The get_mesh function is a helper function that creates a JAX Mesh object.
+
+    Args:
+        shape: typing.Sequence[int]: Specify the shape of the array that
+            is used to create the mesh
+        axis_names: typing.Sequence[int]: Specify the Axis Names in mesh
+
+    Returns:
+        A mesh object
     """
     from jax.sharding import Mesh
     from jax.experimental import mesh_utils

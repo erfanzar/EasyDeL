@@ -17,17 +17,20 @@ def get_partitions(
         jax_attn_format: bool = True,
         fsdp_on_batch: bool = True
 ) -> EasyDeLPartitions:
-    """
-    The get_partitions function is a helper function that returns an EasyDeLPartitions object.
+    """The get_partitions function is a helper function that returns an EasyDeLPartitions object.
     The EasyDeLPartitions object contains the PartitionSpec objects for each of the five tensors in
     the attention computation: query, key, value, bias and attention. The PartitionSpec objects are
     used to specify how each tensor should be partitioned across devices (i.e., which dimensions of
     each tensor should be split across devices). For example, if we want to split the batch dimension
     of all five tensors across two devices then we would set ``query_partition_spec=key_partition_spec=value_partition_spec=
 
-    :param jax_attn_format: bool: Specify whether the attention
-    :param fsdp_on_batch: bool: Determine whether the batch dimension is partitioned
-    :return: A easydelpartitions object
+    Args:
+        jax_attn_format: bool: Specify whether the attention
+        fsdp_on_batch: bool: Determine whether the batch dimension is
+            partitioned
+
+    Returns:
+        A easydelpartitions object
     """
     if jax_attn_format:
         if fsdp_on_batch:

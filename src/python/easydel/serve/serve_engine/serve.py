@@ -58,15 +58,18 @@ class EasyServe:
         return self.greedy_generate_function if greedy else self.non_greedy_generate_function
 
     def conversation_template(self, conversation: List[Dict]) -> str:
-        """
-        The conversation_template function takes a list of ConversationItem objects and returns a string.
+        """The conversation_template function takes a list of ConversationItem objects and returns a string.
         where system message, user message, and assistant message are the content fields of the ConversationItem objects.
         If there is no system message in the conversation, then it will be omitted from the template.
 
-        :param self: Refer to the current instance of a class
-        :param conversation: List[ConversationItem]: Pass in the conversation items
-        :return: A string that is a concatenation of the messages in the conversation
+        Args:
+            self: Refer to the current instance of a class
+            conversation: List[ConversationItem]: Pass in the
+                conversation items
 
+        Returns:
+            A string that is a concatenation of the messages in the
+            conversation
         """
         return self.tokenizer.apply_chat_template(
             conversation=conversation,
@@ -128,17 +131,21 @@ class EasyServe:
             dtype: Union[jax.numpy.dtype, str] = "fp16"
     ):
 
-        """
-        The create_shard_and_gather_functions function takes in a dictionary of parameters,
+        """The create_shard_and_gather_functions function takes in a dictionary of parameters,
         a tuple of partition rules, and an optional dtype. It then matches the partition rules to the
         parameters and creates shard functions for each parameter. The shard functions are used to
         split up a parameter into shards (or partitions) that can be stored on different devices.
         The gather function is used to combine all the shards back together again.
 
-        :param parameters: dict: Specify the parameters of the model
-        :param partition_rules: Tuple[Tuple[str,  PartitionSpec]]: Specify which parameters to partition
-        :param dtype: jax.numpy.dtype | str: Specify the data type of the parameters
-        :return: A tuple of three elements:
+        Args:
+            parameters: dict: Specify the parameters of the model
+            partition_rules: Tuple[Tuple[str,  PartitionSpec]]: Specify
+                which parameters to partition
+            dtype: jax.numpy.dtype | str: Specify the data type of the
+                parameters
+
+        Returns:
+            A tuple of three elements:
         """
         partition_specs = match_partition_rules(partition_rules, parameters)
         shard_fns, gather_fns = make_shard_and_gather_fns(
@@ -155,15 +162,21 @@ class EasyServe:
             serve_config: EasyServeConfig,
     ):
 
-        """
-        The shard_parameters function takes a set of parameters and partitions them according to the partition_rules.
+        """The shard_parameters function takes a set of parameters and partitions them according to the partition_rules.
 
-        :param mesh: Mesh: Create a mesh object that is used to shard the parameters
-        :param params: FrozenDict | dict: Pass in the parameters of the model
-        :param partition_rules: Tuple[Tuple[str, PartitionSpec]]: Specify the partitioning rules for each parameter
-        :param serve_config: EasyServeConfig: Specify the dtype of the parameters
+        Args:
+            mesh: Mesh: Create a mesh object that is used to shard the
+                parameters
+            params: FrozenDict | dict: Pass in the parameters of the
+                model
+            partition_rules: Tuple[Tuple[str, PartitionSpec]]: Specify
+                the partitioning rules for each parameter
+            serve_config: EasyServeConfig: Specify the dtype of the
+                parameters
         :param : Create a mesh of devices
-        :return: sharded parameters
+
+        Returns:
+            sharded parameters
         """
 
         partition_specs = match_partition_rules(params=params, rules=partition_rules)
@@ -183,17 +196,23 @@ class EasyServe:
             serve_config: EasyServeConfig,
             partition_specs: dict[str, PartitionSpec]
     ) -> LLMBaseReq:
-        """
-        The create_generation_functions_and_tokenizers function is used to create the functions that will be used for
+        """The create_generation_functions_and_tokenizers function is used to create the functions that will be used for
         generation. It also creates a tokenizer object that can be used to encode and decode text. The function takes in
         a model, a tokenizer, an EasyServeConfig object (which contains all the parameters needed for generation), and
         partition_specs which are specifications about how data should be partitioned across devices.
 
-        :param model: EasyDeLFlaxPretrainedModel: Create the model and tokenizer
-        :param tokenizer: PreTrainedTokenizerBase: Create a tokenizer object
-        :param serve_config: EasyServeConfig: Create the generation function
-        :param partition_specs: dict[str, PartitionSpec]: Specify the sharding of the model parameters
-        :return: An LLMBaseReq object
+        Args:
+            model: EasyDeLFlaxPretrainedModel: Create the model and
+                tokenizer
+            tokenizer: PreTrainedTokenizerBase: Create a tokenizer
+                object
+            serve_config: EasyServeConfig: Create the generation
+                function
+            partition_specs: dict[str, PartitionSpec]: Specify the
+                sharding of the model parameters
+
+        Returns:
+            An LLMBaseReq object
         """
         if tokenizer.pad_token is None:
             logging.info(
@@ -300,20 +319,26 @@ class EasyServe:
             shard_parameters: bool = True,
     ):
 
-        """
-        The from_parameters function is the main entry point for creating a model that can be served.
+        """The from_parameters function is the main entry point for creating a model that can be served.
         It takes in a pretrained model, parameters, tokenizer and serve_config as input and returns an object of type
         EasyServe.
 
-        :param cls: Create a new instance of the class
-        :param llm: EasyDeLFlaxPretrainedModel: Pass the model to the class
-        :param params: dict: Pass the parameters of the model
-        :param tokenizer: PreTrainedTokenizerBase: Create the tokenizer and prefix_tokenizer
-        :param serve_config: EasyServeConfig: Configure the model for serving
-        :param partition_rules: Tuple[Tuple[str, PartitionSpec]]: Partition the parameters of the model
-        :param shard_parameters: bool: Specify whether the parameters should be sharded or not
+        Args:
+            cls: Create a new instance of the class
+            llm: EasyDeLFlaxPretrainedModel: Pass the model to the class
+            params: dict: Pass the parameters of the model
+            tokenizer: PreTrainedTokenizerBase: Create the tokenizer and
+                prefix_tokenizer
+            serve_config: EasyServeConfig: Configure the model for
+                serving
+            partition_rules: Tuple[Tuple[str, PartitionSpec]]: Partition
+                the parameters of the model
+            shard_parameters: bool: Specify whether the parameters
+                should be sharded or not
         :param : Shard the parameters of the model
-        :return: A EasyServe object
+
+        Returns:
+            A EasyServe object
         """
         shard_fns, gather_fns, partition_specs = cls.create_shard_and_gather_functions(
             parameters=params,
@@ -353,18 +378,22 @@ class EasyServe:
             max_new_tokens: int = None,
             **kwargs
     ):
-        """
-        The process function is the main function of a model. It takes in an input string and returns a list of strings
+        """The process function is the main function of a model. It takes in an input string and returns a list of strings
         that are generated from that input string. The process function can be called multiple times with different inputs,
         and each time it will return a new set of outputs based on those inputs.
 
-        :param self: Access the class attributes
-        :param string: str: Pass the string that we want to generate
-        :param greedy: bool: Determine whether to use the greedy or non-greedy version of the generate function
-        :param max_new_tokens: int: Set the number of tokens to generate
-        :param kwargs: Pass any additional parameters to the process function
-        :return: A generator that yields the predicted text and the number of tokens generated
+        Args:
+            self: Access the class attributes
+            string: str: Pass the string that we want to generate
+            greedy: bool: Determine whether to use the greedy or non-
+                greedy version of the generate function
+            max_new_tokens: int: Set the number of tokens to generate
+            **kwargs: Pass any additional parameters to the process
+                function
 
+        Returns:
+            A generator that yields the predicted text and the number of
+            tokens generated
         """
         with self.llm.config.jax_mesh():
             fixed_pad = self.serve_config.max_sequence_length - self.serve_config.max_compile_tokens
@@ -428,16 +457,18 @@ class EasyServe:
                     break
 
     def compile(self, verbose: bool = True) -> bool:
-        """
-        The compile function is used to compile the model for use in inference.
+        """The compile function is used to compile the model for use in inference.
         It does this by running through all possible combinations of rules and actions,
         and compiling them into functions that can be called later on during inference.
         This allows us to avoid having to recompile the model every time we want to run it,
         which would be very slow.
 
-        :param self: Represent the instance of the class
-        :param verbose: bool: Print out the compiling process
-        :return: True, but what does it do?
+        Args:
+            self: Represent the instance of the class
+            verbose: bool: Print out the compiling process
+
+        Returns:
+            True, but what does it do?
         """
         if self.serve_config.use_prefix_tokenizer:
             if verbose:
@@ -467,14 +498,16 @@ class EasyServe:
 
     def __repr__(self):
 
-        """
-        The __repr__ function is used to generate a string representation of an object.
+        """The __repr__ function is used to generate a string representation of an object.
         This function should return a string that can be parsed by the Python interpreter
         to recreate the object. The __repr__ function is called when you use print() on an
         object, or when you type its name in the REPL.
 
-        :param self: Refer to the instance of the class
-        :return: A string representation of the object
+        Args:
+            self: Refer to the instance of the class
+
+        Returns:
+            A string representation of the object
         """
         string = f"{self.__class__.__name__}(\n"
         for k, v in self.__dict__.items():
@@ -488,12 +521,14 @@ class EasyServe:
 
     def __str__(self):
 
-        """
-        The __str__ function is called when you use the print function or when str() is used.
+        """The __str__ function is called when you use the print function or when str() is used.
         It should return a string representation of the object.
 
-        :param self: Refer to the instance of the class
-        :return: The object's string representation
+        Args:
+            self: Refer to the instance of the class
+
+        Returns:
+            The object's string representation
         """
         return self.__repr__()
 

@@ -121,11 +121,11 @@ plugins:
       handlers:
         python:
           options:
-            docstring_style: sphinx
+            docstring_style: google
 
 repo_url: https://github.com/erfanzar/EasyDeL
 site_author: Erfan Zare Chavoshi
-site_name: easydel
+site_name: EasyDeL
 copyright: Erfan Zare Chavoshi-easydel
 
 theme:
@@ -138,9 +138,9 @@ theme:
 
     statics = {
         ("Home",): "index.md",
-        ("install",): "Install.md",
-        ("AvailableModels",): "AvailableModels.md",
-        ("EasyBIT",): "Bits.md",
+        ("Install",): "Install.md",
+        ("Available models",): "AvailableModels.md",
+        ("Easy Bits",): "Bits.md",
         ("Examples", "EasyState"): "EasyStateExample.md",
         ("Examples", "LoRA and Transfer Learning"): "LoRA-TransferLearningExample.md",
         ("Examples", "Fine Tuning Example"): "FineTuningExample.md",
@@ -154,7 +154,7 @@ theme:
         ("Examples", "MosaicMPT Models"): "MosaicMPT.md",
         ("Examples", "Easy Attention"): "AttentionModuleExample.md",
         ("Examples", "Model Parameter Quantization"): "Parameter-Quantization.md",
-        ("CONTRIBUTING",): "CONTRIBUTING.md"
+        ("Contributing",): "CONTRIBUTING.md"
 
     }
     cache = {("APIs",) + k: v for k, v in cache.items()}

@@ -108,15 +108,17 @@ class PyTorchServerConfig:
 class PyTorchServer(GradioUserInference):
 
     def __init__(self, server_config: PyTorchServerConfig):
-        """
-        The __init__ function is called when the class is instantiated.
+        """The __init__ function is called when the class is instantiated.
         It sets up the instance of the class, and defines all its attributes.
         The __init__ function can accept arguments, which are passed at instantiation.
 
-        :param self: Represent the instance of the class
-        :param server_config: PyTorchServerConfig: Pass the configuration parameters to the class
-        :return: The app, which is a fastapi object
-        
+        Args:
+            self: Represent the instance of the class
+            server_config: PyTorchServerConfig: Pass the configuration
+                parameters to the class
+
+        Returns:
+            The app, which is a fastapi object
         """
         self.model, self.tokenizer = [None] * 2
 
@@ -141,12 +143,13 @@ class PyTorchServer(GradioUserInference):
     @staticmethod
     def get_gpu_memory(num_gpus_req=None):
 
-        """
-        The get_gpu_memory function returns the amount of available GPU memory in GB.
+        """The get_gpu_memory function returns the amount of available GPU memory in GB.
 
-        :param num_gpus_req: Specify the number of gpus to be used
-        :return: The amount of free memory on each gpu
-        
+        Args:
+            num_gpus_req: Specify the number of gpus to be used
+
+        Returns:
+            The amount of free memory on each gpu
         """
         gpu_m = []
         dc = torch.cuda.device_count()
@@ -160,12 +163,13 @@ class PyTorchServer(GradioUserInference):
         return gpu_m
 
     def get_model_load_kwargs(self):
-        """
-        The get_model_load_kwargs function is used to set the torch_dtype, device_map and max_memory parameters for loading a model.
+        """The get_model_load_kwargs function is used to set the torch_dtype, device_map and max_memory parameters for loading a model.
 
-        :param self: Bind the method to an object
-        :return: A dictionary with the following keys:
-        
+        Args:
+            self: Bind the method to an object
+
+        Returns:
+            A dictionary with the following keys:
         """
         if self.server_config.dtype == "fp16":
             dtype = torch.float16
@@ -184,8 +188,7 @@ class PyTorchServer(GradioUserInference):
 
     def status(self):
 
-        """
-        The status function returns a dictionary with the following keys:
+        """The status function returns a dictionary with the following keys:
             server_config: A dictionary of configuration parameters.
             devices: The number of GPUs available to the server.
             device_sharding: Whether device sharding is enabled. If True, then each request will be served by
@@ -194,9 +197,11 @@ class PyTorchServer(GradioUserInference):
             initialization function via torch-serve"s DeviceShardingStrategy
             class. See https://pytorch-lightning.readthedoc
 
-        :param self: Represent the instance of the class
-        :return: A dictionary with the following keys:
-        
+        Args:
+            self: Represent the instance of the class
+
+        Returns:
+            A dictionary with the following keys:
         """
         return {
             "server_config": {k: v for k, v in self.server_config.__dict__.items()},
@@ -208,17 +213,19 @@ class PyTorchServer(GradioUserInference):
         }
 
     def forward_instruct_fast_api(self, data: InstructRequest):
-        """
-        The forward_instruct_fast_api function is a ReST API endpoint that takes in an InstructRequest object and returns
+        """The forward_instruct_fast_api function is a ReST API endpoint that takes in an InstructRequest object and returns
         a response. The InstructRequest object contains the following fields:
             - system (str): A string representing the name of the system to be instructed. This should match one of the
                 systems defined in your server_config file, or else it will default to &quot;default&quot;. If you want to instruct multiple
                 systems at once, use forward_instruct_fast instead.
 
-        :param self: Refer to the object itself
-        :param data: InstructRequest: Pass in the data that is used to generate the response
-        :return: A dictionary with a single key, response
-        
+        Args:
+            self: Refer to the object itself
+            data: InstructRequest: Pass in the data that is used to
+                generate the response
+
+        Returns:
+            A dictionary with a single key, response
         """
         string = self.format_instruct(
             system=data.system,
@@ -238,14 +245,16 @@ class PyTorchServer(GradioUserInference):
         }
 
     def forward_chat_fast_api(self, data: ChatRequest):
-        """
-        The forward_chat_fast_api function is a ReST API endpoint that takes in a ChatRequest object and returns the
+        """The forward_chat_fast_api function is a ReST API endpoint that takes in a ChatRequest object and returns the
         response from the model.
 
-        :param self: Refer to the object itself
-        :param data: ChatRequest: Pass the data from the serve_engine to the function
-        :return: A dictionary with a single key, response
-        
+        Args:
+            self: Refer to the object itself
+            data: ChatRequest: Pass the data from the serve_engine to
+                the function
+
+        Returns:
+            A dictionary with a single key, response
         """
         string = self.format_chat(
             system=data.system,
@@ -266,9 +275,7 @@ class PyTorchServer(GradioUserInference):
         }
 
     def format_instruct(self, system: str, instruction: str) -> str:
-        """
-        Here you will get the system and instruction from user, and you can apply your prompting style
-        """
+        """Here you will get the system and instruction from user, and you can apply your prompting style"""
         conversation = []
         if system is not None and system != "":
             conversation.append({
@@ -284,9 +291,7 @@ class PyTorchServer(GradioUserInference):
         )
 
     def format_chat(self, history: List[List[str]], prompt: str, system: typing.Union[str, None]) -> str:
-        """
-        Here you will get the system, prompt and history from user, and you can apply your prompting style
-        """
+        """Here you will get the system, prompt and history from user, and you can apply your prompting style"""
         conversation = []
         if system is not None and system != "":
             conversation.append({
@@ -327,21 +332,29 @@ class PyTorchServer(GradioUserInference):
             stream: bool = True,
             sample: bool = True
     ):
-        """
-        The sample function is the main function of this class. It takes a string as input and returns a generator that yields strings.
+        """The sample function is the main function of this class. It takes a string as input and returns a generator that yields strings.
 
-        :param self: Represent the instance of the class
-        :param string: str: Pass the string to be generated
-        :param max_new_tokens: Optional[int]: Limit the number of new tokens that can be generated
-        :param max_sequence_length: Optional[int]: Set the maximum length of the generated text
-        :param temperature: Optional[float]: Control the randomness of the text generation
-        :param top_k:Optional[int]: Filter out the top k tokens with the highest probability
-        :param top_p:Optional[int]: Control the probability of sampling from the top n tokens
-        :param repetition_penalty: optional[float]: repetition penalty for generation
-        :param stream: bool: Determine whether to stream the output or not
-        :param sample: optional[bool]: Indicate whether to sample from the distribution or take the argmax
-        :return: A generator
-        
+        Args:
+            self: Represent the instance of the class
+            string: str: Pass the string to be generated
+            max_new_tokens: Optional[int]: Limit the number of new
+                tokens that can be generated
+            max_sequence_length: Optional[int]: Set the maximum length
+                of the generated text
+            temperature: Optional[float]: Control the randomness of the
+                text generation
+            top_k: Optional[int]: Filter out the top k tokens with the
+                highest probability
+            top_p: Optional[int]: Control the probability of sampling
+                from the top n tokens
+            repetition_penalty: optional[float]: repetition penalty for
+                generation
+            stream: bool: Determine whether to stream the output or not
+            sample: optional[bool]: Indicate whether to sample from the
+                distribution or take the argmax
+
+        Returns:
+            A generator
         """
         assert self.model is not None, "you should first load model with ``load`` method"
         tokens = self.tokenizer(
@@ -405,16 +418,20 @@ class PyTorchServer(GradioUserInference):
             return pred
 
     def load(self, pretrained_model_name_or_path: str, tokenizer_repo: str = None, auto_config: bool = True, **kwargs):
-        """
-        The load function is used to load a model from the HuggingFace Model Hub.
+        """The load function is used to load a model from the HuggingFace Model Hub.
 
-        :param self: Represent the instance of the class
-        :param pretrained_model_name_or_path: str: Specify the name of the model to be loaded
-        :param tokenizer_repo: str: Specify the repo id of the tokenizer
-        :param auto_config: bool: Determine whether the model should be loaded with a server_config file or not
-        :param kwargs: Pass a variable number of keyword arguments to the function
-        :return: A tuple of model and tokenizer
-        
+        Args:
+            self: Represent the instance of the class
+            pretrained_model_name_or_path: str: Specify the name of the
+                model to be loaded
+            tokenizer_repo: str: Specify the repo id of the tokenizer
+            auto_config: bool: Determine whether the model should be
+                loaded with a server_config file or not
+            **kwargs: Pass a variable number of keyword arguments to the
+                function
+
+        Returns:
+            A tuple of model and tokenizer
         """
         load_kwargs = kwargs if not auto_config else self.get_model_load_kwargs()
         load_kwargs = load_kwargs | kwargs
@@ -486,12 +503,13 @@ class PyTorchServer(GradioUserInference):
         )
 
     def fire(self):
-        """
-        The fire function starts the uvicorn server in a separate process.
+        """The fire function starts the uvicorn server in a separate process.
 
-        :param self: Represent the instance of the class
-        :return: A process that runs the uvicorn server
-        
+        Args:
+            self: Represent the instance of the class
+
+        Returns:
+            A process that runs the uvicorn server
         """
 
         def run():
@@ -501,13 +519,14 @@ class PyTorchServer(GradioUserInference):
         self.process_uvicorn.start()
 
     def end(self):
-        """
-        The end function is used to stop the server.
+        """The end function is used to stop the server.
             It will wait for the process to end before returning.
 
-        :param self: Represent the instance of the class
-        :return: A boolean value
-        
+        Args:
+            self: Represent the instance of the class
+
+        Returns:
+            A boolean value
         """
         if self.process_uvicorn is not None:
             self.process_uvicorn.join()

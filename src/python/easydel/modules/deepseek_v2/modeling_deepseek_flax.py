@@ -946,25 +946,31 @@ class FlaxDeepseekV2Module(nn.Module):
             output_hidden_states: bool = False,
             return_dict: bool = True,
     ) -> typing.Union[Tuple[chex.Array, ...], FlaxBaseModelOutput]:
-        """
-        The __call__ function is the main function of a Flax model.
+        """The __call__ function is the main function of a Flax model.
         It takes in input_ids, attention_mask, and position_ids as inputs to the model.
         The output is a tuple containing: last hidden state (hidden states), all hidden states (if output_hidden_states=True), attentions (if output attentions=True).
 
-
-        :param self: Represent the instance of the class
-        :param input_ids: chex.Array: Pass in the input ids
-        :param attention_mask: chex.Array: Mask out the attention weights for certain tokens
-        :param position_ids: chex.Array: Determine the position of each token in a sequence
-        :param deterministic: bool: Determine whether to use dropout or not
-        :param inputs_embeds: chex.Array: Pass in the embedding of the input_ids
-        :param init_cache: bool: Initialize the cache for the decoder
-        :param output_attentions: bool: Determine whether to return the attention weights or not
-        :param output_hidden_states: bool: Return all hidden states or just the last one
-        :param return_dict: bool: Return a dictionary of the outputs or not
+        Args:
+            self: Represent the instance of the class
+            input_ids: chex.Array: Pass in the input ids
+            attention_mask: chex.Array: Mask out the attention weights
+                for certain tokens
+            position_ids: chex.Array: Determine the position of each
+                token in a sequence
+            deterministic: bool: Determine whether to use dropout or not
+            inputs_embeds: chex.Array: Pass in the embedding of the
+                input_ids
+            init_cache: bool: Initialize the cache for the decoder
+            output_attentions: bool: Determine whether to return the
+                attention weights or not
+            output_hidden_states: bool: Return all hidden states or just
+                the last one
+            return_dict: bool: Return a dictionary of the outputs or not
         :param : Determine whether the model is in training mode or not
-        :return: A tuple of the hidden states, all hidden states, and attentions
 
+        Returns:
+            A tuple of the hidden states, all hidden states, and
+            attentions
         """
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
@@ -1038,17 +1044,21 @@ class DeepseekV2PreTrainedModel(EasyDeLFlaxPretrainedModel):
             input_shape: Tuple,
             params: FrozenDict = None
     ) -> FrozenDict:
-        """
-        The init_weights function is used to initialize the weights of a model.
+        """The init_weights function is used to initialize the weights of a model.
         It takes in a rng, which is a random number generator key that can be used to generate random numbers.
         The input_shape parameter specifies the shape of the inputs that will be fed into this model.
         The params parameter allows you to pass in pre-trained weights for your model, if you have them available.
 
-        :param self: Access variables that belong to the class
-        :param rng: jax.random.PRNGKey: Initialize the weights of the model
-        :param input_shape: Tuple: Initialize the input_ids, attention_mask and position_ids
-        :param params: flax.core.FrozenDict: Pass in the parameters of a pre-trained model
-        :return: A frozendict of parameters
+        Args:
+            self: Access variables that belong to the class
+            rng: jax.random.PRNGKey: Initialize the weights of the model
+            input_shape: Tuple: Initialize the input_ids, attention_mask
+                and position_ids
+            params: flax.core.FrozenDict: Pass in the parameters of a
+                pre-trained model
+
+        Returns:
+            A frozendict of parameters
         """
 
         self.config.initialization_of_moe = True
@@ -1122,28 +1132,35 @@ class DeepseekV2PreTrainedModel(EasyDeLFlaxPretrainedModel):
             add_params_field: bool = False,
             **kwargs
     ):
-        """
-        The __call__ function is the main function of a JAX module.
+        """The __call__ function is the main function of a JAX module.
         It takes as input:
         - The parameters of the model (self.params)
         - The inputs to the model (input_ids, attention_mask, position_ids)
         - Whether we are training (train=True/False) and whether we want to return all hidden states and
         attentions weights at each layer in addition to just the last layer output (output_hidden_states=True/False).
 
-        :param self: Represent the instance of the class
-        :param input_ids: Pass the input sequence to the model
-        :param attention_mask: Mask out the padding tokens
-        :param position_ids: Specify the position of each token in the sequence
-        :param params: dict: Pass in the parameters of the model
-        :param past_key_values: dict: Pass the past key values to the model
-        :param dropout_rng: jax.random.PRNGKey: Pass in a random number generator key to the model
-        :param train: bool: Determine whether to use dropout or not
-        :param output_attentions: Optional[bool]: Determine whether to return the attention weights
-        :param output_hidden_states: Optional[bool]: Determine whether to return the hidden states of all layers
-        :param return_dict: Optional[bool]: Return a dictionary of the outputs
-        :param add_params_field: bool: Add a params field to the inputs dictionary
-        :return: A tuple of (last_hidden_state, past_key_values)
+        Args:
+            self: Represent the instance of the class
+            input_ids: Pass the input sequence to the model
+            attention_mask: Mask out the padding tokens
+            position_ids: Specify the position of each token in the
+                sequence
+            params: dict: Pass in the parameters of the model
+            past_key_values: dict: Pass the past key values to the model
+            dropout_rng: jax.random.PRNGKey: Pass in a random number
+                generator key to the model
+            train: bool: Determine whether to use dropout or not
+            output_attentions: Optional[bool]: Determine whether to
+                return the attention weights
+            output_hidden_states: Optional[bool]: Determine whether to
+                return the hidden states of all layers
+            return_dict: Optional[bool]: Return a dictionary of the
+                outputs
+            add_params_field: bool: Add a params field to the inputs
+                dictionary
 
+        Returns:
+            A tuple of (last_hidden_state, past_key_values)
         """
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -1247,26 +1264,32 @@ class FlaxDeepseekV2ForCausalLMModule(nn.Module):
             output_hidden_states: bool = False,
             return_dict: bool = True,
     ):
-        """
-            The __call__ function is the main function of a Flax module. It defines how the model will be called,
-            and what it returns. In this case, we are calling our Transformer model with input_ids and attention_mask
-            as inputs (these are defined in __init__). We also have some optional arguments that can be passed to
-            the call function: deterministic (whether to use dropout), inputs_embeds (if you want to pass your own embeddings),
-            output_attentions and output_hidden states which return additional outputs from the transformer layers if set True. Finally,
+        """The __call__ function is the main function of a Flax module. It defines how the model will be called,
+        and what it returns. In this case, we are calling our Transformer model with input_ids and attention_mask
+        as inputs (these are defined in __init__). We also have some optional arguments that can be passed to
+        the call function: deterministic (whether to use dropout), inputs_embeds (if you want to pass your own embeddings),
+        output_attentions and output_hidden states which return additional outputs from the transformer layers if set True. Finally,
 
-            :param self: Refer to the object itself
-            :param input_ids: chex.Array: Pass in the input tokens
-            :param attention_mask: chex.Array: Mask out the padding tokens
-            :param position_ids: chex.Array: Specify the position of each token in the sequence
-            :param deterministic: bool: Determine whether to use dropout in the model
-            :param inputs_embeds: chex.Array: Pass in the embeddings of the input tokens
-            :param init_cache: bool: Initialize the cache for the decoder
-            :param output_attentions: bool: Return the attention weights
-            :param output_hidden_states: bool: Return the hidden states of all layers
-            :param return_dict: bool: Return a dictionary of the outputs or just the logits
-            :param : Determine whether to return the logits or not
-            :return: A tuple of (lm_logits, hidden_states, attentions)
+        Args:
+            self: Refer to the object itself
+            input_ids: chex.Array: Pass in the input tokens
+            attention_mask: chex.Array: Mask out the padding tokens
+            position_ids: chex.Array: Specify the position of each token
+                in the sequence
+            deterministic: bool: Determine whether to use dropout in the
+                model
+            inputs_embeds: chex.Array: Pass in the embeddings of the
+                input tokens
+            init_cache: bool: Initialize the cache for the decoder
+            output_attentions: bool: Return the attention weights
+            output_hidden_states: bool: Return the hidden states of all
+                layers
+            return_dict: bool: Return a dictionary of the outputs or
+                just the logits
+        :param : Determine whether to return the logits or not
 
+        Returns:
+            A tuple of (lm_logits, hidden_states, attentions)
         """
         batch_size, seq_length = input_ids.shape
 
@@ -1333,15 +1356,18 @@ class FlaxDeepseekV2ForCausalLM(DeepseekV2PreTrainedModel):
         self.module.lm_head = new_embeddings
 
     def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[chex.Array] = None):
-        """
-        The prepare_inputs_for_generation function is used to prepare the inputs for a generation task.
+        """The prepare_inputs_for_generation function is used to prepare the inputs for a generation task.
 
-        :param self: Access variables that belong to the class
-        :param input_ids: Pass in the input tokens
-        :param max_length: Set the length of the sequence to be generated
-        :param attention_mask: Optional[chex.Array]: Mask the attention weights
-        :return: A dictionary of the past_key_values, attention_mask and position ids
+        Args:
+            self: Access variables that belong to the class
+            input_ids: Pass in the input tokens
+            max_length: Set the length of the sequence to be generated
+            attention_mask: Optional[chex.Array]: Mask the attention
+                weights
 
+        Returns:
+            A dictionary of the past_key_values, attention_mask and
+            position ids
         """
         batch_size, seq_length = input_ids.shape
 

@@ -170,8 +170,7 @@ def _collate_batch(examples, tokenizer, pad_to_multiple_of: Optional[int] = None
 
 
 def tolist(x):
-    """
-    from HF
+    """from HF
     Args:
         x:
 
@@ -186,8 +185,7 @@ def tolist(x):
 
 
 class DataCollatorForCompletionOnlyLM:
-    """
-    Data collator used for completion tasks. It ensures that all the tokens of the labels are set to an 'ignore_index'
+    """Data collator used for completion tasks. It ensures that all the tokens of the labels are set to an 'ignore_index'
     when they do not come from the assistant. This ensures that the loss is only
     calculated on the completion made by the assistant.
     """
@@ -270,9 +268,7 @@ class DataCollatorForCompletionOnlyLM:
         return mask_labels
 
     def jax_mask_tokens(self, inputs: Any, special_tokens_mask: Optional[Any] = None) -> Tuple[Any, Any]:
-        """
-        Prepare masked tokens inputs/labels for masked language modeling: 80% MASK, 10% random, 10% original.
-        """
+        """Prepare masked tokens inputs/labels for masked language modeling: 80% MASK, 10% random, 10% original."""
         labels = np.copy(inputs)
         probability_matrix = np.full(labels.shape, 0.15)
         if special_tokens_mask is None:
@@ -434,8 +430,7 @@ def conversations_formatting_function(tokenizer: AutoTokenizer, messages_field: 
 
 
 def instructions_formatting_function(tokenizer: AutoTokenizer):
-    r"""
-    from TRL
+    r"""from TRL
     return a callable function that takes in an "instructions" dataset and returns a formatted dataset, based on the tokenizer
     apply chat template to the dataset
     """
@@ -463,8 +458,7 @@ def instructions_formatting_function(tokenizer: AutoTokenizer):
 def get_formatting_func_from_dataset(
         dataset: Union[Dataset, "ConstantLengthDataset"], tokenizer: AutoTokenizer  # type: ignore
 ) -> Optional[Callable]:
-    r"""
-    from TRL
+    r"""from TRL
     Finds the correct formatting function based on the dataset structure. Currently supported datasets are:
     - `ChatML` with [{"role": str, "content": str}]
     - `instruction` with [{"prompt": str, "completion": str}]

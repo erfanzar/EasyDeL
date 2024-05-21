@@ -109,16 +109,18 @@ class FlaxStableLmMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
-        """
-        The __call__ function is the main function of a class.
+        """The __call__ function is the main function of a class.
         It is called when an instance of the class (an object) is invoked as a function, i.e., obj(arguments).
         The __call__ method enables instances of a class to be called like standard Python functions.
 
-        :param self: Represent the instance of the class
-        :param x: jnp.ndarray: Pass in the input to the layer
-        :param deterministic: bool: Determine whether to use dropout # Ignored
-        :return: A tensor that is the result of function to x
+        Args:
+            self: Represent the instance of the class
+            x: jnp.ndarray: Pass in the input to the layer
+            deterministic: bool: Determine whether to use dropout #
+                Ignored
 
+        Returns:
+            A tensor that is the result of function to x
         """
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
@@ -225,33 +227,38 @@ class FlaxStableLmAttention(BaseJAXAttentionModule):
 
     @staticmethod
     def _transpose_sequence_head(query, key, value):
-        """
-        The _transpose_sequence_head function transposes the query, key and value matrices.
+        """The _transpose_sequence_head function transposes the query, key and value matrices.
 
-        :param query: Get the attention weights for each of the heads
-        :param key: Determine the number of heads
-        :param value: Store the values of the input
-        :return: The transpose of the query, key and value matrices
+        Args:
+            query: Get the attention weights for each of the heads
+            key: Determine the number of heads
+            value: Store the values of the input
 
+        Returns:
+            The transpose of the query, key and value matrices
         """
         return jnp.transpose(query, (0, 2, 1, 3)), jnp.transpose(key, (0, 2, 1, 3)), jnp.transpose(value, (0, 2, 1, 3))
 
     def apply_rotary(self, batch_size, sequence_length, query, key, value, freq_cis, position_ids):
-        """
-        The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
+        """The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
         The main difference is that it takes in an additional argument, freq_cis, which are used to calculate
         the rotary attention weights. The other differences are minor and mostly related to reshaping tensors.
 
-        :param self: Access variables that belong to the class
-        :param batch_size: Reshape the query_states, key and value tensors
-        :param sequence_length: Reshape the query_states, key and value tensors
-        :param query: Calculate the attention weights
-        :param key: Calculate the attention
-        :param value: Compute the attention weights
-        :param freq_cis: Calculate the frequency of each word in the vocabulary
-        :param position_ids: Identify the position of each token in the sequence
-        :return: A tuple of 3 tensors: query_states, key and value
+        Args:
+            self: Access variables that belong to the class
+            batch_size: Reshape the query_states, key and value tensors
+            sequence_length: Reshape the query_states, key and value
+                tensors
+            query: Calculate the attention weights
+            key: Calculate the attention
+            value: Compute the attention weights
+            freq_cis: Calculate the frequency of each word in the
+                vocabulary
+            position_ids: Identify the position of each token in the
+                sequence
 
+        Returns:
+            A tuple of 3 tensors: query_states, key and value
         """
         query = query.reshape(
             batch_size,
@@ -311,25 +318,32 @@ class FlaxStableLmAttention(BaseJAXAttentionModule):
             output_attentions: bool = False,
             fcm_mask=None,
     ):
-        """
-
-        The __call__ function is the main function of a JAX module. It defines how the module behaves when called
+        """The __call__ function is the main function of a JAX module. It defines how the module behaves when called
         with inputs. The __call__ function can be thought of as a &quot;forward pass&quot; through the model,
         and it should return all outputs that are needed for training or inference.
 
-        :param self: Access variables that belong to the class
-        :param hidden_states: chex.Array: Pass the hidden states of the previous layer
-        :param freq_cis: Tuple[chex.Array, chex.Array],: Pass in the frequency coefficients for each position
-        :param attention_mask: chex.Array: Mask out certain tokens in the input sequence
-        :param position_ids: chex.Array: Determine the position of each token in a sequence
-        :param causal_mask: chex.Array: Mask out the future tokens in the decoder
-        :param deterministic: bool: Determine whether to use dropout or not
-        :param init_cache: bool: Initialize the cache
-        :param output_attentions: bool: Determine whether to return the attention weights or not
-        :param fcm_mask: Mask out the attention weights between the input and output tokens
+        Args:
+            self: Access variables that belong to the class
+            hidden_states: chex.Array: Pass the hidden states of the
+                previous layer
+            freq_cis: Tuple[chex.Array, chex.Array],: Pass in the
+                frequency coefficients for each position
+            attention_mask: chex.Array: Mask out certain tokens in the
+                input sequence
+            position_ids: chex.Array: Determine the position of each
+                token in a sequence
+            causal_mask: chex.Array: Mask out the future tokens in the
+                decoder
+            deterministic: bool: Determine whether to use dropout or not
+            init_cache: bool: Initialize the cache
+            output_attentions: bool: Determine whether to return the
+                attention weights or not
+            fcm_mask: Mask out the attention weights between the input
+                and output tokens
         :param : Determine if the attention is causal or not
-        :return: A tuple of two arrays
 
+        Returns:
+            A tuple of two arrays
         """
         batch_size, sequence_length = hidden_states.shape[:2]
         query_states, key_states, value_states = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(

@@ -148,9 +148,7 @@ def llama_convert_flax_to_pt(flax_params, config: LlamaConfig, dtype=jnp.float16
 
 
 def llama_easydel_to_hf(path, config: LlamaConfig):
-    """
-        Takes path to easydel saved ckpt and return the model in pytorch (Transformers Huggingface)
-    """
+    """Takes path to easydel saved ckpt and return the model in pytorch (Transformers Huggingface)"""
     torch_params = load_and_convert_checkpoint_to_torch(path)
     edited_params = {}
     for k, v in torch_params.items():
@@ -161,9 +159,7 @@ def llama_easydel_to_hf(path, config: LlamaConfig):
 
 
 def llama_from_pretrained(model_id, device):
-    """
-    return: Weight or Params for easydel Model , Config
-    """
+    """return: Weight or Params for easydel Model , Config"""
     config = LlamaConfig.from_pretrained(model_id)
     model = LlamaForCausalLM.from_pretrained(model_id)
     easydel_wights = llama_convert_hf_to_flax(

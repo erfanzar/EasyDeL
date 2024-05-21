@@ -26,12 +26,13 @@ def pad_to_length(tensor: chex.Array, length: int, pad_value: Union[int, float],
 
 @dataclass
 class DPODataCollatorWithPadding:
-    r"""
-    DPO DataCollator class that pads the tokenized inputs to the maximum length of the batch.
+    r"""DPO DataCollator class that pads the tokenized inputs to the maximum length of the batch.
 
-    :param pad_token_id: int: The tokenizers pad_token_id.
-    :param label_pad_token_id: int: The label used for masking.
-    :param is_encoder_decoder: Optional[bool]: Whether you model has an encoder_decoder architecture
+    Args:
+        pad_token_id: int: The tokenizers pad_token_id.
+        label_pad_token_id: int: The label used for masking.
+        is_encoder_decoder: Optional[bool]: Whether you model has an
+            encoder_decoder architecture
     """
     max_prompt_length: int
     max_target_length: int

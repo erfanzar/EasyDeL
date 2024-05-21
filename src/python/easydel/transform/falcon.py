@@ -20,9 +20,7 @@ def match_keywords(string, ts, ns):
 
 
 def falcon_from_pretrained(model_id, device):
-    """
-    return: Weight or Params for easydel Model , Config
-    """
+    """return: Weight or Params for easydel Model , Config"""
     # Requested By vwxyzjn at https://github.com/erfanzar/EasyDeL/issues/15#issue-1881044170
     config = FalconConfig.from_pretrained(model_id)
     model = FalconForCausalLM.from_pretrained(model_id)

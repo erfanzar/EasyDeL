@@ -114,15 +114,18 @@ class DeepseekV2Config(EasyDeLPretrainedConfig):
         )
 
     def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
-        """
-        The get_partition_rules function is used to define the partitioning scheme for a model.
+        """The get_partition_rules function is used to define the partitioning scheme for a model.
         It returns a list of tuples, where each tuple contains two elements:
           1) A regex string that matches the name of one or more parameters in the model.
           2) A PartitionScheme object that defines how those parameters should be partitioned.
 
-        :param fully_sharded_data_parallel: bool: Determine whether to use the fully_sharded_data_parallel partitioning scheme or not
-        :return: A list of tuples
+        Args:
+            fully_sharded_data_parallel: bool: Determine whether to use
+                the fully_sharded_data_parallel partitioning scheme or
+                not
 
+        Returns:
+            A list of tuples
         """
         return (
 
@@ -170,22 +173,31 @@ class DeepseekV2Config(EasyDeLPretrainedConfig):
             rope_scaling: Dict[str, Union[str, float]] = None,
             **kwargs,
     ):
-        """
-        The add_jax_args function adds the following arguments to the model:
+        """The add_jax_args function adds the following arguments to the model:
 
-        :param self: Bind the attributes and methods of a class to an instance of that class
-        :param gradient_checkpointing: str: Determine whether to use gradient checkpointing
-        :param use_scan_mlp: bool: Determine whether to use the scan_mlp function or not
-        :param scan_mlp_chunk_size: int: Chunk the input to the mlp
-        :param number_rep_kv: int: Control the number of times that the key and value vectors are repeated
-        :param bits: Optional[int]: Specify the number of bits to use for quantization
-        :param attention_dropout: float: Set the dropout rate for the attention layer
-        :param attention_bias: bool: when ever to use attention_bias
-        :param initialization_of_moe: bool: initialization of moe needs to disable some dynamic part's this boolean
-         variable will turn them off.
-        :param rope_scaling: Dict[str, Union[str, float]]: rope_scaling for rope
-        :return: A tuple of the following:
+        Args:
+            self: Bind the attributes and methods of a class to an
+                instance of that class
+            gradient_checkpointing: str: Determine whether to use
+                gradient checkpointing
+            use_scan_mlp: bool: Determine whether to use the scan_mlp
+                function or not
+            scan_mlp_chunk_size: int: Chunk the input to the mlp
+            number_rep_kv: int: Control the number of times that the key
+                and value vectors are repeated
+            bits: Optional[int]: Specify the number of bits to use for
+                quantization
+            attention_dropout: float: Set the dropout rate for the
+                attention layer
+            attention_bias: bool: when ever to use attention_bias
+            initialization_of_moe: bool: initialization of moe needs to
+                disable some dynamic part's this boolean variable will
+                turn them off.
+            rope_scaling: Dict[str, Union[str, float]]: rope_scaling for
+                rope
 
+        Returns:
+            A tuple of the following:
         """
         self.attention_dropout = attention_dropout
         self.attention_bias = attention_bias

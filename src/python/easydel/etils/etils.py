@@ -7,8 +7,7 @@ import argparse
 
 @dataclass
 class EasyDeLOptimizers:
-    """
-    The code snippet is defining a data class called `EasyDeLOptimizers` using the `@dataclass`
+    """The code snippet is defining a data class called `EasyDeLOptimizers` using the `@dataclass`
     decorator. A data class is a class that is primarily used to store data, and it automatically
     generates special methods such as `__init__`, `__repr__`, and `__eq__` based on the class
     attributes.
@@ -20,8 +19,7 @@ class EasyDeLOptimizers:
 
 @dataclass
 class EasyDeLSchedulers:
-    """
-    The code snippet is defining a data class called `EasyDeLSchedulers` using the `@dataclass`
+    """The code snippet is defining a data class called `EasyDeLSchedulers` using the `@dataclass`
     decorator. A data class is a class that is primarily used to store data, and it automatically
     generates special methods such as `__init__`, `__repr__`, and `__eq__` based on the class
     attributes.
@@ -35,8 +33,7 @@ class EasyDeLSchedulers:
 
 @dataclass
 class EasyDeLGradientCheckPointers:
-    """
-    The code snippet is defining a data class called `EasyDeLGradientCheckPointers` using the `@dataclass`
+    """The code snippet is defining a data class called `EasyDeLGradientCheckPointers` using the `@dataclass`
     decorator. A data class is a class that is primarily used to store data, and it automatically
     generates special methods such as `__init__`, `__repr__`, and `__eq__` based on the class
     attributes.
@@ -94,9 +91,11 @@ def get_logger(name, level: int = logging.INFO) -> logging.Logger:
 
 
 def set_loggers_level(level: int = logging.WARNING):
-    """
-    Function to set the logging level of all loggers to the specified level.
-    :param level: int: The logging level to set. Defaults to logging.WARNING.
+    """Function to set the logging level of all loggers to the specified level.
+
+    Args:
+        level: int: The logging level to set. Defaults to
+            logging.WARNING.
     """
     logging.root.setLevel(level)
     for handler in logging.root.handlers:
@@ -107,8 +106,7 @@ def define_flags_with_default(
         _required_fields: List = None,
         **kwargs
 ) -> Tuple[argparse.Namespace, Dict[str, Any]]:
-    """
-    Defines flags with default values using argparse.
+    """Defines flags with default values using argparse.
 
     Args:
         _required_fields: A dictionary with required flag names

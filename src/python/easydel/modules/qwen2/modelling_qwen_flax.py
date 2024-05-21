@@ -126,16 +126,18 @@ class FlaxQwen2MLP(nn.Module):
         self.dropout = flax.linen.Dropout(rate=self.config.resid_pdrop)
 
     def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
-        """
-        The __call__ function is the main function of a class.
+        """The __call__ function is the main function of a class.
         It is called when an instance of the class (an object) is invoked as a function, i.e., obj(arguments).
         The __call__ method enables instances of a class to be called like standard Python functions.
 
-        :param self: Represent the instance of the class
-        :param x: jnp.ndarray: Pass in the input to the layer
-        :param deterministic: bool: Determine whether to use dropout
-        :return: A tensor that is the result of applying a dropout function to x
+        Args:
+            self: Represent the instance of the class
+            x: jnp.ndarray: Pass in the input to the layer
+            deterministic: bool: Determine whether to use dropout
 
+        Returns:
+            A tensor that is the result of applying a dropout function
+            to x
         """
         x = self.down_proj(jax.nn.silu(self.gate_proj(x)) * self.up_proj(x))
         x = self.dropout(x, deterministic=deterministic)
@@ -244,33 +246,37 @@ class FlaxQwen2Attention(BaseJAXAttentionModule):
 
     @staticmethod
     def _transpose_sequence_head(query, key, value):
-        """
-        The _transpose_sequence_head function transposes the query, key and value matrices.
+        """The _transpose_sequence_head function transposes the query, key and value matrices.
 
-        :param query: Get the attention weights for each of the heads
-        :param key: Determine the number of heads
-        :param value: Store the values of the input
-        :return: The transpose of the query, key and value matrices
+        Args:
+            query: Get the attention weights for each of the heads
+            key: Determine the number of heads
+            value: Store the values of the input
 
+        Returns:
+            The transpose of the query, key and value matrices
         """
         return jnp.transpose(query, (0, 2, 1, 3)), jnp.transpose(key, (0, 2, 1, 3)), jnp.transpose(value, (0, 2, 1, 3))
 
     def apply_rotary(self, batch_size, sequence_length, query, key, value, freq_cis, position_ids):
-        """
-        The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
+        """The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
         The main difference is that it takes in an additional argument, freq_cis, which are used to calculate
         the rotary attention weights. The other differences are minor and mostly related to reshaping tensors.
 
-        :param self: Access variables that belong to the class
-        :param batch_size: Reshape the query, key and value tensors
-        :param sequence_length: Reshape the query, key and value tensors
-        :param query: Calculate the attention weights
-        :param key: Calculate the attention
-        :param value: Compute the attention weights
-        :param freq_cis: Calculate the frequency of each word in the vocabulary
-        :param position_ids: Identify the position of each token in the sequence
-        :return: A tuple of 3 tensors: query, key and value
+        Args:
+            self: Access variables that belong to the class
+            batch_size: Reshape the query, key and value tensors
+            sequence_length: Reshape the query, key and value tensors
+            query: Calculate the attention weights
+            key: Calculate the attention
+            value: Compute the attention weights
+            freq_cis: Calculate the frequency of each word in the
+                vocabulary
+            position_ids: Identify the position of each token in the
+                sequence
 
+        Returns:
+            A tuple of 3 tensors: query, key and value
         """
         query = query.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
         key = key.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
@@ -297,25 +303,32 @@ class FlaxQwen2Attention(BaseJAXAttentionModule):
             output_attentions: bool = False,
             fcm_mask=None,
     ):
-        """
-
-        The __call__ function is the main function of a JAX module. It defines how the module behaves when called
+        """The __call__ function is the main function of a JAX module. It defines how the module behaves when called
         with inputs. The __call__ function can be thought of as a &quot;forward pass&quot; through the model,
         and it should return all outputs that are needed for training or inference.
 
-        :param self: Access variables that belong to the class
-        :param hidden_states: chex.Array: Pass the hidden states of the previous layer
-        :param freq_cis: Tuple[chex.Array, chex.Array],: Pass in the frequency coefficients for each position
-        :param attention_mask: chex.Array: Mask out certain tokens in the input sequence
-        :param position_ids: chex.Array: Determine the position of each token in a sequence
-        :param causal_mask: chex.Array: Mask out the future tokens in the decoder
-        :param deterministic: bool: Determine whether to use dropout or not
-        :param init_cache: bool: Initialize the cache
-        :param output_attentions: bool: Determine whether to return the attention weights or not
-        :param fcm_mask: Mask out the attention weights between the input and output tokens
+        Args:
+            self: Access variables that belong to the class
+            hidden_states: chex.Array: Pass the hidden states of the
+                previous layer
+            freq_cis: Tuple[chex.Array, chex.Array],: Pass in the
+                frequency coefficients for each position
+            attention_mask: chex.Array: Mask out certain tokens in the
+                input sequence
+            position_ids: chex.Array: Determine the position of each
+                token in a sequence
+            causal_mask: chex.Array: Mask out the future tokens in the
+                decoder
+            deterministic: bool: Determine whether to use dropout or not
+            init_cache: bool: Initialize the cache
+            output_attentions: bool: Determine whether to return the
+                attention weights or not
+            fcm_mask: Mask out the attention weights between the input
+                and output tokens
         :param : Determine if the attention is causal or not
-        :return: A tuple of two arrays
 
+        Returns:
+            A tuple of two arrays
         """
         batch_size, sequence_length = hidden_states.shape[:2]
         query_states, key_states, value_states = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(
@@ -499,25 +512,32 @@ class FlaxQwen2Block(nn.Module):
             output_attentions: bool = False,
             fcm_mask: Optional[jnp.ndarray] = None,
     ):
-        """
-        The __call__ function is the main function of a TransformerEncoderLayer.
+        """The __call__ function is the main function of a TransformerEncoderLayer.
         It takes in hidden states, frequency-domain inputs, and masks as input. It then
         applies self-attention to the hidden states using those inputs and returns an
         output tensor with shape (batch_size, sequence_length, model_dim).
 
-        :param self: Refer to the class instance itself
-        :param hidden_states: chex.Array: Pass in the hidden state of the previous layer
-        :param freq_cis: Tuple[chex.Array, chex.Array],: Pass in the frequency information
-        :param attention_mask: chex.Array: Mask out the attention weights for padding tokens
-        :param position_ids: chex.Array: Determine the position of each token in the sequence
-        :param causal_mask: chex.Array: Mask the attention weights
-        :param deterministic: bool: Control whether the dropout is applied or not
-        :param init_cache: bool: Initialize the cache in the attention layer
-        :param output_attentions: bool: Return the attention weights
-        :param fcm_mask: Optional[jnp.ndarray]: Mask the self-attention
+        Args:
+            self: Refer to the class instance itself
+            hidden_states: chex.Array: Pass in the hidden state of the
+                previous layer
+            freq_cis: Tuple[chex.Array, chex.Array],: Pass in the
+                frequency information
+            attention_mask: chex.Array: Mask out the attention weights
+                for padding tokens
+            position_ids: chex.Array: Determine the position of each
+                token in the sequence
+            causal_mask: chex.Array: Mask the attention weights
+            deterministic: bool: Control whether the dropout is applied
+                or not
+            init_cache: bool: Initialize the cache in the attention
+                layer
+            output_attentions: bool: Return the attention weights
+            fcm_mask: Optional[jnp.ndarray]: Mask the self-attention
         :param : Control the dropout in the self attention layer
-        :return: A tuple of two items
 
+        Returns:
+            A tuple of two items
         """
         attn_outputs = self.self_attn(
             self.input_layernorm(hidden_states),
@@ -568,36 +588,41 @@ class FlaxQwen2PreTrainedModel(EasyDeLFlaxPretrainedModel):
             _do_init: bool = True,
             **kwargs,
     ):
-        """
-        The __init__ function is called when the class is instantiated.
+        """The __init__ function is called when the class is instantiated.
         It sets up the instance of the class, and defines what happens when it's created.
         The __init__ function can take arguments, but self is always required (it refers to the instance of the object).
 
-
-        :param self: Refer to the object itself
-        :param config: Qwen2Config: Pass the configuration to the module
-        :param input_shape: Tuple: Specify the shape of the input to the model
-        :param seed: int: Set the seed for random number generation
-        :param dtype: jnp.dtype: Specify the data type of the input
-        :param _do_init: bool: Control whether the module is initialized or not
-        :param kwargs: Pass in any additional parameters that the module_class might need
+        Args:
+            self: Refer to the object itself
+            config: Qwen2Config: Pass the configuration to the module
+            input_shape: Tuple: Specify the shape of the input to the
+                model
+            seed: int: Set the seed for random number generation
+            dtype: jnp.dtype: Specify the data type of the input
+            _do_init: bool: Control whether the module is initialized or
+                not
+            **kwargs: Pass in any additional parameters that the
+                module_class might need
         :param : Specify the number of layers in the network
-        :return: The super() of the class
 
+        Returns:
+            The super() of the class
         """
         module = self.module_class(config=config, dtype=dtype, **kwargs)
         super().__init__(config, module, input_shape=input_shape, seed=seed, dtype=dtype, _do_init=_do_init)
 
     def init_weights(self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None) -> FrozenDict:
-        """
-        The init_weights function is used to initialize the weights of a model.
+        """The init_weights function is used to initialize the weights of a model.
 
-        :param self: Access variables that belong to the class
-        :param rng: jax.random.PRNGKey: Initialize the weights of the model
-        :param input_shape: Tuple: Specify the shape of the input tensor
-        :param params: FrozenDict: Pass in the parameters of a pre-trained model
-        :return: A frozendict of parameters
+        Args:
+            self: Access variables that belong to the class
+            rng: jax.random.PRNGKey: Initialize the weights of the model
+            input_shape: Tuple: Specify the shape of the input tensor
+            params: FrozenDict: Pass in the parameters of a pre-trained
+                model
 
+        Returns:
+            A frozendict of parameters
         """
         input_ids = jnp.zeros(input_shape, dtype="i4")
         attention_mask = jnp.ones_like(input_ids)
@@ -635,17 +660,18 @@ class FlaxQwen2PreTrainedModel(EasyDeLFlaxPretrainedModel):
             return random_params
 
     def init_cache(self, batch_size, max_length):
-        """
-        The init_cache function is used to initialize the cache for a given batch size and sequence length.
+        """The init_cache function is used to initialize the cache for a given batch size and sequence length.
         The cache is a dictionary that contains all the intermediate states from each layer in the model.
         This allows us to run inference on multiple batches without having to re-run forward passes through every layer in
         the model, which would be very slow.
 
-        :param self: Access the module
-        :param batch_size: Define the batch size of the input tensors
-        :param max_length: Set the length of the input sequence
-        :return: A dictionary with the following keys:
+        Args:
+            self: Access the module
+            batch_size: Define the batch size of the input tensors
+            max_length: Set the length of the input sequence
 
+        Returns:
+            A dictionary with the following keys:
         """
         input_ids = jnp.ones((batch_size, max_length))
         attention_mask = jnp.ones_like(input_ids)
@@ -673,27 +699,36 @@ class FlaxQwen2PreTrainedModel(EasyDeLFlaxPretrainedModel):
             add_params_field: bool = False,
             **kwargs
     ):
-        """
-        The __call__ function is the main function of a JAX module.
+        """The __call__ function is the main function of a JAX module.
         It takes in inputs and returns outputs, but it also has some other important features:
         - It can take in mutable state (e.g., past_key_values) that will be updated during the call and returned at the end.
         - It can take in random number generators (rngs) that are used to generate random numbers for dropout or sampling operations.
 
-        :param self: Represent the instance of the class
-        :param input_ids: chex.Array: Pass in the input tokens
-        :param attention_mask: chex.Array: Mask out certain tokens in the input
-        :param position_ids: chex.Array: Create the positional embeddings
-        :param params: dict: Pass in the parameters of the model
-        :param past_key_values: dict: Pass in the past key values from a previous call to __call__
-        :param dropout_rng: jax.random.PRNGKey: Make sure that the dropout is applied in a random way
-        :param train: bool: Determine whether to use dropout or not
-        :param output_attentions: Optional[bool]: Determine whether to return the attention weights
-        :param output_hidden_states: Optional[bool]: Return the hidden states of all layers
-        :param return_dict: Optional[bool]: Determine whether to return a dictionary or not
-        :param extra_embedding: Optional[Union[jnp.ndarray,None]]: Pass in the embedding for the input_ids
-        :param add_params_field: bool: Add the params field to the inputs dictionary
-        :return: A tuple of the following:
+        Args:
+            self: Represent the instance of the class
+            input_ids: chex.Array: Pass in the input tokens
+            attention_mask: chex.Array: Mask out certain tokens in the
+                input
+            position_ids: chex.Array: Create the positional embeddings
+            params: dict: Pass in the parameters of the model
+            past_key_values: dict: Pass in the past key values from a
+                previous call to __call__
+            dropout_rng: jax.random.PRNGKey: Make sure that the dropout
+                is applied in a random way
+            train: bool: Determine whether to use dropout or not
+            output_attentions: Optional[bool]: Determine whether to
+                return the attention weights
+            output_hidden_states: Optional[bool]: Return the hidden
+                states of all layers
+            return_dict: Optional[bool]: Determine whether to return a
+                dictionary or not
+            extra_embedding: Optional[Union[jnp.ndarray,None]]: Pass in
+                the embedding for the input_ids
+            add_params_field: bool: Add the params field to the inputs
+                dictionary
 
+        Returns:
+            A tuple of the following:
         """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -793,27 +828,35 @@ class FlaxQwen2BlockCollection(nn.Module):
             output_hidden_states: bool = False,
             return_dict: bool = True,
     ):
-        """
-        The __call__ function is the main function of a JAX nn.Module.
+        """The __call__ function is the main function of a JAX nn.Module.
         It defines how the module behaves when called as a function, and it's what you'll use to call your model
          in training loops or inference scripts.
         The __call__ method should take all inputs that are necessary for computing outputs from the module,
         and return all outputs that are computed by this module.
 
-        :param self: Represent the instance of the class
-        :param hidden_states: chex.Array: Pass the input tensor to the encoder
-        :param freq_cis: Tuple[chex.Array, chex.Array],: Pass in the frequency of each token
-        :param attention_mask: chex.Array: Mask out certain tokens in the input sequence
-        :param position_ids: chex.Array: Specify the position of each token in a sequence
-        :param causal_mask: chex.Array: Mask the attention weights
-        :param deterministic: bool: Determine whether the model is in training or evaluation mode
-        :param init_cache: bool: Initialize the cache for each layer
-        :param output_attentions: bool: Determine whether to output the attention weights
-        :param output_hidden_states: bool: Determine whether to return the hidden states of each layer
-        :param return_dict: bool: Return a dictionary of the outputs
+        Args:
+            self: Represent the instance of the class
+            hidden_states: chex.Array: Pass the input tensor to the
+                encoder
+            freq_cis: Tuple[chex.Array, chex.Array],: Pass in the
+                frequency of each token
+            attention_mask: chex.Array: Mask out certain tokens in the
+                input sequence
+            position_ids: chex.Array: Specify the position of each token
+                in a sequence
+            causal_mask: chex.Array: Mask the attention weights
+            deterministic: bool: Determine whether the model is in
+                training or evaluation mode
+            init_cache: bool: Initialize the cache for each layer
+            output_attentions: bool: Determine whether to output the
+                attention weights
+            output_hidden_states: bool: Determine whether to return the
+                hidden states of each layer
+            return_dict: bool: Return a dictionary of the outputs
         :param : Determine whether to use the forgetful causal mask
-        :return: A tuple of 3 values
 
+        Returns:
+            A tuple of 3 values
         """
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
@@ -929,26 +972,33 @@ class FlaxQwen2Module(nn.Module):
             return_dict: bool = True,
             extra_embedding: Optional[Union[jnp.ndarray, None]] = None
     ):
-        """
-        The __call__ function is the main function of a Flax model. It takes in input_ids, attention_mask, and position_ids
+        """The __call__ function is the main function of a Flax model. It takes in input_ids, attention_mask, and position_ids
         and returns the output of the model. The __call__ function also has optional arguments that can be used to control
         the behavior of the model (e.g., deterministic=True). These optional arguments are passed as keyword arguments when
         calling a Flax model.
 
-        :param self: Represent the instance of the class
-        :param input_ids: chex.Array: Pass in the input token ids
-        :param attention_mask: chex.Array: Mask out the padding tokens
-        :param position_ids: chex.Array: Indicate the position of each token in a sequence
-        :param deterministic: bool: Control whether dropout is applied or not
-        :param inputs_embeds: chex.Array: Pass in the embeddings of the input tokens
-        :param init_cache: bool: Initialize the cache
-        :param output_attentions: bool: Determine whether to return the attentions or not
-        :param output_hidden_states: bool: Determine whether to return hidden states
-        :param return_dict: bool: Return a dictionary of the output or not
-        :param extra_embedding: Optional[Union[jnp.ndarray: Pass in the embedding of the
-        :param None]]: Pass in the extra embedding
-        :return: A tuple of:
+        Args:
+            self: Represent the instance of the class
+            input_ids: chex.Array: Pass in the input token ids
+            attention_mask: chex.Array: Mask out the padding tokens
+            position_ids: chex.Array: Indicate the position of each
+                token in a sequence
+            deterministic: bool: Control whether dropout is applied or
+                not
+            inputs_embeds: chex.Array: Pass in the embeddings of the
+                input tokens
+            init_cache: bool: Initialize the cache
+            output_attentions: bool: Determine whether to return the
+                attentions or not
+            output_hidden_states: bool: Determine whether to return
+                hidden states
+            return_dict: bool: Return a dictionary of the output or not
+            extra_embedding: Optional[Union[jnp.ndarray: Pass in the
+                embedding of the
+            None]]: Pass in the extra embedding
 
+        Returns:
+            A tuple of:
         """
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
@@ -1038,22 +1088,27 @@ class FlaxQwen2ForCausalLMModule(nn.Module):
             return_dict: bool = True,
             extra_embedding: Optional[Union[jnp.ndarray, None]] = None
     ):
-        """
-        The __call__ function is the main function of a Flax module. It takes in inputs and returns outputs.
+        """The __call__ function is the main function of a Flax module. It takes in inputs and returns outputs.
 
-        :param self: Refer to the object itself
-        :param input_ids: chex.Array: Pass the input token ids to the model
-        :param attention_mask: chex.Array: Mask out the padding tokens
-        :param position_ids: chex.Array: Specify the position of each token in the input sequence
-        :param deterministic: bool: Control whether the model is trained or not
-        :param init_cache: bool: Initialize the cache for the decoder
-        :param output_attentions: bool: Return the attention weights
-        :param output_hidden_states: bool: Determine whether to return the hidden states
-        :param return_dict: bool: Return a dictionary of the outputs or not
-        :param extra_embedding: Optional[Union[jnp.ndarray: Pass in the embedding of the word that we want to predict
-        :param None]]: Pass in the extra embedding
-        :return: The logits and the hidden states
+        Args:
+            self: Refer to the object itself
+            input_ids: chex.Array: Pass the input token ids to the model
+            attention_mask: chex.Array: Mask out the padding tokens
+            position_ids: chex.Array: Specify the position of each token
+                in the input sequence
+            deterministic: bool: Control whether the model is trained or
+                not
+            init_cache: bool: Initialize the cache for the decoder
+            output_attentions: bool: Return the attention weights
+            output_hidden_states: bool: Determine whether to return the
+                hidden states
+            return_dict: bool: Return a dictionary of the outputs or not
+            extra_embedding: Optional[Union[jnp.ndarray: Pass in the
+                embedding of the word that we want to predict
+            None]]: Pass in the extra embedding
 
+        Returns:
+            The logits and the hidden states
         """
         batch_size, seq_length = input_ids.shape
         if attention_mask is None:
@@ -1115,15 +1170,18 @@ class FlaxQwen2ForCausalLM(FlaxQwen2PreTrainedModel):
         self.module.lm_head = new_embeddings
 
     def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[chex.Array] = None):
-        """
-        The prepare_inputs_for_generation function is used to prepare the inputs for a generation task.
+        """The prepare_inputs_for_generation function is used to prepare the inputs for a generation task.
 
-        :param self: Access variables that belong to the class
-        :param input_ids: Pass in the input tokens
-        :param max_length: Set the length of the sequence to be generated
-        :param attention_mask: Optional[chex.Array]: Mask the attention weights
-        :return: A dictionary of the past_key_values, attention_mask and position ids
+        Args:
+            self: Access variables that belong to the class
+            input_ids: Pass in the input tokens
+            max_length: Set the length of the sequence to be generated
+            attention_mask: Optional[chex.Array]: Mask the attention
+                weights
 
+        Returns:
+            A dictionary of the past_key_values, attention_mask and
+            position ids
         """
         batch_size, seq_length = input_ids.shape
 
@@ -1158,12 +1216,14 @@ class FlaxQwen2ForSequenceClassificationModule(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self):
-        """
-        The setup function is called once at the beginning of training.
+        """The setup function is called once at the beginning of training.
         It initializes the model and optimizer, and sets up any other state that needs to be initialized.
 
-        :param self: Access variables that belong to the class
-        :return: A tuple of the model and the classifier
+        Args:
+            self: Access variables that belong to the class
+
+        Returns:
+            A tuple of the model and the classifier
         """
         self.model = FlaxQwen2Module(self.config, dtype=self.dtype)
         self.classifier = Linear(
@@ -1188,26 +1248,31 @@ class FlaxQwen2ForSequenceClassificationModule(nn.Module):
             return_dict: bool = True,
             extra_embedding: Optional[Union[jnp.ndarray, None]] = None
     ):
-        """
-        The __call__ function is the main function of a Flax module.
+        """The __call__ function is the main function of a Flax module.
         It takes in all the inputs to the model and returns all outputs from it.
         The __call__ function can be called directly on an instance of a class, or by using parentheses after an instance:
             &gt;&gt;&gt; my_model = MyModel()  # instantiate your model class
             &gt;&gt;&gt; output = my_model(input)  # call your model with input data as arguments to __call__
 
-        :param self: Refer to the class instance
-        :param input_ids: chex.Array: Pass the input to the model
-        :param attention_mask: chex.Array: Specify which tokens are masked
-        :param position_ids: chex.Array: Specify the position of each token in the sequence
-        :param deterministic: bool: Control whether the model is run in deterministic or stochastic mode
-        :param init_cache: bool: Initialize the cache for the transformer
-        :param output_attentions: bool: Return the attention weights
-        :param output_hidden_states: bool: Return the hidden states of all layers
-        :param return_dict: bool: Return a dictionary of outputs
-        :param extra_embedding: Optional[Union[jnp.ndarray: Pass in the embedding of a new word
-        :param None]]: Pass the extra embedding to the model
-        :return: A tuple of logits and hidden_states
+        Args:
+            self: Refer to the class instance
+            input_ids: chex.Array: Pass the input to the model
+            attention_mask: chex.Array: Specify which tokens are masked
+            position_ids: chex.Array: Specify the position of each token
+                in the sequence
+            deterministic: bool: Control whether the model is run in
+                deterministic or stochastic mode
+            init_cache: bool: Initialize the cache for the transformer
+            output_attentions: bool: Return the attention weights
+            output_hidden_states: bool: Return the hidden states of all
+                layers
+            return_dict: bool: Return a dictionary of outputs
+            extra_embedding: Optional[Union[jnp.ndarray: Pass in the
+                embedding of a new word
+            None]]: Pass the extra embedding to the model
 
+        Returns:
+            A tuple of logits and hidden_states
         """
         batch_size, seq_length = input_ids.shape
         if attention_mask is None:

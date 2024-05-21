@@ -69,16 +69,19 @@ class EasyDeLState(struct.PyTreeNode):
 
     def apply_gradients(self, *, grads, **kwargs):
 
-        """
-        The apply_gradients function is the core of the optimizer. It takes in a dictionary of gradients,
+        """The apply_gradients function is the core of the optimizer. It takes in a dictionary of gradients,
         and returns an updated version of itself with new parameters and state. The function also updates
         the step count.
 
-        :param self: Refer to the current instance of the class
-        :param *: Unpack the grads dictionary into positional arguments
-        :param grads: Pass in the gradients of the loss function with respect to each parameter
-        :param kwargs: Pass in additional arguments to the function
-        :return: A new State with the updated parameters and params
+        Args:
+            self: Refer to the current instance of the class
+            : Unpack the grads dictionary into positional arguments
+            grads: Pass in the gradients of the loss function with
+                respect to each parameter
+            **kwargs: Pass in additional arguments to the function
+
+        Returns:
+            A new State with the updated parameters and params
         """
         if OVERWRITE_WITH_GRADIENT in grads:
             grads_with_opt = grads['params']
@@ -120,21 +123,28 @@ class EasyDeLState(struct.PyTreeNode):
             **kwargs
     ):
 
-        """
-        The create function is used to create a new instance of the class.
+        """The create function is used to create a new instance of the class.
 
-        :param cls: Create a new instance of the class
-        :param *: Pass a list of parameters to the function
-        :param apply_fn: Callable: Apply the model to a batch of data
-        :param params: core.FrozenDict[str,Any] | Mapping[str,Any]: Pass in the parameters of the model
-        :param tx: optax.GradientTransformation: Initialize the optimizer
-        :param tx_init: Optional[dict]: Initialize the optimizer
-        :param hyperparameters: Optional[dict]: Pass hyperparameters to the state for init
-        :param module: Optional[EasyDeLFlaxPretrainedModel]: Pass the module to be used int state
-        :param module_config: Optional[EasyDeLPretrainedConfig]: Pass in the module config
-        :param module_config_args: Optional[dict]: Store the config args of the model
-        :param kwargs: Pass in additional parameters to the
-        :return: A EasyDeLState object
+        Args:
+            cls: Create a new instance of the class
+            : Pass a list of parameters to the function
+            apply_fn: Callable: Apply the model to a batch of data
+            params: core.FrozenDict[str,Any] | Mapping[str,Any]: Pass in
+                the parameters of the model
+            tx: optax.GradientTransformation: Initialize the optimizer
+            tx_init: Optional[dict]: Initialize the optimizer
+            hyperparameters: Optional[dict]: Pass hyperparameters to the
+                state for init
+            module: Optional[EasyDeLFlaxPretrainedModel]: Pass the
+                module to be used int state
+            module_config: Optional[EasyDeLPretrainedConfig]: Pass in
+                the module config
+            module_config_args: Optional[dict]: Store the config args of
+                the model
+            **kwargs: Pass in additional parameters to the
+
+        Returns:
+            A EasyDeLState object
         """
         if hyperparameters is None:
             hyperparameters = {}
@@ -175,22 +185,32 @@ class EasyDeLState(struct.PyTreeNode):
             **kwargs
     ):
 
-        """
-        The load function is used to load a saved state of the Model and optimizer or Model Only.
+        """The load function is used to load a saved state of the Model and optimizer or Model Only.
 
-        :param cls: Make the function a class method
-        :param *: Pass in a variable number of arguments
-        :param step: int: Keep track of the number of steps that have been taken
-        :param apply_fn: Callable: Apply the optimizer to the model
-        :param params: core.FrozenDict[str,Any] | Mapping[str,Any]: Pass in the parameters of the model
-        :param opt_state: Optional[optax.OptState]: optimizer state
-        :param tx_init: Optional[dict]: Pass the hyperparameters to the optimizer
-        :param hyperparameters: Optional[dict]: Load hyperparameters from the state dict
-        :param module: Optional[EasyDeLFlaxPretrainedModel]: Pass in the module
-        :param module_config: Optional[EasyDeLPretrainedConfig]: Pass the module config
-        :param module_config_args: Optional[dict]: Pass the config_args to the model
-        :param kwargs: Pass in any additional parameters that may be needed for the model
-        :return: A new instance of the class
+        Args:
+            cls: Make the function a class method
+            : Pass in a variable number of arguments
+            step: int: Keep track of the number of steps that have been
+                taken
+            apply_fn: Callable: Apply the optimizer to the model
+            params: core.FrozenDict[str,Any] | Mapping[str,Any]: Pass in
+                the parameters of the model
+            opt_state: Optional[optax.OptState]: optimizer state
+            tx_init: Optional[dict]: Pass the hyperparameters to the
+                optimizer
+            hyperparameters: Optional[dict]: Load hyperparameters from
+                the state dict
+            module: Optional[EasyDeLFlaxPretrainedModel]: Pass in the
+                module
+            module_config: Optional[EasyDeLPretrainedConfig]: Pass the
+                module config
+            module_config_args: Optional[dict]: Pass the config_args to
+                the model
+            **kwargs: Pass in any additional parameters that may be
+                needed for the model
+
+        Returns:
+            A new instance of the class
         """
         if module_config is not None:
             module_config = copy.deepcopy(module_config)
@@ -267,22 +287,29 @@ class EasyDeLState(struct.PyTreeNode):
             config_kwargs: Optional[dict] = None
     ):
 
-        """    
-        The load_state function is a class method that loads the state of an EasyDeLModel from a checkpoint.
-        
-        :param cls: Create an instance of the class
-        :param checkpoint_path: str | os.PathLike: Specify the path to the checkpoint file
-        :param dtype: jnp.dtype: The dtype of the model
-        :param param_dtype: jnp.dtype: The dtype of the model parameters
-        :param precision: Optional[Union[str, jax.lax.Precision]]: precision of the model
-        :param init_optimizer_state: bool: Initialize the optimizer if it's not Initialized yet (if it Initialized the option
+        """The load_state function is a class method that loads the state of an EasyDeLModel from a checkpoint.
+
+        Args:
+            cls: Create an instance of the class
+            checkpoint_path: str | os.PathLike: Specify the path to the
+                checkpoint file
+            dtype: jnp.dtype: The dtype of the model
+            param_dtype: jnp.dtype: The dtype of the model parameters
+            precision: Optional[Union[str, jax.lax.Precision]]:
+                precision of the model
+            init_optimizer_state: bool: Initialize the optimizer if it's
+                not Initialized yet (if it Initialized the option
+            state_shard_fns: Optional[Mapping[str,Callable]]: Specify
+                the function that will be used
+            verbose: bool: Print out the progress of loading
+            input_shape: Tuple: input_shape to init module
+            config_kwargs: Optional[dict] : config kwargs to be passed
+                to model config
         will be ignored )
-        :param state_shard_fns: Optional[Mapping[str,Callable]]: Specify the function that will be used 
         to shard the loaded state
-        :param verbose: bool: Print out the progress of loading
-        :param input_shape: Tuple: input_shape to init module
-        :param config_kwargs: Optional[dict] : config kwargs to be passed to model config
-        :return: A state object
+
+        Returns:
+            A state object
         """
         from ..modules.auto_easydel_model import get_modules_by_type
 
@@ -349,18 +376,25 @@ class EasyDeLState(struct.PyTreeNode):
             float_dtype: Union[str, jax.numpy.dtype] = None,
     ):
 
-        """
-        The save_state function saves the state of a model to disk.
+        """The save_state function saves the state of a model to disk.
 
-        :param self: Pass the object itself to the function
-        :param filename: str | os.PathLike: Specify the name of the file to save
-        :param save_optimizer: bool: Determine whether to save the optimizer state or not
-        :param checkpoint_dir: Optional[str | os.PathLike]: Specify the directory where the checkpoint is saved
-        :param verbose: bool: Print out the path of the saved file
-        :param gather_fns: dict[Callable]: Specify a dictionary of functions that can be used to gather
-        :param float_dtype: str | jax.numpy.dtype: Specify the precision of the saved model
+        Args:
+            self: Pass the object itself to the function
+            filename: str | os.PathLike: Specify the name of the file to
+                save
+            save_optimizer: bool: Determine whether to save the
+                optimizer state or not
+            checkpoint_dir: Optional[str | os.PathLike]: Specify the
+                directory where the checkpoint is saved
+            verbose: bool: Print out the path of the saved file
+            gather_fns: dict[Callable]: Specify a dictionary of
+                functions that can be used to gather
+            float_dtype: str | jax.numpy.dtype: Specify the precision of
+                the saved model
         :param : Save the optimizer state
-        :return: None
+
+        Returns:
+            None
         """
         state = self
         if not save_optimizer:
@@ -385,13 +419,14 @@ class EasyDeLState(struct.PyTreeNode):
 
     def free_opt_state(self) -> "EasyDeLState":
 
-        """
-        The free_opt_state function is used to free the memory allocated by a previous call to setopt.
+        """The free_opt_state function is used to free the memory allocated by a previous call to setopt.
         It should be called after all the options have been set, and before you perform any of the transfers.
 
+        Args:
+            self: Represent the instance of the class
 
-        :param self: Represent the instance of the class
-        :return: A new state with the opt_state field set to none
+        Returns:
+            A new state with the opt_state field set to none
         """
         return self.replace(
             opt_state=None
@@ -399,10 +434,14 @@ class EasyDeLState(struct.PyTreeNode):
 
     def init_opt_state(self) -> "EasyDeLState":
 
-        """
-        The init_opt_state function initializes the optimizer state.
-        :param self: Make the object callable, and params is used to pass in a dictionary of parameters
-        :return: A new instance of the class with opt_state initialized
+        """The init_opt_state function initializes the optimizer state.
+
+        Args:
+            self: Make the object callable, and params is used to pass
+                in a dictionary of parameters
+
+        Returns:
+            A new instance of the class with opt_state initialized
         """
         if self.opt_state is None:
             params_with_opt = (
@@ -447,40 +486,63 @@ class EasyDeLState(struct.PyTreeNode):
             **kwargs
     ) -> "EasyDeLState":
 
-        """
-        The from_pretrained function is a helper function to quickly load a pretrained model and its associated configuration.
+        """The from_pretrained function is a helper function to quickly load a pretrained model and its associated configuration.
         This method takes care of returning the correct model class instance based on the `model_type` property in the
         config object, or when it's missing, falling back to using pattern matching on the
          `pretrained_model_name_or_path` string:
 
-        :param cls: Refer to the class that is being defined
-        :param pretrained_model_name_or_path: str: Load the pretrained model
-        :param filename: Optional[str]: Specify the name of the file to download from huggingface hub
-        :param optimizer: AVAILABLE_OPTIMIZERS: Specify the optimizer used for training
-        :param scheduler: AVAILABLE_SCHEDULERS: Specify the name of the scheduler to use
-        :param tx_init: Optional[dict]: Pass the hyperparameters of the optimizer
-        :param device: Specify the device on which to run the model
-        :param dtype: jax.numpy.dtype: Specify the dtype of the model parameters
-        :param param_dtype: jax.numpy.dtype: Specify the data type of the parameters
-        :param precision: jax.lax.Precision: Control the precision of the calculation
-        :param sharding_axis_dims: Sequence[int]: Specify the dimension of each axis
-        :param sharding_axis_names: Sequence[str]: Specify the names of the axes in each shard
-        :param query_partition_spec: PartitionSpec: Specify the partitioning of the query matrix
-        :param generation_query_partition_spec: PartitionSpec: Specify the partitioning of the query tensor in
+        Args:
+            cls: Refer to the class that is being defined
+            pretrained_model_name_or_path: str: Load the pretrained
+                model
+            filename: Optional[str]: Specify the name of the file to
+                download from huggingface hub
+            optimizer: AVAILABLE_OPTIMIZERS: Specify the optimizer used
+                for training
+            scheduler: AVAILABLE_SCHEDULERS: Specify the name of the
+                scheduler to use
+            tx_init: Optional[dict]: Pass the hyperparameters of the
+                optimizer
+            device: Specify the device on which to run the model
+            dtype: jax.numpy.dtype: Specify the dtype of the model
+                parameters
+            param_dtype: jax.numpy.dtype: Specify the data type of the
+                parameters
+            precision: jax.lax.Precision: Control the precision of the
+                calculation
+            sharding_axis_dims: Sequence[int]: Specify the dimension of
+                each axis
+            sharding_axis_names: Sequence[str]: Specify the names of the
+                axes in each shard
+            query_partition_spec: PartitionSpec: Specify the
+                partitioning of the query matrix
+            generation_query_partition_spec: PartitionSpec: Specify the
+                partitioning of the query tensor in
+            value_partition_spec: PartitionSpec: Specify the
+                partitioning of the value tensor
+            bias_partition_spec: PartitionSpec: Specify the partitioning
+                of the bias
+            attention_partition_spec: PartitionSpec: Partition the
+                attention weights
+            shard_attention_computation: bool: Determine whether to use
+                shard_map or not
+            input_shape: Sequence[int]: Specify the shape of the input
+                to be used for training
+            backend: Optional[str]: Specify the backend used for the
+                model
+            init_optimizer_state: bool: Initialize the optimizer state
+            free_optimizer_state: bool: Free the optimizer state from
+                memory
+            verbose: bool: Print the progress of loading the model
+            state_shard_fns: Optional[Mapping[str,Callable]]: Specify
+                the function to use for sharding the state
+            **kwargs: Pass keyword arguments to the function
+            config_kwargs: Optional[Mapping[str, Any]]: Config kwargs to
+                be added to config before creating module
         generation process:param key_partition_spec: PartitionSpec: Specify the partitioning of the key matrix
-        :param value_partition_spec: PartitionSpec: Specify the partitioning of the value tensor
-        :param bias_partition_spec: PartitionSpec: Specify the partitioning of the bias
-        :param attention_partition_spec: PartitionSpec: Partition the attention weights
-        :param shard_attention_computation: bool: Determine whether to use shard_map or not
-        :param input_shape: Sequence[int]: Specify the shape of the input to be used for training
-        :param backend: Optional[str]: Specify the backend used for the model
-        :param init_optimizer_state: bool: Initialize the optimizer state
-        :param free_optimizer_state: bool: Free the optimizer state from memory
-        :param verbose: bool: Print the progress of loading the model
-        :param state_shard_fns: Optional[Mapping[str,Callable]]: Specify the function to use for sharding the state
-        :param kwargs: Pass keyword arguments to the function
-        :param config_kwargs: Optional[Mapping[str, Any]]: Config kwargs to be added to config before creating module
-        :return: An `EasyDeLState` object
+
+        Returns:
+            An `EasyDeLState` object
         """
         if free_optimizer_state and init_optimizer_state:
             raise EasyDeLRuntimeError(
@@ -586,9 +648,7 @@ class EasyDeLState(struct.PyTreeNode):
 
     @staticmethod
     def create_hyperparameters(model_type: str):
-        """
-        it's the only way we can dump xla compiler
-        """
+        """it's the only way we can dump xla compiler"""
         return {
             STRING_REP.format(
                 type="str",
@@ -625,13 +685,15 @@ class EasyDeLState(struct.PyTreeNode):
 
     def __str__(self):
 
-        """
-        The __str__ function is called when you call str(object) or print(object).
+        """The __str__ function is called when you call str(object) or print(object).
         The __repr__ function is called when you type the object name in the interpreter.
         If no __str__ method exists, Python will use __repr__ as a fallback.
 
-        :param self: Refer to the object itself
-        :return: string
+        Args:
+            self: Refer to the object itself
+
+        Returns:
+            string
         """
         params_size = sum(getattr(n, "size", 0) for n in jax.tree_util.tree_flatten(self.params)[0])
         opt_state_size = sum(getattr(n, "size", 0) for n in jax.tree_util.tree_flatten(self.opt_state)[0])
@@ -695,15 +757,17 @@ class EasyDeLState(struct.PyTreeNode):
 
     def __repr__(self):
 
-        """
-        The __repr__ function is the &quot;official&quot; string representation of an object.
+        """The __repr__ function is the &quot;official&quot; string representation of an object.
         It's what you get when you type the object name at the Python prompt, or pass it to str().
         The goal of __repr__ is to be unambiguous: if eval(repr(x)) == x, then __repr__ should return a string that
         looks like a valid Python expression that could be used to recreate an object with the same value (
         given an appropriate environment). If this is not possible, a string formatted using %s
         formatting is also acceptable.
 
-        :param self: Represent the instance of the class
-        :return: A string that is a valid python expression
+        Args:
+            self: Represent the instance of the class
+
+        Returns:
+            A string that is a valid python expression
         """
         return self.__str__()

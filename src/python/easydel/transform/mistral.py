@@ -248,9 +248,7 @@ def mistral_convert_flax_to_pt(flax_params, config: MistralConfig, dtype=jnp.flo
 
 
 def mistral_easydel_to_hf(path, config: MistralConfig):
-    """
-    Takes path to easydel saved ckpt and return the model in pytorch (Transformers Huggingface)
-    """
+    """Takes path to easydel saved ckpt and return the model in pytorch (Transformers Huggingface)"""
     torch_params = load_and_convert_checkpoint_to_torch(path)
     edited_params = {}
     for k, v in torch_params.items():
@@ -261,9 +259,7 @@ def mistral_easydel_to_hf(path, config: MistralConfig):
 
 
 def mistral_from_pretrained(model_id, device):
-    """
-    return: Weight or Params for easydel Model , Config
-    """
+    """return: Weight or Params for easydel Model , Config"""
     config = MistralConfig.from_pretrained(model_id)
     model = MistralForCausalLM.from_pretrained(model_id)
     easydel_wights = mistral_convert_hf_to_flax(

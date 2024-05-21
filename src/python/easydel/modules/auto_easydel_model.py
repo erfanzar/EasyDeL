@@ -90,7 +90,7 @@ def get_modules_by_type(model_type: str) -> Tuple[
                 embedding_layer_names=["wte"],
                 rnn_based_or_rwkv=False,
                 layer_norm_names=[
-                    "norm_1", "norm_2","norm_f"
+                    "norm_1", "norm_2", "norm_f"
                 ]
             )
         )
@@ -374,20 +374,52 @@ def get_modules_by_type(model_type: str) -> Tuple[
 
 
 def is_flatten(pytree: dict):
-    """
-    The is_flatten function checks if the pytree is flattened.
+    """The is_flatten function checks if the pytree is flattened.
         If it is, then the first key in the dictionary will be a tuple of (mpl, mpl_id).
         Otherwise, it will be an integer representing mpl_id.
 
-    :param pytree: dict: Pass the pytree to the function
-    :return: True if the pytree is a flattened tree, and false otherwise
-    
+    Args:
+        pytree: dict: Pass the pytree to the function
+
+    Returns:
+        True if the pytree is a flattened tree, and false otherwise
     """
     mpl = [k for k in pytree.keys()][0]
     return True if isinstance(mpl, tuple) else False
 
 
 class AutoEasyDeLModelForCausalLM:
+    """This class provides a convenient way to load and shard pretrained causal language models from the Hugging Face Hub
+    and convert them into EasyDeL compatible models. It utilizes the EasyDeL library for distributed training and inference
+    with JAX.
+
+    This class inherits from the `EasyDeLFlaxPretrainedModel` class, providing functionalities for model loading,
+    parameter sharding, and interaction with the EasyDeL framework.
+
+    Attributes:
+        None
+
+    Examples:
+        ```python
+        import jax
+        from easydel import AutoEasyDeLModelForCausalLM
+
+        # Load a GPT-2 model on a single CPU
+        model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
+            "gpt2",
+            device=jax.devices("cpu")[0]
+        )
+
+        # Load a GPT-2 model sharded across 8 GPUs with data parallelism (DP) and fully sharded data parallelism (FSDP)
+        model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
+            "gpt2",
+            sharding_axis_dims=(1, 8, 1, 1),
+            sharding_axis_names=("dp", "fsdp", "tp", "sp"),
+            device=jax.devices("cpu")[0] # offload to CPU [OPTIONAL]
+        )
+        ```
+    """
+
     @classmethod
     def from_pretrained(
             cls,
@@ -416,40 +448,49 @@ class AutoEasyDeLModelForCausalLM:
             bit_targeted_params: Optional[List[str]] = None,
             **kwargs
     ) -> Tuple[EasyDeLFlaxPretrainedModel, dict]:
-        """
-        The from_pretrained function is a helper function that allows you to instantiate a model from the pretrained
-        model repository. It takes as input the name of the model (e.g., 'bert-base-uncased') and returns an instance of
-        the class corresponding to your model, with all weights loaded from disk.
+        """Loads and shards a pretrained causal language model from the Hugging Face Hub and converts it into an
+        EasyDeL compatible model.
 
-        :param cls: Create an instance of the class that called this function
-        :param pretrained_model_name_or_path: str: Identify the model in the huggingface model hub
-        :param device: Specify the device on which to run the model
-        :param dtype: jax.numpy.dtype: Specify the data type of the model
-        :param param_dtype: jax.numpy.dtype: Specify the dtype of the parameters
-        :param precision: jax.lax.Precision: Control the precision of the model
-        :param sharding_axis_dims: typing.Sequence[int]: Specify the dimension of each axis in the sharded model
-        :param sharding_axis_names: typing.Sequence[str]: Specify the order of sharding
-        :param query_partition_spec: PartitionSpec: Specify the partitioning of the query tensor
-        :param generation_query_partition_spec: PartitionSpec: Specify the partitioning of the query tensor in
-        generation process
-        :param key_partition_spec: PartitionSpec: Partition the key matrix
-        :param value_partition_spec: PartitionSpec: Specify the partitioning of the value tensor
-        :param bias_partition_spec: PartitionSpec: Specify the Attention Bias partition spec
-        :param generation_bias_partition_spec: PartitionSpec: Specify the Attention Bias partition spec for generation
-        :param attention_partition_spec: PartitionSpec: Specify the partitioning of the attention weights
-        :param shard_attention_computation: bool: whenever to use shard_map for attention
-        :param input_shape: typing.Sequence[int]: Specify the shape of the input to the model
-        :param shard_fns: Optional[Mapping[tuple, Callable]]: Sharding Function to be used to shard model
-        :param backend: typing.Optional[str]: backend to use for model
-        :param config_kwargs: Optional[Mapping[str, Any]]: Config kwargs to be added to config before creating module
-        :param auto_shard_params: bool: whether to automaticly shard the model parameters
-        :param partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]]: custom partition rules to create partition
-        specs required to shard model parameters
-        :param load_in_8bit: bool: whether to load model parameters and convert them into 8bit
-        :param bit_targeted_params: Optional[List[str]]: list of targeted parameters to be converted into 8bit
-        :param kwargs: Pass additional arguments to the model and config classes
-        :return: A model and parameters
+        Args:
+            pretrained_model_name_or_path (str): Path or name of the pretrained model in the Hugging Face Hub.
+            device (jax.Array, optional): Device to load the model on. Defaults to the first CPU.
+            dtype (jax.numpy.dtype, optional): Data type of the model. Defaults to jax.numpy.float32.
+            param_dtype (jax.numpy.dtype, optional): Data type of the model parameters. Defaults to jax.numpy.float32.
+            precision (jax.lax.Precision, optional): Precision for computations. Defaults to jax.lax.Precision("fastest").
+            sharding_axis_dims (Sequence[int], optional): Dimensions of each sharding axis. Defaults to (1, -1, 1, 1).
+            sharding_axis_names (Sequence[str], optional): Names of the sharding axes. Defaults to ("dp", "fsdp", "tp", "sp").
+            query_partition_spec (PartitionSpec, optional): Partitioning specification for the query tensor. Defaults to
+                PartitionSpec(("dp", "fsdp"), "sp", "tp", None).
+            generation_query_partition_spec (PartitionSpec, optional): Partitioning specification for the query tensor during
+                generation. Defaults to PartitionSpec(("dp", "fsdp"), None, "tp", None).
+            key_partition_spec (PartitionSpec, optional): Partitioning specification for the key tensor. Defaults to
+                PartitionSpec(("dp", "fsdp"), "sp", "tp", None).
+            value_partition_spec (PartitionSpec, optional): Partitioning specification for the value tensor. Defaults to
+                PartitionSpec(("dp", "fsdp"), "sp", "tp", None).
+            bias_partition_spec (PartitionSpec, optional): Partitioning specification for the attention bias. Defaults to
+                PartitionSpec(("dp", "fsdp"), None, None, None).
+            generation_bias_partition_spec (PartitionSpec, optional): Partitioning specification for the attention bias during
+                generation. Defaults to PartitionSpec(("dp", "fsdp"), None, None, None).
+            attention_partition_spec (PartitionSpec, optional): Partitioning specification for the attention weights. Defaults to
+                PartitionSpec(("dp", "fsdp"), "sp", "tp", None).
+            shard_attention_computation (bool, optional): Whether to shard attention computation. Defaults to True.
+            input_shape (Sequence[int], optional): Shape of the input to the model. Defaults to (1, 1).
+            shard_fns (Optional[Mapping[tuple, Callable] | dict], optional): Sharding functions to use for the model. If None,
+                auto-sharding is used if auto_shard_params is True. Defaults to None.
+            backend (Optional[str], optional): Backend to use for the model. Defaults to None.
+            config_kwargs (Optional[Mapping[str, Any]], optional): Configuration keyword arguments to pass to the model config.
+                Defaults to None.
+            auto_shard_params (bool, optional): Whether to automatically shard the model parameters. Defaults to False.
+            partition_rules (Optional[Tuple[Tuple[str, PartitionSpec]]], optional): Custom partition rules for parameter
+                sharding. If not None, shard_fns should also be provided. Defaults to None.
+            load_in_8bit (bool, optional): Whether to load the model parameters in 8-bit precision. Defaults to False.
+            bit_targeted_params (Optional[List[str]], optional): List of parameter names to convert to 8-bit precision. If
+                None and load_in_8bit is True, all kernels and embeddings are converted to 8-bit. Defaults to None.
+            **kwargs: Additional keyword arguments to pass to the model and config classes.
 
+        Returns:
+            Tuple[EasyDeLFlaxPretrainedModel, dict]: A tuple containing the EasyDeL model and the loaded and sharded
+                model parameters.
         """
 
         logger.debug(f"Downloading model config from {pretrained_model_name_or_path}")
@@ -583,28 +624,41 @@ class AutoEasyDeLConfig:
             backend: Optional[str] = None,
             **kwargs
     ) -> EasyDeLPretrainedConfig:
-        """
-        The from_pretrained function is a helper function that allows you to instantiate a model from the pretrained
+        """The from_pretrained function is a helper function that allows you to instantiate a model from the pretrained
         model repository. It takes as input the name of the model (e.g., 'bert-base-uncased') and returns an instance of
         the class corresponding to your model, with all weights loaded from disk.
 
-        :param cls: Create an instance of the class that called this function
-        :param pretrained_model_name_or_path: str: Identify the model in the huggingface model hub
-        :param sharding_axis_dims: Sequence[int]: Specify the dimension of each axis in the sharded model
-        :param sharding_axis_names: Sequence[str]: Specify the order of sharding
-        :param query_partition_spec: PartitionSpec: Specify the partitioning of the query tensor
-        :param generation_query_partition_spec: PartitionSpec: Specify the partitioning of the query tensor in
+        Args:
+            cls: Create an instance of the class that called this
+                function
+            pretrained_model_name_or_path: str: Identify the model in
+                the huggingface model hub
+            sharding_axis_dims: Sequence[int]: Specify the dimension of
+                each axis in the sharded model
+            sharding_axis_names: Sequence[str]: Specify the order of
+                sharding
+            query_partition_spec: PartitionSpec: Specify the
+                partitioning of the query tensor
+            generation_query_partition_spec: PartitionSpec: Specify the
+                partitioning of the query tensor in
+            key_partition_spec: PartitionSpec: Partition the key matrix
+            value_partition_spec: PartitionSpec: Specify the
+                partitioning of the value tensor
+            bias_partition_spec: PartitionSpec: Specify the Attention
+                Bias partition spec
+            generation_bias_partition_spec: PartitionSpec: Specify the
+                Attention Bias partition spec for generation
+            attention_partition_spec: PartitionSpec: Specify the
+                partitioning of the attention weights
+            shard_attention_computation: bool: whenever to use shard_map
+                for attention
+            backend: Optional[str]: backend to use for model
+            **kwargs: Pass additional arguments to the model and config
+                classes
         generation process
-        :param key_partition_spec: PartitionSpec: Partition the key matrix
-        :param value_partition_spec: PartitionSpec: Specify the partitioning of the value tensor
-        :param bias_partition_spec: PartitionSpec: Specify the Attention Bias partition spec
-        :param generation_bias_partition_spec: PartitionSpec: Specify the Attention Bias partition spec for generation
-        :param attention_partition_spec: PartitionSpec: Specify the partitioning of the attention weights
-        :param shard_attention_computation: bool: whenever to use shard_map for attention
-        :param backend: Optional[str]: backend to use for model
-        :param kwargs: Pass additional arguments to the model and config classes
-        :return: A Model Config
 
+        Returns:
+            A Model Config
         """
 
         config = AutoConfig.from_pretrained(pretrained_model_name_or_path)

@@ -144,9 +144,7 @@ def mpt_convert_flax_to_pt_1b(state_dict_flax, n_layers: int, device=torch.devic
 
 
 def mpt_from_pretrained(model_id, device, **kwargs):
-    """
-    return: Weight or Params for easydel Model , Config
-    """
+    """return: Weight or Params for easydel Model , Config"""
     config = MptConfig.from_pretrained(model_id)
     model = AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code=True, **kwargs)
 

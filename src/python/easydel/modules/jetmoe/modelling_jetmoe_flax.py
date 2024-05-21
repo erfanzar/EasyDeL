@@ -69,9 +69,7 @@ def _make_sliding_window_causal_mask(
         past_key_values_length: int = 0,
         sliding_window: int = 4096,
 ):
-    """
-    Make causal mask used for sliding window attention
-    """
+    """Make causal mask used for sliding window attention"""
     bsz, tgt_len = input_ids_shape
 
     tensor = jnp.full(
@@ -91,9 +89,7 @@ def _make_sliding_window_causal_mask(
 def compute_gating(k: int, num_experts: int, top_k_gates: jnp.ndarray, top_k_indices: jnp.ndarray) -> Tuple[
     chex.Array, chex.Array, chex.Array, chex.Array
 ]:
-    """
-    Compute gating values for the mixture of experts based on probabilities and top-k indices.
-    """
+    """Compute gating values for the mixture of experts based on probabilities and top-k indices."""
     zeros = jnp.zeros([top_k_gates.shape[0], num_experts], dtype=top_k_gates.dtype)
     gates = zeros.at[jnp.arange(zeros.shape[0])[:, None], top_k_indices].set(1)
     expert_size = gates.astype(jnp.int32).sum(axis=0)

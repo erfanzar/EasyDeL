@@ -81,15 +81,17 @@ class Qwen2Config(EasyDeLPretrainedConfig):
         )
 
     def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
-        """
-        The get_partition_rules function is used to define the partitioning scheme for a model.
+        """The get_partition_rules function is used to define the partitioning scheme for a model.
         It returns a list of tuples, where each tuple contains two elements:
             1) A regex string that matches the name of one or more parameters in the model.
             2) A PartitionScheme object that defines how those parameters should be partitioned across devices.
 
-        :param fully_sharded_data_parallel: bool: Determine whether to partition the model fully or not
-        :return: A list of tuples
+        Args:
+            fully_sharded_data_parallel: bool: Determine whether to
+                partition the model fully or not
 
+        Returns:
+            A list of tuples
         """
         return (
 
@@ -146,26 +148,38 @@ class Qwen2Config(EasyDeLPretrainedConfig):
             rope_scaling: Optional[Mapping[str, str | float]] = None,
             **kwargs,
     ):
-        """
-        The add_jax_args function adds the following arguments to the Transformer class:
+        """The add_jax_args function adds the following arguments to the Transformer class:
 
-        :param self: Refer to the current object
-        :param resid_pdrop: float: Set the dropout rate for residual connections
-        :param embd_pdrop: float: Set the probability of dropping an embedding
-        :param attention_dropout: float: Set the probability of dropping out the attention layer
-        :param tie_word_embeddings: bool: Tie the word embeddings to the decoder
-        :param gradient_checkpointing: str: Control the amount of memory used by jax
-        :param fcm_min_ratio: float: Control the minimum ratio of the number of chunks to be used in flash-based computation
-        :param fcm_max_ratio: float: Set the maximum ratio of the number of input tokens to output tokens
-        :param use_scan_mlp: bool: Determine whether to use the scan_mlp function or not
-        :param scan_mlp_chunk_size: int: Set the chunk size for scan_mlp
-        :param number_rep_kv: int: Determine how many times the key and value vectors are repeated
-        :param bits: Optional[int]: Determine the number of bits used in the quantization
-        :param rope_theta: float : rope_theta for compute rope
-        :param hidden_act: str : hidden_act for mlp
-        :param scan_layers: bool: Determine whether to use scan layers or not
-        :return: The following:
+        Args:
+            self: Refer to the current object
+            resid_pdrop: float: Set the dropout rate for residual
+                connections
+            embd_pdrop: float: Set the probability of dropping an
+                embedding
+            attention_dropout: float: Set the probability of dropping
+                out the attention layer
+            tie_word_embeddings: bool: Tie the word embeddings to the
+                decoder
+            gradient_checkpointing: str: Control the amount of memory
+                used by jax
+            fcm_min_ratio: float: Control the minimum ratio of the
+                number of chunks to be used in flash-based computation
+            fcm_max_ratio: float: Set the maximum ratio of the number of
+                input tokens to output tokens
+            use_scan_mlp: bool: Determine whether to use the scan_mlp
+                function or not
+            scan_mlp_chunk_size: int: Set the chunk size for scan_mlp
+            number_rep_kv: int: Determine how many times the key and
+                value vectors are repeated
+            bits: Optional[int]: Determine the number of bits used in
+                the quantization
+            rope_theta: float : rope_theta for compute rope
+            hidden_act: str : hidden_act for mlp
+            scan_layers: bool: Determine whether to use scan layers or
+                not
 
+        Returns:
+            The following:
         """
         self.scan_layers = scan_layers
         self.embd_pdrop = embd_pdrop

@@ -1,5 +1,4 @@
-"""
-An implementation of Blockwise parallel transformer https://arxiv.org/abs/2305.19370
+"""An implementation of Blockwise parallel transformer https://arxiv.org/abs/2305.19370
 Also include a reference implementation of memory-efficient transformer https://arxiv.org/abs/2112.05682
 from EasyLM https://github.com/young-geng/EasyLM/blob/main/EasyLM/bpt.py
 """
