@@ -240,9 +240,7 @@ from checkpoint
         available_backends = len(jax.devices(backend))
         if force_batch_and_gradient_accumulation_steps_calculation:
             total_batch_size *= gradient_accumulation_steps  # Changed and will be handled inside FJFormer
-
         array_devices = jnp.ones((available_backends, 1)).reshape(sharding_array)
-
         JaxDistributedConfig.initialize(jax_distributed_config)
         self.force_batch_and_gradient_accumulation_steps_calculation = (
             force_batch_and_gradient_accumulation_steps_calculation
