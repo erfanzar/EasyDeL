@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # This model is copied from the Transformers and this script will apply pjit on them
-""" Flax T5 model."""
+"""Flax T5 model."""
 
 import copy
 from typing import Callable, Optional, Tuple

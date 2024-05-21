@@ -110,9 +110,7 @@ def combine_flash_masks(causal_mask, segment_ids):
 
 
 def get_flash_attention() -> Tuple[Callable, bool, bool]:
-    """
-    return: FlashAttention FN, Upcast Needed to float32,do_shard_map
-    """
+    """return: FlashAttention FN, Upcast Needed to float32,do_shard_map"""
     platform = jax.lib.xla_bridge.get_backend().platform
     if platform == "gpu":
         warnings.warn("for GPU backend use `cudnn` or `pallas_flash`")
@@ -1165,9 +1163,7 @@ class AttentionModule:
             chunk_size=128,
             axis_dims=(1, -1, 1, 1)
     ):
-        """
-        creates a test for attention module to help you find the best attention mechanism you can use.
-        """
+        """creates a test for attention module to help you find the best attention mechanism you can use."""
         import flax
         try:
             import pandas

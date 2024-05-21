@@ -72,15 +72,17 @@ class Qwen1Config(EasyDeLPretrainedConfig):
         )
 
     def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
-        """
-        The get_partition_rules function is used to define the partitioning scheme for a model.
+        """The get_partition_rules function is used to define the partitioning scheme for a model.
         It returns a list of tuples, where each tuple contains two elements:
             1) A regex string that matches the name of one or more parameters in the model.
             2) A PartitionScheme object that defines how those parameters should be partitioned across devices.
 
-        :param fully_sharded_data_parallel: bool: Determine whether to partition the model fully or not
-        :return: A list of tuples
+        Args:
+            fully_sharded_data_parallel: bool: Determine whether to
+                partition the model fully or not
 
+        Returns:
+            A list of tuples
         """
         return (
 
@@ -129,18 +131,24 @@ class Qwen1Config(EasyDeLPretrainedConfig):
             init_rope_cache_auto: bool = False,
             **kwargs,
     ):
-        """
-        The add_jax_args function adds the following arguments to the Transformer class:
+        """The add_jax_args function adds the following arguments to the Transformer class:
 
-        :param self: Refer to the current object
-        :param gradient_checkpointing: str: Control the amount of memory used by jax
-        :param use_scan_mlp: bool: Determine whether to use the scan_mlp function or not
-        :param scan_mlp_chunk_size: int: Set the chunk size for scan_mlp
-        :param init_rope_cache_auto: bool: Whether to use the rope_cache_auto in model
-        :param bits: Optional[int]: Determine the number of bits used in the quantization
-        :param scan_layers: bool: Determine whether to use scan layers or not
-        :return: The following:
+        Args:
+            self: Refer to the current object
+            gradient_checkpointing: str: Control the amount of memory
+                used by jax
+            use_scan_mlp: bool: Determine whether to use the scan_mlp
+                function or not
+            scan_mlp_chunk_size: int: Set the chunk size for scan_mlp
+            init_rope_cache_auto: bool: Whether to use the
+                rope_cache_auto in model
+            bits: Optional[int]: Determine the number of bits used in
+                the quantization
+            scan_layers: bool: Determine whether to use scan layers or
+                not
 
+        Returns:
+            The following:
         """
         self.scan_layers = scan_layers
         self.gradient_checkpointing = gradient_checkpointing

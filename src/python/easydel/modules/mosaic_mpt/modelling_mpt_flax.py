@@ -143,21 +143,27 @@ class FlaxMptAttention(BaseJAXAttentionModule):
             deterministic: bool = False
     ):
 
-        """
-        The __call__ function is the main function of a JAX module.
+        """The __call__ function is the main function of a JAX module.
         It takes in inputs and returns outputs, just like any other Python function.
         The difference is that __call__ can also take in state (e.g., parameters) from the module itself,
         and it can update that state as part of its computation.
 
-        :param self: Access variables that belong to the class
-        :param hidden_states: chex.Array: Pass the input to the attention layer
-        :param attention_mask: chex.Array: Mask out certain positions in the sequence
-        :param position_bias: chex.Array: Add a bias to the attention scores
-        :param causal_mask: chex.Array: Mask out certain positions in the sequence
-        :param init_cache: bool: Initialize the cache
-        :param deterministic: bool: deterministic to activate dropouts and detect training process
-        :return: The output of the attention layer
-        
+        Args:
+            self: Access variables that belong to the class
+            hidden_states: chex.Array: Pass the input to the attention
+                layer
+            attention_mask: chex.Array: Mask out certain positions in
+                the sequence
+            position_bias: chex.Array: Add a bias to the attention
+                scores
+            causal_mask: chex.Array: Mask out certain positions in the
+                sequence
+            init_cache: bool: Initialize the cache
+            deterministic: bool: deterministic to activate dropouts and
+                detect training process
+
+        Returns:
+            The output of the attention layer
         """
         inp_shape = hidden_states.shape
         mixed_qkv = self.Wqkv(hidden_states)

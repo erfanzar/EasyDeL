@@ -189,8 +189,7 @@ def build_bert_batch_from_txt(text_list, tokenizer, device):
 
 
 def multinomial(logits, num_samples: int, replacement: bool = False):
-    """
-    Implements the `torch.multinomial` function in JAX.
+    """Implements the `torch.multinomial` function in JAX.
 
     Args:
         logits (jnp.array): The unnormalized log probabilities of the events.

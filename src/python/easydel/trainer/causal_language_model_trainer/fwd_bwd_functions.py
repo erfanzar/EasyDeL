@@ -17,30 +17,39 @@ def create_casual_language_model_train_step(
         z_loss=0.0,
         gradient_accumulation_steps: int = 1,
 ):
-    """
-    The create_casual_language_model_train_step function is a training step function that takes in the current state
+    """The create_casual_language_model_train_step function is a training step function that takes in the current state
     of the model,and a batch of data. It then calculates the loss and accuracy for this batch, and returns
     an updated state with new parameters based on these gradients.
 
-    :param partition_spec: Specify which devices the model will be split across
-    :param label_smoothing_factor: A float in [0, 1] specifying the amount of label smoothing to apply,
-           where 0 means no smoothing.
-    :param z_loss: A regularization term that adds a penalty for large weights, where 0 means no regularization.
-    :param gradient_accumulation_steps: int : gradient accumulation step size from arguments
-    :return: A casual_language_model_train_step function that takes in the current state of the model,
+    Args:
+        partition_spec: Specify which devices the model will be split
+            across
+        label_smoothing_factor: A float in [0, 1] specifying the amount
+            of label smoothing to apply, where 0 means no smoothing.
+        z_loss: A regularization term that adds a penalty for large
+            weights, where 0 means no regularization.
+        gradient_accumulation_steps: int : gradient accumulation step
+            size from arguments
+
+    Returns:
+        A casual_language_model_train_step function that takes in the
+        current state of the model,
     """
     assert gradient_accumulation_steps > 0, "gradient_accumulation_steps must be greater than 0"  # Ignore
 
     def casual_language_model_train_step(state, batch):
-        """
-        The casual_language_model_train_step function is a training step function that takes in the current state
+        """The casual_language_model_train_step function is a training step function that takes in the current state
         of the model and a batch of data. It then calculates the loss and accuracy for this batch,
         and returns an updated state with new parameters based on these gradients.
 
-        :param state: Store the model parameters
-        :param batch: Pass the data to the model, dict with
-                      input_ids(bs, seq_len), labels(bs, seq_len-1), attention_mask(bs, seq_len)
-        :return: A tuple of (state, loss, accuracy)
+        Args:
+            state: Store the model parameters
+            batch: Pass the data to the model, dict with input_ids(bs,
+                seq_len), labels(bs, seq_len-1), attention_mask(bs,
+                seq_len)
+
+        Returns:
+            A tuple of (state, loss, accuracy)
         """
         batch = with_sharding_constraint(batch, partition_spec)
 
@@ -110,28 +119,32 @@ def create_casual_language_model_train_step(
 def create_casual_language_model_evaluation_step(
         partition_spec=PartitionSpec(("dp", "fsdp"), "sp")
 ):
-    """
-    The create_casual_language_model_evaluation_step function is used to create a function that calculates the loss
+    """The create_casual_language_model_evaluation_step function is used to create a function that calculates the loss
      and accuracy of a model. It takes in a set of parameters, which are then passed into the state.apply_fn function
     to generate logits for each token in the batch. The cross entropy loss and accuracy are then calculated from these
     logits.
 
-    :param partition_spec: Specify the partitioning of the model parameters
-    :return: A function that can be used to calculate the loss and accuracy of a model
+    Args:
+        partition_spec: Specify the partitioning of the model parameters
 
+    Returns:
+        A function that can be used to calculate the loss and accuracy
+        of a model
     """
 
     def casual_language_model_evaluation_step(state, batch_eval):
-        """
-        The casual_language_model_evaluation_step function is used to calculate the loss and accuracy of a model.
+        """The casual_language_model_evaluation_step function is used to calculate the loss and accuracy of a model.
         It takes in a set of parameters, which are then passed into the state.apply_fn function
         to generate logits for each token in the batch. The cross entropy loss and accuracy are then calculated from
         these logits.
 
-        :param state: Store the model parameters and other information about the training process
-        :param batch_eval: Pass the batch of data to the function
-        :return: The loss and accuracy of the model
+        Args:
+            state: Store the model parameters and other information
+                about the training process
+            batch_eval: Pass the batch of data to the function
 
+        Returns:
+            The loss and accuracy of the model
         """
         batch_eval = with_sharding_constraint(batch_eval, partition_spec)
 

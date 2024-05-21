@@ -57,14 +57,16 @@ class CausalLanguageModelTrainer(BaseTrainer):
         return collate_fn
 
     def configure_functions(self) -> TrainerConfigureFunctionFuncOutput:
-        """
-        The configure_functions function is responsible for configuring the functions that will be used in training.
+        """The configure_functions function is responsible for configuring the functions that will be used in training.
         It does this by first defining a function called function_configurations, which initializes the model parameters and returns
         them as a EasyDeLState object. The EasyDeLState object contains all the information needed to train or evaluate
         on a batch of data, including:
-        :param self: Access the class attributes
-        :return: A TrainerConfigureFunctionFuncOutput object
 
+        Args:
+            self: Access the class attributes
+
+        Returns:
+            A TrainerConfigureFunctionFuncOutput object
         """
 
         def initialize_state_function():
@@ -355,18 +357,20 @@ class CausalLanguageModelTrainer(BaseTrainer):
             model_parameters: Optional[flax.core.FrozenDict] = None,
             state: Optional[EasyDeLState] = None
     ) -> CausalLMTrainerOutput:
-        """
-        The train function is the main function of this module.
+        """The train function is the main function of this module.
         It takes a model_parameters argument which can be used to load a pretrained model and finetune it.
         The train function returns an CausalLMTrainerOutput object that contains the last saved file name, predict func,
         train state, mesh and checkpoint streamer.
 
+        Args:
+            self: Make the class methods aware of other methods and
+                attributes within the class
+            model_parameters: flax.core.FrozenDict: Load a pre-trained
+                model
+            state: Optional[EasyDeLState]: Ready to Use State
 
-        :param self: Make the class methods aware of other methods and attributes within the class
-        :param model_parameters: flax.core.FrozenDict: Load a pre-trained model
-        :param state: Optional[EasyDeLState]: Ready to Use State
-        :return: An object of type "CausalLMTrainerOutput"
-
+        Returns:
+            An object of type "CausalLMTrainerOutput"
         """
 
         def get_layer_names(frozen_dict, prefix=""):

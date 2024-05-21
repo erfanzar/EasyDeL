@@ -891,24 +891,29 @@ class FlaxMambaPretrainedModel(EasyDeLFlaxPretrainedModel):
             _do_init: bool = True,
             **kwargs,
     ):
-        """
-        The __init__ function is called when the class is instantiated.
+        """The __init__ function is called when the class is instantiated.
         It sets up the instance of the class, and defines what happens when it's created.
         The __init__ function can take arguments, but self is always required (it refers to the instance of the object).
 
-
-        :param self: Refer to the object itself
-        :param config: MambaConfig: Pass the configuration to the module
-        :param input_shape: Tuple: Specify the shape of the input to the model
-        :param seed: int: Set the seed for random number generation
-        :param dtype: jnp.dtype: Specify the data type of the model ra
-        :param param_dtype: jnp.dtype: Specify the data type of the param_dtype
-        :param precision: Optional[Union[str, lax.Precision]]: precision for model operations
-        :param _do_init: bool: Control whether the module is initialized or not
-        :param kwargs: Pass in any additional parameters that the module_class might need
+        Args:
+            self: Refer to the object itself
+            config: MambaConfig: Pass the configuration to the module
+            input_shape: Tuple: Specify the shape of the input to the
+                model
+            seed: int: Set the seed for random number generation
+            dtype: jnp.dtype: Specify the data type of the model ra
+            param_dtype: jnp.dtype: Specify the data type of the
+                param_dtype
+            precision: Optional[Union[str, lax.Precision]]: precision
+                for model operations
+            _do_init: bool: Control whether the module is initialized or
+                not
+            **kwargs: Pass in any additional parameters that the
+                module_class might need
         :param : Specify the number of layers in the network
-        :return: The super() of the class
 
+        Returns:
+            The super() of the class
         """
         module = self.module_class(
             config=config,
@@ -927,15 +932,17 @@ class FlaxMambaPretrainedModel(EasyDeLFlaxPretrainedModel):
         )
 
     def init_weights(self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None) -> FrozenDict:
-        """
-        The init_weights function is used to initialize the weights of a model.
+        """The init_weights function is used to initialize the weights of a model.
 
-        :param self: Access variables that belong to the class
-        :param rng: jax.random.PRNGKey: Initialize the weights of the model
-        :param input_shape: Tuple: Specify the shape of the input tensor
-        :param params: FrozenDict: Pass in the parameters of a pre-trained model
-        :return: A frozendict of parameters
+        Args:
+            self: Access variables that belong to the class
+            rng: jax.random.PRNGKey: Initialize the weights of the model
+            input_shape: Tuple: Specify the shape of the input tensor
+            params: FrozenDict: Pass in the parameters of a pre-trained
+                model
 
+        Returns:
+            A frozendict of parameters
         """
         input_ids = jnp.zeros(input_shape, dtype="i4")
         params_rng, dropout_rng = jax.random.split(rng)
@@ -979,22 +986,30 @@ class FlaxMambaPretrainedModel(EasyDeLFlaxPretrainedModel):
             use_cache: bool = False,
             **kwargs
     ):
-        """
-        The __call__ function is the main function of a JAX module.
+        """The __call__ function is the main function of a JAX module.
 
-        :param self: Represent the instance of the class
-        :param input_ids: Optional[chex.Array]: Pass in the input tokens
-        :param inputs_embeds: Optional[chex.Array]: Pass in the embedded tokens
-        :param cache_params: dict: Pass in the past cache_params from a previous call to __call__
-        :param params: dict: Pass in the parameters of the model
-        :param dropout_rng: jax.random.PRNGKey: Make sure that the dropout is applied in a random way
-        :param train: bool: Determine whether to use dropout or not
-        :param output_hidden_states: Optional[bool]: Return the hidden states of all layers
-        :param return_dict: Optional[bool]: Determine whether to return a dictionary or not
-        :param extra_embedding: Optional[Union[jnp.ndarray,None]]: Pass in the embedding for the input_ids
-        :param add_params_field: bool: Add the params field to the inputs dictionary
-        :return: A tuple of the following:
+        Args:
+            self: Represent the instance of the class
+            input_ids: Optional[chex.Array]: Pass in the input tokens
+            inputs_embeds: Optional[chex.Array]: Pass in the embedded
+                tokens
+            cache_params: dict: Pass in the past cache_params from a
+                previous call to __call__
+            params: dict: Pass in the parameters of the model
+            dropout_rng: jax.random.PRNGKey: Make sure that the dropout
+                is applied in a random way
+            train: bool: Determine whether to use dropout or not
+            output_hidden_states: Optional[bool]: Return the hidden
+                states of all layers
+            return_dict: Optional[bool]: Determine whether to return a
+                dictionary or not
+            extra_embedding: Optional[Union[jnp.ndarray,None]]: Pass in
+                the embedding for the input_ids
+            add_params_field: bool: Add the params field to the inputs
+                dictionary
 
+        Returns:
+            A tuple of the following:
         """
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states

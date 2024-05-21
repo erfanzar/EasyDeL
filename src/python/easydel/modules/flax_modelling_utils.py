@@ -68,17 +68,18 @@ def canonicalize_dtype(
 
 
 def get_names_from_partition_spec(partition_specs):
-    """
-    The get_names_from_partition_spec function takes a partition_specs argument, which is either a dictionary or list.
+    """The get_names_from_partition_spec function takes a partition_specs argument, which is either a dictionary or list.
     If it's a dictionary, the function converts it to a list of values. Then for each item in the partition_specs list:
         If the item is None, continue (do nothing) and move on to next iteration of loop.
         If the item is an instance of str (i.e., if it's just one string), add that string to names set and move
         on to next iteration of loop.
         Otherwise, (if not None or str), call get_names_from_partition_spec recurs
 
-    :param partition_specs: Define the partitioning of a table
-    :return: A list of the names of all partitions
+    Args:
+        partition_specs: Define the partitioning of a table
 
+    Returns:
+        A list of the names of all partitions
     """
     names = set()
     if isinstance(partition_specs, dict):
@@ -95,15 +96,17 @@ def get_names_from_partition_spec(partition_specs):
 
 
 def names_in_mesh(*names):
-    """
-    The names_in_mesh function is a decorator that can be used to check whether
+    """The names_in_mesh function is a decorator that can be used to check whether
     the names of the axes passed into a function are valid.  It will raise an
     exception if any of the axis names are not in the physical mesh.  For example,
     if you have a function that takes two axes as arguments, and you want to make sure they're both in your mesh:
 
-    :param names: Collect all the names passed to the function into a tuple
-    :return: A boolean indicating whether all the given
+    Args:
+        *names: Collect all the names passed to the function into a
+            tuple
 
+    Returns:
+        A boolean indicating whether all the given
     """
     return set(names) <= set(pxla.thread_resources.env.physical_mesh.axis_names)
 
@@ -136,17 +139,19 @@ def get_gradient_checkpoint_policy(name):
 
 
 def repeat_kv_bnsh(x: chex.Array, n_rep: int) -> chex.Array:
-    """
-    The repeat_kv_bnsh function is used to repeat the key and value vectors for each head in a multi-head attention
+    """The repeat_kv_bnsh function is used to repeat the key and value vectors for each head in a multi-head attention
     module. This function takes as input an array of shape (batch_size, n_heads, sequence_length, head_dim) and returns
     an array of shape (batch_size, n_heads * nrep, sequence length, head dim). The reason this is necessary is because the
     attention module expects keys/values/queries to be repeated across heads but not across batches. However we want our
     keys/values/queries to be repeated both across heads AND batches so that we can use them
 
-    :param x: chex.Array: Pass in the input to the function
-    :param n_rep: int: Repeat the key and value heads
-    :return: A new array with the same shape as x, except for the second dimension which is n_kv_heads * n_rep
+    Args:
+        x: chex.Array: Pass in the input to the function
+        n_rep: int: Repeat the key and value heads
 
+    Returns:
+        A new array with the same shape as x, except for the second
+        dimension which is n_kv_heads * n_rep
     """
     bs, n_kv_heads, s, head_dim = x.shape
     if n_rep == 1:
@@ -158,13 +163,15 @@ def repeat_kv_bnsh(x: chex.Array, n_rep: int) -> chex.Array:
 
 
 def repeat_kv_bsnh(x: chex.Array, n_rep: int) -> chex.Array:
-    """
-    The repeat_kv_bsnh function is used to repeat the key and value vectors for each head.
+    """The repeat_kv_bsnh function is used to repeat the key and value vectors for each head.
 
-    :param x: chex.Array: Specify the input array
-    :param n_rep: int: Repeat the key-value attention heads n_rep times
-    :return: A new array with the same batch size, sequence length, and head dimension as the input array
+    Args:
+        x: chex.Array: Specify the input array
+        n_rep: int: Repeat the key-value attention heads n_rep times
 
+    Returns:
+        A new array with the same batch size, sequence length, and head
+        dimension as the input array
     """
     bs, s, n_kv_heads, head_dim = x.shape
     x = x.transpose(0, 2, 1, 3)
@@ -283,15 +290,15 @@ def precompute_freq_cis(
 
 
 def rotate_half(x):
-    """
-    The rotate_half function takes a complex-valued array and rotates the
+    """The rotate_half function takes a complex-valued array and rotates the
     phase of its second half by 180 degrees. This is equivalent to multiplying
     the second half by -i, or equivalently rotating it 90 degrees counterclockwise.
 
+    Args:
+        x: Specify the input array
 
-    :param x: Specify the input array
-    :return: A new array that is the same as the input
-
+    Returns:
+        A new array that is the same as the input
     """
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2:]
@@ -299,31 +306,33 @@ def rotate_half(x):
 
 
 def apply_rotary_pos_emb(tensor, sin_, cos_):
-    """
-    The apply_rotary_pos_emb function applies a rotary positional embedding to the input tensor.
+    """The apply_rotary_pos_emb function applies a rotary positional embedding to the input tensor.
     b,h,s,d or pytorch style
 
-    :param tensor: Store the tensor that is passed into the function
-    :param sin_: Rotate the tensor by pi/2
-    :param cos_: Apply the cosine function to the tensor
-    :return: A tensor with the same shape as the input tensor
+    Args:
+        tensor: Store the tensor that is passed into the function
+        sin_: Rotate the tensor by pi/2
+        cos_: Apply the cosine function to the tensor
 
+    Returns:
+        A tensor with the same shape as the input tensor
     """
     b, h, s, d = tensor.shape
     return (tensor * cos_[:, :, :s, :]) + (rotate_half(tensor) * sin_[:, :, :s, :])
 
 
 def get_ranks_and_size(mesh):
-    """
-    The get_ranks_and_size function is used to determine the number of MPI processes
+    """The get_ranks_and_size function is used to determine the number of MPI processes
     (``mp_node_size``) and the number of devices per process (``dp_node_size``).
     The ``mesh.shape[mp]`` determines how many MPI processes are needed,
     and then we divide that by the local device count to get ``mp_node_size = max( 1, mp / jax.local )`.
     This means that if there are more than enough devices for all MPI ranks on a node, each rank will only use one device; otherwise it will use
 
-    :param mesh: Get the shape of the mesh
-    :return: A dictionary with the following keys:
+    Args:
+        mesh: Get the shape of the mesh
 
+    Returns:
+        A dictionary with the following keys:
     """
     out = dict(mesh=mesh)
     total_process_size = mesh.shape["tp"] * mesh.shape["sp"]
@@ -342,14 +351,15 @@ def get_ranks_and_size(mesh):
 def create_mesh(
         axis_dims: Sequence[int] = (1, -1, 1, 1), axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"), backend=""
 ):
-    """
-    The create_mesh function creates a mesh object that can be used to shard arrays.
+    """The create_mesh function creates a mesh object that can be used to shard arrays.
 
-    :param axis_dims: Sequence[int]: Specify the dimensions of the mesh
-    :param axis_names: Sequence[str]: Name the axes of the mesh
-    :param backend: Specify the backend to use
-    :return: A mesh object
+    Args:
+        axis_dims: Sequence[int]: Specify the dimensions of the mesh
+        axis_names: Sequence[str]: Name the axes of the mesh
+        backend: Specify the backend to use
 
+    Returns:
+        A mesh object
     """
     array_devices = jax.numpy.ones(
         (len(jax.devices() if backend == "" else jax.devices(backend)), 1))
@@ -361,15 +371,16 @@ def create_mesh(
 
 
 def add_start_docstrings(*docstr):
-    """
-    The add_start_docstrings function is a decorator that adds the docstrings to the beginning of a function.
+    """The add_start_docstrings function is a decorator that adds the docstrings to the beginning of a function.
     The add_start_docstrings function takes in an arbitrary number of strings and returns a decorator.
     The returned decorator takes in one argument, fn, which is assumed to be a function. The docstring for fn is set equal to
     the concatenation of all the strings passed into add_start_docstrings plus (if it exists) the original docstring for fn.
 
-    :param docstr: Pass in a variable number of arguments to the function
-    :return: A decorator that adds the docstrings to the function
+    Args:
+        *docstr: Pass in a variable number of arguments to the function
 
+    Returns:
+        A decorator that adds the docstrings to the function
     """
 
     def docstring_decorator(fn):
@@ -384,14 +395,17 @@ def get_dot_general_by_bits(
         bits: Optional[int] = None,
         mode: Literal["train", "serve", "convert"] = EasyMethod.TRAIN
 ) -> dict:
-    """
-    The get_general_dot function is a helper function that returns a q_flax.QDotGeneral object
+    """The get_general_dot function is a helper function that returns a q_flax.QDotGeneral object
     with the specified number of bits for forward and backward passes. If no bits are specified,
     the function returns None.
 
-    :param bits: Optional[int]: Specify the number of bits for quantization
-    :param mode: EasyMethod: Specify the use of model to init the QDot Method for (e.q TRAIN,SERVE,...)
-    :return: A dict that contain dot_general_cls
+    Args:
+        bits: Optional[int]: Specify the number of bits for quantization
+        mode: EasyMethod: Specify the use of model to init the QDot
+            Method for (e.q TRAIN,SERVE,...)
+
+    Returns:
+        A dict that contain dot_general_cls
     """
     if mode == EasyMethod.TRAIN:
         rhs_quant_mode = q_flax.QuantMode.TRAIN
@@ -420,19 +434,22 @@ class BaseJAXAttentionModule(nn.Module):
 
     @nn.compact
     def _concatenate_to_cache(self, key, value, query_states, attention_mask):
-        """
-        The _concatenate_to_cache function is used to concatenate the key and value vectors
+        """The _concatenate_to_cache function is used to concatenate the key and value vectors
         of a query_states with those of previous queries. This allows for the attention mechanism to
         look at all previous queries when computing its output. The function takes in three
         arguments: key, value, and query_states. It also uses two variables that are stored in the cache:
         cached_key and cached_value.
 
-        :param self: Access the variables stored in the cache
-        :param key: Store the keys of the encoder-decoder attention
-        :param value: Initialize the cached_value variable
-        :param query_states: Determine the number of cache vectors to update
-        :param attention_mask: Mask out the padded vectors in the cache
-        :return: The key, value and attention_mask
+        Args:
+            self: Access the variables stored in the cache
+            key: Store the keys of the encoder-decoder attention
+            value: Initialize the cached_value variable
+            query_states: Determine the number of cache vectors to
+                update
+            attention_mask: Mask out the padded vectors in the cache
+
+        Returns:
+            The key, value and attention_mask
         """
         quantize_kv_cache = self.config.quantize_kv_cache
         is_initialized = self.has_variable("cache", "cached_key")

@@ -214,33 +214,37 @@ class FlaxGemmaAttention(BaseJAXAttentionModule):
 
     @staticmethod
     def _transpose_sequence_head(query, key, value):
-        """
-        The _transpose_sequence_head function transposes the query, key and value matrices.
+        """The _transpose_sequence_head function transposes the query, key and value matrices.
 
-        :param query: Get the attention weights for each of the heads
-        :param key: Determine the number of heads
-        :param value: Store the values of the input
-        :return: The transpose of the query, key and value matrices
+        Args:
+            query: Get the attention weights for each of the heads
+            key: Determine the number of heads
+            value: Store the values of the input
 
+        Returns:
+            The transpose of the query, key and value matrices
         """
         return jnp.transpose(query, (0, 2, 1, 3)), jnp.transpose(key, (0, 2, 1, 3)), jnp.transpose(value, (0, 2, 1, 3))
 
     def apply_rotary(self, batch_size, sequence_length, query, key, value, freq_cis, position_ids):
-        """
-        The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
+        """The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
         The main difference is that it takes in an additional argument, freq_cis, which are used to calculate
         the rotary attention weights. The other differences are minor and mostly related to reshaping tensors.
 
-        :param self: Access variables that belong to the class
-        :param batch_size: Reshape the query, key and value tensors
-        :param sequence_length: Reshape the query, key and value tensors
-        :param query: Calculate the attention weights
-        :param key: Calculate the attention
-        :param value: Compute the attention weights
-        :param freq_cis: Calculate the frequency of each word in the vocabulary
-        :param position_ids: Identify the position of each token in the sequence
-        :return: A tuple of 3 tensors: query, key and value
+        Args:
+            self: Access variables that belong to the class
+            batch_size: Reshape the query, key and value tensors
+            sequence_length: Reshape the query, key and value tensors
+            query: Calculate the attention weights
+            key: Calculate the attention
+            value: Compute the attention weights
+            freq_cis: Calculate the frequency of each word in the
+                vocabulary
+            position_ids: Identify the position of each token in the
+                sequence
 
+        Returns:
+            A tuple of 3 tensors: query, key and value
         """
         query = query.reshape(
             batch_size,
@@ -513,8 +517,7 @@ class FlaxGemmaDecoderLayer(nn.Module):
 
 
 class FlaxGemmaPreTrainedModel(EasyDeLFlaxPretrainedModel):
-    """
-    An abstract class to handle weights initialization and a simple interface for downloading and loading pretrained
+    """An abstract class to handle weights initialization and a simple interface for downloading and loading pretrained
     models.
     """
 
@@ -550,17 +553,18 @@ class FlaxGemmaPreTrainedModel(EasyDeLFlaxPretrainedModel):
         )
 
     def init_cache(self, batch_size, max_length):
-        """
-        The init_cache function is used to initialize the cache for a given batch size and sequence length.
+        """The init_cache function is used to initialize the cache for a given batch size and sequence length.
         The cache is a dictionary that contains all the intermediate states from each layer in the model.
         This allows us to run inference on multiple batches without having to re-run forward passes through every layer in
         the model, which would be very slow.
 
-        :param self: Access the module
-        :param batch_size: Define the batch size of the input tensors
-        :param max_length: Set the length of the input sequence
-        :return: A dictionary with the following keys:
+        Args:
+            self: Access the module
+            batch_size: Define the batch size of the input tensors
+            max_length: Set the length of the input sequence
 
+        Returns:
+            A dictionary with the following keys:
         """
         input_ids = jnp.ones((batch_size, max_length))
         attention_mask = jnp.ones_like(input_ids)

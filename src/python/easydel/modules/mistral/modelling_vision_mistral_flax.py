@@ -52,15 +52,17 @@ class FlaxVisionMistralPreTrainedModel(EasyDeLFlaxPretrainedModel):
         return init_variables["cache"]
 
     def init_weights(self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None) -> FrozenDict:
-        """
-        The init_weights function is used to initialize the weights of a model.
+        """The init_weights function is used to initialize the weights of a model.
 
-        :param self: Access variables that belong to the class
-        :param rng: jax.random.PRNGKey: Initialize the weights of the model
-        :param input_shape: Tuple: Specify the shape of the input tensor
-        :param params: FrozenDict: Pass in the parameters of a pre-trained model
-        :return: A frozendict of parameters
+        Args:
+            self: Access variables that belong to the class
+            rng: jax.random.PRNGKey: Initialize the weights of the model
+            input_shape: Tuple: Specify the shape of the input tensor
+            params: FrozenDict: Pass in the parameters of a pre-trained
+                model
 
+        Returns:
+            A frozendict of parameters
         """
         input_ids = jnp.zeros(input_shape, dtype="i4")
         attention_mask = jnp.ones_like(input_ids)

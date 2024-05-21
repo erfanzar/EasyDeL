@@ -1,5 +1,7 @@
 nav:
   - APIs:
+    - Cli:
+      - Cli: generated-cli-cli.md
     - Data Preprocessing:
       - Processor: generated-data_preprocessing-_processor.md
     - Etils:
@@ -188,9 +190,9 @@ nav:
       - Prompters: generated-utils-prompters.md
       - Tensor Utils: generated-utils-tensor_utils.md
       - Utils: generated-utils-utils.md
-  - AvailableModels: AvailableModels.md
-  - CONTRIBUTING: CONTRIBUTING.md
-  - EasyBIT: Bits.md
+  - Available models: AvailableModels.md
+  - Contributing: CONTRIBUTING.md
+  - Easy Bits: Bits.md
   - Examples:
     - DataProcessing: DataProcessing.md
     - Easy Attention: AttentionModuleExample.md
@@ -206,7 +208,7 @@ nav:
     - MosaicMPT Models: MosaicMPT.md
     - PytorchServer: PyTorchServer.md
   - Home: index.md
-  - install: Install.md
+  - Install: Install.md
 
 plugins:
   - search
@@ -214,11 +216,11 @@ plugins:
       handlers:
         python:
           options:
-            docstring_style: sphinx
+            docstring_style: google
 
 repo_url: https://github.com/erfanzar/EasyDeL
 site_author: Erfan Zare Chavoshi
-site_name: easydel
+site_name: EasyDeL
 copyright: Erfan Zare Chavoshi-easydel
 
 theme:

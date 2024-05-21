@@ -20,20 +20,26 @@ def get_optimizer_and_scheduler(
         weight_decay: float = 0.02,
         warmup_steps: int = 0
 ):
-    """
-    The get_optimizer_and_scheduler function is a helper function that returns an optimizer and scheduler
+    """The get_optimizer_and_scheduler function is a helper function that returns an optimizer and scheduler
         based on the parameters passed to it.
 
-    :param optimizer: AVAILABLE_OPTIMIZERS: Choose the optimizer
-    :param scheduler: AVAILABLE_SCHEDULERS: Determine the learning rate scheduler
-    :param steps: int: Specify the number of steps in the training process
-    :param learning_rate: float: Set the learning rate for the optimizer
-    :param learning_rate_end: float: Set the final learning rate
-    :param gradient_accumulation_steps: int: Accumulate the gradients before updating the weights
-    :param extra_optimizer_kwargs: dict | None: Pass extra arguments to the optimizer
-    :param weight_decay: float: Set the weight decay for adamw optimizer
-    :param warmup_steps: int: Specify the number of steps to warm up the learning rate
-    :return: A tuple of two objects: (Optimizer and scheduler)
+    Args:
+        optimizer: AVAILABLE_OPTIMIZERS: Choose the optimizer
+        scheduler: AVAILABLE_SCHEDULERS: Determine the learning rate
+            scheduler
+        steps: int: Specify the number of steps in the training process
+        learning_rate: float: Set the learning rate for the optimizer
+        learning_rate_end: float: Set the final learning rate
+        gradient_accumulation_steps: int: Accumulate the gradients
+            before updating the weights
+        extra_optimizer_kwargs: dict | None: Pass extra arguments to the
+            optimizer
+        weight_decay: float: Set the weight decay for adamw optimizer
+        warmup_steps: int: Specify the number of steps to warm up the
+            learning rate
+
+    Returns:
+        A tuple of two objects: (Optimizer and scheduler)
     """
     if extra_optimizer_kwargs is None:
         extra_optimizer_kwargs = {}

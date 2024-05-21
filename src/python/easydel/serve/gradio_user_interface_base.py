@@ -13,8 +13,7 @@ class GradioUserInference:
             max_new_tokens: int,
             max_compile_tokens: int
     ):
-        """
-        The function `chat_interface_components` creates the components for a chat interface, including
+        """The function `chat_interface_components` creates the components for a chat interface, including
         a chat history, message box, buttons for submitting, stopping, and clearing the conversation,
         and sliders for advanced options.
         """
@@ -173,10 +172,11 @@ class GradioUserInference:
             max_new_tokens: int,
             max_compile_tokens: int
     ) -> gr.Blocks:
-        """
-        The function "build_inference" returns a gr.Blocks object that model
+        """The function "build_inference" returns a gr.Blocks object that model
         interface components.
-        :return: a gr.Blocks object.
+
+        Returns:
+            a gr.Blocks object.
         """
         with gr.Blocks(
                 theme=seafoam
@@ -191,14 +191,16 @@ class GradioUserInference:
 
     def __repr__(self):
 
-        """
-        The __repr__ function is used to generate a string representation of an object.
+        """The __repr__ function is used to generate a string representation of an object.
         This function should return a string that can be parsed by the Python interpreter
         to recreate the object. The __repr__ function is called when you use print() on an
         object, or when you type its name in the REPL.
 
-        :param self: Refer to the instance of the class
-        :return: A string representation of the object
+        Args:
+            self: Refer to the instance of the class
+
+        Returns:
+            A string representation of the object
         """
         string = f"{self.__class__.__name__}(\n"
         for k, v in self.__dict__.items():
@@ -214,11 +216,13 @@ class GradioUserInference:
 
     def __str__(self):
 
-        """
-        The __str__ function is called when you use the print function or when str() is used.
+        """The __str__ function is called when you use the print function or when str() is used.
         It should return a string representation of the object.
 
-        :param self: Refer to the instance of the class
-        :return: The object's string representation
+        Args:
+            self: Refer to the instance of the class
+
+        Returns:
+            The object's string representation
         """
         return self.__repr__()

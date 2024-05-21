@@ -196,34 +196,40 @@ class FlaxPhi3Attention(BaseJAXAttentionModule):
 
     @staticmethod
     def _transpose_sequence_head(query_states, key, value):
-        """
-        The _transpose_sequence_head function transposes the query_states, key and value matrices.
+        """The _transpose_sequence_head function transposes the query_states, key and value matrices.
 
-        :param query_states: Get the attention weights for each of the heads
-        :param key: Determine the number of heads
-        :param value: Store the values of the input
-        :return: The transpose of the query_states, key and value matrices
+        Args:
+            query_states: Get the attention weights for each of the
+                heads
+            key: Determine the number of heads
+            value: Store the values of the input
 
+        Returns:
+            The transpose of the query_states, key and value matrices
         """
         return jnp.transpose(query_states, (0, 2, 1, 3)), jnp.transpose(key, (0, 2, 1, 3)), jnp.transpose(value,
                                                                                                           (0, 2, 1, 3))
 
     def apply_rotary(self, batch_size, sequence_length, query, key, value, freq_cis, position_ids):
-        """
-        The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
+        """The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
         The main difference is that it takes in an additional argument, freq_cis, which are used to calculate
         the rotary attention weights. The other differences are minor and mostly related to reshaping tensors.
 
-        :param self: Access variables that belong to the class
-        :param batch_size: Reshape the query_states, key and value tensors
-        :param sequence_length: Reshape the query_states, key and value tensors
-        :param query: Calculate the attention weights
-        :param key: Calculate the attention
-        :param value: Compute the attention weights
-        :param freq_cis: Calculate the frequency of each word in the vocabulary
-        :param position_ids: Identify the position of each token in the sequence
-        :return: A tuple of 3 tensors: query_states, key and value
+        Args:
+            self: Access variables that belong to the class
+            batch_size: Reshape the query_states, key and value tensors
+            sequence_length: Reshape the query_states, key and value
+                tensors
+            query: Calculate the attention weights
+            key: Calculate the attention
+            value: Compute the attention weights
+            freq_cis: Calculate the frequency of each word in the
+                vocabulary
+            position_ids: Identify the position of each token in the
+                sequence
 
+        Returns:
+            A tuple of 3 tensors: query_states, key and value
         """
         query = query.reshape(
             batch_size,

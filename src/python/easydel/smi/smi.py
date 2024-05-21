@@ -14,18 +14,20 @@ import re
 
 # Edited version of Jax-SMI from https://github.com/ayaka14732/jax-smi/
 def run(note_book=None, interval: float = 1, dir_prefix: str = '/dev/shm', dpr=True):
-    """
-    The run function is a simple wrapper around the go tool pprof command.
+    """The run function is a simple wrapper around the go tool pprof command.
     It runs the command every interval seconds and prints out its output to stdout.
     If you are running this in a notebook, it will print to IPython's display instead of stdout.
 
+    Args:
+        note_book: Determine whether the program is running in a
+            notebook or not
+        interval: float: Specify the time interval between each refresh
+        dir_prefix: str: Specify the directory where the memory
+        dpr: Control whether the output is displayed in a notebook or
+            not
 
-    :param note_book: Determine whether the program is running in a notebook or not
-    :param interval: float: Specify the time interval between each refresh
-    :param dir_prefix: str: Specify the directory where the memory
-    :param dpr: Control whether the output is displayed in a notebook or not
-    :return: The output of the pprof command
-    
+    Returns:
+        The output of the pprof command
     """
     if note_book is None:
         import os
@@ -62,15 +64,16 @@ def run(note_book=None, interval: float = 1, dir_prefix: str = '/dev/shm', dpr=T
 
 
 def get_mem(dir_prefix: str = "/dev/shm" if sys.platform != "win32" else "."):
-    """
-    The get_mem function is a wrapper around the go tool pprof command.
+    """The get_mem function is a wrapper around the go tool pprof command.
     It takes in an optional argument, dir_prefix, which defaults to /dev/shm.
     The function then runs the go tool pprof command with arguments -tags and dir_prefix/memory.prof,
     and returns its stdout as a string.
 
-    :param dir_prefix: str: Specify the directory where
-    :return: A string of the memory profile
-    
+    Args:
+        dir_prefix: str: Specify the directory where
+
+    Returns:
+        A string of the memory profile
     """
     return subprocess.run(
         args=['go', 'tool', 'pprof', '-tags', f'{dir_prefix}/memory.prof'],
@@ -81,13 +84,16 @@ def get_mem(dir_prefix: str = "/dev/shm" if sys.platform != "win32" else "."):
 
 def initialise_tracking(interval: float = 0.5,
                         dir_prefix: str = "/dev/shm" if sys.platform != "win32" else ".") -> None:
-    """
-    The initialise_tracking function starts a daemon thread that periodically saves the current memory profile to disk.
+    """The initialise_tracking function starts a daemon thread that periodically saves the current memory profile to disk.
 
-    :param interval: float: Specify the time interval between each memory profile
-    :param dir_prefix: str: Specify the directory where the memory profile will be saved
-    :return: Nothing, but it starts a thread that
-    
+    Args:
+        interval: float: Specify the time interval between each memory
+            profile
+        dir_prefix: str: Specify the directory where the memory profile
+            will be saved
+
+    Returns:
+        Nothing, but it starts a thread that
     """
 
     def inner():

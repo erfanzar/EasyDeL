@@ -396,13 +396,14 @@ opt_configs = {
 
 
 def get_config(model_type: str, struct: str):
-    """
-    The get_config function takes in a model_type and struct, and returns the corresponding config.
+    """The get_config function takes in a model_type and struct, and returns the corresponding config.
 
-    :param model_type: str: Determine which model to use
-    :param struct: str: Specify the structure of the model
-    :return: A dictionary of hyperparameters
-    
+    Args:
+        model_type: str: Determine which model to use
+        struct: str: Specify the structure of the model
+
+    Returns:
+        A dictionary of hyperparameters
     """
     if model_type == "llama":
         return llama_configs[struct]

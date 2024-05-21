@@ -21,14 +21,17 @@ class VisionCausalLanguageModelStepOutput:
 
 
 def create_vision_casual_language_model_train_step(partition_spec=PartitionSpec(("dp", "fsdp"), "sp")):
-    """
-    The create_vision_casual_language_model_train_step function is a training step function that takes in the current
+    """The create_vision_casual_language_model_train_step function is a training step function that takes in the current
      state of the model,and a batch of data. It then calculates the loss and accuracy for this batch, and returns
     an updated state with new parameters based on these gradients.
 
-    :param partition_spec: Specify which devices the model will be split across
-    :return: A casual_language_model_train_step function that takes in the current state of the model,
+    Args:
+        partition_spec: Specify which devices the model will be split
+            across
 
+    Returns:
+        A casual_language_model_train_step function that takes in the
+        current state of the model,
     """
 
     def vision_casual_language_model_train_step(state, batch) -> [
@@ -36,15 +39,17 @@ def create_vision_casual_language_model_train_step(partition_spec=PartitionSpec(
         chex.Array,
         VisionCausalLanguageModelStepOutput
     ]:
-        """
-        The vision_casual_language_model_train_step function is a training step function that takes in the current state
+        """The vision_casual_language_model_train_step function is a training step function that takes in the current state
         of the model and a batch of data. It then calculates the loss and accuracy for this batch,
         and returns an updated state with new parameters based on these gradients.
 
-        :param state: Store the model parameters
-        :param batch: Pass the data to the model
-        :return: A tuple of (state, loss, VisionCausalLanguageModelStepOutput)
+        Args:
+            state: Store the model parameters
+            batch: Pass the data to the model
 
+        Returns:
+            A tuple of (state, loss,
+            VisionCausalLanguageModelStepOutput)
         """
         batch = with_sharding_constraint(batch, partition_spec)
 
@@ -90,15 +95,17 @@ def create_vision_casual_language_model_train_step(partition_spec=PartitionSpec(
 
 
 def create_vision_casual_language_model_evaluation_step(partition_spec=PartitionSpec(("dp", "fsdp"), "sp")):
-    """
-    The create_vision_casual_language_model_evaluation_step function is used to create a function that calculates the
+    """The create_vision_casual_language_model_evaluation_step function is used to create a function that calculates the
      loss and accuracy of a model. It takes in a set of parameters, which are then passed into the state.apply_fn function
     to generate logits for each token in the batch. The cross entropy loss and accuracy are then calculated from these
     logits.
 
-    :param partition_spec: Specify the partitioning of the model parameters
-    :return: A function that can be used to calculate the loss and accuracy of a model
+    Args:
+        partition_spec: Specify the partitioning of the model parameters
 
+    Returns:
+        A function that can be used to calculate the loss and accuracy
+        of a model
     """
 
     def vision_casual_language_model_evaluation_step(state, batch) -> [
@@ -106,15 +113,17 @@ def create_vision_casual_language_model_evaluation_step(partition_spec=Partition
         chex.Array,
         VisionCausalLanguageModelStepOutput
     ]:
-        """
-        The vision_casual_language_model_train_step function is a training step function that takes in the current state
+        """The vision_casual_language_model_train_step function is a training step function that takes in the current state
         of the model and a batch of data. It then calculates the loss and accuracy for this batch,
         and returns an updated state with new parameters based on these gradients.
 
-        :param state: Store the model parameters
-        :param batch: Pass the data to the model
-        :return: A tuple of (state, loss, VisionCausalLanguageModelStepOutput)
+        Args:
+            state: Store the model parameters
+            batch: Pass the data to the model
 
+        Returns:
+            A tuple of (state, loss,
+            VisionCausalLanguageModelStepOutput)
         """
         batch = with_sharding_constraint(batch, partition_spec)
 

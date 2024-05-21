@@ -118,9 +118,7 @@ class Phi3Config(EasyDeLPretrainedConfig):
         )
 
     def _rope_scaling_validation(self):
-        """
-        Validate the `rope_scaling` configuration.
-        """
+        """Validate the `rope_scaling` configuration."""
         if self.rope_scaling is None:
             return
 

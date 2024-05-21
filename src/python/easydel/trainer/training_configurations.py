@@ -122,85 +122,143 @@ class TrainArguments(
             loaded_model_config_kwargs: Optional[dict] = None,
             **kwargs
     ):
-        """
-The __init__ function is called when the class is instantiated.
-It sets up the attributes of an object, which are sometimes called fields or properties.
-The __init__ function can accept arguments, just like a normal function.
+        """The __init__ function is called when the class is instantiated.
+        It sets up the attributes of an object, which are sometimes called fields or properties.
+        The __init__ function can accept arguments, just like a normal function.
 
-:param self: Represent the instance of the class
-:param model_name: str: Specify the model name
-:param num_train_epochs: int: Set the number of epochs for training
-:param model_huggingface_repo_id: Optional[str]: Load a pretrained model from the huggingface model hub
-:param model_class: Optional[EasyDeLFlaxPretrainedModel]: Pass a model class to the trainer
-:param total_batch_size: int: Set the batch size of the model
-:param max_training_steps: Optional[int]: Set the maximum total number of training steps across all epochs
-:param max_evaluation_steps: Optional[int]: Set the maximum number of steps to evaluate for
-:param optimizer: AVAILABLE_OPTIMIZERS: Specify the optimizer used to train the model
-:param scheduler: AVAILABLE_SCHEDULERS: Set the learning rate scheduler
-:param learning_rate: Union[int, float] : Set the learning rate for the optimizer
-:param learning_rate_end: Optional[float]: Set the learning rate at the end of training
-:param gradient_accumulation_steps: int: Accumulate gradients over multiple batches
-:param weight_decay: float: Specify the weight decay to be used by the optimizer
-:param label_smoothing_factor: float: Set the label smoothing factor to be used by the loss function
-:param z_loss: float: Set the z loss factor to be used by the loss function
-:param gradient_checkpointing: AVAILABLE_GRADIENT_CHECKPOINTS: Determine how to use gradient checkpointing
-:param max_sequence_length: Optional[int]: Set the maximum length of the input sequence
-:param sharding_array: Union[tuple,int]: Specify the mesh of devices to use for training
-:param is_fine_tuning: bool: Tell the model whether or not to initialize the weights of
-:param do_train: bool: Indicate whether to train the model or not
-:param do_eval: bool: Determine whether to run evaluation on the validation set after training
-:param do_test: Optional[bool]: Determine if the model should be tested
-:param train_on_inputs: bool: Use input_ids instead of labels, overrides ignored (-100) tokens in the labels
-:param backend: Optional[str]: Specify the backend of jax
-:param extra_optimizer_kwargs: dict: Pass extra arguments to the optimizer
-:param save_steps: Optional[int]: Save the model after every n steps
-:param save_dir: str: Define the directory where the checkpoints will be saved
-:param save_total_limit: int: Set the maximum number of checkpoints to keep, older checkpoints will be deleted
-:param dtype: jnp.dtype: Set the dtype of the model parameters
-:param param_dtype: jnp.dtype: Specify the data type of the model parameters
-:param fully_sharded_data_parallel: bool: Determine if the model should be fully fsdp or not
-:param use_wandb: bool: Enable or disable the wandb logging
-:param custom_rule: Mapping[str, PartitionSpec]: Specify the partitioning rules of the model
-:param extra_configs: Optional[dict]: Pass extra configurations to the model class
-:param ids_to_pop_from_dataset: Optional[list]: Remove some of the ids from the dataset
-:param remove_ckpt_after_load: bool: Remove the checkpoint after loading it
-:param configs_to_initialize_model_class: Optional[dict]: Pass extra configurations to the model class
-:param do_last_save: bool: Save the model after training is complete
-:param model_parameters: Optional[dict]: Pass the model parameters to the model class
-:param do_shard_fns: bool: Shard the model functions across devices
-:param track_memory: bool: Track the memory usage of the model
-:param loss_re_mat: str: Specify the regular expression to match the loss function name
-:param loss_chunk: int: Chunk the loss to avoid memory overflow
-:param truncation_mode: typing.Literal["keep_end", "keep_start"]: Determine if the input is left padded or not and
-    which side of the array should remain in case of using maximum padding.
-:param warmup_steps: int: Specify the number of steps to warm up the learning rate
-:param init_input_shape: Tuple[int, int]: Initialize the model with a shape that is not (batch_size, length)
-:param step_partition_spec: PartitionSpec: Partition the model for training
-:param training_time: Optional[str]: Set a time limit for the training process
-:param dataloader_num_workers: Optional[int]: Set the number of workers used by pytorch's
-:param dataloader_pin_memory: Optional[bool]: Pin the memory of the dataloader
-:param jax_distributed_config: Optional[dict]: Configure the jax distributed backend
-:param log_all_workers: bool: Log all workers in wandb,
-:param wandb_entity: Optional[str]: Specify the entity to use when logging to weights &amp; biases
-:param save_optimizer_state : bool: when ever to save optimizer state and other args in checkpoint
-:param step_start_point: Optional[int]: start training from given step for example instead of starting training from
-    step 0 it will start from 20000 and leave the data behind
-:param verbose: bool: when ever to turn verbose mode of or on
-:param offload_device: jax.Device: device to be used to offload parameters on
-:param rapture_config: Optional[EasyDeLXRaptureConfig]: LoRA Config for models
-:param merge_lora_rapture_parameters: bool: whenever to merge lora parameters with original parameters before saving
-:param state_apply_fn_kwarguments_to_model: Optional[dict]: state_apply_fn_kwarguments_to_model is a dictionary that
-    be used to apply the parameters and extra things that you want to deliver to model.
-:param remove_unused_columns: bool: when ever to remove the unused data columns from dataset
-:param force_batch_and_gradient_accumulation_steps_calculation: bool: whether to force batch and gradient to be
-    applied as total batch_size (e.g total_batch_size = total_batch_size * gradient_accumulation_steps be applied)
-:param performance_mode: bool: whether to optimize the whole training process this will cut off some logging options
-    and optimize training process.
-:param neftune_noise_alpha: Optional[float]: If not `None`, this will activate NEFTune noise embeddings. This has been
-    proven to drastically improve model performances for instruction fine-tuning.
-:param loaded_model_config_kwargs: Optional[dict]: config key arguments to be passed to the model while being loaded
-from checkpoint
-:param **kwargs: Pass keyword, variable-length argument list
+        Args:
+            self: Represent the instance of the class
+            model_name: str: Specify the model name
+            num_train_epochs: int: Set the number of epochs for training
+            model_huggingface_repo_id: Optional[str]: Load a pretrained
+                model from the huggingface model hub
+            model_class: Optional[EasyDeLFlaxPretrainedModel]: Pass a
+                model class to the trainer
+            total_batch_size: int: Set the batch size of the model
+            max_training_steps: Optional[int]: Set the maximum total
+                number of training steps across all epochs
+            max_evaluation_steps: Optional[int]: Set the maximum number
+                of steps to evaluate for
+            optimizer: AVAILABLE_OPTIMIZERS: Specify the optimizer used
+                to train the model
+            scheduler: AVAILABLE_SCHEDULERS: Set the learning rate
+                scheduler
+            learning_rate: Union[int, float] : Set the learning rate for
+                the optimizer
+            learning_rate_end: Optional[float]: Set the learning rate at
+                the end of training
+            gradient_accumulation_steps: int: Accumulate gradients over
+                multiple batches
+            weight_decay: float: Specify the weight decay to be used by
+                the optimizer
+            label_smoothing_factor: float: Set the label smoothing
+                factor to be used by the loss function
+            z_loss: float: Set the z loss factor to be used by the loss
+                function
+            gradient_checkpointing: AVAILABLE_GRADIENT_CHECKPOINTS:
+                Determine how to use gradient checkpointing
+            max_sequence_length: Optional[int]: Set the maximum length
+                of the input sequence
+            sharding_array: Union[tuple,int]: Specify the mesh of
+                devices to use for training
+            is_fine_tuning: bool: Tell the model whether or not to
+                initialize the weights of
+            do_train: bool: Indicate whether to train the model or not
+            do_eval: bool: Determine whether to run evaluation on the
+                validation set after training
+            do_test: Optional[bool]: Determine if the model should be
+                tested
+            train_on_inputs: bool: Use input_ids instead of labels,
+                overrides ignored (-100) tokens in the labels
+            backend: Optional[str]: Specify the backend of jax
+            extra_optimizer_kwargs: dict: Pass extra arguments to the
+                optimizer
+            save_steps: Optional[int]: Save the model after every n
+                steps
+            save_dir: str: Define the directory where the checkpoints
+                will be saved
+            save_total_limit: int: Set the maximum number of checkpoints
+                to keep, older checkpoints will be deleted
+            dtype: jnp.dtype: Set the dtype of the model parameters
+            param_dtype: jnp.dtype: Specify the data type of the model
+                parameters
+            fully_sharded_data_parallel: bool: Determine if the model
+                should be fully fsdp or not
+            use_wandb: bool: Enable or disable the wandb logging
+            custom_rule: Mapping[str, PartitionSpec]: Specify the
+                partitioning rules of the model
+            extra_configs: Optional[dict]: Pass extra configurations to
+                the model class
+            ids_to_pop_from_dataset: Optional[list]: Remove some of the
+                ids from the dataset
+            remove_ckpt_after_load: bool: Remove the checkpoint after
+                loading it
+            configs_to_initialize_model_class: Optional[dict]: Pass
+                extra configurations to the model class
+            do_last_save: bool: Save the model after training is
+                complete
+            model_parameters: Optional[dict]: Pass the model parameters
+                to the model class
+            do_shard_fns: bool: Shard the model functions across devices
+            track_memory: bool: Track the memory usage of the model
+            loss_re_mat: str: Specify the regular expression to match
+                the loss function name
+            loss_chunk: int: Chunk the loss to avoid memory overflow
+            truncation_mode: typing.Literal["keep_end", "keep_start"]:
+                Determine if the input is left padded or not and which
+                side of the array should remain in case of using maximum
+                padding.
+            warmup_steps: int: Specify the number of steps to warm up
+                the learning rate
+            init_input_shape: Tuple[int, int]: Initialize the model with
+                a shape that is not (batch_size, length)
+            step_partition_spec: PartitionSpec: Partition the model for
+                training
+            training_time: Optional[str]: Set a time limit for the
+                training process
+            dataloader_num_workers: Optional[int]: Set the number of
+                workers used by pytorch's
+            dataloader_pin_memory: Optional[bool]: Pin the memory of the
+                dataloader
+            jax_distributed_config: Optional[dict]: Configure the jax
+                distributed backend
+            log_all_workers: bool: Log all workers in wandb,
+            wandb_entity: Optional[str]: Specify the entity to use when
+                logging to weights &amp; biases
+            save_optimizer_state: bool: when ever to save optimizer
+                state and other args in checkpoint
+            step_start_point: Optional[int]: start training from given
+                step for example instead of starting training from step
+                0 it will start from 20000 and leave the data behind
+            verbose: bool: when ever to turn verbose mode of or on
+            offload_device: jax.Device: device to be used to offload
+                parameters on
+            rapture_config: Optional[EasyDeLXRaptureConfig]: LoRA Config
+                for models
+            merge_lora_rapture_parameters: bool: whenever to merge lora
+                parameters with original parameters before saving
+            state_apply_fn_kwarguments_to_model: Optional[dict]:
+                state_apply_fn_kwarguments_to_model is a dictionary that
+                be used to apply the parameters and extra things that
+                you want to deliver to model.
+            remove_unused_columns: bool: when ever to remove the unused
+                data columns from dataset
+            force_batch_and_gradient_accumulation_steps_calculation:
+                bool: whether to force batch and gradient to be applied
+                as total batch_size (e.g total_batch_size =
+                total_batch_size * gradient_accumulation_steps be
+                applied)
+            performance_mode: bool: whether to optimize the whole
+                training process this will cut off some logging options
+                and optimize training process.
+            neftune_noise_alpha: Optional[float]: If not `None`, this
+                will activate NEFTune noise embeddings. This has been
+                proven to drastically improve model performances for
+                instruction fine-tuning.
+            loaded_model_config_kwargs: Optional[dict]: config key
+                arguments to be passed to the model while being loaded
+            **kwargs: Pass keyword, variable-length argument list
+        from checkpoint
         """
         super().__init__()
 
@@ -368,15 +426,16 @@ from checkpoint
         return {k: v for k, v in self.__dict__.items()}
 
     def get_meter_dict(self):
-        """
-        The get_meter_dict function is used to return a dictionary of the hyperparameters.
+        """The get_meter_dict function is used to return a dictionary of the hyperparameters.
         The function iterates through all the attributes in the class and returns a dictionary with
         the key as &quot;hyperparameters/{k}&quot; and value as v for each attribute k,v in self.__dict__ if it is an
          instance of int, float, str, bool or torch.Tensor.
 
-        :param self: Represent the instance of the class
-        :return: A dictionary of hyperparameters
+        Args:
+            self: Represent the instance of the class
 
+        Returns:
+            A dictionary of hyperparameters
         """
         return {
             f"hyperparameters/{k}": v for k, v in self.__dict__.items() if
@@ -384,13 +443,14 @@ from checkpoint
         }
 
     def get_wandb_init(self) -> Run | RunDisabled | None:
-        """
-        The get_wandb_init function is a helper function that returns the wandb.init() call with
+        """The get_wandb_init function is a helper function that returns the wandb.init() call with
         the project name, config object, and tags set to appropriate values for this model.
 
-        :param self: Pass the class instance to the function
-        :return: A wandb or None
+        Args:
+            self: Pass the class instance to the function
 
+        Returns:
+            A wandb or None
         """
         return wandb.init(
             project=f"EasyDeL-{self.model_name}",
@@ -423,8 +483,7 @@ from checkpoint
         return string
 
     def get_path(self):
-        """
-        The get_path function returns a pathlib.Path object, which is a class that
+        """The get_path function returns a pathlib.Path object, which is a class that
         represents file paths and provides methods for interacting with the files at
         those paths. The get_path function takes no arguments and returns an instance of
         the Path class initialized with two arguments: self.save_dir (a string) and
@@ -432,38 +491,42 @@ from checkpoint
         store our model checkpoints, while the model name will be used to create unique
         filenames for each checkpoint.
 
-        :param self: Represent the instance of the class
-        :return: A pathlib
+        Args:
+            self: Represent the instance of the class
 
+        Returns:
+            A pathlib
         """
         return pathlib.Path(
             self.save_dir, self.model_name
         )
 
     def ckpt_path_exists(self):
-        """
-        The ckpt_path_exists function checks to see if the path exists. If it does not, then it creates a new directory.
+        """The ckpt_path_exists function checks to see if the path exists. If it does not, then it creates a new directory.
 
-        :param self: Represent the instance of the class
-        :return: A path
+        Args:
+            self: Represent the instance of the class
 
+        Returns:
+            A path
         """
         path = self.get_path()
         if not path.exists():
             path.mkdir(parents=True)
 
     def get_mesh(self):
-        """
-        The get_mesh function is used to create a mesh object that can be used
+        """The get_mesh function is used to create a mesh object that can be used
         to define the geometry of the device. The mesh object contains two arrays:
         a list of vertices and a list of faces. Each face is defined by three indices,
         which correspond to three vertices in the vertex array. The get_mesh function
         is called when creating an instance of DeviceGeometry, which is then passed
         into an instance of DeviceSimulation.
 
-        :param self: Refer to the object itself
-        :return: A mesh object with the device array shape and the mesh names
+        Args:
+            self: Refer to the object itself
 
+        Returns:
+            A mesh object with the device array shape and the mesh names
         """
         return Mesh(
             create_device_mesh(
@@ -489,15 +552,16 @@ from checkpoint
         )
 
     def get_streaming_checkpointer(self):
-        """
-        The get_streaming_checkpointer function is used to save the model's weights.
+        """The get_streaming_checkpointer function is used to save the model's weights.
         The streaming checkpointer saves the model's weights in a file called &quot;checkpoint&quot; and then
         saves a copy of that file with an incrementing number appended to it (e.g., checkpoint_001,
         checkpoint_002, etc.). This allows you to keep multiple versions of your trained models.
 
-        :param self: Represent the instance of the class
-        :return: A CheckpointManager object
+        Args:
+            self: Represent the instance of the class
 
+        Returns:
+            A CheckpointManager object
         """
         return CheckpointManager(
             os.path.join(self.save_dir, self.model_name),
@@ -506,15 +570,16 @@ from checkpoint
         )
 
     def get_board(self):
-        """
-        The get_board function is a helper function that returns a TensorBoard object.
+        """The get_board function is a helper function that returns a TensorBoard object.
         The TensorBoard object is used to log the training and validation loss, as well as
         the accuracy of the model during training. The get_board function takes no arguments,
         and returns an instance of torch.utils.tensorboard SummaryWriter class.
 
-        :param self: Represent the instance of the class
-        :return: A summary-writer object
+        Args:
+            self: Represent the instance of the class
 
+        Returns:
+            A summary-writer object
         """
         return torch.utils.tensorboard.SummaryWriter(
             log_dir=str(self.get_path()),

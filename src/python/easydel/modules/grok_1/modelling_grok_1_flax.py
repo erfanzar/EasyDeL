@@ -196,33 +196,37 @@ class FlaxGrok1Attention(BaseJAXAttentionModule):
 
     @staticmethod
     def _transpose_sequence_head(query, key, value):
-        """
-        The _transpose_sequence_head function transposes the query, key and value matrices.
+        """The _transpose_sequence_head function transposes the query, key and value matrices.
 
-        :param query: Get the attention weights for each of the heads
-        :param key: Determine the number of heads
-        :param value: Store the values of the input
-        :return: The transpose of the query, key and value matrices
+        Args:
+            query: Get the attention weights for each of the heads
+            key: Determine the number of heads
+            value: Store the values of the input
 
+        Returns:
+            The transpose of the query, key and value matrices
         """
         return jnp.transpose(query, (0, 2, 1, 3)), jnp.transpose(key, (0, 2, 1, 3)), jnp.transpose(value, (0, 2, 1, 3))
 
     def apply_rotary(self, batch_size, sequence_length, query, key, value, freq_cis, position_ids):
-        """
-        The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
+        """The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
         The main difference is that it takes in an additional argument, freq_cis, which are used to calculate
         the rotary attention weights. The other differences are minor and mostly related to reshaping tensors.
 
-        :param self: Access variables that belong to the class
-        :param batch_size: Reshape the query, key and value tensors
-        :param sequence_length: Reshape the query, key and value tensors
-        :param query: Calculate the attention weights
-        :param key: Calculate the attention
-        :param value: Compute the attention weights
-        :param freq_cis: Calculate the frequency of each word in the vocabulary
-        :param position_ids: Identify the position of each token in the sequence
-        :return: A tuple of 3 tensors: query, key and value
+        Args:
+            self: Access variables that belong to the class
+            batch_size: Reshape the query, key and value tensors
+            sequence_length: Reshape the query, key and value tensors
+            query: Calculate the attention weights
+            key: Calculate the attention
+            value: Compute the attention weights
+            freq_cis: Calculate the frequency of each word in the
+                vocabulary
+            position_ids: Identify the position of each token in the
+                sequence
 
+        Returns:
+            A tuple of 3 tensors: query, key and value
         """
         query = query.reshape(
             batch_size,
@@ -264,25 +268,32 @@ class FlaxGrok1Attention(BaseJAXAttentionModule):
             output_attentions: bool = False,
             fcm_mask=None,
     ):
-        """
-
-        The __call__ function is the main function of a JAX module. It defines how the module behaves when called
+        """The __call__ function is the main function of a JAX module. It defines how the module behaves when called
         with inputs. The __call__ function can be thought of as a &quot;forward pass&quot; through the model,
         and it should return all outputs that are needed for training or inference.
 
-        :param self: Access variables that belong to the class
-        :param hidden_states: chex.Array: Pass the hidden states of the previous layer
-        :param freq_cis: Tuple[chex.Array, chex.Array],: Pass in the frequency coefficients for each position
-        :param attention_mask: chex.Array: Mask out certain tokens in the input sequence
-        :param position_ids: chex.Array: Determine the position of each token in a sequence
-        :param causal_mask: chex.Array: Mask out the future tokens in the decoder
-        :param deterministic: bool: Determine whether to use dropout or not
-        :param init_cache: bool: Initialize the cache
-        :param output_attentions: bool: Determine whether to return the attention weights or not
-        :param fcm_mask: Mask out the attention weights between the input and output tokens
+        Args:
+            self: Access variables that belong to the class
+            hidden_states: chex.Array: Pass the hidden states of the
+                previous layer
+            freq_cis: Tuple[chex.Array, chex.Array],: Pass in the
+                frequency coefficients for each position
+            attention_mask: chex.Array: Mask out certain tokens in the
+                input sequence
+            position_ids: chex.Array: Determine the position of each
+                token in a sequence
+            causal_mask: chex.Array: Mask out the future tokens in the
+                decoder
+            deterministic: bool: Determine whether to use dropout or not
+            init_cache: bool: Initialize the cache
+            output_attentions: bool: Determine whether to return the
+                attention weights or not
+            fcm_mask: Mask out the attention weights between the input
+                and output tokens
         :param : Determine if the attention is causal or not
-        :return: A tuple of two arrays
 
+        Returns:
+            A tuple of two arrays
         """
         batch_size, sequence_length = hidden_states.shape[:2]
         query_states, key_states, value_states = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(
@@ -443,16 +454,19 @@ class FlaxGrok1BLockSparseMLP(nn.Module):
         )
 
     def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
-        """
-        The __call__ function is the main function of a class.
+        """The __call__ function is the main function of a class.
         It is called when an instance of the class (an object) is invoked as a function, i.e., obj(arguments).
         The __call__ method enables instances of a class to be called like standard Python functions.
 
-        :param self: Represent the instance of the class
-        :param x: jnp.ndarray: Pass in the input to the layer
-        :param deterministic: bool: Determine whether to use dropout # IGNORED
-        :return: A tensor that is the result of applying a dropout function to x
+        Args:
+            self: Represent the instance of the class
+            x: jnp.ndarray: Pass in the input to the layer
+            deterministic: bool: Determine whether to use dropout #
+                IGNORED
 
+        Returns:
+            A tensor that is the result of applying a dropout function
+            to x
         """
         return self.linear_1(nn.gelu(self.linear(x)) * self.linear_v(x))
 
@@ -503,8 +517,7 @@ class FlaxGrok1BlocKSparesTop2MLPCollection(nn.Module):
 
 
 class FlaxGrok1SparseMoeBlock(nn.Module):
-    """
-    This implementation is
+    """This implementation is
     strictly equivalent to standard MoE with full capacity (no
     dropped tokens). It's faster since it formulates MoE operations
     in terms of block-sparse operations to accomodate imbalanced
@@ -652,23 +665,30 @@ class FlaxGrok1DecoderLayer(nn.Module):
             output_attentions: bool = True,
             output_router_logits: Optional[bool] = False,
     ):
-        """
-        The __call__ function is the main function of a TransformerEncoderLayer.
+        """The __call__ function is the main function of a TransformerEncoderLayer.
         It takes in the following arguments:
             hidden_states (chex.Array): The input to the encoder layer, which is also its output after being processed by all sublayers.
             freq_cis (chex.Array): A tensor containing frequency-domain representations of each token's context vector, used for computing self-attention weights and biases in a more efficient manner than using position embeddings or sinusoidal positional encoding vectors would allow for [2]. This tensor has shape `(batch_size, num
 
-        :param self: Represent the instance of the class
-        :param hidden_states: chex.Array: Represent the input to the encoder layer
-        :param freq_cis: Tuple[chex.Array, chex.Array],: Pass the frequency information to the attention layer
-        :param attention_mask: chex.Array: Mask out the attention weights for certain positions
-        :param causal_mask: chex.Array: Mask the future tokens
-        :param position_ids: chex.Array: Indicate the position of each token in the sequence
-        :param deterministic: bool: Determine whether to use dropout or not
-        :param init_cache: bool: Initialize the cache for the self-attention layer
-        :param output_attentions: bool: Determine whether to return the attention weights or not
-        :return: A tuple of hidden_states and attention_output
+        Args:
+            self: Represent the instance of the class
+            hidden_states: chex.Array: Represent the input to the
+                encoder layer
+            freq_cis: Tuple[chex.Array, chex.Array],: Pass the frequency
+                information to the attention layer
+            attention_mask: chex.Array: Mask out the attention weights
+                for certain positions
+            causal_mask: chex.Array: Mask the future tokens
+            position_ids: chex.Array: Indicate the position of each
+                token in the sequence
+            deterministic: bool: Determine whether to use dropout or not
+            init_cache: bool: Initialize the cache for the self-
+                attention layer
+            output_attentions: bool: Determine whether to return the
+                attention weights or not
 
+        Returns:
+            A tuple of hidden_states and attention_output
         """
         residual = hidden_states
         hidden_states = self.pre_attn_norm(hidden_states)
@@ -734,23 +754,31 @@ class FlaxGrok1DecoderLayerCollection(nn.Module):
             output_attentions: Optional[bool] = False,
             output_router_logits: Optional[bool] = False,
     ):
-        """
-        The __call__ function is the main function of a TransformerEncoderLayer.
+        """The __call__ function is the main function of a TransformerEncoderLayer.
         It takes in the following arguments:
             hidden_states (chex.Array): The input to the encoder layer, which is also its output after being processed by all sublayers.
             freq_cis (chex.Array): A tensor containing frequency-domain representations of each token's context vector, used for computing self-attention weights and biases in a more efficient manner than using position embeddings or sinusoidal positional encoding vectors would allow for [2]. This tensor has shape `(batch_size, num
 
-        :param self: Represent the instance of the class
-        :param hidden_states: chex.Array: Represent the input to the encoder layer
-        :param freq_cis: Tuple[chex.Array, chex.Array],: Pass the frequency information to the attention layer
-        :param attention_mask: chex.Array: Mask out the attention weights for certain positions
-        :param causal_mask: chex.Array: Mask the future tokens
-        :param position_ids: chex.Array: Indicate the position of each token in the sequence
-        :param deterministic: bool: Determine whether to use dropout or not
-        :param init_cache: bool: Initialize the cache for the self-attention layer
-        :param output_attentions: bool: Determine whether to return the attention weights or not
-        :return: A tuple of hidden_states, attention_output, all_hidden_states and all_router_logits
+        Args:
+            self: Represent the instance of the class
+            hidden_states: chex.Array: Represent the input to the
+                encoder layer
+            freq_cis: Tuple[chex.Array, chex.Array],: Pass the frequency
+                information to the attention layer
+            attention_mask: chex.Array: Mask out the attention weights
+                for certain positions
+            causal_mask: chex.Array: Mask the future tokens
+            position_ids: chex.Array: Indicate the position of each
+                token in the sequence
+            deterministic: bool: Determine whether to use dropout or not
+            init_cache: bool: Initialize the cache for the self-
+                attention layer
+            output_attentions: bool: Determine whether to return the
+                attention weights or not
 
+        Returns:
+            A tuple of hidden_states, attention_output,
+            all_hidden_states and all_router_logits
         """
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
@@ -824,17 +852,21 @@ class Grok1PreTrainedModel(EasyDeLFlaxPretrainedModel):
 
     def init_weights(self, rng: jax.random.PRNGKey, input_shape: Tuple,
                      params: Optional[FrozenDict] = None) -> FrozenDict:
-        """
-        The init_weights function is used to initialize the weights of a model.
+        """The init_weights function is used to initialize the weights of a model.
         It takes in a rng, which is a random number generator key that can be used to generate random numbers.
         The input_shape parameter specifies the shape of the inputs that will be fed into this model.
         The params parameter allows you to pass in pre-trained weights for your model, if you have them available.
 
-        :param self: Access variables that belong to the class
-        :param rng: jax.random.PRNGKey: Initialize the weights of the model
-        :param input_shape: Tuple: Initialize the input_ids, attention_mask and position_ids
-        :param params: flax.core.FrozenDict: Pass in the parameters of a pre-trained model
-        :return: A frozendict of parameters
+        Args:
+            self: Access variables that belong to the class
+            rng: jax.random.PRNGKey: Initialize the weights of the model
+            input_shape: Tuple: Initialize the input_ids, attention_mask
+                and position_ids
+            params: flax.core.FrozenDict: Pass in the parameters of a
+                pre-trained model
+
+        Returns:
+            A frozendict of parameters
         """
 
         self.config.initialization_of_moe = True
@@ -908,28 +940,35 @@ class Grok1PreTrainedModel(EasyDeLFlaxPretrainedModel):
             add_params_field: bool = False,
             **kwargs
     ):
-        """
-        The __call__ function is the main function of a JAX module.
+        """The __call__ function is the main function of a JAX module.
         It takes as input:
         - The parameters of the model (self.params)
         - The inputs to the model (input_ids, attention_mask, position_ids)
         - Whether we are training (train=True/False) and whether we want to return all hidden states and
         attentions weights at each layer in addition to just the last layer output (output_hidden_states=True/False).
 
-        :param self: Represent the instance of the class
-        :param input_ids: Pass the input sequence to the model
-        :param attention_mask: Mask out the padding tokens
-        :param position_ids: Specify the position of each token in the sequence
-        :param params: dict: Pass in the parameters of the model
-        :param past_key_values: dict: Pass the past key values to the model
-        :param dropout_rng: jax.random.PRNGKey: Pass in a random number generator key to the model
-        :param train: bool: Determine whether to use dropout or not
-        :param output_attentions: Optional[bool]: Determine whether to return the attention weights
-        :param output_hidden_states: Optional[bool]: Determine whether to return the hidden states of all layers
-        :param return_dict: Optional[bool]: Return a dictionary of the outputs
-        :param add_params_field: bool: Add a params field to the inputs dictionary
-        :return: A tuple of (last_hidden_state, past_key_values)
+        Args:
+            self: Represent the instance of the class
+            input_ids: Pass the input sequence to the model
+            attention_mask: Mask out the padding tokens
+            position_ids: Specify the position of each token in the
+                sequence
+            params: dict: Pass in the parameters of the model
+            past_key_values: dict: Pass the past key values to the model
+            dropout_rng: jax.random.PRNGKey: Pass in a random number
+                generator key to the model
+            train: bool: Determine whether to use dropout or not
+            output_attentions: Optional[bool]: Determine whether to
+                return the attention weights
+            output_hidden_states: Optional[bool]: Determine whether to
+                return the hidden states of all layers
+            return_dict: Optional[bool]: Return a dictionary of the
+                outputs
+            add_params_field: bool: Add a params field to the inputs
+                dictionary
 
+        Returns:
+            A tuple of (last_hidden_state, past_key_values)
         """
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions

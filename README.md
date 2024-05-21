@@ -192,7 +192,7 @@ print(f"Hey ! , here's where your model saved {output.checkpoint_path}")
 ```
 
 > [!NOTE]
-> You Can use Lora too, both for DPO and SFT Trainers.
+> You Can use Lora too, for DPO, ORPO and SFT Trainers.
 
 ## FineTuning
 

@@ -39,12 +39,13 @@ class ValueHead(nn.Module):
     kernel_init: Callable = nn.initializers.orthogonal()
 
     def setup(self):
-        """
-        The setup function is called by the model's constructor.
+        """The setup function is called by the model's constructor.
         It initializes all the layers in your model, and assigns them to member variables.
         The setup function should be used for any initialization that needs to happen before running forward().
         This includes things like loading weights from a file, or setting up an optimizer.
-        :param self: Represent the instance of the class
+
+        Args:
+            self: Represent the instance of the class
         """
         self.dropout = flax.linen.Dropout(self.summary_dropout_prob)
 
@@ -58,16 +59,18 @@ class ValueHead(nn.Module):
         )
 
     def __call__(self, hidden_states: chex.Array, deterministic: bool = True):
-        """
-        The __call__ function is the main function of a class.
+        """The __call__ function is the main function of a class.
         It is called when an instance of the class (an object) is invoked as a function, e.g., x(arg).
         The __call__ method enables instances of a class to be called like standard Python functions.
 
-        :param self: Represent the instance of the class
-        :param hidden_states: chex.Array: Pass the hidden states of the previous layer
-        :param deterministic: bool: Determine whether to use dropout
-        :return: A tensor of shape (batch_size, num_classes)
+        Args:
+            self: Represent the instance of the class
+            hidden_states: chex.Array: Pass the hidden states of the
+                previous layer
+            deterministic: bool: Determine whether to use dropout
 
+        Returns:
+            A tensor of shape (batch_size, num_classes)
         """
         return self.summary(self.dropout(hidden_states, deterministic=deterministic))
 

@@ -26,16 +26,20 @@ from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 
 
 def built_bloom_alibi(attention_mask, num_attention_heads):
-    """
-    The built_bloom_alibi function is used to create a bloom alibi for the attention mask.
+    """The built_bloom_alibi function is used to create a bloom alibi for the attention mask.
     The bloom alibi is used in the Bloom Attention layer to ensure that each token has a unique
     attention vector, even if it's masked out. This ensures that all tokens have an equal chance of being selected as
     the most important token in the sequence, which helps with training stability and performance.
 
-    :param attention_mask: Mask out the padding tokens in the input sequence
-    :param num_attention_heads: Determine the number of attention heads in the model
-    :return: A tensor of shape (batch_size, num_attention_heads, 1, sequence_length)
-    
+    Args:
+        attention_mask: Mask out the padding tokens in the input
+            sequence
+        num_attention_heads: Determine the number of attention heads in
+            the model
+
+    Returns:
+        A tensor of shape (batch_size, num_attention_heads, 1,
+        sequence_length)
     """
     batch_size, sequence_length = attention_mask.shape
     cp2 = 2 ** math.floor(math.log2(num_attention_heads))
@@ -57,18 +61,20 @@ def built_bloom_alibi(attention_mask, num_attention_heads):
 
 
 def precompute_falcon_freq_cis(max_position_embedding: int, head_dim: int, theta: float = 10000):
-    """
-    The precompute_falcon_freq_cis function is used to precompute the sinusoidal frequencies for the FALCON model.
+    """The precompute_falcon_freq_cis function is used to precompute the sinusoidal frequencies for the FALCON model.
     The function takes in three arguments: max_position_embedding, head_dim, and theta. The first two are self-explanatory;
     the third is a hyperparameter that controls how quickly the frequency increases with position (i.e., how many times
     higher it will be at position i than at position 0). The default value of 10000 was chosen because it worked well on
     the tasks we tested.
 
-    :param max_position_embedding: int: Set the maximum length of the sequence
-    :param head_dim: int: Determine the size of the positional embedding
-    :param theta: float: Adjust the frequency of the sinusoid
-    :return: A tuple of two arrays
-    
+    Args:
+        max_position_embedding: int: Set the maximum length of the
+            sequence
+        head_dim: int: Determine the size of the positional embedding
+        theta: float: Adjust the frequency of the sinusoid
+
+    Returns:
+        A tuple of two arrays
     """
     inv_freq_cis = 1.0 / (theta ** (jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim))
     freq = jnp.einsum("i , j -> i j", jnp.arange(max_position_embedding), inv_freq_cis).astype("float32")
@@ -78,46 +84,53 @@ def precompute_falcon_freq_cis(max_position_embedding: int, head_dim: int, theta
 
 
 def _rotate_half(x):
-    """
-    The _rotate_half function takes a 1D array and rotates it by half its length.
+    """The _rotate_half function takes a 1D array and rotates it by half its length.
     For example, if the input is [0, 1, 2, 3], then the output will be [-2,-3,-0,-4].
     This function is used to rotate the Fourier transform of an image so that its zero-frequency component
     is in the center of the spectrum.
 
-    :param x: Specify the input array
-    :return: The negative of the second half of x concatenated with the first half
-    
+    Args:
+        x: Specify the input array
+
+    Returns:
+        The negative of the second half of x concatenated with the first
+        half
     """
     return jnp.concatenate((-x[..., x.shape[-1] // 2:], x[..., : x.shape[-1] // 2]), axis=-1)
 
 
 def apply_rotary_pos_embedding(tensor, sin_, cos_):
-    """
-    The apply_rotary_pos_embedding function applies a rotary positional embedding to the input tensor.
+    """The apply_rotary_pos_embedding function applies a rotary positional embedding to the input tensor.
 
-    :param tensor: Pass in the tensor that we want to apply the positional embedding to
-    :param sin_: Rotate the tensor by half of its length
-    :param cos_: Multiply the tensor and cosine of the angle
-    :return: A tensor with the same shape as its input,
-    
+    Args:
+        tensor: Pass in the tensor that we want to apply the positional
+            embedding to
+        sin_: Rotate the tensor by half of its length
+        cos_: Multiply the tensor and cosine of the angle
+
+    Returns:
+        A tensor with the same shape as its input,
     """
     return (tensor * cos_) + (_rotate_half(tensor) * sin_)
 
 
 def dropout_add(linen_drop: flax.linen.Dropout, x: chex.Array, residual: chex.Array, deterministic: bool) -> chex.Array:
-    """
-    The dropout_add function is a helper function that adds the residual to the output of
+    """The dropout_add function is a helper function that adds the residual to the output of
     the dropout layer. This is necessary because we want to use deterministic=True when
     we are evaluating our model, but we still need to add in the residual. The reason for this
     is that during training, we have two paths through our network: one with dropout and one without.
     The path without dropout (residual) allows us to backpropagate gradients through both paths at once.
 
-    :param linen_drop: flax.linen.Dropout: Specify the dropout layer
-    :param x: chex.Array: Pass in the input to the dropout layer
-    :param residual: chex.Array: Add the residual to the output of dropout_add
-    :param deterministic: bool: Determine whether the dropout layer is active or not
-    :return: A tensor that is the sum of the residual and a dropout layer
-    
+    Args:
+        linen_drop: flax.linen.Dropout: Specify the dropout layer
+        x: chex.Array: Pass in the input to the dropout layer
+        residual: chex.Array: Add the residual to the output of
+            dropout_add
+        deterministic: bool: Determine whether the dropout layer is
+            active or not
+
+    Returns:
+        A tensor that is the sum of the residual and a dropout layer
     """
     out = linen_drop(inputs=x, deterministic=deterministic)
     out = residual + out
@@ -718,15 +731,17 @@ class FlaxFalconPretrainedModel(EasyDeLFlaxPretrainedModel):
         super().__init__(_do_init=_do_init, module=module, config=config, dtype=dtype, input_shape=input_shape)
 
     def init_weights(self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None) -> FrozenDict:
-        """
-        The init_weights function is used to initialize the weights of a model.
+        """The init_weights function is used to initialize the weights of a model.
 
-        :param self: Access variables that belong to the class
-        :param rng: jax.random.PRNGKey: Initialize the weights of the model
-        :param input_shape: Tuple: Specify the shape of the input tensor
-        :param params: FrozenDict: Pass in the parameters of a pre-trained model
-        :return: A frozendict of parameters
+        Args:
+            self: Access variables that belong to the class
+            rng: jax.random.PRNGKey: Initialize the weights of the model
+            input_shape: Tuple: Specify the shape of the input tensor
+            params: FrozenDict: Pass in the parameters of a pre-trained
+                model
 
+        Returns:
+            A frozendict of parameters
         """
         input_ids = jnp.zeros(input_shape, dtype="i4")
         attention_mask = jnp.ones_like(input_ids)

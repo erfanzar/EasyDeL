@@ -58,22 +58,27 @@ class Seafoam(Base):
                     "monospace",
             ),
     ):
-        """
-        The __init__ function is called when the class is instantiated.
+        """The __init__ function is called when the class is instantiated.
         It sets up the object with all of its instance variables and other things it needs to function properly.
 
+        Args:
+            self: Represent the instance of the object
+            : Unpack the list of parameters into a tuple
+            primary_hue: Union[colors.Color,str]: Set the primary color
+                of the theme
+            secondary_hue: Union[colors.Color,str]: Set the secondary
+                color of the theme
+            neutral_hue: Union[colors.Color,str]: Set the neutral color
+                of the theme
+            spacing_size: Union[sizes.Size,str]: Set the spacing size of
+                the theme
+            radius_size: Union[sizes.Size,str]: Set the radius of the
+                buttons and other elements
+            text_size: Union[sizes.Size,str]: Set the size of the text
+                in the app
 
-        :param self: Represent the instance of the object
-        :param *: Unpack the list of parameters into a tuple
-        :param primary_hue: Union[colors.Color,str]: Set the primary color of the theme
-        :param secondary_hue: Union[colors.Color,str]: Set the secondary color of the theme
-        :param neutral_hue: Union[colors.Color,str]: Set the neutral color of the theme
-        :param spacing_size: Union[sizes.Size,str]: Set the spacing size of the theme
-        :param radius_size: Union[sizes.Size,str]: Set the radius of the buttons and other elements
-        :param text_size: Union[sizes.Size,str]: Set the size of the text in the app
-
-        :return: The class object
-
+        Returns:
+            The class object
         """
 
         super().__init__(
@@ -179,8 +184,9 @@ def create_generate_function(
         :param logits_processor :LogitsProcessor: Processor for model logits. Defaults to None.
         :param return_prediction_only :bool: Whether to return only the generated sequences. Defaults to True.
 
-    :return :Callable[[Any, chex.Array, chex.Array], chex.Array]: Sharded function for text generation.
-
+    Returns:
+        Callable[[Any, chex.Array, chex.Array], chex.Array]: Sharded
+        function for text generation.
     """
 
     def generate_fn(
@@ -190,10 +196,14 @@ def create_generate_function(
     ) -> chex.Array:
         """Generate text sequences using the provided model and parameters.
 
-        :param parameters:Union[dict, jax.tree_util.PyTreeDef]: Model parameters.
-        :param input_ids: chex.Array: Input token IDs.
-        :param attention_mask:chex.Array: Attention mask.
-        :return: Generated array sequences.
+        Args:
+            parameters: Union[dict, jax.tree_util.PyTreeDef]: Model
+                parameters.
+            input_ids: chex.Array: Input token IDs.
+            attention_mask: chex.Array: Attention mask.
+
+        Returns:
+            Generated array sequences.
         """
         input_ids = with_sharding_constraint(
             input_ids,

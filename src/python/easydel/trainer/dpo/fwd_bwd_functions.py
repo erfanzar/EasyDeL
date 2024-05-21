@@ -25,18 +25,24 @@ def create_concatenated_forward(
         truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
         fixed_max_length: int | None = None
 ):
-    """
-    The create_concatenated_forward function is a helper function that creates a forward pass function for the
+    """The create_concatenated_forward function is a helper function that creates a forward pass function for the
     model. The forward pass function takes in an apply_fn, which is the model's apply_fn, and runs it on concatenated
     inputs. It returns chosen log probs, rejected log probs, chosen logits and rejected logits.
 
-    :param is_encoder_decoder: Determine whether the model is an encoder-decoder model or not
-    :param label_pad_token_id: Pad the labels to the same length
-    :param padding_value: Pad the inputs to the same length
-    :param truncation_mode: typing.Literal["keep_end","keep_start"]: where to pad and where to keep.
-    :param fixed_max_length : int|None: by providing fixed_max_length the func will always return a fixed sequence length
+    Args:
+        is_encoder_decoder: Determine whether the model is an encoder-
+            decoder model or not
+        label_pad_token_id: Pad the labels to the same length
+        padding_value: Pad the inputs to the same length
+        truncation_mode: typing.Literal["keep_end","keep_start"]: where
+            to pad and where to keep.
+        fixed_max_length: int|None: by providing fixed_max_length the
+            func will always return a fixed sequence length
     and won't use dynamic methods.
-    :return: A function that takes in a apply_fn, params and a batch of inputs,
+
+    Returns:
+        A function that takes in a apply_fn, params and a batch of
+        inputs,
     """
 
     def concatenated_forward(
@@ -45,13 +51,18 @@ def create_concatenated_forward(
             batch: Dict[str, Union[List, chex.Array]]
 
     ) -> Tuple[chex.Array, chex.Array, chex.Array, chex.Array]:
-        """
-        The concatenated_forward function is used to compute the log-probabilities of both chosen and rejected labels.
+        """The concatenated_forward function is used to compute the log-probabilities of both chosen and rejected labels.
 
-        :param apply_fn: Callable: Pass in the model function
-        :param params: dict | flax.core.FrozenDict: Pass the model parameters to the function
-        :param batch: Dict[str, Union[List, chex.Array]] : Pass the batch of data to the concatenated_forward function
-        :return: The log_probs of the chosen and rejected labels, as well as their corresponding logits
+        Args:
+            apply_fn: Callable: Pass in the model function
+            params: dict | flax.core.FrozenDict: Pass the model
+                parameters to the function
+            batch: Dict[str, Union[List, chex.Array]] : Pass the batch
+                of data to the concatenated_forward function
+
+        Returns:
+            The log_probs of the chosen and rejected labels, as well as
+            their corresponding logits
         """
         assert padding_value is not None, "`padding_value` can not be set as `None` it must be an integer."
         concatenated_batch = concatenated_inputs(
@@ -113,16 +124,21 @@ def get_batch_log_probs(
         label_pad_token_id: int = -100,
         is_encoder_decoder: bool = False,
 ) -> chex.Array:
-    """
-    The get_batch_log_probs function computes the log probability of a batch of sequences.
+    """The get_batch_log_probs function computes the log probability of a batch of sequences.
 
-    :param logits: chex.Array: Compute the log_softmax of the input
-    :param labels: chex.Array: Mask the logits
-    :param average_log_prob: bool: Determine whether to average the log prob over the sequence length
-    :param label_pad_token_id: int: Mask out the padding tokens in the labels
-    :param is_encoder_decoder: bool: Indicate whether the model is an encoder-decoder model
+    Args:
+        logits: chex.Array: Compute the log_softmax of the input
+        labels: chex.Array: Mask the logits
+        average_log_prob: bool: Determine whether to average the log
+            prob over the sequence length
+        label_pad_token_id: int: Mask out the padding tokens in the
+            labels
+        is_encoder_decoder: bool: Indicate whether the model is an
+            encoder-decoder model
     :param : Determine whether to average the log probability over all tokens or not
-    :return: The log probability of the labels given the logits
+
+    Returns:
+        The log probability of the labels given the logits
     """
 
     # sudo code
@@ -169,26 +185,31 @@ def concatenated_inputs(
         truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
         fixed_max_length: int | None = None
 ) -> Dict[str, chex.Array]:
-    """
-    The concatenated_inputs function takes a batch of chosen and rejected examples,
+    """The concatenated_inputs function takes a batch of chosen and rejected examples,
     and concatenates them together. This is useful for training the model to predict whether an example was chosen
     by the human annotator. The function also pads all inputs to
     the same length as the longest input in that batch.
 
-    :param batch: Dict[str,Union[List,chex.Array]]: Pass the batch of data into the function,
+    Args:
+        batch: Dict[str,Union[List,chex.Array]]: Pass the batch of data
+            into the function,
+        is_encoder_decoder: bool: Determine whether the model is an
+            encoder-decoder model
+        label_pad_token_id: int: Pad the labels with a value of -100
+        padding_value: int: Pad the input_ids and attention_mask arrays
+            to the same length
+        truncation_mode: typing.Literal["keep_end", "keep_start"]: is
+            left padded or not should it keep start of the
+        fixed_max_length: int|None: by providing fixed_max_length the
+            func will always return a fixed sequence length and won't
+            use dynamic methods.
     Allow for the batch to be a list of arrays or just an array,
     Specify the type of data that is being passed in
 
-    :param is_encoder_decoder: bool: Determine whether the model is an encoder-decoder model
-    :param label_pad_token_id: int: Pad the labels with a value of -100
-    :param padding_value: int: Pad the input_ids and attention_mask arrays to the same length
-    :param truncation_mode: typing.Literal["keep_end", "keep_start"]: is left padded or not should it keep start of the
     array or the end of the array?.
 
-    :param fixed_max_length : int|None: by providing fixed_max_length the func will always return a fixed sequence
-     length and won't use dynamic methods.
-
-    :return: A dictionary of the concatenated inputs
+    Returns:
+        A dictionary of the concatenated inputs
     """
     concatenated_batch = {}
     if fixed_max_length is None:
@@ -252,16 +273,21 @@ def create_dpo_train_function(
         loss_type: Literal["sigmoid", "hinge", "ipo", "kto"] = "sigmoid",
         reference_free: bool = False,
 ):
-    """
-    The create_dpo_train_function function is a helper function that creates the DPO training step.
+    """The create_dpo_train_function function is a helper function that creates the DPO training step.
 
-    :param concatenated_forward: Callable: Define the forward pass of the model
-    :param ref_state: EasyDeLState: Specify the reference policy
-    :param beta: float: Scale the logits
-    :param label_smoothing: float: Smooth the labels
-    :param loss_type:  Literal["sigmoid", "hinge", "ipo", "kto"]: Determine the loss function
-    :param reference_free: bool: Indicate whether the reference policy is used or not
-    :return: A function that takes in a state and a batch
+    Args:
+        concatenated_forward: Callable: Define the forward pass of the
+            model
+        ref_state: EasyDeLState: Specify the reference policy
+        beta: float: Scale the logits
+        label_smoothing: float: Smooth the labels
+        loss_type: Literal["sigmoid", "hinge", "ipo", "kto"]: Determine
+            the loss function
+        reference_free: bool: Indicate whether the reference policy is
+            used or not
+
+    Returns:
+        A function that takes in a state and a batch
     """
 
     def _sigmoid_dpo_loss(
@@ -272,17 +298,23 @@ def create_dpo_train_function(
             reference_rejected_log_probs: chex.Array = None  # IGNORED
     ):
 
-        """
-        The _sigmoid_dpo_loss function is a helper function for the sigmoid_dpo_loss
+        """The _sigmoid_dpo_loss function is a helper function for the sigmoid_dpo_loss
             function. It computes the loss of each example in a batch, given its logits
             and (optionally) its chosen/rejected log probabilities under both policies.
 
-        :param logits: chex.Array: Compute the loss
-        :param policy_chosen_log_probs: chex.Array: Calculate the policy loss
-        :param reference_chosen_log_probs: chex.Array: Compute the loss for the reference policy # IGNORED
-        :param policy_rejected_log_probs: chex.Array: Calculate the loss for the rejected samples # IGNORED
-        :param reference_rejected_log_probs: chex.Array: Calculate the loss of rejected samples # IGNORED
-        :return: an array represent loss
+        Args:
+            logits: chex.Array: Compute the loss
+            policy_chosen_log_probs: chex.Array: Calculate the policy
+                loss
+            reference_chosen_log_probs: chex.Array: Compute the loss for
+                the reference policy # IGNORED
+            policy_rejected_log_probs: chex.Array: Calculate the loss
+                for the rejected samples # IGNORED
+            reference_rejected_log_probs: chex.Array: Calculate the loss
+                of rejected samples # IGNORED
+
+        Returns:
+            an array represent loss
         """
         losses = (
                 -jax.nn.log_sigmoid(beta * logits) * (1 - label_smoothing)
@@ -298,15 +330,20 @@ def create_dpo_train_function(
             reference_rejected_log_probs: chex.Array  # IGNORED
     ):
 
-        """
-        The _hinge_dpo_loss function is a helper function that computes the loss for DPO.
+        """The _hinge_dpo_loss function is a helper function that computes the loss for DPO.
 
-        :param logits: chex.Array: Calculate the hinge loss
-        :param policy_chosen_log_probs: chex.Array: Compute the policy loss
-        :param reference_chosen_log_probs: chex.Array: Compute the loss for the reference policy # IGNORED
-        :param policy_rejected_log_probs: chex.Array: Calculate the loss for the rejected samples # IGNORED
-        :param reference_rejected_log_probs: chex.Array: Calculate the loss of rejected samples # IGNORED
-        :return: an array represent The hinge loss
+        Args:
+            logits: chex.Array: Calculate the hinge loss
+            policy_chosen_log_probs: chex.Array: Compute the policy loss
+            reference_chosen_log_probs: chex.Array: Compute the loss for
+                the reference policy # IGNORED
+            policy_rejected_log_probs: chex.Array: Calculate the loss
+                for the rejected samples # IGNORED
+            reference_rejected_log_probs: chex.Array: Calculate the loss
+                of rejected samples # IGNORED
+
+        Returns:
+            an array represent The hinge loss
         """
         return jax.relu(1 - beta * logits)
 
@@ -317,20 +354,19 @@ def create_dpo_train_function(
             policy_rejected_log_probs: chex.Array,  # IGNORED
             reference_rejected_log_probs: chex.Array  # IGNORED
     ):
-        """
-         The _ipo_dpo_loss function is a helper function that calculates the loss for
-         the IPO-DPO algorithm. It takes in the logits, policy_chosen_log_probs,
-         reference_chosen_log_probs, policy rejected log probs and reference rejected
-         log probs as inputs. The output of this function is used to calculate the loss
-         for each batch of data.
+        """The _ipo_dpo_loss function is a helper function that calculates the loss for
+        the IPO-DPO algorithm. It takes in the logits, policy_chosen_log_probs,
+        reference_chosen_log_probs, policy rejected log probs and reference rejected
+        log probs as inputs. The output of this function is used to calculate the loss
+        for each batch of data.
 
-        :param logits: chex.Array: Calculate the loss
-        :param policy_chosen_log_probs: chex.Array: Compute the
-        :param reference_chosen_log_probs: chex.Array: Compute the loss for the reference policy # IGNORED
-        :param policy_rejected_log_probs: chex.Array: Calculate the loss for the rejected samples # IGNORED
-        :param reference_rejected_log_probs: chex.Array: Calculate the loss of rejected samples # IGNORED
-        :return: an array represent loss
-         """
+                :param logits: chex.Array: Calculate the loss
+                :param policy_chosen_log_probs: chex.Array: Compute the
+                :param reference_chosen_log_probs: chex.Array: Compute the loss for the reference policy # IGNORED
+                :param policy_rejected_log_probs: chex.Array: Calculate the loss for the rejected samples # IGNORED
+                :param reference_rejected_log_probs: chex.Array: Calculate the loss of rejected samples # IGNORED
+                :return: an array represent loss
+        """
         return (logits - 1 / (2 * beta)) ** 2
 
     def _kto_pair_dpo_loss(
@@ -341,20 +377,26 @@ def create_dpo_train_function(
             reference_rejected_log_probs: chex.Array
     ):
 
-        """
-        The _kto_pair_dpo_loss function is a helper function that computes the loss for
+        """The _kto_pair_dpo_loss function is a helper function that computes the loss for
         a single pair of trajectories. It takes in two sets of log probabilities, one from
         the policy and one from the reference distribution. The first set are the log
         probabilities for actions taken by each agent in a trajectory, while the second set
         are those for actions not taken by each agent (i.e., rejected). The function then
         computes KL divergences between these two sets of distributions and uses them to compute losses.
 
-        :param logits: chex.Array: Calculate the log_probs
-        :param  policy_chosen_log_probs: chex.Array: Calculate the chosen_kl # IGNORED
-        :param reference_chosen_log_probs: chex.Array: Calculate the chosen_kl
-        :param policy_rejected_log_probs: chex.Array: Calculate the rejected_kl variable
-        :param reference_rejected_log_probs: chex.Array: Calculate the rejected_kl variable
-        :return: an array represent loss
+        Args:
+            logits: chex.Array: Calculate the log_probs
+            policy_chosen_log_probs: chex.Array: Calculate the chosen_kl
+                # IGNORED
+            reference_chosen_log_probs: chex.Array: Calculate the
+                chosen_kl
+            policy_rejected_log_probs: chex.Array: Calculate the
+                rejected_kl variable
+            reference_rejected_log_probs: chex.Array: Calculate the
+                rejected_kl variable
+
+        Returns:
+            an array represent loss
         """
         chosen_kl = jax.lax.clamp(
             min=0,
@@ -395,16 +437,19 @@ def create_dpo_train_function(
             batch: dict
     ) -> tuple[EasyDeLState, DPOStepOut]:
 
-        """
-        The dpo_step function is the core of DPO. It takes a state and a batch,
+        """The dpo_step function is the core of DPO. It takes a state and a batch,
         and returns an updated state. The update is done by calculating the loss
         for each example in the batch, then taking its gradient with respect to
         the parameters of the policy network (which are stored in `state`). This
         gradient is then used to update `state`.
 
-        :param state: EasyDeLState: Store the parameters of the model
-        :param batch: dict: Pass the data to the model
-        :return: A new state, which is a collection of the parameters and apply_fn
+        Args:
+            state: EasyDeLState: Store the parameters of the model
+            batch: dict: Pass the data to the model
+
+        Returns:
+            A new state, which is a collection of the parameters and
+            apply_fn
         """
 
         def calculate_loss(params: dict | flax.core.FrozenDict):
@@ -496,16 +541,21 @@ def create_dpo_eval_function(
         loss_type: Literal["sigmoid", "hinge", "ipo", "kto"] = "sigmoid",
         reference_free: bool = False,
 ):
-    """
-    The create_dpo_eval_function function is a helper function that creates the DPO evaluating step.
+    """The create_dpo_eval_function function is a helper function that creates the DPO evaluating step.
 
-    :param concatenated_forward: Callable: Define the forward pass of the model
-    :param ref_state: EasyDeLState: Specify the reference policy
-    :param beta: float: Scale the logits
-    :param label_smoothing: float: Smooth the labels
-    :param loss_type:  Literal["sigmoid", "hinge", "ipo", "kto"]: Determine the loss function
-    :param reference_free: bool: Indicate whether the reference policy is used or not
-    :return: A function that takes in a state and a batch
+    Args:
+        concatenated_forward: Callable: Define the forward pass of the
+            model
+        ref_state: EasyDeLState: Specify the reference policy
+        beta: float: Scale the logits
+        label_smoothing: float: Smooth the labels
+        loss_type: Literal["sigmoid", "hinge", "ipo", "kto"]: Determine
+            the loss function
+        reference_free: bool: Indicate whether the reference policy is
+            used or not
+
+    Returns:
+        A function that takes in a state and a batch
     """
 
     def _sigmoid_dpo_loss(
@@ -516,17 +566,23 @@ def create_dpo_eval_function(
             reference_rejected_log_probs: chex.Array = None  # IGNORED
     ):
 
-        """
-        The _sigmoid_dpo_loss function is a helper function for the sigmoid_dpo_loss
+        """The _sigmoid_dpo_loss function is a helper function for the sigmoid_dpo_loss
             function. It computes the loss of each example in a batch, given its logits
             and (optionally) its chosen/rejected log probabilities under both policies.
 
-        :param logits: chex.Array: Compute the loss
-        :param policy_chosen_log_probs: chex.Array: Calculate the policy loss
-        :param reference_chosen_log_probs: chex.Array: Compute the loss for the reference policy # IGNORED
-        :param policy_rejected_log_probs: chex.Array: Calculate the loss for the rejected samples # IGNORED
-        :param reference_rejected_log_probs: chex.Array: Calculate the loss of rejected samples # IGNORED
-        :return: an array represent loss
+        Args:
+            logits: chex.Array: Compute the loss
+            policy_chosen_log_probs: chex.Array: Calculate the policy
+                loss
+            reference_chosen_log_probs: chex.Array: Compute the loss for
+                the reference policy # IGNORED
+            policy_rejected_log_probs: chex.Array: Calculate the loss
+                for the rejected samples # IGNORED
+            reference_rejected_log_probs: chex.Array: Calculate the loss
+                of rejected samples # IGNORED
+
+        Returns:
+            an array represent loss
         """
         losses = (
                 -jax.nn.log_sigmoid(beta * logits) * (1 - label_smoothing)
@@ -542,15 +598,20 @@ def create_dpo_eval_function(
             reference_rejected_log_probs: chex.Array  # IGNORED
     ):
 
-        """
-        The _hinge_dpo_loss function is a helper function that computes the loss for DPO.
+        """The _hinge_dpo_loss function is a helper function that computes the loss for DPO.
 
-        :param logits: chex.Array: Calculate the hinge loss
-        :param policy_chosen_log_probs: chex.Array: Compute the policy loss
-        :param reference_chosen_log_probs: chex.Array: Compute the loss for the reference policy # IGNORED
-        :param policy_rejected_log_probs: chex.Array: Calculate the loss for the rejected samples # IGNORED
-        :param reference_rejected_log_probs: chex.Array: Calculate the loss of rejected samples # IGNORED
-        :return: an array represent The hinge loss
+        Args:
+            logits: chex.Array: Calculate the hinge loss
+            policy_chosen_log_probs: chex.Array: Compute the policy loss
+            reference_chosen_log_probs: chex.Array: Compute the loss for
+                the reference policy # IGNORED
+            policy_rejected_log_probs: chex.Array: Calculate the loss
+                for the rejected samples # IGNORED
+            reference_rejected_log_probs: chex.Array: Calculate the loss
+                of rejected samples # IGNORED
+
+        Returns:
+            an array represent The hinge loss
         """
         return jax.relu(1 - beta * logits)
 
@@ -561,20 +622,19 @@ def create_dpo_eval_function(
             policy_rejected_log_probs: chex.Array,  # IGNORED
             reference_rejected_log_probs: chex.Array  # IGNORED
     ):
-        """
-         The _ipo_dpo_loss function is a helper function that calculates the loss for
-         the IPO-DPO algorithm. It takes in the logits, policy_chosen_log_probs,
-         reference_chosen_log_probs, policy rejected log probs and reference rejected
-         log probs as inputs. The output of this function is used to calculate the loss
-         for each batch of data.
+        """The _ipo_dpo_loss function is a helper function that calculates the loss for
+        the IPO-DPO algorithm. It takes in the logits, policy_chosen_log_probs,
+        reference_chosen_log_probs, policy rejected log probs and reference rejected
+        log probs as inputs. The output of this function is used to calculate the loss
+        for each batch of data.
 
-        :param logits: chex.Array: Calculate the loss
-        :param policy_chosen_log_probs: chex.Array: Compute the
-        :param reference_chosen_log_probs: chex.Array: Compute the loss for the reference policy # IGNORED
-        :param policy_rejected_log_probs: chex.Array: Calculate the loss for the rejected samples # IGNORED
-        :param reference_rejected_log_probs: chex.Array: Calculate the loss of rejected samples # IGNORED
-        :return: an array represent loss
-         """
+                :param logits: chex.Array: Calculate the loss
+                :param policy_chosen_log_probs: chex.Array: Compute the
+                :param reference_chosen_log_probs: chex.Array: Compute the loss for the reference policy # IGNORED
+                :param policy_rejected_log_probs: chex.Array: Calculate the loss for the rejected samples # IGNORED
+                :param reference_rejected_log_probs: chex.Array: Calculate the loss of rejected samples # IGNORED
+                :return: an array represent loss
+        """
         return (logits - 1 / (2 * beta)) ** 2
 
     def _kto_pair_dpo_loss(
@@ -585,20 +645,26 @@ def create_dpo_eval_function(
             reference_rejected_log_probs: chex.Array
     ):
 
-        """
-        The _kto_pair_dpo_loss function is a helper function that computes the loss for
+        """The _kto_pair_dpo_loss function is a helper function that computes the loss for
         a single pair of trajectories. It takes in two sets of log probabilities, one from
         the policy and one from the reference distribution. The first set are the log
         probabilities for actions taken by each agent in a trajectory, while the second set
         are those for actions not taken by each agent (i.e., rejected). The function then
         computes KL divergences between these two sets of distributions and uses them to compute losses.
 
-        :param logits: chex.Array: Calculate the log_probs
-        :param  policy_chosen_log_probs: chex.Array: Calculate the chosen_kl # IGNORED
-        :param reference_chosen_log_probs: chex.Array: Calculate the chosen_kl
-        :param policy_rejected_log_probs: chex.Array: Calculate the rejected_kl variable
-        :param reference_rejected_log_probs: chex.Array: Calculate the rejected_kl variable
-        :return: an array represent loss
+        Args:
+            logits: chex.Array: Calculate the log_probs
+            policy_chosen_log_probs: chex.Array: Calculate the chosen_kl
+                # IGNORED
+            reference_chosen_log_probs: chex.Array: Calculate the
+                chosen_kl
+            policy_rejected_log_probs: chex.Array: Calculate the
+                rejected_kl variable
+            reference_rejected_log_probs: chex.Array: Calculate the
+                rejected_kl variable
+
+        Returns:
+            an array represent loss
         """
         chosen_kl = jax.lax.clamp(
             min=0,
@@ -639,16 +705,18 @@ def create_dpo_eval_function(
             batch: dict
     ) -> DPOStepOut:
 
-        """
-        The dpo_step function is the core of DPO. It takes a state and a batch,
+        """The dpo_step function is the core of DPO. It takes a state and a batch,
         and returns an updated state. The update is done by calculating the loss
         for each example in the batch, then taking its gradient with respect to
         the parameters of the policy network (which are stored in `state`). This
         gradient is then used to update `state`.
 
-        :param state: EasyDeLState: Store the parameters of the model
-        :param batch: dict: Pass the data to the model
-        :return: A `DPOStepOut` class
+        Args:
+            state: EasyDeLState: Store the parameters of the model
+            batch: dict: Pass the data to the model
+
+        Returns:
+            A `DPOStepOut` class
         """
 
         def calculate_loss(params: dict | flax.core.FrozenDict):

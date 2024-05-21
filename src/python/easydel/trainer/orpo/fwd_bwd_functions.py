@@ -44,18 +44,24 @@ def create_concatenated_forward(
         truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
         fixed_max_length: int | None = None
 ):
-    """
-    The create_concatenated_forward function is a helper function that creates a forward pass function for the
+    """The create_concatenated_forward function is a helper function that creates a forward pass function for the
     model. The forward pass function takes in an apply_fn, which is the model's apply_fn, and runs it on concatenated
     inputs. It returns chosen log probs, rejected log probs, chosen logits and rejected logits.
 
-    :param is_encoder_decoder: Determine whether the model is an encoder-decoder model or not
-    :param label_pad_token_id: Pad the labels to the same length
-    :param padding_value: Pad the inputs to the same length
-    :param truncation_mode: typing.Literal["keep_end","keep_start"]: where to pad and where to keep.
-    :param fixed_max_length : int|None: by providing fixed_max_length the func will always return a fixed sequence length
+    Args:
+        is_encoder_decoder: Determine whether the model is an encoder-
+            decoder model or not
+        label_pad_token_id: Pad the labels to the same length
+        padding_value: Pad the inputs to the same length
+        truncation_mode: typing.Literal["keep_end","keep_start"]: where
+            to pad and where to keep.
+        fixed_max_length: int|None: by providing fixed_max_length the
+            func will always return a fixed sequence length
     and won't use dynamic methods.
-    :return: A function that takes in a apply_fn, params and a batch of inputs,
+
+    Returns:
+        A function that takes in a apply_fn, params and a batch of
+        inputs,
     """
 
     def concatenated_forward(
@@ -64,13 +70,18 @@ def create_concatenated_forward(
             batch: Dict[str, Union[List, chex.Array]]
 
     ) -> Tuple[chex.Array, chex.Array, chex.Array, chex.Array, chex.Array]:
-        """
-        The concatenated_forward function is used to compute the log-probabilities of both chosen and rejected labels.
+        """The concatenated_forward function is used to compute the log-probabilities of both chosen and rejected labels.
 
-        :param apply_fn: Callable: Pass in the model function
-        :param params: dict | flax.core.FrozenDict: Pass the model parameters to the function
-        :param batch: Dict[str, Union[List, chex.Array]] : Pass the batch of data to the concatenated_forward function
-        :return: The log_probs of the chosen and rejected labels, as well as their corresponding logits
+        Args:
+            apply_fn: Callable: Pass in the model function
+            params: dict | flax.core.FrozenDict: Pass the model
+                parameters to the function
+            batch: Dict[str, Union[List, chex.Array]] : Pass the batch
+                of data to the concatenated_forward function
+
+        Returns:
+            The log_probs of the chosen and rejected labels, as well as
+            their corresponding logits
         """
         assert padding_value is not None, "`padding_value` can not be set as `None` it must be an integer."
         concatenated_batch = concatenated_inputs(
@@ -149,16 +160,21 @@ def get_batch_log_probs(
         label_pad_token_id: int = -100,
         is_encoder_decoder: bool = False,
 ) -> chex.Array:
-    """
-    The get_batch_log_probs function computes the log probability of a batch of sequences.
+    """The get_batch_log_probs function computes the log probability of a batch of sequences.
 
-    :param logits: chex.Array: Compute the log_softmax of the input
-    :param labels: chex.Array: Mask the logits
-    :param average_log_prob: bool: Determine whether to average the log prob over the sequence length
-    :param label_pad_token_id: int: Mask out the padding tokens in the labels
-    :param is_encoder_decoder: bool: Indicate whether the model is an encoder-decoder model
+    Args:
+        logits: chex.Array: Compute the log_softmax of the input
+        labels: chex.Array: Mask the logits
+        average_log_prob: bool: Determine whether to average the log
+            prob over the sequence length
+        label_pad_token_id: int: Mask out the padding tokens in the
+            labels
+        is_encoder_decoder: bool: Indicate whether the model is an
+            encoder-decoder model
     :param : Determine whether to average the log probability over all tokens or not
-    :return: The log probability of the labels given the logits
+
+    Returns:
+        The log probability of the labels given the logits
     """
 
     # sudo code
@@ -196,26 +212,31 @@ def concatenated_inputs(
         truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
         fixed_max_length: int | None = None
 ) -> Dict[str, chex.Array]:
-    """
-    The concatenated_inputs function takes a batch of chosen and rejected examples,
+    """The concatenated_inputs function takes a batch of chosen and rejected examples,
     and concatenates them together. This is useful for training the model to predict whether an example was chosen
     by the human annotator. The function also pads all inputs to
     the same length as the longest input in that batch.
 
-    :param batch: Dict[str,Union[List,chex.Array]]: Pass the batch of data into the function,
+    Args:
+        batch: Dict[str,Union[List,chex.Array]]: Pass the batch of data
+            into the function,
+        is_encoder_decoder: bool: Determine whether the model is an
+            encoder-decoder model
+        label_pad_token_id: int: Pad the labels with a value of -100
+        padding_value: int: Pad the input_ids and attention_mask arrays
+            to the same length
+        truncation_mode: typing.Literal["keep_end", "keep_start"]: is
+            left padded or not should it keep start of the
+        fixed_max_length: int|None: by providing fixed_max_length the
+            func will always return a fixed sequence length and won't
+            use dynamic methods.
     Allow for the batch to be a list of arrays or just an array,
     Specify the type of data that is being passed in
 
-    :param is_encoder_decoder: bool: Determine whether the model is an encoder-decoder model
-    :param label_pad_token_id: int: Pad the labels with a value of -100
-    :param padding_value: int: Pad the input_ids and attention_mask arrays to the same length
-    :param truncation_mode: typing.Literal["keep_end", "keep_start"]: is left padded or not should it keep start of the
     array or the end of the array?.
 
-    :param fixed_max_length : int|None: by providing fixed_max_length the func will always return a fixed sequence
-     length and won't use dynamic methods.
-
-    :return: A dictionary of the concatenated inputs
+    Returns:
+        A dictionary of the concatenated inputs
     """
     concatenated_batch = {}
     if fixed_max_length is None:
@@ -308,30 +329,36 @@ def create_orpo_step_function(
         mode: Literal["train", "eval"] = "train",
         batch_partition_spec: PartitionSpec = PartitionSpec(("fsdp", "dp"), "sp")
 ):
-    """
-    The create_orpo_step_function function is a helper function that creates the ORPO training step.
+    """The create_orpo_step_function function is a helper function that creates the ORPO training step.
 
-    :param concatenated_forward: Callable: Define the forward pass of the model
-    :param beta: float: Scale the logits
-    :param mode: Literal["train", "eval"] : "train", "eval" function modes
-    :param batch_partition_spec: PartitionSpec: Batch PartitionSpec
-    :return: A function that takes in a state and a batch
+    Args:
+        concatenated_forward: Callable: Define the forward pass of the
+            model
+        beta: float: Scale the logits
+        mode: Literal["train", "eval"] : "train", "eval" function modes
+        batch_partition_spec: PartitionSpec: Batch PartitionSpec
+
+    Returns:
+        A function that takes in a state and a batch
     """
 
     def orpo_step(
             state: EasyDeLState,
             batch: dict
     ) -> tuple[EasyDeLState, ORPOStepOut]:
-        """
-        The orpo_step function is the core of ORPO. It takes a state and a batch,
+        """The orpo_step function is the core of ORPO. It takes a state and a batch,
         and returns an updated state. The update is done by calculating the loss
         for each example in the batch, then taking its gradient with respect to
         the parameters of the policy network (which are stored in `state`). This
         gradient is then used to update `state`.
 
-        :param state: EasyDeLState: Store the parameters of the model
-        :param batch: dict: Pass the data to the model
-        :return: A new state, which is a collection of the parameters and apply_fn
+        Args:
+            state: EasyDeLState: Store the parameters of the model
+            batch: dict: Pass the data to the model
+
+        Returns:
+            A new state, which is a collection of the parameters and
+            apply_fn
         """
         batch = fjformer.with_sharding_constraint(batch, partition_specs=batch_partition_spec)
 

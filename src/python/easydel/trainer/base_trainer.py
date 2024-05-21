@@ -67,8 +67,7 @@ class BaseTrainer:
             checkpoint_path: Union[str, os.PathLike] = None,
             _do_init_fns: bool = True
     ):
-        """
-        The __init__ function is called when the class is instantiated.
+        """The __init__ function is called when the class is instantiated.
         It sets up all the variables that are needed for training, including:
         - The timer to keep track of how long each epoch takes.
         - The dataloaders for both training and evaluation (if provided).
@@ -78,15 +77,19 @@ class BaseTrainer:
          or loaded from a checkpoint file (see below).
           This means that you can pass in either
 
-        :param self: Represent the instance of the class
-        :param arguments: TrainArguments: Pass the arguments to the trainer
-        :param dataset_train: Dataset: Pass the training dataset to the trainer
-        :param dataset_eval: Dataset: Pass the validation dataset
-        :param finetune: bool: Load the model from a checkpoint
-        :param checkpoint_path: Union[str,os.PathLike] : Load the checkpoint path
-        :param _do_init_fns: bool: Initialize the functions
-        :return: Nothing, it just initializes the class
+        Args:
+            self: Represent the instance of the class
+            arguments: TrainArguments: Pass the arguments to the trainer
+            dataset_train: Dataset: Pass the training dataset to the
+                trainer
+            dataset_eval: Dataset: Pass the validation dataset
+            finetune: bool: Load the model from a checkpoint
+            checkpoint_path: Union[str,os.PathLike] : Load the
+                checkpoint path
+            _do_init_fns: bool: Initialize the functions
 
+        Returns:
+            Nothing, it just initializes the class
         """
         # Loggers
         self.timer = getattr(self, "timer", None)
@@ -177,12 +180,11 @@ class BaseTrainer:
 
     @staticmethod
     def finish():
-        """
-        The finish function is called when the experiment ends.
+        """The finish function is called when the experiment ends.
         It can be used to save data, upload files, or do any other cleanup tasks.
 
-        :return: A dictionary of the run's metadata
-
+        Returns:
+            A dictionary of the run's metadata
         """
         wandb.finish()
 
@@ -203,16 +205,17 @@ class BaseTrainer:
         return threading.Thread(target=_start)
 
     def initialize_trainer_utils(self):
-        """
-        The initialize_trainer_utils function is responsible for initializing the following:
+        """The initialize_trainer_utils function is responsible for initializing the following:
             - wandb_runtime (if you use_wandb is True)
             - timer object (for logging time taken by various functions)
             - dataloader objects for training and evaluation data, along with max steps per epoch.
               The configure_dataloader function accomplishes this task.
 
-        :param self: Represent the instance of the class
-        :return: A tuple of functions
+        Args:
+            self: Represent the instance of the class
 
+        Returns:
+            A tuple of functions
         """
         self.wandb_runtime = None
         if self.arguments.use_wandb:
@@ -279,24 +282,27 @@ class BaseTrainer:
 
     @abc.abstractmethod
     def configure_functions(self) -> TrainerConfigureFunctionFuncOutput:
-        """
-        The configure_functions function is responsible for configuring the functions that will be used in training.
+        """The configure_functions function is responsible for configuring the functions that will be used in training.
         It does this by first defining a function called function_configurations, which initializes the model parameters and returns
         them as a EasyDeLState object. The EasyDeLState object contains all the information needed to train or evaluate
         on a batch of data, including:
-        :param self: Access the class attributes
-        :return: A TrainerConfigureFunctionFuncOutput object
 
+        Args:
+            self: Access the class attributes
+
+        Returns:
+            A TrainerConfigureFunctionFuncOutput object
         """
         raise NotImplementedError
 
     def configure_dataloader(self) -> TrainerConfigureDataloaderFuncOutput:
-        """
-        The configure_dataloader function is used to configure the dataloader for training and evaluation.
+        """The configure_dataloader function is used to configure the dataloader for training and evaluation.
 
-        :param self: Refer to the class instance itself
-        :return: A TrainerConfigureDataloaderFuncOutput object
+        Args:
+            self: Refer to the class instance itself
 
+        Returns:
+            A TrainerConfigureDataloaderFuncOutput object
         """
 
         def create_tf_dataset(dataset: Dataset, is_train: bool) -> Iterator[ndarray[Any, Any]]:
@@ -332,9 +338,7 @@ class BaseTrainer:
             )
 
         def calculate_steps(dataset: Union[Dataset, IterableDataset], is_train: bool):
-            """
-            Return total number of steps to train or evaluate on.
-            """
+            """Return total number of steps to train or evaluate on."""
             if hasattr(dataset, "__len__"):
                 num_steps = len(dataset) * (self.arguments.num_train_epochs if is_train else 1)
                 max_steps = self.arguments.max_training_steps if is_train else self.arguments.max_evaluation_steps
@@ -369,12 +373,14 @@ class BaseTrainer:
         )
 
     def configure_model(self) -> TrainerConfigureModelFuncOutput:
-        """
-        The configure_model function is responsible for creating the model, optimizer and scheduler.
+        """The configure_model function is responsible for creating the model, optimizer and scheduler.
 
-        :param self: Represent the instance of the class
-        :return: A model, optimizer, scheduler and config  in TrainerConfigureModelFuncOutput Object
+        Args:
+            self: Represent the instance of the class
 
+        Returns:
+            A model, optimizer, scheduler and config  in
+            TrainerConfigureModelFuncOutput Object
         """
         extra_configs = {} if self.arguments.extra_configs is None else self.arguments.extra_configs
         if self.arguments.model_class is not None:
@@ -452,12 +458,8 @@ class BaseTrainer:
 
     @abc.abstractmethod
     def train(self):
-        """
-        abstract of Train Function to train model
-        """
+        """abstract of Train Function to train model"""
 
     @abc.abstractmethod
     def eval(self, state):
-        """
-        abstract of Eval Function to evaluate model
-        """
+        """abstract of Eval Function to evaluate model"""
