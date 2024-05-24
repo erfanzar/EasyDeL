@@ -419,7 +419,7 @@ class FlaxFalconMlp(nn.Module):
         )
 
     def __call__(self, x: chex.Array, deterministic: bool = True):
-        return self.dense_4h_to_h(nn.gelu(self.dense_h_to_4h(x)))
+        return self.dense_4h_to_h(nn.gelu(self.dense_h_to_4h(x), approximate=False))
 
 
 class FlaxFalconBlock(nn.Module):
@@ -430,25 +430,13 @@ class FlaxFalconBlock(nn.Module):
 
     def setup(self) -> None:
         config = self.config
-        self.input_layernorm = nn.LayerNorm(epsilon=config.layer_norm_epsilon,
-                                            dtype=self.dtype)
-        if not config.parallel_attn:
-            self.post_attention_layernorm = nn.LayerNorm(epsilon=config.layer_norm_epsilon,
-                                                         dtype=self.dtype)
+        if config.new_decoder_architecture and config.num_ln_in_parallel_attn == 2:
+            self.ln_attn = nn.LayerNorm(epsilon=config.layer_norm_epsilon, dtype=self.dtype)
+            self.ln_mlp = nn.LayerNorm(epsilon=config.layer_norm_epsilon, dtype=self.dtype)
         if config.new_decoder_architecture:
-            self.ln_attn = nn.LayerNorm(epsilon=config.layer_norm_epsilon,
-                                        dtype=self.dtype)
-            self.ln_mlp = nn.LayerNorm(epsilon=config.layer_norm_epsilon,
-                                       dtype=self.dtype)
-
-        # hidden_states: chex.Array
-        # attention_mask: chex.Array
-        # position_ids: chex.Array
-        # causal_mask: chex.Array = None
-        # alibi: chex.Array = None
-        # freq_cis: Tuple[chex.Array, chex.Array] = None
-        # init_cache: bool = False
-        # output_attentions: bool = False
+            self.input_layernorm = nn.LayerNorm(epsilon=config.layer_norm_epsilon, dtype=self.dtype)
+            if not config.parallel_attn:
+                self.post_attention_layernorm = nn.LayerNorm(epsilon=config.layer_norm_epsilon, dtype=self.dtype)
 
         attn_block = FlaxFalconAttention
         mlp_block = FlaxFalconMlp
@@ -494,23 +482,12 @@ class FlaxFalconBlock(nn.Module):
             deterministic: bool = True
     ):
         residual = hidden_states
-        mlp_layernorm_out = None
-        if self.config.new_decoder_architecture:
+
+        if self.config.num_ln_in_parallel_attn == 2:
             attention_layernorm_out = self.ln_attn(hidden_states)
             mlp_layernorm_out = self.ln_mlp(hidden_states)
         else:
             attention_layernorm_out = self.input_layernorm(hidden_states)
-
-        # Self attention.
-
-        # hidden_states: chex.Array
-        # attention_mask: chex.Array
-        # position_ids: chex.Array
-        # causal_mask: chex.Array = None
-        # alibi: chex.Array = None
-        # freq_cis: Tuple[chex.Array, chex.Array] = None
-        # init_cache: bool = False
-        # output_attentions: bool = False
 
         attn_outputs = self.self_attention(
             attention_layernorm_out,
@@ -525,15 +502,15 @@ class FlaxFalconBlock(nn.Module):
 
         attention_output = attn_outputs[0]
 
-        if not self.config.new_decoder_architecture:
+        if self.config.num_ln_in_parallel_attn == 1:
             if self.config.parallel_attn:
                 mlp_layernorm_out = attention_layernorm_out
             else:
                 residual = dropout_add(
-                    linen_drop=self.dropout,
-                    x=attention_output,
-                    residual=residual,
-                    deterministic=deterministic
+                    self.dropout,
+                    attention_output,
+                    residual,
+                    deterministic
                 )
                 mlp_layernorm_out = self.post_attention_layernorm(residual)
 
@@ -555,14 +532,13 @@ class FlaxFalconBlock(nn.Module):
             mlp_output += attention_output
 
         output = dropout_add(
-            linen_drop=self.dropout_mlp,
-            x=mlp_output,
-            residual=residual,
-            deterministic=deterministic
-
+            self.dropout_mlp,
+            mlp_output,
+            residual,
+            deterministic
         )
 
-        return output, outputs
+        return (output,) + outputs[1:]
 
 
 class FlaxFalconCollection(nn.Module):
