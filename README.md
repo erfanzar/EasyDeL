@@ -43,21 +43,16 @@ models on TPU/GPU for both serving and training purposes.
 With its comprehensive set of features and tools, EasyDeL aims to streamline and accelerate the training and deployment
 of machine learning models, particularly in the domain of large language models and video-related applications.
 
-> **News**
->
-> Falcon Model is Updated and now Falcon11B is supported wih flash attention support.
->
-> `pallas_flash` is now available for CPU/GPU/TPU with custom pallas kernel.
->
-> DeepseekV2 Model is Added (beta mood).
->
-> OpenELM Model is Added.
->
-> EasyDeL project structure has changed now you have to import EasyDel as `easydel`.
->
-> `ORPOTrainer` is Added
->
-> Phi3 Model bugs are fixed, Arctic Model is added.
+### Latest News 🔥
+
+- Aya Model is Supported.
+- Falcon Model is Updated and now Falcon11B is supported wih flash attention support.
+- `pallas_flash` is now available for CPU/GPU/TPU with custom pallas kernel.
+- DeepseekV2 Model is Added (beta mood).
+- OpenELM Model is Added.
+- EasyDeL project structure has changed now you have to import EasyDel as `easydel`.
+- `ORPOTrainer` is Added
+- Phi3 Model bugs are fixed, Arctic Model is added.
 
 > [!TIP]
 >
