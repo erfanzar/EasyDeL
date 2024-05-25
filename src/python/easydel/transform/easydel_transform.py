@@ -260,7 +260,7 @@ def easystate_to_torch(
         try:
             torch_state_dict[key] = torch.from_numpy(tensor)
         except TypeError:
-            torch_state_dict[key] = torch.from_numpy(numpy.asarray(tensor))
+            torch_state_dict[key] = torch.from_numpy(numpy.array(tensor.tolist()))
     return torch_state_dict
 
 

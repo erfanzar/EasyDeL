@@ -93,13 +93,10 @@ def main(use_iterable_dataset: bool):
         dataset_train=example_train_data,
         dataset_eval=example_eval_data,
     )
-
-    trainer.train(model_parameters=flax.core.FrozenDict({"params": params}))
+    print(trainer._get_information())
+    trainer.save_pretrained(model.to_easydel_state(flax.core.FrozenDict({"params": params})), to_torch=True)
+    # trainer.train(model_parameters=flax.core.FrozenDict({"params": params}))
 
 
 if __name__ == "__main__":
-    print("Running with normal Dataset:")
-    main(use_iterable_dataset=False)
-
-    print("\nRunning with IterableDataset:")
     main(use_iterable_dataset=True)

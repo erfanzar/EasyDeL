@@ -3,7 +3,7 @@ import warnings
 import chex
 import flax
 from jax.experimental.mesh_utils import create_device_mesh
-from transformers import PretrainedConfig, FlaxPreTrainedModel
+from transformers import PretrainedConfig, FlaxPreTrainedModel, AutoModelForCausalLM
 import jax
 from jax import numpy as jnp
 from typing import Sequence, Union, Optional, Literal, Tuple, Any
@@ -688,9 +688,41 @@ class EasyDeLFlaxPretrainedModel(FlaxPreTrainedModel):
             self,
             params: flax.core.FrozenDict,
     ):
+        """
+        Convert the Model to EasyDeLState
+        """
         return EasyDeLState.load(
             apply_fn=self.__call__,
             params=params,
             opt_state=None,
             module_config=self.config,
         )
+
+    def to_pytorch(
+            self,
+            params: flax.core.FrozenDict,
+            base_hf_auto_class=AutoModelForCausalLM,
+            easystate_to_huggingface_model_kwargs: Optional[dict] = None
+    ):
+        """
+        Return the Huggingface / Pytorch implementation of the model with same weights  (if model is available in HF)
+        """
+
+        from ..transform.easydel_transform import easystate_to_huggingface_model
+        state = self.to_easydel_state(params=params)
+        if easystate_to_huggingface_model_kwargs is None:
+            easystate_to_huggingface_model_kwargs = {}
+
+        model_config = state.module_config
+        if model_config is None:
+            model_config = state.module.config_class
+        # model_type = model_config.model_type
+        model_class = base_hf_auto_class._model_mapping[type(model_config)]  # noqa
+        hf_model = easystate_to_huggingface_model(
+            state=state,
+            base_huggingface_module=model_class,
+            config=model_config,
+
+            **easystate_to_huggingface_model_kwargs
+        )
+        return hf_model

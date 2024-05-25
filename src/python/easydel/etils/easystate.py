@@ -29,13 +29,15 @@ def revert_type_back(tp, val):
     elif tp == "float":
         val = float(val)
     elif tp == "dict":
-        val = dict(val)
+        val = dict(eval(val))
     elif tp == "bool":
         val = bool(val)
     elif tp == "list":
-        val = list(val)
+        val = list(eval(val))
     elif tp == "str":
         val = str(val)
+    elif tp == "NoneType":
+        val = None
     return val
 
 
