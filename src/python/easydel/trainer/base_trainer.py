@@ -25,7 +25,7 @@ from ..modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel, EasyDe
 from optax import GradientTransformation, Schedule
 from fjformer import CheckpointManager
 from jax.sharding import Mesh
-
+from transformers import AutoModelForCausalLM, AutoConfig
 from ..etils.etils import get_logger
 
 logger = get_logger(__name__)
@@ -429,9 +429,10 @@ class BaseTrainer:
 
     def _save_state(
             self,
-            state: "EasyDeLState",
+            state: "EasyDeLState",  # type: ignore
             gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
-            milestone: bool = False
+            milestone: bool = False,
+            save_dir: Optional[str] = None,
     ) -> str:
         step = int(
             jax.device_get(
@@ -446,14 +447,18 @@ class BaseTrainer:
         filename = f"{checkpoint_name}_{step}" if milestone else f"{checkpoint_name}"
         filename += ".easy"
         termcolor.cprint(f"Saving Model {filename}.", color="cyan", force_color=True)
+
+        checkpoint_dir = os.path.join(self.arguments.save_dir,
+                                      self.arguments.model_name) if save_dir is None else save_dir
         state.save_state(
             filename=filename,
-            checkpoint_dir=os.path.join(self.arguments.save_dir, self.arguments.model_name),
+            checkpoint_dir=checkpoint_dir,
             gather_fns=gather_fns,
             float_dtype=self.dtype,
             verbose=self.arguments.verbose,
             save_optimizer=self.arguments.save_optimizer_state,
         )
+        open(os.path.join(checkpoint_dir, "README.md"), "w").write(self._get_information())
         return filename
 
     @abc.abstractmethod
@@ -463,3 +468,115 @@ class BaseTrainer:
     @abc.abstractmethod
     def eval(self, state):
         """abstract of Eval Function to evaluate model"""
+
+    def _get_information(self):
+        makrdown = f"""
+---
+tags:
+- EasyDeL
+- {self.arguments.model_class.config_class.model_type}
+---
+# {self.arguments.model_name}
+
+## Trained With [EasyDeL](https://github.com/erfanzar/EasyDeL)
+
+EasyDeL is an open-source framework designed to enhance and streamline the training process of machine learning
+models. With a primary focus on Jax, EasyDeL aims to provide convenient and effective solutions for 
+training Flax/Jax models on TPU/GPU for both serving and training purposes.
+
+## Training Detail
+
+- Model Architecture : {self.arguments.model_class.config_class.model_type}
+- Platform : {jax.devices()[0].platform.upper()}
+- Number of Devices : {len(jax.devices())}
+- Learning Rate Start : {self.arguments.learning_rate}
+- Learning Rate End : {self.arguments.learning_rate_end}
+- Optimizer : {self.arguments.optimizer}
+- Scheduler : {self.arguments.scheduler}
+- Warmup Steps : {self.arguments.warmup_steps}
+- Weight Decay : {self.arguments.weight_decay}
+- Z Loss : {self.arguments.z_loss}
+- Epoch : {self.arguments.num_train_epochs}
+- Batch size : {self.arguments.total_batch_size}
+- Sequence Length : {self.arguments.max_sequence_length}
+- EasyDeL init InputShape : {self.arguments.init_input_shape}
+- Dtype : {self.arguments.dtype}
+- Params Dtype : {self.arguments.param_dtype}
+- Gradient checkpointing : {self.arguments.gradient_checkpointing}
+- Fully Sharded Data Parallel : {self.arguments.fully_sharded_data_parallel}
+- Force batch GradientAccumulation : {self.arguments.force_batch_and_gradient_accumulation_steps_calculation}
+- Gradient Accumulation Steps : {self.arguments.gradient_accumulation_steps}
+- Max Training Steps : {self.arguments.max_training_steps}
+- Max Evaluation Steps : {self.arguments.max_evaluation_steps}
+- Training Time : {self.arguments.training_time}
+
+#### Sharding Partition Rules
+```python
+partition_rules = {
+        self.arguments.custom_rule if self.arguments.custom_rule is not None else
+        self.arguments.model_class.config_class.get_partition_rules(self.arguments.fully_sharded_data_parallel)
+        }
+```
+        """
+        return makrdown
+
+    def save_pretrained(
+            self,
+            state: "EasyDeLState",  # type: ignore
+            save_dir: Optional[str] = None,
+            gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]] = None,
+            to_torch: bool = False,
+            base_hf_auto_class=AutoModelForCausalLM,
+            easystate_to_huggingface_model_kwargs: Optional[dict] = None,
+            add_params_field_to_torch_convertation: bool = False,
+            torch_save_pretrained_kwargs: Optional[dict] = None
+    ):
+        if torch_save_pretrained_kwargs is None:
+            torch_save_pretrained_kwargs = {}
+        if easystate_to_huggingface_model_kwargs is None:
+            easystate_to_huggingface_model_kwargs = {}
+        if save_dir is None:
+            save_dir = os.path.join(self.arguments.save_dir, self.arguments.model_name)
+        if to_torch:
+            from ..transform.easydel_transform import easystate_to_huggingface_model
+
+            if easystate_to_huggingface_model_kwargs is None:
+                easystate_to_huggingface_model_kwargs = {}
+
+            model_config = state.module_config
+            if model_config is None:
+                model_config = state.module.config_class
+            model_type = model_config.model_type
+
+            model_class = base_hf_auto_class._model_mapping[type(model_config)]  # noqa
+
+            unsafe_dict = state.unsafe_dict(model_config.__dict__)
+            hf_model_config = AutoConfig.for_model(model_type=model_type)
+            blocked_statics = ["torch_dtype"]
+            kss = list(hf_model_config.__dict__.keys())
+            for k, v in unsafe_dict.items():
+                if not k.startswith("_") and k in kss and k not in blocked_statics:
+                    if isinstance(v, str):
+                        if v.isnumeric():
+                            v = float(v)
+                            if v.is_integer():
+                                v = int(v)
+
+                    setattr(hf_model_config, k, v)
+            hf_model = easystate_to_huggingface_model(
+                state=state,
+                base_huggingface_module=model_class,
+                config=hf_model_config,
+                **easystate_to_huggingface_model_kwargs
+            )
+
+            open(os.path.join(save_dir, "README.md"), "w").write(self._get_information())
+            hf_model.save_pretrained(save_dir, **torch_save_pretrained_kwargs)
+            return hf_model
+        else:
+            self._save_state(
+                state=state,
+                gather_fns=gather_fns,
+                save_dir=save_dir
+            )
+            return state
