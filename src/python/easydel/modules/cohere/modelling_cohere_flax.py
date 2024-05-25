@@ -522,7 +522,7 @@ class FlaxCohereBlock(nn.Module):
         )
         self.input_layernorm = RMSNorm(
             self.config.hidden_size,
-            eps=self.config.rms_norm_eps,
+            eps=self.config.layer_norm_eps,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
         )
@@ -950,8 +950,12 @@ class FlaxCohereModule(nn.Module):
         )
         self.layers = FlaxCohereBlockCollection(self.config, dtype=self.dtype, param_dtype=self.param_dtype,
                                                 precision=self.precision)
-        self.norm = RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps, dtype=self.dtype,
-                            param_dtype=self.param_dtype)
+        self.norm = RMSNorm(
+            self.config.hidden_size,
+            eps=self.config.layer_norm_eps,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype
+        )
         config = self.config
         self.causal_mask = flax.linen.make_causal_mask(
             jnp.ones(
