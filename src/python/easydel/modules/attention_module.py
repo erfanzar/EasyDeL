@@ -182,7 +182,8 @@ class AttentionModule:
             use_sharding_constraint: Optional[bool] = ...,
             axis_name: str = ...,
             backward_pass_impl: Literal["triton", "xla"] = "triton",
-            base_module_class: Optional[EasyDeLPretrainedConfig] = None
+            base_module_class: Optional[EasyDeLPretrainedConfig] = None,
+            _do_check: bool = True
     ):
 
         self.block_k: int = ...
@@ -312,7 +313,7 @@ class AttentionModule:
         self.attention_dropout = attention_dropout
         self.dtype = dtype
         self.backward_pass_impl = backward_pass_impl
-
+        self._do_check = _do_check
         if attn_mechanism == "splash" and self.platform != "tpu":
             raise OSError("splash attention is only supported on TPU.")
         if attn_mechanism == "flash" and self.platform != "tpu":
@@ -432,13 +433,14 @@ class AttentionModule:
         if key_value_sequence_length is None:
             key_value_sequence_length = key_states.shape[1]
         with self.mesh:
-            self._check_states(
-                query_states=query_states,
-                key_states=key_states,
-                value_states=value_states,
-                query_sequence_length=query_sequence_length,
-                key_value_sequence_length=key_value_sequence_length
-            )
+            if self._do_check:
+                self._check_states(
+                    query_states=query_states,
+                    key_states=key_states,
+                    value_states=value_states,
+                    query_sequence_length=query_sequence_length,
+                    key_value_sequence_length=key_value_sequence_length
+                )
             if self.attn_mechanism == "flash":
                 if segment_ids is not None:
                     warnings.warn(
@@ -883,10 +885,6 @@ class AttentionModule:
             key_states = fjformer.with_sharding_constraint(key_states, kps)
             value_states = fjformer.with_sharding_constraint(value_states, vps)
 
-            assert query_states.ndim == key_states.ndim, "q, k must have same rank."
-            assert query_states.shape[:-3] == key_states.shape[:-3], "q, k batch dims must match."
-            assert query_states.shape[-2] == key_states.shape[-2], "q, k num_heads must match."
-            assert query_states.shape[-1] == key_states.shape[-1], "q, k depths must match."
             query_states, key_states, value_states = promote_dtype(
                 query_states, key_states, value_states,
                 dtype=dtype

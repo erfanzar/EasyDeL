@@ -10,8 +10,6 @@ from einops import rearrange
 from flax.linen.partitioning import remat
 from ..flax_modelling_utils import (
     get_gradient_checkpoint_policy,
-    with_sharding_constraint,
-    ACT2FN,
     get_dot_general_by_bits,
     BaseJAXAttentionModule,
 )
