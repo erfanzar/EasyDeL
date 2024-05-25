@@ -32,10 +32,6 @@ def vanilla_attention(
         precision: Optional[jax.lax.Precision] = None,
         attention_dropout: float = 0.0
 ):
-    assert query_states.ndim == key_states.ndim, "q, k must have same rank."
-    assert query_states.shape[:-3] == key_states.shape[:-3], "q, k batch dims must match."
-    assert query_states.shape[-2] == key_states.shape[-2], "q, k num_heads must match."
-    assert query_states.shape[-1] == key_states.shape[-1], "q, k depths must match."
     query_states, key_states, value_states = promote_dtype(query_states, key_states, value_states, dtype=dtype)
     sp, tp = "sp", "tp"
     if query_states.shape[1] == 1:
@@ -249,10 +245,6 @@ def shard_vanilla_attention(
 ):
     batch_size, query_length, num_heads, dim = query_states.shape
     key_length = key_states.shape[1]
-    assert query_states.ndim == key_states.ndim, "q, k must have same rank."
-    assert query_states.shape[:-3] == key_states.shape[:-3], "q, k batch dims must match."
-    assert query_states.shape[-2] == key_states.shape[-2], "q, k num_heads must match."
-    assert query_states.shape[-1] == key_states.shape[-1], "q, k depths must match."
     query_states, key_states, value_states = promote_dtype(query_states, key_states, value_states, dtype=dtype)
 
     depth = query_states.shape[-1]
@@ -441,11 +433,6 @@ def static_sharded_dot_product_attention(
         precision: Optional[Union[str, lax.Precision]] = None,
         shard_attention_computation: bool = True
 ):
-    assert key_states.shape[1] == value_states.shape[1], "miss match on key_states and value_states sequence length"
-    assert query_states.ndim == key_states.ndim, "q, k must have same rank."
-    assert query_states.shape[:-3] == key_states.shape[:-3], "q, k batch dims must match."
-    assert query_states.shape[-2] == key_states.shape[-2], "q, k num_heads must match."
-    assert query_states.shape[-1] == key_states.shape[-1], "q, k depths must match."
 
     query_states, key_states, value_states = promote_dtype(query_states, key_states, value_states, dtype=dtype)
 

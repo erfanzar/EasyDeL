@@ -14,34 +14,38 @@ class FalconConfig(EasyDeLPretrainedConfig):
 
     def __init__(
             self,
-            vocab_size: int = 65024,
-            hidden_size: int = 4544,
-            num_hidden_layers: int = 32,
-            num_attention_heads: int = 71,
-            layer_norm_epsilon: float = 1e-5,
-            initializer_range: float = 0.02,
-            use_cache: bool = True,
-            hidden_dropout: float = 0.0,
-            attention_dropout: float = 0.0,
+            vocab_size=65024,
+            hidden_size=4544,
+            num_hidden_layers=32,
+            num_attention_heads=71,
+            num_ln_in_parallel_attn=None,
+            layer_norm_epsilon=1e-5,
+            initializer_range=0.02,
+            use_cache=True,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
             num_kv_heads=None,
-            alibi: bool = False,
-            new_decoder_architecture: bool = False,
-            multi_query: bool = True,
-            parallel_attn: bool = True,
-            bias: bool = False,
-            max_position_embeddings: int = 2048,
-            rope_theta: float = 10000.0,
+            alibi=False,
+            new_decoder_architecture=False,
+            multi_query=True,
+            parallel_attn=True,
+            bias=False,
+            max_position_embeddings=2048,
+            rope_theta=10000.0,
             rope_scaling=None,
-            bos_token_id: int = 11,
-            eos_token_id: int = 11,
+            bos_token_id=11,
+            eos_token_id=11,
+            ffn_hidden_size=None,
+            activation="gelu",
             gradient_checkpointing: str = "",
             bits: Optional[int] = None,
-            **kwargs,
+            **kwargs
     ):
         self.vocab_size = vocab_size
         n_embed = kwargs.pop("n_embed", None)
         self.hidden_size = hidden_size if n_embed is None else n_embed
         self.num_hidden_layers = num_hidden_layers
+        self.num_ln_in_parallel_attn = num_ln_in_parallel_attn
         self.num_attention_heads = num_attention_heads
         self.layer_norm_epsilon = layer_norm_epsilon
         self.initializer_range = initializer_range
@@ -52,6 +56,7 @@ class FalconConfig(EasyDeLPretrainedConfig):
         self.hidden_dropout = hidden_dropout
         self.attention_dropout = attention_dropout
         self.bos_token_id = bos_token_id
+        self.activation = activation
         self.eos_token_id = eos_token_id
         self.multi_query = multi_query
         self.alibi = alibi
@@ -63,7 +68,8 @@ class FalconConfig(EasyDeLPretrainedConfig):
         self.bits = bits
         self.from_pt = False
         self.head_dim = self.hidden_size // self.num_attention_heads
-
+        if ffn_hidden_size is None:
+            self.ffn_hidden_size = hidden_size * 4
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,

@@ -45,6 +45,8 @@ of machine learning models, particularly in the domain of large language models 
 
 > **News**
 >
+> Falcon Model is Updated and now Falcon11B is supported wih flash attention support.
+>
 > `pallas_flash` is now available for CPU/GPU/TPU with custom pallas kernel.
 >
 > DeepseekV2 Model is Added (beta mood).
