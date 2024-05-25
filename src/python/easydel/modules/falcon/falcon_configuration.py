@@ -63,6 +63,8 @@ class FalconConfig(EasyDeLPretrainedConfig):
         self.bias = bias
         self.gradient_checkpointing = gradient_checkpointing
         self.parallel_attn = parallel_attn
+        if num_kv_heads is None:
+            num_kv_heads = num_attention_heads
         self.num_kv_heads = num_kv_heads
         self.new_decoder_architecture = new_decoder_architecture
         self.bits = bits

@@ -111,7 +111,9 @@ class EasyModelsTest(TestCase):
                 rms_norm_eps=self.rms_norm_eps,
                 layer_norm_eps=self.layer_norm_eps,
                 axis_dims=(1, -1, 1, 1),
-                head_dim=self.head_dim
+                head_dim=self.head_dim,
+                new_decoder_architecture=True,
+                num_kv_heads=self.num_key_value_heads
                 # residual_in_fp32=True
             )
         else:

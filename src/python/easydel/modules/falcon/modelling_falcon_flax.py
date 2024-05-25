@@ -108,7 +108,12 @@ class FlaxFalconAttention(BaseJAXAttentionModule):
     def setup(self) -> None:
         config = self.config
         head_dim = config.hidden_size // config.num_attention_heads
-        features = 3 * config.hidden_size if not config.multi_query else config.hidden_size + 2 * head_dim
+        if config.new_decoder_architecture:
+            qkv_out_dim = (config.num_kv_heads * 2 + config.num_attention_heads) * head_dim
+        elif config.multi_query:
+            qkv_out_dim = config.hidden_size + 2 * head_dim
+        else:
+            qkv_out_dim = 3 * config.hidden_size
 
         self.head_dim = head_dim
         assert self.head_dim * config.num_attention_heads == config.hidden_size
@@ -116,7 +121,7 @@ class FlaxFalconAttention(BaseJAXAttentionModule):
         self.new_decoder_architecture = config.new_decoder_architecture
         self.num_heads = config.num_attention_heads
         self.query_key_value = Linear(
-            features=features,
+            features=qkv_out_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=config.bias,
@@ -158,8 +163,7 @@ class FlaxFalconAttention(BaseJAXAttentionModule):
         batch_size, sequence_length, _ = qkv.shape
 
         if self.config.new_decoder_architecture:
-            batch, sequence_length, _ = qkv.shape
-            qkv = qkv.reshape(batch, sequence_length, -1, self.num_heads // self.num_kv_heads + 2, self.head_dim)
+            qkv = qkv.reshape(batch_size, sequence_length, -1, self.num_heads // self.num_kv_heads + 2, self.head_dim)
             query_states = qkv[:, :, :, :-2]
             key_states = qkv[:, :, :, [-2]]
             value_states = qkv[:, :, :, [-1]]
