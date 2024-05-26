@@ -342,15 +342,13 @@ class FlaxFalconBlock(nn.Module):
             self.config.num_ln_in_parallel_attn = 2
         config = self.config
 
-        if not config.parallel_attn:
-            self.input_layernorm = nn.LayerNorm(epsilon=config.layer_norm_epsilon, dtype=self.dtype)
-            self.post_attention_layernorm = nn.LayerNorm(epsilon=config.layer_norm_epsilon, dtype=self.dtype)
+        if config.new_decoder_architecture and config.num_ln_in_parallel_attn == 2:
+            self.ln_attn = nn.LayerNorm(epsilon=config.layer_norm_epsilon, dtype=self.dtype)
+            self.ln_mlp = nn.LayerNorm(epsilon=config.layer_norm_epsilon, dtype=self.dtype)
         else:
-            if config.num_ln_in_parallel_attn == 2:
-                self.ln_attn = nn.LayerNorm(epsilon=config.layer_norm_epsilon, dtype=self.dtype)
-                self.ln_mlp = nn.LayerNorm(epsilon=config.layer_norm_epsilon, dtype=self.dtype)
-            else:
-                self.input_layernorm = nn.LayerNorm(epsilon=config.layer_norm_epsilon, dtype=self.dtype)
+            self.input_layernorm = nn.LayerNorm(epsilon=config.layer_norm_epsilon, dtype=self.dtype)
+            if not config.parallel_attn:
+                self.post_attention_layernorm = nn.LayerNorm(epsilon=config.layer_norm_epsilon, dtype=self.dtype)
         attn_block = FlaxFalconAttention
         mlp_block = FlaxFalconMlp
         if self.config.gradient_checkpointing != "":
