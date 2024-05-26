@@ -419,7 +419,7 @@ class FlaxFalconBlock(nn.Module):
             deterministic
         )
 
-        if not self.config.new_decoder_architecture:
+        if self.config.num_ln_in_parallel_attn == 1:
             if self.config.parallel_attn:
                 mlp_layernorm_out = attention_layernorm_out
             else:
@@ -430,13 +430,6 @@ class FlaxFalconBlock(nn.Module):
                     deterministic
                 )
                 mlp_layernorm_out = self.post_attention_layernorm(residual)
-
-        if (
-                self.config.new_decoder_architecture
-                and self.config.parallel_attn
-                and self.config.num_ln_in_parallel_attn == 1
-        ):
-            mlp_layernorm_out = attention_layernorm_out
 
         if self.config.use_scan_mlp:
             mlp_output = block_wise_ffn(
