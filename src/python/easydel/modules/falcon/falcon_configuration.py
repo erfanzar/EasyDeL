@@ -71,7 +71,8 @@ class FalconConfig(EasyDeLPretrainedConfig):
         self.from_pt = False
         self.head_dim = self.hidden_size // self.num_attention_heads
         if ffn_hidden_size is None:
-            self.ffn_hidden_size = hidden_size * 4
+            ffn_hidden_size = hidden_size * 4
+        self.ffn_hidden_size = ffn_hidden_size
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
