@@ -338,8 +338,8 @@ class FlaxFalconBlock(nn.Module):
 
     def setup(self) -> None:
 
-        if getattr(self.config, "num_ln_in_parallel_attn", None) is None and self.config.new_decoder_architecture:
-            self.config.num_ln_in_parallel_attn = 2
+        if getattr(self.config, "num_ln_in_parallel_attn", None) is None:
+            self.config.num_ln_in_parallel_attn = 1
         config = self.config
 
         if config.new_decoder_architecture and config.num_ln_in_parallel_attn == 2:

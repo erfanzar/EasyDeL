@@ -36,6 +36,7 @@ class FalconConfig(EasyDeLPretrainedConfig):
             bos_token_id=11,
             eos_token_id=11,
             ffn_hidden_size=None,
+            ff_factor=None,
             activation="gelu",
             gradient_checkpointing: str = "",
             bits: Optional[int] = None,
@@ -73,6 +74,9 @@ class FalconConfig(EasyDeLPretrainedConfig):
         if ffn_hidden_size is None:
             ffn_hidden_size = hidden_size * 4
         self.ffn_hidden_size = ffn_hidden_size
+        if ff_factor is None:
+            ff_factor = ffn_hidden_size // hidden_size
+        self.ff_factor = ff_factor
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
