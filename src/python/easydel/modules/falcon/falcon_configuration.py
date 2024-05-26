@@ -46,6 +46,8 @@ class FalconConfig(EasyDeLPretrainedConfig):
         n_embed = kwargs.pop("n_embed", None)
         self.hidden_size = hidden_size if n_embed is None else n_embed
         self.num_hidden_layers = num_hidden_layers
+        if num_ln_in_parallel_attn is None:
+            num_ln_in_parallel_attn = 0
         self.num_ln_in_parallel_attn = num_ln_in_parallel_attn
         self.num_attention_heads = num_attention_heads
         self.layer_norm_epsilon = layer_norm_epsilon

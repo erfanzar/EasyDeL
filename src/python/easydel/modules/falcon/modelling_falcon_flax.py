@@ -337,9 +337,6 @@ class FlaxFalconBlock(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
-
-        if getattr(self.config, "num_ln_in_parallel_attn", None) is None:
-            self.config.num_ln_in_parallel_attn = 1
         config = self.config
 
         if config.new_decoder_architecture and config.num_ln_in_parallel_attn == 2:
@@ -394,7 +391,7 @@ class FlaxFalconBlock(nn.Module):
     ):
         residual = hidden_states
 
-        if self.config.new_decoder_architecture and self.config.num_ln_in_parallel_attn == 2:
+        if self.config.num_ln_in_parallel_attn == 2:
             attention_layernorm_out = self.ln_attn(hidden_states)
             mlp_layernorm_out = self.ln_mlp(hidden_states)
         else:
