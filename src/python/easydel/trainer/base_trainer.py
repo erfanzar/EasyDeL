@@ -563,6 +563,7 @@ partition_rules = {
                                 v = int(v)
 
                     setattr(hf_model_config, k, v)
+
             hf_model = easystate_to_huggingface_model(
                 state=state,
                 base_huggingface_module=model_class,

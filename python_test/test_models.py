@@ -329,6 +329,9 @@ class EasyModelsTest(TestCase):
                     setattr(conf, k, v)
                 except:  # noqa
                     ...
+        conf.ffn_hidden_size = self.hidden_size * 2
+        conf.ff_factor = 2
+
         res, err = self.create_test_for_models(
             "falcon",
             type(
