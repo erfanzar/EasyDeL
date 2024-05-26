@@ -80,6 +80,7 @@ class ORPOTrainer(BaseTrainer, ABC):
             train_dataset: Optional[Dataset] = None,
             eval_dataset: Optional[Union[Dataset, Dict[str, Dataset]]] = None,
             tokenizer: Optional[PreTrainedTokenizerBase] = None,
+            dataset_num_proc: Optional[int] = None,
             _do_init_fns: bool = True,
             dataset_map_arguments: Optional[Dict[str, Any]] = None,
             low_mem_usage: bool = False,
@@ -88,7 +89,6 @@ class ORPOTrainer(BaseTrainer, ABC):
         """
         The __init__ function is called when the class is instantiated.
         It sets up the attributes of an object.
-
 
         :param self: Refer to the object itself
         :param beta: float: Control the strength of the regularization term
@@ -103,6 +103,7 @@ class ORPOTrainer(BaseTrainer, ABC):
         :param max_completion_length: Optional[int]: Truncate the target sequence
         :param data_collator: Optional[Callable]: Function to be used for creating datasets.
         tokenizing process with `dataset.map`.
+        :parma dataset_num_proc: Optional[int]: The number of processes to use for the dataset mapping.
         :param _do_init_fns: bool : preferred to set ture to trainer will automatically configure
         model with provided training Arguments
         :param : Set the padding value for the model
@@ -153,6 +154,7 @@ class ORPOTrainer(BaseTrainer, ABC):
         self.is_encoder_decoder = is_encoder_decoder
         self.low_mem_usage = low_mem_usage
         self.beta = beta
+        self.dataset_num_proc = dataset_num_proc
         data_collator = DPODataCollatorWithPadding(
             max_prompt_length=self.max_prompt_length,
             max_target_length=self.max_completion_length,
@@ -165,11 +167,13 @@ class ORPOTrainer(BaseTrainer, ABC):
             dataset_map_arguments = {}
         train_dataset = train_dataset.map(
             self.tokenize_row,
+            dataset_num_proc=dataset_num_proc,
             **dataset_map_arguments
         )
         if eval_dataset is not None:
             eval_dataset = eval_dataset.map(
                 self.tokenize_row,
+                dataset_num_proc=dataset_num_proc,
                 **dataset_map_arguments
             )
 
