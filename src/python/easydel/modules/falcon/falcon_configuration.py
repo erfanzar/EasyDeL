@@ -96,6 +96,7 @@ class FalconConfig(EasyDeLPretrainedConfig):
             ("transformer/ln_f/scale", PartitionSpec(("fsdp", "sp"))),
             ("transformer/post_attention_layernorm/scale", PartitionSpec(("fsdp", "sp"))),
             ("transformer/post_attention_layernorm/bias", PartitionSpec(("fsdp", "sp"))),
+            ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
             (".*", PartitionSpec(("fsdp", "sp")))
         ) if not fully_sharded_data_parallel else (
             ("word_embeddings/embedding", PartitionSpec(("fsdp", "sp"))),
@@ -108,6 +109,7 @@ class FalconConfig(EasyDeLPretrainedConfig):
             ("transformer/ln_f/scale", PartitionSpec(("fsdp", "sp"))),
             ("transformer/post_attention_layernorm/scale", PartitionSpec(("fsdp", "sp"))),
             ("transformer/post_attention_layernorm/bias", PartitionSpec(("fsdp", "sp"))),
+            ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
             (".*", PartitionSpec(("fsdp", "sp")))
         )
 
