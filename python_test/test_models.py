@@ -114,7 +114,10 @@ class EasyModelsTest(TestCase):
                 axis_dims=(1, -1, 1, 1),
                 head_dim=self.head_dim,
                 new_decoder_architecture=True,
-                num_kv_heads=self.num_key_value_heads
+                num_kv_heads=self.num_key_value_heads,
+                multi_query=True,
+                num_ln_in_parallel_attn=1,
+                parallel_attn=True
                 # residual_in_fp32=True
             )
         else:
@@ -316,7 +319,26 @@ class EasyModelsTest(TestCase):
         )
 
     def test_falcon(self):
-        res, err = self.create_test_for_models("falcon", transformers.FalconForCausalLM)
+        conf = transformers.AutoConfig.from_pretrained(
+            "tiiuae/falcon-11B",
+            trust_remote_code=True
+        )
+        for k, v in self.__dict__.items():
+            if isinstance(v, (bool, str, float, type(None), int,)):
+                try:
+                    setattr(conf, k, v)
+                except:  # noqa
+                    ...
+        res, err = self.create_test_for_models(
+            "falcon",
+            type(
+                transformers.AutoModelForCausalLM.from_config(
+                    conf,
+                    trust_remote_code=True,
+                )
+            )
+        )
+
         self.assertTrue(
             res,
             f"Falcon model Failed [ERROR {err}]"
