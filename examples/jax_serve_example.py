@@ -84,6 +84,7 @@ flags.DEFINE_enum(
         "cudnn",
         "local_ring",
         "sharded_vanilla",
+        "legacy_sharded_vanilla",
         "wise_ring",
         "blockwise",
         "pallas_flash"
