@@ -46,7 +46,8 @@ from ._attentions import (
     vanilla_attention,
     ring_attention_standard,
     wise_ring_attention,
-    blockwise_attn
+    blockwise_attn,
+    shard_vanilla_attention
 )
 from .flax_modelling_utils import get_gradient_checkpoint_policy
 from ..etils.etils import get_logger
@@ -146,6 +147,7 @@ class AttentionModule:
                 "cudnn",
                 "local_ring",
                 "sharded_vanilla",
+                "legacy_sharded_vanilla",
                 "wise_ring",
                 "blockwise",
                 "pallas_flash"
@@ -477,6 +479,17 @@ class AttentionModule:
                 )
             elif self.attn_mechanism == "sharded_vanilla":
                 return self.sharded_vanilla_attention(
+                    query_states=query_states,
+                    key_states=key_states,
+                    value_states=value_states,
+                    bias=bias,
+                    dropout_rng=dropout_rng,
+                    deterministic=deterministic,
+                    query_sequence_length=query_sequence_length,
+                    key_value_sequence_length=key_value_sequence_length
+                )
+            elif self.attn_mechanism == "legacy_sharded_vanilla":
+                return self.legacy_sharded_vanilla_attention(
                     query_states=query_states,
                     key_states=key_states,
                     value_states=value_states,
@@ -921,6 +934,44 @@ class AttentionModule:
                 attention_outputs=attention
             )
 
+    def legacy_sharded_vanilla_attention(
+            self,
+            *,  # it's Kwarg Only
+            query_states: Array,
+            key_states: Array,
+            value_states: Array,
+            bias: Optional[Array] = None,
+            deterministic: bool = False,
+            dropout_rng: Optional[random.PRNGKey] = None,
+            query_sequence_length: int,
+            key_value_sequence_length: int,
+    ) -> AttentionOutput:
+        dtype = jnp.promote_types(self.dtype, jnp.float32)
+
+        qps, kps, vps, bps, aps, is_gen = self.get_partition_specs(qs=query_sequence_length)
+
+        with self.mesh:
+            attention_outputs = shard_map(
+                partial(
+                    shard_vanilla_attention,
+                    deterministic=deterministic,
+                    dropout_rng=dropout_rng,
+                    dtype=dtype,
+                    precision=self.precision,
+                    attention_dropout=self.attention_dropout
+                ),
+                in_specs=(qps, kps, vps, PartitionSpec(bps[0], None, None, None) if bias is not None else None),
+                out_specs=aps,
+                check_rep=False,
+                mesh=self.mesh
+            )(query_states, key_states, value_states, bias)
+            attention_outputs = fjformer.with_sharding_constraint(attention_outputs, aps)
+
+            return AttentionOutput(
+                attention_weights=None,
+                attention_outputs=attention_outputs
+            )
+
     def flash_attention(
             self,
             *,  # it's Kwarg Only
@@ -1247,6 +1298,7 @@ class AttentionModule:
             "vanilla",
             "wise_ring",
             "sharded_vanilla",
+            "legacy_sharded_vanilla",
             "flash",
             "splash",
             "cudnn",
