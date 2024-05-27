@@ -167,13 +167,13 @@ class ORPOTrainer(BaseTrainer, ABC):
             dataset_map_arguments = {}
         train_dataset = train_dataset.map(
             self.tokenize_row,
-            dataset_num_proc=dataset_num_proc,
+            num_proc=dataset_num_proc,
             **dataset_map_arguments
         )
         if eval_dataset is not None:
             eval_dataset = eval_dataset.map(
                 self.tokenize_row,
-                dataset_num_proc=dataset_num_proc,
+                num_proc=dataset_num_proc,
                 **dataset_map_arguments
             )
 
