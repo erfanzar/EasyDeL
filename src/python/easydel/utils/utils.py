@@ -1,14 +1,17 @@
 import typing
+import warnings
 
+import flax.metrics.tensorboard
 import jax
 import jax.numpy as jnp
-import os
 import time
 
 import termcolor
-import wandb
-from jax.experimental.pjit import pjit
-from jax.interpreters import pxla
+
+try:
+    import wandb
+except ModuleNotFoundError:
+    wandb = None
 
 
 class Timer:
@@ -131,7 +134,7 @@ def prefix_print(
 class Timers:
     """Group of timers."""
 
-    def __init__(self, use_wandb, tensorboard_writer):
+    def __init__(self, use_wandb, tensorboard_writer: flax.metrics.tensorboard.SummaryWriter):
         self.timers = {}
         self.use_wandb = use_wandb
         self.tensorboard_writer = tensorboard_writer
@@ -161,10 +164,14 @@ class Timers:
             value = self.timers[name].elapsed(reset=reset) / normalizer
 
             if self.tensorboard_writer:
-                self.tensorboard_writer.add_scalar(f"timers/{name}", value, iteration)
+                self.tensorboard_writer.scalar(f"timers/{name}", value, iteration)
 
             if self.use_wandb:
-                wandb.log({f"timers/{name}": value}, step=iteration)
+                if wandb is None:
+                    warnings.warn("`wandb` is not installed use `pip install wandb` (use_wandb=True will be ignored)")
+                    self.use_wandb = False
+                else:
+                    wandb.log({f"timers/{name}": value}, step=iteration)
 
     def log(self, names, normalizer=1.0, reset=True):
         """The log function is used to print the time elapsed for a given function.

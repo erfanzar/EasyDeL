@@ -497,8 +497,8 @@ class EasyDeLPretrainedConfig(PretrainedConfig):
 class EasyDeLFlaxPretrainedModel(FlaxPreTrainedModel):
     def __init__(
             self,
-            config: PretrainedConfig,
-            module: flax.linen.Module,
+            config: Optional[PretrainedConfig] = None,
+            module: Optional[flax.linen.Module] = None,
             input_shape: Tuple = (1, 1),
             seed: int = 0,
             dtype: jnp.dtype = jnp.float32,
@@ -506,6 +506,8 @@ class EasyDeLFlaxPretrainedModel(FlaxPreTrainedModel):
             precision: Optional[Union[jax.lax.Precision, str]] = None,  # Ignored
             _do_init: bool = True,
     ):
+        assert config is not None, "`config` must be provided.`"
+        assert module is not None, "`module` must be provided.`"
         super().__init__(
             config=config,
             module=module,

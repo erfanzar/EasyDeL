@@ -13,14 +13,12 @@ import jax
 import tensorflow.data
 import tensorflow_datasets
 import termcolor
-import wandb
 from fjformer import match_partition_rules, make_shard_and_gather_fns
 from flax.core import FrozenDict
 from tqdm import tqdm
 
 from typing import (
     Optional,
-    Literal,
     Dict,
     Union,
     Any,
@@ -1125,7 +1123,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 
                 output.checkpoint_path = checkpoint_path
                 output.last_save_file_name = filename
-                wandb.finish()
+                self.finish()
 
         return output
 

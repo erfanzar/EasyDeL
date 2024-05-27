@@ -438,7 +438,7 @@ class AutoEasyDeLModelForCausalLM:
             generation_bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
             attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             shard_attention_computation: bool = True,
-            input_shape: Sequence[int] = (1, 1),
+            input_shape: Tuple[int, int] = (1, 1),
             shard_fns: Optional[Mapping[tuple, Callable] | dict] = None,
             backend: Optional[str] = None,
             config_kwargs: Optional[Mapping[str, Any]] = None,
@@ -474,7 +474,7 @@ class AutoEasyDeLModelForCausalLM:
             attention_partition_spec (PartitionSpec, optional): Partitioning specification for the attention weights. Defaults to
                 PartitionSpec(("dp", "fsdp"), "sp", "tp", None).
             shard_attention_computation (bool, optional): Whether to shard attention computation. Defaults to True.
-            input_shape (Sequence[int], optional): Shape of the input to the model. Defaults to (1, 1).
+            input_shape (Tuple[int, int], optional): Shape of the input to the model. Defaults to (1, 1).
             shard_fns (Optional[Mapping[tuple, Callable] | dict], optional): Sharding functions to use for the model. If None,
                 auto-sharding is used if auto_shard_params is True. Defaults to None.
             backend (Optional[str], optional): Backend to use for the model. Defaults to None.
@@ -686,6 +686,22 @@ class AutoEasyDeLConfig:
 
 
 class AutoShardAndGatherFunctions:
+    """
+    A class to automatically generate shard and gather functions for a given model configuration.
+
+    This class provides two methods to generate shard and gather functions:
+
+    - `from_config`: Generates functions based on a provided `EasyDeLPretrainedConfig` object.
+    - `from_pretrained`: Generates functions based on a pretrained model name or path.
+
+    Attributes:
+        None
+
+    Methods:
+        from_config: Generates shard and gather functions based on a provided `EasyDeLPretrainedConfig` object.
+        from_pretrained: Generates functions based on a pretrained model name or path.
+    """
+
     @classmethod
     def from_config(
             cls,
@@ -695,6 +711,20 @@ class AutoShardAndGatherFunctions:
             dtype_specs=jax.numpy.float16,
             input_shape: Tuple[int, int] = (1, 1),
     ):
+        """
+        Generates shard and gather functions based on a provided `EasyDeLPretrainedConfig` object.
+
+        Args:
+            config: An `EasyDeLPretrainedConfig` object containing the model configuration.
+            partition_rules: A tuple of tuples containing partition rule names and `PartitionSpec` objects.
+                If None, uses the default partition rules from the `config`.
+            flatten: Whether to flatten the shard and gather functions. Defaults to True.
+            dtype_specs: The data type to use for the shard and gather functions. Defaults to `jax.numpy.float16`.
+            input_shape: The input shape of the model. Defaults to (1, 1).
+
+        Returns:
+            A tuple containing the shard and gather functions.
+        """
         if partition_rules is None:
             warnings.warn("Using config partition rules from `get_partition_rules(fully_sharded_data_parallel=True)`")
             partition_rules = config.get_partition_rules(True)
@@ -742,7 +772,33 @@ class AutoShardAndGatherFunctions:
             flatten: bool = True,
             dtype_specs=jax.numpy.float16,
             config_kwargs: Optional[Mapping[str, Any]] = None,
-    ):
+    ) -> Tuple[Mapping[str, Callable], Mapping[str, Callable]]:
+        """
+        Generates shard and gather functions based on a pretrained model name or path.
+
+        Args:
+            pretrained_model_name_or_path: The name or path of the pretrained model.
+            input_shape: The input shape of the model. Defaults to (1, 1).
+            sharding_axis_dims: The dimensions of the sharding axes. Defaults to (1, -1, 1, 1).
+            sharding_axis_names: The names of the sharding axes. Defaults to ("dp", "fsdp", "tp", "sp").
+            query_partition_spec: The partition specification for the query matrix. Defaults to `PartitionSpec(("dp", "fsdp"), "sp", "tp", None)`.
+            generation_query_partition_spec: The partition specification for the generation query matrix. Defaults to `PartitionSpec(("dp", "fsdp"), "sp", None, None)`.
+            key_partition_spec: The partition specification for the key matrix. Defaults to `PartitionSpec(("dp", "fsdp"), "sp", "tp", None)`.
+            value_partition_spec: The partition specification for the value matrix. Defaults to `PartitionSpec(("dp", "fsdp"), "sp", "tp", None)`.
+            bias_partition_spec: The partition specification for the bias. Defaults to `PartitionSpec(("dp", "fsdp"), None, None, None)`.
+            generation_bias_partition_spec: The partition specification for the generation bias. Defaults to `PartitionSpec(("dp", "fsdp"), None, None, None)`.
+            attention_partition_spec: The partition specification for the attention computation. Defaults to `PartitionSpec(("dp", "fsdp"), "sp", "tp", None)`.
+            shard_attention_computation: Whether to shard the attention computation. Defaults to True.
+            backend: The backend to use for sharding. Defaults to None.
+            partition_rules: A tuple of tuples containing partition rule names and `PartitionSpec` objects.
+                If None, uses the default partition rules from the `config`.
+            flatten: Whether to flatten the shard and gather functions. Defaults to True.
+            dtype_specs: The data type to use for the shard and gather functions. Defaults to `jax.numpy.float16`.
+            config_kwargs: Additional keyword arguments to pass to the `AutoEasyDeLConfig` constructor. Defaults to None.
+
+        Returns:
+            A tuple containing the shard and gather functions.
+        """
         config = AutoEasyDeLConfig.from_pretrained(
             pretrained_model_name_or_path,
             sharding_axis_dims=sharding_axis_dims,

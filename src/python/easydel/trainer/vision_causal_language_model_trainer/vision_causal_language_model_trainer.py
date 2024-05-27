@@ -3,7 +3,11 @@ import os
 import time
 import typing
 import termcolor
-import wandb
+
+try:
+    import wandb
+except ModuleNotFoundError:
+    wandb = None
 
 import jax
 import flax
@@ -537,7 +541,7 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
 
             output.checkpoint_path = checkpoint_path
             output.last_save_file_name = filename
-            wandb.finish()
+            self.finish()
 
             return output
 

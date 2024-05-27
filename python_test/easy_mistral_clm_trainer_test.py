@@ -94,8 +94,8 @@ def main(use_iterable_dataset: bool):
         dataset_eval=example_eval_data,
     )
     print(trainer._get_information())
-    trainer.save_pretrained(model.to_easydel_state(flax.core.FrozenDict({"params": params})), to_torch=True)
-    # trainer.train(model_parameters=flax.core.FrozenDict({"params": params}))
+    output = trainer.train(model_parameters=flax.core.FrozenDict({"params": params}))
+    trainer.save_pretrained(output.state, to_torch=True)
 
 
 if __name__ == "__main__":
