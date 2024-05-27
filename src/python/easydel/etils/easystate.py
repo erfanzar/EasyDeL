@@ -286,7 +286,9 @@ class EasyDeLState(struct.PyTreeNode):
             state_shard_fns: Optional[Mapping[str, Callable]] = None,
             verbose: bool = False,
             input_shape: Tuple = (1, 1),
-            config_kwargs: Optional[dict] = None
+            config_kwargs: Optional[dict] = None,
+            sharding_axes_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+            sharding_axes_dims: Sequence[int] = (1, -1, 1, 1)
     ):
 
         """The load_state function is a class method that loads the state of an EasyDeLModel from a checkpoint.
@@ -314,54 +316,58 @@ class EasyDeLState(struct.PyTreeNode):
             A state object
         """
         from ..modules.auto_easydel_model import get_modules_by_type
+        from fjformer.partition_utils import create_mesh
+        mesh = create_mesh(sharding_axes_dims, sharding_axes_names)
 
-        checkpoint = fjformer.CheckpointManager.load_checkpoint(
-            path=checkpoint_path,
-            shard_fns=state_shard_fns,
-            verbose=verbose,
-        )
-        hyperparameters = checkpoint.get("hyperparameters")
-        cfg, module, convertor = get_modules_by_type(model_type=cls.get_model_type(hyperparameters))
-        checkpoint.pop("module_config", None)
-        if checkpoint["module_config_args"] is not None:
-            cfg_behave = cls.unsafe_dict(checkpoint.get("module_config_args", {}))
-            cfg_behave.pop("id2label", None)
-            cfg_behave.pop("label2id", None)
-            cfg_behave.pop("torch_dtype", None)
-            for k, v in cfg_behave.items():
-                if v is None:
-                    cfg_behave.pop(k, None)
-                elif v == "None":
-                    cfg_behave[k] = None
-                elif isinstance(v, str):
-                    if v.startswith("{") or v.startswith("(") or v.startswith("PartitionSpec"):
-                        cfg_behave[k] = eval(v)
-            module_config = cfg.from_dict(cfg_behave)
-            if config_kwargs is not None:
-                for k, v in config_kwargs.items():
-                    setattr(module_config, k, v)
-            module_in = module(
-                config=module_config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                input_shape=input_shape
+        with mesh:
+            checkpoint = fjformer.CheckpointManager.load_checkpoint(
+                path=checkpoint_path,
+                shard_fns=state_shard_fns,
+                verbose=verbose,
             )
-        else:
-            raise TypeError(
-                "Om seems like i couldn't read model correctly ;("
+            hyperparameters = checkpoint.get("hyperparameters")
+            cfg, module, convertor = get_modules_by_type(model_type=cls.get_model_type(hyperparameters))
+            checkpoint.pop("module_config", None)
+            if checkpoint["module_config_args"] is not None:
+                cfg_behave = cls.unsafe_dict(checkpoint.get("module_config_args", {}))
+                cfg_behave.pop("id2label", None)
+                cfg_behave.pop("label2id", None)
+                cfg_behave.pop("torch_dtype", None)
+                for k, v in cfg_behave.items():
+                    if v is None:
+                        cfg_behave.pop(k, None)
+                    elif v == "None":
+                        cfg_behave[k] = None
+                    elif isinstance(v, str):
+                        if v.startswith("{") or v.startswith("(") or v.startswith("PartitionSpec"):
+                            cfg_behave[k] = eval(v)
+                module_config = cfg.from_dict(cfg_behave)
+                if config_kwargs is not None:
+                    for k, v in config_kwargs.items():
+                        setattr(module_config, k, v)
+                module_in = module(
+                    config=module_config,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    input_shape=input_shape,
+                    _do_init=False
+                )
+            else:
+                raise TypeError(
+                    "Om seems like i couldn't read model correctly ;("
+                )
+            state = cls.load(
+                apply_fn=module_in.__call__,
+                module=module_in,
+                module_config=module_config,
+                **checkpoint
             )
-        state = cls.load(
-            apply_fn=module_in.__call__,
-            module=module_in,
-            module_config=module_config,
-            **checkpoint
-        )
-        state = state.replace(
-            module_config_args=None  # removing because it's not needed anymore
-        )
-        if init_optimizer_state:
-            state = state.init_opt_state()
+            state = state.replace(
+                module_config_args=None  # removing because it's not needed anymore
+            )
+            if init_optimizer_state:
+                state = state.init_opt_state()
         return state
 
     @classmethod

@@ -13,7 +13,7 @@ dependencies = [
     "jax>=0.4.20",
     "jaxlib>=0.4.20",
     "flax>=0.8.3",
-    "fjformer==0.0.57",
+    "fjformer==0.0.58",
     "einops==0.8.0",
     "transformers>=4.40.0",
     "optax~=0.1.7",
