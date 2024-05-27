@@ -65,6 +65,7 @@ def main():
 
     dtype = jnp.bfloat16
     sharding_axis_dims = eval(FLAGS.sharding_axis_dims)
+    FLAGS.input_shape = eval(FLAGS.input_shape)
     qps = PartitionSpec(("dp", "fsdp"), "sp", None, "tp")
     kps = PartitionSpec(("dp", "fsdp"), "sp", None, "tp")
     vps = PartitionSpec(("dp", "fsdp"), "sp", None, "tp")
