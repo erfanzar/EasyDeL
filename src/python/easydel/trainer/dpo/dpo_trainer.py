@@ -11,7 +11,11 @@ import jax
 import tensorflow.data
 import tensorflow_datasets
 import termcolor
-import wandb
+
+try:
+    import wandb
+except ModuleNotFoundError:
+    wandb = None
 from fjformer import match_partition_rules, make_shard_and_gather_fns
 from tqdm import tqdm
 
@@ -1158,7 +1162,7 @@ class DPOTrainer(BaseTrainer, ABC):
 
                 output.checkpoint_path = checkpoint_path
                 output.last_save_file_name = filename
-                wandb.finish()
+                self.finish()
 
         return output
 

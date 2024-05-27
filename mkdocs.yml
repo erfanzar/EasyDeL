@@ -2,27 +2,23 @@ nav:
   - APIs:
     - Cli:
       - Cli: generated-cli-cli.md
+      - Train:
+        - Cl Train Cli: generated-cli-train-cl_train_cli.md
     - Data Preprocessing:
-      - Processor: generated-data_preprocessing-_processor.md
+      - Data Processor: generated-data_preprocessing-data_processor.md
     - Etils:
       - Auto Tx: generated-etils-auto_tx.md
       - Configs: generated-etils-configs.md
       - Easystate: generated-etils-easystate.md
       - Errors: generated-etils-errors.md
       - Etils: generated-etils-etils.md
-    - Eval:
-      - Lm Eval: generated-eval-lm_eval.md
     - Modules:
       - Arctic:
         - Arctic Configuration: generated-modules-arctic-arctic_configuration.md
         - Modelling Arctic Flax: generated-modules-arctic-modelling_arctic_flax.md
       - Attention Module: generated-modules-attention_module.md
-      - Attentions:
-        - Blockwise Attn: generated-modules-_attentions-blockwise_attn.md
-        - Flash: generated-modules-_attentions-flash.md
-        - Ring: generated-modules-_attentions-ring.md
-        - Vanilla: generated-modules-_attentions-vanilla.md
       - Auto Easydel Model: generated-modules-auto_easydel_model.md
+      - Blockwise Attention: generated-modules-_blockwise_attention.md
       - Cohere:
         - Cohere Configuration: generated-modules-cohere-cohere_configuration.md
         - Modelling Cohere Flax: generated-modules-cohere-modelling_cohere_flax.md
@@ -104,6 +100,7 @@ nav:
       - Qwen2 Moe:
         - Configuration Qwen2 Moe: generated-modules-qwen2_moe-configuration_qwen2_moe.md
         - Modeling Qwen2 Moe Flax: generated-modules-qwen2_moe-modeling_qwen2_moe_flax.md
+      - Ring Attention: generated-modules-_ring_attention.md
       - Roberta:
         - Modelling Roberta Flax: generated-modules-roberta-modelling_roberta_flax.md
         - Roberta Configuration: generated-modules-roberta-roberta_configuration.md
@@ -116,11 +113,10 @@ nav:
       - T5:
         - Modelling T5 Flax: generated-modules-t5-modelling_t5_flax.md
         - T5 Configuration: generated-modules-t5-t5_configuration.md
+      - Vanilla Attention: generated-modules-_vanilla_attention.md
       - Whisper:
         - Modelling Whisper Flax: generated-modules-whisper-modelling_whisper_flax.md
         - Whisper Configuration: generated-modules-whisper-whisper_configuration.md
-    - Partitioning:
-      - Partitioner: generated-partitioning-partitioner.md
     - Reinforcement Learning:
       - Core: generated-reinforcement_learning-core.md
       - Models:
@@ -134,23 +130,9 @@ nav:
       - Utils:
         - Collectors: generated-reinforcement_learning-utils-collectors.md
     - Serve:
-      - Gradio User Interface Base: generated-serve-gradio_user_interface_base.md
-      - Jax Serve: generated-serve-jax_serve.md
-      - Prompters:
-        - Base Prompter: generated-serve-prompters-base_prompter.md
-        - Cargo Prompter: generated-serve-prompters-cargo_prompter.md
-        - Chatml Prompter: generated-serve-prompters-chatml_prompter.md
-        - Gemma Prompter: generated-serve-prompters-gemma_prompter.md
-        - Guanaco Prompter: generated-serve-prompters-guanaco_prompter.md
-        - Llama2 Prompter: generated-serve-prompters-llama2_prompter.md
-        - Openchat Prompter: generated-serve-prompters-openchat_prompter.md
-        - Zephyr Prompter: generated-serve-prompters-zephyr_prompter.md
-      - Serve Engine:
-        - Client: generated-serve-serve_engine-client.md
-        - Configuration: generated-serve-serve_engine-configuration.md
-        - Serve: generated-serve-serve_engine-serve.md
-      - Torch Serve: generated-serve-torch_serve.md
-      - Utils: generated-serve-utils.md
+      - Client: generated-serve-client.md
+      - Configuration: generated-serve-configuration.md
+      - Serve: generated-serve-serve.md
     - Smi:
       - Smi: generated-smi-smi.md
     - Trainer:
@@ -180,10 +162,6 @@ nav:
         - Vision Causal Language Model Trainer: generated-trainer-vision_causal_language_model_trainer-vision_causal_language_model_trainer.md
     - Transform:
       - Easydel Transform: generated-transform-easydel_transform.md
-      - Falcon: generated-transform-falcon.md
-      - Llama: generated-transform-llama.md
-      - Mistral: generated-transform-mistral.md
-      - Mpt: generated-transform-mpt.md
       - Utils: generated-transform-utils.md
     - Utils:
       - Checker: generated-utils-checker.md
@@ -192,27 +170,28 @@ nav:
       - Utils: generated-utils-utils.md
   - Available models: AvailableModels.md
   - Contributing: CONTRIBUTING.md
-  - Easy Bits: Bits.md
   - Examples:
     - DataProcessing: DataProcessing.md
     - Easy Attention: AttentionModuleExample.md
     - EasyState: EasyStateExample.md
     - Falcon Models: Falcon.md
     - Fine Tuning Example: FineTuningExample.md
-    - JAXServer: JAXServer.md
     - Llama Models: Llama.md
     - Llama2 Models: Llama2.md
     - LoRA and Transfer Learning: LoRA-TransferLearningExample.md
     - Mistral Models: Mistral.md
     - Model Parameter Quantization: Parameter-Quantization.md
     - MosaicMPT Models: MosaicMPT.md
-    - PytorchServer: PyTorchServer.md
   - Home: index.md
   - Install: Install.md
 
 plugins:
   - search
-  - mkdocstrings
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            docstring_style: google
 
 repo_url: https://github.com/erfanzar/EasyDeL
 site_author: Erfan Zare Chavoshi

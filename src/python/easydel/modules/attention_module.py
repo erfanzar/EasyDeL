@@ -41,14 +41,15 @@ from jax import numpy as jnp, lax, random
 from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec, Mesh
 from fjformer.pallas_operations import flash_attention
-
-from ._attentions import (
+from ._vanilla_attention import (
     vanilla_attention,
-    ring_attention_standard,
-    wise_ring_attention,
-    blockwise_attn,
     shard_vanilla_attention
 )
+from ._ring_attention import (
+    ring_attention_standard,
+    wise_ring_attention,
+)
+from ._blockwise_attention import blockwise_attn
 from .flax_modelling_utils import get_gradient_checkpoint_policy
 from ..etils.etils import get_logger
 

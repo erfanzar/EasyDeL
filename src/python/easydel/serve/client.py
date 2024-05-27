@@ -14,13 +14,13 @@ class StreamClientResponse:
     done: bool
 
 
-class EasyClient:
+class EngineClient:
     def __init__(
             self,
             host: str = "0.0.0.0",
             port: Optional[int] = None,
     ):
-        host = host.replace("https://", "").replace("http://", "").replace("ws", "")
+        host = host.replace("https://", "").replace("http://", "").replace("ws", "")  # noqa
         self.host = host
         self.port = port
 

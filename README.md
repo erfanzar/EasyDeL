@@ -74,34 +74,15 @@ of machine learning models, particularly in the domain of large language models 
 
 1. [script](https://www.kaggle.com/citifer/easydel-causal-language-model-trainer-example) for mindset of using EasyDeL
    CausalLanguageModelTrainer on kaggle, but you can do much more.
-2. [script](https://www.kaggle.com/code/citifer/easydel-serve-example-mixtral) for using and serving LLMs with EasyDeL
-   JAXServer API (Mixtral Example).
-3. [script](https://www.kaggle.com/code/citifer/easydel-sfttrainer-example) SuperVised Finetuning with EasyDeL.
+2. [script](https://www.kaggle.com/code/citifer/easydel-sfttrainer-example) SuperVised Finetuning with EasyDeL.
 
 ## Serving
 
-you can read docs or examples to see how `JAXServer` works but let me show you how you can simply host and serve any
-model that supported by `EasyDeL` fo this example ill just use `gemma-7-it` by google, but you can use any model as you
-wish.
-
-```shell
-python -m examples.jax_serve_example \
-  --prompter_type="gemma" \ 
-  --share_gradio=True \ 
-  --sharding_axis_dims=1,1,1,-1 \
-  --attn_mechanism="sharded_vanilla" \
-  --scan_ring_attention=True \
-  --max_sequence_length=8192 \ 
-  --max_new_tokens_ratio=25 \
-  --max_compile_tokens=256 \ 
-  --block_k=128 \
-  --block_q=128 \
-  --pretrained_model_name_or_path="google/gemma-7b-it" \
-  --dtype="bf16"
-```
+APIs are changing ...
 
 > [!NOTE]
-> you can use `EasyServe` which is a Serve API Engine for production purpose sice that's more stable provide versioned
+> you can use `EasyDeLServeEngine` which is a Serve API Engine for production purpose sice that's more stable provide
+> versioned
 > API and efficient.
 
 ## Supervised Fine-Tuning with EasyDeL
@@ -306,46 +287,6 @@ print(f"Hey ! , here's where your model saved {output.checkpoint_path}")
 > [!TIP]
 > you can then convert it to pytorch for better use I don't recommend jax/flax for hosting models since
 > pytorch is better option for gpus
-
-## LLMServe
-
-To use EasyDeL in your project, you will need to import the library in your Python script and use its various functions
-and classes. Here is an example of how to import EasyDeL and use its Model class:
-
-```python
-from easydel.modules import AutoEasyDeLModelForCausalLM
-from easydel.serve import JAXServer
-from transformers import AutoTokenizer
-import jax
-
-model_huggingface_repo_id = "meta-llama/Llama.md-2-7b-chat-hf"
-
-tokenizer = AutoTokenizer.from_pretrained(model_huggingface_repo_id, trust_remote_code=True)
-model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
-    model_huggingface_repo_id,
-    jax.devices("cpu")[0],
-    jax.numpy.float16,
-    jax.numpy.float16,
-    jax.lax.Precision("fastest"),
-    (1, -1, 1, 1),
-    device_map="auto"
-)
-
-server = JAXServer.from_parameters(
-    model=model,
-    config_model=model.config,
-    tokenizer=tokenizer,
-    params=model.params,
-    add_params_field=True
-)
-
-response_printed = 0
-for response, tokens_used in server.process(
-        "String To The Model", stream=True
-):
-    print(response[response_printed:], end="")
-    response_printed = len(response)
-```
 
 ## DPO Fine-tuning
 

@@ -6,7 +6,11 @@ import typing
 
 from flax.core import FrozenDict
 import termcolor
-import wandb
+
+try:
+    import wandb
+except ModuleNotFoundError:
+    wandb = None
 
 import jax
 import flax
@@ -598,8 +602,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
             output.checkpoint_path = checkpoint_path
             output.last_save_file_name = filename
             self.arguments._stop_capturing_memory = True
-            wandb.finish()
-
+            self.finish()
             return output
 
     def eval(self, model_state: EasyDeLState) -> typing.Iterator[dict]:

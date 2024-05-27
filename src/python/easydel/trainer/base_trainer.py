@@ -1,5 +1,6 @@
 import abc
 import os
+import pprint
 import sys
 import threading
 import time
@@ -11,11 +12,13 @@ import fjformer
 import jax
 import tensorflow as tf
 import termcolor
-import wandb
+
+try:
+    import wandb
+except ModuleNotFoundError:
+    wandb = None
 from numpy import ndarray
 from datasets import Dataset, IterableDataset
-from wandb.sdk.lib import RunDisabled
-from wandb.sdk.wandb_run import Run
 from .training_configurations import TrainArguments
 from ..smi import get_capacity_matrix, initialise_tracking
 from ..utils.utils import prefix_print, Timers
@@ -93,7 +96,7 @@ class BaseTrainer:
         """
         # Loggers
         self.timer = getattr(self, "timer", None)
-        self.wandb_runtime: Run | RunDisabled | None = getattr(self, "wandb_runtime", None)
+        self.wandb_runtime: Optional[Union["Run", "RunDisabled"]] = getattr(self, "wandb_runtime", None)
 
         # Data
         self.dataloader_train = getattr(self, "dataloader_train", None)
@@ -186,7 +189,8 @@ class BaseTrainer:
         Returns:
             A dictionary of the run's metadata
         """
-        wandb.finish()
+        if wandb is not None:
+            wandb.finish()
 
     def _start_capturing_memory(self, dir_prefix: str = "/dev/shm" if sys.platform != "win32" else "."):
         def _start():
@@ -470,6 +474,12 @@ class BaseTrainer:
         """abstract of Eval Function to evaluate model"""
 
     def _get_information(self):
+        partition_rules = pprint.pformat(
+
+            self.arguments.custom_rule if self.arguments.custom_rule is not None else
+            self.arguments.model_class.config_class.get_partition_rules(self.arguments.fully_sharded_data_parallel)
+
+        )
         makrdown = f"""
 ---
 tags:
@@ -483,6 +493,19 @@ tags:
 EasyDeL is an open-source framework designed to enhance and streamline the training process of machine learning
 models. With a primary focus on Jax, EasyDeL aims to provide convenient and effective solutions for 
 training Flax/Jax models on TPU/GPU for both serving and training purposes.
+
+## Using Example
+
+### Using From EasyDeLState (_*.easy_ files)
+
+```python
+```
+
+### Using From AutoEasyDeLModelForCausalLM (_from pytorch_)
+
+```python
+```
+
 
 ## Training Detail
 
@@ -512,10 +535,7 @@ training Flax/Jax models on TPU/GPU for both serving and training purposes.
 
 #### Sharding Partition Rules
 ```python
-partition_rules = {
-        self.arguments.custom_rule if self.arguments.custom_rule is not None else
-        self.arguments.model_class.config_class.get_partition_rules(self.arguments.fully_sharded_data_parallel)
-        }
+partition_rules = {partition_rules}
 ```
         """
         return makrdown

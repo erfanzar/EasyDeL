@@ -5,15 +5,17 @@ import typing
 import warnings
 from typing import OrderedDict, List, Union, Mapping, Optional, Tuple, Callable, Type
 
+import flax.metrics.tensorboard
 import termcolor
-from wandb.apis.public import Run
-from wandb.sdk.lib import RunDisabled
+
+try:
+    import wandb
+except ModuleNotFoundError:
+    wandb = None
 
 from .utils import JaxDistributedConfig
 from ..etils.auto_tx import get_optimizer_and_scheduler
 from jax.sharding import PartitionSpec
-import torch.utils.tensorboard
-import wandb
 from fjformer import CheckpointManager
 from jax.experimental.mesh_utils import create_device_mesh
 from fjformer.xrapture import XRapTureConfig, XRapTure
@@ -34,9 +36,7 @@ from jax.tree_util import PyTreeDef
 
 logger = get_logger(__name__)
 
-AVAILABLE_BACKENDS: List[str] = [
-    "cpu", "gpu", "tpu", None
-]
+AVAILABLE_BACKENDS: List[str] = ["cpu", "gpu", "tpu", None]  # EasyDeL supported Backends ...
 
 
 class EasyDeLXRapTureConfig(XRapTureConfig):  # Don't Make user involved with FJFormer
@@ -377,7 +377,6 @@ class TrainArguments(
             steps=self.max_training_steps,
         )
         self.training_time = self._time_to_seconds(training_time) if training_time is not None else None
-        torch.set_default_device("cpu")
         self.merge_lora_rapture_parameters = merge_lora_rapture_parameters
         self.rapture = None
         self.rapture_config = None
@@ -439,10 +438,10 @@ class TrainArguments(
         """
         return {
             f"hyperparameters/{k}": v for k, v in self.__dict__.items() if
-            isinstance(v, (int, float, str, bool, torch.Tensor))
+            isinstance(v, (int, float, str, bool))
         }
 
-    def get_wandb_init(self) -> Run | RunDisabled | None:
+    def get_wandb_init(self) -> Optional[Union["Run" , "RunDisabled"]] :  # type:ignore
         """The get_wandb_init function is a helper function that returns the wandb.init() call with
         the project name, config object, and tags set to appropriate values for this model.
 
@@ -452,18 +451,21 @@ class TrainArguments(
         Returns:
             A wandb or None
         """
-        return wandb.init(
-            project=f"EasyDeL-{self.model_name}",
-            config=self(),
-            tags=[
-                "EasyDeL",
-                "FJFormer",
-                "OST-OpenSourceTransformers",
-                "Jax/Flax"
-            ],
-            entity=self.wandb_entity
+        if wandb is None:
+            return None
+        else:
+            return wandb.init(  # noqa
+                project=f"EasyDeL-{self.model_name}",
+                config=self(),
+                tags=[
+                    "EasyDeL",
+                    "FJFormer",
+                    "OST-OpenSourceTransformers",
+                    "Jax/Flax"
+                ],
+                entity=self.wandb_entity
 
-        ) if self.log_all_workers or (jax.process_index() == 0) else None
+            ) if self.log_all_workers or (jax.process_index() == 0) else None
 
     def __str__(self):
         string = f"{self.__class__.__name__}(\n"
@@ -581,11 +583,7 @@ class TrainArguments(
         Returns:
             A summary-writer object
         """
-        return torch.utils.tensorboard.SummaryWriter(
-            log_dir=str(self.get_path()),
-            comment=f"{self.model_name}",
-            filename_suffix="easydel"
-        )
+        return flax.metrics.tensorboard.SummaryWriter(log_dir=str(self.get_path()))
 
     @property
     def stop_capturing_memory(self):

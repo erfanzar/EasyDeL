@@ -12,12 +12,12 @@ import websockets
 from fjformer import with_sharding_constraint, match_partition_rules, make_shard_and_gather_fns, get_dtype
 from jax import numpy as jnp
 
-from ...etils.etils import get_logger
-from ...modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
+from easydel.etils.etils import get_logger
+from easydel.modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 from flax.core import FrozenDict
 from transformers import PreTrainedTokenizerBase, GenerationConfig
-from typing import Callable, Tuple, List, Optional, Union, Dict
-from .configuration import EasyServeConfig
+from typing import Callable, Tuple, List, Union, Dict
+from .configuration import EasyDeLServeEngineConfig
 from jax.sharding import PartitionSpec, Mesh
 from jax.experimental.pjit import pjit
 from dataclasses import dataclass
@@ -33,7 +33,7 @@ class LLMBaseReq:
     prefix_tokenizer: PreTrainedTokenizerBase
 
 
-class EasyServe:
+class EasyDeLServeEngine:
     def __init__(
             self,
             llm: EasyDeLFlaxPretrainedModel,
@@ -42,7 +42,7 @@ class EasyServe:
             prefix_tokenizer: PreTrainedTokenizerBase,
             greedy_generate_function: Callable,
             non_greedy_generate_function: Callable,
-            serve_config: EasyServeConfig,
+            serve_config: EasyDeLServeEngineConfig,
     ):
         self.llm = llm
         self.params = params
@@ -116,9 +116,9 @@ class EasyServe:
             if path == "/stream/v1/conversation":
                 await self.generate(socket)
             elif path == "/":
-                await socket.send(json.dumps({"status": "AgentX server is Running..."}))
+                await socket.send(json.dumps({"status": "EasyDeLServeEngine server is Running..."}))  # noqa
             else:
-                await socket.send(json.dumps({"error": f"invalid path {path}"}))
+                await socket.send(json.dumps({"error": f"invalid path {path}"}))  # noqa
         except websockets.ConnectionClosed:
             logger.info("connection closed")
         except Exception as e:
@@ -159,7 +159,7 @@ class EasyServe:
             mesh: Mesh,
             params: Union[FrozenDict, dict],
             partition_rules: Tuple[Tuple[str, PartitionSpec]],
-            serve_config: EasyServeConfig,
+            serve_config: EasyDeLServeEngineConfig,
     ):
 
         """The shard_parameters function takes a set of parameters and partitions them according to the partition_rules.
@@ -171,7 +171,7 @@ class EasyServe:
                 model
             partition_rules: Tuple[Tuple[str, PartitionSpec]]: Specify
                 the partitioning rules for each parameter
-            serve_config: EasyServeConfig: Specify the dtype of the
+            serve_config: EasyDeLServeEngineConfig: Specify the dtype of the
                 parameters
         :param : Create a mesh of devices
 
@@ -193,12 +193,12 @@ class EasyServe:
     def create_generation_functions_and_tokenizers(
             model: EasyDeLFlaxPretrainedModel,
             tokenizer: PreTrainedTokenizerBase,
-            serve_config: EasyServeConfig,
+            serve_config: EasyDeLServeEngineConfig,
             partition_specs: dict[str, PartitionSpec]
     ) -> LLMBaseReq:
         """The create_generation_functions_and_tokenizers function is used to create the functions that will be used for
         generation. It also creates a tokenizer object that can be used to encode and decode text. The function takes in
-        a model, a tokenizer, an EasyServeConfig object (which contains all the parameters needed for generation), and
+        a model, a tokenizer, an EasyDeLServeEngineConfig object (which contains all the parameters needed for generation), and
         partition_specs which are specifications about how data should be partitioned across devices.
 
         Args:
@@ -206,7 +206,7 @@ class EasyServe:
                 tokenizer
             tokenizer: PreTrainedTokenizerBase: Create a tokenizer
                 object
-            serve_config: EasyServeConfig: Create the generation
+            serve_config: EasyDeLServeEngineConfig: Create the generation
                 function
             partition_specs: dict[str, PartitionSpec]: Specify the
                 sharding of the model parameters
@@ -314,7 +314,7 @@ class EasyServe:
             llm: EasyDeLFlaxPretrainedModel,
             params: dict,
             tokenizer: PreTrainedTokenizerBase,
-            serve_config: EasyServeConfig,
+            serve_config: EasyDeLServeEngineConfig,
             partition_rules: Tuple[Tuple[str, PartitionSpec]],
             shard_parameters: bool = True,
     ):
@@ -329,7 +329,7 @@ class EasyServe:
             params: dict: Pass the parameters of the model
             tokenizer: PreTrainedTokenizerBase: Create the tokenizer and
                 prefix_tokenizer
-            serve_config: EasyServeConfig: Configure the model for
+            serve_config: EasyDeLServeEngineConfig: Configure the model for
                 serving
             partition_rules: Tuple[Tuple[str, PartitionSpec]]: Partition
                 the parameters of the model

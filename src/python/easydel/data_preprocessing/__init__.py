@@ -1,1 +1,1 @@
-from ._processor import DataProcessorArguments, DataProcessor
+from .data_processor import DataProcessorArguments, DataProcessor
