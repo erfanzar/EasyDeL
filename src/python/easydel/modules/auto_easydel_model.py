@@ -502,7 +502,9 @@ class AutoEasyDeLModelForCausalLM:
         logger.debug(f"Downloading model weights from {pretrained_model_name_or_path}")
         model = AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path, **kwargs)
         cfg = cfg.from_pretrained(pretrained_model_name_or_path)
-        state_dict = model.state_dict()
+        t_state_dict = model.state_dict()
+        del model
+        gc.collect()
         logger.debug(f"adding model basic EasyDeL configurations.")
         if hasattr(cfg, 'add_jax_args'):
             cfg.add_jax_args()
@@ -537,10 +539,14 @@ class AutoEasyDeLModelForCausalLM:
             s.replace(".kernel", ".weight").replace(".scale", ".weight").replace(".embedding", ".weight") for s in
             list(flax.traverse_util.flatten_dict(ed_model.params_shape_tree, sep=".").keys())
         ]
-        for k in list(state_dict.keys()):
-            if k not in needs:
+        state_dict = {}
+        for k in list(t_state_dict.keys()):
+            tensor = t_state_dict.pop(k)
+            if k in needs:
+                state_dict[k] = tensor
+            else:
                 logger.debug(f"removing {k} from weights as it was not needed by flax model")
-                del state_dict[k]
+        del t_state_dict
         if shard_fns is not None:
             if auto_shard_params:
                 warnings.warn(
@@ -596,7 +602,6 @@ class AutoEasyDeLModelForCausalLM:
         logger.debug("deleting huggingface-model")
 
         del state_dict
-        del model
         gc.collect()
 
         if is_flatten(params):
@@ -710,6 +715,7 @@ class AutoShardAndGatherFunctions:
             flatten: bool = True,
             dtype_specs=jax.numpy.float16,
             input_shape: Tuple[int, int] = (1, 1),
+            depth_target: Optional[List[str]] = None
     ):
         """
         Generates shard and gather functions based on a provided `EasyDeLPretrainedConfig` object.
@@ -721,6 +727,7 @@ class AutoShardAndGatherFunctions:
             flatten: Whether to flatten the shard and gather functions. Defaults to True.
             dtype_specs: The data type to use for the shard and gather functions. Defaults to `jax.numpy.float16`.
             input_shape: The input shape of the model. Defaults to (1, 1).
+            depth_target: Pad the sharding to depth, for example make {params:tensor} with depth_target = ["row"] to {row:{params:tensor}}. Defaults to None.
 
         Returns:
             A tuple containing the shard and gather functions.
@@ -743,6 +750,10 @@ class AutoShardAndGatherFunctions:
             partition_specs=partition_specs,
             dtype_specs=dtype_specs
         )
+        if depth_target is not None:
+            for dp in depth_target[::-1]:
+                gather_fns = {dp: gather_fns}
+                shard_fns = {dp: shard_fns}
         if flatten and not is_flatten(shard_fns):
             gather_fns = flax.traverse_util.flatten_dict(gather_fns)
             shard_fns = flax.traverse_util.flatten_dict(shard_fns)
@@ -772,6 +783,7 @@ class AutoShardAndGatherFunctions:
             flatten: bool = True,
             dtype_specs=jax.numpy.float16,
             config_kwargs: Optional[Mapping[str, Any]] = None,
+            depth_target: Optional[List[str]] = None
     ) -> Tuple[Mapping[str, Callable], Mapping[str, Callable]]:
         """
         Generates shard and gather functions based on a pretrained model name or path.
@@ -795,6 +807,7 @@ class AutoShardAndGatherFunctions:
             flatten: Whether to flatten the shard and gather functions. Defaults to True.
             dtype_specs: The data type to use for the shard and gather functions. Defaults to `jax.numpy.float16`.
             config_kwargs: Additional keyword arguments to pass to the `AutoEasyDeLConfig` constructor. Defaults to None.
+            depth_target: Pad the sharding to depth, for example make {params:tensor} with depth_target = ["row"] to {row:{params:tensor}}. Defaults to None.
 
         Returns:
             A tuple containing the shard and gather functions.
@@ -821,5 +834,6 @@ class AutoShardAndGatherFunctions:
             partition_rules=partition_rules,
             flatten=flatten,
             dtype_specs=dtype_specs,
-            input_shape=input_shape
+            input_shape=input_shape,
+            depth_target=depth_target
         )

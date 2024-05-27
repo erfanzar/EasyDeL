@@ -123,8 +123,9 @@ def huggingface_to_easydel(
 
         pbar.set_description("Converting Model")
 
-        for key, tensor in list(state_dict.items()):
+        for key in list(state_dict.keys()):
             # Determine if renaming is necessary
+            tensor = state_dict.pop(key)
             new_key = key
             if any(layer_name in key for layer_name in embedding_layer_names):
                 new_key = key[:-_l] + ".embedding"
@@ -142,9 +143,10 @@ def huggingface_to_easydel(
             array = jax.lax.convert_element_type(jnp.asarray(tensor.cpu().detach().numpy()), dtype)
             if remove_state_dict:
                 del tensor
-                del state_dict[key]
+                gc.collect()
             # Apply sharding functions if provided
-            if shard_fns and key_tuple in shard_fns:                array = shard_fns[key_tuple](array)
+            if shard_fns and key_tuple in shard_fns:
+                array = shard_fns[key_tuple](array)
             if convert_to_8bit:
                 if params_pattern_selection.search("/".join(key_tuple)):
                     array = fjformer.linen.linen.LinearBitKernel(

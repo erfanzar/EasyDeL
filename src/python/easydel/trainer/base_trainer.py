@@ -499,11 +499,52 @@ training Flax/Jax models on TPU/GPU for both serving and training purposes.
 ### Using From EasyDeLState (_*.easy_ files)
 
 ```python
+import os
+
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = ".99"
+
+from src.python.easydel import EasyDeLState, AutoShardAndGatherFunctions
+from jax import numpy as jnp, lax
+
+shard_fns, gather_fns = AutoShardAndGatherFunctions.from_pretrained(
+    "REPO_ID", # Pytorch State should be saved to in order to find shard gather fns with no effort, otherwise read docs.
+    backend="gpu",
+    depth_target=["params", "params"],
+    flatten=False
+)
+
+state = EasyDeLState.load_state(
+    "REPO_ID/{self.arguments.model_name}.easy",
+    dtype=jnp.float16,
+    param_dtype=jnp.float16,
+    precision=lax.Precision("fastest"),
+    verbose=True,
+    state_shard_fns=shard_fns
+)
+# State file Ready to use ...
 ```
 
 ### Using From AutoEasyDeLModelForCausalLM (_from pytorch_)
 
 ```python
+import os
+
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = ".99"
+
+from src.python.easydel import AutoEasyDeLModelForCausalLM
+from jax import numpy as jnp, lax
+
+
+model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
+    "REPO_ID/{self.arguments.model_name}",
+    dtype=jnp.float16,
+    param_dtype=jnp.float16,
+    precision=lax.Precision("fastest"),
+    auto_shard_params=True
+)
+# Model and Parameters Ready to use ...
 ```
 
 
