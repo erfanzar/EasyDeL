@@ -1,7 +1,7 @@
 ``etils`` module
 ================
 
-.. automodule:: src.python.easydel.etils.etils
+.. automodule:: easydel.etils.etils
     :members:
     :undoc-members:
     :show-inheritance:

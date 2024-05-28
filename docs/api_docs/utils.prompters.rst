@@ -1,7 +1,7 @@
 ``prompters`` module
 ====================
 
-.. automodule:: src.python.easydel.utils.prompters
+.. automodule:: easydel.utils.prompters
     :members:
     :undoc-members:
     :show-inheritance:

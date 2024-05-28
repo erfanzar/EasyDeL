@@ -1,7 +1,7 @@
 ``configuration`` module
 ========================
 
-.. automodule:: src.python.easydel.serve.configuration
+.. automodule:: easydel.serve.configuration
     :members:
     :undoc-members:
     :show-inheritance:

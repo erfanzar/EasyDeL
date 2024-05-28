@@ -1,7 +1,7 @@
 ``gpt neo x/gpt neo x configuration`` module
 ============================================
 
-.. automodule:: src.python.easydel.modules.gpt_neo_x.gpt_neo_x_configuration
+.. automodule:: easydel.modules.gpt_neo_x.gpt_neo_x_configuration
     :members:
     :undoc-members:
     :show-inheritance:
