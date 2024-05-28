@@ -186,6 +186,11 @@ class AttentionModule:
     attention_outputs = attention_output.attention_outputs
     attention_weights = attention_output.attention_weights
     ```
+    The AttentionModule class is a crucial component within EasyDeL, responsible for managing and optimizing attention
+    computations. It provides a user-friendly way to select and execute different attention mechanisms,
+    leveraging JAX's sharding capabilities and offering performance enhancements through specialized implementations
+     like FlashAttention and SplashAttention. Its ability to handle block-wise computations and customization options
+      makes it adaptable to a variety of model architectures and hardware configurations.
 
     Attributes:
         mesh (Mesh): JAX mesh for device distribution.

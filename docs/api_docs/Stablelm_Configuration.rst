@@ -6,3 +6,5 @@ Stablelm Configuration
 
 .. automodule:: src.python.easydel.modules.stablelm.stablelm_configuration
    :members:
+   :undoc-members:
+   :show-inheritance:

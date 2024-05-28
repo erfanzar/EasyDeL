@@ -6,3 +6,5 @@ Whisper Configuration
 
 .. automodule:: src.python.easydel.modules.whisper.whisper_configuration
    :members:
+   :undoc-members:
+   :show-inheritance:

@@ -117,9 +117,9 @@ def create_rst_pages(data, output_dir=".", parent_page=None):
                 content += f".. toctree::\n   :maxdepth: 2\n\n   {sub_page_name}\n\n"
         # Handle leaf nodes (links to existing .rst files)
         elif isinstance(value, str):
-            content += f".. automodule:: {value.replace('.rst', '')}\n   :members:\n"
+            content += f".. automodule:: {value.replace('.rst', '')}\n   :members:\n   :undoc-members:\n   :show-inheritance:\n"
 
-        # Write the content to the .rst file
+            # Write the content to the .rst file
         with open(file_path, "w") as f:
             f.write(content)
 

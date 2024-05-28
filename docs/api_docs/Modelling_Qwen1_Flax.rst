@@ -6,3 +6,5 @@ Modelling Qwen1 Flax
 
 .. automodule:: src.python.easydel.modules.qwen1.modelling_qwen1_flax
    :members:
+   :undoc-members:
+   :show-inheritance:
