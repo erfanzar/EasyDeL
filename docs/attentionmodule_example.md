@@ -1,8 +1,43 @@
-AttentionModule
-========
+# AttentionModule: A Versatile Attention Mechanism Factory
 
-what is `AttentionModule`
---------
+The `AttentionModule` class is designed to simplify the creation and execution of different attention mechanisms within
+your EasyDeL models. It provides a unified interface for working with various attention types, allowing you to easily
+switch between them and experiment with different configurations.
+
+**Key Features:**
+
+* **Mechanism Selection:** The `attn_mechanism` argument lets you choose the specific attention algorithm you want to
+  use (e.g., "vanilla," "flash," "splash," "ring," "cudnn").
+* **Sharding and Partitioning:** The class supports advanced JAX sharding techniques to distribute attention
+  computations across multiple devices for efficient processing of large models. It handles partitioning of query, key,
+  value, bias, and attention weight matrices using `PartitionSpec`.
+* **Blockwise Attention:** Enables the use of blockwise attention for increased memory efficiency, especially with long
+  sequences.
+* **Caching Support:** Facilitates the use of attention caching to speed up inference and generation tasks.
+* **Dropout and Determinism:** Allows for applying dropout to attention weights and controlling the deterministic
+  behavior of the attention computation.
+* **Testing Utility:**  Provides a `test_attentions` method to compare different attention mechanisms in terms of
+  accuracy, gradient stability, and computation time.
+
+**How it Works:**
+
+1. **Initialization:**
+    - During initialization, you provide the desired `attn_mechanism`, JAX `mesh` for sharding, scaling
+      factor (`sm_scale`), number of attention heads, head dimensions, and other configuration parameters.
+    - The class automatically sets default values for many parameters based on the chosen attention mechanism and the
+      provided EasyDeL configuration (`base_module_class`).
+2. **Calling the Module:**
+    - When you call the `AttentionModule` object, you pass in the query, key, and value states, along with optional
+      parameters like attention masks, biases, and causal flags.
+    - The module internally selects the appropriate attention function based on the specified `attn_mechanism`.
+    - It performs any necessary sharding and partitioning based on the configured partition specifications.
+    - The attention computation is executed, and the attention outputs (and optionally attention weights) are returned.
+
+**Advantages:**
+
+* **Flexibility:**  Allows you to easily switch between different attention mechanisms without major code changes.
+* **Efficiency:**  Supports advanced JAX sharding for distributed computation, enabling the handling of large models.
+
 AttentionModule is a EasyDeL module that can perform attention operation with different strategies to help user achieve
 the best possible performance and numerical stability, here are some strategies supported right now.
 
@@ -14,9 +49,28 @@ the best possible performance and numerical stability, here are some strategies 
 6. Local Ring attention via "local_ring"
 7. Wise Ring attention via "wise_ring"
 8. sharded Attention with shard map known as "sharded_vanilla"
+9. Other Attention modules might be added you can check source code for that..
 
-Example of Using Flash Attention on TPU
---------
+## Testing which Attention Module works best
+
+in order to test which attention module in what axis dims works best for you you can run
+```python
+from easydel import AttentionModule
+
+print(
+    AttentionModule.test_attentions(
+        axis_dims=(1, 1, 1, -1),
+        sequence_length=128 * 8,
+        num_attention_heads=32,
+        num_key_value_heads=32,
+        chunk_size=128,
+
+    )
+)
+```
+
+## Example of Using Flash Attention on TPU
+
 ```python
 import jax
 import flax.linen.attention as flt

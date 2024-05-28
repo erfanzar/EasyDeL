@@ -1,5 +1,5 @@
-EasyDeLXRapTure for layer tuning and LoRA
----------
+# EasyDeLXRapTure for layer tuning and LoRA
+
 in case of using LoRA and applying that on the EasyDeL models there are some other things
 that you might need to config on your own but a lot of things being handled by EasyDeL so let just jump into an example
 for LoRA fine-tuning section and use _EasyDeLXRapTure_ in for mistral models with flash attention example
@@ -90,7 +90,6 @@ train_arguments = TrainArguments(
     # What this does ? this will merge the lora parameters with the original model parameters and the end of training
 )
 
-
 def ultra_chat_prompting_sample(
         data_chunk
 ):
@@ -117,7 +116,7 @@ tokenization_process = lambda data_chunk: tokenizer(
 )
 
 dataset = load_dataset("HuggingFaceH4/ultrachat_200k")
-dataset_train = dataset["train_gen"].map(ultra_chat_prompting_process, num_proc=12)
+dataset_train = dataset["train_gen"].map(ultra_chat_prompting_sample, num_proc=12)
 dataset_train = dataset_train.map(
     tokenization_process,
     num_proc=12,
