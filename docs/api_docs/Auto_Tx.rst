@@ -6,3 +6,5 @@ Auto Tx
 
 .. automodule:: src.python.easydel.etils.auto_tx
    :members:
+   :undoc-members:
+   :show-inheritance:

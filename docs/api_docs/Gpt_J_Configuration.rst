@@ -6,3 +6,5 @@ Gpt J Configuration
 
 .. automodule:: src.python.easydel.modules.gpt_j.gpt_j_configuration
    :members:
+   :undoc-members:
+   :show-inheritance:
