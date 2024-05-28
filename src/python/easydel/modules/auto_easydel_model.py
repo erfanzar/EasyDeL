@@ -5,7 +5,7 @@ import warnings
 from functools import partial
 from typing import Sequence, Optional, Tuple, Mapping, Callable, Type, Any, List
 
-import fjformer.linen.linen
+# import fjformer.linen.linen
 import flax.traverse_util
 import jax.numpy
 from fjformer import match_partition_rules, make_shard_and_gather_fns
@@ -446,6 +446,7 @@ class AutoEasyDeLModelForCausalLM:
             partition_rules: Optional[Tuple[Tuple[str, PartitionSpec], ...]] = None,
             load_in_8bit: bool = False,
             bit_targeted_params: Optional[List[str]] = None,
+            verbose_params: bool = False,
             **kwargs
     ) -> Tuple[EasyDeLFlaxPretrainedModel, dict]:
         """Loads and shards a pretrained causal language model from the Hugging Face Hub and converts it into an
@@ -486,6 +487,7 @@ class AutoEasyDeLModelForCausalLM:
             load_in_8bit (bool, optional): Whether to load the model parameters in 8-bit precision. Defaults to False.
             bit_targeted_params (Optional[List[str]], optional): List of parameter names to convert to 8-bit precision. If
                 None and load_in_8bit is True, all kernels and embeddings are converted to 8-bit. Defaults to None.
+            verbose_params (bool): whenever to log number of parameters in converting state.
             **kwargs: Additional keyword arguments to pass to the model and config classes.
 
         Returns:
@@ -501,6 +503,8 @@ class AutoEasyDeLModelForCausalLM:
 
         logger.debug(f"Downloading model weights from {pretrained_model_name_or_path}")
         model = AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path, **kwargs)
+        if verbose_params:
+            print(f"PyTorch - HF Model contains {sum(p.numel() for p in model.parameters()) / 1e9} Billion Parameters")
         cfg = cfg.from_pretrained(pretrained_model_name_or_path)
         t_state_dict = model.state_dict()
         del model
@@ -608,6 +612,10 @@ class AutoEasyDeLModelForCausalLM:
             logger.info("converted parameters are flatten making them unflatten ")
             params = unflatten_dict(params)
 
+        if verbose_params:
+            print(
+                f"JAX - EasyDeL Model contains {sum(n.size for n in jax.tree_util.tree_flatten(flax.core.unfreeze(params))[0]) / 1e9} Billion Parameters"
+            )
         return ed_model, params
 
 
