@@ -114,7 +114,7 @@ def create_rst_pages(data, output_dir=".", parent_page=None):
             # Add links to the sub-pages
             for sub_key in value.keys():
                 sub_page_name = sub_key.replace(" ", "_") + ".rst"
-                content += f".. toctree::\n   :maxdepth: 2\n\n   {sub_page_name}\n\n"
+                content += f".. toctree::\n   :maxdepth: 2\n\n   {sub_page_name.replace('.rst','')}\n\n"
         # Handle leaf nodes (links to existing .rst files)
         elif isinstance(value, str):
             content += f".. automodule:: {value.replace('.rst', '')}\n   :members:\n   :undoc-members:\n   :show-inheritance:\n"
