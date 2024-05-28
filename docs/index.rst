@@ -101,6 +101,13 @@ Zare Chavoshi, Erfan. "EasyDeL, an open-source library, is specifically designed
     contributing
     easydelstate.md
 
+.. toctree::
+    :hidden:
+    :maxdepth: 1
+    :caption: APIs
+
+    api_docs/index
+
 
 .. toctree::
     :hidden:
@@ -112,6 +119,7 @@ Zare Chavoshi, Erfan. "EasyDeL, an open-source library, is specifically designed
     parameterquantization.md
     attentionmodule_example.md
     data_processing.md
+
 
 
 .. bibliography:: references.bib

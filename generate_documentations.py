@@ -1,7 +1,6 @@
 import os
-import re
 
-import yaml
+static_joins = "\n\t:members:\n\t:undoc-members:\n\t:show-inheritance:"
 
 cache = {}
 
@@ -35,7 +34,7 @@ def get_files(path: str):
             os.path.exists(os.path.join(path, o)) and not os.path.isdir(os.path.join(path, o))]
 
 
-def run(project_locations="src/python/easydel", docs_file="docs/", start_head="src/python/easydel"):
+def run(project_locations="src/python/easydel", docs_file="docs/api_docs/", start_head="src/python/easydel"):
     global cache
     try:
         for current_file in get_inner(project_locations):
@@ -60,13 +59,13 @@ def run(project_locations="src/python/easydel", docs_file="docs/", start_head="s
                     .replace("/", ".")
                 )
 
-                markdown_documentation = f"# {name.replace(doted, '')}\n::: {name}"
+                markdown_documentation = f"{name.replace(doted, '')}\n========\n.. automodule:: {name}" + static_joins
                 categorical_name = name.replace(doted, "")
                 markdown_filename = (
-                        "generated-" + name
+                        "generated_" + name
                         .replace(doted, "")
                         .replace(".", "-")
-                        + ".md"
+                        + ".rst"
                 )
 
                 with open(docs_file + markdown_filename, "w") as buffer:
@@ -85,89 +84,49 @@ def run(project_locations="src/python/easydel", docs_file="docs/", start_head="s
         ...
 
 
+def generate_index_file(nested_dict, parent_title="", depth=0):
+    lines = []
+
+    if parent_title:
+        indent = "    " * depth
+        lines.append(f"{indent}{parent_title}\n")
+        lines.append(f"{indent}{'-' * len(parent_title)}\n")
+
+    for key, value in nested_dict.items():
+        if isinstance(value, dict):
+            lines.extend(generate_index_file(value, key, depth + 1))
+        else:
+            indent = "    " * (depth + 1)
+            lines.append(f"{indent}- {key} <{value}>\n")
+
+    return lines
+
+
 def main():
     global cache
 
-    for current_file in get_inner("docs/"):
-        if current_file.startswith("docs/generated-"):
+    for current_file in get_inner("docs/api_docs/"):
+        if current_file.startswith("docs/api_docs/generated_"):
             os.remove(current_file)
-            print("Removed Past generated file: " + current_file)
+            # print("Removed Past generated file: " + current_file)
     run()
-    mkdocstrings_options = {
-        "mkdocstrings": {
-            "handlers": {
-                "python": {
-                    "options": {
-                        "docstring_style": "sphinx"
-                    }
-                }
-            },
-        }
-    }
-    theme_options = {
 
-        "name": "material",
-        "highlightjs": True,
-        "hljs_languages": [
-            "yaml", "python"
-        ]
-
-    }
-
-    string_options = """
-plugins:
-  - search
-  - mkdocstrings:
-      handlers:
-        python:
-          options:
-            docstring_style: google
-
-repo_url: https://github.com/erfanzar/EasyDeL
-site_author: Erfan Zare Chavoshi
-site_name: EasyDeL
-copyright: Erfan Zare Chavoshi-easydel
-
-theme:
-  highlightjs: true
-  hljs_languages:
-    - yaml
-    - python
-  name: material
-"""
-
-    statics = {
-        ("Home",): "index.rst",
-        ("Install",): "Install.rst",
-        ("Available models",): "AvailableModels.md",
-        ("Examples", "EasyState"): "easydelstate.rst",
-        ("Examples", "LoRA and Transfer Learning"): "LoRA-TransferLearningExample.rst",
-        ("Examples", "Fine Tuning Example"): "finetuning.example.rst",
-        ("Examples", "DataProcessing"): "data_processing.rst",
-        ("Examples", "Easy Attention"): "AttentionModuleExample.md",
-        ("Examples", "Model Parameter Quantization"): "Parameter-Quantization.rst",
-        ("Contributing",): "contributing.rst"
-
-    }
     cache = {("APIs",) + k: v for k, v in cache.items()}
-    cache = statics | cache
     pages = unflatten_dict(cache)
+    index_lines = [
+        "API Home",
+        "====\n",
+        ".. toctree::\n",
+        "    :maxdepth: 2\n",
+        "    :caption: Contents\n"
+    ]
 
-    def custom_sort(page):
-        order = {'Home': 0, 'install': 1, "AvailableModels": 2, "Examples": 3}
-        return 0, order.get(page, 4), page
+    index_lines.extend(generate_index_file(pages))
+    index_content = "\n".join(index_lines)
 
-    yaml_data = {
-        "nav": {key: pages[key] for key in sorted(pages.keys(), key=custom_sort)},
-    }
-    buff = open("mkdocs.yml", "w")
-    yaml.safe_dump(yaml_data, buff)
-    chk = open("mkdocs.yml", "r")
-    wrote = chk.read()
-    output_string = re.sub(r'(\n\s*)(\w[^:\n]*:)(.*?)(?=\n\s*\w[^:\n]*:|\Z)', r'\1- \2\3', str(wrote), flags=re.DOTALL)
-    buff = open("mkdocs.yml", "w")
-    buff.write(output_string)
-    buff.write(string_options)
+    # Write the index content to a file
+    with open("docs/api_docs/index.rst", "w") as f:
+        f.write(index_content)
 
 
 if __name__ == "__main__":

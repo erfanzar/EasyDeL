@@ -1,0 +1,6 @@
+modules.opt.modelling_opt_flax
+========
+.. automodule:: src.python.easydel.modules.opt.modelling_opt_flax
+	:members:
+	:undoc-members:
+	:show-inheritance:
