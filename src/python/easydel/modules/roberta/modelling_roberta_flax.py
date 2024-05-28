@@ -26,7 +26,7 @@ from ..attention_module import AttentionModule
 from ..flax_modelling_utils import get_gradient_checkpoint_policy, ACT2FN, get_dot_general_by_bits, \
     BaseJAXAttentionModule
 
-from fjformer.linen import Linear
+from fjformer.linen import Dense
 
 
 class FlaxRobertaEmbeddings(nn.Module):
@@ -118,21 +118,21 @@ class FlaxRobertaSelfAttention(BaseJAXAttentionModule):
             axis_name=self.config.attention_axis_name,
             backward_pass_impl=self.config.flash_attention_backward_pass_impl
         )
-        self.query = Linear(
+        self.query = Dense(
             self.config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             **get_dot_general_by_bits(bits=self.config.bits, mode=self.config.easy_method)
         )
-        self.key = Linear(
+        self.key = Dense(
             self.config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             **get_dot_general_by_bits(bits=self.config.bits, mode=self.config.easy_method)
         )
-        self.value = Linear(
+        self.value = Dense(
             self.config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -263,7 +263,7 @@ class FlaxRobertaSelfOutput(nn.Module):
     precision: Optional[lax.Precision] = None
 
     def setup(self):
-        self.dense = Linear(
+        self.dense = Dense(
             self.config.hidden_size,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             dtype=self.dtype,
@@ -335,7 +335,7 @@ class FlaxRobertaIntermediate(nn.Module):
     precision: Optional[lax.Precision] = None
 
     def setup(self):
-        self.dense = Linear(
+        self.dense = Dense(
             self.config.intermediate_size,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             dtype=self.dtype,
@@ -358,7 +358,7 @@ class FlaxRobertaOutput(nn.Module):
     precision: Optional[lax.Precision] = None
 
     def setup(self):
-        self.dense = Linear(
+        self.dense = Dense(
             self.config.hidden_size,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             dtype=self.dtype,
@@ -585,7 +585,7 @@ class FlaxRobertaPooler(nn.Module):
     precision: Optional[lax.Precision] = None
 
     def setup(self):
-        self.dense = Linear(
+        self.dense = Dense(
             self.config.hidden_size,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             dtype=self.dtype,
@@ -607,7 +607,7 @@ class FlaxRobertaLMHead(nn.Module):
     precision: Optional[lax.Precision] = None
 
     def setup(self):
-        self.dense = Linear(
+        self.dense = Dense(
             self.config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -616,7 +616,7 @@ class FlaxRobertaLMHead(nn.Module):
             **get_dot_general_by_bits(bits=self.config.bits, mode=self.config.easy_method)
         )
         self.layer_norm = nn.LayerNorm(epsilon=self.config.layer_norm_eps, dtype=self.dtype)
-        self.decoder = Linear(
+        self.decoder = Dense(
             self.config.vocab_size,
             dtype=self.dtype,
             use_bias=False,
@@ -643,7 +643,7 @@ class FlaxRobertaLMHead(nn.Module):
         else:
             hidden_states = self.decoder(hidden_states)
 
-        bias = fjformer.linen.linen.control_quantization(self.bias, self.dtype)
+        bias = fjformer.linen.control_quantization(self.bias, self.dtype)
         hidden_states += bias
         return hidden_states
 
@@ -655,7 +655,7 @@ class FlaxRobertaClassificationHead(nn.Module):
     precision: Optional[lax.Precision] = None
 
     def setup(self):
-        self.dense = Linear(
+        self.dense = Dense(
             self.config.hidden_size,
             dtype=self.dtype,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
@@ -669,7 +669,7 @@ class FlaxRobertaClassificationHead(nn.Module):
             else self.config.hidden_dropout_prob
         )
         self.dropout = flax.linen.Dropout(rate=classifier_dropout)
-        self.out_proj = Linear(
+        self.out_proj = Dense(
             self.config.num_labels,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -1016,7 +1016,7 @@ class FlaxRobertaForMaskedLMModule(nn.Module):
         hidden_states = outputs[0]
         if self.config.tie_word_embeddings:
             shared_embedding = self.roberta.variables["params"]["embeddings"]["word_embeddings"]["embedding"]
-            shared_embedding = fjformer.linen.linen.control_quantization(shared_embedding, self.param_dtype)
+            shared_embedding = fjformer.linen.control_quantization(shared_embedding, self.param_dtype)
         else:
             shared_embedding = None
 
@@ -1110,7 +1110,7 @@ class FlaxRobertaForMultipleChoiceModule(nn.Module):
             precision=self.precision
         )
         self.dropout = flax.linen.Dropout(rate=self.config.hidden_dropout_prob)
-        self.classifier = Linear(
+        self.classifier = Dense(
             1,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -1189,7 +1189,7 @@ class FlaxRobertaForTokenClassificationModule(nn.Module):
             else self.config.hidden_dropout_prob
         )
         self.dropout = flax.linen.Dropout(rate=classifier_dropout)
-        self.classifier = Linear(
+        self.classifier = Dense(
             self.config.num_labels,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -1255,7 +1255,7 @@ class FlaxRobertaForQuestionAnsweringModule(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.qa_outputs = Linear(
+        self.qa_outputs = Dense(
             self.config.num_labels,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -1365,7 +1365,7 @@ class FlaxRobertaForCausalLMModule(nn.Module):
         hidden_states = outputs[0]
         if self.config.tie_word_embeddings:
             shared_embedding = self.roberta.variables["params"]["embeddings"]["word_embeddings"]["embedding"]
-            shared_embedding = fjformer.linen.linen.control_quantization(shared_embedding, self.param_dtype)
+            shared_embedding = fjformer.linen.control_quantization(shared_embedding, self.param_dtype)
         else:
             shared_embedding = None
 

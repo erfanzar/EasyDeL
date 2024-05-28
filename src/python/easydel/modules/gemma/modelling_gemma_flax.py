@@ -10,7 +10,7 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec
 from fjformer import with_sharding_constraint
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
-from fjformer.linen import Linear
+from fjformer.linen import Dense
 from flax.linen import combine_masks, make_causal_mask
 
 from flax.traverse_util import flatten_dict, unflatten_dict
@@ -133,7 +133,7 @@ class FlaxGemmaAttention(BaseJAXAttentionModule):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
 
         kernel = jax.nn.initializers.normal(self.config.initializer_range)
-        self.q_proj = Linear(
+        self.q_proj = Dense(
             self.num_heads * self.head_dim,
             use_bias=config.attention_bias,
             dtype=self.dtype,
@@ -142,7 +142,7 @@ class FlaxGemmaAttention(BaseJAXAttentionModule):
             kernel_init=kernel,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.k_proj = Linear(
+        self.k_proj = Dense(
             self.num_key_value_heads * self.head_dim,
             use_bias=config.attention_bias,
             dtype=self.dtype,
@@ -151,7 +151,7 @@ class FlaxGemmaAttention(BaseJAXAttentionModule):
             kernel_init=kernel,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.v_proj = Linear(
+        self.v_proj = Dense(
             self.num_key_value_heads * self.head_dim,
             use_bias=config.attention_bias,
             dtype=self.dtype,
@@ -160,7 +160,7 @@ class FlaxGemmaAttention(BaseJAXAttentionModule):
             kernel_init=kernel,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.o_proj = Linear(
+        self.o_proj = Dense(
             self.embed_dim,
             use_bias=config.attention_bias,
             dtype=self.dtype,
@@ -394,7 +394,7 @@ class FlaxGemmaMLP(nn.Module):
             hidden_activation = self.config.hidden_activation
         self.act = ACT2FN[hidden_activation]
 
-        self.gate_proj = Linear(
+        self.gate_proj = Dense(
             inner_dim,
             use_bias=False,
             dtype=self.dtype,
@@ -403,7 +403,7 @@ class FlaxGemmaMLP(nn.Module):
             kernel_init=kernel_init,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.down_proj = Linear(
+        self.down_proj = Dense(
             embed_dim,
             use_bias=False,
             dtype=self.dtype,
@@ -412,7 +412,7 @@ class FlaxGemmaMLP(nn.Module):
             kernel_init=kernel_init,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.up_proj = Linear(
+        self.up_proj = Dense(
             inner_dim,
             use_bias=False,
             dtype=self.dtype,
@@ -829,7 +829,7 @@ class FlaxGemmaForCausalLMModule(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.lm_head = Linear(
+        self.lm_head = Dense(
             self.config.vocab_size,
             use_bias=False,
             dtype=self.dtype,
@@ -865,7 +865,7 @@ class FlaxGemmaForCausalLMModule(nn.Module):
         hidden_states = outputs[0]
         if self.config.tie_word_embeddings:
             shared_kernel = self.model.variables["params"]["embed_tokens"]["embedding"]
-            shared_kernel = fjformer.linen.linen.control_quantization(shared_kernel, self.param_dtype).T
+            shared_kernel = fjformer.linen.control_quantization(shared_kernel, self.param_dtype).T
             lm_logits = self.lm_head.apply({"params": {"kernel": shared_kernel}}, hidden_states)
         else:
             lm_logits = self.lm_head(hidden_states)

@@ -51,7 +51,7 @@ from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 import chex
 from fjformer.bits import config as q_config, q_flax
 from .gpt_j_configuration import GPTJConfig
-from fjformer.linen import Linear
+from fjformer.linen import Dense
 
 logger = logging.get_logger(__name__)
 
@@ -107,7 +107,7 @@ class FlaxGPTJAttention(BaseJAXAttentionModule):
 
         dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
         dense = partial(
-            Linear,
+            Dense,
             self.embed_dim,
             use_bias=False,
             dtype=self.dtype,
@@ -297,7 +297,7 @@ class FlaxGPTJMLP(nn.Module):
             _dot_general_cls = None
 
         dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
-        self.fc_in = Linear(
+        self.fc_in = Dense(
             self.intermediate_size,
             dtype=self.dtype,
             param_dtype=self.dtype,
@@ -305,7 +305,7 @@ class FlaxGPTJMLP(nn.Module):
             kernel_init=kernel_init,
             dot_general=dot_general_cls
         )
-        self.fc_out = Linear(
+        self.fc_out = Dense(
             embed_dim,
             dtype=self.dtype,
             param_dtype=self.dtype,
@@ -710,7 +710,7 @@ class FlaxGPTJForCausalLMModule(nn.Module):
             param_dtype=self.dtype,
             precision=self.precision
         )
-        self.lm_head = Linear(
+        self.lm_head = Dense(
             self.config.vocab_size,
             dtype=self.dtype,
             kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
@@ -745,7 +745,7 @@ class FlaxGPTJForCausalLMModule(nn.Module):
 
         if self.config.tie_word_embeddings:
             shared_kernel = self.transformer.variables["params"]["wte"]["embedding"]
-            shared_kernel = fjformer.linen.linen.control_quantization(shared_kernel, self.param_dtype).T
+            shared_kernel = fjformer.linen.control_quantization(shared_kernel, self.param_dtype).T
             lm_logits = self.lm_head.apply({"params": {"kernel": shared_kernel}}, hidden_states)
         else:
             lm_logits = self.lm_head(hidden_states)

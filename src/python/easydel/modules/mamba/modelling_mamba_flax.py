@@ -9,7 +9,7 @@ import chex
 from fjformer import linen as nn
 import jax
 import jax.numpy as jnp
-from fjformer.linen import Linear
+from fjformer.linen import Dense
 import numpy as np
 from chex import PRNGKey, Shape, Array
 from einops import einsum
@@ -242,7 +242,7 @@ class MambaRMSNorm(nn.Module):
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
         output = self._norm(x).astype(self.dtype)
-        weight = jnp.asarray(fjformer.linen.linen.control_quantization(self.weight, self.dtype))
+        weight = jnp.asarray(fjformer.linen.control_quantization(self.weight, self.dtype))
         return output * weight
 
 
@@ -508,7 +508,7 @@ class FlaxMambaMixer(nn.Module):
         inv_dt = dt + jnp.log(-jnp.expm1(-dt))
 
         dense_class = functools.partial(
-            Linear,
+            Dense,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
@@ -823,7 +823,7 @@ class FlaxMambaForCausalLMModule(nn.Module):
             self.param_dtype,
             self.precision
         )
-        self.lm_head = Linear(
+        self.lm_head = Dense(
             self.config.vocab_size,
             use_bias=False,
             dtype=self.dtype,

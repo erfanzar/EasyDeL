@@ -15,7 +15,7 @@ from flax.linen import partitioning as nn_partitioning, combine_masks
 from transformers.modeling_flax_outputs import FlaxMaskedLMOutput
 from fjformer.func import auxiliary_load_balancing_loss_func
 from ..attention_module import AttentionModule
-from fjformer.linen import Linear
+from fjformer.linen import Dense
 from ..flax_modelling_utils import (
     ACT2FN,
     with_sharding_constraint,
@@ -68,7 +68,7 @@ class MixtralRMSNorm(nn.Module):
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
         output = self._norm(x).astype(self.dtype)
-        weight = fjformer.linen.linen.control_quantization(self.weight, self.dtype)
+        weight = fjformer.linen.control_quantization(self.weight, self.dtype)
         return output * weight
 
 
@@ -104,7 +104,7 @@ class FlaxMixtralAttention(BaseJAXAttentionModule):
         self.max_position_embeddings = config.max_position_embeddings
 
         dense = functools.partial(
-            Linear,
+            Dense,
             use_bias=getattr(self.config, "attention_bias", False),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -333,7 +333,7 @@ class FlaxMixtralBLockSparseTop2MLP(nn.Module):
 
     def setup(self) -> None:
         dense = functools.partial(
-            Linear,
+            Dense,
             use_bias=False,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -414,7 +414,7 @@ class FlaxMixtralSparseMoeBlock(nn.Module):
     ] = jax.lax.Precision("fastest")
 
     def setup(self) -> None:
-        self.gate = Linear(
+        self.gate = Dense(
             self.config.num_local_experts,
             use_bias=False,
             dtype=self.dtype,
@@ -1065,7 +1065,7 @@ class FlaxMixtralForCausalLMModule(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.lm_head = Linear(
+        self.lm_head = Dense(
             self.config.vocab_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,

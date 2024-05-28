@@ -9,7 +9,7 @@ from flax.linen import combine_masks
 from flax.traverse_util import unflatten_dict, flatten_dict
 from jax import numpy as jnp, lax
 import jax
-from fjformer.linen import Linear
+from fjformer.linen import Dense
 from jax.sharding import PartitionSpec
 from transformers.modeling_flax_outputs import FlaxCausalLMOutput, FlaxBaseModelOutput
 from ..flax_modelling_utils import (
@@ -120,7 +120,7 @@ class FlaxFalconAttention(BaseJAXAttentionModule):
         self.num_kv_heads = config.num_kv_heads if (config.new_decoder_architecture or not config.multi_query) else 1
         self.new_decoder_architecture = config.new_decoder_architecture
         self.num_heads = config.num_attention_heads
-        self.query_key_value = Linear(
+        self.query_key_value = Dense(
             features=qkv_out_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -128,7 +128,7 @@ class FlaxFalconAttention(BaseJAXAttentionModule):
             **get_dot_general_by_bits(config.bits, config.easy_method)
         )
         self.inv_norm_factor = 1 / math.sqrt(head_dim)
-        self.dense = Linear(
+        self.dense = Dense(
             features=config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -311,14 +311,14 @@ class FlaxFalconMlp(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
-        self.dense_h_to_4h = Linear(
+        self.dense_h_to_4h = Dense(
             features=self.config.ffn_hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=self.config.bias,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.dense_4h_to_h = Linear(
+        self.dense_4h_to_h = Dense(
             features=self.config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -788,7 +788,7 @@ class FlaxFalconForCausalLMModule(nn.Module):
             precision=self.precision
         )
 
-        self.lm_head = Linear(
+        self.lm_head = Dense(
             self.config.vocab_size,
             use_bias=False,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)

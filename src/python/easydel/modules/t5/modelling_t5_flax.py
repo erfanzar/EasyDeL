@@ -49,7 +49,7 @@ from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
 import chex
 from .t5_configuration import T5Config
 from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
-from fjformer.linen import Linear
+from fjformer.linen import Dense
 
 remat = nn_partitioning.remat
 
@@ -79,7 +79,7 @@ class FlaxT5LayerNorm(nn.Module):
         variance = jnp.power(hidden_states.astype("f4"), 2).mean(axis=-1, keepdims=True)
         hidden_states = hidden_states / jnp.sqrt(variance + self.eps)
 
-        return fjformer.linen.linen.control_quantization(self.weight, self.dtype) * hidden_states
+        return fjformer.linen.control_quantization(self.weight, self.dtype) * hidden_states
 
 
 class FlaxT5DenseActDense(nn.Module):
@@ -90,13 +90,13 @@ class FlaxT5DenseActDense(nn.Module):
         wi_init_std = self.config.initializer_factor * (self.config.d_model ** -0.5)
         wo_init_std = self.config.initializer_factor * (self.config.d_ff ** -0.5)
 
-        self.wi = Linear(
+        self.wi = Dense(
             self.config.d_ff,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(wi_init_std),
             dtype=self.dtype,
         )
-        self.wo = Linear(
+        self.wo = Dense(
             self.config.d_model,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(wo_init_std),
@@ -121,19 +121,19 @@ class FlaxT5DenseGatedActDense(nn.Module):
         wi_init_std = self.config.initializer_factor * (self.config.d_model ** -0.5)
         wo_init_std = self.config.initializer_factor * (self.config.d_ff ** -0.5)
 
-        self.wi_0 = Linear(
+        self.wi_0 = Dense(
             self.config.d_ff,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(wi_init_std),
             dtype=self.dtype,
         )
-        self.wi_1 = Linear(
+        self.wi_1 = Dense(
             self.config.d_ff,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(wi_init_std),
             dtype=self.dtype,
         )
-        self.wo = Linear(
+        self.wo = Dense(
             self.config.d_model,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(wo_init_std),
@@ -190,25 +190,25 @@ class FlaxT5Attention(BaseJAXAttentionModule):
         kv_init_std = self.config.initializer_factor * (self.inner_dim ** -0.5)
         o_init_std = self.config.initializer_factor * (self.inner_dim ** -0.5)
 
-        self.q = Linear(
+        self.q = Dense(
             self.inner_dim,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(q_init_std),
             dtype=self.dtype,
         )
-        self.k = Linear(
+        self.k = Dense(
             self.inner_dim,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(kv_init_std),
             dtype=self.dtype,
         )
-        self.v = Linear(
+        self.v = Dense(
             self.inner_dim,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(kv_init_std),
             dtype=self.dtype,
         )
-        self.o = Linear(
+        self.o = Dense(
             self.d_model,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(o_init_std),
@@ -1232,7 +1232,7 @@ class FlaxT5ForConditionalGenerationModule(nn.Module):
             decoder_config, self.shared, dtype=self.dtype, gradient_checkpointing=self.gradient_checkpointing
         )
 
-        self.lm_head = Linear(
+        self.lm_head = Dense(
             self.config.vocab_size,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_factor),
@@ -1284,7 +1284,7 @@ class FlaxT5ForConditionalGenerationModule(nn.Module):
 
         if self.config.tie_word_embeddings:
             shared_embedding = self.shared.variables["params"]["embedding"]
-            shared_embedding = fjformer.linen.linen.control_quantization(shared_embedding, self.dtype).T
+            shared_embedding = fjformer.linen.control_quantization(shared_embedding, self.dtype).T
             lm_logits = self.lm_head.apply({"params": {"kernel": shared_embedding}}, sequence_output)
         else:
             lm_logits = self.lm_head(sequence_output)
@@ -1365,7 +1365,7 @@ class FlaxT5ForConditionalGeneration(FlaxT5PreTrainedModel):
 
             if self.config.tie_word_embeddings:
                 shared_embedding = module.shared.variables["params"]["embedding"]
-                shared_embedding = fjformer.linen.linen.control_quantization(shared_embedding, self.dtype).T
+                shared_embedding = fjformer.linen.control_quantization(shared_embedding, self.dtype).T
                 lm_logits = module.lm_head.apply({"params": {"kernel": shared_embedding}}, sequence_output)
             else:
                 lm_logits = module.lm_head(sequence_output)

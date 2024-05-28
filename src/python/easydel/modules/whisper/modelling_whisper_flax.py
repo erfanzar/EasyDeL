@@ -14,7 +14,7 @@ from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks
 from flax.linen import partitioning as nn_partitioning
 from flax.traverse_util import flatten_dict, unflatten_dict
-from fjformer.linen import Linear
+from fjformer.linen import Dense
 from jax import lax
 from jax.sharding import PartitionSpec
 from transformers import FlaxWhisperTimeStampLogitsProcessor
@@ -74,7 +74,7 @@ class FlaxWhisperAttention(BaseJAXAttentionModule):
             )
 
         dense = partial(
-            Linear,
+            Dense,
             self.embed_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -254,7 +254,7 @@ class FlaxWhisperEncoderLayer(nn.Module):
         self.dropout_layer = flax.linen.Dropout(rate=self.config.dropout)
         self.activation_fn = ACT2FN[self.config.activation_function]
         self.activation_dropout_layer = flax.linen.Dropout(rate=self.config.activation_dropout)
-        self.fc1 = Linear(
+        self.fc1 = Dense(
             self.config.encoder_ffn_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -262,7 +262,7 @@ class FlaxWhisperEncoderLayer(nn.Module):
             kernel_init=jax.nn.initializers.normal(self.config.init_std),
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.fc2 = Linear(
+        self.fc2 = Dense(
             self.embed_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -403,7 +403,7 @@ class FlaxWhisperDecoderLayer(nn.Module):
             precision=self.precision
         )
         self.encoder_attn_layer_norm = nn.LayerNorm(dtype=self.dtype, epsilon=1e-05)
-        self.fc1 = Linear(
+        self.fc1 = Dense(
             self.config.decoder_ffn_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -411,7 +411,7 @@ class FlaxWhisperDecoderLayer(nn.Module):
             kernel_init=jax.nn.initializers.normal(self.config.init_std),
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.fc2 = Linear(
+        self.fc2 = Dense(
             self.embed_dim,
             param_dtype=self.param_dtype,
             precision=self.precision,
@@ -1120,7 +1120,7 @@ class FlaxWhisperForConditionalGenerationModule(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.lm_head = Linear(
+        self.lm_head = Dense(
             self.config.vocab_size,
             use_bias=False,
             dtype=self.dtype,
@@ -1165,7 +1165,7 @@ class FlaxWhisperForConditionalGenerationModule(nn.Module):
         if self.config.tie_word_embeddings:
             shared_embedding = self.model.decoder.embed_tokens.variables["params"]["embedding"]
 
-            shared_embedding = fjformer.linen.linen.control_quantization(shared_embedding, self.param_dtype).T
+            shared_embedding = fjformer.linen.control_quantization(shared_embedding, self.param_dtype).T
             lm_logits = self.lm_head.apply({"params": {"kernel": shared_embedding}}, hidden_states)
         else:
             lm_logits = self.lm_head(hidden_states)
@@ -1255,7 +1255,7 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
             if self.config.tie_word_embeddings:
                 shared_embedding = module.model.decoder.embed_tokens.variables["params"]["embedding"]
 
-                shared_embedding = fjformer.linen.linen.control_quantization(shared_embedding, self.param_dtype).T
+                shared_embedding = fjformer.linen.control_quantization(shared_embedding, self.param_dtype).T
                 lm_logits = module.lm_head.apply({"params": {"kernel": shared_embedding}}, hidden_states)
             else:
                 lm_logits = module.lm_head(hidden_states)
@@ -1417,14 +1417,14 @@ class FlaxWhisperForAudioClassificationModule(nn.Module):
         num_layers = self.config.num_hidden_layers + 1
         if self.config.use_weighted_layer_sum:
             self.layer_weights = jnp.repeat(1 / num_layers, num_layers)
-        self.projector = Linear(
+        self.projector = Dense(
             self.config.classifier_proj_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.classifier = Linear(
+        self.classifier = Dense(
             self.config.num_labels,
             dtype=self.dtype,
             param_dtype=self.param_dtype,

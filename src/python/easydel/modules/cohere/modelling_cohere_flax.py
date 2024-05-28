@@ -118,7 +118,7 @@ class FlaxCohereAttention(BaseJAXAttentionModule):
                 param_dtype=self.param_dtype,
                 do_t=True
             )
-        self.q_proj = nn.Linear(
+        self.q_proj = nn.Dense(
             config.num_attention_heads * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -128,7 +128,7 @@ class FlaxCohereAttention(BaseJAXAttentionModule):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.k_proj = nn.Linear(
+        self.k_proj = nn.Dense(
             config.num_key_value_heads * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -138,7 +138,7 @@ class FlaxCohereAttention(BaseJAXAttentionModule):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.v_proj = nn.Linear(
+        self.v_proj = nn.Dense(
             config.num_key_value_heads * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -148,7 +148,7 @@ class FlaxCohereAttention(BaseJAXAttentionModule):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.o_proj = nn.Linear(
+        self.o_proj = nn.Dense(
             config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -431,7 +431,7 @@ class FlaxCohereMLP(nn.Module):
     def setup(self) -> None:
         config = self.config
 
-        self.gate_proj = nn.Linear(
+        self.gate_proj = nn.Dense(
             config.intermediate_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -442,7 +442,7 @@ class FlaxCohereMLP(nn.Module):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.down_proj = nn.Linear(
+        self.down_proj = nn.Dense(
             config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -453,7 +453,7 @@ class FlaxCohereMLP(nn.Module):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.up_proj = nn.Linear(
+        self.up_proj = nn.Dense(
             config.intermediate_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -1088,7 +1088,7 @@ class FlaxCohereForCausalLMModule(nn.Module):
             precision=self.precision,
         )
 
-        self.lm_head = nn.Linear(
+        self.lm_head = nn.Dense(
             self.config.vocab_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -1158,7 +1158,7 @@ class FlaxCohereForCausalLMModule(nn.Module):
 
         if self.config.tie_word_embeddings:
             shared_kernel = self.model.variables["params"]["embed_tokens"]["embedding"]
-            shared_kernel = fjformer.linen.linen.control_quantization(shared_kernel, self.param_dtype).T
+            shared_kernel = fjformer.linen.control_quantization(shared_kernel, self.param_dtype).T
             lm_logits = self.lm_head.apply(
                 {"params": {"kernel": shared_kernel}}, hidden_states)
         else:

@@ -21,7 +21,7 @@ from ..flax_modelling_utils import (
     get_dot_general_by_bits, repeat_kv_bnsh, with_sharding_constraint, precompute_freq_cis, BaseJAXAttentionModule,
     block_wise_ffn
 )
-from fjformer.linen import Linear
+from fjformer.linen import Dense
 from .phi_configuration import PhiConfig
 from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 from jax.sharding import PartitionSpec
@@ -58,14 +58,14 @@ class FlaxPhiMLP(nn.Module):
     def setup(
             self
     ) -> None:
-        self.fc1 = Linear(
+        self.fc1 = Dense(
             self.config.intermediate_size,
             kernel_init=nn.initializers.normal(self.config.initializer_range),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.fc2 = Linear(
+        self.fc2 = Dense(
             self.config.n_embd,
             kernel_init=nn.initializers.normal(self.config.initializer_range),
             dtype=self.dtype,
@@ -110,7 +110,7 @@ class FlaxPhiAttention(BaseJAXAttentionModule):
             )
 
         dense_class = functools.partial(
-            Linear,
+            Dense,
             use_bias=True,
             precision=self.precision,
             dtype=self.dtype,
@@ -708,7 +708,7 @@ class FlaxPhiForCausalLMModule(nn.Module):
             precision=self.precision
         )
         self.vocab_size = self.config.vocab_size
-        self.lm_head = Linear(
+        self.lm_head = Dense(
             self.config.vocab_size,
             use_bias=True,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
@@ -744,7 +744,7 @@ class FlaxPhiForCausalLMModule(nn.Module):
         outputs = (res.last_hidden_state, res.hidden_states, res.attentions)
         if self.config.tie_word_embeddings:
             shared_kernel = self.model.variables["params"]["embed_tokens"]["embedding"]
-            shared_kernel = fjformer.linen.linen.control_quantization(shared_kernel, self.param_dtype).T
+            shared_kernel = fjformer.linen.control_quantization(shared_kernel, self.param_dtype).T
             lm_logits = self.lm_head.apply(
                 {"params": {"kernel": shared_kernel}}, res.last_hidden_state)
         else:

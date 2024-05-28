@@ -51,7 +51,7 @@ as possible
 
 When comparing JAX to PyTorch and TensorFlow, there are several benefits to using JAX that are worth considering.
 
-1. **Performance**: JAX provides excellent performance through its XLA (Accelerated Linear Algebra) backend, which can
+1. **Performance**: JAX provides excellent performance through its XLA (Accelerated Dense Algebra) backend, which can
    optimize and compile your code for various hardware accelerators such as GPUs and TPUs. This can lead to significant
    speed improvements for certain types of computations.
 

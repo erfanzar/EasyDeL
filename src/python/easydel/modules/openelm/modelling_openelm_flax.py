@@ -56,7 +56,7 @@ class OpenELMRMSNorm(nn.Module):
         x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
         output = self._norm(x).astype(self.dtype)
 
-        weight = fjformer.linen.linen.control_quantization(self.weight, self.dtype)
+        weight = fjformer.linen.control_quantization(self.weight, self.dtype)
         return output * weight
 
 
@@ -108,7 +108,7 @@ class FlaxOpenELMMultiHeadCausalAttention(BaseJAXAttentionModule):
         k_heads = config.num_kv_heads[layer_idx]
         v_heads = config.num_kv_heads[layer_idx]
 
-        self.qkv_proj = nn.Linear(
+        self.qkv_proj = nn.Dense(
             (q_heads + k_heads + v_heads) * head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -132,7 +132,7 @@ class FlaxOpenELMMultiHeadCausalAttention(BaseJAXAttentionModule):
             self.q_norm = None
             self.k_norm = None
 
-        self.out_proj = nn.Linear(
+        self.out_proj = nn.Dense(
             config.model_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -434,7 +434,7 @@ class FlaxOpenELMFeedForwardNetwork(nn.Module):
         )
         if config.ffn_with_glu:
             # FFN with Gated linear unit, as described in https://arxiv.org/abs/2002.05202v1.
-            self.proj_1 = nn.Linear(
+            self.proj_1 = nn.Dense(
                 2 * intermediate_dim,
                 use_bias=False,
                 dtype=self.dtype,
@@ -443,7 +443,7 @@ class FlaxOpenELMFeedForwardNetwork(nn.Module):
                 kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
                 **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
             )
-            self.proj_2 = nn.Linear(
+            self.proj_2 = nn.Dense(
                 config.model_dim,
                 use_bias=False,
                 dtype=self.dtype,
@@ -454,7 +454,7 @@ class FlaxOpenELMFeedForwardNetwork(nn.Module):
             )
             self.ffn_with_glu = True
         else:
-            self.proj_1 = nn.Linear(
+            self.proj_1 = nn.Dense(
                 intermediate_dim,
                 use_bias=False,
                 dtype=self.dtype,
@@ -463,7 +463,7 @@ class FlaxOpenELMFeedForwardNetwork(nn.Module):
                 kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
                 **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
             )
-            self.proj_2 = nn.Linear(
+            self.proj_2 = nn.Dense(
                 config.model_dim,
                 use_bias=False,
                 dtype=self.dtype,
@@ -693,7 +693,7 @@ class FlaxOpenELMModule(nn.Module):
         if config.share_input_output_layers:
             self.classifier = None
         else:
-            self.classifier = nn.Linear(
+            self.classifier = nn.Dense(
                 config.vocab_size,
                 use_bias=False,
                 dtype=self.dtype,
@@ -1031,7 +1031,7 @@ class FlaxOpenELMForCausalLMModule(nn.Module):
             precision=self.precision,
         )
 
-        self.lm_head = nn.Linear(
+        self.lm_head = nn.Dense(
             self.config.vocab_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -1105,7 +1105,7 @@ class FlaxOpenELMForCausalLMModule(nn.Module):
 
         if self.config.share_input_output_layers:
             shared_kernel = self.transformer.variables["params"]["token_embeddings"]["embedding"]
-            shared_kernel = fjformer.linen.linen.control_quantization(shared_kernel, self.param_dtype).T
+            shared_kernel = fjformer.linen.control_quantization(shared_kernel, self.param_dtype).T
             lm_logits = self.lm_head.apply(
                 {"params": {"kernel": shared_kernel}}, hidden_states)
         else:

@@ -149,8 +149,8 @@ def huggingface_to_easydel(
                 array = shard_fns[key_tuple](array)
             if convert_to_8bit:
                 if params_pattern_selection.search("/".join(key_tuple)):
-                    array = fjformer.linen.linen.LinearBitKernel(
-                        *fjformer.linen.linen.quantize(array, int_dtype=jnp.int8)  # type: ignore
+                    array = fjformer.linen.linen.Int8Params(
+                        *fjformer.linen.quantize(array)
                     )
             flax_dict[key_tuple] = array
 

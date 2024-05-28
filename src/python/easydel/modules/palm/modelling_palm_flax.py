@@ -15,7 +15,7 @@ from jax.sharding import PartitionSpec
 from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
     with_sharding_constraint
 import chex
-from fjformer.linen import Linear
+from fjformer.linen import Dense
 from .palm_configuration import PalmConfig
 from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 
@@ -41,7 +41,7 @@ class RMSNorm(nn.Module):
     def __call__(self, hidden_state: jnp.ndarray) -> jnp.ndarray:
         hidden_state = hidden_state.astype(jnp.promote_types(self.dtype, jnp.bfloat16))
         output = self._norm(hidden_state).astype(self.dtype)
-        weight = fjformer.linen.linen.control_quantization(self.weight, self.dtype)
+        weight = fjformer.linen.control_quantization(self.weight, self.dtype)
         return output * weight
 
 
@@ -82,7 +82,7 @@ class ParallelPalmBlock(nn.Module):
         self.fused_dims = (attn_inner_dim, self.config.dim_head, self.config.dim_head, ff_inner_dim, ff_inner_dim)
 
         # INPUT WEIGHTS
-        self.wi = fjformer.linen.linen.control_quantization(self.param(
+        self.wi = fjformer.linen.control_quantization(self.param(
             'kernel',
             nn.initializers.normal,
             (self.config.hidden_size, sum(self.fused_dims)),
@@ -90,7 +90,7 @@ class ParallelPalmBlock(nn.Module):
         ), self.param_dtype)
 
         # ATTENTION WEIGHT OUTPUT
-        self.attn_wo = fjformer.linen.linen.control_quantization(self.param(
+        self.attn_wo = fjformer.linen.control_quantization(self.param(
             'kernel',
             nn.initializers.normal,
             (attn_inner_dim, self.config.hidden_size),
@@ -98,7 +98,7 @@ class ParallelPalmBlock(nn.Module):
         ), self.param_dtype
         )
 
-        self.ff_wo = fjformer.linen.linen.control_quantization(self.param(
+        self.ff_wo = fjformer.linen.control_quantization(self.param(
             'kernel',
             nn.initializers.normal,
             (attn_inner_dim, self.config.hidden_size),
@@ -348,7 +348,7 @@ class FlaxPalmForCausalLMModule(nn.Module):
             precision=self.precision
         )
         if not self.config.use_tie_word_embedding:
-            self.lm_head = fjformer.linen.linen.control_quantization(self.param(
+            self.lm_head = fjformer.linen.control_quantization(self.param(
                 'kernel',
                 jax.nn.initializers.normal,
                 (self.config.hidden_size, self.config.vocab_size),

@@ -8,7 +8,7 @@ import jax.numpy as jnp
 import flax.linen
 from flax.core import FrozenDict, unfreeze, freeze
 from flax.linen import combine_masks
-from fjformer.linen import Linear
+from fjformer.linen import Dense
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax.sharding import PartitionSpec
@@ -117,7 +117,7 @@ class FlaxDbrxAttention(BaseJAXAttentionModule):
 
         if self.num_key_value_groups == 1:
             assert self.num_attention_heads == self.config.attn_config.kv_n_heads
-        self.Wqkv = Linear(
+        self.Wqkv = Dense(
             self.hidden_size + 2 * self.num_key_value_heads * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -127,7 +127,7 @@ class FlaxDbrxAttention(BaseJAXAttentionModule):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.out_proj = Linear(
+        self.out_proj = Dense(
             config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -555,7 +555,7 @@ class FlaxDbrxRouter(nn.Module):
         self.moe_normalize_expert_weights = self.config.ffn_config.moe_normalize_expert_weights
         self.uniform_expert_assignment = self.config.ffn_config.uniform_expert_assignment
 
-        self.layer = Linear(
+        self.layer = Dense(
             self.moe_num_experts,
             use_bias=False,
             dtype=self.dtype,
@@ -1138,7 +1138,7 @@ class FlaxDbrxForCausalLMModule(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.lm_head = Linear(
+        self.lm_head = Dense(
             self.config.vocab_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,

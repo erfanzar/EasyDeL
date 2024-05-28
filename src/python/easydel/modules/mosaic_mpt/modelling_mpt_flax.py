@@ -15,7 +15,7 @@ from ..flax_modelling_utils import (
 )
 from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 import chex
-from fjformer.linen import Linear
+from fjformer.linen import Dense
 from fjformer import linen as nn
 from .mosaic_configuration import MptConfig
 from ..attention_module import AttentionModule
@@ -47,7 +47,7 @@ class FlaxMptMLP(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
-        self.up_proj = Linear(
+        self.up_proj = Dense(
             self.config.expansion_ratio * self.config.hidden_size,
             kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
             use_bias=self.config.use_bias,
@@ -56,7 +56,7 @@ class FlaxMptMLP(nn.Module):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.down_proj = Linear(
+        self.down_proj = Dense(
             self.config.hidden_size,
             kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
             use_bias=self.config.use_bias,
@@ -90,7 +90,7 @@ class FlaxMptAttention(BaseJAXAttentionModule):
 
     def setup(self) -> None:
 
-        self.Wqkv = Linear(
+        self.Wqkv = Dense(
             self.config.hidden_size * 3,
             kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
             use_bias=self.config.use_bias,
@@ -98,7 +98,7 @@ class FlaxMptAttention(BaseJAXAttentionModule):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision)
-        self.out_proj = Linear(
+        self.out_proj = Dense(
             self.config.hidden_size,
             kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
             use_bias=self.config.use_bias,
@@ -581,7 +581,7 @@ class FlaxMptForCausalLMModule(nn.Module):
             precision=self.precision
         )
 
-        self.lm_head = Linear(
+        self.lm_head = Dense(
             self.config.vocab_size,
             kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
             use_bias=self.config.use_bias,

@@ -12,7 +12,7 @@ from ...modules.auto_easydel_model import AutoEasyDeLModelForCausalLM
 from ...modules.easydel_modelling_utils import EasyDeLPretrainedConfig, EasyDeLFlaxPretrainedModel
 from fjformer import GenerateRNG, with_sharding_constraint, make_shard_and_gather_fns, match_partition_rules
 from dataclasses import dataclass
-from fjformer.linen import Linear
+from fjformer.linen import Dense
 
 
 @dataclass
@@ -49,7 +49,7 @@ class ValueHead(nn.Module):
         """
         self.dropout = flax.linen.Dropout(self.summary_dropout_prob)
 
-        self.summary = Linear(
+        self.summary = Dense(
             1,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
