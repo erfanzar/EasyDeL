@@ -20,35 +20,25 @@ def main():
         input_shape=(8, 8),
         _do_init=True
     )
-
-    tx_init = dict(
-        optimizer="adamw",
-        scheduler="none",
-        learning_rate=1e-5,
-        steps=5000
-    )
-    tx, sc = get_optimizer_and_scheduler(
-        **tx_init
-    )
-    state = EasyDeLState.create(
-        params=module.params,
-        apply_fn=module.__call__,
-        tx=tx,
-        tx_init=tx_init,
-        hyperparameters=EasyDeLState.create_hyperparameters(
-            model_type="llama"
-        ),
-        module_config=config,
-    )
-
-    state.save_state(
-        filename="state.easy", verbose=True
-    )
+    # print(module.params)
+    state = module.to_easydel_state(module.params)
+    state.save_state("state.easy")
 
 
 def load():
-    state = EasyDeLState.load_state("state.easy", init_optimizer_state=False, verbose=True)
-    print(jax.eval_shape(lambda: state))
+    state = EasyDeLState.load_state(
+        "state.easy",
+        init_optimizer_state=False,
+        verbose=True
+    )
+    # print(jax.eval_shape(lambda: state))
+    print(state)
+    print("-" * 50)
+    state.serialize()
+    print(state)
+    print("-" * 50)
+    state.un_serialize()
+    print(state)
 
 
 def eval_shape_create_test():
@@ -91,6 +81,6 @@ def eval_shape_create_test():
 
 
 if __name__ == "__main__":
-    # main()
-    # load()
-    eval_shape_create_test()
+    main()
+    load()
+    # eval_shape_create_test()

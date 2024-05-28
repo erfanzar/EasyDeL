@@ -1,2 +1,0 @@
-# trainer.causal_language_model_trainer.causal_language_model_trainer
-::: src.python.easydel.trainer.causal_language_model_trainer.causal_language_model_trainer
