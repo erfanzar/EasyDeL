@@ -140,13 +140,13 @@ theme:
         ("Home",): "index.rst",
         ("Install",): "Install.rst",
         ("Available models",): "AvailableModels.md",
-        ("Examples", "EasyState"): "EasyStateExample.md",
+        ("Examples", "EasyState"): "easydelstate.rst",
         ("Examples", "LoRA and Transfer Learning"): "LoRA-TransferLearningExample.rst",
-        ("Examples", "Fine Tuning Example"): "FineTuningExample.rst",
-        ("Examples", "DataProcessing"): "DataProcessing.rst",
+        ("Examples", "Fine Tuning Example"): "finetuning.example.rst",
+        ("Examples", "DataProcessing"): "data_processing.rst",
         ("Examples", "Easy Attention"): "AttentionModuleExample.md",
-        ("Examples", "Model Parameter Quantization"): "Parameter-Quantization.md",
-        ("Contributing",): "CONTRIBUTING.rst"
+        ("Examples", "Model Parameter Quantization"): "Parameter-Quantization.rst",
+        ("Contributing",): "contributing.rst"
 
     }
     cache = {("APIs",) + k: v for k, v in cache.items()}
