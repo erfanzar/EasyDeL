@@ -88,39 +88,47 @@ Citing EasyDeL 🥶
 To cite this Project
 ---------------------------------------------------------------
 
-```misc
-@misc{Zare Chavoshi_2023,
-    title={EasyDeL, an open-source library, is specifically designed to enhance and streamline the training process of machine learning models. It focuses primarily on Jax/Flax and aims to provide convenient and effective solutions for training Flax/Jax Models on TPU/GPU for both Serving and Training purposes.},
-    url={https://github.com/erfanzar/EasyDeL},
-    journal={EasyDeL Easy and Fast DeepLearning with JAX},
-    publisher={Erfan Zare Chavoshi},
-    author={Zare Chavoshi, Erfan},
-    year={2023}
-} 
-```
+.. _EasyDeL:
+
+Zare Chavoshi, Erfan. "EasyDeL, an open-source library, is specifically designed to enhance and streamline the training process of machine learning models. It focuses primarily on Jax/Flax and aims to provide convenient and effective solutions for training Flax/Jax Models on TPU/GPU for both Serving and Training purposes." 2023. https://github.com/erfanzar/EasyDeL
 
 .. toctree::
     :hidden:
     :maxdepth: 1
     :caption: Getting Started
 
-    install
+    install.md
     contributing
+
 .. toctree::
     :hidden:
     :maxdepth: 1
     :caption: EasyDeL Magics
 
-    easydelstate
+    easydelstate.md
 
 .. toctree::
     :hidden:
     :maxdepth: 1
     :caption: Examples
 
-    finetuning_example
-    lora_transferlearning_example
-    parameterquantization
-    attentionmodule_example
-    data_processing
+    finetuning_example.md
+    lora_transferlearning_example.md
+    parameterquantization.md
+    attentionmodule_example.md
+    data_processing.md
 
+
+.. bibliography:: references.bib
+   :filter: author % "Zare Chavoshi"
+
+   .. code-block:: bibtex
+
+      @misc{Zare Chavoshi_2023,
+          title={EasyDeL, an open-source library, is specifically designed to enhance and streamline the training process of machine learning models. It focuses primarily on Jax/Flax and aims to provide convenient and effective solutions for training Flax/Jax Models on TPU/GPU for both Serving and Training purposes.},
+          url={https://github.com/erfanzar/EasyDeL},
+          journal={EasyDeL Easy and Fast DeepLearning with JAX},
+          publisher={Erfan Zare Chavoshi},
+          author={Zare Chavoshi, Erfan},
+          year={2023}
+      }
