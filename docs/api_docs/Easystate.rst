@@ -4,5 +4,5 @@ Easystate
 .. automodule:: Etils
    :members:
 
-.. automodule:: generated_etils-easystate
+.. automodule:: src.python.easydel.etils.easystate
    :members:

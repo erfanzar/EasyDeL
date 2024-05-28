@@ -4,5 +4,5 @@ Client
 .. automodule:: Serve
    :members:
 
-.. automodule:: generated_serve-client
+.. automodule:: src.python.easydel.serve.client
    :members:

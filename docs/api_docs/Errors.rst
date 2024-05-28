@@ -4,5 +4,5 @@ Errors
 .. automodule:: Etils
    :members:
 
-.. automodule:: generated_etils-errors
+.. automodule:: src.python.easydel.etils.errors
    :members:

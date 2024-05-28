@@ -4,5 +4,5 @@ Auto Tx
 .. automodule:: Etils
    :members:
 
-.. automodule:: generated_etils-auto_tx
+.. automodule:: src.python.easydel.etils.auto_tx
    :members:

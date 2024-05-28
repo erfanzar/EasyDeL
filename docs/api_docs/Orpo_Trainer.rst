@@ -4,5 +4,5 @@ Orpo Trainer
 .. automodule:: Orpo
    :members:
 
-.. automodule:: generated_trainer-orpo-orpo_trainer
+.. automodule:: src.python.easydel.trainer.orpo.orpo_trainer
    :members:

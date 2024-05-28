@@ -4,5 +4,5 @@ Whisper Configuration
 .. automodule:: Whisper
    :members:
 
-.. automodule:: generated_modules-whisper-whisper_configuration
+.. automodule:: src.python.easydel.modules.whisper.whisper_configuration
    :members:

@@ -4,5 +4,5 @@ Prompters
 .. automodule:: Utils
    :members:
 
-.. automodule:: generated_utils-prompters
+.. automodule:: src.python.easydel.utils.prompters
    :members:

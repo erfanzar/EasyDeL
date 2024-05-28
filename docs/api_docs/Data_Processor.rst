@@ -4,5 +4,5 @@ Data Processor
 .. automodule:: Data_Preprocessing
    :members:
 
-.. automodule:: generated_data_preprocessing-data_processor
+.. automodule:: src.python.easydel.data_preprocessing.data_processor
    :members:

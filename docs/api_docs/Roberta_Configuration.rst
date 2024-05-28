@@ -4,5 +4,5 @@ Roberta Configuration
 .. automodule:: Roberta
    :members:
 
-.. automodule:: generated_modules-roberta-roberta_configuration
+.. automodule:: src.python.easydel.modules.roberta.roberta_configuration
    :members:

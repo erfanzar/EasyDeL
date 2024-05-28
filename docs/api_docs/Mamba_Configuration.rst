@@ -4,5 +4,5 @@ Mamba Configuration
 .. automodule:: Mamba
    :members:
 
-.. automodule:: generated_modules-mamba-mamba_configuration
+.. automodule:: src.python.easydel.modules.mamba.mamba_configuration
    :members:

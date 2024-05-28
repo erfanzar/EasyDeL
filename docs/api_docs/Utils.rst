@@ -4,5 +4,5 @@ Utils
 .. automodule:: Trainer
    :members:
 
-.. automodule:: generated_trainer-utils
+.. automodule:: src.python.easydel.trainer.utils
    :members:
