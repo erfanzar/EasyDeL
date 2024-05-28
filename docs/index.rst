@@ -1,5 +1,5 @@
-## EasyDeL 🔮
-
+EasyDeL 🔮
+==========
 EasyDeL is an open-source framework designed to enhance and streamline the training process of machine learning models.
 With a primary focus on Jax/Flax, EasyDeL aims to provide convenient and effective solutions for training Flax/Jax
 models on TPU/GPU for both serving and training purposes.
@@ -43,7 +43,8 @@ models on TPU/GPU for both serving and training purposes.
 With its comprehensive set of features and tools, EasyDeL aims to streamline and accelerate the training and deployment
 of machine learning models, particularly in the domain of large language models and video-related applications.
 
-## What Makes EasyDeL 🔮 Special
+What Makes EasyDeL 🔮 Special
+---------------------------------------------------------------
 
 EasyDeL is built up on JAX and Flax and that's why EasyDeL can perform as fast and as easy
 as possible
@@ -75,17 +76,17 @@ extensive libraries, and a wide range of pre-trained models, which can be advant
 Additionally, the choice of framework often depends on the specific requirements of the project and the familiarity of
 the team with a particular toolset.
 
-### Hands on Code Kaggle Examples
+Hands on Code Kaggle Examples
+---------------------------------------------------------------
 
-1. [script](https://www.kaggle.com/citifer/easydel-causal-language-model-trainer-example) for mindset of using EasyDeL
-   CausalLanguageModelTrainer on kaggle, but you can do much more.
-2. [script](https://www.kaggle.com/code/citifer/easydel-serve-example-mixtral) for using and serving LLMs with EasyDeL
-   JAXServer API (Mixtral Example).
-3. [script](https://www.kaggle.com/code/citifer/easydel-sfttrainer-example) SuperVised Finetuning with EasyDeL.
+1. for mindset of using EasyDeL CausalLanguageModelTrainer on kaggle, but you can do much more. CLMScript
+2. SuperVised Finetuning with EasyDeL. SFTScript_
 
-## Citing EasyDeL 🥶
+Citing EasyDeL 🥶
+---------------------------------------------------------------
 
-#### To cite this Project
+To cite this Project
+---------------------------------------------------------------
 
 ```misc
 @misc{Zare Chavoshi_2023,
@@ -97,3 +98,33 @@ the team with a particular toolset.
     year={2023}
 } 
 ```
+
+.. toctree::
+    :hidden:
+    :maxdepth: 1
+    :caption: Getting Started
+
+    install
+    contributing
+.. toctree::
+    :hidden:
+    :maxdepth: 1
+    :caption: EasyDeL Magics
+
+    easydelstate
+
+.. toctree::
+    :hidden:
+    :maxdepth: 1
+    :caption: Examples
+
+    finetuning_example
+    lora_transferlearning_example
+    parameterquantization
+    attentionmodule_example
+    data_processing
+
+
+
+.. _SFTScript https://www.kaggle.com/code/citifer/easydel-sfttrainer-example
+.. _CLMScript https://www.kaggle.com/citifer/easydel-causal-language-model-trainer-example

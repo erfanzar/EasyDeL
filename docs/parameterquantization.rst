@@ -1,5 +1,5 @@
-# What's 8-bit quantization? How does it help ?
-
+What's 8-bit quantization? How does it help ?
+=======
 Quantization in the context of deep learning is the process of constraining the number of bits that represent the
 weights and biases of the model.
 
@@ -8,8 +8,8 @@ Weights and Biases numbers that we need in backpropagation.
 In 8-bit quantization, each weight or bias is represented using only 8 bits as opposed to the typical 32 bits used in
 single-precision floating-point format (float32).
 
-## Why does it use less GPU/TPU Memory?
-
+Why does it use less GPU/TPU Memory?
+---------
 The primary advantage of using 8-bit quantization is the reduction in model size and memory usage. Here's a simple
 explanation:
 
@@ -35,8 +35,8 @@ To convert these to bytes (since memory is often measured in bytes):
 - 8-bit integer would use ( 8/8 = 1 ) bytes.
 - A 16-bit integer would use ( 16/8 = 2 ) bytes.
 
-## Example of Using Parameters Quantization in EasyDeL
-
+Example of Using Parameters Quantization in EasyDeL
+---------
 in case of serving models or using them with `JAX` The Easiest and the best way you can find
 is EasyDeL (you can explore more if you want) you have 4 ways to use models
 
@@ -47,8 +47,8 @@ is EasyDeL (you can explore more if you want) you have 4 ways to use models
 
 let assume we want to run a 7B model on only 12 GB of vram let just jump into codding
 
-### Using Quantized Model via generate Function
-
+Using Quantized Model via generate Function
+---------
 let assume we want to run `Qwen/Qwen1.5-7B-Chat`
 
 ```python
