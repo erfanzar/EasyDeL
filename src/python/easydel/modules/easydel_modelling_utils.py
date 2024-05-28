@@ -690,15 +690,21 @@ class EasyDeLFlaxPretrainedModel(FlaxPreTrainedModel):
     def to_easydel_state(
             self,
             params: flax.core.FrozenDict,
+            auto_check_params: bool = True
     ):
         """
         Convert the Model to EasyDeLState
         """
+        if auto_check_params:
+            gp = params.get("params", None)
+            params = flax.core.FrozenDict({"params": params} if gp is None else {"params": gp})
         return EasyDeLState.load(
             apply_fn=self.__call__,
             params=params,
             opt_state=None,
             module_config=self.config,
+            module=self,
+            step=0
         )
 
     def to_pytorch(

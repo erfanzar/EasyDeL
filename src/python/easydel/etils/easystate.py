@@ -1,15 +1,16 @@
 import copy
 import os
-from typing import Any, Callable, Optional, Mapping, Sequence, Tuple, Union
+from typing import Any, Callable, Optional, Mapping, Sequence, Tuple, Union, List
 
 import fjformer
 import jax.tree_util
-import termcolor
 from flax import core
 from flax import struct
 from flax.core import FrozenDict
 from flax.linen.fp8_ops import OVERWRITE_WITH_GRADIENT
 import optax
+from transformers import AutoModelForCausalLM
+
 from .auto_tx import get_optimizer_and_scheduler
 from ..etils import AVAILABLE_SCHEDULERS, AVAILABLE_OPTIMIZERS, EasyDeLRuntimeError
 from jax.sharding import Mesh, PartitionSpec
@@ -23,7 +24,7 @@ DEFAULT_ES_VAL = -1
 
 
 def revert_type_back(tp, val):
-    # assert tp in ["int", "float", "dict", "bool", "list", "str"], f"type {tp} not supported"
+    """Reverts a value to its original type after deserialization."""
     if tp == "int":
         val = int(val)
     elif tp == "float":
@@ -42,6 +43,7 @@ def revert_type_back(tp, val):
 
 
 def break_format(key, value):
+    """Breaks down a serialized key-value pair."""
     k, v = [None] * 2
     if value == DEFAULT_ES_VAL:
         try:
@@ -58,6 +60,77 @@ def break_format(key, value):
 
 
 class EasyDeLState(struct.PyTreeNode):
+    """
+    **EasyDeLState A Snapshot of Your EasyDeL Model**
+
+    The `EasyDeLState` class acts like a comprehensive container that holds all the essential information about your EasyDeL
+    model at a given point in time. Think of it as a snapshot of your model. It includes:
+
+    * **Training Progress:**
+        * `step`: Tracks the current training step.
+    * **Model Itself:**
+        * `module`:  Holds the actual instance of your EasyDeL model.
+        * `module_config`: Stores the model's configuration settings.
+        * `module_config_args`:  Keeps track of arguments used to create the configuration (useful for reloading).
+        * `apply_fn`:  References the core function that applies your model to data.
+    * **Learned Parameters:**
+        * `params`: Contains the trained weights and biases of your model.
+    * **Optimizer Information:**
+        * `tx`: Stores the optimizer you're using to update the model's parameters (e.g., AdamW).
+        * `opt_state`: Keeps track of the optimizer's internal state (this is important for things like momentum in
+          optimizers).
+        * `tx_init`: Remembers the initial settings used to create the optimizer (again, for reloading purposes).
+    * **Additional Settings:**
+        * `hyperparameters`:  Provides a flexible place to store other hyperparameters related to your model or training
+          process.
+
+    **Key Capabilities of EasyDeLState:**
+
+    * **Initialization (`create`)**: Lets you create a brand new `EasyDeLState` to start training.
+    * **Loading (`load`, `load_state`, `from_pretrained`)**: Enables you to reload a saved model from a checkpoint file or
+      even a pre-trained model from a repository like Hugging Face Hub.
+    * **Saving (`save_state`)**: Allows you to save your model's current state, including its parameters and optimizer
+      state.
+    * **Optimizer Management (`apply_gradients`, `free_opt_state`, `init_opt_state`)**: Provides methods for updating the
+      model's parameters using gradients, releasing optimizer memory, and re-initializing the optimizer if needed.
+    * **Sharding (`shard_params`)**:  Helps you distribute your model's parameters efficiently across multiple devices (
+      important for training large models).
+    * **PyTorch Conversion (`to_pytorch`)**:  Gives you a way to convert your EasyDeL model to its PyTorch equivalent.
+
+    **In Essence:**
+
+    `EasyDeLState` streamlines the process of managing, saving, loading, and even converting your EasyDeL models. It ensures
+    that you can easily work with your models and maintain consistency throughout your machine learning workflow.
+
+    State of an EasyDeL model, including parameters, optimizer state, and other metadata.
+
+    This class inherits from `flax.struct.PyTreeNode` to support JAX's tree-based data structures.
+
+    Attributes:
+        step (int): Current training step.
+        module (Optional[EasyDeLFlaxPretrainedModel]): An instance of an EasyDeL model.
+        module_config (Optional[EasyDeLPretrainedConfig]): Configuration of the EasyDeL model.
+        module_config_args (Optional[dict]): Dictionary of arguments used to initialize the model configuration.
+        apply_fn (Callable): Function to apply the model to input data.
+        params (core.FrozenDict[str, Any]): Model parameters, stored as a frozen dictionary.
+        tx (optax.GradientTransformation): Optimizer used for training.
+        opt_state (Optional[optax.OptState]): Optimizer state.
+        tx_init (Optional[dict]): Dictionary containing optimizer and scheduler initialization parameters.
+        hyperparameters (Optional[dict]): Dictionary to store any additional hyperparameters.
+
+    Example Usage:
+
+    ```python
+    # Initialize an EasyDeLState object
+    state = EasyDeLState.create(
+        apply_fn=model.__call__,
+        params=model.params,
+        tx=optax.adam(learning_rate=1e-3),
+        module=model,
+        module_config=model.config
+    )
+    ```
+    """
     step: int
     module: Optional["EasyDeLFlaxPretrainedModel"] = struct.field(pytree_node=False)  # type:ignore
     module_config: Optional["EasyDeLPretrainedConfig"] = struct.field(pytree_node=False)  # type:ignore
@@ -71,20 +144,18 @@ class EasyDeLState(struct.PyTreeNode):
 
     def apply_gradients(self, *, grads, **kwargs):
 
-        """The apply_gradients function is the core of the optimizer. It takes in a dictionary of gradients,
-        and returns an updated version of itself with new parameters and state. The function also updates
-        the step count.
-
-        Args:
-            self: Refer to the current instance of the class
-            : Unpack the grads dictionary into positional arguments
-            grads: Pass in the gradients of the loss function with
-                respect to each parameter
-            **kwargs: Pass in additional arguments to the function
-
-        Returns:
-            A new State with the updated parameters and params
         """
+         Applies gradients to the model parameters and updates the optimizer state.
+
+         This function is typically called during training to update the model based on the computed gradients.
+
+         Args:
+             grads: A dictionary of gradients, where keys correspond to model parameters.
+             **kwargs: Additional keyword arguments.
+
+         Returns:
+             EasyDeLState: An updated EasyDeLState object with modified parameters and optimizer state.
+         """
         if OVERWRITE_WITH_GRADIENT in grads:
             grads_with_opt = grads['params']
             params_with_opt = self.params['params']
@@ -125,28 +196,24 @@ class EasyDeLState(struct.PyTreeNode):
             **kwargs
     ):
 
-        """The create function is used to create a new instance of the class.
+        """
+        Creates a new EasyDeLState object.
+
+        This class method is used to initialize an EasyDeLState object from model parameters, optimizer, and other configurations.
 
         Args:
-            cls: Create a new instance of the class
-            : Pass a list of parameters to the function
-            apply_fn: Callable: Apply the model to a batch of data
-            params: core.FrozenDict[str,Any] | Mapping[str,Any]: Pass in
-                the parameters of the model
-            tx: optax.GradientTransformation: Initialize the optimizer
-            tx_init: Optional[dict]: Initialize the optimizer
-            hyperparameters: Optional[dict]: Pass hyperparameters to the
-                state for init
-            module: Optional[EasyDeLFlaxPretrainedModel]: Pass the
-                module to be used int state
-            module_config: Optional[EasyDeLPretrainedConfig]: Pass in
-                the module config
-            module_config_args: Optional[dict]: Store the config args of
-                the model
-            **kwargs: Pass in additional parameters to the
+            apply_fn (Callable): A function that applies the model to a batch of data.
+            params (Union[core.FrozenDict[str, Any], Mapping[str, Any]]): Model parameters.
+            tx (optax.GradientTransformation): An optax optimizer.
+            tx_init (Optional[dict]): A dictionary of optimizer initialization parameters.
+            hyperparameters (Optional[dict]): A dictionary of additional hyperparameters.
+            module (Optional[EasyDeLFlaxPretrainedModel]): An instance of an EasyDeL model.
+            module_config (Optional[EasyDeLPretrainedConfig]): An instance of an EasyDeL model configuration.
+            module_config_args (Optional[dict]): A dictionary of arguments used to initialize the model configuration.
+            **kwargs: Additional keyword arguments.
 
         Returns:
-            A EasyDeLState object
+            EasyDeLState: A new EasyDeLState object.
         """
         if hyperparameters is None:
             hyperparameters = {}
@@ -187,32 +254,25 @@ class EasyDeLState(struct.PyTreeNode):
             **kwargs
     ):
 
-        """The load function is used to load a saved state of the Model and optimizer or Model Only.
+        """
+        Loads an EasyDeLState object from a checkpoint.
+
+        This class method is used to load a previously saved EasyDeLState object from a checkpoint file. This can be useful for resuming training or inference.
 
         Args:
-            cls: Make the function a class method
-            : Pass in a variable number of arguments
-            step: int: Keep track of the number of steps that have been
-                taken
-            apply_fn: Callable: Apply the optimizer to the model
-            params: core.FrozenDict[str,Any] | Mapping[str,Any]: Pass in
-                the parameters of the model
-            opt_state: Optional[optax.OptState]: optimizer state
-            tx_init: Optional[dict]: Pass the hyperparameters to the
-                optimizer
-            hyperparameters: Optional[dict]: Load hyperparameters from
-                the state dict
-            module: Optional[EasyDeLFlaxPretrainedModel]: Pass in the
-                module
-            module_config: Optional[EasyDeLPretrainedConfig]: Pass the
-                module config
-            module_config_args: Optional[dict]: Pass the config_args to
-                the model
-            **kwargs: Pass in any additional parameters that may be
-                needed for the model
+            apply_fn (Callable): A function that applies the model to a batch of data.
+            params (Union[core.FrozenDict[str, Any], Mapping[str, Any]]): Model parameters.
+            step (int, optional): The training step to resume from. Defaults to 0.
+            opt_state (Optional[optax.OptState], optional): The optimizer state to load. Defaults to None.
+            tx_init (Optional[dict], optional): A dictionary of optimizer initialization parameters. Defaults to None.
+            hyperparameters (Optional[dict], optional): A dictionary of additional hyperparameters. Defaults to None.
+            module (Optional[EasyDeLFlaxPretrainedModel], optional): An instance of an EasyDeL model. Defaults to None.
+            module_config (Optional[EasyDeLPretrainedConfig], optional): An instance of an EasyDeL model configuration. Defaults to None.
+            module_config_args (Optional[dict], optional): A dictionary of arguments used to initialize the model configuration. Defaults to None.
+            **kwargs: Additional keyword arguments.
 
         Returns:
-            A new instance of the class
+            EasyDeLState: A loaded EasyDeLState object.
         """
         if module_config is not None:
             module_config = copy.deepcopy(module_config)
@@ -288,36 +348,56 @@ class EasyDeLState(struct.PyTreeNode):
             input_shape: Tuple = (1, 1),
             config_kwargs: Optional[dict] = None,
             sharding_axes_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            sharding_axes_dims: Sequence[int] = (1, -1, 1, 1)
+            sharding_axes_dims: Sequence[int] = (1, -1, 1, 1),
+            module_config: Optional["EasyDeLPretrainedConfig"] = None,  # type:ignore
+            auto_shard_state: bool = False,
+            partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
+            depth_target: Optional[List[str]] = None
     ):
 
-        """The load_state function is a class method that loads the state of an EasyDeLModel from a checkpoint.
+        """
+        Loads an EasyDeLState object from a checkpoint file.
+
+        This class method is used to load a pre-trained EasyDeL model and its associated state from a checkpoint file.
 
         Args:
-            cls: Create an instance of the class
-            checkpoint_path: str | os.PathLike: Specify the path to the
-                checkpoint file
-            dtype: jnp.dtype: The dtype of the model
-            param_dtype: jnp.dtype: The dtype of the model parameters
-            precision: Optional[Union[str, jax.lax.Precision]]:
-                precision of the model
-            init_optimizer_state: bool: Initialize the optimizer if it's
-                not Initialized yet (if it Initialized the option
-            state_shard_fns: Optional[Mapping[str,Callable]]: Specify
-                the function that will be used
-            verbose: bool: Print out the progress of loading
-            input_shape: Tuple: input_shape to init module
-            config_kwargs: Optional[dict] : config kwargs to be passed
-                to model config
-        will be ignored )
-        to shard the loaded state
+            checkpoint_path (Union[str, os.PathLike]): Path to the checkpoint file.
+            dtype (jnp.dtype, optional): The data type to use for the model parameters. Defaults to jnp.float32.
+            param_dtype (jnp.dtype, optional): The data type to use for the model parameters during training. Defaults to jnp.float32.
+            precision (Optional[Union[str, jax.lax.Precision]], optional): The precision to use for computations. Defaults to None.
+            init_optimizer_state (bool, optional): Whether to initialize the optimizer state. Defaults to False.
+            state_shard_fns (Optional[Mapping[str, Callable]], optional): Functions to shard the model state. Defaults to None.
+            verbose (bool, optional): Whether to print verbose output during loading. Defaults to False.
+            input_shape (Tuple, optional): The shape of the input data. Defaults to (1, 1).
+            config_kwargs (Optional[dict], optional): Keyword arguments to pass to the model configuration. Defaults to None.
+            sharding_axes_names (Sequence[str], optional): Names of the axes for sharding. Defaults to ("dp", "fsdp", "tp", "sp").
+            sharding_axes_dims (Sequence[int], optional): Dimensions of the axes for sharding. Defaults to (1, -1, 1, 1).
+            module_config (Optional[EasyDeLPretrainedConfig], optional): An instance of an EasyDeL model configuration. Defaults to None.
+            auto_shard_state (bool, optional): Whether to automatically shard the model state. Defaults to False.
+            partition_rules (Optional[Tuple[Tuple[str, PartitionSpec]]], optional): Rules for partitioning the model parameters. Defaults to None.
+            depth_target (Optional[List[str]], optional): Target depth for partitioning. Defaults to None.
 
         Returns:
-            A state object
+            EasyDeLState: A loaded EasyDeLState object.
         """
-        from ..modules.auto_easydel_model import get_modules_by_type
+        if depth_target is None:
+            depth_target = ["params", "params"]
+        from ..modules.auto_easydel_model import get_modules_by_type, AutoShardAndGatherFunctions
         from fjformer.partition_utils import create_mesh
         mesh = create_mesh(sharding_axes_dims, sharding_axes_names)
+        if auto_shard_state:
+            assert module_config is not None, (
+                "`module_config` is None, in case of using"
+                " `auto_shard_state=True` you should pass Module Config"
+            )
+            state_shard_fns, state_gather_fns = AutoShardAndGatherFunctions.from_config(
+                config=module_config,
+                partition_rules=partition_rules,
+                input_shape=input_shape,  # type:ignore
+                dtype_specs=dtype,
+                flatten=False,
+                depth_target=depth_target
+            )
 
         with mesh:
             checkpoint = fjformer.CheckpointManager.load_checkpoint(
@@ -384,25 +464,16 @@ class EasyDeLState(struct.PyTreeNode):
             float_dtype: Union[str, jax.numpy.dtype] = None,
     ):
 
-        """The save_state function saves the state of a model to disk.
+        """
+        Saves the EasyDeLState object to a checkpoint file.
 
         Args:
-            self: Pass the object itself to the function
-            filename: str | os.PathLike: Specify the name of the file to
-                save
-            save_optimizer: bool: Determine whether to save the
-                optimizer state or not
-            checkpoint_dir: Optional[str | os.PathLike]: Specify the
-                directory where the checkpoint is saved
-            verbose: bool: Print out the path of the saved file
-            gather_fns: dict[Callable]: Specify a dictionary of
-                functions that can be used to gather
-            float_dtype: str | jax.numpy.dtype: Specify the precision of
-                the saved model
-        :param : Save the optimizer state
-
-        Returns:
-            None
+            filename (Union[str, os.PathLike]): The name of the checkpoint file.
+            save_optimizer (bool, optional): Whether to save the optimizer state. Defaults to False.
+            checkpoint_dir (Optional[Union[str, os.PathLike]], optional): The directory to save the checkpoint to. Defaults to None.
+            verbose (bool, optional): Whether to print verbose output during saving. Defaults to False.
+            gather_fns (dict[Callable], optional): Functions to gather sharded parameters. Defaults to None.
+            float_dtype (Union[str, jax.numpy.dtype], optional): The data type to use for floating-point numbers in the saved checkpoint. Defaults to None.
         """
         state = self
         if not save_optimizer:
@@ -426,15 +497,11 @@ class EasyDeLState(struct.PyTreeNode):
         )
 
     def free_opt_state(self) -> "EasyDeLState":
-
-        """The free_opt_state function is used to free the memory allocated by a previous call to setopt.
-        It should be called after all the options have been set, and before you perform any of the transfers.
-
-        Args:
-            self: Represent the instance of the class
+        """
+        Frees the memory allocated for the optimizer state.
 
         Returns:
-            A new state with the opt_state field set to none
+            EasyDeLState: A new EasyDeLState object with the optimizer state set to None.
         """
         return self.replace(
             opt_state=None
@@ -442,14 +509,11 @@ class EasyDeLState(struct.PyTreeNode):
 
     def init_opt_state(self) -> "EasyDeLState":
 
-        """The init_opt_state function initializes the optimizer state.
-
-        Args:
-            self: Make the object callable, and params is used to pass
-                in a dictionary of parameters
+        """
+        Initializes the optimizer state.
 
         Returns:
-            A new instance of the class with opt_state initialized
+            EasyDeLState: A new EasyDeLState object with an initialized optimizer state.
         """
         if self.opt_state is None:
             params_with_opt = (
@@ -494,63 +558,45 @@ class EasyDeLState(struct.PyTreeNode):
             **kwargs
     ) -> "EasyDeLState":
 
-        """The from_pretrained function is a helper function to quickly load a pretrained model and its associated configuration.
-        This method takes care of returning the correct model class instance based on the `model_type` property in the
-        config object, or when it's missing, falling back to using pattern matching on the
-         `pretrained_model_name_or_path` string:
+        """
+        Loads a pre-trained EasyDeL model and its state.
+
+        This class method can load a model from either a local checkpoint or a remote repository like Hugging Face Hub.
 
         Args:
-            cls: Refer to the class that is being defined
-            pretrained_model_name_or_path: str: Load the pretrained
-                model
-            filename: Optional[str]: Specify the name of the file to
-                download from huggingface hub
-            optimizer: AVAILABLE_OPTIMIZERS: Specify the optimizer used
-                for training
-            scheduler: AVAILABLE_SCHEDULERS: Specify the name of the
-                scheduler to use
-            tx_init: Optional[dict]: Pass the hyperparameters of the
-                optimizer
-            device: Specify the device on which to run the model
-            dtype: jax.numpy.dtype: Specify the dtype of the model
-                parameters
-            param_dtype: jax.numpy.dtype: Specify the data type of the
-                parameters
-            precision: jax.lax.Precision: Control the precision of the
-                calculation
-            sharding_axis_dims: Sequence[int]: Specify the dimension of
-                each axis
-            sharding_axis_names: Sequence[str]: Specify the names of the
-                axes in each shard
-            query_partition_spec: PartitionSpec: Specify the
-                partitioning of the query matrix
-            generation_query_partition_spec: PartitionSpec: Specify the
-                partitioning of the query tensor in
-            value_partition_spec: PartitionSpec: Specify the
-                partitioning of the value tensor
-            bias_partition_spec: PartitionSpec: Specify the partitioning
-                of the bias
-            attention_partition_spec: PartitionSpec: Partition the
-                attention weights
-            shard_attention_computation: bool: Determine whether to use
-                shard_map or not
-            input_shape: Sequence[int]: Specify the shape of the input
-                to be used for training
-            backend: Optional[str]: Specify the backend used for the
-                model
-            init_optimizer_state: bool: Initialize the optimizer state
-            free_optimizer_state: bool: Free the optimizer state from
-                memory
-            verbose: bool: Print the progress of loading the model
-            state_shard_fns: Optional[Mapping[str,Callable]]: Specify
-                the function to use for sharding the state
-            **kwargs: Pass keyword arguments to the function
-            config_kwargs: Optional[Mapping[str, Any]]: Config kwargs to
-                be added to config before creating module
-        generation process:param key_partition_spec: PartitionSpec: Specify the partitioning of the key matrix
+            pretrained_model_name_or_path (str): The name of the pre-trained model or the path to the local checkpoint.
+            filename (Optional[str], optional): The name of the file to load from Hugging Face Hub. Defaults to None.
+            optimizer (AVAILABLE_OPTIMIZERS, optional): The optimizer to use for training. Defaults to "adamw".
+            scheduler (AVAILABLE_SCHEDULERS, optional): The learning rate scheduler to use during training. Defaults to "none".
+            tx_init (Optional[dict], optional): A dictionary of optimizer initialization parameters. Defaults to None.
+            device (optional): The device to load the model on. Defaults to jax.devices('cpu')[0].
+            dtype (jax.numpy.dtype, optional): The data type to use for the model parameters. Defaults to jax.numpy.float32.
+            param_dtype (jax.numpy.dtype, optional): The data type to use for the model parameters during training. Defaults to jax.numpy.float32.
+            precision (Optional[jax.lax.Precision], optional): The precision to use for computations. Defaults to jax.lax.Precision("fastest").
+            sharding_axis_dims (Sequence[int], optional): The dimensions of the axes for sharding. Defaults to (1, -1, 1, 1).
+            sharding_axis_names (Sequence[str], optional): The names of the axes for sharding. Defaults to ("dp", "fsdp", "tp", "sp").
+            query_partition_spec (PartitionSpec, optional): The partitioning specification for query matrices. Defaults to PartitionSpec(("dp", "fsdp"), "sp", "tp", None).
+            generation_query_partition_spec (PartitionSpec, optional): The partitioning specification for query matrices during generation. Defaults to PartitionSpec(("dp", "fsdp"), "tp", None, None).
+            key_partition_spec (PartitionSpec, optional): The partitioning specification for key matrices. Defaults to PartitionSpec(("dp", "fsdp"), "sp", "tp", None).
+            value_partition_spec (PartitionSpec, optional): The partitioning specification for value matrices. Defaults to PartitionSpec(("dp", "fsdp"), "sp", "tp", None).
+            bias_partition_spec (PartitionSpec, optional): The partitioning specification for bias vectors. Defaults to PartitionSpec(("dp", "fsdp"), None, None, None).
+            generation_bias_partition_spec (PartitionSpec, optional): The partitioning specification for bias vectors during generation. Defaults to PartitionSpec(("dp", "fsdp"), None, None, None).
+            attention_partition_spec (PartitionSpec, optional): The partitioning specification for attention weights. Defaults to PartitionSpec(("dp", "fsdp"), "sp", "tp", None).
+            shard_attention_computation (bool, optional): Whether to shard attention computation. Defaults to True.
+            input_shape (Sequence[int], optional): The shape of the input data. Defaults to (1, 1).
+            backend (Optional[str], optional): The backend to use for computations. Defaults to None.
+            init_optimizer_state (bool, optional): Whether to initialize the optimizer state. Defaults to False.
+            free_optimizer_state (bool, optional): Whether to free the optimizer state after loading. Defaults to True.
+            verbose (bool, optional): Whether to print verbose output. Defaults to True.
+            state_shard_fns (Optional[Mapping[str, Callable]], optional): Functions to shard the model state. Defaults to None.
+            config_kwargs (Optional[Mapping[str, Any]], optional): Keyword arguments to pass to the model configuration. Defaults to None.
+            **kwargs: Additional keyword arguments.
 
         Returns:
-            An `EasyDeLState` object
+            EasyDeLState: A loaded EasyDeLState object.
+
+        Raises:
+            EasyDeLRuntimeError: If both `free_optimizer_state` and `init_optimizer_state` are set to True.
         """
         if free_optimizer_state and init_optimizer_state:
             raise EasyDeLRuntimeError(
@@ -576,7 +622,7 @@ class EasyDeLState(struct.PyTreeNode):
                 bias_partition_spec=bias_partition_spec,
                 attention_partition_spec=attention_partition_spec,
                 shard_attention_computation=shard_attention_computation,
-                input_shape=input_shape,
+                input_shape=input_shape,  # type:ignore
                 backend=backend,
                 config_kwargs=config_kwargs,
                 **kwargs
@@ -613,7 +659,7 @@ class EasyDeLState(struct.PyTreeNode):
                     dtype=dtype,
                     param_dtype=param_dtype,
                     precision=precision,
-                    input_shape=input_shape
+                    input_shape=input_shape  # type: ignore
                 )
         if init_optimizer_state:
             with jax.default_device(device):
@@ -630,6 +676,22 @@ class EasyDeLState(struct.PyTreeNode):
             mesh: Optional[Mesh] = None,
             rules: Optional[Sequence[Mapping[str, PartitionSpec]]] = None
     ):
+        """
+        Shards the model parameters across devices.
+
+        Args:
+            fully_sharded_data_parallel (bool, optional): Whether to use fully sharded data parallelism. Defaults to True.
+            shard_fns (Optional[Mapping[str, Callable]], optional): Functions to shard the model parameters. Defaults to None.
+            dtype (Union[jax.numpy.dtype, str], optional): The data type to use for sharded parameters. Defaults to "bf16".
+            mesh (Optional[Mesh], optional): The JAX mesh to use for sharding. Defaults to None.
+            rules (Optional[Sequence[Mapping[str, PartitionSpec]]], optional): Rules for partitioning the model parameters. Defaults to None.
+
+        Returns:
+            EasyDeLState: An EasyDeLState object with sharded parameters.
+
+        Raises:
+            EasyDeLRuntimeError: If `shard_fns` and `rules` are both None and the model does not have a `module_config`.
+        """
         dtype = fjformer.get_dtype(dtype)
         if shard_fns is None and self.module_config is None and rules is None:
             raise EasyDeLRuntimeError(
@@ -748,6 +810,17 @@ class EasyDeLState(struct.PyTreeNode):
 
     @classmethod
     def search(cls, key, dictionary: dict, default: Any = None):
+        """
+        Searches for a key in a dictionary, handling serialized keys.
+
+        Args:
+            key: The key to search for.
+            dictionary (dict): The dictionary to search within.
+            default: The default value to return if the key is not found.
+
+        Returns:
+            The value associated with the key, or the default value if the key is not found.
+        """
         req = dictionary.get(key, None)
         if req is None:
             req = cls.find_key(key, dictionary)
@@ -755,6 +828,18 @@ class EasyDeLState(struct.PyTreeNode):
 
     @staticmethod
     def find_key(key, dictionary: dict) -> Union[str, None]:
+        """
+        Finds a key within a dictionary, considering serialized keys.
+
+        This method iterates through the dictionary, checking for both regular and serialized keys.
+
+        Args:
+            key: The key to find.
+            dictionary (dict): The dictionary to search.
+
+        Returns:
+            The value associated with the key, or None if not found.
+        """
         result = None
         for k, v in dictionary.items():
             k_, v_ = break_format(key=k, value=v)
@@ -762,6 +847,47 @@ class EasyDeLState(struct.PyTreeNode):
                 result = v_
                 break
         return result
+
+    def serialize(self):
+        """
+        Prepares the state for JAX sharding and saving by serializing specific attributes.
+
+        This method modifies the `module_config` in-place, converting non-trivial data types into
+        strings to ensure compatibility with JAX sharding and checkpointing mechanisms.
+        """
+        for k, v in self.safe_dict(self.module_config.__dict__).items():
+            setattr(self.module_config, k, v)
+
+    def un_serialize(self):
+        """
+        Reverses the serialization process, restoring the original data types of `module_config` attributes.
+
+        This method iterates through the `module_config` attributes, identifying and converting
+        serialized string values back to their appropriate data types.
+        """
+        for k, v in self.unsafe_dict(self.module_config.__dict__).items():
+            setattr(self.module_config, k, v)
+
+    def to_pytorch(
+            self,
+            base_hf_auto_class=AutoModelForCausalLM,
+            easystate_to_huggingface_model_kwargs: Optional[dict] = None
+    ):
+        """
+        Converts the EasyDeL model to a PyTorch model.
+
+        Args:
+            base_hf_auto_class: The base Hugging Face AutoModel class to use for conversion.
+            easystate_to_huggingface_model_kwargs: Keyword arguments to pass to the conversion method.
+
+        Returns:
+            A PyTorch model equivalent to the EasyDeL model.
+        """
+        return self.module.to_pytorch(
+            params=self.params,
+            base_hf_auto_class=base_hf_auto_class,
+            easystate_to_huggingface_model_kwargs=easystate_to_huggingface_model_kwargs
+        )
 
     def __repr__(self):
 

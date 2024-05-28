@@ -1,2 +1,0 @@
-# trainer.vision_causal_language_model_trainer.vision_causal_language_model_trainer
-::: src.python.easydel.trainer.vision_causal_language_model_trainer.vision_causal_language_model_trainer

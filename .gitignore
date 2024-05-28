@@ -7,7 +7,7 @@ __pycache__/
 .idea
 *.so
 env.ipynb
-env.ipynb
+env.py
 pallas_env.py
 test_EasyDeLState.py
 io.py

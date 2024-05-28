@@ -137,16 +137,16 @@ theme:
 """
 
     statics = {
-        ("Home",): "index.md",
-        ("Install",): "Install.md",
+        ("Home",): "index.rst",
+        ("Install",): "Install.rst",
         ("Available models",): "AvailableModels.md",
         ("Examples", "EasyState"): "EasyStateExample.md",
-        ("Examples", "LoRA and Transfer Learning"): "LoRA-TransferLearningExample.md",
-        ("Examples", "Fine Tuning Example"): "FineTuningExample.md",
-        ("Examples", "DataProcessing"): "DataProcessing.md",
+        ("Examples", "LoRA and Transfer Learning"): "LoRA-TransferLearningExample.rst",
+        ("Examples", "Fine Tuning Example"): "FineTuningExample.rst",
+        ("Examples", "DataProcessing"): "DataProcessing.rst",
         ("Examples", "Easy Attention"): "AttentionModuleExample.md",
         ("Examples", "Model Parameter Quantization"): "Parameter-Quantization.md",
-        ("Contributing",): "CONTRIBUTING.md"
+        ("Contributing",): "CONTRIBUTING.rst"
 
     }
     cache = {("APIs",) + k: v for k, v in cache.items()}
