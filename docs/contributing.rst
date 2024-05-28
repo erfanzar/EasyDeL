@@ -15,7 +15,7 @@ To contribute to EasyDeL, follow these steps:
 
 Code of Conduct
 ------
-Please adhere to the Apache Code of Conduct_ in all interactions related to EasyDeL.
+Please adhere to the `Apache Code of Conduct <https://www.apache.org/foundation/policies/conduct.html>`_ in all interactions related to EasyDeL.
 
 Reporting Bugs
 ------
@@ -41,5 +41,3 @@ License
 By contributing to EasyDeL, you agree that your contributions will be licensed under the Apache License, Version 2.0.
 
 Thank you for your interest in contributing to EasyDeL! We appreciate your support.
-
-.. _Conduct https://www.apache.org/foundation/policies/conduct.html

@@ -1,4 +1,4 @@
-**EasyDeLState: A Snapshot of Your EasyDeL Model**
+# **EasyDeLState: A Snapshot of Your EasyDeL Model**
 
 The `EasyDeLState` class acts like a comprehensive container that holds all the essential information about your EasyDeL
 model at a given point in time. Think of it as a snapshot of your model. It includes:
