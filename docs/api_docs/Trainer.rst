@@ -1,46 +1,25 @@
 Trainer
 =======
 
-.. automodule:: APIs
-   :members:
-
 .. toctree::
    :maxdepth: 2
 
-   Base_Trainer.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Causal_Language_Model_Trainer.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Sft.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Training_Configurations.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Orpo.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Dpo.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Vision_Causal_Language_Model_Trainer.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Utils.rst
-
+   trainer.base_trainer.rst
+   trainer.causal_language_model_trainer.fwd_bwd_functions.rst
+   trainer.causal_language_model_trainer.modeling_output.rst
+   trainer.causal_language_model_trainer.causal_language_model_trainer.rst
+   trainer.sft.stf_trainer.rst
+   trainer.sft.utils.rst
+   trainer.training_configurations.rst
+   trainer.orpo.fwd_bwd_functions.rst
+   trainer.orpo.modelling_output.rst
+   trainer.orpo.orpo_trainer.rst
+   trainer.orpo.utils.rst
+   trainer.dpo.fwd_bwd_functions.rst
+   trainer.dpo.modelling_output.rst
+   trainer.dpo.utils.rst
+   trainer.dpo.dpo_trainer.rst
+   trainer.vision_causal_language_model_trainer.fwd_bwd_functions.rst
+   trainer.vision_causal_language_model_trainer.vision_causal_language_model_trainer.rst
+   trainer.vision_causal_language_model_trainer.modelling_output.rst
+   trainer.utils.rst
