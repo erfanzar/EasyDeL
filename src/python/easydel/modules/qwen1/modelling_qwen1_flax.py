@@ -17,7 +17,7 @@ from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks, make_causal_mask
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput, FlaxSequenceClassifierOutput
 
-from fjformer.linen import Linear
+from fjformer.linen import Dense
 from ..flax_modelling_utils import (
     with_sharding_constraint,
     get_gradient_checkpoint_policy,
@@ -144,7 +144,7 @@ class FlaxQwen1MLP(nn.Module):
     def setup(self) -> None:
         config = self.config
 
-        self.w1 = Linear(
+        self.w1 = Dense(
             config.intermediate_size // 2,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -155,7 +155,7 @@ class FlaxQwen1MLP(nn.Module):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.w2 = Linear(
+        self.w2 = Dense(
             config.intermediate_size // 2,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -165,7 +165,7 @@ class FlaxQwen1MLP(nn.Module):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.c_proj = Linear(
+        self.c_proj = Dense(
             config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -209,7 +209,7 @@ class FlaxQwen1Attention(BaseJAXAttentionModule):
         assert self.projection_size % config.num_attention_heads == 0
         self.hidden_size_per_attention_head = self.projection_size // config.num_attention_heads
 
-        self.c_attn = Linear(
+        self.c_attn = Dense(
             self.projection_size * 3,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -221,7 +221,7 @@ class FlaxQwen1Attention(BaseJAXAttentionModule):
             **get_dot_general_by_bits(config.bits, config.easy_method)
         )
 
-        self.c_proj = Linear(
+        self.c_proj = Dense(
             config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -1198,7 +1198,7 @@ class FlaxQwen1ForCausalLMModule(nn.Module):
             precision=self.precision,
         )
 
-        self.lm_head = Linear(
+        self.lm_head = Dense(
             self.config.vocab_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -1266,7 +1266,7 @@ class FlaxQwen1ForCausalLMModule(nn.Module):
 
         if self.config.tie_word_embeddings:
             shared_kernel = self.model.variables["params"]["wte"]["embedding"]
-            shared_kernel = fjformer.linen.linen.control_quantization(shared_kernel, self.param_dtype).T
+            shared_kernel = fjformer.linen.control_quantization(shared_kernel, self.param_dtype).T
             lm_logits = self.lm_head.apply(
                 {"params": {"kernel": shared_kernel}}, hidden_states)
         else:
@@ -1320,7 +1320,7 @@ class FlaxQwen1ForSequenceClassificationModule(nn.Module):
             A tuple of the model and the classifier
         """
         self.model = FlaxQwen1Module(self.config, dtype=self.dtype)
-        self.classifier = Linear(
+        self.classifier = Dense(
             self.num_classes,
             dtype=self.dtype,
             param_dtype=self.param_dtype,

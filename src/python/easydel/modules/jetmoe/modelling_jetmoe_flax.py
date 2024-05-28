@@ -15,7 +15,7 @@ from typing import Union, Optional, Tuple
 from flax.struct import dataclass
 from ..attention_module import AttentionModule
 from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
-from fjformer.linen import Linear
+from fjformer.linen import Dense
 from flax.linen import partitioning as nn_partitioning, combine_masks
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 
@@ -141,7 +141,7 @@ class TopKGating(nn.Module):
     precision: Optional[Union[str, lax.Precision]] = None
 
     def setup(self):
-        self.layer = Linear(
+        self.layer = Dense(
             self.num_experts,
             use_bias=False,
             dtype=self.dtype,
@@ -259,7 +259,7 @@ class FlaxMoE(nn.Module):
         y = zeros.at[0, self.batch_index].add(expert_outputs)
         y = y.view((bsz, length, self.input_size))
         if self.bias_kernel is not None:
-            bias = fjformer.linen.linen.control_quantization(self.bias_kernel, self.dtype)
+            bias = fjformer.linen.control_quantization(self.bias_kernel, self.dtype)
             y = y + bias
         return y, loss
 
@@ -438,7 +438,7 @@ class FlaxJetMoEMLP(nn.Module):
 
     def setup(self) -> None:
         dense = functools.partial(
-            Linear,
+            Dense,
             use_bias=False,
             dtype=self.dtype,
             param_dtype=self.param_dtype,

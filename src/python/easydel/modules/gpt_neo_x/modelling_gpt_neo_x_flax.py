@@ -15,7 +15,7 @@ import chex
 from .gpt_neo_x_configuration import GPTNeoXConfig
 from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 
-from fjformer.linen import Linear
+from fjformer.linen import Dense
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0,
                          dtype: jnp.dtype = jnp.bfloat16) -> jnp.ndarray:
@@ -63,10 +63,10 @@ class FlaxGPTNeoXAttention(BaseJAXAttentionModule):
             dim=self.head_size,
             end=self.config.max_position_embeddings
         )
-        self.w_qkv = Linear(
+        self.w_qkv = Dense(
             3 * self.config.hidden_size
         )
-        self.w_o = Linear(
+        self.w_o = Dense(
             self.config.hidden_size
         )
 
@@ -117,8 +117,8 @@ class FlaxGPTNeoXMlp(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
-        self.dense_h_to_4h = Linear(self.config.intermediate_size)
-        self.dense_4h_to_h = Linear(self.config.hidden_size)
+        self.dense_h_to_4h = Dense(self.config.intermediate_size)
+        self.dense_4h_to_h = Dense(self.config.hidden_size)
         self.act = ACT2FN[self.config.hidden_act]
 
     def __call__(self, x):
@@ -336,7 +336,7 @@ class FlaxGPTNeoXForCausalLMModule(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.lm_head = Linear(
+        self.lm_head = Dense(
             self.config.vocab_size,
             use_bias=False
         )

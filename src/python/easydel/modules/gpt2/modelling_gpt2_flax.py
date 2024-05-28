@@ -36,7 +36,7 @@ from ..flax_modelling_utils import ACT2FN, with_sharding_constraint, \
     get_dot_general_by_bits, ACT2FN, BaseJAXAttentionModule, get_gradient_checkpoint_policy, block_wise_ffn
 from .gpt2_configuration import GPT2Config
 from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
-from fjformer.linen import Linear
+from fjformer.linen import Dense
 
 _CHECKPOINT_FOR_DOC = "gpt2"
 _CONFIG_FOR_DOC = "GPT2Config"
@@ -713,7 +713,7 @@ class FlaxGPT2LMHeadModule(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision,
         )
-        self.lm_head = Linear(
+        self.lm_head = Dense(
             self.config.vocab_size,
             use_bias=False,
             dtype=self.dtype,
@@ -753,7 +753,7 @@ class FlaxGPT2LMHeadModule(nn.Module):
 
         if self.config.tie_word_embeddings:
             shared_kernel = self.transformer.variables["params"]["wte"]["embedding"]
-            shared_kernel = fjformer.linen.linen.control_quantization(shared_kernel, self.param_dtype).T
+            shared_kernel = fjformer.linen.control_quantization(shared_kernel, self.param_dtype).T
             lm_logits = self.lm_head.apply({"params": {"kernel": shared_kernel}}, hidden_states)
         else:
             lm_logits = self.lm_head(hidden_states)

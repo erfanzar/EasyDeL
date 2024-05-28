@@ -454,14 +454,24 @@ class BaseJAXAttentionModule(nn.Module):
         quantize_kv_cache = self.config.quantize_kv_cache
         is_initialized = self.has_variable("cache", "cached_key")
         if quantize_kv_cache:
-            cached_key = self.variable("cache", "cached_key", jnp.zeros, key.shape, jnp.int8)
-            cached_value = self.variable("cache", "cached_value", jnp.zeros, value.shape, jnp.int8)
-            cached_key_scale = self.variable("cache", "cached_key_scale", jnp.zeros, key.shape[0:-1], jnp.float32)
-            cached_value_scale = self.variable("cache", "cached_value_scale", jnp.zeros, value.shape[0:-1], jnp.float32)
-            cache_index = self.variable("cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32))
+            cached_key = self.variable(
+                "cache", "cached_key", jnp.zeros, key.shape, jnp.int8
+            )
+            cached_value = self.variable(
+                "cache", "cached_value", jnp.zeros, value.shape, jnp.int8
+            )
+            cached_key_absmax = self.variable(
+                "cache", "cached_key_absmax", jnp.zeros, key.shape[0:-1], key.dtype
+            )
+            cached_value_absmax = self.variable(
+                "cache", "cached_value_absmax", jnp.zeros, value.shape[0:-1], value.dtype
+            )
+            cache_index = self.variable(
+                "cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32)
+            )
         else:
-            cached_key_scale = None
-            cached_value_scale = None
+            cached_key_absmax = None
+            cached_value_absmax = None
             cached_key = self.variable("cache", "cached_key", jnp.zeros, key.shape, key.dtype)
             cached_value = self.variable("cache", "cached_value", jnp.zeros, value.shape, value.dtype)
             cache_index = self.variable("cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32))
@@ -514,15 +524,15 @@ class BaseJAXAttentionModule(nn.Module):
                 cur_index = cache_index.value
                 indices = (0,) * len(batch_dims) + (cur_index, 0, 0)  # type:ignore
                 if quantize_kv_cache:
-                    key_val = fjformer.linen.linen.de_quantize(
+                    key_val = fjformer.linen.linen.dequantize(
                         cached_key.value,
                         cached_key_scale.value,
                         key.dtype,
                         .0
                     )
-                    value_val = fjformer.linen.linen.de_quantize(
+                    value_val = fjformer.linen.linen.dequantize(
                         cached_value.value,
-                        cached_value_scale.value,
+                        cached_value_scale.value,  # TODO: FIX THIS ...
                         value.dtype,
                         .0
                     )

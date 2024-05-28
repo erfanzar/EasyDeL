@@ -66,7 +66,7 @@ class DeepseekV2RMSNorm(nn.Module):
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
         output = self._norm(x).astype(self.dtype)
-        weight = fjformer.linen.linen.control_quantization(self.weight, self.dtype)
+        weight = fjformer.linen.control_quantization(self.weight, self.dtype)
         return output * weight
 
 
@@ -213,7 +213,7 @@ class FlaxDeepseekV2MLP(nn.Module):
 
     def setup(self) -> None:
         dense = functools.partial(
-            nn.Linear,
+            nn.Dense,
             use_bias=False,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -443,7 +443,7 @@ class FlaxDeepseekV2Attention(BaseJAXAttentionModule):
         self.is_causal = True
 
         dense_class = functools.partial(
-            nn.Linear,
+            nn.Dense,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
@@ -1242,7 +1242,7 @@ class FlaxDeepseekV2ForCausalLMModule(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.lm_head = nn.Linear(
+        self.lm_head = nn.Dense(
             self.config.vocab_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -1316,7 +1316,7 @@ class FlaxDeepseekV2ForCausalLMModule(nn.Module):
 
         if self.config.tie_word_embeddings:
             shared_kernel = self.transformer.variables["params"]["embed_tokens"]["embedding"]
-            shared_kernel = fjformer.linen.linen.control_quantization(shared_kernel, self.param_dtype).T
+            shared_kernel = fjformer.linen.control_quantization(shared_kernel, self.param_dtype).T
             lm_logits = self.lm_head.apply(
                 {"params": {"kernel": shared_kernel}}, hidden_states)
         else:

@@ -101,7 +101,7 @@ def main():
             _do_init=True,
             input_shape=(8, 8)
         )
-        ref_module.params = fjformer.linen.linen.quantize_parameters(
+        ref_module.params = fjformer.linen.linen.quantize_int8_parameters(
             ["kernel", "embedding"],
             ref_module.params,
         )

@@ -1,15 +1,13 @@
 import math
 
 import jax.nn.initializers
-from fjformer import with_sharding_constraint
 from jax import numpy as jnp
 
 from functools import partial
 
 from flax import linen as nn
-from fjformer.linen import Linear
+from fjformer.linen import Dense
 from transformers import FlaxPreTrainedModel
-from jax.sharding import PartitionSpec
 import flax
 from einops import rearrange
 from typing import Dict, Optional
@@ -36,7 +34,7 @@ class LTSelfAttention(BaseJAXAttentionModule):
     param_dtype: jnp.dtype = jnp.float32
 
     def setup(self) -> None:
-        dense = partial(Linear,
+        dense = partial(Dense,
                         features=self.config.hidden_size,
                         use_bias=False,
                         kernel_init=jax.nn.initializers.normal(self.config.initializer_range)
@@ -72,14 +70,14 @@ class LTMlp(nn.Module):
     param_dtype: jnp.dtype = jnp.float32
 
     def setup(self) -> None:
-        self.up = Linear(
+        self.up = Dense(
             self.config.intermediate_size,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(
                 self.config.initializer_range
             )
         )
-        self.down = Linear(
+        self.down = Dense(
             self.config.hidden_size,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(
@@ -261,7 +259,7 @@ class FlaxLTModelForCausalLMModule(nn.Module):
         self.model = FlaxLTModule(
             config=self.config, dtype=self.dtype, param_dtype=self.param_dtype
         )
-        self.lm_head = Linear(
+        self.lm_head = Dense(
             self.config.vocab_size,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range)

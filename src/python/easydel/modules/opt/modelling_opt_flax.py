@@ -43,7 +43,7 @@ import chex
 
 from .opt_configuration import OPTConfig
 from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
-from fjformer.linen import Linear
+from fjformer.linen import Dense
 
 logger = logging.get_logger(__name__)
 
@@ -67,7 +67,7 @@ class FlaxOPTAttention(BaseJAXAttentionModule):
             )
 
         dense = partial(
-            Linear,
+            Dense,
             self.embed_dim,
             use_bias=self.bias,
             dtype=self.dtype,
@@ -206,12 +206,12 @@ class FlaxOPTDecoderLayer(nn.Module):
         self.activation_fn = ACT2FN[self.config.activation_function]
 
         self.self_attn_layer_norm = nn.LayerNorm(dtype=self.dtype, epsilon=1e-05)
-        self.fc1 = Linear(
+        self.fc1 = Dense(
             self.config.ffn_dim,
             dtype=self.dtype,
             kernel_init=jax.nn.initializers.normal(self.config.init_std),
         )
-        self.fc2 = Linear(
+        self.fc2 = Dense(
             self.embed_dim, dtype=self.dtype, kernel_init=jax.nn.initializers.normal(self.config.init_std)
         )
         self.final_layer_norm = nn.LayerNorm(dtype=self.dtype, epsilon=1e-05)
@@ -364,8 +364,8 @@ class FlaxOPTDecoder(nn.Module):
         )
 
         if self.config.word_embed_proj_dim != self.config.hidden_size:
-            self.project_in = Linear(self.config.hidden_size, use_bias=False)
-            self.project_out = Linear(self.config.word_embed_proj_dim, use_bias=False)
+            self.project_in = Dense(self.config.hidden_size, use_bias=False)
+            self.project_out = Dense(self.config.word_embed_proj_dim, use_bias=False)
 
         else:
             self.project_in = None
@@ -608,7 +608,7 @@ class FlaxOPTForCausalLMModule(nn.Module):
 
     def setup(self):
         self.model = FlaxOPTModule(config=self.config, dtype=self.dtype)
-        self.lm_head = Linear(
+        self.lm_head = Dense(
             self.config.vocab_size,
             use_bias=False,
             dtype=self.dtype,
@@ -641,7 +641,7 @@ class FlaxOPTForCausalLMModule(nn.Module):
 
         if self.config.tie_word_embeddings:
             shared_kernel = self.model.variables["params"]["decoder"]["embed_tokens"]["embedding"]
-            shared_kernel = fjformer.linen.linen.control_quantization(shared_kernel, self.param_dtype).T
+            shared_kernel = fjformer.linen.control_quantization(shared_kernel, self.param_dtype).T
             lm_logits = self.lm_head.apply({"params": {"kernel": shared_kernel}}, hidden_states)
         else:
             lm_logits = self.lm_head(hidden_states)

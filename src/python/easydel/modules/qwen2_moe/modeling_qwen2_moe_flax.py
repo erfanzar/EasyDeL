@@ -9,7 +9,7 @@ import jax.numpy as jnp
 from fjformer.func import auxiliary_load_balancing_loss_func
 from jax import lax
 from jax.experimental.shard_map import shard_map
-from fjformer.linen import Linear
+from fjformer.linen import Dense
 from jax.sharding import PartitionSpec
 from fjformer import linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
@@ -112,7 +112,7 @@ class FlaxQwen2MoeMLP(nn.Module):
     def setup(self) -> None:
         config = self.config
         intermediate_size = self.intermediate_size if self.intermediate_size is not None else config.moe_intermediate_size
-        self.gate_proj = Linear(
+        self.gate_proj = Dense(
             intermediate_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -123,7 +123,7 @@ class FlaxQwen2MoeMLP(nn.Module):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.down_proj = Linear(
+        self.down_proj = Dense(
             config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -133,7 +133,7 @@ class FlaxQwen2MoeMLP(nn.Module):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.up_proj = Linear(
+        self.up_proj = Dense(
             intermediate_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -176,7 +176,7 @@ class FlaxQwen2MoeAttention(BaseJAXAttentionModule):
 
         if self.num_key_value_groups == 1:
             assert self.config.num_attention_heads == self.config.num_key_value_heads
-        self.q_proj = Linear(
+        self.q_proj = Dense(
             config.num_attention_heads * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -187,7 +187,7 @@ class FlaxQwen2MoeAttention(BaseJAXAttentionModule):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.k_proj = Linear(
+        self.k_proj = Dense(
             config.num_key_value_heads * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -198,7 +198,7 @@ class FlaxQwen2MoeAttention(BaseJAXAttentionModule):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.v_proj = Linear(
+        self.v_proj = Dense(
             config.num_key_value_heads * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -209,7 +209,7 @@ class FlaxQwen2MoeAttention(BaseJAXAttentionModule):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.o_proj = Linear(
+        self.o_proj = Dense(
             config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -530,7 +530,7 @@ class FlaxQwen2MoeSparseMoeBlock(nn.Module):
     ] = jax.lax.Precision("fastest")
 
     def setup(self) -> None:
-        self.gate = Linear(
+        self.gate = Dense(
             self.config.num_experts,
             use_bias=False,
             dtype=self.dtype,
@@ -553,7 +553,7 @@ class FlaxQwen2MoeSparseMoeBlock(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.shared_expert_gate = Linear(
+        self.shared_expert_gate = Dense(
             1,
             use_bias=False,
             dtype=self.dtype,
@@ -1224,7 +1224,7 @@ class FlaxQwen2MoeForCausalLMModule(nn.Module):
             precision=self.precision,
         )
 
-        self.lm_head = Linear(
+        self.lm_head = Dense(
             self.config.vocab_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -1289,7 +1289,7 @@ class FlaxQwen2MoeForCausalLMModule(nn.Module):
         hidden_states = outputs.last_hidden_state
         if self.config.tie_word_embeddings:
             shared_kernel = self.model.variables["params"]["embed_tokens"]["embedding"]
-            shared_kernel = fjformer.linen.linen.control_quantization(shared_kernel, self.param_dtype).T
+            shared_kernel = fjformer.linen.control_quantization(shared_kernel, self.param_dtype).T
             logits = self.lm_head.apply(
                 {"params": {"kernel": shared_kernel}}, hidden_states)
         else:
@@ -1406,7 +1406,7 @@ class FlaxQwen2MoeForSequenceClassificationModule(nn.Module):
             A tuple of the model and the classifier
         """
         self.model = FlaxQwen2MoeModule(self.config, dtype=self.dtype)
-        self.classifier = Linear(
+        self.classifier = Dense(
             self.num_classes,
             dtype=self.dtype,
             param_dtype=self.param_dtype,

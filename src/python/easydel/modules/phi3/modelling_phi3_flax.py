@@ -21,7 +21,7 @@ from ..flax_modelling_utils import (
     get_dot_general_by_bits, repeat_kv_bnsh, with_sharding_constraint, precompute_freq_cis, BaseJAXAttentionModule,
     block_wise_ffn
 )
-from fjformer.linen import Linear
+from fjformer.linen import Dense
 from .phi3_configuration import Phi3Config
 from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 from jax.sharding import PartitionSpec
@@ -47,7 +47,7 @@ class FlaxPhi3RMSNorm(nn.Module):
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
         output = self._norm(x).astype(self.dtype)
-        weight = fjformer.linen.linen.control_quantization(self.weight, self.dtype)
+        weight = fjformer.linen.control_quantization(self.weight, self.dtype)
         return output * weight
 
 
@@ -82,7 +82,7 @@ class FlaxPhi3MLP(nn.Module):
     def setup(
             self
     ) -> None:
-        self.gate_up_proj = Linear(
+        self.gate_up_proj = Dense(
             2 * self.config.intermediate_size,
             kernel_init=nn.initializers.normal(self.config.initializer_range),
             dtype=self.dtype,
@@ -90,7 +90,7 @@ class FlaxPhi3MLP(nn.Module):
             precision=self.precision,
             use_bias=False
         )
-        self.down_proj = Linear(
+        self.down_proj = Dense(
             self.config.hidden_size,
             kernel_init=nn.initializers.normal(self.config.initializer_range),
             dtype=self.dtype,
@@ -142,7 +142,7 @@ class FlaxPhi3Attention(BaseJAXAttentionModule):
             )
 
         dense_class = functools.partial(
-            Linear,
+            Dense,
             use_bias=False,
             precision=self.precision,
             dtype=self.dtype,
@@ -704,7 +704,7 @@ class FlaxPhi3ForCausalLMModule(nn.Module):
             precision=self.precision
         )
         self.vocab_size = self.config.vocab_size
-        self.lm_head = Linear(
+        self.lm_head = Dense(
             self.config.vocab_size,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
@@ -740,7 +740,7 @@ class FlaxPhi3ForCausalLMModule(nn.Module):
         outputs = (res.last_hidden_state, res.hidden_states, res.attentions)
         if self.config.tie_word_embeddings:
             shared_kernel = self.model.variables["params"]["embed_tokens"]["embedding"]
-            shared_kernel = fjformer.linen.linen.control_quantization(shared_kernel, self.param_dtype).T
+            shared_kernel = fjformer.linen.control_quantization(shared_kernel, self.param_dtype).T
             lm_logits = self.lm_head.apply(
                 {"params": {"kernel": shared_kernel}}, res.last_hidden_state)
         else:

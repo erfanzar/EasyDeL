@@ -19,7 +19,7 @@ from .vision_mistral_configuration import VisionMistralConfig
 from .modelling_mistral_flax import FlaxMistralDecoratorCollection, MistralRMSNorm
 from ..flax_modelling_utils import precompute_freq_cis
 from ...etils.etils import get_logger
-from fjformer.linen import Linear
+from fjformer.linen import Dense
 
 
 class FlaxVisionMistralPreTrainedModel(EasyDeLFlaxPretrainedModel):
@@ -304,7 +304,7 @@ class FlaxVisionMistralForCausalLMModule(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.vision_head = Linear(
+        self.vision_head = Dense(
             self.config.vision_vocab_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -312,7 +312,7 @@ class FlaxVisionMistralForCausalLMModule(nn.Module):
             kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
             precision=self.precision,
         )
-        self.lm_head = Linear(
+        self.lm_head = Dense(
             self.config.vocab_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -358,14 +358,14 @@ class FlaxVisionMistralForCausalLMModule(nn.Module):
 
         if self.config.tie_vision_embeddings:
             shared_kernel = self.transformer.variables["params"]["embed_vision"]["embedding"]
-            shared_kernel = fjformer.linen.linen.control_quantization(shared_kernel, self.param_dtype).T
+            shared_kernel = fjformer.linen.control_quantization(shared_kernel, self.param_dtype).T
             vision_logits = self.vision_head.apply({"params": {"kernel": shared_kernel}}, hidden_states)
         else:
             vision_logits = self.vision_head(hidden_states)
 
         if self.config.tie_word_embeddings:
             shared_kernel = self.transformer.variables["params"]["embed_tokens"]["embedding"]
-            shared_kernel = fjformer.linen.linen.control_quantization(shared_kernel, self.param_dtype).T
+            shared_kernel = fjformer.linen.control_quantization(shared_kernel, self.param_dtype).T
             lm_logits = self.lm_head.apply({"params": {"kernel": shared_kernel}}, hidden_states)
         else:
             lm_logits = self.lm_head(hidden_states)

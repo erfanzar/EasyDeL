@@ -18,7 +18,7 @@ from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 from flax.linen import partitioning as nn_partitioning, combine_masks
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 
-from fjformer.linen import Linear
+from fjformer.linen import Dense
 from ..flax_modelling_utils import (
     ACT2FN,
     with_sharding_constraint,
@@ -89,7 +89,7 @@ class MistralRMSNorm(nn.Module):
         x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
         output = self._norm(x).astype(self.dtype)
 
-        weight = fjformer.linen.linen.control_quantization(self.weight, self.dtype)
+        weight = fjformer.linen.control_quantization(self.weight, self.dtype)
         return output * weight
 
 
@@ -116,7 +116,7 @@ class FlaxMistralMLP(nn.Module):
 
     def setup(self) -> None:
         dense = functools.partial(
-            Linear,
+            Dense,
             use_bias=False,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -151,7 +151,7 @@ class FlaxMistralAttention(BaseJAXAttentionModule):
 
         if self.num_key_value_groups == 1:
             assert self.config.num_attention_heads == self.config.num_key_value_heads
-        self.q_proj = Linear(
+        self.q_proj = Dense(
             config.num_attention_heads * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -161,7 +161,7 @@ class FlaxMistralAttention(BaseJAXAttentionModule):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.k_proj = Linear(
+        self.k_proj = Dense(
             config.num_key_value_heads * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -171,7 +171,7 @@ class FlaxMistralAttention(BaseJAXAttentionModule):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.v_proj = Linear(
+        self.v_proj = Dense(
             config.num_key_value_heads * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -181,7 +181,7 @@ class FlaxMistralAttention(BaseJAXAttentionModule):
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
-        self.o_proj = Linear(
+        self.o_proj = Dense(
             config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -988,7 +988,7 @@ class FlaxMistralForCausalLMModule(nn.Module):
             precision=self.precision,
         )
 
-        self.lm_head = Linear(
+        self.lm_head = Dense(
             self.config.vocab_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -1063,7 +1063,7 @@ class FlaxMistralForCausalLMModule(nn.Module):
 
         if self.config.tie_word_embeddings:
             shared_kernel = self.transformer.variables["params"]["embed_tokens"]["embedding"]
-            shared_kernel = fjformer.linen.linen.control_quantization(shared_kernel, self.param_dtype).T
+            shared_kernel = fjformer.linen.control_quantization(shared_kernel, self.param_dtype).T
             lm_logits = self.lm_head.apply(
                 {"params": {"kernel": shared_kernel}}, hidden_states)
         else:
