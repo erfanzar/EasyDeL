@@ -99,13 +99,8 @@ Zare Chavoshi, Erfan. "EasyDeL, an open-source library, is specifically designed
 
     install.md
     contributing
+    easydelstate
 
-.. toctree::
-    :hidden:
-    :maxdepth: 1
-    :caption: EasyDeL Magics
-
-    easydelstate.md
 
 .. toctree::
     :hidden:
