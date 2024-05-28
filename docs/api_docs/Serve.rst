@@ -4,6 +4,6 @@ Serve
 .. toctree::
    :maxdepth: 2
 
-   serve.client.rst
-   serve.serve.rst
-   serve.configuration.rst
+   serve.client
+   serve.serve
+   serve.configuration
