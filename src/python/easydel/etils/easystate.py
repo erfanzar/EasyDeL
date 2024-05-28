@@ -668,6 +668,13 @@ class EasyDeLState(struct.PyTreeNode):
             state = state.free_opt_state()
         return state
 
+    def to_8bit(self, quantization_fields=None):
+        if quantization_fields is None:
+            quantization_fields = ["kernel", "embedding"]
+        params = fjformer.linen.quantize_int8_parameters(quantization_fields, self.params)  # type:ignore
+        self = self.replace(params=params)  # type:ignore
+        return self
+
     def shard_params(
             self,
             fully_sharded_data_parallel: bool = True,

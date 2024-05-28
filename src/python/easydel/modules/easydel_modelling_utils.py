@@ -1,6 +1,7 @@
 import warnings
 
 import chex
+import fjformer.linen
 import flax
 from jax.experimental.mesh_utils import create_device_mesh
 from transformers import PretrainedConfig, FlaxPreTrainedModel, AutoModelForCausalLM
@@ -735,3 +736,9 @@ class EasyDeLFlaxPretrainedModel(FlaxPreTrainedModel):
             **easystate_to_huggingface_model_kwargs
         )
         return hf_model
+
+    @staticmethod
+    def to_8bit(params, quantization_fields=None):
+        if quantization_fields is None:
+            quantization_fields = ["kernel", "embedding"]
+        return fjformer.linen.quantize_int8_parameters(quantization_fields, params)
