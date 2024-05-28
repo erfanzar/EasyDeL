@@ -84,22 +84,44 @@ def run(project_locations="src/python/easydel", docs_file="docs/api_docs/", star
         ...
 
 
-def generate_index_file(nested_dict, parent_title="", depth=0):
-    lines = []
+def create_rst_pages(data, output_dir=".", parent_page=None):
+    """
+    Recursively generates .rst pages from a nested dictionary.
 
-    if parent_title:
-        indent = "    " * depth
-        lines.append(f"{indent}{parent_title}\n")
-        lines.append(f"{indent}{'-' * len(parent_title)}\n")
+    Args:
+        data (dict): The dictionary representing the page structure.
+        output_dir (str, optional): The directory to write the .rst files to. Defaults to "." (current directory).
+        parent_page (str, optional): The name of the parent page (used for creating links). Defaults to None.
+    """
 
-    for key, value in nested_dict.items():
+    for key, value in data.items():
+        # Create a file-system friendly page name
+        page_name = key.replace(" ", "_") + ".rst"
+
+        # Create the full path to the .rst file
+        file_path = os.path.join(output_dir, page_name)
+
+        # Construct the content of the .rst file
+        content = f"{key}\n{'=' * len(key)}\n\n"  # Title with underline
+
+        # Add a link back to the parent page if it exists
+        if parent_page:
+            content += f".. automodule:: {parent_page.replace('.rst', '')}\n   :members:\n\n"
+
+        # Handle nested dictionaries (sub-pages)
         if isinstance(value, dict):
-            lines.extend(generate_index_file(value, key, depth + 1))
-        else:
-            indent = "    " * (depth + 1)
-            lines.append(f"{indent}- {key} <{value}>\n")
+            create_rst_pages(value, output_dir, page_name)  # Recursive call
+            # Add links to the sub-pages
+            for sub_key in value.keys():
+                sub_page_name = sub_key.replace(" ", "_") + ".rst"
+                content += f".. toctree::\n   :maxdepth: 2\n\n   {sub_page_name}\n\n"
+        # Handle leaf nodes (links to existing .rst files)
+        elif isinstance(value, str):
+            content += f".. automodule:: {value.replace('.rst', '')}\n   :members:\n"
 
-    return lines
+        # Write the content to the .rst file
+        with open(file_path, "w") as f:
+            f.write(content)
 
 
 def main():
@@ -113,20 +135,15 @@ def main():
 
     cache = {("APIs",) + k: v for k, v in cache.items()}
     pages = unflatten_dict(cache)
-    index_lines = [
-        "API Home",
-        "====\n",
-        ".. toctree::\n",
-        "    :maxdepth: 2\n",
-        "    :caption: Contents\n"
-    ]
+    # index_lines = [
+    #     "API Home",
+    #     "====\n",
+    #     ".. toctree::\n",
+    #     "    :maxdepth: 2\n",
+    #     "    :caption: Contents\n"
+    # ]
 
-    index_lines.extend(generate_index_file(pages))
-    index_content = "\n".join(index_lines)
-
-    # Write the index content to a file
-    with open("docs/api_docs/index.rst", "w") as f:
-        f.write(index_content)
+    create_rst_pages(pages, "docs/api_docs/")
 
 
 if __name__ == "__main__":

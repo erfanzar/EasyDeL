@@ -106,7 +106,7 @@ Zare Chavoshi, Erfan. "EasyDeL, an open-source library, is specifically designed
     :maxdepth: 1
     :caption: APIs
 
-    api_docs/index
+    api_docs/APIs
 
 
 .. toctree::
