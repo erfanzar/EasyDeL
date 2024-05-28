@@ -66,7 +66,7 @@ of machine learning models, particularly in the domain of large language models 
 ## Documentation 💫
 
 > [!IMPORTANT]
-> Documents and Examples are ready at [Here](https://erfanzar.github.io/EasyDeL)
+> Documents and Examples are ready at [Here](https://easydel.readthedocs.io/en/latest/)
 > Please have that in mind that EasyDeL is in the loop of fast-development
 > so we might have API changes.
 
