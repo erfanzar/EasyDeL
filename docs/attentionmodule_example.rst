@@ -1,7 +1,8 @@
-# AttentionModule
+AttentionModule
+========
 
-## what is `AttentionModule`
-
+what is `AttentionModule`
+--------
 AttentionModule is a EasyDeL module that can perform attention operation with different strategies to help user achieve
 the best possible performance and numerical stability, here are some strategies supported right now.
 
@@ -14,8 +15,8 @@ the best possible performance and numerical stability, here are some strategies 
 7. Wise Ring attention via "wise_ring"
 8. sharded Attention with shard map known as "sharded_vanilla"
 
-## Example of Using Flash Attention on TPU
-
+Example of Using Flash Attention on TPU
+--------
 ```python
 import jax
 import flax.linen.attention as flt
