@@ -4,8 +4,8 @@ EasyDeL is an open-source framework designed to enhance and streamline the train
 With a primary focus on Jax/Flax, EasyDeL aims to provide convenient and effective solutions for training Flax/Jax
 models on TPU/GPU for both serving and training purposes.
 
-## Key Features
-
+Key Features
+---------
 1. **Trainers**: EasyDeL offers a range of trainers, including DPOTrainer, ORPOTrainer, SFTTrainer, and VideoCLM
    Trainer, tailored for specific training requirements.
 
@@ -79,8 +79,8 @@ the team with a particular toolset.
 Hands on Code Kaggle Examples
 ---------------------------------------------------------------
 
-1. for mindset of using EasyDeL CausalLanguageModelTrainer on kaggle, but you can do much more. CLMScript
-2. SuperVised Finetuning with EasyDeL. SFTScript_
+1. `script <https://www.kaggle.com/citifer/easydel-causal-language-model-trainer-example>`_ for mindset of using EasyDeL CausalLanguageModelTrainer on kaggle, but you can do much more.
+2. `script <https://www.kaggle.com/code/citifer/easydel-sfttrainer-example>`_ SuperVised Finetuning with EasyDeL.
 
 Citing EasyDeL 🥶
 ---------------------------------------------------------------
@@ -124,7 +124,3 @@ To cite this Project
     attentionmodule_example
     data_processing
 
-
-
-.. _SFTScript https://www.kaggle.com/code/citifer/easydel-sfttrainer-example
-.. _CLMScript https://www.kaggle.com/citifer/easydel-causal-language-model-trainer-example

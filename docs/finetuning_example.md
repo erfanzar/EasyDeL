@@ -1,5 +1,5 @@
-FineTuning Causal Language Model 🥵
-=====
+# FineTuning Causal Language Model with EasyDeL
+
 with using EasyDeL FineTuning LLM (CausalLanguageModels) are easy as much as possible with using Jax and Flax
 and having the benefit of `TPUs` for the best speed here's a simple code to use in order to finetune your
 own Model

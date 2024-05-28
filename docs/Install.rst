@@ -41,18 +41,18 @@ pip install --upgrade "jax[cuda11_pip]" -f https://storage.googleapis.com/jax-re
 ```
 
 
-## Installing GO
-
-#### Note this Library needs golang to run (for some tracking stuff on TPU/GPU/CPU)
-
-#### Ubuntu GO installation
+Installing GO
+------
+Note this Library needs golang to run (for some tracking stuff on TPU/GPU/CPU)
+Ubuntu GO installation
+------
 
 ```shell
 sudo apt-get update && apt-get upgrade -y
 sudo apt-get install golang -y 
 ```
-
-#### Manjaro/Arch GO installation
+Manjaro/Arch GO installation
+------
 
 ```shell
 sudo pacman -Syyuu go
