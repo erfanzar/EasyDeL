@@ -1,5 +1,5 @@
-## EasyDeLXRapTure for layer tuning and LoRA
-
+EasyDeLXRapTure for layer tuning and LoRA
+---------
 in case of using LoRA and applying that on the EasyDeL models there are some other things
 that you might need to config on your own but a lot of things being handled by EasyDeL so let just jump into an example
 for LoRA fine-tuning section and use _EasyDeLXRapTure_ in for mistral models with flash attention example

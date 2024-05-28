@@ -1,11 +1,11 @@
-## FineTuning Causal Language Model 🥵
-
+FineTuning Causal Language Model 🥵
+=====
 with using EasyDeL FineTuning LLM (CausalLanguageModels) are easy as much as possible with using Jax and Flax
 and having the benefit of `TPUs` for the best speed here's a simple code to use in order to finetune your
 own Model
 
-_Days Has Been Passed and now using easydel in Jax is way more similar to HF/PyTorch Style
-now it's time to finetune our model_.
+Days Has Been Passed and now using easydel in Jax is way more similar to HF/PyTorch Style
+now it's time to finetune our model.
 
 ```python
 import jax.numpy
