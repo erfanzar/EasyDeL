@@ -22,6 +22,7 @@ def main():
     )
     # print(module.params)
     state = module.to_easydel_state(module.params)
+    state = state.to_8bit()
     state.save_state("state.easy")
 
 

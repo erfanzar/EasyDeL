@@ -2,6 +2,7 @@ import gc
 import unittest
 from unittest import TestCase
 
+import fjformer.linen
 import flax.traverse_util
 from fjformer import make_shard_and_gather_fns, match_partition_rules
 
@@ -272,7 +273,6 @@ class EasyModelsTest(TestCase):
                 labels=torch_input_ids[:, 1:],
                 output_router_logits=True
             )
-
             ed_output = ed_model(
                 input_ids=jax_input_ids[:, :-1],
                 params=params,
