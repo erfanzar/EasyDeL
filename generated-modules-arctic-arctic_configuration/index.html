@@ -1,0 +1,6084 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+      
+        <meta name="author" content="Erfan Zare Chavoshi">
+      
+      
+      
+        <link rel="prev" href="../generated-etils-etils/">
+      
+      
+        <link rel="next" href="../generated-modules-arctic-modelling_arctic_flax/">
+      
+      
+      <link rel="icon" href="../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.0, mkdocs-material-9.5.25">
+    
+    
+      
+        <title>Arctic Configuration - EasyDeL</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.6543a935.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/_mkdocstrings.css">
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce((e,_)=>(e<<5)-e+_.charCodeAt(0),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+    
+  </head>
+  
+  
+    <body dir="ltr">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#modulesarcticarctic_configuration" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="EasyDeL" class="md-header__button md-logo" aria-label="EasyDeL" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54Z"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3V6m0 5h18v2H3v-2m0 5h18v2H3v-2Z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            EasyDeL
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Arctic Configuration
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+    
+      <script>var media,input,key,value,palette=__md_get("__palette");if(palette&&palette.color){"(prefers-color-scheme)"===palette.color.media&&(media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']"),palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent"));for([key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      <label class="md-header__button md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.516 6.516 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5Z"/></svg>
+      </label>
+      <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.516 6.516 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5Z"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11h12Z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12 19 6.41Z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/erfanzar/EasyDeL" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.5.2 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2024 Fonticons, Inc.--><path d="M439.55 236.05 244 40.45a28.87 28.87 0 0 0-40.81 0l-40.66 40.63 51.52 51.52c27.06-9.14 52.68 16.77 43.39 43.68l49.66 49.66c34.23-11.8 61.18 31 35.47 56.69-26.49 26.49-70.21-2.87-56-37.34L240.22 199v121.85c25.3 12.54 22.26 41.85 9.08 55a34.34 34.34 0 0 1-48.55 0c-17.57-17.6-11.07-46.91 11.25-56v-123c-20.8-8.51-24.6-30.74-18.64-45L142.57 101 8.45 235.14a28.86 28.86 0 0 0 0 40.81l195.61 195.6a28.86 28.86 0 0 0 40.8 0l194.69-194.69a28.86 28.86 0 0 0 0-40.81z"/></svg>
+  </div>
+  <div class="md-source__repository">
+    GitHub
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="EasyDeL" class="md-nav__button md-logo" aria-label="EasyDeL" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54Z"/></svg>
+
+    </a>
+    EasyDeL
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/erfanzar/EasyDeL" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.5.2 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2024 Fonticons, Inc.--><path d="M439.55 236.05 244 40.45a28.87 28.87 0 0 0-40.81 0l-40.66 40.63 51.52 51.52c27.06-9.14 52.68 16.77 43.39 43.68l49.66 49.66c34.23-11.8 61.18 31 35.47 56.69-26.49 26.49-70.21-2.87-56-37.34L240.22 199v121.85c25.3 12.54 22.26 41.85 9.08 55a34.34 34.34 0 0 1-48.55 0c-17.57-17.6-11.07-46.91 11.25-56v-123c-20.8-8.51-24.6-30.74-18.64-45L142.57 101 8.45 235.14a28.86 28.86 0 0 0 0 40.81l195.61 195.6a28.86 28.86 0 0 0 40.8 0l194.69-194.69a28.86 28.86 0 0 0 0-40.81z"/></svg>
+  </div>
+  <div class="md-source__repository">
+    GitHub
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_1" id="__nav_1_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    APIs
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_1_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_1">
+            <span class="md-nav__icon md-icon"></span>
+            APIs
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_1" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_1" id="__nav_1_1_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Cli
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_1_1_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_1">
+            <span class="md-nav__icon md-icon"></span>
+            Cli
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-cli-cli/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Cli
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_1_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_1_2" id="__nav_1_1_2_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Train
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_1_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_1_2">
+            <span class="md-nav__icon md-icon"></span>
+            Train
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-cli-train-cl_train_cli/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Cl Train Cli
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_2" id="__nav_1_2_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Data Preprocessing
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_1_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_2">
+            <span class="md-nav__icon md-icon"></span>
+            Data Preprocessing
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-data_preprocessing-data_processor/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Data Processor
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_3" id="__nav_1_3_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Etils
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_1_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_3">
+            <span class="md-nav__icon md-icon"></span>
+            Etils
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-etils-auto_tx/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Auto Tx
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-etils-configs/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Configs
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-etils-easystate/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Easystate
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-etils-errors/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Errors
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-etils-etils/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Etils
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_1_4" id="__nav_1_4_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Modules
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_1_4_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_1_4">
+            <span class="md-nav__icon md-icon"></span>
+            Modules
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4_1" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_1_4_1" id="__nav_1_4_1_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Arctic
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_4_1_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_1_4_1">
+            <span class="md-nav__icon md-icon"></span>
+            Arctic
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  <span class="md-ellipsis">
+    Arctic Configuration
+  </span>
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  <span class="md-ellipsis">
+    Arctic Configuration
+  </span>
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#src.python.easydel.modules.arctic.arctic_configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      arctic_configuration
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#src.python.easydel.modules.arctic.arctic_configuration.ArcticConfig" class="md-nav__link">
+    <span class="md-ellipsis">
+      ArcticConfig
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="ArcticConfig">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#src.python.easydel.modules.arctic.arctic_configuration.ArcticConfig.add_jax_args" class="md-nav__link">
+    <span class="md-ellipsis">
+      add_jax_args
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#src.python.easydel.modules.arctic.arctic_configuration.ArcticConfig.get_partition_rules" class="md-nav__link">
+    <span class="md-ellipsis">
+      get_partition_rules
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-arctic-modelling_arctic_flax/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Modelling Arctic Flax
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-attention_module/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Attention Module
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-auto_easydel_model/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Auto Easydel Model
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-_blockwise_attention/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Blockwise Attention
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_4_5" id="__nav_1_4_5_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Cohere
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_4_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_4_5">
+            <span class="md-nav__icon md-icon"></span>
+            Cohere
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-cohere-cohere_configuration/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Cohere Configuration
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-cohere-modelling_cohere_flax/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Modelling Cohere Flax
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_4_6" id="__nav_1_4_6_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Dbrx
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_4_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_4_6">
+            <span class="md-nav__icon md-icon"></span>
+            Dbrx
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-dbrx-dbrx_configuration/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Dbrx Configuration
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-dbrx-modelling_dbrx_flax/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Modelling Dbrx Flax
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4_7" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_4_7" id="__nav_1_4_7_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Deepseek V2
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_4_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_4_7">
+            <span class="md-nav__icon md-icon"></span>
+            Deepseek V2
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-deepseek_v2-deepseek_configuration/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Deepseek Configuration
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-deepseek_v2-modeling_deepseek_flax/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Modeling Deepseek Flax
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-easydel_modelling_utils/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Easydel Modelling Utils
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4_9" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_4_9" id="__nav_1_4_9_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Falcon
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_4_9_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_4_9">
+            <span class="md-nav__icon md-icon"></span>
+            Falcon
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-falcon-falcon_configuration/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Falcon Configuration
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-falcon-modelling_falcon_flax/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Modelling Falcon Flax
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-flax_modelling_utils/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Flax Modelling Utils
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4_11" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_4_11" id="__nav_1_4_11_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Gemma
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_4_11_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_4_11">
+            <span class="md-nav__icon md-icon"></span>
+            Gemma
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-gemma-gemma_configuration/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Gemma Configuration
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-gemma-modelling_gemma_flax/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Modelling Gemma Flax
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4_12" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_4_12" id="__nav_1_4_12_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Gpt J
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_4_12_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_4_12">
+            <span class="md-nav__icon md-icon"></span>
+            Gpt J
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-gpt_j-gpt_j_configuration/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Gpt J Configuration
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-gpt_j-modelling_gpt_j_flax/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Modelling Gpt J Flax
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4_13" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_4_13" id="__nav_1_4_13_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Gpt Neo X
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_4_13_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_4_13">
+            <span class="md-nav__icon md-icon"></span>
+            Gpt Neo X
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-gpt_neo_x-gpt_neo_x_configuration/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Gpt Neo X Configuration
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-gpt_neo_x-modelling_gpt_neo_x_flax/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Modelling Gpt Neo X Flax
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4_14" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_4_14" id="__nav_1_4_14_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Gpt2
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_4_14_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_4_14">
+            <span class="md-nav__icon md-icon"></span>
+            Gpt2
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-gpt2-gpt2_configuration/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Gpt2 Configuration
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-gpt2-modelling_gpt2_flax/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Modelling Gpt2 Flax
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4_15" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_4_15" id="__nav_1_4_15_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Grok 1
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_4_15_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_4_15">
+            <span class="md-nav__icon md-icon"></span>
+            Grok 1
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-grok_1-grok_1_configuration/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Grok 1 Configuration
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-grok_1-modelling_grok_1_flax/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Modelling Grok 1 Flax
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4_16" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_4_16" id="__nav_1_4_16_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Jetmoe
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_4_16_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_4_16">
+            <span class="md-nav__icon md-icon"></span>
+            Jetmoe
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-jetmoe-jetmoe_configuration/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Jetmoe Configuration
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-jetmoe-modelling_jetmoe_flax/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Modelling Jetmoe Flax
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4_17" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_4_17" id="__nav_1_4_17_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Llama
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_4_17_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_4_17">
+            <span class="md-nav__icon md-icon"></span>
+            Llama
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-llama-llama_configuration/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Llama Configuration
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-llama-modelling_llama_flax/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Modelling Llama Flax
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-llama-modelling_vision_llama_flax/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Modelling Vision Llama Flax
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-llama-vision_llama_configuration/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Vision Llama Configuration
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4_18" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_4_18" id="__nav_1_4_18_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Lucid Transformer
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_4_18_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_4_18">
+            <span class="md-nav__icon md-icon"></span>
+            Lucid Transformer
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-lucid_transformer-lt_configuration/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Lt Configuration
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-lucid_transformer-modelling_lt_flax/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Modelling Lt Flax
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4_19" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_4_19" id="__nav_1_4_19_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Mamba
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_4_19_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_4_19">
+            <span class="md-nav__icon md-icon"></span>
+            Mamba
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-mamba-mamba_configuration/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Mamba Configuration
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-mamba-modelling_mamba_flax/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Modelling Mamba Flax
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4_20" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_4_20" id="__nav_1_4_20_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Mistral
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_4_20_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_4_20">
+            <span class="md-nav__icon md-icon"></span>
+            Mistral
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-mistral-mistral_configuration/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Mistral Configuration
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-mistral-modelling_mistral_flax/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Modelling Mistral Flax
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-mistral-modelling_vision_mistral_flax/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Modelling Vision Mistral Flax
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-mistral-vision_mistral_configuration/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Vision Mistral Configuration
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4_21" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_4_21" id="__nav_1_4_21_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Mixtral
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_4_21_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_4_21">
+            <span class="md-nav__icon md-icon"></span>
+            Mixtral
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-mixtral-mixtral_configuration/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Mixtral Configuration
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-mixtral-modelling_mixtral_flax/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Modelling Mixtral Flax
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4_22" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_4_22" id="__nav_1_4_22_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Mosaic Mpt
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_4_22_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_4_22">
+            <span class="md-nav__icon md-icon"></span>
+            Mosaic Mpt
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-mosaic_mpt-modelling_mpt_flax/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Modelling Mpt Flax
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-mosaic_mpt-mosaic_configuration/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Mosaic Configuration
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4_23" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_4_23" id="__nav_1_4_23_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Olmo
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_4_23_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_4_23">
+            <span class="md-nav__icon md-icon"></span>
+            Olmo
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-olmo-modelling_olmo_flax/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Modelling Olmo Flax
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-olmo-olmo_configuration/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Olmo Configuration
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4_24" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_4_24" id="__nav_1_4_24_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Openelm
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_4_24_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_4_24">
+            <span class="md-nav__icon md-icon"></span>
+            Openelm
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-openelm-modelling_openelm_flax/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Modelling Openelm Flax
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-openelm-openelm_configuration/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Openelm Configuration
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4_25" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_4_25" id="__nav_1_4_25_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Opt
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_4_25_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_4_25">
+            <span class="md-nav__icon md-icon"></span>
+            Opt
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-opt-modelling_opt_flax/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Modelling Opt Flax
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-opt-opt_configuration/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Opt Configuration
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4_26" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_4_26" id="__nav_1_4_26_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Palm
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_4_26_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_4_26">
+            <span class="md-nav__icon md-icon"></span>
+            Palm
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-palm-modelling_palm_flax/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Modelling Palm Flax
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-palm-palm_configuration/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Palm Configuration
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4_27" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_4_27" id="__nav_1_4_27_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Phi
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_4_27_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_4_27">
+            <span class="md-nav__icon md-icon"></span>
+            Phi
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-phi-modelling_phi_flax/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Modelling Phi Flax
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-phi-phi_configuration/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Phi Configuration
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4_28" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_4_28" id="__nav_1_4_28_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Phi3
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_4_28_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_4_28">
+            <span class="md-nav__icon md-icon"></span>
+            Phi3
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-phi3-modelling_phi3_flax/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Modelling Phi3 Flax
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-phi3-phi3_configuration/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Phi3 Configuration
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4_29" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_4_29" id="__nav_1_4_29_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Qwen1
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_4_29_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_4_29">
+            <span class="md-nav__icon md-icon"></span>
+            Qwen1
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-qwen1-modelling_qwen1_flax/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Modelling Qwen1 Flax
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-qwen1-qwen1_configuration/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Qwen1 Configuration
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4_30" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_4_30" id="__nav_1_4_30_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Qwen2
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_4_30_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_4_30">
+            <span class="md-nav__icon md-icon"></span>
+            Qwen2
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-qwen2-modelling_qwen_flax/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Modelling Qwen Flax
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-qwen2-qwen_configuration/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Qwen Configuration
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4_31" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_4_31" id="__nav_1_4_31_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Qwen2 Moe
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_4_31_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_4_31">
+            <span class="md-nav__icon md-icon"></span>
+            Qwen2 Moe
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-qwen2_moe-configuration_qwen2_moe/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Configuration Qwen2 Moe
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-qwen2_moe-modeling_qwen2_moe_flax/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Modeling Qwen2 Moe Flax
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-_ring_attention/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Ring Attention
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4_33" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_4_33" id="__nav_1_4_33_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Roberta
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_4_33_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_4_33">
+            <span class="md-nav__icon md-icon"></span>
+            Roberta
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-roberta-modelling_roberta_flax/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Modelling Roberta Flax
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-roberta-roberta_configuration/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Roberta Configuration
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4_34" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_4_34" id="__nav_1_4_34_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Rwkv
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_4_34_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_4_34">
+            <span class="md-nav__icon md-icon"></span>
+            Rwkv
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-rwkv-modelling_rwkv_flax/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Modelling Rwkv Flax
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-rwkv-rwkv_configuration/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Rwkv Configuration
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4_35" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_4_35" id="__nav_1_4_35_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Stablelm
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_4_35_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_4_35">
+            <span class="md-nav__icon md-icon"></span>
+            Stablelm
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-stablelm-modelling_stablelm_flax/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Modelling Stablelm Flax
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-stablelm-stablelm_configuration/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Stablelm Configuration
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4_36" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_4_36" id="__nav_1_4_36_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    T5
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_4_36_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_4_36">
+            <span class="md-nav__icon md-icon"></span>
+            T5
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-t5-modelling_t5_flax/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Modelling T5 Flax
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-t5-t5_configuration/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    T5 Configuration
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-_vanilla_attention/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Vanilla Attention
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4_38" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_4_38" id="__nav_1_4_38_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Whisper
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_4_38_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_4_38">
+            <span class="md-nav__icon md-icon"></span>
+            Whisper
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-whisper-modelling_whisper_flax/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Modelling Whisper Flax
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-modules-whisper-whisper_configuration/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Whisper Configuration
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_5" id="__nav_1_5_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Reinforcement Learning
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_1_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_5">
+            <span class="md-nav__icon md-icon"></span>
+            Reinforcement Learning
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-reinforcement_learning-core/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Core
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_5_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_5_2" id="__nav_1_5_2_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Models
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_5_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_5_2">
+            <span class="md-nav__icon md-icon"></span>
+            Models
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-reinforcement_learning-models-modelling_casual_language_rl/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Modelling Casual Language Rl
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_5_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_5_3" id="__nav_1_5_3_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Trainer
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_5_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_5_3">
+            <span class="md-nav__icon md-icon"></span>
+            Trainer
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-reinforcement_learning-trainer-partitioner_config/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Partitioner Config
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-reinforcement_learning-trainer-ppo_config/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Ppo Config
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-reinforcement_learning-trainer-ppo_trainer/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Ppo Trainer
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-reinforcement_learning-trainer-training_configs/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Training Configs
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-reinforcement_learning-trainer-utils/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Utils
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_5_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_5_4" id="__nav_1_5_4_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Utils
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_5_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_5_4">
+            <span class="md-nav__icon md-icon"></span>
+            Utils
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-reinforcement_learning-utils-collectors/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Collectors
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_6" id="__nav_1_6_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Serve
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_1_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_6">
+            <span class="md-nav__icon md-icon"></span>
+            Serve
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-serve-client/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Client
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-serve-configuration/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Configuration
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-serve-serve/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Serve
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_7" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_7" id="__nav_1_7_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Smi
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_1_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_7">
+            <span class="md-nav__icon md-icon"></span>
+            Smi
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-smi-smi/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Smi
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_8" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_8" id="__nav_1_8_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Trainer
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_1_8_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_8">
+            <span class="md-nav__icon md-icon"></span>
+            Trainer
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-trainer-base_trainer/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Base Trainer
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_8_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_8_2" id="__nav_1_8_2_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Causal Language Model Trainer
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_8_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_8_2">
+            <span class="md-nav__icon md-icon"></span>
+            Causal Language Model Trainer
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-trainer-causal_language_model_trainer-causal_language_model_trainer/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Causal Language Model Trainer
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-trainer-causal_language_model_trainer-fwd_bwd_functions/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Fwd Bwd Functions
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-trainer-causal_language_model_trainer-modeling_output/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Modeling Output
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_8_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_8_3" id="__nav_1_8_3_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Dpo
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_8_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_8_3">
+            <span class="md-nav__icon md-icon"></span>
+            Dpo
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-trainer-dpo-dpo_trainer/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Dpo Trainer
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-trainer-dpo-fwd_bwd_functions/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Fwd Bwd Functions
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-trainer-dpo-modelling_output/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Modelling Output
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-trainer-dpo-utils/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Utils
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_8_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_8_4" id="__nav_1_8_4_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Orpo
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_8_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_8_4">
+            <span class="md-nav__icon md-icon"></span>
+            Orpo
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-trainer-orpo-fwd_bwd_functions/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Fwd Bwd Functions
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-trainer-orpo-modelling_output/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Modelling Output
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-trainer-orpo-orpo_trainer/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Orpo Trainer
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-trainer-orpo-utils/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Utils
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_8_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_8_5" id="__nav_1_8_5_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Sft
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_8_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_8_5">
+            <span class="md-nav__icon md-icon"></span>
+            Sft
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-trainer-sft-stf_trainer/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Stf Trainer
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-trainer-sft-utils/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Utils
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-trainer-training_configurations/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Training Configurations
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-trainer-utils/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Utils
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_8_8" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_8_8" id="__nav_1_8_8_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Vision Causal Language Model Trainer
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_8_8_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_8_8">
+            <span class="md-nav__icon md-icon"></span>
+            Vision Causal Language Model Trainer
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-trainer-vision_causal_language_model_trainer-fwd_bwd_functions/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Fwd Bwd Functions
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-trainer-vision_causal_language_model_trainer-modelling_output/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Modelling Output
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-trainer-vision_causal_language_model_trainer-vision_causal_language_model_trainer/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Vision Causal Language Model Trainer
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_9" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_9" id="__nav_1_9_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Transform
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_1_9_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_9">
+            <span class="md-nav__icon md-icon"></span>
+            Transform
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-transform-easydel_transform/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Easydel Transform
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-transform-utils/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Utils
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_10" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_10" id="__nav_1_10_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Utils
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_1_10_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_10">
+            <span class="md-nav__icon md-icon"></span>
+            Utils
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-utils-checker/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Checker
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-utils-prompters/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Prompters
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-utils-tensor_utils/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Tensor Utils
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../generated-utils-utils/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Utils
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../AvailableModels.md" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Available models
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../CONTRIBUTING/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Contributing
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="0">
+            
+  
+  <span class="md-ellipsis">
+    Examples
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            Examples
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../DataProcessing/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    DataProcessing
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../AttentionModuleExample.md" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Easy Attention
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../EasyStateExample/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    EasyState
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../Falcon.md" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Falcon Models
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../FineTuningExample/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Fine Tuning Example
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../Llama.md" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Llama Models
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../Llama2.md" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Llama2 Models
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../LoRA-TransferLearningExample/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    LoRA and Transfer Learning
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../Mistral.md" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Mistral Models
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../Parameter-Quantization/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Model Parameter Quantization
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../MosaicMPT.md" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    MosaicMPT Models
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Home
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../Install/" class="md-nav__link">
+        
+  
+  <span class="md-ellipsis">
+    Install
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#src.python.easydel.modules.arctic.arctic_configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      arctic_configuration
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#src.python.easydel.modules.arctic.arctic_configuration.ArcticConfig" class="md-nav__link">
+    <span class="md-ellipsis">
+      ArcticConfig
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="ArcticConfig">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#src.python.easydel.modules.arctic.arctic_configuration.ArcticConfig.add_jax_args" class="md-nav__link">
+    <span class="md-ellipsis">
+      add_jax_args
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#src.python.easydel.modules.arctic.arctic_configuration.ArcticConfig.get_partition_rules" class="md-nav__link">
+    <span class="md-ellipsis">
+      get_partition_rules
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+  
+  
+
+
+<h1 id="modulesarcticarctic_configuration">modules.arctic.arctic_configuration</h1>
+
+
+<div class="doc doc-object doc-module">
+
+
+
+<a id="src.python.easydel.modules.arctic.arctic_configuration"></a>
+    <div class="doc doc-contents first">
+
+
+
+  <div class="doc doc-children">
+
+
+
+
+
+
+
+
+<div class="doc doc-object doc-class">
+
+
+
+<h2 id="src.python.easydel.modules.arctic.arctic_configuration.ArcticConfig" class="doc doc-heading">
+            <code>ArcticConfig</code>
+
+
+</h2>
+
+
+    <div class="doc doc-contents ">
+            <p class="doc doc-class-bases">
+              Bases: <code><a class="autorefs autorefs-internal" title="src.python.easydel.modules.easydel_modelling_utils.EasyDeLPretrainedConfig" href="../generated-modules-easydel_modelling_utils/#src.python.easydel.modules.easydel_modelling_utils.EasyDeLPretrainedConfig">EasyDeLPretrainedConfig</a></code></p>
+
+
+              <details class="quote">
+                <summary>Source code in <code>src/python/easydel/modules/arctic/arctic_configuration.py</code></summary>
+                <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal">  9</span>
+<span class="normal"> 10</span>
+<span class="normal"> 11</span>
+<span class="normal"> 12</span>
+<span class="normal"> 13</span>
+<span class="normal"> 14</span>
+<span class="normal"> 15</span>
+<span class="normal"> 16</span>
+<span class="normal"> 17</span>
+<span class="normal"> 18</span>
+<span class="normal"> 19</span>
+<span class="normal"> 20</span>
+<span class="normal"> 21</span>
+<span class="normal"> 22</span>
+<span class="normal"> 23</span>
+<span class="normal"> 24</span>
+<span class="normal"> 25</span>
+<span class="normal"> 26</span>
+<span class="normal"> 27</span>
+<span class="normal"> 28</span>
+<span class="normal"> 29</span>
+<span class="normal"> 30</span>
+<span class="normal"> 31</span>
+<span class="normal"> 32</span>
+<span class="normal"> 33</span>
+<span class="normal"> 34</span>
+<span class="normal"> 35</span>
+<span class="normal"> 36</span>
+<span class="normal"> 37</span>
+<span class="normal"> 38</span>
+<span class="normal"> 39</span>
+<span class="normal"> 40</span>
+<span class="normal"> 41</span>
+<span class="normal"> 42</span>
+<span class="normal"> 43</span>
+<span class="normal"> 44</span>
+<span class="normal"> 45</span>
+<span class="normal"> 46</span>
+<span class="normal"> 47</span>
+<span class="normal"> 48</span>
+<span class="normal"> 49</span>
+<span class="normal"> 50</span>
+<span class="normal"> 51</span>
+<span class="normal"> 52</span>
+<span class="normal"> 53</span>
+<span class="normal"> 54</span>
+<span class="normal"> 55</span>
+<span class="normal"> 56</span>
+<span class="normal"> 57</span>
+<span class="normal"> 58</span>
+<span class="normal"> 59</span>
+<span class="normal"> 60</span>
+<span class="normal"> 61</span>
+<span class="normal"> 62</span>
+<span class="normal"> 63</span>
+<span class="normal"> 64</span>
+<span class="normal"> 65</span>
+<span class="normal"> 66</span>
+<span class="normal"> 67</span>
+<span class="normal"> 68</span>
+<span class="normal"> 69</span>
+<span class="normal"> 70</span>
+<span class="normal"> 71</span>
+<span class="normal"> 72</span>
+<span class="normal"> 73</span>
+<span class="normal"> 74</span>
+<span class="normal"> 75</span>
+<span class="normal"> 76</span>
+<span class="normal"> 77</span>
+<span class="normal"> 78</span>
+<span class="normal"> 79</span>
+<span class="normal"> 80</span>
+<span class="normal"> 81</span>
+<span class="normal"> 82</span>
+<span class="normal"> 83</span>
+<span class="normal"> 84</span>
+<span class="normal"> 85</span>
+<span class="normal"> 86</span>
+<span class="normal"> 87</span>
+<span class="normal"> 88</span>
+<span class="normal"> 89</span>
+<span class="normal"> 90</span>
+<span class="normal"> 91</span>
+<span class="normal"> 92</span>
+<span class="normal"> 93</span>
+<span class="normal"> 94</span>
+<span class="normal"> 95</span>
+<span class="normal"> 96</span>
+<span class="normal"> 97</span>
+<span class="normal"> 98</span>
+<span class="normal"> 99</span>
+<span class="normal">100</span>
+<span class="normal">101</span>
+<span class="normal">102</span>
+<span class="normal">103</span>
+<span class="normal">104</span>
+<span class="normal">105</span>
+<span class="normal">106</span>
+<span class="normal">107</span>
+<span class="normal">108</span>
+<span class="normal">109</span>
+<span class="normal">110</span>
+<span class="normal">111</span>
+<span class="normal">112</span>
+<span class="normal">113</span>
+<span class="normal">114</span>
+<span class="normal">115</span>
+<span class="normal">116</span>
+<span class="normal">117</span>
+<span class="normal">118</span>
+<span class="normal">119</span>
+<span class="normal">120</span>
+<span class="normal">121</span>
+<span class="normal">122</span>
+<span class="normal">123</span>
+<span class="normal">124</span>
+<span class="normal">125</span>
+<span class="normal">126</span>
+<span class="normal">127</span>
+<span class="normal">128</span>
+<span class="normal">129</span>
+<span class="normal">130</span>
+<span class="normal">131</span>
+<span class="normal">132</span>
+<span class="normal">133</span>
+<span class="normal">134</span>
+<span class="normal">135</span>
+<span class="normal">136</span>
+<span class="normal">137</span>
+<span class="normal">138</span>
+<span class="normal">139</span>
+<span class="normal">140</span>
+<span class="normal">141</span>
+<span class="normal">142</span>
+<span class="normal">143</span>
+<span class="normal">144</span>
+<span class="normal">145</span>
+<span class="normal">146</span>
+<span class="normal">147</span>
+<span class="normal">148</span>
+<span class="normal">149</span>
+<span class="normal">150</span>
+<span class="normal">151</span>
+<span class="normal">152</span>
+<span class="normal">153</span>
+<span class="normal">154</span>
+<span class="normal">155</span>
+<span class="normal">156</span>
+<span class="normal">157</span>
+<span class="normal">158</span>
+<span class="normal">159</span>
+<span class="normal">160</span>
+<span class="normal">161</span>
+<span class="normal">162</span>
+<span class="normal">163</span>
+<span class="normal">164</span>
+<span class="normal">165</span>
+<span class="normal">166</span>
+<span class="normal">167</span>
+<span class="normal">168</span>
+<span class="normal">169</span>
+<span class="normal">170</span>
+<span class="normal">171</span>
+<span class="normal">172</span>
+<span class="normal">173</span>
+<span class="normal">174</span>
+<span class="normal">175</span>
+<span class="normal">176</span>
+<span class="normal">177</span>
+<span class="normal">178</span>
+<span class="normal">179</span></pre></div></td><td class="code"><div><pre><span></span><code><span class="k">class</span> <span class="nc">ArcticConfig</span><span class="p">(</span><span class="n">EasyDeLPretrainedConfig</span><span class="p">):</span>
+    <span class="n">model_type</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;arctic&quot;</span>
+
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span>
+            <span class="bp">self</span><span class="p">,</span>
+            <span class="n">vocab_size</span><span class="o">=</span><span class="mi">32000</span><span class="p">,</span>
+            <span class="n">hidden_size</span><span class="o">=</span><span class="mi">4096</span><span class="p">,</span>
+            <span class="n">intermediate_size</span><span class="o">=</span><span class="mi">14336</span><span class="p">,</span>
+            <span class="n">num_hidden_layers</span><span class="o">=</span><span class="mi">32</span><span class="p">,</span>
+            <span class="n">num_attention_heads</span><span class="o">=</span><span class="mi">32</span><span class="p">,</span>
+            <span class="n">num_key_value_heads</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+            <span class="n">hidden_act</span><span class="o">=</span><span class="s2">&quot;silu&quot;</span><span class="p">,</span>
+            <span class="n">max_position_embeddings</span><span class="o">=</span><span class="mi">4096</span><span class="p">,</span>
+            <span class="n">initializer_range</span><span class="o">=</span><span class="mf">0.02</span><span class="p">,</span>
+            <span class="n">rms_norm_eps</span><span class="o">=</span><span class="mf">1e-5</span><span class="p">,</span>
+            <span class="n">use_cache</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+            <span class="n">pad_token_id</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+            <span class="n">bos_token_id</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+            <span class="n">eos_token_id</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span>
+            <span class="n">tie_word_embeddings</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+            <span class="n">rope_theta</span><span class="o">=</span><span class="mf">1e6</span><span class="p">,</span>
+            <span class="n">sliding_window</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+            <span class="n">attention_dropout</span><span class="o">=</span><span class="mf">0.0</span><span class="p">,</span>
+            <span class="n">num_experts_per_tok</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+            <span class="n">num_local_experts</span><span class="o">=</span><span class="mi">8</span><span class="p">,</span>
+            <span class="n">router_aux_loss_coef</span><span class="o">=</span><span class="mf">0.001</span><span class="p">,</span>
+            <span class="n">moe_layer_frequency</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span>
+            <span class="n">parallel_attn_mlp_res</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+            <span class="n">moe_train_capacity_factor</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+            <span class="n">moe_eval_capacity_factor</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+            <span class="n">enable_expert_tensor_parallelism</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+            <span class="n">moe_min_capacity</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+            <span class="n">moe_token_dropping</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+            <span class="n">quantization</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+            <span class="n">gradient_checkpointing</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;nothing_saveable&quot;</span><span class="p">,</span>
+            <span class="n">use_scan_mlp</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+            <span class="n">scan_mlp_chunk_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1024</span><span class="p">,</span>
+            <span class="n">bits</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+            <span class="n">rope_scaling</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">float</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+            <span class="o">**</span><span class="n">kwargs</span><span class="p">,</span>
+    <span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">vocab_size</span> <span class="o">=</span> <span class="n">vocab_size</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">max_position_embeddings</span> <span class="o">=</span> <span class="n">max_position_embeddings</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span> <span class="o">=</span> <span class="n">hidden_size</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">intermediate_size</span> <span class="o">=</span> <span class="n">intermediate_size</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">num_hidden_layers</span> <span class="o">=</span> <span class="n">num_hidden_layers</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span> <span class="o">=</span> <span class="n">num_attention_heads</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">sliding_window</span> <span class="o">=</span> <span class="n">sliding_window</span>
+
+        <span class="c1"># for backward compatibility</span>
+        <span class="k">if</span> <span class="n">num_key_value_heads</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">num_key_value_heads</span> <span class="o">=</span> <span class="n">num_attention_heads</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">num_key_value_heads</span> <span class="o">=</span> <span class="n">num_key_value_heads</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">hidden_act</span> <span class="o">=</span> <span class="n">hidden_act</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">initializer_range</span> <span class="o">=</span> <span class="n">initializer_range</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">rms_norm_eps</span> <span class="o">=</span> <span class="n">rms_norm_eps</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">use_cache</span> <span class="o">=</span> <span class="n">use_cache</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">rope_theta</span> <span class="o">=</span> <span class="n">rope_theta</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">attention_dropout</span> <span class="o">=</span> <span class="n">attention_dropout</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">num_experts_per_tok</span> <span class="o">=</span> <span class="n">num_experts_per_tok</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">num_local_experts</span> <span class="o">=</span> <span class="n">num_local_experts</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">router_aux_loss_coef</span> <span class="o">=</span> <span class="n">router_aux_loss_coef</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">moe_layer_frequency</span> <span class="o">=</span> <span class="n">moe_layer_frequency</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">moe_train_capacity_factor</span> <span class="o">=</span> <span class="n">moe_train_capacity_factor</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">moe_eval_capacity_factor</span> <span class="o">=</span> <span class="n">moe_eval_capacity_factor</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">enable_expert_tensor_parallelism</span> <span class="o">=</span> <span class="n">enable_expert_tensor_parallelism</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">moe_min_capacity</span> <span class="o">=</span> <span class="n">moe_min_capacity</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">moe_token_dropping</span> <span class="o">=</span> <span class="n">moe_token_dropping</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">parallel_attn_mlp_res</span> <span class="o">=</span> <span class="n">parallel_attn_mlp_res</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">quantization</span> <span class="o">=</span> <span class="n">quantization</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">gradient_checkpointing</span> <span class="o">=</span> <span class="n">gradient_checkpointing</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">use_scan_mlp</span> <span class="o">=</span> <span class="n">use_scan_mlp</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">scan_mlp_chunk_size</span> <span class="o">=</span> <span class="n">scan_mlp_chunk_size</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">bits</span> <span class="o">=</span> <span class="n">bits</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">rope_scaling</span> <span class="o">=</span> <span class="n">rope_scaling</span>
+
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span>
+            <span class="n">pad_token_id</span><span class="o">=</span><span class="n">pad_token_id</span><span class="p">,</span>
+            <span class="n">bos_token_id</span><span class="o">=</span><span class="n">bos_token_id</span><span class="p">,</span>
+            <span class="n">eos_token_id</span><span class="o">=</span><span class="n">eos_token_id</span><span class="p">,</span>
+            <span class="n">tie_word_embeddings</span><span class="o">=</span><span class="n">tie_word_embeddings</span><span class="p">,</span>
+            <span class="o">**</span><span class="n">kwargs</span><span class="p">,</span>
+        <span class="p">)</span>
+
+    <span class="k">def</span> <span class="nf">get_partition_rules</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">fully_sharded_data_parallel</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        The get_partition_rules function is used to define the partitioning scheme for a model.</span>
+<span class="sd">        It returns a list of tuples, where each tuple contains two elements:</span>
+<span class="sd">          1) A regex string that matches the name of one or more parameters in the model.</span>
+<span class="sd">          2) A PartitionScheme object that defines how those parameters should be partitioned.</span>
+
+<span class="sd">        :param fully_sharded_data_parallel: bool: Determine whether to use the fully_sharded_data_parallel partitioning</span>
+<span class="sd">         scheme or not</span>
+<span class="sd">        :return: A list of tuples</span>
+
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">return</span> <span class="p">(</span>
+
+            <span class="p">(</span><span class="s2">&quot;model/embed_tokens/embedding&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">(</span><span class="s2">&quot;sp&quot;</span><span class="p">,</span> <span class="s2">&quot;fsdp&quot;</span><span class="p">)),</span>
+
+            <span class="p">(</span><span class="s2">&quot;self_attn/(q_proj|k_proj|v_proj)/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">((</span><span class="s2">&quot;fsdp&quot;</span><span class="p">,</span> <span class="s2">&quot;sp&quot;</span><span class="p">),</span> <span class="s2">&quot;tp&quot;</span><span class="p">)),</span>
+            <span class="p">(</span><span class="s2">&quot;self_attn/o_proj/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">(</span><span class="s2">&quot;tp&quot;</span><span class="p">,</span> <span class="p">(</span><span class="s2">&quot;sp&quot;</span><span class="p">,</span> <span class="s2">&quot;fsdp&quot;</span><span class="p">))),</span>
+
+            <span class="p">(</span><span class="s2">&quot;w1/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">((</span><span class="s2">&quot;fsdp&quot;</span><span class="p">,</span> <span class="s2">&quot;sp&quot;</span><span class="p">))),</span>
+            <span class="p">(</span><span class="s2">&quot;w2/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">((</span><span class="s2">&quot;fsdp&quot;</span><span class="p">,</span> <span class="s2">&quot;sp&quot;</span><span class="p">))),</span>
+            <span class="p">(</span><span class="s2">&quot;w3/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">((</span><span class="s2">&quot;fsdp&quot;</span><span class="p">,</span> <span class="s2">&quot;sp&quot;</span><span class="p">))),</span>
+            <span class="p">(</span><span class="s2">&quot;gate/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">((</span><span class="s2">&quot;fsdp&quot;</span><span class="p">,</span> <span class="s2">&quot;sp&quot;</span><span class="p">))),</span>
+
+            <span class="p">(</span><span class="s2">&quot;input_layernorm/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">(</span><span class="kc">None</span><span class="p">)),</span>
+            <span class="p">(</span><span class="s2">&quot;post_attention_layernorm/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">(</span><span class="kc">None</span><span class="p">)),</span>
+
+            <span class="p">(</span><span class="s2">&quot;model/norm/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">(</span><span class="kc">None</span><span class="p">)),</span>
+            <span class="p">(</span><span class="s2">&quot;lm_head/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">(</span><span class="s2">&quot;fsdp&quot;</span><span class="p">,</span> <span class="s2">&quot;sp&quot;</span><span class="p">)),</span>
+            <span class="p">(</span><span class="s2">&quot;.*&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">(</span><span class="kc">None</span><span class="p">)),</span>
+        <span class="p">)</span> <span class="k">if</span> <span class="ow">not</span> <span class="n">fully_sharded_data_parallel</span> <span class="k">else</span> <span class="p">(</span>
+            <span class="p">(</span><span class="s2">&quot;model/embed_tokens/embedding&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">((</span><span class="s2">&quot;fsdp&quot;</span><span class="p">,</span> <span class="s2">&quot;sp&quot;</span><span class="p">))),</span>
+
+            <span class="p">(</span><span class="s2">&quot;self_attn/(q_proj|k_proj|v_proj)/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">((</span><span class="s2">&quot;fsdp&quot;</span><span class="p">,</span> <span class="s2">&quot;sp&quot;</span><span class="p">),</span> <span class="s2">&quot;tp&quot;</span><span class="p">)),</span>
+            <span class="p">(</span><span class="s2">&quot;self_attn/o_proj/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">(</span><span class="s2">&quot;tp&quot;</span><span class="p">,</span> <span class="p">(</span><span class="s2">&quot;sp&quot;</span><span class="p">,</span> <span class="s2">&quot;fsdp&quot;</span><span class="p">))),</span>
+
+            <span class="p">(</span><span class="s2">&quot;w1/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">((</span><span class="s2">&quot;fsdp&quot;</span><span class="p">,</span> <span class="s2">&quot;sp&quot;</span><span class="p">))),</span>
+            <span class="p">(</span><span class="s2">&quot;w2/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">((</span><span class="s2">&quot;fsdp&quot;</span><span class="p">,</span> <span class="s2">&quot;sp&quot;</span><span class="p">))),</span>
+            <span class="p">(</span><span class="s2">&quot;w3/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">((</span><span class="s2">&quot;fsdp&quot;</span><span class="p">,</span> <span class="s2">&quot;sp&quot;</span><span class="p">))),</span>
+            <span class="p">(</span><span class="s2">&quot;gate/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">((</span><span class="s2">&quot;fsdp&quot;</span><span class="p">,</span> <span class="s2">&quot;sp&quot;</span><span class="p">))),</span>
+
+            <span class="p">(</span><span class="s2">&quot;input_layernorm/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">(</span><span class="kc">None</span><span class="p">)),</span>
+            <span class="p">(</span><span class="s2">&quot;post_attention_layernorm/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">(</span><span class="kc">None</span><span class="p">)),</span>
+
+            <span class="p">(</span><span class="s2">&quot;model/norm/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">(</span><span class="kc">None</span><span class="p">)),</span>
+            <span class="p">(</span><span class="s2">&quot;lm_head/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">((</span><span class="s2">&quot;fsdp&quot;</span><span class="p">,</span> <span class="s2">&quot;sp&quot;</span><span class="p">))),</span>
+            <span class="p">(</span><span class="s2">&quot;.*&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">((</span><span class="s2">&quot;fsdp&quot;</span><span class="p">,</span> <span class="s2">&quot;sp&quot;</span><span class="p">))),</span>
+        <span class="p">)</span>
+
+    <span class="k">def</span> <span class="nf">add_jax_args</span><span class="p">(</span>
+            <span class="bp">self</span><span class="p">,</span>
+            <span class="n">gradient_checkpointing</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;nothing_saveable&quot;</span><span class="p">,</span>
+            <span class="n">use_scan_mlp</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+            <span class="n">scan_mlp_chunk_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1024</span><span class="p">,</span>
+            <span class="n">bits</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+            <span class="n">rope_scaling</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">float</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+            <span class="o">**</span><span class="n">kwargs</span><span class="p">,</span>
+    <span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        The add_jax_args function adds the following arguments to the model:</span>
+
+<span class="sd">        :param self: Bind the attributes and methods of a class to an instance of that class</span>
+<span class="sd">        :param gradient_checkpointing: str: Determine whether to use gradient checkpointing</span>
+<span class="sd">        :param use_scan_mlp: bool: Determine whether to use the scan_mlp function or not</span>
+<span class="sd">        :param scan_mlp_chunk_size: int: Chunk the input to the mlp</span>
+<span class="sd">        :param bits: Optional[int]: Specify the number of bits to use for quantization</span>
+<span class="sd">         variable will turn them off.</span>
+<span class="sd">        :param rope_scaling: Dict[str, Union[str, float]]: rope_scaling for rope</span>
+<span class="sd">        :return: A tuple of the following:</span>
+
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">rope_scaling</span> <span class="o">=</span> <span class="n">rope_scaling</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">gradient_checkpointing</span> <span class="o">=</span> <span class="n">gradient_checkpointing</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">use_scan_mlp</span> <span class="o">=</span> <span class="n">use_scan_mlp</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">scan_mlp_chunk_size</span> <span class="o">=</span> <span class="n">scan_mlp_chunk_size</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">bits</span> <span class="o">=</span> <span class="n">bits</span>
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span> <span class="nf">get_weight_decay_exclusions</span><span class="p">():</span>
+        <span class="k">return</span> <span class="nb">tuple</span><span class="p">()</span>
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span> <span class="nf">rng_keys</span><span class="p">():</span>
+        <span class="k">return</span> <span class="s1">&#39;params&#39;</span><span class="p">,</span> <span class="s1">&#39;dropout&#39;</span><span class="p">,</span> <span class="s1">&#39;fcm&#39;</span>
+</code></pre></div></td></tr></table></div>
+              </details>
+
+
+
+  <div class="doc doc-children">
+
+
+
+
+
+
+
+
+
+<div class="doc doc-object doc-function">
+
+
+<h3 id="src.python.easydel.modules.arctic.arctic_configuration.ArcticConfig.add_jax_args" class="doc doc-heading">
+            <code class="highlight language-python"><span class="n">add_jax_args</span><span class="p">(</span><span class="n">gradient_checkpointing</span><span class="o">=</span><span class="s1">&#39;nothing_saveable&#39;</span><span class="p">,</span> <span class="n">use_scan_mlp</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">scan_mlp_chunk_size</span><span class="o">=</span><span class="mi">1024</span><span class="p">,</span> <span class="n">bits</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">rope_scaling</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span></code>
+
+</h3>
+
+
+    <div class="doc doc-contents ">
+
+      <p>The add_jax_args function adds the following arguments to the model:</p>
+<p>:param self: Bind the attributes and methods of a class to an instance of that class
+:param gradient_checkpointing: str: Determine whether to use gradient checkpointing
+:param use_scan_mlp: bool: Determine whether to use the scan_mlp function or not
+:param scan_mlp_chunk_size: int: Chunk the input to the mlp
+:param bits: Optional[int]: Specify the number of bits to use for quantization
+ variable will turn them off.
+:param rope_scaling: Dict[str, Union[str, float]]: rope_scaling for rope
+:return: A tuple of the following:</p>
+
+            <details class="quote">
+              <summary>Source code in <code>src/python/easydel/modules/arctic/arctic_configuration.py</code></summary>
+              <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal">145</span>
+<span class="normal">146</span>
+<span class="normal">147</span>
+<span class="normal">148</span>
+<span class="normal">149</span>
+<span class="normal">150</span>
+<span class="normal">151</span>
+<span class="normal">152</span>
+<span class="normal">153</span>
+<span class="normal">154</span>
+<span class="normal">155</span>
+<span class="normal">156</span>
+<span class="normal">157</span>
+<span class="normal">158</span>
+<span class="normal">159</span>
+<span class="normal">160</span>
+<span class="normal">161</span>
+<span class="normal">162</span>
+<span class="normal">163</span>
+<span class="normal">164</span>
+<span class="normal">165</span>
+<span class="normal">166</span>
+<span class="normal">167</span>
+<span class="normal">168</span>
+<span class="normal">169</span>
+<span class="normal">170</span>
+<span class="normal">171</span></pre></div></td><td class="code"><div><pre><span></span><code><span class="k">def</span> <span class="nf">add_jax_args</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">gradient_checkpointing</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;nothing_saveable&quot;</span><span class="p">,</span>
+        <span class="n">use_scan_mlp</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+        <span class="n">scan_mlp_chunk_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1024</span><span class="p">,</span>
+        <span class="n">bits</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">rope_scaling</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">float</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="o">**</span><span class="n">kwargs</span><span class="p">,</span>
+<span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    The add_jax_args function adds the following arguments to the model:</span>
+
+<span class="sd">    :param self: Bind the attributes and methods of a class to an instance of that class</span>
+<span class="sd">    :param gradient_checkpointing: str: Determine whether to use gradient checkpointing</span>
+<span class="sd">    :param use_scan_mlp: bool: Determine whether to use the scan_mlp function or not</span>
+<span class="sd">    :param scan_mlp_chunk_size: int: Chunk the input to the mlp</span>
+<span class="sd">    :param bits: Optional[int]: Specify the number of bits to use for quantization</span>
+<span class="sd">     variable will turn them off.</span>
+<span class="sd">    :param rope_scaling: Dict[str, Union[str, float]]: rope_scaling for rope</span>
+<span class="sd">    :return: A tuple of the following:</span>
+
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">rope_scaling</span> <span class="o">=</span> <span class="n">rope_scaling</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">gradient_checkpointing</span> <span class="o">=</span> <span class="n">gradient_checkpointing</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">use_scan_mlp</span> <span class="o">=</span> <span class="n">use_scan_mlp</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">scan_mlp_chunk_size</span> <span class="o">=</span> <span class="n">scan_mlp_chunk_size</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">bits</span> <span class="o">=</span> <span class="n">bits</span>
+</code></pre></div></td></tr></table></div>
+            </details>
+    </div>
+
+</div>
+
+<div class="doc doc-object doc-function">
+
+
+<h3 id="src.python.easydel.modules.arctic.arctic_configuration.ArcticConfig.get_partition_rules" class="doc doc-heading">
+            <code class="highlight language-python"><span class="n">get_partition_rules</span><span class="p">(</span><span class="n">fully_sharded_data_parallel</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span></code>
+
+</h3>
+
+
+    <div class="doc doc-contents ">
+
+      <p>The get_partition_rules function is used to define the partitioning scheme for a model.
+It returns a list of tuples, where each tuple contains two elements:
+  1) A regex string that matches the name of one or more parameters in the model.
+  2) A PartitionScheme object that defines how those parameters should be partitioned.</p>
+<p>:param fully_sharded_data_parallel: bool: Determine whether to use the fully_sharded_data_parallel partitioning
+ scheme or not
+:return: A list of tuples</p>
+
+            <details class="quote">
+              <summary>Source code in <code>src/python/easydel/modules/arctic/arctic_configuration.py</code></summary>
+              <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"> 96</span>
+<span class="normal"> 97</span>
+<span class="normal"> 98</span>
+<span class="normal"> 99</span>
+<span class="normal">100</span>
+<span class="normal">101</span>
+<span class="normal">102</span>
+<span class="normal">103</span>
+<span class="normal">104</span>
+<span class="normal">105</span>
+<span class="normal">106</span>
+<span class="normal">107</span>
+<span class="normal">108</span>
+<span class="normal">109</span>
+<span class="normal">110</span>
+<span class="normal">111</span>
+<span class="normal">112</span>
+<span class="normal">113</span>
+<span class="normal">114</span>
+<span class="normal">115</span>
+<span class="normal">116</span>
+<span class="normal">117</span>
+<span class="normal">118</span>
+<span class="normal">119</span>
+<span class="normal">120</span>
+<span class="normal">121</span>
+<span class="normal">122</span>
+<span class="normal">123</span>
+<span class="normal">124</span>
+<span class="normal">125</span>
+<span class="normal">126</span>
+<span class="normal">127</span>
+<span class="normal">128</span>
+<span class="normal">129</span>
+<span class="normal">130</span>
+<span class="normal">131</span>
+<span class="normal">132</span>
+<span class="normal">133</span>
+<span class="normal">134</span>
+<span class="normal">135</span>
+<span class="normal">136</span>
+<span class="normal">137</span>
+<span class="normal">138</span>
+<span class="normal">139</span>
+<span class="normal">140</span>
+<span class="normal">141</span>
+<span class="normal">142</span>
+<span class="normal">143</span></pre></div></td><td class="code"><div><pre><span></span><code><span class="k">def</span> <span class="nf">get_partition_rules</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">fully_sharded_data_parallel</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    The get_partition_rules function is used to define the partitioning scheme for a model.</span>
+<span class="sd">    It returns a list of tuples, where each tuple contains two elements:</span>
+<span class="sd">      1) A regex string that matches the name of one or more parameters in the model.</span>
+<span class="sd">      2) A PartitionScheme object that defines how those parameters should be partitioned.</span>
+
+<span class="sd">    :param fully_sharded_data_parallel: bool: Determine whether to use the fully_sharded_data_parallel partitioning</span>
+<span class="sd">     scheme or not</span>
+<span class="sd">    :return: A list of tuples</span>
+
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="k">return</span> <span class="p">(</span>
+
+        <span class="p">(</span><span class="s2">&quot;model/embed_tokens/embedding&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">(</span><span class="s2">&quot;sp&quot;</span><span class="p">,</span> <span class="s2">&quot;fsdp&quot;</span><span class="p">)),</span>
+
+        <span class="p">(</span><span class="s2">&quot;self_attn/(q_proj|k_proj|v_proj)/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">((</span><span class="s2">&quot;fsdp&quot;</span><span class="p">,</span> <span class="s2">&quot;sp&quot;</span><span class="p">),</span> <span class="s2">&quot;tp&quot;</span><span class="p">)),</span>
+        <span class="p">(</span><span class="s2">&quot;self_attn/o_proj/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">(</span><span class="s2">&quot;tp&quot;</span><span class="p">,</span> <span class="p">(</span><span class="s2">&quot;sp&quot;</span><span class="p">,</span> <span class="s2">&quot;fsdp&quot;</span><span class="p">))),</span>
+
+        <span class="p">(</span><span class="s2">&quot;w1/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">((</span><span class="s2">&quot;fsdp&quot;</span><span class="p">,</span> <span class="s2">&quot;sp&quot;</span><span class="p">))),</span>
+        <span class="p">(</span><span class="s2">&quot;w2/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">((</span><span class="s2">&quot;fsdp&quot;</span><span class="p">,</span> <span class="s2">&quot;sp&quot;</span><span class="p">))),</span>
+        <span class="p">(</span><span class="s2">&quot;w3/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">((</span><span class="s2">&quot;fsdp&quot;</span><span class="p">,</span> <span class="s2">&quot;sp&quot;</span><span class="p">))),</span>
+        <span class="p">(</span><span class="s2">&quot;gate/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">((</span><span class="s2">&quot;fsdp&quot;</span><span class="p">,</span> <span class="s2">&quot;sp&quot;</span><span class="p">))),</span>
+
+        <span class="p">(</span><span class="s2">&quot;input_layernorm/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">(</span><span class="kc">None</span><span class="p">)),</span>
+        <span class="p">(</span><span class="s2">&quot;post_attention_layernorm/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">(</span><span class="kc">None</span><span class="p">)),</span>
+
+        <span class="p">(</span><span class="s2">&quot;model/norm/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">(</span><span class="kc">None</span><span class="p">)),</span>
+        <span class="p">(</span><span class="s2">&quot;lm_head/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">(</span><span class="s2">&quot;fsdp&quot;</span><span class="p">,</span> <span class="s2">&quot;sp&quot;</span><span class="p">)),</span>
+        <span class="p">(</span><span class="s2">&quot;.*&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">(</span><span class="kc">None</span><span class="p">)),</span>
+    <span class="p">)</span> <span class="k">if</span> <span class="ow">not</span> <span class="n">fully_sharded_data_parallel</span> <span class="k">else</span> <span class="p">(</span>
+        <span class="p">(</span><span class="s2">&quot;model/embed_tokens/embedding&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">((</span><span class="s2">&quot;fsdp&quot;</span><span class="p">,</span> <span class="s2">&quot;sp&quot;</span><span class="p">))),</span>
+
+        <span class="p">(</span><span class="s2">&quot;self_attn/(q_proj|k_proj|v_proj)/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">((</span><span class="s2">&quot;fsdp&quot;</span><span class="p">,</span> <span class="s2">&quot;sp&quot;</span><span class="p">),</span> <span class="s2">&quot;tp&quot;</span><span class="p">)),</span>
+        <span class="p">(</span><span class="s2">&quot;self_attn/o_proj/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">(</span><span class="s2">&quot;tp&quot;</span><span class="p">,</span> <span class="p">(</span><span class="s2">&quot;sp&quot;</span><span class="p">,</span> <span class="s2">&quot;fsdp&quot;</span><span class="p">))),</span>
+
+        <span class="p">(</span><span class="s2">&quot;w1/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">((</span><span class="s2">&quot;fsdp&quot;</span><span class="p">,</span> <span class="s2">&quot;sp&quot;</span><span class="p">))),</span>
+        <span class="p">(</span><span class="s2">&quot;w2/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">((</span><span class="s2">&quot;fsdp&quot;</span><span class="p">,</span> <span class="s2">&quot;sp&quot;</span><span class="p">))),</span>
+        <span class="p">(</span><span class="s2">&quot;w3/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">((</span><span class="s2">&quot;fsdp&quot;</span><span class="p">,</span> <span class="s2">&quot;sp&quot;</span><span class="p">))),</span>
+        <span class="p">(</span><span class="s2">&quot;gate/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">((</span><span class="s2">&quot;fsdp&quot;</span><span class="p">,</span> <span class="s2">&quot;sp&quot;</span><span class="p">))),</span>
+
+        <span class="p">(</span><span class="s2">&quot;input_layernorm/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">(</span><span class="kc">None</span><span class="p">)),</span>
+        <span class="p">(</span><span class="s2">&quot;post_attention_layernorm/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">(</span><span class="kc">None</span><span class="p">)),</span>
+
+        <span class="p">(</span><span class="s2">&quot;model/norm/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">(</span><span class="kc">None</span><span class="p">)),</span>
+        <span class="p">(</span><span class="s2">&quot;lm_head/kernel&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">((</span><span class="s2">&quot;fsdp&quot;</span><span class="p">,</span> <span class="s2">&quot;sp&quot;</span><span class="p">))),</span>
+        <span class="p">(</span><span class="s2">&quot;.*&quot;</span><span class="p">,</span> <span class="n">PartitionSpec</span><span class="p">((</span><span class="s2">&quot;fsdp&quot;</span><span class="p">,</span> <span class="s2">&quot;sp&quot;</span><span class="p">))),</span>
+    <span class="p">)</span>
+</code></pre></div></td></tr></table></div>
+            </details>
+    </div>
+
+</div>
+
+
+
+  </div>
+
+    </div>
+
+</div>
+
+
+
+
+  </div>
+
+    </div>
+
+</div>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Erfan Zare Chavoshi-easydel
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    <script id="__config" type="application/json">{"base": "..", "features": [], "search": "../assets/javascripts/workers/search.b8dbb3d2.min.js", "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.081f42fc.min.js"></script>
+      
+    
+  </body>
+</html>
