@@ -1,21 +1,9 @@
 Serve
 =====
 
-.. automodule:: APIs
-   :members:
-
 .. toctree::
    :maxdepth: 2
 
-   Client.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Serve.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Configuration.rst
-
+   serve.client.rst
+   serve.serve.rst
+   serve.configuration.rst

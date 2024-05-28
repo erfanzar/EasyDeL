@@ -1,196 +1,79 @@
 Modules
 =======
 
-.. automodule:: APIs
-   :members:
-
 .. toctree::
    :maxdepth: 2
 
-   Arctic.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Whisper.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Dbrx.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Falcon.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Palm.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Vanilla_Attention.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Cohere.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Rwkv.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Flax_Modelling_Utils.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Mamba.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Auto_Easydel_Model.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Attention_Module.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Grok_1.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Jetmoe.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Gpt_Neo_X.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Roberta.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Qwen2.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Qwen2_Moe.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Openelm.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Phi3.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Qwen1.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Mixtral.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Gpt_J.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Mistral.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Lucid_Transformer.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Deepseek_V2.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Stablelm.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Opt.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Ring_Attention.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Mosaic_Mpt.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Phi.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Llama.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Blockwise_Attention.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Easydel_Modelling_Utils.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Olmo.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Gemma.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   T5.rst
-
-.. toctree::
-   :maxdepth: 2
-
-   Gpt2.rst
-
+   modules.arctic.arctic_configuration.rst
+   modules.arctic.modelling_arctic_flax.rst
+   modules.whisper.whisper_configuration.rst
+   modules.whisper.modelling_whisper_flax.rst
+   modules.dbrx.modelling_dbrx_flax.rst
+   modules.dbrx.dbrx_configuration.rst
+   modules.falcon.falcon_configuration.rst
+   modules.falcon.modelling_falcon_flax.rst
+   modules.palm.palm_configuration.rst
+   modules.palm.modelling_palm_flax.rst
+   modules._vanilla_attention.rst
+   modules.cohere.cohere_configuration.rst
+   modules.cohere.modelling_cohere_flax.rst
+   modules.rwkv.modelling_rwkv_flax.rst
+   modules.rwkv.rwkv_configuration.rst
+   modules.flax_modelling_utils.rst
+   modules.mamba.modelling_mamba_flax.rst
+   modules.mamba.mamba_configuration.rst
+   modules.auto_easydel_model.rst
+   modules.attention_module.rst
+   modules.grok_1.grok_1_configuration.rst
+   modules.grok_1.modelling_grok_1_flax.rst
+   modules.jetmoe.jetmoe_configuration.rst
+   modules.jetmoe.modelling_jetmoe_flax.rst
+   modules.gpt_neo_x.gpt_neo_x_configuration.rst
+   modules.gpt_neo_x.modelling_gpt_neo_x_flax.rst
+   modules.roberta.modelling_roberta_flax.rst
+   modules.roberta.roberta_configuration.rst
+   modules.qwen2.qwen_configuration.rst
+   modules.qwen2.modelling_qwen_flax.rst
+   modules.qwen2_moe.modeling_qwen2_moe_flax.rst
+   modules.qwen2_moe.configuration_qwen2_moe.rst
+   modules.openelm.modelling_openelm_flax.rst
+   modules.openelm.openelm_configuration.rst
+   modules.phi3.phi3_configuration.rst
+   modules.phi3.modelling_phi3_flax.rst
+   modules.qwen1.modelling_qwen1_flax.rst
+   modules.qwen1.qwen1_configuration.rst
+   modules.mixtral.modelling_mixtral_flax.rst
+   modules.mixtral.mixtral_configuration.rst
+   modules.gpt_j.gpt_j_configuration.rst
+   modules.gpt_j.modelling_gpt_j_flax.rst
+   modules.mistral.vision_mistral_configuration.rst
+   modules.mistral.mistral_configuration.rst
+   modules.mistral.modelling_mistral_flax.rst
+   modules.mistral.modelling_vision_mistral_flax.rst
+   modules.lucid_transformer.lt_configuration.rst
+   modules.lucid_transformer.modelling_lt_flax.rst
+   modules.deepseek_v2.modeling_deepseek_flax.rst
+   modules.deepseek_v2.deepseek_configuration.rst
+   modules.stablelm.stablelm_configuration.rst
+   modules.stablelm.modelling_stablelm_flax.rst
+   modules.opt.opt_configuration.rst
+   modules.opt.modelling_opt_flax.rst
+   modules._ring_attention.rst
+   modules.mosaic_mpt.modelling_mpt_flax.rst
+   modules.mosaic_mpt.mosaic_configuration.rst
+   modules.phi.phi_configuration.rst
+   modules.phi.modelling_phi_flax.rst
+   modules.llama.vision_llama_configuration.rst
+   modules.llama.modelling_vision_llama_flax.rst
+   modules.llama.llama_configuration.rst
+   modules.llama.modelling_llama_flax.rst
+   modules._blockwise_attention.rst
+   modules.easydel_modelling_utils.rst
+   modules.olmo.modelling_olmo_flax.rst
+   modules.olmo.olmo_configuration.rst
+   modules.gemma.gemma_configuration.rst
+   modules.gemma.modelling_gemma_flax.rst
+   modules.t5.t5_configuration.rst
+   modules.t5.modelling_t5_flax.rst
+   modules.gpt2.modelling_gpt2_flax.rst
+   modules.gpt2.gpt2_configuration.rst

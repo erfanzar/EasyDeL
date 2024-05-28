@@ -1,10 +1,10 @@
 Utils
 =====
 
-.. automodule:: Trainer
-   :members:
+.. toctree::
+   :maxdepth: 2
 
-.. automodule:: src.python.easydel.trainer.utils
-   :members:
-   :undoc-members:
-   :show-inheritance:
+   utils.tensor_utils.rst
+   utils.prompters.rst
+   utils.utils.rst
+   utils.checker.rst
