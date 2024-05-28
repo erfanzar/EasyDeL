@@ -1,7 +1,7 @@
 ``easystate`` module
 ====================
 
-.. automodule:: src.python.easydel.etils.easystate
+.. automodule:: easydel.etils.easystate
     :members:
     :undoc-members:
     :show-inheritance:

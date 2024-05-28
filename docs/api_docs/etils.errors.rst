@@ -1,7 +1,7 @@
 ``errors`` module
 =================
 
-.. automodule:: src.python.easydel.etils.errors
+.. automodule:: easydel.etils.errors
     :members:
     :undoc-members:
     :show-inheritance:

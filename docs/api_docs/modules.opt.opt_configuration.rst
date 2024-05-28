@@ -1,7 +1,7 @@
 ``opt/opt configuration`` module
 ================================
 
-.. automodule:: src.python.easydel.modules.opt.opt_configuration
+.. automodule:: easydel.modules.opt.opt_configuration
     :members:
     :undoc-members:
     :show-inheritance:
