@@ -138,35 +138,62 @@ def set_attrs_smartly_with_prp(self, attr_name: str, default: Any, new_attr: Any
 
 class AttentionModule:
     """
-    ## AttentionModule: A Versatile Attention Mechanism Factory
+    Manages different attention mechanisms for efficient computation in EasyDeL models.
 
-    The `AttentionModule` class is designed to simplify the creation and execution of different attention mechanisms within your EasyDeL models. It provides a unified interface for working with various attention types, allowing you to easily switch between them and experiment with different configurations.
+    This class serves as a central hub for handling various attention mechanisms, including
+    optimized implementations like FlashAttention, SplashAttention, RingAttention, and more traditional
+    approaches like vanilla (dot-product) attention. It provides a unified interface to
+    select and execute the appropriate attention mechanism based on the model's configuration and
+    hardware platform.
 
-    **Key Features:**
+    Key Features:
 
-    * **Mechanism Selection:** The `attn_mechanism` argument lets you choose the specific attention algorithm you want to use (e.g., "vanilla," "flash," "splash," "ring," "cudnn").
-    * **Sharding and Partitioning:** The class supports advanced JAX sharding techniques to distribute attention computations across multiple devices for efficient processing of large models. It handles partitioning of query, key, value, bias, and attention weight matrices using `PartitionSpec`.
-    * **Blockwise Attention:** Enables the use of blockwise attention for increased memory efficiency, especially with long sequences.
-    * **Caching Support:** Facilitates the use of attention caching to speed up inference and generation tasks.
-    * **Dropout and Determinism:** Allows for applying dropout to attention weights and controlling the deterministic behavior of the attention computation.
-    * **Testing Utility:**  Provides a `test_attentions` method to compare different attention mechanisms in terms of accuracy, gradient stability, and computation time.
+    * **Attention Mechanism Selection:** Supports a wide range of attention mechanisms,
+      allowing users to choose the most suitable option based on performance and hardware constraints.
+    * **Sharding and Partitioning:** Integrates with JAX's sharding capabilities, enabling efficient
+      distribution of computations and data across multiple devices.
+    * **Block-wise Computation:** Implements block-wise attention computations for optimized memory
+      usage and speed, particularly beneficial for large models.
+    * **Performance Optimization:** Includes support for highly optimized implementations like
+      FlashAttention, SplashAttention, and RingAttention for TPU and GPU acceleration.
+    * **Flexibility and Customization:** Offers fine-grained control over attention parameters,
+      sharding specifications, and block sizes, providing flexibility for different use cases.
+    * **Testing and Evaluation:** Includes a `test_attentions` method to systematically evaluate
+      different attention mechanisms and help users identify the best-performing option.
 
-    **How it Works:**
+    Example Usage:
 
-    1. **Initialization:**
-       - During initialization, you provide the desired `attn_mechanism`, JAX `mesh` for sharding, scaling factor (`sm_scale`), number of attention heads, head dimensions, and other configuration parameters.
-       - The class automatically sets default values for many parameters based on the chosen attention mechanism and the provided EasyDeL configuration (`base_module_class`).
-    2. **Calling the Module:**
-       - When you call the `AttentionModule` object, you pass in the query, key, and value states, along with optional parameters like attention masks, biases, and causal flags.
-       - The module internally selects the appropriate attention function based on the specified `attn_mechanism`.
-       - It performs any necessary sharding and partitioning based on the configured partition specifications.
-       - The attention computation is executed, and the attention outputs (and optionally attention weights) are returned.
+    ```python
+    # Initialize an AttentionModule instance
+    attention_module = AttentionModule(
+        mesh=mesh,
+        attn_mechanism="ring",  # Select the desired attention mechanism
+        sm_scale=1.0 / math.sqrt(head_dim),
+        num_attention_heads=num_heads,
+        head_dims=head_dim,
+        # ... other configuration parameters ...
+    )
 
-    **Advantages:**
+    # Compute attention outputs
+    attention_output = attention_module(
+        query_states=query_states,
+        key_states=key_states,
+        value_states=value_states,
+        # ... other attention inputs ...
+    )
 
-    * **Flexibility:**  Allows you to easily switch between different attention mechanisms without major code changes.
-    * **Efficiency:**  Supports advanced JAX sharding for distributed computation, enabling the handling of large models.
+    # Access attention outputs
+    attention_outputs = attention_output.attention_outputs
+    attention_weights = attention_output.attention_weights
+    ```
 
+    Attributes:
+        mesh (Mesh): JAX mesh for device distribution.
+        attn_mechanism (str): The selected attention mechanism.
+        sm_scale (float): Scaling factor for attention scores.
+        num_attention_heads (int): Number of attention heads.
+        head_dims (int): Dimensionality of each attention head.
+        # ... other attributes for block sizes, partitioning, dropout, etc. ...
     """
 
     def __init__(

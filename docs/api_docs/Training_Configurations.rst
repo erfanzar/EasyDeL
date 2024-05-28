@@ -4,5 +4,5 @@ Training Configurations
 .. automodule:: Trainer
    :members:
 
-.. automodule:: generated_trainer-training_configurations
+.. automodule:: src.python.easydel.trainer.training_configurations
    :members:

@@ -4,5 +4,5 @@ Openelm Configuration
 .. automodule:: Openelm
    :members:
 
-.. automodule:: generated_modules-openelm-openelm_configuration
+.. automodule:: src.python.easydel.modules.openelm.openelm_configuration
    :members:

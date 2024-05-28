@@ -4,5 +4,5 @@ Phi Configuration
 .. automodule:: Phi
    :members:
 
-.. automodule:: generated_modules-phi-phi_configuration
+.. automodule:: src.python.easydel.modules.phi.phi_configuration
    :members:

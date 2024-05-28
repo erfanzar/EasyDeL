@@ -4,5 +4,5 @@ Attention Module
 .. automodule:: Modules
    :members:
 
-.. automodule:: generated_modules-attention_module
+.. automodule:: src.python.easydel.modules.attention_module
    :members:

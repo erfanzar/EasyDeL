@@ -4,5 +4,5 @@ Olmo Configuration
 .. automodule:: Olmo
    :members:
 
-.. automodule:: generated_modules-olmo-olmo_configuration
+.. automodule:: src.python.easydel.modules.olmo.olmo_configuration
    :members:

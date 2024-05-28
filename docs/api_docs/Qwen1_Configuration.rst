@@ -4,5 +4,5 @@ Qwen1 Configuration
 .. automodule:: Qwen1
    :members:
 
-.. automodule:: generated_modules-qwen1-qwen1_configuration
+.. automodule:: src.python.easydel.modules.qwen1.qwen1_configuration
    :members:

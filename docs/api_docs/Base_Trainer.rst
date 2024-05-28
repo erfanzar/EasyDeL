@@ -4,5 +4,5 @@ Base Trainer
 .. automodule:: Trainer
    :members:
 
-.. automodule:: generated_trainer-base_trainer
+.. automodule:: src.python.easydel.trainer.base_trainer
    :members:

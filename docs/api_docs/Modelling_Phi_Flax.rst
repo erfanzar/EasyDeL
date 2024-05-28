@@ -4,5 +4,5 @@ Modelling Phi Flax
 .. automodule:: Phi
    :members:
 
-.. automodule:: generated_modules-phi-modelling_phi_flax
+.. automodule:: src.python.easydel.modules.phi.modelling_phi_flax
    :members:

@@ -4,5 +4,5 @@ Mixtral Configuration
 .. automodule:: Mixtral
    :members:
 
-.. automodule:: generated_modules-mixtral-mixtral_configuration
+.. automodule:: src.python.easydel.modules.mixtral.mixtral_configuration
    :members:

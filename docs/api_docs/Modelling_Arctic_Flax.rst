@@ -4,5 +4,5 @@ Modelling Arctic Flax
 .. automodule:: Arctic
    :members:
 
-.. automodule:: generated_modules-arctic-modelling_arctic_flax
+.. automodule:: src.python.easydel.modules.arctic.modelling_arctic_flax
    :members:

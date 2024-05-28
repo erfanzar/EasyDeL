@@ -4,5 +4,5 @@ Configuration
 .. automodule:: Serve
    :members:
 
-.. automodule:: generated_serve-configuration
+.. automodule:: src.python.easydel.serve.configuration
    :members:

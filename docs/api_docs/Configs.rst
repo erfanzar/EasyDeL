@@ -4,5 +4,5 @@ Configs
 .. automodule:: Etils
    :members:
 
-.. automodule:: generated_etils-configs
+.. automodule:: src.python.easydel.etils.configs
    :members:

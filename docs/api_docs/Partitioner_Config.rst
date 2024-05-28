@@ -4,5 +4,5 @@ Partitioner Config
 .. automodule:: Trainer
    :members:
 
-.. automodule:: generated_reinforcement_learning-trainer-partitioner_config
+.. automodule:: src.python.easydel.reinforcement_learning.trainer.partitioner_config
    :members:

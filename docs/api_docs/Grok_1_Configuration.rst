@@ -4,5 +4,5 @@ Grok 1 Configuration
 .. automodule:: Grok_1
    :members:
 
-.. automodule:: generated_modules-grok_1-grok_1_configuration
+.. automodule:: src.python.easydel.modules.grok_1.grok_1_configuration
    :members:

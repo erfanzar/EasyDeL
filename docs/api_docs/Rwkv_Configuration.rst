@@ -4,5 +4,5 @@ Rwkv Configuration
 .. automodule:: Rwkv
    :members:
 
-.. automodule:: generated_modules-rwkv-rwkv_configuration
+.. automodule:: src.python.easydel.modules.rwkv.rwkv_configuration
    :members:

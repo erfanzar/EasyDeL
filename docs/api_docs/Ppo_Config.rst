@@ -4,5 +4,5 @@ Ppo Config
 .. automodule:: Trainer
    :members:
 
-.. automodule:: generated_reinforcement_learning-trainer-ppo_config
+.. automodule:: src.python.easydel.reinforcement_learning.trainer.ppo_config
    :members:

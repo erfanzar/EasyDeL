@@ -4,5 +4,5 @@ Easydel Transform
 .. automodule:: Transform
    :members:
 
-.. automodule:: generated_transform-easydel_transform
+.. automodule:: src.python.easydel.transform.easydel_transform
    :members:

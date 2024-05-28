@@ -4,5 +4,5 @@ Collectors
 .. automodule:: Utils
    :members:
 
-.. automodule:: generated_reinforcement_learning-utils-collectors
+.. automodule:: src.python.easydel.reinforcement_learning.utils.collectors
    :members:

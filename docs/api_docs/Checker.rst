@@ -4,5 +4,5 @@ Checker
 .. automodule:: Utils
    :members:
 
-.. automodule:: generated_utils-checker
+.. automodule:: src.python.easydel.utils.checker
    :members:

@@ -59,17 +59,16 @@ def run(project_locations="src/python/easydel", docs_file="docs/api_docs/", star
                     .replace("/", ".")
                 )
 
-                markdown_documentation = f"{name.replace(doted, '')}\n========\n.. automodule:: {name}" + static_joins
+                # markdown_documentation = f"{name.replace(doted, '')}\n========\n.. automodule:: {name}" + static_joins
                 categorical_name = name.replace(doted, "")
                 markdown_filename = (
-                        "generated_" + name
+                        name
                         .replace(doted, "")
-                        .replace(".", "-")
                         + ".rst"
                 )
 
-                with open(docs_file + markdown_filename, "w") as buffer:
-                    buffer.write(markdown_documentation)
+                # with open(docs_file + markdown_filename, "w") as buffer:
+                #     buffer.write(markdown_documentation)
                 category_tuple = tuple(categorical_name.split("."))
                 edited_category_tuple = ()
 
@@ -77,7 +76,8 @@ def run(project_locations="src/python/easydel", docs_file="docs/api_docs/", star
                     key = key.split("_")
                     capitalized_words = [word.capitalize() for word in key if word != ""]
                     edited_category_tuple += (" ".join(capitalized_words),)
-                cache[edited_category_tuple] = markdown_filename
+
+                cache[edited_category_tuple] = start_head.replace("/", ".") + "." + markdown_filename
             else:
                 run(current_file)
     except NotADirectoryError:
