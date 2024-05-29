@@ -10,7 +10,7 @@ from flax.core import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks
 from flax.traverse_util import unflatten_dict, flatten_dict
 from jax import numpy as jnp, lax
-from flax import linen as nn
+from fjformer import linen as nn
 from chex import Array
 
 from ..attention_module import AttentionModule
@@ -18,7 +18,11 @@ from ..flax_modelling_utils import (
     ACT2FN,
     get_gradient_checkpoint_policy,
     apply_rotary_pos_emb,
-    get_dot_general_by_bits, repeat_kv_bnsh, with_sharding_constraint, precompute_freq_cis, BaseJAXAttentionModule,
+    get_dot_general_by_bits,
+    repeat_kv_bnsh,
+    with_sharding_constraint,
+    precompute_freq_cis,
+    BaseJAXAttentionModule,
     block_wise_ffn
 )
 from fjformer.linen import Dense
