@@ -829,7 +829,7 @@ class FlaxRobertaPreTrainedModel(EasyDeLFlaxPretrainedModel):
         inputs = {"params": params or self.params}
 
         if self.config.add_cross_attention:
-            if past_key_values:
+            if past_key_values is not None:
                 inputs["cache"] = past_key_values
                 mutable = ["cache"]
             else:

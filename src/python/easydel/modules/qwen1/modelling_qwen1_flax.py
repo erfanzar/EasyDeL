@@ -830,7 +830,7 @@ class FlaxQwen1PreTrainedModel(EasyDeLFlaxPretrainedModel):
             "params": params or self.params
         } if add_params_field else params or self.params
         mutable = False
-        if past_key_values:
+        if past_key_values is not None:
             inputs["cache"] = past_key_values
             mutable = ["cache"]
 

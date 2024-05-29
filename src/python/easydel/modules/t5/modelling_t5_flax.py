@@ -975,7 +975,7 @@ class FlaxT5PreTrainedModel(EasyDeLFlaxPretrainedModel):
 
         inputs = {"params": params or self.params}
 
-        if past_key_values:
+        if past_key_values is not None:
             inputs["cache"] = past_key_values
             mutable = ["cache"]
         else:
@@ -1344,7 +1344,7 @@ class FlaxT5ForConditionalGeneration(FlaxT5PreTrainedModel):
 
         inputs = {"params": params or self.params}
 
-        if past_key_values:
+        if past_key_values is not None:
             inputs["cache"] = past_key_values
             mutable = ["cache"]
         else:
