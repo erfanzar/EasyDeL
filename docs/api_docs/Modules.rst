@@ -6,74 +6,74 @@ Modules
 
    modules.arctic.arctic_configuration
    modules.arctic.modelling_arctic_flax
-   modules.whisper.whisper_configuration
-   modules.whisper.modelling_whisper_flax
-   modules.dbrx.modelling_dbrx_flax
-   modules.dbrx.dbrx_configuration
-   modules.falcon.falcon_configuration
-   modules.falcon.modelling_falcon_flax
-   modules.palm.palm_configuration
-   modules.palm.modelling_palm_flax
-   modules._vanilla_attention
+   modules.attention_module
+   modules.auto_easydel_model
    modules.cohere.cohere_configuration
    modules.cohere.modelling_cohere_flax
-   modules.rwkv.modelling_rwkv_flax
-   modules.rwkv.rwkv_configuration
+   modules.dbrx.dbrx_configuration
+   modules.dbrx.modelling_dbrx_flax
+   modules.deepseek_v2.deepseek_configuration
+   modules.deepseek_v2.modeling_deepseek_flax
+   modules.easydel_modelling_utils
+   modules.falcon.falcon_configuration
+   modules.falcon.modelling_falcon_flax
    modules.flax_modelling_utils
-   modules.mamba.modelling_mamba_flax
-   modules.mamba.mamba_configuration
-   modules.auto_easydel_model
-   modules.attention_module
+   modules.gemma.gemma_configuration
+   modules.gemma.modelling_gemma_flax
+   modules.gpt2.gpt2_configuration
+   modules.gpt2.modelling_gpt2_flax
+   modules.gpt_j.gpt_j_configuration
+   modules.gpt_j.modelling_gpt_j_flax
+   modules.gpt_neo_x.gpt_neo_x_configuration
+   modules.gpt_neo_x.modelling_gpt_neo_x_flax
    modules.grok_1.grok_1_configuration
    modules.grok_1.modelling_grok_1_flax
    modules.jetmoe.jetmoe_configuration
    modules.jetmoe.modelling_jetmoe_flax
-   modules.gpt_neo_x.gpt_neo_x_configuration
-   modules.gpt_neo_x.modelling_gpt_neo_x_flax
-   modules.roberta.modelling_roberta_flax
-   modules.roberta.roberta_configuration
-   modules.qwen2.qwen_configuration
-   modules.qwen2.modelling_qwen_flax
-   modules.qwen2_moe.modeling_qwen2_moe_flax
-   modules.qwen2_moe.configuration_qwen2_moe
-   modules.openelm.modelling_openelm_flax
-   modules.openelm.openelm_configuration
-   modules.phi3.phi3_configuration
-   modules.phi3.modelling_phi3_flax
-   modules.qwen1.modelling_qwen1_flax
-   modules.qwen1.qwen1_configuration
-   modules.mixtral.modelling_mixtral_flax
-   modules.mixtral.mixtral_configuration
-   modules.gpt_j.gpt_j_configuration
-   modules.gpt_j.modelling_gpt_j_flax
-   modules.mistral.vision_mistral_configuration
+   modules.llama.llama_configuration
+   modules.llama.modelling_llama_flax
+   modules.llama.modelling_vision_llama_flax
+   modules.llama.vision_llama_configuration
+   modules.lucid_transformer.lt_configuration
+   modules.lucid_transformer.modelling_lt_flax
+   modules.mamba.mamba_configuration
+   modules.mamba.modelling_mamba_flax
    modules.mistral.mistral_configuration
    modules.mistral.modelling_mistral_flax
    modules.mistral.modelling_vision_mistral_flax
-   modules.lucid_transformer.lt_configuration
-   modules.lucid_transformer.modelling_lt_flax
-   modules.deepseek_v2.modeling_deepseek_flax
-   modules.deepseek_v2.deepseek_configuration
-   modules.stablelm.stablelm_configuration
-   modules.stablelm.modelling_stablelm_flax
-   modules.opt.opt_configuration
-   modules.opt.modelling_opt_flax
-   modules._ring_attention
+   modules.mistral.vision_mistral_configuration
+   modules.mixtral.mixtral_configuration
+   modules.mixtral.modelling_mixtral_flax
    modules.mosaic_mpt.modelling_mpt_flax
    modules.mosaic_mpt.mosaic_configuration
-   modules.phi.phi_configuration
-   modules.phi.modelling_phi_flax
-   modules.llama.vision_llama_configuration
-   modules.llama.modelling_vision_llama_flax
-   modules.llama.llama_configuration
-   modules.llama.modelling_llama_flax
-   modules._blockwise_attention
-   modules.easydel_modelling_utils
    modules.olmo.modelling_olmo_flax
    modules.olmo.olmo_configuration
-   modules.gemma.gemma_configuration
-   modules.gemma.modelling_gemma_flax
-   modules.t5.t5_configuration
+   modules.openelm.modelling_openelm_flax
+   modules.openelm.openelm_configuration
+   modules.opt.modelling_opt_flax
+   modules.opt.opt_configuration
+   modules.palm.modelling_palm_flax
+   modules.palm.palm_configuration
+   modules.phi.modelling_phi_flax
+   modules.phi.phi_configuration
+   modules.phi3.modelling_phi3_flax
+   modules.phi3.phi3_configuration
+   modules.qwen1.modelling_qwen1_flax
+   modules.qwen1.qwen1_configuration
+   modules.qwen2.modelling_qwen_flax
+   modules.qwen2.qwen_configuration
+   modules.qwen2_moe.configuration_qwen2_moe
+   modules.qwen2_moe.modeling_qwen2_moe_flax
+   modules.roberta.modelling_roberta_flax
+   modules.roberta.roberta_configuration
+   modules.rwkv.modelling_rwkv_flax
+   modules.rwkv.rwkv_configuration
+   modules.stablelm.modelling_stablelm_flax
+   modules.stablelm.stablelm_configuration
    modules.t5.modelling_t5_flax
-   modules.gpt2.modelling_gpt2_flax
-   modules.gpt2.gpt2_configuration
+   modules.t5.t5_configuration
+   modules.whisper.modelling_whisper_flax
+   modules.whisper.whisper_configuration
+   modules._blockwise_attention
+   modules._ring_attention
+   modules._vanilla_attention
