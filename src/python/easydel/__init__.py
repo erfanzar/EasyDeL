@@ -1,7 +1,9 @@
-from .serve import (
-    EasyDeLServeEngine,
-    EasyDeLServeEngineConfig,
-    EngineClient
+from .inference import (
+    EasyDeLServeEngine as EasyDeLServeEngine,
+    EasyDeLServeEngineConfig as EasyDeLServeEngineConfig,
+    EngineClient as EngineClient,
+    GenerationPipelineConfig as GenerationPipelineConfig,
+    GenerationPipeline as GenerationPipeline
 )
 
 from .modules.llama import (
@@ -234,11 +236,12 @@ from .etils import (
 )
 
 __all__ = (
-    # API Serving Modules
+    # Inference Modules
     "EngineClient",
     "EasyDeLServeEngineConfig",
     "EasyDeLServeEngine",
-
+    "GenerationPipelineConfig",
+    "GenerationPipeline",
     # Models
 
     # LLama Models

@@ -773,7 +773,7 @@ class FlaxLlamaPreTrainedModel(EasyDeLFlaxPretrainedModel):
             "params": params or self.params
         } if add_params_field else params or self.params
 
-        if past_key_values:
+        if past_key_values is not None:
             inputs["cache"] = past_key_values
             mutable = ["cache"]
         else:
@@ -800,8 +800,7 @@ class FlaxLlamaPreTrainedModel(EasyDeLFlaxPretrainedModel):
             return outputs
         elif past_key_values is not None and not return_dict:
             outputs, past_key_values = outputs
-            outputs = outputs[:1] + \
-                      (unfreeze(past_key_values["cache"]),) + outputs[1:]
+            outputs = outputs[:1] + (unfreeze(past_key_values["cache"]),) + outputs[1:]
 
         return outputs
 

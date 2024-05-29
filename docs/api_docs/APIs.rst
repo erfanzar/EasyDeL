@@ -7,9 +7,9 @@ EasyDeL APIs 🔮
    Cli
    Data Preprocessing
    Etils
+   Inference
    Modules
    Reinforcement Learning
-   Serve
    Smi
    Trainer
    Transform

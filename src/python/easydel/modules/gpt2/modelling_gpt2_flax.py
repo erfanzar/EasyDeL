@@ -510,7 +510,7 @@ class FlaxGPT2PreTrainedModel(EasyDeLFlaxPretrainedModel):
             rngs["dropout"] = dropout_rng
         inputs = {"params": params or self.params} if add_params_field is True else params or self.params
 
-        if past_key_values:
+        if past_key_values is not None:
             inputs["cache"] = past_key_values
             mutable = ["cache"]
         else:

@@ -989,7 +989,7 @@ class ArcticPreTrainedModel(EasyDeLFlaxPretrainedModel):
 
         if self.config.bits is not None:
             rng_s['params'] = jax.random.key(0)
-        if past_key_values:
+        if past_key_values is not None:
             inputs["cache"] = past_key_values
             mutable = ["cache"]
         else:
