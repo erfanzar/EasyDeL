@@ -120,11 +120,9 @@ def huggingface_to_easydel(
     with jax.default_device(device):
         flax_dict = {}
         pbar = tqdm(total=len(state_dict), disable=not verbose)
-
         pbar.set_description("Converting Model")
 
         for key in list(state_dict.keys()):
-            # Determine if renaming is necessary
             tensor = state_dict.pop(key)
             new_key = key
             if any(layer_name in key for layer_name in embedding_layer_names):
@@ -139,25 +137,26 @@ def huggingface_to_easydel(
                 new_key = key.replace(".weight", ".kernel")
 
             key_tuple = tuple(new_key.split("."))
-            # Convert tensor to jax.numpy.array without detaching and moving to CPU
+
+            # Convert tensor to jax.numpy.array and delete the tensor to free memory
             array = jax.lax.convert_element_type(jnp.asarray(tensor.cpu().detach().numpy()), dtype)
             if remove_state_dict:
                 del tensor
                 gc.collect()
+
             # Apply sharding functions if provided
             if shard_fns and key_tuple in shard_fns:
                 array = shard_fns[key_tuple](array)
-            if convert_to_8bit:
-                if params_pattern_selection.search("/".join(key_tuple)):
-                    array = fjformer.linen.linen.Int8Params(
-                        *fjformer.linen.quantize(array)
-                    )
-            flax_dict[key_tuple] = array
+            if convert_to_8bit and params_pattern_selection.search("/".join(key_tuple)):
+                array = fjformer.linen.linen.Int8Params(
+                    *fjformer.linen.quantize(array)
+                )
 
-            # Update progress bar less frequently to reduce overhead
+            flax_dict[key_tuple] = array
             pbar.update(1)
+
         pbar.close()
-        gc.collect()
+        gc.collect()  # Call garbage collection once after processing all tensors
         return traverse_util.unflatten_dict(flax_dict)
 
 
