@@ -494,7 +494,19 @@ class AutoEasyDeLModelForCausalLM:
             Tuple[EasyDeLFlaxPretrainedModel, dict]: A tuple containing the EasyDeL model and the loaded and sharded
                 model parameters.
         """
-        import torch
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                def _clear():
+                    gc.collect()
+                    torch.cuda.empty_cache()
+            else:
+                def _clear():
+                    gc.collect()
+        except ModuleNotFoundError as e:
+            def _clear():
+                gc.collect()
 
         logger.debug(f"Downloading model config from {pretrained_model_name_or_path}")
         config = AutoConfig.from_pretrained(pretrained_model_name_or_path)
@@ -511,7 +523,7 @@ class AutoEasyDeLModelForCausalLM:
 
         # Clear and collect memory after deleting the model
         del model
-        gc.collect()
+        _clear()
 
         logger.debug(f"adding model basic EasyDeL configurations.")
         if hasattr(cfg, 'add_jax_args'):
@@ -532,7 +544,6 @@ class AutoEasyDeLModelForCausalLM:
         if config_kwargs is not None:
             for k, v in config_kwargs.items():
                 setattr(cfg, k, v)
-
         logger.debug("creating easydel model")
         ed_model = module(
             config=cfg,
@@ -551,10 +562,10 @@ class AutoEasyDeLModelForCausalLM:
             if k not in needs:
                 tensor = state_dict.pop(k)
                 del tensor
+                _clear()
                 logger.debug(f"removing {k} from weights as it was not needed by flax model")
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+
+        _clear()
 
         if shard_fns is not None:
             if auto_shard_params:
@@ -611,9 +622,7 @@ class AutoEasyDeLModelForCausalLM:
 
         # Clear and collect memory after converting the model
         del state_dict
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        _clear()
 
         if is_flatten(params):
             logger.info("converted parameters are flatten making them unflatten ")
