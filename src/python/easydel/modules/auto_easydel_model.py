@@ -494,6 +494,7 @@ class AutoEasyDeLModelForCausalLM:
             Tuple[EasyDeLFlaxPretrainedModel, dict]: A tuple containing the EasyDeL model and the loaded and sharded
                 model parameters.
         """
+        import torch
 
         logger.debug(f"Downloading model config from {pretrained_model_name_or_path}")
         config = AutoConfig.from_pretrained(pretrained_model_name_or_path)
@@ -548,9 +549,12 @@ class AutoEasyDeLModelForCausalLM:
         ]
         for k in list(state_dict.keys()):
             if k not in needs:
-                state_dict.pop(k)
+                tensor = state_dict.pop(k)
+                del tensor
                 logger.debug(f"removing {k} from weights as it was not needed by flax model")
         gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         if shard_fns is not None:
             if auto_shard_params:
@@ -608,6 +612,8 @@ class AutoEasyDeLModelForCausalLM:
         # Clear and collect memory after converting the model
         del state_dict
         gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         if is_flatten(params):
             logger.info("converted parameters are flatten making them unflatten ")

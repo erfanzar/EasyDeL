@@ -106,6 +106,7 @@ def huggingface_to_easydel(
         A dictionary of the weights and biases in a format that can be
         used by flax (it's an UnFlattenDict)
     """
+    import torch
     embedding_layer_names = set(embedding_layer_names or [])
     layer_norm_names = set(layer_norm_names or [])
     _l = len(".weight")
@@ -143,6 +144,8 @@ def huggingface_to_easydel(
             if remove_state_dict:
                 del tensor
                 gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             # Apply sharding functions if provided
             if shard_fns and key_tuple in shard_fns:
@@ -157,6 +160,9 @@ def huggingface_to_easydel(
 
         pbar.close()
         gc.collect()  # Call garbage collection once after processing all tensors
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         return traverse_util.unflatten_dict(flax_dict)
 
 
