@@ -134,7 +134,7 @@ def huggingface_to_easydel(
         flax_dict = {}
         pbar = tqdm(total=len(state_dict), disable=not verbose)
         pbar.set_description("Converting Model")
-
+        missed_shardings = 0
         for key in list(state_dict.keys()):
             tensor = state_dict.pop(key)
             new_key = key
@@ -158,14 +158,18 @@ def huggingface_to_easydel(
                 _clear()
 
             # Apply sharding functions if provided
-            if shard_fns and key_tuple in shard_fns:
-                array = shard_fns[key_tuple](array)
+            if shard_fns:
+                if key_tuple in shard_fns:
+                    array = shard_fns[key_tuple](array)
+                else:
+                    missed_shardings += 1
             if convert_to_8bit and params_pattern_selection.search("/".join(key_tuple)):
                 array = fjformer.linen.linen.Int8Params(
                     *fjformer.linen.quantize(array)
                 )
 
             flax_dict[key_tuple] = array
+            pbar.set_postfix(missed_shardings=missed_shardings)
             pbar.update(1)
 
         pbar.close()
