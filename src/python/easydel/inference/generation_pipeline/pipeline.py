@@ -203,7 +203,7 @@ class GenerationPipeline:
             sequences=sequences,
             running_token=input_ids,
             is_sent_finished=is_sent_finished,
-            prng_key=self._rng_gen.RNG_GEN,
+            prng_key=self._rng_gen.rng,
             model_kwargs=model_kwargs
         )
 
@@ -253,14 +253,14 @@ class GenerationPipeline:
             )
 
         if input_ids.shape[1] > 1:
-            if self.over_compiled_func is None:
-                self.over_compiled_func = compile_function(
-                    generation_func_body,
-                    (generation_state,),
-                    {},
-                    mesh=self.mesh
-                )
-            generation_state = self.over_compiled_func(generation_state)
+            # if self.over_compiled_func is None:
+            #     self.over_compiled_func = compile_function(
+            #         generation_func_body,
+            #         (generation_state,),
+            #         {},
+            #         mesh=self.mesh
+            #     )
+            generation_state = generation_func_body(generation_state)
         if stream:
             if self.compiled_func is None:
                 self.compiled_func = compile_function(
