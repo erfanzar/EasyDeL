@@ -11,8 +11,8 @@ import websocket
 import websockets
 from fjformer import with_sharding_constraint, match_partition_rules, make_shard_and_gather_fns, get_dtype
 from jax import numpy as jnp
-from ..modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
-from ..etils.etils import get_logger
+from ...modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
+from ...etils.etils import get_logger
 from flax.core import FrozenDict
 from transformers import PreTrainedTokenizerBase, GenerationConfig
 from typing import Callable, Tuple, List, Union, Dict
