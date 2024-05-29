@@ -106,18 +106,18 @@ def create_rst(name, children, output_dir):
             for child_name, child_value in children.items():
                 if isinstance(child_value, str):
                     children_name = child_value.replace("src.python.easydel.", "")
-                    rst_file.write(f"   {children_name}\n")
+                    rst_file.write(f"   {children_name.replace('.rst', '')}\n")
                 else:
                     assert isinstance(child_value, dict)
                     child_value = flatten_dict(child_value)
                 create_rst(child_name, child_value, output_dir)
     else:
         children_name = children.replace("src.python.easydel.", "")
-        ca = "/".join([s.strip() for s in children_name.split(".")[1:-1]]).replace("_", " ")
+        ca = "/".join([s.replace("_", " ").strip() for s in children_name.split(".")[1:-1]])
         name = f'``{ca}`` module'
         with open(os.path.join(output_dir, children_name), "w") as rst_file:
             rst_file.write(f"{name.replace('_', ' ')}\n{'=' * len(name)}\n\n")
-            children = children.replace(".rst", "")
+            children = children.replace(".rst", "").replace("src.python.", "")
             rst_file.write(
                 f".. automodule:: {children}\n"
                 f"    :members:\n"

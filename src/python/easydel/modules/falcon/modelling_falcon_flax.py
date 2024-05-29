@@ -312,7 +312,7 @@ class FlaxFalconMlp(nn.Module):
 
     def setup(self) -> None:
         self.dense_h_to_4h = Dense(
-            features=self.config.ffn_hidden_size,
+            features=self.config.ff_factor * self.config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=self.config.bias,
@@ -757,8 +757,7 @@ class FlaxFalconPretrainedModel(EasyDeLFlaxPretrainedModel):
             "position_ids": position_ids,
         }
 
-    @staticmethod
-    def update_inputs_for_generation(model_outputs, model_kwargs):
+    def update_inputs_for_generation(self, model_outputs, model_kwargs):
         model_kwargs["past_key_values"] = model_outputs.past_key_values
         model_kwargs["position_ids"] = model_kwargs["position_ids"][:, -1:] + 1
         return model_kwargs
