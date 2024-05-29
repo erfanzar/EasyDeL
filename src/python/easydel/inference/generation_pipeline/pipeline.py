@@ -5,7 +5,7 @@ from typing import Optional, Union, Dict
 import flax.core
 import jax
 
-from src.python.easydel.modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
+from ...modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 from jax import numpy as jnp, random, lax
 from fjformer import GenerateRNG
 from transformers import PreTrainedTokenizer
