@@ -1,5 +1,5 @@
-`` ring attention`` module
-==========================
+``ring attention`` module
+=========================
 
 .. automodule:: easydel.modules._ring_attention
     :members:

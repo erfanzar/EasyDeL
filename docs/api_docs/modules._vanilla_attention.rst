@@ -1,5 +1,5 @@
-`` vanilla attention`` module
-=============================
+``vanilla attention`` module
+============================
 
 .. automodule:: easydel.modules._vanilla_attention
     :members:

@@ -20,6 +20,6 @@ Trainer
    trainer.dpo.utils
    trainer.dpo.dpo_trainer
    trainer.vision_causal_language_model_trainer.fwd_bwd_functions
-   trainer.vision_causal_language_model_trainer.vision_causal_language_model_trainer.rst
-   trainer.vision_causal_language_model_trainer.modelling_output.rst
-   trainer.utils.rst
+   trainer.vision_causal_language_model_trainer.vision_causal_language_model_trainer
+   trainer.vision_causal_language_model_trainer.modelling_output
+   trainer.utils
