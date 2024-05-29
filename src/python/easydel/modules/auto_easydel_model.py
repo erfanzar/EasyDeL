@@ -506,9 +506,12 @@ class AutoEasyDeLModelForCausalLM:
         if verbose_params:
             print(f"PyTorch - HF Model contains {sum(p.numel() for p in model.parameters()) / 1e9} Billion Parameters")
         cfg = cfg.from_pretrained(pretrained_model_name_or_path)
-        t_state_dict = model.state_dict()
+        state_dict = model.state_dict()
+
+        # Clear and collect memory after deleting the model
         del model
         gc.collect()
+
         logger.debug(f"adding model basic EasyDeL configurations.")
         if hasattr(cfg, 'add_jax_args'):
             cfg.add_jax_args()
@@ -543,14 +546,12 @@ class AutoEasyDeLModelForCausalLM:
             s.replace(".kernel", ".weight").replace(".scale", ".weight").replace(".embedding", ".weight") for s in
             list(flax.traverse_util.flatten_dict(ed_model.params_shape_tree, sep=".").keys())
         ]
-        state_dict = {}
-        for k in list(t_state_dict.keys()):
-            tensor = t_state_dict.pop(k)
-            if k in needs:
-                state_dict[k] = tensor
-            else:
+        for k in list(state_dict.keys()):
+            if k not in needs:
+                state_dict.pop(k)
                 logger.debug(f"removing {k} from weights as it was not needed by flax model")
-        del t_state_dict
+        gc.collect()
+
         if shard_fns is not None:
             if auto_shard_params:
                 warnings.warn(
@@ -603,8 +604,8 @@ class AutoEasyDeLModelForCausalLM:
                 params_pattern_selection=params_pattern_selection,
                 remove_state_dict=True
             )
-        logger.debug("deleting huggingface-model")
 
+        # Clear and collect memory after converting the model
         del state_dict
         gc.collect()
 
