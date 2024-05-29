@@ -1118,8 +1118,7 @@ class FlaxMistralForCausalLM(FlaxMistralPretrainedModel):
             "position_ids": position_ids,
         }
 
-    @staticmethod
-    def update_inputs_for_generation(model_outputs, model_kwargs):
+    def update_inputs_for_generation(self, model_outputs, model_kwargs):
         model_kwargs["past_key_values"] = model_outputs.past_key_values
         model_kwargs["position_ids"] = model_kwargs["position_ids"][:, -1:] + 1
         return model_kwargs
