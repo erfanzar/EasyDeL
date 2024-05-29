@@ -5,6 +5,17 @@ static_joins = "\n\t:members:\n\t:undoc-members:\n\t:show-inheritance:"
 cache = {}
 
 
+def flatten_dict(d, parent_key='', sep='-'):
+    items = []
+    for k, v in d.items():
+        new_key = parent_key + sep + k if parent_key else k
+        if isinstance(v, dict):
+            items.extend(flatten_dict(v, new_key, sep=sep).items())
+        else:
+            items.append((new_key, v))
+    return dict(items)
+
+
 def unflatten_dict(xs, sep=None):
     assert isinstance(xs, dict), f"input is not a dict; it is a {type(xs)}"
     result = {}
@@ -76,74 +87,81 @@ def run(project_locations="src/python/easydel", docs_file="docs/api_docs/", star
                     key = key.split("_")
                     capitalized_words = [word.capitalize() for word in key if word != ""]
                     edited_category_tuple += (" ".join(capitalized_words),)
-
-                cache[edited_category_tuple] = start_head.replace("/", ".") + "." + markdown_filename
+                #
+                cache[edited_category_tuple] = start_head.replace("/", ".") + "." + markdown_filename.replace(".py", "")
             else:
                 run(current_file)
     except NotADirectoryError:
         ...
 
 
-def create_rst_pages(data, output_dir=".", parent_page=None):
-    """
-    Recursively generates .rst pages from a nested dictionary.
+def create_rst(name, children, output_dir):
+    """Create an .rst file with a toctree linking its children."""
+    rst_path = os.path.join(output_dir, f"{name}.rst")
+    # print(rst_path)
+    if isinstance(children, dict):
+        with open(rst_path, "w") as rst_file:
+            rst_file.write(f"{name.replace('_', ' ')}\n{'=' * len(name)}\n\n")
+            rst_file.write(".. toctree::\n   :maxdepth: 2\n\n")
+            for child_name, child_value in children.items():
+                if isinstance(child_value, str):
+                    children_name = child_value.replace("src.python.easydel.", "")
+                    rst_file.write(f"   {children_name}\n")
+                else:
+                    assert isinstance(child_value, dict)
+                    child_value = flatten_dict(child_value)
+                create_rst(child_name, child_value, output_dir)
+    else:
+        children_name = children.replace("src.python.easydel.", "")
+        ca = "/".join([s.strip() for s in children_name.split(".")[1:-1]]).replace("_", " ")
+        name = f'``{ca}`` module'
+        with open(os.path.join(output_dir, children_name), "w") as rst_file:
+            rst_file.write(f"{name.replace('_', ' ')}\n{'=' * len(name)}\n\n")
+            children = children.replace(".rst", "")
+            rst_file.write(
+                f".. automodule:: {children}\n"
+                f"    :members:\n"
+                f"    :undoc-members:\n"
+                f"    :show-inheritance:\n"
+            )
 
-    Args:
-        data (dict): The dictionary representing the page structure.
-        output_dir (str, optional): The directory to write the .rst files to. Defaults to "." (current directory).
-        parent_page (str, optional): The name of the parent page (used for creating links). Defaults to None.
-    """
 
-    for key, value in data.items():
-        # Create a file-system friendly page name
-        page_name = key.replace(" ", "_") + ".rst"
+def generate_api_docs(structure, output_dir):
+    """Recursively generate .rst files based on the given dictionary structure."""
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
 
-        # Create the full path to the .rst file
-        file_path = os.path.join(output_dir, page_name)
-
-        # Construct the content of the .rst file
-        content = f"{key}\n{'=' * len(key)}\n\n"  # Title with underline
-
-        # Add a link back to the parent page if it exists
-        if parent_page:
-            content += f".. automodule:: {parent_page.replace('.rst', '')}\n   :members:\n\n"
-
-        # Handle nested dictionaries (sub-pages)
-        if isinstance(value, dict):
-            create_rst_pages(value, output_dir, page_name)  # Recursive call
-            # Add links to the sub-pages
-            for sub_key in value.keys():
-                sub_page_name = sub_key.replace(" ", "_") + ".rst"
-                content += f".. toctree::\n   :maxdepth: 2\n\n   {sub_page_name.replace('.rst','')}\n\n"
-        # Handle leaf nodes (links to existing .rst files)
-        elif isinstance(value, str):
-            content += f".. automodule:: {value.replace('.rst', '')}\n   :members:\n   :undoc-members:\n   :show-inheritance:\n"
-
-            # Write the content to the .rst file
-        with open(file_path, "w") as f:
-            f.write(content)
+    for root_name, children in structure.items():
+        create_rst(root_name.replace(" ", "_"), children, output_dir)
 
 
 def main():
     global cache
 
     for current_file in get_inner("docs/api_docs/"):
-        if current_file.startswith("docs/api_docs/generated_"):
+        if current_file.startswith("docs/api_docs/"):
             os.remove(current_file)
             # print("Removed Past generated file: " + current_file)
     run()
 
     cache = {("APIs",) + k: v for k, v in cache.items()}
     pages = unflatten_dict(cache)
-    # index_lines = [
-    #     "API Home",
-    #     "====\n",
-    #     ".. toctree::\n",
-    #     "    :maxdepth: 2\n",
-    #     "    :caption: Contents\n"
-    # ]
+    base_dir = "docs/api_docs/"
+    generate_api_docs(pages, base_dir, )
+    uf_f = flatten_dict(pages)
+    st = []
+    for k, v in uf_f.items():
+        st.append(k.split("-")[1])
+    st = set(st)
+    apis_index = """EasyDeL APIs 🔮
+====
 
-    create_rst_pages(pages, "docs/api_docs/")
+.. toctree::
+   :maxdepth: 2
+   
+   {form}
+   """.format(form="\n   ".join(sorted(st)))
+    open(os.path.join(base_dir, "APIs.rst"), "w").write(apis_index)
 
 
 if __name__ == "__main__":
