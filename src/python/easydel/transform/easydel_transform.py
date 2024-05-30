@@ -157,8 +157,8 @@ def huggingface_to_easydel(
                 del tensor
                 _clear()
 
-            # Apply sharding functions if provided
-            if shard_fns:
+            # Apply sharding functions if
+            if shard_fns is not None:
                 if key_tuple in shard_fns:
                     array = shard_fns[key_tuple](array)
                 else:
@@ -167,7 +167,6 @@ def huggingface_to_easydel(
                 array = fjformer.linen.linen.Int8Params(
                     *fjformer.linen.quantize(array)
                 )
-
             flax_dict[key_tuple] = array
             pbar.set_postfix(missed_shardings=missed_shardings)
             pbar.update(1)
