@@ -49,7 +49,7 @@ def main():
     )
     partition_specs = match_partition_rules(partition_rules, params=params)
     with mesh:
-        shard_fns, _ = make_shard_and_gather_fns(partition_specs=partition_specs)
+        shard_fns, _ = make_shard_and_gather_fns(partition_specs=partition_specs, mesh=mesh)
         new_params = jax.tree_util.tree_map(lambda f, p: f(p), shard_fns, params)
     del params
     time.sleep(0.2)

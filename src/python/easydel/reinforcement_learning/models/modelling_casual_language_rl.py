@@ -189,7 +189,8 @@ class AutoRLModelForCasualLMWithValueHead:
                     match_partition_rules(
                         partition_rules,
                         params
-                    )
+                    ),
+                    mesh=self.module.config.jax_mesh(),
                 )[0],
                 params
             )

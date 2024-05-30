@@ -1,4 +1,4 @@
-from fjformer.func.loss_func import cross_entropy_loss_and_accuracy
+from fjformer.functions.loss_func import cross_entropy_loss_and_accuracy
 
 import jax
 from jax.sharding import PartitionSpec
