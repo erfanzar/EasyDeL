@@ -344,7 +344,9 @@ class BaseTrainer:
         def calculate_steps(dataset: Union[Dataset, IterableDataset], is_train: bool):
             """Return total number of steps to train or evaluate on."""
             if hasattr(dataset, "__len__"):
-                num_steps = len(dataset) * (self.arguments.num_train_epochs if is_train else 1)
+                total_data_len = len(dataset)
+                batch_size = self.arguments.total_batch_size if is_train else self.arguments.eval_batch_size
+                num_steps = (total_data_len + batch_size - 1) // batch_size * (self.arguments.num_train_epochs if is_train else 1)
                 max_steps = self.arguments.max_training_steps if is_train else self.arguments.max_evaluation_steps
                 return min(num_steps, max_steps) if max_steps else num_steps
             else:
