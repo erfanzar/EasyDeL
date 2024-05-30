@@ -126,6 +126,7 @@ class EasyDeLServeEngine:
     @staticmethod
     def create_shard_and_gather_functions(
             parameters: dict,
+            mesh,
             partition_rules: Tuple[Tuple[str, PartitionSpec]],
             dtype: Union[jax.numpy.dtype, str] = "fp16"
     ):
@@ -149,6 +150,7 @@ class EasyDeLServeEngine:
         partition_specs = match_partition_rules(partition_rules, parameters)
         shard_fns, gather_fns = make_shard_and_gather_fns(
             partition_specs=partition_specs,
+            mesh=mesh,
             dtype_specs=get_dtype(dtype)
         )
         return shard_fns, gather_fns, partition_specs
@@ -179,7 +181,7 @@ class EasyDeLServeEngine:
         """
 
         partition_specs = match_partition_rules(params=params, rules=partition_rules)
-        shard_fns, _ = make_shard_and_gather_fns(partition_specs, get_dtype(serve_config.dtype))
+        shard_fns, _ = make_shard_and_gather_fns(partition_specs, mesh, get_dtype(serve_config.dtype))
 
         with mesh:
             params = jax.tree_map(

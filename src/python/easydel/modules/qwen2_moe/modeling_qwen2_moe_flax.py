@@ -6,7 +6,7 @@ import fjformer
 from einops import einops
 import jax
 import jax.numpy as jnp
-from fjformer.func import auxiliary_load_balancing_loss_func
+from fjformer.functions import auxiliary_load_balancing_loss_func
 from jax import lax
 from jax.experimental.shard_map import shard_map
 from fjformer.linen import Dense

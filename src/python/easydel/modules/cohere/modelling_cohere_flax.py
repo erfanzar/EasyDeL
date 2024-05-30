@@ -8,7 +8,7 @@ import flax.linen.partitioning
 import flax.struct
 import jax
 import jax.numpy as jnp
-from fjformer.func import auxiliary_load_balancing_loss_func
+from fjformer.functions import auxiliary_load_balancing_loss_func
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks
 from flax.traverse_util import flatten_dict, unflatten_dict

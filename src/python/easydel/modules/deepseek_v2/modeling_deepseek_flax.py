@@ -13,7 +13,7 @@ from flax.core import freeze, unfreeze, FrozenDict
 from typing import Union, Optional, Tuple
 from flax.linen import partitioning as nn_partitioning, combine_masks
 from transformers.modeling_flax_outputs import FlaxMaskedLMOutput, FlaxBaseModelOutput, FlaxCausalLMOutput
-from fjformer.func import auxiliary_load_balancing_loss_func
+from fjformer.functions import auxiliary_load_balancing_loss_func
 from ..attention_module import AttentionModule
 from ..flax_modelling_utils import (
     ACT2FN,

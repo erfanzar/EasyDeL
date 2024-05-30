@@ -383,7 +383,7 @@ class EasyDeLState(struct.PyTreeNode):
         if depth_target is None:
             depth_target = ["params", "params"]
         from ..modules.auto_easydel_model import get_modules_by_type, AutoShardAndGatherFunctions
-        from fjformer.partition_utils import create_mesh
+        from fjformer.sharding import create_mesh
         mesh = create_mesh(sharding_axes_dims, sharding_axes_names)
         if auto_shard_state:
             assert module_config is not None, (
@@ -712,7 +712,8 @@ class EasyDeLState(struct.PyTreeNode):
             )
             shard_fns, gather_fns = make_shard_and_gather_fns(
                 partition_specs=partition_specs,
-                dtype_specs=dtype
+                dtype_specs=dtype,
+                mesh=mesh
             )
         if mesh is None:
             mesh = self.module_config.jax_mesh()
