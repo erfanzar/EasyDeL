@@ -125,7 +125,7 @@ class FlaxMptAttention(BaseJAXAttentionModule):
             force_float32_tpu=True,
             attn_mechanism=self.config.attn_mechanism,
             dtype=self.dtype,
-            mesh=self.config.jax_mesh(),
+            mesh=self.config.get_mesh(),
             sm_scale=1 / math.sqrt(self.head_dim),
             axis_name=self.config.attention_axis_name,
             base_module_class=self.config

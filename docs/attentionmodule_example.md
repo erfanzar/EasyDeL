@@ -158,7 +158,7 @@ flash_attention = AttentionModule(
     generation_bias_partition_spec=config.generation_bias_partition_spec,
     value_partition_spec=config.value_partition_spec,
     scan_ring_attention=config.scan_ring_attention,
-    mesh=config.jax_mesh(),
+    mesh=config.get_mesh(),
     sm_scale=1 / math.sqrt(q.shape[-1]),
 )
 
@@ -191,11 +191,11 @@ normal_attention = AttentionModule(
     generation_bias_partition_spec=config.generation_bias_partition_spec,
     value_partition_spec=config.value_partition_spec,
     scan_ring_attention=config.scan_ring_attention,
-    mesh=config.jax_mesh(),
+    mesh=config.get_mesh(),
     sm_scale=1 / math.sqrt(q.shape[-1]),
 )
 
-with config.jax_mesh():
+with config.get_mesh():
     flash_attn_out = flash_attention(
         query_states=q,
         key_states=k,

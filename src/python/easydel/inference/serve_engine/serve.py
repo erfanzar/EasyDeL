@@ -358,7 +358,7 @@ class EasyDeLServeEngine:
                 params=params,
                 partition_rules=partition_rules,
                 serve_config=serve_config,
-                mesh=llm.config.jax_mesh()
+                mesh=llm.config.get_mesh()
             )
 
         return cls(
@@ -396,7 +396,7 @@ class EasyDeLServeEngine:
             A generator that yields the predicted text and the number of
             tokens generated
         """
-        with self.llm.config.jax_mesh():
+        with self.llm.config.get_mesh():
             fixed_pad = self.serve_config.max_sequence_length - self.serve_config.max_compile_tokens
             tokens = self.prefix_tokenizer(
                 string,

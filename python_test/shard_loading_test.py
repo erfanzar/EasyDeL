@@ -30,7 +30,7 @@ def main():
     partition_specs = match_partition_rules(config.get_partition_rules(True), dummy_model.params_shape_tree)
     shard_fns, gather_fns = make_shard_and_gather_fns(
         partition_specs=partition_specs,
-        mesh=dummy_model.config.jax_mesh(),
+        mesh=dummy_model.config.get_mesh(),
         dtype_specs=jax.numpy.float16
     )
 

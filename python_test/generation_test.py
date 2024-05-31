@@ -119,7 +119,7 @@ class EasyModelsGenerationTest(TestCase):
             precision=self.precision,
             _do_init=True
         )
-        mesh = config.jax_mesh()
+        mesh = config.get_mesh()
         server_config = ed.JAXServerConfig(
             batch_size=1,
             max_sequence_length=self.max_position_embeddings,

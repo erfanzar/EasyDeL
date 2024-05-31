@@ -170,7 +170,7 @@ class AutoRLModelForCasualLMWithValueHead:
         return generate
 
     def get_mesh(self):
-        return self.module.config.jax_mesh()
+        return self.module.config.get_mesh()
 
     def generate(self, input_id, attention_mask, params: dict | flax.core.FrozenDict = None):
         params = self.module_params if params is None else params
@@ -190,7 +190,7 @@ class AutoRLModelForCasualLMWithValueHead:
                         partition_rules,
                         params
                     ),
-                    mesh=self.module.config.jax_mesh(),
+                    mesh=self.module.config.get_mesh(),
                 )[0],
                 params
             )

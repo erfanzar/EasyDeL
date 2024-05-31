@@ -594,7 +594,7 @@ class AutoEasyDeLModelForCausalLM:
                 input_shape=input_shape,  # type:ignore
                 config_kwargs=config_kwargs
             )
-        with cfg.jax_mesh():
+        with cfg.get_mesh():
             logger.debug("converting huggingface-model to easydel-model.")
             params_pattern_selection = None
             if load_in_8bit:
@@ -773,7 +773,7 @@ class AutoShardAndGatherFunctions:
         shard_fns, gather_fns = make_shard_and_gather_fns(
             partition_specs=partition_specs,
             dtype_specs=dtype_specs,
-            mesh=config.jax_mesh()
+            mesh=config.get_mesh()
         )
         if depth_target is not None:
             for dp in depth_target[::-1]:

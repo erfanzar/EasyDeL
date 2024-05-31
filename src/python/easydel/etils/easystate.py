@@ -716,7 +716,7 @@ class EasyDeLState(struct.PyTreeNode):
                 mesh=mesh
             )
         if mesh is None:
-            mesh = self.module_config.jax_mesh()
+            mesh = self.module_config.get_mesh()
         with mesh:
             return self.replace(
                 params=jax.tree_util.tree_map(

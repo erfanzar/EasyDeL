@@ -137,7 +137,8 @@ class GenerationPipeline:
             generation_config: Optional[GenerationPipelineConfig] = None,
             add_params_field=False,
             seed: Optional[int] = None,
-            input_partition_spec: sharding.PartitionSpec = sharding.PartitionSpec(("dp", "fsdp"))
+            input_partition_spec: sharding.PartitionSpec = sharding.PartitionSpec(("dp", "fsdp")),
+            partition_rules=None
     ):
         if generation_config is None:
             generation_config = GenerationPipelineConfig()
@@ -151,8 +152,17 @@ class GenerationPipeline:
         self.over_compiled_func = None
         self._rng_gen = GenerateRNG(seed or 42)
         self.input_partition_spec = input_partition_spec
-        self.mesh = self.model.config.jax_mesh()
-
+        self.mesh = self.model.config.get_mesh()
+        if partition_rules is None:
+            partition_rules = self.model.config.get_partition_rules(True)
+        self.model_sharding = self.model.get_named_sharding(partition_rules=partition_rules)
+        self.input_sharding = jax.sharding.NamedSharding(spec=input_partition_spec, mesh=self.model.mesh)
+        self.gen_input_sharding = jax.sharding.NamedSharding(
+            spec=jax.sharding.PartitionSpec(input_partition_spec[0], None),
+            mesh=self.model.mesh
+        )
+        self.state_sample = None
+        self.state_sample_ms = None  # multi sequences
         # Ensure essential token IDs are set
         if self.generation_config.pad_token_id is None:
             self.generation_config.pad_token_id = tokenizer.pad_token_id
@@ -174,107 +184,111 @@ class GenerationPipeline:
             input_ids: jax.Array,
             attention_mask: Optional[jax.Array] = None,
             position_ids: Optional[jax.Array] = None,
-            stream: bool = True
     ):
-        with self.mesh:
-            eos_token_id = jnp.array(self.generation_config.eos_token_id, dtype=jnp.int32)
-            pad_token_id = jnp.array(self.generation_config.pad_token_id, dtype=jnp.int32)
-            batch_size, cur_len = input_ids.shape
-            max_length = cur_len + self.generation_config.max_new_tokens
-            cur_len = jnp.array(cur_len)
-            sequences = jnp.full((batch_size, max_length), pad_token_id, dtype=jnp.int32)
-            sequences = lax.dynamic_update_slice(sequences, input_ids, (0, 0))
-            is_sent_finished = jnp.zeros((batch_size,), dtype=jnp.bool_)
 
-            if attention_mask is None:
-                warnings.warn(
-                    "`attention_mask` is not provided, it's recommended to "
-                    "pass an attention mask for better results."
-                )
-                attention_mask = jnp.ones_like(input_ids)
+        eos_token_id = jnp.array(self.generation_config.eos_token_id, dtype=jnp.int32)
+        pad_token_id = jnp.array(self.generation_config.pad_token_id, dtype=jnp.int32)
+        batch_size, cur_len = input_ids.shape
+        max_length = cur_len + self.generation_config.max_new_tokens
+        cur_len = jnp.array(cur_len)
+        sequences = jnp.full((batch_size, max_length), pad_token_id, dtype=jnp.int32)
+        sequences = lax.dynamic_update_slice(sequences, input_ids, (0, 0))
+        is_sent_finished = jnp.zeros((batch_size,), dtype=jnp.bool_)
 
-            if position_ids is None:
-                position_ids = (attention_mask.cumsum(axis=-1, dtype="i4") - 1)  # Check this logic
-            assert position_ids.shape == attention_mask.shape, (
-                "`position_ids` and `attention_mask` must have the same shape."
+        if attention_mask is None:
+            warnings.warn(
+                "`attention_mask` is not provided, it's recommended to "
+                "pass an attention mask for better results."
             )
-            model_kwargs = self.model.prepare_inputs_for_generation(input_ids, max_length, attention_mask)
-            # Initial GenerationContent
-            generation_state = SampleState(
-                cur_len=cur_len,
-                sequences=sequences,
-                running_token=input_ids,
-                is_sent_finished=is_sent_finished,
-                prng_key=self._rng_gen.rng,
-                model_kwargs=model_kwargs
+            attention_mask = jnp.ones_like(input_ids)
+
+        if position_ids is None:
+            position_ids = (attention_mask.cumsum(axis=-1, dtype="i4") - 1)  # Check this logic
+        assert position_ids.shape == attention_mask.shape, (
+            "`position_ids` and `attention_mask` must have the same shape."
+        )
+        model_kwargs = self.model.prepare_inputs_for_generation(input_ids, max_length, attention_mask)
+        # Initial GenerationContent
+        generation_state = SampleState(
+            cur_len=cur_len,
+            sequences=sequences,
+            running_token=input_ids,
+            is_sent_finished=is_sent_finished,
+            prng_key=self._rng_gen.rng,
+            model_kwargs=model_kwargs
+        )
+
+        def sample_search_cond_fn(state):
+            """state termination condition fn."""
+            all_sequence_finished = jnp.all(state.is_sent_finished)
+            return ~jnp.logical_or(all_sequence_finished, state.cur_len >= max_length)
+
+        def inference_step(logits, token, prng_key):
+            if self.generation_config.do_sample:
+                logits = logits / self.generation_config.temperature
+                logits = apply_repetition_penalty(logits, token, self.generation_config.repetition_penalty)
+                if self.generation_config.top_k > 0:
+                    logits = apply_top_k_sampling(logits, self.generation_config.top_k)
+                if self.generation_config.top_p < 1.0:
+                    logits = apply_top_p_sampling(logits, self.generation_config.top_p)
+                probs = jax.nn.softmax(logits, axis=-1)
+                return jax.random.categorical(prng_key, jnp.log(probs), axis=-1).reshape(-1)
+
+            return jnp.argmax(jax.nn.softmax(logits, axis=-1), axis=-1).reshape(-1)
+
+        def generation_func_body(params, state: SampleState):
+            model_outputs = self.model(
+                input_ids=state.running_token,
+                params=params,
+                add_params_field=self.add_params_field,
+                return_dict=True,
+                **state.model_kwargs
             )
 
-            def sample_search_cond_fn(state):
-                """state termination condition fn."""
-                all_sequence_finished = jnp.all(state.is_sent_finished)
-                return ~jnp.logical_or(all_sequence_finished, state.cur_len >= max_length)
+            logits = model_outputs.logits
 
-            def inference_step(logits, token, prng_key):
-                if self.generation_config.do_sample:
-                    logits = logits / self.generation_config.temperature
-                    logits = apply_repetition_penalty(logits, token, self.generation_config.repetition_penalty)
-                    if self.generation_config.top_k > 0:
-                        logits = apply_top_k_sampling(logits, self.generation_config.top_k)
-                    if self.generation_config.top_p < 1.0:
-                        logits = apply_top_p_sampling(logits, self.generation_config.top_p)
-                    probs = jax.nn.softmax(logits, axis=-1)
-                    return jax.random.categorical(prng_key, jnp.log(probs), axis=-1).reshape(-1)
+            next_token = inference_step(logits[:, -1], state.running_token, state.prng_key)
 
-                return jnp.argmax(jax.nn.softmax(logits, axis=-1), axis=-1).reshape(-1)
+            next_token = next_token * ~state.is_sent_finished + pad_token_id * state.is_sent_finished
+            next_is_sent_finished = state.is_sent_finished | (next_token == eos_token_id)
+            next_token = next_token[:, None]
+            next_sequences = lax.dynamic_update_slice(state.sequences, next_token, (0, state.cur_len))
+            next_model_kwargs = self.model.update_inputs_for_generation(model_outputs, state.model_kwargs)
+            return SampleState(
+                cur_len=state.cur_len + 1,
+                sequences=next_sequences,
+                running_token=next_token,
+                is_sent_finished=next_is_sent_finished,
+                prng_key=random.split(state.prng_key, 2)[-1],
+                model_kwargs=next_model_kwargs,
+            )
 
-            def generation_func_body(state: SampleState):
-                model_outputs = self.model(
-                    input_ids=state.running_token,
-                    params=self.params,
-                    add_params_field=self.add_params_field,
-                    return_dict=True,
-                    **state.model_kwargs
+        if input_ids.shape[1] > 1:
+            if self.state_sample_ms is None:
+                self.state_sample_ms = compile_function(
+                    generation_func_body,
+                    (self.params, generation_state),
+                    {},
+                    mesh=self.mesh,
+                    in_shardings=(
+                        self.model_sharding,
+                        SampleState(None, self.input_sharding, self.input_sharding, None, None, None)),
+                    out_shardings=SampleState(None, self.input_sharding, self.input_sharding, None, None, None)
                 )
+            generation_state = self.state_sample_ms(self.params, generation_state)
 
-                logits = model_outputs.logits
-
-                next_token = inference_step(logits[:, -1], state.running_token, state.prng_key)
-
-                next_token = next_token * ~state.is_sent_finished + pad_token_id * state.is_sent_finished
-                next_is_sent_finished = state.is_sent_finished | (next_token == eos_token_id)
-                next_token = next_token[:, None]
-                next_sequences = lax.dynamic_update_slice(state.sequences, next_token, (0, state.cur_len))
-                next_model_kwargs = self.model.update_inputs_for_generation(model_outputs, state.model_kwargs)
-                return SampleState(
-                    cur_len=state.cur_len + 1,
-                    sequences=next_sequences,
-                    running_token=next_token,
-                    is_sent_finished=next_is_sent_finished,
-                    prng_key=random.split(state.prng_key, 2)[-1],
-                    model_kwargs=next_model_kwargs,
-                )
-
-            if input_ids.shape[1] > 1:
-                # if self.over_compiled_func is None:
-                #     self.over_compiled_func = compile_function(
-                #         generation_func_body,
-                #         (generation_state,),
-                #         {},
-                #         mesh=self.mesh
-                #     )
-                generation_state = generation_func_body(generation_state)
-            if stream:
-                yield generation_state.running_token
-                if self.compiled_func is None:
-                    self.compiled_func = compile_function(
-                        generation_func_body,
-                        (generation_state,),
-                        {},
-                        mesh=self.mesh,
-                    )
-                while sample_search_cond_fn(generation_state):
-                    generation_state = self.compiled_func(generation_state)
-                    yield generation_state.running_token
-            else:
-                generation_state = lax.while_loop(sample_search_cond_fn, generation_func_body, generation_state)
-                return generation_state.sequences
+        yield generation_state.running_token
+        if self.state_sample is None:
+            self.state_sample = compile_function(
+                generation_func_body,
+                (self.params, generation_state),
+                {},
+                mesh=self.mesh,
+                in_shardings=(
+                    self.model_sharding,
+                    SampleState(None, self.input_sharding, self.gen_input_sharding, None, None, None)),
+                out_shardings=SampleState(None, self.input_sharding, self.gen_input_sharding, None, None, None)
+            )
+        while sample_search_cond_fn(generation_state):
+            generation_state = self.state_sample(self.params, generation_state)
+            yield generation_state.running_token
