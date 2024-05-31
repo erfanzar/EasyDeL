@@ -144,7 +144,7 @@ class FlaxFalconAttention(BaseJAXAttentionModule):
             force_float32_tpu=True,
             attn_mechanism=config.attn_mechanism,
             dtype=self.dtype,
-            mesh=config.jax_mesh(),
+            mesh=config.get_mesh(),
             sm_scale=self.inv_norm_factor,
             axis_name=config.attention_axis_name,
             base_module_class=config,

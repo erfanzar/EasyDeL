@@ -480,7 +480,7 @@ class BaseJAXAttentionModule(nn.Module):
             *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
             cur_index = cache_index.value
             if query_states.shape[1] == 1 and self.config.use_sharded_kv_caching:
-                mesh = self.config.jax_mesh()
+                mesh = self.config.get_mesh()
 
                 def fn(
                         _cached_key,

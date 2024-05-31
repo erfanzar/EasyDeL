@@ -46,7 +46,7 @@ def main():
     )
 
     pytorch_dict = torch_model.state_dict()
-    with config.jax_mesh():
+    with config.get_mesh():
         params = transform_fn(
             pytorch_dict,
             device=jax.devices("cpu")[0],  # This got no use but incase that some key missmatch and not getting

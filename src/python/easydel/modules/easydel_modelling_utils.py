@@ -195,8 +195,8 @@ class EasyDeLPretrainedConfig(PretrainedConfig):
             create_device_mesh(resh), axis_names
         )
 
-    def jax_mesh(self) -> Mesh:
-        """The jax_mesh function is a helper function that creates a Mesh object from the
+    def get_mesh(self) -> Mesh:
+        """The get_mesh function is a helper function that creates a Mesh object from the
         axis_dims and axis_names attributes of an object, which are assumed to be lists of integers and strings, respectively.
         The backend attribute is also used if it exists.
 
@@ -215,9 +215,16 @@ class EasyDeLPretrainedConfig(PretrainedConfig):
                 self.axis_names,
                 dict
             ) else self.axis_names,
-            backend=(self.backend if self.backend is not None else "") if hasattr(
-                self, 'backend') else ""
+            backend=(self.backend if self.backend is not None else "") if hasattr(self, 'backend') else ""
         )
+
+    @property
+    def mesh(self):
+        return self.get_mesh()
+
+    def jax_mesh(self):
+        warnings.warn("`jax_mesh` is deprecated use `get_mesh` or `mesh`")
+        return self.get_mesh()
 
     def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
 
@@ -516,6 +523,20 @@ class EasyDeLFlaxPretrainedModel(FlaxPreTrainedModel):
             seed=seed,
             dtype=dtype,
             _do_init=_do_init
+        )
+
+    @property
+    def mesh(self):
+        return self.config.get_mesh()
+
+    def get_named_sharding(self, partition_rules=None, partition_specs=None):
+        if partition_rules is None:
+            partition_rules = self.config.get_partition_rules(True)
+        if partition_specs is None:
+            partition_specs = fjformer.match_partition_rules(partition_rules, self.params_shape_tree)
+        return jax.tree_util.tree_map(
+            lambda spec: jax.sharding.NamedSharding(spec=spec, mesh=self.mesh, ),
+            partition_specs
         )
 
     def get_input_embeddings(self):

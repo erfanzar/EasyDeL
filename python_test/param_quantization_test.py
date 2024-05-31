@@ -129,7 +129,7 @@ class EasyModelsTest(TestCase):
             use_sharding_constraint=self.use_sharding_constraint,
             scan_mlp_chunk_size=self.scan_mlp_chunk_size
         )
-        mesh = config.jax_mesh()
+        mesh = config.get_mesh()
 
         with mesh:
             partition_specs = match_partition_rules(config.get_partition_rules(True), params)
@@ -224,7 +224,7 @@ class EasyModelsTest(TestCase):
             scan_mlp_chunk_size=self.scan_mlp_chunk_size,
             use_sharding_constraint=self.use_sharding_constraint
         )
-        mesh = config.jax_mesh()
+        mesh = config.get_mesh()
 
         with mesh:
             partition_specs = match_partition_rules(config.get_partition_rules(True), params)
