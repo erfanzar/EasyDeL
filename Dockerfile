@@ -1,15 +1,13 @@
-FROM python:3.11
+FROM python:3.11-slim
 
 WORKDIR /app
 
-COPY poetry.lock pyproject.toml ./
+COPY pyproject.toml env_requirements.txt ./
 
-RUN curl -sSL https://install.python-poetry.org | python -
-
-RUN poetry install --no-dev
+RUN pip install --no-cache-dir -r env_requirements.txt
 
 COPY . .
 
-EXPOSE 8000
+RUN poetry install --no-dev
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+ENTRYPOINT ["poetry", "run", "easydel"]
