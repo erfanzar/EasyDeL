@@ -223,18 +223,19 @@ class GenerationPipeline:
             all_sequence_finished = jnp.all(state.is_sent_finished)
             return ~jnp.logical_or(all_sequence_finished, state.cur_len >= max_length)
 
-        def inference_step(logits, token, prng_key):
+        def inference_step(logits, token, prng_key, temperature, repetition_penalty, top_k, top_p):
             if self.generation_config.do_sample:
-                logits = logits / self.generation_config.temperature
-                logits = apply_repetition_penalty(logits, token, self.generation_config.repetition_penalty)
-                if self.generation_config.top_k > 0:
-                    logits = apply_top_k_sampling(logits, self.generation_config.top_k)
-                if self.generation_config.top_p < 1.0:
-                    logits = apply_top_p_sampling(logits, self.generation_config.top_p)
+                logits = logits / temperature
+                # logits = apply_repetition_penalty(logits, token, repetition_penalty)
+                if top_k > 0:
+                    logits = apply_top_k_sampling(logits, top_k)
+                if top_p < 1.0:
+                    logits = apply_top_p_sampling(logits, top_p)
                 probs = jax.nn.softmax(logits, axis=-1)
                 return jax.random.categorical(prng_key, jnp.log(probs), axis=-1).reshape(-1)
-
             return jnp.argmax(jax.nn.softmax(logits, axis=-1), axis=-1).reshape(-1)
+
+        inference_step_compiled = jax.jit(inference_step)
 
         def generation_func_body(params, state: SampleState):
             model_outputs = self.model(
@@ -247,7 +248,15 @@ class GenerationPipeline:
 
             logits = model_outputs.logits
 
-            next_token = inference_step(logits[:, -1], state.running_token, state.prng_key)
+            next_token = inference_step_compiled(
+                logits[:, -1],
+                state.running_token,
+                state.prng_key,
+                self.generation_config.temperature,
+                self.generation_config.repetition_penalty,
+                self.generation_config.top_k,
+                self.generation_config.top_p
+            )
 
             next_token = next_token * ~state.is_sent_finished + pad_token_id * state.is_sent_finished
             next_is_sent_finished = state.is_sent_finished | (next_token == eos_token_id)
@@ -264,18 +273,18 @@ class GenerationPipeline:
             )
 
         if input_ids.shape[1] > 1:
-            if self.state_sample_ms is None:
-                self.state_sample_ms = compile_function(
-                    generation_func_body,
-                    (self.params, generation_state),
-                    {},
-                    mesh=self.mesh,
-                    in_shardings=(
-                        self.model_sharding,
-                        SampleState(None, self.input_sharding, self.input_sharding, None, None, None)),
-                    out_shardings=SampleState(None, self.input_sharding, self.input_sharding, None, None, None)
-                )
-            generation_state = self.state_sample_ms(self.params, generation_state)
+            # if self.state_sample_ms is None:
+            #     self.state_sample_ms = compile_function(
+            #         generation_func_body,
+            #         (self.params, generation_state),
+            #         {},
+            #         mesh=self.mesh,
+            #         in_shardings=(
+            #             self.model_sharding,
+            #             SampleState(None, self.input_sharding, self.input_sharding, None, None, None)),
+            #         out_shardings=SampleState(None, self.input_sharding, self.input_sharding, None, None, None)
+            #     )
+            generation_state = generation_func_body(self.params, generation_state)
 
         yield generation_state.running_token
         if self.state_sample is None:
