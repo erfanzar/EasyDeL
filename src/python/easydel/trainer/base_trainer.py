@@ -6,6 +6,7 @@ import threading
 import time
 import warnings
 from abc import abstractmethod
+from glob import glob
 from typing import Union, Callable, Optional, Any, Literal, Mapping, Iterator
 
 import fjformer
@@ -121,7 +122,7 @@ class BaseTrainer:
         self.lora_opt_state = getattr(self, "lora_opt_state", None)
         self.lora_apply_fn = getattr(self, "lora_apply_fn", None)
 
-        # PJit functions
+        # Jit functions
         self.create_sharded_state_from_params_function = getattr(
             self,
             "create_sharded_state_from_params_function",
@@ -138,6 +139,7 @@ class BaseTrainer:
         # EasyState
         self.state_shape = getattr(self, "state_shape", None)
         self.state_partition_spec = getattr(self, "state_partition_spec", None)
+        self.state_named_sharding = getattr(self, "state_named_sharding", None)
         self.sharded_state = getattr(self, "sharded_state", None)
 
         # Rest
@@ -346,7 +348,8 @@ class BaseTrainer:
             if hasattr(dataset, "__len__"):
                 total_data_len = len(dataset)
                 batch_size = self.arguments.total_batch_size if is_train else self.arguments.eval_batch_size
-                num_steps = (total_data_len + batch_size - 1) // batch_size * (self.arguments.num_train_epochs if is_train else 1)
+                num_steps = (total_data_len + batch_size - 1) // batch_size * (
+                    self.arguments.num_train_epochs if is_train else 1)
                 max_steps = self.arguments.max_training_steps if is_train else self.arguments.max_evaluation_steps
                 return min(num_steps, max_steps) if max_steps else num_steps
             else:
@@ -449,13 +452,23 @@ class BaseTrainer:
                 state.step
             )
         )
+
+        checkpoint_dir = os.path.join(
+            self.arguments.save_dir,
+            self.arguments.model_name
+        ) if save_dir is None else save_dir
+        filename_extension = ".easy"
+        if self.arguments.save_total_limit:
+            checkpoint_files = glob(os.path.join(checkpoint_dir, f"*{filename_extension}"))
+            checkpoint_files.sort(key=os.path.getmtime)
+            for old_checkpoint in checkpoint_files[:-self.arguments.save_total_limit]:
+                os.remove(old_checkpoint)
+                termcolor.cprint(f"Removed old checkpoint: {old_checkpoint}", color="red", force_color=True)
         checkpoint_name = f"{self.arguments.model_name}-S{step}"
         filename = f"{checkpoint_name}_{step}" if milestone else f"{checkpoint_name}"
-        filename += ".easy"
+        filename += filename_extension
         termcolor.cprint(f"Saving Model {filename}.", color="cyan", force_color=True)
 
-        checkpoint_dir = os.path.join(self.arguments.save_dir,
-                                      self.arguments.model_name) if save_dir is None else save_dir
         state.save_state(
             filename=filename,
             checkpoint_dir=checkpoint_dir,
@@ -501,11 +514,6 @@ training Flax/Jax models on TPU/GPU for both serving and training purposes.
 ### Using From EasyDeLState (_*.easy_ files)
 
 ```python
-import os
-
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = ".99"
-
 from src.python.easydel import EasyDeLState, AutoShardAndGatherFunctions
 from jax import numpy as jnp, lax
 
@@ -530,11 +538,6 @@ state = EasyDeLState.load_state(
 ### Using From AutoEasyDeLModelForCausalLM (_from pytorch_)
 
 ```python
-import os
-
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = ".99"
-
 from src.python.easydel import AutoEasyDeLModelForCausalLM
 from jax import numpy as jnp, lax
 
@@ -644,3 +647,13 @@ partition_rules = {partition_rules}
                 save_dir=save_dir
             )
             return state
+
+    def specs_to_name_sharding(self, tree, mesh=None):
+        if mesh is None:
+            mesh = self.mesh
+            if mesh is None:
+                mesh = self.arguments.get_mesh()
+        return jax.tree_util.tree_map(
+            lambda spec: jax.sharding.NamedSharding(spec=spec, mesh=mesh),
+            tree
+        )

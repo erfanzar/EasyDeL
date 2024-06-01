@@ -1,5 +1,4 @@
 import copy
-from glob import glob
 import os
 import time
 import typing
@@ -15,14 +14,13 @@ except ModuleNotFoundError:
 import jax
 import flax
 from tqdm import tqdm
-from jax.experimental.pjit import pjit
 from jax.sharding import PartitionSpec
 from jax import numpy as jnp
 from fjformer import (
     match_partition_rules,
     make_shard_and_gather_fns
 )
-from typing import Any, Optional, Tuple, Callable, Mapping
+from typing import Optional, Tuple, Callable, Mapping
 from ...etils.easystate import EasyDeLState
 from ...trainer.base_trainer import BaseTrainer, TrainerConfigureFunctionFuncOutput
 from ...etils.errors import EasyDeLTimerError
@@ -152,27 +150,30 @@ class CausalLanguageModelTrainer(BaseTrainer):
             ) if self.arguments.custom_rule is None else self.arguments.custom_rule,
             state_shape
         )
-        create_sharded_state_from_params_function = pjit(
+
+        spec_named_sharding = self.specs_to_name_sharding(state_partition_spec)
+        empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=self.arguments.get_mesh())
+        create_sharded_state_from_params_function = jax.jit(
             create_state_from_params_function,
-            in_shardings=(state_partition_spec.params,),
-            out_shardings=state_partition_spec,
+            in_shardings=(spec_named_sharding.params,),
+            out_shardings=spec_named_sharding,
             donate_argnums=(0,)
         )
-        sharded_train_step_function = pjit(
+        sharded_train_step_function = jax.jit(
             create_casual_language_model_train_step(
                 partition_spec=self.arguments.step_partition_spec,
                 label_smoothing_factor=self.arguments.label_smoothing_factor,
                 z_loss=self.arguments.z_loss,
             ),
-            in_shardings=(state_partition_spec, PartitionSpec()),
-            out_shardings=(state_partition_spec, PartitionSpec(), PartitionSpec()),
+            in_shardings=(spec_named_sharding, empty_sharding),
+            out_shardings=(spec_named_sharding, empty_sharding, empty_sharding),
             donate_argnums=(0, 0),
         )
 
-        sharded_eval_step_function = pjit(
+        sharded_eval_step_function = jax.jit(
             create_casual_language_model_evaluation_step(self.arguments.step_partition_spec),
-            in_shardings=(state_partition_spec, PartitionSpec()),
-            out_shardings=(PartitionSpec(), PartitionSpec(), PartitionSpec()),
+            in_shardings=(spec_named_sharding, empty_sharding),
+            out_shardings=(empty_sharding, empty_sharding, empty_sharding),
             donate_argnums=(0, 0),
         )
 
@@ -180,6 +181,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
         self.arguments.ckpt_path_exists()
         checkpoint_manager = self.arguments.get_streaming_checkpointer()
         self.state_partition_spec = state_partition_spec
+        self.state_named_sharding = spec_named_sharding
         self.state_shape = state_shape
 
         return TrainerConfigureFunctionFuncOutput(
@@ -255,25 +257,29 @@ class CausalLanguageModelTrainer(BaseTrainer):
                             ) if self.arguments.custom_rule is None else self.arguments.custom_rule,
                             state_shape
                         )
-                        sharded_train_step_function = pjit(
+
+                        spec_named_sharding = self.specs_to_name_sharding(state_partition_spec)
+                        empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=self.arguments.get_mesh())
+                        sharded_train_step_function = jax.jit(
                             create_casual_language_model_train_step(
                                 partition_spec=self.arguments.step_partition_spec,
                                 label_smoothing_factor=self.arguments.label_smoothing_factor,
                                 z_loss=self.arguments.z_loss,
                             ),
-                            in_shardings=(state_partition_spec, PartitionSpec()),
-                            out_shardings=(state_partition_spec, PartitionSpec(), PartitionSpec()),
+                            in_shardings=(spec_named_sharding, empty_sharding),
+                            out_shardings=(spec_named_sharding, empty_sharding, empty_sharding),
                             donate_argnums=(0, 0),
                         )
 
-                        sharded_eval_step_function = pjit(
+                        sharded_eval_step_function = jax.jit(
                             create_casual_language_model_evaluation_step(self.arguments.step_partition_spec),
-                            in_shardings=(state_partition_spec, PartitionSpec()),
-                            out_shardings=(PartitionSpec(), PartitionSpec(), PartitionSpec()),
+                            in_shardings=(spec_named_sharding, empty_sharding),
+                            out_shardings=(empty_sharding, empty_sharding, empty_sharding),
                             donate_argnums=(0, 0),
                         )
 
                         self.state_partition_spec = state_partition_spec
+                        self.state_named_sharding = spec_named_sharding
                         self.state_shape = state_shape
                         self.sharded_train_step_function = sharded_train_step_function
                         self.sharded_eval_step_function = sharded_eval_step_function
@@ -317,45 +323,6 @@ class CausalLanguageModelTrainer(BaseTrainer):
 
             self.sharded_state = sharded_state
             return sharded_state, shard_fns, gather_fns
-
-    def _save_state(
-            self,
-            state: EasyDeLState,
-            gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
-            milestone: bool = False
-    ) -> str:
-        step = int(
-            jax.device_get(
-                state.step
-            )
-        ) + self.arguments.step_start_point if self.arguments.step_start_point is not None else int(
-            jax.device_get(
-                state.step
-            )
-        )
-
-        checkpoint_dir = os.path.join(self.arguments.save_dir, self.arguments.model_name)
-        filename_extension = ".easy"
-        if self.arguments.save_total_limit:
-            checkpoint_files = glob(os.path.join(checkpoint_dir, f"*{filename_extension}"))
-            checkpoint_files.sort(key=os.path.getmtime)
-            for old_checkpoint in checkpoint_files[:-self.arguments.save_total_limit]:
-                os.remove(old_checkpoint)
-                termcolor.cprint(f"Removed old checkpoint: {old_checkpoint}", color="red", force_color=True)
-
-        checkpoint_name = f"{self.arguments.model_name}-S{step}"
-        filename = f"{checkpoint_name}_{step}" if milestone else f"{checkpoint_name}"
-        filename += ".easy"
-        termcolor.cprint(f"Saving Model {filename}.", color="cyan", force_color=True)
-        state.save_state(
-            filename=filename,
-            checkpoint_dir=checkpoint_dir,
-            gather_fns=gather_fns,
-            float_dtype=self.dtype,
-            verbose=self.arguments.verbose,
-            save_optimizer=self.arguments.save_optimizer_state,
-        )
-        return filename
 
     def train(
             self,
