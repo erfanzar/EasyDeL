@@ -584,7 +584,7 @@ class AutoEasyDeLModelForCausalLM:
                         partition_rules = cfg.get_partition_rules(True)
                     params = jax.jit(
                         trf_partial,
-                        out_shardings=jax.tree_util.tree_flatten(
+                        out_shardings=jax.tree_util.tree_map(
                             lambda spec: jax.sharding.NamedSharding(
                                 spec=spec, mesh=cfg.get_mesh()
                             ),
