@@ -1,5 +1,6 @@
 import transformers
 
+import easydel
 from easydel import (
     AutoEasyDeLModelForCausalLM,
     TrainArguments,
@@ -66,20 +67,7 @@ def main():
     dtype = jnp.bfloat16
     sharding_axis_dims = eval(FLAGS.sharding_axis_dims)
     input_shape = eval(FLAGS.input_shape)
-    qps = PartitionSpec(("dp", "fsdp"), "sp", None, "tp")
-    kps = PartitionSpec(("dp", "fsdp"), "sp", None, "tp")
-    vps = PartitionSpec(("dp", "fsdp"), "sp", None, "tp")
-    bps = PartitionSpec(("dp", "fsdp"), "sp", None, None)
-    aps = PartitionSpec(("dp", "fsdp"), "sp", None, "tp")
-
-    attention_partitions = dict(
-        query_partition_spec=qps,
-        key_partition_spec=kps,
-        value_partition_spec=vps,
-        bias_partition_spec=bps,
-        attention_partition_spec=aps,
-    )
-
+    partition_axis = easydel.PartitionAxis()
     model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
         FLAGS.pretrained_model_name_or_path,
         device=jax.devices('cpu')[0],
@@ -89,9 +77,9 @@ def main():
         config_kwargs=dict(
             use_scan_mlp=False,
             attn_mechanism=FLAGS.attn_mechanism,
-            **attention_partitions
+            partition_axis=partition_axis
         ),
-        **attention_partitions
+        partition_axis=partition_axis
     )
 
     config = model.config
@@ -108,7 +96,7 @@ def main():
     config.add_basic_configurations(
         attn_mechanism=FLAGS.attn_mechanism,
         shard_attention_computation=True,
-        **attention_partitions
+        partition_axis=partition_axis
     )
 
     configs_to_initialize_model_class = {

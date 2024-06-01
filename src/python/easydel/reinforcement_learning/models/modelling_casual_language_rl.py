@@ -8,6 +8,8 @@ from transformers import PretrainedConfig, GenerationConfig
 from flax import linen as nn
 from typing import Sequence, Optional, Type, Tuple, Any, Callable, Mapping
 from jax import numpy as jnp
+
+from ...etils.partition_module import PartitionAxis
 from ...modules.auto_easydel_model import AutoEasyDeLModelForCausalLM
 from ...modules.easydel_modelling_utils import EasyDeLPretrainedConfig, EasyDeLFlaxPretrainedModel
 from fjformer import GenerateRNG, with_sharding_constraint, make_shard_and_gather_fns, match_partition_rules
@@ -241,16 +243,7 @@ class AutoRLModelForCasualLMWithValueHead:
             precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
             sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
             sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            query_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp",
-                                                                                          None),
-            key_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp",
-                                                                                        None),
-            value_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp",
-                                                                                          None),
-            bias_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), None, None,
-                                                                                         None),
-            attention_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(("dp", "fsdp"), "sp",
-                                                                                              "tp", None),
+            partition_axis: PartitionAxis = PartitionAxis(),
             shard_attention_computation: bool = True,
             input_shape: Tuple[int, int] = (1, 1),
             backend: Optional[str] = None,
@@ -270,11 +263,7 @@ class AutoRLModelForCasualLMWithValueHead:
             precision=precision,
             sharding_axis_dims=sharding_axis_dims,
             sharding_axis_names=sharding_axis_names,
-            query_partition_spec=query_partition_spec,
-            key_partition_spec=key_partition_spec,
-            value_partition_spec=value_partition_spec,
-            bias_partition_spec=bias_partition_spec,
-            attention_partition_spec=attention_partition_spec,
+            partition_axis=partition_axis,
             shard_attention_computation=shard_attention_computation,
             input_shape=input_shape,
             shard_fns=shard_fns,

@@ -1,4 +1,5 @@
 from easydel import EasyDeLState
+from easydel.etils.partition_module import PartitionAxis
 import jax
 from jax.sharding import PartitionSpec
 from typing import Sequence, Optional
@@ -12,13 +13,7 @@ def load_model(
         precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
         sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
         sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-        query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-        generation_query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "tp", None, None),
-        key_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-        value_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-        bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
-        generation_bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
-        attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+        partition_axis: PartitionAxis = PartitionAxis(),
         shard_attention_computation: bool = True,
         input_shape: Sequence[int] = (1, 1),
         backend: Optional[str] = None,
@@ -31,13 +26,7 @@ def load_model(
         precision=precision,
         sharding_axis_names=sharding_axis_names,
         sharding_axis_dims=sharding_axis_dims,
-        query_partition_spec=query_partition_spec,
-        generation_query_partition_spec=generation_query_partition_spec,
-        generation_bias_partition_spec=generation_bias_partition_spec,
-        key_partition_spec=key_partition_spec,
-        value_partition_spec=value_partition_spec,
-        bias_partition_spec=bias_partition_spec,
-        attention_partition_spec=attention_partition_spec,
+        partition_axis=partition_axis,
         shard_attention_computation=shard_attention_computation,
         input_shape=input_shape,
         backend=backend,

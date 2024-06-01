@@ -4,6 +4,7 @@ import re
 import warnings
 from functools import partial
 from typing import Sequence, Optional, Tuple, Mapping, Callable, Type, Any, List
+from ..etils.partition_module import PartitionAxis
 
 # import fjformer.linen.linen
 import flax.traverse_util
@@ -430,13 +431,7 @@ class AutoEasyDeLModelForCausalLM:
             precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
             sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
             sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            generation_query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, "tp", None),
-            key_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            value_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
-            generation_bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
-            attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            partition_axis: PartitionAxis = PartitionAxis(),
             shard_attention_computation: bool = True,
             input_shape: Tuple[int, int] = (1, 1),
             shard_fns: Optional[Mapping[tuple, Callable] | dict] = None,
@@ -460,20 +455,7 @@ class AutoEasyDeLModelForCausalLM:
             precision (jax.lax.Precision, optional): Precision for computations. Defaults to jax.lax.Precision("fastest").
             sharding_axis_dims (Sequence[int], optional): Dimensions of each sharding axis. Defaults to (1, -1, 1, 1).
             sharding_axis_names (Sequence[str], optional): Names of the sharding axes. Defaults to ("dp", "fsdp", "tp", "sp").
-            query_partition_spec (PartitionSpec, optional): Partitioning specification for the query tensor. Defaults to
-                PartitionSpec(("dp", "fsdp"), "sp", "tp", None).
-            generation_query_partition_spec (PartitionSpec, optional): Partitioning specification for the query tensor during
-                generation. Defaults to PartitionSpec(("dp", "fsdp"), None, "tp", None).
-            key_partition_spec (PartitionSpec, optional): Partitioning specification for the key tensor. Defaults to
-                PartitionSpec(("dp", "fsdp"), "sp", "tp", None).
-            value_partition_spec (PartitionSpec, optional): Partitioning specification for the value tensor. Defaults to
-                PartitionSpec(("dp", "fsdp"), "sp", "tp", None).
-            bias_partition_spec (PartitionSpec, optional): Partitioning specification for the attention bias. Defaults to
-                PartitionSpec(("dp", "fsdp"), None, None, None).
-            generation_bias_partition_spec (PartitionSpec, optional): Partitioning specification for the attention bias during
-                generation. Defaults to PartitionSpec(("dp", "fsdp"), None, None, None).
-            attention_partition_spec (PartitionSpec, optional): Partitioning specification for the attention weights. Defaults to
-                PartitionSpec(("dp", "fsdp"), "sp", "tp", None).
+            partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
             shard_attention_computation (bool, optional): Whether to shard attention computation. Defaults to True.
             input_shape (Tuple[int, int], optional): Shape of the input to the model. Defaults to (1, 1).
             shard_fns (Optional[Mapping[tuple, Callable] | dict], optional): Sharding functions to use for the model. If None,
@@ -531,13 +513,7 @@ class AutoEasyDeLModelForCausalLM:
         cfg.add_basic_configurations(
             axis_dims=sharding_axis_dims,
             axis_names=sharding_axis_names,
-            query_partition_spec=query_partition_spec,
-            generation_query_partition_spec=generation_query_partition_spec,
-            generation_bias_partition_spec=generation_bias_partition_spec,
-            key_partition_spec=key_partition_spec,
-            value_partition_spec=value_partition_spec,
-            bias_partition_spec=bias_partition_spec,
-            attention_partition_spec=attention_partition_spec,
+            partition_axis=partition_axis,
             backend=backend,
             shard_attention_computation=shard_attention_computation,
         )
@@ -582,13 +558,7 @@ class AutoEasyDeLModelForCausalLM:
                 partition_rules=partition_rules,
                 sharding_axis_dims=sharding_axis_dims,
                 sharding_axis_names=sharding_axis_names,
-                query_partition_spec=query_partition_spec,
-                generation_query_partition_spec=generation_query_partition_spec,
-                key_partition_spec=key_partition_spec,
-                value_partition_spec=value_partition_spec,
-                bias_partition_spec=bias_partition_spec,
-                generation_bias_partition_spec=generation_bias_partition_spec,
-                attention_partition_spec=attention_partition_spec,
+                partition_axis=partition_axis,
                 shard_attention_computation=shard_attention_computation,
                 backend=backend,
                 input_shape=input_shape,  # type:ignore
@@ -642,13 +612,7 @@ class AutoEasyDeLConfig:
             pretrained_model_name_or_path: str,
             sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
             sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            generation_query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", None, None),
-            key_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            value_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
-            generation_bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
-            attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            partition_axis: PartitionAxis = PartitionAxis(),
             shard_attention_computation: bool = True,
             backend: Optional[str] = None,
             **kwargs
@@ -658,32 +622,14 @@ class AutoEasyDeLConfig:
         the class corresponding to your model, with all weights loaded from disk.
 
         Args:
-            cls: Create an instance of the class that called this
-                function
-            pretrained_model_name_or_path: str: Identify the model in
-                the huggingface model hub
-            sharding_axis_dims: Sequence[int]: Specify the dimension of
-                each axis in the sharded model
-            sharding_axis_names: Sequence[str]: Specify the order of
-                sharding
-            query_partition_spec: PartitionSpec: Specify the
-                partitioning of the query tensor
-            generation_query_partition_spec: PartitionSpec: Specify the
-                partitioning of the query tensor in
-            key_partition_spec: PartitionSpec: Partition the key matrix
-            value_partition_spec: PartitionSpec: Specify the
-                partitioning of the value tensor
-            bias_partition_spec: PartitionSpec: Specify the Attention
-                Bias partition spec
-            generation_bias_partition_spec: PartitionSpec: Specify the
-                Attention Bias partition spec for generation
-            attention_partition_spec: PartitionSpec: Specify the
-                partitioning of the attention weights
-            shard_attention_computation: bool: whenever to use shard_map
-                for attention
+            cls: Create an instance of the class that called this function
+            pretrained_model_name_or_path: str: Identify the model in the huggingface model hub
+            sharding_axis_dims: Sequence[int]: Specify the dimension of each axis in the sharded model
+            sharding_axis_names: Sequence[str]: Specify the order of sharding
+            partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
+            shard_attention_computation: bool: whenever to use shard_map for attention
             backend: Optional[str]: backend to use for model
-            **kwargs: Pass additional arguments to the model and config
-                classes
+            **kwargs: Pass additional arguments to the model and config classes
         generation process
 
         Returns:
@@ -700,13 +646,7 @@ class AutoEasyDeLConfig:
         cfg.add_basic_configurations(
             axis_dims=sharding_axis_dims,
             axis_names=sharding_axis_names,
-            query_partition_spec=query_partition_spec,
-            generation_query_partition_spec=generation_query_partition_spec,
-            generation_bias_partition_spec=generation_bias_partition_spec,
-            key_partition_spec=key_partition_spec,
-            value_partition_spec=value_partition_spec,
-            bias_partition_spec=bias_partition_spec,
-            attention_partition_spec=attention_partition_spec,
+            partition_axis=partition_axis,
             backend=backend,
             shard_attention_computation=shard_attention_computation,
         )
@@ -795,13 +735,7 @@ class AutoShardAndGatherFunctions:
             input_shape: Tuple[int, int] = (1, 1),
             sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
             sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            generation_query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", None, None),
-            key_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            value_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
-            generation_bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
-            attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            partition_axis: PartitionAxis = PartitionAxis(),
             shard_attention_computation: bool = True,
             backend: Optional[str] = None,
             partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
@@ -818,13 +752,7 @@ class AutoShardAndGatherFunctions:
             input_shape: The input shape of the model. Defaults to (1, 1).
             sharding_axis_dims: The dimensions of the sharding axes. Defaults to (1, -1, 1, 1).
             sharding_axis_names: The names of the sharding axes. Defaults to ("dp", "fsdp", "tp", "sp").
-            query_partition_spec: The partition specification for the query matrix. Defaults to `PartitionSpec(("dp", "fsdp"), "sp", "tp", None)`.
-            generation_query_partition_spec: The partition specification for the generation query matrix. Defaults to `PartitionSpec(("dp", "fsdp"), "sp", None, None)`.
-            key_partition_spec: The partition specification for the key matrix. Defaults to `PartitionSpec(("dp", "fsdp"), "sp", "tp", None)`.
-            value_partition_spec: The partition specification for the value matrix. Defaults to `PartitionSpec(("dp", "fsdp"), "sp", "tp", None)`.
-            bias_partition_spec: The partition specification for the bias. Defaults to `PartitionSpec(("dp", "fsdp"), None, None, None)`.
-            generation_bias_partition_spec: The partition specification for the generation bias. Defaults to `PartitionSpec(("dp", "fsdp"), None, None, None)`.
-            attention_partition_spec: The partition specification for the attention computation. Defaults to `PartitionSpec(("dp", "fsdp"), "sp", "tp", None)`.
+            partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
             shard_attention_computation: Whether to shard the attention computation. Defaults to True.
             backend: The backend to use for sharding. Defaults to None.
             partition_rules: A tuple of tuples containing partition rule names and `PartitionSpec` objects.
@@ -841,13 +769,7 @@ class AutoShardAndGatherFunctions:
             pretrained_model_name_or_path,
             sharding_axis_dims=sharding_axis_dims,
             sharding_axis_names=sharding_axis_names,
-            query_partition_spec=query_partition_spec,
-            generation_query_partition_spec=generation_query_partition_spec,
-            key_partition_spec=key_partition_spec,
-            value_partition_spec=value_partition_spec,
-            bias_partition_spec=bias_partition_spec,
-            generation_bias_partition_spec=generation_bias_partition_spec,
-            attention_partition_spec=attention_partition_spec,
+            partition_axis=partition_axis,
             shard_attention_computation=shard_attention_computation,
             backend=backend,
         )

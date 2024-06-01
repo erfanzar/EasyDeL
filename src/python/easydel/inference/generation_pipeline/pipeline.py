@@ -235,7 +235,7 @@ class GenerationPipeline:
                 return jax.random.categorical(prng_key, jnp.log(probs), axis=-1).reshape(-1)
             return jnp.argmax(jax.nn.softmax(logits, axis=-1), axis=-1).reshape(-1)
 
-        inference_step_compiled = jax.jit(inference_step)
+        inference_step_compiled = jax.jit(inference_step, static_argnames=["top_k", "top_p"])
 
         def generation_func_body(params, state: SampleState):
             model_outputs = self.model(

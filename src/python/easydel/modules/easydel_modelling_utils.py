@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from jax.sharding import PartitionSpec, Mesh
 from ..etils.etils import get_logger
 from ..etils.easystate import EasyDeLState
+from ..etils.partition_module import PartitionAxis
 
 logger = get_logger(__name__)
 AVAILABLE_ATTENTION_MECHANISMS = Literal[
@@ -64,15 +65,7 @@ class EasyDeLPretrainedConfig(PretrainedConfig):
         block_k_major_dq: int: block size of block_k_major_dq
         block_k_dq: int: block size of block_k_dq
         block_q_dq: int: block size of block_q_dq
-        query_partition_spec: PartitionSpec: Specify the partitioning of
-            the query tensor
-        key_partition_spec: PartitionSpec: Partition the key matrix
-        value_partition_spec: PartitionSpec: Specify the partitioning of
-            the value tensor
-        bias_partition_spec: PartitionSpec: Specify the Attention Bias
-            partition spec
-        attention_partition_spec: PartitionSpec: Specify the
-            partitioning of the attention weights
+        partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
         shard_attention_computation: bool: whenever to shard qkv b for
             attention
         use_sharding_constraint: bool: whether to use sharding
@@ -99,14 +92,7 @@ class EasyDeLPretrainedConfig(PretrainedConfig):
             block_k_major_dq: int | None = None,
             block_k_dq: int | None = None,
             block_q_dq: int | None = None,
-            query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            generation_query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, "tp", None),
-            key_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            value_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
-            generation_bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
-            attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            generation_attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, "tp", None),
+            partition_axis: PartitionAxis = PartitionAxis(),
             shard_attention_computation: bool = True,
             use_sharded_kv_caching: bool = True,
             use_sharding_constraint: bool = False,
@@ -122,15 +108,6 @@ class EasyDeLPretrainedConfig(PretrainedConfig):
             flash_attention_backward_pass_impl: Literal["triton", "xla"] = "triton",
             **kwargs
     ):
-        self.query_partition_spec = query_partition_spec
-        self.generation_query_partition_spec = generation_query_partition_spec
-        self.key_partition_spec = key_partition_spec
-        self.value_partition_spec = value_partition_spec
-        self.bias_partition_spec = bias_partition_spec
-        self.generation_bias_partition_spec = generation_bias_partition_spec
-        self.attention_partition_spec = attention_partition_spec
-        self.generation_attention_partition_spec = generation_attention_partition_spec
-        self.shard_attention_computation = shard_attention_computation
         self.axis_dims = axis_dims
         self.axis_names = axis_names
         self.backend = backend if backend is not None else ""
@@ -147,6 +124,8 @@ class EasyDeLPretrainedConfig(PretrainedConfig):
         self.block_k_major_dq = block_k_major_dq or block_k
         self.block_k_dq = block_k_dq or block_k
         self.block_q_dq = block_q_dq or block_q
+        self.partition_axis = partition_axis
+        self.shard_attention_computation = shard_attention_computation
         self.bits = bits
         self.scan_attention_layers = scan_attention_layers
         self.scan_ring_attention = scan_ring_attention
@@ -161,7 +140,9 @@ class EasyDeLPretrainedConfig(PretrainedConfig):
 
     @staticmethod
     def create_mesh(
-            axis_dims: Sequence[int] = (1, -1, 1, 1), axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"), backend=""
+            axis_dims: Sequence[int] = (1, -1, 1, 1),
+            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+            backend=""
     ):
         """The create_mesh function creates a mesh object that can be used to shard arrays.
 
@@ -295,14 +276,7 @@ class EasyDeLPretrainedConfig(PretrainedConfig):
             block_k_major_dq: int | None = ...,
             block_k_dq: int | None = ...,
             block_q_dq: int | None = ...,
-            query_partition_spec: PartitionSpec = ...,
-            generation_query_partition_spec: PartitionSpec = ...,
-            key_partition_spec: PartitionSpec = ...,
-            value_partition_spec: PartitionSpec = ...,
-            bias_partition_spec: PartitionSpec = ...,
-            attention_partition_spec: PartitionSpec = ...,
-            generation_bias_partition_spec: PartitionSpec = ...,
-            generation_attention_partition_spec: PartitionSpec = ...,
+            partition_axis: PartitionAxis = ...,
             shard_attention_computation: bool = ...,
             use_sharded_kv_caching: bool = ...,
             backend: Optional[None] = ...,
@@ -337,22 +311,8 @@ class EasyDeLPretrainedConfig(PretrainedConfig):
             block_k_major_dq: int: block size of block_k_major_dq
             block_k_dq: int: block size of block_k_dq
             block_q_dq: int: block size of block_q_dq
-            query_partition_spec: PartitionSpec: Specify the
-                partitioning of the query tensor
-            key_partition_spec: PartitionSpec: Partition the key matrix
-            value_partition_spec: PartitionSpec: Specify the
-                partitioning of the value tensor
-            bias_partition_spec: PartitionSpec: Specify the Attention
-                Bias partition spec
-            attention_partition_spec: PartitionSpec: Specify the
-                partitioning of the attention weights
-            generation_attention_partition_spec: : PartitionSpec:
-                Specify the partitioning of the attention weights
-            generation_bias_partition_spec: : PartitionSpec: Specify the
-                partitioning of the Attention Bias partition spec in
-                generation process
-            generation_query_partition_spec: : PartitionSpec: Specify
-                the partitioning of the query tensor
+
+            partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
             shard_attention_computation: bool: whenever to use shard_map
                 for attention
             use_sharded_kv_caching: bool: whenever to use shard_map and
@@ -372,9 +332,7 @@ class EasyDeLPretrainedConfig(PretrainedConfig):
             attention_axis_name: str: Name of the attention axis name
             quantize_kv_cache: bool: Whether to quantize Key/Value in
                 attention for generation process.
-            flash_attention_backward_pass_impl: Literal["triton",
-                "xla"]: Specify the backward pass kernel for flash
-                attention
+            flash_attention_backward_pass_impl: Literal["triton", "xla"]: Specify the backward pass kernel for flash attention
         in generation process
         in generation process
         """
@@ -385,54 +343,8 @@ class EasyDeLPretrainedConfig(PretrainedConfig):
         set_attrs_smartly(self, "block_k", 1024, block_k)
         set_attrs_smartly(self, "block_b", 1024, block_b)
 
-        set_attrs_smartly(
-            self,
-            "query_partition_spec",
-            PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            query_partition_spec
-        )
-        set_attrs_smartly(
-            self,
-            "generation_query_partition_spec",
-            PartitionSpec(("dp", "fsdp"), None, "tp", None),
-            generation_query_partition_spec
-        )
-        set_attrs_smartly(
-            self,
-            "generation_bias_partition_spec",
-            PartitionSpec(("dp", "fsdp"), None, None, None),
-            generation_bias_partition_spec
-        )
-        set_attrs_smartly(
-            self,
-            "key_partition_spec",
-            PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            key_partition_spec
-        )
-        set_attrs_smartly(
-            self,
-            "value_partition_spec",
-            PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            value_partition_spec
-        )
-        set_attrs_smartly(
-            self,
-            "bias_partition_spec",
-            PartitionSpec(("dp", "fsdp"), None, None, None),
-            bias_partition_spec
-        )
-        set_attrs_smartly(
-            self,
-            "attention_partition_spec",
-            PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            attention_partition_spec
-        )
-        set_attrs_smartly(
-            self,
-            "generation_attention_partition_spec",
-            PartitionSpec(("dp", "fsdp"), None, "tp", None),
-            generation_attention_partition_spec
-        )
+        set_attrs_smartly(self, "partition_axis", PartitionAxis(), partition_axis)
+
         set_attrs_smartly(self, "use_sharding_constraint", False, use_sharding_constraint)
         set_attrs_smartly(self, "backend", jax.default_backend(), backend)
         set_attrs_smartly(self, "shard_attention_computation", True, shard_attention_computation)
