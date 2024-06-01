@@ -79,9 +79,81 @@ of machine learning models, particularly in the domain of large language models 
    CausalLanguageModelTrainer on kaggle, but you can do much more.
 2. [script](https://www.kaggle.com/code/citifer/easydel-sfttrainer-example) SuperVised Finetuning with EasyDeL.
 
-## Serving
+## Serving and Generation
 
-APIs are changing ...
+### EasyDeL Generation Pipeline: Your Guide to Text Generation with JAX
+
+The `GenerationPipeline` class in EasyDeL provides a streamlined interface for generating text using pre-trained
+language
+models within the JAX framework that support token streaming option. This introduction will guide you through its
+purpose, potential applications, and basic usage.
+
+#### What it Does:
+
+At its core, the GenerationPipeline takes your input text (provided as `input_ids` and optionally an `attention_mask`)
+and
+uses a pre-trained language model to predict the most likely following tokens. This process is repeated iteratively,
+generating new text one token at a time, until a stopping condition is met (e.g., reaching a maximum length or
+encountering a special end-of-sequence token).
+
+**Here's how it works:**
+
+1. **Initialization:**
+    - You provide a pre-trained `EasyDeLFlaxPretrainedModel`, typically an instance
+      of `EasyDeLFlaxPretrainedModelForCausalLM`.
+    - You provide the corresponding model parameters (`params`).
+    - A `PreTrainedTokenizer` instance handles tokenization, ensuring compatibility between your text and the model.
+    - Optionally, you can customize generation behavior using a `GenerationPipelineConfig` object.
+
+2. **Generating Text:**
+    - Call the `generate` method with your input text represented as `input_ids` and an optional `attention_mask`.
+    - The pipeline iteratively generates new tokens, extending the input sequence.
+    - You can either receive each generated token as it's produced or use a `TextIteratorStreamer` to handle streaming
+      output.
+
+
+**Example Usage:**
+
+```python
+import easydel as ed
+from transformers import AutoTokenizer
+from jax import numpy as jnp
+
+# Load your pre-trained model and tokenizer
+model, params = ed.AutoEasyDeLModelForCausalLM.from_pretrained(...)
+tokenizer = AutoTokenizer.from_pretrained(...)
+tokenizer.padding_side = "left"
+tokenizer.truncation_side = "left"
+
+# Create a GenerationPipeline
+pipeline = ed.GenerationPipeline(model=model, params=params, tokenizer=tokenizer)
+
+# Prepare your input
+input_text = "The quick brown fox jumps over the "
+tokens = tokenizer(input_text, return_tensors="np", max_length=512, padding="max_length")
+
+# Generate text
+outputs = []
+pl = 0
+for token in pipeline.generate(**tokens):
+    outputs.append(token)
+    sq = tokenizer.decode(jnp.concatenate(outputs, axis=-1)[0])
+    print(sq[pl:],end="")
+    pl = len(sq)
+```
+
+**Key Points:**
+
+- **Input Format:** The `generate` method expects `input_ids` (numerical representation of tokens) and optionally
+  an `attention_mask` to specify relevant input positions.
+- **Output Handling:** You can either iterate over individual generated tokens or employ a `TextIteratorStreamer` for
+  streaming output.
+- **Customization:** Tailor the generation process with options like `max_new_tokens`, `temperature`, `top_k` sampling,
+  and more using the `GenerationPipelineConfig`.
+
+The `GenerationPipeline` offers a user-friendly interface to harness the power of EasyDeL's language models for a wide
+range of text generation applications.
+
 
 > [!NOTE]
 > you can use `EasyDeLServeEngine` which is a Serve API Engine for production purpose sice that's more stable provide
