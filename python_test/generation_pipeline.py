@@ -1,4 +1,5 @@
 import os
+import threading
 
 os.environ["XLA_FLAGS"] = '--xla_force_host_platform_device_count=2'
 
@@ -9,7 +10,7 @@ from src.python.easydel import (
     GenerationPipeline
 )
 from jax import numpy as jnp, random, lax, jit
-from transformers import AutoTokenizer, PreTrainedTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizer, TextIteratorStreamer
 
 
 def main():
@@ -48,6 +49,10 @@ def main():
     print("*" * 50)
     for token in pipeline.generate(input_ids, attention_mask):
         print(token, end="")
+    # streamer = TextIteratorStreamer(tokenizer=tokenizer)
+    # threading.Thread(target=pipeline.generate, args=(input_ids, attention_mask, streamer)).start()
+    # for char in streamer:
+    #     print(char, end="")
 
 
 if __name__ == "__main__":

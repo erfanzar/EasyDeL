@@ -6,6 +6,7 @@ from typing import Optional, Union, Dict
 import fjformer
 import flax.core
 import jax
+import transformers
 from jax.sharding import PartitionSpec
 from ...modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 from jax import numpy as jnp, random, lax, sharding
@@ -188,6 +189,7 @@ class GenerationPipeline:
             input_ids: jax.Array,
             attention_mask: Optional[jax.Array] = None,
             position_ids: Optional[jax.Array] = None,
+            streamer: Optional[transformers.TextIteratorStreamer] = None
     ):
 
         eos_token_id = jnp.array(self.generation_config.eos_token_id, dtype=jnp.int32)
@@ -211,7 +213,48 @@ class GenerationPipeline:
         assert position_ids.shape == attention_mask.shape, (
             "`position_ids` and `attention_mask` must have the same shape."
         )
-        model_kwargs = self.model.prepare_inputs_for_generation(input_ids, max_length, attention_mask)
+        paxis = self.model.config.partition_axis
+        _model_kwargs_sharding = jax.tree_util.tree_map(
+            lambda spec: jax.sharding.NamedSharding(spec=spec, mesh=self.mesh),
+            fjformer.match_partition_rules(
+                (
+                    (
+                        "position_ids", PartitionSpec(
+                            paxis.batch_axis,
+                            None
+                        )
+                    ),
+                    (
+                        "attention_mask", PartitionSpec(
+                            paxis.batch_axis,
+                            None
+                        )
+                    ),
+                    (
+                        "cached_key", PartitionSpec(
+                            paxis.batch_axis,
+                            paxis.key_sequence_axis,
+                            paxis.head_axis,
+                            None
+                        )
+                    ),
+                    (
+                        "cached_value", PartitionSpec(
+                            paxis.batch_axis,
+                            paxis.key_sequence_axis,
+                            paxis.head_axis,
+                            None
+                        )
+                    )
+                ),
+                jax.eval_shape(lambda: self.model.prepare_inputs_for_generation(input_ids, max_length, attention_mask))
+            ),
+        )
+
+        model_kwargs = jax.jit(
+            lambda: self.model.prepare_inputs_for_generation(input_ids, max_length, attention_mask),
+            out_shardings=_model_kwargs_sharding
+        )()
         # Initial GenerationContent
         generation_state = SampleState(
             cur_len=cur_len,
@@ -289,47 +332,14 @@ class GenerationPipeline:
             #         out_shardings=SampleState(None, self.input_sharding, self.input_sharding, None, None, None)
             #     )
             generation_state = generation_func_body(self.params, generation_state)
-
-        yield generation_state.running_token
+        if streamer is None:
+            yield generation_state.running_token
+        else:
+            streamer.put(generation_state.running_token)
         if self.state_sample is None:
             paxis = self.model.config.partition_axis
             _args_tree = jax.eval_shape(lambda: generation_state.model_kwargs)
-            _model_kwargs_sharding = jax.tree_util.tree_map(
-                lambda spec: jax.sharding.NamedSharding(spec=spec, mesh=self.mesh),
-                fjformer.match_partition_rules(
-                    (
-                        (
-                            "position_ids", PartitionSpec(
-                                paxis.batch_axis,
-                                None
-                            )
-                        ),
-                        (
-                            "attention_mask", PartitionSpec(
-                                paxis.batch_axis,
-                                None
-                            )
-                        ),
-                        (
-                            "cached_key", PartitionSpec(
-                                paxis.batch_axis,
-                                paxis.key_sequence_axis,
-                                paxis.head_axis,
-                                None
-                            )
-                        ),
-                        (
-                            "cached_value", PartitionSpec(
-                                paxis.batch_axis,
-                                paxis.key_sequence_axis,
-                                paxis.head_axis,
-                                None
-                            )
-                        )
-                    ),
-                    _args_tree
-                ),
-            )
+
             state_sharding = SampleState(
                 self.empty_sharding,
                 self.input_sharding,
@@ -355,7 +365,7 @@ class GenerationPipeline:
                 return st
 
             self._shard_state = _shard_state
-            generation_state = _shard_state(generation_state)  # noqa
+            # generation_state = _shard_state(generation_state)  # noqa
             self.state_sample = compile_function(
                 generation_func_body,
                 (self.params, generation_state),
@@ -367,8 +377,18 @@ class GenerationPipeline:
                 ),
                 out_shardings=state_sharding
             )
-        else:
-            generation_state = self._shard_state(generation_state)  # noqa
+        # else:
+        #     generation_state = self._shard_state(generation_state)  # noqa
         while sample_search_cond_fn(generation_state):
             generation_state = self.state_sample(self.params, generation_state)
-            yield generation_state.running_token
+
+            if streamer is None:
+                yield generation_state.running_token
+            else:
+                streamer.put(generation_state.running_token)
+        if streamer is not None:
+            streamer.end()
+        del generation_state.model_kwargs
+        del generation_state.sequences
+        del generation_state.running_token
+        del generation_state
