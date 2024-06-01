@@ -101,7 +101,6 @@ jupyterlab==3.6.7
 jupyterlab_pygments==0.3.0
 jupyterlab_server==2.25.4
 kagglehub==0.2.0
-keras==3.0.5
 keras-cv==0.8.2
 keras-nlp==0.8.2
 kiwisolver==1.4.5
