@@ -9,6 +9,7 @@ import jax
 from chex import Array
 from fjformer import with_sharding_constraint
 from .easydel_modelling_utils import EasyDeLPretrainedConfig
+from ..etils.partition_module import PartitionAxis
 
 try:
     from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention as tpu_flash_attention
@@ -231,14 +232,7 @@ class AttentionModule:
             block_k_major_dq: int = ...,
             block_k_dq: int = ...,
             block_q_dq: int = ...,
-            query_partition_spec: PartitionSpec = ...,
-            generation_query_partition_spec: PartitionSpec = ...,
-            key_partition_spec: PartitionSpec = ...,
-            value_partition_spec: PartitionSpec = ...,
-            bias_partition_spec: PartitionSpec = ...,
-            generation_bias_partition_spec: PartitionSpec = ...,
-            attention_partition_spec: PartitionSpec = ...,
-            generation_attention_partition_spec: PartitionSpec = ...,
+            partition_axis: PartitionAxis = ...,
             scan_ring_attention: bool = ...,
             scan_attention_layers: bool = ...,
             attention_dropout: float = 0.0,
@@ -264,23 +258,14 @@ class AttentionModule:
         self.block_k_major_dq: int = ...
         self.block_k_dq: int = ...
         self.block_q_dq: int = ...
-        self.query_partition_spec: PartitionSpec = ...
-        self.generation_query_partition_spec: PartitionSpec = ...
-        self.key_partition_spec: PartitionSpec = ...
-        self.value_partition_spec: PartitionSpec = ...
-        self.bias_partition_spec: PartitionSpec = ...
-        self.generation_bias_partition_spec: PartitionSpec = ...
-        self.attention_partition_spec: PartitionSpec = ...
-        self.generation_attention_partition_spec: PartitionSpec = ...
+        self.partition_axis: PartitionAxis = ...
         self.scan_ring_attention: bool = ...
         self.precision: lax.Precision = ...
         self.force_float32_tpu: bool = ...
         self.shard_attention_computation: bool = ...
         self.use_sharding_constraint: Optional[bool] = ...
         self.axis_name: str = ...
-
         set_attrs_smartly_with_prp(self, "use_sharding_constraint", False, use_sharding_constraint, base_module_class)
-
         set_attrs_smartly_with_prp(self, "block_k_major", DEFAULT_K_BLOCK, block_k_major, base_module_class)
         set_attrs_smartly_with_prp(self, "block_b", 1, block_b, base_module_class)
         set_attrs_smartly_with_prp(self, "block_q", DEFAULT_Q_BLOCK, block_q, base_module_class)
@@ -292,79 +277,10 @@ class AttentionModule:
         set_attrs_smartly_with_prp(self, "block_q_dkv", DEFAULT_Q_BLOCK, block_q_dkv, base_module_class)
         set_attrs_smartly_with_prp(self, "block_q_dq", DEFAULT_Q_BLOCK, block_q_dq, base_module_class)
         set_attrs_smartly_with_prp(self, "block_k_dq", DEFAULT_K_BLOCK, block_k_dq, base_module_class)
-
-        set_attrs_smartly_with_prp(
-            self,
-            "shard_attention_computation",
-            True,
-            shard_attention_computation,
-            base_module_class
-        )
-        set_attrs_smartly_with_prp(
-            self,
-            "scan_ring_attention",
-            True,
-            scan_ring_attention,
-            base_module_class
-        )
-
-        set_attrs_smartly_with_prp(
-            self,
-            "query_partition_spec",
-            DEFAULT_QPS,
-            query_partition_spec,
-            base_module_class
-        )
-        set_attrs_smartly_with_prp(
-            self,
-            "key_partition_spec",
-            DEFAULT_KPS,
-            key_partition_spec,
-            base_module_class
-        )
-        set_attrs_smartly_with_prp(
-            self,
-            "value_partition_spec",
-            DEFAULT_VPS,
-            value_partition_spec,
-            base_module_class
-        )
-        set_attrs_smartly_with_prp(
-            self,
-            "bias_partition_spec",
-            DEFAULT_BPS,
-            bias_partition_spec,
-            base_module_class
-        )
-        set_attrs_smartly_with_prp(
-            self,
-            "attention_partition_spec",
-            DEFAULT_APS,
-            attention_partition_spec,
-            base_module_class
-        )
-        set_attrs_smartly_with_prp(
-            self,
-            "generation_query_partition_spec",
-            DEFAULT_G_QPS,
-            generation_query_partition_spec,
-            base_module_class
-        )
-        set_attrs_smartly_with_prp(
-            self,
-            "generation_bias_partition_spec",
-            DEFAULT_G_BPS,
-            generation_bias_partition_spec,
-            base_module_class
-        )
-        set_attrs_smartly_with_prp(
-            self,
-            "generation_attention_partition_spec",
-            DEFAULT_G_APS,
-            generation_attention_partition_spec,
-            base_module_class
-        )
-
+        set_attrs_smartly_with_prp(self, "shard_attention_computation", True, shard_attention_computation,
+                                   base_module_class)
+        set_attrs_smartly_with_prp(self, "scan_ring_attention", True, scan_ring_attention, base_module_class)
+        set_attrs_smartly_with_prp(self, "partition_axis", PartitionAxis(), partition_axis, base_module_class)
         set_attrs_smartly_with_prp(self, "precision", lax.Precision("fastest"), precision)  # DON'T READ FROM CONFIG
         set_attrs_smartly_with_prp(self, "force_float32_tpu", True, force_float32_tpu)  # DON'T READ FROM CONFIG
         set_attrs_smartly_with_prp(self, "axis_name", "sp", axis_name)  # DON'T READ FROM CONFIG
@@ -418,18 +334,143 @@ class AttentionModule:
             block_q_major_dkv=min(self.block_q_major_dkv, q_seq)
         )
 
-    def get_partition_specs(self, qs) -> Tuple[
-        PartitionSpec, PartitionSpec, PartitionSpec, PartitionSpec, PartitionSpec, bool
+    def get_bshd_partition_specs(self, query_sequence_length) -> Tuple[
+        PartitionSpec,
+        PartitionSpec,
+        PartitionSpec,
+        PartitionSpec,
+        PartitionSpec,
+        bool
     ]:
-        is_generating = qs == 1
-        query_sequence_partition = self.generation_query_partition_spec if is_generating else self.query_partition_spec
-        bias_partition_spec = self.generation_bias_partition_spec if is_generating else self.bias_partition_spec
-        attention_partition_spec = self.generation_attention_partition_spec if is_generating else self.attention_partition_spec
+        is_generating = query_sequence_length == 1
+        if is_generating:
+            query_partition_spec = PartitionSpec(
+                self.partition_axis.batch_axis,
+                self.partition_axis.query_sequence_axis,
+                self.partition_axis.head_axis,
+                self.partition_axis.attention_dim_axis,
+            )
+            key_partition_spec = PartitionSpec(
+                self.partition_axis.batch_axis,
+                self.partition_axis.key_sequence_axis,
+                self.partition_axis.head_axis,
+                self.partition_axis.attention_dim_axis,
+            )
+            value_partition_spec = PartitionSpec(
+                self.partition_axis.batch_axis,
+                self.partition_axis.key_sequence_axis,
+                self.partition_axis.head_axis,
+                self.partition_axis.attention_dim_axis,
+            )
+            bias_partition_spec = PartitionSpec(
+                self.partition_axis.batch_axis,
+                self.partition_axis.bias_head_sequence_axis,
+                self.partition_axis.query_sequence_axis,
+                self.partition_axis.bias_key_sequence_axis
+            )
+            attention_partition_spec = query_partition_spec
+        else:
 
+            query_partition_spec = PartitionSpec(
+                self.partition_axis.batch_axis,
+                self.partition_axis.generation_query_sequence_axis,
+                self.partition_axis.head_axis,
+                self.partition_axis.attention_dim_axis,
+            )
+            key_partition_spec = PartitionSpec(
+                self.partition_axis.batch_axis,
+                self.partition_axis.generation_key_sequence_axis,
+                self.partition_axis.head_axis,
+                self.partition_axis.attention_dim_axis,
+            )
+            value_partition_spec = PartitionSpec(
+                self.partition_axis.batch_axis,
+                self.partition_axis.generation_key_sequence_axis,
+                self.partition_axis.head_axis,
+                self.partition_axis.attention_dim_axis,
+            )
+            bias_partition_spec = PartitionSpec(
+                self.partition_axis.batch_axis,
+                self.partition_axis.bias_head_sequence_axis,
+                self.partition_axis.generation_query_sequence_axis,
+                self.partition_axis.bias_key_sequence_axis
+            )
+            attention_partition_spec = query_partition_spec
         return (
-            query_sequence_partition,
-            self.key_partition_spec,
-            self.value_partition_spec,
+            query_partition_spec,
+            key_partition_spec,
+            value_partition_spec,
+            bias_partition_spec,
+            attention_partition_spec,
+            is_generating
+        )
+
+    def get_bhsd_partition_specs(self, query_sequence_length) -> Tuple[
+        PartitionSpec,
+        PartitionSpec,
+        PartitionSpec,
+        PartitionSpec,
+        PartitionSpec,
+        bool
+    ]:
+        is_generating = query_sequence_length == 1
+        if is_generating:
+            query_partition_spec = PartitionSpec(
+                self.partition_axis.batch_axis,
+                self.partition_axis.head_axis,
+                self.partition_axis.query_sequence_axis,
+                self.partition_axis.attention_dim_axis,
+            )
+            key_partition_spec = PartitionSpec(
+                self.partition_axis.batch_axis,
+                self.partition_axis.head_axis,
+                self.partition_axis.key_sequence_axis,
+                self.partition_axis.attention_dim_axis,
+            )
+            value_partition_spec = PartitionSpec(
+                self.partition_axis.batch_axis,
+                self.partition_axis.head_axis,
+                self.partition_axis.key_sequence_axis,
+                self.partition_axis.attention_dim_axis,
+            )
+            bias_partition_spec = PartitionSpec(
+                self.partition_axis.batch_axis,
+                self.partition_axis.bias_head_sequence_axis,
+                self.partition_axis.query_sequence_axis,
+                self.partition_axis.bias_key_sequence_axis
+            )
+            attention_partition_spec = query_partition_spec
+        else:
+
+            query_partition_spec = PartitionSpec(
+                self.partition_axis.batch_axis,
+                self.partition_axis.head_axis,
+                self.partition_axis.generation_query_sequence_axis,
+                self.partition_axis.attention_dim_axis,
+            )
+            key_partition_spec = PartitionSpec(
+                self.partition_axis.batch_axis,
+                self.partition_axis.head_axis,
+                self.partition_axis.generation_key_sequence_axis,
+                self.partition_axis.attention_dim_axis,
+            )
+            value_partition_spec = PartitionSpec(
+                self.partition_axis.batch_axis,
+                self.partition_axis.head_axis,
+                self.partition_axis.generation_key_sequence_axis,
+                self.partition_axis.attention_dim_axis,
+            )
+            bias_partition_spec = PartitionSpec(
+                self.partition_axis.batch_axis,
+                self.partition_axis.bias_head_sequence_axis,
+                self.partition_axis.generation_query_sequence_axis,
+                self.partition_axis.bias_key_sequence_axis
+            )
+            attention_partition_spec = query_partition_spec
+        return (
+            query_partition_spec,
+            key_partition_spec,
+            value_partition_spec,
             bias_partition_spec,
             attention_partition_spec,
             is_generating
@@ -691,7 +732,7 @@ class AttentionModule:
             key_value_sequence_length: int,
             bias: Optional[Array] = None,
     ):
-        qps, kps, vps, bps, aps, _ = self.get_partition_specs(query_sequence_length)
+        qps, kps, vps, bps, aps, _ = self.get_bshd_partition_specs(query_sequence_length)
         attention_outputs = shard_map(
             partial(
                 ring_attention_standard,
@@ -725,6 +766,7 @@ class AttentionModule:
             dropout_rng: Optional[random.PRNGKey] = None,
             segment_ids: Optional[Array] = None,
     ):
+        qps, kps, vps, bps, aps, _ = self.get_bshd_partition_specs(query_sequence_length)
         if segment_ids is None:
             segment_ids = jnp.zeros((query_states.shape[0], query_sequence_length), dtype="i4")
         if self.scan_ring_attention and query_states.shape[1] > max(
@@ -755,17 +797,17 @@ class AttentionModule:
                 ),
                 mesh=self.mesh,
                 in_specs=(
-                    self.query_partition_spec,
-                    self.key_partition_spec,
-                    self.value_partition_spec,
-                    self.bias_partition_spec,
-                    PartitionSpec(("dp", "fsdp"), None),
+                    qps,
+                    kps,
+                    vps,
+                    bps,
+                    PartitionSpec(self.partition_axis.batch_axis, None),
                 ),
-                out_specs=self.attention_partition_spec,
+                out_specs=aps,
                 check_rep=False
             )
             attn_output = ring_attention_sharded(query_states, key_states, value_states, bias, segment_ids)
-            attn_output = with_sharding_constraint(attn_output, self.attention_partition_spec)
+            attn_output = with_sharding_constraint(attn_output, aps)
         else:
             if self.platform != "tpu":
                 warnings.warn(
@@ -776,7 +818,9 @@ class AttentionModule:
                     f"\nquery_states.shape[1]({query_states.shape[1]}) > max({self.block_q},{self.block_k})"
                     f"({max(self.block_q, self.block_k)})"
                 )
-            query_sequence_partition = None if query_states.shape[1] == 1 else "sp"
+            query_sequence_partition = self.partition_axis.generation_query_sequence_axis if (
+                    query_states.shape[1] == 1
+            ) else self.partition_axis.query_sequence_axis
             ring_attention_sharded = shard_map(
                 partial(
                     ring_attention_standard,
@@ -785,12 +829,17 @@ class AttentionModule:
                 ),
                 mesh=self.mesh,
                 in_specs=(
-                    PartitionSpec(("dp", "fsdp"), query_sequence_partition, "tp", None),
-                    PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-                    PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-                    PartitionSpec(("dp", "fsdp"), None, query_sequence_partition, None)
+                    qps,
+                    kps,
+                    vps,
+                    PartitionSpec(self.partition_axis.batch_axis, None, query_sequence_partition, None)
                 ),
-                out_specs=PartitionSpec(("dp", "fsdp"), query_sequence_partition, "tp", None),
+                out_specs=PartitionSpec(
+                    self.partition_axis.batch_axis,
+                    query_sequence_partition,
+                    self.partition_axis.head_axis,
+                    None
+                ),
                 check_rep=False
             )
             attn_output = ring_attention_sharded(
@@ -814,6 +863,7 @@ class AttentionModule:
             dropout_rng: Optional[random.PRNGKey] = None,
             segment_ids: Optional[Array] = None
     ):
+        qps, kps, vps, bps, aps, _ = self.get_bshd_partition_specs(query_sequence_length)
         if segment_ids is None:
             segment_ids = jnp.zeros((query_states.shape[0], query_sequence_length), dtype="i4")
         if self.scan_ring_attention and query_states.shape[1] > max(self.block_q, self.block_k):
@@ -836,18 +886,12 @@ class AttentionModule:
                     )
                 ),
                 mesh=self.mesh,
-                in_specs=(
-                    self.query_partition_spec,
-                    self.key_partition_spec,
-                    self.value_partition_spec,
-                    self.bias_partition_spec,
-                    PartitionSpec(("dp", "fsdp"), "sp"),
-                ),
-                out_specs=self.attention_partition_spec,
+                in_specs=[qps, kps, vps, bps, PartitionSpec(qps[0], qps[1])],
+                out_specs=aps,
                 check_rep=False
             )
             attn_output = ring_attention_sharded(query_states, key_states, value_states, bias, segment_ids)
-            attn_output = with_sharding_constraint(attn_output, self.attention_partition_spec)
+            attn_output = with_sharding_constraint(attn_output, aps)
             return AttentionOutput(
                 attention_weights=None,
                 attention_outputs=attn_output
@@ -912,12 +956,12 @@ class AttentionModule:
             key_value_sequence_length: int,
     ) -> AttentionOutput:
         dtype = jnp.promote_types(self.dtype, jnp.float32)
-        qps, kps, vps, bps, aps, is_gen = self.get_partition_specs(qs=query_sequence_length)
+        qps, kps, vps, bps, aps, is_gen = self.get_bshd_partition_specs(query_sequence_length)
         block_size = self.get_block_size_flash_attn(query_sequence_length, key_value_sequence_length)
         with self.mesh:
             query_states = with_sharding_constraint(query_states, qps)
-            key_states = with_sharding_constraint(key_states, self.key_partition_spec)
-            value_states = with_sharding_constraint(value_states, self.value_partition_spec)
+            key_states = with_sharding_constraint(key_states, kps)
+            value_states = with_sharding_constraint(value_states, vps)
             bias = with_sharding_constraint(bias, bps)
             o = blockwise_attn(
                 query=query_states,
@@ -956,7 +1000,7 @@ class AttentionModule:
     ) -> AttentionOutput:
         dtype = jnp.promote_types(self.dtype, jnp.float32)
 
-        qps, kps, vps, bps, aps, is_gen = self.get_partition_specs(qs=query_sequence_length)
+        qps, kps, vps, bps, aps, is_gen = self.get_bshd_partition_specs(query_sequence_length)
 
         with self.mesh:
             query_states = fjformer.with_sharding_constraint(query_states, qps)
@@ -1013,7 +1057,7 @@ class AttentionModule:
     ) -> AttentionOutput:
         dtype = jnp.promote_types(self.dtype, jnp.float32)
 
-        qps, kps, vps, bps, aps, is_gen = self.get_partition_specs(qs=query_sequence_length)
+        qps, kps, vps, bps, aps, is_gen = self.get_bshd_partition_specs(query_sequence_length)
 
         with self.mesh:
             attention_outputs = shard_map(
@@ -1025,7 +1069,12 @@ class AttentionModule:
                     precision=self.precision,
                     attention_dropout=self.attention_dropout
                 ),
-                in_specs=(qps, kps, vps, PartitionSpec(bps[0], None, None, None) if bias is not None else None),
+                in_specs=(
+                    qps,
+                    kps,
+                    vps,
+                    PartitionSpec(bps[0], None, None, None) if bias is not None else None
+                ),
                 out_specs=aps,
                 check_rep=False,
                 mesh=self.mesh
@@ -1049,7 +1098,7 @@ class AttentionModule:
             causal: bool = False,
     ) -> AttentionOutput:
 
-        qps, kps, vps, bps, aps, is_gen = self.get_partition_specs(qs=query_sequence_length)
+        qps, kps, vps, bps, aps, is_gen = self.get_bhsd_partition_specs(query_sequence_length)
         block_size = self.get_block_size_flash_attn(query_sequence_length, key_value_sequence_length)
         query_states = query_states.transpose(0, 2, 1, 3)
         key_states = key_states.transpose(0, 2, 1, 3)
@@ -1104,7 +1153,7 @@ class AttentionModule:
             attention_mask: Array
     ) -> AttentionOutput:
 
-        qps, kps, vps, bps, aps, is_gen = self.get_partition_specs(qs=query_sequence_length)
+        qps, kps, vps, bps, aps, is_gen = self.get_bhsd_partition_specs(query_sequence_length)
 
         query_states = query_states.transpose(0, 2, 1, 3)
         key_states = key_states.transpose(0, 2, 1, 3)
@@ -1160,7 +1209,7 @@ class AttentionModule:
     ) -> AttentionOutput:
         if query_sequence_length is None:
             query_sequence_length = query_states.shape[1]
-        qps, kps, vps, bps, aps, is_gen = self.get_partition_specs(qs=query_sequence_length)
+        qps, kps, vps, bps, aps, is_gen = self.get_bshd_partition_specs(query_sequence_length)
 
         query_states, key_states, value_states = map(
             lambda s: s.astype(jnp.float32),

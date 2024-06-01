@@ -75,6 +75,7 @@ print(
 import jax
 import flax.linen.attention as flt
 from fjformer import GenerateRNG
+from easydel import PartitionAxis
 from easydel.modules.attention_module import AttentionModule
 from easydel.modules.easydel_modelling_utils import EasyDeLPretrainedConfig
 from jax import numpy as jnp, random, lax
@@ -145,18 +146,18 @@ flash_attention = AttentionModule(
     num_attention_heads=NUM_ATTN_HEADS,
     attention_dropout=0.0,
     head_dims=HEAD_DIM,
-    attention_partition_spec=config.attention_partition_spec,
+    partition_axis=PartitionAxis(
+        batch_axis=("dp", "fsdp"),
+        query_sequence_axis="sp",
+        key_sequence_axis="sp",
+        head_axis="tp",
+        attention_dim_axis=None
+    ),
     shard_attention_computation=config.shard_attention_computation,
     precision=lax.Precision("fastest"),
     force_float32_tpu=True,
     attn_mechanism="flash",
     dtype=jnp.float32,
-    bias_partition_spec=config.bias_partition_spec,
-    key_partition_spec=config.key_partition_spec,
-    query_partition_spec=config.query_partition_spec,
-    generation_query_partition_spec=config.generation_query_partition_spec,
-    generation_bias_partition_spec=config.generation_bias_partition_spec,
-    value_partition_spec=config.value_partition_spec,
     scan_ring_attention=config.scan_ring_attention,
     mesh=config.get_mesh(),
     sm_scale=1 / math.sqrt(q.shape[-1]),
@@ -178,18 +179,18 @@ normal_attention = AttentionModule(
     num_attention_heads=NUM_ATTN_HEADS,
     attention_dropout=0.0,
     head_dims=HEAD_DIM,
-    attention_partition_spec=config.attention_partition_spec,
+    partition_axis=PartitionAxis(
+        batch_axis=("dp", "fsdp"),
+        query_sequence_axis="sp",
+        key_sequence_axis="sp",
+        head_axis="tp",
+        attention_dim_axis=None
+    ),
     shard_attention_computation=config.shard_attention_computation,
     precision=lax.Precision("fastest"),
     force_float32_tpu=True,
-    attn_mechanism="normal",
+    attn_mechanism="sharded_vanilla",
     dtype=jnp.float32,
-    bias_partition_spec=config.bias_partition_spec,
-    key_partition_spec=config.key_partition_spec,
-    query_partition_spec=config.query_partition_spec,
-    generation_query_partition_spec=config.generation_query_partition_spec,
-    generation_bias_partition_spec=config.generation_bias_partition_spec,
-    value_partition_spec=config.value_partition_spec,
     scan_ring_attention=config.scan_ring_attention,
     mesh=config.get_mesh(),
     sm_scale=1 / math.sqrt(q.shape[-1]),

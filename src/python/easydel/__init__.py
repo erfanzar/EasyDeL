@@ -238,7 +238,8 @@ from .etils import (
     EasyDeLState as EasyDeLState,
     EasyDeLTimerError as EasyDeLTimerError,
     EasyDeLRuntimeError as EasyDeLRuntimeError,
-    EasyDeLSyntaxRuntimeError as EasyDeLSyntaxRuntimeError
+    EasyDeLSyntaxRuntimeError as EasyDeLSyntaxRuntimeError,
+    PartitionAxis as PartitionAxis
 )
 
 __all__ = (
@@ -463,7 +464,8 @@ __all__ = (
     "EasyDeLState",
     "EasyDeLTimerError",
     "EasyDeLRuntimeError",
-    "EasyDeLSyntaxRuntimeError"
+    "EasyDeLSyntaxRuntimeError",
+    "PartitionAxis"
 )
 
-__version__ = "0.0.65"
+__version__ = "0.0.66"

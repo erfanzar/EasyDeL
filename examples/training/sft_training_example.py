@@ -1,5 +1,6 @@
 import transformers
 
+import easydel
 from easydel import (
     AutoEasyDeLModelForCausalLM,
     TrainArguments,
@@ -74,12 +75,11 @@ def main():
     bps = PartitionSpec(("dp", "fsdp"), "sp", None, None)
     aps = PartitionSpec(("dp", "fsdp"), "sp", None, "tp")
 
-    attention_partitions = dict(
-        query_partition_spec=qps,
-        key_partition_spec=kps,
-        value_partition_spec=vps,
-        bias_partition_spec=bps,
-        attention_partition_spec=aps,
+    partition_axis = easydel.PartitionAxis(
+        batch_axis=("dp", "fsdp"),
+        query_sequence_axis="sp",
+        key_sequence_axis="sp",
+        head_axis="tp"
     )
 
     model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
@@ -91,9 +91,9 @@ def main():
         config_kwargs=dict(
             use_scan_mlp=False,
             attn_mechanism=FLAGS.attn_mechanism,
-            **attention_partitions
+            partition_axis=partition_axis
         ),
-        **attention_partitions
+        partition_axis=partition_axis
     )
 
     config = model.config
@@ -110,7 +110,7 @@ def main():
     config.add_basic_configurations(
         attn_mechanism=FLAGS.attn_mechanism,
         shard_attention_computation=True,
-        **attention_partitions
+        partition_axis=partition_axis
     )
 
     configs_to_initialize_model_class = {

@@ -343,6 +343,7 @@ you can fine-tune your own model with DPOTrainer
 > DPO Tuning a Mixtral model with Intel DPO dataset.
 
 ```python
+import easydel
 from easydel import (
     TrainArguments,
     EasyDeLOptimizers,
@@ -376,37 +377,6 @@ dtype = jnp.bfloat16
 
 sharding_axis_dims = (1, -1, 1, 1)
 sharding_axis_names = ("dp", "fsdp", "tp", "sp")
-query_partition_spec = PartitionSpec(
-    ("dp", "fsdp"), "sp", "tp", None
-)  # Query Partition Spec for Model
-key_partition_spec = PartitionSpec(
-    ("dp", "fsdp"), "sp", "tp", None
-)  # Key Partition Spec for Model
-value_partition_spec = PartitionSpec(
-    ("dp", "fsdp"), "sp", "tp", None
-)  # Value Partition Spec for Model
-bias_partition_spec = PartitionSpec(
-    ("dp", "fsdp"), None, None, None
-)  # Attention Mask / Bias Partition Spec for Model
-attention_partition_spec = PartitionSpec(
-    ("dp", "fsdp"), "sp", "tp", None
-)  # Attention Score / Weight Partition Spec for Model
-
-ref_model_query_partition_spec = PartitionSpec(
-    ("dp", "fsdp"), "sp", "tp", None
-)  # Query Partition Spec for Ref Model
-ref_model_key_partition_spec = PartitionSpec(
-    ("dp", "fsdp"), "sp", "tp", None
-)  # Key Partition Spec for Ref Model
-ref_model_value_partition_spec = PartitionSpec(
-    ("dp", "fsdp"), "sp", "tp", None
-)  # Value Partition Spec for Ref Model
-ref_model_bias_partition_spec = PartitionSpec(
-    ("dp", "fsdp"), None, None, None
-)  # Attention Mask / Bias Partition Spec for Ref Model
-ref_model_attention_partition_spec = PartitionSpec(
-    ("dp", "fsdp"), "sp", "tp", None
-)  # Attention Score / Weight Partition Spec for Ref Model
 
 
 def extract_anthropic_prompt(prompt_and_response):
@@ -492,11 +462,13 @@ state = EasyDeLState.from_pretrained(
     free_optimizer_state=True,
     sharding_axis_dims=sharding_axis_dims,
     sharding_axis_names=sharding_axis_names,
-    query_partition_spec=query_partition_spec,
-    key_partition_spec=key_partition_spec,
-    value_partition_spec=value_partition_spec,
-    bias_partition_spec=bias_partition_spec,
-    attention_partition_spec=attention_partition_spec,
+    partition_axis=easydel.PartitionAxis(
+        batch_axis=("dp", "fsdp"),
+        query_sequence_axis="sp",
+        key_sequence_axis="sp",
+        head_axis="tp",
+        attention_dim_axis=None
+    )
 )
 
 ref_state = EasyDeLState.from_pretrained(
@@ -507,11 +479,13 @@ ref_state = EasyDeLState.from_pretrained(
     free_optimizer_state=True,
     sharding_axis_dims=sharding_axis_dims,
     sharding_axis_names=sharding_axis_names,
-    query_partition_spec=ref_model_query_partition_spec,
-    key_partition_spec=ref_model_key_partition_spec,
-    value_partition_spec=ref_model_value_partition_spec,
-    bias_partition_spec=ref_model_bias_partition_spec,
-    attention_partition_spec=ref_model_attention_partition_spec,
+    partition_axis=easydel.PartitionAxis(
+        batch_axis=("dp", "fsdp"),
+        query_sequence_axis="sp",
+        key_sequence_axis="sp",
+        head_axis="tp",
+        attention_dim_axis=None
+    )
 )
 
 dpo_trainer = DPOTrainer(
@@ -576,7 +550,8 @@ Fine-tuning from a previous State or a new state
 ```python
 from easydel import (
     AutoEasyDeLConfig,
-    EasyDeLState
+    EasyDeLState,
+    PartitionAxis
 )
 from transformers import AutoTokenizer
 from jax import numpy as jnp, lax
@@ -599,11 +574,13 @@ state = EasyDeLState.from_pretrained(
     # the way to shard model across gpu,cpu or TPUs using sharding array (1, -1, 1, 1)
     # everything training will be in sequence and model parallel automatic and share data between devices
     sharding_axis_names=("dp", "fsdp", "tp", "sp"),
-    query_partition_spec=jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-    key_partition_spec=jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-    value_partition_spec=jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-    bias_partition_spec=jax.sharding.PartitionSpec(("dp", "fsdp"), None, None, None),
-    attention_partition_spec=jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+    partition_axis=PartitionAxis(
+        batch_axis=("dp", "fsdp"),
+        query_sequence_axis="sp",
+        key_sequence_axis="sp",
+        head_axis="tp",
+        attention_dim_axis=None
+    ),
     shard_attention_computation=True,
     input_shape=(1, 1),
     backend=None,
@@ -714,17 +691,6 @@ switch between them and experiment with different configurations.
 * **Efficiency:**  Supports advanced JAX sharding for distributed computation, enabling the handling of large models.
 
 _Flash Attention works on TPU with ease but for gpu there are still some improvements in process._
-
-> [!TIP]
-> use these partition specs in case of not using custom sharding_axis_names and using sequence sharding with flash
-> flash attention
-> ```python
->query_partition_spec=PartitionSpec(("dp", "fsdp"), None, "sp", "tp"),
->generation_query_partition_spec=PartitionSpec(("dp", "fsdp"), None, None, "tp"),
->key_partition_spec=PartitionSpec(("dp", "fsdp"), None, "sp", "tp"),
->value_partition_spec=PartitionSpec(("dp", "fsdp"), None, "sp", "tp"),
->attention_partition_spec=PartitionSpec(("dp", "fsdp"), None,"sp", "tp"),
-> ```
 
 ## EasyDeLXRapTure for layer tuning and LoRA
 

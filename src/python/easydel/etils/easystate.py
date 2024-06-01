@@ -12,6 +12,7 @@ import optax
 from transformers import AutoModelForCausalLM
 
 from .auto_tx import get_optimizer_and_scheduler
+from .partition_module import PartitionAxis
 from ..etils import AVAILABLE_SCHEDULERS, AVAILABLE_OPTIMIZERS, EasyDeLRuntimeError
 from jax.sharding import Mesh, PartitionSpec
 from jax import numpy as jnp
@@ -540,13 +541,7 @@ class EasyDeLState(struct.PyTreeNode):
             precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
             sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
             sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            generation_query_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "tp", None, None),
-            key_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            value_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
-            generation_bias_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), None, None, None),
-            attention_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            partition_axis: PartitionAxis = PartitionAxis(),
             shard_attention_computation: bool = True,
             input_shape: Sequence[int] = (1, 1),
             backend: Optional[str] = None,
@@ -575,13 +570,7 @@ class EasyDeLState(struct.PyTreeNode):
             precision (Optional[jax.lax.Precision], optional): The precision to use for computations. Defaults to jax.lax.Precision("fastest").
             sharding_axis_dims (Sequence[int], optional): The dimensions of the axes for sharding. Defaults to (1, -1, 1, 1).
             sharding_axis_names (Sequence[str], optional): The names of the axes for sharding. Defaults to ("dp", "fsdp", "tp", "sp").
-            query_partition_spec (PartitionSpec, optional): The partitioning specification for query matrices. Defaults to PartitionSpec(("dp", "fsdp"), "sp", "tp", None).
-            generation_query_partition_spec (PartitionSpec, optional): The partitioning specification for query matrices during generation. Defaults to PartitionSpec(("dp", "fsdp"), "tp", None, None).
-            key_partition_spec (PartitionSpec, optional): The partitioning specification for key matrices. Defaults to PartitionSpec(("dp", "fsdp"), "sp", "tp", None).
-            value_partition_spec (PartitionSpec, optional): The partitioning specification for value matrices. Defaults to PartitionSpec(("dp", "fsdp"), "sp", "tp", None).
-            bias_partition_spec (PartitionSpec, optional): The partitioning specification for bias vectors. Defaults to PartitionSpec(("dp", "fsdp"), None, None, None).
-            generation_bias_partition_spec (PartitionSpec, optional): The partitioning specification for bias vectors during generation. Defaults to PartitionSpec(("dp", "fsdp"), None, None, None).
-            attention_partition_spec (PartitionSpec, optional): The partitioning specification for attention weights. Defaults to PartitionSpec(("dp", "fsdp"), "sp", "tp", None).
+            partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
             shard_attention_computation (bool, optional): Whether to shard attention computation. Defaults to True.
             input_shape (Sequence[int], optional): The shape of the input data. Defaults to (1, 1).
             backend (Optional[str], optional): The backend to use for computations. Defaults to None.
@@ -614,13 +603,7 @@ class EasyDeLState(struct.PyTreeNode):
                 precision=precision,
                 sharding_axis_dims=sharding_axis_dims,
                 sharding_axis_names=sharding_axis_names,
-                query_partition_spec=query_partition_spec,
-                generation_query_partition_spec=generation_query_partition_spec,
-                generation_bias_partition_spec=generation_bias_partition_spec,
-                key_partition_spec=key_partition_spec,
-                value_partition_spec=value_partition_spec,
-                bias_partition_spec=bias_partition_spec,
-                attention_partition_spec=attention_partition_spec,
+                partition_axis=partition_axis,
                 shard_attention_computation=shard_attention_computation,
                 input_shape=input_shape,  # type:ignore
                 backend=backend,

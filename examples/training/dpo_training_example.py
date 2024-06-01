@@ -4,7 +4,8 @@ from easydel import (
     EasyDeLSchedulers,
     EasyDeLGradientCheckPointers,
     DPOTrainer,
-    EasyDeLState
+    EasyDeLState,
+    PartitionAxis
 )
 
 from datasets import load_dataset
@@ -68,18 +69,6 @@ def main():
     sharding_axis_dims = (1, -1, 1, 1)
     sharding_axis_names = ("dp", "fsdp", "tp", "sp")
 
-    query_partition_spec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
-    key_partition_spec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
-    value_partition_spec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
-    bias_partition_spec = PartitionSpec(("dp", "fsdp"), None, None, None)
-    attention_partition_spec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
-
-    ref_model_query_partition_spec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
-    ref_model_key_partition_spec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
-    ref_model_value_partition_spec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
-    ref_model_bias_partition_spec = PartitionSpec(("dp", "fsdp"), None, None, None)
-    ref_model_attention_partition_spec = PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
-
     dataset = load_dataset("Intel/orca_dpo_pairs")['train']
 
     original_columns = dataset.column_names
@@ -128,11 +117,13 @@ def main():
         free_optimizer_state=True,
         sharding_axis_dims=sharding_axis_dims,
         sharding_axis_names=sharding_axis_names,
-        query_partition_spec=query_partition_spec,
-        key_partition_spec=key_partition_spec,
-        value_partition_spec=value_partition_spec,
-        bias_partition_spec=bias_partition_spec,
-        attention_partition_spec=attention_partition_spec,
+        partition_axis=PartitionAxis(
+            batch_axis=("dp", "fsdp"),
+            query_sequence_axis="sp",
+            key_sequence_axis="sp",
+            head_axis="tp",
+            attention_dim_axis=None
+        ),
         config_kwargs=dict(
             gradient_checkpointing="nothing_saveable"
         )
@@ -147,11 +138,13 @@ def main():
         free_optimizer_state=True,
         sharding_axis_dims=sharding_axis_dims,
         sharding_axis_names=sharding_axis_names,
-        query_partition_spec=ref_model_query_partition_spec,
-        key_partition_spec=ref_model_key_partition_spec,
-        value_partition_spec=ref_model_value_partition_spec,
-        bias_partition_spec=ref_model_bias_partition_spec,
-        attention_partition_spec=ref_model_attention_partition_spec,
+        partition_axis=PartitionAxis(
+            batch_axis=("dp", "fsdp"),
+            query_sequence_axis="sp",
+            key_sequence_axis="sp",
+            head_axis="tp",
+            attention_dim_axis=None
+        ),
         load_in_8bit=True
     )
     print("Ref Model State is Loaded.")
