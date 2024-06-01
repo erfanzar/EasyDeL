@@ -231,6 +231,34 @@ class GenerationPipeline:
                         )
                     ),
                     (
+                        "cached_key_scale", PartitionSpec(
+                            paxis.batch_axis,
+                            paxis.key_sequence_axis,
+                            paxis.head_axis,
+                        )
+                    ),
+                    (
+                        "cached_value_scale", PartitionSpec(
+                            paxis.batch_axis,
+                            paxis.key_sequence_axis,
+                            paxis.head_axis,
+                        )
+                    ),
+                    (
+                        "cached_key_minval", PartitionSpec(
+                            paxis.batch_axis,
+                            paxis.key_sequence_axis,
+                            paxis.head_axis,
+                        )
+                    ),
+                    (
+                        "cached_value_minval", PartitionSpec(
+                            paxis.batch_axis,
+                            paxis.key_sequence_axis,
+                            paxis.head_axis,
+                        )
+                    ),
+                    (
                         "cached_key", PartitionSpec(
                             paxis.batch_axis,
                             paxis.key_sequence_axis,
@@ -245,7 +273,8 @@ class GenerationPipeline:
                             paxis.head_axis,
                             None
                         )
-                    )
+                    ),
+
                 ),
                 jax.eval_shape(lambda: self.model.prepare_inputs_for_generation(input_ids, max_length, attention_mask))
             ),
