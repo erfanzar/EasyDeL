@@ -1,6 +1,8 @@
 import os
 import threading
 
+import fjformer.linen
+
 os.environ["XLA_FLAGS"] = '--xla_force_host_platform_device_count=2'
 
 from src.python.easydel import (
@@ -37,9 +39,11 @@ def main():
     tokens = tokenizer("SOME TEXT", return_tensors="np", max_length=32, padding="max_length")
     input_ids = tokens["input_ids"]
     attention_mask = tokens["attention_mask"]
+    params = model.params
+    params = fjformer.linen.quantize_int8_parameters(["kernel", "embedding"], params)
     pipeline = GenerationPipeline(
         model=model,
-        params=model.params,
+        params=params,
         tokenizer=tokenizer,
         add_params_field=True,
         generation_config=GenerationPipelineConfig(max_new_tokens=128, do_sample=True)

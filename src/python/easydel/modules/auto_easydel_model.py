@@ -589,7 +589,7 @@ class AutoEasyDeLModelForCausalLM:
             if auto_shard_params:
                 if partition_rules is None:
                     partition_rules = cfg.get_partition_rules(True)
-                params = jax.tree_util.tree_map(
+                params_sharding = jax.tree_util.tree_map(
                     lambda spec: jax.sharding.NamedSharding(
                         spec=spec, mesh=cfg.get_mesh()
                     ),
@@ -598,6 +598,11 @@ class AutoEasyDeLModelForCausalLM:
                         ed_model.params_shape_tree
                     )
                 )
+                params = jax.jit(
+                    lambda x: x,
+                    in_shardings=(jax.tree_util.tree_map(lambda x: x.sharding, params),),
+                    out_shardings=params_sharding
+                )(params)
 
             # Clear and collect memory after converting the model
             del state_dict
