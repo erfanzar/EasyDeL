@@ -569,6 +569,7 @@ class AutoEasyDeLModelForCausalLM:
                     params_pattern_selection = re.compile("({})".format("|".join(bit_targeted_params)))
             trf_partial = functools.partial(
                 trf,
+                state_dict=state_dict,
                 config=config,
                 device=device,
                 shard_fns=shard_fns,
@@ -577,7 +578,7 @@ class AutoEasyDeLModelForCausalLM:
                 remove_state_dict=True
             )
             if shard_fns is not None:
-                params = trf_partial(state_dict)
+                params = trf_partial()
             else:
                 if auto_shard_params:
                     if partition_rules is None:
@@ -593,12 +594,12 @@ class AutoEasyDeLModelForCausalLM:
                                 ed_model.params_shape_tree
                             )
                         )
-                    )(state_dict)
+                    )()
                 else:
                     params = jax.jit(
                         trf_partial,
                         out_shardings=None
-                    )(state_dict)
+                    )()
                 # Clear and collect memory after converting the model
             del state_dict
             _clear()
