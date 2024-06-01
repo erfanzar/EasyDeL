@@ -34,7 +34,7 @@ def get_modules_by_type(model_type: str) -> Tuple[
 
     :param model_type: str: Determine which model to use
     :return: A tuple of three elements (BaseConfig,BaseModel,Func To Transform Model from Torch to EasyDeL)
-    
+
     """
     if model_type == "llama":
         from .llama import LlamaConfig as _LlamaConfig
@@ -544,14 +544,22 @@ class AutoEasyDeLModelForCausalLM:
         _clear()
 
         if shard_fns is not None:
-            if auto_shard_params:
-                warnings.warn(
-                    "`auto_shard_params` will be ignored since you are passing custom sharding functions"
-                )
             logger.debug("sharding model parameters based on the given shard_fns.")
             if not is_flatten(shard_fns):
                 shard_fns = flax.traverse_util.flatten_dict(shard_fns)
-
+        elif auto_shard_params:
+            shard_fns, _ = AutoShardAndGatherFunctions.from_pretrained(
+                pretrained_model_name_or_path=pretrained_model_name_or_path,
+                dtype_specs=param_dtype,
+                partition_rules=partition_rules,
+                sharding_axis_dims=sharding_axis_dims,
+                sharding_axis_names=sharding_axis_names,
+                partition_axis=partition_axis,
+                shard_attention_computation=shard_attention_computation,
+                backend=backend,
+                input_shape=input_shape,  # type:ignore
+                config_kwargs=config_kwargs
+            )
         with cfg.get_mesh():
             logger.debug("converting huggingface-model to easydel-model.")
             params_pattern_selection = None
@@ -567,9 +575,9 @@ class AutoEasyDeLModelForCausalLM:
                     ]
 
                     params_pattern_selection = re.compile("({})".format("|".join(bit_targeted_params)))
-            trf_partial = functools.partial(
-                trf,
-                state_dict=state_dict,
+
+            params = trf(
+                state_dict,
                 config=config,
                 device=device,
                 shard_fns=shard_fns,
@@ -577,30 +585,21 @@ class AutoEasyDeLModelForCausalLM:
                 params_pattern_selection=params_pattern_selection,
                 remove_state_dict=True
             )
-            if shard_fns is not None:
-                params = trf_partial()
-            else:
-                if auto_shard_params:
-                    if partition_rules is None:
-                        partition_rules = cfg.get_partition_rules(True)
-                    params = jax.jit(
-                        trf_partial,
-                        out_shardings=jax.tree_util.tree_map(
-                            lambda spec: jax.sharding.NamedSharding(
-                                spec=spec, mesh=cfg.get_mesh()
-                            ),
-                            match_partition_rules(
-                                partition_rules,
-                                ed_model.params_shape_tree
-                            )
-                        )
-                    )()
-                else:
-                    params = jax.jit(
-                        trf_partial,
-                        out_shardings=None
-                    )()
-                # Clear and collect memory after converting the model
+
+            if auto_shard_params:
+                if partition_rules is None:
+                    partition_rules = cfg.get_partition_rules(True)
+                params = jax.tree_util.tree_map(
+                    lambda spec: jax.sharding.NamedSharding(
+                        spec=spec, mesh=cfg.get_mesh()
+                    ),
+                    match_partition_rules(
+                        partition_rules,
+                        ed_model.params_shape_tree
+                    )
+                )
+
+            # Clear and collect memory after converting the model
             del state_dict
             _clear()
 
