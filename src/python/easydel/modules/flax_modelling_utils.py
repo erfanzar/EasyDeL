@@ -10,6 +10,7 @@ from jax.experimental.shard_map import shard_map
 from jax.interpreters import pxla
 import jax
 from flax import linen as nn
+from ..etils.partition_module import PartitionAxis
 from functools import partial
 import chex
 from typing import Sequence, Optional, Literal, List
@@ -455,27 +456,35 @@ class BaseJAXAttentionModule(nn.Module):
         is_initialized = self.has_variable("cache", "cached_key")
         if quantize_kv_cache:
             cached_key = self.variable(
-                "cache", "cached_key", jnp.zeros, key.shape, jnp.int8
+                "cache", "cached_key", jnp.zeros, key.shape, jnp.uint8
             )
             cached_value = self.variable(
-                "cache", "cached_value", jnp.zeros, value.shape, jnp.int8
+                "cache", "cached_value", jnp.zeros, value.shape, jnp.uint8
             )
-            cached_key_absmax = self.variable(
-                "cache", "cached_key_absmax", jnp.zeros, key.shape[0:-1], key.dtype
+            cached_key_scale = self.variable(
+                "cache", "cached_key_scale", jnp.zeros, key.shape[0:-1] + (1,), key.dtype
             )
-            cached_value_absmax = self.variable(
-                "cache", "cached_value_absmax", jnp.zeros, value.shape[0:-1], value.dtype
+            cached_value_scale = self.variable(
+                "cache", "cached_value_scale", jnp.zeros, value.shape[0:-1] + (1,), value.dtype
+            )
+            cached_key_minval = self.variable(
+                "cache", "cached_key_minval", jnp.zeros, key.shape[0:-1] + (1,), key.dtype
+            )
+            cached_value_minval = self.variable(
+                "cache", "cached_value_minval", jnp.zeros, value.shape[0:-1] + (1,), value.dtype
             )
             cache_index = self.variable(
                 "cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32)
             )
         else:
-            cached_key_absmax = None
-            cached_value_absmax = None
+            cached_key_scale = None
+            cached_value_scale = None
+            cached_value_minval = None
+            cached_key_minval = None
             cached_key = self.variable("cache", "cached_key", jnp.zeros, key.shape, key.dtype)
             cached_value = self.variable("cache", "cached_value", jnp.zeros, value.shape, value.dtype)
             cache_index = self.variable("cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32))
-
+        paxs: PartitionAxis = self.config.partition_axis
         if is_initialized:
             *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
             cur_index = cache_index.value
@@ -506,15 +515,46 @@ class BaseJAXAttentionModule(nn.Module):
                 fn = shard_map(
                     fn, mesh=mesh,
                     in_specs=(
-                        PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-                        PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-                        PartitionSpec(("dp", "fsdp"), None, "tp", None),
-                        PartitionSpec(("dp", "fsdp"), None, "tp", None),
+                        PartitionSpec(
+                            paxs.batch_axis,
+                            paxs.key_sequence_axis,
+                            paxs.head_axis,
+                            paxs.attention_dim_axis
+                        ),
+                        PartitionSpec(
+                            paxs.batch_axis,
+                            paxs.key_sequence_axis,
+                            paxs.head_axis,
+                            paxs.attention_dim_axis
+                        ),
+
+                        PartitionSpec(
+                            paxs.batch_axis,
+                            None,
+                            paxs.head_axis,
+                            paxs.attention_dim_axis
+                        ),
+                        PartitionSpec(
+                            paxs.batch_axis,
+                            None,
+                            paxs.head_axis,
+                            paxs.attention_dim_axis
+                        ),
                         PartitionSpec()
                     ),
                     out_specs=(
-                        PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-                        PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
+                        PartitionSpec(
+                            paxs.batch_axis,
+                            paxs.key_sequence_axis,
+                            paxs.head_axis,
+                            paxs.attention_dim_axis
+                        ),
+                        PartitionSpec(
+                            paxs.batch_axis,
+                            paxs.key_sequence_axis,
+                            paxs.head_axis,
+                            paxs.attention_dim_axis
+                        )
                     ),
                     check_rep=False
                 )
@@ -527,14 +567,14 @@ class BaseJAXAttentionModule(nn.Module):
                     key_val = fjformer.linen.linen.dequantize(
                         cached_key.value,
                         cached_key_scale.value,
+                        cached_key_minval.value,
                         key.dtype,
-                        .0
                     )
                     value_val = fjformer.linen.linen.dequantize(
                         cached_value.value,
                         cached_value_scale.value,  # TODO: FIX THIS ...
+                        cached_key_minval.value,
                         value.dtype,
-                        .0
                     )
                 else:
                     key_val = cached_key.value
@@ -549,15 +589,16 @@ class BaseJAXAttentionModule(nn.Module):
                 )
                 attention_mask = combine_masks(pad_mask, attention_mask)
             if quantize_kv_cache:
-                kq, ks = fjformer.linen.linen.quantize(key)
-                vq, vs = fjformer.linen.linen.quantize(value)
+                kq, ks, km = fjformer.linen.linen.quantize(key)
+                vq, vs, vm = fjformer.linen.linen.quantize(value)
 
                 cached_key.value = kq
-                cached_key_scale.value = ks
+                cached_key_scale.value = ks.astype(self.dtype)
+                cached_key_minval.value = km.astype(self.dtype)
 
                 cached_value.value = vq
-                cached_value_scale.value = vs
-
+                cached_value_scale.value = vs.astype(self.dtype)
+                cached_value_minval.value = vm.astype(self.dtype)
             else:
                 cached_key.value = key
                 cached_value.value = value
