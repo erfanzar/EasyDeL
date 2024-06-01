@@ -1,9 +1,6 @@
-import dataclasses
-import warnings
-from typing import Optional, Union, Dict, Any
+import os
 
-import flax.core
-import jax
+os.environ["XLA_FLAGS"] = '--xla_force_host_platform_device_count=2'
 
 from src.python.easydel import (
     FlaxLlamaForCausalLM,
@@ -24,13 +21,15 @@ def main():
         intermediate_size=512,
         num_hidden_layers=4,
         max_position_embeddings=512,
-        use_scan_mlp=False
+        use_scan_mlp=False,
+        axis_dims=(1, 1, 1, -1)
     )
     model = FlaxLlamaForCausalLM(
         config=config,
         dtype=jnp.float16,
         param_dtype=jnp.float16,
         precision=lax.Precision("fastest"),
+        input_shape=(1, 2),
         _do_init=True
     )
     tokens = tokenizer("SOME TEXT", return_tensors="np", max_length=32, padding="max_length")
