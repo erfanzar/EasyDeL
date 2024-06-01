@@ -45,6 +45,7 @@ of machine learning models, particularly in the domain of large language models 
 
 ### Latest News 🔥
 
+- removing *(q,k,v,b,a)_partition_specs and using `PartitionAxis` instead of them.
 - Sharding Strategies are changed.
 - Now EasyDeL is more Memory efficient Multi-GPUs
 - Aya Model is Supported.
