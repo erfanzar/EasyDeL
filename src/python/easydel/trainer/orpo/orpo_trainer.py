@@ -27,9 +27,8 @@ from typing import (
     Tuple
 )
 
-from jax.experimental.pjit import pjit
 from datasets import Dataset
-from jax import numpy as jnp
+from jax import numpy as jnp, jit
 
 from ...etils.etils import get_logger
 from ..training_configurations import TrainArguments
@@ -496,6 +495,7 @@ class ORPOTrainer(BaseTrainer, ABC):
         :return: A TrainerConfigureFunctionFuncOutput object
 
         """
+        mesh = self.arguments.get_mesh()
 
         def initialize_state_function():
             initialized_parameters = self.model.init_weights(
@@ -576,40 +576,43 @@ class ORPOTrainer(BaseTrainer, ABC):
             ) if self.arguments.custom_rule is None else self.arguments.custom_rule,
             state_shape
         )
-        create_sharded_state_from_params_function = pjit(
+
+        spec_named_sharding = self.specs_to_name_sharding(state_partition_spec)
+        empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=mesh)
+        create_sharded_state_from_params_function = jit(
             create_state_from_params_function,
-            in_shardings=(state_partition_spec.params,),
-            out_shardings=state_partition_spec,
+            in_shardings=(spec_named_sharding.params,),
+            out_shardings=spec_named_sharding,
             donate_argnums=(0,)
         )
-        sharded_train_step_function = pjit(
+        sharded_train_step_function = jit(
             create_orpo_step_function(
                 mode="train",
                 beta=self.beta,
                 concatenated_forward=self.concatenated_forward,
                 batch_partition_spec=self.arguments.step_partition_spec
             ),
-            in_shardings=(state_partition_spec, PartitionSpec()),
-            out_shardings=(state_partition_spec, PartitionSpec(),),
+            in_shardings=(spec_named_sharding, empty_sharding),
+            out_shardings=(spec_named_sharding, empty_sharding,),
 
         )
 
-        sharded_eval_step_function = pjit(
+        sharded_eval_step_function = jit(
             create_orpo_step_function(
                 mode="eval",
                 beta=self.beta,
                 concatenated_forward=self.concatenated_forward,
                 batch_partition_spec=self.arguments.step_partition_spec
             ),
-            in_shardings=(state_partition_spec, PartitionSpec()),
-            out_shardings=(state_partition_spec, PartitionSpec(),),
+            in_shardings=(spec_named_sharding, empty_sharding),
+            out_shardings=(spec_named_sharding, empty_sharding,),
 
         )
 
-        mesh = self.arguments.get_mesh()
         self.arguments.ckpt_path_exists()
         checkpoint_manager = self.arguments.get_streaming_checkpointer()
         self.state_partition_spec = state_partition_spec
+        self.state_named_sharding = spec_named_sharding
         self.state_shape = state_shape
 
         return TrainerConfigureFunctionFuncOutput(
@@ -685,30 +688,34 @@ class ORPOTrainer(BaseTrainer, ABC):
                             ) if self.arguments.custom_rule is None else self.arguments.custom_rule,
                             state_shape
                         )
-                        sharded_train_step_function = pjit(
+
+                        spec_named_sharding = self.specs_to_name_sharding(state_partition_spec)
+                        empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=self.arguments.get_mesh())
+                        sharded_train_step_function = jit(
                             create_orpo_step_function(
                                 mode="train",
                                 beta=self.beta,
                                 concatenated_forward=self.concatenated_forward,
                                 batch_partition_spec=self.arguments.step_partition_spec
                             ),
-                            in_shardings=(state_partition_spec, PartitionSpec()),
-                            out_shardings=(state_partition_spec, PartitionSpec(),),
+                            in_shardings=(spec_named_sharding, empty_sharding),
+                            out_shardings=(spec_named_sharding, empty_sharding,),
 
                         )
 
-                        sharded_eval_step_function = pjit(
+                        sharded_eval_step_function = jit(
                             create_orpo_step_function(
                                 mode="eval",
                                 beta=self.beta,
                                 concatenated_forward=self.concatenated_forward,
                                 batch_partition_spec=self.arguments.step_partition_spec
                             ),
-                            in_shardings=(state_partition_spec, PartitionSpec()),
-                            out_shardings=(state_partition_spec, PartitionSpec(),),
+                            in_shardings=(spec_named_sharding, empty_sharding),
+                            out_shardings=(spec_named_sharding, empty_sharding,),
                         )
 
                         self.state_partition_spec = state_partition_spec
+                        self.state_named_sharding = spec_named_sharding
                         self.state_shape = state_shape
                         self.sharded_train_step_function = sharded_train_step_function
                         self.sharded_eval_step_function = sharded_eval_step_function
@@ -752,45 +759,6 @@ class ORPOTrainer(BaseTrainer, ABC):
 
             self.sharded_state = sharded_state
             return sharded_state, shard_fns, gather_fns
-
-    def _save_state(
-            self,
-            state: EasyDeLState,
-            gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
-            milestone: bool = False
-    ) -> str:
-        step = int(
-            jax.device_get(
-                state.step
-            )
-        ) + self.arguments.step_start_point if self.arguments.step_start_point is not None else int(
-            jax.device_get(
-                state.step
-            )
-        )
-
-        checkpoint_dir = os.path.join(self.arguments.save_dir, self.arguments.model_name)
-        filename_extension = ".easy"
-        if self.arguments.save_total_limit:
-            checkpoint_files = glob(os.path.join(checkpoint_dir, f"*{filename_extension}"))
-            checkpoint_files.sort(key=os.path.getmtime)
-            for old_checkpoint in checkpoint_files[:-self.arguments.save_total_limit]:
-                os.remove(old_checkpoint)
-                termcolor.cprint(f"Removed old checkpoint: {old_checkpoint}", color="red", force_color=True)
-
-        checkpoint_name = f"{self.arguments.model_name}-S{step}"
-        filename = f"{checkpoint_name}_{step}" if milestone else f"{checkpoint_name}"
-        filename += ".easy"
-        termcolor.cprint(f"Saving Model {filename}.", color="cyan", force_color=True)
-        state.save_state(
-            filename=filename,
-            checkpoint_dir=checkpoint_dir,
-            gather_fns=gather_fns,
-            float_dtype=self.dtype,
-            verbose=self.arguments.verbose,
-            save_optimizer=self.arguments.save_optimizer_state,
-        )
-        return filename
 
     def initialize_trainer_utils(self):
         """
@@ -874,10 +842,12 @@ class ORPOTrainer(BaseTrainer, ABC):
             def _shard(x):
                 return x
 
-            shard = pjit(
+            spec_named_sharding = self.specs_to_name_sharding(partition_spec)
+            empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=self.arguments.get_mesh())
+            shard = jit(
                 _shard,
-                in_shardings=(PartitionSpec(),),
-                out_shardings=partition_spec
+                in_shardings=(empty_sharding,),
+                out_shardings=spec_named_sharding
             )
             return shard(state)
 

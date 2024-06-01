@@ -40,7 +40,6 @@ FLAGS, DEF_FLAGS = define_flags_with_default(
     attn_mechanism="sharded_vanilla",
     weight_decay=0.02,
     total_batch_size=24,
-    use_pjit_attention_force=False,
     gradient_accumulation_steps=1,
     step_start_point=0,
     num_train_epochs=3,
@@ -152,7 +151,6 @@ def main():
         training_time=FLAGS.training_time,
         gradient_checkpointing=FLAGS.gradient_checkpointing,
         sharding_array=sharding_axis_dims,
-        use_pjit_attention_force=FLAGS.use_pjit_attention_force,
         gradient_accumulation_steps=FLAGS.gradient_accumulation_steps,
         step_start_point=FLAGS.step_start_point,
 

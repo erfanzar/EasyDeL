@@ -21,7 +21,6 @@ from tqdm import tqdm
 
 from typing import Optional, Literal, Dict, Union, Any, Callable, Mapping
 
-from jax.experimental.pjit import pjit
 from datasets import Dataset
 from jax import numpy as jnp
 
@@ -373,13 +372,16 @@ class DPOTrainer(BaseTrainer, ABC):
         with self.arguments.get_mesh():
             partition_spec = match_partition_rules(rules=rules, params=jax.eval_shape(lambda: state))
 
+            spec_named_sharding = self.specs_to_name_sharding(partition_spec)
+            empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=self.arguments.get_mesh())
+
             def _shard(x):
                 return x
 
-            shard = pjit(
+            shard = jax.jit(
                 _shard,
-                in_shardings=(PartitionSpec(),),
-                out_shardings=partition_spec
+                in_shardings=(empty_sharding,),
+                out_shardings=spec_named_sharding
             )
             return shard(state)
 
@@ -482,10 +484,12 @@ class DPOTrainer(BaseTrainer, ABC):
             ) if self.arguments.custom_rule is None else self.arguments.custom_rule,
             state_shape
         )
-        create_sharded_state_from_params_function = pjit(
+        spec_named_sharding = self.specs_to_name_sharding(state_partition_spec)
+        empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=self.arguments.get_mesh())
+        create_sharded_state_from_params_function = jax.jit(
             create_state_from_params_function,
-            in_shardings=(state_partition_spec.params,),
-            out_shardings=state_partition_spec,
+            in_shardings=(spec_named_sharding.params,),
+            out_shardings=spec_named_sharding,
             donate_argnums=(0,)
         )
         train_function = create_dpo_train_function(
@@ -496,10 +500,16 @@ class DPOTrainer(BaseTrainer, ABC):
             label_smoothing=self.label_smoothing,
             beta=self.beta
         )
-        sharded_train_step_function = pjit(
+        sharded_train_step_function = jax.jit(
             train_function,
-            in_shardings=(state_partition_spec, self.arguments.step_partition_spec),
-            out_shardings=(state_partition_spec, PartitionSpec()),
+            in_shardings=(
+                spec_named_sharding,
+                jax.sharding.NamedSharding(
+                    spec=self.arguments.step_partition_spec,
+                    mesh=self.mesh
+                )
+            ),
+            out_shardings=(spec_named_sharding, empty_sharding),
         )
 
         eval_function = create_dpo_eval_function(
@@ -511,14 +521,21 @@ class DPOTrainer(BaseTrainer, ABC):
             beta=self.beta
         )
 
-        sharded_eval_step_function = pjit(
+        sharded_eval_step_function = jax.jit(
             eval_function,
-            in_shardings=(state_partition_spec, self.arguments.step_partition_spec),
-            out_shardings=(state_partition_spec, PartitionSpec()),
+            in_shardings=(
+                spec_named_sharding,
+                jax.sharding.NamedSharding(
+                    spec=self.arguments.step_partition_spec,
+                    mesh=self.mesh
+                )
+            ),
+            out_shardings=(spec_named_sharding, empty_sharding),
         )
 
         self.arguments.ckpt_path_exists()
         self.state_partition_spec = state_partition_spec
+        self.state_named_sharding = spec_named_sharding
         self.state_shape = state_shape
         checkpoint_manager = self.arguments.get_streaming_checkpointer()
         mesh = self.arguments.get_mesh()

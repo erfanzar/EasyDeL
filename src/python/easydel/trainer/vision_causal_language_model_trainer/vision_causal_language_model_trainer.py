@@ -12,7 +12,6 @@ except ModuleNotFoundError:
 import jax
 import flax
 from tqdm import tqdm
-from jax.experimental.pjit import pjit
 from jax.sharding import PartitionSpec
 from jax import numpy as jnp
 from fjformer import (
@@ -149,29 +148,32 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
                 )
 
         state_shape = jax.eval_shape(initialize_state_function)
+
         state_partition_spec = match_partition_rules(
             self.config.get_partition_rules(
                 fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
             ) if self.arguments.custom_rule is None else self.arguments.custom_rule,
             state_shape
         )
-        create_sharded_state_from_params_function = pjit(
+        spec_named_sharding = self.specs_to_name_sharding(state_partition_spec)
+        empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=self.arguments.get_mesh())
+        create_sharded_state_from_params_function = jax.jit(
             create_state_from_params_function,
-            in_shardings=(state_partition_spec.params,),
-            out_shardings=state_partition_spec,
+            in_shardings=(spec_named_sharding.params,),
+            out_shardings=spec_named_sharding,
             donate_argnums=(0,)
         )
-        sharded_train_step_function = pjit(
+        sharded_train_step_function = jax.jit(
             create_vision_casual_language_model_train_step(self.arguments.step_partition_spec),
-            in_shardings=(state_partition_spec, PartitionSpec()),
-            out_shardings=(state_partition_spec, PartitionSpec(), PartitionSpec()),
+            in_shardings=(spec_named_sharding, empty_sharding),
+            out_shardings=(spec_named_sharding, empty_sharding, empty_sharding),
             donate_argnums=(0, 0),
         )
 
-        sharded_eval_step_function = pjit(
+        sharded_eval_step_function = jax.jit(
             create_vision_casual_language_model_evaluation_step(self.arguments.step_partition_spec),
-            in_shardings=(state_partition_spec, PartitionSpec()),
-            out_shardings=(PartitionSpec(), PartitionSpec()),
+            in_shardings=(spec_named_sharding, empty_sharding),
+            out_shardings=(empty_sharding, empty_sharding),
             donate_argnums=(0, 0),
         )
 
@@ -179,6 +181,7 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
         self.arguments.ckpt_path_exists()
         checkpoint_manager = self.arguments.get_streaming_checkpointer()
         self.state_partition_spec = state_partition_spec
+        self.state_named_sharding = spec_named_sharding
         self.state_shape = state_shape
 
         return TrainerConfigureFunctionFuncOutput(
@@ -256,23 +259,26 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
                             ) if self.arguments.custom_rule is None else self.arguments.custom_rule,
                             state_shape
                         )
-                        sharded_train_step_function = pjit(
+                        spec_named_sharding = self.specs_to_name_sharding(state_partition_spec)
+                        empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=self.arguments.get_mesh())
+                        sharded_train_step_function = jax.jit(
                             create_vision_casual_language_model_train_step(
                                 partition_spec=self.arguments.step_partition_spec,
                             ),
-                            in_shardings=(state_partition_spec, PartitionSpec()),
-                            out_shardings=(state_partition_spec, PartitionSpec(), PartitionSpec()),
+                            in_shardings=(spec_named_sharding, empty_sharding),
+                            out_shardings=(spec_named_sharding, empty_sharding, empty_sharding),
                             donate_argnums=(0, 0),
                         )
 
-                        sharded_eval_step_function = pjit(
+                        sharded_eval_step_function = jax.jit(
                             create_vision_casual_language_model_evaluation_step(self.arguments.step_partition_spec),
-                            in_shardings=(state_partition_spec, PartitionSpec()),
-                            out_shardings=(PartitionSpec(), PartitionSpec()),
+                            in_shardings=(spec_named_sharding, empty_sharding),
+                            out_shardings=(empty_sharding, empty_sharding),
                             donate_argnums=(0, 0),
                         )
 
                         self.state_partition_spec = state_partition_spec
+                        self.state_named_sharding = spec_named_sharding
                         self.state_shape = state_shape
                         self.sharded_train_step_function = sharded_train_step_function
                         self.sharded_eval_step_function = sharded_eval_step_function
