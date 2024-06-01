@@ -83,7 +83,6 @@ easydict==1.13
 ecos==2.0.13
 editdistance==0.6.2
 eerepr==0.0.4
-en-core-web-sm==3.7.1
 entrypoints==0.4
 et-xmlfile==1.1.0
 etils==1.7.0
