@@ -337,7 +337,6 @@ class GenerationPipeline:
         else:
             streamer.put(generation_state.running_token)
         if self.state_sample is None:
-            paxis = self.model.config.partition_axis
             _args_tree = jax.eval_shape(lambda: generation_state.model_kwargs)
 
             state_sharding = SampleState(
