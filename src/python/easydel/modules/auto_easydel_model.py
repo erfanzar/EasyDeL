@@ -544,6 +544,10 @@ class AutoEasyDeLModelForCausalLM:
         _clear()
 
         if shard_fns is not None:
+            if auto_shard_params:
+                warnings.warn(
+                    "`auto_shard_params` will be ignored since you are passing custom sharding functions"
+                )
             logger.debug("sharding model parameters based on the given shard_fns.")
             if not is_flatten(shard_fns):
                 shard_fns = flax.traverse_util.flatten_dict(shard_fns)
@@ -585,24 +589,6 @@ class AutoEasyDeLModelForCausalLM:
                 params_pattern_selection=params_pattern_selection,
                 remove_state_dict=True
             )
-
-            if auto_shard_params:
-                if partition_rules is None:
-                    partition_rules = cfg.get_partition_rules(True)
-                params_sharding = jax.tree_util.tree_map(
-                    lambda spec: jax.sharding.NamedSharding(
-                        spec=spec, mesh=cfg.get_mesh()
-                    ),
-                    match_partition_rules(
-                        partition_rules,
-                        ed_model.params_shape_tree
-                    )
-                )
-                params = jax.jit(
-                    lambda x: x,
-                    in_shardings=(jax.tree_util.tree_map(lambda x: x.sharding, params),),
-                    out_shardings=params_sharding
-                )(params)
 
             # Clear and collect memory after converting the model
             del state_dict

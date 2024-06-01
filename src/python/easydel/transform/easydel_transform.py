@@ -62,6 +62,14 @@ def match_keywords(string, ts, ns):
     return True
 
 
+class _DummyContextManager:
+    def __enter__(self):
+        pass
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        pass
+
+
 def huggingface_to_easydel(
         state_dict,
         *,
@@ -129,8 +137,8 @@ def huggingface_to_easydel(
             "in case of converting parameters to 8bit you should pass "
             "`params_pattern_selection` too, to tell the quantizer which parameters should be quantized."
         )
-
-    with jax.default_device(device):
+    ctx_m = jax.default_device(device) if shard_fns is None else _DummyContextManager()
+    with ctx_m:
         flax_dict = {}
         pbar = tqdm(total=len(state_dict), disable=not verbose)
         pbar.set_description("Converting Model")
