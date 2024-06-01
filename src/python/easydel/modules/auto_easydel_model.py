@@ -551,19 +551,7 @@ class AutoEasyDeLModelForCausalLM:
             logger.debug("sharding model parameters based on the given shard_fns.")
             if not is_flatten(shard_fns):
                 shard_fns = flax.traverse_util.flatten_dict(shard_fns)
-        elif auto_shard_params:
-            shard_fns, _ = AutoShardAndGatherFunctions.from_pretrained(
-                pretrained_model_name_or_path=pretrained_model_name_or_path,
-                dtype_specs=param_dtype,
-                partition_rules=partition_rules,
-                sharding_axis_dims=sharding_axis_dims,
-                sharding_axis_names=sharding_axis_names,
-                partition_axis=partition_axis,
-                shard_attention_computation=shard_attention_computation,
-                backend=backend,
-                input_shape=input_shape,  # type:ignore
-                config_kwargs=config_kwargs
-            )
+
         with cfg.get_mesh():
             logger.debug("converting huggingface-model to easydel-model.")
             params_pattern_selection = None
@@ -579,9 +567,8 @@ class AutoEasyDeLModelForCausalLM:
                     ]
 
                     params_pattern_selection = re.compile("({})".format("|".join(bit_targeted_params)))
-
-            params = trf(
-                state_dict,
+            trf_partial = functools.partial(
+                trf,
                 config=config,
                 device=device,
                 shard_fns=shard_fns,
@@ -589,20 +576,42 @@ class AutoEasyDeLModelForCausalLM:
                 params_pattern_selection=params_pattern_selection,
                 remove_state_dict=True
             )
+            if shard_fns is not None:
+                params = trf_partial(state_dict)
+            else:
+                if auto_shard_params:
+                    if partition_rules is None:
+                        partition_rules = cfg.get_partition_rules(True)
+                    params = jax.jit(
+                        trf_partial,
+                        out_shardings=jax.tree_util.tree_flatten(
+                            lambda spec: jax.sharding.NamedSharding(
+                                spec=spec, mesh=cfg.get_mesh()
+                            ),
+                            match_partition_rules(
+                                partition_rules,
+                                ed_model.params_shape_tree
+                            )
+                        )
+                    )(state_dict)
+                else:
+                    params = jax.jit(
+                        trf_partial,
+                        out_shardings=None
+                    )(state_dict)
+                # Clear and collect memory after converting the model
+            del state_dict
+            _clear()
 
-        # Clear and collect memory after converting the model
-        del state_dict
-        _clear()
+            if is_flatten(params):
+                logger.info("converted parameters are flatten making them unflatten ")
+                params = unflatten_dict(params)
 
-        if is_flatten(params):
-            logger.info("converted parameters are flatten making them unflatten ")
-            params = unflatten_dict(params)
-
-        if verbose_params:
-            print(
-                f"JAX - EasyDeL Model contains {sum(n.size for n in jax.tree_util.tree_flatten(flax.core.unfreeze(params))[0]) / 1e9} Billion Parameters"
-            )
-        return ed_model, params
+            if verbose_params:
+                print(
+                    f"JAX - EasyDeL Model contains {sum(n.size for n in jax.tree_util.tree_flatten(flax.core.unfreeze(params))[0]) / 1e9} Billion Parameters"
+                )
+            return ed_model, params
 
 
 class AutoEasyDeLConfig:
