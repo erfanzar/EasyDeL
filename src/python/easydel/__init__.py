@@ -1,3 +1,9 @@
+import os as _os
+
+if bool(_os.environ.get("EASYDEL_AUTO", "true")):
+    _os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+    _os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.99"
+
 from .inference import (
     EasyDeLServeEngine as EasyDeLServeEngine,
     EasyDeLServeEngineConfig as EasyDeLServeEngineConfig,
