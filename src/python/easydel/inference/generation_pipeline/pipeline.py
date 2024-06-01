@@ -1,10 +1,12 @@
 import dataclasses
+import functools
 import warnings
 from typing import Optional, Union, Dict
 
+import fjformer
 import flax.core
 import jax
-
+from jax.sharding import PartitionSpec
 from ...modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 from jax import numpy as jnp, random, lax, sharding
 from fjformer import GenerateRNG
@@ -148,6 +150,7 @@ class GenerationPipeline:
         self.tokenizer = tokenizer
         self.generation_config = generation_config
         self.add_params_field = add_params_field
+        self._shard_state = None
         self.compiled_func = None
         self.over_compiled_func = None
         self._rng_gen = GenerateRNG(seed or 42)
@@ -157,6 +160,7 @@ class GenerationPipeline:
             partition_rules = self.model.config.get_partition_rules(True)
         self.model_sharding = self.model.get_named_sharding(partition_rules=partition_rules)
         self.input_sharding = jax.sharding.NamedSharding(spec=input_partition_spec, mesh=self.model.mesh)
+        self.empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=self.model.mesh)
         self.gen_input_sharding = jax.sharding.NamedSharding(
             spec=jax.sharding.PartitionSpec(input_partition_spec[0], None),
             mesh=self.model.mesh
@@ -288,6 +292,70 @@ class GenerationPipeline:
 
         yield generation_state.running_token
         if self.state_sample is None:
+            paxis = self.model.config.partition_axis
+            _args_tree = jax.eval_shape(lambda: generation_state.model_kwargs)
+            _model_kwargs_sharding = jax.tree_util.tree_map(
+                lambda spec: jax.sharding.NamedSharding(spec=spec, mesh=self.mesh),
+                fjformer.match_partition_rules(
+                    (
+                        (
+                            "position_ids", PartitionSpec(
+                                paxis.batch_axis,
+                                None
+                            )
+                        ),
+                        (
+                            "attention_mask", PartitionSpec(
+                                paxis.batch_axis,
+                                None
+                            )
+                        ),
+                        (
+                            "cached_key", PartitionSpec(
+                                paxis.batch_axis,
+                                paxis.key_sequence_axis,
+                                paxis.head_axis,
+                                None
+                            )
+                        ),
+                        (
+                            "cached_value", PartitionSpec(
+                                paxis.batch_axis,
+                                paxis.key_sequence_axis,
+                                paxis.head_axis,
+                                None
+                            )
+                        )
+                    ),
+                    _args_tree
+                ),
+            )
+            state_sharding = SampleState(
+                self.empty_sharding,
+                self.input_sharding,
+                self.gen_input_sharding,
+                self.empty_sharding,
+                self.empty_sharding,
+                _model_kwargs_sharding
+            )
+
+            @functools.partial(
+                jax.jit,
+                in_shardings=(SampleState(
+                    self.empty_sharding,
+                    self.input_sharding,
+                    self.gen_input_sharding,
+                    self.empty_sharding,
+                    self.empty_sharding,
+                    self.empty_sharding,
+                ),),
+                out_shardings=state_sharding
+            )
+            def _shard_state(st):
+                return st
+
+            self._shard_state = _shard_state
+            generation_state = _shard_state(generation_state)  # noqa
             self.state_sample = compile_function(
                 generation_func_body,
                 (self.params, generation_state),
@@ -295,9 +363,12 @@ class GenerationPipeline:
                 mesh=self.mesh,
                 in_shardings=(
                     self.model_sharding,
-                    SampleState(None, self.input_sharding, self.gen_input_sharding, None, None, None)),
-                out_shardings=SampleState(None, self.input_sharding, self.gen_input_sharding, None, None, None)
+                    state_sharding,
+                ),
+                out_shardings=state_sharding
             )
+        else:
+            generation_state = self._shard_state(generation_state)  # noqa
         while sample_search_cond_fn(generation_state):
             generation_state = self.state_sample(self.params, generation_state)
             yield generation_state.running_token
