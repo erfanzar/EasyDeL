@@ -334,4 +334,4 @@ else:
 
     sys.modules[__name__] = _LazyModule(__name__, globals()["__file__"], _import_structure, module_spec=__spec__)
 
-__version__ = "0.0.66"
+__version__ = "0.0.67"
