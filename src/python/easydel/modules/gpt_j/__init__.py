@@ -1,9 +1,25 @@
-from .gpt_j_configuration import GPTJConfig
-from .modelling_gpt_j_flax import (
-    FlaxGPTJForCausalLM,
-    FlaxGPTJForCausalLMModule,
-    FlaxGPTJModel,
-    FlaxGPTJModule,
-)
+from ...utils.lazy_import import _LazyModule
+from typing import TYPE_CHECKING
 
-__all__ = "FlaxGPTJModel", "FlaxGPTJForCausalLM", "GPTJConfig"
+_import_structure = {
+    "gpt_j_configuration": ["GPTJConfig"],
+    "modelling_gpt_j_flax": [
+        "FlaxGPTJForCausalLM",
+        "FlaxGPTJForCausalLMModule",
+        "FlaxGPTJModel",
+        "FlaxGPTJModule",
+    ],
+}
+
+if TYPE_CHECKING:
+    from .gpt_j_configuration import GPTJConfig
+    from .modelling_gpt_j_flax import (
+        FlaxGPTJForCausalLM,
+        FlaxGPTJForCausalLMModule,
+        FlaxGPTJModel,
+        FlaxGPTJModule,
+    )
+else:
+    import sys
+
+    sys.modules[__name__] = _LazyModule(__name__, globals()["__file__"], _import_structure, module_spec=__spec__)

@@ -4,7 +4,7 @@ import jax.numpy
 from flax.core import FrozenDict
 
 from easydel import MistralConfig, FlaxMistralForCausalLM
-from src.python.easydel.trainer.orpo import ORPOTrainer
+from src.python.easydel.trainer.odds_ratio_preference_optimization_trainer import ORPOTrainer
 from src.python.easydel import TrainArguments, EasyDeLState
 from transformers import AutoTokenizer
 from datasets import load_dataset

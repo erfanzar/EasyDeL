@@ -1,11 +1,12 @@
-from ..utils.lazy_import import _LazyModule
+from ...utils.lazy_import import _LazyModule
 from typing import TYPE_CHECKING
 
 _import_structure = {
-    "data_processor": ["DataProcessorArguments", "DataProcessor"]
+    "stf_trainer": ["SFTTrainer"]
 }
+
 if TYPE_CHECKING:
-    from .data_processor import DataProcessorArguments, DataProcessor
+    from .stf_trainer import SFTTrainer
 else:
     import sys
 
