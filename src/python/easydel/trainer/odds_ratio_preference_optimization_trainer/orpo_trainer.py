@@ -43,7 +43,7 @@ from transformers import PreTrainedTokenizerBase
 from jax.sharding import PartitionSpec
 
 from ...utils import Timers, prefix_print
-from ..dpo.utils import (
+from ..direct_oreference_optimization_trainer.utils import (
     pad_to_length,
     DPODataCollatorWithPadding,
     leave_alone_context_manager
