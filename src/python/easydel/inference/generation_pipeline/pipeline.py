@@ -60,17 +60,17 @@ def apply_top_k_sampling(logits, top_k):
     return jnp.where(indices_to_remove, jnp.inf, logits)
 
 
-def apply_top_p_sampling(logits, top_p):
+def apply_top_p_sampling(logits, top_p, prng_key):
     """Applies top-p (nucleus) sampling to the logits."""
-    sorted_logits = jnp.sort(logits)
-    cumulative_probs = jnp.cumsum(jax.nn.softmax(sorted_logits))
+    assert 0 <= top_p <= 1
 
-    sorted_indices_to_remove = cumulative_probs > top_p
-    sorted_indices_to_remove = jnp.roll(sorted_indices_to_remove, 1)
-    sorted_indices_to_remove = sorted_indices_to_remove.at[0].set(False)
-
-    indices_to_remove = sorted_indices_to_remove[jnp.argsort(logits)]
-    return jnp.where(indices_to_remove, jnp.inf, logits)
+    probs_sort, probs_idx = jax.lax.sort_key_val(logits, -jnp.ones_like(logits))
+    probs_sum = jnp.cumsum(probs_sort, axis=-1)
+    mask = probs_sum - probs_sort > top_p
+    probs_sort = jnp.where(mask, 0.0, probs_sort)
+    probs_sort = probs_sort / jnp.sum(probs_sort, axis=-1, keepdims=True)
+    next_token = jax.random.categorical(prng_key, probs_sort, axis=-1, shape=probs_sort.shape[:-1] + (1,))
+    return jnp.take_along_axis(probs_idx, jnp.squeeze(next_token, axis=-1), axis=-1)
 
 
 def compile_function(
@@ -104,28 +104,8 @@ def compile_function(
 class GenerationPipelineConfig:
     def __init__(self, **kwargs):
         self.max_new_tokens = kwargs.pop("max_new_tokens", 64)
-        self.max_time = kwargs.pop("max_time", None)  # Not implemented yet
-        self.stop_strings = kwargs.pop("stop_strings", None)  # Not implemented yet
-        self.do_sample = kwargs.pop("do_sample", False)  # Add this for potential future use
-        self.num_beams = kwargs.pop("num_beams", 1)  # Add for beam search (not implemented)
-        self.num_beam_groups = kwargs.pop(
-            "num_beam_groups", 1
-        )  # Add for beam search (not implemented)
-        self.penalty_alpha = kwargs.pop(
-            "penalty_alpha", None
-        )  # Add for contrastive search (not implemented)
-        self.use_cache = kwargs.pop("use_cache", True)
-        self.temperature = kwargs.pop("temperature", 1.0)
-        self.top_k = kwargs.pop("top_k", 50)
-        self.top_p = kwargs.pop("top_p", 1.0)
-        self.min_p = kwargs.pop("min_p", None)  # Add this for potential future use
-        self.typical_p = kwargs.pop("typical_p", 1.0)  # Add for potential future use
-        self.epsilon_cutoff = kwargs.pop(
-            "epsilon_cutoff", 0.0
-        )  # Add for potential future use
-        self.eta_cutoff = kwargs.pop("eta_cutoff", 0.0)  # Add for potential future use
-        self.diversity_penalty = kwargs.pop("diversity_penalty", 0.0)
-        self.repetition_penalty = kwargs.pop("repetition_penalty", 1.0)
+        self.temperature = kwargs.pop("temperature", 0)
+        self.top_p = kwargs.pop("top_p", 0.95)
         self.pad_token_id = kwargs.pop("pad_token_id", None)
         self.bos_token_id = kwargs.pop("bos_token_id", None)
         self.eos_token_id = kwargs.pop("eos_token_id", None)
@@ -299,19 +279,13 @@ class GenerationPipeline:
             all_sequence_finished = jnp.all(state.is_sent_finished)
             return ~jnp.logical_or(all_sequence_finished, state.cur_len >= max_length)
 
-        def inference_step(logits, token, prng_key, temperature, repetition_penalty, top_k, top_p):
-            if self.generation_config.do_sample:
-                logits = logits / temperature
-                # logits = apply_repetition_penalty(logits, token, repetition_penalty)
-                if top_k > 0:
-                    logits = apply_top_k_sampling(logits, top_k)
-                if top_p < 1.0:
-                    logits = apply_top_p_sampling(logits, top_p)
-                probs = jax.nn.softmax(logits, axis=-1)
-                return jax.random.categorical(prng_key, jnp.log(probs), axis=-1).reshape(-1)
+        def inference_step(logits, token, prng_key, temperature, top_p):
+            if temperature > 0.:
+                logits = jax.nn.softmax(logits / temperature, axis=-1)
+                return apply_top_p_sampling(logits, top_p, prng_key)
             return jnp.argmax(jax.nn.softmax(logits, axis=-1), axis=-1).reshape(-1)
 
-        inference_step_compiled = jax.jit(inference_step, static_argnames=["top_k", "top_p"])
+        inference_step_compiled = jax.jit(inference_step, static_argnames=["top_p", "temperature"])
 
         def generation_func_body(params, state: SampleState):
             model_outputs = self.model(
@@ -329,8 +303,6 @@ class GenerationPipeline:
                 state.running_token,
                 state.prng_key,
                 self.generation_config.temperature,
-                self.generation_config.repetition_penalty,
-                self.generation_config.top_k,
                 self.generation_config.top_p
             )
 
