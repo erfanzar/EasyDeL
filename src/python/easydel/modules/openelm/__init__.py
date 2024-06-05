@@ -3,7 +3,7 @@ from ...utils.lazy_import import _LazyModule
 
 _import_structure = {
     "openelm_configuration": ["OpenELMConfig"],
-    "modelling_mpt_flax": [
+    "modelling_openelm_flax": [
         "FlaxOpenELMModel",
         "FlaxOpenELMForCausalLM",
     ]
