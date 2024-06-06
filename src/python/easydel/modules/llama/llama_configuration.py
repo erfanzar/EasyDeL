@@ -37,6 +37,7 @@ class LlamaConfig(EasyDeLPretrainedConfig):
             bits: Optional[int] = None,
             hidden_act: str = 'silu',
             pretraining_tp: int = 1,
+            mlp_bias:bool=False,
             scan_layers: bool = False,
             **kwargs,
     ):
@@ -123,6 +124,7 @@ class LlamaConfig(EasyDeLPretrainedConfig):
         self.embd_pdrop = embd_pdrop
         self.attention_dropout = attention_dropout
         self.gradient_checkpointing = gradient_checkpointing
+        self.mlp_bias=mlp_bias
         self.fcm_min_ratio = fcm_min_ratio
         self.hidden_act = hidden_act
         self.fcm_max_ratio = fcm_max_ratio
