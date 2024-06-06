@@ -153,7 +153,7 @@ class FlaxLlamaAttention(BaseJAXAttentionModule):
             num_attention_heads=self.config.num_attention_heads,
             attention_dropout=self.config.attention_dropout,
             head_dims=self.head_dim,
-            
+
             shard_attention_computation=self.config.shard_attention_computation,
             precision=self.precision,
             force_float32_tpu=True,
@@ -321,11 +321,12 @@ class FlaxLlamaAttention(BaseJAXAttentionModule):
         batch_size = hidden_states.shape[0]
         causal_mask = jnp.broadcast_to(
             causal_mask, (batch_size,) + causal_mask.shape[1:])
-        attention_mask = jnp.broadcast_to(jnp.expand_dims(
-            attention_mask, axis=(-3, -2)), causal_mask.shape)
+        attention_mask = jnp.broadcast_to(
+            jnp.expand_dims(
+                attention_mask, axis=(-3, -2)
+            ), causal_mask.shape
+        )
         attention_mask = combine_masks(attention_mask, causal_mask, fcm_mask)
-        if attention_mask.ndim == 2:
-            attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
 
         dropout_rng = None
 
@@ -404,7 +405,7 @@ class FlaxLlamaMLP(nn.Module):
             config.intermediate_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            use_bias=False,
+            use_bias=self.config.mlp_bias,
             kernel_init=jax.nn.initializers.normal(
                 self.config.initializer_range),
             precision=self.precision,
@@ -414,7 +415,7 @@ class FlaxLlamaMLP(nn.Module):
             config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            use_bias=False,
+            use_bias=self.config.mlp_bias,
             kernel_init=jax.nn.initializers.normal(
                 self.config.initializer_range),
             precision=self.precision,
@@ -424,7 +425,7 @@ class FlaxLlamaMLP(nn.Module):
             config.intermediate_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            use_bias=False,
+            use_bias=self.config.mlp_bias,
             kernel_init=jax.nn.initializers.normal(
                 self.config.initializer_range),
             precision=self.precision,
