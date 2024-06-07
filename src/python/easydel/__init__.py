@@ -169,6 +169,10 @@ _import_structure = {
         "AutoShardAndGatherFunctions",
         "get_modules_by_type"
     ],
+    "modules.easydel_modelling_utils": [
+        "EasyDeLPretrainedConfig",
+        "EasyDeLFlaxPretrainedModel"
+    ],
     "modules.attention_module": [
         "AttentionModule"
     ],
@@ -288,9 +292,13 @@ if TYPE_CHECKING:
         AutoShardAndGatherFunctions,
         get_modules_by_type
     )
+    from .modules.easydel_modelling_utils import (
+        EasyDeLPretrainedConfig,
+        EasyDeLFlaxPretrainedModel
+    )
     from .modules.attention_module import AttentionModule
 
-    from .utils.utils import get_mesh, RNG
+    from .utils.helpers import get_mesh, RNG
     from .trainer import (
         TrainArguments,
         EasyDeLXRapTureConfig,

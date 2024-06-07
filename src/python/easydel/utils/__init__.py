@@ -9,13 +9,13 @@ _import_structure = {
         "is_flax_available",
         "is_tensorflow_available"
     ],
-    "utils": [
+    "helpers": [
         "get_mesh",
         "Timers",
         "Timer",
         "prefix_print",
         "RNG"
-    ]
+    ],
 }
 
 if TYPE_CHECKING:
@@ -26,7 +26,7 @@ if TYPE_CHECKING:
         is_flax_available,
         is_tensorflow_available
     )
-    from .utils import (
+    from .helpers import (
         get_mesh,
         Timers,
         Timer,

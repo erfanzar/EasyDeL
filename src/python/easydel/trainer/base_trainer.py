@@ -22,7 +22,7 @@ from numpy import ndarray
 from datasets import Dataset, IterableDataset
 from .training_configurations import TrainArguments
 from ..smi import get_capacity_matrix, initialise_tracking
-from ..utils.utils import prefix_print, Timers
+from ..utils.helpers import prefix_print, Timers
 from dataclasses import dataclass
 from ..modules.auto_easydel_model import AutoEasyDeLModelForCausalLM, AutoEasyDeLConfig
 from ..modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel, EasyDeLPretrainedConfig

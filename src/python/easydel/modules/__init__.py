@@ -35,5 +35,10 @@ from . import (
 from .auto_easydel_model import (
     AutoEasyDeLModelForCausalLM as AutoEasyDeLModelForCausalLM,
     AutoEasyDeLConfig as AutoEasyDeLConfig,
-    AutoShardAndGatherFunctions as AutoShardAndGatherFunctions
+    AutoShardAndGatherFunctions as AutoShardAndGatherFunctions,
+    get_modules_by_type as get_modules_by_type
+)
+from .easydel_modelling_utils import (
+    EasyDeLPretrainedConfig as EasyDeLPretrainedConfig,
+    EasyDeLFlaxPretrainedModel as EasyDeLFlaxPretrainedModel
 )

@@ -1,15 +1,25 @@
+import os
 import warnings
 
 import chex
 import fjformer.linen
 import flax
+from flax.core import unfreeze
+from flax.traverse_util import unflatten_dict, flatten_dict
 from jax.experimental.mesh_utils import create_device_mesh
-from transformers import PretrainedConfig, FlaxPreTrainedModel, AutoModelForCausalLM
+from transformers import PretrainedConfig, FlaxPreTrainedModel, AutoModelForCausalLM, GenerationConfig
 import jax
 from jax import numpy as jnp
-from typing import Sequence, Union, Optional, Literal, Tuple, Any
+from typing import Sequence, Union, Optional, Literal, Tuple, Any, Callable
 from dataclasses import dataclass
 from jax.sharding import PartitionSpec, Mesh
+from transformers.utils import (
+    is_offline_mode as _is_offline_mode,
+    cached_file as _cached_file,
+    is_remote_url as _is_remote_url,
+    download_url as _download_url
+)
+
 from ..etils.etils import get_logger
 from ..etils.easystate import EasyDeLState
 from ..etils.partition_module import PartitionAxis
@@ -28,6 +38,7 @@ AVAILABLE_ATTENTION_MECHANISMS = Literal[
     "blockwise",
     "pallas_flash"
 ]
+FLAX_WEIGHTS_NAME = "easydel-model.parameters"
 
 
 def set_attrs_smartly(self, attr_name: str, default: Any, new_attr: Any):
@@ -675,3 +686,339 @@ class EasyDeLFlaxPretrainedModel(FlaxPreTrainedModel):
         if quantization_fields is None:
             quantization_fields = ["kernel", "embedding"]
         return fjformer.linen.quantize_int8_parameters(quantization_fields, params)
+
+    def save_pretrained(  # noqa
+            self,
+            save_directory: Union[str, os.PathLike],
+            params,
+            push_to_hub=False,
+            token: Optional[Union[str, bool]] = None,
+            safe_serialization: bool = False,
+            gather_fns: dict[Callable] = None,
+            float_dtype=None,
+            verbose: bool = False,
+            mismatch_allowed: bool = True,
+            **kwargs,
+    ):
+        if token is not None:
+            kwargs["token"] = token
+        if os.path.isfile(save_directory):
+            logger.error(f"Provided path ({save_directory}) should be a directory, not a file")
+            return
+        os.makedirs(save_directory, exist_ok=True)
+        if push_to_hub:
+            commit_message = kwargs.pop("commit_message", None)
+            repo_id = kwargs.pop("repo_id", save_directory.split(os.path.sep)[-1])
+            repo_id = self._create_repo(repo_id, **kwargs)
+            files_timestamps = self._get_files_timestamps(save_directory)
+        save_directory = os.path.abspath(save_directory)
+        self.config.architectures = [self.__class__.__name__[4:]]
+        self.config.save_pretrained(save_directory)
+        if self.can_generate():
+            self.generation_config.save_pretrained(save_directory)
+        output_model_file = os.path.join(save_directory, "easydel-model.parameters")
+
+        fjformer.checkpoint.CheckpointManager.save_state_to_file(
+            path=output_model_file,
+            gather_fns=gather_fns,
+            mismatch_allowed=mismatch_allowed,
+            state=params,
+            float_dtype=float_dtype,
+            verbose=verbose
+        )
+
+        logger.info(f"Model weights saved in {output_model_file}")
+
+        if push_to_hub:
+            self._upload_modified_files(
+                save_directory,
+                repo_id,
+                files_timestamps,
+                commit_message=commit_message,
+                token=token,
+            )
+
+    @classmethod
+    def can_generate(cls) -> bool:
+        """
+        Returns whether this model can generate sequences with `.generate()`. Returns:
+            `bool`: Whether this model can generate sequences with `.generate()`.
+        """
+        # Detects whether `prepare_inputs_for_generation` has been overwritten, which is a requirement for generation.
+        # Alternativelly, the model can also have a custom `generate` function.
+        if "GenerationMixin" in str(cls.prepare_inputs_for_generation) and "GenerationMixin" in str(cls.generate):
+            return False
+        return True
+
+    @classmethod
+    def from_pretrained(
+            cls,
+            pretrained_model_name_or_path: Union[str, os.PathLike],
+            sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
+            sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+            partition_axis: PartitionAxis = PartitionAxis(),
+            dtype: jnp.dtype = jnp.float32,
+            param_dtype: jnp.dtype = jnp.float32,
+            precision: jax.lax.PrecisionLike = jax.lax.Precision("fastest"),
+            input_shape: Optional[Tuple[int, int]] = None,
+            shard_fns: dict[Callable] = None,
+            auto_shard_params: bool = False,
+            remove_dict_prefix=None,
+            verbose: bool = False,
+            mismatch_allowed: bool = True,
+            *model_args,
+            config: Optional[Union[EasyDeLPretrainedConfig, str, os.PathLike]] = None,
+            cache_dir: Optional[Union[str, os.PathLike]] = None,
+            ignore_mismatched_sizes: bool = False,
+            force_download: bool = False,
+            local_files_only: bool = False,
+            token: Optional[Union[str, bool]] = None,
+            revision: str = "main",
+            **kwargs,
+    ):
+        resume_download = kwargs.pop("resume_download", False)
+        proxies = kwargs.pop("proxies", None)
+        trust_remote_code = kwargs.pop("trust_remote_code", None)
+        from_pipeline = kwargs.pop("_from_pipeline", None)
+        from_auto_class = kwargs.pop("_from_auto", False)
+        subfolder = kwargs.pop("subfolder", "")
+        commit_hash = kwargs.pop("_commit_hash", None)
+
+        # Not relevant for Flax Models
+        _ = kwargs.pop("adapter_kwargs", None)
+
+        if trust_remote_code is True:
+            logger.warning(
+                "The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is"
+                " ignored."
+            )
+
+        user_agent = {"file_type": "model", "framework": "flax", "from_auto_class": from_auto_class}
+        if from_pipeline is not None:
+            user_agent["using_pipeline"] = from_pipeline
+
+        if _is_offline_mode() and not local_files_only:
+            logger.info("Offline mode: forcing local_files_only=True")
+            local_files_only = True
+
+        if input_shape is None:
+            cl_di = len(jax.devices())
+            input_shape = (cl_di, cl_di)  # safest way to perform loading ...
+        config_path = config if config is not None else pretrained_model_name_or_path
+        from .auto_easydel_model import AutoEasyDeLConfig, AutoShardAndGatherFunctions, get_modules_by_type
+        config = AutoEasyDeLConfig.from_pretrained(
+            config_path,
+            sharding_axis_dims=sharding_axis_dims,
+            sharding_axis_names=sharding_axis_names,
+            partition_axis=partition_axis,
+            from_torch=False
+        )
+        _, model_kwargs = EasyDeLPretrainedConfig.from_pretrained(
+            config_path,
+            cache_dir=cache_dir,
+            return_unused_kwargs=True,
+            force_download=force_download,
+            resume_download=resume_download,
+            proxies=proxies,
+            local_files_only=local_files_only,
+            token=token,
+            revision=revision,
+            subfolder=subfolder,
+            _from_auto=from_auto_class,
+            _from_pipeline=from_pipeline,
+            _commit_hash=commit_hash,
+            **kwargs,
+        )
+        if commit_hash is None:
+            commit_hash = getattr(config, "_commit_hash", None)
+        if auto_shard_params and shard_fns is None:
+            shard_fns, _ = AutoShardAndGatherFunctions.from_config(
+                config=config,
+                dtype_specs=param_dtype,
+                input_shape=input_shape
+            )
+        elif auto_shard_params and shard_fns is not None:
+            logger.warning("`auto_shard_params` will be ignored since `shard_fns` is provided.")
+        if pretrained_model_name_or_path is not None:
+            pretrained_model_name_or_path = str(pretrained_model_name_or_path)
+            is_local = os.path.isdir(pretrained_model_name_or_path)
+            if os.path.isdir(pretrained_model_name_or_path):
+                if os.path.isfile(os.path.join(pretrained_model_name_or_path, subfolder, FLAX_WEIGHTS_NAME)):
+                    archive_file = os.path.join(pretrained_model_name_or_path, subfolder, FLAX_WEIGHTS_NAME)
+                else:
+                    raise EnvironmentError(
+                        f"Error no file named {FLAX_WEIGHTS_NAME} found in directory {pretrained_model_name_or_path}"
+                    )
+            elif os.path.isfile(os.path.join(subfolder, pretrained_model_name_or_path)):
+                archive_file = pretrained_model_name_or_path
+                is_local = True
+            elif _is_remote_url(pretrained_model_name_or_path):
+                filename = pretrained_model_name_or_path
+                resolved_archive_file = _download_url(pretrained_model_name_or_path)
+            else:
+                filename = FLAX_WEIGHTS_NAME
+                try:
+                    cached_file_kwargs = {
+                        "cache_dir": cache_dir,
+                        "force_download": force_download,
+                        "proxies": proxies,
+                        "resume_download": resume_download,
+                        "local_files_only": local_files_only,
+                        "token": token,
+                        "user_agent": user_agent,
+                        "revision": revision,
+                        "subfolder": subfolder,
+                        "_raise_exceptions_for_gated_repo": False,
+                        "_raise_exceptions_for_missing_entries": False,
+                        "_commit_hash": commit_hash,
+                    }
+                    resolved_archive_file = _cached_file(pretrained_model_name_or_path, filename, **cached_file_kwargs)
+
+                    if resolved_archive_file is None:
+                        raise EnvironmentError("no model parameters found!")
+                except EnvironmentError:
+                    raise
+                except Exception:
+                    raise EnvironmentError(
+                        f"Can't load the model for '{pretrained_model_name_or_path}'. If you were trying to load it"
+                        " from 'https://huggingface.co/models', make sure you don't have a local directory with the"
+                        f" same name. Otherwise, make sure '{pretrained_model_name_or_path}' is the correct path to a"
+                        f" directory containing a file named {FLAX_WEIGHTS_NAME}."
+                    )
+
+            if is_local:
+                logger.info(f"loading weights file {archive_file}")
+                resolved_archive_file = archive_file
+                filename = resolved_archive_file.split(os.path.sep)[-1]
+            else:
+                logger.info(f"loading weights file {filename} from cache at {resolved_archive_file}")
+        else:
+            resolved_archive_file = None
+
+        if cls.__name__ == "EasyDeLFlaxPretrainedModel":
+            # if they are using EasyDeLFlaxPretrainedModel.from_pretrained
+            # they will get error AssertionError: `module` must be provided.` so we autoset this to make sure user don't
+            # experience this error.
+            _, cls, _ = get_modules_by_type(config.model_type)
+        model = cls(
+            config,
+            *model_args,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            _do_init=False,
+            **model_kwargs
+        )
+
+        state = fjformer.checkpoint.CheckpointManager.load_checkpoint(
+            path=resolved_archive_file,
+            mismatch_allowed=mismatch_allowed,
+            verbose=verbose,
+            shard_fns=shard_fns,
+            remove_dict_prefix=remove_dict_prefix,
+        )
+
+        state = flatten_dict(state)
+
+        random_state = flatten_dict(unfreeze(model.params_shape_tree))
+
+        missing_keys = model.required_params - set(state.keys())
+        unexpected_keys = set(state.keys()) - model.required_params
+
+        # Disabling warning when porting pytorch weights to flax, flax does not uses num_batches_tracked
+        for unexpected_key in unexpected_keys.copy():
+            if "num_batches_tracked" in unexpected_key[-1]:
+                unexpected_keys.remove(unexpected_key)
+
+        if missing_keys:
+            logger.warning(
+                f"The checkpoint {pretrained_model_name_or_path} is missing required keys: {missing_keys}. "
+                "Make sure to call model.init_weights to initialize the missing weights."
+            )
+            cls._missing_keys = missing_keys
+
+        mismatched_keys = []
+        for key in state.keys():
+            if key in random_state and state[key].shape != random_state[key].shape:
+                if ignore_mismatched_sizes:
+                    mismatched_keys.append((key, state[key].shape, random_state[key].shape))
+                    state[key] = random_state[key]
+                else:
+                    raise ValueError(
+                        f"Trying to load the pretrained weight for {key} failed: checkpoint has shape "
+                        f"{state[key].shape} which is incompatible with the model shape {random_state[key].shape}. "
+                        "Using `ignore_mismatched_sizes=True` if you really want to load this checkpoint inside this "
+                        "model."
+                    )
+
+        if missing_keys:
+            for missing_key in missing_keys:
+                state[missing_key] = random_state[missing_key]
+
+        # remove unexpected keys to not be saved again
+        for unexpected_key in unexpected_keys:
+            del state[unexpected_key]
+
+        if len(unexpected_keys) > 0:
+            logger.warning(
+                f"Some weights of the model checkpoint at {pretrained_model_name_or_path} were not used when"
+                f" initializing {model.__class__.__name__}: {unexpected_keys}\n- This IS expected if you are"
+                f" initializing {model.__class__.__name__} from the checkpoint of a model trained on another task or"
+                " with another architecture (e.g. initializing a BertForSequenceClassification model from a"
+                " BertForPreTraining model).\n- This IS NOT expected if you are initializing"
+                f" {model.__class__.__name__} from the checkpoint of a model that you expect to be exactly identical"
+                " (initializing a BertForSequenceClassification model from a BertForSequenceClassification model)."
+            )
+        else:
+            logger.info(f"All model checkpoint weights were used when initializing {model.__class__.__name__}.\n")
+
+        if len(missing_keys) > 0:
+            logger.warning(
+                f"Some weights of {model.__class__.__name__} were not initialized from the model checkpoint at"
+                f" {pretrained_model_name_or_path} and are newly initialized: {missing_keys}\nYou should probably"
+                " TRAIN this model on a down-stream task to be able to use it for predictions and inference."
+            )
+        elif len(mismatched_keys) == 0:
+            logger.info(
+                f"All the weights of {model.__class__.__name__} were initialized from the model checkpoint at"
+                f" {pretrained_model_name_or_path}.\nIf your task is similar to the task the model of the checkpoint"
+                f" was trained on, you can already use {model.__class__.__name__} for predictions without further"
+                " training."
+            )
+        if len(mismatched_keys) > 0:
+            mismatched_warning = "\n".join(
+                [
+                    f"- {key}: found shape {shape1} in the checkpoint and {shape2} in the model instantiated"
+                    for key, shape1, shape2 in mismatched_keys
+                ]
+            )
+            logger.warning(
+                f"Some weights of {model.__class__.__name__} were not initialized from the model checkpoint at"
+                f" {pretrained_model_name_or_path} and are newly initialized because the shapes did not"
+                f" match:\n{mismatched_warning}\nYou should probably TRAIN this model on a down-stream task to be able"
+                " to use it for predictions and inference."
+            )
+
+        if model.can_generate():
+            try:
+                model.generation_config = GenerationConfig.from_pretrained(
+                    pretrained_model_name_or_path,
+                    cache_dir=cache_dir,
+                    force_download=force_download,
+                    resume_download=resume_download,
+                    proxies=proxies,
+                    local_files_only=local_files_only,
+                    token=token,
+                    revision=revision,
+                    subfolder=subfolder,
+                    _from_auto=from_auto_class,
+                    _from_pipeline=from_pipeline,
+                    **kwargs,
+                )
+            except OSError:
+                logger.info(
+                    "Generation config file not found, using a generation config created from the model config."
+                )
+                pass
+
+        return model, unflatten_dict(state)

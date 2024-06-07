@@ -24,7 +24,7 @@ from typing import Optional, Tuple, Callable, Mapping
 from ...etils.easystate import EasyDeLState
 from ...trainer.base_trainer import BaseTrainer, TrainerConfigureFunctionFuncOutput
 from ...etils.errors import EasyDeLTimerError
-from ...utils.utils import prefix_print
+from ...utils.helpers import prefix_print
 from .modeling_output import CausalLMTrainerOutput
 from .fwd_bwd_functions import (
     create_casual_language_model_train_step,
