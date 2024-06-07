@@ -416,7 +416,8 @@ class AutoEasyDeLModelForCausalLM:
             "gpt2",
             sharding_axis_dims=(1, 8, 1, 1),
             sharding_axis_names=("dp", "fsdp", "tp", "sp"),
-            device=jax.devices("cpu")[0] # offload to CPU [OPTIONAL]
+            device=jax.devices("cpu")[0], # offload to CPU [OPTIONAL]
+            from_torch=True,
         )
         ```
     """
@@ -442,6 +443,7 @@ class AutoEasyDeLModelForCausalLM:
             load_in_8bit: bool = False,
             bit_targeted_params: Optional[List[str]] = None,
             verbose_params: bool = False,
+            from_torch: bool = True,
             **kwargs
     ) -> Tuple[EasyDeLFlaxPretrainedModel, dict]:
         """Loads and shards a pretrained causal language model from the Hugging Face Hub and converts it into an
@@ -470,12 +472,74 @@ class AutoEasyDeLModelForCausalLM:
             bit_targeted_params (Optional[List[str]], optional): List of parameter names to convert to 8-bit precision. If
                 None and load_in_8bit is True, all kernels and embeddings are converted to 8-bit. Defaults to None.
             verbose_params (bool): whenever to log number of parameters in converting state.
+            from_torch (bool): whenever to load the model from transformers-pytorch.
             **kwargs: Additional keyword arguments to pass to the model and config classes.
 
         Returns:
             Tuple[EasyDeLFlaxPretrainedModel, dict]: A tuple containing the EasyDeL model and the loaded and sharded
                 model parameters.
         """
+        if from_torch:
+            return cls._from_torch(
+                pretrained_model_name_or_path=pretrained_model_name_or_path,
+                param_dtype=param_dtype,
+                dtype=dtype,
+                shard_fns=shard_fns,
+                auto_shard_params=auto_shard_params,
+                precision=precision,
+                backend=backend,
+                verbose_params=verbose_params,
+                partition_axis=partition_axis,
+                load_in_8bit=load_in_8bit,
+                partition_rules=partition_rules,
+                bit_targeted_params=bit_targeted_params,
+                sharding_axis_names=sharding_axis_names,
+                sharding_axis_dims=sharding_axis_dims,
+                input_shape=input_shape,
+                config_kwargs=config_kwargs,
+                device=device,
+                **kwargs
+            )
+        return cls._from_easydel_params(
+            auto_shard_params=auto_shard_params,
+            input_shape=input_shape,
+            partition_axis=partition_axis,
+            sharding_axis_dims=sharding_axis_dims,
+            sharding_axis_names=sharding_axis_names,
+            shard_fns=shard_fns,
+            param_dtype=param_dtype,
+            config_kwargs=config_kwargs,
+            partition_rules=partition_rules,
+            backend=backend,
+            precision=precision,
+            device=device,
+            dtype=dtype,
+            pretrained_model_name_or_path=pretrained_model_name_or_path,
+            shard_attention_computation=shard_attention_computation,
+        )
+
+    @staticmethod
+    def _from_torch(
+            pretrained_model_name_or_path,
+            device,
+            dtype: jax.numpy.dtype,
+            param_dtype: jax.numpy.dtype,
+            precision: Optional[jax.lax.Precision],
+            sharding_axis_dims: Sequence[int],
+            sharding_axis_names: Sequence[str],
+            partition_axis: PartitionAxis,
+            shard_attention_computation: bool,
+            input_shape: Tuple[int, int],
+            shard_fns: Optional[Mapping[tuple, Callable] | dict],
+            backend: Optional[str],
+            config_kwargs: Optional[Mapping[str, Any]],
+            auto_shard_params: bool,
+            partition_rules: Optional[Tuple[Tuple[str, PartitionSpec], ...]],
+            load_in_8bit: bool,
+            bit_targeted_params: Optional[List[str]],
+            verbose_params: bool,
+            **kwargs
+    ):
         try:
             import torch
 
@@ -487,8 +551,10 @@ class AutoEasyDeLModelForCausalLM:
                 def _clear():
                     gc.collect()
         except ModuleNotFoundError as e:
-            def _clear():
-                gc.collect()
+            raise ModuleNotFoundError(
+                "in order to load model from torch you should install torch first "
+                "run `pip install torch`"
+            )
 
         logger.debug(f"Downloading model config from {pretrained_model_name_or_path}")
         config = AutoConfig.from_pretrained(pretrained_model_name_or_path)
@@ -600,9 +666,33 @@ class AutoEasyDeLModelForCausalLM:
 
             if verbose_params:
                 print(
-                    f"JAX - EasyDeL Model contains {sum(n.size for n in jax.tree_util.tree_flatten(flax.core.unfreeze(params))[0]) / 1e9} Billion Parameters"
+                    f"JAX - EasyDeL Model contains "
+                    f"{sum(n.size for n in jax.tree_util.tree_flatten(flax.core.unfreeze(params))[0]) / 1e9}"
+                    f" Billion Parameters"
                 )
             return ed_model, params
+
+    @staticmethod
+    def _from_easydel_params(
+            pretrained_model_name_or_path,
+            device,
+            dtype: jax.numpy.dtype,
+            param_dtype: jax.numpy.dtype,
+            precision: Optional[jax.lax.Precision],
+            sharding_axis_dims: Sequence[int],
+            sharding_axis_names: Sequence[str],
+            partition_axis: PartitionAxis,
+            shard_attention_computation: bool,
+            input_shape: Tuple[int, int],
+            shard_fns: Optional[Mapping[tuple, Callable] | dict],
+            backend: Optional[str],
+            config_kwargs: Optional[Mapping[str, Any]],
+            auto_shard_params: bool,
+            partition_rules: Optional[Tuple[Tuple[str, PartitionSpec], ...]],
+            # load_in_8bit: bool,
+            # bit_targeted_params: Optional[List[str]],
+    ):
+        ...
 
 
 class AutoEasyDeLConfig:
@@ -615,6 +705,7 @@ class AutoEasyDeLConfig:
             partition_axis: PartitionAxis = PartitionAxis(),
             shard_attention_computation: bool = True,
             backend: Optional[str] = None,
+            from_torch: bool = False,
             **kwargs
     ) -> EasyDeLPretrainedConfig:
         """The from_pretrained function is a helper function that allows you to instantiate a model from the pretrained
@@ -629,14 +720,15 @@ class AutoEasyDeLConfig:
             partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
             shard_attention_computation: bool: whenever to use shard_map for attention
             backend: Optional[str]: backend to use for model
+            from_torch: should config be loaded from torch models or not.
             **kwargs: Pass additional arguments to the model and config classes
         generation process
 
         Returns:
             A Model Config
         """
-
-        config = AutoConfig.from_pretrained(pretrained_model_name_or_path)
+        cls_main = AutoConfig if from_torch else EasyDeLPretrainedConfig
+        config = cls_main.from_pretrained(pretrained_model_name_or_path)
         model_type: str = config.model_type
 
         cfg, module, trf = get_modules_by_type(model_type)
@@ -742,7 +834,8 @@ class AutoShardAndGatherFunctions:
             flatten: bool = True,
             dtype_specs=jax.numpy.float16,
             config_kwargs: Optional[Mapping[str, Any]] = None,
-            depth_target: Optional[List[str]] = None
+            depth_target: Optional[List[str]] = None,
+            from_torch: bool = False
     ) -> Tuple[Mapping[str, Callable], Mapping[str, Callable]]:
         """
         Generates shard and gather functions based on a pretrained model name or path.
@@ -761,7 +854,7 @@ class AutoShardAndGatherFunctions:
             dtype_specs: The data type to use for the shard and gather functions. Defaults to `jax.numpy.float16`.
             config_kwargs: Additional keyword arguments to pass to the `AutoEasyDeLConfig` constructor. Defaults to None.
             depth_target: Pad the sharding to depth, for example make {params:tensor} with depth_target = ["row"] to {row:{params:tensor}}. Defaults to None.
-
+            from_torch: should config be loaded from torch models or not.
         Returns:
             A tuple containing the shard and gather functions.
         """
@@ -772,6 +865,7 @@ class AutoShardAndGatherFunctions:
             partition_axis=partition_axis,
             shard_attention_computation=shard_attention_computation,
             backend=backend,
+            from_torch=from_torch
         )
         if config_kwargs is not None:
             for k, v in config_kwargs.items():
