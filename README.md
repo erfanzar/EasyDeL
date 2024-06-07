@@ -45,6 +45,8 @@ of machine learning models, particularly in the domain of large language models 
 
 ### Latest News 🔥
 
+- adding `EasyDeLFlaxPretrainedModel.from_pretrained` and `EasyDeLFlaxPretrainedModel.save_pretrained` to give users
+  experience of being free and not only using easydel states
 - removing *(q,k,v,b,a)_partition_specs and using `PartitionAxis` instead of them.
 - Sharding Strategies are changed.
 - Now EasyDeL is more Memory efficient Multi-GPUs
@@ -111,7 +113,6 @@ encountering a special end-of-sequence token).
     - You can either receive each generated token as it's produced or use a `TextIteratorStreamer` to handle streaming
       output.
 
-
 **Example Usage:**
 
 ```python
@@ -138,7 +139,7 @@ pl = 0
 for token in pipeline.generate(**tokens):
     outputs.append(token)
     sq = tokenizer.decode(jnp.concatenate(outputs, axis=-1)[0])
-    print(sq[pl:],end="")
+    print(sq[pl:], end="")
     pl = len(sq)
 ```
 
