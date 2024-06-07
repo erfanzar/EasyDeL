@@ -44,7 +44,7 @@ from transformers.modeling_flax_utils import (
 from jax.sharding import PartitionSpec
 
 from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
-    with_sharding_constraint, BaseJAXAttentionModule
+    with_sharding_constraint, BaseJAXAttentionModule, control_mlp_sharding
 
 import chex
 from .t5_configuration import T5Config
@@ -165,6 +165,7 @@ class FlaxT5LayerFF(nn.Module):
         self.dropout = flax.linen.Dropout(self.config.dropout_rate)
 
     def __call__(self, hidden_states, deterministic=True):
+        hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
         forwarded_states = self.layer_norm(hidden_states)
         forwarded_states = self.DenseReluDense(forwarded_states, deterministic=deterministic)
         hidden_states = hidden_states + self.dropout(forwarded_states, deterministic=deterministic)

@@ -27,8 +27,9 @@ from ..flax_modelling_utils import (
     precompute_freq_cis,
     get_dot_general_by_bits,
     BaseJAXAttentionModule,
-    block_wise_ffn
+    block_wise_ffn, control_mlp_sharding
 )
+from ..common import RMSNorm as RMSNorm
 from ..attention_module import AttentionModule
 
 from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
@@ -64,42 +65,6 @@ class FlaxQwen2MoeEmbedding(nn.Module):
         query = apply_rotary_pos_emb(query, sin, cos)
 
         return query.astype(self.dtype), key.astype(self.dtype)
-
-
-def repeat_kv(x: chex.Array, n_rep: int) -> chex.Array:
-    bs, s, n_kv_heads, head_dim = x.shape
-    if n_rep == 1:
-        return x
-    x = x[:, :, jnp.newaxis, :, :]
-    x = jnp.repeat(x, n_rep, axis=2)
-
-    return x.reshape(bs, s,
-                     n_kv_heads * n_rep,
-                     head_dim)
-
-
-class Qwen2MoeRMSNorm(nn.Module):
-    dim: int
-    eps: float = 1e-6
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
-
-    def setup(self) -> None:
-        self.weight = self.param(
-            'kernel',
-            nn.initializers.ones,
-            (self.dim,),
-            self.param_dtype,
-        )
-
-    def _norm(self, x: jnp.ndarray) -> jnp.ndarray:
-        return x * jax.lax.rsqrt(jnp.square(x).mean(-1, keepdims=True) + self.eps)
-
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
-        output = self._norm(x).astype(self.dtype)
-        weight = nn.linen.control_quantization(self.weight, self.dtype)
-        return output * weight
 
 
 class FlaxQwen2MoeMLP(nn.Module):
@@ -158,6 +123,8 @@ class FlaxQwen2MoeMLP(nn.Module):
             A tensor that is the result of applying a dropout function
             to x
         """
+
+        x = control_mlp_sharding(x, self.config.partition_axis)
         x = self.down_proj(jax.nn.silu(self.gate_proj(x)) * self.up_proj(x))
         return x
 
@@ -238,7 +205,7 @@ class FlaxQwen2MoeAttention(BaseJAXAttentionModule):
             num_attention_heads=self.config.num_attention_heads,
             attention_dropout=self.config.attention_dropout,
             head_dims=self.head_dim,
-            
+
             shard_attention_computation=self.config.shard_attention_computation,
             precision=self.precision,
             force_float32_tpu=True,
@@ -437,7 +404,6 @@ class FlaxQwen2MoeAttention(BaseJAXAttentionModule):
             causal_mask=causal_mask
         )
 
-
         attn_output = self._merge_heads(attentions.attention_outputs)
         if self.config.shard_attention_computation:
             attn_output = with_sharding_constraint(
@@ -560,6 +526,7 @@ class FlaxQwen2MoeSparseMoeBlock(nn.Module):
             hidden_states: chex.Array,
             e: bool = False  # Ignored
     ) -> Tuple[chex.Array, chex.Array]:
+        hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
         batch_size, sequence_length, hidden_dim = hidden_states.shape
 
         router_logits = self.gate(hidden_states).astype(
@@ -636,13 +603,13 @@ class FlaxQwen2MoeBlock(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision,
         )
-        self.input_layernorm = Qwen2MoeRMSNorm(
+        self.input_layernorm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
         )
-        self.post_attention_layernorm = Qwen2MoeRMSNorm(
+        self.post_attention_layernorm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
             dtype=self.dtype,
@@ -1087,7 +1054,7 @@ class FlaxQwen2MoeModule(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.norm = Qwen2MoeRMSNorm(
+        self.norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
             dtype=self.dtype,

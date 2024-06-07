@@ -21,8 +21,10 @@ from fjformer.linen import Dense
 from ..flax_modelling_utils import (
     with_sharding_constraint,
     get_gradient_checkpoint_policy,
-    get_dot_general_by_bits, rotate_half, BaseJAXAttentionModule
+    get_dot_general_by_bits, rotate_half, BaseJAXAttentionModule, control_mlp_sharding
 )
+
+from ..common import RMSNorm as RMSNorm
 from ..attention_module import AttentionModule
 
 from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
@@ -111,30 +113,6 @@ def compute_qwen1_rope(
     return jnp.cos(emb), jnp.sin(emb)
 
 
-class Qwen1RMSNorm(nn.Module):
-    dim: int
-    eps: float = 1e-6
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
-
-    def setup(self) -> None:
-        self.weight = self.param(
-            'kernel',
-            nn.initializers.ones,
-            (self.dim,),
-            self.param_dtype,
-        )
-
-    def _norm(self, x: jnp.ndarray) -> jnp.ndarray:
-        return x * jax.lax.rsqrt(jnp.square(x).mean(-1, keepdims=True) + self.eps)
-
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
-        output = self._norm(x).astype(self.dtype)
-        weight = nn.linen.control_quantization(self.weight, self.dtype)
-        return output * weight
-
-
 class FlaxQwen1MLP(nn.Module):
     config: Qwen1Config
     dtype: jnp.dtype = jnp.float32
@@ -190,6 +168,8 @@ class FlaxQwen1MLP(nn.Module):
             A tensor that is the result of applying a dropout function
             to x
         """
+
+        x = control_mlp_sharding(x, self.config.partition_axis)
         x = self.c_proj(jax.nn.silu(self.w2(x)) * self.w1(x))
         return x
 
@@ -255,7 +235,7 @@ class FlaxQwen1Attention(BaseJAXAttentionModule):
             num_attention_heads=self.config.num_attention_heads,
             attention_dropout=self.config.attn_dropout_prob,
             head_dims=self.head_dim,
-            
+
             shard_attention_computation=self.config.shard_attention_computation,
             precision=self.precision,
             force_float32_tpu=True,
@@ -438,7 +418,6 @@ class FlaxQwen1Attention(BaseJAXAttentionModule):
             causal_mask=causal_mask
         )
 
-
         attn_output = self._merge_heads(attentions.attention_outputs)
         if self.config.shard_attention_computation:
             attn_output = with_sharding_constraint(
@@ -495,13 +474,13 @@ class FlaxQwen1Block(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision,
         )
-        self.ln_1 = Qwen1RMSNorm(
+        self.ln_1 = RMSNorm(
             self.config.hidden_size,
             eps=self.config.layer_norm_epsilon,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
         )
-        self.ln_2 = Qwen1RMSNorm(
+        self.ln_2 = RMSNorm(
             self.config.hidden_size,
             eps=self.config.layer_norm_epsilon,
             dtype=self.dtype,
@@ -1035,7 +1014,7 @@ class FlaxQwen1Module(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.ln_f = Qwen1RMSNorm(
+        self.ln_f = RMSNorm(
             self.config.hidden_size,
             eps=self.config.layer_norm_epsilon,
             dtype=self.dtype,

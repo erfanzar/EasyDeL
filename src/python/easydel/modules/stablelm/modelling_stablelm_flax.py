@@ -27,8 +27,9 @@ from ..flax_modelling_utils import (
     repeat_kv_bnsh,
     apply_rotary_pos_emb,
     precompute_freq_cis,
-    get_dot_general_by_bits, BaseJAXAttentionModule, block_wise_ffn, ACT2FN
+    get_dot_general_by_bits, BaseJAXAttentionModule, block_wise_ffn, ACT2FN, control_mlp_sharding
 )
+from ..common import RMSNorm
 
 
 def repeat_kv(x: chex.Array, n_rep: int) -> chex.Array:
@@ -41,30 +42,6 @@ def repeat_kv(x: chex.Array, n_rep: int) -> chex.Array:
     return x.reshape(bs, s,
                      n_kv_heads * n_rep,
                      head_dim)
-
-
-class RMSNorm(nn.Module):
-    dim: int
-    eps: float = 1e-6
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
-
-    def setup(self) -> None:
-        self.weight = self.param(
-            'kernel',
-            nn.initializers.ones,
-            (self.dim,),
-            self.param_dtype,
-        )
-
-    def _norm(self, x: jnp.ndarray) -> jnp.ndarray:
-        return x * jax.lax.rsqrt(jnp.square(x).mean(-1, keepdims=True) + self.eps)
-
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
-        output = self._norm(x).astype(self.dtype)
-
-        return output * fjformer.linen.control_quantization(self.weight, self.dtype)
 
 
 class FlaxStableLmMLP(nn.Module):
@@ -122,6 +99,8 @@ class FlaxStableLmMLP(nn.Module):
         Returns:
             A tensor that is the result of function to x
         """
+
+        x = control_mlp_sharding(x, self.config.partition_axis)
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
@@ -202,7 +181,7 @@ class FlaxStableLmAttention(BaseJAXAttentionModule):
             num_attention_heads=self.config.num_attention_heads,
             attention_dropout=self.config.attention_dropout,
             head_dims=self.head_dim,
-            
+
             shard_attention_computation=self.config.shard_attention_computation,
             precision=self.precision,
             force_float32_tpu=True,
@@ -438,7 +417,6 @@ class FlaxStableLmAttention(BaseJAXAttentionModule):
             segment_ids=segment_ids,
             causal_mask=causal_mask
         )
-
 
         attn_output = self._merge_heads(attentions.attention_outputs)
         if self.config.shard_attention_computation:

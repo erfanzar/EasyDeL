@@ -25,7 +25,8 @@ from ..flax_modelling_utils import (
     get_dot_general_by_bits,
     BaseJAXAttentionModule,
     get_gradient_checkpoint_policy,
-    block_wise_ffn
+    block_wise_ffn,
+    control_mlp_sharding
 )
 import chex
 from .arctic_configuration import ArcticConfig
@@ -134,7 +135,7 @@ class FlaxArcticAttention(BaseJAXAttentionModule):
             num_attention_heads=self.config.num_attention_heads,
             attention_dropout=self.config.attention_dropout,
             head_dims=self.head_dim,
-            
+
             shard_attention_computation=self.config.shard_attention_computation,
             precision=self.precision,
             force_float32_tpu=True,
@@ -346,6 +347,7 @@ class ArcticMLP(nn.Module):
         self.act_fn = ACT2FN[self.config.hidden_act]
 
     def __call__(self, x: chex.Array, e=None):
+        x = control_mlp_sharding(x, self.config.partition_axis)
         return self.w2(self.act_fn(self.w1(x)) * self.w3(x))
 
 
@@ -440,6 +442,8 @@ class FlaxArcticMoE(nn.Module):
             hidden_states: chex.Array,
             e: bool = False  # Ignored
     ) -> Tuple[chex.Array, chex.Array]:
+
+        hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
         batch_size, sequence_length, hidden_dim = hidden_states.shape
 
         router_logits = self.gate(hidden_states).astype(  # no reshaping is needed
@@ -517,6 +521,7 @@ class FlaxArcticSparseMoeBlock(nn.Module):
             hidden_states: chex.Array,
             e: bool = False  # Ignored
     ) -> Tuple[chex.Array, chex.Array]:
+        hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
         batch_size, sequence_length, hidden_dim = hidden_states.shape
 
         router_logits = self.gate(hidden_states).astype(  # no reshaping is needed

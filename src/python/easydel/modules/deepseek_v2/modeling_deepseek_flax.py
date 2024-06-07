@@ -22,13 +22,13 @@ from ..flax_modelling_utils import (
     get_dot_general_by_bits,
     BaseJAXAttentionModule,
     get_gradient_checkpoint_policy,
-    block_wise_ffn
+    block_wise_ffn, control_mlp_sharding
 )
 from jax.sharding import PartitionSpec
 import chex
 from .deepseek_configuration import DeepseekV2Config
 from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
-
+from ..common import RMSNorm
 re_mat = nn_partitioning.remat
 
 
@@ -44,30 +44,6 @@ class MoeModelOutput:
 class MoeCausalLMOutput(FlaxMaskedLMOutput):
     aux_loss: Optional[chex.Array] = None
     router_logits: Optional[Tuple[chex.Array]] = None
-
-
-class DeepseekV2RMSNorm(nn.Module):
-    dim: int
-    eps: float = 1e-6
-    dtype: jnp.dtype = jnp.bfloat16
-    param_dtype: jnp.dtype = jnp.bfloat16
-
-    def setup(self) -> None:
-        self.weight = self.param(
-            'kernel',
-            nn.initializers.ones,
-            (self.dim,),
-            self.param_dtype,
-        )
-
-    def _norm(self, x: jnp.ndarray) -> jnp.ndarray:
-        return x * jax.lax.rsqrt(jnp.square(x).mean(-1, keepdims=True) + self.eps)
-
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
-        output = self._norm(x).astype(self.dtype)
-        weight = fjformer.linen.control_quantization(self.weight, self.dtype)
-        return output * weight
 
 
 def yarn_find_correction_dim(
@@ -231,6 +207,8 @@ class FlaxDeepseekV2MLP(nn.Module):
             x: chex.Array,
             e: bool = False  # Ignored
     ):
+
+        x = control_mlp_sharding(x, self.config.partition_axis)
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
@@ -403,6 +381,7 @@ class FlaxDeepseekV2MoE(nn.Module):
             e: bool = False  # ignored !
     ):
 
+        hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
         identity = hidden_states
         orig_shape = hidden_states.shape
         topk_idx, topk_weight, aux_loss = self.gate(hidden_states)
@@ -450,14 +429,14 @@ class FlaxDeepseekV2Attention(BaseJAXAttentionModule):
         )
 
         self.q_a_proj = dense_class(config.q_lora_rank, use_bias=config.attention_bias)
-        self.q_a_layernorm = DeepseekV2RMSNorm(config.q_lora_rank)
+        self.q_a_layernorm = RMSNorm(config.q_lora_rank)
         self.q_b_proj = dense_class(self.num_heads * self.q_head_dim, use_bias=False)
 
         self.kv_a_proj_with_mqa = dense_class(
             config.kv_lora_rank + config.qk_rope_head_dim,
             use_bias=config.attention_bias,
         )
-        self.kv_a_layernorm = DeepseekV2RMSNorm(config.kv_lora_rank)
+        self.kv_a_layernorm = RMSNorm(config.kv_lora_rank)
         self.kv_b_proj = dense_class(
             self.num_heads
             * (self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim),
@@ -711,13 +690,13 @@ class FlaxDeepseekV2DecoderLayer(nn.Module):
                 precision=self.precision
             )
         )
-        self.input_layernorm = DeepseekV2RMSNorm(
+        self.input_layernorm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
             dtype=self.dtype,
             param_dtype=self.param_dtype
         )
-        self.post_attention_layernorm = DeepseekV2RMSNorm(
+        self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
             dtype=self.dtype,
@@ -873,7 +852,7 @@ class FlaxDeepseekV2Module(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.norm = DeepseekV2RMSNorm(
+        self.norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
             dtype=self.dtype,

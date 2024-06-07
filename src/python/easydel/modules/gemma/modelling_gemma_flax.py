@@ -25,7 +25,7 @@ from ..flax_modelling_utils import (
     get_dot_general_by_bits,
     block_wise_ffn,
     precompute_freq_cis,
-    apply_rotary_pos_emb
+    apply_rotary_pos_emb, control_mlp_sharding
 )
 from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 from .gemma_configuration import GemmaConfig
@@ -185,7 +185,7 @@ class FlaxGemmaAttention(BaseJAXAttentionModule):
             num_attention_heads=self.config.num_attention_heads,
             attention_dropout=self.config.attention_dropout,
             head_dims=self.head_dim,
-            
+
             shard_attention_computation=self.config.shard_attention_computation,
             precision=self.precision,
             force_float32_tpu=True,
@@ -417,6 +417,8 @@ class FlaxGemmaMLP(nn.Module):
         )
 
     def __call__(self, hidden_states, deterministic=False):
+
+        hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
         up_proj_states = self.up_proj(hidden_states)
         gate_states = self.act(self.gate_proj(hidden_states))
 

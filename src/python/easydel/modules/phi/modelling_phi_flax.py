@@ -19,7 +19,7 @@ from ..flax_modelling_utils import (
     get_gradient_checkpoint_policy,
     apply_rotary_pos_emb,
     get_dot_general_by_bits, repeat_kv_bnsh, with_sharding_constraint, precompute_freq_cis, BaseJAXAttentionModule,
-    block_wise_ffn
+    block_wise_ffn, control_mlp_sharding
 )
 from fjformer.linen import Dense
 from .phi_configuration import PhiConfig
@@ -79,6 +79,8 @@ class FlaxPhiMLP(nn.Module):
             hidden_states: Array,
             e: bool = False  # Ignored
     ) -> Array:
+
+        hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
         return self.fc2(self.act(self.fc1(hidden_states)))
 
 

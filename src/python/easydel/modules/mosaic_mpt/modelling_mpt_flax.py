@@ -11,7 +11,7 @@ from flax.linen.partitioning import remat
 from ..flax_modelling_utils import (
     get_gradient_checkpoint_policy,
     get_dot_general_by_bits,
-    BaseJAXAttentionModule,
+    BaseJAXAttentionModule, control_mlp_sharding,
 )
 from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 import chex
@@ -19,26 +19,7 @@ from fjformer.linen import Dense
 from fjformer import linen as nn
 from .mosaic_configuration import MptConfig
 from ..attention_module import AttentionModule
-
-
-class RMSNorm(nn.Module):
-    dim: int
-    eps: float = 1e-6
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
-
-    def setup(self) -> None:
-        self.weight = self.param("kernel", nn.initializers.ones, (self.dim,), self.param_dtype, )
-
-    def _norm(self, x: jnp.ndarray) -> jnp.ndarray:
-        return x * jax.lax.rsqrt(jnp.square(x).mean(-1, keepdims=True) + self.eps)
-
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        x = x.astype(jnp.promote_types(self.dtype, jnp.bfloat16))
-        output = self._norm(x).astype(self.dtype)
-        weight = nn.linen.control_quantization(self.weight, self.dtype)
-        return output * weight
-
+from ..common import RMSNorm
 
 class FlaxMptMLP(nn.Module):
     config: MptConfig
@@ -70,6 +51,7 @@ class FlaxMptMLP(nn.Module):
     def __call__(
             self, hidden_states: chex.Array, residual: chex.Array, deterministic: bool = False
     ):
+        hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
         return self.hidden_dropout(
             self.down_proj(
                 jax.nn.gelu(

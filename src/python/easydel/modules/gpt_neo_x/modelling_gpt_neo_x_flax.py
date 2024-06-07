@@ -1,5 +1,6 @@
 import math
 
+import flax
 from flax import linen as nn
 from flax.core import FrozenDict
 from typing import Optional, Dict, Union, Tuple
@@ -10,12 +11,13 @@ from jax.sharding import PartitionSpec
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput
 from einops import rearrange
 from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
-    with_sharding_constraint, ACT2FN, BaseJAXAttentionModule
+    with_sharding_constraint, ACT2FN, BaseJAXAttentionModule, control_mlp_sharding
 import chex
 from .gpt_neo_x_configuration import GPTNeoXConfig
 from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 
 from fjformer.linen import Dense
+
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0,
                          dtype: jnp.dtype = jnp.bfloat16) -> jnp.ndarray:
@@ -91,12 +93,11 @@ class FlaxGPTNeoXAttention(BaseJAXAttentionModule):
                          )
         q, k = apply_rotary_emb(q, k, freqs_cis=freq, dtype=self.dtype)
 
-        # if self.config.use_sharding_constraint:
-        #     q = with_sharding_constraint(
-        #         q, jax.sharding.PartitionSpec(("dp", "fsdp"), "sp" if q.shape[1] != 1 else None, "tp", None)
-        #     )
-        #     k = with_sharding_constraint(k, jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None))
-        #     v = with_sharding_constraint(v, jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None))
+        q = with_sharding_constraint(
+            q, jax.sharding.PartitionSpec(("dp", "fsdp"), "sp" if q.shape[1] != 1 else None, "tp", None)
+        )
+        k = with_sharding_constraint(k, jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None))
+        v = with_sharding_constraint(v, jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None))
         attn = jnp.einsum(
             '...qhd,...khd->...hqk', q, k, precision=self.precision
         ) * self.factor
@@ -122,6 +123,7 @@ class FlaxGPTNeoXMlp(nn.Module):
         self.act = ACT2FN[self.config.hidden_act]
 
     def __call__(self, x):
+        x = control_mlp_sharding(x, self.config.partition_axis)
         return self.dense_4h_to_h(self.act(self.dense_h_to_4h(x)))
 
 

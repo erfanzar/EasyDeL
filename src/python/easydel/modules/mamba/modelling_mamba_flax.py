@@ -37,6 +37,7 @@ from ..flax_modelling_utils import (
     get_dot_general_by_bits,
     ACT2FN
 )
+from ..common import RMSNorm as MambaRMSNorm
 
 
 def init_to_value(x, dtype):
@@ -220,31 +221,6 @@ def mamba_ssm(
 
     y = y + u * D
     return y
-
-
-class MambaRMSNorm(nn.Module):
-    dim: int
-    eps: float = 1e-6
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
-
-    def setup(self) -> None:
-        self.weight = self.param(
-            'kernel',
-            nn.initializers.ones,
-            (self.dim,),
-            self.param_dtype,
-        )
-
-    def _norm(self, x: jnp.ndarray) -> jnp.ndarray:
-        return x * jax.lax.rsqrt(jnp.square(x).mean(-1, keepdims=True) + self.eps)
-
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
-        output = self._norm(x).astype(self.dtype)
-        weight = jnp.asarray(fjformer.linen.control_quantization(self.weight, self.dtype))
-        return output * weight
-
 
 class Conv(nn.Module):
     features: int

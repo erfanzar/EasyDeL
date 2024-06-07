@@ -685,3 +685,19 @@ def get_maximum_depths(dictionary: dict):
             except ValueError:
                 ...
     return maximums, minimums
+
+
+def control_mlp_sharding(x: jax.Array, partition_axis: PartitionAxis):
+    batch_size, sequence_length, hidden_size = x.shape
+    is_gen = sequence_length == 1
+    mesh = jax.interpreters.pxla.thread_resources.env.physical_mesh
+    if not mesh.empty:
+        partition_spec = PartitionSpec(
+            partition_axis.batch_axis,
+            None if is_gen else partition_axis.sequence_axis,
+            partition_axis.hidden_state_axis if (
+                    mesh.shape[partition_axis.hidden_state_axis] / hidden_size
+            ).is_integer() else None
+        )
+        x = with_sharding_constraint(x, partition_spec)
+    return x
