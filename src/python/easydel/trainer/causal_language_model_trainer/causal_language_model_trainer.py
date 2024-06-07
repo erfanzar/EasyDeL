@@ -259,7 +259,8 @@ class CausalLanguageModelTrainer(BaseTrainer):
                         )
 
                         spec_named_sharding = self.specs_to_name_sharding(state_partition_spec)
-                        empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=self.arguments.get_mesh())
+                        empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(),
+                                                                    mesh=self.arguments.get_mesh())
                         sharded_train_step_function = jax.jit(
                             create_casual_language_model_train_step(
                                 partition_spec=self.arguments.step_partition_spec,
@@ -371,11 +372,8 @@ class CausalLanguageModelTrainer(BaseTrainer):
                 force_color=True
             )
         start_time = time.time()
-        sharded_state, shard_fns, gather_fns = self.initialize_state(
-            model_parameters=model_parameters,
-            state=state
-        )
-
+        sharded_state, shard_fns, gather_fns = self.initialize_state(model_parameters=model_parameters, state=state)
+        flops_per_device = self.calculate_number_total_flops_per_device(params=model_parameters) / 1e12
         count_model_parameters(sharded_state.params)
         with self.mesh:
             pbar = tqdm(total=self.max_training_steps)
@@ -397,7 +395,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
             try:
                 train_iter = iter(self.dataloader_train)
                 for epoch in range(self.arguments.num_train_epochs):
-                    time_s = time.time()
+                    time_start = time.time()
                     for _ in range(self.max_training_steps // self.arguments.num_train_epochs):
                         try:
                             batch = next(train_iter)
@@ -413,9 +411,9 @@ class CausalLanguageModelTrainer(BaseTrainer):
                             pbar.update(1)
                         elif current_step < self.max_training_steps:
 
-                            time_prev = time_s
-                            time_s = time.time()
-                            step_time = time_s - time_prev
+                            time_prev = time_start
+                            time_start = time.time()
+                            step_time = time_start - time_prev
 
                             for ssb in self.arguments.ids_to_pop_from_dataset:
                                 _ = batch.pop(ssb, None)
@@ -425,7 +423,8 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                 loss,
                                 metrics,
                             ) = self.sharded_train_step_function(sharded_state, batch)
-
+                            total_time = time.time() - time_start
+                            flops = flops_per_device / total_time
                             trained_tokens = jnp.multiply(
                                 self.arguments.max_sequence_length, jnp.multiply(
                                     current_step,
@@ -454,6 +453,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                     "train/trained_tokens": trained_tokens,
                                     "train/regularization_z_loss": metrics["regularization_z_loss"].tolist(),
                                     "train/epoch": epoch,
+                                    "train/TFLOPs": flops
                                 }
                             if self.arguments.log_grad_norms:
                                 train_metrics.update(
@@ -584,6 +584,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
             loss_sum = None
             accuracy_sum = None
 
+            flops_per_device = self.calculate_number_total_flops_per_device(params=model_state.params) / 1e12
             try:
                 eval_iter = iter(self.dataloader_eval)
                 for _ in range(self.max_evaluation_steps):
@@ -601,6 +602,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
                         batch
                     )
                     total_time = time.time() - time_start
+                    flops = flops_per_device / total_time
                     (
                         loss, accuracy, aux_loss
                     ) = metrics
@@ -621,6 +623,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
                         "eval/step": current_step,
                         "eval/step_time": total_time,
                         "eval/perplexity": jnp.exp(loss).tolist(),
+                        "eval/TFLOPs": flops
                     }
                     if aux_loss is not None:
                         eval_metrics.update(

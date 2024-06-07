@@ -690,7 +690,8 @@ class ORPOTrainer(BaseTrainer, ABC):
                         )
 
                         spec_named_sharding = self.specs_to_name_sharding(state_partition_spec)
-                        empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=self.arguments.get_mesh())
+                        empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(),
+                                                                    mesh=self.arguments.get_mesh())
                         sharded_train_step_function = jit(
                             create_orpo_step_function(
                                 mode="train",
@@ -971,6 +972,7 @@ class ORPOTrainer(BaseTrainer, ABC):
         )
         self.model_state = sharded_state
         count_model_parameters(sharded_state.params)
+        flops_per_device = self.calculate_number_total_flops_per_device(params=sharded_state.params) / 1e12
         with self.mesh:
             with jax.default_device(jax.devices("cpu")[0]) if self.low_mem_usage else leave_alone_context_manager():
                 dir_prefix: str = "/dev/shm" if sys.platform != "win32" else "."
@@ -993,12 +995,9 @@ class ORPOTrainer(BaseTrainer, ABC):
                                 ...
                             elif current_step < self.max_training_steps:
                                 time_start = time.time()
-
-                                self.model_state, outputs = self.sharded_train_step_function(
-                                    self.model_state,
-                                    batch
-                                )
+                                self.model_state, outputs = self.sharded_train_step_function(self.model_state, batch)
                                 total_time = time.time() - time_start
+                                flops = flops_per_device / total_time
                                 (loss, metrics) = outputs.loss, outputs.metrics
 
                                 loss_sum = loss.tolist() if loss_sum is None else loss_sum + loss
@@ -1007,11 +1006,13 @@ class ORPOTrainer(BaseTrainer, ABC):
                                     "train/loss": loss.tolist(),
                                     "train/mean_loss": loss_sum / (current_step - self.arguments.step_start_point),
                                     "train/learning_rate": self.scheduler(
-                                        jax.device_get(self.model_state.step)).tolist(),
+                                        jax.device_get(self.model_state.step)
+                                    ).tolist(),
                                     "train/step": current_step,
                                     "train/step_time": total_time,
                                     "train/perplexity": jnp.exp(loss).tolist(),
-                                    "train/epoch": epoch_index
+                                    "train/epoch": epoch_index,
+                                    "train/TFLOPs": flops
                                 }
                                 train_metrics.update(metrics)
                                 log_metrics = copy.deepcopy(train_metrics)
@@ -1107,6 +1108,7 @@ class ORPOTrainer(BaseTrainer, ABC):
             pbar = tqdm(total=self.max_evaluation_steps)
             pbar.set_description("Evaluating")
             current_step = 0
+            flops_per_device = self.calculate_number_total_flops_per_device(params=model_state.params) / 1e12
             loss_sum = None
             try:
                 for batch in self.dataloader_eval:
@@ -1122,23 +1124,18 @@ class ORPOTrainer(BaseTrainer, ABC):
                         ):
                             _ = batch.pop(key, None)
 
-                    _, outputs = self.sharded_eval_step_function(
-                        model_state,
-                        batch
-                    )
+                    _, outputs = self.sharded_eval_step_function(model_state, batch)
                     total_time = time.time() - time_start
-                    (
-                        loss, metrics
-                    ) = outputs.loss, outputs.metrics
-
+                    flops = flops_per_device / total_time
+                    loss, metrics = outputs.loss, outputs.metrics
                     loss_sum = loss.tolist() if loss_sum is None else loss_sum + loss
-
                     eval_metrics = {
                         "eval/loss": loss.tolist(),
                         "eval/mean_loss": loss_sum / (current_step - self.arguments.step_start_point),
                         "eval/step": current_step,
                         "eval/step_time": total_time,
                         "eval/perplexity": jnp.exp(loss).tolist(),
+                        "eval/TFLOPs": flops
                     }
                     eval_metrics.update(metrics)
                     log_metrics = copy.deepcopy(eval_metrics)
