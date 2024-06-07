@@ -260,7 +260,8 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
                             state_shape
                         )
                         spec_named_sharding = self.specs_to_name_sharding(state_partition_spec)
-                        empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=self.arguments.get_mesh())
+                        empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(),
+                                                                    mesh=self.arguments.get_mesh())
                         sharded_train_step_function = jax.jit(
                             create_vision_casual_language_model_train_step(
                                 partition_spec=self.arguments.step_partition_spec,
@@ -359,6 +360,7 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
         )
 
         count_model_parameters(sharded_state.params)
+        flops_per_device = self.calculate_number_total_flops_per_device(params=sharded_state.params) / 1e12
         with self.mesh:
             pbar = tqdm(total=self.max_training_steps)
             current_step = int(jax.device_get(sharded_state.step))
@@ -395,15 +397,16 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
 
                             for ssb in self.arguments.ids_to_pop_from_dataset:
                                 _ = batch.pop(ssb, None)
-                            time_s = time.time()
+                            time_start = time.time()
+
                             outputs_and_metrics: tuple[
                                 EasyDeLState, chex.Array, VisionCausalLanguageModelStepOutput
-                            ] = self.sharded_train_step_function(
-                                sharded_state,
-                                batch
-                            )
+                            ] = self.sharded_train_step_function(sharded_state, batch)
+
                             sharded_state, loss, information_and_accuracies = outputs_and_metrics
-                            ttl_time = time.time() - time_s
+
+                            total_time = time.time() - time_start
+                            flops = flops_per_device / total_time
                             loss_sum = loss.tolist() if loss_sum is None else loss_sum + loss
                             vision_loss = information_and_accuracies.vision_loss
                             vision_accuracy = information_and_accuracies.vision_accuracy
@@ -451,10 +454,11 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
 
                                     "train/learning_rate": self.scheduler(current_step).tolist(),
                                     "train/step": current_step,
-                                    "train/step_time": ttl_time,
+                                    "train/step_time": total_time,
                                     "train/perplexity": jnp.exp(loss).tolist(),
                                     "train/trained_tokens": trained_tokens,
                                     "train/epoch": epoch,
+                                    "train/TFLOPs": flops
                                 }
 
                                 log_metrics = copy.deepcopy(train_metrics)
@@ -567,6 +571,7 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
             text_loss_sum = None
             text_accuracy_sum = None
 
+            flops_per_device = self.calculate_number_total_flops_per_device(params=model_state.params) / 1e12
             try:
                 for batch in self.dataloader_eval:
                     current_step += 1
@@ -579,9 +584,8 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
                         batch
                     )
                     total_time = time.time() - time_start
-                    (
-                        loss, information_and_accuracies
-                    ) = metrics
+                    flops = flops_per_device / total_time
+                    loss, information_and_accuracies = metrics
 
                     vision_loss = information_and_accuracies.vision_loss
                     vision_accuracy = information_and_accuracies.vision_accuracy
@@ -617,6 +621,8 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
                         "eval/step": current_step,
                         "eval/step_time": total_time,
                         "eval/perplexity": jnp.exp(loss).tolist(),
+
+                        "eval/TFLOPs": flops
                     }
                     log_metrics = copy.deepcopy(eval_metrics)
                     eval_metrics.update(**self.arguments.captured_memory)

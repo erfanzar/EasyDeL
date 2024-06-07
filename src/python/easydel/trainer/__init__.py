@@ -19,7 +19,7 @@ _import_structure = {
         "create_vision_casual_language_model_train_step",
         "VisionCausalLMTrainerOutput"
     ],
-    "direct_oreference_optimization_trainer": [
+    "direct_preference_optimization_trainer": [
         "DPOTrainer",
         "create_dpo_eval_function",
         "create_concatenated_forward",

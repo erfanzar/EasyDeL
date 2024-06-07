@@ -1040,7 +1040,7 @@ class DPOTrainer(BaseTrainer, ABC):
             with jax.default_device(jax.devices("cpu")[0]) if self.low_mem_usage else leave_alone_context_manager:
                 dir_prefix: str = "/dev/shm" if sys.platform != "win32" else "."
                 checkpoint_path = "SAVING_SKIPPED"
-
+                flops_per_device = self.calculate_number_total_flops_per_device(params=self.model_state.params) / 1e12
                 pbar = tqdm(total=self.max_training_steps)
                 pbar.set_description("Training")
                 current_step = self.model_state.step.tolist() if isinstance(
@@ -1066,6 +1066,7 @@ class DPOTrainer(BaseTrainer, ABC):
                                     batch
                                 )
                                 total_time = time.time() - time_start
+                                flops = flops_per_device / total_time
                                 (
                                     loss, chosen_rewards, rejected_rewards
                                 ) = metrics.loss, metrics.chosen_rewards[0], metrics.rejected_rewards[0]
@@ -1092,12 +1093,12 @@ class DPOTrainer(BaseTrainer, ABC):
                                             current_step - self.arguments.step_start_point
                                     ),
                                     "train/learning_rate": self.scheduler(
-                                        jax.device_get(self.model_state.step)
-                                    ).tolist(),
+                                        jax.device_get(self.model_state.step)).tolist(),
                                     "train/step": current_step,
                                     "train/step_time": total_time,
                                     "train/perplexity": jnp.exp(loss).tolist(),
-                                    "train/epoch": epoch_index
+                                    "train/epoch": epoch_index,
+                                    "train/TFLOPs": flops
                                 }
                                 log_metrics = copy.deepcopy(train_metrics)
                                 train_metrics.update(self.arguments.captured_memory)
@@ -1195,6 +1196,7 @@ class DPOTrainer(BaseTrainer, ABC):
             loss_sum = None
             chosen_rewards_sum = None
             rejected_rewards_sum = None
+            flops_per_device = self.calculate_number_total_flops_per_device(params=self.model_state.params) / 1e12
 
             try:
                 for batch in self.dataloader_eval:
@@ -1215,6 +1217,7 @@ class DPOTrainer(BaseTrainer, ABC):
                         batch
                     )
                     total_time = time.time() - time_start
+                    flops = flops_per_device / total_time
                     (
                         loss, chosen_rewards, rejected_rewards
                     ) = metrics.loss, metrics.chosen_rewards[0], metrics.rejected_rewards[0]
@@ -1243,6 +1246,7 @@ class DPOTrainer(BaseTrainer, ABC):
                         "eval/step": current_step,
                         "eval/step_time": total_time,
                         "eval/perplexity": jnp.exp(loss).tolist(),
+                        "eval/TFLOPs": flops
                     }
                     log_metrics = copy.deepcopy(eval_metrics)
                     eval_metrics.update(self.arguments.captured_memory)

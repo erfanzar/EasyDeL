@@ -138,4 +138,5 @@ def re_train(checkpoint_path: str | os.PathLike):
 
 
 if __name__ == "__main__":
-    re_train(train())
+    # re_train(train())
+    train()

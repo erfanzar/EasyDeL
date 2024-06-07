@@ -10,6 +10,7 @@ from glob import glob
 from typing import Union, Callable, Optional, Any, Literal, Mapping, Iterator
 
 import fjformer
+import flax.core
 import jax
 import tensorflow as tf
 import termcolor
@@ -657,3 +658,8 @@ partition_rules = {partition_rules}
             lambda spec: jax.sharding.NamedSharding(spec=spec, mesh=mesh),
             tree
         )
+
+    def calculate_number_total_flops_per_device(self, params):
+        size = sum(x.size for x in jax.tree_util.tree_flatten(flax.core.unfreeze(params))[0])
+        flops = (6 * size * (self.arguments.total_batch_size * self.arguments.max_sequence_length)) / jax.device_count()
+        return flops
