@@ -18,31 +18,7 @@ import chex
 from fjformer.linen import Dense
 from .palm_configuration import PalmConfig
 from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
-
-
-class RMSNorm(nn.Module):
-    dim: int
-    eps: float = 1e-6
-    dtype: jnp.dtype = jnp.bfloat16
-    param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[jax.lax.Precision, str]] = None
-
-    def setup(self) -> None:
-        self.weight = self.param(
-            'kernel',
-            nn.initializers.ones,
-            (self.dim,),
-            self.param_dtype,
-        )
-
-    def _norm(self, hidden_state: jnp.ndarray) -> jnp.ndarray:
-        return hidden_state * jax.lax.rsqrt(jnp.square(hidden_state).mean(-1, keepdims=True) + self.eps)
-
-    def __call__(self, hidden_state: jnp.ndarray) -> jnp.ndarray:
-        hidden_state = hidden_state.astype(jnp.promote_types(self.dtype, jnp.bfloat16))
-        output = self._norm(hidden_state).astype(self.dtype)
-        weight = fjformer.linen.control_quantization(self.weight, self.dtype)
-        return output * weight
+from ..common import RMSNorm
 
 
 def pre_compute_freq_cis(dim, max_length, theta: int = 10000.0, dtype=jnp.bfloat16):
@@ -105,8 +81,8 @@ class ParallelPalmBlock(nn.Module):
             self.param_dtype,
         ), self.param_dtype)
 
-        self.norm = RMSNorm(dim=self.config.hidden_size)
-        self.post_norm = RMSNorm(dim=self.config.hidden_size)
+        self.norm = RMSNorm(dim=self.config.hidden_size, dtype=self.dtype, param_dtype=self.param_dtype)
+        self.post_norm = RMSNorm(dim=self.config.hidden_size, dtype=self.dtype, param_dtype=self.param_dtype)
 
         self.num_attention_heads: int = self.config.num_attention_heads
         self.scale: float = self.config.dim_head ** -0.5
@@ -266,7 +242,6 @@ class FlaxPalmModule(nn.Module):
         self.ln_f = RMSNorm(
             dim=self.config.hidden_size,
             dtype=self.dtype,
-            precision=self.precision,
             param_dtype=self.param_dtype,
             eps=self.config.eps
         )

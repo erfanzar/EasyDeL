@@ -25,12 +25,12 @@ from ..flax_modelling_utils import (
     get_dot_general_by_bits,
     BaseJAXAttentionModule,
     get_gradient_checkpoint_policy,
-    block_wise_ffn
+    block_wise_ffn, control_mlp_sharding
 )
 import chex
 from .mixtral_configuration import MixtralConfig
 from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
-
+from ..common import RMSNorm
 re_mat = nn_partitioning.remat
 
 
@@ -47,29 +47,6 @@ class MoeCausalLMOutput(FlaxMaskedLMOutput):
     aux_loss: Optional[chex.Array] = None
     router_logits: Optional[Tuple[chex.Array]] = None
 
-
-class MixtralRMSNorm(nn.Module):
-    dim: int
-    eps: float = 1e-6
-    dtype: jnp.dtype = jnp.bfloat16
-    param_dtype: jnp.dtype = jnp.bfloat16
-
-    def setup(self) -> None:
-        self.weight = self.param(
-            'kernel',
-            nn.initializers.ones,
-            (self.dim,),
-            self.param_dtype,
-        )
-
-    def _norm(self, x: jnp.ndarray) -> jnp.ndarray:
-        return x * jax.lax.rsqrt(jnp.square(x).mean(-1, keepdims=True) + self.eps)
-
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
-        output = self._norm(x).astype(self.dtype)
-        weight = fjformer.linen.control_quantization(self.weight, self.dtype)
-        return output * weight
 
 
 class FlaxMixtralRotaryEmbedding(nn.Module):
@@ -429,6 +406,8 @@ class FlaxMixtralSparseMoeBlock(nn.Module):
             hidden_states: chex.Array,
             e: bool = False  # Ignored
     ) -> Tuple[chex.Array, chex.Array]:
+
+        hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
         batch_size, sequence_length, hidden_dim = hidden_states.shape
 
         router_logits = self.gate(hidden_states).astype(  # no reshaping is needed
@@ -501,13 +480,13 @@ class FlaxMixtralDecoderLayer(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.input_layernorm = MixtralRMSNorm(
+        self.input_layernorm = RMSNorm(
             dim=self.config.hidden_size,
             eps=self.config.rms_norm_eps,
             dtype=self.dtype,
             param_dtype=self.param_dtype
         )
-        self.post_attention_layernorm = MixtralRMSNorm(
+        self.post_attention_layernorm = RMSNorm(
             dim=self.config.hidden_size,
             eps=self.config.rms_norm_eps,
             dtype=self.dtype,
@@ -933,7 +912,7 @@ class FlaxMixtralModule(nn.Module):
             precision=self.precision
         )
 
-        self.norm = MixtralRMSNorm(
+        self.norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
             dtype=self.dtype,

@@ -28,7 +28,7 @@ from ..flax_modelling_utils import (
     precompute_freq_cis,
     get_dot_general_by_bits,
     BaseJAXAttentionModule,
-    block_wise_ffn
+    block_wise_ffn, control_mlp_sharding
 )
 
 re_mat = flax.linen.partitioning.remat
@@ -473,6 +473,8 @@ class FlaxCohereMLP(nn.Module):
             A tensor that is the result of applying a dropout function
             to x
         """
+
+        x = control_mlp_sharding(x, self.config.partition_axis)
         x = self.down_proj(jax.nn.silu(self.gate_proj(x)) * self.up_proj(x))
         return x
 

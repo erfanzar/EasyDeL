@@ -19,7 +19,7 @@ from ..flax_modelling_utils import (
     BaseJAXAttentionModule,
     block_wise_ffn,
     precompute_freq_cis,
-    apply_rotary_pos_emb
+    apply_rotary_pos_emb, control_mlp_sharding
 )
 import chex
 from .falcon_configuration import FalconConfig
@@ -327,6 +327,8 @@ class FlaxFalconMlp(nn.Module):
         )
 
     def __call__(self, x: chex.Array, deterministic: bool = True):
+
+        x = control_mlp_sharding(x, self.config.partition_axis)
         return self.dense_4h_to_h(nn.gelu(self.dense_h_to_4h(x), approximate=False))
 
 

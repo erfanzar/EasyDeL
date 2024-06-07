@@ -26,8 +26,10 @@ from ..flax_modelling_utils import (
     repeat_kv_bnsh,
     apply_rotary_pos_emb,
     precompute_freq_cis,
-    get_dot_general_by_bits, BaseJAXAttentionModule, block_wise_ffn
+    get_dot_general_by_bits, BaseJAXAttentionModule, block_wise_ffn, control_mlp_sharding
 )
+
+from ..common import RMSNorm
 
 
 class FlaxLlamaEmbedding(nn.Module):
@@ -43,42 +45,6 @@ class FlaxLlamaEmbedding(nn.Module):
         query = apply_rotary_pos_emb(query, sin, cos)
 
         return query.astype(self.dtype), key.astype(self.dtype)
-
-
-def repeat_kv(x: chex.Array, n_rep: int) -> chex.Array:
-    bs, s, n_kv_heads, head_dim = x.shape
-    if n_rep == 1:
-        return x
-    x = x[:, :, jnp.newaxis, :, :]
-    x = jnp.repeat(x, n_rep, axis=2)
-
-    return x.reshape(bs, s,
-                     n_kv_heads * n_rep,
-                     head_dim)
-
-
-class RMSNorm(nn.Module):
-    dim: int
-    eps: float = 1e-6
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
-
-    def setup(self) -> None:
-        self.weight = self.param(
-            'kernel',
-            nn.initializers.ones,
-            (self.dim,),
-            self.param_dtype,
-        )
-
-    def _norm(self, x: jnp.ndarray) -> jnp.ndarray:
-        return x * jax.lax.rsqrt(jnp.square(x).mean(-1, keepdims=True) + self.eps)
-
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
-        output = self._norm(x).astype(self.dtype)
-        weight = nn.linen.control_quantization(self.weight, self.dtype)
-        return output * weight
 
 
 class FlaxLlamaAttention(BaseJAXAttentionModule):
@@ -447,6 +413,8 @@ class FlaxLlamaMLP(nn.Module):
             A tensor that is the result of applying a dropout function
             to x
         """
+
+        x = control_mlp_sharding(x, self.config.partition_axis)
         x = self.down_proj(jax.nn.silu(self.gate_proj(x)) * self.up_proj(x))
         x = self.dropout(x, deterministic=deterministic)
         return x

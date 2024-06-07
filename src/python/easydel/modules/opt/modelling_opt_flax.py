@@ -37,7 +37,7 @@ from jax.sharding import PartitionSpec
 from transformers import logging
 
 from ..flax_modelling_utils import get_gradient_checkpoint_policy, \
-    with_sharding_constraint, BaseJAXAttentionModule
+    with_sharding_constraint, BaseJAXAttentionModule, control_mlp_sharding
 
 import chex
 
@@ -239,6 +239,7 @@ class FlaxOPTDecoderLayer(nn.Module):
         )
         hidden_states = self.dropout_layer(hidden_states, deterministic=deterministic)
         hidden_states = residual + hidden_states
+        hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
         # 350m applies layer norm AFTER attention
         if not self.do_layer_norm_before:
             hidden_states = self.self_attn_layer_norm(hidden_states)

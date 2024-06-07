@@ -28,7 +28,7 @@ from ..flax_modelling_utils import (
     precompute_freq_cis,
     get_dot_general_by_bits,
     BaseJAXAttentionModule,
-    block_wise_ffn
+    block_wise_ffn, control_mlp_sharding
 )
 import chex
 from .jetmoe_configuration import JetMoEConfig
@@ -456,4 +456,6 @@ class FlaxJetMoEMLP(nn.Module):
             x: chex.Array,
             e: bool = False  # Ignored
     ):
+
+        x = control_mlp_sharding(x, self.config.partition_axis)
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))

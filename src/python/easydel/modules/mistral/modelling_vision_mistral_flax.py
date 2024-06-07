@@ -16,10 +16,11 @@ from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 from transformers.generation.flax_utils import SampleState, FlaxLogitsProcessorList, FlaxSampleOutput, logger
 from transformers import GenerationConfig
 from .vision_mistral_configuration import VisionMistralConfig
-from .modelling_mistral_flax import FlaxMistralDecoratorCollection, MistralRMSNorm
+from .modelling_mistral_flax import FlaxMistralDecoratorCollection
 from ..flax_modelling_utils import precompute_freq_cis
 from ...etils.etils import get_logger
 from fjformer.linen import Dense
+from ..common import RMSNorm
 
 
 class FlaxVisionMistralPreTrainedModel(EasyDeLFlaxPretrainedModel):
@@ -198,7 +199,7 @@ class FlaxVisionMistralModule(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.norm = MistralRMSNorm(
+        self.norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
             dtype=self.dtype,

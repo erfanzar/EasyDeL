@@ -23,36 +23,13 @@ from ..flax_modelling_utils import (
     with_sharding_constraint,
     precompute_freq_cis,
     BaseJAXAttentionModule,
-    block_wise_ffn
+    block_wise_ffn, control_mlp_sharding
 )
 from fjformer.linen import Dense
 from .phi3_configuration import Phi3Config
 from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 from jax.sharding import PartitionSpec
-
-
-class FlaxPhi3RMSNorm(nn.Module):
-    dim: int
-    eps: float = 1e-6
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
-
-    def setup(self) -> None:
-        self.weight = self.param(
-            'kernel',
-            nn.initializers.ones,
-            (self.dim,),
-            self.param_dtype,
-        )
-
-    def _norm(self, x: jnp.ndarray) -> jnp.ndarray:
-        return x * jax.lax.rsqrt(jnp.square(x).mean(-1, keepdims=True) + self.eps)
-
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
-        output = self._norm(x).astype(self.dtype)
-        weight = fjformer.linen.control_quantization(self.weight, self.dtype)
-        return output * weight
+from ..common import RMSNorm as RMSNorm
 
 
 class FlaxPhi3Embedding(nn.Module):
@@ -109,6 +86,8 @@ class FlaxPhi3MLP(nn.Module):
             hidden_states: Array,
             e: bool = False  # Ignored
     ) -> Array:
+
+        hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
         up_states = self.gate_up_proj(hidden_states)
 
         gate, up_states = jnp.split(up_states, 2, axis=-1)
@@ -423,7 +402,7 @@ class FlaxPhi3DecoderLayer(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.input_layernorm = FlaxPhi3RMSNorm(
+        self.input_layernorm = RMSNorm(
             dim=self.config.hidden_size,
             eps=self.config.rms_norm_eps,
             dtype=self.dtype,
@@ -432,7 +411,7 @@ class FlaxPhi3DecoderLayer(nn.Module):
 
         self.resid_attn_dropout = nn.Dropout(self.config.resid_pdrop)
         self.resid_mlp_dropout = nn.Dropout(self.config.resid_pdrop)
-        self.post_attention_layernorm = FlaxPhi3RMSNorm(
+        self.post_attention_layernorm = RMSNorm(
             dim=self.config.hidden_size,
             eps=self.config.rms_norm_eps,
             dtype=self.dtype,
@@ -593,7 +572,7 @@ class FlaxPhi3Module(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.norm = FlaxPhi3RMSNorm(
+        self.norm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
             dtype=self.dtype,

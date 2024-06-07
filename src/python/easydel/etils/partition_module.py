@@ -5,10 +5,11 @@ AxisType = Optional[Union[Tuple[str, ...], str]]
 
 class PartitionAxis(NamedTuple):
     batch_axis: AxisType = ("fsdp", "dp")
+    sequence_axis: AxisType = "sp"
     query_sequence_axis: AxisType = "sp"
     head_axis: AxisType = "tp"
     key_sequence_axis: AxisType = "sp"
-    hidden_state_axis: AxisType = "sp"
+    hidden_state_axis: AxisType = "tp"
     attention_dim_axis: AxisType = None
     bias_head_sequence_axis: AxisType = None
     bias_key_sequence_axis: AxisType = None

@@ -26,10 +26,11 @@ from ..flax_modelling_utils import (
     repeat_kv_bnsh,
     apply_rotary_pos_emb,
     precompute_freq_cis,
-    get_dot_general_by_bits, BaseJAXAttentionModule, block_wise_ffn
+    get_dot_general_by_bits, BaseJAXAttentionModule, block_wise_ffn, control_mlp_sharding
 )
 import chex
 from .mistral_configuration import MistralConfig
+from ..common import RMSNorm
 
 re_mat = nn_partitioning.remat
 
@@ -66,31 +67,6 @@ def _make_sliding_window_causal_mask(
         mask = jnp.concatenate(
             [jnp.zeros((tgt_len, past_key_values_length), dtype=dtype), mask], axis=-1)
     return mask[None, None, :, :].repeat(bsz, 0)
-
-
-class MistralRMSNorm(nn.Module):
-    dim: int
-    eps: float = 1e-6
-    dtype: jnp.dtype = jnp.bfloat16
-    param_dtype: jnp.dtype = jnp.bfloat16
-
-    def setup(self) -> None:
-        self.weight = self.param(
-            'kernel',
-            nn.initializers.ones,
-            (self.dim,),
-            self.param_dtype,
-        )
-
-    def _norm(self, x: jnp.ndarray) -> jnp.ndarray:
-        return x * jax.lax.rsqrt(jnp.square(x).mean(-1, keepdims=True) + self.eps)
-
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
-        output = self._norm(x).astype(self.dtype)
-
-        weight = fjformer.linen.control_quantization(self.weight, self.dtype)
-        return output * weight
 
 
 class FlaxMistralRotaryEmbedding(nn.Module):
@@ -134,6 +110,7 @@ class FlaxMistralMLP(nn.Module):
             x: chex.Array,
             e: bool = False  # Ignored
     ):
+        x = control_mlp_sharding(x, self.config.partition_axis)
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
@@ -472,13 +449,13 @@ class FlaxMistralDecoderLayer(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.input_layernorm = MistralRMSNorm(
+        self.input_layernorm = RMSNorm(
             dim=self.config.hidden_size,
             eps=self.config.rms_norm_eps,
             dtype=self.dtype,
             param_dtype=self.param_dtype
         )
-        self.post_attention_layernorm = MistralRMSNorm(
+        self.post_attention_layernorm = RMSNorm(
             dim=self.config.hidden_size,
             eps=self.config.rms_norm_eps,
             dtype=self.dtype,
@@ -858,7 +835,7 @@ class FlaxMistralModule(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.norm = MistralRMSNorm(
+        self.norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
             dtype=self.dtype,

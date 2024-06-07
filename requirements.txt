@@ -14,3 +14,5 @@ tensorflow_datasets<=4.9.0
 scipy==1.13.1
 websocket-client
 websockets
+flax
+chex

@@ -27,37 +27,13 @@ from ..flax_modelling_utils import (
     precompute_freq_cis,
     get_dot_general_by_bits,
     BaseJAXAttentionModule,
-    block_wise_ffn
+    block_wise_ffn, control_mlp_sharding
 )
 import chex
 from .openelm_configuration import OpenELMConfig, make_divisible
+from ..common import RMSNorm
 
 re_mat = nn_partitioning.remat
-
-
-class OpenELMRMSNorm(nn.Module):
-    dim: int
-    eps: float = 1e-6
-    dtype: jnp.dtype = jnp.bfloat16
-    param_dtype: jnp.dtype = jnp.bfloat16
-
-    def setup(self) -> None:
-        self.weight = self.param(
-            'kernel',
-            nn.initializers.ones,
-            (self.dim,),
-            self.param_dtype,
-        )
-
-    def _norm(self, x: jnp.ndarray) -> jnp.ndarray:
-        return x * jax.lax.rsqrt(jnp.square(x).mean(-1, keepdims=True) + self.eps)
-
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
-        output = self._norm(x).astype(self.dtype)
-
-        weight = fjformer.linen.control_quantization(self.weight, self.dtype)
-        return output * weight
 
 
 class FlaxOpenELMRotaryEmbedding(nn.Module):
@@ -118,15 +94,17 @@ class FlaxOpenELMMultiHeadCausalAttention(BaseJAXAttentionModule):
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
         )
         if config.normalize_qk_projections:
-            self.q_norm = OpenELMRMSNorm(
+            self.q_norm = RMSNorm(
                 dim=config.head_dim,
                 dtype=self.dtype,
-                param_dtype=self.param_dtype
+                param_dtype=self.param_dtype,
+                eps=1e-6
             )
-            self.k_norm = OpenELMRMSNorm(
+            self.k_norm = RMSNorm(
                 dim=config.head_dim,
                 dtype=self.dtype,
-                param_dtype=self.param_dtype
+                param_dtype=self.param_dtype,
+                eps=1e-6
             )
         else:
             self.q_norm = None
@@ -159,7 +137,7 @@ class FlaxOpenELMMultiHeadCausalAttention(BaseJAXAttentionModule):
             num_attention_heads=q_heads,
             attention_dropout=0.0,
             head_dims=head_dim,
-            
+
             shard_attention_computation=self.config.shard_attention_computation,
             precision=self.precision,
             force_float32_tpu=True,
@@ -471,6 +449,7 @@ class FlaxOpenELMFeedForwardNetwork(nn.Module):
         self.act = ACT2FN[config.activation_fn_name]
 
     def __call__(self, x: chex.Array, e: bool = False) -> chex.Array:
+        x = control_mlp_sharding(x, self.config.partition_axis)
         if self.ffn_with_glu:
             y_12 = self.proj_1(x)
             y_1, y_2 = jnp.split(y_12, 2, axis=-1)
@@ -526,15 +505,17 @@ class FlaxOpenELMDecoderLayer(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.ffn_norm = OpenELMRMSNorm(
+        self.ffn_norm = RMSNorm(
             self.config.model_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
+            eps=1e-6
         )
-        self.attn_norm = OpenELMRMSNorm(
+        self.attn_norm = RMSNorm(
             self.config.model_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
+            eps=1e-6
         )
 
     def __call__(
@@ -679,10 +660,11 @@ class FlaxOpenELMModule(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision
         )
-        self.norm = OpenELMRMSNorm(
+        self.norm = RMSNorm(
             config.model_dim,
             dtype=self.dtype,
-            param_dtype=self.param_dtype
+            param_dtype=self.param_dtype,
+            eps=1e-6
         )
         if config.share_input_output_layers:
             self.classifier = None
