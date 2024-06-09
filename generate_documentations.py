@@ -5,7 +5,7 @@ static_joins = "\n\t:members:\n\t:undoc-members:\n\t:show-inheritance:"
 cache = {}
 
 
-def flatten_dict(d, parent_key='', sep='-'):
+def flatten_dict(d, parent_key="", sep="-"):
     items = []
     for k, v in d.items():
         new_key = parent_key + sep + k if parent_key else k
@@ -32,51 +32,55 @@ def unflatten_dict(xs, sep=None):
 
 
 def get_inner(path: str):
-    return [os.path.join(path, o) for o in os.listdir(path) if os.path.exists(os.path.join(path, o))]
+    return [
+        os.path.join(path, o)
+        for o in os.listdir(path)
+        if os.path.exists(os.path.join(path, o))
+    ]
 
 
 def get_dirs(path: str):
-    return [os.path.join(path, o) for o in os.listdir(path) if
-            os.path.exists(os.path.join(path, o)) and os.path.isdir(os.path.join(path, o))]
+    return [
+        os.path.join(path, o)
+        for o in os.listdir(path)
+        if os.path.exists(os.path.join(path, o))
+        and os.path.isdir(os.path.join(path, o))
+    ]
 
 
 def get_files(path: str):
-    return [os.path.join(path, o) for o in os.listdir(path) if
-            os.path.exists(os.path.join(path, o)) and not os.path.isdir(os.path.join(path, o))]
+    return [
+        os.path.join(path, o)
+        for o in os.listdir(path)
+        if os.path.exists(os.path.join(path, o))
+        and not os.path.isdir(os.path.join(path, o))
+    ]
 
 
-def run(project_locations="src/python/easydel", docs_file="docs/api_docs/", start_head="src/python/easydel"):
+def run(
+    project_locations="src/python/easydel",
+    docs_file="docs/api_docs/",
+    start_head="src/python/easydel",
+):
     global cache
     try:
         for current_file in get_inner(project_locations):
-            if not current_file.endswith(
-                    "__init__.py"
-            ) and not os.path.isdir(
-                current_file
-            ) and current_file.endswith(
-                ".py"
+            if (
+                not current_file.endswith("__init__.py")
+                and not os.path.isdir(current_file)
+                and current_file.endswith(".py")
             ):
-
-                doted = (
-                        start_head
-                        .replace(os.path.sep, ".")
-                        .replace("/", ".") + "."
-                )
+                doted = start_head.replace(os.path.sep, ".").replace("/", ".") + "."
 
                 name = (
-                    current_file
-                    .replace(".py", "")
+                    current_file.replace(".py", "")
                     .replace(os.path.sep, ".")
                     .replace("/", ".")
                 )
 
                 # markdown_documentation = f"{name.replace(doted, '')}\n========\n.. automodule:: {name}" + static_joins
                 categorical_name = name.replace(doted, "")
-                markdown_filename = (
-                        name
-                        .replace(doted, "")
-                        + ".rst"
-                )
+                markdown_filename = name.replace(doted, "") + ".rst"
 
                 # with open(docs_file + markdown_filename, "w") as buffer:
                 #     buffer.write(markdown_documentation)
@@ -85,10 +89,16 @@ def run(project_locations="src/python/easydel", docs_file="docs/api_docs/", star
 
                 for key in category_tuple:
                     key = key.split("_")
-                    capitalized_words = [word.capitalize() for word in key if word != ""]
+                    capitalized_words = [
+                        word.capitalize() for word in key if word != ""
+                    ]
                     edited_category_tuple += (" ".join(capitalized_words),)
                 #
-                cache[edited_category_tuple] = start_head.replace("/", ".") + "." + markdown_filename.replace(".py", "")
+                cache[edited_category_tuple] = (
+                    start_head.replace("/", ".")
+                    + "."
+                    + markdown_filename.replace(".py", "")
+                )
             else:
                 run(current_file)
     except NotADirectoryError:
@@ -113,8 +123,10 @@ def create_rst(name, children, output_dir):
                 create_rst(child_name, child_value, output_dir)
     else:
         children_name = children.replace("src.python.easydel.", "")
-        ca = "/".join([s.replace("_", " ").strip() for s in children_name.split(".")[1:-1]])
-        name = f'``{ca}`` module'
+        ca = "/".join(
+            [s.replace("_", " ").strip() for s in children_name.split(".")[1:-1]]
+        )
+        name = f"``{ca}`` module"
         with open(os.path.join(output_dir, children_name), "w") as rst_file:
             rst_file.write(f"{name.replace('_', ' ')}\n{'=' * len(name)}\n\n")
             children = children.replace(".rst", "").replace("src.python.", "")
@@ -147,7 +159,10 @@ def main():
     cache = {("APIs",) + k: v for k, v in cache.items()}
     pages = unflatten_dict(cache)
     base_dir = "docs/api_docs/"
-    generate_api_docs(pages, base_dir, )
+    generate_api_docs(
+        pages,
+        base_dir,
+    )
     uf_f = flatten_dict(pages)
     st = []
     for k, v in uf_f.items():
@@ -161,7 +176,9 @@ def main():
    
    {form}
    """.format(form="\n   ".join(sorted(st)))
-    open(os.path.join(base_dir, "APIs.rst"), "w").write(apis_index)
+    open(os.path.join(str(base_dir), "APIs.rst"), "w", encoding="utf-8").write(
+        apis_index
+    )
 
 
 if __name__ == "__main__":
