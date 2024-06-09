@@ -1,7 +1,7 @@
 import typing
 
 import termcolor
-from datasets import load_dataset, Dataset, DatasetDict
+from datasets import Dataset, DatasetDict
 from dataclasses import dataclass
 from typing import Optional, Union, List
 import copy
@@ -33,10 +33,10 @@ class DataProcessorArguments:
 class DataProcessor:
     @staticmethod
     def process_data(
-            data: Dataset,
-            tokenizer: PreTrainedTokenizer,
-            arguments: DataProcessorArguments,
-            field: str = 'train'
+        data: Dataset,
+        tokenizer: PreTrainedTokenizer,
+        arguments: DataProcessorArguments,
+        field: str = "train",
     ):
         data = copy.deepcopy(data) if arguments.use_deepcopy else data
 
@@ -59,7 +59,7 @@ class DataProcessor:
             "num_proc": arguments.num_proc,
             "suffix_template": arguments.suffix_template,
             "new_fingerprint": arguments.new_fingerprint,
-            "desc": arguments.desc
+            "desc": arguments.desc,
         }
 
         for k, v in _reqs.items():
@@ -70,18 +70,21 @@ class DataProcessor:
             termcolor.cprint(
                 "Tokenizer Doesn't include the padding "
                 "token so i set `(tokenizer.pad_token = tokenizer.eos_token)`",
-                color="red", force_color=True
+                color="red",
+                force_color=True,
             )
             tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.padding_side = 'left' if arguments.truncation_mode == "keep_end" else 'right'
+        tokenizer.padding_side = (
+            "left" if arguments.truncation_mode == "keep_end" else "right"
+        )
         data = data.map(
             lambda x: tokenizer(
                 x[arguments.prompt_field],
                 max_length=arguments.max_position_embeddings,
-                padding='max_length',
-                return_tensors='jax'
+                padding="max_length",
+                return_tensors="jax",
             ),
-            **map_kwargs
+            **map_kwargs,
         )
 
         return DatasetDict({field: data})

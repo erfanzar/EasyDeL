@@ -10,20 +10,22 @@ _import_structure = {
         "FlaxRobertaForQuestionAnswering",
         "FlaxRobertaForSequenceClassification",
         "FlaxRobertaForTokenClassification",
-    ]
+    ],
 }
 
 if TYPE_CHECKING:
-    from .roberta_configuration import RobertaConfig
+    from .roberta_configuration import RobertaConfig as RobertaConfig
     from .modelling_roberta_flax import (
-        FlaxRobertaForCausalLM,
-        FlaxRobertaForMultipleChoice,
-        FlaxRobertaForMaskedLMModule,
-        FlaxRobertaForQuestionAnswering,
-        FlaxRobertaForSequenceClassification,
-        FlaxRobertaForTokenClassification,
+        FlaxRobertaForCausalLM as FlaxRobertaForCausalLM,
+        FlaxRobertaForMultipleChoice as FlaxRobertaForMultipleChoice,
+        FlaxRobertaForMaskedLMModule as FlaxRobertaForMaskedLMModule,
+        FlaxRobertaForQuestionAnswering as FlaxRobertaForQuestionAnswering,
+        FlaxRobertaForSequenceClassification as FlaxRobertaForSequenceClassification,
+        FlaxRobertaForTokenClassification as FlaxRobertaForTokenClassification,
     )
 else:
     import sys
 
-    sys.modules[__name__] = _LazyModule(__name__, globals()["__file__"], _import_structure, module_spec=__spec__)
+    sys.modules[__name__] = _LazyModule(
+        __name__, globals()["__file__"], _import_structure, module_spec=__spec__
+    )

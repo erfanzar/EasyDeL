@@ -12,14 +12,16 @@ _import_structure = {
 }
 
 if TYPE_CHECKING:
-    from .mixtral_configuration import MixtralConfig
+    from .mixtral_configuration import MixtralConfig as MixtralConfig
     from .modelling_mixtral_flax import (
-        FlaxMixtralForCausalLM,
-        FlaxMixtralForCausalLMModule,
-        FlaxMixtralModel,
-        FlaxMixtralModule,
+        FlaxMixtralForCausalLM as FlaxMixtralForCausalLM,
+        FlaxMixtralForCausalLMModule as FlaxMixtralForCausalLMModule,
+        FlaxMixtralModel as FlaxMixtralModel,
+        FlaxMixtralModule as FlaxMixtralModule,
     )
 else:
     import sys
 
-    sys.modules[__name__] = _LazyModule(__name__, globals()["__file__"], _import_structure, module_spec=__spec__)
+    sys.modules[__name__] = _LazyModule(
+        __name__, globals()["__file__"], _import_structure, module_spec=__spec__
+    )

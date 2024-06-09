@@ -16,10 +16,7 @@ import flax
 from tqdm import tqdm
 from jax.sharding import PartitionSpec
 from jax import numpy as jnp
-from fjformer import (
-    match_partition_rules,
-    make_shard_and_gather_fns
-)
+from fjformer import match_partition_rules, make_shard_and_gather_fns
 from typing import Optional, Tuple, Callable, Mapping
 from ...etils.easystate import EasyDeLState
 from ...trainer.base_trainer import BaseTrainer, TrainerConfigureFunctionFuncOutput
@@ -28,16 +25,15 @@ from ...utils.helpers import prefix_print
 from .modeling_output import CausalLMTrainerOutput
 from .fwd_bwd_functions import (
     create_casual_language_model_train_step,
-    create_casual_language_model_evaluation_step
+    create_casual_language_model_evaluation_step,
 )
 
 
 class CausalLanguageModelTrainer(BaseTrainer):
-
     def create_collate_function(
-            self,
-            max_sequence_length: int,
-            truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
+        self,
+        max_sequence_length: int,
+        truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> Callable:
         def collate_fn(batch):
             results = {}
@@ -51,8 +47,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
                         jnp.array(f[key])[..., :max_sequence_length] for f in batch
                     ]
                 results[key] = jnp.stack(corrected_sequence).reshape(
-                    -1,
-                    corrected_sequence[0].shape[-1]
+                    -1, corrected_sequence[0].shape[-1]
                 )
             return results
 
@@ -73,8 +68,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
 
         def initialize_state_function():
             initialized_parameters = self.model.init_weights(
-                jax.random.PRNGKey(0),
-                self.arguments.init_input_shape
+                jax.random.PRNGKey(0), self.arguments.init_input_shape
             )
 
             if self.arguments.dtype == jnp.bfloat16:
@@ -100,7 +94,9 @@ class CausalLanguageModelTrainer(BaseTrainer):
                     tx=self.lora_tx,
                     opt_state=self.lora_opt_state,
                     tx_init=EasyDeLState.safe_dict(tx_init),
-                    hyperparameters=EasyDeLState.create_hyperparameters(self.model.config.model_type),
+                    hyperparameters=EasyDeLState.create_hyperparameters(
+                        self.model.config.model_type
+                    ),
                     module=self.lora_model,
                     module_config=self.model.config,
                     module_config_args=None,
@@ -112,9 +108,11 @@ class CausalLanguageModelTrainer(BaseTrainer):
                     apply_fn=self.model.__call__,
                     module_config=copy.deepcopy(self.model.config),
                     tx_init=tx_init,
-                    hyperparameters=EasyDeLState.create_hyperparameters(self.model.config.model_type),
+                    hyperparameters=EasyDeLState.create_hyperparameters(
+                        self.model.config.model_type
+                    ),
                     module=self.model,
-                    module_config_args=None
+                    module_config_args=None,
                 )
 
         def create_state_from_params_function(parameters):
@@ -125,9 +123,11 @@ class CausalLanguageModelTrainer(BaseTrainer):
                     apply_fn=self.model.__call__,
                     module_config=copy.deepcopy(self.model.config),
                     tx_init=copy.deepcopy(self.arguments.optimizer_kwargs),
-                    hyperparameters=EasyDeLState.create_hyperparameters(self.model.config.model_type),
+                    hyperparameters=EasyDeLState.create_hyperparameters(
+                        self.model.config.model_type
+                    ),
                     module=self.model,
-                    module_config_args=None
+                    module_config_args=None,
                 )
             else:
                 return EasyDeLState(
@@ -136,8 +136,12 @@ class CausalLanguageModelTrainer(BaseTrainer):
                     params=parameters,
                     tx=self.lora_tx,
                     opt_state=self.lora_opt_state,
-                    tx_init=EasyDeLState.safe_dict(copy.deepcopy(self.arguments.optimizer_kwargs)),
-                    hyperparameters=EasyDeLState.create_hyperparameters(self.model.config.model_type),
+                    tx_init=EasyDeLState.safe_dict(
+                        copy.deepcopy(self.arguments.optimizer_kwargs)
+                    ),
+                    hyperparameters=EasyDeLState.create_hyperparameters(
+                        self.model.config.model_type
+                    ),
                     module=self.lora_model,
                     module_config=self.model.config,
                     module_config_args=None,
@@ -147,17 +151,21 @@ class CausalLanguageModelTrainer(BaseTrainer):
         state_partition_spec = match_partition_rules(
             self.config.get_partition_rules(
                 fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
-            ) if self.arguments.custom_rule is None else self.arguments.custom_rule,
-            state_shape
+            )
+            if self.arguments.custom_rule is None
+            else self.arguments.custom_rule,
+            state_shape,
         )
 
         spec_named_sharding = self.specs_to_name_sharding(state_partition_spec)
-        empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=self.arguments.get_mesh())
+        empty_sharding = jax.sharding.NamedSharding(
+            spec=PartitionSpec(), mesh=self.arguments.get_mesh()
+        )
         create_sharded_state_from_params_function = jax.jit(
             create_state_from_params_function,
             in_shardings=(spec_named_sharding.params,),
             out_shardings=spec_named_sharding,
-            donate_argnums=(0,)
+            donate_argnums=(0,),
         )
         sharded_train_step_function = jax.jit(
             create_casual_language_model_train_step(
@@ -171,7 +179,9 @@ class CausalLanguageModelTrainer(BaseTrainer):
         )
 
         sharded_eval_step_function = jax.jit(
-            create_casual_language_model_evaluation_step(self.arguments.step_partition_spec),
+            create_casual_language_model_evaluation_step(
+                self.arguments.step_partition_spec
+            ),
             in_shardings=(spec_named_sharding, empty_sharding),
             out_shardings=(empty_sharding, empty_sharding, empty_sharding),
             donate_argnums=(0, 0),
@@ -190,15 +200,20 @@ class CausalLanguageModelTrainer(BaseTrainer):
             sharded_eval_step_function=sharded_eval_step_function,
             mesh=mesh,
             checkpoint_manager=checkpoint_manager,
-            initialize_state_function=initialize_state_function
+            initialize_state_function=initialize_state_function,
         )
 
     def initialize_state(
-            self,
-            model_parameters: Optional[flax.core.FrozenDict] = None,
-            state: Optional[EasyDeLState] = None,
+        self,
+        model_parameters: Optional[flax.core.FrozenDict] = None,
+        state: Optional[EasyDeLState] = None,
     ) -> Tuple[EasyDeLState, Mapping[str, Callable], Mapping[str, Callable]]:
-        if model_parameters is None and state is None and self.rapture is None and self.checkpoint_path is None:
+        if (
+            model_parameters is None
+            and state is None
+            and self.rapture is None
+            and self.checkpoint_path is None
+        ):
             raise RuntimeError(
                 "You are passing `model_parameters=None`, `state=None`, and `checkpoint_path=None` and also you are not"
                 " using LoRA, if you are "
@@ -209,16 +224,16 @@ class CausalLanguageModelTrainer(BaseTrainer):
             model_parameters = self.lora_parameters
         with self.mesh:
             shard_fns, gather_fns = make_shard_and_gather_fns(
-                self.state_partition_spec,
-                mesh=self.mesh,
-                dtype_specs=self.dtype
+                self.state_partition_spec, mesh=self.mesh, dtype_specs=self.dtype
             )
             if state is not None:
                 sharded_state = state
-                params = sharded_state.params if not self.arguments.do_shard_fns else jax.tree_util.tree_map(
-                    lambda f, x: f(x),
-                    shard_fns.params,
+                params = (
                     sharded_state.params
+                    if not self.arguments.do_shard_fns
+                    else jax.tree_util.tree_map(
+                        lambda f, x: f(x), shard_fns.params, sharded_state.params
+                    )
                 )
                 sharded_state.params = params
                 if sharded_state.opt_state is None:
@@ -227,20 +242,19 @@ class CausalLanguageModelTrainer(BaseTrainer):
                     )
                     with jax.default_device(self.arguments.offload_device):
                         sharded_state = sharded_state.init_opt_state()
-                        opt_state = sharded_state.opt_state if not self.arguments.do_shard_fns else jax.tree_util.tree_map(
-                            lambda f, x: f(x),
-                            shard_fns.opt_state,
+                        opt_state = (
                             sharded_state.opt_state
+                            if not self.arguments.do_shard_fns
+                            else jax.tree_util.tree_map(
+                                lambda f, x: f(x),
+                                shard_fns.opt_state,
+                                sharded_state.opt_state,
+                            )
                         )
-                        sharded_state = sharded_state.replace(
-                            opt_state=opt_state
-                        )
+                        sharded_state = sharded_state.replace(opt_state=opt_state)
             elif self.finetune:
-
                 if model_parameters is None and self.checkpoint_path is not None:
-                    prefix_print(
-                        "Action", f"Loading Model From {self.checkpoint_path}"
-                    )
+                    prefix_print("Action", f"Loading Model From {self.checkpoint_path}")
                     with jax.default_device(self.arguments.offload_device):
                         sharded_state = EasyDeLState.load_state(
                             verbose=self.arguments.verbose,
@@ -248,19 +262,24 @@ class CausalLanguageModelTrainer(BaseTrainer):
                             init_optimizer_state=True,
                             checkpoint_path=self.checkpoint_path,
                             input_shape=self.arguments.init_input_shape,
-                            config_kwargs=self.arguments.loaded_model_config_kwargs
+                            config_kwargs=self.arguments.loaded_model_config_kwargs,
                         )
                         state_shape = jax.eval_shape(lambda: sharded_state)
                         state_partition_spec = match_partition_rules(
                             self.config.get_partition_rules(
                                 fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
-                            ) if self.arguments.custom_rule is None else self.arguments.custom_rule,
-                            state_shape
+                            )
+                            if self.arguments.custom_rule is None
+                            else self.arguments.custom_rule,
+                            state_shape,
                         )
 
-                        spec_named_sharding = self.specs_to_name_sharding(state_partition_spec)
-                        empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(),
-                                                                    mesh=self.arguments.get_mesh())
+                        spec_named_sharding = self.specs_to_name_sharding(
+                            state_partition_spec
+                        )
+                        empty_sharding = jax.sharding.NamedSharding(
+                            spec=PartitionSpec(), mesh=self.arguments.get_mesh()
+                        )
                         sharded_train_step_function = jax.jit(
                             create_casual_language_model_train_step(
                                 partition_spec=self.arguments.step_partition_spec,
@@ -268,14 +287,24 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                 z_loss=self.arguments.z_loss,
                             ),
                             in_shardings=(spec_named_sharding, empty_sharding),
-                            out_shardings=(spec_named_sharding, empty_sharding, empty_sharding),
+                            out_shardings=(
+                                spec_named_sharding,
+                                empty_sharding,
+                                empty_sharding,
+                            ),
                             donate_argnums=(0, 0),
                         )
 
                         sharded_eval_step_function = jax.jit(
-                            create_casual_language_model_evaluation_step(self.arguments.step_partition_spec),
+                            create_casual_language_model_evaluation_step(
+                                self.arguments.step_partition_spec
+                            ),
                             in_shardings=(spec_named_sharding, empty_sharding),
-                            out_shardings=(empty_sharding, empty_sharding, empty_sharding),
+                            out_shardings=(
+                                empty_sharding,
+                                empty_sharding,
+                                empty_sharding,
+                            ),
                             donate_argnums=(0, 0),
                         )
 
@@ -288,23 +317,26 @@ class CausalLanguageModelTrainer(BaseTrainer):
                     if self.arguments.remove_ckpt_after_load:
                         os.remove(self.checkpoint_path)
                 elif model_parameters is not None and self.checkpoint_path is None:
-                    prefix_print(
-                        "Action", f"Sharding Passed Parameters"
-                    )
-                    from flax.core import unfreeze
+                    prefix_print("Action", "Sharding Passed Parameters")
                     if not isinstance(model_parameters, flax.core.FrozenDict):
                         prefix_print(
                             "Warning",
                             "Model Parameters should be like FrozenDict({'params': params}) make sure to "
-                            "pass as type FrozenDict in case of not getting UnExcepted Errors "
+                            "pass as type FrozenDict in case of not getting UnExcepted Errors ",
                         )
 
-                    model_parameters = model_parameters if not self.arguments.do_shard_fns else jax.tree_util.tree_map(
-                        lambda f, x: f(x),
-                        shard_fns.params,
-                        model_parameters,
+                    model_parameters = (
+                        model_parameters
+                        if not self.arguments.do_shard_fns
+                        else jax.tree_util.tree_map(
+                            lambda f, x: f(x),
+                            shard_fns.params,
+                            model_parameters,
+                        )
                     )
-                    sharded_state = self.create_sharded_state_from_params_function(model_parameters)
+                    sharded_state = self.create_sharded_state_from_params_function(
+                        model_parameters
+                    )
                 elif model_parameters is not None and self.checkpoint_path is not None:
                     raise EasyDeLTimerError(
                         "You can't pass `model_parameters` and `checkpoint_path` at same time"
@@ -315,10 +347,12 @@ class CausalLanguageModelTrainer(BaseTrainer):
                     )
             else:
                 sharded_state = self.initialize_state_function()
-                params = sharded_state.params if not self.arguments.do_shard_fns else jax.tree_util.tree_map(
-                    lambda f, x: f(x),
-                    shard_fns.params,
+                params = (
                     sharded_state.params
+                    if not self.arguments.do_shard_fns
+                    else jax.tree_util.tree_map(
+                        lambda f, x: f(x), shard_fns.params, sharded_state.params
+                    )
                 )
                 sharded_state.params = params
 
@@ -326,9 +360,9 @@ class CausalLanguageModelTrainer(BaseTrainer):
             return sharded_state, shard_fns, gather_fns
 
     def train(
-            self,
-            model_parameters: Optional[flax.core.FrozenDict] = None,
-            state: Optional[EasyDeLState] = None
+        self,
+        model_parameters: Optional[flax.core.FrozenDict] = None,
+        state: Optional[EasyDeLState] = None,
     ) -> CausalLMTrainerOutput:
         """The train function is the main function of this module.
         It takes a model_parameters argument which can be used to load a pretrained model and finetune it.
@@ -360,7 +394,8 @@ class CausalLanguageModelTrainer(BaseTrainer):
             termcolor.cprint(
                 f"Model Contain {sum(n.size for n in jax.tree_util.tree_flatten(flax.core.unfreeze(_p))[0]) / 1e9} "
                 f"Billion Parameters",
-                color="red", force_color=True
+                color="red",
+                force_color=True,
             )
 
         checkpoint_path = "SAVING_SKIPPED"
@@ -369,11 +404,15 @@ class CausalLanguageModelTrainer(BaseTrainer):
                 "Performance Mode is ON, we will ignore the Memory Tracking, WANDB Logging, and extra information "
                 "Process.",
                 color="red",
-                force_color=True
+                force_color=True,
             )
         start_time = time.time()
-        sharded_state, shard_fns, gather_fns = self.initialize_state(model_parameters=model_parameters, state=state)
-        flops_per_device = self.calculate_number_total_flops_per_device(params=model_parameters) / 1e12
+        sharded_state, shard_fns, gather_fns = self.initialize_state(
+            model_parameters=model_parameters, state=state
+        )
+        flops_per_device = (
+            self.calculate_number_total_flops_per_device(params=model_parameters) / 1e12
+        )
         count_model_parameters(sharded_state.params)
         with self.mesh:
             pbar = tqdm(total=self.max_training_steps)
@@ -382,21 +421,28 @@ class CausalLanguageModelTrainer(BaseTrainer):
             accuracy_sum = None
             pbar.update(sharded_state.step.tolist())  # type: ignore
             if self.wandb_runtime is not None:
-                model_parameters_number = sum(
-                    n.size for n in
-                    jax.tree_util.tree_flatten(flax.core.unfreeze(sharded_state.params))[0]
-                ) / 1e9
-                self.wandb_runtime.log(
-                    {
-                        "Number of Model Parameters (Billion)": model_parameters_number
-                    }
+                model_parameters_number = (
+                    sum(
+                        n.size
+                        for n in jax.tree_util.tree_flatten(
+                            flax.core.unfreeze(sharded_state.params)
+                        )[0]
+                    )
+                    / 1e9
                 )
-                wandb.summary["Number of Model Parameters (Billion)"] = model_parameters_number
+                self.wandb_runtime.log(
+                    {"Number of Model Parameters (Billion)": model_parameters_number}
+                )
+                wandb.summary["Number of Model Parameters (Billion)"] = (
+                    model_parameters_number
+                )
             try:
                 train_iter = iter(self.dataloader_train)
                 for epoch in range(self.arguments.num_train_epochs):
                     time_start = time.time()
-                    for _ in range(self.max_training_steps // self.arguments.num_train_epochs):
+                    for _ in range(
+                        self.max_training_steps // self.arguments.num_train_epochs
+                    ):
                         try:
                             batch = next(train_iter)
                         except StopIteration:
@@ -404,13 +450,11 @@ class CausalLanguageModelTrainer(BaseTrainer):
                             batch = next(train_iter)
                         current_step += 1
                         if (
-                                self.arguments.step_start_point is not None
-                                and
-                                self.arguments.step_start_point > current_step
+                            self.arguments.step_start_point is not None
+                            and self.arguments.step_start_point > current_step
                         ):
                             pbar.update(1)
                         elif current_step < self.max_training_steps:
-
                             time_prev = time_start
                             time_start = time.time()
                             step_time = time_start - time_prev
@@ -426,19 +470,27 @@ class CausalLanguageModelTrainer(BaseTrainer):
                             total_time = time.time() - time_start
                             flops = flops_per_device / total_time
                             trained_tokens = jnp.multiply(
-                                self.arguments.max_sequence_length, jnp.multiply(
-                                    current_step,
-                                    self.arguments.total_batch_size
-                                )
+                                self.arguments.max_sequence_length,
+                                jnp.multiply(
+                                    current_step, self.arguments.total_batch_size
+                                ),
                             )  # It's faster
 
                             with jax.spmd_mode("allow_all"):
                                 calculating_metrics_start = time.time()
                                 loss_sum = loss if loss_sum is None else loss_sum + loss
                                 accuracy = metrics["accuracy"]
-                                accuracy_sum = accuracy if accuracy_sum is None else accuracy_sum + accuracy
-                                mean_loss = loss_sum / (current_step - self.arguments.step_start_point)
-                                mean_accuracy = accuracy_sum / (current_step - self.arguments.step_start_point)
+                                accuracy_sum = (
+                                    accuracy
+                                    if accuracy_sum is None
+                                    else accuracy_sum + accuracy
+                                )
+                                mean_loss = loss_sum / (
+                                    current_step - self.arguments.step_start_point
+                                )
+                                mean_accuracy = accuracy_sum / (
+                                    current_step - self.arguments.step_start_point
+                                )
                                 perplexity = jnp.exp(loss)
                                 calculating_metrics_end = time.time()
                                 train_metrics = {
@@ -446,61 +498,88 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                     "train/mean_loss": mean_loss.tolist(),
                                     "train/accuracy": accuracy,
                                     "train/mean_accuracy": mean_accuracy.tolist(),
-                                    "train/learning_rate": self.scheduler(current_step).tolist(),
+                                    "train/learning_rate": self.scheduler(
+                                        current_step
+                                    ).tolist(),
                                     "train/step": current_step,
                                     "train/step_time": step_time,
                                     "train/perplexity": perplexity.tolist(),
                                     "train/trained_tokens": trained_tokens,
-                                    "train/regularization_z_loss": metrics["regularization_z_loss"].tolist(),
+                                    "train/regularization_z_loss": metrics[
+                                        "regularization_z_loss"
+                                    ].tolist(),
                                     "train/epoch": epoch,
-                                    "train/TFLOPs": flops
+                                    "train/TFLOPs": flops,
                                 }
                             if self.arguments.log_grad_norms:
                                 train_metrics.update(
                                     {
-                                        "train/max_grad_norm": metrics["max_grad_norm"].tolist(),
-                                        "train/mean_grad_norm": metrics["mean_grad_norm"].tolist(),
+                                        "train/max_grad_norm": metrics[
+                                            "max_grad_norm"
+                                        ].tolist(),
+                                        "train/mean_grad_norm": metrics[
+                                            "mean_grad_norm"
+                                        ].tolist(),
                                     }
                                 )
                             aux_loss = metrics.get("aux_loss", None)
                             if aux_loss is not None:
                                 train_metrics.update(
-                                    {
-                                        "train/aux_loss": aux_loss.tolist()
-                                    }
+                                    {"train/aux_loss": aux_loss.tolist()}
                                 )
                             pbar.update(1)
-                            pbar.set_postfix(**{k.replace("train/", ""): v for k, v in train_metrics.items()})
+                            pbar.set_postfix(
+                                **{
+                                    k.replace("train/", ""): v
+                                    for k, v in train_metrics.items()
+                                }
+                            )
                             if not self.arguments.performance_mode:
                                 if self.arguments.log_grad_norms:
-                                    train_metrics.update({
-                                        f"grad_norm/{layer_name}": grad_norm.tolist()
-                                        for layer_name, grad_norm in get_layer_names(metrics["grad_norms"]).items()
-                                    })
+                                    train_metrics.update(
+                                        {
+                                            f"grad_norm/{layer_name}": grad_norm.tolist()
+                                            for layer_name, grad_norm in get_layer_names(
+                                                metrics["grad_norms"]
+                                            ).items()
+                                        }
+                                    )
                                 train_metrics.update(
                                     {
                                         "time_cal/calculating_metrics_step_time": (
-                                                calculating_metrics_end - calculating_metrics_start
+                                            calculating_metrics_end
+                                            - calculating_metrics_start
                                         )
                                     }
                                 )
                                 train_metrics.update(self.arguments.captured_memory)
-                            if self.wandb_runtime is not None and not self.arguments.performance_mode:
+                            if (
+                                self.wandb_runtime is not None
+                                and not self.arguments.performance_mode
+                            ):
                                 with jax.spmd_mode("allow_all"):
                                     self.wandb_runtime.log(train_metrics)
                             if self.arguments.training_time is not None:
-                                if time.time() - start_time > self.arguments.training_time:
+                                if (
+                                    time.time() - start_time
+                                    > self.arguments.training_time
+                                ):
                                     raise EasyDeLTimerError("Time Out")
                         else:
                             break
-                        if self.arguments.save_steps is not None and current_step % self.arguments.save_steps == 0:
+                        if (
+                            self.arguments.save_steps is not None
+                            and current_step % self.arguments.save_steps == 0
+                        ):
                             if self.rapture is None:
                                 filename = self._save_state(
                                     state=sharded_state,
                                     gather_fns=gather_fns,
-                                    milestone=True
+                                    milestone=True,
                                 )
-                                checkpoint_path = f"{str(self.arguments.get_path())}/{filename}"
+                                checkpoint_path = (
+                                    f"{str(self.arguments.get_path())}/{filename}"
+                                )
                             else:
                                 print(
                                     termcolor.colored(
@@ -508,14 +587,16 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                     ),
                                     termcolor.colored(
                                         "You can not use `save_steps` while using LoRA "
-                                        "right now. this action will be skipped", color="white", force_color=True
-                                    )
+                                        "right now. this action will be skipped",
+                                        color="white",
+                                        force_color=True,
+                                    ),
                                 )
             except KeyboardInterrupt:
                 termcolor.cprint(
                     "KeyboardInterrupt At training model Will return Current State of the Model with Parameters.",
                     color="cyan",
-                    force_color=True
+                    force_color=True,
                 )
 
             except EasyDeLTimerError:
@@ -523,16 +604,17 @@ class CausalLanguageModelTrainer(BaseTrainer):
                     "Training reached out maximum training Time Killing training Process "
                     "and Will return Current State of the Model with Parameters.",
                     color="cyan",
-                    force_color=True
+                    force_color=True,
                 )
-            if self.arguments.merge_lora_rapture_parameters and self.rapture is not None:
+            if (
+                self.arguments.merge_lora_rapture_parameters
+                and self.rapture is not None
+            ):
                 print(
-                    termcolor.colored(
-                        "Info : ", color="red", force_color=True
-                    ),
+                    termcolor.colored("Info : ", color="red", force_color=True),
                     termcolor.colored(
                         "Merging LoRA Parameters.", color="white", force_color=True
-                    )
+                    ),
                 )
                 sharded_state = sharded_state.replace(
                     params=self.rapture.merge_parameters(sharded_state.params)
@@ -549,23 +631,20 @@ class CausalLanguageModelTrainer(BaseTrainer):
                     match_partition_rules(
                         self.config.get_partition_rules(
                             fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
-                        ) if self.arguments.custom_rule is None else self.arguments.custom_rule,
-                        jax.eval_shape(lambda: sharded_state)
+                        )
+                        if self.arguments.custom_rule is None
+                        else self.arguments.custom_rule,
+                        jax.eval_shape(lambda: sharded_state),
                     ),
                     mesh=self.mesh,
-                    dtype_specs=self.dtype
+                    dtype_specs=self.dtype,
                 )  # You have to re-init the new shard and gather functions in order to be able to skip LoRA weight
                 # crashing errors and saving errors
-                filename = self._save_state(
-                    state=sharded_state,
-                    gather_fns=gather_fns
-                )
+                filename = self._save_state(state=sharded_state, gather_fns=gather_fns)
                 checkpoint_path = f"{str(self.arguments.get_path())}/{filename}"
 
             if self.arguments.do_eval:
-                for _ in self.eval(
-                        sharded_state
-                ):
+                for _ in self.eval(sharded_state):
                     ...
 
             output.checkpoint_path = checkpoint_path
@@ -576,7 +655,9 @@ class CausalLanguageModelTrainer(BaseTrainer):
 
     def eval(self, model_state: EasyDeLState) -> typing.Iterator[dict]:
         """Evaluate the Given Model State and yield the eval metrics"""
-        assert self.dataloader_eval is not None, "`dataloader_eval` is required by evaluator function."
+        assert (
+            self.dataloader_eval is not None
+        ), "`dataloader_eval` is required by evaluator function."
         with self.mesh:
             pbar = tqdm(total=self.max_evaluation_steps)
             pbar.set_description("Evaluating")
@@ -584,7 +665,10 @@ class CausalLanguageModelTrainer(BaseTrainer):
             loss_sum = None
             accuracy_sum = None
 
-            flops_per_device = self.calculate_number_total_flops_per_device(params=model_state.params) / 1e12
+            flops_per_device = (
+                self.calculate_number_total_flops_per_device(params=model_state.params)
+                / 1e12
+            )
             try:
                 eval_iter = iter(self.dataloader_eval)
                 for _ in range(self.max_evaluation_steps):
@@ -597,52 +681,45 @@ class CausalLanguageModelTrainer(BaseTrainer):
                     time_start = time.time()
                     for key in self.arguments.ids_to_pop_from_dataset:
                         _ = batch.pop(key, None)
-                    metrics = self.sharded_eval_step_function(
-                        model_state,
-                        batch
-                    )
+                    metrics = self.sharded_eval_step_function(model_state, batch)
                     total_time = time.time() - time_start
                     flops = flops_per_device / total_time
-                    (
-                        loss, accuracy, aux_loss
-                    ) = metrics
+                    (loss, accuracy, aux_loss) = metrics
 
                     loss_sum = loss.tolist() if loss_sum is None else loss_sum + loss
                     accuracy_sum = (
-                        accuracy.tolist() if (
-                                accuracy_sum is None
-                        ) else accuracy_sum + accuracy
+                        accuracy.tolist()
+                        if (accuracy_sum is None)
+                        else accuracy_sum + accuracy
                     )
 
                     eval_metrics = {
                         "eval/loss": loss.tolist(),
-                        "eval/mean_loss": loss_sum / (current_step - self.arguments.step_start_point),
-                        "eval/mean_accuracy_sum": accuracy_sum / (
-                                current_step - self.arguments.step_start_point
-                        ),
+                        "eval/mean_loss": loss_sum
+                        / (current_step - self.arguments.step_start_point),
+                        "eval/mean_accuracy_sum": accuracy_sum
+                        / (current_step - self.arguments.step_start_point),
                         "eval/step": current_step,
                         "eval/step_time": total_time,
                         "eval/perplexity": jnp.exp(loss).tolist(),
-                        "eval/TFLOPs": flops
+                        "eval/TFLOPs": flops,
                     }
                     if aux_loss is not None:
-                        eval_metrics.update(
-                            {"eval/aux_loss": aux_loss}
-                        )
+                        eval_metrics.update({"eval/aux_loss": aux_loss})
                     log_metrics = copy.deepcopy(eval_metrics)
                     eval_metrics.update(self.arguments.captured_memory)
                     if self.arguments.use_wandb:
                         with jax.spmd_mode("allow_all"):
-                            self.wandb_runtime.log(
-                                eval_metrics
-                            )
+                            self.wandb_runtime.log(eval_metrics)
 
                     pbar.update(1)
-                    pbar.set_postfix(**{k.replace("eval/", ""): v for k, v in log_metrics.items()})
+                    pbar.set_postfix(
+                        **{k.replace("eval/", ""): v for k, v in log_metrics.items()}
+                    )
                     yield log_metrics
             except KeyboardInterrupt:
                 termcolor.cprint(
                     "KeyboardInterrupt At Evaluation model Will return Nothing and just pass.",
                     color="cyan",
-                    force_color=True
+                    force_color=True,
                 )

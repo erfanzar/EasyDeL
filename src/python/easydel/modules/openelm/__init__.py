@@ -6,15 +6,17 @@ _import_structure = {
     "modelling_openelm_flax": [
         "FlaxOpenELMModel",
         "FlaxOpenELMForCausalLM",
-    ]
+    ],
 }
 if TYPE_CHECKING:
     from .openelm_configuration import OpenELMConfig as OpenELMConfig
     from .modelling_openelm_flax import (
         FlaxOpenELMForCausalLM as FlaxOpenELMForCausalLM,
-        FlaxOpenELMModel as FlaxOpenELMModel
+        FlaxOpenELMModel as FlaxOpenELMModel,
     )
 else:
     import sys
 
-    sys.modules[__name__] = _LazyModule(__name__, globals()["__file__"], _import_structure, module_spec=__spec__)
+    sys.modules[__name__] = _LazyModule(
+        __name__, globals()["__file__"], _import_structure, module_spec=__spec__
+    )

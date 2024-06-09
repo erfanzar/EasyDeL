@@ -10,10 +10,10 @@ _import_structure = {
 }
 
 if TYPE_CHECKING:
-    from .cohere_configuration import CohereConfig
+    from .cohere_configuration import CohereConfig as CohereConfig
     from .modelling_cohere_flax import (
-        FlaxCohereModel,
-        FlaxCohereForCausalLM
+        FlaxCohereModel as FlaxCohereModel,
+        FlaxCohereForCausalLM as FlaxCohereForCausalLM,
     )
 else:
     import sys

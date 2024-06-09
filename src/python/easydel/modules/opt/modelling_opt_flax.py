@@ -19,17 +19,16 @@ from functools import partial
 
 import fjformer
 import flax.linen
-from typing import Optional, Tuple, Sequence
+from typing import Optional, Tuple
 
 from fjformer import linen as nn
 import jax
 import jax.numpy as jnp
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
-from flax.linen import combine_masks, make_causal_mask
+from flax.linen import combine_masks
 from flax.linen.attention import dot_product_attention_weights
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
-from jax.experimental.shard_map import shard_map
 from jax.random import PRNGKey
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxMaskedLMOutput
 from transformers.modeling_flax_utils import ACT2FN

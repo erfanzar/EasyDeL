@@ -1,11 +1,9 @@
-import os.path
 import pathlib
 import re
 import typing
 import warnings
-from typing import OrderedDict, List, Union, Mapping, Optional, Tuple, Callable, Type
+from typing import OrderedDict, List, Union, Mapping, Optional, Tuple, Callable
 
-import flax.metrics.tensorboard
 import termcolor
 
 try:
@@ -14,12 +12,10 @@ except ModuleNotFoundError:
     wandb = None
 
 from .utils import JaxDistributedConfig
-from ..etils.auto_tx import get_optimizer_and_scheduler
+
 from jax.sharding import PartitionSpec
-from fjformer import CheckpointManager
-from jax.experimental.mesh_utils import create_device_mesh
 from fjformer.xrapture import XRapTureConfig, XRapTure
-from jax.sharding import Mesh
+
 from jax import numpy as jnp
 import jax
 from ..etils import (
@@ -28,99 +24,97 @@ from ..etils import (
     EasyDeLSchedulers,
     AVAILABLE_GRADIENT_CHECKPOINTS,
     AVAILABLE_SCHEDULERS,
-    AVAILABLE_OPTIMIZERS
+    AVAILABLE_OPTIMIZERS,
+    get_logger,
 )
-from ..modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
-from ..etils.etils import get_logger
 from jax.tree_util import PyTreeDef
 
 logger = get_logger(__name__)
 
-AVAILABLE_BACKENDS: List[str] = ["cpu", "gpu", "tpu", None]  # EasyDeL supported Backends ...
+AVAILABLE_BACKENDS: List[str] = [
+    "cpu",
+    "gpu",
+    "tpu",
+    None,
+]  # EasyDeL supported Backends ...
 
 
 class EasyDeLXRapTureConfig(XRapTureConfig):  # Don't Make user involved with FJFormer
-    def __init__(
-            self,
-            parameters: PyTreeDef | dict,
-            **kwargs
-    ):
+    def __init__(self, parameters: PyTreeDef | dict, **kwargs):
         self.parameters = parameters
         super().__init__(**kwargs)
 
 
-class TrainArguments(
-    OrderedDict
-):
+class TrainArguments(OrderedDict):
     def __init__(
-            self,
-            model_name: str,
-            num_train_epochs: int,
-            model_class: Optional[EasyDeLFlaxPretrainedModel | Type[EasyDeLFlaxPretrainedModel]] = None,
-            model_huggingface_repo_id: Optional[str] = None,
-            total_batch_size: int = 32,
-            max_training_steps: Optional[int] = None,
-            max_evaluation_steps: Optional[int] = None,
-            optimizer: AVAILABLE_OPTIMIZERS = EasyDeLOptimizers.ADAMW,
-            scheduler: AVAILABLE_SCHEDULERS = EasyDeLSchedulers.NONE,
-            learning_rate: Union[int, float] = 5e-5,
-            learning_rate_end: Optional[float] = 5e-6,
-            gradient_accumulation_steps: int = 1,
-            weight_decay: float = 0.01,
-            label_smoothing_factor: float = 0.0,
-            z_loss: float = 0.0,
-            gradient_checkpointing: AVAILABLE_GRADIENT_CHECKPOINTS = EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
-            max_sequence_length: Optional[int] = 4096,
-            sharding_array: Union[tuple, int] = (1, -1, 1, 1),
-            is_fine_tuning: bool = True,
-            do_train: bool = True,
-            do_eval: bool = False,
-            do_test: Optional[bool] = False,
-            train_on_inputs: bool = True,
-            backend: Optional[str] = None,
-            extra_optimizer_kwargs: dict = None,
-            save_steps: Optional[int] = None,
-            save_dir: str = "EasyDeL-Checkpoints",
-            save_total_limit: Optional[int] = None,
-            dtype: jnp.dtype = jnp.bfloat16,
-            param_dtype: jnp.dtype = jnp.bfloat16,
-            fully_sharded_data_parallel: bool = True,
-            use_wandb: bool = True,
-            custom_rule: Mapping[str, PartitionSpec] = None,
-            extra_configs: Optional[dict] = None,
-            ids_to_pop_from_dataset: Optional[list] = None,
-            remove_ckpt_after_load: bool = False,
-            configs_to_initialize_model_class: Optional[dict] = None,
-            do_last_save: bool = True,
-            model_parameters: Optional[dict] = None,
-            do_shard_fns: bool = True,
-            track_memory: Optional[bool] = None,
-            loss_re_mat: str = "",
-            loss_chunk: int = 1024,
-            truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
-            warmup_steps: int = 500,
-            init_input_shape: Tuple[int, int] = (1, 1),
-            step_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp"),
-            training_time: Optional[str] = None,
-            dataloader_num_workers: Optional[int] = 0,
-            dataloader_pin_memory: Optional[bool] = False,
-            jax_distributed_config: Optional[dict] = None,
-            log_all_workers: bool = False,
-            wandb_entity: Optional[str] = None,
-            save_optimizer_state: bool = False,
-            step_start_point: Optional[int] = None,
-            verbose: bool = True,
-            offload_device: jax.Device = jax.devices("cpu")[0],
-            rapture_config: Optional[EasyDeLXRapTureConfig] = None,
-            merge_lora_rapture_parameters: bool = True,
-            state_apply_fn_kwarguments_to_model: Optional[dict] = None,
-            remove_unused_columns: bool = True,
-            force_batch_and_gradient_accumulation_steps_calculation: bool = False,
-            performance_mode: bool = False,
-            neftune_noise_alpha: Optional[float] = None,
-            log_grad_norms: bool = True,
-            loaded_model_config_kwargs: Optional[dict] = None,
-            **kwargs
+        self,
+        model_name: str,
+        num_train_epochs: int,
+        model_class: Optional["EasyDeLFlaxPretrainedModel"] = None,  # type:ignore # noqa
+        model_huggingface_repo_id: Optional[str] = None,
+        total_batch_size: int = 32,
+        max_training_steps: Optional[int] = None,
+        max_evaluation_steps: Optional[int] = None,
+        optimizer: AVAILABLE_OPTIMIZERS = EasyDeLOptimizers.ADAMW,
+        scheduler: AVAILABLE_SCHEDULERS = EasyDeLSchedulers.NONE,
+        learning_rate: Union[int, float] = 5e-5,
+        learning_rate_end: Optional[float] = 5e-6,
+        gradient_accumulation_steps: int = 1,
+        weight_decay: float = 0.01,
+        label_smoothing_factor: float = 0.0,
+        z_loss: float = 0.0,
+        gradient_checkpointing: AVAILABLE_GRADIENT_CHECKPOINTS = EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
+        max_sequence_length: Optional[int] = 4096,
+        sharding_array: Union[tuple, int] = (1, -1, 1, 1),
+        is_fine_tuning: bool = True,
+        do_train: bool = True,
+        do_eval: bool = False,
+        do_test: Optional[bool] = False,
+        train_on_inputs: bool = True,
+        backend: Optional[str] = None,
+        extra_optimizer_kwargs: dict = None,
+        save_steps: Optional[int] = None,
+        save_dir: str = "EasyDeL-Checkpoints",
+        save_total_limit: Optional[int] = None,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        fully_sharded_data_parallel: bool = True,
+        use_wandb: bool = True,
+        custom_rule: Mapping[str, PartitionSpec] = None,
+        extra_configs: Optional[dict] = None,
+        ids_to_pop_from_dataset: Optional[list] = None,
+        remove_ckpt_after_load: bool = False,
+        configs_to_initialize_model_class: Optional[dict] = None,
+        do_last_save: bool = True,
+        model_parameters: Optional[dict] = None,
+        do_shard_fns: bool = True,
+        track_memory: Optional[bool] = None,
+        loss_re_mat: str = "",
+        loss_chunk: int = 1024,
+        truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
+        warmup_steps: int = 500,
+        init_input_shape: Tuple[int, int] = (1, 1),
+        step_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp"),
+        training_time: Optional[str] = None,
+        dataloader_num_workers: Optional[int] = 0,
+        dataloader_pin_memory: Optional[bool] = False,
+        jax_distributed_config: Optional[dict] = None,
+        log_all_workers: bool = False,
+        wandb_entity: Optional[str] = None,
+        save_optimizer_state: bool = False,
+        step_start_point: Optional[int] = None,
+        verbose: bool = True,
+        offload_device: jax.Device = jax.devices("cpu")[0],
+        rapture_config: Optional[EasyDeLXRapTureConfig] = None,
+        merge_lora_rapture_parameters: bool = True,
+        state_apply_fn_kwarguments_to_model: Optional[dict] = None,
+        remove_unused_columns: bool = True,
+        force_batch_and_gradient_accumulation_steps_calculation: bool = False,
+        performance_mode: bool = False,
+        neftune_noise_alpha: Optional[float] = None,
+        log_grad_norms: bool = True,
+        loaded_model_config_kwargs: Optional[dict] = None,
+        **kwargs,
     ):
         """The __init__ function is called when the class is instantiated.
         It sets up the attributes of an object, which are sometimes called fields or properties.
@@ -269,13 +263,13 @@ class TrainArguments(
 
         if model_class is None and model_huggingface_repo_id is None:
             print(
-                termcolor.colored(
-                    "Warning : ", color="red", force_color=True
-                ) + termcolor.colored(
+                termcolor.colored("Warning : ", color="red", force_color=True)
+                + termcolor.colored(
                     "You should at least pass model_class or model_huggingface_repo_id if you want to use "
                     "CasualLanguageModel Trainer But in case that you want to use "
-                    "DPOTrainer or ORPOTrainer you can ignore this warning", color="white",
-                    force_color=True
+                    "DPOTrainer or ORPOTrainer you can ignore this warning",
+                    color="white",
+                    force_color=True,
                 )
             )
         assert backend in AVAILABLE_BACKENDS, (
@@ -290,8 +284,9 @@ class TrainArguments(
                 termcolor.colored(
                     "track_memory is set to False by default inorder make make training faster. "
                     "you can turn it on with just passing `track_memory=True` in TrainArguments",
-                    color="white", force_color=True
-                )
+                    color="white",
+                    force_color=True,
+                ),
             )
             track_memory = False
 
@@ -376,7 +371,9 @@ class TrainArguments(
             weight_decay=self.weight_decay,
             steps=self.max_training_steps,
         )
-        self.training_time = self._time_to_seconds(training_time) if training_time is not None else None
+        self.training_time = (
+            self._time_to_seconds(training_time) if training_time is not None else None
+        )
         self.merge_lora_rapture_parameters = merge_lora_rapture_parameters
         self.rapture = None
         self.rapture_config = None
@@ -390,15 +387,19 @@ class TrainArguments(
             )
             self.log_grad_norms = False
         self.state_apply_fn_kwarguments_to_model = (
-            state_apply_fn_kwarguments_to_model
-        ) if state_apply_fn_kwarguments_to_model is not None else {}
+            (state_apply_fn_kwarguments_to_model)
+            if state_apply_fn_kwarguments_to_model is not None
+            else {}
+        )
         if rapture_config is not None:
             print(
                 termcolor.colored("Warning : ", color="red", force_color=True),
                 termcolor.colored(
                     "You are using LoRA (Low-Rank Adaptation of Large Language Models) and this feature is"
-                    "still in Beta mode so it might act unexpected", color="red", force_color=True
-                )
+                    "still in Beta mode so it might act unexpected",
+                    color="red",
+                    force_color=True,
+                ),
             )
             self.rapture_config = rapture_config
             self.rapture = XRapTure(config=rapture_config)
@@ -419,7 +420,8 @@ class TrainArguments(
                 return value * 60  # Convert minutes to seconds
         else:
             raise SyntaxError(
-                "Invalid input format it should be like 50Min for M and 23H for hours")
+                "Invalid input format it should be like 50Min for M and 23H for hours"
+            )
 
     def __call__(self):
         return {k: v for k, v in self.__dict__.items()}
@@ -437,11 +439,12 @@ class TrainArguments(
             A dictionary of hyperparameters
         """
         return {
-            f"hyperparameters/{k}": v for k, v in self.__dict__.items() if
-            isinstance(v, (int, float, str, bool))
+            f"hyperparameters/{k}": v
+            for k, v in self.__dict__.items()
+            if isinstance(v, (int, float, str, bool))
         }
 
-    def get_wandb_init(self) -> Optional[Union["Run" , "RunDisabled"]] :  # type:ignore
+    def get_wandb_init(self) -> Optional[Union["Run", "RunDisabled"]]:  # type:ignore # noqa: F821 # noqa: F821 # noqa: F821
         """The get_wandb_init function is a helper function that returns the wandb.init() call with
         the project name, config object, and tags set to appropriate values for this model.
 
@@ -454,23 +457,27 @@ class TrainArguments(
         if wandb is None:
             return None
         else:
-            return wandb.init(  # noqa
-                project=f"EasyDeL-{self.model_name}",
-                config=self(),
-                tags=[
-                    "EasyDeL",
-                    "FJFormer",
-                    "OST-OpenSourceTransformers",
-                    "Jax/Flax"
-                ],
-                entity=self.wandb_entity
-
-            ) if self.log_all_workers or (jax.process_index() == 0) else None
+            return (
+                wandb.init(  # noqa
+                    project=f"EasyDeL-{self.model_name}",
+                    config=self(),
+                    tags=[
+                        "EasyDeL",
+                        "FJFormer",
+                        "OST-OpenSourceTransformers",
+                        "Jax/Flax",
+                    ],
+                    entity=self.wandb_entity,
+                )
+                if self.log_all_workers or (jax.process_index() == 0)
+                else None
+            )
 
     def __str__(self):
         string = f"{self.__class__.__name__}(\n"
         for k, v in self.__call__().items():
             if isinstance(v, Callable):
+
                 def string_func(it_self):
                     string_ = f"{it_self.__class__.__name__}(\n"
                     for k_, v_ in it_self.__dict__.items():
@@ -499,9 +506,7 @@ class TrainArguments(
         Returns:
             A pathlib
         """
-        return pathlib.Path(
-            self.save_dir, self.model_name
-        )
+        return pathlib.Path(self.save_dir, self.model_name)
 
     def ckpt_path_exists(self):
         """The ckpt_path_exists function checks to see if the path exists. If it does not, then it creates a new directory.
@@ -530,12 +535,10 @@ class TrainArguments(
         Returns:
             A mesh object with the device array shape and the mesh names
         """
-        return Mesh(
-            create_device_mesh(
-                self.array_devices_shape
-            ),
-            self.get_mesh_names()
-        )
+        from jax.experimental.mesh_utils import create_device_mesh
+        from jax.sharding import Mesh
+
+        return Mesh(create_device_mesh(self.array_devices_shape), self.get_mesh_names())
 
     def __repr__(self):
         return self.__str__()
@@ -544,14 +547,11 @@ class TrainArguments(
     def get_mesh_names():
         return "dp", "fsdp", "tp", "sp"
 
-    def get_optimizer_and_scheduler(
-            self,
-            steps: int | None = None
-    ):
+    def get_optimizer_and_scheduler(self, steps: int | None = None):
         self.optimizer_kwargs["steps"] = steps or self.optimizer_kwargs["steps"]
-        return get_optimizer_and_scheduler(
-            **self.optimizer_kwargs
-        )
+        from ..etils.auto_tx import get_optimizer_and_scheduler
+
+        return get_optimizer_and_scheduler(**self.optimizer_kwargs)
 
     def get_streaming_checkpointer(self):
         """The get_streaming_checkpointer function is used to save the model's weights.
@@ -565,10 +565,14 @@ class TrainArguments(
         Returns:
             A CheckpointManager object
         """
+
+        from fjformer import CheckpointManager
+        import os.path
+
         return CheckpointManager(
             os.path.join(self.save_dir, self.model_name),
             save_optimizer_state=self.save_optimizer_state,
-            verbose=self.verbose
+            verbose=self.verbose,
         )
 
     def get_board(self):
@@ -583,6 +587,9 @@ class TrainArguments(
         Returns:
             A summary-writer object
         """
+
+        import flax.metrics.tensorboard
+
         return flax.metrics.tensorboard.SummaryWriter(log_dir=str(self.get_path()))
 
     @property

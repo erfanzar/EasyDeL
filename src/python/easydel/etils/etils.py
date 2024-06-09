@@ -1,6 +1,6 @@
 import logging
 from dataclasses import dataclass
-from typing import Literal, List, Tuple, Dict, Callable, Any
+from typing import Literal, List, Tuple, Dict, Any
 
 import argparse
 
@@ -12,9 +12,10 @@ class EasyDeLOptimizers:
     generates special methods such as `__init__`, `__repr__`, and `__eq__` based on the class
     attributes.
     """
-    ADAFACTOR: Literal["adafactor"] = "adafactor"  # Fix Pycharm Debugging Issue
-    LION: Literal["lion"] = "lion"  # Fix Pycharm Debugging Issue
-    ADAMW: Literal["adamw"] = 'adamw'  # Fix Pycharm Debugging Issue
+
+    ADAFACTOR: Literal["adafactor"] = "adafactor"
+    LION: Literal["lion"] = "lion"
+    ADAMW: Literal["adamw"] = "adamw"
 
 
 @dataclass
@@ -24,11 +25,12 @@ class EasyDeLSchedulers:
     generates special methods such as `__init__`, `__repr__`, and `__eq__` based on the class
     attributes.
     """
-    LINEAR: Literal["linear"] = "linear"  # Fix Pycharm Debugging Issue
-    COSINE: Literal["cosine"] = "cosine"  # Fix Pycharm Debugging Issue
-    NONE: Literal["none"] = "none"  # Fix Pycharm Debugging Issue
-    WARM_UP_COSINE: Literal["warm_up_cosine"] = "warm_up_cosine"  # Fix Pycharm Debugging Issue
-    WARM_UP_LINEAR: Literal["warm_up_linear"] = "warm_up_linear"  # Fix Pycharm Debugging Issue
+
+    LINEAR: Literal["linear"] = "linear"
+    COSINE: Literal["cosine"] = "cosine"
+    NONE: Literal["none"] = "none"
+    WARM_UP_COSINE: Literal["warm_up_cosine"] = "warm_up_cosine"
+    WARM_UP_LINEAR: Literal["warm_up_linear"] = "warm_up_linear"
 
 
 @dataclass
@@ -38,33 +40,27 @@ class EasyDeLGradientCheckPointers:
     generates special methods such as `__init__`, `__repr__`, and `__eq__` based on the class
     attributes.
     """
-    EVERYTHING_SAVEABLE: Literal["everything_saveable"] = "everything_saveable"  # Fix Pycharm Debugging Issue
-    NOTHING_SAVEABLE: Literal["nothing_saveable"] = "nothing_saveable"  # Fix Pycharm Debugging Issue
-    CHECKPOINT_DOTS: Literal["checkpoint_dots"] = "checkpoint_dots"  # Fix Pycharm Debugging Issue
-    CHECKPOINT_DOTS_WITH_NO_BATCH_DMIS: Literal["checkpoint_dots_with_no_batch_dims"] = \
-        "checkpoint_dots_with_no_batch_dims"  # Fix Pycharm Debugging Issue
+
+    EVERYTHING_SAVEABLE: Literal["everything_saveable"] = "everything_saveable"
+    NOTHING_SAVEABLE: Literal["nothing_saveable"] = "nothing_saveable"
+    CHECKPOINT_DOTS: Literal["checkpoint_dots"] = "checkpoint_dots"
+    CHECKPOINT_DOTS_WITH_NO_BATCH_DMIS: Literal[
+        "checkpoint_dots_with_no_batch_dims"
+    ] = "checkpoint_dots_with_no_batch_dims"
 
 
 AVAILABLE_GRADIENT_CHECKPOINTS = Literal[
     "everything_saveable",
     "nothing_saveable",
     "checkpoint_dots",
-    "checkpoint_dots_with_no_batch_dims"
+    "checkpoint_dots_with_no_batch_dims",
 ]
 
 AVAILABLE_SCHEDULERS = Literal[
-    "linear",
-    "cosine",
-    "none",
-    "warm_up_cosine",
-    "warm_up_linear"
+    "linear", "cosine", "none", "warm_up_cosine", "warm_up_linear"
 ]
 
-AVAILABLE_OPTIMIZERS = Literal[
-    "adafactor",
-    "lion",
-    'adamw'
-]
+AVAILABLE_OPTIMIZERS = Literal["adafactor", "lion", "adamw"]
 
 
 def get_logger(name, level: int = logging.INFO) -> logging.Logger:
@@ -103,8 +99,7 @@ def set_loggers_level(level: int = logging.WARNING):
 
 
 def define_flags_with_default(
-        _required_fields: List = None,
-        **kwargs
+    _required_fields: List = None, **kwargs
 ) -> Tuple[argparse.Namespace, Dict[str, Any]]:
     """Defines flags with default values using argparse.
 
@@ -133,15 +128,12 @@ def define_flags_with_default(
                 type=str,  # Read as string
                 default=str(value),  # Store default as string
                 help=f"Value for {name} (comma-separated integers)",
-                action=StoreTupleAction
+                action=StoreTupleAction,
             )
         else:
             # For other types, infer type from default value
             parser.add_argument(
-                f"--{name}",
-                type=type(value),
-                default=value,
-                help=f"Value for {name}"
+                f"--{name}", type=type(value), default=value, help=f"Value for {name}"
             )
 
     args = parser.parse_args()

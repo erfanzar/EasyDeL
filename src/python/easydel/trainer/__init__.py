@@ -2,88 +2,61 @@ from ..utils.lazy_import import _LazyModule
 from typing import TYPE_CHECKING
 
 _import_structure = {
-    "training_configurations": [
-        "TrainArguments",
-        "EasyDeLXRapTureConfig"
-    ],
     "causal_language_model_trainer": [
-        "create_casual_language_model_evaluation_step",
-        "create_casual_language_model_train_step",
         "CausalLanguageModelTrainer",
-        "CausalLMTrainerOutput"
+        "CausalLMTrainerOutput",
     ],
+    "supervised_fine_tuning_trainer": ["SFTTrainer"],
     "vision_causal_language_model_trainer": [
         "VisionCausalLanguageModelStepOutput",
         "VisionCausalLanguageModelTrainer",
-        "create_vision_casual_language_model_evaluation_step",
-        "create_vision_casual_language_model_train_step",
-        "VisionCausalLMTrainerOutput"
+        "VisionCausalLMTrainerOutput",
     ],
-    "direct_preference_optimization_trainer": [
-        "DPOTrainer",
-        "create_dpo_eval_function",
-        "create_concatenated_forward",
-        "create_dpo_train_function",
-        "concatenated_dpo_inputs"
+    "odds_ratio_preference_optimization_trainer": [
+        "ORPOTrainer",
+        "ORPOTrainerOutput",
     ],
-    "supervised_fine_tuning_trainer": [
-        "SFTTrainer"
-    ],
+    "direct_preference_optimization_trainer": ["DPOTrainer", "DPOTrainerOutput"],
+    "training_configurations": ["TrainArguments", "EasyDeLXRapTureConfig"],
     "utils": [
         "create_constant_length_dataset",
         "get_formatting_func_from_dataset",
         "conversations_formatting_function",
-        "instructions_formatting_function"
+        "instructions_formatting_function",
     ],
-    "odds_ratio_preference_optimization_trainer": [
-        "ORPOTrainer",
-        "create_orpo_step_function",
-        "create_concatenated_forward",
-        "odds_ratio_loss",
-        "ORPOTrainerOutput"
-    ]
 }
 
 if TYPE_CHECKING:
     from .training_configurations import (
-        TrainArguments,
-        EasyDeLXRapTureConfig
+        TrainArguments as TrainArguments,
+        EasyDeLXRapTureConfig as EasyDeLXRapTureConfig,
     )
     from .causal_language_model_trainer import (
-        create_casual_language_model_evaluation_step,
-        create_casual_language_model_train_step,
-        CausalLanguageModelTrainer,
-        CausalLMTrainerOutput
+        CausalLanguageModelTrainer as CausalLanguageModelTrainer,
+        CausalLMTrainerOutput as CausalLMTrainerOutput,
     )
     from .vision_causal_language_model_trainer import (
-        VisionCausalLanguageModelStepOutput,
-        VisionCausalLanguageModelTrainer,
-        create_vision_casual_language_model_evaluation_step,
-        create_vision_casual_language_model_train_step,
-        VisionCausalLMTrainerOutput
+        VisionCausalLanguageModelTrainer as VisionCausalLanguageModelTrainer,
+        VisionCausalLMTrainerOutput as VisionCausalLMTrainerOutput,
     )
-    from .direct_oreference_optimization_trainer import (
-        DPOTrainer,
-        create_dpo_eval_function,
-        create_concatenated_forward,
-        create_dpo_train_function,
-        concatenated_dpo_inputs
+    from .direct_preference_optimization_trainer import (
+        DPOTrainer as DPOTrainer,
+        DPOTrainerOutput as DPOTrainerOutput,
     )
-    from .supervised_fine_tuning_trainer import SFTTrainer
+    from .supervised_fine_tuning_trainer import SFTTrainer as SFTTrainer
     from .utils import (
-        create_constant_length_dataset,
-        get_formatting_func_from_dataset,
-        conversations_formatting_function,
-        instructions_formatting_function
+        create_constant_length_dataset as create_constant_length_dataset,
+        get_formatting_func_from_dataset as get_formatting_func_from_dataset,
+        conversations_formatting_function as conversations_formatting_function,
+        instructions_formatting_function as instructions_formatting_function,
     )
     from .odds_ratio_preference_optimization_trainer import (
-        ORPOTrainer,
-        create_orpo_step_function,
-        create_concatenated_forward,
-        odds_ratio_loss,
-        ORPOTrainerOutput
+        ORPOTrainer as ORPOTrainer,
+        ORPOTrainerOutput as ORPOTrainerOutput,
     )
 else:
     import sys
 
-    sys.modules[__name__] = _LazyModule(__name__, globals()["__file__"], _import_structure, module_spec=__spec__)
+    sys.modules[__name__] = _LazyModule(
+        __name__, globals()["__file__"], _import_structure, module_spec=__spec__
+    )

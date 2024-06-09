@@ -12,14 +12,16 @@ _import_structure = {
 }
 
 if TYPE_CHECKING:
-    from .t5_configuration import T5Config
+    from .t5_configuration import T5Config as T5Config
     from .modelling_t5_flax import (
-        FlaxT5ForConditionalGeneration,
-        FlaxT5ForConditionalGenerationModule,
-        FlaxT5Model,
-        FlaxT5Module,
+        FlaxT5ForConditionalGeneration as FlaxT5ForConditionalGeneration,
+        FlaxT5ForConditionalGenerationModule as FlaxT5ForConditionalGenerationModule,
+        FlaxT5Model as FlaxT5Model,
+        FlaxT5Module as FlaxT5Module,
     )
 else:
     import sys
 
-    sys.modules[__name__] = _LazyModule(__name__, globals()["__file__"], _import_structure, module_spec=__spec__)
+    sys.modules[__name__] = _LazyModule(
+        __name__, globals()["__file__"], _import_structure, module_spec=__spec__
+    )

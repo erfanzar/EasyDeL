@@ -3,33 +3,40 @@ from typing import Optional, Tuple, Union
 
 import chex
 import fjformer.linen.linen
-from fjformer import linen as nn
+import flax.linen
 import jax
 import jax.numpy as jnp
+from fjformer import linen as nn
+from fjformer.linen import Dense
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks
 from flax.linen import partitioning as nn_partitioning
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax.sharding import PartitionSpec
-from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput, FlaxSequenceClassifierOutput
-
-from .llama_configuration import LlamaConfig
-from fjformer.linen import Dense
-from ..attention_module import AttentionModule
-from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
-import flax.linen
-# easydel.modules
-from ..flax_modelling_utils import (
-    with_sharding_constraint,
-    get_gradient_checkpoint_policy,
-    repeat_kv_bnsh,
-    apply_rotary_pos_emb,
-    precompute_freq_cis,
-    get_dot_general_by_bits, BaseJAXAttentionModule, block_wise_ffn, control_mlp_sharding
+from transformers.modeling_flax_outputs import (
+    FlaxBaseModelOutput,
+    FlaxCausalLMOutput,
+    FlaxSequenceClassifierOutput,
 )
 
+from ..attention_module import AttentionModule
 from ..common import RMSNorm
+from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
+
+# easydel.modules
+from ..flax_modelling_utils import (
+    BaseJAXAttentionModule,
+    apply_rotary_pos_emb,
+    block_wise_ffn,
+    control_mlp_sharding,
+    get_dot_general_by_bits,
+    get_gradient_checkpoint_policy,
+    precompute_freq_cis,
+    repeat_kv_bnsh,
+    with_sharding_constraint,
+)
+from .llama_configuration import LlamaConfig
 
 
 class FlaxLlamaEmbedding(nn.Module):
@@ -956,9 +963,7 @@ class FlaxLlamaModule(nn.Module):
             output_hidden_states: bool: Determine whether to return
                 hidden states
             return_dict: bool: Return a dictionary of the output or not
-            extra_embedding: Optional[Union[jnp.ndarray: Pass in the
-                embedding of the
-            None]]: Pass in the extra embedding
+            extra_embedding: Optional[Union[jnp.ndarray]]: Pass in the extra embedding 
 
         Returns:
             A tuple of:
@@ -1068,7 +1073,7 @@ class FlaxLlamaForCausalLMModule(nn.Module):
             output_hidden_states: bool: Determine whether to return the
                 hidden states
             return_dict: bool: Return a dictionary of the outputs or not
-            extra_embedding: Optional[Union[jnp.ndarray: Pass in the
+            extra_embedding: Optional[Union[jnp.ndarray]]: Pass in the
                 embedding of the word that we want to predict
             None]]: Pass in the extra embedding
 
@@ -1232,7 +1237,7 @@ class FlaxLlamaForSequenceClassificationModule(nn.Module):
             output_hidden_states: bool: Return the hidden states of all
                 layers
             return_dict: bool: Return a dictionary of outputs
-            extra_embedding: Optional[Union[jnp.ndarray: Pass in the
+            extra_embedding: Optional[Union[jnp.ndarray]]: Pass in the
                 embedding of a new word
             None]]: Pass the extra embedding to the model
 

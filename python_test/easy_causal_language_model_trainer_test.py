@@ -1,17 +1,26 @@
 import os
+import sys
 
+dirname = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(dirname)  # noqa: E402
+sys.path.append(
+    os.path.join(
+        dirname,
+        "..",
+    )
+)  # noqa: E402
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
-import flax.core
+import flax.core  # noqa: E402
 
-from src.python.easydel import (
+from src.python.easydel import (  # noqa: E402
     CausalLanguageModelTrainer,
     TrainArguments,
     FlaxMixtralForCausalLM,
-    MixtralConfig
+    MixtralConfig,
 )
-from jax import numpy as jnp, random
-from datasets import Dataset
-from fjformer import GenerateRNG
+from jax import numpy as jnp, random  # noqa: E402
+from datasets import Dataset  # noqa: E402
+from fjformer import GenerateRNG  # noqa: E402
 
 SEQUENCE_LENGTH = 128
 DATA_ROW_SIZE = 10000
@@ -28,31 +37,28 @@ MODEL_CONFIG = MixtralConfig(
     use_scan_mlp=False,
     num_local_experts=8,
     num_experts_per_tok=2,
-    output_router_logits=True
+    output_router_logits=True,
 )
 
 RNG_GEN = GenerateRNG(seed=42)
 
 
 def train():
-    model = FlaxMixtralForCausalLM(
-        config=MODEL_CONFIG,
-        _do_init=True
-    )
+    model = FlaxMixtralForCausalLM(config=MODEL_CONFIG, _do_init=True)
     params = model.params
 
     def data_generator():
         for i in range(DATA_ROW_SIZE):
             yield {
-                "attention_mask": jnp.ones(
-                    SEQUENCE_LENGTH, dtype="i4"
-                ),
+                "attention_mask": jnp.ones(SEQUENCE_LENGTH, dtype="i4"),
                 "input_ids": random.randint(
                     RNG_GEN.rng, (SEQUENCE_LENGTH,), 0, 32000, dtype="i4"
-                )
+                ),
             }
 
-    example_data = Dataset.from_generator(data_generator, )
+    example_data = Dataset.from_generator(
+        data_generator,
+    )
     dtype = jnp.float32
     trainer = CausalLanguageModelTrainer(
         arguments=TrainArguments(
@@ -68,7 +74,7 @@ def train():
                 "config": model.config,
                 "input_shape": (1, 1),
                 "dtype": dtype,
-                "param_dtype": dtype
+                "param_dtype": dtype,
             },
             dtype=dtype,
             param_dtype=dtype,
@@ -86,24 +92,21 @@ def train():
 
 
 def re_train(checkpoint_path: str | os.PathLike):
-    model = FlaxMixtralForCausalLM(
-        config=MODEL_CONFIG,
-        _do_init=False
-    )
+    model = FlaxMixtralForCausalLM(config=MODEL_CONFIG, _do_init=False)
 
     def data_generator():
         for i in range(DATA_ROW_SIZE):
             yield {
-                "attention_mask": jnp.ones(
-                    (SEQUENCE_LENGTH,), dtype="i4"
-                ),
+                "attention_mask": jnp.ones((SEQUENCE_LENGTH,), dtype="i4"),
                 "input_ids": random.randint(
                     RNG_GEN.rng, (SEQUENCE_LENGTH,), 0, 32000, dtype="i4"
-                )
+                ),
             }
 
     # example_data = IterableDataset.from_generator(data_generator, )
-    example_data = Dataset.from_generator(data_generator, )
+    example_data = Dataset.from_generator(
+        data_generator,
+    )
     dtype = jnp.float32
     trainer = CausalLanguageModelTrainer(
         arguments=TrainArguments(
@@ -119,7 +122,7 @@ def re_train(checkpoint_path: str | os.PathLike):
                 "config": model.config,
                 "input_shape": (1, 1),
                 "dtype": dtype,
-                "param_dtype": dtype
+                "param_dtype": dtype,
             },
             dtype=dtype,
             param_dtype=dtype,

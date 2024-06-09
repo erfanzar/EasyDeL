@@ -1,6 +1,6 @@
 from ..easydel_modelling_utils import EasyDeLPretrainedConfig
 from jax.sharding import PartitionSpec
-from typing import Optional, Union
+from typing import Optional
 
 
 class Qwen2MoeConfig(EasyDeLPretrainedConfig):

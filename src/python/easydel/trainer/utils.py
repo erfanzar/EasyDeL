@@ -5,7 +5,12 @@ from ml_collections import ConfigDict
 from ml_collections.config_dict import placeholder
 import random
 from typing import Callable, Literal, Union, List, Optional, Any, Dict, Mapping, Tuple
-from transformers import AutoTokenizer, PreTrainedTokenizerBase, BertTokenizer, BertTokenizerFast
+from transformers import (
+    AutoTokenizer,
+    PreTrainedTokenizerBase,
+    BertTokenizer,
+    BertTokenizerFast,
+)
 from jax import numpy as jnp
 import numpy as np
 import logging
@@ -39,7 +44,7 @@ class JaxDistributedConfig(object):
         config = cls.get_default_config(config)
         if config.initialize_jax_distributed:
             if config.local_device_ids is not None:
-                local_device_ids = [int(x) for x in config.local_device_ids.split(',')]
+                local_device_ids = [int(x) for x in config.local_device_ids.split(",")]
             else:
                 local_device_ids = None
 
@@ -52,18 +57,18 @@ class JaxDistributedConfig(object):
 
 
 def create_constant_length_dataset(
-        tokenizer,
-        dataset,
-        dataset_text_field=None,
-        formatting_func=None,
-        infinite=False,
-        seq_length=1024,
-        num_of_sequences=1024,
-        chars_per_token=3.6,
-        eos_token_id=0,
-        shuffle=True,
-        append_concat_token=True,
-        add_special_tokens=True,
+    tokenizer,
+    dataset,
+    dataset_text_field=None,
+    formatting_func=None,
+    infinite=False,
+    seq_length=1024,
+    num_of_sequences=1024,
+    chars_per_token=3.6,
+    eos_token_id=0,
+    shuffle=True,
+    append_concat_token=True,
+    add_special_tokens=True,
 ):
     if tokenizer.eos_token_id is None:
         warnings.warn(
@@ -74,7 +79,7 @@ def create_constant_length_dataset(
 
     concat_token_id = tokenizer.eos_token_id if tokenizer.eos_token_id else eos_token_id
     if formatting_func is None:
-        formatting_func = lambda x: x[dataset_text_field]
+        formatting_func = lambda x: x[dataset_text_field]  # noqa
     else:
         formatting_func = formatting_func
 
@@ -88,7 +93,6 @@ def create_constant_length_dataset(
     max_buffer_size = seq_length * chars_per_token * num_of_sequences
 
     def constant_dataset_collect_fn():
-
         iterator = iter(dataset)
         more_examples = True
         while more_examples:
@@ -105,18 +109,24 @@ def create_constant_length_dataset(
                 except StopIteration:
                     if infinite:
                         iterator = iter(dataset)
-                        warnings.warn("The dataset reached end and the iterator is reset to the start.")
+                        warnings.warn(
+                            "The dataset reached end and the iterator is reset to the start."
+                        )
                     else:
                         more_examples = False
                         break
-            tokens = tokenizer(buffer, add_special_tokens=add_special_tokens, truncation=False)
+            tokens = tokenizer(
+                buffer, add_special_tokens=add_special_tokens, truncation=False
+            )
 
             tokenized_inputs = tokens["input_ids"]
             attention_masks = tokens["attention_mask"]
 
             all_token_ids = []
             all_attention_masks = []
-            for tokenized_input, attention_mask in zip(tokenized_inputs, attention_masks):
+            for tokenized_input, attention_mask in zip(
+                tokenized_inputs, attention_masks
+            ):
                 if append_concat_token:
                     tokenized_input = tokenized_input + [concat_token_id]
                     attention_mask = attention_mask + [1]
@@ -126,14 +136,16 @@ def create_constant_length_dataset(
             examples = []
             examples_attention_masks = []
             for i in range(0, len(all_token_ids), seq_length):
-                input_ids = all_token_ids[i: i + seq_length]
-                org_attention_masks = all_attention_masks[i: i + seq_length]
+                input_ids = all_token_ids[i : i + seq_length]
+                org_attention_masks = all_attention_masks[i : i + seq_length]
                 if len(input_ids) == seq_length:
                     examples.append(input_ids)
                     examples_attention_masks.append(org_attention_masks)
             if shuffle:
                 random.shuffle(examples)
-            for example, example_attention_mask in zip(examples, examples_attention_masks):
+            for example, example_attention_mask in zip(
+                examples, examples_attention_masks
+            ):
                 yield {
                     "input_ids": jnp.asarray(example, dtype="i4"),
                     "attention_mask": jnp.asarray(example_attention_mask, dtype="i4"),
@@ -148,7 +160,9 @@ def _collate_batch(examples, tokenizer, pad_to_multiple_of: Optional[int] = None
 
     length_of_first = len(examples[0])
     are_tensors_same_length = all(len(x) == length_of_first for x in examples)
-    if are_tensors_same_length and (pad_to_multiple_of is None or length_of_first % pad_to_multiple_of == 0):
+    if are_tensors_same_length and (
+        pad_to_multiple_of is None or length_of_first % pad_to_multiple_of == 0
+    ):
         return jnp.stack(examples, axis=0)
 
     if tokenizer._pad_token is None:
@@ -160,12 +174,16 @@ def _collate_batch(examples, tokenizer, pad_to_multiple_of: Optional[int] = None
     max_length = max(len(x) for x in examples)
     if pad_to_multiple_of is not None and (max_length % pad_to_multiple_of != 0):
         max_length = ((max_length // pad_to_multiple_of) + 1) * pad_to_multiple_of
-    result = jnp.full(shape=(len(examples), max_length), fill_value=tokenizer.pad_token_id, dtype=examples[0].dtype)
+    result = jnp.full(
+        shape=(len(examples), max_length),
+        fill_value=tokenizer.pad_token_id,
+        dtype=examples[0].dtype,
+    )
     for i, example in enumerate(examples):
         if tokenizer.padding_side == "right":
             result[i, : example.shape[0]] = example
         else:
-            result[i, -example.shape[0]:] = example
+            result[i, -example.shape[0] :] = example
     return result
 
 
@@ -191,31 +209,39 @@ class DataCollatorForCompletionOnlyLM:
     """
 
     def __init__(
-            self,
-            tokenizer: Union[str, PreTrainedTokenizerBase],
-            response_template: Union[str, List[int]],
-            instruction_template: Optional[Union[str, List[int]]] = None,
-            *args,
-            mlm: bool = False,
-            ignore_index: int = -100,
-            **kwargs,
+        self,
+        tokenizer: Union[str, PreTrainedTokenizerBase],
+        response_template: Union[str, List[int]],
+        instruction_template: Optional[Union[str, List[int]]] = None,
+        *args,
+        mlm: bool = False,
+        ignore_index: int = -100,
+        **kwargs,
     ):
         if isinstance(tokenizer, str):
             tokenizer = AutoTokenizer.from_pretrained(tokenizer)
             self.tokenizer = tokenizer
         self.instruction_template = instruction_template
         if isinstance(instruction_template, str):
-            self.instruction_token_ids = self.tokenizer.encode(self.instruction_template, add_special_tokens=False)
+            self.instruction_token_ids = self.tokenizer.encode(
+                self.instruction_template, add_special_tokens=False
+            )
         else:
             self.instruction_token_ids = instruction_template
 
         self.response_template = response_template
         if isinstance(response_template, str):
-            self.response_token_ids = self.tokenizer.encode(self.response_template, add_special_tokens=False)
+            self.response_token_ids = self.tokenizer.encode(
+                self.response_template, add_special_tokens=False
+            )
         else:
             self.response_token_ids = response_template
 
-        if not mlm and self.instruction_template and self.tokenizer.pad_token_id == self.tokenizer.eos_token_id:
+        if (
+            not mlm
+            and self.instruction_template
+            and self.tokenizer.pad_token_id == self.tokenizer.eos_token_id
+        ):
             warnings.warn(
                 "The pad_token_id and eos_token_id values of this tokenizer are identical. "
                 "If you are planning for multi-turn training, "
@@ -243,7 +269,9 @@ class DataCollatorForCompletionOnlyLM:
                 cand_indexes.append([i])
 
         random.shuffle(cand_indexes)
-        num_to_predict = min(max_predictions, max(1, int(round(len(input_tokens) * 0.15))))
+        num_to_predict = min(
+            max_predictions, max(1, int(round(len(input_tokens) * 0.15)))
+        )
         masked_lms = []
         covered_indexes = set()
         for index_set in cand_indexes:
@@ -263,44 +291,67 @@ class DataCollatorForCompletionOnlyLM:
                 masked_lms.append(index)
 
         if len(covered_indexes) != len(masked_lms):
-            raise ValueError("Length of covered_indexes is not equal to length of masked_lms.")
-        mask_labels = [1 if i in covered_indexes else 0 for i in range(len(input_tokens))]
+            raise ValueError(
+                "Length of covered_indexes is not equal to length of masked_lms."
+            )
+        mask_labels = [
+            1 if i in covered_indexes else 0 for i in range(len(input_tokens))
+        ]
         return mask_labels
 
-    def jax_mask_tokens(self, inputs: Any, special_tokens_mask: Optional[Any] = None) -> Tuple[Any, Any]:
+    def jax_mask_tokens(
+        self, inputs: Any, special_tokens_mask: Optional[Any] = None
+    ) -> Tuple[Any, Any]:
         """Prepare masked tokens inputs/labels for masked language modeling: 80% MASK, 10% random, 10% original."""
         labels = np.copy(inputs)
         probability_matrix = np.full(labels.shape, 0.15)
         if special_tokens_mask is None:
             special_tokens_mask = [
-                self.tokenizer.get_special_tokens_mask(val, already_has_special_tokens=True) for val in labels.tolist()
+                self.tokenizer.get_special_tokens_mask(
+                    val, already_has_special_tokens=True
+                )
+                for val in labels.tolist()
             ]
             special_tokens_mask = np.array(special_tokens_mask, dtype=bool)
         else:
             special_tokens_mask = special_tokens_mask.astype(bool)
 
         probability_matrix[special_tokens_mask] = 0
-        masked_indices = np.random.binomial(1, probability_matrix, size=probability_matrix.shape).astype(bool)
+        masked_indices = np.random.binomial(
+            1, probability_matrix, size=probability_matrix.shape
+        ).astype(bool)
         labels[~masked_indices] = -100
-        indices_replaced = np.random.binomial(1, 0.8, size=labels.shape).astype(bool) & masked_indices
+        indices_replaced = (
+            np.random.binomial(1, 0.8, size=labels.shape).astype(bool) & masked_indices
+        )
         inputs[indices_replaced] = self.tokenizer.mask_token_id
         indices_random = (
-                np.random.binomial(1, 0.5, size=labels.shape).astype(bool) & masked_indices & ~indices_replaced
+            np.random.binomial(1, 0.5, size=labels.shape).astype(bool)
+            & masked_indices
+            & ~indices_replaced
         )
         random_words = np.random.randint(
-            low=0, high=len(self.tokenizer), size=np.count_nonzero(indices_random), dtype=np.int64
+            low=0,
+            high=len(self.tokenizer),
+            size=np.count_nonzero(indices_random),
+            dtype=np.int64,
         )
         inputs[indices_random] = random_words
         return inputs, labels
 
-    def jax_call(self, examples: List[Union[List[int], Any, Dict[str, Any]]]) -> Dict[str, Any]:
+    def jax_call(
+        self, examples: List[Union[List[int], Any, Dict[str, Any]]]
+    ) -> Dict[str, Any]:
         if isinstance(examples[0], Mapping):
             input_ids = [e["input_ids"] for e in examples]
         else:
             input_ids = examples
             examples = [{"input_ids": e} for e in examples]
 
-        batch_input = _collate_batch(input_ids, self.tokenizer, )
+        batch_input = _collate_batch(
+            input_ids,
+            self.tokenizer,
+        )
 
         mask_labels = []
         for e in examples:
@@ -317,13 +368,15 @@ class DataCollatorForCompletionOnlyLM:
                     if i in ref_pos:
                         ref_tokens[i] = "##" + ref_tokens[i]
             mask_labels.append(self._whole_word_mask(ref_tokens))
-        batch_mask = _collate_batch(mask_labels, self.tokenizer, )
+        batch_mask = _collate_batch(
+            mask_labels,
+            self.tokenizer,
+        )
         inputs, labels = self.jax_mask_tokens(batch_input, batch_mask)
         return {"input_ids": inputs, "labels": labels}
 
     def __call__(
-            self,
-            examples: List[Union[List[int], Any, Dict[str, Any]]]
+        self, examples: List[Union[List[int], Any, Dict[str, Any]]]
     ) -> Dict[str, Any]:
         batch = self.jax_call(examples)
 
@@ -331,10 +384,14 @@ class DataCollatorForCompletionOnlyLM:
             for i in range(len(examples)):
                 response_token_ids_start_idx = None
 
-                for idx in jnp.where(batch["labels"][i] == self.response_token_ids[0])[0]:
+                for idx in jnp.where(batch["labels"][i] == self.response_token_ids[0])[
+                    0
+                ]:
                     if (
-                            self.response_token_ids
-                            == batch["labels"][i][idx: idx + len(self.response_token_ids)].tolist()
+                        self.response_token_ids
+                        == batch["labels"][i][
+                            idx : idx + len(self.response_token_ids)
+                        ].tolist()
                     ):
                         response_token_ids_start_idx = idx
 
@@ -347,7 +404,9 @@ class DataCollatorForCompletionOnlyLM:
                     )
                     batch["labels"][i, :] = self.ignore_index
                 else:
-                    response_token_ids_end_idx = response_token_ids_start_idx + len(self.response_token_ids)
+                    response_token_ids_end_idx = response_token_ids_start_idx + len(
+                        self.response_token_ids
+                    )
                     batch["labels"][i, :response_token_ids_end_idx] = self.ignore_index
 
         else:
@@ -355,12 +414,18 @@ class DataCollatorForCompletionOnlyLM:
                 response_token_ids_idxs = []
                 human_token_ids_idxs = []
 
-                for assistant_idx in jnp.where(batch["labels"][i] == self.response_token_ids[0])[0]:
+                for assistant_idx in jnp.where(
+                    batch["labels"][i] == self.response_token_ids[0]
+                )[0]:
                     if (
-                            self.response_token_ids
-                            == batch["labels"][i][assistant_idx: assistant_idx + len(self.response_token_ids)].tolist()
+                        self.response_token_ids
+                        == batch["labels"][i][
+                            assistant_idx : assistant_idx + len(self.response_token_ids)
+                        ].tolist()
                     ):
-                        response_token_ids_idxs.append(assistant_idx + len(self.response_token_ids))
+                        response_token_ids_idxs.append(
+                            assistant_idx + len(self.response_token_ids)
+                        )
 
                 if len(response_token_ids_idxs) == 0:
                     warnings.warn(
@@ -373,7 +438,12 @@ class DataCollatorForCompletionOnlyLM:
 
                 human_token_ids = self.instruction_token_ids
                 for human_idx in jnp.where(batch["labels"][i] == human_token_ids[0])[0]:
-                    if human_token_ids == batch["labels"][i][human_idx: human_idx + len(human_token_ids)].tolist():
+                    if (
+                        human_token_ids
+                        == batch["labels"][i][
+                            human_idx : human_idx + len(human_token_ids)
+                        ].tolist()
+                    ):
                         human_token_ids_idxs.append(human_idx)
 
                 if len(human_token_ids_idxs) == 0:
@@ -386,31 +456,43 @@ class DataCollatorForCompletionOnlyLM:
                     batch["labels"][i, :] = self.ignore_index
 
                 if (
-                        len(human_token_ids_idxs) > 0
-                        and len(response_token_ids_idxs) > 0
-                        and human_token_ids_idxs[0] > response_token_ids_idxs[0]
+                    len(human_token_ids_idxs) > 0
+                    and len(response_token_ids_idxs) > 0
+                    and human_token_ids_idxs[0] > response_token_ids_idxs[0]
                 ):
                     human_token_ids_idxs = [0] + human_token_ids_idxs
 
-                for idx, (start, end) in enumerate(zip(human_token_ids_idxs, response_token_ids_idxs)):
+                for idx, (start, end) in enumerate(
+                    zip(human_token_ids_idxs, response_token_ids_idxs)
+                ):
                     if idx != 0:
                         batch["labels"][i, start:end] = self.ignore_index
                     else:
                         batch["labels"][i, :end] = self.ignore_index
 
                 if len(response_token_ids_idxs) < len(human_token_ids_idxs):
-                    batch["labels"][i, human_token_ids_idxs[-1]:] = self.ignore_index
+                    batch["labels"][i, human_token_ids_idxs[-1] :] = self.ignore_index
 
         return batch
 
 
 FORMAT_MAPPING = {
-    "chatml": [{"content": Value(dtype="string", id=None), "role": Value(dtype="string", id=None)}],
-    "instruction": {"completion": Value(dtype="string", id=None), "prompt": Value(dtype="string", id=None)},
+    "chatml": [
+        {
+            "content": Value(dtype="string", id=None),
+            "role": Value(dtype="string", id=None),
+        }
+    ],
+    "instruction": {
+        "completion": Value(dtype="string", id=None),
+        "prompt": Value(dtype="string", id=None),
+    },
 }
 
 
-def conversations_formatting_function(tokenizer: AutoTokenizer, messages_field: Literal["messages", "conversations"]):
+def conversations_formatting_function(
+    tokenizer: AutoTokenizer, messages_field: Literal["messages", "conversations"]
+):
     r"""
     return a callable function that takes in a "messages" dataset and returns a formatted dataset, based on the tokenizer
     apply chat template to the dataset
@@ -421,10 +503,15 @@ def conversations_formatting_function(tokenizer: AutoTokenizer, messages_field: 
             output_texts = []
             for i in range(len(examples[messages_field])):
                 output_texts.append(
-                    tokenizer.apply_chat_template(examples[messages_field][i], tokenize=False))  # type: ignore
+                    tokenizer.apply_chat_template(
+                        examples[messages_field][i], tokenize=False
+                    )
+                )  # type: ignore
             return output_texts
         else:
-            return tokenizer.apply_chat_template(examples[messages_field], tokenize=False)  # type: ignore
+            return tokenizer.apply_chat_template(
+                examples[messages_field], tokenize=False
+            )  # type: ignore
 
     return format_dataset
 
@@ -443,7 +530,9 @@ def instructions_formatting_function(tokenizer: AutoTokenizer):
                     {"role": "user", "content": examples["prompt"][i]},
                     {"role": "assistant", "content": examples["completion"][i]},
                 ]
-                output_texts.append(tokenizer.apply_chat_template(converted_sample, tokenize=False))  # type: ignore
+                output_texts.append(
+                    tokenizer.apply_chat_template(converted_sample, tokenize=False)
+                )  # type: ignore
             return output_texts
         else:
             converted_sample = [
@@ -456,7 +545,8 @@ def instructions_formatting_function(tokenizer: AutoTokenizer):
 
 
 def get_formatting_func_from_dataset(
-        dataset: Union[Dataset, "ConstantLengthDataset"], tokenizer: AutoTokenizer  # type: ignore
+    dataset: Union[Dataset, "ConstantLengthDataset"],  # type: ignore # noqa
+    tokenizer: AutoTokenizer,
 ) -> Optional[Callable]:
     r"""from TRL
     Finds the correct formatting function based on the dataset structure. Currently supported datasets are:

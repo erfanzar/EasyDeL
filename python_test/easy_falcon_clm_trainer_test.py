@@ -1,17 +1,26 @@
 import os
+import sys
 
-import flax.core
+dirname = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(dirname)  # noqa: E402
+sys.path.append(
+    os.path.join(
+        dirname,
+        "..",
+    )
+)  # noqa: E402
+import flax.core  # noqa: E402
 
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 
-from src.python.easydel import (
+from src.python.easydel import (  # noqa: E402
     CausalLanguageModelTrainer,
     TrainArguments,
     FlaxFalconForCausalLM,
     FalconConfig,
 )
-from jax import numpy as jnp, random
-from datasets import Dataset, IterableDataset
+from jax import numpy as jnp, random  # noqa: E402
+from datasets import Dataset, IterableDataset  # noqa: E402
 
 NUM_TRAIN_EXAMPLES = 50
 NUM_EVAL_EXAMPLES = 12
@@ -32,7 +41,7 @@ def main(use_iterable_dataset: bool):
         gradient_checkpointing="",
         max_position_embeddings=sequence_length,
         new_decoder_architecture=True,
-        use_scan_mlp=False
+        use_scan_mlp=False,
     )
 
     model = FlaxFalconForCausalLM(config=config, _do_init=True)

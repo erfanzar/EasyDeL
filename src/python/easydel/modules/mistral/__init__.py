@@ -9,25 +9,25 @@ _import_structure = {
         "FlaxMistralModel",
         "FlaxMistralModule",
     ],
-    "modelling_vision_mistral_flax": [
-        "FlaxVisionMistralForCausalLM"
-    ],
-    "vision_mistral_configuration": ["VisionMistralConfig"]
+    "modelling_vision_mistral_flax": ["FlaxVisionMistralForCausalLM"],
+    "vision_mistral_configuration": ["VisionMistralConfig"],
 }
 
 if TYPE_CHECKING:
-    from .mistral_configuration import MistralConfig
+    from .mistral_configuration import MistralConfig as MistralConfig
     from .modelling_mistral_flax import (
-        FlaxMistralForCausalLM,
-        FlaxMistralForCausalLMModule,
-        FlaxMistralModel,
-        FlaxMistralModule,
+        FlaxMistralForCausalLM as FlaxMistralForCausalLM,
+        FlaxMistralForCausalLMModule as FlaxMistralForCausalLMModule,
+        FlaxMistralModel as FlaxMistralModel,
+        FlaxMistralModule as FlaxMistralModule,
     )
     from .modelling_vision_mistral_flax import (
-        FlaxVisionMistralForCausalLM
+        FlaxVisionMistralForCausalLM as FlaxVisionMistralForCausalLM,
     )
-    from .vision_mistral_configuration import VisionMistralConfig
+    from .vision_mistral_configuration import VisionMistralConfig as VisionMistralConfig
 else:
     import sys
 
-    sys.modules[__name__] = _LazyModule(__name__, globals()["__file__"], _import_structure, module_spec=__spec__)
+    sys.modules[__name__] = _LazyModule(
+        __name__, globals()["__file__"], _import_structure, module_spec=__spec__
+    )
