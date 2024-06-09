@@ -169,6 +169,9 @@ def huggingface_to_easydel(
                 new_key = key.replace(".weight", ".kernel")
 
             key_tuple = tuple(new_key.split("."))
+            if uses_tie_word_embedding is not None and lm_head_name is not None:
+                if key_tuple[0] == lm_head_name:
+                    continue
 
             # Convert tensor to jax.numpy.array and delete the tensor to free memory
             array = jax.lax.convert_element_type(
