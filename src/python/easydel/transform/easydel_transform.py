@@ -27,13 +27,18 @@ def float_tensor_to_dtype(tensor, dtype):
     :param tensor: Convert the tensor to a float dtype
     :param dtype: Convert the tensor to a specific dtype
     :return: A tensor with the specified dtype
-    
+
     """
     if dtype is None or dtype == "":
         return tensor
     if isinstance(dtype, str):
         dtype = get_dtype(dtype)
-    float_dtypes = (jax.numpy.bfloat16, jax.numpy.float16, jax.numpy.float32, jax.numpy.float64)
+    float_dtypes = (
+        jax.numpy.bfloat16,
+        jax.numpy.float16,
+        jax.numpy.float32,
+        jax.numpy.float64,
+    )
     if getattr(tensor, "dtype", None) in float_dtypes:
         tensor = tensor.astype(dtype)
     return tensor
@@ -71,19 +76,21 @@ class _DummyContextManager:
 
 
 def huggingface_to_easydel(
-        state_dict,
-        *,
-        device,
-        embedding_layer_names: Optional[List[str]] = None,
-        layer_norm_names: Optional[List[str]] = None,
-        shard_fns: Optional[Mapping[tuple, Callable]] = None,
-        convert_to_8bit: bool = False,
-        params_pattern_selection: Optional[re.Pattern] = None,
-        dtype: jax.numpy.dtype = jax.numpy.float16,
-        rnn_based_or_rwkv: bool = False,
-        verbose: bool = True,
-        remove_state_dict: bool = False,
-        **kwargs
+    state_dict,
+    *,
+    device,
+    embedding_layer_names: Optional[List[str]] = None,
+    layer_norm_names: Optional[List[str]] = None,
+    shard_fns: Optional[Mapping[tuple, Callable]] = None,
+    convert_to_8bit: bool = False,
+    params_pattern_selection: Optional[re.Pattern] = None,
+    dtype: jax.numpy.dtype = jax.numpy.float16,
+    rnn_based_or_rwkv: bool = False,
+    verbose: bool = True,
+    remove_state_dict: bool = False,
+    lm_head_name: Optional[str] = None,
+    uses_tie_word_embedding: bool = False,
+    **kwargs,
 ):
     """The huggingface_to_easydel function takes a huggingface model's state_dict and converts it to an easydel
     model's flax_dict. The function is designed to be used in conjunction with the load_huggingface function, which
@@ -118,15 +125,19 @@ def huggingface_to_easydel(
         import torch
 
         if torch.cuda.is_available():
+
             def _clear():
                 gc.collect()
                 torch.cuda.empty_cache()
         else:
+
             def _clear():
                 gc.collect()
     except ModuleNotFoundError as e:
+
         def _clear():
             gc.collect()
+
     embedding_layer_names = set(embedding_layer_names or [])
     layer_norm_names = set(layer_norm_names or [])
     _l = len(".weight")
@@ -160,7 +171,9 @@ def huggingface_to_easydel(
             key_tuple = tuple(new_key.split("."))
 
             # Convert tensor to jax.numpy.array and delete the tensor to free memory
-            array = jax.lax.convert_element_type(jnp.asarray(tensor.cpu().detach().numpy()), dtype)
+            array = jax.lax.convert_element_type(
+                jnp.asarray(tensor.cpu().detach().numpy()), dtype
+            )
             if remove_state_dict:
                 del tensor
                 _clear()
@@ -172,9 +185,7 @@ def huggingface_to_easydel(
                 else:
                     missed_shardings += 1
             if convert_to_8bit and params_pattern_selection.search("/".join(key_tuple)):
-                array = fjformer.linen.linen.Int8Params(
-                    *fjformer.linen.quantize(array)
-                )
+                array = fjformer.linen.linen.Int8Params(*fjformer.linen.quantize(array))
             flax_dict[key_tuple] = array
             pbar.set_postfix(missed_shardings=missed_shardings)
             pbar.update(1)
@@ -184,7 +195,9 @@ def huggingface_to_easydel(
         return traverse_util.unflatten_dict(flax_dict)
 
 
-def read_ckpt(path: [str, os.PathLike], shard_fns=None, add_extra_past_fix: list = None):
+def read_ckpt(
+    path: [str, os.PathLike], shard_fns=None, add_extra_past_fix: list = None
+):
     """The read_ckpt function reads a checkpoint file and returns the tensors in it.
 
     Args:
@@ -239,13 +252,12 @@ def save_ckpt(train_state, path, gather_fns=None, float_dtype=None):
 
 
 def easystate_to_torch(
-        state,
-        dtype=jnp.float16,
-        transpose_needed=None,
-        transpose_not_needed=None,
-        select_params_field: bool = True,
-        rnn_based_or_rwkv: bool = False
-
+    state,
+    dtype=jnp.float16,
+    transpose_needed=None,
+    transpose_not_needed=None,
+    select_params_field: bool = True,
+    rnn_based_or_rwkv: bool = False,
 ):
     import torch
 
@@ -263,17 +275,14 @@ def easystate_to_torch(
                 return False
         return True
 
-    model_parameters = flatten_dict(
-        state.params["params"],
-        sep="."
-    ) if select_params_field else flatten_dict(
-        state.params,
-        sep="."
+    model_parameters = (
+        flatten_dict(state.params["params"], sep=".")
+        if select_params_field
+        else flatten_dict(state.params, sep=".")
     )
     torch_state_dict = {}
     pbar = tqdm(
-        model_parameters.items(),
-        desc="Converting EasyDeLState to torch state_dict"
+        model_parameters.items(), desc="Converting EasyDeLState to torch state_dict"
     )
     for key, tensor in pbar:
         if match_keywords(key, transpose_needed, transpose_not_needed):
@@ -281,7 +290,11 @@ def easystate_to_torch(
         elif rnn_based_or_rwkv and ("time_mix_" in key or "time_" in key):
             tensor = tensor.reshape(1, 1, -1)
         tensor = tensor.astype(get_dtype(dtype))
-        key = key.replace(".kernel", ".weight").replace(".embedding", ".weight").replace(".scale", ".weight")
+        key = (
+            key.replace(".kernel", ".weight")
+            .replace(".embedding", ".weight")
+            .replace(".scale", ".weight")
+        )
         try:
             torch_state_dict[key] = torch.from_numpy(tensor)
         except TypeError:
@@ -290,25 +303,21 @@ def easystate_to_torch(
 
 
 def easystate_to_huggingface_model(
-        state,
-        config,
-        base_huggingface_module: transformers.PreTrainedModel,
-        base_huggingface_module_kwarguments=None,
-        dtype=jnp.float16,
-        transpose_needed=None,
-        transpose_not_needed=None,
-        select_params_field: bool = True,
-        rnn_based_or_rwkv: bool = False,
-        auto_correct: bool = True
+    state,
+    config,
+    base_huggingface_module: transformers.PreTrainedModel,
+    base_huggingface_module_kwarguments=None,
+    dtype=jnp.float16,
+    transpose_needed=None,
+    transpose_not_needed=None,
+    select_params_field: bool = True,
+    rnn_based_or_rwkv: bool = False,
+    auto_correct: bool = True,
 ):
     if not rnn_based_or_rwkv and auto_correct:
         if isinstance(
-                base_huggingface_module,
-                transformers.RwkvForCausalLM
-        ) or isinstance(
-            base_huggingface_module,
-            transformers.RwkvModel
-        ):
+            base_huggingface_module, transformers.RwkvForCausalLM
+        ) or isinstance(base_huggingface_module, transformers.RwkvModel):
             logger.warning(
                 "Rnn Based Model detected 'setting `rnn_based_or_rwkv = True`' for correct weight handling"
             )
@@ -321,11 +330,10 @@ def easystate_to_huggingface_model(
         transpose_needed=transpose_needed,
         transpose_not_needed=transpose_not_needed,
         select_params_field=select_params_field,
-        rnn_based_or_rwkv=rnn_based_or_rwkv
+        rnn_based_or_rwkv=rnn_based_or_rwkv,
     )
     model = base_huggingface_module(
-        config=config,
-        **base_huggingface_module_kwarguments
+        config=config, **base_huggingface_module_kwarguments
     )
     model.load_state_dict(state_dict)
     return model
