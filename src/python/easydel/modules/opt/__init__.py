@@ -7,19 +7,21 @@ _import_structure = {
         "FlaxOPTForCausalLM",
         "FlaxOPTForCausalLMModule",
         "FlaxOPTModel",
-        "FlaxOPTModule"
+        "FlaxOPTModule",
     ],
 }
 
 if TYPE_CHECKING:
-    from .opt_configuration import OPTConfig
+    from .opt_configuration import OPTConfig as OPTConfig
     from .modelling_opt_flax import (
-        FlaxOPTForCausalLM,
-        FlaxOPTForCausalLMModule,
-        FlaxOPTModel,
-        FlaxOPTModule
+        FlaxOPTForCausalLM as FlaxOPTForCausalLM,
+        FlaxOPTForCausalLMModule as FlaxOPTForCausalLMModule,
+        FlaxOPTModel as FlaxOPTModel,
+        FlaxOPTModule as FlaxOPTModule,
     )
 else:
     import sys
 
-    sys.modules[__name__] = _LazyModule(__name__, globals()["__file__"], _import_structure, module_spec=__spec__)
+    sys.modules[__name__] = _LazyModule(
+        __name__, globals()["__file__"], _import_structure, module_spec=__spec__
+    )

@@ -8,29 +8,33 @@ import warnings
 from abc import abstractmethod
 from glob import glob
 from typing import Union, Callable, Optional, Any, Literal, Mapping, Iterator
+from dataclasses import dataclass
 
 import fjformer
 import flax.core
 import jax
 import tensorflow as tf
 import termcolor
+from fjformer import CheckpointManager
+from jax.sharding import Mesh
+from numpy import ndarray
+from datasets import Dataset, IterableDataset
+from optax import GradientTransformation, Schedule
+from transformers import AutoModelForCausalLM, AutoConfig
 
 try:
     import wandb
 except ModuleNotFoundError:
     wandb = None
-from numpy import ndarray
-from datasets import Dataset, IterableDataset
+
 from .training_configurations import TrainArguments
 from ..smi import get_capacity_matrix, initialise_tracking
 from ..utils.helpers import prefix_print, Timers
-from dataclasses import dataclass
-from ..modules.auto_easydel_model import AutoEasyDeLModelForCausalLM, AutoEasyDeLConfig
-from ..modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel, EasyDeLPretrainedConfig
-from optax import GradientTransformation, Schedule
-from fjformer import CheckpointManager
-from jax.sharding import Mesh
-from transformers import AutoModelForCausalLM, AutoConfig
+from ..modules.auto_easydel_model import AutoEasyDeLModelForCausalLM
+from ..modules.easydel_modelling_utils import (
+    EasyDeLFlaxPretrainedModel,
+    EasyDeLPretrainedConfig,
+)
 from ..etils.etils import get_logger
 
 logger = get_logger(__name__)
@@ -64,13 +68,13 @@ class TrainerConfigureFunctionFuncOutput:
 
 class BaseTrainer:
     def __init__(
-            self,
-            arguments: TrainArguments,
-            dataset_train: Dataset,
-            dataset_eval: Dataset = None,
-            finetune: bool = True,
-            checkpoint_path: Union[str, os.PathLike] = None,
-            _do_init_fns: bool = True
+        self,
+        arguments: TrainArguments,
+        dataset_train: Dataset,
+        dataset_eval: Dataset = None,
+        finetune: bool = True,
+        checkpoint_path: Union[str, os.PathLike] = None,
+        _do_init_fns: bool = True,
     ):
         """The __init__ function is called when the class is instantiated.
         It sets up all the variables that are needed for training, including:
@@ -98,7 +102,9 @@ class BaseTrainer:
         """
         # Loggers
         self.timer = getattr(self, "timer", None)
-        self.wandb_runtime: Optional[Union["Run", "RunDisabled"]] = getattr(self, "wandb_runtime", None)
+        self.wandb_runtime: Optional[Union["Run", "RunDisabled"]] = getattr(  # type:ignore # noqa
+            self, "wandb_runtime", None
+        )
 
         # Data
         self.dataloader_train = getattr(self, "dataloader_train", None)
@@ -125,17 +131,23 @@ class BaseTrainer:
 
         # Jit functions
         self.create_sharded_state_from_params_function = getattr(
-            self,
-            "create_sharded_state_from_params_function",
-            None
+            self, "create_sharded_state_from_params_function", None
         )
-        self.sharded_train_step_function = getattr(self, "sharded_train_step_function", None)
-        self.sharded_eval_step_function = getattr(self, "sharded_eval_step_function", None)
-        self.initialize_state_function = getattr(self, "initialize_state_function", None)
+        self.sharded_train_step_function = getattr(
+            self, "sharded_train_step_function", None
+        )
+        self.sharded_eval_step_function = getattr(
+            self, "sharded_eval_step_function", None
+        )
+        self.initialize_state_function = getattr(
+            self, "initialize_state_function", None
+        )
         self.mesh = getattr(self, "mesh", None)
 
         # Checkpoint Managers
-        self.checkpoint_manager: fjformer.CheckpointManager | None = getattr(self, "checkpoint_manager", None)
+        self.checkpoint_manager: fjformer.CheckpointManager | None = getattr(
+            self, "checkpoint_manager", None
+        )
 
         # EasyState
         self.state_shape = getattr(self, "state_shape", None)
@@ -160,7 +172,7 @@ class BaseTrainer:
                 prefix_print(
                     "Warning",
                     "In case of using `finetune = True` and Passing `checkpoint_path = None`"
-                    " you should pass parameters in train function"
+                    " you should pass parameters in train function",
                 )
         if _do_init_fns:
             self.initialize_trainer_utils()
@@ -168,7 +180,7 @@ class BaseTrainer:
             prefix_print(
                 "Warning",
                 "you have set `_do_init_fns = False` so function will not me initialized you have "
-                f"to do in manually (simply with `trainer.initialize_trainer_utils()` )"
+                "to do in manually (simply with `trainer.initialize_trainer_utils()` )",
             )
 
     def __str__(self):
@@ -195,15 +207,19 @@ class BaseTrainer:
         if wandb is not None:
             wandb.finish()
 
-    def _start_capturing_memory(self, dir_prefix: str = "/dev/shm" if sys.platform != "win32" else "."):
+    def _start_capturing_memory(
+        self, dir_prefix: str = "/dev/shm" if sys.platform != "win32" else "."
+    ):
         def _start():
             while True:
                 information_queries = {}
                 for key in ["Used", "Usage Percent"]:
-                    for device, info in get_capacity_matrix(dir_prefix=dir_prefix).items():
-                        information_queries[f"accelerators/{device.replace('_', ' ')} ({key})"] = float(
-                            info[key].replace("%", "").replace("GB", "")
-                        )
+                    for device, info in get_capacity_matrix(
+                        dir_prefix=dir_prefix
+                    ).items():
+                        information_queries[
+                            f"accelerators/{device.replace('_', ' ')} ({key})"
+                        ] = float(info[key].replace("%", "").replace("GB", ""))
                 self.arguments._captured_memory = information_queries
                 if self.arguments.stop_capturing_memory:
                     break
@@ -228,8 +244,7 @@ class BaseTrainer:
         if self.arguments.use_wandb:
             self.wandb_runtime = self.arguments.get_wandb_init()
         self.timer = Timers(
-            use_wandb=False,
-            tensorboard_writer=self.arguments.get_board()
+            use_wandb=False, tensorboard_writer=self.arguments.get_board()
         )
 
         self.timer("configure dataloaders").start()
@@ -269,21 +284,28 @@ class BaseTrainer:
         self.timer.log(["configure Model, Optimizer, Scheduler and Config"])
         self.timer("configure functions and sharding them").start()
         function_configurations = self.configure_functions()
-        self.create_sharded_state_from_params_function = \
+        self.create_sharded_state_from_params_function = (
             function_configurations.create_sharded_state_from_params_function
-        self.sharded_train_step_function = function_configurations.sharded_train_step_function
-        self.sharded_eval_step_function = function_configurations.sharded_eval_step_function
+        )
+        self.sharded_train_step_function = (
+            function_configurations.sharded_train_step_function
+        )
+        self.sharded_eval_step_function = (
+            function_configurations.sharded_eval_step_function
+        )
         self.mesh = function_configurations.mesh
         self.checkpoint_manager = function_configurations.checkpoint_manager
-        self.initialize_state_function = function_configurations.initialize_state_function
+        self.initialize_state_function = (
+            function_configurations.initialize_state_function
+        )
         self.timer("configure functions and sharding them").stop()
         self.timer.log(["configure functions and sharding them"])
 
     @abstractmethod
     def create_collate_function(
-            self,
-            max_sequence_length: int,
-            truncation_mode: Literal["keep_end", "keep_start"]
+        self,
+        max_sequence_length: int,
+        truncation_mode: Literal["keep_end", "keep_start"],
     ) -> Callable:
         raise NotImplementedError
 
@@ -312,31 +334,37 @@ class BaseTrainer:
             A TrainerConfigureDataloaderFuncOutput object
         """
 
-        def create_tf_dataset(dataset: Dataset, is_train: bool) -> Iterator[ndarray[Any, Any]]:
+        def create_tf_dataset(
+            dataset: Dataset, is_train: bool
+        ) -> Iterator[ndarray[Any, Any]]:
             return (
                 dataset.to_tf_dataset(
                     collate_fn=self.create_collate_function(
                         max_sequence_length=self.arguments.max_sequence_length,
-                        truncation_mode=self.arguments.truncation_mode
+                        truncation_mode=self.arguments.truncation_mode,
                     ),
                     batch_size=self.arguments.total_batch_size,
                     drop_remainder=True,
                     shuffle=not is_train,
-                    num_workers=self.arguments.dataloader_num_workers
+                    num_workers=self.arguments.dataloader_num_workers,
                 )
                 .repeat(self.arguments.num_train_epochs if is_train else 1)
                 .prefetch(tf.data.experimental.AUTOTUNE)
                 .as_numpy_iterator()
             )
 
-        def create_tf_dataset_from_iterable(dataset: IterableDataset, is_train: bool) -> Iterator[ndarray[Any, Any]]:
+        def create_tf_dataset_from_iterable(
+            dataset: IterableDataset, is_train: bool
+        ) -> Iterator[ndarray[Any, Any]]:
             return (
                 tf.data.Dataset.from_generator(
                     lambda: dataset,
                     output_signature={
-                        col: tf.TensorSpec(shape=(self.arguments.max_sequence_length,), dtype=tf.int32)
+                        col: tf.TensorSpec(
+                            shape=(self.arguments.max_sequence_length,), dtype=tf.int32
+                        )
                         for col in next(iter(dataset)).keys()
-                    }
+                    },
                 )
                 .repeat(self.arguments.num_train_epochs if is_train else 1)
                 .batch(self.arguments.total_batch_size, drop_remainder=False)
@@ -348,16 +376,32 @@ class BaseTrainer:
             """Return total number of steps to train or evaluate on."""
             if hasattr(dataset, "__len__"):
                 total_data_len = len(dataset)
-                batch_size = self.arguments.total_batch_size if is_train else self.arguments.eval_batch_size
-                num_steps = (total_data_len + batch_size - 1) // batch_size * (
-                    self.arguments.num_train_epochs if is_train else 1)
-                max_steps = self.arguments.max_training_steps if is_train else self.arguments.max_evaluation_steps
+                batch_size = (
+                    self.arguments.total_batch_size
+                    if is_train
+                    else self.arguments.eval_batch_size
+                )
+                num_steps = (
+                    (total_data_len + batch_size - 1)
+                    // batch_size
+                    * (self.arguments.num_train_epochs if is_train else 1)
+                )
+                max_steps = (
+                    self.arguments.max_training_steps
+                    if is_train
+                    else self.arguments.max_evaluation_steps
+                )
                 return min(num_steps, max_steps) if max_steps else num_steps
             else:
-                num_steps = self.arguments.max_training_steps if is_train else self.arguments.max_evaluation_steps
+                num_steps = (
+                    self.arguments.max_training_steps
+                    if is_train
+                    else self.arguments.max_evaluation_steps
+                )
                 if not num_steps:
                     raise ValueError(
-                        f"Specify the number of {'training' if is_train else 'evaluation'} steps for a generator/streaming dataset.")
+                        f"Specify the number of {'training' if is_train else 'evaluation'} steps for a generator/streaming dataset."
+                    )
                 return num_steps
 
         def to_tf_dataloader(dataset: Union[Dataset, IterableDataset], is_train: bool):
@@ -379,7 +423,7 @@ class BaseTrainer:
             dataloader_train=dataloader_train,
             max_training_steps=max_training_steps,
             dataloader_eval=dataloader_eval,
-            max_evaluation_steps=max_evaluation_steps
+            max_evaluation_steps=max_evaluation_steps,
         )
 
     def configure_model(self) -> TrainerConfigureModelFuncOutput:
@@ -392,32 +436,39 @@ class BaseTrainer:
             A model, optimizer, scheduler and config  in
             TrainerConfigureModelFuncOutput Object
         """
-        extra_configs = {} if self.arguments.extra_configs is None else self.arguments.extra_configs
+        extra_configs = (
+            {} if self.arguments.extra_configs is None else self.arguments.extra_configs
+        )
         if self.arguments.model_class is not None:
-
-            if not hasattr(self.arguments.configs_to_initialize_model_class["config"], "get_partition_rules"):
+            if not hasattr(
+                self.arguments.configs_to_initialize_model_class["config"],
+                "get_partition_rules",
+            ):
                 assert self.arguments.custom_rule is not None, (
                     "if you are using custom model to init you must"
                     " pass custom_rule for partition rules "
                 )
 
-            self.arguments.configs_to_initialize_model_class["config"].axis_dims = self.arguments.sharding_array
+            self.arguments.configs_to_initialize_model_class[
+                "config"
+            ].axis_dims = self.arguments.sharding_array
 
             model = self.arguments.model_class(
-                **self.arguments.configs_to_initialize_model_class,
-                _do_init=False
+                **self.arguments.configs_to_initialize_model_class, _do_init=False
             )
 
             config = self.arguments.configs_to_initialize_model_class["config"]
 
         else:
-            extra_configs["gradient_checkpointing"] = self.arguments.gradient_checkpointing
+            extra_configs["gradient_checkpointing"] = (
+                self.arguments.gradient_checkpointing
+            )
 
             model = AutoEasyDeLModelForCausalLM.from_pretrained(
                 self.arguments.model_huggingface_repo_id,
                 dtype=self.arguments.dtype,
                 param_dtype=self.arguments.param_dtype,
-                _do_init=False
+                _do_init=False,
             )
             if hasattr(model, "config"):
                 for k, v in extra_configs.items():
@@ -429,42 +480,44 @@ class BaseTrainer:
                     "Config is being set to None due to not detecting Model Configuration from taken Model "
                     "this will cause errors later."
                 )
-        tx, scheduler = self.arguments.get_optimizer_and_scheduler(self.max_training_steps)
+        tx, scheduler = self.arguments.get_optimizer_and_scheduler(
+            self.max_training_steps
+        )
         return TrainerConfigureModelFuncOutput(
-            model=model,
-            tx=tx,
-            scheduler=scheduler,
-            config=config
+            model=model, tx=tx, scheduler=scheduler, config=config
         )
 
     def _save_state(
-            self,
-            state: "EasyDeLState",  # type: ignore
-            gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
-            milestone: bool = False,
-            save_dir: Optional[str] = None,
+        self,
+        state: "EasyDeLState",  # type: ignore #noqa
+        gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
+        milestone: bool = False,
+        save_dir: Optional[str] = None,
     ) -> str:
-        step = int(
-            jax.device_get(
-                state.step
-            )
-        ) + self.arguments.step_start_point if self.arguments.step_start_point is not None else int(
-            jax.device_get(
-                state.step
-            )
+        step = (
+            int(jax.device_get(state.step)) + self.arguments.step_start_point
+            if self.arguments.step_start_point is not None
+            else int(jax.device_get(state.step))
         )
 
-        checkpoint_dir = os.path.join(
-            self.arguments.save_dir,
-            self.arguments.model_name
-        ) if save_dir is None else save_dir
+        checkpoint_dir = (
+            os.path.join(self.arguments.save_dir, self.arguments.model_name)
+            if save_dir is None
+            else save_dir
+        )
         filename_extension = ".easy"
         if self.arguments.save_total_limit:
-            checkpoint_files = glob(os.path.join(checkpoint_dir, f"*{filename_extension}"))
+            checkpoint_files = glob(
+                os.path.join(checkpoint_dir, f"*{filename_extension}")
+            )
             checkpoint_files.sort(key=os.path.getmtime)
-            for old_checkpoint in checkpoint_files[:-self.arguments.save_total_limit]:
+            for old_checkpoint in checkpoint_files[: -self.arguments.save_total_limit]:
                 os.remove(old_checkpoint)
-                termcolor.cprint(f"Removed old checkpoint: {old_checkpoint}", color="red", force_color=True)
+                termcolor.cprint(
+                    f"Removed old checkpoint: {old_checkpoint}",
+                    color="red",
+                    force_color=True,
+                )
         checkpoint_name = f"{self.arguments.model_name}-S{step}"
         filename = f"{checkpoint_name}_{step}" if milestone else f"{checkpoint_name}"
         filename += filename_extension
@@ -478,7 +531,9 @@ class BaseTrainer:
             verbose=self.arguments.verbose,
             save_optimizer=self.arguments.save_optimizer_state,
         )
-        open(os.path.join(checkpoint_dir, "README.md"), "w").write(self._get_information())
+        open(os.path.join(checkpoint_dir, "README.md"), "w").write(
+            self._get_information()
+        )
         return filename
 
     @abc.abstractmethod
@@ -491,10 +546,11 @@ class BaseTrainer:
 
     def _get_information(self):
         partition_rules = pprint.pformat(
-
-            self.arguments.custom_rule if self.arguments.custom_rule is not None else
-            self.arguments.model_class.config_class.get_partition_rules(self.arguments.fully_sharded_data_parallel)
-
+            self.arguments.custom_rule
+            if self.arguments.custom_rule is not None
+            else self.arguments.model_class.config_class.get_partition_rules(
+                self.arguments.fully_sharded_data_parallel
+            )
         )
         makrdown = f"""
 ---
@@ -588,15 +644,15 @@ partition_rules = {partition_rules}
         return makrdown
 
     def save_pretrained(
-            self,
-            state: "EasyDeLState",  # type: ignore
-            save_dir: Optional[str] = None,
-            gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]] = None,
-            to_torch: bool = False,
-            base_hf_auto_class=AutoModelForCausalLM,
-            easystate_to_huggingface_model_kwargs: Optional[dict] = None,
-            add_params_field_to_torch_convertation: bool = False,
-            torch_save_pretrained_kwargs: Optional[dict] = None
+        self,
+        state: "EasyDeLState",  # type: ignore #noqa
+        save_dir: Optional[str] = None,
+        gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]] = None,
+        to_torch: bool = False,
+        base_hf_auto_class=AutoModelForCausalLM,
+        easystate_to_huggingface_model_kwargs: Optional[dict] = None,
+        add_params_field_to_torch_convertation: bool = False,
+        torch_save_pretrained_kwargs: Optional[dict] = None,
     ):
         if torch_save_pretrained_kwargs is None:
             torch_save_pretrained_kwargs = {}
@@ -635,18 +691,16 @@ partition_rules = {partition_rules}
                 state=state,
                 base_huggingface_module=model_class,
                 config=hf_model_config,
-                **easystate_to_huggingface_model_kwargs
+                **easystate_to_huggingface_model_kwargs,
             )
 
-            open(os.path.join(save_dir, "README.md"), "w").write(self._get_information())
+            open(os.path.join(save_dir, "README.md"), "w").write(
+                self._get_information()
+            )
             hf_model.save_pretrained(save_dir, **torch_save_pretrained_kwargs)
             return hf_model
         else:
-            self._save_state(
-                state=state,
-                gather_fns=gather_fns,
-                save_dir=save_dir
-            )
+            self._save_state(state=state, gather_fns=gather_fns, save_dir=save_dir)
             return state
 
     def specs_to_name_sharding(self, tree, mesh=None):
@@ -655,11 +709,16 @@ partition_rules = {partition_rules}
             if mesh is None:
                 mesh = self.arguments.get_mesh()
         return jax.tree_util.tree_map(
-            lambda spec: jax.sharding.NamedSharding(spec=spec, mesh=mesh),
-            tree
+            lambda spec: jax.sharding.NamedSharding(spec=spec, mesh=mesh), tree
         )
 
     def calculate_number_total_flops_per_device(self, params):
-        size = sum(x.size for x in jax.tree_util.tree_flatten(flax.core.unfreeze(params))[0])
-        flops = (6 * size * (self.arguments.total_batch_size * self.arguments.max_sequence_length)) / jax.device_count()
+        size = sum(
+            x.size for x in jax.tree_util.tree_flatten(flax.core.unfreeze(params))[0]
+        )
+        flops = (
+            6
+            * size
+            * (self.arguments.total_batch_size * self.arguments.max_sequence_length)
+        ) / jax.device_count()
         return flops

@@ -8,20 +8,22 @@ _import_structure = {
         "FlaxMambaCache",
         "FlaxMambaForCausalLMModule",
         "FlaxMambaForCausalLM",
-        "FlaxMambaModel"
-    ]
+        "FlaxMambaModel",
+    ],
 }
 
 if TYPE_CHECKING:
-    from .mamba_configuration import MambaConfig
+    from .mamba_configuration import MambaConfig as MambaConfig
     from .modelling_mamba_flax import (
-        FlaxMambaModule,
-        FlaxMambaCache,
-        FlaxMambaForCausalLMModule,
-        FlaxMambaForCausalLM,
-        FlaxMambaModel
+        FlaxMambaModule as FlaxMambaModule,
+        FlaxMambaCache as FlaxMambaCache,
+        FlaxMambaForCausalLMModule as FlaxMambaForCausalLMModule,
+        FlaxMambaForCausalLM as FlaxMambaForCausalLM,
+        FlaxMambaModel as FlaxMambaModel,
     )
 else:
     import sys
 
-    sys.modules[__name__] = _LazyModule(__name__, globals()["__file__"], _import_structure, module_spec=__spec__)
+    sys.modules[__name__] = _LazyModule(
+        __name__, globals()["__file__"], _import_structure, module_spec=__spec__
+    )

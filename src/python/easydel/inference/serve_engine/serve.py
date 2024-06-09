@@ -9,7 +9,12 @@ import warnings
 import jax
 import websocket
 import websockets
-from fjformer import with_sharding_constraint, match_partition_rules, make_shard_and_gather_fns, get_dtype
+from fjformer import (
+    with_sharding_constraint,
+    match_partition_rules,
+    make_shard_and_gather_fns,
+    get_dtype,
+)
 from jax import numpy as jnp
 from ...modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 from ...etils.etils import get_logger
@@ -34,14 +39,14 @@ class LLMBaseReq:
 
 class EasyDeLServeEngine:
     def __init__(
-            self,
-            llm: EasyDeLFlaxPretrainedModel,
-            params: Union[FrozenDict, dict],
-            tokenizer: PreTrainedTokenizerBase,
-            prefix_tokenizer: PreTrainedTokenizerBase,
-            greedy_generate_function: Callable,
-            non_greedy_generate_function: Callable,
-            serve_config: EasyDeLServeEngineConfig,
+        self,
+        llm: EasyDeLFlaxPretrainedModel,
+        params: Union[FrozenDict, dict],
+        tokenizer: PreTrainedTokenizerBase,
+        prefix_tokenizer: PreTrainedTokenizerBase,
+        greedy_generate_function: Callable,
+        non_greedy_generate_function: Callable,
+        serve_config: EasyDeLServeEngineConfig,
     ):
         self.llm = llm
         self.params = params
@@ -54,7 +59,11 @@ class EasyDeLServeEngine:
             self.compile(verbose=serve_config.verbose)
 
     def get_generation_function(self, greedy: bool):
-        return self.greedy_generate_function if greedy else self.non_greedy_generate_function
+        return (
+            self.greedy_generate_function
+            if greedy
+            else self.non_greedy_generate_function
+        )
 
     def conversation_template(self, conversation: List[Dict]) -> str:
         """The conversation_template function takes a list of ConversationItem objects and returns a string.
@@ -71,24 +80,23 @@ class EasyDeLServeEngine:
             conversation
         """
         return self.tokenizer.apply_chat_template(
-            conversation=conversation,
-            add_generation_prompt=True,
-            tokenize=False
+            conversation=conversation, add_generation_prompt=True, tokenize=False
         )
 
     async def generate(self, socket):
         data = json.loads(await socket.recv())
         prompt = self.conversation_template(data["conversation"])
-        max_new_tokens = data.get("max_new_tokens", None) or self.serve_config.max_new_tokens
+        max_new_tokens = (
+            data.get("max_new_tokens", None) or self.serve_config.max_new_tokens
+        )
         greedy = data.get("greedy", None) or self.serve_config.greedy
         start = time.time()
         send_data = {}
         prl_res = 0
         for response, num_token_generated in self.sample(
-                string=prompt,
-                max_new_tokens=max_new_tokens,
-                greedy=greedy,
-
+            string=prompt,
+            max_new_tokens=max_new_tokens,
+            greedy=greedy,
         ):
             generation_duration = time.time() - start
             tokens_pre_second = num_token_generated / generation_duration
@@ -100,7 +108,7 @@ class EasyDeLServeEngine:
                 "model_prompt": prompt,
                 "generation_duration": generation_duration,
                 "tokens_pre_second": tokens_pre_second,
-                "done": False
+                "done": False,
             }
             prl_res += len(response)
             await socket.send(json.dumps(send_data))
@@ -115,7 +123,9 @@ class EasyDeLServeEngine:
             if path == "/stream/v1/conversation":
                 await self.generate(socket)
             elif path == "/":
-                await socket.send(json.dumps({"status": "EasyDeLServeEngine server is Running..."}))  # noqa
+                await socket.send(
+                    json.dumps({"status": "EasyDeLServeEngine server is Running..."})
+                )  # noqa
             else:
                 await socket.send(json.dumps({"error": f"invalid path {path}"}))  # noqa
         except websockets.ConnectionClosed:
@@ -125,12 +135,11 @@ class EasyDeLServeEngine:
 
     @staticmethod
     def create_shard_and_gather_functions(
-            parameters: dict,
-            mesh,
-            partition_rules: Tuple[Tuple[str, PartitionSpec]],
-            dtype: Union[jax.numpy.dtype, str] = "fp16"
+        parameters: dict,
+        mesh,
+        partition_rules: Tuple[Tuple[str, PartitionSpec]],
+        dtype: Union[jax.numpy.dtype, str] = "fp16",
     ):
-
         """The create_shard_and_gather_functions function takes in a dictionary of parameters,
         a tuple of partition rules, and an optional dtype. It then matches the partition rules to the
         parameters and creates shard functions for each parameter. The shard functions are used to
@@ -149,20 +158,17 @@ class EasyDeLServeEngine:
         """
         partition_specs = match_partition_rules(partition_rules, parameters)
         shard_fns, gather_fns = make_shard_and_gather_fns(
-            partition_specs=partition_specs,
-            mesh=mesh,
-            dtype_specs=get_dtype(dtype)
+            partition_specs=partition_specs, mesh=mesh, dtype_specs=get_dtype(dtype)
         )
         return shard_fns, gather_fns, partition_specs
 
     @staticmethod
     def shard_parameters(
-            mesh: Mesh,
-            params: Union[FrozenDict, dict],
-            partition_rules: Tuple[Tuple[str, PartitionSpec]],
-            serve_config: EasyDeLServeEngineConfig,
+        mesh: Mesh,
+        params: Union[FrozenDict, dict],
+        partition_rules: Tuple[Tuple[str, PartitionSpec]],
+        serve_config: EasyDeLServeEngineConfig,
     ):
-
         """The shard_parameters function takes a set of parameters and partitions them according to the partition_rules.
 
         Args:
@@ -181,21 +187,21 @@ class EasyDeLServeEngine:
         """
 
         partition_specs = match_partition_rules(params=params, rules=partition_rules)
-        shard_fns, _ = make_shard_and_gather_fns(partition_specs, mesh, get_dtype(serve_config.dtype))
+        shard_fns, _ = make_shard_and_gather_fns(
+            partition_specs, mesh, get_dtype(serve_config.dtype)
+        )
 
         with mesh:
-            params = jax.tree_map(
-                lambda func, param: func(param), shard_fns, params
-            )
+            params = jax.tree_map(lambda func, param: func(param), shard_fns, params)
 
         return params
 
     @staticmethod
     def create_generation_functions_and_tokenizers(
-            model: EasyDeLFlaxPretrainedModel,
-            tokenizer: PreTrainedTokenizerBase,
-            serve_config: EasyDeLServeEngineConfig,
-            partition_specs: dict[str, PartitionSpec]
+        model: EasyDeLFlaxPretrainedModel,
+        tokenizer: PreTrainedTokenizerBase,
+        serve_config: EasyDeLServeEngineConfig,
+        partition_specs: dict[str, PartitionSpec],
     ) -> LLMBaseReq:
         """The create_generation_functions_and_tokenizers function is used to create the functions that will be used for
         generation. It also creates a tokenizer object that can be used to encode and decode text. The function takes in
@@ -217,7 +223,8 @@ class EasyDeLServeEngine:
         """
         if tokenizer.pad_token is None:
             logging.info(
-                "Tokenizer does not contain padding token setting padding token to eos token for open end generation")
+                "Tokenizer does not contain padding token setting padding token to eos token for open end generation"
+            )
             tokenizer.pad_token = tokenizer.eos_token
 
         try:
@@ -228,7 +235,7 @@ class EasyDeLServeEngine:
             tokenizer.truncation_side = "right"
             tokenizer = copy.deepcopy(tokenizer)
 
-        except:
+        except:  # noqa E722
             warnings.warn(
                 f"The class Model of Tokenizer {type(tokenizer)} do not support deepcopy option "
             )
@@ -243,83 +250,74 @@ class EasyDeLServeEngine:
         @functools.partial(
             pjit,
             in_shardings=(partition_specs, PartitionSpec(), PartitionSpec()),
-            out_shardings=(PartitionSpec())
+            out_shardings=(PartitionSpec()),
         )
-        def greedy_generate_function(
-                parameters,
-                input_ids,
-                attention_mask
-        ):
+        def greedy_generate_function(parameters, input_ids, attention_mask):
             input_ids = with_sharding_constraint(input_ids, serve_config.generation_ps)
-            attention_mask = with_sharding_constraint(attention_mask, serve_config.generation_ps)
+            attention_mask = with_sharding_constraint(
+                attention_mask, serve_config.generation_ps
+            )
             predict = model.generate(
                 input_ids,
                 attention_mask=attention_mask,
                 params=parameters,
                 generation_config=GenerationConfig(
                     max_new_tokens=serve_config.max_compile_tokens,
-
                     eos_token_id=serve_config.eos_token_id or tokenizer.eos_token_id,
                     pad_token_id=serve_config.pad_token_id or tokenizer.pad_token_id,
                     bos_token_id=serve_config.bos_token_id or tokenizer.bos_token_id,
-
                     do_sample=False,
                     num_beams=1,
-                )
-            ).sequences[:, input_ids.shape[1]:]
+                ),
+            ).sequences[:, input_ids.shape[1] :]
             return predict
 
         @functools.partial(
             pjit,
             in_shardings=(partition_specs, PartitionSpec(), PartitionSpec()),
-            out_shardings=(PartitionSpec())
+            out_shardings=(PartitionSpec()),
         )
-        def non_greedy_generate_function(
-                parameters,
-                input_ids,
-                attention_mask
-        ):
+        def non_greedy_generate_function(parameters, input_ids, attention_mask):
             input_ids = with_sharding_constraint(input_ids, serve_config.generation_ps)
-            attention_mask = with_sharding_constraint(attention_mask, serve_config.generation_ps)
+            attention_mask = with_sharding_constraint(
+                attention_mask, serve_config.generation_ps
+            )
             predict = model.generate(
                 input_ids,
                 attention_mask=attention_mask,
                 params=parameters,
                 generation_config=GenerationConfig(
                     max_new_tokens=serve_config.max_compile_tokens,
-
                     eos_token_id=serve_config.eos_token_id or tokenizer.eos_token_id,
                     pad_token_id=serve_config.pad_token_id or tokenizer.pad_token_id,
                     bos_token_id=serve_config.bos_token_id or tokenizer.bos_token_id,
-
                     temperature=serve_config.temperature,
                     repetition_penalty=serve_config.repetition_penalty,
                     do_sample=True,
                     num_beams=1,
                     top_p=serve_config.top_p,
                     top_k=serve_config.top_k,
-                )
-            ).sequences[:, input_ids.shape[1]:]
+                ),
+            ).sequences[:, input_ids.shape[1] :]
             return predict
 
         return LLMBaseReq(
             greedy_generate_function=greedy_generate_function,
             non_greedy_generate_function=non_greedy_generate_function,
             tokenizer=tokenizer,
-            prefix_tokenizer=prefix_tokenizer
+            prefix_tokenizer=prefix_tokenizer,
         )
 
     @classmethod
     def from_parameters(
-            cls,
-            llm: EasyDeLFlaxPretrainedModel,
-            params: dict,
-            tokenizer: PreTrainedTokenizerBase,
-            serve_config: EasyDeLServeEngineConfig,
-            partition_rules: Tuple[Tuple[str, PartitionSpec]],
-            shard_parameters: bool = True,
+        cls,
+        llm: EasyDeLFlaxPretrainedModel,
+        params: dict,
+        tokenizer: PreTrainedTokenizerBase,
+        serve_config: EasyDeLServeEngineConfig,
+        partition_rules: Tuple[Tuple[str, PartitionSpec]],
+        shard_parameters: bool = True,
     ):
-
         """The from_parameters function is the main entry point for creating a model that can be served.
         It takes in a pretrained model, parameters, tokenizer and serve_config as input and returns an object of type
         EasyServe.
@@ -342,15 +340,13 @@ class EasyDeLServeEngine:
             A EasyServe object
         """
         shard_fns, gather_fns, partition_specs = cls.create_shard_and_gather_functions(
-            parameters=params,
-            partition_rules=partition_rules,
-            dtype=serve_config.dtype
+            parameters=params, partition_rules=partition_rules, dtype=serve_config.dtype
         )
         llm_base_req = cls.create_generation_functions_and_tokenizers(
             model=llm,
             tokenizer=tokenizer,
             partition_specs=partition_specs,
-            serve_config=serve_config
+            serve_config=serve_config,
         )
 
         if shard_parameters:
@@ -358,7 +354,7 @@ class EasyDeLServeEngine:
                 params=params,
                 partition_rules=partition_rules,
                 serve_config=serve_config,
-                mesh=llm.config.get_mesh()
+                mesh=llm.config.get_mesh(),
             )
 
         return cls(
@@ -372,12 +368,7 @@ class EasyDeLServeEngine:
         )
 
     def sample(
-            self,
-            string: str,
-            *,
-            greedy: bool = False,
-            max_new_tokens: int = None,
-            **kwargs
+        self, string: str, *, greedy: bool = False, max_new_tokens: int = None, **kwargs
     ):
         """The process function is the main function of a model. It takes in an input string and returns a list of strings
         that are generated from that input string. The process function can be called multiple times with different inputs,
@@ -397,15 +388,19 @@ class EasyDeLServeEngine:
             tokens generated
         """
         with self.llm.config.get_mesh():
-            fixed_pad = self.serve_config.max_sequence_length - self.serve_config.max_compile_tokens
-            tokens = self.prefix_tokenizer(
-                string,
-                max_length=fixed_pad,
-                padding="max_length",
-                return_tensors="jax"
-            ) if self.serve_config.use_prefix_tokenizer else self.tokenizer(
-                string,
-                return_tensors="jax"
+            fixed_pad = (
+                self.serve_config.max_sequence_length
+                - self.serve_config.max_compile_tokens
+            )
+            tokens = (
+                self.prefix_tokenizer(
+                    string,
+                    max_length=fixed_pad,
+                    padding="max_length",
+                    return_tensors="jax",
+                )
+                if self.serve_config.use_prefix_tokenizer
+                else self.tokenizer(string, return_tensors="jax")
             )
 
             input_ids = tokens.input_ids
@@ -413,47 +408,47 @@ class EasyDeLServeEngine:
             num_generated_tokens = 0
 
             for _ in range(
-                    (max_new_tokens or self.serve_config.max_new_tokens) // self.serve_config.max_compile_tokens):
-
+                (max_new_tokens or self.serve_config.max_new_tokens)
+                // self.serve_config.max_compile_tokens
+            ):
                 predicted_token = self.get_generation_function(greedy=greedy)(
-                    self.params,
-                    input_ids,
-                    attention_mask
+                    self.params, input_ids, attention_mask
                 )
 
                 num_generated_tokens += predicted_token.shape[-1]
                 plus_attn_mask = jnp.ones(
                     (len(attention_mask), self.serve_config.max_compile_tokens),
-                    dtype="i4"
+                    dtype="i4",
                 )
 
                 input_ids = jnp.concatenate(
-                    (input_ids, predicted_token), dtype="i4",
-                    axis=-1
+                    (input_ids, predicted_token), dtype="i4", axis=-1
                 )[:, -fixed_pad:]
 
                 attention_mask = jnp.concatenate(
-                    (attention_mask, plus_attn_mask), dtype="i4",
-                    axis=-1
+                    (attention_mask, plus_attn_mask), dtype="i4", axis=-1
                 )[:, -fixed_pad:]
 
                 returns = (
                     self.tokenizer.decode(
                         input_ids[0][-num_generated_tokens:],  # type:ignore
-                        skip_special_tokens=True
+                        skip_special_tokens=True,
                     ),
-                    num_generated_tokens
+                    num_generated_tokens,
                 )
 
                 yield returns
 
                 if self.serve_config.use_mxn_break_point:
-                    if self.serve_config.max_compile_tokens != predicted_token.shape[-1]:
+                    if (
+                        self.serve_config.max_compile_tokens
+                        != predicted_token.shape[-1]
+                    ):
                         break
-                if (
-                        predicted_token[0][-1] == (self.serve_config.eos_token_id or self.tokenizer.eos_token_id)
-                        or
-                        predicted_token[0][-1] == (self.serve_config.eos_token_id or self.prefix_tokenizer.eos_token_id)
+                if predicted_token[0][-1] == (
+                    self.serve_config.eos_token_id or self.tokenizer.eos_token_id
+                ) or predicted_token[0][-1] == (
+                    self.serve_config.eos_token_id or self.prefix_tokenizer.eos_token_id
                 ):
                     break
 
@@ -476,17 +471,17 @@ class EasyDeLServeEngine:
                 logger.info("Compiling greedy generate function")
             response, tokens = [None] * 2
             for response, tokens in self.sample(
-                    string="",
-                    max_new_tokens=self.serve_config.max_compile_tokens,
-                    greedy=True
+                string="",
+                max_new_tokens=self.serve_config.max_compile_tokens,
+                greedy=True,
             ):
                 ...
             if verbose:
                 logger.info("Compiling non-greedy generate function")
             for response, tokens in self.sample(
-                    string="",
-                    max_new_tokens=self.serve_config.max_compile_tokens,
-                    greedy=False
+                string="",
+                max_new_tokens=self.serve_config.max_compile_tokens,
+                greedy=False,
             ):
                 ...
 
@@ -498,7 +493,6 @@ class EasyDeLServeEngine:
         return True
 
     def __repr__(self):
-
         """The __repr__ function is used to generate a string representation of an object.
         This function should return a string that can be parsed by the Python interpreter
         to recreate the object. The __repr__ function is called when you use print() on an
@@ -515,13 +509,16 @@ class EasyDeLServeEngine:
             if not k.startswith("_"):
                 try:
                     repr_src = f"\t{k} : " + v.__str__().replace("\n", "\n\t") + "\n"
-                    string += repr_src if len(repr_src) < 500 else f"\t{k} : " + f"{v.__class__.__name__}(...)" + "\n"
+                    string += (
+                        repr_src
+                        if len(repr_src) < 500
+                        else f"\t{k} : " + f"{v.__class__.__name__}(...)" + "\n"
+                    )
                 except TypeError:
                     ...
         return string + ")"
 
     def __str__(self):
-
         """The __str__ function is called when you use the print function or when str() is used.
         It should return a string representation of the object.
 
@@ -535,8 +532,12 @@ class EasyDeLServeEngine:
 
     def fire(self):
         async def run_engine():
-            async with websockets.serve(self.handle_client, self.serve_config.host, self.serve_config.port) as ws:
-                logger.info(f"Starting EasyDeL websocket server on {self.serve_config.host}:{self.serve_config.port}")
+            async with websockets.serve(
+                self.handle_client, self.serve_config.host, self.serve_config.port
+            ) as ws:
+                logger.info(
+                    f"Starting EasyDeL websocket server on {self.serve_config.host}:{self.serve_config.port}"
+                )
                 await ws.wait_closed()
 
         asyncio.run(run_engine())

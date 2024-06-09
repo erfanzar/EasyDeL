@@ -12,14 +12,16 @@ _import_structure = {
 }
 
 if TYPE_CHECKING:
-    from .gpt_j_configuration import GPTJConfig
+    from .gpt_j_configuration import GPTJConfig as GPTJConfig
     from .modelling_gpt_j_flax import (
-        FlaxGPTJForCausalLM,
-        FlaxGPTJForCausalLMModule,
-        FlaxGPTJModel,
-        FlaxGPTJModule,
+        FlaxGPTJForCausalLM as FlaxGPTJForCausalLM,
+        FlaxGPTJForCausalLMModule as FlaxGPTJForCausalLMModule,
+        FlaxGPTJModel as FlaxGPTJModel,
+        FlaxGPTJModule as FlaxGPTJModule,
     )
 else:
     import sys
 
-    sys.modules[__name__] = _LazyModule(__name__, globals()["__file__"], _import_structure, module_spec=__spec__)
+    sys.modules[__name__] = _LazyModule(
+        __name__, globals()["__file__"], _import_structure, module_spec=__spec__
+    )

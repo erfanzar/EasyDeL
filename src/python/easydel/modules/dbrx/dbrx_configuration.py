@@ -1,4 +1,5 @@
 """Dbrx configuration."""
+
 import warnings
 from typing import Any, Optional
 
@@ -11,14 +12,13 @@ DBRX_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
 
 
 class DbrxAttentionConfig(EasyDeLPretrainedConfig):
-
     def __init__(
-            self,
-            attn_pdrop: float = 0,
-            clip_qkv: Optional[float] = 8,
-            kv_n_heads: int = 1,
-            rope_theta: float = 10000.0,
-            **kwargs: Any,
+        self,
+        attn_pdrop: float = 0,
+        clip_qkv: Optional[float] = 8,
+        kv_n_heads: int = 1,
+        rope_theta: float = 10000.0,
+        **kwargs: Any,
     ):
         super().__init__(**kwargs)
         self.attn_pdrop = attn_pdrop
@@ -34,21 +34,22 @@ class DbrxAttentionConfig(EasyDeLPretrainedConfig):
 
     @classmethod
     def from_pretrained(
-            cls,
-            pretrained_model_name_or_path: str,
-            **kwargs: Any
-    ) -> "PretrainedConfig":
+        cls, pretrained_model_name_or_path: str, **kwargs: Any
+    ) -> "PretrainedConfig":  # type: ignore[misc] # noqa: F821
         cls._set_token_in_kwargs(kwargs)
 
-        config_dict, kwargs = cls.get_config_dict(pretrained_model_name_or_path,
-                                                  **kwargs)
+        config_dict, kwargs = cls.get_config_dict(
+            pretrained_model_name_or_path, **kwargs
+        )
 
         if config_dict.get("model_type") == "dbrx":
             config_dict = config_dict["attn_config"]
 
-        if "model_type" in config_dict and hasattr(
-                cls,
-                "model_type") and config_dict["model_type"] != cls.model_type:
+        if (
+            "model_type" in config_dict
+            and hasattr(cls, "model_type")
+            and config_dict["model_type"] != cls.model_type
+        ):
             warnings.warn(
                 f"You are using a model of type {config_dict['model_type']} to instantiate a model of type "
                 f"{cls.model_type}. This is not supported for all configurations of models and can yield errors."
@@ -58,18 +59,17 @@ class DbrxAttentionConfig(EasyDeLPretrainedConfig):
 
 
 class DbrxFFNConfig(EasyDeLPretrainedConfig):
-
     def __init__(
-            self,
-            ffn_act_fn: Optional[dict] = None,
-            ffn_hidden_size: int = 3584,
-            moe_num_experts: int = 4,
-            moe_top_k: int = 1,
-            moe_jitter_eps: Optional[float] = None,
-            moe_loss_weight: float = 0.01,
-            moe_normalize_expert_weights: Optional[float] = 1,
-            uniform_expert_assignment: bool = False,
-            **kwargs: Any,
+        self,
+        ffn_act_fn: Optional[dict] = None,
+        ffn_hidden_size: int = 3584,
+        moe_num_experts: int = 4,
+        moe_top_k: int = 1,
+        moe_jitter_eps: Optional[float] = None,
+        moe_loss_weight: float = 0.01,
+        moe_normalize_expert_weights: Optional[float] = 1,
+        uniform_expert_assignment: bool = False,
+        **kwargs: Any,
     ):
         super().__init__()
         if ffn_act_fn is None:
@@ -91,22 +91,22 @@ class DbrxFFNConfig(EasyDeLPretrainedConfig):
 
     @classmethod
     def from_pretrained(
-            cls,
-            pretrained_model_name_or_path: str,
-            **kwargs: Any
+        cls, pretrained_model_name_or_path: str, **kwargs: Any
     ) -> "EasyDeLPretrainedConfig":
         cls._set_token_in_kwargs(kwargs)
 
-        config_dict, kwargs = cls.get_config_dict(pretrained_model_name_or_path,
-                                                  **kwargs)
+        config_dict, kwargs = cls.get_config_dict(
+            pretrained_model_name_or_path, **kwargs
+        )
 
         if config_dict.get("model_type") == "dbrx":
             config_dict = config_dict["ffn_config"]
 
-        if "model_type" in config_dict and hasattr(
-                cls,
-                "model_type"
-        ) and config_dict["model_type"] != cls.model_type:
+        if (
+            "model_type" in config_dict
+            and hasattr(cls, "model_type")
+            and config_dict["model_type"] != cls.model_type
+        ):
             warnings.warn(
                 f"You are using a model of type {config_dict['model_type']} to instantiate a model of type "
                 f"{cls.model_type}. This is not supported for all configurations of models and can yield errors."
@@ -121,25 +121,25 @@ class DbrxConfig(EasyDeLPretrainedConfig):
         "num_attention_heads": "n_heads",
         "hidden_size": "d_model",
         "num_hidden_layers": "n_layers",
-        "max_position_embeddings": "max_seq_len"
+        "max_position_embeddings": "max_seq_len",
     }
 
     def __init__(
-            self,
-            d_model: int = 2048,
-            n_heads: int = 16,
-            n_layers: int = 24,
-            max_seq_len: int = 2048,
-            vocab_size: int = 32000,
-            resid_pdrop: float = 0.0,
-            emb_pdrop: float = 0.0,
-            attn_config: Optional[DbrxAttentionConfig] = None,
-            ffn_config: Optional[DbrxFFNConfig] = None,
-            use_cache: bool = True,
-            initializer_range: float = 0.02,
-            output_router_logits: bool = False,
-            router_aux_loss_coef: float = 0.05,
-            **kwargs: Any,
+        self,
+        d_model: int = 2048,
+        n_heads: int = 16,
+        n_layers: int = 24,
+        max_seq_len: int = 2048,
+        vocab_size: int = 32000,
+        resid_pdrop: float = 0.0,
+        emb_pdrop: float = 0.0,
+        attn_config: Optional[DbrxAttentionConfig] = None,
+        ffn_config: Optional[DbrxFFNConfig] = None,
+        use_cache: bool = True,
+        initializer_range: float = 0.02,
+        output_router_logits: bool = False,
+        router_aux_loss_coef: float = 0.05,
+        **kwargs: Any,
     ):
         if attn_config is None:
             self.attn_config = DbrxAttentionConfig()

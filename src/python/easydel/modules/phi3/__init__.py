@@ -7,18 +7,20 @@ _import_structure = {
         "FlaxPhi3ForCausalLM",
         "FlaxPhi3ForCausalLMModule",
         "FlaxPhi3Model",
-        "FlaxPhi3Module"
-    ]
+        "FlaxPhi3Module",
+    ],
 }
 if TYPE_CHECKING:
-    from .phi3_configuration import Phi3Config
+    from .phi3_configuration import Phi3Config as Phi3Config
     from .modelling_phi3_flax import (
-        FlaxPhi3ForCausalLM,
-        FlaxPhi3ForCausalLMModule,
-        FlaxPhi3Model,
-        FlaxPhi3Module
+        FlaxPhi3ForCausalLM as FlaxPhi3ForCausalLM,
+        FlaxPhi3ForCausalLMModule as FlaxPhi3ForCausalLMModule,
+        FlaxPhi3Model as FlaxPhi3Model,
+        FlaxPhi3Module as FlaxPhi3Module,
     )
 else:
     import sys
 
-    sys.modules[__name__] = _LazyModule(__name__, globals()["__file__"], _import_structure, module_spec=__spec__)
+    sys.modules[__name__] = _LazyModule(
+        __name__, globals()["__file__"], _import_structure, module_spec=__spec__
+    )

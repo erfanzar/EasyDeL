@@ -1,24 +1,26 @@
 import functools
 import math
+from functools import partial
+from typing import List, Literal, Optional, Sequence
 
+import chex
 import fjformer
+import jax
 from einops import rearrange
-from fjformer.bits import config as q_config, q_flax
+from fjformer.bits import config as q_config
+from fjformer.bits import q_flax
+from flax import linen as nn
 from flax.linen import combine_masks
-from jax import lax, numpy as jnp
+from jax import lax
+from jax import numpy as jnp
+from jax.experimental.mesh_utils import create_device_mesh
 from jax.experimental.shard_map import shard_map
 from jax.interpreters import pxla
-import jax
-from flax import linen as nn
-from ..etils.partition_module import PartitionAxis
-from functools import partial
-import chex
-from typing import Sequence, Optional, Literal, List
-from jax.experimental.mesh_utils import create_device_mesh
-from .easydel_modelling_utils import EasyMethod
 from jax.sharding import PartitionSpec
 
 from ..etils.errors import EasyDeLBlockWiseFFNError
+from ..etils.partition_module import PartitionAxis
+from .easydel_modelling_utils import EasyMethod
 
 ACT2FN = {
     "gelu": partial(nn.gelu, approximate=False),
@@ -32,12 +34,12 @@ ACT2FN = {
     "leaky_relu": partial(nn.leaky_relu, negative_slope=0.01),
     "glu": nn.glu,
     "elu": nn.elu,
-    "softmax": nn.softmax
+    "softmax": nn.softmax,
 }
 
 
 def canonicalize_dtype(
-        *args, dtype: Optional[chex.ArrayDType] = None, inexact: bool = True
+    *args, dtype: Optional[chex.ArrayDType] = None, inexact: bool = True
 ) -> chex.ArrayDType:
     """Canonicalize an optional dtype to the definitive dtype.
 
@@ -64,7 +66,7 @@ def canonicalize_dtype(
         if inexact and not jax.numpy.issubdtype(dtype, jax.numpy.inexact):
             dtype = jax.numpy.promote_types(jax.numpy.float32, dtype)
     if inexact and not jax.numpy.issubdtype(dtype, jax.numpy.inexact):
-        raise ValueError(f'Dtype must be inexact: {dtype}')
+        raise ValueError(f"Dtype must be inexact: {dtype}")
     return dtype
 
 
@@ -134,7 +136,7 @@ def get_gradient_checkpoint_policy(name):
         save_anything_except_these_names=jax.checkpoint_policies.save_anything_except_these_names,
         save_any_names_but_these=jax.checkpoint_policies.save_any_names_but_these,
         save_only_these_names=jax.checkpoint_policies.save_only_these_names,
-        save_from_both_policies=jax.checkpoint_policies.save_from_both_policies
+        save_from_both_policies=jax.checkpoint_policies.save_from_both_policies,
     )
     return gradients[name]
 
@@ -187,25 +189,37 @@ def repeat_kv_bsnh(x: chex.Array, n_rep: int) -> chex.Array:
 
 
 def precompute_freq_cis(
-        dim,
-        max_position_embeddings=2048,
-        base=10000,
-        scaling_factor=1.0,
-        rope_type: Optional[Literal["none", "linear", "dynamic", "yarn", "su",]] = None,
-        t_dtype: jnp.dtype = jnp.int32,
-        original_max_position_embeddings: Optional[int] = None,
-        long_factor: Optional[List[float]] = None,
-        short_factor: Optional[List[float]] = None
+    dim,
+    max_position_embeddings=2048,
+    base=10000,
+    scaling_factor=1.0,
+    rope_type: Optional[
+        Literal[
+            "none",
+            "linear",
+            "dynamic",
+            "yarn",
+            "su",
+        ]
+    ] = None,
+    t_dtype: jnp.dtype = jnp.int32,
+    original_max_position_embeddings: Optional[int] = None,
+    long_factor: Optional[List[float]] = None,
+    short_factor: Optional[List[float]] = None,
 ):
     def _calc_yarn_scaling_factor(scale):
         if scale <= 1.0:
             return 1.0
-        return math.sqrt(1 + math.log(scale) / math.log(original_max_position_embeddings))
+        return math.sqrt(
+            1 + math.log(scale) / math.log(original_max_position_embeddings)
+        )
 
     def _calc_su_scaling_factor(scale):
         if scale <= 1.0:
             return 1.0
-        return math.sqrt(1 + math.log(scale) / math.log(original_max_position_embeddings))
+        return math.sqrt(
+            1 + math.log(scale) / math.log(original_max_position_embeddings)
+        )
 
     if t_dtype == jnp.int64:
         jax.config.update("jax_enable_x64", True)
@@ -213,7 +227,7 @@ def precompute_freq_cis(
     if rope_type is None or rope_type == "none":
         t = jax.numpy.arange(max_position_embeddings, dtype=t_dtype)
         inv_freq = 1.0 / (
-                base ** (jax.numpy.arange(0, dim, 2, dtype=jax.numpy.float32) / dim)
+            base ** (jax.numpy.arange(0, dim, 2, dtype=jax.numpy.float32) / dim)
         )
         freq = jax.numpy.einsum("i , j -> i j", t, inv_freq).astype("float32")
         embed = jax.numpy.concatenate((freq, freq), axis=-1)
@@ -222,40 +236,44 @@ def precompute_freq_cis(
         t = jax.numpy.arange(max_position_embeddings, dtype=t_dtype)
         t = t / scaling_factor
         inv_freq = 1.0 / (
-                base ** (jax.numpy.arange(0, dim, 2, dtype=jax.numpy.float32) / dim)
+            base ** (jax.numpy.arange(0, dim, 2, dtype=jax.numpy.float32) / dim)
         )
-        freq = jax.numpy.einsum(
-            "i , j -> i j", t, inv_freq
-        ).astype("float32")
+        freq = jax.numpy.einsum("i , j -> i j", t, inv_freq).astype("float32")
 
         embed = jax.numpy.concatenate((freq, freq), axis=-1)
         return jax.numpy.sin(embed)[:, :], jax.numpy.cos(embed)[:, :]
     elif rope_type == "dynamic":
         t = jax.numpy.arange(max_position_embeddings, dtype=t_dtype)
-        base = base * (
-                scaling_factor - (scaling_factor - 1)
-        ) ** (dim / (dim - 2))
+        base = base * (scaling_factor - (scaling_factor - 1)) ** (dim / (dim - 2))
         inv_freq = 1.0 / (
-                base ** (jax.numpy.arange(0, dim, 2, dtype=jax.numpy.float32) / dim)
+            base ** (jax.numpy.arange(0, dim, 2, dtype=jax.numpy.float32) / dim)
         )
-        freq = jax.numpy.einsum(
-            "i , j -> i j", t, inv_freq
-        ).astype("float32")
+        freq = jax.numpy.einsum("i , j -> i j", t, inv_freq).astype("float32")
 
         embed = jax.numpy.concatenate((freq, freq), axis=-1)
         return jax.numpy.sin(embed)[:, :], jax.numpy.cos(embed)[:, :]
     elif rope_type == "su":
-        assert original_max_position_embeddings is not None, "No original max position embeddings is provided"
+        assert (
+            original_max_position_embeddings is not None
+        ), "No original max position embeddings is provided"
         if max_position_embeddings > original_max_position_embeddings:
             ext_factors = jnp.array(long_factor, dtype=jnp.float32)
         else:
             ext_factors = jnp.array(short_factor, dtype=jnp.float32)
 
-        inv_freq = 1.0 / (ext_factors * base ** (jnp.arange(0, dim, 2, dtype=t_dtype).astype(jnp.float32) / dim))[None,
-                         :, None]
-        position_ids = jnp.arange(
-            0, max_position_embeddings, dtype="i4"
-        ).reshape(1, -1)[:, None, :].astype("float32")
+        inv_freq = (
+            1.0
+            / (
+                ext_factors
+                * base
+                ** (jnp.arange(0, dim, 2, dtype=t_dtype).astype(jnp.float32) / dim)
+            )[None, :, None]
+        )
+        position_ids = (
+            jnp.arange(0, max_position_embeddings, dtype="i4")
+            .reshape(1, -1)[:, None, :]
+            .astype("float32")
+        )
         freqs = (inv_freq @ position_ids).transpose(0, 2, 1)
         scaling_factor = _calc_su_scaling_factor(
             max_position_embeddings / original_max_position_embeddings
@@ -265,19 +283,27 @@ def precompute_freq_cis(
         sin = jnp.sin(emb) * scaling_factor
         return sin[0], cos[0]
     elif rope_type == "yarn":
-        assert original_max_position_embeddings is not None, "No original max position embeddings is provided"
+        assert (
+            original_max_position_embeddings is not None
+        ), "No original max position embeddings is provided"
         if max_position_embeddings > original_max_position_embeddings:
             ext_factors = jnp.array(long_factor, dtype=jnp.float32)
         else:
             ext_factors = jnp.array(short_factor, dtype=jnp.float32)
 
-        inv_freq = 1.0 / (
-                                 ext_factors
-                                 * base ** (jnp.arange(0, dim, 2, dtype=t_dtype).astype(jnp.float32) / dim)
-                         )[None, :, None]
-        position_ids = jnp.arange(
-            0, max_position_embeddings, dtype="i4"
-        ).reshape(1, -1)[:, None, :].astype("float32")
+        inv_freq = (
+            1.0
+            / (
+                ext_factors
+                * base
+                ** (jnp.arange(0, dim, 2, dtype=t_dtype).astype(jnp.float32) / dim)
+            )[None, :, None]
+        )
+        position_ids = (
+            jnp.arange(0, max_position_embeddings, dtype="i4")
+            .reshape(1, -1)[:, None, :]
+            .astype("float32")
+        )
         freqs = (inv_freq @ position_ids).transpose(0, 2, 1)
         scaling_factor = _calc_yarn_scaling_factor(
             max_position_embeddings / original_max_position_embeddings
@@ -302,7 +328,7 @@ def rotate_half(x):
         A new array that is the same as the input
     """
     x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2:]
+    x2 = x[..., x.shape[-1] // 2 :]
     return jax.numpy.concatenate((-x2, x1), axis=-1)
 
 
@@ -339,18 +365,18 @@ def get_ranks_and_size(mesh):
     total_process_size = mesh.shape["tp"] * mesh.shape["sp"]
     mp_node_size = max(1, total_process_size // jax.local_device_count())
     dp_node_size = jax.process_count() // mp_node_size
-    out.update(mp_node_size=mp_node_size,
-               dp_node_size=dp_node_size)
+    out.update(mp_node_size=mp_node_size, dp_node_size=dp_node_size)
 
     dp_node_rank = jax.process_index() // mp_node_size
     mp_node_rank = jax.process_index() % mp_node_size
-    out.update(dp_node_rank=dp_node_rank,
-               mp_node_rank=mp_node_rank)
+    out.update(dp_node_rank=dp_node_rank, mp_node_rank=mp_node_rank)
     return out
 
 
 def create_mesh(
-        axis_dims: Sequence[int] = (1, -1, 1, 1), axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"), backend=""
+    axis_dims: Sequence[int] = (1, -1, 1, 1),
+    axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+    backend="",
 ):
     """The create_mesh function creates a mesh object that can be used to shard arrays.
 
@@ -363,12 +389,11 @@ def create_mesh(
         A mesh object
     """
     array_devices = jax.numpy.ones(
-        (len(jax.devices() if backend == "" else jax.devices(backend)), 1))
+        (len(jax.devices() if backend == "" else jax.devices(backend)), 1)
+    )
     resh = array_devices.reshape(axis_dims).shape
 
-    return jax.sharding.Mesh(
-        create_device_mesh(resh), axis_names
-    )
+    return jax.sharding.Mesh(create_device_mesh(resh), axis_names)
 
 
 def add_start_docstrings(*docstr):
@@ -385,16 +410,15 @@ def add_start_docstrings(*docstr):
     """
 
     def docstring_decorator(fn):
-        fn.__doc__ = "".join(docstr) + \
-                     (fn.__doc__ if fn.__doc__ is not None else "")
+        fn.__doc__ = "".join(docstr) + (fn.__doc__ if fn.__doc__ is not None else "")
         return fn
 
     return docstring_decorator
 
 
 def get_dot_general_by_bits(
-        bits: Optional[int] = None,
-        mode: Literal["train", "serve", "convert"] = EasyMethod.TRAIN
+    bits: Optional[int] = None,
+    mode: Literal["train", "serve", "convert"] = EasyMethod.TRAIN,
 ) -> dict:
     """The get_general_dot function is a helper function that returns a q_flax.QDotGeneral object
     with the specified number of bits for forward and backward passes. If no bits are specified,
@@ -420,18 +444,15 @@ def get_dot_general_by_bits(
         return {
             "dot_general_cls": functools.partial(
                 q_flax.QDotGeneral,
-                q_config.fully_quantized(
-                    fwd_bits=bits,
-                    bwd_bits=bits
-                ),
-                rhs_quant_mode=rhs_quant_mode
+                q_config.fully_quantized(fwd_bits=bits, bwd_bits=bits),
+                rhs_quant_mode=rhs_quant_mode,
             )
         }
     return {}  # empty just in case of not getting any error
 
 
 class BaseJAXAttentionModule(nn.Module):
-    config: "EasyDeLPretrainedConfig"  # type: ignore
+    config: "EasyDeLPretrainedConfig"  # type: ignore  # noqa
 
     @nn.compact
     def _concatenate_to_cache(self, key, value, query_states, attention_mask):
@@ -452,9 +473,9 @@ class BaseJAXAttentionModule(nn.Module):
         Returns:
             The key, value and attention_mask
         """
-        quantize_kv_cache = self.config.quantize_kv_cache
+        do_quantize_kv_cache = self.config.quantize_kv_cache
         is_initialized = self.has_variable("cache", "cached_key")
-        if quantize_kv_cache:
+        if do_quantize_kv_cache:
             cached_key = self.variable(
                 "cache", "cached_key", jnp.zeros, key.shape, jnp.uint8
             )
@@ -462,16 +483,32 @@ class BaseJAXAttentionModule(nn.Module):
                 "cache", "cached_value", jnp.zeros, value.shape, jnp.uint8
             )
             cached_key_scale = self.variable(
-                "cache", "cached_key_scale", jnp.zeros, key.shape[0:-1] + (1,), key.dtype
+                "cache",
+                "cached_key_scale",
+                jnp.zeros,
+                key.shape[0:-1] + (1,),
+                key.dtype,
             )
             cached_value_scale = self.variable(
-                "cache", "cached_value_scale", jnp.zeros, value.shape[0:-1] + (1,), value.dtype
+                "cache",
+                "cached_value_scale",
+                jnp.zeros,
+                value.shape[0:-1] + (1,),
+                value.dtype,
             )
             cached_key_minval = self.variable(
-                "cache", "cached_key_minval", jnp.zeros, key.shape[0:-1] + (1,), key.dtype
+                "cache",
+                "cached_key_minval",
+                jnp.zeros,
+                key.shape[0:-1] + (1,),
+                key.dtype,
             )
             cached_value_minval = self.variable(
-                "cache", "cached_value_minval", jnp.zeros, value.shape[0:-1] + (1,), value.dtype
+                "cache",
+                "cached_value_minval",
+                jnp.zeros,
+                value.shape[0:-1] + (1,),
+                value.dtype,
             )
             cache_index = self.variable(
                 "cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32)
@@ -481,9 +518,15 @@ class BaseJAXAttentionModule(nn.Module):
             cached_value_scale = None
             cached_value_minval = None
             cached_key_minval = None
-            cached_key = self.variable("cache", "cached_key", jnp.zeros, key.shape, key.dtype)
-            cached_value = self.variable("cache", "cached_value", jnp.zeros, value.shape, value.dtype)
-            cache_index = self.variable("cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32))
+            cached_key = self.variable(
+                "cache", "cached_key", jnp.zeros, key.shape, key.dtype
+            )
+            cached_value = self.variable(
+                "cache", "cached_value", jnp.zeros, value.shape, value.dtype
+            )
+            cache_index = self.variable(
+                "cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32)
+            )
         paxs: PartitionAxis = self.config.partition_axis
         if is_initialized:
             *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
@@ -491,14 +534,11 @@ class BaseJAXAttentionModule(nn.Module):
             if query_states.shape[1] == 1 and self.config.use_sharded_kv_caching:
                 mesh = self.config.get_mesh()
 
-                def fn(
-                        _cached_key,
-                        _cached_value,
-                        _key,
-                        _value,
-                        _cur_index
-                ):
-                    assert _key.shape[1] == 1 and _value.shape[1] == 1, (_key.shape, _value.shape)
+                def fn(_cached_key, _cached_value, _key, _value, _cur_index):
+                    assert _key.shape[1] == 1 and _value.shape[1] == 1, (
+                        _key.shape,
+                        _value.shape,
+                    )
                     sp_size = max_length // mesh.shape["sp"]
                     axis_index = jax.lax.axis_index("sp")
                     _cur_index = _cur_index - axis_index * sp_size
@@ -513,66 +553,70 @@ class BaseJAXAttentionModule(nn.Module):
                     return _key, _value
 
                 fn = shard_map(
-                    fn, mesh=mesh,
+                    fn,
+                    mesh=mesh,
                     in_specs=(
                         PartitionSpec(
                             paxs.batch_axis,
                             paxs.key_sequence_axis,
                             paxs.head_axis,
-                            paxs.attention_dim_axis
+                            paxs.attention_dim_axis,
                         ),
                         PartitionSpec(
                             paxs.batch_axis,
                             paxs.key_sequence_axis,
                             paxs.head_axis,
-                            paxs.attention_dim_axis
-                        ),
-
-                        PartitionSpec(
-                            paxs.batch_axis,
-                            None,
-                            paxs.head_axis,
-                            paxs.attention_dim_axis
+                            paxs.attention_dim_axis,
                         ),
                         PartitionSpec(
                             paxs.batch_axis,
                             None,
                             paxs.head_axis,
-                            paxs.attention_dim_axis
+                            paxs.attention_dim_axis,
                         ),
-                        PartitionSpec()
+                        PartitionSpec(
+                            paxs.batch_axis,
+                            None,
+                            paxs.head_axis,
+                            paxs.attention_dim_axis,
+                        ),
+                        PartitionSpec(),
                     ),
                     out_specs=(
                         PartitionSpec(
                             paxs.batch_axis,
                             paxs.key_sequence_axis,
                             paxs.head_axis,
-                            paxs.attention_dim_axis
+                            paxs.attention_dim_axis,
                         ),
                         PartitionSpec(
                             paxs.batch_axis,
                             paxs.key_sequence_axis,
                             paxs.head_axis,
-                            paxs.attention_dim_axis
-                        )
+                            paxs.attention_dim_axis,
+                        ),
                     ),
-                    check_rep=False
+                    check_rep=False,
                 )
-                key, value = fn(cached_key.value, cached_value.value, key, value, cur_index)
+                key, value = fn(
+                    cached_key.value, cached_value.value, key, value, cur_index
+                )
             else:
-                *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
+                *batch_dims, max_length, num_heads, depth_per_head = (
+                    cached_key.value.shape
+                )
                 cur_index = cache_index.value
                 indices = (0,) * len(batch_dims) + (cur_index, 0, 0)  # type:ignore
-                if quantize_kv_cache:
-                    key_val = fjformer.linen.linen.dequantize(
+                if do_quantize_kv_cache:
+                    key_val = dequantize_kv_cache(
                         cached_key.value,
                         cached_key_scale.value,
                         cached_key_minval.value,
                         key.dtype,
                     )
-                    value_val = fjformer.linen.linen.dequantize(
+                    value_val = dequantize_kv_cache(
                         cached_value.value,
-                        cached_value_scale.value,  # TODO: FIX THIS ...
+                        cached_value_scale.value,
                         cached_key_minval.value,
                         value.dtype,
                     )
@@ -588,9 +632,9 @@ class BaseJAXAttentionModule(nn.Module):
                     tuple(batch_dims) + (1, num_updated_cache_vectors, max_length),
                 )
                 attention_mask = combine_masks(pad_mask, attention_mask)
-            if quantize_kv_cache:
-                kq, ks, km = fjformer.linen.linen.quantize(key)
-                vq, vs, vm = fjformer.linen.linen.quantize(value)
+            if do_quantize_kv_cache:
+                kq, ks, km = quantize_kv_cache(key)
+                vq, vs, vm = quantize_kv_cache(value)
 
                 cached_key.value = kq
                 cached_key_scale.value = ks.astype(self.dtype)
@@ -614,7 +658,7 @@ def block_wise_ffn(remat_ffn, inputs, chunk_size: int, deterministic: bool):
         if generating:
             return remat_ffn(inputs, deterministic)
         else:
-            inputs = rearrange(inputs, 'b (c n) d -> b c n d', c=chunk_size)
+            inputs = rearrange(inputs, "b (c n) d -> b c n d", c=chunk_size)
 
             def scan_ffn(remat_ffn_, carry, hidden_states):
                 outputs = remat_ffn_(hidden_states, deterministic)
@@ -628,7 +672,7 @@ def block_wise_ffn(remat_ffn, inputs, chunk_size: int, deterministic: bool):
                 in_axes=scan_axis,
                 out_axes=scan_axis,
             )(remat_ffn, None, inputs)
-            output = rearrange(output, 'b c n d -> b (c n) d')
+            output = rearrange(output, "b c n d -> b (c n) d")
             return output
     except Exception as e:
         raise EasyDeLBlockWiseFFNError(
@@ -639,20 +683,14 @@ def block_wise_ffn(remat_ffn, inputs, chunk_size: int, deterministic: bool):
         )
 
 
-def read_depth(
-        params: dict,
-        path: str | None = None,
-        state: dict | None = None
-):
+def read_depth(params: dict, path: str | None = None, state: dict | None = None):
     if state is None:
         state = {}
     for key, value in params.items():
         if isinstance(value, dict):
             accureated_path = path + "/" + key if path is not None else key
             state = read_depth(
-                params[key],
-                path=key if path is None else accureated_path,
-                state=state
+                params[key], path=key if path is None else accureated_path, state=state
             )
         else:
             value_string = type(value).__name__ + f"(shape={value.shape})"
@@ -695,9 +733,100 @@ def control_mlp_sharding(x: jax.Array, partition_axis: PartitionAxis):
         partition_spec = PartitionSpec(
             partition_axis.batch_axis,
             None if is_gen else partition_axis.sequence_axis,
-            partition_axis.hidden_state_axis if (
+            (
+                partition_axis.hidden_state_axis
+                if (
                     mesh.shape[partition_axis.hidden_state_axis] / hidden_size
-            ).is_integer() else None
+                ).is_integer()
+                else None
+            ),
         )
         x = with_sharding_constraint(x, partition_spec)
     return x
+
+
+@partial(jax.jit, static_argnames=["reformat"])
+def quantize_kv_cache(fdata, reformat: bool = True):
+    """Quantizes the given tensor using scalar quantization.
+
+    Args:
+        fdata: The input JAX array to quantize.
+
+    Returns:
+        A tuple containing:
+            - The quantized JAX array.
+            - The scale factor used for quantization.
+            - The zero-point offset used for quantization.
+    """
+    if reformat:
+        fdata = fdata.transpose(0, 2, 1, 3)
+    qmin = jnp.array(jnp.iinfo(jnp.uint8).min, dtype=jnp.float16)
+    qmax = jnp.array(jnp.iinfo(jnp.uint8).max, dtype=jnp.float16)
+    shape = fdata.shape
+
+    fdata_cal = jnp.reshape(fdata, fdata.shape[:2] + (-1,))
+    fmax = jnp.max(fdata_cal, axis=-1, keepdims=True)
+    fmin = jnp.min(fdata_cal, axis=-1, keepdims=True)
+
+    # Ensure qmax and qmin are on the same device as fdata
+    qmax = jax.tree_map(lambda x: jnp.array(x, dtype=fdata.dtype), qmax)
+    qmin = jax.tree_map(lambda x: jnp.array(x, dtype=fdata.dtype), qmin)
+
+    scale = (fmax - fmin) / (qmax - qmin)
+
+    zero = qmin - fmin / scale
+
+    # Expand dimensions of scale and zero to match fdata
+    scale = jnp.expand_dims(scale, axis=-1).repeat(shape[2], axis=-2)
+    zero = jnp.expand_dims(zero, axis=-1).repeat(shape[2], axis=-2)
+    # Quantize
+    res_data = fdata / scale + zero
+    qdata = jnp.clip(res_data, qmin, qmax).astype(jnp.uint8)
+    if reformat:
+        qdata, scale, zero = map(
+            lambda x: x.transpose(0, 2, 1, 3), [qdata, scale, zero]
+        )
+        # print(f"{qdata.shape=}, {scale.shape=}, {zero.shape=}")
+    return qdata, scale, zero
+
+
+@partial(jax.jit, static_argnames=["float_dtype", "reformat"])
+def dequantize_kv_cache(
+    array_quant: jax.Array,
+    scale: jax.Array,
+    zero: jax.Array,
+    float_dtype: jnp.dtype = jnp.float16,
+    reformat: bool = True,
+):
+    """
+    The function `dequantize` takes a quantized array, scale, minimum values, and float data
+    type, and returns the dequantized array.
+
+    Args:
+      array_quant (Array): The `array_quant` parameter is an array containing quantized
+    values that need to be dequantized.
+      scale (Array): The `scale` parameter is an array that contains the scaling factors
+    used for dequantization. It is used to scale the quantized values back to their original
+    range during the dequantization process.
+      zero (Array): The `zero` parameter in the `dequantize` function represents the
+    minimum values used during quantization. These values are added back during
+    dequantization to recover the original range of the data.
+      float_dtype (jnp.dtype): The `float_dtype` parameter in the `dequantize` function is
+    the data type to which the dequantized array will be converted before returning. In this
+    case, the default data type is `jnp.float16`, which is a 16-bit floating-point data type
+    in JAX.
+
+    Returns:
+      The `dequantize` function is returning the dequantized array. The dequantization
+    process involves multiplying the quantized array (`array_quant`) by the scale factor,
+    adding the minimum values, and then converting the result to the specified
+    floating-point data type (`float_dtype`).
+    """
+    if reformat:
+        array_quant, scale, zero = map(
+            lambda x: x.transpose(0, 2, 1, 3), [array_quant, scale, zero]
+        )
+    uq = lax.convert_element_type(scale * (array_quant - zero), float_dtype)
+    if reformat:
+        uq = uq.transpose(0, 2, 1, 3)
+    return uq

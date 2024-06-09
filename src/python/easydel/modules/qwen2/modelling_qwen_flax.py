@@ -1,36 +1,41 @@
 import math
-from functools import partial
 from typing import Optional, Tuple, Union
 
+import chex
 import fjformer
 import flax.linen
 import jax
 import jax.numpy as jnp
-from jax import lax
-from jax.experimental.shard_map import shard_map
-from jax.sharding import PartitionSpec
 from fjformer import linen as nn
-from flax.traverse_util import flatten_dict, unflatten_dict
-from flax.linen import partitioning as nn_partitioning
+from fjformer.linen import Dense
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks, make_causal_mask
-from fjformer.linen import Dense
-from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput, FlaxSequenceClassifierOutput
-# easydel.modules
-from ..flax_modelling_utils import (
-    with_sharding_constraint,
-    get_gradient_checkpoint_policy,
-    repeat_kv_bnsh,
-    apply_rotary_pos_emb,
-    precompute_freq_cis,
-    get_dot_general_by_bits, BaseJAXAttentionModule, block_wise_ffn, control_mlp_sharding
+from flax.linen import partitioning as nn_partitioning
+from flax.traverse_util import flatten_dict, unflatten_dict
+from jax import lax
+from jax.sharding import PartitionSpec
+from transformers.modeling_flax_outputs import (
+    FlaxBaseModelOutput,
+    FlaxCausalLMOutput,
+    FlaxSequenceClassifierOutput,
 )
 
-from ..common import RMSNorm as RMSNorm
 from ..attention_module import AttentionModule
-
+from ..common import RMSNorm as RMSNorm
 from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
-import chex
+
+# easydel.modules
+from ..flax_modelling_utils import (
+    BaseJAXAttentionModule,
+    apply_rotary_pos_emb,
+    block_wise_ffn,
+    control_mlp_sharding,
+    get_dot_general_by_bits,
+    get_gradient_checkpoint_policy,
+    precompute_freq_cis,
+    repeat_kv_bnsh,
+    with_sharding_constraint,
+)
 from .qwen_configuration import Qwen2Config
 
 
@@ -63,31 +68,27 @@ class FlaxQwen2MLP(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(
-                self.config.initializer_range
-            ),
+            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.down_proj = Dense(
             config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(
-                self.config.initializer_range),
+            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.up_proj = Dense(
             config.intermediate_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(
-                self.config.initializer_range),
+            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.dropout = flax.linen.Dropout(rate=self.config.resid_pdrop)
 
@@ -122,7 +123,9 @@ class FlaxQwen2Attention(BaseJAXAttentionModule):
         config = self.config
         self.hidden_size = config.hidden_size
         self.head_dim = self.config.hidden_size // self.config.num_attention_heads
-        self.num_key_value_groups = self.config.num_attention_heads // self.config.num_key_value_heads
+        self.num_key_value_groups = (
+            self.config.num_attention_heads // self.config.num_key_value_heads
+        )
 
         if self.num_key_value_groups == 1:
             assert self.config.num_attention_heads == self.config.num_key_value_heads
@@ -131,44 +134,36 @@ class FlaxQwen2Attention(BaseJAXAttentionModule):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=True,
-            kernel_init=jax.nn.initializers.normal(
-                self.config.initializer_range
-            ),
+            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.k_proj = Dense(
             config.num_key_value_heads * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=True,
-            kernel_init=jax.nn.initializers.normal(
-                self.config.initializer_range
-            ),
+            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.v_proj = Dense(
             config.num_key_value_heads * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=True,
-            kernel_init=jax.nn.initializers.normal(
-                self.config.initializer_range
-            ),
+            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.o_proj = Dense(
             config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(
-                self.config.initializer_range
-            ),
+            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
 
         self.rotary = FlaxQwen2Embedding(self.dtype)
@@ -188,7 +183,6 @@ class FlaxQwen2Attention(BaseJAXAttentionModule):
             num_attention_heads=self.config.num_attention_heads,
             attention_dropout=self.config.attention_dropout,
             head_dims=self.head_dim,
-            
             shard_attention_computation=self.config.shard_attention_computation,
             precision=self.precision,
             force_float32_tpu=True,
@@ -199,7 +193,7 @@ class FlaxQwen2Attention(BaseJAXAttentionModule):
             mesh=self.config.get_mesh(),
             sm_scale=1 / math.sqrt(self.head_dim),
             axis_name=self.config.attention_axis_name,
-            backward_pass_impl=self.config.flash_attention_backward_pass_impl
+            backward_pass_impl=self.config.flash_attention_backward_pass_impl,
         )
         self.resid_dropout = flax.linen.Dropout(rate=config.resid_pdrop)
 
@@ -218,9 +212,15 @@ class FlaxQwen2Attention(BaseJAXAttentionModule):
         Returns:
             The transpose of the query, key and value matrices
         """
-        return jnp.transpose(query, (0, 2, 1, 3)), jnp.transpose(key, (0, 2, 1, 3)), jnp.transpose(value, (0, 2, 1, 3))
+        return (
+            jnp.transpose(query, (0, 2, 1, 3)),
+            jnp.transpose(key, (0, 2, 1, 3)),
+            jnp.transpose(value, (0, 2, 1, 3)),
+        )
 
-    def apply_rotary(self, batch_size, sequence_length, query, key, value, freq_cis, position_ids):
+    def apply_rotary(
+        self, batch_size, sequence_length, query, key, value, freq_cis, position_ids
+    ):
         """The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
         The main difference is that it takes in an additional argument, freq_cis, which are used to calculate
         the rotary attention weights. The other differences are minor and mostly related to reshaping tensors.
@@ -240,9 +240,15 @@ class FlaxQwen2Attention(BaseJAXAttentionModule):
         Returns:
             A tuple of 3 tensors: query, key and value
         """
-        query = query.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
-        key = key.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
-        value = value.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
+        query = query.reshape(
+            batch_size, sequence_length, self.config.num_attention_heads, self.head_dim
+        )
+        key = key.reshape(
+            batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim
+        )
+        value = value.reshape(
+            batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim
+        )
 
         query, key, value = self._transpose_sequence_head(query, key, value)
         query, key = self.rotary(
@@ -253,17 +259,17 @@ class FlaxQwen2Attention(BaseJAXAttentionModule):
         return self._transpose_sequence_head(query, key, value)
 
     def __call__(
-            self,
-            hidden_states: chex.Array,
-            freq_cis: Tuple[chex.Array, chex.Array],
-            attention_mask: chex.Array,
-            position_ids: chex.Array,
-            causal_mask: chex.Array,
-            segment_ids: Optional[chex.Array] = None,
-            deterministic: bool = True,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            fcm_mask=None,
+        self,
+        hidden_states: chex.Array,
+        freq_cis: Tuple[chex.Array, chex.Array],
+        attention_mask: chex.Array,
+        position_ids: chex.Array,
+        causal_mask: chex.Array,
+        segment_ids: Optional[chex.Array] = None,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        fcm_mask=None,
     ):
         """The __call__ function is the main function of a JAX module. It defines how the module behaves when called
         with inputs. The __call__ function can be thought of as a &quot;forward pass&quot; through the model,
@@ -293,12 +299,21 @@ class FlaxQwen2Attention(BaseJAXAttentionModule):
             A tuple of two arrays
         """
         batch_size, sequence_length = hidden_states.shape[:2]
-        query_states, key_states, value_states = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(
-            hidden_states)
+        query_states, key_states, value_states = (
+            self.q_proj(hidden_states),
+            self.k_proj(hidden_states),
+            self.v_proj(hidden_states),
+        )
 
-        query_states = query_states.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
-        key_states = key_states.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
-        value_states = value_states.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
+        query_states = query_states.reshape(
+            batch_size, sequence_length, self.config.num_attention_heads, self.head_dim
+        )
+        key_states = key_states.reshape(
+            batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim
+        )
+        value_states = value_states.reshape(
+            batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim
+        )
 
         query_states, key_states, value_states = self.apply_rotary(
             query=query_states,
@@ -307,7 +322,7 @@ class FlaxQwen2Attention(BaseJAXAttentionModule):
             position_ids=position_ids,
             freq_cis=freq_cis,
             batch_size=batch_size,
-            sequence_length=sequence_length
+            sequence_length=sequence_length,
         )
 
         assert_msg = (
@@ -326,17 +341,20 @@ class FlaxQwen2Attention(BaseJAXAttentionModule):
             mask_shift = self.variables["cache"]["cache_index"]
             max_decoder_length = self.variables["cache"]["cached_key"].shape[1]
             causal_mask = lax.dynamic_slice(
-                causal_mask, (0, 0, mask_shift, 0), (1, 1,
-                                                     query_length, max_decoder_length)
+                causal_mask,
+                (0, 0, mask_shift, 0),
+                (1, 1, query_length, max_decoder_length),
             )
         else:
             causal_mask = causal_mask[:, :, :query_length, :key_length]
 
         batch_size = hidden_states.shape[0]
         causal_mask = jnp.broadcast_to(
-            causal_mask, (batch_size,) + causal_mask.shape[1:])
-        attention_mask = jnp.broadcast_to(jnp.expand_dims(
-            attention_mask, axis=(-3, -2)), causal_mask.shape)
+            causal_mask, (batch_size,) + causal_mask.shape[1:]
+        )
+        attention_mask = jnp.broadcast_to(
+            jnp.expand_dims(attention_mask, axis=(-3, -2)), causal_mask.shape
+        )
         attention_mask = combine_masks(attention_mask, causal_mask, fcm_mask)
         if attention_mask.ndim == 2:
             attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
@@ -348,10 +366,7 @@ class FlaxQwen2Attention(BaseJAXAttentionModule):
 
         if self.has_variable("cache", "cached_key") or init_cache:
             key_states, value_states, attention_mask = self._concatenate_to_cache(
-                key_states,
-                value_states,
-                query_states,
-                attention_mask
+                key_states, value_states, query_states, attention_mask
             )
         # if self.config.use_sharding_constraint:
         #     query_states = with_sharding_constraint(
@@ -367,8 +382,9 @@ class FlaxQwen2Attention(BaseJAXAttentionModule):
         attention_bias = lax.select(
             attention_mask > 0,
             jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-            jnp.full(attention_mask.shape, jnp.finfo(
-                self.dtype).min).astype(self.dtype),
+            jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(
+                self.dtype
+            ),
         )
         query_length, key_length = query_states.shape[1], key_states.shape[1]
 
@@ -385,27 +401,24 @@ class FlaxQwen2Attention(BaseJAXAttentionModule):
             key_value_sequence_length=key_length,
             uses_cache=self.has_variable("cache", "cached_key") or init_cache,
             segment_ids=segment_ids,
-            causal_mask=causal_mask
+            causal_mask=causal_mask,
         )
-
 
         attn_output = self._merge_heads(attentions.attention_outputs)
         if self.config.shard_attention_computation:
             attn_output = with_sharding_constraint(
-                attn_output, PartitionSpec(
-                    ("dp", "fsdp"),
-                    "sp" if attn_output.shape[1] != 1 else None,
-                    "tp"
-                )
+                attn_output,
+                PartitionSpec(
+                    ("dp", "fsdp"), "sp" if attn_output.shape[1] != 1 else None, "tp"
+                ),
             )
         attn_output = self.o_proj(attn_output)
 
-        attn_output = self.resid_dropout(
-            attn_output, deterministic=deterministic)
+        attn_output = self.resid_dropout(attn_output, deterministic=deterministic)
         outputs = (
-            attn_output, attentions.attention_weights
-        ) if output_attentions else (
-            attn_output,
+            (attn_output, attentions.attention_weights)
+            if output_attentions
+            else (attn_output,)
         )
         return outputs
 
@@ -420,25 +433,28 @@ class FlaxQwen2Block(nn.Module):
         attn_block = FlaxQwen2Attention
         if self.config.gradient_checkpointing != "":
             attn_block = nn_partitioning.remat(
-                FlaxQwen2Attention, static_argnums=(1, 3, 4, 6, 7, 8, 9),
+                FlaxQwen2Attention,
+                static_argnums=(1, 3, 4, 6, 7, 8, 9),
                 policy=get_gradient_checkpoint_policy(
-                    self.config.gradient_checkpointing)
+                    self.config.gradient_checkpointing
+                ),
             )
 
         self.self_attn = attn_block(
             self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            precision=self.precision
+            precision=self.precision,
         )
         mlp_block = FlaxQwen2MLP
 
         if self.config.gradient_checkpointing != "":
             mlp_block = nn_partitioning.remat(
-                FlaxQwen2MLP, static_argnums=(1,),
+                FlaxQwen2MLP,
+                static_argnums=(1,),
                 policy=get_gradient_checkpoint_policy(
                     self.config.gradient_checkpointing
-                )
+                ),
             )
 
         self.mlp = mlp_block(
@@ -458,21 +474,20 @@ class FlaxQwen2Block(nn.Module):
             eps=self.config.rms_norm_eps,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-
         )
 
     def __call__(
-            self,
-            hidden_states: chex.Array,
-            freq_cis: Tuple[chex.Array, chex.Array],
-            attention_mask: chex.Array,
-            position_ids: chex.Array,
-            causal_mask: chex.Array,
-            segment_ids: Optional[chex.Array] = None,
-            deterministic: bool = True,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            fcm_mask: Optional[jnp.ndarray] = None,
+        self,
+        hidden_states: chex.Array,
+        freq_cis: Tuple[chex.Array, chex.Array],
+        attention_mask: chex.Array,
+        position_ids: chex.Array,
+        causal_mask: chex.Array,
+        segment_ids: Optional[chex.Array] = None,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        fcm_mask: Optional[jnp.ndarray] = None,
     ):
         """The __call__ function is the main function of a TransformerEncoderLayer.
         It takes in hidden states, frequency-domain inputs, and masks as input. It then
@@ -523,7 +538,7 @@ class FlaxQwen2Block(nn.Module):
                 self.mlp,
                 feed_forward_input,
                 self.config.scan_mlp_chunk_size,
-                deterministic
+                deterministic,
             )
         else:
             feed_forward_hidden_states = self.mlp(
@@ -542,13 +557,13 @@ class FlaxQwen2PreTrainedModel(EasyDeLFlaxPretrainedModel):
     module_class: nn.Module = None
 
     def __init__(
-            self,
-            config: Qwen2Config,
-            input_shape: Tuple = (1, 1),
-            seed: int = 0,
-            dtype: jnp.dtype = jnp.float32,
-            _do_init: bool = True,
-            **kwargs,
+        self,
+        config: Qwen2Config,
+        input_shape: Tuple = (1, 1),
+        seed: int = 0,
+        dtype: jnp.dtype = jnp.float32,
+        _do_init: bool = True,
+        **kwargs,
     ):
         """The __init__ function is called when the class is instantiated.
         It sets up the instance of the class, and defines what happens when it's created.
@@ -571,9 +586,18 @@ class FlaxQwen2PreTrainedModel(EasyDeLFlaxPretrainedModel):
             The super() of the class
         """
         module = self.module_class(config=config, dtype=dtype, **kwargs)
-        super().__init__(config, module, input_shape=input_shape, seed=seed, dtype=dtype, _do_init=_do_init)
+        super().__init__(
+            config,
+            module,
+            input_shape=input_shape,
+            seed=seed,
+            dtype=dtype,
+            _do_init=_do_init,
+        )
 
-    def init_weights(self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None) -> FrozenDict:
+    def init_weights(
+        self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
+    ) -> FrozenDict:
         """The init_weights function is used to initialize the weights of a model.
 
         Args:
@@ -588,13 +612,14 @@ class FlaxQwen2PreTrainedModel(EasyDeLFlaxPretrainedModel):
         """
         input_ids = jnp.zeros(input_shape, dtype="i4")
         attention_mask = jnp.ones_like(input_ids)
-        position_ids = jnp.broadcast_to(jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_shape)
+        position_ids = jnp.broadcast_to(
+            jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_shape
+        )
         params_rng, dropout_rng = jax.random.split(rng)
         rngs = {"params": params_rng, "dropout": dropout_rng}
 
         if self.config.add_cross_attention:
-            encoder_hidden_states = jnp.zeros(
-                input_shape + (self.config.hidden_size,))
+            encoder_hidden_states = jnp.zeros(input_shape + (self.config.hidden_size,))
             encoder_attention_mask = attention_mask
             module_init_outputs = self.module.init(
                 rngs,
@@ -607,7 +632,8 @@ class FlaxQwen2PreTrainedModel(EasyDeLFlaxPretrainedModel):
             )
         else:
             module_init_outputs = self.module.init(
-                rngs, input_ids, attention_mask, position_ids, return_dict=False)
+                rngs, input_ids, attention_mask, position_ids, return_dict=False
+            )
 
         random_params = module_init_outputs["params"]
 
@@ -637,29 +663,35 @@ class FlaxQwen2PreTrainedModel(EasyDeLFlaxPretrainedModel):
         """
         input_ids = jnp.ones((batch_size, max_length))
         attention_mask = jnp.ones_like(input_ids)
-        position_ids = jnp.broadcast_to(jnp.arange(
-            jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape)
+        position_ids = jnp.broadcast_to(
+            jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape
+        )
 
         init_variables = self.module.init(
-            jax.random.PRNGKey(0), input_ids, attention_mask, position_ids, return_dict=False, init_cache=True
+            jax.random.PRNGKey(0),
+            input_ids,
+            attention_mask,
+            position_ids,
+            return_dict=False,
+            init_cache=True,
         )
         return init_variables["cache"]
 
     def __call__(
-            self,
-            input_ids: chex.Array,
-            attention_mask: chex.Array = None,
-            position_ids: chex.Array = None,
-            params: dict = None,
-            past_key_values: dict = None,
-            dropout_rng: jax.random.PRNGKey = None,
-            train: bool = False,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
-            extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
-            add_params_field: bool = False,
-            **kwargs
+        self,
+        input_ids: chex.Array,
+        attention_mask: chex.Array = None,
+        position_ids: chex.Array = None,
+        params: dict = None,
+        past_key_values: dict = None,
+        dropout_rng: jax.random.PRNGKey = None,
+        train: bool = False,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+        add_params_field: bool = False,
+        **kwargs,
     ):
         """The __call__ function is the main function of a JAX module.
         It takes in inputs and returns outputs, but it also has some other important features:
@@ -692,23 +724,35 @@ class FlaxQwen2PreTrainedModel(EasyDeLFlaxPretrainedModel):
         Returns:
             A tuple of the following:
         """
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
         )
-        return_dict = return_dict if return_dict is not None else self.config.return_dict
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
+        )
+        return_dict = (
+            return_dict if return_dict is not None else self.config.return_dict
+        )
 
         batch_size, sequence_length = input_ids.shape
 
-        assert sequence_length <= self.config.max_position_embeddings, "Maximum Position Embedding Reached !"
+        assert (
+            sequence_length <= self.config.max_position_embeddings
+        ), "Maximum Position Embedding Reached !"
 
         if position_ids is None:
             if past_key_values is not None:
                 raise ValueError(
-                    "Make sure to provide `position_ids` when passing `past_key_values`.")
+                    "Make sure to provide `position_ids` when passing `past_key_values`."
+                )
 
-            position_ids = jnp.broadcast_to(jnp.arange(sequence_length)[
-                                            None, :], (batch_size, sequence_length))
+            position_ids = jnp.broadcast_to(
+                jnp.arange(sequence_length)[None, :], (batch_size, sequence_length)
+            )
 
         if attention_mask is None:
             attention_mask = jnp.ones((batch_size, sequence_length))
@@ -718,11 +762,13 @@ class FlaxQwen2PreTrainedModel(EasyDeLFlaxPretrainedModel):
             rngs["dropout"] = dropout_rng
 
         if self.config.bits is not None:
-            rngs['params'] = jax.random.key(0)
+            rngs["params"] = jax.random.key(0)
 
-        inputs = {
-            "params": params or self.params
-        } if add_params_field else params or self.params
+        inputs = (
+            {"params": params or self.params}
+            if add_params_field
+            else params or self.params
+        )
 
         if past_key_values is not None:
             inputs["cache"] = past_key_values
@@ -751,8 +797,7 @@ class FlaxQwen2PreTrainedModel(EasyDeLFlaxPretrainedModel):
             return outputs
         elif past_key_values is not None and not return_dict:
             outputs, past_key_values = outputs
-            outputs = outputs[:1] + \
-                      (unfreeze(past_key_values["cache"]),) + outputs[1:]
+            outputs = outputs[:1] + (unfreeze(past_key_values["cache"]),) + outputs[1:]
 
         return outputs
 
@@ -770,25 +815,23 @@ class FlaxQwen2BlockCollection(nn.Module):
                 name=str(i),
                 dtype=self.dtype,
                 param_dtype=self.param_dtype,
-                precision=self.precision
+                precision=self.precision,
             )
-            for i in range(
-                self.config.num_hidden_layers
-            )
+            for i in range(self.config.num_hidden_layers)
         ]
 
     def __call__(
-            self,
-            hidden_states: chex.Array,
-            freq_cis: Tuple[chex.Array, chex.Array],
-            attention_mask: chex.Array,
-            position_ids: chex.Array,
-            causal_mask: chex.Array,
-            deterministic: bool = True,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            output_hidden_states: bool = False,
-            return_dict: bool = True,
+        self,
+        hidden_states: chex.Array,
+        freq_cis: Tuple[chex.Array, chex.Array],
+        attention_mask: chex.Array,
+        position_ids: chex.Array,
+        causal_mask: chex.Array,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        return_dict: bool = True,
     ):
         """The __call__ function is the main function of a JAX nn.Module.
         It defines how the module behaves when called as a function, and it's what you'll use to call your model
@@ -827,16 +870,19 @@ class FlaxQwen2BlockCollection(nn.Module):
             # Apply forgetful causal mask
             batch_size, seq_length = hidden_states.shape[0], hidden_states.shape[1]
             fcm_ratio = jax.random.uniform(
-                self.make_rng('fcm'), shape=(batch_size, 1, 1, 1),
+                self.make_rng("fcm"),
+                shape=(batch_size, 1, 1, 1),
                 minval=self.config.fcm_min_ratio,
-                maxval=self.config.fcm_max_ratio
+                maxval=self.config.fcm_max_ratio,
             )
-            fcm_mask = jax.random.uniform(
-                self.make_rng('fcm'),
-                shape=(batch_size, 1, seq_length, seq_length)
-            ) > fcm_ratio
+            fcm_mask = (
+                jax.random.uniform(
+                    self.make_rng("fcm"), shape=(batch_size, 1, seq_length, seq_length)
+                )
+                > fcm_ratio
+            )
             fcm_mask = fcm_mask.at[:, :, :, 0].set(True)
-            fcm_mask = fcm_mask.astype('bool')
+            fcm_mask = fcm_mask.astype("bool")
         else:
             fcm_mask = None
 
@@ -887,52 +933,62 @@ class FlaxQwen2Module(nn.Module):
             self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            precision=self.precision
+            precision=self.precision,
         )
         self.norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
             dtype=self.dtype,
-            param_dtype=self.param_dtype
+            param_dtype=self.param_dtype,
         )
         config = self.config
         self.causal_mask = make_causal_mask(
             jnp.ones(
-                (1, getattr(config, "c_max_position_embeddings", config.max_position_embeddings)), dtype="bool"
-            ), dtype="bool"
+                (
+                    1,
+                    getattr(
+                        config,
+                        "c_max_position_embeddings",
+                        config.max_position_embeddings,
+                    ),
+                ),
+                dtype="bool",
+            ),
+            dtype="bool",
         )
 
-        initial_rope_kwargs = dict(
-            rope_type="none"
-        )
+        initial_rope_kwargs = dict(rope_type="none")
         if config.rope_scaling is not None:
             scaling_type = config.rope_scaling["type"]
             scaling_factor = config.rope_scaling["factor"]
             initial_rope_kwargs = dict(
-                scaling_factor=scaling_factor,
-                rope_type=scaling_type
+                scaling_factor=scaling_factor, rope_type=scaling_type
             )
         self.freq_cis = precompute_freq_cis(
             max_position_embeddings=(
-                getattr(self.config, "freq_max_position_embeddings", self.config.max_position_embeddings)
+                getattr(
+                    self.config,
+                    "freq_max_position_embeddings",
+                    self.config.max_position_embeddings,
+                )
             ),
             dim=config.hidden_size // config.num_attention_heads,
             base=config.rope_theta,
-            **initial_rope_kwargs
+            **initial_rope_kwargs,
         )
 
     def __call__(
-            self,
-            input_ids: chex.Array,
-            attention_mask: chex.Array,
-            position_ids: chex.Array,
-            deterministic: bool = True,
-            inputs_embeds: chex.Array = None,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            output_hidden_states: bool = False,
-            return_dict: bool = True,
-            extra_embedding: Optional[Union[jnp.ndarray, None]] = None
+        self,
+        input_ids: chex.Array,
+        attention_mask: chex.Array,
+        position_ids: chex.Array,
+        deterministic: bool = True,
+        inputs_embeds: chex.Array = None,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        return_dict: bool = True,
+        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
     ):
         """The __call__ function is the main function of a Flax model. It takes in input_ids, attention_mask, and position_ids
         and returns the output of the model. The __call__ function also has optional arguments that can be used to control
@@ -955,7 +1011,7 @@ class FlaxQwen2Module(nn.Module):
             output_hidden_states: bool: Determine whether to return
                 hidden states
             return_dict: bool: Return a dictionary of the output or not
-            extra_embedding: Optional[Union[jnp.ndarray: Pass in the
+            extra_embedding: Optional[Union[jnp.ndarray]]: Pass in the
                 embedding of the
             None]]: Pass in the extra embedding
 
@@ -967,10 +1023,15 @@ class FlaxQwen2Module(nn.Module):
 
         batch_size, sequence_length, _ = inputs_embeds.shape
 
-        assert sequence_length <= self.config.max_position_embeddings, "Maximum Position Embedding Reached !"
-        inputs_embeds = inputs_embeds + extra_embedding if extra_embedding is not None else inputs_embeds
-        hidden_states = self.dropout(
-            inputs_embeds, deterministic=deterministic)
+        assert (
+            sequence_length <= self.config.max_position_embeddings
+        ), "Maximum Position Embedding Reached !"
+        inputs_embeds = (
+            inputs_embeds + extra_embedding
+            if extra_embedding is not None
+            else inputs_embeds
+        )
+        hidden_states = self.dropout(inputs_embeds, deterministic=deterministic)
 
         outputs = self.layers(
             hidden_states=hidden_states,
@@ -1033,22 +1094,24 @@ class FlaxQwen2ForCausalLMModule(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+            kernel_init=jax.nn.initializers.normal(
+                stddev=self.config.initializer_range
+            ),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method)
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
 
     def __call__(
-            self,
-            input_ids: chex.Array,
-            attention_mask: chex.Array = None,
-            position_ids: chex.Array = None,
-            deterministic: bool = True,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            output_hidden_states: bool = False,
-            return_dict: bool = True,
-            extra_embedding: Optional[Union[jnp.ndarray, None]] = None
+        self,
+        input_ids: chex.Array,
+        attention_mask: chex.Array = None,
+        position_ids: chex.Array = None,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        return_dict: bool = True,
+        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
     ):
         """The __call__ function is the main function of a Flax module. It takes in inputs and returns outputs.
 
@@ -1065,7 +1128,7 @@ class FlaxQwen2ForCausalLMModule(nn.Module):
             output_hidden_states: bool: Determine whether to return the
                 hidden states
             return_dict: bool: Return a dictionary of the outputs or not
-            extra_embedding: Optional[Union[jnp.ndarray: Pass in the
+            extra_embedding: Optional[Union[jnp.ndarray]]: Pass in the
                 embedding of the word that we want to predict
             None]]: Pass in the extra embedding
 
@@ -1078,7 +1141,7 @@ class FlaxQwen2ForCausalLMModule(nn.Module):
         if position_ids is None:
             position_ids = jnp.broadcast_to(
                 jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
-                (batch_size, seq_length)
+                (batch_size, seq_length),
             )
         outputs = self.model(
             input_ids,
@@ -1089,16 +1152,19 @@ class FlaxQwen2ForCausalLMModule(nn.Module):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            extra_embedding=extra_embedding
+            extra_embedding=extra_embedding,
         )
 
         hidden_states = outputs[0]
 
         if self.config.tie_word_embeddings:
             shared_kernel = self.model.variables["params"]["embed_tokens"]["embedding"]
-            shared_kernel = fjformer.linen.control_quantization(shared_kernel, self.param_dtype).T
+            shared_kernel = fjformer.linen.control_quantization(
+                shared_kernel, self.param_dtype
+            ).T
             lm_logits = self.lm_head.apply(
-                {"params": {"kernel": shared_kernel}}, hidden_states)
+                {"params": {"kernel": shared_kernel}}, hidden_states
+            )
         else:
             lm_logits = self.lm_head(hidden_states)
 
@@ -1107,7 +1173,11 @@ class FlaxQwen2ForCausalLMModule(nn.Module):
         if not return_dict:
             return (lm_logits,) + outputs[1:]
 
-        return FlaxCausalLMOutput(logits=lm_logits, hidden_states=outputs.hidden_states, attentions=outputs.attentions)
+        return FlaxCausalLMOutput(
+            logits=lm_logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
 
 
 class FlaxQwen2ForCausalLM(FlaxQwen2PreTrainedModel):
@@ -1131,7 +1201,9 @@ class FlaxQwen2ForCausalLM(FlaxQwen2PreTrainedModel):
     def set_output_embeddings(self, new_embeddings):
         self.module.lm_head = new_embeddings
 
-    def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[chex.Array] = None):
+    def prepare_inputs_for_generation(
+        self, input_ids, max_length, attention_mask: Optional[chex.Array] = None
+    ):
         """The prepare_inputs_for_generation function is used to prepare the inputs for a generation task.
 
         Args:
@@ -1148,15 +1220,16 @@ class FlaxQwen2ForCausalLM(FlaxQwen2PreTrainedModel):
         batch_size, seq_length = input_ids.shape
 
         past_key_values = self.init_cache(batch_size, max_length)
-        extended_attention_mask = jnp.ones(
-            (batch_size, max_length), dtype="i4")
+        extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
         if attention_mask is not None:
             position_ids = attention_mask.cumsum(axis=-1) - 1
             extended_attention_mask = lax.dynamic_update_slice(
-                extended_attention_mask, attention_mask, (0, 0))
+                extended_attention_mask, attention_mask, (0, 0)
+            )
         else:
-            position_ids = jnp.broadcast_to(jnp.arange(seq_length, dtype="i4")[
-                                            None, :], (batch_size, seq_length))
+            position_ids = jnp.broadcast_to(
+                jnp.arange(seq_length, dtype="i4")[None, :], (batch_size, seq_length)
+            )
 
         return {
             "past_key_values": past_key_values,
@@ -1194,21 +1267,22 @@ class FlaxQwen2ForSequenceClassificationModule(nn.Module):
             param_dtype=self.param_dtype,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(
-                stddev=self.config.initializer_range),
+                stddev=self.config.initializer_range
+            ),
             precision=self.precision,
         )
 
     def __call__(
-            self,
-            input_ids: chex.Array,
-            attention_mask: chex.Array = None,
-            position_ids: chex.Array = None,
-            deterministic: bool = True,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            output_hidden_states: bool = False,
-            return_dict: bool = True,
-            extra_embedding: Optional[Union[jnp.ndarray, None]] = None
+        self,
+        input_ids: chex.Array,
+        attention_mask: chex.Array = None,
+        position_ids: chex.Array = None,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        return_dict: bool = True,
+        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
     ):
         """The __call__ function is the main function of a Flax module.
         It takes in all the inputs to the model and returns all outputs from it.
@@ -1229,7 +1303,7 @@ class FlaxQwen2ForSequenceClassificationModule(nn.Module):
             output_hidden_states: bool: Return the hidden states of all
                 layers
             return_dict: bool: Return a dictionary of outputs
-            extra_embedding: Optional[Union[jnp.ndarray: Pass in the
+            extra_embedding: Optional[Union[jnp.ndarray]]: Pass in the
                 embedding of a new word
             None]]: Pass the extra embedding to the model
 
@@ -1242,7 +1316,7 @@ class FlaxQwen2ForSequenceClassificationModule(nn.Module):
         if position_ids is None:
             position_ids = jnp.broadcast_to(
                 jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
-                (batch_size, seq_length)
+                (batch_size, seq_length),
             )
         outputs = self.model(
             input_ids,
@@ -1253,18 +1327,17 @@ class FlaxQwen2ForSequenceClassificationModule(nn.Module):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            extra_embedding=extra_embedding
+            extra_embedding=extra_embedding,
         )
 
         hidden_states = outputs[0]
         prediction = self.classifier(hidden_states)
         if return_dict:
             return FlaxSequenceClassifierOutput(
-                logits=prediction,
-                hidden_states=hidden_states
+                logits=prediction, hidden_states=hidden_states
             )
         else:
-            return prediction,
+            return (prediction,)
 
 
 class FlaxQwen2ForSequenceClassification(FlaxQwen2PreTrainedModel):

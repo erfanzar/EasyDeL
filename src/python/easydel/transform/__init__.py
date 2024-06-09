@@ -5,17 +5,19 @@ _import_structure = {
     "easydel_transform": [
         "huggingface_to_easydel",
         "easystate_to_huggingface_model",
-        "easystate_to_torch"
+        "easystate_to_torch",
     ]
 }
 
 if TYPE_CHECKING:
     from .easydel_transform import (
-        huggingface_to_easydel,
-        easystate_to_huggingface_model,
-        easystate_to_torch
+        huggingface_to_easydel as huggingface_to_easydel,
+        easystate_to_huggingface_model as easystate_to_huggingface_model,
+        easystate_to_torch as easystate_to_torch,
     )
 else:
     import sys
 
-    sys.modules[__name__] = _LazyModule(__name__, globals()["__file__"], _import_structure, module_spec=__spec__)
+    sys.modules[__name__] = _LazyModule(
+        __name__, globals()["__file__"], _import_structure, module_spec=__spec__
+    )

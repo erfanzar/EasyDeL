@@ -9,27 +9,29 @@ _import_structure = {
         "FlaxLlamaForCausalLM",
         "FlaxLlamaForCausalLMModule",
         "FlaxLlamaModel",
-        "FlaxLlamaModule"
+        "FlaxLlamaModule",
     ],
-    "modelling_vision_llama_flax": [
-        "FlaxVisionLlamaForCausalLM"
-    ],
-    "vision_llama_configuration": ["VisionLlamaConfig"]
+    "modelling_vision_llama_flax": ["FlaxVisionLlamaForCausalLM"],
+    "vision_llama_configuration": ["VisionLlamaConfig"],
 }
 
 if TYPE_CHECKING:
-    from .llama_configuration import LlamaConfig
+    from .llama_configuration import LlamaConfig as LlamaConfig
     from .modelling_llama_flax import (
-        FlaxLlamaForSequenceClassification,
-        FlaxLlamaForSequenceClassificationModule,
-        FlaxLlamaForCausalLM,
-        FlaxLlamaForCausalLMModule,
-        FlaxLlamaModel,
-        FlaxLlamaModule
+        FlaxLlamaForSequenceClassification as FlaxLlamaForSequenceClassification,
+        FlaxLlamaForSequenceClassificationModule as FlaxLlamaForSequenceClassificationModule,
+        FlaxLlamaForCausalLM as FlaxLlamaForCausalLM,
+        FlaxLlamaForCausalLMModule as FlaxLlamaForCausalLMModule,
+        FlaxLlamaModel as FlaxLlamaModel,
+        FlaxLlamaModule as FlaxLlamaModule,
     )
-    from .modelling_vision_llama_flax import FlaxVisionLlamaForCausalLM
-    from .vision_llama_configuration import VisionLlamaConfig
+    from .modelling_vision_llama_flax import (
+        FlaxVisionLlamaForCausalLM as FlaxVisionLlamaForCausalLM,
+    )
+    from .vision_llama_configuration import VisionLlamaConfig as VisionLlamaConfig
 else:
     import sys
 
-    sys.modules[__name__] = _LazyModule(__name__, globals()["__file__"], _import_structure, module_spec=__spec__)
+    sys.modules[__name__] = _LazyModule(
+        __name__, globals()["__file__"], _import_structure, module_spec=__spec__
+    )

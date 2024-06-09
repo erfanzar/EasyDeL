@@ -1,14 +1,27 @@
-import multiprocessing
+import os
+import sys
 
-import jax.numpy
-from flax.core import FrozenDict
+dirname = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(dirname)  # noqa: E402
+sys.path.append(
+    os.path.join(
+        dirname,
+        "..",
+    )
+)  # noqa: E402
 
-from easydel import MistralConfig, FlaxMistralForCausalLM
-from src.python.easydel.trainer.odds_ratio_preference_optimization_trainer import ORPOTrainer
-from src.python.easydel import TrainArguments, EasyDeLState
-from transformers import AutoTokenizer
-from datasets import load_dataset
-from jax import numpy as jnp
+
+import jax.numpy  # noqa: E402
+from flax.core import FrozenDict  # noqa: E402
+
+from easydel import MistralConfig, FlaxMistralForCausalLM  # noqa: E402
+from src.python.easydel.trainer.odds_ratio_preference_optimization_trainer import (  # noqa: E402
+    ORPOTrainer,
+)
+from src.python.easydel import TrainArguments  # noqa: E402
+from transformers import AutoTokenizer  # noqa: E402
+from datasets import load_dataset  # noqa: E402
+from jax import numpy as jnp  # noqa: E402
 
 SEQUENCE_LENGTH = 128
 NUM_TRAIN_EXAMPLES = 50
@@ -40,7 +53,7 @@ def orpo_main():
             dtype=jnp.float32,
             param_dtype=jnp.float32,
             _do_init=True,
-            input_shape=(8, 8)
+            input_shape=(8, 8),
         )
         tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
 
@@ -95,9 +108,8 @@ def orpo_main():
             use_wandb=False,
             learning_rate=5e-4,
             do_last_save=True,
-            init_input_shape=(8, 8)
+            init_input_shape=(8, 8),
         ),
-
     )
 
     trainer.train(model_parameters=FrozenDict({"params": model.params}))

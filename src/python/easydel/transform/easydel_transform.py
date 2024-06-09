@@ -13,7 +13,7 @@ import msgpack
 import os
 from fjformer import get_dtype
 from jax import numpy as jnp
-from typing import List, Optional, Mapping, Callable
+from typing import List, Optional, Mapping, Callable, Union
 from tqdm import tqdm
 from ..etils.etils import get_logger
 
@@ -133,7 +133,7 @@ def huggingface_to_easydel(
 
             def _clear():
                 gc.collect()
-    except ModuleNotFoundError as e:
+    except ModuleNotFoundError:
 
         def _clear():
             gc.collect()
@@ -199,7 +199,7 @@ def huggingface_to_easydel(
 
 
 def read_ckpt(
-    path: [str, os.PathLike], shard_fns=None, add_extra_past_fix: list = None
+    path: Union[str, os.PathLike], shard_fns=None, add_extra_past_fix: list = None
 ):
     """The read_ckpt function reads a checkpoint file and returns the tensors in it.
 

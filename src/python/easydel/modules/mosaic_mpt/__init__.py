@@ -7,22 +7,24 @@ _import_structure = {
         "FlaxMptForCausalLM",
         "FlaxMptForCausalLMModule",
         "FlaxMptModel",
-        "FlaxMptModule"
-    ]
+        "FlaxMptModule",
+    ],
 }
 if TYPE_CHECKING:
     from .mosaic_configuration import (
         MptConfig as MptConfig,
-        MptAttentionConfig as MptAttentionConfig
+        MptAttentionConfig as MptAttentionConfig,
     )
     from .modelling_mpt_flax import (
-        FlaxMptForCausalLM,
-        FlaxMptForCausalLMModule,
-        FlaxMptModel,
-        FlaxMptModule
+        FlaxMptForCausalLM as FlaxMptForCausalLM,
+        FlaxMptForCausalLMModule as FlaxMptForCausalLMModule,
+        FlaxMptModel as FlaxMptModel,
+        FlaxMptModule as FlaxMptModule,
     )
 
 else:
     import sys
 
-    sys.modules[__name__] = _LazyModule(__name__, globals()["__file__"], _import_structure, module_spec=__spec__)
+    sys.modules[__name__] = _LazyModule(
+        __name__, globals()["__file__"], _import_structure, module_spec=__spec__
+    )

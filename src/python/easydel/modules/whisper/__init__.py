@@ -6,18 +6,20 @@ _import_structure = {
     "modelling_whisper_flax": [
         "FlaxWhisperForConditionalGeneration",
         "FlaxWhisperForAudioClassification",
-        "FlaxWhisperTimeStampLogitsProcessor"
+        "FlaxWhisperTimeStampLogitsProcessor",
     ],
 }
 
 if TYPE_CHECKING:
-    from .whisper_configuration import WhisperConfig
+    from .whisper_configuration import WhisperConfig as WhisperConfig
     from .modelling_whisper_flax import (
-        FlaxWhisperForConditionalGeneration,
-        FlaxWhisperForAudioClassification,
-        FlaxWhisperTimeStampLogitsProcessor
+        FlaxWhisperForConditionalGeneration as FlaxWhisperForConditionalGeneration,
+        FlaxWhisperForAudioClassification as FlaxWhisperForAudioClassification,
+        FlaxWhisperTimeStampLogitsProcessor as FlaxWhisperTimeStampLogitsProcessor,
     )
 else:
     import sys
 
-    sys.modules[__name__] = _LazyModule(__name__, globals()["__file__"], _import_structure, module_spec=__spec__)
+    sys.modules[__name__] = _LazyModule(
+        __name__, globals()["__file__"], _import_structure, module_spec=__spec__
+    )

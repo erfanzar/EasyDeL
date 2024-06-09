@@ -172,6 +172,8 @@ class GenerationPipeline:
             streamer: Optional[transformers.TextIteratorStreamer] = None
     ):
 
+        paxis = self.model.config.partition_axis
+        mesh = self.mesh
         eos_token_id = jnp.array(self.generation_config.eos_token_id, dtype=jnp.int32)
         pad_token_id = jnp.array(self.generation_config.pad_token_id, dtype=jnp.int32)
         batch_size, cur_len = input_ids.shape
@@ -190,10 +192,22 @@ class GenerationPipeline:
 
         if position_ids is None:
             position_ids = (attention_mask.cumsum(axis=-1, dtype="i4") - 1)  # Check this logic
+        with mesh:
+            input_ids = fjformer.with_sharding_constraint(input_ids, PartitionSpec(
+                paxis.batch_axis,
+                paxis.key_sequence_axis,
+            ))
+            attention_mask = fjformer.with_sharding_constraint(attention_mask, PartitionSpec(
+                paxis.batch_axis,
+                paxis.key_sequence_axis,
+            ))
+            position_ids = fjformer.with_sharding_constraint(position_ids, PartitionSpec(
+                paxis.batch_axis,
+                paxis.key_sequence_axis,
+            ))
         assert position_ids.shape == attention_mask.shape, (
             "`position_ids` and `attention_mask` must have the same shape."
         )
-        paxis = self.model.config.partition_axis
         _model_kwargs_sharding = jax.tree_util.tree_map(
             lambda spec: jax.sharding.NamedSharding(spec=spec, mesh=self.mesh),
             fjformer.match_partition_rules(
@@ -215,6 +229,7 @@ class GenerationPipeline:
                             paxis.batch_axis,
                             paxis.key_sequence_axis,
                             paxis.head_axis,
+                            None
                         )
                     ),
                     (
@@ -222,6 +237,7 @@ class GenerationPipeline:
                             paxis.batch_axis,
                             paxis.key_sequence_axis,
                             paxis.head_axis,
+                            None
                         )
                     ),
                     (
@@ -229,6 +245,7 @@ class GenerationPipeline:
                             paxis.batch_axis,
                             paxis.key_sequence_axis,
                             paxis.head_axis,
+                            None
                         )
                     ),
                     (
@@ -236,6 +253,7 @@ class GenerationPipeline:
                             paxis.batch_axis,
                             paxis.key_sequence_axis,
                             paxis.head_axis,
+                            None
                         )
                     ),
                     (

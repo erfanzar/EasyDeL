@@ -12,14 +12,16 @@ _import_structure = {
 }
 
 if TYPE_CHECKING:
-    from .falcon_configuration import FalconConfig
+    from .falcon_configuration import FalconConfig as FalconConfig
     from .modelling_falcon_flax import (
-        FlaxFalconForCausalLM,
-        FlaxFalconForCausalLMModule,
-        FlaxFalconModel,
-        FlaxFalconModule,
+        FlaxFalconForCausalLM as FlaxFalconForCausalLM,
+        FlaxFalconForCausalLMModule as FlaxFalconForCausalLMModule,
+        FlaxFalconModel as FlaxFalconModel,
+        FlaxFalconModule as FlaxFalconModule,
     )
 else:
     import sys
 
-    sys.modules[__name__] = _LazyModule(__name__, globals()["__file__"], _import_structure, module_spec=__spec__)
+    sys.modules[__name__] = _LazyModule(
+        __name__, globals()["__file__"], _import_structure, module_spec=__spec__
+    )
