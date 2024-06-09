@@ -121,7 +121,6 @@ class CohereConfig(EasyDeLPretrainedConfig):
 
     def add_jax_args(
             self,
-            tie_word_embeddings: bool = False,
             gradient_checkpointing: str = "nothing_saveable",
             bits: Optional[int] = None,
             **kwargs,
@@ -130,14 +129,11 @@ class CohereConfig(EasyDeLPretrainedConfig):
 
         Args:
             self: Refer to the current object
-            tie_word_embeddings: bool: Tie the word embeddings to the
-                decoder
             gradient_checkpointing: str: Control the amount of memory
                 used by jax
             bits: Optional[int]: Determine the number of bits used in
                 the quantization
         """
-        self.tie_word_embeddings = tie_word_embeddings
         self.gradient_checkpointing = gradient_checkpointing
         self.bits = bits
 
