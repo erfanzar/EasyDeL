@@ -498,6 +498,7 @@ class AutoEasyDeLModelForCausalLM:
                 input_shape=input_shape,
                 config_kwargs=config_kwargs,
                 device=device,
+                shard_attention_computation=shard_attention_computation,
                 **kwargs
             )
         return cls._from_easydel_params(
