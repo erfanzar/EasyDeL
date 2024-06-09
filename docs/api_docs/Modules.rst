@@ -4,15 +4,15 @@ Modules
 .. toctree::
    :maxdepth: 2
 
-   modules._blockwise_attention
-   modules._ring_attention
-   modules._vanilla_attention
    modules.arctic.arctic_configuration
    modules.arctic.modelling_arctic_flax
    modules.attention_module
    modules.auto_easydel_model
+   modules.chatglm.chatglm_configuration
+   modules.chatglm.modelling_chatglm_flax
    modules.cohere.cohere_configuration
    modules.cohere.modelling_cohere_flax
+   modules.common
    modules.dbrx.dbrx_configuration
    modules.dbrx.modelling_dbrx_flax
    modules.deepseek_v2.deepseek_configuration
@@ -77,3 +77,6 @@ Modules
    modules.t5.t5_configuration
    modules.whisper.modelling_whisper_flax
    modules.whisper.whisper_configuration
+   modules._blockwise_attention
+   modules._ring_attention
+   modules._vanilla_attention

@@ -45,6 +45,7 @@ of machine learning models, particularly in the domain of large language models 
 
 ### Latest News 🔥
 
+- KV cache quantization is improved and now have +%21 accuracy from old version (%69)
 - adding `EasyDeLFlaxPretrainedModel.from_pretrained` and `EasyDeLFlaxPretrainedModel.save_pretrained` to give users
   experience of being free and not only using easydel states
 - removing *(q,k,v,b,a)_partition_specs and using `PartitionAxis` instead of them.
@@ -935,3 +936,8 @@ To cite this repository:
     year={2023}
 } 
 ```
+## Refrences
+- _[young-geng/EasyLM](https://github.com/young-geng/EasyLM)_: Large language models (LLMs) made easy, EasyLM is a one stop solution for pre-training, finetuning, evaluating and serving LLMs in JAX/Flax.
+- _[Sea-Snell/JAXSeq](https://github.com/Sea-Snell/JAXSeq)_: Train very large language models in Jax.
+
+- _[lhao499/RingAttention](https://github.com/lhao499/RingAttention)_:Transformers with Arbitrarily Large Context
