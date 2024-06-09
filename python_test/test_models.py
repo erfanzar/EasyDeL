@@ -118,7 +118,8 @@ class EasyModelsTest(TestCase):
                 num_kv_heads=self.num_key_value_heads,
                 multi_query=True,
                 num_ln_in_parallel_attn=1,
-                parallel_attn=True
+                parallel_attn=True,
+                tie_word_embedding=True,
                 # residual_in_fp32=True
             )
         else:
