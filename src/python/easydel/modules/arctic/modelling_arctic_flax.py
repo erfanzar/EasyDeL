@@ -1,36 +1,38 @@
 import functools
 import math
+from typing import Optional, Tuple, Union
 
+import chex
 import fjformer
 import flax
-from flax.struct import dataclass
-from jax import numpy as jnp, lax
-from jax.sharding import PartitionSpec
 import jax
-from flax import linen as nn
-from flax.traverse_util import unflatten_dict, flatten_dict
-from flax.core import freeze, unfreeze, FrozenDict
-from typing import Union, Optional, Tuple
-from flax.linen import partitioning as nn_partitioning, combine_masks
-from transformers.modeling_flax_outputs import FlaxMaskedLMOutput
 from fjformer.functions import auxiliary_load_balancing_loss_func
-from ..attention_module import AttentionModule
 from fjformer.linen import Dense
+from flax import linen as nn
+from flax.core import FrozenDict, freeze, unfreeze
+from flax.linen import combine_masks
+from flax.linen import partitioning as nn_partitioning
+from flax.traverse_util import flatten_dict, unflatten_dict
+from jax import lax
+from jax import numpy as jnp
+from jax.sharding import PartitionSpec
+from transformers.modeling_flax_outputs import FlaxMaskedLMOutput
+
+from ..attention_module import AttentionModule
+from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 from ..flax_modelling_utils import (
     ACT2FN,
-    with_sharding_constraint,
-    repeat_kv_bnsh,
-    apply_rotary_pos_emb,
-    precompute_freq_cis,
-    get_dot_general_by_bits,
     BaseJAXAttentionModule,
-    get_gradient_checkpoint_policy,
+    apply_rotary_pos_emb,
     block_wise_ffn,
-    control_mlp_sharding
+    control_mlp_sharding,
+    get_dot_general_by_bits,
+    get_gradient_checkpoint_policy,
+    precompute_freq_cis,
+    repeat_kv_bnsh,
+    with_sharding_constraint,
 )
-import chex
 from .arctic_configuration import ArcticConfig
-from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 
 re_mat = nn_partitioning.remat
 
@@ -135,12 +137,11 @@ class FlaxArcticAttention(BaseJAXAttentionModule):
             num_attention_heads=self.config.num_attention_heads,
             attention_dropout=self.config.attention_dropout,
             head_dims=self.head_dim,
-
             shard_attention_computation=self.config.shard_attention_computation,
             precision=self.precision,
             force_float32_tpu=True,
             attn_mechanism=self.config.attn_mechanism,
-            dtype=self.dtype,
+            dtype=self.config.attn_dtype,
             partition_axis=self.config.partition_axis,
             scan_ring_attention=self.config.scan_ring_attention,
             mesh=self.config.get_mesh(),

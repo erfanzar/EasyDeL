@@ -1,36 +1,39 @@
 import functools
 import math
 import typing
+from typing import Optional, Tuple, Union
 
+import chex
 import fjformer
 import flax
-from jax import numpy as jnp, lax
 import jax
 from fjformer import linen as nn
-from flax.traverse_util import unflatten_dict, flatten_dict
-from flax.core import freeze, unfreeze, FrozenDict
-from typing import Union, Optional, Tuple
-from flax.linen import partitioning as nn_partitioning, combine_masks
+from flax.core import FrozenDict, freeze, unfreeze
+from flax.linen import combine_masks
+from flax.linen import partitioning as nn_partitioning
+from flax.traverse_util import flatten_dict, unflatten_dict
+from jax import lax
+from jax import numpy as jnp
+from jax.sharding import PartitionSpec
 from transformers.modeling_flax_outputs import (
-    FlaxMaskedLMOutput,
     FlaxBaseModelOutput,
     FlaxCausalLMOutput,
+    FlaxMaskedLMOutput,
 )
+
 from ..attention_module import AttentionModule
+from ..common import RMSNorm
+from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 from ..flax_modelling_utils import (
     ACT2FN,
-    with_sharding_constraint,
-    get_dot_general_by_bits,
     BaseJAXAttentionModule,
-    get_gradient_checkpoint_policy,
     block_wise_ffn,
     control_mlp_sharding,
+    get_dot_general_by_bits,
+    get_gradient_checkpoint_policy,
+    with_sharding_constraint,
 )
-from jax.sharding import PartitionSpec
-import chex
 from .deepseek_configuration import DeepseekV2Config
-from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
-from ..common import RMSNorm
 
 re_mat = nn_partitioning.remat
 
@@ -488,7 +491,7 @@ class FlaxDeepseekV2Attention(BaseJAXAttentionModule):
             precision=self.precision,
             force_float32_tpu=True,
             attn_mechanism=self.config.attn_mechanism,
-            dtype=self.dtype,
+            dtype=self.config.attn_dtype,
             partition_axis=self.config.partition_axis,
             scan_ring_attention=self.config.scan_ring_attention,
             mesh=self.config.get_mesh(),

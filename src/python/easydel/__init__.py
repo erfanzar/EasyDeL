@@ -104,21 +104,21 @@ _modules_import_structure = {
 }
 
 _trainer_import_structure = {
-    "trainer.causal_language_model_trainer": [
+    "trainer.causal_language_model_trainer.causal_language_model_trainer": [
         "CausalLanguageModelTrainer",
         "CausalLMTrainerOutput",
     ],
-    "trainer.supervised_fine_tuning_trainer": ["SFTTrainer"],
-    "trainer.vision_causal_language_model_trainer": [
+    "trainer.supervised_fine_tuning_trainer.stf_trainer": ["SFTTrainer"],
+    "trainer.vision_causal_language_model_trainer.vision_causal_language_model_trainer": [
         "VisionCausalLanguageModelStepOutput",
         "VisionCausalLanguageModelTrainer",
         "VisionCausalLMTrainerOutput",
     ],
-    "trainer.odds_ratio_preference_optimization_trainer": [
+    "trainer.odds_ratio_preference_optimization_trainer.orpo_trainer": [
         "ORPOTrainer",
         "ORPOTrainerOutput",
     ],
-    "trainer.direct_preference_optimization_trainer": [
+    "trainer.direct_preference_optimization_trainer.direct_preference_optimization_trainer": [
         "DPOTrainer",
         "DPOTrainerOutput",
     ],
@@ -188,6 +188,7 @@ if TYPE_CHECKING:
         GenerationPipelineConfig as GenerationPipelineConfig,
         GenerationPipeline as GenerationPipeline,
     )
+
     # INFERENCE IMPORT END HERE
 
     # MODULES IMPORT START HERE
@@ -348,6 +349,7 @@ if TYPE_CHECKING:
         EasyDeLFlaxPretrainedModel as EasyDeLFlaxPretrainedModel,
     )
     from .modules.attention_module import AttentionModule as AttentionModule
+
     # MODULES IMPORT END HERE
 
     # TRAINER IMPORT START HERE
@@ -377,10 +379,12 @@ if TYPE_CHECKING:
         conversations_formatting_function as conversations_formatting_function,
         instructions_formatting_function as instructions_formatting_function,
     )
+
     # TRAINER IMPORT ENDS HERE
 
     # UTILS IMPORT START HERE
     from .utils.helpers import get_mesh as get_mesh, RNG as RNG
+
     # UTILS IMPORT ENDS HERE
 
     # SMI IMPORT START HERE
@@ -389,6 +393,7 @@ if TYPE_CHECKING:
         initialise_tracking as initialise_tracking,
         get_mem as get_mem,
     )
+
     # SMI IMPORT ENDS HERE
 
     # TRANSFORM IMPORT START HERE
@@ -397,6 +402,7 @@ if TYPE_CHECKING:
         easystate_to_huggingface_model as easystate_to_huggingface_model,
         easystate_to_torch as easystate_to_torch,
     )
+
     # TRANSFORM IMPORT ENDS HERE
 
     # ETILS IMPORT START HERE
@@ -410,6 +416,7 @@ if TYPE_CHECKING:
         EasyDeLSyntaxRuntimeError as EasyDeLSyntaxRuntimeError,
         PartitionAxis as PartitionAxis,
     )
+
     # ETILS IMPORT ENDS HERE
 
 else:

@@ -230,7 +230,7 @@ class FlaxQwen1Attention(BaseJAXAttentionModule):
             precision=self.precision,
             force_float32_tpu=True,
             attn_mechanism=self.config.attn_mechanism,
-            dtype=self.dtype,
+            dtype=self.config.attn_dtype,
             partition_axis=self.config.partition_axis,
             scan_ring_attention=self.config.scan_ring_attention,
             mesh=self.config.get_mesh(),
@@ -291,7 +291,7 @@ class FlaxQwen1Attention(BaseJAXAttentionModule):
         """
         query_states, key = self.rotary(
             position_ids=position_ids,
-            query_states=query_states,
+            query_states=query,
             key=key,
             rotary_pos_emb_list=rotary_pos_emb_list,
         )

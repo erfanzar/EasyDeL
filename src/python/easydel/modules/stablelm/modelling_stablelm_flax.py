@@ -1,15 +1,15 @@
 import math
-from typing import Optional, Tuple, Union, Any
+from typing import Any, Optional, Tuple, Union
 
 import chex
 import fjformer
-from fjformer import linen as nn
 import flax.linen.partitioning
 import jax
 import jax.numpy as jnp
+from fjformer import linen as nn
+from fjformer.linen import Dense
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks
-from fjformer.linen import Dense
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax.sharding import PartitionSpec
@@ -19,23 +19,23 @@ from transformers.modeling_flax_outputs import (
     FlaxMaskedLMOutput,
 )
 
-from .stablelm_configuration import StableLmConfig
 from ..attention_module import AttentionModule
 from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 
 # easydel.modules
 from ..flax_modelling_utils import (
-    with_sharding_constraint,
-    get_gradient_checkpoint_policy,
-    repeat_kv_bnsh,
-    apply_rotary_pos_emb,
-    precompute_freq_cis,
-    get_dot_general_by_bits,
-    BaseJAXAttentionModule,
-    block_wise_ffn,
     ACT2FN,
+    BaseJAXAttentionModule,
+    apply_rotary_pos_emb,
+    block_wise_ffn,
     control_mlp_sharding,
+    get_dot_general_by_bits,
+    get_gradient_checkpoint_policy,
+    precompute_freq_cis,
+    repeat_kv_bnsh,
+    with_sharding_constraint,
 )
+from .stablelm_configuration import StableLmConfig
 
 
 def repeat_kv(x: chex.Array, n_rep: int) -> chex.Array:
@@ -182,7 +182,7 @@ class FlaxStableLmAttention(BaseJAXAttentionModule):
             precision=self.precision,
             force_float32_tpu=True,
             attn_mechanism=self.config.attn_mechanism,
-            dtype=self.dtype,
+            dtype=self.config.attn_dtype,
             partition_axis=self.config.partition_axis,
             scan_ring_attention=self.config.scan_ring_attention,
             mesh=self.config.get_mesh(),

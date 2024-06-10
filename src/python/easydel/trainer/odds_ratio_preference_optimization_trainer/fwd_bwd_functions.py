@@ -6,7 +6,7 @@ import fjformer
 import flax.core
 import jax
 
-from typing import Literal, Dict, Union, Tuple, List, Callable
+from typing import Literal, Dict, Union, Tuple, List, Callable, Mapping
 
 from jax import numpy as jnp
 from ...etils import EasyDeLState
@@ -69,7 +69,7 @@ def create_orpo_concatenated_forward(
     def concatenated_forward(
         apply_fn: Callable,
         params: dict | flax.core.FrozenDict,
-        batch: Dict[str, Union[List, chex.Array]],
+        batch: Mapping[str, Union[List, chex.Array]],
     ) -> Tuple[chex.Array, chex.Array, chex.Array, chex.Array, chex.Array]:
         """The concatenated_forward function is used to compute the log-probabilities of both chosen and rejected labels.
 

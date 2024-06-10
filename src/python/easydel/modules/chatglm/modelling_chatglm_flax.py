@@ -1,38 +1,35 @@
 import math
-from typing import Optional, Tuple, Union, Any
+from typing import Any, Optional, Tuple, Union
 
 import chex
-from fjformer import linen as nn
 import jax
 import jax.numpy as jnp
+import jax.tree_util
+from fjformer import linen as nn
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
-from flax.linen import combine_masks
+from flax.linen import combine_masks, initializers
 from flax.linen import partitioning as nn_partitioning
+from flax.linen.module import compact
 from flax.traverse_util import flatten_dict, unflatten_dict
-from jax import lax, Array
+from jax import Array, lax
 from jax.sharding import PartitionSpec
 from transformers.modeling_flax_outputs import (
     FlaxBaseModelOutput,
 )
 
-from .chatglm_configuration import ChatGLMConfig
 from ..attention_module import AttentionModule
+from ..common import RMSNorm
 from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 
 # easydel.modules
 from ..flax_modelling_utils import (
-    with_sharding_constraint,
+    BaseJAXAttentionModule,
+    get_dot_general_by_bits,
     get_gradient_checkpoint_policy,
     repeat_kv_bnsh,
-    get_dot_general_by_bits,
-    BaseJAXAttentionModule,
+    with_sharding_constraint,
 )
-import jax.tree_util
-from flax.linen.module import compact
-import jax
-from flax.linen import initializers
-
-from ..common import RMSNorm
+from .chatglm_configuration import ChatGLMConfig
 
 
 def flatten_axes(a: Array, start: int = 0, end: int = -1) -> Array:
@@ -252,7 +249,7 @@ class CoreAttention(nn.Module):
             precision=self.precision,
             force_float32_tpu=True,
             attn_mechanism=self.config.attn_mechanism,
-            dtype=self.dtype,
+            dtype=self.config.attn_dtype,
             mesh=self.config.get_mesh(),
             sm_scale=1 / math.sqrt(self.head_dim),
             axis_name=self.config.attention_axis_name,
