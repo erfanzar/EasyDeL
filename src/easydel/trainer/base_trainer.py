@@ -23,7 +23,7 @@ from optax import GradientTransformation, Schedule
 from transformers import AutoModelForCausalLM, AutoConfig
 
 try:
-    import wandb
+    import wandb  # noqa #type:ignore
 except ModuleNotFoundError:
     wandb = None
 
@@ -102,9 +102,9 @@ class BaseTrainer:
         """
         # Loggers
         self.timer = getattr(self, "timer", None)
-        self.wandb_runtime: Optional[Union["Run", "RunDisabled"]] = getattr(  # type:ignore # noqa
-            self, "wandb_runtime", None
-        )
+        self.wandb_runtime: Optional[
+            Union["Run", "RunDisabled"]  # type:ignore # noqa
+        ] = getattr(self, "wandb_runtime", None)
 
         # Data
         self.dataloader_train = getattr(self, "dataloader_train", None)
@@ -449,9 +449,9 @@ class BaseTrainer:
                     " pass custom_rule for partition rules "
                 )
 
-            self.arguments.configs_to_initialize_model_class[
-                "config"
-            ].axis_dims = self.arguments.sharding_array
+            self.arguments.configs_to_initialize_model_class["config"].axis_dims = (
+                self.arguments.sharding_array
+            )
 
             model = self.arguments.model_class(
                 **self.arguments.configs_to_initialize_model_class, _do_init=False
@@ -661,7 +661,9 @@ partition_rules = {partition_rules}
         if save_dir is None:
             save_dir = os.path.join(self.arguments.save_dir, self.arguments.model_name)
         if to_torch:
-            from ..transform.easydel_transform import easystate_to_huggingface_model
+            from easydel.transform.easydel_transform import (
+                easystate_to_huggingface_model,
+            )
 
             if easystate_to_huggingface_model_kwargs is None:
                 easystate_to_huggingface_model_kwargs = {}

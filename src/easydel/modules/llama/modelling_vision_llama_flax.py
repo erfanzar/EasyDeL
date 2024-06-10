@@ -14,10 +14,14 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 from easydel.modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
-from transformers.generation.flax_utils import SampleState, FlaxLogitsProcessorList, FlaxSampleOutput
+from transformers.generation.flax_utils import (
+    SampleState,
+    FlaxLogitsProcessorList,
+    FlaxSampleOutput,
+)
 from transformers import GenerationConfig
-from .vision_llama_configuration import VisionLlamaConfig
-from .modelling_llama_flax import FlaxLlamaBlockCollection, RMSNorm
+from easydel.modules.llama.vision_llama_configuration import VisionLlamaConfig
+from easydel.modules.llama.modelling_llama_flax import FlaxLlamaBlockCollection, RMSNorm
 from easydel.modules.flax_modelling_utils import precompute_freq_cis
 from fjformer.linen import Dense
 
@@ -25,36 +29,53 @@ from easydel.etils.etils import get_logger
 
 logger = get_logger(__name__)
 
+
 class FlaxVisionLlamaPreTrainedModel(EasyDeLFlaxPretrainedModel):
     config_class = VisionLlamaConfig
     base_model_prefix = "model"
     module_class: nn.Module = None
 
     def __init__(
-            self,
-            config: VisionLlamaConfig,
-            input_shape: Tuple = (4, 1),
-            seed: int = 0,
-            dtype: jnp.dtype = jnp.float32,
-            _do_init: bool = True,
-            **kwargs,
+        self,
+        config: VisionLlamaConfig,
+        input_shape: Tuple = (4, 1),
+        seed: int = 0,
+        dtype: jnp.dtype = jnp.float32,
+        _do_init: bool = True,
+        **kwargs,
     ):
         module = self.module_class(config=config, dtype=dtype, **kwargs)
-        super().__init__(config, module, input_shape=input_shape, seed=seed, dtype=dtype, _do_init=_do_init)
+        super().__init__(
+            config,
+            module,
+            input_shape=input_shape,
+            seed=seed,
+            dtype=dtype,
+            _do_init=_do_init,
+        )
 
     def init_cache(self, batch_size, max_length):
         input_ids = jnp.ones((batch_size, max_length))
         attention_mask = jnp.ones_like(input_ids)
-        position_ids = jnp.broadcast_to(jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape)
+        position_ids = jnp.broadcast_to(
+            jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape
+        )
         vision_mask = jnp.ones((batch_size, max_length), dtype=bool)
 
         init_variables = self.module.init(
-            jax.random.PRNGKey(0), input_ids, vision_mask, attention_mask, position_ids,
-            return_dict=False, init_cache=True
+            jax.random.PRNGKey(0),
+            input_ids,
+            vision_mask,
+            attention_mask,
+            position_ids,
+            return_dict=False,
+            init_cache=True,
         )
         return init_variables["cache"]
 
-    def init_weights(self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None) -> FrozenDict:
+    def init_weights(
+        self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
+    ) -> FrozenDict:
         """
         The init_weights function is used to initialize the weights of a model.
 
@@ -68,19 +89,18 @@ class FlaxVisionLlamaPreTrainedModel(EasyDeLFlaxPretrainedModel):
         input_ids = jnp.zeros(input_shape, dtype="i4")
         attention_mask = jnp.ones_like(input_ids)
         vision_mask = jnp.ones(input_ids.shape, dtype=bool)
-        position_ids = jnp.broadcast_to(jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_shape)
+        position_ids = jnp.broadcast_to(
+            jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_shape
+        )
         params_rng, dropout_rng = jax.random.split(rng)
 
         random_params = self.module.init(
-            {
-                "params": params_rng,
-                "dropout": dropout_rng
-            },
+            {"params": params_rng, "dropout": dropout_rng},
             input_ids,
             vision_mask,
             attention_mask,
             position_ids,
-            return_dict=False
+            return_dict=False,
         )["params"]
 
         if params is not None:
@@ -94,35 +114,47 @@ class FlaxVisionLlamaPreTrainedModel(EasyDeLFlaxPretrainedModel):
             return random_params
 
     def __call__(
-            self,
-            input_ids: chex.Array,
-            vision_mask: Optional[chex.Array] = None,
-            attention_mask: Optional[chex.Array] = None,
-            position_ids: Optional[chex.Array] = None,
-            params: dict = None,
-            past_key_values: dict = None,
-            dropout_rng: jax.random.PRNGKey = None,
-            train: bool = False,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
-            extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
-            add_params_field: bool = False,
-            **kwargs
+        self,
+        input_ids: chex.Array,
+        vision_mask: Optional[chex.Array] = None,
+        attention_mask: Optional[chex.Array] = None,
+        position_ids: Optional[chex.Array] = None,
+        params: dict = None,
+        past_key_values: dict = None,
+        dropout_rng: jax.random.PRNGKey = None,
+        train: bool = False,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+        add_params_field: bool = False,
+        **kwargs,
     ):
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
         )
-        return_dict = return_dict if return_dict is not None else self.config.return_dict
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
+        )
+        return_dict = (
+            return_dict if return_dict is not None else self.config.return_dict
+        )
 
         batch_size, sequence_length = input_ids.shape
 
         if position_ids is None:
             if past_key_values is not None:
-                raise ValueError("Make sure to provide `position_ids` when passing `past_key_values`.")
+                raise ValueError(
+                    "Make sure to provide `position_ids` when passing `past_key_values`."
+                )
 
-            position_ids = jnp.broadcast_to(jnp.arange(sequence_length)[None, :], (batch_size, sequence_length))
+            position_ids = jnp.broadcast_to(
+                jnp.arange(sequence_length)[None, :], (batch_size, sequence_length)
+            )
 
         if attention_mask is None:
             attention_mask = jnp.ones((batch_size, sequence_length))
@@ -192,73 +224,87 @@ class FlaxVisionLlamaModule(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
         )
-        self.dropout = flax.linen.Dropout(rate=config.embd_pdrop)
+        self.dropout = nn.Dropout(rate=config.embd_pdrop)
         self.layers = FlaxLlamaBlockCollection(
             self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            precision=self.precision
+            precision=self.precision,
         )
         self.norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
             dtype=self.dtype,
-            param_dtype=self.param_dtype
+            param_dtype=self.param_dtype,
         )
-        self.causal_mask = flax.linen.make_causal_mask(
+        self.causal_mask = nn.make_causal_mask(
             jnp.ones(
-                (1, getattr(self.config, "c_max_position_embeddings", self.config.max_position_embeddings)),
-                dtype="bool"
-            ), dtype="bool"
+                (
+                    1,
+                    getattr(
+                        self.config,
+                        "c_max_position_embeddings",
+                        self.config.max_position_embeddings,
+                    ),
+                ),
+                dtype="bool",
+            ),
+            dtype="bool",
         )
 
-        initial_rope_kwargs = dict(
-            rope_type="none"
-        )
+        initial_rope_kwargs = dict(rope_type="none")
         if config.rope_scaling is not None:
             scaling_type = config.rope_scaling["type"]
             scaling_factor = config.rope_scaling["factor"]
             initial_rope_kwargs = dict(
-                scaling_factor=scaling_factor,
-                rope_type=scaling_type
+                scaling_factor=scaling_factor, rope_type=scaling_type
             )
         self.freq_cis = precompute_freq_cis(
             max_position_embeddings=(
-                getattr(self.config, "freq_max_position_embeddings", self.config.max_position_embeddings)
+                getattr(
+                    self.config,
+                    "freq_max_position_embeddings",
+                    self.config.max_position_embeddings,
+                )
             ),
             dim=config.hidden_size // config.num_attention_heads,
             base=config.rope_theta,
-            **initial_rope_kwargs
+            **initial_rope_kwargs,
         )
 
     def __call__(
-            self,
-            input_ids,
-            vision_mask,
-            attention_mask,
-            position_ids,
-            deterministic=True,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            output_hidden_states: bool = False,
-            return_dict: bool = True,
+        self,
+        input_ids,
+        vision_mask,
+        attention_mask,
+        position_ids,
+        deterministic=True,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        return_dict: bool = True,
     ):
         input_ids = input_ids.astype("i4")
 
         if input_ids.shape[1] == 1:
-            if self.config.sample_mode == 'text':
+            if self.config.sample_mode == "text":
                 input_embeds = self.embed_tokens(input_ids)
-            elif self.config.sample_mode == 'vision':
+            elif self.config.sample_mode == "vision":
                 input_embeds = self.embed_vision(input_ids)
-            elif self.config.sample_mode == 'all':
+            elif self.config.sample_mode == "all":
                 raise NotImplementedError
             else:
                 raise ValueError(f"Invalid sample_mode: {self.config.sample_mode}")
         else:
             input_text_embeds = self.embed_tokens(jnp.where(vision_mask, 0, input_ids))
-            input_vision_embeds = self.embed_vision(jnp.where(vision_mask, input_ids, 0))
+            input_vision_embeds = self.embed_vision(
+                jnp.where(vision_mask, input_ids, 0)
+            )
             vision_mask = vision_mask[..., None].astype("f4")
-            input_embeds = input_text_embeds * (1 - vision_mask) + input_vision_embeds * vision_mask
+            input_embeds = (
+                input_text_embeds * (1 - vision_mask)
+                + input_vision_embeds * vision_mask
+            )
 
         hidden_states = self.dropout(input_embeds, deterministic=deterministic)
 
@@ -305,14 +351,16 @@ class FlaxVisionLlamaForCausalLMModule(nn.Module):
             self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            precision=self.precision
+            precision=self.precision,
         )
         self.vision_head = Dense(
             self.config.vision_vocab_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+            kernel_init=jax.nn.initializers.normal(
+                stddev=self.config.initializer_range
+            ),
             precision=self.precision,
         )
         self.lm_head = Dense(
@@ -320,21 +368,23 @@ class FlaxVisionLlamaForCausalLMModule(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+            kernel_init=jax.nn.initializers.normal(
+                stddev=self.config.initializer_range
+            ),
             precision=self.precision,
         )
 
     def __call__(
-            self,
-            input_ids,
-            vision_mask,
-            attention_mask=None,
-            position_ids=None,
-            deterministic: bool = True,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            output_hidden_states: bool = False,
-            return_dict: bool = True,
+        self,
+        input_ids,
+        vision_mask,
+        attention_mask=None,
+        position_ids=None,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        return_dict: bool = True,
     ):
         batch_size, seq_length = input_ids.shape
         if attention_mask is None:
@@ -342,7 +392,7 @@ class FlaxVisionLlamaForCausalLMModule(nn.Module):
         if position_ids is None:
             position_ids = jnp.broadcast_to(
                 jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
-                (batch_size, seq_length)
+                (batch_size, seq_length),
             )
 
         outputs = self.transformer(
@@ -360,36 +410,58 @@ class FlaxVisionLlamaForCausalLMModule(nn.Module):
         hidden_states = outputs[0]
 
         if self.config.tie_vision_embeddings:
-            shared_kernel = self.transformer.variables["params"]["embed_vision"]["embedding"].T
-            vision_logits = self.vision_head.apply({"params": {"kernel": shared_kernel}}, hidden_states)
+            shared_kernel = self.transformer.variables["params"]["embed_vision"][
+                "embedding"
+            ].T
+            vision_logits = self.vision_head.apply(
+                {"params": {"kernel": shared_kernel}}, hidden_states
+            )
         else:
             vision_logits = self.vision_head(hidden_states)
 
         if self.config.tie_word_embeddings:
-            shared_kernel = self.transformer.variables["params"]["embed_tokens"]["embedding"]
-            shared_kernel = fjformer.linen.control_quantization(shared_kernel, self.param_dtype).T
-            lm_logits = self.lm_head.apply({"params": {"kernel": shared_kernel}}, hidden_states)
+            shared_kernel = self.transformer.variables["params"]["embed_tokens"][
+                "embedding"
+            ]
+            shared_kernel = fjformer.linen.control_quantization(
+                shared_kernel, self.param_dtype
+            ).T
+            lm_logits = self.lm_head.apply(
+                {"params": {"kernel": shared_kernel}}, hidden_states
+            )
         else:
             lm_logits = self.lm_head(hidden_states)
 
-        if self.config.sample_mode == 'all':
+        if self.config.sample_mode == "all":
             if not return_dict:
-                return (vision_logits, lm_logits,) + outputs[1:]
+                return (
+                    vision_logits,
+                    lm_logits,
+                ) + outputs[1:]
 
-            return FlaxCausalLMOutput(logits=(vision_logits, lm_logits), hidden_states=outputs.hidden_states,
-                                      attentions=outputs.attentions)
-        elif self.config.sample_mode == 'vision':
+            return FlaxCausalLMOutput(
+                logits=(vision_logits, lm_logits),
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+            )
+        elif self.config.sample_mode == "vision":
             if not return_dict:
                 return (vision_logits,) + outputs[1:]
 
-            return FlaxCausalLMOutput(logits=vision_logits, hidden_states=outputs.hidden_states,
-                                      attentions=outputs.attentions)
-        elif self.config.sample_mode == 'text':
+            return FlaxCausalLMOutput(
+                logits=vision_logits,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+            )
+        elif self.config.sample_mode == "text":
             if not return_dict:
                 return (lm_logits,) + outputs[1:]
 
-            return FlaxCausalLMOutput(logits=lm_logits, hidden_states=outputs.hidden_states,
-                                      attentions=outputs.attentions)
+            return FlaxCausalLMOutput(
+                logits=lm_logits,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+            )
         else:
             raise ValueError(f"Invalid sample_mode: {self.config.sample_mode}")
 
@@ -398,11 +470,11 @@ class FlaxVisionLlamaForCausalLM(FlaxVisionLlamaPreTrainedModel):
     module_class = FlaxVisionLlamaForCausalLMModule
 
     def prepare_inputs_for_generation(
-            self,
-            input_ids,
-            max_length,
-            attention_mask: Optional[jax.Array] = None,
-            vision_mask=None
+        self,
+        input_ids,
+        max_length,
+        attention_mask: Optional[jax.Array] = None,
+        vision_mask=None,
     ):
         # initializing the cache
         batch_size, seq_length = input_ids.shape
@@ -411,15 +483,19 @@ class FlaxVisionLlamaForCausalLM(FlaxVisionLlamaPreTrainedModel):
         extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
         if attention_mask is not None:
             position_ids = attention_mask.cumsum(axis=-1) - 1
-            extended_attention_mask = lax.dynamic_update_slice(extended_attention_mask, attention_mask, (0, 0))
+            extended_attention_mask = lax.dynamic_update_slice(
+                extended_attention_mask, attention_mask, (0, 0)
+            )
         else:
-            position_ids = jnp.broadcast_to(jnp.arange(seq_length, dtype="i4")[None, :], (batch_size, seq_length))
+            position_ids = jnp.broadcast_to(
+                jnp.arange(seq_length, dtype="i4")[None, :], (batch_size, seq_length)
+            )
 
         return {
             "past_key_values": past_key_values,
             "attention_mask": extended_attention_mask,
             "position_ids": position_ids,
-            "vision_mask": vision_mask
+            "vision_mask": vision_mask,
         }
 
     def update_inputs_for_generation(self, model_outputs, model_kwargs):
@@ -427,33 +503,45 @@ class FlaxVisionLlamaForCausalLM(FlaxVisionLlamaPreTrainedModel):
             "past_key_values": model_outputs.past_key_values,
             "position_ids": model_kwargs["position_ids"][:, -1:] + 1,
             "attention_mask": model_kwargs["attention_mask"],
-            "vision_mask": model_kwargs["vision_mask"]
+            "vision_mask": model_kwargs["vision_mask"],
         }
 
     def _sample_vision(
-            self,
-            input_ids: None,
-            max_length: Optional[int] = None,
-            pad_token_id: Optional[int] = None,
-            eos_token_id: Optional[int] = None,
-            prng_key: Optional[jnp.ndarray] = None,
-            logits_processor: Optional[FlaxLogitsProcessorList] = None,
-            logits_warper: Optional[FlaxLogitsProcessorList] = None,
-            cfg_scales: jnp.ndarray = 1.0,
-            trace: bool = True,
-            params: Optional[Dict[str, jnp.ndarray]] = None,
-            model_kwargs: Optional[Dict[str, jnp.ndarray]] = None,
+        self,
+        input_ids: None,
+        max_length: Optional[int] = None,
+        pad_token_id: Optional[int] = None,
+        eos_token_id: Optional[int] = None,
+        prng_key: Optional[jnp.ndarray] = None,
+        logits_processor: Optional[FlaxLogitsProcessorList] = None,
+        logits_warper: Optional[FlaxLogitsProcessorList] = None,
+        cfg_scales: jnp.ndarray = 1.0,
+        trace: bool = True,
+        params: Optional[Dict[str, jnp.ndarray]] = None,
+        model_kwargs: Optional[Dict[str, jnp.ndarray]] = None,
     ):
         # init values
-        max_length = max_length if max_length is not None else self.generation_config.max_length
-        pad_token_id = pad_token_id if pad_token_id is not None else self.generation_config.pad_token_id
-        eos_token_id = eos_token_id if eos_token_id is not None else self.generation_config.eos_token_id
+        max_length = (
+            max_length if max_length is not None else self.generation_config.max_length
+        )
+        pad_token_id = (
+            pad_token_id
+            if pad_token_id is not None
+            else self.generation_config.pad_token_id
+        )
+        eos_token_id = (
+            eos_token_id
+            if eos_token_id is not None
+            else self.generation_config.eos_token_id
+        )
         prng_key = prng_key if prng_key is not None else jax.random.PRNGKey(0)
 
         batch_size, cur_len = input_ids.shape
         initial_len = cur_len
 
-        eos_token_id = jnp.array(eos_token_id, dtype=jnp.int32 if eos_token_id is not None else None)
+        eos_token_id = jnp.array(
+            eos_token_id, dtype=jnp.int32 if eos_token_id is not None else None
+        )
         pad_token_id = jnp.array(pad_token_id, dtype=jnp.int32)
         cur_len = jnp.array(cur_len)
 
@@ -469,7 +557,9 @@ class FlaxVisionLlamaForCausalLM(FlaxVisionLlamaPreTrainedModel):
         model = self.decode if self.config.is_encoder_decoder else self
 
         # initialize model specific kwargs
-        model_kwargs = self.prepare_inputs_for_generation(input_ids, max_length, **model_kwargs)
+        model_kwargs = self.prepare_inputs_for_generation(
+            input_ids, max_length, **model_kwargs
+        )
 
         # initialize state
         state = SampleState(
@@ -485,13 +575,17 @@ class FlaxVisionLlamaForCausalLM(FlaxVisionLlamaPreTrainedModel):
             """state termination condition fn."""
             has_reached_max_length = state.cur_len == max_length
             all_sequence_finished = jnp.all(state.is_sent_finished)
-            finish_generation = jnp.logical_or(has_reached_max_length, all_sequence_finished)
+            finish_generation = jnp.logical_or(
+                has_reached_max_length, all_sequence_finished
+            )
             return ~finish_generation
 
         def sample_search_body_fn(state):
             """state update fn."""
             prng_key, prng_key_next = jax.random.split(state.prng_key)
-            model_outputs = model(state.running_token, params=params, **state.model_kwargs)
+            model_outputs = model(
+                state.running_token, params=params, **state.model_kwargs
+            )
 
             logits = model_outputs.logits[:, -1]
             cond_logits, uncond_logits = jnp.split(logits, 2, axis=0)
@@ -506,16 +600,22 @@ class FlaxVisionLlamaForCausalLM(FlaxVisionLlamaPreTrainedModel):
             next_token = jax.lax.cond(
                 (state.cur_len - initial_len + 1) % 257 == 0,
                 lambda: jnp.full_like(next_token, 8192),
-                lambda: next_token
+                lambda: next_token,
             )
             next_token = jnp.concatenate([next_token, next_token], axis=0)
 
             # next_token = next_token * ~state.is_sent_finished + pad_token_id * state.is_sent_finished
-            next_is_sent_finished = state.is_sent_finished | (next_token == eos_token_id)
+            next_is_sent_finished = state.is_sent_finished | (
+                next_token == eos_token_id
+            )
             next_token = next_token[:, None]
 
-            next_sequences = lax.dynamic_update_slice(state.sequences, next_token, (0, state.cur_len))
-            next_model_kwargs = self.update_inputs_for_generation(model_outputs, state.model_kwargs)
+            next_sequences = lax.dynamic_update_slice(
+                state.sequences, next_token, (0, state.cur_len)
+            )
+            next_model_kwargs = self.update_inputs_for_generation(
+                model_outputs, state.model_kwargs
+            )
 
             return SampleState(
                 cur_len=state.cur_len + 1,
@@ -531,22 +631,24 @@ class FlaxVisionLlamaForCausalLM(FlaxVisionLlamaPreTrainedModel):
             state = sample_search_body_fn(state)
 
         if not trace:
-            state = self._run_loop_in_debug(sample_search_cond_fn, sample_search_body_fn, state)
+            state = self._run_loop_in_debug(
+                sample_search_cond_fn, sample_search_body_fn, state
+            )
         else:
             state = lax.while_loop(sample_search_cond_fn, sample_search_body_fn, state)
 
         return FlaxSampleOutput(sequences=state.sequences)
 
     def generate_vision(
-            self,
-            input_ids: jnp.ndarray,
-            cfg_scales: jnp.ndarray,
-            generation_config: Optional[GenerationConfig] = None,
-            prng_key: Optional[jnp.ndarray] = None,
-            trace: bool = True,
-            params: Optional[Dict[str, jnp.ndarray]] = None,
-            logits_processor: Optional[FlaxLogitsProcessorList] = None,
-            **kwargs,
+        self,
+        input_ids: jnp.ndarray,
+        cfg_scales: jnp.ndarray,
+        generation_config: Optional[GenerationConfig] = None,
+        prng_key: Optional[jnp.ndarray] = None,
+        trace: bool = True,
+        params: Optional[Dict[str, jnp.ndarray]] = None,
+        logits_processor: Optional[FlaxLogitsProcessorList] = None,
+        **kwargs,
     ):
         # Handle `generation_config` and kwargs that might update it, and validate the `.generate()` call
         self._validate_model_class()
@@ -557,8 +659,10 @@ class FlaxVisionLlamaForCausalLM(FlaxVisionLlamaPreTrainedModel):
             # two conditions must be met
             # 1) the generation config must have been created from the model config (`_from_model_config` field);
             # 2) the generation config must have seen no modification since its creation (the hash is the same).
-            if self.generation_config._from_model_config and self.generation_config._original_object_hash == hash(
-                    self.generation_config
+            if (
+                self.generation_config._from_model_config
+                and self.generation_config._original_object_hash
+                == hash(self.generation_config)
             ):
                 new_generation_config = GenerationConfig.from_model_config(self.config)
                 if new_generation_config != self.generation_config:
@@ -573,16 +677,25 @@ class FlaxVisionLlamaForCausalLM(FlaxVisionLlamaPreTrainedModel):
             generation_config = self.generation_config
 
         generation_config = copy.deepcopy(generation_config)
-        model_kwargs = generation_config.update(**kwargs)  # All unused kwargs must be model kwargs
+        model_kwargs = generation_config.update(
+            **kwargs
+        )  # All unused kwargs must be model kwargs
         generation_config.validate()
         self._validate_model_kwargs(model_kwargs.copy())
 
-        logits_processor = logits_processor if logits_processor is not None else FlaxLogitsProcessorList()
+        logits_processor = (
+            logits_processor
+            if logits_processor is not None
+            else FlaxLogitsProcessorList()
+        )
 
         # set init values
         prng_key = prng_key if prng_key is not None else jax.random.PRNGKey(0)
 
-        if generation_config.pad_token_id is None and generation_config.eos_token_id is not None:
+        if (
+            generation_config.pad_token_id is None
+            and generation_config.eos_token_id is not None
+        ):
             if model_kwargs.get("attention_mask") is None:
                 warnings.warn(
                     "The attention mask and the pad token id were not set. As a consequence, you may observe "
@@ -591,17 +704,24 @@ class FlaxVisionLlamaForCausalLM(FlaxVisionLlamaPreTrainedModel):
             eos_token_id = generation_config.eos_token_id
             if isinstance(eos_token_id, list):
                 eos_token_id = eos_token_id[0]
-            warnings.warn(f"Setting `pad_token_id` to `eos_token_id`:{eos_token_id} for open-end generation.")
+            warnings.warn(
+                f"Setting `pad_token_id` to `eos_token_id`:{eos_token_id} for open-end generation."
+            )
             generation_config.pad_token_id = eos_token_id
 
-        if generation_config.decoder_start_token_id is None and self.config.is_encoder_decoder:
-            raise ValueError("`decoder_start_token_id` has to be defined for encoder-decoder generation.")
+        if (
+            generation_config.decoder_start_token_id is None
+            and self.config.is_encoder_decoder
+        ):
+            raise ValueError(
+                "`decoder_start_token_id` has to be defined for encoder-decoder generation."
+            )
 
         # decoder-only models should use left-padding for generation (can't be checked with `trace=True`)
         if not self.config.is_encoder_decoder and not trace:
             if (
-                    generation_config.pad_token_id is not None
-                    and jnp.sum(input_ids[:, -1] == generation_config.pad_token_id) > 0
+                generation_config.pad_token_id is not None
+                and jnp.sum(input_ids[:, -1] == generation_config.pad_token_id) > 0
             ):
                 warnings.warn(
                     "A decoder-only architecture is being used, but right-padding was detected! For correct "
@@ -613,7 +733,9 @@ class FlaxVisionLlamaForCausalLM(FlaxVisionLlamaPreTrainedModel):
         if self.config.is_encoder_decoder:
             # add encoder_outputs to model_kwargs
             if model_kwargs.get("encoder_outputs") is None:
-                model_kwargs = self._prepare_encoder_decoder_kwargs_for_generation(input_ids, params, model_kwargs)
+                model_kwargs = self._prepare_encoder_decoder_kwargs_for_generation(
+                    input_ids, params, model_kwargs
+                )
             # prepare decoder_input_ids for generation
             input_ids = self._prepare_decoder_input_ids_for_generation(
                 batch_size,
@@ -624,8 +746,15 @@ class FlaxVisionLlamaForCausalLM(FlaxVisionLlamaPreTrainedModel):
 
         # Prepare `max_length` depending on other stopping criteria.
         input_ids_seq_length = input_ids.shape[-1]
-        has_default_max_length = kwargs.get("max_length") is None and generation_config.max_length is not None
-        if has_default_max_length and generation_config.max_new_tokens is None and generation_config.max_length == 20:
+        has_default_max_length = (
+            kwargs.get("max_length") is None
+            and generation_config.max_length is not None
+        )
+        if (
+            has_default_max_length
+            and generation_config.max_new_tokens is None
+            and generation_config.max_length == 20
+        ):
             # 20 is the default max_length of the generation config
             warnings.warn(
                 f"Using the model-agnostic default `max_length` (={generation_config.max_length}) "
@@ -641,15 +770,22 @@ class FlaxVisionLlamaForCausalLM(FlaxVisionLlamaPreTrainedModel):
                     "Please refer to the documentation for more information. "
                     "(https://huggingface.co/docs/transformers/main/en/main_classes/text_generation)"
                 )
-            generation_config.max_length = generation_config.max_new_tokens + input_ids_seq_length
+            generation_config.max_length = (
+                generation_config.max_new_tokens + input_ids_seq_length
+            )
 
-        if generation_config.min_length is not None and generation_config.min_length > generation_config.max_length:
+        if (
+            generation_config.min_length is not None
+            and generation_config.min_length > generation_config.max_length
+        ):
             raise ValueError(
                 f"Unfeasable length constraints: the minimum length ({generation_config.min_length}) is larger than"
                 f" the maximum length ({generation_config.max_length})"
             )
         if input_ids_seq_length >= generation_config.max_length:
-            input_ids_string = "decoder_input_ids" if self.config.is_encoder_decoder else "input_ids"
+            input_ids_string = (
+                "decoder_input_ids" if self.config.is_encoder_decoder else "input_ids"
+            )
             warnings.warn(
                 f"Input length of {input_ids_string} is {input_ids_seq_length}, but `max_length` is set to"
                 f" {generation_config.max_length}. This can lead to unexpected behavior. You should consider"
