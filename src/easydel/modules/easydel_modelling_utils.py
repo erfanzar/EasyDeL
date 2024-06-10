@@ -832,7 +832,7 @@ class EasyDeLFlaxPretrainedModel(FlaxPreTrainedModel):
             shard_fns: dict[Callable] = None,
             auto_shard_params: bool = False,
             remove_dict_prefix=None,
-            verbose: bool = False,
+            verbose: bool = True,
             mismatch_allowed: bool = True,
             *model_args,
             config: Optional[Union[EasyDeLPretrainedConfig, str, os.PathLike]] = None,
@@ -1006,7 +1006,6 @@ class EasyDeLFlaxPretrainedModel(FlaxPreTrainedModel):
         )
 
         state = flatten_dict(state)
-
         random_state = flatten_dict(unfreeze(model.params_shape_tree))
 
         missing_keys = model.required_params - set(state.keys())
@@ -1058,23 +1057,12 @@ class EasyDeLFlaxPretrainedModel(FlaxPreTrainedModel):
                 f" {model.__class__.__name__} from the checkpoint of a model that you expect to be exactly identical"
                 " (initializing a BertForSequenceClassification model from a BertForSequenceClassification model)."
             )
-        else:
-            logger.info(
-                f"All model checkpoint weights were used when initializing {model.__class__.__name__}.\n"
-            )
 
         if len(missing_keys) > 0:
             logger.warning(
                 f"Some weights of {model.__class__.__name__} were not initialized from the model checkpoint at"
                 f" {pretrained_model_name_or_path} and are newly initialized: {missing_keys}\nYou should probably"
                 " TRAIN this model on a down-stream task to be able to use it for predictions and inference."
-            )
-        elif len(mismatched_keys) == 0:
-            logger.info(
-                f"All the weights of {model.__class__.__name__} were initialized from the model checkpoint at"
-                f" {pretrained_model_name_or_path}.\nIf your task is similar to the task the model of the checkpoint"
-                f" was trained on, you can already use {model.__class__.__name__} for predictions without further"
-                " training."
             )
         if len(mismatched_keys) > 0:
             mismatched_warning = "\n".join(

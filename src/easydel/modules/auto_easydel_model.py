@@ -709,7 +709,7 @@ class AutoEasyDeLModelForCausalLM:
                     params_pattern_selection = re.compile(
                         "({})".format("|".join(bit_targeted_params))
                     )
-
+            uses_tie_word_embedding = getattr(config, "tie_word_embeddings", False)
             params = trf(
                 state_dict,
                 config=config,
@@ -718,7 +718,7 @@ class AutoEasyDeLModelForCausalLM:
                 convert_to_8bit=load_in_8bit,
                 params_pattern_selection=params_pattern_selection,
                 remove_state_dict=True,
-                uses_tie_word_embedding=getattr(config, "tie_word_embeddings", False),
+                uses_tie_word_embedding=uses_tie_word_embedding,
             )
 
             # Clear and collect memory after converting the model
