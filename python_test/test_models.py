@@ -449,7 +449,7 @@ class EasyModelsTest(TestCase):
         conf = transformers.AutoConfig.from_pretrained(
             "apple/OpenELM-270M-Instruct", trust_remote_code=True
         )
-        from src.python.easydel import OpenELMConfig
+        from easydel import OpenELMConfig
 
         conf_f = OpenELMConfig()
         for k, v in conf.__dict__.items():

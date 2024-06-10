@@ -1,8 +1,8 @@
 import jax
 
-from src.python.easydel import LlamaConfig, FlaxLlamaForCausalLM
-from src.python.easydel import EasyDeLState
-from src.python.easydel.etils.auto_tx import get_optimizer_and_scheduler
+from easydel import LlamaConfig, FlaxLlamaForCausalLM
+from easydel import EasyDeLState
+from easydel.etils.auto_tx import get_optimizer_and_scheduler
 
 
 def main():
