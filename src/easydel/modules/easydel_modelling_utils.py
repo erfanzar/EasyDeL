@@ -910,7 +910,10 @@ class EasyDeLFlaxPretrainedModel(FlaxPreTrainedModel):
             commit_hash = getattr(config, "_commit_hash", None)
         if auto_shard_params and shard_fns is None:
             shard_fns, _ = AutoShardAndGatherFunctions.from_config(
-                config=config, dtype_specs=param_dtype, input_shape=input_shape
+                config=config,
+                dtype_specs=param_dtype,
+                input_shape=input_shape,
+                flatten=False
             )
         elif auto_shard_params and shard_fns is not None:
             logger.warning(
