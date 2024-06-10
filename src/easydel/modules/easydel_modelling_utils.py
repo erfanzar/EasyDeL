@@ -725,7 +725,7 @@ class EasyDeLFlaxPretrainedModel(FlaxPreTrainedModel):
         Return the Huggingface / Pytorch implementation of the model with same weights  (if model is available in HF)
         """
 
-        from ..transform.easydel_transform import easystate_to_huggingface_model
+        from easydel.transform.easydel_transform import easystate_to_huggingface_model
 
         state = self.to_easydel_state(params=params)
         if easystate_to_huggingface_model_kwargs is None:
@@ -877,7 +877,7 @@ class EasyDeLFlaxPretrainedModel(FlaxPreTrainedModel):
             cl_di = len(jax.devices())
             input_shape = (cl_di, cl_di)  # safest way to perform loading ...
         config_path = config if config is not None else pretrained_model_name_or_path
-        from .auto_easydel_model import (
+        from easydel.modules.auto_easydel_model import (
             AutoEasyDeLConfig,
             AutoShardAndGatherFunctions,
             get_modules_by_type,

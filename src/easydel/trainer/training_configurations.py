@@ -7,7 +7,7 @@ from typing import OrderedDict, List, Union, Mapping, Optional, Tuple, Callable
 import termcolor
 
 try:
-    import wandb
+    import wandb  # noqa #type:ignore
 except ModuleNotFoundError:
     wandb = None
 
@@ -47,75 +47,78 @@ class EasyDeLXRapTureConfig(XRapTureConfig):  # Don't Make user involved with FJ
 
 
 class TrainArguments(OrderedDict):
+
     def __init__(
-            self,
-            model_name: str,
-            num_train_epochs: int,
-            model_class: Optional["EasyDeLFlaxPretrainedModel"] = None,  # type:ignore # noqa
-            model_huggingface_repo_id: Optional[str] = None,
-            total_batch_size: int = 32,
-            max_training_steps: Optional[int] = None,
-            max_evaluation_steps: Optional[int] = None,
-            optimizer: AVAILABLE_OPTIMIZERS = EasyDeLOptimizers.ADAMW,
-            scheduler: AVAILABLE_SCHEDULERS = EasyDeLSchedulers.NONE,
-            learning_rate: Union[int, float] = 5e-5,
-            learning_rate_end: Optional[float] = 5e-6,
-            gradient_accumulation_steps: int = 1,
-            weight_decay: float = 0.01,
-            label_smoothing_factor: float = 0.0,
-            z_loss: float = 0.0,
-            gradient_checkpointing: AVAILABLE_GRADIENT_CHECKPOINTS = EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
-            max_sequence_length: Optional[int] = 4096,
-            sharding_array: Union[tuple, int] = (1, -1, 1, 1),
-            is_fine_tuning: bool = True,
-            do_train: bool = True,
-            do_eval: bool = False,
-            do_test: Optional[bool] = False,
-            train_on_inputs: bool = True,
-            backend: Optional[str] = None,
-            extra_optimizer_kwargs: dict = None,
-            save_steps: Optional[int] = None,
-            save_dir: str = "EasyDeL-Checkpoints",
-            save_total_limit: Optional[int] = None,
-            dtype: jnp.dtype = jnp.bfloat16,
-            param_dtype: jnp.dtype = jnp.bfloat16,
-            fully_sharded_data_parallel: bool = True,
-            use_wandb: bool = True,
-            custom_rule: Mapping[str, PartitionSpec] = None,
-            extra_configs: Optional[dict] = None,
-            ids_to_pop_from_dataset: Optional[list] = None,
-            remove_ckpt_after_load: bool = False,
-            configs_to_initialize_model_class: Optional[dict] = None,
-            do_last_save: bool = True,
-            model_parameters: Optional[dict] = None,
-            do_shard_fns: bool = True,
-            track_memory: Optional[bool] = None,
-            loss_re_mat: str = "",
-            loss_chunk: int = 1024,
-            truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
-            warmup_steps: int = 500,
-            init_input_shape: Tuple[int, int] = (1, 1),
-            step_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp"),
-            training_time: Optional[str] = None,
-            dataloader_num_workers: Optional[int] = 0,
-            dataloader_pin_memory: Optional[bool] = False,
-            jax_distributed_config: Optional[dict] = None,
-            log_all_workers: bool = False,
-            wandb_entity: Optional[str] = None,
-            save_optimizer_state: bool = False,
-            step_start_point: Optional[int] = None,
-            verbose: bool = True,
-            offload_device: jax.Device = jax.devices("cpu")[0],
-            rapture_config: Optional[EasyDeLXRapTureConfig] = None,
-            merge_lora_rapture_parameters: bool = True,
-            state_apply_fn_kwarguments_to_model: Optional[dict] = None,
-            remove_unused_columns: bool = True,
-            force_batch_and_gradient_accumulation_steps_calculation: bool = False,
-            performance_mode: bool = False,
-            neftune_noise_alpha: Optional[float] = None,
-            log_grad_norms: bool = True,
-            loaded_model_config_kwargs: Optional[dict] = None,
-            **kwargs,
+        self,
+        model_name: str,
+        num_train_epochs: int,
+        model_class: Optional[
+            "EasyDeLFlaxPretrainedModel"  # type:ignore # noqa
+        ] = None,
+        model_huggingface_repo_id: Optional[str] = None,
+        total_batch_size: int = 32,
+        max_training_steps: Optional[int] = None,
+        max_evaluation_steps: Optional[int] = None,
+        optimizer: AVAILABLE_OPTIMIZERS = EasyDeLOptimizers.ADAMW,
+        scheduler: AVAILABLE_SCHEDULERS = EasyDeLSchedulers.NONE,
+        learning_rate: Union[int, float] = 5e-5,
+        learning_rate_end: Optional[float] = 5e-6,
+        gradient_accumulation_steps: int = 1,
+        weight_decay: float = 0.01,
+        label_smoothing_factor: float = 0.0,
+        z_loss: float = 0.0,
+        gradient_checkpointing: AVAILABLE_GRADIENT_CHECKPOINTS = EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
+        max_sequence_length: Optional[int] = 4096,
+        sharding_array: Union[tuple, int] = (1, -1, 1, 1),
+        is_fine_tuning: bool = True,
+        do_train: bool = True,
+        do_eval: bool = False,
+        do_test: Optional[bool] = False,
+        train_on_inputs: bool = True,
+        backend: Optional[str] = None,
+        extra_optimizer_kwargs: dict = None,
+        save_steps: Optional[int] = None,
+        save_dir: str = "EasyDeL-Checkpoints",
+        save_total_limit: Optional[int] = None,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        fully_sharded_data_parallel: bool = True,
+        use_wandb: bool = True,
+        custom_rule: Mapping[str, PartitionSpec] = None,
+        extra_configs: Optional[dict] = None,
+        ids_to_pop_from_dataset: Optional[list] = None,
+        remove_ckpt_after_load: bool = False,
+        configs_to_initialize_model_class: Optional[dict] = None,
+        do_last_save: bool = True,
+        model_parameters: Optional[dict] = None,
+        do_shard_fns: bool = True,
+        track_memory: Optional[bool] = None,
+        loss_re_mat: str = "",
+        loss_chunk: int = 1024,
+        truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
+        warmup_steps: int = 500,
+        init_input_shape: Tuple[int, int] = (1, 1),
+        step_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp"),
+        training_time: Optional[str] = None,
+        dataloader_num_workers: Optional[int] = 0,
+        dataloader_pin_memory: Optional[bool] = False,
+        jax_distributed_config: Optional[dict] = None,
+        log_all_workers: bool = False,
+        wandb_entity: Optional[str] = None,
+        save_optimizer_state: bool = False,
+        step_start_point: Optional[int] = None,
+        verbose: bool = True,
+        offload_device: jax.Device = jax.devices("cpu")[0],
+        rapture_config: Optional[EasyDeLXRapTureConfig] = None,
+        merge_lora_rapture_parameters: bool = True,
+        state_apply_fn_kwarguments_to_model: Optional[dict] = None,
+        remove_unused_columns: bool = True,
+        force_batch_and_gradient_accumulation_steps_calculation: bool = False,
+        performance_mode: bool = False,
+        neftune_noise_alpha: Optional[float] = None,
+        log_grad_norms: bool = True,
+        loaded_model_config_kwargs: Optional[dict] = None,
+        **kwargs,
     ):
         """The __init__ function is called when the class is instantiated.
         It sets up the attributes of an object, which are sometimes called fields or properties.
@@ -445,8 +448,13 @@ class TrainArguments(OrderedDict):
             if isinstance(v, (int, float, str, bool))
         }
 
-    def get_wandb_init(self) -> Optional[
-        Union["Run", "RunDisabled"]]:  # type:ignore # noqa: F821 # noqa: F821 # noqa: F821
+    def get_wandb_init(
+        self,
+    ) -> Optional[
+        Union[
+            "Run", "RunDisabled"  # type:ignore # noqa: F821
+        ]
+    ]:
         """The get_wandb_init function is a helper function that returns the wandb.init() call with
         the project name, config object, and tags set to appropriate values for this model.
 
@@ -551,7 +559,7 @@ class TrainArguments(OrderedDict):
 
     def get_optimizer_and_scheduler(self, steps: int | None = None):
         self.optimizer_kwargs["steps"] = steps or self.optimizer_kwargs["steps"]
-        from ..etils.auto_tx import get_optimizer_and_scheduler
+        from easydel.etils.auto_tx import get_optimizer_and_scheduler
 
         return get_optimizer_and_scheduler(**self.optimizer_kwargs)
 

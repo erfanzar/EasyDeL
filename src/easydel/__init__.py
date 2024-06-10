@@ -239,4 +239,4 @@ from easydel.etils.etils import (
 from easydel.etils.partition_module import PartitionAxis as PartitionAxis
 
 # ETILS IMPORT ENDS HERE
-__version__ = "0.0.68"
+__version__ = "0.0.69"

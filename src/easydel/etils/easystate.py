@@ -133,9 +133,14 @@ class EasyDeLState(struct.PyTreeNode):
     >> )
     ```
     """
+
     step: int
-    module: Optional["EasyDeLFlaxPretrainedModel"] = struct.field(pytree_node=False)  # type:ignore
-    module_config: Optional["EasyDeLPretrainedConfig"] = struct.field(pytree_node=False)  # type:ignore
+    module: Optional["EasyDeLFlaxPretrainedModel"] = struct.field(  # type:ignore # noqa
+        pytree_node=False
+    )
+    module_config: Optional["EasyDeLPretrainedConfig"] = (  # type:ignore # noqa
+        struct.field(pytree_node=False)
+    )
     module_config_args: Optional[dict] = struct.field(pytree_node=True)
     apply_fn: Callable = struct.field(pytree_node=False)
     params: core.FrozenDict[str, Any] = struct.field(pytree_node=True)
@@ -145,22 +150,21 @@ class EasyDeLState(struct.PyTreeNode):
     hyperparameters: Optional[dict] = struct.field(pytree_node=True)
 
     def apply_gradients(self, *, grads, **kwargs):
-
         """
-         Applies gradients to the model parameters and updates the optimizer state.
+        Applies gradients to the model parameters and updates the optimizer state.
 
-         This function is typically called during training to update the model based on the computed gradients.
+        This function is typically called during training to update the model based on the computed gradients.
 
-         Args:
-             grads: A dictionary of gradients, where keys correspond to model parameters.
-             **kwargs: Additional keyword arguments.
+        Args:
+            grads: A dictionary of gradients, where keys correspond to model parameters.
+            **kwargs: Additional keyword arguments.
 
-         Returns:
-             EasyDeLState: An updated EasyDeLState object with modified parameters and optimizer state.
-         """
+        Returns:
+            EasyDeLState: An updated EasyDeLState object with modified parameters and optimizer state.
+        """
         if OVERWRITE_WITH_GRADIENT in grads:
-            grads_with_opt = grads['params']
-            params_with_opt = self.params['params']
+            grads_with_opt = grads["params"]
+            params_with_opt = self.params["params"]
         else:
             grads_with_opt = grads
             params_with_opt = self.params
@@ -171,8 +175,8 @@ class EasyDeLState(struct.PyTreeNode):
         new_params_with_opt = optax.apply_updates(params_with_opt, updates)
         if OVERWRITE_WITH_GRADIENT in grads:
             new_params = {
-                'params': new_params_with_opt,
-                OVERWRITE_WITH_GRADIENT: grads[OVERWRITE_WITH_GRADIENT]
+                "params": new_params_with_opt,
+                OVERWRITE_WITH_GRADIENT: grads[OVERWRITE_WITH_GRADIENT],
             }
         else:
             new_params = new_params_with_opt
@@ -185,19 +189,18 @@ class EasyDeLState(struct.PyTreeNode):
 
     @classmethod
     def create(
-            cls,
-            *,
-            apply_fn: Callable,
-            params: Union[core.FrozenDict[str, Any], Mapping[str, Any]],
-            tx: optax.GradientTransformation,
-            tx_init: Optional[dict] = None,
-            hyperparameters: Optional[dict] = None,
-            module: Optional["EasyDeLFlaxPretrainedModel"] = None,  # type:ignore
-            module_config: Optional["EasyDeLPretrainedConfig"] = None,  # type:ignore
-            module_config_args: Optional[dict] = None,
-            **kwargs
+        cls,
+        *,
+        apply_fn: Callable,
+        params: Union[core.FrozenDict[str, Any], Mapping[str, Any]],
+        tx: optax.GradientTransformation,
+        tx_init: Optional[dict] = None,
+        hyperparameters: Optional[dict] = None,
+        module: Optional["EasyDeLFlaxPretrainedModel"] = None,  # type:ignore #noqa
+        module_config: Optional["EasyDeLPretrainedConfig"] = None,  # type:ignore #noqa
+        module_config_args: Optional[dict] = None,
+        **kwargs,
     ):
-
         """
         Creates a new EasyDeLState object.
 
@@ -220,7 +223,7 @@ class EasyDeLState(struct.PyTreeNode):
         if hyperparameters is None:
             hyperparameters = {}
         params_with_opt = (
-            params['params'] if OVERWRITE_WITH_GRADIENT in params else params
+            params["params"] if OVERWRITE_WITH_GRADIENT in params else params
         )
         opt_state = tx.init(params_with_opt)
         if module_config is not None:
@@ -242,20 +245,19 @@ class EasyDeLState(struct.PyTreeNode):
 
     @classmethod
     def load(
-            cls,
-            *,
-            apply_fn: Callable,
-            params: Union[core.FrozenDict[str, Any], Mapping[str, Any]],
-            step: int = 0,
-            opt_state: Optional[optax.OptState] = None,
-            tx_init: Optional[dict] = None,
-            hyperparameters: Optional[dict] = None,
-            module: Optional["EasyDeLFlaxPretrainedModel"] = None,  # type:ignore
-            module_config: Optional["EasyDeLPretrainedConfig"] = None,  # type:ignore
-            module_config_args: Optional[dict] = None,
-            **kwargs
+        cls,
+        *,
+        apply_fn: Callable,
+        params: Union[core.FrozenDict[str, Any], Mapping[str, Any]],
+        step: int = 0,
+        opt_state: Optional[optax.OptState] = None,
+        tx_init: Optional[dict] = None,
+        hyperparameters: Optional[dict] = None,
+        module: Optional["EasyDeLFlaxPretrainedModel"] = None,  # type:ignore #noqa
+        module_config: Optional["EasyDeLPretrainedConfig"] = None,  # type:ignore #noqa
+        module_config_args: Optional[dict] = None,
+        **kwargs,
     ):
-
         """
         Loads an EasyDeLState object from a checkpoint.
 
@@ -292,31 +294,31 @@ class EasyDeLState(struct.PyTreeNode):
             fixed_dict = input_dict.copy()
 
             # Fix extra_optimizer_kwargs
-            if 'extra_optimizer_kwargs' in fixed_dict:
-                fixed_dict['extra_optimizer_kwargs'] = eval(fixed_dict['extra_optimizer_kwargs'])
+            if "extra_optimizer_kwargs" in fixed_dict:
+                fixed_dict["extra_optimizer_kwargs"] = eval(
+                    fixed_dict["extra_optimizer_kwargs"]
+                )
 
             # Fix gradient_accumulation_steps
-            if 'gradient_accumulation_steps' in fixed_dict:
-                fixed_dict['gradient_accumulation_steps'] = int(fixed_dict['gradient_accumulation_steps'])
+            if "gradient_accumulation_steps" in fixed_dict:
+                fixed_dict["gradient_accumulation_steps"] = int(
+                    fixed_dict["gradient_accumulation_steps"]
+                )
 
             # Fix steps
-            if 'steps' in fixed_dict:
-                fixed_dict['steps'] = int(fixed_dict['steps'])
+            if "steps" in fixed_dict:
+                fixed_dict["steps"] = int(fixed_dict["steps"])
 
             # Fix warmup_steps
-            if 'warmup_steps' in fixed_dict:
-                fixed_dict['warmup_steps'] = int(fixed_dict['warmup_steps'])
+            if "warmup_steps" in fixed_dict:
+                fixed_dict["warmup_steps"] = int(fixed_dict["warmup_steps"])
 
             return fixed_dict
 
         try:
-            tx, sc = get_optimizer_and_scheduler(
-                **tx_init
-            )
+            tx, sc = get_optimizer_and_scheduler(**tx_init)
         except TypeError:
-            tx, sc = get_optimizer_and_scheduler(
-                **fix_dict_types(tx_init)
-            )
+            tx, sc = get_optimizer_and_scheduler(**fix_dict_types(tx_init))
         if hyperparameters is None:
             hyperparameters = {}
 
@@ -339,24 +341,23 @@ class EasyDeLState(struct.PyTreeNode):
 
     @classmethod
     def load_state(
-            cls,
-            checkpoint_path: Union[str, os.PathLike],
-            dtype: jnp.dtype = jnp.float32,
-            param_dtype: jnp.dtype = jnp.float32,
-            precision: Optional[Union[str, jax.lax.Precision]] = None,
-            init_optimizer_state: bool = False,
-            state_shard_fns: Optional[Mapping[str, Callable]] = None,
-            verbose: bool = False,
-            input_shape: Tuple = (1, 1),
-            config_kwargs: Optional[dict] = None,
-            sharding_axes_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            sharding_axes_dims: Sequence[int] = (1, -1, 1, 1),
-            module_config: Optional["EasyDeLPretrainedConfig"] = None,  # type:ignore
-            auto_shard_state: bool = False,
-            partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
-            depth_target: Optional[List[str]] = None
+        cls,
+        checkpoint_path: Union[str, os.PathLike],
+        dtype: jnp.dtype = jnp.float32,
+        param_dtype: jnp.dtype = jnp.float32,
+        precision: Optional[Union[str, jax.lax.Precision]] = None,
+        init_optimizer_state: bool = False,
+        state_shard_fns: Optional[Mapping[str, Callable]] = None,
+        verbose: bool = False,
+        input_shape: Tuple = (1, 1),
+        config_kwargs: Optional[dict] = None,
+        sharding_axes_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+        sharding_axes_dims: Sequence[int] = (1, -1, 1, 1),
+        module_config: Optional["EasyDeLPretrainedConfig"] = None,  # type:ignore #noqa
+        auto_shard_state: bool = False,
+        partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
+        depth_target: Optional[List[str]] = None,
     ):
-
         """
         Loads an EasyDeLState object from a checkpoint file.
 
@@ -384,8 +385,12 @@ class EasyDeLState(struct.PyTreeNode):
         """
         if depth_target is None:
             depth_target = ["params", "params"]
-        from ..modules.auto_easydel_model import get_modules_by_type, AutoShardAndGatherFunctions
+        from easydel.modules.auto_easydel_model import (
+            get_modules_by_type,
+            AutoShardAndGatherFunctions,
+        )
         from fjformer.sharding import create_mesh
+
         mesh = create_mesh(sharding_axes_dims, sharding_axes_names)
         if auto_shard_state:
             assert module_config is not None, (
@@ -398,7 +403,7 @@ class EasyDeLState(struct.PyTreeNode):
                 input_shape=input_shape,  # type:ignore
                 dtype_specs=dtype,
                 flatten=False,
-                depth_target=depth_target
+                depth_target=depth_target,
             )
 
         with mesh:
@@ -408,7 +413,9 @@ class EasyDeLState(struct.PyTreeNode):
                 verbose=verbose,
             )
             hyperparameters = checkpoint.get("hyperparameters")
-            cfg, module, convertor = get_modules_by_type(model_type=cls.get_model_type(hyperparameters))
+            cfg, module, convertor = get_modules_by_type(
+                model_type=cls.get_model_type(hyperparameters)
+            )
             checkpoint.pop("module_config", None)
             if checkpoint["module_config_args"] is not None:
                 cfg_behave = cls.unsafe_dict(checkpoint.get("module_config_args", {}))
@@ -421,7 +428,11 @@ class EasyDeLState(struct.PyTreeNode):
                     elif v == "None":
                         cfg_behave[k] = None
                     elif isinstance(v, str):
-                        if v.startswith("{") or v.startswith("(") or v.startswith("PartitionSpec"):
+                        if (
+                            v.startswith("{")
+                            or v.startswith("(")
+                            or v.startswith("PartitionSpec")
+                        ):
                             cfg_behave[k] = eval(v)
                 module_config = cfg.from_dict(cfg_behave)
                 if config_kwargs is not None:
@@ -433,17 +444,15 @@ class EasyDeLState(struct.PyTreeNode):
                     param_dtype=param_dtype,
                     precision=precision,
                     input_shape=input_shape,
-                    _do_init=False
+                    _do_init=False,
                 )
             else:
-                raise TypeError(
-                    "Om seems like i couldn't read model correctly ;("
-                )
+                raise TypeError("Om seems like i couldn't read model correctly ;(")
             state = cls.load(
                 apply_fn=module_in.__call__,
                 module=module_in,
                 module_config=module_config,
-                **checkpoint
+                **checkpoint,
             )
             state = state.replace(
                 module_config_args=None  # removing because it's not needed anymore
@@ -457,15 +466,14 @@ class EasyDeLState(struct.PyTreeNode):
         return cls.find_key("model_type", dictionary)
 
     def save_state(
-            self,
-            filename: Union[str, os.PathLike],
-            save_optimizer: bool = False,
-            checkpoint_dir: Optional[Union[str, os.PathLike]] = None,
-            verbose: bool = False,
-            gather_fns: dict[Callable] = None,
-            float_dtype: Union[str, jax.numpy.dtype] = None,
+        self,
+        filename: Union[str, os.PathLike],
+        save_optimizer: bool = False,
+        checkpoint_dir: Optional[Union[str, os.PathLike]] = None,
+        verbose: bool = False,
+        gather_fns: dict[Callable] = None,
+        float_dtype: Union[str, jax.numpy.dtype] = None,
     ):
-
         """
         Saves the EasyDeLState object to a checkpoint file.
 
@@ -479,20 +487,21 @@ class EasyDeLState(struct.PyTreeNode):
         """
         state = self
         if not save_optimizer:
-            state = self.replace(
-                opt_state=None
-            )
+            state = self.replace(opt_state=None)
         state = state.replace(
             module_config_args={
-                k: v for k, v in state.module.config.__dict__.items() if
-                isinstance(
-                    v, (int, bool, float)
-                )
+                k: v
+                for k, v in state.module.config.__dict__.items()
+                if isinstance(v, (int, bool, float))
             }
         )
         fjformer.CheckpointManager.save_state_to_file(
             state=state,
-            path=os.path.join(checkpoint_dir, filename) if checkpoint_dir is not None else filename,
+            path=(
+                os.path.join(checkpoint_dir, filename)
+                if checkpoint_dir is not None
+                else filename
+            ),
             verbose=verbose,
             gather_fns=gather_fns,
             float_dtype=float_dtype,
@@ -505,12 +514,9 @@ class EasyDeLState(struct.PyTreeNode):
         Returns:
             EasyDeLState: A new EasyDeLState object with the optimizer state set to None.
         """
-        return self.replace(
-            opt_state=None
-        )
+        return self.replace(opt_state=None)
 
     def init_opt_state(self) -> "EasyDeLState":
-
         """
         Initializes the optimizer state.
 
@@ -519,41 +525,40 @@ class EasyDeLState(struct.PyTreeNode):
         """
         if self.opt_state is None:
             params_with_opt = (
-                self.params['params'] if OVERWRITE_WITH_GRADIENT in self.params else self.params
+                self.params["params"]
+                if OVERWRITE_WITH_GRADIENT in self.params
+                else self.params
             )
             opt_state = self.tx.init(params_with_opt)
 
-            return self.replace(
-                opt_state=opt_state
-            )
+            return self.replace(opt_state=opt_state)
         return self
 
     @classmethod
     def from_pretrained(
-            cls,
-            pretrained_model_name_or_path: str,
-            filename: Optional[str] = None,
-            optimizer: AVAILABLE_OPTIMIZERS = "adamw",
-            scheduler: AVAILABLE_SCHEDULERS = "none",
-            tx_init: Optional[dict] = None,
-            device=jax.devices('cpu')[0],
-            dtype: jax.numpy.dtype = jax.numpy.float32,
-            param_dtype: jax.numpy.dtype = jax.numpy.float32,
-            precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
-            sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
-            sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            partition_axis: PartitionAxis = PartitionAxis(),
-            shard_attention_computation: bool = True,
-            input_shape: Sequence[int] = (1, 1),
-            backend: Optional[str] = None,
-            init_optimizer_state: bool = False,
-            free_optimizer_state: bool = True,
-            verbose: bool = True,
-            state_shard_fns: Optional[Mapping[str, Callable]] = None,
-            config_kwargs: Optional[Mapping[str, Any]] = None,
-            **kwargs
+        cls,
+        pretrained_model_name_or_path: str,
+        filename: Optional[str] = None,
+        optimizer: AVAILABLE_OPTIMIZERS = "adamw",
+        scheduler: AVAILABLE_SCHEDULERS = "none",
+        tx_init: Optional[dict] = None,
+        device=jax.devices("cpu")[0],
+        dtype: jax.numpy.dtype = jax.numpy.float32,
+        param_dtype: jax.numpy.dtype = jax.numpy.float32,
+        precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
+        sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
+        sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+        partition_axis: PartitionAxis = PartitionAxis(),
+        shard_attention_computation: bool = True,
+        input_shape: Sequence[int] = (1, 1),
+        backend: Optional[str] = None,
+        init_optimizer_state: bool = False,
+        free_optimizer_state: bool = True,
+        verbose: bool = True,
+        state_shard_fns: Optional[Mapping[str, Callable]] = None,
+        config_kwargs: Optional[Mapping[str, Any]] = None,
+        **kwargs,
     ) -> "EasyDeLState":
-
         """
         Loads a pre-trained EasyDeL model and its state.
 
@@ -594,7 +599,7 @@ class EasyDeLState(struct.PyTreeNode):
             )
 
         if filename is None:
-            from ..modules.auto_easydel_model import AutoEasyDeLModelForCausalLM
+            from easydel.modules.auto_easydel_model import AutoEasyDeLModelForCausalLM
 
             model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
                 pretrained_model_name_or_path,
@@ -609,7 +614,7 @@ class EasyDeLState(struct.PyTreeNode):
                 input_shape=input_shape,  # type:ignore
                 backend=backend,
                 config_kwargs=config_kwargs,
-                **kwargs
+                **kwargs,
             )
             if tx_init is None:
                 tx_init = {}
@@ -619,18 +624,19 @@ class EasyDeLState(struct.PyTreeNode):
 
             state = cls.load(
                 apply_fn=model.__call__,
-                params=FrozenDict({'params': params}),
+                params=FrozenDict({"params": params}),
                 step=0,
                 opt_state=None,
                 tx_init=tx_init,
                 hyperparameters=None,
                 module=model,
                 module_config=model.config,
-                module_config_args=model.config.to_dict()
+                module_config_args=model.config.to_dict(),
             )
         else:
             with jax.default_device(device):
                 from huggingface_hub import hf_hub_download
+
                 checkpoint_path = hf_hub_download(
                     repo_id=pretrained_model_name_or_path,
                     filename=filename,
@@ -643,7 +649,7 @@ class EasyDeLState(struct.PyTreeNode):
                     dtype=dtype,
                     param_dtype=param_dtype,
                     precision=precision,
-                    input_shape=input_shape  # type: ignore
+                    input_shape=input_shape,  # type: ignore
                 )
         if init_optimizer_state:
             with jax.default_device(device):
@@ -655,17 +661,19 @@ class EasyDeLState(struct.PyTreeNode):
     def to_8bit(self, quantization_fields=None):
         if quantization_fields is None:
             quantization_fields = ["kernel", "embedding"]
-        params = fjformer.linen.quantize_int8_parameters(quantization_fields, self.params)  # type:ignore
+        params = fjformer.linen.quantize_int8_parameters(
+            quantization_fields, self.params
+        )  # type:ignore
         self = self.replace(params=params)  # type:ignore #noqa
         return self
 
     def shard_params(
-            self,
-            fully_sharded_data_parallel: bool = True,
-            shard_fns: Optional[Mapping[str, Callable]] = None,
-            dtype: Union[jax.numpy.dtype, str] = "bf16",
-            mesh: Optional[Mesh] = None,
-            rules: Optional[Sequence[Mapping[str, PartitionSpec]]] = None
+        self,
+        fully_sharded_data_parallel: bool = True,
+        shard_fns: Optional[Mapping[str, Callable]] = None,
+        dtype: Union[jax.numpy.dtype, str] = "bf16",
+        mesh: Optional[Mesh] = None,
+        rules: Optional[Sequence[Mapping[str, PartitionSpec]]] = None,
     ):
         """
         Shards the model parameters across devices.
@@ -690,22 +698,19 @@ class EasyDeLState(struct.PyTreeNode):
             )
         elif shard_fns is None and rules is not None or self.module_config is not None:
             from fjformer import match_partition_rules, make_shard_and_gather_fns
-            rules = rules or self.module_config.get_partition_rules(fully_sharded_data_parallel)
-            partition_specs = match_partition_rules(
-                rules=rules, params=self.params
+
+            rules = rules or self.module_config.get_partition_rules(
+                fully_sharded_data_parallel
             )
+            partition_specs = match_partition_rules(rules=rules, params=self.params)
             shard_fns, gather_fns = make_shard_and_gather_fns(
-                partition_specs=partition_specs,
-                dtype_specs=dtype,
-                mesh=mesh
+                partition_specs=partition_specs, dtype_specs=dtype, mesh=mesh
             )
         if mesh is None:
             mesh = self.module_config.get_mesh()
         with mesh:
             return self.replace(
-                params=jax.tree_util.tree_map(
-                    lambda f, p: f(p), shard_fns, self.params
-                )
+                params=jax.tree_util.tree_map(lambda f, p: f(p), shard_fns, self.params)
             )
 
     @staticmethod
@@ -713,9 +718,7 @@ class EasyDeLState(struct.PyTreeNode):
         """it's the only way we can dump xla compiler"""
         return {
             STRING_REP.format(
-                type="str",
-                key="model_type",
-                value=model_type
+                type="str", key="model_type", value=model_type
             ): DEFAULT_ES_VAL
         }
 
@@ -726,9 +729,7 @@ class EasyDeLState(struct.PyTreeNode):
             if not isinstance(val, (int, bool)):
                 val = dictionary.pop(k)
                 string_value_format = STRING_REP.format(
-                    type=type(val).__name__,
-                    key=k,
-                    value=val
+                    type=type(val).__name__, key=k, value=val
                 )
                 dictionary[string_value_format] = DEFAULT_ES_VAL
         return dictionary
@@ -746,7 +747,6 @@ class EasyDeLState(struct.PyTreeNode):
         return result
 
     def __str__(self):
-
         """The __str__ function is called when you call str(object) or print(object).
         The __repr__ function is called when you type the object name in the interpreter.
         If no __str__ method exists, Python will use __repr__ as a fallback.
@@ -757,17 +757,21 @@ class EasyDeLState(struct.PyTreeNode):
         Returns:
             string
         """
-        params_size = sum(getattr(n, "size", 0) for n in jax.tree_util.tree_flatten(self.params)[0])
-        opt_state_size = sum(getattr(n, "size", 0) for n in jax.tree_util.tree_flatten(self.opt_state)[0])
+        params_size = sum(
+            getattr(n, "size", 0) for n in jax.tree_util.tree_flatten(self.params)[0]
+        )
+        opt_state_size = sum(
+            getattr(n, "size", 0) for n in jax.tree_util.tree_flatten(self.opt_state)[0]
+        )
 
         def make_depth(mdl=None):
             if mdl is not None:
                 try:
-                    return mdl.__str__().replace(
-                        "\n",
-                        "\n\t"
-                        ""
-                    ) if hasattr(mdl, "__str__") else None
+                    return (
+                        mdl.__str__().replace("\n", "\n\t" "")
+                        if hasattr(mdl, "__str__")
+                        else None
+                    )
                 except TypeError:
                     ...
             return mdl
@@ -776,15 +780,9 @@ class EasyDeLState(struct.PyTreeNode):
         scheduler = self.tx_init.get("scheduler", None)
 
         if optimizer is None:
-            optimizer = self.find_key(
-                "optimizer",
-                self.tx_init
-            )
+            optimizer = self.find_key("optimizer", self.tx_init)
         if scheduler is None:
-            scheduler = self.find_key(
-                "scheduler",
-                self.tx_init
-            )
+            scheduler = self.find_key("scheduler", self.tx_init)
 
         string = (
             f"{self.__class__.__name__}("
@@ -861,9 +859,9 @@ class EasyDeLState(struct.PyTreeNode):
             setattr(self.module_config, k, v)
 
     def to_pytorch(
-            self,
-            base_hf_auto_class=AutoModelForCausalLM,
-            easystate_to_huggingface_model_kwargs: Optional[dict] = None
+        self,
+        base_hf_auto_class=AutoModelForCausalLM,
+        easystate_to_huggingface_model_kwargs: Optional[dict] = None,
     ):
         """
         Converts the EasyDeL model to a PyTorch model.
@@ -878,11 +876,10 @@ class EasyDeLState(struct.PyTreeNode):
         return self.module.to_pytorch(
             params=self.params,
             base_hf_auto_class=base_hf_auto_class,
-            easystate_to_huggingface_model_kwargs=easystate_to_huggingface_model_kwargs
+            easystate_to_huggingface_model_kwargs=easystate_to_huggingface_model_kwargs,
         )
 
     def __repr__(self):
-
         """The __repr__ function is the &quot;official&quot; string representation of an object.
         It's what you get when you type the object name at the Python prompt, or pass it to str().
         The goal of __repr__ is to be unambiguous: if eval(repr(x)) == x, then __repr__ should return a string that

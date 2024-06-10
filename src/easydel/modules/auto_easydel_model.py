@@ -39,8 +39,8 @@ def get_modules_by_type(
 
     """
     if model_type == "llama":
-        from .llama import LlamaConfig as _LlamaConfig
-        from .llama import FlaxLlamaForCausalLM as _FlaxLlamaForCausalLM
+        from easydel.modules.llama import LlamaConfig as _LlamaConfig
+        from easydel.modules.llama import FlaxLlamaForCausalLM as _FlaxLlamaForCausalLM
 
         return (
             _LlamaConfig,
@@ -53,8 +53,8 @@ def get_modules_by_type(
             ),
         )
     elif model_type == "gemma":
-        from .gemma import GemmaConfig as _GemmaConfig
-        from .gemma import FlaxGemmaForCausalLM as _FlaxGemmaForCausalLM
+        from easydel.modules.gemma import GemmaConfig as _GemmaConfig
+        from easydel.modules.gemma import FlaxGemmaForCausalLM as _FlaxGemmaForCausalLM
 
         return (
             _GemmaConfig,
@@ -67,8 +67,8 @@ def get_modules_by_type(
             ),
         )
     elif model_type == "falcon":
-        from .falcon import FlaxFalconForCausalLM as _FlaxFalconForCausalLM
-        from .falcon import FalconConfig as _FalconConfig
+        from easydel.modules.falcon import FlaxFalconForCausalLM as _FlaxFalconForCausalLM
+        from easydel.modules.falcon import FalconConfig as _FalconConfig
 
         return (
             _FalconConfig,
@@ -88,8 +88,8 @@ def get_modules_by_type(
             ),
         )
     elif model_type == "mpt":
-        from .mosaic_mpt import FlaxMptForCausalLM as _FlaxMptForCausalLM
-        from .mosaic_mpt import MptConfig as _MptConfig
+        from easydel.modules.mosaic_mpt import FlaxMptForCausalLM as _FlaxMptForCausalLM
+        from easydel.modules.mosaic_mpt import MptConfig as _MptConfig
 
         return (
             _MptConfig,
@@ -104,8 +104,8 @@ def get_modules_by_type(
         )
 
     elif model_type == "mistral":
-        from .mistral import FlaxMistralForCausalLM as _FlaxMistralForCausalLM
-        from .mistral import MistralConfig as _MistralConfig
+        from easydel.modules.mistral import FlaxMistralForCausalLM as _FlaxMistralForCausalLM
+        from easydel.modules.mistral import MistralConfig as _MistralConfig
 
         return (
             _MistralConfig,
@@ -118,8 +118,8 @@ def get_modules_by_type(
             ),
         )
     elif model_type == "gptj":
-        from .gpt_j import FlaxGPTJForCausalLM as _FlaxGPTJForCausalLM
-        from .gpt_j import GPTJConfig as _GPTJConfig
+        from easydel.modules.gpt_j import FlaxGPTJForCausalLM as _FlaxGPTJForCausalLM
+        from easydel.modules.gpt_j import GPTJConfig as _GPTJConfig
 
         return (
             _GPTJConfig,
@@ -138,8 +138,8 @@ def get_modules_by_type(
         )
 
     elif model_type == "gpt_neox":
-        from .gpt_neo_x import FlaxGPTNeoXForCausalLM as _FlaxGPTNeoXForCausalLM
-        from .gpt_neo_x import GPTNeoXConfig as _GPTNeoXConfig
+        from easydel.modules.gpt_neo_x import FlaxGPTNeoXForCausalLM as _FlaxGPTNeoXForCausalLM
+        from easydel.modules.gpt_neo_x import GPTNeoXConfig as _GPTNeoXConfig
 
         return (
             _GPTNeoXConfig,
@@ -152,8 +152,8 @@ def get_modules_by_type(
             ),
         )
     elif model_type == "palm":
-        from .palm import FlaxPalmForCausalLM as _FlaxPalmForCausalLM
-        from .palm import PalmConfig as _PalmConfig
+        from easydel.modules.palm import FlaxPalmForCausalLM as _FlaxPalmForCausalLM
+        from easydel.modules.palm import PalmConfig as _PalmConfig
 
         return (
             _PalmConfig,
@@ -166,8 +166,8 @@ def get_modules_by_type(
             ),
         )
     elif model_type == "lt":
-        from .lucid_transformer import FlaxLTForCausalLM as _FlaxLTForCausalLM
-        from .lucid_transformer import FlaxLTConfig as _FlaxLTConfig
+        from easydel.modules.lucid_transformer import FlaxLTForCausalLM as _FlaxLTForCausalLM
+        from easydel.modules.lucid_transformer import FlaxLTConfig as _FlaxLTConfig
 
         return (
             _FlaxLTConfig,
@@ -180,8 +180,8 @@ def get_modules_by_type(
             ),
         )
     elif model_type == "gpt2":
-        from .gpt2 import FlaxGPT2LMHeadModel as _FlaxGPT2LMHeadModel
-        from .gpt2 import GPT2Config as _GPT2Config
+        from easydel.modules.gpt2 import FlaxGPT2LMHeadModel as _FlaxGPT2LMHeadModel
+        from easydel.modules.gpt2 import GPT2Config as _GPT2Config
 
         return (
             _GPT2Config,
@@ -195,8 +195,8 @@ def get_modules_by_type(
             ),
         )
     elif model_type == "mixtral":
-        from .mixtral import FlaxMixtralForCausalLM as _FlaxMixtralForCausalLM
-        from .mixtral import MixtralConfig as _MixtralConfig
+        from easydel.modules.mixtral import FlaxMixtralForCausalLM as _FlaxMixtralForCausalLM
+        from easydel.modules.mixtral import MixtralConfig as _MixtralConfig
 
         return (
             _MixtralConfig,
@@ -209,8 +209,8 @@ def get_modules_by_type(
             ),
         )
     elif model_type == "phi":
-        from .phi import FlaxPhiForCausalLM as _FlaxPhiForCausalLM
-        from .phi import PhiConfig as _PhiConfig
+        from easydel.modules.phi import FlaxPhiForCausalLM as _FlaxPhiForCausalLM
+        from easydel.modules.phi import PhiConfig as _PhiConfig
 
         return (
             _PhiConfig,
@@ -229,8 +229,8 @@ def get_modules_by_type(
             ),
         )
     elif model_type == "qwen":
-        from .qwen1 import Qwen1Config as _Qwen1Config
-        from .qwen1 import FlaxQwen1ForCausalLM as _FlaxQwen1ForCausalLM
+        from easydel.modules.qwen1 import Qwen1Config as _Qwen1Config
+        from easydel.modules.qwen1 import FlaxQwen1ForCausalLM as _FlaxQwen1ForCausalLM
 
         return (
             _Qwen1Config,
@@ -244,8 +244,8 @@ def get_modules_by_type(
         )
 
     elif model_type == "qwen2":
-        from .qwen2 import Qwen2Config as _Qwen2Config
-        from .qwen2 import FlaxQwen2ForCausalLM as _FlaxQwen2ForCausalLM
+        from easydel.modules.qwen2 import Qwen2Config as _Qwen2Config
+        from easydel.modules.qwen2 import FlaxQwen2ForCausalLM as _FlaxQwen2ForCausalLM
 
         return (
             _Qwen2Config,
@@ -258,8 +258,8 @@ def get_modules_by_type(
             ),
         )
     elif model_type == "stablelm":
-        from .stablelm import StableLmConfig as _StableLmConfig
-        from .stablelm import FlaxStableLmForCausalLM as _FlaxStableLmForCausalLM
+        from easydel.modules.stablelm import StableLmConfig as _StableLmConfig
+        from easydel.modules.stablelm import FlaxStableLmForCausalLM as _FlaxStableLmForCausalLM
 
         return (
             _StableLmConfig,
@@ -277,8 +277,8 @@ def get_modules_by_type(
             ),
         )
     elif model_type == "rwkv":
-        from .rwkv import RwkvConfig as _RwkvConfig
-        from .rwkv import FlaxRwkvForCausalLM as _FlaxRwkvForCausalLM
+        from easydel.modules.rwkv import RwkvConfig as _RwkvConfig
+        from easydel.modules.rwkv import FlaxRwkvForCausalLM as _FlaxRwkvForCausalLM
 
         return (
             _RwkvConfig,
@@ -292,8 +292,8 @@ def get_modules_by_type(
             ),
         )
     elif model_type == "mamba":
-        from .mamba import MambaConfig as _MambaConfig
-        from .mamba import FlaxMambaForCausalLM as _FlaxMambaForCausalLM
+        from easydel.modules.mamba import MambaConfig as _MambaConfig
+        from easydel.modules.mamba import FlaxMambaForCausalLM as _FlaxMambaForCausalLM
 
         return (
             _MambaConfig,
@@ -306,8 +306,8 @@ def get_modules_by_type(
             ),
         )
     elif model_type == "grok-1":
-        from .grok_1 import Grok1Config as _Grok1Config
-        from .grok_1 import FlaxGrok1ForCausalLM as _FlaxGrok1ForCausalLM
+        from easydel.modules.grok_1 import Grok1Config as _Grok1Config
+        from easydel.modules.grok_1 import FlaxGrok1ForCausalLM as _FlaxGrok1ForCausalLM
 
         return (
             _Grok1Config,
@@ -320,8 +320,8 @@ def get_modules_by_type(
             ),
         )
     elif model_type == "qwen2_moe":
-        from .qwen2_moe import Qwen2MoeConfig as _Qwen2MoeConfig
-        from .qwen2_moe import FlaxQwen2MoeForCausalLM as _FlaxQwen2MoeForCausalLM
+        from easydel.modules.qwen2_moe import Qwen2MoeConfig as _Qwen2MoeConfig
+        from easydel.modules.qwen2_moe import FlaxQwen2MoeForCausalLM as _FlaxQwen2MoeForCausalLM
 
         return (
             _Qwen2MoeConfig,
@@ -334,8 +334,8 @@ def get_modules_by_type(
             ),
         )
     elif model_type == "cohere":
-        from .cohere import CohereConfig as _CohereConfig
-        from .cohere import FlaxCohereForCausalLM as _FlaxCohereForCausalLM
+        from easydel.modules.cohere import CohereConfig as _CohereConfig
+        from easydel.modules.cohere import FlaxCohereForCausalLM as _FlaxCohereForCausalLM
 
         return (
             _CohereConfig,
@@ -348,8 +348,8 @@ def get_modules_by_type(
             ),
         )
     elif model_type == "dbrx":
-        from .dbrx import DbrxConfig as _DbrxConfig
-        from .dbrx import FlaxDbrxForCausalLM as _FlaxDbrxForCausalLM
+        from easydel.modules.dbrx import DbrxConfig as _DbrxConfig
+        from easydel.modules.dbrx import FlaxDbrxForCausalLM as _FlaxDbrxForCausalLM
 
         return (
             _DbrxConfig,
@@ -363,8 +363,8 @@ def get_modules_by_type(
             ),
         )
     elif model_type == "phi3":
-        from .phi3 import Phi3Config as _Phi3Config
-        from .phi3 import FlaxPhi3ForCausalLM as _FlaxPhi3ForCausalLM
+        from easydel.modules.phi3 import Phi3Config as _Phi3Config
+        from easydel.modules.phi3 import FlaxPhi3ForCausalLM as _FlaxPhi3ForCausalLM
 
         return (
             _Phi3Config,
@@ -378,8 +378,8 @@ def get_modules_by_type(
         )
 
     elif model_type == "arctic":
-        from .arctic import ArcticConfig as _ArcticConfig
-        from .arctic import FlaxArcticForCausalLM as _FlaxArcticForCausalLM
+        from easydel.modules.arctic import ArcticConfig as _ArcticConfig
+        from easydel.modules.arctic import FlaxArcticForCausalLM as _FlaxArcticForCausalLM
 
         return (
             _ArcticConfig,
@@ -392,8 +392,8 @@ def get_modules_by_type(
             ),
         )
     elif model_type == "openelm":
-        from .openelm import OpenELMConfig as _OpenELMConfig
-        from .openelm import FlaxOpenELMForCausalLM as _FlaxOpenELMForCausalLM
+        from easydel.modules.openelm import OpenELMConfig as _OpenELMConfig
+        from easydel.modules.openelm import FlaxOpenELMForCausalLM as _FlaxOpenELMForCausalLM
 
         return (
             _OpenELMConfig,
@@ -406,8 +406,8 @@ def get_modules_by_type(
             ),
         )
     elif model_type == "deepseek_v2":
-        from .deepseek_v2 import DeepseekV2Config as _DeepseekV2Config
-        from .deepseek_v2 import FlaxDeepseekV2ForCausalLM as _FlaxDeepseekV2ForCausalLM
+        from easydel.modules.deepseek_v2 import DeepseekV2Config as _DeepseekV2Config
+        from easydel.modules.deepseek_v2 import FlaxDeepseekV2ForCausalLM as _FlaxDeepseekV2ForCausalLM
 
         return (
             _DeepseekV2Config,
@@ -603,7 +603,7 @@ class AutoEasyDeLModelForCausalLM:
 
                 def _clear():
                     gc.collect()
-        except ModuleNotFoundError as e:
+        except ModuleNotFoundError:
             raise ModuleNotFoundError(
                 "in order to load model from torch you should install torch first "
                 "run `pip install torch`"
@@ -630,7 +630,7 @@ class AutoEasyDeLModelForCausalLM:
         del model
         _clear()
 
-        logger.debug(f"adding model basic EasyDeL configurations.")
+        logger.debug("adding model basic EasyDeL configurations.")
         if hasattr(cfg, "add_jax_args"):
             cfg.add_jax_args()
         cfg.add_basic_configurations(
