@@ -10,7 +10,7 @@ datasets~=2.14.6
 tensorboard
 numpy~=1.26.2
 tensorflow~=2.16.1
-tensorflow_datasets<=4.9.0
+tensorflow_datasets>=4.9.0
 scipy==1.13.1
 websocket-client
 websockets

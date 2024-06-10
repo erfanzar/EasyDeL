@@ -5,7 +5,7 @@
 import jax
 
 try:
-    from src.python.easydel import AutoEasyDeLModelForCausalLM, AutoEasyDeLConfig, get_modules_by_type, \
+    from easydel import AutoEasyDeLModelForCausalLM, AutoEasyDeLConfig, get_modules_by_type, \
         AutoShardAndGatherFunctions
 except ModuleNotFoundError:
     import sys
@@ -13,7 +13,7 @@ except ModuleNotFoundError:
 
     cp = Path.cwd().__str__()
     sys.path.append(cp)
-    from src.python.easydel import AutoEasyDeLModelForCausalLM, AutoEasyDeLConfig, get_modules_by_type, \
+    from easydel import AutoEasyDeLModelForCausalLM, AutoEasyDeLConfig, get_modules_by_type, \
         AutoShardAndGatherFunctions
 
 from fjformer import make_shard_and_gather_fns, match_partition_rules

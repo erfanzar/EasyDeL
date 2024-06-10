@@ -13,7 +13,7 @@ sys.path.append(
 
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 
-from src.python.easydel import (  # noqa: E402
+from easydel import (  # noqa: E402
     EasyDeLXRapTureConfig,
     CausalLanguageModelTrainer,
     AutoEasyDeLModelForCausalLM,
