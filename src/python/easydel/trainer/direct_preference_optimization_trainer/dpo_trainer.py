@@ -186,7 +186,7 @@ class DPOTrainer(BaseTrainer, ABC):
 
         padding_value = (
             padding_value if padding_value is not None else tokenizer.pad_token_id
-        )
+        ) # type: ignore
         self.max_length = max_length
         self.label_pad_token_id = label_pad_token_id
         self.padding_value = padding_value
@@ -207,8 +207,8 @@ class DPOTrainer(BaseTrainer, ABC):
         data_collator = (
             DPODataCollatorWithPadding(
                 max_prompt_length=self.max_prompt_length,
-                max_target_length=self.max_target_length,
-                pad_token_id=tokenizer.pad_token_id,
+                max_target_length=self.max_target_length, # type: ignore
+                pad_token_id=tokenizer.pad_token_id, # type: ignore
                 label_pad_token_id=label_pad_token_id,
                 is_encoder_decoder=False,
             )

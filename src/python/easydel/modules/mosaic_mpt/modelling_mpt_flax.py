@@ -1,25 +1,28 @@
 import math
-from flax.core import FrozenDict
-from typing import Optional, Union, Tuple
-from flax.linen import combine_masks
-from jax import numpy as jnp, lax
-import jax
-from transformers.modeling_flax_outputs import FlaxCausalLMOutput, FlaxBaseModelOutput
+from typing import Optional, Tuple, Union
+
+import chex
 import flax
+import jax
 from einops import rearrange
+from fjformer import linen as nn
+from fjformer.linen import Dense
+from flax.core import FrozenDict
+from flax.linen import combine_masks
 from flax.linen.partitioning import remat
+from jax import lax
+from jax import numpy as jnp
+from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
+
+from ..attention_module import AttentionModule
+from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 from ..flax_modelling_utils import (
-    get_gradient_checkpoint_policy,
-    get_dot_general_by_bits,
     BaseJAXAttentionModule,
     control_mlp_sharding,
+    get_dot_general_by_bits,
+    get_gradient_checkpoint_policy,
 )
-from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
-import chex
-from fjformer.linen import Dense
-from fjformer import linen as nn
 from .mosaic_configuration import MptConfig
-from ..attention_module import AttentionModule
 
 
 class FlaxMptMLP(nn.Module):
@@ -117,7 +120,7 @@ class FlaxMptAttention(BaseJAXAttentionModule):
             precision=self.precision,
             force_float32_tpu=True,
             attn_mechanism=self.config.attn_mechanism,
-            dtype=self.dtype,
+            dtype=self.config.attn_dtype,
             mesh=self.config.get_mesh(),
             sm_scale=1 / math.sqrt(self.head_dim),
             axis_name=self.config.attention_axis_name,

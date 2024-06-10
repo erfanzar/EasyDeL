@@ -25,34 +25,33 @@ import math
 from functools import partial
 from typing import Optional, Tuple, Union
 
+import chex
 import fjformer
 import flax.linen.partitioning
-from fjformer import with_sharding_constraint
-from jax.sharding import PartitionSpec
-from fjformer import linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
+from fjformer import linen as nn
+from fjformer import with_sharding_constraint
+from fjformer.bits import config as q_config
+from fjformer.bits import q_flax
+from fjformer.linen import Dense
 from flax.core.frozen_dict import FrozenDict, unfreeze
 from flax.linen import combine_masks, make_causal_mask
 from jax import lax
-
+from jax.sharding import PartitionSpec
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 from transformers.utils import logging
 
-
 from ..attention_module import AttentionModule
+from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 from ..flax_modelling_utils import (
     ACT2FN,
     BaseJAXAttentionModule,
-    get_gradient_checkpoint_policy,
     block_wise_ffn,
+    get_gradient_checkpoint_policy,
 )
-from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
-import chex
-from fjformer.bits import config as q_config, q_flax
 from .gpt_j_configuration import GPTJConfig
-from fjformer.linen import Dense
 
 logger = logging.get_logger(__name__)
 
@@ -157,7 +156,7 @@ class FlaxGPTJAttention(BaseJAXAttentionModule):
             precision=self.precision,
             force_float32_tpu=True,
             attn_mechanism=self.config.attn_mechanism,
-            dtype=self.dtype,
+            dtype=self.config.attn_dtype,
             partition_axis=self.config.partition_axis,
             scan_ring_attention=self.config.scan_ring_attention,
             mesh=self.config.get_mesh(),

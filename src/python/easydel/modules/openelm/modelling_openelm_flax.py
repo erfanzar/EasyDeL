@@ -1,36 +1,37 @@
 import math
 import typing
+from typing import Optional, Tuple, Union
 
+import chex
 import fjformer
 import flax.core
-from jax import numpy as jnp, Array, lax
-from jax.sharding import PartitionSpec
 import jax
-from flax.traverse_util import unflatten_dict, flatten_dict
+from fjformer import linen as nn
 from flax.core import freeze, unfreeze
-from typing import Union, Optional, Tuple
-
-from ..attention_module import AttentionModule
-from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
-from flax.linen import partitioning as nn_partitioning, combine_masks
+from flax.linen import combine_masks
+from flax.linen import partitioning as nn_partitioning
+from flax.traverse_util import flatten_dict, unflatten_dict
+from jax import Array, lax
+from jax import numpy as jnp
+from jax.sharding import PartitionSpec
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 
-from fjformer import linen as nn
+from ..attention_module import AttentionModule
+from ..common import RMSNorm
+from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 from ..flax_modelling_utils import (
     ACT2FN,
-    with_sharding_constraint,
-    get_gradient_checkpoint_policy,
-    repeat_kv_bnsh,
-    apply_rotary_pos_emb,
-    precompute_freq_cis,
-    get_dot_general_by_bits,
     BaseJAXAttentionModule,
+    apply_rotary_pos_emb,
     block_wise_ffn,
     control_mlp_sharding,
+    get_dot_general_by_bits,
+    get_gradient_checkpoint_policy,
+    precompute_freq_cis,
+    repeat_kv_bnsh,
+    with_sharding_constraint,
 )
-import chex
 from .openelm_configuration import OpenELMConfig, make_divisible
-from ..common import RMSNorm
 
 re_mat = nn_partitioning.remat
 
@@ -135,7 +136,7 @@ class FlaxOpenELMMultiHeadCausalAttention(BaseJAXAttentionModule):
             precision=self.precision,
             force_float32_tpu=True,
             attn_mechanism=self.config.attn_mechanism,
-            dtype=self.dtype,
+            dtype=self.config.attn_dtype,
             partition_axis=self.config.partition_axis,
             scan_ring_attention=self.config.scan_ring_attention,
             mesh=self.config.get_mesh(),
@@ -1140,7 +1141,9 @@ class FlaxOpenELMForCausalLM(FlaxOpenELMPretrainedModel):
             "position_ids": position_ids,
         }
 
-    def update_inputs_for_generation(self, model_outputs, model_kwargs):  # noqa:E722 # type:ignore
+    def update_inputs_for_generation(
+        self, model_outputs, model_kwargs
+    ):  # noqa:E722 # type:ignore
         model_kwargs["past_key_values"] = model_outputs.past_key_values
         model_kwargs["position_ids"] = model_kwargs["position_ids"][:, -1:] + 1
         return model_kwargs

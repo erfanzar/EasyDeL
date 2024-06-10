@@ -2,13 +2,14 @@ from ...utils.lazy_import import _LazyModule
 from typing import TYPE_CHECKING
 
 _import_structure = {
-    "modelling_output": ["ORPOTrainerOutput"],
-    "orpo_trainer": ["ORPOTrainer"],
+    "orpo_trainer": ["ORPOTrainer", "ORPOTrainerOutput"],
 }
 
 if TYPE_CHECKING:
-    from .modelling_output import ORPOTrainerOutput as ORPOTrainerOutput
-    from .orpo_trainer import ORPOTrainer as ORPOTrainer
+    from .orpo_trainer import (
+        ORPOTrainer as ORPOTrainer,
+        ORPOTrainerOutput as ORPOTrainerOutput,
+    )
 else:
     import sys
 

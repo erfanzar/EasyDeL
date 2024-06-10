@@ -2,16 +2,16 @@ from ...utils.lazy_import import _LazyModule
 from typing import TYPE_CHECKING
 
 _import_structure = {
-    "modelling_output": ["VisionCausalLMTrainerOutput"],
-    "vision_causal_language_model_trainer": ["VisionCausalLanguageModelTrainer"],
+    "vision_causal_language_model_trainer": [
+        "VisionCausalLanguageModelTrainer",
+        "VisionCausalLMTrainerOutput",
+    ],
 }
 
 if TYPE_CHECKING:
-    from .modelling_output import (
-        VisionCausalLMTrainerOutput as VisionCausalLMTrainerOutput,
-    )
     from .vision_causal_language_model_trainer import (
         VisionCausalLanguageModelTrainer as VisionCausalLanguageModelTrainer,
+        VisionCausalLMTrainerOutput as VisionCausalLMTrainerOutput,
     )
 else:
     import sys

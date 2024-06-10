@@ -24,21 +24,22 @@ from datasets import Dataset, IterableDataset  # noqa: E402
 
 
 def main(use_iterable_dataset: bool):
-    sequence_length = 128
-    NUM_TRAIN_EXAMPLES = 50
+    sequence_length = 512
+    NUM_TRAIN_EXAMPLES = 100000
     NUM_EVAL_EXAMPLES = 12
     TOTAL_BATCH_SIZE = 2
     NUM_TRAIN_EPOCHS = 3
     max_training_steps = NUM_TRAIN_EXAMPLES // TOTAL_BATCH_SIZE * NUM_TRAIN_EPOCHS
     max_evaluation_steps = NUM_EVAL_EXAMPLES // TOTAL_BATCH_SIZE
     config = MistralConfig(
-        hidden_size=128,
+        hidden_size=512,
         num_attention_heads=8,
         num_key_value_heads=4,
-        num_hidden_layers=4,
-        intermediate_size=256,
+        num_hidden_layers=16,
+        intermediate_size=1024,
         gradient_checkpointing="",
         max_position_embeddings=sequence_length,
+        attn_dtype=jnp.float16,
     )
 
     model = FlaxMistralForCausalLM(config=config, _do_init=True)
@@ -67,7 +68,7 @@ def main(use_iterable_dataset: bool):
         example_eval_data = IterableDataset.from_generator(
             data_generator, gen_kwargs={"num_rows": NUM_EVAL_EXAMPLES}
         )
-    dtype = jnp.float32
+    dtype = jnp.float16
     trainer = CausalLanguageModelTrainer(
         arguments=TrainArguments(
             model_name="MistralSmoothZlossTest",
@@ -95,14 +96,14 @@ def main(use_iterable_dataset: bool):
             label_smoothing_factor=0.1,
             z_loss=0.0001,
             train_on_inputs=True,
-            save_steps=50,
-            save_total_limit=1,
+            # save_steps=50,
+            # save_total_limit=1,
             do_last_save=True,
         ),
         dataset_train=example_train_data,
         dataset_eval=example_eval_data,
     )
-    print(trainer._get_information())
+
     output = trainer.train(model_parameters=flax.core.FrozenDict({"params": params}))
     trainer.save_pretrained(output.state, to_torch=True)
 

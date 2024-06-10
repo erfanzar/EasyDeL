@@ -6,40 +6,40 @@ from typing import Optional, Tuple
 
 import chex
 import fjformer
+import flax.linen
+import jax
+from fjformer.linen import Dense
 from flax import linen as nn
 from flax.core import FrozenDict, freeze
 from flax.linen.attention import (
-    make_causal_mask,
     combine_masks,
     dot_product_attention_weights,
+    make_causal_mask,
 )
 from flax.linen.partitioning import remat
 from flax.traverse_util import flatten_dict, unflatten_dict
-import flax.linen
+from jax import lax
+from jax import numpy as jnp
 from transformers.modeling_flax_outputs import (
     FlaxBaseModelOutputWithPastAndCrossAttentions,
-    FlaxMaskedLMOutput,
-    FlaxSequenceClassifierOutput,
-    FlaxMultipleChoiceModelOutput,
-    FlaxTokenClassifierOutput,
-    FlaxQuestionAnsweringModelOutput,
-    FlaxCausalLMOutputWithCrossAttentions,
     FlaxBaseModelOutputWithPoolingAndCrossAttentions,
+    FlaxCausalLMOutputWithCrossAttentions,
+    FlaxMaskedLMOutput,
+    FlaxMultipleChoiceModelOutput,
+    FlaxQuestionAnsweringModelOutput,
+    FlaxSequenceClassifierOutput,
+    FlaxTokenClassifierOutput,
 )
 
-from .roberta_configuration import RobertaConfig
-import jax
-from jax import lax, numpy as jnp
-from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 from ..attention_module import AttentionModule
+from ..easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 from ..flax_modelling_utils import (
-    get_gradient_checkpoint_policy,
     ACT2FN,
-    get_dot_general_by_bits,
     BaseJAXAttentionModule,
+    get_dot_general_by_bits,
+    get_gradient_checkpoint_policy,
 )
-
-from fjformer.linen import Dense
+from .roberta_configuration import RobertaConfig
 
 
 class FlaxRobertaEmbeddings(nn.Module):
@@ -131,7 +131,7 @@ class FlaxRobertaSelfAttention(BaseJAXAttentionModule):
             precision=self.precision,
             force_float32_tpu=True,
             attn_mechanism=self.config.attn_mechanism,
-            dtype=self.dtype,
+            dtype=self.config.attn_dtype,
             partition_axis=self.config.partition_axis,
             scan_ring_attention=self.config.scan_ring_attention,
             mesh=self.config.get_mesh(),
