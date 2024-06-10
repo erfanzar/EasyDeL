@@ -15,10 +15,10 @@ import jax.numpy  # noqa: E402
 from flax.core import FrozenDict  # noqa: E402
 
 from easydel import MistralConfig, FlaxMistralForCausalLM  # noqa: E402
-from src.python.easydel.trainer.odds_ratio_preference_optimization_trainer import (  # noqa: E402
+from easydel.trainer.odds_ratio_preference_optimization_trainer import (  # noqa: E402
     ORPOTrainer,
 )
-from src.python.easydel import TrainArguments  # noqa: E402
+from easydel import TrainArguments  # noqa: E402
 from transformers import AutoTokenizer  # noqa: E402
 from datasets import load_dataset  # noqa: E402
 from jax import numpy as jnp  # noqa: E402

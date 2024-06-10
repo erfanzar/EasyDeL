@@ -44,7 +44,7 @@ With its comprehensive set of features and tools, EasyDeL aims to streamline and
 of machine learning models, particularly in the domain of large language models and video-related applications.
 
 ### Latest News 🔥
-
+- Improt structure is now like the older versions and multi-host(GPU) training issues are fixed.
 - KV cache quantization is improved and now have +%21 accuracy from old version (%69)
 - adding `EasyDeLFlaxPretrainedModel.from_pretrained` and `EasyDeLFlaxPretrainedModel.save_pretrained` to give users
   experience of being free and not only using easydel states

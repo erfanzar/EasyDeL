@@ -1,6 +1,6 @@
 import transformers
 
-from src.python.easydel import EasyServe, EasyServeConfig, EasyClient, AutoEasyDeLModelForCausalLM
+from easydel import EasyServe, EasyServeConfig, EasyClient, AutoEasyDeLModelForCausalLM
 from jax import numpy as jnp, lax
 
 

@@ -12,7 +12,7 @@ sys.path.append(
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 import flax.core  # noqa: E402
 
-from src.python.easydel import (  # noqa: E402
+from easydel import (  # noqa: E402
     CausalLanguageModelTrainer,
     TrainArguments,
     FlaxMixtralForCausalLM,
