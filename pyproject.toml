@@ -1,31 +1,28 @@
 [project]
-name = "EasyDeL"
-authors = [
-    { name = "Erfan Zare Chavoshi", email = "Erfanzare810@gmail.com" }
-]
-requires-python = ">=3.8"
-
+name = "easydel"
+version = "0.0.69"
+authors = [{ name = "Erfan Zare Chavoshi", email = "Erfanzare810@gmail.com" }]
+description = "An open-source library to make training faster and more optimized in Jax/Flax"
 readme = "README.md"
-
-version = "0.0.68"
-
+requires-python = ">=3.8"
+license = { text = "Apache-2.0" }
 dependencies = [
-    "jax>=0.4.20",
-    "jaxlib>=0.4.20",
-    "fjformer==0.0.64",
+    "jax>=0.4.23",
+    "jaxlib>=0.4.23",
+    "FJFormer==0.0.65",
     "transformers>=4.40.0",
-    "optax~=0.1.7",
+    "optax~=0.2.2",
     "msgpack~=1.0.7",
     "ipython~=8.17.2",
     "tqdm~=4.64.1",
-    "datasets~=2.14.6",
-    "tensorboard",
+    "datasets~=2.19.2",
+    "tensorboard~=2.16.2",
     "numpy~=1.26.2",
     "tensorflow~=2.16.1",
-    "tensorflow_datasets<=4.9.0",
+    "tensorflow-datasets~=4.9.6",
     "scipy==1.13.1",
-    "websocket-client",
-    "websockets"
+    "websocket-client~=1.8.0",
+    "websockets~=11.0.3",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -39,37 +36,17 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
 ]
-description = "An open-source library to make training faster and more optimized in Jax/Flax"
-
-license = { text = "Apache-2.0" }
-
-keywords = [
-    "JAX", "Torch", "Deep Learning", "Machine Learning", "Flax", "XLA"
-]
-
+keywords = ["JAX", "Torch", "Deep Learning", "Machine Learning", "Flax", "XLA"]
 
 [project.optional-dependencies]
-
-torch = [
-    "torch",
-    "torchvision",
-    "torchaudio"
-]
-
-all = [
-    "EasyDeL[torch]"
-]
-
-[build-system]
-requires = ["setuptools>=46.4.0", "wheel>=0.34.2"]
-build-backend = "setuptools.build_meta"
-
-[tool.setuptools.packages]
-find = { where = ["src/python"] }
-
+torch = ["torch", "torchvision", "torchaudio"]
+all = ["EasyDeL[torch]"]
 
 [project.urls]
-
 Homepage = "https://github.com/erfanzar/EasyDeL"
 Issues = "https://github.com/erfanzar/EasyDeL/issues"
 Documentation = "https://erfanzar.github.io/EasyDeL"
+
+[build-system]
+requires = ["flit_core >=3.2,<4"]
+build-backend = "flit_core.buildapi"

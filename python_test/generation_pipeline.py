@@ -5,7 +5,7 @@ import fjformer.linen
 
 os.environ["XLA_FLAGS"] = '--xla_force_host_platform_device_count=2'
 
-from src.python.easydel import (
+from easydel import (
     FlaxLlamaForCausalLM,
     LlamaConfig,
     GenerationPipelineConfig,
