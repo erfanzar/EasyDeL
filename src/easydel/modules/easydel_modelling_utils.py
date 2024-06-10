@@ -758,7 +758,7 @@ class EasyDeLFlaxPretrainedModel(FlaxPreTrainedModel):
             token: Optional[Union[str, bool]] = None,
             gather_fns: dict[Callable] = None,
             float_dtype=None,
-            verbose: bool = False,
+            verbose: bool = True,
             mismatch_allowed: bool = True,
             **kwargs,
     ):
@@ -778,7 +778,7 @@ class EasyDeLFlaxPretrainedModel(FlaxPreTrainedModel):
         save_directory = os.path.abspath(save_directory)
         self.config.architectures = [self.__class__.__name__[4:]]
         config = deepcopy(self.config)
-        print(config)
+        config.__dict__.pop("attn_dtype", None)  # make sure dtypes are not included
         config.save_pretrained(save_directory)
         if self.can_generate():
             self.generation_config.save_pretrained(save_directory)
