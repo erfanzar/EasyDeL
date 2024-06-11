@@ -143,7 +143,6 @@ class OpenELMConfig(EasyDeLPretrainedConfig):
         self.model_dim = model_dim
         self.head_dim = head_dim
         self.qkv_multipliers = qkv_multipliers
-        self.num_query_heads = num_query_heads
         self.num_gqa_groups = num_gqa_groups
         self.ffn_multipliers = ffn_multipliers
         self.ffn_with_glu = ffn_with_glu
@@ -176,6 +175,7 @@ class OpenELMConfig(EasyDeLPretrainedConfig):
             bits=bits,
             **kwargs,
         )
+        self.__post_init__()
 
     def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
         """The get_partition_rules function is used to define the partitioning scheme for a model.
