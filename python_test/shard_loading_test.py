@@ -31,7 +31,6 @@ def main():
     shard_fns, gather_fns = make_shard_and_gather_fns(
         partition_specs=partition_specs,
         mesh=dummy_model.config.get_mesh(),
-        dtype_specs=jax.numpy.float16
     )
 
     model, params = AutoEasyDeLModelForCausalLM.from_pretrained(model_id, shard_fns=shard_fns)

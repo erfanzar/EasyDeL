@@ -401,7 +401,6 @@ class EasyDeLState(struct.PyTreeNode):
                 config=module_config,
                 partition_rules=partition_rules,
                 input_shape=input_shape,  # type:ignore
-                dtype_specs=dtype,
                 flatten=False,
                 depth_target=depth_target,
             )
@@ -704,7 +703,7 @@ class EasyDeLState(struct.PyTreeNode):
             )
             partition_specs = match_partition_rules(rules=rules, params=self.params)
             shard_fns, gather_fns = make_shard_and_gather_fns(
-                partition_specs=partition_specs, dtype_specs=dtype, mesh=mesh
+                partition_specs=partition_specs, mesh=mesh
             )
         if mesh is None:
             mesh = self.module_config.get_mesh()

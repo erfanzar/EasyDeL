@@ -224,7 +224,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
             model_parameters = self.lora_parameters
         with self.mesh:
             shard_fns, gather_fns = make_shard_and_gather_fns(
-                self.state_partition_spec, mesh=self.mesh, dtype_specs=self.dtype
+                self.state_partition_spec, mesh=self.mesh
             )
             if state is not None:
                 sharded_state = state
@@ -637,7 +637,6 @@ class CausalLanguageModelTrainer(BaseTrainer):
                         jax.eval_shape(lambda: sharded_state),
                     ),
                     mesh=self.mesh,
-                    dtype_specs=self.dtype,
                 )  # You have to re-init the new shard and gather functions in order to be able to skip LoRA weight
                 # crashing errors and saving errors
                 filename = self._save_state(state=sharded_state, gather_fns=gather_fns)

@@ -685,7 +685,6 @@ class AutoEasyDeLModelForCausalLM:
         elif auto_shard_params:
             shard_fns, _ = AutoShardAndGatherFunctions.from_pretrained(
                 pretrained_model_name_or_path=pretrained_model_name_or_path,
-                dtype_specs=param_dtype,
                 partition_rules=partition_rules,
                 sharding_axis_dims=sharding_axis_dims,
                 sharding_axis_names=sharding_axis_names,
@@ -719,6 +718,7 @@ class AutoEasyDeLModelForCausalLM:
                 params_pattern_selection=params_pattern_selection,
                 remove_state_dict=True,
                 uses_tie_word_embedding=uses_tie_word_embedding,
+                dtype=param_dtype
             )
 
             # Clear and collect memory after converting the model
@@ -834,7 +834,6 @@ class AutoShardAndGatherFunctions:
             config: EasyDeLPretrainedConfig,
             partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
             flatten: bool = True,
-            dtype_specs=jax.numpy.float16,
             input_shape: Tuple[int, int] = (1, 1),
             depth_target: Optional[List[str]] = None,
     ):
@@ -846,7 +845,6 @@ class AutoShardAndGatherFunctions:
             partition_rules: A tuple of tuples containing partition rule names and `PartitionSpec` objects.
                 If None, uses the default partition rules from the `config`.
             flatten: Whether to flatten the shard and gather functions. Defaults to True.
-            dtype_specs: The data type to use for the shard and gather functions. Defaults to `jax.numpy.float16`.
             input_shape: The input shape of the model. Defaults to (1, 1).
             depth_target: Pad the sharding to depth, for example make {params:tensor} with depth_target = ["row"] to {row:{params:tensor}}. Defaults to None.
 
@@ -866,7 +864,6 @@ class AutoShardAndGatherFunctions:
         )
         shard_fns, gather_fns = make_shard_and_gather_fns(
             partition_specs=partition_specs,
-            dtype_specs=dtype_specs,
             mesh=config.get_mesh(),
         )
         if depth_target is not None:
@@ -894,7 +891,6 @@ class AutoShardAndGatherFunctions:
             backend: Optional[str] = None,
             partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
             flatten: bool = True,
-            dtype_specs=jax.numpy.float16,
             config_kwargs: Optional[Mapping[str, Any]] = None,
             depth_target: Optional[List[str]] = None,
             from_torch: bool = False,
@@ -913,7 +909,6 @@ class AutoShardAndGatherFunctions:
             partition_rules: A tuple of tuples containing partition rule names and `PartitionSpec` objects.
                 If None, uses the default partition rules from the `config`.
             flatten: Whether to flatten the shard and gather functions. Defaults to True.
-            dtype_specs: The data type to use for the shard and gather functions. Defaults to `jax.numpy.float16`.
             config_kwargs: Additional keyword arguments to pass to the `AutoEasyDeLConfig` constructor. Defaults to None.
             depth_target: Pad the sharding to depth, for example make {params:tensor} with depth_target = ["row"] to {row:{params:tensor}}. Defaults to None.
             from_torch: should config be loaded from torch models or not.
@@ -936,7 +931,6 @@ class AutoShardAndGatherFunctions:
             config=config,
             partition_rules=partition_rules,
             flatten=flatten,
-            dtype_specs=dtype_specs,
             input_shape=input_shape,
             depth_target=depth_target,
         )

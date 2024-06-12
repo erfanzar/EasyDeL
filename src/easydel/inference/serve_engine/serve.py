@@ -158,7 +158,7 @@ class EasyDeLServeEngine:
         """
         partition_specs = match_partition_rules(partition_rules, parameters)
         shard_fns, gather_fns = make_shard_and_gather_fns(
-            partition_specs=partition_specs, mesh=mesh, dtype_specs=get_dtype(dtype)
+            partition_specs=partition_specs, mesh=mesh
         )
         return shard_fns, gather_fns, partition_specs
 
@@ -188,7 +188,7 @@ class EasyDeLServeEngine:
 
         partition_specs = match_partition_rules(params=params, rules=partition_rules)
         shard_fns, _ = make_shard_and_gather_fns(
-            partition_specs, mesh, get_dtype(serve_config.dtype)
+            partition_specs, mesh,
         )
 
         with mesh:
