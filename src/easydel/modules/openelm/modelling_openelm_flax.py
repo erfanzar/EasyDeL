@@ -15,7 +15,6 @@ from jax import Array, lax
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
-
 from easydel.modules.attention_module import AttentionModule
 from easydel.modules.common import RMSNorm
 from easydel.modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
@@ -31,7 +30,7 @@ from easydel.modules.flax_modelling_utils import (
     repeat_kv_bnsh,
     with_sharding_constraint,
 )
-from easydel.modules.openelm.openelm_configuration import OpenELMConfig as OpenELMConfig
+from easydel.modules.openelm.openelm_configuration import OpenELMConfig as OpenELMConfig, make_divisible
 
 re_mat = nn_partitioning.remat
 
