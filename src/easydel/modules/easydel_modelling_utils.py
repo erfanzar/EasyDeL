@@ -911,7 +911,6 @@ class EasyDeLFlaxPretrainedModel(FlaxPreTrainedModel):
         if auto_shard_params and shard_fns is None:
             shard_fns, _ = AutoShardAndGatherFunctions.from_config(
                 config=config,
-                dtype_specs=param_dtype,
                 input_shape=input_shape,
                 flatten=False
             )

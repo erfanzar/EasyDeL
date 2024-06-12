@@ -1217,7 +1217,6 @@ class DPOTrainer(BaseTrainer, ABC):
                         params=jax.eval_shape(lambda: self.model_state),
                     ),
                     mesh=self.mesh,
-                    dtype_specs=self.arguments.dtype,
                 )
                 output = DPOTrainerOutput(
                     state=self.model_state,
@@ -1237,7 +1236,6 @@ class DPOTrainer(BaseTrainer, ABC):
                             jax.eval_shape(lambda: self.model_state),
                         ),
                         mesh=self.mesh,
-                        dtype_specs=self.dtype,
                     )  # You have to re-init the new shard and gather functions in order to be able to skip LoRA weight
                     # crashing errors and saving errors
                     filename = self._save_state(

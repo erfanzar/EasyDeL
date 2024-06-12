@@ -140,7 +140,7 @@ class EasyModelsTest(TestCase):
             partition_specs = match_partition_rules(
                 config.get_partition_rules(True), params
             )
-            shard, _ = make_shard_and_gather_fns(partition_specs, mesh, jnp.float32)
+            shard, _ = make_shard_and_gather_fns(partition_specs, mesh)
 
             params = jax.tree_util.tree_map(lambda p, f: f(p), params, shard)
             config.add_basic_configurations(
@@ -231,7 +231,7 @@ class EasyModelsTest(TestCase):
             partition_specs = match_partition_rules(
                 config.get_partition_rules(True), params
             )
-            shard, _ = make_shard_and_gather_fns(partition_specs, mesh, jnp.float32)
+            shard, _ = make_shard_and_gather_fns(partition_specs, mesh)
 
             params = jax.tree_map(lambda p, f: f(p), params, shard)
             config.add_basic_configurations(
