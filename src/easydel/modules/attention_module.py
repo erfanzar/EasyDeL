@@ -257,48 +257,49 @@ class AttentionModule:
             use_sharding_constraint,
             base_module_class,
         )
-        set_attrs_smartly_with_prp(
-            self, "block_k_major", DEFAULT_K_BLOCK, block_k_major, base_module_class
-        )
-        set_attrs_smartly_with_prp(self, "block_b", 1, block_b, base_module_class)
+
         set_attrs_smartly_with_prp(
             self, "block_q", DEFAULT_Q_BLOCK, block_q, base_module_class
         )
         set_attrs_smartly_with_prp(
             self, "block_k", DEFAULT_K_BLOCK, block_k, base_module_class
         )
+        set_attrs_smartly_with_prp(self, "block_b", 1, block_b, base_module_class)
         set_attrs_smartly_with_prp(
             self,
             "block_q_major_dkv",
-            DEFAULT_Q_BLOCK,
+            self.block_q,
             block_q_major_dkv,
             base_module_class,
         )
         set_attrs_smartly_with_prp(
             self,
             "block_k_major_dkv",
-            DEFAULT_K_BLOCK,
+            self.block_k,
             block_k_major_dkv,
             base_module_class,
         )
         set_attrs_smartly_with_prp(
             self,
             "block_k_major_dq",
-            DEFAULT_K_BLOCK,
+            self.block_k,
             block_k_major_dq,
             base_module_class,
         )
         set_attrs_smartly_with_prp(
-            self, "block_k_dkv", DEFAULT_K_BLOCK, block_k_dkv, base_module_class
+            self, "block_k_dkv", self.block_k, block_k_dkv, base_module_class
         )
         set_attrs_smartly_with_prp(
-            self, "block_q_dkv", DEFAULT_Q_BLOCK, block_q_dkv, base_module_class
+            self, "block_q_dkv", self.block_q, block_q_dkv, base_module_class
         )
         set_attrs_smartly_with_prp(
-            self, "block_q_dq", DEFAULT_Q_BLOCK, block_q_dq, base_module_class
+            self, "block_q_dq", self.block_q, block_q_dq, base_module_class
         )
         set_attrs_smartly_with_prp(
-            self, "block_k_dq", DEFAULT_K_BLOCK, block_k_dq, base_module_class
+            self, "block_k_dq", self.block_k, block_k_dq, base_module_class
+        )
+        set_attrs_smartly_with_prp(
+            self, "block_k_major", self.block_k, block_k_major, base_module_class
         )
         set_attrs_smartly_with_prp(
             self,
