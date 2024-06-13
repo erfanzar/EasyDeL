@@ -1,12 +1,13 @@
-jax>=0.4.29
-jaxlib>=0.4.29
-fjformer==0.0.67
+jax>=0.4.28
+jaxlib>=0.4.28
+fjformer==0.0.68
 transformers>=4.40.0
 optax~=0.2.2
 msgpack~=1.0.7
 ipython~=8.17.2
 tqdm~=4.64.1
 datasets~=2.19.2
+tensorflow~=2.16.1 
 tensorboard~=2.16.2
 numpy~=1.26.2
 tensorflow-datasets~=4.9.6

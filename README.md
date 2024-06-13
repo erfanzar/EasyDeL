@@ -47,7 +47,7 @@ of machine learning models, particularly in the domain of large language models 
 
 - Now Flash attention will automatically switch on pallas_flash in case that your on GPUs.
 - GPU Flash Attention Bugs are now fixed.
-- changing required version of jax from `>=0.4.23` to `>=0.4.29`
+- changing required version of jax from `>=0.4.23` to `>=0.4.28`, but `0.4.29` or higher versions (if available) are recommended.
 - Import structure is now like the older versions and multi-host(GPU) training issues are fixed.
 - KV cache quantization is improved and now have +%21 accuracy from old version (%69)
 - adding `EasyDeLFlaxPretrainedModel.from_pretrained` and `EasyDeLFlaxPretrainedModel.save_pretrained` to give users

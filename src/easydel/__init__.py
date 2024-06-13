@@ -1,35 +1,9 @@
 import os as _os
-import warnings as _warnings
-import sys as _sys
 
 if bool(_os.environ.get("EASYDEL_AUTO", "true")):
     _os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     _os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.99"
     _os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-_install_command = f"{_sys.executable} -m pip install tensorflow~=2.16.1 -q -U"
-_install_ml_dtypes_command = f"{_sys.executable} -m pip install ml_dtypes>=0.4.0 -q -U"
-
-
-def _install_tf():
-    _os.system(_install_command)
-    _os.system(_install_ml_dtypes_command)
-
-
-try:
-    import tensorflow as _tf
-
-    _version_tf_ = _tf.__version__
-    del _tf
-    if _version_tf_ != "2.16.1":
-        _install_tf()
-
-except ModuleNotFoundError:
-    _warnings.warn(
-        "installing tensorflow before using easydel. "
-        "(easydel uses tensorflow for dataloader and it's not added in required packages in order to pass the compiling"
-        " error)\nrunning : {}".format(_install_command)
-    )
-    _install_tf()
 # INFERENCE IMPORT START HERE
 from easydel.inference.serve_engine import (
     EasyDeLServeEngine as EasyDeLServeEngine,
