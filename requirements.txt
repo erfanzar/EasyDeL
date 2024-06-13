@@ -9,7 +9,6 @@ tqdm~=4.64.1
 datasets~=2.19.2
 tensorboard~=2.16.2
 numpy~=1.26.2
-tensorflow~=2.16.1
 tensorflow-datasets~=4.9.6
 scipy==1.13.1
 websocket-client~=1.8.0

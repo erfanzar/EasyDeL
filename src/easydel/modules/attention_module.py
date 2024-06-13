@@ -955,7 +955,7 @@ class AttentionModule:
                     ),
                 ),
                 mesh=self.mesh,
-                in_specs=[qps, kps, vps, bps, PartitionSpec(qps[0], qps[1])],
+                in_specs=(qps, kps, vps, bps, PartitionSpec(qps[0], qps[1])),
                 out_specs=aps,
                 check_rep=False,
             )
@@ -1438,6 +1438,8 @@ class AttentionModule:
             num_key_value_heads=32,
             chunk_size=128,
             axis_dims=(1, -1, 1, 1),
+            head_dim=128,
+            dtype=jnp.float16
     ):
         """creates a test for attention module to help you find the best attention mechanism you can use."""
         import flax
@@ -1450,7 +1452,6 @@ class AttentionModule:
         from easydel.modules.mistral import MistralConfig
         from fjformer import GenerateRNG
 
-        head_dim = 128
         rng = GenerateRNG()
 
         config = MistralConfig(
@@ -1487,7 +1488,7 @@ class AttentionModule:
             attention_pred = AttentionModule(
                 attn_mechanism=attn_mechanism,
                 axis_name="sp",
-                dtype=jnp.float32,
+                dtype=dtype,
                 mesh=config.get_mesh(),
                 head_dims=q.shape[-1],
                 sm_scale=1 / math.sqrt(q.shape[-1]),
@@ -1504,17 +1505,17 @@ class AttentionModule:
             q = jax.random.normal(
                 rng.rng,
                 (batch_size, sequence_length, num_attention_heads, head_dim),
-                dtype="float32",
+                dtype=dtype,
             )
             k = jax.random.normal(
                 rng.rng,
                 (batch_size, sequence_length, num_key_value_heads, head_dim),
-                dtype="float32",
+                dtype=dtype,
             )
             v = jax.random.normal(
                 rng.rng,
                 (batch_size, sequence_length, num_key_value_heads, head_dim),
-                dtype="float32",
+                dtype=dtype,
             )
             c = flax.linen.attention.make_causal_mask(
                 jnp.ones((batch_size, sequence_length))
@@ -1534,6 +1535,7 @@ class AttentionModule:
         q, k, v, b, a = make_inputs()
         excepted_output, excepted_grads = call_dot_product(q, k, v, b)
         test_attentions = [
+            "pallas_flash",
             "local_ring",
             "blockwise",
             "vanilla",
@@ -1543,7 +1545,6 @@ class AttentionModule:
             "flash",
             "splash",
             "cudnn",
-            "pallas_flash",
         ]
         fns = {
             k: partial(call_attention_module, attn_mechanism=k) for k in test_attentions
