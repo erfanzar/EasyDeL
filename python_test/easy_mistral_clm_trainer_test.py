@@ -18,6 +18,7 @@ from easydel import (  # noqa: E402
     TrainArguments,
     FlaxMistralForCausalLM,
     MistralConfig,
+    AttentionMechanisms
 )
 from jax import numpy as jnp, random  # noqa: E402
 from datasets import Dataset, IterableDataset  # noqa: E402
@@ -40,6 +41,9 @@ def main(use_iterable_dataset: bool):
         gradient_checkpointing="",
         max_position_embeddings=sequence_length,
         attn_dtype=jnp.float16,
+        attn_mechanism=AttentionMechanisms.pallas_flash,
+        block_k=128,
+        block_q=128
     )
 
     model = FlaxMistralForCausalLM(config=config, _do_init=True)

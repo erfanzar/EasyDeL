@@ -11,11 +11,11 @@ from flax.traverse_util import flatten_dict
 from flax.serialization import from_bytes, to_bytes, to_state_dict
 import msgpack
 import os
-from fjformer import get_dtype
 from jax import numpy as jnp
 from typing import List, Optional, Mapping, Callable, Union
 from tqdm import tqdm
 from easydel.etils.etils import get_logger
+from fjformer.checkpoint import get_dtype
 
 logger = get_logger(__name__)
 

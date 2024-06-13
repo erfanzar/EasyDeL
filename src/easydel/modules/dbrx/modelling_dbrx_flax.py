@@ -6,7 +6,7 @@ import flax.linen
 import flax.struct
 import jax
 import jax.numpy as jnp
-from fjformer import auxiliary_load_balancing_loss_func
+from fjformer.functions import auxiliary_load_balancing_loss_func
 from fjformer import linen as nn
 from fjformer.linen import Dense
 from flax.core import FrozenDict, freeze, unfreeze

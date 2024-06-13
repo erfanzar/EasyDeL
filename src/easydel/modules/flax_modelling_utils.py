@@ -7,8 +7,8 @@ import chex
 import fjformer
 import jax
 from einops import rearrange
-from fjformer.bits import config as q_config
-from fjformer.bits import q_flax
+from fjformer.bit_quantization import config as q_config
+from fjformer.bit_quantization import q_flax
 from flax import linen as nn
 from flax.linen import combine_masks
 from jax import lax

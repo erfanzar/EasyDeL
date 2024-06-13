@@ -33,8 +33,8 @@ import jax.numpy as jnp
 import numpy as np
 from fjformer import linen as nn
 from fjformer import with_sharding_constraint
-from fjformer.bits import config as q_config
-from fjformer.bits import q_flax
+from fjformer.bit_quantization import config as q_config
+from fjformer.bit_quantization import q_flax
 from fjformer.linen import Dense
 from flax.core.frozen_dict import FrozenDict, unfreeze
 from flax.linen import combine_masks, make_causal_mask

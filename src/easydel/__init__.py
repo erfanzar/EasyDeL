@@ -174,7 +174,10 @@ from easydel.modules.easydel_modelling_utils import (
     EasyDeLPretrainedConfig as EasyDeLPretrainedConfig,
     EasyDeLFlaxPretrainedModel as EasyDeLFlaxPretrainedModel,
 )
-from easydel.modules.attention_module import AttentionModule as AttentionModule
+from easydel.modules.attention_module import (
+    AttentionModule as AttentionModule,
+    AttentionMechanisms as AttentionMechanisms
+)
 
 # MODULES IMPORT END HERE
 

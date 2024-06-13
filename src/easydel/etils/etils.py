@@ -57,7 +57,11 @@ AVAILABLE_GRADIENT_CHECKPOINTS = Literal[
 ]
 
 AVAILABLE_SCHEDULERS = Literal[
-    "linear", "cosine", "none", "warm_up_cosine", "warm_up_linear"
+    "linear",
+    "cosine",
+    "none",
+    "warm_up_cosine",
+    "warm_up_linear"
 ]
 
 AVAILABLE_OPTIMIZERS = Literal["adafactor", "lion", "adamw"]
@@ -99,7 +103,7 @@ def set_loggers_level(level: int = logging.WARNING):
 
 
 def define_flags_with_default(
-    _required_fields: List = None, **kwargs
+        _required_fields: List = None, **kwargs
 ) -> Tuple[argparse.Namespace, Dict[str, Any]]:
     """Defines flags with default values using argparse.
 

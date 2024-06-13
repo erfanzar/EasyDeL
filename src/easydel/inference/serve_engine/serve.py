@@ -13,7 +13,6 @@ from fjformer import (
     with_sharding_constraint,
     match_partition_rules,
     make_shard_and_gather_fns,
-    get_dtype,
 )
 from jax import numpy as jnp
 from easydel.modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel

@@ -144,7 +144,10 @@ from easydel.modules.deepseek_v2 import (
     FlaxDeepseekV2ForCausalLM as FlaxDeepseekV2ForCausalLM,
     DeepseekV2Config as DeepseekV2Config,
 )
-from easydel.modules.attention_module import AttentionModule as AttentionModule
+from easydel.modules.attention_module import (
+    AttentionModule as AttentionModule,
+    AttentionMechanisms as AttentionMechanisms
+)
 
 from easydel.modules.auto_easydel_model import (
     AutoEasyDeLModelForCausalLM as AutoEasyDeLModelForCausalLM,
