@@ -45,6 +45,7 @@ of machine learning models, particularly in the domain of large language models 
 
 ### Latest News 🔥
 
+- Now Flash attention will automatically switch on pallas_flash in case that your on GPUs.
 - GPU Flash Attention Bugs are now fixed.
 - changing required version of jax from `>=0.4.23` to `>=0.4.29`
 - Import structure is now like the older versions and multi-host(GPU) training issues are fixed.
