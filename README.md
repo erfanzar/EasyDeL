@@ -44,7 +44,10 @@ With its comprehensive set of features and tools, EasyDeL aims to streamline and
 of machine learning models, particularly in the domain of large language models and video-related applications.
 
 ### Latest News 🔥
-- Improt structure is now like the older versions and multi-host(GPU) training issues are fixed.
+
+- GPU Flash Attention Bugs are now fixed.
+- changing required version of jax from `>=0.4.23` to `>=0.4.29`
+- Import structure is now like the older versions and multi-host(GPU) training issues are fixed.
 - KV cache quantization is improved and now have +%21 accuracy from old version (%69)
 - adding `EasyDeLFlaxPretrainedModel.from_pretrained` and `EasyDeLFlaxPretrainedModel.save_pretrained` to give users
   experience of being free and not only using easydel states
@@ -936,8 +939,11 @@ To cite this repository:
     year={2023}
 } 
 ```
+
 ## Refrences
-- _[young-geng/EasyLM](https://github.com/young-geng/EasyLM)_: Large language models (LLMs) made easy, EasyLM is a one stop solution for pre-training, finetuning, evaluating and serving LLMs in JAX/Flax.
+
+- _[young-geng/EasyLM](https://github.com/young-geng/EasyLM)_: Large language models (LLMs) made easy, EasyLM is a one
+  stop solution for pre-training, finetuning, evaluating and serving LLMs in JAX/Flax.
 - _[Sea-Snell/JAXSeq](https://github.com/Sea-Snell/JAXSeq)_: Train very large language models in Jax.
 
 - _[lhao499/RingAttention](https://github.com/lhao499/RingAttention)_:Transformers with Arbitrarily Large Context
