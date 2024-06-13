@@ -2,7 +2,7 @@ import math
 import time
 import warnings
 from functools import partial
-from typing import Tuple, Callable, Optional, Literal, Any
+from typing import Tuple, Optional, Literal, Any
 
 import jax
 
@@ -16,7 +16,6 @@ from flax.struct import dataclass
 from chex import Array
 
 import fjformer
-from fjformer.pallas_operations.gpu.flash_attention import flash_attention as gpu_flash_attention
 from fjformer.pallas_operations.pallas_attention import flash_attention
 from fjformer import with_sharding_constraint
 from fjformer.pallas_operations.tpu.flash_attention import (
@@ -106,24 +105,6 @@ def combine_flash_masks(causal_mask, segment_ids):
         1,
     )
     return jnp.logical_or(~causal_mask, segment_ids)
-
-
-def get_flash_attention() -> Tuple[Callable, bool, bool]:
-    """return: FlashAttention FN, Upcast Needed to float32,do_shard_map"""
-    platform = jax.lib.xla_bridge.get_backend().platform
-    if platform == "gpu":
-        # warnings.warn("for GPU backend use `cudnn` or `pallas_flash`")
-        float32_logits = False
-        ring_attention_fn = gpu_flash_attention
-        do_shard_map = True
-    elif platform == "tpu":
-        float32_logits = True
-        ring_attention_fn = tpu_flash_attention
-        do_shard_map = False
-    else:
-        raise ValueError(f"Unsupported platform {platform}")
-
-    return ring_attention_fn, float32_logits, do_shard_map
 
 
 def set_attrs_smartly_with_prp(
@@ -354,11 +335,6 @@ class AttentionModule:
         self._do_check = _do_check
         if attn_mechanism == "splash" and self.platform != "tpu":
             raise OSError("splash attention is only supported on TPU.")
-        if attn_mechanism == "flash" and self.platform != "tpu":
-            error_msg = "flash attention is only supported on TPU"
-            if self.platform == "gpu":
-                error_msg += ", for GPUs flash attention you can use `cudnn`."
-            raise OSError(error_msg)
         if attn_mechanism == "cudnn" and self.platform != "gpu":
             raise OSError("flash attention is only supported on GPU.")
 
@@ -617,6 +593,7 @@ class AttentionModule:
                     causal=causal,
                     query_sequence_length=query_sequence_length,
                     key_value_sequence_length=key_value_sequence_length,
+                    attention_mask=attention_mask
                 )
 
             elif self.attn_mechanism == "vanilla":
@@ -1172,60 +1149,67 @@ class AttentionModule:
             value_states: Array,
             query_sequence_length: int,
             key_value_sequence_length: int,
+            attention_mask: Optional[Array] = None,
             bias: Optional[Array] = None,
             causal: bool = False,
     ) -> AttentionOutput:
+        if self.platform == "tpu":
+            qps, kps, vps, bps, aps, is_gen = self.get_bhsd_partition_specs(
+                query_sequence_length
+            )
+            block_size = self.get_block_size_flash_attn(
+                query_sequence_length, key_value_sequence_length
+            )
+            query_states = query_states.transpose(0, 2, 1, 3)
+            key_states = key_states.transpose(0, 2, 1, 3)
+            value_states = value_states.transpose(0, 2, 1, 3)
 
-        qps, kps, vps, bps, aps, is_gen = self.get_bhsd_partition_specs(
-            query_sequence_length
-        )
-        block_size = self.get_block_size_flash_attn(
-            query_sequence_length, key_value_sequence_length
-        )
-        query_states = query_states.transpose(0, 2, 1, 3)
-        key_states = key_states.transpose(0, 2, 1, 3)
-        value_states = value_states.transpose(0, 2, 1, 3)
+            batch_size, num_attention_heads, query_sequence_length, head_dims = (
+                query_states.shape
+            )
+            if bias is not None:
+                if bias.shape[1] != num_attention_heads:
+                    bias = bias.repeat(
+                        num_attention_heads,
+                        1,
+                    )
 
-        batch_size, num_attention_heads, query_sequence_length, head_dims = (
-            query_states.shape
-        )
-        if bias is not None:
-            if bias.shape[1] != num_attention_heads:
-                bias = bias.repeat(
-                    num_attention_heads,
-                    1,
-                )
-
-        flash_func, float32_logits, _ = get_flash_attention()
-        if float32_logits:
             query_states, key_states, value_states = map(
                 lambda s: s.astype(jnp.float32),
                 (query_states, key_states, value_states),
             )
 
-        if self.sm_scale is None:
-            self.sm_scale = 1 / math.sqrt(query_states[-1])
-        attention_o = shard_map(
-            partial(
-                flash_func,
-                causal=causal,
-                sm_scale=self.sm_scale,
-                block_sizes=block_size,
-                debug=False,
-            ),
-            in_specs=(qps, kps, vps, bps),
-            out_specs=aps,
-            mesh=self.mesh,
-            check_rep=False,
-        )(
-            query_states,
-            key_states,
-            value_states,
-            bias,
-        )
+            if self.sm_scale is None:
+                self.sm_scale = 1 / math.sqrt(query_states[-1])
+            attention_o = shard_map(
+                partial(
+                    tpu_flash_attention,
+                    causal=causal,
+                    sm_scale=self.sm_scale,
+                    block_sizes=block_size,
+                    debug=False,
+                ),
+                in_specs=(qps, kps, vps, bps),
+                out_specs=aps,
+                mesh=self.mesh,
+                check_rep=False,
+            )(
+                query_states,
+                key_states,
+                value_states,
+                bias,
+            )
 
-        attention_o = attention_o.transpose(0, 2, 1, 3)
-        return AttentionOutput(attention_outputs=attention_o, attention_weights=None)
+            attention_o = attention_o.transpose(0, 2, 1, 3)
+            return AttentionOutput(attention_outputs=attention_o, attention_weights=None)
+        else:
+            return self.pallas_flash_attention(
+                query_states=query_states,
+                key_states=key_states,
+                value_states=value_states,
+                bias=bias,
+                query_sequence_length=query_sequence_length,
+            )
 
     def splash_attention(
             self,
@@ -1306,21 +1290,17 @@ class AttentionModule:
         query_states, key_states, value_states = map(
             lambda s: s.astype(self.dtype), (query_states, key_states, value_states)
         )
-        # query_states = with_sharding_constraint(query_states, qps)
-        # key_states = with_sharding_constraint(key_states, kps)
-        # value_states = with_sharding_constraint(value_states, vps)
-        # bias = with_sharding_constraint(bias, bps)
-        wrapped_fn = partial(
-            flash_attention,
-            sm_scale=self.sm_scale,
-            block_k=self.block_k,
-            block_q=self.block_q,
-            interpret=True if self.platform == "cpu" else None,  # auto-decide
-            backward_pass_impl=self.backward_pass_impl,
-            debug=False,
-        )
+
         attention_outputs = shard_map(
-            f=wrapped_fn,
+            f=partial(
+                flash_attention,
+                sm_scale=self.sm_scale,
+                block_k=self.block_k,
+                block_q=self.block_q,
+                interpret=True if self.platform == "cpu" else False,  # auto-decide
+                backward_pass_impl=self.backward_pass_impl,
+                debug=False,
+            ),
             in_specs=(qps, kps, vps, bps),
             out_specs=aps,
             mesh=self.mesh,
@@ -1439,7 +1419,8 @@ class AttentionModule:
             chunk_size=128,
             axis_dims=(1, -1, 1, 1),
             head_dim=128,
-            dtype=jnp.float16
+            dtype=jnp.float16,
+            calculate_gradients: bool = True
     ):
         """creates a test for attention module to help you find the best attention mechanism you can use."""
         import flax
@@ -1455,13 +1436,18 @@ class AttentionModule:
         rng = GenerateRNG()
 
         config = MistralConfig(
-            axis_dims=axis_dims, block_q=chunk_size, block_k=chunk_size
+            axis_dims=axis_dims,
+            block_q=chunk_size,
+            block_k=chunk_size,
+            attn_dtype=dtype
         )
 
         def value_and_grad_wrapper(fn, **kwargs):
-            @partial(jax.value_and_grad, **kwargs)
+
             def inner(*args, **kwargs):
                 return jnp.sum(fn(*args, **kwargs))
+
+            inner = jax.value_and_grad(inner, **kwargs) if calculate_gradients else inner
 
             return inner
 
@@ -1533,9 +1519,13 @@ class AttentionModule:
             return q, k, v, b, a
 
         q, k, v, b, a = make_inputs()
-        excepted_output, excepted_grads = call_dot_product(q, k, v, b)
+        out = call_dot_product(q, k, v, b)
+        if calculate_gradients:
+            excepted_output, excepted_grads = out
+        else:
+            excepted_output = out
+            excepted_grads = 1
         test_attentions = [
-            "pallas_flash",
             "local_ring",
             "blockwise",
             "vanilla",
@@ -1544,6 +1534,7 @@ class AttentionModule:
             "legacy_sharded_vanilla",
             "flash",
             "splash",
+            "pallas_flash",
             "cudnn",
         ]
         fns = {
@@ -1555,6 +1546,8 @@ class AttentionModule:
                 start = time.time()
                 out = jax.block_until_ready(fn(q, k, v, b, a))
                 end = time.time() - start
+                if not calculate_gradients:
+                    out = (out, 1)
                 outs_and_grads[nm] = out + (end,)
             except Exception as e:
                 print(f"{nm} is Failed :\n\n{e}")
@@ -1571,8 +1564,11 @@ class AttentionModule:
                 }
             else:
                 output_diff = diff(excepted_output, out)
-                g_diff = [diff(*args) for args in zip(excepted_grads, grad)]
-                sum_g = sum(g_diff)
+                if calculate_gradients:
+                    g_diff = [diff(*args) for args in zip(excepted_grads, grad)]
+                    sum_g = sum(g_diff)
+                else:
+                    sum_g = 0
                 # TODO : Fix this
                 # XlaRuntimeError: FAILED_PRECONDITION: The program continuator has halted unexpectedly.
                 # sum_g = jax.device_get(sum_g)
