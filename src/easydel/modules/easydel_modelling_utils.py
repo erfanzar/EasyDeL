@@ -914,6 +914,9 @@ class EasyDeLFlaxPretrainedModel(FlaxPreTrainedModel):
                 input_shape=input_shape,
                 flatten=False
             )
+            fns = {"params": shard_fns}
+            fns.update(shard_fns)
+            shard_fns = fns
         elif auto_shard_params and shard_fns is not None:
             logger.warning(
                 "`auto_shard_params` will be ignored since `shard_fns` is provided."
