@@ -137,7 +137,7 @@ class FlaxPhi3Attention(BaseJAXAttentionModule):
         )
 
         op_size = self.num_heads * self.head_dim + 2 * (
-                self.num_key_value_heads * self.head_dim
+            self.num_key_value_heads * self.head_dim
         )
         self.o_proj = dense_class(self.hidden_size)
         self.qkv_proj = dense_class(op_size)
@@ -194,7 +194,7 @@ class FlaxPhi3Attention(BaseJAXAttentionModule):
         )
 
     def apply_rotary(
-            self, batch_size, sequence_length, query, key, value, freq_cis, position_ids
+        self, batch_size, sequence_length, query, key, value, freq_cis, position_ids
     ):
         """The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
         The main difference is that it takes in an additional argument, freq_cis, which are used to calculate
@@ -237,25 +237,25 @@ class FlaxPhi3Attention(BaseJAXAttentionModule):
         return self._transpose_sequence_head(query, key, value)
 
     def __call__(
-            self,
-            hidden_states: chex.Array,
-            freq_cis: Tuple[chex.Array, chex.Array],
-            attention_mask: chex.Array,
-            causal_mask: chex.Array,
-            position_ids: chex.Array,
-            segment_ids: Optional[chex.Array] = None,
-            deterministic: bool = True,
-            init_cache: bool = False,
-            output_attentions: bool = True,
+        self,
+        hidden_states: chex.Array,
+        freq_cis: Tuple[chex.Array, chex.Array],
+        attention_mask: chex.Array,
+        causal_mask: chex.Array,
+        position_ids: chex.Array,
+        segment_ids: Optional[chex.Array] = None,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: bool = True,
     ):
         batch_size, sequence_length = hidden_states.shape[:2]
         qkv = self.qkv_proj(hidden_states)
         query_pos = self.num_heads * self.head_dim
         query_states = qkv[..., :query_pos]
         key_states = qkv[
-                     ..., query_pos: query_pos + self.num_key_value_heads * self.head_dim
-                     ]
-        value_states = qkv[..., query_pos + self.num_key_value_heads * self.head_dim:]
+            ..., query_pos : query_pos + self.num_key_value_heads * self.head_dim
+        ]
+        value_states = qkv[..., query_pos + self.num_key_value_heads * self.head_dim :]
 
         query_states, key_states, value_states = self.apply_rotary(
             query=query_states,
@@ -428,16 +428,16 @@ class FlaxPhi3DecoderLayer(nn.Module):
         )
 
     def __call__(
-            self,
-            hidden_states: chex.Array,
-            freq_cis: Tuple[chex.Array, chex.Array],
-            attention_mask: Optional[chex.Array],
-            position_ids: Optional[chex.Array],
-            causal_mask: Optional[chex.Array],
-            segment_ids: Optional[chex.Array] = None,
-            deterministic: bool = True,
-            output_attentions: bool = False,
-            init_cache: bool = False,
+        self,
+        hidden_states: chex.Array,
+        freq_cis: Tuple[chex.Array, chex.Array],
+        attention_mask: Optional[chex.Array],
+        position_ids: Optional[chex.Array],
+        causal_mask: Optional[chex.Array],
+        segment_ids: Optional[chex.Array] = None,
+        deterministic: bool = True,
+        output_attentions: bool = False,
+        init_cache: bool = False,
     ):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -458,8 +458,8 @@ class FlaxPhi3DecoderLayer(nn.Module):
         )
 
         hidden_states = (
-                self.resid_attn_dropout(attn_outputs, deterministic=deterministic)
-                + residual
+            self.resid_attn_dropout(attn_outputs, deterministic=deterministic)
+            + residual
         )
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -504,18 +504,18 @@ class FlaxPhiDecoderLayerCollection(nn.Module):
         ]
 
     def __call__(
-            self,
-            hidden_states: chex.Array,
-            freq_cis: Tuple[chex.Array, chex.Array],
-            attention_mask: Optional[chex.Array],
-            position_ids: Optional[chex.Array],
-            causal_mask: Optional[chex.Array],
-            segment_ids: Optional[chex.Array] = None,
-            deterministic: bool = True,
-            output_attentions: bool = False,
-            output_hidden_states: bool = False,
-            init_cache: bool = False,
-            return_dict: bool = True,
+        self,
+        hidden_states: chex.Array,
+        freq_cis: Tuple[chex.Array, chex.Array],
+        attention_mask: Optional[chex.Array],
+        position_ids: Optional[chex.Array],
+        causal_mask: Optional[chex.Array],
+        segment_ids: Optional[chex.Array] = None,
+        deterministic: bool = True,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        init_cache: bool = False,
+        return_dict: bool = True,
     ) -> Union[tuple[tuple, ...], FlaxBaseModelOutput]:
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
@@ -637,17 +637,17 @@ class FlaxPhi3Module(nn.Module):
         )
 
     def __call__(
-            self,
-            input_ids: Optional[chex.Array] = None,
-            inputs_embeds: Optional[chex.Array] = None,
-            attention_mask: Optional[chex.Array] = None,
-            position_ids: Optional[chex.Array] = None,
-            extra_embedding: Optional[chex.Array] = None,
-            deterministic: bool = True,
-            output_attentions: bool = False,
-            output_hidden_states: bool = False,
-            init_cache: bool = False,
-            return_dict: bool = True,
+        self,
+        input_ids: Optional[chex.Array] = None,
+        inputs_embeds: Optional[chex.Array] = None,
+        attention_mask: Optional[chex.Array] = None,
+        position_ids: Optional[chex.Array] = None,
+        extra_embedding: Optional[chex.Array] = None,
+        deterministic: bool = True,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        init_cache: bool = False,
+        return_dict: bool = True,
     ) -> Union[tuple[tuple[Any, ...], ...], FlaxBaseModelOutput]:
         if input_ids is None and inputs_embeds is None:
             raise RuntimeError("Both `input_ids` and `inputs_embeds` can not be None !")
@@ -664,8 +664,9 @@ class FlaxPhi3Module(nn.Module):
                 .astype("i4")
             )
         assert (
-                sequence_length <= self.config.max_position_embeddings
-        ), "Maximum Position Embedding Reached !"
+            sequence_length <= self.config.max_position_embeddings
+        ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
+
         inputs_embeds = (
             inputs_embeds + extra_embedding
             if extra_embedding is not None
@@ -728,17 +729,17 @@ class FlaxPhi3ForCausalLMModule(nn.Module):
         )
 
     def __call__(
-            self,
-            input_ids: Optional[chex.Array] = None,
-            inputs_embeds: Optional[chex.Array] = None,
-            attention_mask: Optional[chex.Array] = None,
-            position_ids: Optional[chex.Array] = None,
-            extra_embedding: Optional[chex.Array] = None,
-            deterministic: bool = True,
-            output_attentions: bool = False,
-            output_hidden_states: bool = False,
-            init_cache: bool = False,
-            return_dict: bool = True,
+        self,
+        input_ids: Optional[chex.Array] = None,
+        inputs_embeds: Optional[chex.Array] = None,
+        attention_mask: Optional[chex.Array] = None,
+        position_ids: Optional[chex.Array] = None,
+        extra_embedding: Optional[chex.Array] = None,
+        deterministic: bool = True,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        init_cache: bool = False,
+        return_dict: bool = True,
     ) -> Union[tuple[Any, ...], FlaxMaskedLMOutput]:
         res = self.model(
             input_ids=input_ids,
@@ -781,14 +782,14 @@ class FlaxPhiPreTrainedModel(EasyDeLFlaxPretrainedModel):
     base_model_prefix = "transformer"
 
     def __init__(
-            self,
-            config: Phi3Config,
-            dtype: jnp.dtype = jnp.float32,
-            param_dtype: jnp.dtype = jnp.float32,
-            precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
-            input_shape=(1, 1),
-            seed: int = 42,
-            _do_init: bool = False,
+        self,
+        config: Phi3Config,
+        dtype: jnp.dtype = jnp.float32,
+        param_dtype: jnp.dtype = jnp.float32,
+        precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
+        input_shape=(1, 1),
+        seed: int = 42,
+        _do_init: bool = False,
     ) -> None:
         module = self.module_class(
             config=config, dtype=dtype, param_dtype=param_dtype, precision=precision
@@ -820,7 +821,7 @@ class FlaxPhiPreTrainedModel(EasyDeLFlaxPretrainedModel):
         return init_variables["cache"]
 
     def init_weights(
-            self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
+        self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
     ) -> FrozenDict:
         input_ids = jnp.zeros(input_shape, dtype="i4")
         attention_mask = jnp.ones_like(input_ids)
@@ -842,20 +843,20 @@ class FlaxPhiPreTrainedModel(EasyDeLFlaxPretrainedModel):
             return random_params
 
     def __call__(
-            self,
-            input_ids: chex.Array,
-            attention_mask: chex.Array = None,
-            position_ids: chex.Array = None,
-            params: dict = None,
-            past_key_values: dict = None,
-            dropout_rng: jax.random.PRNGKey = None,
-            train: bool = False,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = True,
-            extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
-            add_params_field: bool = False,
-            **kwargs,
+        self,
+        input_ids: chex.Array,
+        attention_mask: chex.Array = None,
+        position_ids: chex.Array = None,
+        params: dict = None,
+        past_key_values: dict = None,
+        dropout_rng: jax.random.PRNGKey = None,
+        train: bool = False,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = True,
+        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+        add_params_field: bool = False,
+        **kwargs,
     ):
 
         output_attentions = (
@@ -875,8 +876,8 @@ class FlaxPhiPreTrainedModel(EasyDeLFlaxPretrainedModel):
         batch_size, sequence_length = input_ids.shape
 
         assert (
-                sequence_length <= self.config.max_position_embeddings
-        ), "Maximum Position Embedding Reached !"
+            sequence_length <= self.config.max_position_embeddings
+        ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
 
         if attention_mask is None:
             attention_mask = jnp.ones((batch_size, sequence_length))
