@@ -1007,6 +1007,10 @@ class EasyDeLFlaxPretrainedModel(FlaxPreTrainedModel):
             remove_dict_prefix=remove_dict_prefix,
         )
 
+        params = state.get("params", None)
+        if params is not None:
+            state = params
+
         state = flatten_dict(state)
         random_state = flatten_dict(unfreeze(model.params_shape_tree))
 
