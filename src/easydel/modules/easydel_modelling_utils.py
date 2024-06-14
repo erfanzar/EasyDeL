@@ -100,7 +100,7 @@ class EasyDeLPretrainedConfig(PretrainedConfig):
             block_k: int = 128,
             block_q: int = 128,
             block_b: int = 1,
-            block_k_major: int = 128,
+            block_k_major: int | None = None,
             block_q_major_dkv: int | None = None,
             block_k_major_dkv: int | None = None,
             block_k_dkv: int | None = None,
@@ -133,7 +133,7 @@ class EasyDeLPretrainedConfig(PretrainedConfig):
         self.block_b = block_b
         self.block_k = block_k
         self.block_q = block_q
-        self.block_k_major = block_k_major
+        self.block_k_major = block_k_major or block_k
         self.block_q_major_dkv = block_q_major_dkv or block_q
         self.block_k_major_dkv = block_k_major_dkv or block_k
         self.block_k_dkv = block_k_dkv or block_k

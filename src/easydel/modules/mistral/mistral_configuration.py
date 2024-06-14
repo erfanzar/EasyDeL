@@ -130,8 +130,7 @@ class MistralConfig(EasyDeLPretrainedConfig):
             **kwargs,
         )
 
-    @staticmethod
-    def get_partition_rules(fully_sharded_data_parallel: bool = True):
+    def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
         """The get_partition_rules function is used to define the partitioning scheme for a model.
         It returns a list of tuples, where each tuple contains two elements:
           1) A regex string that matches the name of one or more parameters in the model.
