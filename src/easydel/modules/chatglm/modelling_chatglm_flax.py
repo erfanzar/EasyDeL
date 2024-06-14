@@ -1052,7 +1052,7 @@ class FlaxChatGLMPreTrainedModel(EasyDeLFlaxPretrainedModel):
 
         assert (
             sequence_length <= self.config.max_position_embeddings
-        ), "Maximum Position Embedding Reached !"
+        ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
 
         if position_ids is None:
             if past_key_values is not None:

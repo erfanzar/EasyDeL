@@ -124,7 +124,7 @@ class FlaxQwen2Attention(BaseJAXAttentionModule):
         self.hidden_size = config.hidden_size
         self.head_dim = self.config.hidden_size // self.config.num_attention_heads
         self.num_key_value_groups = (
-                self.config.num_attention_heads // self.config.num_key_value_heads
+            self.config.num_attention_heads // self.config.num_key_value_heads
         )
 
         if self.num_key_value_groups == 1:
@@ -219,7 +219,7 @@ class FlaxQwen2Attention(BaseJAXAttentionModule):
         )
 
     def apply_rotary(
-            self, batch_size, sequence_length, query, key, value, freq_cis, position_ids
+        self, batch_size, sequence_length, query, key, value, freq_cis, position_ids
     ):
         """The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
         The main difference is that it takes in an additional argument, freq_cis, which are used to calculate
@@ -259,17 +259,17 @@ class FlaxQwen2Attention(BaseJAXAttentionModule):
         return self._transpose_sequence_head(query, key, value)
 
     def __call__(
-            self,
-            hidden_states: chex.Array,
-            freq_cis: Tuple[chex.Array, chex.Array],
-            attention_mask: chex.Array,
-            position_ids: chex.Array,
-            causal_mask: chex.Array,
-            segment_ids: Optional[chex.Array] = None,
-            deterministic: bool = True,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            fcm_mask=None,
+        self,
+        hidden_states: chex.Array,
+        freq_cis: Tuple[chex.Array, chex.Array],
+        attention_mask: chex.Array,
+        position_ids: chex.Array,
+        causal_mask: chex.Array,
+        segment_ids: Optional[chex.Array] = None,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        fcm_mask=None,
     ):
         """The __call__ function is the main function of a JAX module. It defines how the module behaves when called
         with inputs. The __call__ function can be thought of as a &quot;forward pass&quot; through the model,
@@ -477,17 +477,17 @@ class FlaxQwen2Block(nn.Module):
         )
 
     def __call__(
-            self,
-            hidden_states: chex.Array,
-            freq_cis: Tuple[chex.Array, chex.Array],
-            attention_mask: chex.Array,
-            position_ids: chex.Array,
-            causal_mask: chex.Array,
-            segment_ids: Optional[chex.Array] = None,
-            deterministic: bool = True,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            fcm_mask: Optional[jnp.ndarray] = None,
+        self,
+        hidden_states: chex.Array,
+        freq_cis: Tuple[chex.Array, chex.Array],
+        attention_mask: chex.Array,
+        position_ids: chex.Array,
+        causal_mask: chex.Array,
+        segment_ids: Optional[chex.Array] = None,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        fcm_mask: Optional[jnp.ndarray] = None,
     ):
         """The __call__ function is the main function of a TransformerEncoderLayer.
         It takes in hidden states, frequency-domain inputs, and masks as input. It then
@@ -557,13 +557,13 @@ class FlaxQwen2PreTrainedModel(EasyDeLFlaxPretrainedModel):
     module_class: nn.Module = None
 
     def __init__(
-            self,
-            config: Qwen2Config,
-            input_shape: Tuple = (1, 1),
-            seed: int = 0,
-            dtype: jnp.dtype = jnp.float32,
-            _do_init: bool = True,
-            **kwargs,
+        self,
+        config: Qwen2Config,
+        input_shape: Tuple = (1, 1),
+        seed: int = 0,
+        dtype: jnp.dtype = jnp.float32,
+        _do_init: bool = True,
+        **kwargs,
     ):
         """The __init__ function is called when the class is instantiated.
         It sets up the instance of the class, and defines what happens when it's created.
@@ -596,7 +596,7 @@ class FlaxQwen2PreTrainedModel(EasyDeLFlaxPretrainedModel):
         )
 
     def init_weights(
-            self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
+        self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
     ) -> FrozenDict:
         """The init_weights function is used to initialize the weights of a model.
 
@@ -678,20 +678,20 @@ class FlaxQwen2PreTrainedModel(EasyDeLFlaxPretrainedModel):
         return init_variables["cache"]
 
     def __call__(
-            self,
-            input_ids: chex.Array,
-            attention_mask: chex.Array = None,
-            position_ids: chex.Array = None,
-            params: dict = None,
-            past_key_values: dict = None,
-            dropout_rng: jax.random.PRNGKey = None,
-            train: bool = False,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
-            extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
-            add_params_field: bool = False,
-            **kwargs,
+        self,
+        input_ids: chex.Array,
+        attention_mask: chex.Array = None,
+        position_ids: chex.Array = None,
+        params: dict = None,
+        past_key_values: dict = None,
+        dropout_rng: jax.random.PRNGKey = None,
+        train: bool = False,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+        add_params_field: bool = False,
+        **kwargs,
     ):
         """The __call__ function is the main function of a JAX module.
         It takes in inputs and returns outputs, but it also has some other important features:
@@ -741,8 +741,8 @@ class FlaxQwen2PreTrainedModel(EasyDeLFlaxPretrainedModel):
         batch_size, sequence_length = input_ids.shape
 
         assert (
-                sequence_length <= self.config.max_position_embeddings
-        ), "Maximum Position Embedding Reached !"
+            sequence_length <= self.config.max_position_embeddings
+        ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
 
         if position_ids is None:
             if past_key_values is not None:
@@ -821,17 +821,17 @@ class FlaxQwen2BlockCollection(nn.Module):
         ]
 
     def __call__(
-            self,
-            hidden_states: chex.Array,
-            freq_cis: Tuple[chex.Array, chex.Array],
-            attention_mask: chex.Array,
-            position_ids: chex.Array,
-            causal_mask: chex.Array,
-            deterministic: bool = True,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            output_hidden_states: bool = False,
-            return_dict: bool = True,
+        self,
+        hidden_states: chex.Array,
+        freq_cis: Tuple[chex.Array, chex.Array],
+        attention_mask: chex.Array,
+        position_ids: chex.Array,
+        causal_mask: chex.Array,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        return_dict: bool = True,
     ):
         """The __call__ function is the main function of a JAX nn.Module.
         It defines how the module behaves when called as a function, and it's what you'll use to call your model
@@ -876,10 +876,10 @@ class FlaxQwen2BlockCollection(nn.Module):
                 maxval=self.config.fcm_max_ratio,
             )
             fcm_mask = (
-                    jax.random.uniform(
-                        self.make_rng("fcm"), shape=(batch_size, 1, seq_length, seq_length)
-                    )
-                    > fcm_ratio
+                jax.random.uniform(
+                    self.make_rng("fcm"), shape=(batch_size, 1, seq_length, seq_length)
+                )
+                > fcm_ratio
             )
             fcm_mask = fcm_mask.at[:, :, :, 0].set(True)
             fcm_mask = fcm_mask.astype("bool")
@@ -978,17 +978,17 @@ class FlaxQwen2Module(nn.Module):
         )
 
     def __call__(
-            self,
-            input_ids: chex.Array,
-            attention_mask: chex.Array,
-            position_ids: chex.Array,
-            deterministic: bool = True,
-            inputs_embeds: chex.Array = None,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            output_hidden_states: bool = False,
-            return_dict: bool = True,
-            extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+        self,
+        input_ids: chex.Array,
+        attention_mask: chex.Array,
+        position_ids: chex.Array,
+        deterministic: bool = True,
+        inputs_embeds: chex.Array = None,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        return_dict: bool = True,
+        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
     ):
         """The __call__ function is the main function of a Flax model. It takes in input_ids, attention_mask, and position_ids
         and returns the output of the model. The __call__ function also has optional arguments that can be used to control
@@ -1024,8 +1024,9 @@ class FlaxQwen2Module(nn.Module):
         batch_size, sequence_length, _ = inputs_embeds.shape
 
         assert (
-                sequence_length <= self.config.max_position_embeddings
-        ), "Maximum Position Embedding Reached !"
+            sequence_length <= self.config.max_position_embeddings
+        ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
+
         inputs_embeds = (
             inputs_embeds + extra_embedding
             if extra_embedding is not None
@@ -1102,16 +1103,16 @@ class FlaxQwen2ForCausalLMModule(nn.Module):
         )
 
     def __call__(
-            self,
-            input_ids: chex.Array,
-            attention_mask: chex.Array = None,
-            position_ids: chex.Array = None,
-            deterministic: bool = True,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            output_hidden_states: bool = False,
-            return_dict: bool = True,
-            extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+        self,
+        input_ids: chex.Array,
+        attention_mask: chex.Array = None,
+        position_ids: chex.Array = None,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        return_dict: bool = True,
+        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
     ):
         """The __call__ function is the main function of a Flax module. It takes in inputs and returns outputs.
 
@@ -1202,7 +1203,7 @@ class FlaxQwen2ForCausalLM(FlaxQwen2PreTrainedModel):
         self.module.lm_head = new_embeddings
 
     def prepare_inputs_for_generation(
-            self, input_ids, max_length, attention_mask: Optional[chex.Array] = None
+        self, input_ids, max_length, attention_mask: Optional[chex.Array] = None
     ):
         """The prepare_inputs_for_generation function is used to prepare the inputs for a generation task.
 
@@ -1273,16 +1274,16 @@ class FlaxQwen2ForSequenceClassificationModule(nn.Module):
         )
 
     def __call__(
-            self,
-            input_ids: chex.Array,
-            attention_mask: chex.Array = None,
-            position_ids: chex.Array = None,
-            deterministic: bool = True,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            output_hidden_states: bool = False,
-            return_dict: bool = True,
-            extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+        self,
+        input_ids: chex.Array,
+        attention_mask: chex.Array = None,
+        position_ids: chex.Array = None,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        return_dict: bool = True,
+        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
     ):
         """The __call__ function is the main function of a Flax module.
         It takes in all the inputs to the model and returns all outputs from it.
