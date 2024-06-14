@@ -23,13 +23,14 @@ from easydel import (  # noqa: E402
 from jax import numpy as jnp, random  # noqa: E402
 from datasets import Dataset, IterableDataset  # noqa: E402
 
+NUM_TRAIN_EXAMPLES = 100000
+NUM_EVAL_EXAMPLES = 12
+TOTAL_BATCH_SIZE = 2
+NUM_TRAIN_EPOCHS = 3
+
 
 def main(use_iterable_dataset: bool):
     sequence_length = 512
-    NUM_TRAIN_EXAMPLES = 100000
-    NUM_EVAL_EXAMPLES = 12
-    TOTAL_BATCH_SIZE = 2
-    NUM_TRAIN_EPOCHS = 3
     max_training_steps = NUM_TRAIN_EXAMPLES // TOTAL_BATCH_SIZE * NUM_TRAIN_EPOCHS
     max_evaluation_steps = NUM_EVAL_EXAMPLES // TOTAL_BATCH_SIZE
     config = MistralConfig(
