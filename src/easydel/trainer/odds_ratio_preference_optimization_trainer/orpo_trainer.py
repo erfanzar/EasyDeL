@@ -1061,7 +1061,7 @@ class ORPOTrainer(BaseTrainer, ABC):
                                 total_time = time.time() - time_start
                                 flops = flops_per_device / total_time
                                 (loss, metrics) = outputs.loss, outputs.metrics
-
+                                loss.block_until_ready()
                                 loss_sum = (
                                     loss.tolist()
                                     if loss_sum is None

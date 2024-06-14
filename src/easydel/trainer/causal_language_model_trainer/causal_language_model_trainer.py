@@ -467,6 +467,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                 loss,
                                 metrics,
                             ) = self.sharded_train_step_function(sharded_state, batch)
+                            loss.block_until_ready()
                             total_time = time.time() - time_start
                             flops = flops_per_device / total_time
                             trained_tokens = jnp.multiply(

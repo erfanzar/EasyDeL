@@ -1,14 +1,14 @@
 import os
 import sys
 
-dirname = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(dirname)  # noqa: E402
-sys.path.append(
-    os.path.join(
-        dirname,
-        "..",
-    )
-)  # noqa: E402
+# dirname = os.path.dirname(os.path.abspath(__file__))
+# sys.path.append(dirname)  # noqa: E402
+# sys.path.append(
+#     os.path.join(
+#         dirname,
+#         "..",
+#     )
+# )  # noqa: E402
 import flax.core  # noqa: E402
 
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
@@ -33,11 +33,11 @@ def main(use_iterable_dataset: bool):
     max_training_steps = NUM_TRAIN_EXAMPLES // TOTAL_BATCH_SIZE * NUM_TRAIN_EPOCHS
     max_evaluation_steps = NUM_EVAL_EXAMPLES // TOTAL_BATCH_SIZE
     config = MistralConfig(
-        hidden_size=512,
+        hidden_size=128,
         num_attention_heads=8,
         num_key_value_heads=4,
-        num_hidden_layers=16,
-        intermediate_size=1024,
+        num_hidden_layers=4,
+        intermediate_size=256,
         gradient_checkpointing="",
         max_position_embeddings=sequence_length,
         attn_dtype=jnp.float16,
