@@ -169,7 +169,7 @@ class GenerationPipeline:
             input_ids: jax.Array,
             attention_mask: Optional[jax.Array] = None,
             position_ids: Optional[jax.Array] = None,
-            streamer: Optional[transformers.TextIteratorStreamer] = None
+            echo: bool = False,
     ):
 
         paxis = self.model.config.partition_axis
@@ -351,10 +351,9 @@ class GenerationPipeline:
             #         out_shardings=SampleState(None, self.input_sharding, self.input_sharding, None, None, None)
             #     )
             generation_state = generation_func_body(self.params, generation_state)
-        if streamer is None:
-            yield generation_state.running_token
-        else:
-            streamer.put(generation_state.running_token)
+
+        yield generation_state.sequences[:,
+              cur_len:generation_state.cur_len] if echo else generation_state.running_token
         if self.state_sample is None:
             _args_tree = jax.eval_shape(lambda: generation_state.model_kwargs)
 
@@ -400,12 +399,9 @@ class GenerationPipeline:
         while sample_search_cond_fn(generation_state):
             generation_state = self.state_sample(self.params, generation_state)
 
-            if streamer is None:
-                yield generation_state.running_token
-            else:
-                streamer.put(generation_state.running_token)
-        if streamer is not None:
-            streamer.end()
+            yield generation_state.sequences[:,
+                  cur_len:generation_state.cur_len] if echo else generation_state.running_token
+
         del generation_state.model_kwargs
         del generation_state.sequences
         del generation_state.running_token
