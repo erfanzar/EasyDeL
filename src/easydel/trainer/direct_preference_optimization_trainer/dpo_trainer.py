@@ -1132,7 +1132,7 @@ class DPOTrainer(BaseTrainer, ABC):
                                     metrics.chosen_rewards[0],
                                     metrics.rejected_rewards[0],
                                 )
-
+                                loss.block_until_ready()
                                 loss_sum = (
                                     loss.tolist()
                                     if loss_sum is None

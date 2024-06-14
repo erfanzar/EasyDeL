@@ -450,6 +450,7 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
                                 outputs_and_metrics
                             )
 
+                            loss.block_until_ready()
                             total_time = time.time() - time_start
                             flops = flops_per_device / total_time
                             loss_sum = (
