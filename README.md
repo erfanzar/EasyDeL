@@ -260,7 +260,7 @@ train_arguments = TrainArguments(
     do_train=True,
     do_eval=False,  # it's optional but supported 
     backend="tpu",  # default backed is set to cpu, so you must define you want to use tpu cpu or gpu
-    max_length=max_length,  # Note that you have to change this in the model config too
+    max_sequence_length=max_length,  # Note that you have to change this in the model config too
     gradient_checkpointing=EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
     sharding_array=(1, -1, 1, 1),  # the way to shard model across gpu,cpu or TPUs using sharding array (1, -1, 1, 1)
     # everything training will be in sequence and model parallel automatic and share data between devices
@@ -350,7 +350,7 @@ train_arguments = TrainArguments(
     do_train=True,
     do_eval=False,  # it's optional but supported 
     backend="tpu",  # default backed is set to cpu, so you must define you want to use tpu cpu or gpu
-    max_length=max_length,  # Note that you have to change this in the model config too
+    max_sequence_length=max_length,  # Note that you have to change this in the model config too
     gradient_checkpointing=EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
     sharding_array=(1, -1, 1, 1),  # the way to shard model across gpu,cpu or TPUs using sharding array (1, -1, 1, 1)
     # everything training will be in sequence and model parallel automatic and share data between devices
@@ -849,7 +849,7 @@ train_arguments = TrainArguments(
     do_train=True,
     do_eval=False,  # it's optional but supported 
     backend="tpu",  # default backed is set to cpu, so you must define you want to use tpu cpu or gpu
-    max_length=max_length,  # Note that you have to change this in the model config too
+    max_sequence_length=max_length,  # Note that you have to change this in the model config too
     gradient_checkpointing=EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
     sharding_array=(1, -1, 1, 1),  # the way to shard model across gpu,cpu or TPUs using sharding array (1, -1, 1, 1)
     # everything training will be in sequence and model parallel automatic and share data between devices
