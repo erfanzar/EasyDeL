@@ -181,10 +181,13 @@ def main():
 
     api.create_repo(FLAGS.new_repo_id, exist_ok=True)
 
-    api.upload_file(
-        path_or_fileobj=output.checkpoint_path,
+    api.create_repo(FLAGS.new_repo_id, exist_ok=True)
+    file_path = "/".join(output.checkpoint_path.split("/")[:-1])
+    output.state.module.save_pretrained(file_path, output.state.params, float_dtype=dtype)
+
+    api.upload_folder(
         repo_id=FLAGS.new_repo_id,
-        path_in_repo=output.last_save_file_name
+        folder_path=file_path,
     )
 
     with jax.default_device(jax.devices("cpu")[0]):
