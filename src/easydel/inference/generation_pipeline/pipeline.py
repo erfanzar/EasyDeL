@@ -338,71 +338,65 @@ class GenerationPipeline:
                 model_kwargs=next_model_kwargs,
             )
 
-        if input_ids.shape[1] > 1:
-            # if self.state_sample_ms is None:
-            #     self.state_sample_ms = compile_function(
-            #         generation_func_body,
-            #         (self.params, generation_state),
-            #         {},
-            #         mesh=self.mesh,
-            #         in_shardings=(
-            #             self.model_sharding,
-            #             SampleState(None, self.input_sharding, self.input_sharding, None, None, None)),
-            #         out_shardings=SampleState(None, self.input_sharding, self.input_sharding, None, None, None)
-            #     )
-            generation_state = generation_func_body(self.params, generation_state)
+        with self.mesh:
+            if input_ids.shape[1] > 1:
+                generation_state = generation_func_body(self.params, generation_state)
 
-        yield generation_state.sequences[:,
-              cur_len:generation_state.cur_len] if echo else generation_state.running_token
-        if self.state_sample is None:
-            _args_tree = jax.eval_shape(lambda: generation_state.model_kwargs)
-
-            state_sharding = SampleState(
-                self.empty_sharding,
-                self.input_sharding,
-                self.gen_input_sharding,
-                self.empty_sharding,
-                self.empty_sharding,
-                _model_kwargs_sharding
+            yield (
+                generation_state.sequences[:, cur_len:generation_state.cur_len]
+                if echo else
+                generation_state.running_token
             )
+            if self.state_sample is None:
+                _args_tree = jax.eval_shape(lambda: generation_state.model_kwargs)
 
-            @functools.partial(
-                jax.jit,
-                in_shardings=(SampleState(
+                state_sharding = SampleState(
                     self.empty_sharding,
                     self.input_sharding,
                     self.gen_input_sharding,
                     self.empty_sharding,
                     self.empty_sharding,
-                    self.empty_sharding,
-                ),),
-                out_shardings=state_sharding
-            )
-            def _shard_state(st):
-                return st
+                    _model_kwargs_sharding
+                )
 
-            self._shard_state = _shard_state
-            # generation_state = _shard_state(generation_state)  # noqa
-            self.state_sample = compile_function(
-                generation_func_body,
-                (self.params, generation_state),
-                {},
-                mesh=self.mesh,
-                in_shardings=(
-                    self.model_sharding,
-                    state_sharding,
-                ),
-                out_shardings=state_sharding
-            )
-        # else:
-        #     generation_state = self._shard_state(generation_state)  # noqa
-        while sample_search_cond_fn(generation_state):
-            generation_state = self.state_sample(self.params, generation_state)
+                @functools.partial(
+                    jax.jit,
+                    in_shardings=(SampleState(
+                        self.empty_sharding,
+                        self.input_sharding,
+                        self.gen_input_sharding,
+                        self.empty_sharding,
+                        self.empty_sharding,
+                        self.empty_sharding,
+                    ),),
+                    out_shardings=state_sharding
+                )
+                def _shard_state(st):
+                    return st
 
-            yield generation_state.sequences[:,
-                  cur_len:generation_state.cur_len] if echo else generation_state.running_token
-
-        del generation_state.model_kwargs
-        del generation_state.sequences
-        del generation_state.running_token
-        del generation_state
+                self._shard_state = _shard_state
+                # generation_state = _shard_state(generation_state)  # noqa
+                self.state_sample = compile_function(
+                    generation_func_body,
+                    (self.params, generation_state),
+                    {},
+                    mesh=self.mesh,
+                    in_shardings=(
+                        self.model_sharding,
+                        state_sharding,
+                    ),
+                    out_shardings=state_sharding
+                )
+            # else:
+            #     generation_state = self._shard_state(generation_state)  # noqa
+            while sample_search_cond_fn(generation_state):
+                generation_state = self.state_sample(self.params, generation_state)
+                yield (
+                    generation_state.sequences[:, cur_len:generation_state.cur_len]
+                    if echo else
+                    generation_state.running_token
+                )
+            del generation_state.model_kwargs
+            del generation_state.sequences
+            del generation_state.running_token
+            del generation_state
