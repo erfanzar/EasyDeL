@@ -829,6 +829,8 @@ class EasyDeLFlaxPretrainedModel(FlaxPreTrainedModel):
             param_dtype: jnp.dtype = jnp.float32,
             precision: jax.lax.PrecisionLike = jax.lax.Precision("fastest"),
             input_shape: Optional[Tuple[int, int]] = None,
+            config_kwargs: Optional[dict[str, Any]] = None,
+            partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
             shard_fns: dict[Callable] = None,
             auto_shard_params: bool = False,
             remove_dict_prefix=None,
@@ -844,6 +846,9 @@ class EasyDeLFlaxPretrainedModel(FlaxPreTrainedModel):
             revision: str = "main",
             **kwargs,
     ):
+        """
+        loads EasyDeL Models
+        """
         resume_download = kwargs.pop("resume_download", False)
         proxies = kwargs.pop("proxies", None)
         trust_remote_code = kwargs.pop("trust_remote_code", None)
@@ -890,6 +895,10 @@ class EasyDeLFlaxPretrainedModel(FlaxPreTrainedModel):
             partition_axis=partition_axis,
             from_torch=False,
         )
+
+        if config_kwargs is not None:
+            for k, v in config_kwargs.items():
+                setattr(config, k, v)
         _, model_kwargs = EasyDeLPretrainedConfig.from_pretrained(
             config_path,
             cache_dir=cache_dir,
@@ -912,7 +921,8 @@ class EasyDeLFlaxPretrainedModel(FlaxPreTrainedModel):
             shard_fns, _ = AutoShardAndGatherFunctions.from_config(
                 config=config,
                 input_shape=input_shape,
-                flatten=False
+                flatten=False,
+                partition_rules=partition_rules
             )
             fns = {"params": shard_fns}
             fns.update(shard_fns)

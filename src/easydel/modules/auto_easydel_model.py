@@ -551,23 +551,21 @@ class AutoEasyDeLModelForCausalLM:
                 shard_attention_computation=shard_attention_computation,
                 **kwargs,
             )
-        return cls._from_easydel_params(
-            auto_shard_params=auto_shard_params,
-            input_shape=input_shape,
-            partition_axis=partition_axis,
-            sharding_axis_dims=sharding_axis_dims,
-            sharding_axis_names=sharding_axis_names,
-            shard_fns=shard_fns,
-            param_dtype=param_dtype,
-            config_kwargs=config_kwargs,
-            partition_rules=partition_rules,
-            backend=backend,
-            precision=precision,
-            device=device,
-            dtype=dtype,
-            pretrained_model_name_or_path=pretrained_model_name_or_path,
-            shard_attention_computation=shard_attention_computation,
-        )
+        with jax.default_device(device):
+            return cls._from_easydel_params(
+                auto_shard_params=auto_shard_params,
+                input_shape=input_shape,
+                partition_axis=partition_axis,
+                sharding_axis_dims=sharding_axis_dims,
+                sharding_axis_names=sharding_axis_names,
+                shard_fns=shard_fns,
+                param_dtype=param_dtype,
+                config_kwargs=config_kwargs,
+                partition_rules=partition_rules,
+                precision=precision,
+                dtype=dtype,
+                pretrained_model_name_or_path=pretrained_model_name_or_path,
+            )
 
     @staticmethod
     def _from_torch(
@@ -740,24 +738,37 @@ class AutoEasyDeLModelForCausalLM:
     @staticmethod
     def _from_easydel_params(
             pretrained_model_name_or_path,
-            device,
             dtype: jax.numpy.dtype,
             param_dtype: jax.numpy.dtype,
             precision: Optional[jax.lax.Precision],
             sharding_axis_dims: Sequence[int],
             sharding_axis_names: Sequence[str],
             partition_axis: PartitionAxis,
-            shard_attention_computation: bool,
             input_shape: Tuple[int, int],
             shard_fns: Optional[Mapping[tuple, Callable] | dict],
-            backend: Optional[str],
             config_kwargs: Optional[Mapping[str, Any]],
             auto_shard_params: bool,
             partition_rules: Optional[Tuple[Tuple[str, PartitionSpec], ...]],
             # load_in_8bit: bool,
             # bit_targeted_params: Optional[List[str]],
     ):
-        ...
+        from easydel.modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
+
+        return EasyDeLFlaxPretrainedModel.from_pretrained(
+            pretrained_model_name_or_path=pretrained_model_name_or_path,
+            input_shape=input_shape,
+            dtype=dtype,
+            precision=precision,
+            from_pt=False,
+            param_dtype=param_dtype,
+            partition_axis=partition_axis,
+            auto_shard_params=auto_shard_params,
+            shard_fns=shard_fns,
+            sharding_axis_dims=sharding_axis_dims,
+            sharding_axis_names=sharding_axis_names,
+            config_kwargs=config_kwargs,
+            partition_rules=partition_rules
+        )
 
 
 class AutoEasyDeLConfig:
