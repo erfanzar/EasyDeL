@@ -759,7 +759,6 @@ class AutoEasyDeLModelForCausalLM:
             input_shape=input_shape,
             dtype=dtype,
             precision=precision,
-            from_pt=False,
             param_dtype=param_dtype,
             partition_axis=partition_axis,
             auto_shard_params=auto_shard_params,
