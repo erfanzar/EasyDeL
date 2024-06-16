@@ -19,7 +19,7 @@ except ModuleNotFoundError:
 from jax import numpy as jnp
 import torch
 import numpy as np
-from fjformer.functionstions import cross_entropy_loss_and_accuracy
+from fjformer.functions import cross_entropy_loss_and_accuracy
 import copy
 import jax
 import transformers
@@ -162,7 +162,7 @@ class EasyModelsTest(TestCase):
 
             ed_output = ed_model(
                 input_ids=jax_input_ids[:, :-1],
-                params=fjformer.linen.quantize_params(params),
+                params=fjformer.linen.quantize_int8_parameters(["kernel", "embedding"], params),
                 return_dict=True,
                 add_params_field=False,
                 train=False
@@ -258,7 +258,7 @@ class EasyModelsTest(TestCase):
 
             ed_output = ed_model(
                 input_ids=jax_input_ids[:, :-1],
-                params=fjformer.linen.quantize_params(params),
+                params=fjformer.linen.quantize_int8_parameters(["kernel", "embedding"], params),
                 return_dict=True,
                 add_params_field=False,
                 train=False,
