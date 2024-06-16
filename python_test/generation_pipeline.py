@@ -43,9 +43,9 @@ def main():
     # params = fjformer.linen.quantize_int8_parameters(["kernel", "embedding"], params)
     pipeline = GenerationPipeline(
         model=model,
-        params=params,
+        params={"params": params},
         tokenizer=tokenizer,
-        add_params_field=True,
+        add_params_field=False,
         generation_config=GenerationPipelineConfig(max_new_tokens=128, do_sample=True)
     )
     for token in pipeline.generate(input_ids, attention_mask):
