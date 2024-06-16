@@ -118,19 +118,23 @@ class GenerationPipeline:
             params: Union[flax.core.FrozenDict, dict],
             tokenizer: PreTrainedTokenizer,
             generation_config: Optional[GenerationPipelineConfig] = None,
-            add_params_field=False,
+            add_params_field=None,
             seed: Optional[int] = None,
             input_partition_spec: sharding.PartitionSpec = sharding.PartitionSpec(("dp", "fsdp")),
             partition_rules=None
     ):
+        if add_params_field is not None:
+            warnings.warn("`add_params_field` is deprecated and soon will be removed.")
         if generation_config is None:
             generation_config = GenerationPipelineConfig()
-
+        params_get = params.get("params", None)
+        if params_get is not None:
+            warnings.warn("`params` field should be like {k:v} not {'params':{k:v}}")
+            params = params_get
         self.model = model
         self.params = params
         self.tokenizer = tokenizer
         self.generation_config = generation_config
-        self.add_params_field = add_params_field
         self._shard_state = None
         self.compiled_func = None
         self.over_compiled_func = None
@@ -309,7 +313,7 @@ class GenerationPipeline:
             model_outputs = self.model(
                 input_ids=state.running_token,
                 params=params,
-                add_params_field=self.add_params_field,
+                add_params_field=True,
                 return_dict=True,
                 **state.model_kwargs
             )
@@ -361,14 +365,16 @@ class GenerationPipeline:
 
                 @functools.partial(
                     jax.jit,
-                    in_shardings=(SampleState(
-                        self.empty_sharding,
-                        self.input_sharding,
-                        self.gen_input_sharding,
-                        self.empty_sharding,
-                        self.empty_sharding,
-                        self.empty_sharding,
-                    ),),
+                    in_shardings=(
+                            SampleState(
+                                self.empty_sharding,
+                                self.input_sharding,
+                                self.gen_input_sharding,
+                                self.empty_sharding,
+                                self.empty_sharding,
+                                self.empty_sharding,
+                            ),
+                    ),
                     out_shardings=state_sharding
                 )
                 def _shard_state(st):
