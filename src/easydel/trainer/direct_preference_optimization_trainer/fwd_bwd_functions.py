@@ -490,7 +490,8 @@ def create_dpo_train_function(
                     ) = concatenated_forward(
                         ref_state.apply_fn, ref_state.params, batch
                     )
-
+            reference_chosen_log_probs = jax.lax.stop_gradient(reference_chosen_log_probs)
+            reference_rejected_log_probs = jax.lax.stop_gradient(reference_rejected_log_probs)
             pi_log_ratios = policy_chosen_log_probs - policy_rejected_log_probs
 
             if reference_free:
@@ -508,13 +509,10 @@ def create_dpo_train_function(
                 policy_rejected_log_probs,
                 reference_rejected_log_probs,
             )
-            chosen_rewards = beta * (
-                    policy_chosen_log_probs - reference_chosen_log_probs
-            )
-            rejected_rewards = beta * (
-                    policy_rejected_log_probs - reference_rejected_log_probs
-            )
-            return losses[0], (chosen_rewards, rejected_rewards)
+            chosen_rewards = beta * jax.lax.stop_gradient(policy_chosen_log_probs - reference_chosen_log_probs)
+            rejected_rewards = beta * jax.lax.stop_gradient(policy_rejected_log_probs - reference_rejected_log_probs)
+
+            return losses.mean(), (chosen_rewards, rejected_rewards)
 
         grad_fn = jax.value_and_grad(calculate_loss, has_aux=True)
         (__loss, (__chosen_rewards, __rejected_rewards)), grads = grad_fn(state.params)

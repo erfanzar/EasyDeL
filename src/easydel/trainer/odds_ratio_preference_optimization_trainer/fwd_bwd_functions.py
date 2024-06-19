@@ -333,12 +333,6 @@ def odds_ratio_loss(
     sig_ratio = jax.nn.sigmoid(log_odds)
     ratio = jnp.log(sig_ratio)
     losses = beta * ratio
-    # jax.debug.print("policy_chosen_logps   : {x}", x=policy_chosen_logps)
-    # jax.debug.print("policy_rejected_logps : {x}", x=policy_rejected_logps)
-    # jax.debug.print("sig_ratio : {x}", x=sig_ratio)
-    # jax.debug.print("ratio     : {x}", x=ratio)
-    # jax.debug.print("log_odds  : {x}", x=log_odds)
-    # jax.debug.print("losses    : {x}", x=losses)
 
     chosen_rewards = beta * jax.lax.stop_gradient(policy_chosen_logps)
     rejected_rewards = beta * jax.lax.stop_gradient(policy_rejected_logps)
