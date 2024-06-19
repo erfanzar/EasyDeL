@@ -8,7 +8,7 @@ from easydel.modules.common import RMSNorm
 from jax import numpy as jnp
 
 
-# x * (1 / sqrt(sum(x*x)/cols + eps)) * w
+# (x * (1 / sqrt(sum(x * x) / cols + eps))) * w
 def _rms_norm_forward_kernel(
         w_ref,
         x_ref,
@@ -40,13 +40,24 @@ def _rms_norm_backward_kernel(
         x_ref,
         w_ref,
         r_ref,
-        dy_ref,
+        dx_ref,
+        dw_ref,
         *,
         eps,
         dim,
         exp_tun
 ):
-    ...
+    normed = x_ref[...] * r_ref[...]
+    dw_ref[...] = (g_ref[...] * normed).astype(dw_ref.dtype)
+    grad_norm = g_ref[...] * w_ref[...]
+    grad_X_R = grad_norm * r_ref[...]
+
+    grad_inv_var = jnp.sum(grad_norm * x_ref[...], axis=-1, keepdims=True)
+
+    grad_X_R_from_inv_var = -0.5 * grad_inv_var * (
+            x_ref[...] / (jnp.sum(x_ref[...] * x_ref[...], -1, keepdims=True) / dim + eps) ** 1.5)
+
+    dx_ref[...] = grad_X_R + grad_X_R_from_inv_var
 
 
 def _rms_norm_backward_main(
@@ -61,14 +72,20 @@ def _rms_norm_backward_main(
     g = g.reshape(-1, DIM)
     block_size, num_wraps = calculate_settings(DIM, X.dtype)
 
-    out_shape = jax.ShapeDtypeStruct(shape=X.shape, dtype=X.dtype, sharding=X.sharding)
+    out_shape = [
+        jax.ShapeDtypeStruct(shape=X.shape, dtype=X.dtype, sharding=X.sharding),  # X
+        jax.ShapeDtypeStruct(shape=W.shape, dtype=W.dtype, sharding=W.sharding),  # W
+    ]
     in_specs = [
         pl.BlockSpec(lambda i: (i, 0), (S * B, DIM)),
         pl.BlockSpec(lambda i: (i, 0), (S * B, DIM)),
         pl.BlockSpec(lambda i: (0, 0), (1, DIM,)),
         pl.BlockSpec(lambda i: (0, 0), (S, 1)),
     ]
-    out_specs = pl.BlockSpec(lambda i: (i, 0), (S * B, DIM))
+    out_specs = [
+        pl.BlockSpec(lambda i: (i, 0), (S * B, DIM)),  # X
+        pl.BlockSpec(lambda i: (0, 0), (1, DIM,)),  # W
+    ]
     method = pl.pallas_call(
         functools.partial(
             _rms_norm_backward_kernel,
@@ -91,14 +108,14 @@ def _rms_norm_backward_main(
     # r_ref,
     # dy_ref,
 
-    g_y = method(
+    dx, dw = method(
         g,
         X,
         W,
         R,
     )
 
-    return g_y.reshape(B, S, DIM), None
+    return dx.reshape(B, S, DIM), dw
 
 
 def _rms_norm_forward_main(

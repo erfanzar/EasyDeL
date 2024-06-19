@@ -101,6 +101,11 @@ from easydel.modules.qwen2 import (
     FlaxQwen2ForSequenceClassification as FlaxQwen2ForSequenceClassification,
     Qwen2Config as Qwen2Config,
 )
+from easydel.modules.olmo import (
+    FlaxOlmoModel,
+    FlaxOlmoForCausalLM,
+    OlmoConfig
+)
 from easydel.modules.gemma import (
     FlaxGemmaModel as FlaxGemmaModel,
     GemmaConfig as GemmaConfig,

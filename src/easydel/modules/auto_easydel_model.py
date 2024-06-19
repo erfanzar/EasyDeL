@@ -419,6 +419,19 @@ def get_modules_by_type(
                 lm_head_name="lm_head",
             ),
         )
+    elif model_type == "olmo":
+        from easydel.modules.olmo import OlmoConfig as _OlmoConfig
+        from easydel.modules.olmo import FlaxOlmoForCausalLM as _FlaxOlmoForCausalLM
+        return (
+            _OlmoConfig,
+            _FlaxOlmoForCausalLM,
+            functools.partial(
+                huggingface_to_easydel,
+                embedding_layer_names=["embed_tokens"],
+                rnn_based_or_rwkv=False,
+                lm_head_name="lm_head",
+            ),
+        )
     raise EasyDeLRuntimeError(
         f"Model Type ({model_type}) is not supported or is not found"
     )
