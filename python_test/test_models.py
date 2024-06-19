@@ -4,14 +4,14 @@ from unittest import TestCase
 from fjformer import make_shard_and_gather_fns, match_partition_rules
 
 try:
-    import src.python.easydel as ed
+    import src.easydel as ed
 except ModuleNotFoundError:
     import sys
     from pathlib import Path
 
     cp = Path.cwd().__str__()
     sys.path.append(cp)
-    import src.python.easydel as ed
+    import src.easydel as ed
 
 from jax import numpy as jnp
 import torch
@@ -302,14 +302,14 @@ class EasyModelsTest(TestCase):
         )
         for k, v in self.__dict__.items():
             if isinstance(
-                v,
-                (
-                    bool,
-                    str,
-                    float,
-                    type(None),
-                    int,
-                ),
+                    v,
+                    (
+                            bool,
+                            str,
+                            float,
+                            type(None),
+                            int,
+                    ),
             ):
                 try:
                     setattr(conf, k, v)
@@ -354,6 +354,10 @@ class EasyModelsTest(TestCase):
         res, err = self.create_test_for_models("qwen2", transformers.Qwen2ForCausalLM)
         self.assertTrue(res, f"Qwen 2 model Failed [ERROR {err}]")
 
+    def test_olmo(self):
+        res, err = self.create_test_for_models("olmo", transformers.OlmoForCausalLM)
+        self.assertTrue(res, f"OLMO model Failed [ERROR {err}]")
+
     def test_phi(self):
         res, err = self.create_test_for_models("phi", transformers.PhiForCausalLM)
         self.assertTrue(res, f"PHI 2 model Failed [ERROR {err}]")
@@ -394,14 +398,14 @@ class EasyModelsTest(TestCase):
         )
         for k, v in self.__dict__.items():
             if isinstance(
-                v,
-                (
-                    bool,
-                    str,
-                    float,
-                    type(None),
-                    int,
-                ),
+                    v,
+                    (
+                            bool,
+                            str,
+                            float,
+                            type(None),
+                            int,
+                    ),
             ):
                 setattr(conf, k, v)
         res, err = self.create_test_for_models(
@@ -422,14 +426,14 @@ class EasyModelsTest(TestCase):
         )
         for k, v in self.__dict__.items():
             if isinstance(
-                v,
-                (
-                    bool,
-                    str,
-                    float,
-                    type(None),
-                    int,
-                ),
+                    v,
+                    (
+                            bool,
+                            str,
+                            float,
+                            type(None),
+                            int,
+                    ),
             ):
                 setattr(conf, k, v)
         conf._attn_implementation = "eager"
@@ -473,14 +477,14 @@ class EasyModelsTest(TestCase):
         )
         for k, v in self.__dict__.items():
             if isinstance(
-                v,
-                (
-                    bool,
-                    str,
-                    float,
-                    type(None),
-                    int,
-                ),
+                    v,
+                    (
+                            bool,
+                            str,
+                            float,
+                            type(None),
+                            int,
+                    ),
             ):
                 setattr(conf, k, v)
         res, err = self.create_test_for_models(
@@ -544,7 +548,7 @@ class EasyModelsTest(TestCase):
 
     @staticmethod
     def compare_torch_to_jax(
-        name, hf_out, ed_out, ed_loss, atol: float = 1e-035, rtol: float = 1e-08
+            name, hf_out, ed_out, ed_loss, atol: float = 1e-035, rtol: float = 1e-08
     ):
         to, jo = hf_out.logits.cpu().detach().numpy(), ed_out.logits
         err = jnp.mean(to - jo)

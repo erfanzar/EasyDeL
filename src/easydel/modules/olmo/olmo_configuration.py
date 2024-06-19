@@ -1,114 +1,83 @@
-from enum import StrEnum
 from typing import Optional
 from jax.sharding import PartitionSpec
 from easydel.modules.easydel_modelling_utils import EasyDeLPretrainedConfig
 
 
-class LayerNormType(StrEnum):
-    default = "default"
-    low_precision = "low_precision"
-    rms = "rms"
-    amd_compatible = "amd_compatible"
-
-
-class ActivationType(StrEnum):
-    gelu = "gelu"
-    relu = "relu"
-    swiglu = "swiglu"
-
-
-class BlockType(StrEnum):
-    sequential = "sequential"
-    parallel = "parallel"
-    llama = "llama"
-
-
-class OLMoConfig(EasyDeLPretrainedConfig):
+class OlmoConfig(EasyDeLPretrainedConfig):
     """OLMo (model) configuration."""
+
+    model_type = "olmo"
 
     def __init__(
             self,
-            d_model: int = 768,
-            n_heads: int = 12,
-            n_layers: int = 12,
-            mlp_ratio: int = 4,
-            mlp_hidden_size: Optional[int] = None,
-            activation_type: ActivationType = ActivationType.swiglu,
-            block_type: BlockType = BlockType.sequential,
-            block_group_size: int = 1,
-            alibi: bool = False,
-            alibi_bias_max: float = 8.0,
-            rope: bool = False,
-            rope_full_precision: bool = True,
-            flash_attention: bool = False,
-            attention_dropout: float = 0.1,
-            multi_query_attention: bool = False,
-            attention_layer_norm: bool = False,
-            residual_dropout: float = 0.1,
-            embedding_dropout: float = 0.1,
-            layer_norm_type: LayerNormType = LayerNormType.default,
-            layer_norm_with_affine: bool = True,
-            attention_layer_norm_with_affine: bool = True,
-            max_sequence_length: int = 1024,
-            include_bias: bool = True,
-            bias_for_layer_norm: Optional[bool] = None,
-            scale_logits: bool = False,
-            vocab_size: int = 50257,
-            embedding_size: Optional[int] = 50304,
-            weight_tying: bool = True,
-            eos_token_id: int = 50256,
-            pad_token_id: int = 50256,
-            init_std: float = 0.02,
-            init_cutoff_factor: Optional[float] = None,
+            vocab_size=50304,
+            hidden_size=4096,
+            intermediate_size=11008,
+            num_hidden_layers=32,
+            num_attention_heads=32,
+            num_key_value_heads=None,
+            hidden_act="silu",
+            max_position_embeddings=2048,
+            initializer_range=0.02,
+            use_cache=True,
+            pad_token_id=1,
+            bos_token_id=None,
+            eos_token_id=50279,
+            tie_word_embeddings=False,
+            rope_theta=10000.0,
+            rope_scaling=None,
+            attention_bias=False,
+            attention_dropout=0.0,
+            clip_qkv=None,
             gradient_checkpointing: str = "nothing_saveable",
+            use_scan_mlp: bool = False,
+            scan_mlp_chunk_size: int = 1024,
+            bits: Optional[int] = None,
             **kwargs
     ):
-        _ = kwargs.pop("precision", None)
-        _ = kwargs.pop("init_fn", None)
-        _ = kwargs.pop("init_device", None)
-        self.d_model = d_model
-        self.n_heads = n_heads
-        self.n_layers = n_layers
-        self.mlp_ratio = mlp_ratio
-        self.mlp_hidden_size = mlp_hidden_size
-        self.activation_type = activation_type
-        self.block_type = block_type
-        self.block_group_size = block_group_size
-        self.alibi = alibi
-        self.alibi_bias_max = alibi_bias_max
-        self.rope = rope
-        self.rope_full_precision = rope_full_precision
-        self.flash_attention = flash_attention
-        self.attention_dropout = attention_dropout
-        self.multi_query_attention = multi_query_attention
-        self.attention_layer_norm = attention_layer_norm
-        self.residual_dropout = residual_dropout
-        self.embedding_dropout = embedding_dropout
-        self.layer_norm_type = layer_norm_type
-        self.layer_norm_with_affine = layer_norm_with_affine
-        self.attention_layer_norm_with_affine = attention_layer_norm_with_affine
-        self.max_sequence_length = max_sequence_length
-        self.include_bias = include_bias
-        self.bias_for_layer_norm = bias_for_layer_norm
-        self.scale_logits = scale_logits
-        self.gradient_checkpointing = gradient_checkpointing
         self.vocab_size = vocab_size
-        self.embedding_size = embedding_size
-        self.weight_tying = weight_tying
-        self.init_std = init_std
-        self.init_cutoff_factor = init_cutoff_factor
+        self.max_position_embeddings = max_position_embeddings
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+
+        # for backward compatibility
+        if num_key_value_heads is None:
+            num_key_value_heads = num_attention_heads
+
+        self.num_key_value_heads = num_key_value_heads
+        self.hidden_act = hidden_act
+        self.initializer_range = initializer_range
+        self.use_cache = use_cache
+        self.rope_theta = rope_theta
+        self.rope_scaling = rope_scaling
+        self.attention_bias = attention_bias
+        self.attention_dropout = attention_dropout
+        self.clip_qkv = clip_qkv
+        self.gradient_checkpointing = gradient_checkpointing
+        self.use_scan_mlp = use_scan_mlp
+        self.scan_mlp_chunk_size = scan_mlp_chunk_size
+        self.bits = bits
         super().__init__(
             pad_token_id=pad_token_id,
+            bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
+            tie_word_embeddings=tie_word_embeddings,
             **kwargs
         )
 
     def add_jax_args(
             self,
-            gradient_checkpointing: str = "nothing_saveable"
+            gradient_checkpointing: str = "nothing_saveable",
+            use_scan_mlp: bool = False,
+            scan_mlp_chunk_size: int = 1024,
+            bits: Optional[int] = None,
     ):
-        if not hasattr(self, "gradient_checkpointing"):
-            self.gradient_checkpointing = gradient_checkpointing
+        self.gradient_checkpointing = gradient_checkpointing
+        self.use_scan_mlp = use_scan_mlp
+        self.scan_mlp_chunk_size = scan_mlp_chunk_size
+        self.bits = bits
 
     def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
         """The get_partition_rules function is used to define the partitioning scheme for a model.
