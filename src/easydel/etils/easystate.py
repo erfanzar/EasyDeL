@@ -9,6 +9,7 @@ from flax import struct
 from flax.core import FrozenDict
 from flax.linen.fp8_ops import OVERWRITE_WITH_GRADIENT
 import optax
+from safetensors._safetensors_rust import SafetensorError
 from transformers import AutoModelForCausalLM
 
 from easydel.etils.auto_tx import get_optimizer_and_scheduler
@@ -189,17 +190,17 @@ class EasyDeLState(struct.PyTreeNode):
 
     @classmethod
     def create(
-        cls,
-        *,
-        apply_fn: Callable,
-        params: Union[core.FrozenDict[str, Any], Mapping[str, Any]],
-        tx: optax.GradientTransformation,
-        tx_init: Optional[dict] = None,
-        hyperparameters: Optional[dict] = None,
-        module: Optional["EasyDeLFlaxPretrainedModel"] = None,  # type:ignore #noqa
-        module_config: Optional["EasyDeLPretrainedConfig"] = None,  # type:ignore #noqa
-        module_config_args: Optional[dict] = None,
-        **kwargs,
+            cls,
+            *,
+            apply_fn: Callable,
+            params: Union[core.FrozenDict[str, Any], Mapping[str, Any]],
+            tx: optax.GradientTransformation,
+            tx_init: Optional[dict] = None,
+            hyperparameters: Optional[dict] = None,
+            module: Optional["EasyDeLFlaxPretrainedModel"] = None,  # type:ignore #noqa
+            module_config: Optional["EasyDeLPretrainedConfig"] = None,  # type:ignore #noqa
+            module_config_args: Optional[dict] = None,
+            **kwargs,
     ):
         """
         Creates a new EasyDeLState object.
@@ -245,18 +246,18 @@ class EasyDeLState(struct.PyTreeNode):
 
     @classmethod
     def load(
-        cls,
-        *,
-        apply_fn: Callable,
-        params: Union[core.FrozenDict[str, Any], Mapping[str, Any]],
-        step: int = 0,
-        opt_state: Optional[optax.OptState] = None,
-        tx_init: Optional[dict] = None,
-        hyperparameters: Optional[dict] = None,
-        module: Optional["EasyDeLFlaxPretrainedModel"] = None,  # type:ignore #noqa
-        module_config: Optional["EasyDeLPretrainedConfig"] = None,  # type:ignore #noqa
-        module_config_args: Optional[dict] = None,
-        **kwargs,
+            cls,
+            *,
+            apply_fn: Callable,
+            params: Union[core.FrozenDict[str, Any], Mapping[str, Any]],
+            step: int = 0,
+            opt_state: Optional[optax.OptState] = None,
+            tx_init: Optional[dict] = None,
+            hyperparameters: Optional[dict] = None,
+            module: Optional["EasyDeLFlaxPretrainedModel"] = None,  # type:ignore #noqa
+            module_config: Optional["EasyDeLPretrainedConfig"] = None,  # type:ignore #noqa
+            module_config_args: Optional[dict] = None,
+            **kwargs,
     ):
         """
         Loads an EasyDeLState object from a checkpoint.
@@ -341,22 +342,23 @@ class EasyDeLState(struct.PyTreeNode):
 
     @classmethod
     def load_state(
-        cls,
-        checkpoint_path: Union[str, os.PathLike],
-        dtype: jnp.dtype = jnp.float32,
-        param_dtype: jnp.dtype = jnp.float32,
-        precision: Optional[Union[str, jax.lax.Precision]] = None,
-        init_optimizer_state: bool = False,
-        state_shard_fns: Optional[Mapping[str, Callable]] = None,
-        verbose: bool = False,
-        input_shape: Tuple = (1, 1),
-        config_kwargs: Optional[dict] = None,
-        sharding_axes_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-        sharding_axes_dims: Sequence[int] = (1, -1, 1, 1),
-        module_config: Optional["EasyDeLPretrainedConfig"] = None,  # type:ignore #noqa
-        auto_shard_state: bool = False,
-        partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
-        depth_target: Optional[List[str]] = None,
+            cls,
+            checkpoint_path: Union[str, os.PathLike],
+            dtype: jnp.dtype = jnp.float32,
+            param_dtype: jnp.dtype = jnp.float32,
+            precision: Optional[Union[str, jax.lax.Precision]] = None,
+            init_optimizer_state: bool = False,
+            state_shard_fns: Optional[Mapping[str, Callable]] = None,
+            verbose: bool = False,
+            input_shape: Tuple = (1, 1),
+            config_kwargs: Optional[dict] = None,
+            sharding_axes_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+            sharding_axes_dims: Sequence[int] = (1, -1, 1, 1),
+            module_config: Optional["EasyDeLPretrainedConfig"] = None,  # type:ignore #noqa
+            safe: bool = False,
+            auto_shard_state: bool = False,
+            partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
+            depth_target: Optional[List[str]] = None,
     ):
         """
         Loads an EasyDeLState object from a checkpoint file.
@@ -379,7 +381,7 @@ class EasyDeLState(struct.PyTreeNode):
             auto_shard_state (bool, optional): Whether to automatically shard the model state. Defaults to False.
             partition_rules (Optional[Tuple[Tuple[str, PartitionSpec]]], optional): Rules for partitioning the model parameters. Defaults to None.
             depth_target (Optional[List[str]], optional): Target depth for partitioning. Defaults to None.
-
+            safe (bool): whenever to load your model with safetensors and your checkpoints are saved with safe=True. Defaults to True.
         Returns:
             EasyDeLState: A loaded EasyDeLState object.
         """
@@ -406,11 +408,21 @@ class EasyDeLState(struct.PyTreeNode):
             )
 
         with mesh:
-            checkpoint = fjformer.CheckpointManager.load_checkpoint(
-                path=checkpoint_path,
-                shard_fns=state_shard_fns,
-                verbose=verbose,
-            )
+            if safe:
+                try:
+                    checkpoint, _ = fjformer.CheckpointManager.load_checkpoint_safe(
+                        path=checkpoint_path,
+                        shard_fns=state_shard_fns,
+                        verbose=verbose,
+                    )
+                except SafetensorError as e:
+                    raise SafetensorError(e + " Make Sure your checkpoint file saved with ")
+            else:
+                checkpoint = fjformer.CheckpointManager.load_checkpoint(
+                    path=checkpoint_path,
+                    shard_fns=state_shard_fns,
+                    verbose=verbose,
+                )
             hyperparameters = checkpoint.get("hyperparameters")
             cfg, module, convertor = get_modules_by_type(
                 model_type=cls.get_model_type(hyperparameters)
@@ -428,9 +440,9 @@ class EasyDeLState(struct.PyTreeNode):
                         cfg_behave[k] = None
                     elif isinstance(v, str):
                         if (
-                            v.startswith("{")
-                            or v.startswith("(")
-                            or v.startswith("PartitionSpec")
+                                v.startswith("{")
+                                or v.startswith("(")
+                                or v.startswith("PartitionSpec")
                         ):
                             cfg_behave[k] = eval(v)
                 module_config = cfg.from_dict(cfg_behave)
@@ -465,13 +477,14 @@ class EasyDeLState(struct.PyTreeNode):
         return cls.find_key("model_type", dictionary)
 
     def save_state(
-        self,
-        filename: Union[str, os.PathLike],
-        save_optimizer: bool = False,
-        checkpoint_dir: Optional[Union[str, os.PathLike]] = None,
-        verbose: bool = False,
-        gather_fns: dict[Callable] = None,
-        float_dtype: Union[str, jax.numpy.dtype] = None,
+            self,
+            filename: Union[str, os.PathLike],
+            save_optimizer: bool = False,
+            checkpoint_dir: Optional[Union[str, os.PathLike]] = None,
+            verbose: bool = False,
+            safe: bool = False,
+            gather_fns: dict[Callable] = None,
+            float_dtype: Union[str, jax.numpy.dtype] = None,
     ):
         """
         Saves the EasyDeLState object to a checkpoint file.
@@ -483,6 +496,7 @@ class EasyDeLState(struct.PyTreeNode):
             verbose (bool, optional): Whether to print verbose output during saving. Defaults to False.
             gather_fns (dict[Callable], optional): Functions to gather sharded parameters. Defaults to None.
             float_dtype (Union[str, jax.numpy.dtype], optional): The data type to use for floating-point numbers in the saved checkpoint. Defaults to None.
+            safe (bool): whenever to load your model with safetensors and your checkpoints are saved with safe=True. Defaults to True.
         """
         state = self
         if not save_optimizer:
@@ -494,17 +508,30 @@ class EasyDeLState(struct.PyTreeNode):
                 if isinstance(v, (int, bool, float))
             }
         )
-        fjformer.CheckpointManager.save_state_to_file(
-            state=state,
-            path=(
-                os.path.join(checkpoint_dir, filename)
-                if checkpoint_dir is not None
-                else filename
-            ),
-            verbose=verbose,
-            gather_fns=gather_fns,
-            float_dtype=float_dtype,
-        )
+        if safe:
+            fjformer.CheckpointManager.save_checkpoint_safe(
+                state=state,
+                path=(
+                    os.path.join(checkpoint_dir, filename)
+                    if checkpoint_dir is not None
+                    else filename
+                ),
+                verbose=verbose,
+                gather_fns=gather_fns,
+                float_dtype=float_dtype,
+            )
+        else:
+            fjformer.CheckpointManager.save_state_to_file(
+                state=state,
+                path=(
+                    os.path.join(checkpoint_dir, filename)
+                    if checkpoint_dir is not None
+                    else filename
+                ),
+                verbose=verbose,
+                gather_fns=gather_fns,
+                float_dtype=float_dtype,
+            )
 
     def free_opt_state(self) -> "EasyDeLState":
         """
@@ -535,28 +562,28 @@ class EasyDeLState(struct.PyTreeNode):
 
     @classmethod
     def from_pretrained(
-        cls,
-        pretrained_model_name_or_path: str,
-        filename: Optional[str] = None,
-        optimizer: AVAILABLE_OPTIMIZERS = "adamw",
-        scheduler: AVAILABLE_SCHEDULERS = "none",
-        tx_init: Optional[dict] = None,
-        device=jax.devices("cpu")[0],
-        dtype: jax.numpy.dtype = jax.numpy.float32,
-        param_dtype: jax.numpy.dtype = jax.numpy.float32,
-        precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
-        sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
-        sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-        partition_axis: PartitionAxis = PartitionAxis(),
-        shard_attention_computation: bool = True,
-        input_shape: Sequence[int] = (1, 1),
-        backend: Optional[str] = None,
-        init_optimizer_state: bool = False,
-        free_optimizer_state: bool = True,
-        verbose: bool = True,
-        state_shard_fns: Optional[Mapping[str, Callable]] = None,
-        config_kwargs: Optional[Mapping[str, Any]] = None,
-        **kwargs,
+            cls,
+            pretrained_model_name_or_path: str,
+            filename: Optional[str] = None,
+            optimizer: AVAILABLE_OPTIMIZERS = "adamw",
+            scheduler: AVAILABLE_SCHEDULERS = "none",
+            tx_init: Optional[dict] = None,
+            device=jax.devices("cpu")[0],
+            dtype: jax.numpy.dtype = jax.numpy.float32,
+            param_dtype: jax.numpy.dtype = jax.numpy.float32,
+            precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
+            sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
+            sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+            partition_axis: PartitionAxis = PartitionAxis(),
+            shard_attention_computation: bool = True,
+            input_shape: Sequence[int] = (1, 1),
+            backend: Optional[str] = None,
+            init_optimizer_state: bool = False,
+            free_optimizer_state: bool = True,
+            verbose: bool = True,
+            state_shard_fns: Optional[Mapping[str, Callable]] = None,
+            config_kwargs: Optional[Mapping[str, Any]] = None,
+            **kwargs,
     ) -> "EasyDeLState":
         """
         Loads a pre-trained EasyDeL model and its state.
@@ -667,12 +694,12 @@ class EasyDeLState(struct.PyTreeNode):
         return self
 
     def shard_params(
-        self,
-        fully_sharded_data_parallel: bool = True,
-        shard_fns: Optional[Mapping[str, Callable]] = None,
-        dtype: Union[jax.numpy.dtype, str] = "bf16",
-        mesh: Optional[Mesh] = None,
-        rules: Optional[Sequence[Mapping[str, PartitionSpec]]] = None,
+            self,
+            fully_sharded_data_parallel: bool = True,
+            shard_fns: Optional[Mapping[str, Callable]] = None,
+            dtype: Union[jax.numpy.dtype, str] = "bf16",
+            mesh: Optional[Mesh] = None,
+            rules: Optional[Sequence[Mapping[str, PartitionSpec]]] = None,
     ):
         """
         Shards the model parameters across devices.
@@ -858,9 +885,9 @@ class EasyDeLState(struct.PyTreeNode):
             setattr(self.module_config, k, v)
 
     def to_pytorch(
-        self,
-        base_hf_auto_class=AutoModelForCausalLM,
-        easystate_to_huggingface_model_kwargs: Optional[dict] = None,
+            self,
+            base_hf_auto_class=AutoModelForCausalLM,
+            easystate_to_huggingface_model_kwargs: Optional[dict] = None,
     ):
         """
         Converts the EasyDeL model to a PyTorch model.
