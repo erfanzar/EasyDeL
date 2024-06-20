@@ -750,6 +750,82 @@ class EasyDeLFlaxPretrainedModel(FlaxPreTrainedModel):
             quantization_fields = ["kernel", "embedding"]
         return fjformer.linen.quantize_int8_parameters(quantization_fields, params)
 
+    def _md_info(self):
+        md = f"""
+---
+tags:
+- EasyDeL
+- {self.config.model_type}
+---
+## [EasyDeL](https://github.com/erfanzar/EasyDeL) model 
+
+EasyDeL is an open-source framework designed to enhance and streamline the training process of machine learning
+models. With a primary focus on Jax, EasyDeL aims to provide convenient and effective solutions for 
+training Flax/Jax models on TPU/GPU for both serving and training purposes.
+
+## Using Example
+
+### Using From EasyDeLState (_*.easy_ files)
+
+```python
+from easydel import EasyDeLState, AutoShardAndGatherFunctions
+from jax import numpy as jnp, lax
+
+shard_fns, gather_fns = AutoShardAndGatherFunctions.from_pretrained(
+    "REPO_ID", # Pytorch State should be saved to in order to find shard gather fns with no effort, otherwise read docs.
+    backend="gpu",
+    depth_target=["params", "params"],
+    flatten=False
+)
+
+state = EasyDeLState.load_state(
+    "*.easy",
+    dtype=jnp.float16,
+    param_dtype=jnp.float16,
+    precision=lax.Precision("fastest"),
+    verbose=True,
+    state_shard_fns=shard_fns
+)
+# State file Ready to use ...
+```
+
+### Using From AutoEasyDeLModelForCausalLM (_from PyTorch_)
+
+```python
+from easydel import AutoEasyDeLModelForCausalLM
+from jax import numpy as jnp, lax
+
+
+model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
+    "REPO_ID",
+    dtype=jnp.float16,
+    param_dtype=jnp.float16,
+    precision=lax.Precision("fastest"),
+    auto_shard_params=True,
+)
+# Model and Parameters Ready to use ...
+```
+
+### Using From AutoEasyDeLModelForCausalLM (_from EasyDeL_)
+
+```python
+from easydel import AutoEasyDeLModelForCausalLM
+from jax import numpy as jnp, lax
+
+
+model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
+    "REPO_ID/",
+    dtype=jnp.float16,
+    param_dtype=jnp.float16,
+    precision=lax.Precision("fastest"),
+    auto_shard_params=True,
+    from_torch=False
+)
+# Model and Parameters Ready to use ...
+```
+        """
+        return md
+
     def save_pretrained(  # noqa
             self,
             save_directory: Union[str, os.PathLike],
@@ -760,6 +836,7 @@ class EasyDeLFlaxPretrainedModel(FlaxPreTrainedModel):
             float_dtype=None,
             verbose: bool = True,
             mismatch_allowed: bool = True,
+            safe=True,
             **kwargs,
     ):
         if token is not None:
@@ -783,8 +860,12 @@ class EasyDeLFlaxPretrainedModel(FlaxPreTrainedModel):
         if self.can_generate():
             self.generation_config.save_pretrained(save_directory)
         output_model_file = os.path.join(save_directory, "easydel-model.parameters")
-
-        fjformer.checkpoint.CheckpointManager.save_state_to_file(
+        if not os.path.exists(os.path.join(save_directory, "README.md")):
+            open(os.path.join(save_directory, "README.md"), "w").write(self._md_info())
+        func = fjformer.checkpoint.CheckpointManager.save_checkpoint_safe if (
+            safe
+        ) else fjformer.checkpoint.CheckpointManager.save_checkpoint
+        func(
             path=output_model_file,
             gather_fns=gather_fns,
             mismatch_allowed=mismatch_allowed,
@@ -827,6 +908,7 @@ class EasyDeLFlaxPretrainedModel(FlaxPreTrainedModel):
             partition_axis: PartitionAxis = PartitionAxis(),
             dtype: jnp.dtype = jnp.float32,
             param_dtype: jnp.dtype = jnp.float32,
+            safe: bool = True,
             precision: jax.lax.PrecisionLike = jax.lax.Precision("fastest"),
             input_shape: Optional[Tuple[int, int]] = None,
             config_kwargs: Optional[dict[str, Any]] = None,
@@ -1011,14 +1093,21 @@ class EasyDeLFlaxPretrainedModel(FlaxPreTrainedModel):
             _do_init=False,
             **model_kwargs,
         )
-
-        state = fjformer.checkpoint.CheckpointManager.load_checkpoint(
-            path=resolved_archive_file,
-            mismatch_allowed=mismatch_allowed,
-            verbose=verbose,
-            shard_fns=shard_fns,
-            remove_dict_prefix=remove_dict_prefix,
-        )
+        if safe:
+            state, _ = fjformer.checkpoint.CheckpointManager.load_checkpoint_safe(
+                path=resolved_archive_file,
+                mismatch_allowed=mismatch_allowed,
+                verbose=verbose,
+                shard_fns=shard_fns,
+            )
+        else:
+            state = fjformer.checkpoint.CheckpointManager.load_checkpoint(
+                path=resolved_archive_file,
+                mismatch_allowed=mismatch_allowed,
+                verbose=verbose,
+                shard_fns=shard_fns,
+                remove_dict_prefix=remove_dict_prefix,
+            )
 
         params = state.get("params", None)
         if params is not None:

@@ -68,13 +68,13 @@ class TrainerConfigureFunctionFuncOutput:
 
 class BaseTrainer:
     def __init__(
-        self,
-        arguments: TrainArguments,
-        dataset_train: Dataset,
-        dataset_eval: Dataset = None,
-        finetune: bool = True,
-        checkpoint_path: Union[str, os.PathLike] = None,
-        _do_init_fns: bool = True,
+            self,
+            arguments: TrainArguments,
+            dataset_train: Dataset,
+            dataset_eval: Dataset = None,
+            finetune: bool = True,
+            checkpoint_path: Union[str, os.PathLike] = None,
+            _do_init_fns: bool = True,
     ):
         """The __init__ function is called when the class is instantiated.
         It sets up all the variables that are needed for training, including:
@@ -208,14 +208,14 @@ class BaseTrainer:
             wandb.finish()
 
     def _start_capturing_memory(
-        self, dir_prefix: str = "/dev/shm" if sys.platform != "win32" else "."
+            self, dir_prefix: str = "/dev/shm" if sys.platform != "win32" else "."
     ):
         def _start():
             while True:
                 information_queries = {}
                 for key in ["Used", "Usage Percent"]:
                     for device, info in get_capacity_matrix(
-                        dir_prefix=dir_prefix
+                            dir_prefix=dir_prefix
                     ).items():
                         information_queries[
                             f"accelerators/{device.replace('_', ' ')} ({key})"
@@ -303,9 +303,9 @@ class BaseTrainer:
 
     @abstractmethod
     def create_collate_function(
-        self,
-        max_sequence_length: int,
-        truncation_mode: Literal["keep_end", "keep_start"],
+            self,
+            max_sequence_length: int,
+            truncation_mode: Literal["keep_end", "keep_start"],
     ) -> Callable:
         raise NotImplementedError
 
@@ -335,7 +335,7 @@ class BaseTrainer:
         """
 
         def create_tf_dataset(
-            dataset: Dataset, is_train: bool
+                dataset: Dataset, is_train: bool
         ) -> Iterator[ndarray[Any, Any]]:
             return (
                 dataset.to_tf_dataset(
@@ -354,7 +354,7 @@ class BaseTrainer:
             )
 
         def create_tf_dataset_from_iterable(
-            dataset: IterableDataset, is_train: bool
+                dataset: IterableDataset, is_train: bool
         ) -> Iterator[ndarray[Any, Any]]:
             return (
                 tf.data.Dataset.from_generator(
@@ -382,9 +382,9 @@ class BaseTrainer:
                     else self.arguments.eval_batch_size
                 )
                 num_steps = (
-                    (total_data_len + batch_size - 1)
-                    // batch_size
-                    * (self.arguments.num_train_epochs if is_train else 1)
+                        (total_data_len + batch_size - 1)
+                        // batch_size
+                        * (self.arguments.num_train_epochs if is_train else 1)
                 )
                 max_steps = (
                     self.arguments.max_training_steps
@@ -441,8 +441,8 @@ class BaseTrainer:
         )
         if self.arguments.model_class is not None:
             if not hasattr(
-                self.arguments.configs_to_initialize_model_class["config"],
-                "get_partition_rules",
+                    self.arguments.configs_to_initialize_model_class["config"],
+                    "get_partition_rules",
             ):
                 assert self.arguments.custom_rule is not None, (
                     "if you are using custom model to init you must"
@@ -488,11 +488,11 @@ class BaseTrainer:
         )
 
     def _save_state(
-        self,
-        state: "EasyDeLState",  # type: ignore #noqa
-        gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
-        milestone: bool = False,
-        save_dir: Optional[str] = None,
+            self,
+            state: "EasyDeLState",  # type: ignore #noqa
+            gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
+            milestone: bool = False,
+            save_dir: Optional[str] = None,
     ) -> str:
         step = (
             int(jax.device_get(state.step)) + self.arguments.step_start_point
@@ -592,7 +592,7 @@ state = EasyDeLState.load_state(
 # State file Ready to use ...
 ```
 
-### Using From AutoEasyDeLModelForCausalLM (_from pytorch_)
+### Using From AutoEasyDeLModelForCausalLM (_from PyTorch_)
 
 ```python
 from easydel import AutoEasyDeLModelForCausalLM
@@ -604,11 +604,28 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
     dtype=jnp.float16,
     param_dtype=jnp.float16,
     precision=lax.Precision("fastest"),
-    auto_shard_params=True
+    auto_shard_params=True,
 )
 # Model and Parameters Ready to use ...
 ```
 
+### Using From AutoEasyDeLModelForCausalLM (_from EasyDeL_)
+
+```python
+from easydel import AutoEasyDeLModelForCausalLM
+from jax import numpy as jnp, lax
+
+
+model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
+    "REPO_ID/{self.arguments.model_name}",
+    dtype=jnp.float16,
+    param_dtype=jnp.float16,
+    precision=lax.Precision("fastest"),
+    auto_shard_params=True,
+    from_torch=False
+)
+# Model and Parameters Ready to use ...
+```
 
 ## Training Detail
 
@@ -644,15 +661,15 @@ partition_rules = {partition_rules}
         return makrdown
 
     def save_pretrained(
-        self,
-        state: "EasyDeLState",  # type: ignore #noqa
-        save_dir: Optional[str] = None,
-        gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]] = None,
-        to_torch: bool = False,
-        base_hf_auto_class=AutoModelForCausalLM,
-        easystate_to_huggingface_model_kwargs: Optional[dict] = None,
-        add_params_field_to_torch_convertation: bool = False,
-        torch_save_pretrained_kwargs: Optional[dict] = None,
+            self,
+            state: "EasyDeLState",  # type: ignore #noqa
+            save_dir: Optional[str] = None,
+            gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]] = None,
+            to_torch: bool = False,
+            base_hf_auto_class=AutoModelForCausalLM,
+            easystate_to_huggingface_model_kwargs: Optional[dict] = None,
+            add_params_field_to_torch_convertation: bool = False,
+            torch_save_pretrained_kwargs: Optional[dict] = None,
     ):
         if torch_save_pretrained_kwargs is None:
             torch_save_pretrained_kwargs = {}
@@ -719,8 +736,8 @@ partition_rules = {partition_rules}
             x.size for x in jax.tree_util.tree_flatten(flax.core.unfreeze(params))[0]
         )
         flops = (
-            6
-            * size
-            * (self.arguments.total_batch_size * self.arguments.max_sequence_length)
-        ) / jax.device_count()
+                        6
+                        * size
+                        * (self.arguments.total_batch_size * self.arguments.max_sequence_length)
+                ) / jax.device_count()
         return flops
