@@ -1,6 +1,6 @@
 ## EasyDeL SFT Training Tutorial: Fine-tuning Qwen2-7B for Chat
 
-This tutorial guides you through fine-tuning the Qwen2-7B model for chat using EasyDeL's powerful SFT (Supervised Fine-tuning) Trainer.  We'll leverage distributed training on multiple GPUs to handle this large language model efficiently. 
+This tutorial guides you through fine-tuning the Qwen2-7B model for chat using EasyDeL's powerful SFT (Supervised Fine-tuning) Trainer.  We'll leverage distributed training on multiple GPUs/TPUs to handle this large language model efficiently. 
 
 **1. Setup and Installation**
 
@@ -32,7 +32,7 @@ api = HfApi()
 
 **3. Hardware Check**
 
-It's useful to check available GPU memory:
+It's useful to check available GPUs/TPUs memory:
 
 ```python
 def print_accelerator_status():
@@ -52,16 +52,16 @@ Set up essential parameters for the model, training, and data:
 
 ```python
 # Model & Training Configuration
-sharding_axis_dims = (1, 1, 1, -1) # Sharding across the last axis (likely GPUs)
-max_length = 2048  
+sharding_axis_dims = (1, 1, 1, -1) # Sharding across the last axis
+max_length = 8192  
 input_shape = (1, max_length)
 pretrained_model_name_or_path = "Qwen/Qwen2-7B" 
 new_repo_id = "your-username/NewModelTrainedUsingEasyDeL" # Your Hugging Face repo
 
 dtype = jnp.bfloat16  # Data type for reduced memory usage
 use_lora = False
-block_size = 512
-attn_mechanism = "flash" 
+block_size = 128
+attn_mechanism = "flash" # Use (blocwise, wise_ring, ring, local_ring) for really-long-context-size (Check docs also)
 partition_axis = ed.PartitionAxis()
 from_torch = False 
 ```
@@ -79,7 +79,7 @@ model, params = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
     sharding_axis_dims=sharding_axis_dims,
     verbose_params=True,
     config_kwargs=dict(
-        use_scan_mlp=False,
+        use_scan_mlp=False, # Turn this On for really-long-context-size
         attn_mechanism=attn_mechanism,
         partition_axis=partition_axis
     ),
@@ -203,7 +203,7 @@ trainer = ed.SFTTrainer(
     eval_dataset=None, # Add an evaluation dataset if needed
     tokenizer=tokenizer,
     dataset_text_field=None, # Replace with the name of the text field in your dataset
-    formatting_func=lambda x: [tokenizer.apply_chat_template(x, tokenize=False)],
+    formatting_func=lambda x: [tokenizer.apply_chat_template(x["conversation"], tokenize=False)],
     packing=False, 
     num_of_sequences=max_length,
     dataset_num_proc=32 
