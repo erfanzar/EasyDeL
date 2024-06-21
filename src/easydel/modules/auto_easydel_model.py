@@ -606,6 +606,7 @@ class AutoEasyDeLModelForCausalLM:
                 precision=precision,
                 dtype=dtype,
                 pretrained_model_name_or_path=pretrained_model_name_or_path,
+                safe=safe,
             )
 
     @staticmethod
