@@ -138,16 +138,7 @@ pipeline = ed.GenerationPipeline(model=model, params=params, tokenizer=tokenizer
 
 # Prepare your input
 input_text = "The quick brown fox jumps over the "
-tokens = tokenizer(input_text, return_tensors="np", max_length=512, padding="max_length")
 
-# Generate text
-outputs = []
-pl = 0
-for token in pipeline.generate(**tokens):
-    outputs.append(token)
-    sq = tokenizer.decode(jnp.concatenate(outputs, axis=-1)[0])
-    print(sq[pl:], end="")
-    pl = len(sq)
 ```
 
 **Key Points:**
