@@ -6,44 +6,44 @@ import warnings
 from abc import ABC
 from collections import defaultdict
 from glob import glob  # noqa
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple, Union
 
 import flax.core
 import jax
 import tensorflow.data  # type:ignore # noqa  # type:ignore #noqa
 import tensorflow_datasets
 import termcolor
-from fjformer import match_partition_rules, make_shard_and_gather_fns
-from flax.core import FrozenDict
-from tqdm import tqdm
-
-from typing import Optional, Dict, Union, Any, Callable, Mapping, Tuple
-
 from datasets import Dataset
-from jax import numpy as jnp, jit
+from fjformer import make_shard_and_gather_fns, match_partition_rules
+from flax.core import FrozenDict
+from jax import jit
+from jax import numpy as jnp
+from jax.sharding import PartitionSpec
+from tqdm.autonotebook import tqdm
+from transformers import PreTrainedTokenizerBase
 
-from easydel.etils.etils import get_logger
-from easydel.trainer.training_configurations import TrainArguments
-from easydel.trainer.base_trainer import (
-    BaseTrainer,
-    TrainerConfigureFunctionFuncOutput,
-    TrainerConfigureDataloaderFuncOutput,
-)
 from easydel.etils.easystate import EasyDeLState
 from easydel.etils.errors import EasyDeLTimerError
-from transformers import PreTrainedTokenizerBase
-from jax.sharding import PartitionSpec
-
-from easydel.utils import Timers, prefix_print
+from easydel.etils.etils import get_logger
+from easydel.trainer.base_trainer import (
+    BaseTrainer,
+    TrainerConfigureDataloaderFuncOutput,
+    TrainerConfigureFunctionFuncOutput,
+)
 from easydel.trainer.direct_preference_optimization_trainer.utils import (
-    pad_to_length,
     DPODataCollatorWithPadding,
     leave_alone_context_manager,
+    pad_to_length,
 )
 from easydel.trainer.odds_ratio_preference_optimization_trainer.fwd_bwd_functions import (
-    create_orpo_step_function,
     create_orpo_concatenated_forward,
+    create_orpo_step_function,
 )
-from easydel.trainer.odds_ratio_preference_optimization_trainer.modelling_output import ORPOTrainerOutput
+from easydel.trainer.odds_ratio_preference_optimization_trainer.modelling_output import (
+    ORPOTrainerOutput,
+)
+from easydel.trainer.training_configurations import TrainArguments
+from easydel.utils import Timers, prefix_print
 
 logger = get_logger(__name__)
 
@@ -54,24 +54,24 @@ class ORPOTrainer(BaseTrainer, ABC):
     """
 
     def __init__(
-            self,
-            arguments: TrainArguments,
-            max_length: Optional[int] = None,
-            max_prompt_length: Optional[int] = None,
-            max_completion_length: Optional[int] = None,
-            beta: float = 0.1,
-            disable_dropout: bool = True,
-            label_pad_token_id: int = -100,
-            is_encoder_decoder: bool = False,
-            padding_value: int = None,
-            data_collator: Optional[DPODataCollatorWithPadding] = None,
-            train_dataset: Optional[Dataset] = None,
-            eval_dataset: Optional[Union[Dataset, Dict[str, Dataset]]] = None,
-            tokenizer: Optional[PreTrainedTokenizerBase] = None,
-            dataset_num_proc: Optional[int] = None,
-            _do_init_fns: bool = True,
-            dataset_map_arguments: Optional[Dict[str, Any]] = None,
-            low_mem_usage: bool = False,
+        self,
+        arguments: TrainArguments,
+        max_length: Optional[int] = None,
+        max_prompt_length: Optional[int] = None,
+        max_completion_length: Optional[int] = None,
+        beta: float = 0.1,
+        disable_dropout: bool = True,
+        label_pad_token_id: int = -100,
+        is_encoder_decoder: bool = False,
+        padding_value: int = None,
+        data_collator: Optional[DPODataCollatorWithPadding] = None,
+        train_dataset: Optional[Dataset] = None,
+        eval_dataset: Optional[Union[Dataset, Dict[str, Dataset]]] = None,
+        tokenizer: Optional[PreTrainedTokenizerBase] = None,
+        dataset_num_proc: Optional[int] = None,
+        _do_init_fns: bool = True,
+        dataset_map_arguments: Optional[Dict[str, Any]] = None,
+        low_mem_usage: bool = False,
     ):
         """
         The __init__ function is called when the class is instantiated.
@@ -178,7 +178,7 @@ class ORPOTrainer(BaseTrainer, ABC):
         self._loggers_initialized = False
         self.mesh = self.arguments.get_mesh()
         assert (
-                padding_value is not None
+            padding_value is not None
         ), "`padding_value` can not be set as `None` it must be an integer."
 
         self.concatenated_forward = create_orpo_concatenated_forward(
@@ -209,10 +209,10 @@ class ORPOTrainer(BaseTrainer, ABC):
         full_tokenized = self.tokenizer(prompt + answer, add_special_tokens=False)
         prompt_input_ids = self.tokenizer(prompt, add_special_tokens=False)["input_ids"]
 
-        answer_input_ids = full_tokenized["input_ids"][len(prompt_input_ids):]
+        answer_input_ids = full_tokenized["input_ids"][len(prompt_input_ids) :]
         answer_attention_mask = full_tokenized["attention_mask"][
-                                len(prompt_input_ids):
-                                ]
+            len(prompt_input_ids) :
+        ]
         prompt_input_ids = jnp.asarray(prompt_input_ids, dtype="i4")
         answer_input_ids = jnp.asarray(answer_input_ids, dtype="i4")
         full_concat_input_ids = jnp.concatenate((prompt_input_ids, answer_input_ids))
@@ -227,15 +227,15 @@ class ORPOTrainer(BaseTrainer, ABC):
 
         response_token_ids_start_idx = len(prompt_input_ids)
         if (
-                prompt_input_ids.tolist()
-                != full_tokenized["input_ids"][:response_token_ids_start_idx]
+            prompt_input_ids.tolist()
+            != full_tokenized["input_ids"][:response_token_ids_start_idx]
         ):
             response_token_ids_start_idx -= 1
 
         prompt_input_ids = full_tokenized["input_ids"][:response_token_ids_start_idx]
         prompt_attention_mask = full_tokenized["attention_mask"][
-                                :response_token_ids_start_idx
-                                ]
+            :response_token_ids_start_idx
+        ]
 
         if len(prompt_input_ids) != len(prompt_attention_mask):
             raise ValueError(
@@ -244,8 +244,8 @@ class ORPOTrainer(BaseTrainer, ABC):
 
         answer_input_ids = full_tokenized["input_ids"][response_token_ids_start_idx:]
         answer_attention_mask = full_tokenized["attention_mask"][
-                                response_token_ids_start_idx:
-                                ]
+            response_token_ids_start_idx:
+        ]
 
         return dict(
             prompt_input_ids=jnp.array(prompt_input_ids, dtype="i4"),
@@ -342,7 +342,7 @@ class ORPOTrainer(BaseTrainer, ABC):
         # if combined sequence is too long, truncate the prompt
         for answer_tokens in [chosen_tokens, rejected_tokens, prompt_tokens]:
             length_rn = (
-                    answer_tokens["prompt_input_ids"].shape[-1] + longer_response_length
+                answer_tokens["prompt_input_ids"].shape[-1] + longer_response_length
             )
             if length_rn > self.max_length:
                 if self.truncation_mode == "keep_start":
@@ -351,20 +351,20 @@ class ORPOTrainer(BaseTrainer, ABC):
                 elif self.truncation_mode == "keep_end":
                     for k in ["prompt_input_ids", "prompt_attention_mask"]:
                         answer_tokens[k] = answer_tokens[k][
-                                           :, -self.max_prompt_length:
-                                           ]
+                            :, -self.max_prompt_length :
+                        ]
                 else:
                     raise ValueError(f"Unknown truncation mode: {self.truncation_mode}")
         # if that's still too long, truncate the response
         for answer_tokens in [chosen_tokens, rejected_tokens]:
             if (
-                    answer_tokens["prompt_input_ids"].shape[-1] + longer_response_length
-                    > self.max_length
+                answer_tokens["prompt_input_ids"].shape[-1] + longer_response_length
+                > self.max_length
             ):
                 for k in ["input_ids", "attention_mask"]:
                     answer_tokens[k] = answer_tokens[k][
-                                       :, : self.max_length - self.max_prompt_length
-                                       ]
+                        :, : self.max_length - self.max_prompt_length
+                    ]
 
         chosen_sequence_tokens = {
             k: jnp.concatenate(
@@ -583,11 +583,13 @@ class ORPOTrainer(BaseTrainer, ABC):
 
         state_shape = jax.eval_shape(initialize_state_function)
         state_partition_spec = match_partition_rules(
-            self.config.get_partition_rules(
-                fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
-            )
-            if self.arguments.custom_rule is None
-            else self.arguments.custom_rule,
+            (
+                self.config.get_partition_rules(
+                    fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
+                )
+                if self.arguments.custom_rule is None
+                else self.arguments.custom_rule
+            ),
             state_shape,
         )
 
@@ -643,15 +645,15 @@ class ORPOTrainer(BaseTrainer, ABC):
         )
 
     def initialize_state(
-            self,
-            model_parameters: Optional[flax.core.FrozenDict] = None,
-            state: Optional[EasyDeLState] = None,
+        self,
+        model_parameters: Optional[flax.core.FrozenDict] = None,
+        state: Optional[EasyDeLState] = None,
     ) -> Tuple[EasyDeLState, Mapping[str, Callable], Mapping[str, Callable]]:
         if (
-                model_parameters is None
-                and state is None
-                and self.rapture is None
-                and self.checkpoint_path is None
+            model_parameters is None
+            and state is None
+            and self.rapture is None
+            and self.checkpoint_path is None
         ):
             raise RuntimeError(
                 "You are passing `model_parameters=None`, `state=None`, and `checkpoint_path=None` and also you are not"
@@ -705,11 +707,13 @@ class ORPOTrainer(BaseTrainer, ABC):
                         )
                         state_shape = jax.eval_shape(lambda: sharded_state)
                         state_partition_spec = match_partition_rules(
-                            self.config.get_partition_rules(
-                                fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
-                            )
-                            if self.arguments.custom_rule is None
-                            else self.arguments.custom_rule,
+                            (
+                                self.config.get_partition_rules(
+                                    fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
+                                )
+                                if self.arguments.custom_rule is None
+                                else self.arguments.custom_rule
+                            ),
                             state_shape,
                         )
 
@@ -874,9 +878,9 @@ class ORPOTrainer(BaseTrainer, ABC):
         self.timer.log(["configure functions and sharding them"])
 
     def create_collate_function(
-            self,
-            max_sequence_length: int,
-            truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
+        self,
+        max_sequence_length: int,
+        truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> Callable:
         return self.data_collator
 
@@ -944,7 +948,7 @@ class ORPOTrainer(BaseTrainer, ABC):
         )
 
     def _get_eval_dataloader(
-            self, eval_dataset: Optional[Dataset] = None
+        self, eval_dataset: Optional[Dataset] = None
     ) -> tensorflow.data.Dataset:
         """
         Returns the evaluation [`~tensorflow.data.Dataset`].
@@ -971,7 +975,7 @@ class ORPOTrainer(BaseTrainer, ABC):
         )
 
     def get_train_dataloader(
-            self,
+        self,
     ) -> tensorflow.data.Dataset:
         """
         Returns the training [`~tensorflow.data.Dataset`].
@@ -979,7 +983,7 @@ class ORPOTrainer(BaseTrainer, ABC):
         return self._get_train_dataloader()
 
     def get_eval_dataloader(
-            self, eval_dataset: Optional[Dataset] = None
+        self, eval_dataset: Optional[Dataset] = None
     ) -> tensorflow.data.Dataset:
         """
         Returns the evaluation [`~tensorflow.data.Dataset`].
@@ -990,9 +994,9 @@ class ORPOTrainer(BaseTrainer, ABC):
         return self._get_eval_dataloader(eval_dataset=eval_dataset)
 
     def train(
-            self,
-            model_parameters: Optional[flax.core.FrozenDict] = None,
-            state: Optional[EasyDeLState] = None,
+        self,
+        model_parameters: Optional[flax.core.FrozenDict] = None,
+        state: Optional[EasyDeLState] = None,
     ) -> ORPOTrainerOutput:
         def get_layer_names(frozen_dict, prefix=""):
             layer_names = {}
@@ -1026,13 +1030,15 @@ class ORPOTrainer(BaseTrainer, ABC):
         self.model_state = sharded_state
         count_model_parameters(sharded_state.params)
         flops_per_device = (
-                self.calculate_number_total_flops_per_device(params=sharded_state.params)
-                / 1e12
+            self.calculate_number_total_flops_per_device(params=sharded_state.params)
+            / 1e12
         )
         with self.mesh:
-            with jax.default_device(
-                    jax.devices("cpu")[0]
-            ) if self.low_mem_usage else leave_alone_context_manager():
+            with (
+                jax.default_device(jax.devices("cpu")[0])
+                if self.low_mem_usage
+                else leave_alone_context_manager()
+            ):
                 checkpoint_path = "SAVING_SKIPPED"
 
                 pbar = tqdm(total=self.max_training_steps)
@@ -1071,7 +1077,7 @@ class ORPOTrainer(BaseTrainer, ABC):
                                 train_metrics = {
                                     "train/loss": loss.tolist(),
                                     "train/mean_loss": loss_sum
-                                                       / (current_step - self.arguments.step_start_point),
+                                    / (current_step - self.arguments.step_start_point),
                                     "train/learning_rate": self.scheduler(
                                         jax.device_get(self.model_state.step)
                                     ).tolist(),
@@ -1112,8 +1118,8 @@ class ORPOTrainer(BaseTrainer, ABC):
                     )
 
                 if (
-                        self.arguments.merge_lora_rapture_parameters
-                        and self.rapture is not None
+                    self.arguments.merge_lora_rapture_parameters
+                    and self.rapture is not None
                 ):
                     print(
                         termcolor.colored("Info : ", color="red", force_color=True),
@@ -1144,11 +1150,13 @@ class ORPOTrainer(BaseTrainer, ABC):
                 if self.arguments.save_steps is None and self.arguments.do_last_save:
                     shard_fns, gather_fns = make_shard_and_gather_fns(
                         match_partition_rules(
-                            self.config.get_partition_rules(
-                                fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
-                            )
-                            if self.arguments.custom_rule is None
-                            else self.arguments.custom_rule,
+                            (
+                                self.config.get_partition_rules(
+                                    fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
+                                )
+                                if self.arguments.custom_rule is None
+                                else self.arguments.custom_rule
+                            ),
                             jax.eval_shape(lambda: self.model_state),
                         ),
                         mesh=self.mesh,
@@ -1172,15 +1180,15 @@ class ORPOTrainer(BaseTrainer, ABC):
     def eval(self, model_state: EasyDeLState) -> typing.Iterator[dict]:
         """Evaluate the Given Model State and yield the eval metrics"""
         assert (
-                self.eval_dataset is not None
+            self.eval_dataset is not None
         ), "`dataloader_eval` is required by evaluator function."
         with self.mesh:
             pbar = tqdm(total=self.max_evaluation_steps)
             pbar.set_description("Evaluating")
             current_step = 0
             flops_per_device = (
-                    self.calculate_number_total_flops_per_device(params=model_state.params)
-                    / 1e12
+                self.calculate_number_total_flops_per_device(params=model_state.params)
+                / 1e12
             )
             loss_sum = None
             try:
@@ -1191,9 +1199,9 @@ class ORPOTrainer(BaseTrainer, ABC):
                         _ = batch.pop(key, None)
                     for key in list(batch.keys()):
                         if not (
-                                key.endswith("_input_ids")
-                                or key.endswith("_attention_mask")
-                                or key.endswith("_labels")
+                            key.endswith("_input_ids")
+                            or key.endswith("_attention_mask")
+                            or key.endswith("_labels")
                         ):
                             _ = batch.pop(key, None)
 
@@ -1205,7 +1213,7 @@ class ORPOTrainer(BaseTrainer, ABC):
                     eval_metrics = {
                         "eval/loss": loss.tolist(),
                         "eval/mean_loss": loss_sum
-                                          / (current_step - self.arguments.step_start_point),
+                        / (current_step - self.arguments.step_start_point),
                         "eval/step": current_step,
                         "eval/step_time": total_time,
                         "eval/perplexity": jnp.exp(loss).tolist(),

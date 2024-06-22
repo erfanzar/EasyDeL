@@ -5,6 +5,7 @@ import typing
 import warnings
 from abc import ABC
 from collections import defaultdict
+
 import flax.core
 import jax
 import tensorflow.data  # type:ignore # noqa
@@ -15,39 +16,39 @@ try:
     import wandb
 except ModuleNotFoundError:
     wandb = None
-from fjformer import match_partition_rules, make_shard_and_gather_fns
-from tqdm import tqdm
-
-from typing import Optional, Literal, Dict, Union, Any, Callable, Mapping
+from typing import Any, Callable, Dict, Literal, Mapping, Optional, Union
 
 from datasets import Dataset
+from fjformer import make_shard_and_gather_fns, match_partition_rules
 from jax import numpy as jnp
+from jax.sharding import PartitionSpec
+from tqdm.autonotebook import tqdm
+from transformers import PreTrainedTokenizerBase
+
+from easydel.etils.easystate import EasyDeLState
 from easydel.etils.errors import EasyDeLTimerError
 from easydel.etils.etils import get_logger
-from easydel.trainer.training_configurations import TrainArguments
 from easydel.trainer.base_trainer import (
     BaseTrainer,
-    TrainerConfigureFunctionFuncOutput,
     TrainerConfigureDataloaderFuncOutput,
+    TrainerConfigureFunctionFuncOutput,
     TrainerConfigureModelFuncOutput,
 )
-from easydel.etils.easystate import EasyDeLState
-
-from transformers import PreTrainedTokenizerBase
-from jax.sharding import PartitionSpec
-
-from easydel.utils import Timers
+from easydel.trainer.direct_preference_optimization_trainer.fwd_bwd_functions import (
+    create_dpo_concatenated_forward,
+    create_dpo_eval_function,
+    create_dpo_train_function,
+)
+from easydel.trainer.direct_preference_optimization_trainer.modelling_output import (
+    DPOTrainerOutput,
+)
 from easydel.trainer.direct_preference_optimization_trainer.utils import (
-    pad_to_length,
     DPODataCollatorWithPadding,
     leave_alone_context_manager,
+    pad_to_length,
 )
-from easydel.trainer.direct_preference_optimization_trainer.fwd_bwd_functions import (
-    create_dpo_train_function,
-    create_dpo_eval_function,
-    create_dpo_concatenated_forward,
-)
-from easydel.trainer.direct_preference_optimization_trainer.modelling_output import DPOTrainerOutput
+from easydel.trainer.training_configurations import TrainArguments
+from easydel.utils import Timers
 
 logger = get_logger(__name__)
 
@@ -58,33 +59,33 @@ class DPOTrainer(BaseTrainer, ABC):
     """
 
     def __init__(
-            self,
-            arguments: TrainArguments,
-            model_state: EasyDeLState | str,
-            ref_model_state: Optional[EasyDeLState | str] = None,
-            beta: float = 0.1,
-            label_smoothing: float = 0.0,
-            loss_type: Literal["sigmoid", "hinge", "ipo", "kto"] = "sigmoid",
-            label_pad_token_id: int = -100,
-            padding_value: int = None,
-            train_dataset: Optional[Dataset] = None,
-            eval_dataset: Optional[Union[Dataset, Dict[str, Dataset]]] = None,
-            tokenizer: Optional[PreTrainedTokenizerBase] = None,
-            data_collator: Optional[Callable] = None,
-            max_length: Optional[int] = None,
-            max_prompt_length: Optional[int] = None,
-            max_target_length: Optional[int] = None,
-            precompute_ref_log_probs: bool = False,
-            model_init_kwargs: Optional[Dict] = None,
-            ref_model_init_kwargs: Optional[Dict] = None,
-            reference_free: bool = False,
-            auto_shard_model_state: bool = True,
-            auto_shard_ref_model_state: bool = True,
-            is_encoder_decoder: Optional[bool] = False,
-            dataset_map_arguments: Optional[dict] = None,
-            low_mem_usage: bool = True,
-            auto_fix_data: bool = True,
-            _do_init_fns: bool = True,
+        self,
+        arguments: TrainArguments,
+        model_state: EasyDeLState | str,
+        ref_model_state: Optional[EasyDeLState | str] = None,
+        beta: float = 0.1,
+        label_smoothing: float = 0.0,
+        loss_type: Literal["sigmoid", "hinge", "ipo", "kto"] = "sigmoid",
+        label_pad_token_id: int = -100,
+        padding_value: int = None,
+        train_dataset: Optional[Dataset] = None,
+        eval_dataset: Optional[Union[Dataset, Dict[str, Dataset]]] = None,
+        tokenizer: Optional[PreTrainedTokenizerBase] = None,
+        data_collator: Optional[Callable] = None,
+        max_length: Optional[int] = None,
+        max_prompt_length: Optional[int] = None,
+        max_target_length: Optional[int] = None,
+        precompute_ref_log_probs: bool = False,
+        model_init_kwargs: Optional[Dict] = None,
+        ref_model_init_kwargs: Optional[Dict] = None,
+        reference_free: bool = False,
+        auto_shard_model_state: bool = True,
+        auto_shard_ref_model_state: bool = True,
+        is_encoder_decoder: Optional[bool] = False,
+        dataset_map_arguments: Optional[dict] = None,
+        low_mem_usage: bool = True,
+        auto_fix_data: bool = True,
+        _do_init_fns: bool = True,
     ):
         """
         The __init__ function is called when the class is instantiated.
@@ -237,7 +238,7 @@ class DPOTrainer(BaseTrainer, ABC):
         self._loggers_initialized = False
         self.mesh = self.arguments.get_mesh()
         assert (
-                padding_value is not None
+            padding_value is not None
         ), "`padding_value` can not be set as `None` it must be an integer."
 
         self.concatenated_forward = create_dpo_concatenated_forward(
@@ -373,9 +374,9 @@ class DPOTrainer(BaseTrainer, ABC):
         self.timer.log(["configure functions and sharding them"])
 
     def create_collate_function(
-            self,
-            max_sequence_length: int,
-            truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
+        self,
+        max_sequence_length: int,
+        truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> Callable:
         return self.data_collator
 
@@ -505,11 +506,13 @@ class DPOTrainer(BaseTrainer, ABC):
         state_shape = jax.eval_shape(lambda: self.model_state)
 
         state_partition_spec = match_partition_rules(
-            self.config.get_partition_rules(
-                fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
-            )
-            if self.arguments.custom_rule is None
-            else self.arguments.custom_rule,
+            (
+                self.config.get_partition_rules(
+                    fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
+                )
+                if self.arguments.custom_rule is None
+                else self.arguments.custom_rule
+            ),
             state_shape,
         )
         spec_named_sharding = self.specs_to_name_sharding(state_partition_spec)
@@ -612,7 +615,7 @@ class DPOTrainer(BaseTrainer, ABC):
         )
 
     def _get_eval_dataloader(
-            self, eval_dataset: Optional[Dataset] = None
+        self, eval_dataset: Optional[Dataset] = None
     ) -> tensorflow.data.Dataset:
         """
         Returns the evaluation [`~tensorflow.data.Dataset`].
@@ -639,7 +642,7 @@ class DPOTrainer(BaseTrainer, ABC):
         )
 
     def get_train_dataloader(
-            self,
+        self,
     ) -> tensorflow.data.Dataset:
         """
         Returns the training [`~tensorflow.data.Dataset`].
@@ -658,7 +661,7 @@ class DPOTrainer(BaseTrainer, ABC):
             reference_chosen_log_probs = []
             reference_rejected_log_probs = []
             for padded_batch in tqdm(
-                    iterable=data_loader, desc="Train dataset reference log probs"
+                iterable=data_loader, desc="Train dataset reference log probs"
             ):
                 reference_chosen_logp, reference_rejected_logp = (
                     self.compute_reference_log_probs(
@@ -685,7 +688,7 @@ class DPOTrainer(BaseTrainer, ABC):
         return self._get_train_dataloader()
 
     def get_eval_dataloader(
-            self, eval_dataset: Optional[Dataset] = None
+        self, eval_dataset: Optional[Dataset] = None
     ) -> tensorflow.data.Dataset:
         """
         Returns the evaluation [`~tensorflow.data.Dataset`].
@@ -709,7 +712,7 @@ class DPOTrainer(BaseTrainer, ABC):
             reference_chosen_log_probs = []
             reference_rejected_log_probs = []
             for padded_batch in tqdm(
-                    iterable=data_loader, desc="Eval dataset reference log probs"
+                iterable=data_loader, desc="Eval dataset reference log probs"
             ):
                 reference_chosen_logp, reference_rejected_logp = (
                     self.compute_reference_log_probs(self.model_state, padded_batch)
@@ -745,10 +748,10 @@ class DPOTrainer(BaseTrainer, ABC):
         full_tokenized = self.tokenizer(prompt + answer, add_special_tokens=False)
         prompt_input_ids = self.tokenizer(prompt, add_special_tokens=False)["input_ids"]
 
-        answer_input_ids = full_tokenized["input_ids"][len(prompt_input_ids):]
+        answer_input_ids = full_tokenized["input_ids"][len(prompt_input_ids) :]
         answer_attention_mask = full_tokenized["attention_mask"][
-                                len(prompt_input_ids):
-                                ]
+            len(prompt_input_ids) :
+        ]
         prompt_input_ids = jnp.asarray(prompt_input_ids, dtype="i4")
         answer_input_ids = jnp.asarray(answer_input_ids, dtype="i4")
         full_concat_input_ids = jnp.concatenate((prompt_input_ids, answer_input_ids))
@@ -763,15 +766,15 @@ class DPOTrainer(BaseTrainer, ABC):
 
         response_token_ids_start_idx = len(prompt_input_ids)
         if (
-                prompt_input_ids.tolist()
-                != full_tokenized["input_ids"][:response_token_ids_start_idx]
+            prompt_input_ids.tolist()
+            != full_tokenized["input_ids"][:response_token_ids_start_idx]
         ):
             response_token_ids_start_idx -= 1
 
         prompt_input_ids = full_tokenized["input_ids"][:response_token_ids_start_idx]
         prompt_attention_mask = full_tokenized["attention_mask"][
-                                :response_token_ids_start_idx
-                                ]
+            :response_token_ids_start_idx
+        ]
 
         if len(prompt_input_ids) != len(prompt_attention_mask):
             raise ValueError(
@@ -780,8 +783,8 @@ class DPOTrainer(BaseTrainer, ABC):
 
         answer_input_ids = full_tokenized["input_ids"][response_token_ids_start_idx:]
         answer_attention_mask = full_tokenized["attention_mask"][
-                                response_token_ids_start_idx:
-                                ]
+            response_token_ids_start_idx:
+        ]
 
         return dict(
             prompt_input_ids=jnp.array(prompt_input_ids, dtype="i4"),
@@ -878,7 +881,7 @@ class DPOTrainer(BaseTrainer, ABC):
         # if combined sequence is too long, truncate the prompt
         for answer_tokens in [chosen_tokens, rejected_tokens, prompt_tokens]:
             length_rn = (
-                    answer_tokens["prompt_input_ids"].shape[-1] + longer_response_length
+                answer_tokens["prompt_input_ids"].shape[-1] + longer_response_length
             )
             if length_rn > self.max_length:
                 if self.truncation_mode == "keep_start":
@@ -887,20 +890,20 @@ class DPOTrainer(BaseTrainer, ABC):
                 elif self.truncation_mode == "keep_end":
                     for k in ["prompt_input_ids", "prompt_attention_mask"]:
                         answer_tokens[k] = answer_tokens[k][
-                                           :, -self.max_prompt_length:
-                                           ]
+                            :, -self.max_prompt_length :
+                        ]
                 else:
                     raise ValueError(f"Unknown truncation mode: {self.truncation_mode}")
         # if that's still too long, truncate the response
         for answer_tokens in [chosen_tokens, rejected_tokens]:
             if (
-                    answer_tokens["prompt_input_ids"].shape[-1] + longer_response_length
-                    > self.max_length
+                answer_tokens["prompt_input_ids"].shape[-1] + longer_response_length
+                > self.max_length
             ):
                 for k in ["input_ids", "attention_mask"]:
                     answer_tokens[k] = answer_tokens[k][
-                                       :, : self.max_length - self.max_prompt_length
-                                       ]
+                        :, : self.max_length - self.max_prompt_length
+                    ]
 
         chosen_sequence_tokens = {
             k: jnp.concatenate(
@@ -1024,9 +1027,9 @@ class DPOTrainer(BaseTrainer, ABC):
         return batch
 
     def compute_reference_log_probs(
-            self,
-            state: EasyDeLState,
-            padded_batch: Dict,
+        self,
+        state: EasyDeLState,
+        padded_batch: Dict,
     ) -> tuple[Any, Any]:
         """
         Computes log probabilities of the reference model for a single padded batch of a DPO specific dataset.
@@ -1058,10 +1061,10 @@ class DPOTrainer(BaseTrainer, ABC):
         return reference_chosen_log_probs, reference_rejected_log_probs
 
     def _save_state(
-            self,
-            state: EasyDeLState,
-            gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
-            milestone: bool = False,
+        self,
+        state: EasyDeLState,
+        gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
+        milestone: bool = False,
     ) -> str:
         step = (
             int(jax.device_get(state.step)) + self.arguments.step_start_point
@@ -1086,18 +1089,20 @@ class DPOTrainer(BaseTrainer, ABC):
 
     def train(self) -> DPOTrainerOutput:
         assert (
-                self.model_state is not None
+            self.model_state is not None
         ), "model_state can not be None for training purpose"
         with self.mesh:
-            with jax.default_device(
-                    jax.devices("cpu")[0]
-            ) if self.low_mem_usage else leave_alone_context_manager:
+            with (
+                jax.default_device(jax.devices("cpu")[0])
+                if self.low_mem_usage
+                else leave_alone_context_manager
+            ):
                 checkpoint_path = "SAVING_SKIPPED"
                 flops_per_device = (
-                        self.calculate_number_total_flops_per_device(
-                            params=self.model_state.params
-                        )
-                        / 1e12
+                    self.calculate_number_total_flops_per_device(
+                        params=self.model_state.params
+                    )
+                    / 1e12
                 )
                 pbar = tqdm(total=self.max_training_steps)
                 pbar.set_description("Training")
@@ -1152,11 +1157,11 @@ class DPOTrainer(BaseTrainer, ABC):
                                 train_metrics = {
                                     "train/loss": loss.tolist(),
                                     "train/mean_loss": loss_sum
-                                                       / (current_step - self.arguments.step_start_point),
+                                    / (current_step - self.arguments.step_start_point),
                                     "train/mean_rejected_rewards": rejected_rewards_sum
-                                                                   / (current_step - self.arguments.step_start_point),
+                                    / (current_step - self.arguments.step_start_point),
                                     "train/mean_chosen_rewards": chosen_rewards_sum
-                                                                 / (current_step - self.arguments.step_start_point),
+                                    / (current_step - self.arguments.step_start_point),
                                     "train/learning_rate": self.scheduler(
                                         jax.device_get(self.model_state.step)
                                     ).tolist(),
@@ -1196,8 +1201,8 @@ class DPOTrainer(BaseTrainer, ABC):
                     )
 
                 if (
-                        self.arguments.merge_lora_rapture_parameters
-                        and self.rapture is not None
+                    self.arguments.merge_lora_rapture_parameters
+                    and self.rapture is not None
                 ):
                     print(
                         termcolor.colored("Info : ", color="red", force_color=True),
@@ -1228,11 +1233,13 @@ class DPOTrainer(BaseTrainer, ABC):
                 if self.arguments.save_steps is None and self.arguments.do_last_save:
                     shard_fns, gather_fns = make_shard_and_gather_fns(
                         match_partition_rules(
-                            self.config.get_partition_rules(
-                                fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
-                            )
-                            if self.arguments.custom_rule is None
-                            else self.arguments.custom_rule,
+                            (
+                                self.config.get_partition_rules(
+                                    fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
+                                )
+                                if self.arguments.custom_rule is None
+                                else self.arguments.custom_rule
+                            ),
                             jax.eval_shape(lambda: self.model_state),
                         ),
                         mesh=self.mesh,
@@ -1256,7 +1263,7 @@ class DPOTrainer(BaseTrainer, ABC):
     def eval(self, model_state: EasyDeLState) -> typing.Iterator[dict]:
         """Evaluate the Given Model State and yield the eval metrics"""
         assert (
-                self.eval_dataset is not None
+            self.eval_dataset is not None
         ), "`dataloader_eval` is required by evaluator function."
         with self.mesh:
             pbar = tqdm(total=self.max_evaluation_steps)
@@ -1266,10 +1273,10 @@ class DPOTrainer(BaseTrainer, ABC):
             chosen_rewards_sum = None
             rejected_rewards_sum = None
             flops_per_device = (
-                    self.calculate_number_total_flops_per_device(
-                        params=self.model_state.params
-                    )
-                    / 1e12
+                self.calculate_number_total_flops_per_device(
+                    params=self.model_state.params
+                )
+                / 1e12
             )
 
             try:
@@ -1280,9 +1287,9 @@ class DPOTrainer(BaseTrainer, ABC):
                         _ = batch.pop(key, None)
                     for key in list(batch.keys()):
                         if not (
-                                key.endswith("_input_ids")
-                                or key.endswith("_attention_mask")
-                                or key.endswith("_labels")
+                            key.endswith("_input_ids")
+                            or key.endswith("_attention_mask")
+                            or key.endswith("_labels")
                         ):
                             _ = batch.pop(key, None)
 
@@ -1310,11 +1317,11 @@ class DPOTrainer(BaseTrainer, ABC):
                     eval_metrics = {
                         "eval/loss": loss.tolist(),
                         "eval/mean_loss": loss_sum
-                                          / (current_step - self.arguments.step_start_point),
+                        / (current_step - self.arguments.step_start_point),
                         "eval/mean_rejected_rewards": rejected_rewards_sum
-                                                      / (current_step - self.arguments.step_start_point),
+                        / (current_step - self.arguments.step_start_point),
                         "eval/mean_chosen_rewards": chosen_rewards_sum
-                                                    / (current_step - self.arguments.step_start_point),
+                        / (current_step - self.arguments.step_start_point),
                         "eval/step": current_step,
                         "eval/step_time": total_time,
                         "eval/perplexity": jnp.exp(loss).tolist(),

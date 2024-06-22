@@ -3,37 +3,41 @@ import os
 import time
 import typing
 
-from flax.core import FrozenDict
 import termcolor
+from flax.core import FrozenDict
 
 try:
     import wandb
 except ModuleNotFoundError:
     wandb = None
 
-import jax
+from typing import Callable, Mapping, Optional, Tuple
+
 import flax
-from tqdm import tqdm
-from jax.sharding import PartitionSpec
+import jax
+from fjformer import make_shard_and_gather_fns, match_partition_rules
 from jax import numpy as jnp
-from fjformer import match_partition_rules, make_shard_and_gather_fns
-from typing import Optional, Tuple, Callable, Mapping
+from jax.sharding import PartitionSpec
+from tqdm.autonotebook import tqdm
+
 from easydel.etils.easystate import EasyDeLState
-from easydel.trainer.base_trainer import BaseTrainer, TrainerConfigureFunctionFuncOutput
 from easydel.etils.errors import EasyDeLTimerError
-from easydel.utils.helpers import prefix_print
-from easydel.trainer.causal_language_model_trainer.modeling_output import CausalLMTrainerOutput
+from easydel.trainer.base_trainer import BaseTrainer, TrainerConfigureFunctionFuncOutput
 from easydel.trainer.causal_language_model_trainer.fwd_bwd_functions import (
-    create_casual_language_model_train_step,
     create_casual_language_model_evaluation_step,
+    create_casual_language_model_train_step,
 )
+from easydel.trainer.causal_language_model_trainer.modeling_output import (
+    CausalLMTrainerOutput,
+)
+from easydel.utils.helpers import prefix_print
 
 
 class CausalLanguageModelTrainer(BaseTrainer):
     def create_collate_function(
-            self,
-            max_sequence_length: int,
-            truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
+        self,
+        max_sequence_length: int,
+        truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> Callable:
         def collate_fn(batch):
             results = {}
@@ -149,11 +153,13 @@ class CausalLanguageModelTrainer(BaseTrainer):
 
         state_shape = jax.eval_shape(initialize_state_function)
         state_partition_spec = match_partition_rules(
-            self.config.get_partition_rules(
-                fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
-            )
-            if self.arguments.custom_rule is None
-            else self.arguments.custom_rule,
+            (
+                self.config.get_partition_rules(
+                    fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
+                )
+                if self.arguments.custom_rule is None
+                else self.arguments.custom_rule
+            ),
             state_shape,
         )
 
@@ -204,15 +210,15 @@ class CausalLanguageModelTrainer(BaseTrainer):
         )
 
     def initialize_state(
-            self,
-            model_parameters: Optional[flax.core.FrozenDict] = None,
-            state: Optional[EasyDeLState] = None,
+        self,
+        model_parameters: Optional[flax.core.FrozenDict] = None,
+        state: Optional[EasyDeLState] = None,
     ) -> Tuple[EasyDeLState, Mapping[str, Callable], Mapping[str, Callable]]:
         if (
-                model_parameters is None
-                and state is None
-                and self.rapture is None
-                and self.checkpoint_path is None
+            model_parameters is None
+            and state is None
+            and self.rapture is None
+            and self.checkpoint_path is None
         ):
             raise RuntimeError(
                 "You are passing `model_parameters=None`, `state=None`, and `checkpoint_path=None` and also you are not"
@@ -266,11 +272,13 @@ class CausalLanguageModelTrainer(BaseTrainer):
                         )
                         state_shape = jax.eval_shape(lambda: sharded_state)
                         state_partition_spec = match_partition_rules(
-                            self.config.get_partition_rules(
-                                fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
-                            )
-                            if self.arguments.custom_rule is None
-                            else self.arguments.custom_rule,
+                            (
+                                self.config.get_partition_rules(
+                                    fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
+                                )
+                                if self.arguments.custom_rule is None
+                                else self.arguments.custom_rule
+                            ),
                             state_shape,
                         )
 
@@ -360,9 +368,9 @@ class CausalLanguageModelTrainer(BaseTrainer):
             return sharded_state, shard_fns, gather_fns
 
     def train(
-            self,
-            model_parameters: Optional[flax.core.FrozenDict] = None,
-            state: Optional[EasyDeLState] = None,
+        self,
+        model_parameters: Optional[flax.core.FrozenDict] = None,
+        state: Optional[EasyDeLState] = None,
     ) -> CausalLMTrainerOutput:
         """The train function is the main function of this module.
         It takes a model_parameters argument which can be used to load a pretrained model and finetune it.
@@ -411,7 +419,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
             model_parameters=model_parameters, state=state
         )
         flops_per_device = (
-                self.calculate_number_total_flops_per_device(params=model_parameters) / 1e12
+            self.calculate_number_total_flops_per_device(params=model_parameters) / 1e12
         )
         count_model_parameters(sharded_state.params)
         with self.mesh:
@@ -422,13 +430,13 @@ class CausalLanguageModelTrainer(BaseTrainer):
             pbar.update(sharded_state.step.tolist())  # type: ignore
             if self.wandb_runtime is not None:
                 model_parameters_number = (
-                        sum(
-                            n.size
-                            for n in jax.tree_util.tree_flatten(
-                                flax.core.unfreeze(sharded_state.params)
-                            )[0]
-                        )
-                        / 1e9
+                    sum(
+                        n.size
+                        for n in jax.tree_util.tree_flatten(
+                            flax.core.unfreeze(sharded_state.params)
+                        )[0]
+                    )
+                    / 1e9
                 )
                 self.wandb_runtime.log(
                     {"Number of Model Parameters (Billion)": model_parameters_number}
@@ -441,7 +449,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
                 for epoch in range(self.arguments.num_train_epochs):
                     time_start = time.time()
                     for _ in range(
-                            self.max_training_steps // self.arguments.num_train_epochs
+                        self.max_training_steps // self.arguments.num_train_epochs
                     ):
                         try:
                             batch = next(train_iter)
@@ -450,8 +458,8 @@ class CausalLanguageModelTrainer(BaseTrainer):
                             batch = next(train_iter)
                         current_step += 1
                         if (
-                                self.arguments.step_start_point is not None
-                                and self.arguments.step_start_point > current_step
+                            self.arguments.step_start_point is not None
+                            and self.arguments.step_start_point > current_step
                         ):
                             pbar.update(1)
                         elif current_step < self.max_training_steps:
@@ -487,10 +495,10 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                     else accuracy_sum + accuracy
                                 )
                                 mean_loss = loss_sum / (
-                                        current_step - self.arguments.step_start_point
+                                    current_step - self.arguments.step_start_point
                                 )
                                 mean_accuracy = accuracy_sum / (
-                                        current_step - self.arguments.step_start_point
+                                    current_step - self.arguments.step_start_point
                                 )
                                 perplexity = jnp.exp(loss)
                                 calculating_metrics_end = time.time()
@@ -541,36 +549,36 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                         {
                                             f"grad_norm/{layer_name}": grad_norm.tolist()
                                             for layer_name, grad_norm in get_layer_names(
-                                            metrics["grad_norms"]
-                                        ).items()
+                                                metrics["grad_norms"]
+                                            ).items()
                                         }
                                     )
                                 train_metrics.update(
                                     {
                                         "time_cal/calculating_metrics_step_time": (
-                                                calculating_metrics_end
-                                                - calculating_metrics_start
+                                            calculating_metrics_end
+                                            - calculating_metrics_start
                                         )
                                     }
                                 )
                                 train_metrics.update(self.arguments.captured_memory)
                             if (
-                                    self.wandb_runtime is not None
-                                    and not self.arguments.performance_mode
+                                self.wandb_runtime is not None
+                                and not self.arguments.performance_mode
                             ):
                                 with jax.spmd_mode("allow_all"):
                                     self.wandb_runtime.log(train_metrics)
                             if self.arguments.training_time is not None:
                                 if (
-                                        time.time() - start_time
-                                        > self.arguments.training_time
+                                    time.time() - start_time
+                                    > self.arguments.training_time
                                 ):
                                     raise EasyDeLTimerError("Time Out")
                         else:
                             break
                         if (
-                                self.arguments.save_steps is not None
-                                and current_step % self.arguments.save_steps == 0
+                            self.arguments.save_steps is not None
+                            and current_step % self.arguments.save_steps == 0
                         ):
                             if self.rapture is None:
                                 filename = self._save_state(
@@ -608,8 +616,8 @@ class CausalLanguageModelTrainer(BaseTrainer):
                     force_color=True,
                 )
             if (
-                    self.arguments.merge_lora_rapture_parameters
-                    and self.rapture is not None
+                self.arguments.merge_lora_rapture_parameters
+                and self.rapture is not None
             ):
                 print(
                     termcolor.colored("Info : ", color="red", force_color=True),
@@ -630,11 +638,13 @@ class CausalLanguageModelTrainer(BaseTrainer):
             if self.arguments.save_steps is None or self.arguments.do_last_save:
                 shard_fns, gather_fns = make_shard_and_gather_fns(
                     match_partition_rules(
-                        self.config.get_partition_rules(
-                            fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
-                        )
-                        if self.arguments.custom_rule is None
-                        else self.arguments.custom_rule,
+                        (
+                            self.config.get_partition_rules(
+                                fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
+                            )
+                            if self.arguments.custom_rule is None
+                            else self.arguments.custom_rule
+                        ),
                         jax.eval_shape(lambda: sharded_state),
                     ),
                     mesh=self.mesh,
@@ -656,7 +666,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
     def eval(self, model_state: EasyDeLState) -> typing.Iterator[dict]:
         """Evaluate the Given Model State and yield the eval metrics"""
         assert (
-                self.dataloader_eval is not None
+            self.dataloader_eval is not None
         ), "`dataloader_eval` is required by evaluator function."
         with self.mesh:
             pbar = tqdm(total=self.max_evaluation_steps)
@@ -666,8 +676,8 @@ class CausalLanguageModelTrainer(BaseTrainer):
             accuracy_sum = None
 
             flops_per_device = (
-                    self.calculate_number_total_flops_per_device(params=model_state.params)
-                    / 1e12
+                self.calculate_number_total_flops_per_device(params=model_state.params)
+                / 1e12
             )
             try:
                 eval_iter = iter(self.dataloader_eval)
@@ -696,9 +706,9 @@ class CausalLanguageModelTrainer(BaseTrainer):
                     eval_metrics = {
                         "eval/loss": loss.tolist(),
                         "eval/mean_loss": loss_sum
-                                          / (current_step - self.arguments.step_start_point),
+                        / (current_step - self.arguments.step_start_point),
                         "eval/mean_accuracy_sum": accuracy_sum
-                                                  / (current_step - self.arguments.step_start_point),
+                        / (current_step - self.arguments.step_start_point),
                         "eval/step": current_step,
                         "eval/step_time": total_time,
                         "eval/perplexity": jnp.exp(loss).tolist(),
