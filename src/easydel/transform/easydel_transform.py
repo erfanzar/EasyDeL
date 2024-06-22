@@ -1,21 +1,21 @@
 import gc
+import os
 import re
+from typing import Callable, List, Mapping, Optional, Union
 
 import fjformer
 import jax
+import msgpack
 import numpy
 import transformers
-from flax import traverse_util
-
-from flax.traverse_util import flatten_dict
-from flax.serialization import from_bytes, to_bytes, to_state_dict
-import msgpack
-import os
-from jax import numpy as jnp
-from typing import List, Optional, Mapping, Callable, Union
-from tqdm import tqdm
-from easydel.etils.etils import get_logger
 from fjformer.checkpoint import get_dtype
+from flax import traverse_util
+from flax.serialization import from_bytes, to_bytes, to_state_dict
+from flax.traverse_util import flatten_dict
+from jax import numpy as jnp
+from tqdm.autonotebook import tqdm
+
+from easydel.etils.etils import get_logger
 
 logger = get_logger(__name__)
 
@@ -299,7 +299,9 @@ def easystate_to_torch(
             .replace(".embedding", ".weight")
             .replace(".scale", ".weight")
         )
-        torch_state_dict[key] = torch.from_numpy(numpy.asarray(jax.device_get(tensor)))
+        tensor = jax.device_get(tensor)
+        torch_state_dict[key] = torch.from_numpy(numpy.asarray(tensor))
+        del tensor
     return torch_state_dict
 
 

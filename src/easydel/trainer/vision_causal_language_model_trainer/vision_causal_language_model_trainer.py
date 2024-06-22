@@ -2,6 +2,7 @@ import copy
 import os
 import time
 import typing
+
 import termcolor
 
 try:
@@ -9,30 +10,32 @@ try:
 except ModuleNotFoundError:
     wandb = None
 
-import jax
-import flax
-from tqdm import tqdm
-from jax.sharding import PartitionSpec
-from jax import numpy as jnp
-from fjformer import (
-    match_partition_rules,
-    make_shard_and_gather_fns,
-)
-from typing import Optional, Callable, Mapping
-import chex
+from typing import Callable, Mapping, Optional
 
-from easydel.etils.errors import EasyDeLTimerError
+import chex
+import flax
+import jax
+from fjformer import (
+    make_shard_and_gather_fns,
+    match_partition_rules,
+)
+from jax import numpy as jnp
+from jax.sharding import PartitionSpec
+from tqdm.autonotebook import tqdm
+
 from easydel.etils.easystate import EasyDeLState
+from easydel.etils.errors import EasyDeLTimerError
 from easydel.trainer.base_trainer import TrainerConfigureFunctionFuncOutput
 from easydel.trainer.causal_language_model_trainer import CausalLanguageModelTrainer
-from easydel.utils import prefix_print
-
 from easydel.trainer.vision_causal_language_model_trainer.fwd_bwd_functions import (
+    VisionCausalLanguageModelStepOutput,
     create_vision_casual_language_model_evaluation_step,
     create_vision_casual_language_model_train_step,
-    VisionCausalLanguageModelStepOutput,
 )
-from easydel.trainer.vision_causal_language_model_trainer.modelling_output import VisionCausalLMTrainerOutput
+from easydel.trainer.vision_causal_language_model_trainer.modelling_output import (
+    VisionCausalLMTrainerOutput,
+)
+from easydel.utils import prefix_print
 
 
 class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
@@ -157,11 +160,13 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
         state_shape = jax.eval_shape(initialize_state_function)
 
         state_partition_spec = match_partition_rules(
-            self.config.get_partition_rules(
-                fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
-            )
-            if self.arguments.custom_rule is None
-            else self.arguments.custom_rule,
+            (
+                self.config.get_partition_rules(
+                    fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
+                )
+                if self.arguments.custom_rule is None
+                else self.arguments.custom_rule
+            ),
             state_shape,
         )
         spec_named_sharding = self.specs_to_name_sharding(state_partition_spec)
@@ -273,11 +278,13 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
                         # )
                         state_shape = jax.eval_shape(lambda: sharded_state)
                         state_partition_spec = match_partition_rules(
-                            self.config.get_partition_rules(
-                                fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
-                            )
-                            if self.arguments.custom_rule is None
-                            else self.arguments.custom_rule,
+                            (
+                                self.config.get_partition_rules(
+                                    fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
+                                )
+                                if self.arguments.custom_rule is None
+                                else self.arguments.custom_rule
+                            ),
                             state_shape,
                         )
                         spec_named_sharding = self.specs_to_name_sharding(
@@ -606,11 +613,13 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
             if self.arguments.save_steps is None and self.arguments.do_last_save:
                 shard_fns, gather_fns = make_shard_and_gather_fns(
                     match_partition_rules(
-                        self.config.get_partition_rules(
-                            fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
-                        )
-                        if self.arguments.custom_rule is None
-                        else self.arguments.custom_rule,
+                        (
+                            self.config.get_partition_rules(
+                                fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
+                            )
+                            if self.arguments.custom_rule is None
+                            else self.arguments.custom_rule
+                        ),
                         jax.eval_shape(lambda: sharded_state),
                     ),
                     mesh=self.mesh,
