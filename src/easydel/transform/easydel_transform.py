@@ -299,9 +299,8 @@ def easystate_to_torch(
             .replace(".embedding", ".weight")
             .replace(".scale", ".weight")
         )
-        tensor = jax.device_get(tensor)
-        torch_state_dict[key] = torch.from_numpy(numpy.asarray(tensor))
-        del tensor
+        torch_state_dict[key] = torch.from_numpy(numpy.asarray(jax.device_get(tensor)))
+
     return torch_state_dict
 
 
