@@ -299,10 +299,7 @@ def easystate_to_torch(
             .replace(".embedding", ".weight")
             .replace(".scale", ".weight")
         )
-        try:
-            torch_state_dict[key] = torch.from_numpy(tensor)
-        except TypeError:
-            torch_state_dict[key] = torch.from_numpy(numpy.array(tensor.tolist()))
+        torch_state_dict[key] = torch.from_numpy(numpy.asarray(jax.device_get(tensor)))
     return torch_state_dict
 
 
