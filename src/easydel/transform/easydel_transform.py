@@ -265,8 +265,6 @@ def easystate_to_torch(
     select_params_field: bool = True,
     rnn_based_or_rwkv: bool = False,
 ):
-    import torch
-
     if transpose_needed is None:
         transpose_needed = ["kernel"]
     if transpose_not_needed is None:
@@ -295,14 +293,17 @@ def easystate_to_torch(
             tensor = tensor.T
         elif rnn_based_or_rwkv and ("time_mix_" in key or "time_" in key):
             tensor = tensor.reshape(1, 1, -1)
-        tensor = tensor.astype(get_dtype(dtype))
+        if tensor.dtype != get_dtype(dtype):
+            tensor = tensor.astype(
+                get_dtype(dtype)
+            )  # ignores double allocation on GPUs
         key = (
             key.replace(".kernel", ".weight")
             .replace(".embedding", ".weight")
             .replace(".scale", ".weight")
         )
 
-        torch_state_dict[key] =jax2pt(tensor)
+        torch_state_dict[key] = jax2pt(tensor)
 
     return torch_state_dict
 
