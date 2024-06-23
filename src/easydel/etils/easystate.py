@@ -426,7 +426,11 @@ class EasyDeLState(struct.PyTreeNode):
                     verbose=verbose,
                 )
             checkpoint["params"] = jax.tree_map(
-                lambda x: jax.lax.convert_element_type(x, param_dtype),
+                lambda x: (
+                    jax.lax.convert_element_type(x, param_dtype)
+                    if (hasattr(x, "dtype") and x.dtype != param_dtype)
+                    else x
+                ),
                 checkpoint["params"],
             )
             hyperparameters = checkpoint.get("hyperparameters")
