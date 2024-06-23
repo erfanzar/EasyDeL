@@ -194,7 +194,6 @@ class GenerationPipeline:
         position_ids: Optional[jax.Array] = None,
         echo: bool = False,
     ):
-
         paxis = self.model.config.partition_axis
         mesh = self.mesh
         eos_token_id = jnp.array(self.generation_config.eos_token_id, dtype=jnp.int32)
@@ -394,7 +393,6 @@ class GenerationPipeline:
                 else generation_state.running_token
             )
             if self.state_sample is None:
-
                 state_sharding = SampleState(
                     self.empty_sharding,
                     self.input_sharding,
@@ -436,13 +434,27 @@ class GenerationPipeline:
                 )
             # else:
             #     generation_state = self._shard_state(generation_state)  # noqa
-            while sample_search_cond_fn(generation_state):
-                generation_state = self.state_sample(self.params, generation_state)
-                yield (
-                    generation_state.sequences[:, cur_len : generation_state.cur_len]
-                    if echo
-                    else generation_state.running_token
-                )
+            # while sample_search_cond_fn(generation_state):
+            #     generation_state = self.state_sample(self.params, generation_state)
+            #     if generation_state
+            #     yield (
+            #         generation_state.sequences[:, cur_len : generation_state.cur_len]
+            #         if echo
+            #         else generation_state.running_token
+            #     )
+
+            while True:
+                if sample_search_cond_fn(generation_state):
+                    yield (
+                        generation_state.sequences[
+                            :, cur_len : generation_state.cur_len
+                        ]
+                        if echo
+                        else generation_state.running_token
+                    )
+                    generation_state = self.state_sample(self.params, generation_state)
+                else:
+                    break
             del generation_state.model_kwargs
             del generation_state.sequences
             del generation_state.running_token
