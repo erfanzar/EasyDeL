@@ -1,26 +1,33 @@
 import gc
+import os
+import sys
 import unittest
 from unittest import TestCase
+
 from fjformer import make_shard_and_gather_fns, match_partition_rules
 
 try:
-    import src.easydel as ed
+    import easydel as ed
 except ModuleNotFoundError:
-    import sys
-    from pathlib import Path
+    dirname = os.path.dirname(os.path.abspath(__file__))
+    sys.path.append(dirname)  # noqa: E402
+    sys.path.append(
+        os.path.join(
+            dirname,
+            "../src",
+        )
+    )
+    import easydel as ed
 
-    cp = Path.cwd().__str__()
-    sys.path.append(cp)
-    import src.easydel as ed
-
-from jax import numpy as jnp
-import torch
-import numpy as np
-from fjformer.functions import cross_entropy_loss_and_accuracy
 import copy
+from typing import Dict, Literal, Optional, Union
+
 import jax
+import numpy as np
+import torch
 import transformers
-from typing import Optional, Dict, Union, Literal
+from fjformer.functions import cross_entropy_loss_and_accuracy
+from jax import numpy as jnp
 
 torch.manual_seed(42)
 
@@ -302,14 +309,14 @@ class EasyModelsTest(TestCase):
         )
         for k, v in self.__dict__.items():
             if isinstance(
-                    v,
-                    (
-                            bool,
-                            str,
-                            float,
-                            type(None),
-                            int,
-                    ),
+                v,
+                (
+                    bool,
+                    str,
+                    float,
+                    type(None),
+                    int,
+                ),
             ):
                 try:
                     setattr(conf, k, v)
@@ -398,14 +405,14 @@ class EasyModelsTest(TestCase):
         )
         for k, v in self.__dict__.items():
             if isinstance(
-                    v,
-                    (
-                            bool,
-                            str,
-                            float,
-                            type(None),
-                            int,
-                    ),
+                v,
+                (
+                    bool,
+                    str,
+                    float,
+                    type(None),
+                    int,
+                ),
             ):
                 setattr(conf, k, v)
         res, err = self.create_test_for_models(
@@ -426,14 +433,14 @@ class EasyModelsTest(TestCase):
         )
         for k, v in self.__dict__.items():
             if isinstance(
-                    v,
-                    (
-                            bool,
-                            str,
-                            float,
-                            type(None),
-                            int,
-                    ),
+                v,
+                (
+                    bool,
+                    str,
+                    float,
+                    type(None),
+                    int,
+                ),
             ):
                 setattr(conf, k, v)
         conf._attn_implementation = "eager"
@@ -477,14 +484,14 @@ class EasyModelsTest(TestCase):
         )
         for k, v in self.__dict__.items():
             if isinstance(
-                    v,
-                    (
-                            bool,
-                            str,
-                            float,
-                            type(None),
-                            int,
-                    ),
+                v,
+                (
+                    bool,
+                    str,
+                    float,
+                    type(None),
+                    int,
+                ),
             ):
                 setattr(conf, k, v)
         res, err = self.create_test_for_models(
@@ -548,7 +555,7 @@ class EasyModelsTest(TestCase):
 
     @staticmethod
     def compare_torch_to_jax(
-            name, hf_out, ed_out, ed_loss, atol: float = 1e-035, rtol: float = 1e-08
+        name, hf_out, ed_out, ed_loss, atol: float = 1e-035, rtol: float = 1e-08
     ):
         to, jo = hf_out.logits.cpu().detach().numpy(), ed_out.logits
         err = jnp.mean(to - jo)
@@ -583,3 +590,6 @@ class EasyModelsTest(TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+    # test = EasyModelsTest()
+    # test.setUp()
+    # test.test_llama()
