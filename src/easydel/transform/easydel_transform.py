@@ -350,5 +350,5 @@ def easystate_to_huggingface_model(
         model = base_huggingface_module(
             config=config, **base_huggingface_module_kwarguments
         )
-    model.load_state_dict(state_dict)
+    model.load_state_dict(state_dict, assign=True, strict=True)
     return model
