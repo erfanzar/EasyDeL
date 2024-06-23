@@ -14,7 +14,7 @@ from flax.serialization import from_bytes, to_bytes, to_state_dict
 from flax.traverse_util import flatten_dict
 from jax import numpy as jnp
 from tqdm.autonotebook import tqdm
-
+from easydel.transform.utils import pt2jax, jax2pt
 from easydel.etils.etils import get_logger
 
 logger = get_logger(__name__)
@@ -129,10 +129,12 @@ def huggingface_to_easydel(
             def _clear():
                 gc.collect()
                 torch.cuda.empty_cache()
+
         else:
 
             def _clear():
                 gc.collect()
+
     except ModuleNotFoundError:
 
         def _clear():
@@ -175,9 +177,9 @@ def huggingface_to_easydel(
                         continue
 
             # Convert tensor to jax.numpy.array and delete the tensor to free memory
-            array = jax.lax.convert_element_type(
-                jnp.asarray(tensor.cpu().detach().numpy()), dtype
-            )
+            if tensor.dtype == torch.bfloat16:
+                tensor = tensor.float()
+            array = jax.lax.convert_element_type(pt2jax(tensor), dtype)
             if remove_state_dict:
                 del tensor
                 _clear()
@@ -299,7 +301,8 @@ def easystate_to_torch(
             .replace(".embedding", ".weight")
             .replace(".scale", ".weight")
         )
-        torch_state_dict[key] = torch.from_numpy(numpy.asarray(jax.device_get(tensor)))
+
+        torch_state_dict[key] = torch.from_numpy(jax2pt(tensor))
 
     return torch_state_dict
 
