@@ -19,6 +19,7 @@ from easydel.etils.etils import AVAILABLE_SCHEDULERS, AVAILABLE_OPTIMIZERS
 from easydel.etils.errors import EasyDeLRuntimeError
 from jax.sharding import Mesh, PartitionSpec
 from jax import numpy as jnp
+import gc
 
 TYPE_SEP = "<*TYPE*>"
 VALUE_SEP = "<*VALUE*>"
@@ -446,8 +447,10 @@ class EasyDeLState(struct.PyTreeNode):
 
                 x = checkpoint["params"][k]
                 if hasattr(x, "dtype") and x.dtype != param_dtype:
-                    x = jax.lax.convert_element_type(x, param_dtype)
-                    checkpoint["params"][k] = x
+                    x_converted = jax.lax.convert_element_type(x, param_dtype)
+                    checkpoint["params"][k] = x_converted
+                    del x
+                    gc.collect()
 
             checkpoint["params"] = unflatten_dict(checkpoint["params"])
             hyperparameters = checkpoint.get("hyperparameters")
