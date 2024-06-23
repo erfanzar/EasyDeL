@@ -302,7 +302,7 @@ def easystate_to_torch(
             .replace(".scale", ".weight")
         )
 
-        torch_state_dict[key] = torch.from_numpy(jax2pt(tensor))
+        torch_state_dict[key] =jax2pt(tensor)
 
     return torch_state_dict
 
