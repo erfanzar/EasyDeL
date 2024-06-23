@@ -42,6 +42,7 @@ def jax2pt(x: jax.Array):
         dl_pack_jax = dlpack.to_dlpack(
             x,
             stream=True if (_jax_device == "gpu" and not cpu_force) else None,
+            src_device=list(x.devices())[0],
         )
     else:
         device = os.environ.get("EASYDEL_PERFRED_HOST_COPY", "cpu")
