@@ -344,8 +344,11 @@ def easystate_to_huggingface_model(
         select_params_field=select_params_field,
         rnn_based_or_rwkv=rnn_based_or_rwkv,
     )
-    model = base_huggingface_module(
-        config=config, **base_huggingface_module_kwarguments
-    )
+    import torch
+
+    with torch.device("meta"):
+        model = base_huggingface_module(
+            config=config, **base_huggingface_module_kwarguments
+        )
     model.load_state_dict(state_dict)
     return model
