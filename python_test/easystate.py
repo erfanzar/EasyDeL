@@ -1,5 +1,16 @@
 import jax
+import sys
 
+import os
+
+dirname = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(dirname)  # noqa: E402
+sys.path.append(
+    os.path.join(
+        dirname,
+        "../src",
+    )
+)
 from easydel import LlamaConfig, FlaxLlamaForCausalLM
 from easydel import EasyDeLState
 from easydel.etils.auto_tx import get_optimizer_and_scheduler
@@ -18,11 +29,13 @@ def main():
     module = FlaxLlamaForCausalLM(
         config=config,
         input_shape=(8, 8),
-        _do_init=True
+        dtype=jax.numpy.float32,
+        param_dtype=jax.numpy.float32,
+        _do_init=True,
     )
     # print(module.params)
     state = module.to_easydel_state(module.params)
-    state = state.to_8bit()
+    # state = state.to_8bit()
     state.save_state("state.easy")
 
 
@@ -30,16 +43,17 @@ def load():
     state = EasyDeLState.load_state(
         "state.easy",
         init_optimizer_state=False,
-        verbose=True
+        verbose=True,
+        param_dtype=jax.numpy.float16,
     )
     # print(jax.eval_shape(lambda: state))
-    print(state)
-    print("-" * 50)
-    state.serialize()
-    print(state)
-    print("-" * 50)
-    state.un_serialize()
-    print(state)
+    # print(state)
+    # print("-" * 50)
+    # state.serialize()
+    # print(state)
+    # print("-" * 50)
+    # state.un_serialize()
+    # print(state)
 
 
 def eval_shape_create_test():
@@ -52,18 +66,9 @@ def eval_shape_create_test():
         use_scan_mlp=False,
     )
 
-    module = FlaxLlamaForCausalLM(
-        config=config,
-        input_shape=(8, 8),
-        _do_init=True
-    )
+    module = FlaxLlamaForCausalLM(config=config, input_shape=(8, 8), _do_init=True)
 
-    tx_init = dict(
-        optimizer="adamw",
-        scheduler="none",
-        learning_rate=1e-5,
-        steps=5000
-    )
+    tx_init = dict(optimizer="adamw", scheduler="none", learning_rate=1e-5, steps=5000)
 
     def create_state():
         state = EasyDeLState.create(
@@ -72,9 +77,11 @@ def eval_shape_create_test():
             tx_init=tx_init,
             apply_fn=module.__call__,
             tx=get_optimizer_and_scheduler(**tx_init)[0],
-            hyperparameters=EasyDeLState.create_hyperparameters(model_type=config.model_type),
+            hyperparameters=EasyDeLState.create_hyperparameters(
+                model_type=config.model_type
+            ),
             module=module,
-            module_config_args=None
+            module_config_args=None,
         )
         return state
 
