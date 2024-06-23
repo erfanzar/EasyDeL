@@ -2,7 +2,7 @@ import functools
 import math
 from functools import partial
 from typing import List, Literal, Optional, Sequence
-
+import einops
 import chex
 import fjformer
 import jax
@@ -39,7 +39,7 @@ ACT2FN = {
 
 
 def canonicalize_dtype(
-        *args, dtype: Optional[chex.ArrayDType] = None, inexact: bool = True
+    *args, dtype: Optional[chex.ArrayDType] = None, inexact: bool = True
 ) -> chex.ArrayDType:
     """Canonicalize an optional dtype to the definitive dtype.
 
@@ -189,23 +189,23 @@ def repeat_kv_bsnh(x: chex.Array, n_rep: int) -> chex.Array:
 
 
 def precompute_freq_cis(
-        dim,
-        max_position_embeddings=2048,
-        base=10000,
-        scaling_factor=1.0,
-        rope_type: Optional[
-            Literal[
-                "none",
-                "linear",
-                "dynamic",
-                "yarn",
-                "su",
-            ]
-        ] = None,
-        t_dtype: jnp.dtype = jnp.int32,
-        original_max_position_embeddings: Optional[int] = None,
-        long_factor: Optional[List[float]] = None,
-        short_factor: Optional[List[float]] = None,
+    dim,
+    max_position_embeddings=2048,
+    base=10000,
+    scaling_factor=1.0,
+    rope_type: Optional[
+        Literal[
+            "none",
+            "linear",
+            "dynamic",
+            "yarn",
+            "su",
+        ]
+    ] = None,
+    t_dtype: jnp.dtype = jnp.int32,
+    original_max_position_embeddings: Optional[int] = None,
+    long_factor: Optional[List[float]] = None,
+    short_factor: Optional[List[float]] = None,
 ):
     def _calc_yarn_scaling_factor(scale):
         if scale <= 1.0:
@@ -227,7 +227,7 @@ def precompute_freq_cis(
     if rope_type is None or rope_type == "none":
         t = jax.numpy.arange(max_position_embeddings, dtype=t_dtype)
         inv_freq = 1.0 / (
-                base ** (jax.numpy.arange(0, dim, 2, dtype=jax.numpy.float32) / dim)
+            base ** (jax.numpy.arange(0, dim, 2, dtype=jax.numpy.float32) / dim)
         )
         freq = jax.numpy.einsum("i , j -> i j", t, inv_freq).astype("float32")
         embed = jax.numpy.concatenate((freq, freq), axis=-1)
@@ -236,7 +236,7 @@ def precompute_freq_cis(
         t = jax.numpy.arange(max_position_embeddings, dtype=t_dtype)
         t = t / scaling_factor
         inv_freq = 1.0 / (
-                base ** (jax.numpy.arange(0, dim, 2, dtype=jax.numpy.float32) / dim)
+            base ** (jax.numpy.arange(0, dim, 2, dtype=jax.numpy.float32) / dim)
         )
         freq = jax.numpy.einsum("i , j -> i j", t, inv_freq).astype("float32")
 
@@ -246,7 +246,7 @@ def precompute_freq_cis(
         t = jax.numpy.arange(max_position_embeddings, dtype=t_dtype)
         base = base * (scaling_factor - (scaling_factor - 1)) ** (dim / (dim - 2))
         inv_freq = 1.0 / (
-                base ** (jax.numpy.arange(0, dim, 2, dtype=jax.numpy.float32) / dim)
+            base ** (jax.numpy.arange(0, dim, 2, dtype=jax.numpy.float32) / dim)
         )
         freq = jax.numpy.einsum("i , j -> i j", t, inv_freq).astype("float32")
 
@@ -254,7 +254,7 @@ def precompute_freq_cis(
         return jax.numpy.sin(embed)[:, :], jax.numpy.cos(embed)[:, :]
     elif rope_type == "su":
         assert (
-                original_max_position_embeddings is not None
+            original_max_position_embeddings is not None
         ), "No original max position embeddings is provided"
         if max_position_embeddings > original_max_position_embeddings:
             ext_factors = jnp.array(long_factor, dtype=jnp.float32)
@@ -262,12 +262,12 @@ def precompute_freq_cis(
             ext_factors = jnp.array(short_factor, dtype=jnp.float32)
 
         inv_freq = (
-                1.0
-                / (
-                          ext_factors
-                          * base
-                          ** (jnp.arange(0, dim, 2, dtype=t_dtype).astype(jnp.float32) / dim)
-                  )[None, :, None]
+            1.0
+            / (
+                ext_factors
+                * base
+                ** (jnp.arange(0, dim, 2, dtype=t_dtype).astype(jnp.float32) / dim)
+            )[None, :, None]
         )
         position_ids = (
             jnp.arange(0, max_position_embeddings, dtype="i4")
@@ -284,7 +284,7 @@ def precompute_freq_cis(
         return sin[0], cos[0]
     elif rope_type == "yarn":
         assert (
-                original_max_position_embeddings is not None
+            original_max_position_embeddings is not None
         ), "No original max position embeddings is provided"
         if max_position_embeddings > original_max_position_embeddings:
             ext_factors = jnp.array(long_factor, dtype=jnp.float32)
@@ -292,12 +292,12 @@ def precompute_freq_cis(
             ext_factors = jnp.array(short_factor, dtype=jnp.float32)
 
         inv_freq = (
-                1.0
-                / (
-                          ext_factors
-                          * base
-                          ** (jnp.arange(0, dim, 2, dtype=t_dtype).astype(jnp.float32) / dim)
-                  )[None, :, None]
+            1.0
+            / (
+                ext_factors
+                * base
+                ** (jnp.arange(0, dim, 2, dtype=t_dtype).astype(jnp.float32) / dim)
+            )[None, :, None]
         )
         position_ids = (
             jnp.arange(0, max_position_embeddings, dtype="i4")
@@ -328,7 +328,7 @@ def rotate_half(x):
         A new array that is the same as the input
     """
     x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2:]
+    x2 = x[..., x.shape[-1] // 2 :]
     return jax.numpy.concatenate((-x2, x1), axis=-1)
 
 
@@ -374,9 +374,9 @@ def get_ranks_and_size(mesh):
 
 
 def create_mesh(
-        axis_dims: Sequence[int] = (1, -1, 1, 1),
-        axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-        backend="",
+    axis_dims: Sequence[int] = (1, -1, 1, 1),
+    axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+    backend="",
 ):
     """The create_mesh function creates a mesh object that can be used to shard arrays.
 
@@ -417,8 +417,8 @@ def add_start_docstrings(*docstr):
 
 
 def get_dot_general_by_bits(
-        bits: Optional[int] = None,
-        mode: Literal["train", "serve", "convert"] = EasyMethod.TRAIN,
+    bits: Optional[int] = None,
+    mode: Literal["train", "serve", "convert"] = EasyMethod.TRAIN,
 ) -> dict:
     """The get_general_dot function is a helper function that returns a q_flax.QDotGeneral object
     with the specified number of bits for forward and backward passes. If no bits are specified,
@@ -651,6 +651,19 @@ class BaseJAXAttentionModule(nn.Module):
             cache_index.value = cache_index.value + num_updated_cache_vectors
         return key, value, attention_mask
 
+    def repeat_key_value(self, key, value, num_reps: int):
+        key = einops.repeat(
+            key,
+            "b s h d -> b s (h r) d",
+            r=num_reps,
+        )
+        value = einops.repeat(
+            value,
+            "b s h d -> b s (h r) d",
+            r=num_reps,
+        )
+        return key, value
+
 
 def block_wise_ffn(remat_ffn, inputs, chunk_size: int, deterministic: bool):
     generating = inputs.shape[1] == 1
@@ -795,11 +808,11 @@ def quantize_kv_cache(fdata, reformat: bool = True):
 
 @partial(jax.jit, static_argnames=["float_dtype", "reformat"])
 def dequantize_kv_cache(
-        array_quant: jax.Array,
-        scale: jax.Array,
-        zero: jax.Array,
-        float_dtype: jnp.dtype = jnp.float16,
-        reformat: bool = True,
+    array_quant: jax.Array,
+    scale: jax.Array,
+    zero: jax.Array,
+    float_dtype: jnp.dtype = jnp.float16,
+    reformat: bool = True,
 ):
     """
     The function `dequantize` takes a quantized array, scale, minimum values, and float data

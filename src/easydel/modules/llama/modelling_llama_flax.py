@@ -180,22 +180,10 @@ class FlaxLlamaAttention(BaseJAXAttentionModule):
         Returns:
             A tuple of 3 tensors: query, key and value
         """
-        query = query.reshape(
-            batch_size, sequence_length, self.config.num_attention_heads, self.head_dim
-        )
-        key = key.reshape(
-            batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim
-        )
-        value = value.reshape(
-            batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim
-        )
-
         query, key, value = self._transpose_sequence_head(query, key, value)
         query, key = self.rotary(
             position_ids=position_ids, query=query, key=key, freq_cis=freq_cis
         )
-        key = repeat_kv_bnsh(key, self.num_key_value_groups)
-        value = repeat_kv_bnsh(value, self.num_key_value_groups)
         return self._transpose_sequence_head(query, key, value)
 
     def __call__(
@@ -265,16 +253,6 @@ class FlaxLlamaAttention(BaseJAXAttentionModule):
             sequence_length=sequence_length,
         )
 
-        assert_msg = (
-            "num_attention_heads repeat wont work likely\n"
-            f"INFO :\n\trepeat_kv_bnsh Used with num_key_value_groups = {self.num_key_value_groups}\n\t"
-            f"NH : {self.config.num_attention_heads} KVH : {self.config.num_attention_heads}"
-        )
-
-        assert query_states.shape[-2] == self.config.num_attention_heads, assert_msg
-        assert key_states.shape[-2] == self.config.num_attention_heads, assert_msg
-        assert value_states.shape[-2] == self.config.num_attention_heads, assert_msg
-
         query_length, key_length = query_states.shape[1], key_states.shape[1]
 
         if self.has_variable("cache", "cached_key"):
@@ -306,7 +284,18 @@ class FlaxLlamaAttention(BaseJAXAttentionModule):
             key_states, value_states, attention_mask = self._concatenate_to_cache(
                 key_states, value_states, query_states, attention_mask
             )
+        key_states, value_states = self.repeat_key_value(
+            key_states, value_states, self.num_key_value_groups
+        )
+        assert_msg = (
+            "num_attention_heads repeat wont work likely\n"
+            f"INFO :\n\trepeat_kv_bnsh Used with num_key_value_groups = {self.num_key_value_groups}\n\t"
+            f"NH : {self.config.num_attention_heads} KVH : {self.config.num_attention_heads}"
+        )
 
+        assert query_states.shape[-2] == self.config.num_attention_heads, assert_msg
+        assert key_states.shape[-2] == self.config.num_attention_heads, assert_msg
+        assert value_states.shape[-2] == self.config.num_attention_heads, assert_msg
         # if self.config.use_sharding_constraint:
         #     query_states = with_sharding_constraint(
         #         query_states, PartitionSpec(("dp", "fsdp"), "sp" if query_states.shape[1] != 1 else None, "tp", None)

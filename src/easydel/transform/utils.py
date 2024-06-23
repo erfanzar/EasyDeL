@@ -1,8 +1,10 @@
-from fjformer.checkpoint import float_tensor_to_dtype, CheckpointManager
-from flax.traverse_util import flatten_dict
-import jax
-from jax import dlpack
 import os
+from typing import Optional
+
+import jax
+from fjformer.checkpoint import CheckpointManager, float_tensor_to_dtype
+from flax.traverse_util import flatten_dict
+from jax import dlpack
 
 
 def match_keywords(string, positives, negatives):
@@ -33,8 +35,8 @@ def get_pytorch_model_and_config_by_type(): ...
 
 
 def jax2pt(x: jax.Array):
-    from torch.utils import dlpack as dlpack_pt
     from torch import cuda
+    from torch.utils import dlpack as dlpack_pt
 
     _jax_device = list(x.devices())[0].platform
     cpu_force = not cuda.is_available()
@@ -64,16 +66,41 @@ def jax2pt(x: jax.Array):
     return dlpack_pt.from_dlpack(dl_pack_jax)
 
 
-def pt2jax(x):
+def pt2jax(x, transpose_raw: Optional[tuple] = None):
     from torch.utils import dlpack as dlpack_pt
 
-    org_shape = x.shape
-    if org_shape[0] == 1 and len(org_shape) > 1:
-        x = x.view(org_shape[1:])  # Prevent Major-to-Major BUG.
-
-    device = os.environ.get("EASYDEL_PERFRED_HOST_PUT", "none")
-    device = None if device.lower() == "none" else device  # Auto JAX Select
-    return dlpack.from_dlpack(
-        dlpack_pt.to_dlpack(x),
-        jax.devices(device)[int(os.environ.get("EASYDEL_PERFRED_HOST_PUT_IDEX", "0"))],
-    ).reshape(org_shape)
+    need_reshape = False
+    try:  # Prevent Major-to-Major BUG.
+        if x.shape[0] == 1 and len(x.shape) > 1:
+            need_reshape = True
+            x = x.view(*x.shape[1:])
+        device = os.environ.get("EASYDEL_PERFRED_HOST_PUT", "none")
+        device = None if device.lower() == "none" else device  # Auto JAX Select
+        array = dlpack.from_dlpack(
+            dlpack_pt.to_dlpack(x.detach()),
+            jax.devices(device)[
+                int(os.environ.get("EASYDEL_PERFRED_HOST_PUT_IDEX", "0"))
+            ],
+        )
+        if need_reshape:
+            array = jax.numpy.expand_dims(array, 0)
+        if transpose_raw is not None:
+            array = array.transpose(*transpose_raw)
+        return array
+    except Exception as e:
+        if "minor-to-major" in str(e):
+            if transpose_raw is not None:
+                raise OSError("minor-to-major dimensions wont match")
+            res_tr, excepted_tr = (
+                str(e).split("minor-to-major dimensions ")[-1].split(", expected ")
+            )
+            res_tr, excepted_tr = eval(res_tr), eval(excepted_tr)
+            row_tr = excepted_tr
+            if len(row_tr) > 2:
+                row_tr = tuple(
+                    [row_tr[s] for s in range(len(row_tr)) if s != row_tr[s]]
+                )
+            assert len(row_tr) == 2
+            return pt2jax(x=x.transpose(*row_tr), transpose_raw=res_tr)
+        else:
+            raise OSError(e)
