@@ -6,6 +6,7 @@ import fjformer
 import jax.tree_util
 from flax import core
 from flax import struct
+from flax.traverse_util import flatten_dict, unflatten_dict
 from flax.core import FrozenDict
 from flax.linen.fp8_ops import OVERWRITE_WITH_GRADIENT
 import optax
@@ -425,6 +426,8 @@ class EasyDeLState(struct.PyTreeNode):
                     shard_fns=state_shard_fns,
                     verbose=verbose,
                 )
+
+            checkpoint["params"] = flatten_dict(checkpoint["params"])
             for k in list(checkpoint["params"].keys()):
                 # The data conversion is not performed here because it causes double memory allocation
                 # until the loop is completed. This can be problematic for GPUs with limited VRAM
@@ -445,6 +448,8 @@ class EasyDeLState(struct.PyTreeNode):
                 if hasattr(x, "dtype") and x.dtype != param_dtype:
                     x = jax.lax.convert_element_type(x, param_dtype)
                     checkpoint["params"][k] = x
+
+            checkpoint["params"] = unflatten_dict(checkpoint["params"])
             hyperparameters = checkpoint.get("hyperparameters")
             cfg, module, convertor = get_modules_by_type(
                 model_type=cls.get_model_type(hyperparameters)
