@@ -425,14 +425,26 @@ class EasyDeLState(struct.PyTreeNode):
                     shard_fns=state_shard_fns,
                     verbose=verbose,
                 )
-            checkpoint["params"] = jax.tree_map(
-                lambda x: (
-                    jax.lax.convert_element_type(x, param_dtype)
-                    if (hasattr(x, "dtype") and x.dtype != param_dtype)
-                    else x
-                ),
-                checkpoint["params"],
-            )
+            for k in list(checkpoint["params"].keys()):
+                # The data conversion is not performed here because it causes double memory allocation
+                # until the loop is completed. This can be problematic for GPUs with limited VRAM
+                # (e.g., 24GB), making it crucial to avoid such heavy loop allocations.
+                #
+                # The following commented-out code would convert the data types, but it's avoided
+                # due to the above-mentioned reason:
+                # checkpoint["params"] = jax.tree_map(
+                #     lambda x: (
+                #         jax.lax.convert_element_type(x, param_dtype)
+                #         if (hasattr(x, "dtype") and x.dtype != param_dtype)
+                #         else x
+                #     ),
+                #     checkpoint["params"],
+                # )
+
+                x = checkpoint["params"][k]
+                if hasattr(x, "dtype") and x.dtype != param_dtype:
+                    x = jax.lax.convert_element_type(x, param_dtype)
+                    checkpoint["params"][k] = x
             hyperparameters = checkpoint.get("hyperparameters")
             cfg, module, convertor = get_modules_by_type(
                 model_type=cls.get_model_type(hyperparameters)
