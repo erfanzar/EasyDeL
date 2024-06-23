@@ -763,8 +763,8 @@ def quantize_kv_cache(fdata, reformat: bool = True):
     """
     if reformat:
         fdata = fdata.transpose(0, 2, 1, 3)
-    qmin = jnp.array(jnp.iinfo(jnp.uint8).min, dtype=jnp.float16)
-    qmax = jnp.array(jnp.iinfo(jnp.uint8).max, dtype=jnp.float16)
+    qmin = jnp.array(jnp.iinfo(jnp.uint8).min)
+    qmax = jnp.array(jnp.iinfo(jnp.uint8).max)
     shape = fdata.shape
 
     fdata_cal = jnp.reshape(fdata, fdata.shape[:2] + (-1,))

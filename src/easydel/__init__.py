@@ -1,6 +1,9 @@
 import os as _os
 
 if bool(_os.environ.get("EASYDEL_AUTO", "true")):
+    _os.environ["XLA_FLAGS"] = (
+        _os.environ.get("XLA_FLAGS", "") + " --xla_gpu_enable_command_buffer="
+    )
     _os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     _os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.99"
     _os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -101,11 +104,7 @@ from easydel.modules.qwen2 import (
     FlaxQwen2ForSequenceClassification as FlaxQwen2ForSequenceClassification,
     Qwen2Config as Qwen2Config,
 )
-from easydel.modules.olmo import (
-    FlaxOlmoModel,
-    FlaxOlmoForCausalLM,
-    OlmoConfig
-)
+from easydel.modules.olmo import FlaxOlmoModel, FlaxOlmoForCausalLM, OlmoConfig
 from easydel.modules.gemma import (
     FlaxGemmaModel as FlaxGemmaModel,
     GemmaConfig as GemmaConfig,
