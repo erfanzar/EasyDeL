@@ -10,6 +10,7 @@ env.ipynb
 env.py
 pallas_env.py
 test_EasyDeLState.py
+memory_log_dir/
 io.py
 *.easy
 # Distribution / packaging

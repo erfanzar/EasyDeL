@@ -1286,10 +1286,19 @@ class AttentionModule:
             query_sequence_length
         )
 
+        if is_gen and self.platform == "gpu":  # prevents ValueError: all dimensions of x and y must be >= 16
+
+            return self.sharded_vanilla_attention(
+                query_states=query_states,
+                key_states=key_states,
+                value_states=value_states,
+                bias=bias,
+                query_sequence_length=query_sequence_length,
+                key_value_sequence_length=key_states.shape[1]
+            )
         query_states, key_states, value_states = map(
             lambda s: s.astype(self.dtype), (query_states, key_states, value_states)
         )
-
         attention_outputs = shard_map(
             f=partial(
                 flash_attention,
