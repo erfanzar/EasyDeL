@@ -179,7 +179,9 @@ def huggingface_to_easydel(
             # Convert tensor to jax.numpy.array and delete the tensor to free memory
             if tensor.dtype == torch.bfloat16:
                 tensor = tensor.float()
-            array = jax.lax.convert_element_type(pt2jax(tensor), dtype)
+            array = jax.lax.convert_element_type(
+                pt2jax(tensor), dtype
+            ).block_until_ready()
             if remove_state_dict:
                 del tensor
                 _clear()
