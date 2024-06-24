@@ -76,21 +76,21 @@ class _DummyContextManager:
 
 
 def huggingface_to_easydel(
-    state_dict,
-    *,
-    device,
-    embedding_layer_names: Optional[List[str]] = None,
-    layer_norm_names: Optional[List[str]] = None,
-    shard_fns: Optional[Mapping[tuple, Callable]] = None,
-    convert_to_8bit: bool = False,
-    params_pattern_selection: Optional[re.Pattern] = None,
-    dtype: jax.numpy.dtype = jax.numpy.float16,
-    rnn_based_or_rwkv: bool = False,
-    verbose: bool = True,
-    remove_state_dict: bool = False,
-    lm_head_name: Optional[str] = None,
-    uses_tie_word_embedding: bool = False,
-    **kwargs,
+        state_dict,
+        *,
+        device,
+        embedding_layer_names: Optional[List[str]] = None,
+        layer_norm_names: Optional[List[str]] = None,
+        shard_fns: Optional[Mapping[tuple, Callable]] = None,
+        convert_to_8bit: bool = False,
+        params_pattern_selection: Optional[re.Pattern] = None,
+        dtype: jax.numpy.dtype = jax.numpy.float16,
+        rnn_based_or_rwkv: bool = False,
+        verbose: bool = True,
+        remove_state_dict: bool = False,
+        lm_head_name: Optional[str] = None,
+        uses_tie_word_embedding: bool = False,
+        **kwargs,
 ):
     """The huggingface_to_easydel function takes a huggingface model's state_dict and converts it to an easydel
     model's flax_dict. The function is designed to be used in conjunction with the load_huggingface function, which
@@ -136,6 +136,8 @@ def huggingface_to_easydel(
                 gc.collect()
 
     except ModuleNotFoundError:
+        class torch:
+            bfloat16 = None
 
         def _clear():
             gc.collect()
@@ -204,7 +206,7 @@ def huggingface_to_easydel(
 
 
 def read_ckpt(
-    path: Union[str, os.PathLike], shard_fns=None, add_extra_past_fix: list = None
+        path: Union[str, os.PathLike], shard_fns=None, add_extra_past_fix: list = None
 ):
     """The read_ckpt function reads a checkpoint file and returns the tensors in it.
 
@@ -260,12 +262,12 @@ def save_ckpt(train_state, path, gather_fns=None, float_dtype=None):
 
 
 def easystate_to_torch(
-    state,
-    dtype=jnp.float16,
-    transpose_needed=None,
-    transpose_not_needed=None,
-    select_params_field: bool = True,
-    rnn_based_or_rwkv: bool = False,
+        state,
+        dtype=jnp.float16,
+        transpose_needed=None,
+        transpose_not_needed=None,
+        select_params_field: bool = True,
+        rnn_based_or_rwkv: bool = False,
 ):
     if transpose_needed is None:
         transpose_needed = ["kernel"]
@@ -311,20 +313,20 @@ def easystate_to_torch(
 
 
 def easystate_to_huggingface_model(
-    state,
-    config,
-    base_huggingface_module: transformers.PreTrainedModel,
-    base_huggingface_module_kwarguments=None,
-    dtype=jnp.float16,
-    transpose_needed=None,
-    transpose_not_needed=None,
-    select_params_field: bool = True,
-    rnn_based_or_rwkv: bool = False,
-    auto_correct: bool = True,
+        state,
+        config,
+        base_huggingface_module: transformers.PreTrainedModel,
+        base_huggingface_module_kwarguments=None,
+        dtype=jnp.float16,
+        transpose_needed=None,
+        transpose_not_needed=None,
+        select_params_field: bool = True,
+        rnn_based_or_rwkv: bool = False,
+        auto_correct: bool = True,
 ):
     if not rnn_based_or_rwkv and auto_correct:
         if isinstance(
-            base_huggingface_module, transformers.RwkvForCausalLM
+                base_huggingface_module, transformers.RwkvForCausalLM
         ) or isinstance(base_huggingface_module, transformers.RwkvModel):
             logger.warning(
                 "Rnn Based Model detected 'setting `rnn_based_or_rwkv = True`' for correct weight handling"
