@@ -35,8 +35,12 @@ from transformers.modeling_flax_utils import ACT2FN
 from jax.sharding import PartitionSpec
 from transformers import logging
 
-from easydel.modules.flax_modelling_utils import get_gradient_checkpoint_policy, \
-    with_sharding_constraint, BaseJAXAttentionModule, control_mlp_sharding
+from easydel.modules.flax_modelling_utils import (
+    get_gradient_checkpoint_policy,
+    with_sharding_constraint,
+    BaseJAXAttentionModule,
+    control_mlp_sharding
+)
 
 import chex
 from easydel.modules.opt.opt_configuration import OPTConfig as OPTConfig

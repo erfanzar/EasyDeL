@@ -33,7 +33,6 @@ from easydel.modules.flax_modelling_utils import (
     get_dot_general_by_bits,
     get_gradient_checkpoint_policy,
     precompute_freq_cis,
-    repeat_kv_bnsh,
     with_sharding_constraint,
 )
 from easydel.modules.llama.llama_configuration import LlamaConfig as LlamaConfig
@@ -140,23 +139,6 @@ class FlaxLlamaAttention(BaseJAXAttentionModule):
     def _merge_heads(self, hidden_states):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
 
-    @staticmethod
-    def _transpose_sequence_head(query, key, value):
-        """The _transpose_sequence_head function transposes the query, key and value matrices.
-
-        Args:
-            query: Get the attention weights for each of the heads
-            key: Determine the number of heads
-            value: Store the values of the input
-
-        Returns:
-            The transpose of the query, key and value matrices
-        """
-        return (
-            jnp.transpose(query, (0, 2, 1, 3)),
-            jnp.transpose(key, (0, 2, 1, 3)),
-            jnp.transpose(value, (0, 2, 1, 3)),
-        )
 
     def apply_rotary(
         self, batch_size, sequence_length, query, key, value, freq_cis, position_ids
@@ -289,7 +271,7 @@ class FlaxLlamaAttention(BaseJAXAttentionModule):
         )
         assert_msg = (
             "num_attention_heads repeat wont work likely\n"
-            f"INFO :\n\trepeat_kv_bnsh Used with num_key_value_groups = {self.num_key_value_groups}\n\t"
+            f"INFO :\n\trepeat_key_values Used with num_key_value_groups = {self.num_key_value_groups}\n\t"
             f"NH : {self.config.num_attention_heads} KVH : {self.config.num_attention_heads}"
         )
 

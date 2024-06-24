@@ -11,30 +11,32 @@ class StableLmConfig(EasyDeLPretrainedConfig):
     model_type: str = "stablelm"
 
     def __init__(
-        self,
-        vocab_size=50304,
-        intermediate_size=6912,
-        hidden_size=2560,
-        num_hidden_layers=32,
-        num_attention_heads=32,
-        num_key_value_heads=32,
-        hidden_act="silu",
-        max_position_embeddings=4096,
-        initializer_range=0.02,
-        layer_norm_eps=1.0e-5,
-        use_cache=True,
-        tie_word_embeddings=False,
-        rope_theta=10_000,
-        rope_scaling=None,
-        use_qkv_bias=False,
-        hidden_dropout=0.0,
-        attention_dropout=0.0,
-        partial_rotary_factor=0.25,
-        bos_token_id=0,
-        eos_token_id=0,
-        bits: Optional[int] = None,
-        gradient_checkpointing: str = "nothing_saveable",
-        **kwargs,
+            self,
+            vocab_size=50304,
+            intermediate_size=6912,
+            hidden_size=2560,
+            num_hidden_layers=32,
+            num_attention_heads=32,
+            num_key_value_heads=32,
+            hidden_act="silu",
+            max_position_embeddings=4096,
+            initializer_range=0.02,
+            layer_norm_eps=1.0e-5,
+            use_cache=True,
+            tie_word_embeddings=False,
+            rope_theta=10_000,
+            rope_scaling=None,
+            use_qkv_bias=False,
+            qk_layernorm=False,
+            use_parallel_residual=False,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            partial_rotary_factor=0.25,
+            bos_token_id=0,
+            eos_token_id=0,
+            bits: Optional[int] = None,
+            gradient_checkpointing: str = "nothing_saveable",
+            **kwargs,
     ) -> None:
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
@@ -44,7 +46,8 @@ class StableLmConfig(EasyDeLPretrainedConfig):
 
         if num_key_value_heads is None:
             num_key_value_heads = num_attention_heads
-
+        self.qk_layernorm = qk_layernorm
+        self.use_parallel_residual = use_parallel_residual
         self.num_key_value_heads = num_key_value_heads
         self.use_qkv_bias = use_qkv_bias
         self.hidden_dropout = hidden_dropout
@@ -68,10 +71,10 @@ class StableLmConfig(EasyDeLPretrainedConfig):
         )
 
     def add_jax_args(
-        self,
-        bits: Optional[int] = None,
-        gradient_checkpointing: str = "nothing_saveable",
-        **kwargs,
+            self,
+            bits: Optional[int] = None,
+            gradient_checkpointing: str = "nothing_saveable",
+            **kwargs,
     ):
         self.bits = bits
         self.gradient_checkpointing = gradient_checkpointing

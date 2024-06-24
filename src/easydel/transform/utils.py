@@ -41,9 +41,9 @@ def jax2pt(x: jax.Array):
     _jax_device = list(x.devices())[0].platform
     cpu_force = not cuda.is_available()
     if (
-        _jax_device in ["cpu", "gpu"]
-        and not cpu_force
-        and not bool(os.environ.get("EASYDEL_FORCE_TORCH_USE_CPU", "false"))
+            _jax_device in ["cpu", "gpu"]
+            and not cpu_force
+            and not bool(os.environ.get("EASYDEL_FORCE_TORCH_USE_CPU", "false"))
     ):
         dl_pack_jax = dlpack.to_dlpack(
             x,
@@ -67,40 +67,41 @@ def jax2pt(x: jax.Array):
 
 
 def pt2jax(x, transpose_raw: Optional[tuple] = None):
-    from torch.utils import dlpack as dlpack_pt
-
-    need_reshape = False
-    try:  # Prevent Major-to-Major BUG.
-        if x.shape[0] == 1 and len(x.shape) > 1:
-            need_reshape = True
-            x = x.view(*x.shape[1:])
-        device = os.environ.get("EASYDEL_PERFRED_HOST_PUT", "none")
-        device = None if device.lower() == "none" else device  # Auto JAX Select
-        array = dlpack.from_dlpack(
-            dlpack_pt.to_dlpack(x.detach()),
-            jax.devices(device)[
-                int(os.environ.get("EASYDEL_PERFRED_HOST_PUT_IDEX", "0"))
-            ],
-        )
-        if need_reshape:
-            array = jax.numpy.expand_dims(array, 0)
-        if transpose_raw is not None:
-            array = array.transpose(*transpose_raw)
-        return array
-    except Exception as e:
-        if "minor-to-major" in str(e):
-            if transpose_raw is not None:
-                raise OSError("minor-to-major dimensions wont match")
-            res_tr, excepted_tr = (
-                str(e).split("minor-to-major dimensions ")[-1].split(", expected ")
-            )
-            res_tr, excepted_tr = eval(res_tr), eval(excepted_tr)
-            row_tr = excepted_tr
-            if len(row_tr) > 2:
-                row_tr = tuple(
-                    [row_tr[s] for s in range(len(row_tr)) if s != row_tr[s]]
-                )
-            assert len(row_tr) == 2
-            return pt2jax(x=x.transpose(*row_tr), transpose_raw=res_tr)
-        else:
-            raise OSError(e)
+    # from torch.utils import dlpack as dlpack_pt
+    #
+    # need_reshape = False
+    # try:  # Prevent Major-to-Major BUG.
+    #     if x.shape[0] == 1 and len(x.shape) > 1:
+    #         need_reshape = True
+    #         x = x.view(*x.shape[1:])
+    #     device = os.environ.get("EASYDEL_PERFRED_HOST_PUT", "none")
+    #     device = None if device.lower() == "none" else device  # Auto JAX Select
+    #     array = dlpack.from_dlpack(
+    #         dlpack_pt.to_dlpack(x.detach()),
+    #         jax.devices(device)[
+    #             int(os.environ.get("EASYDEL_PERFRED_HOST_PUT_IDEX", "0"))
+    #         ],
+    #     )
+    #     if need_reshape:
+    #         array = jax.numpy.expand_dims(array, 0)
+    #     if transpose_raw is not None:
+    #         array = array.transpose(*transpose_raw)
+    #     return array
+    # except Exception as e:
+    #     if "minor-to-major" in str(e):
+    #         if transpose_raw is not None:
+    #             raise OSError("minor-to-major dimensions wont match")
+    #         res_tr, excepted_tr = (
+    #             str(e).split("minor-to-major dimensions ")[-1].split(", expected ")
+    #         )
+    #         res_tr, excepted_tr = eval(res_tr), eval(excepted_tr)
+    #         row_tr = excepted_tr
+    #         if len(row_tr) > 2:
+    #             row_tr = tuple(
+    #                 [row_tr[s] for s in range(len(row_tr)) if s != row_tr[s]]
+    #             )
+    #         assert len(row_tr) == 2
+    #         return pt2jax(x=x.transpose(*row_tr), transpose_raw=res_tr)
+    #     else:
+    #         raise OSError(e)
+    return jax.numpy.asarray(x.detach().cpu().numpy())

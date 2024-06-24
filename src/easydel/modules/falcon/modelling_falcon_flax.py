@@ -163,14 +163,6 @@ class FlaxFalconAttention(BaseJAXAttentionModule):
             _do_check=False,
         )
 
-    @staticmethod
-    def _transpose_sequence_heads(query, key, value):
-        return (
-            jnp.transpose(query, (0, 2, 1, 3)),
-            jnp.transpose(key, (0, 2, 1, 3)),
-            jnp.transpose(value, (0, 2, 1, 3)),
-        )
-
     def _split_heads(
             self, qkv: chex.Array
     ) -> Tuple[chex.Array, chex.Array, chex.Array]:

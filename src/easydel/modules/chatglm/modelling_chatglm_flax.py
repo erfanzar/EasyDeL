@@ -26,7 +26,6 @@ from easydel.modules.flax_modelling_utils import (
     BaseJAXAttentionModule,
     get_dot_general_by_bits,
     get_gradient_checkpoint_policy,
-    repeat_kv_bnsh,
     with_sharding_constraint,
 )
 from easydel.modules.chatglm.chatglm_configuration import ChatGLMConfig as ChatGLMConfig
@@ -37,9 +36,9 @@ def flatten_axes(a: Array, start: int = 0, end: int = -1) -> Array:
 
 
 def split_tensor_along_last_dim(
-    tensor: jax.Array,
-    num_partitions: int,
-    contiguous_split_chunks: bool = False,
+        tensor: jax.Array,
+        num_partitions: int,
+        contiguous_split_chunks: bool = False,
 ) -> tuple[Array, ...] | list[Array]:
     """Split a tensor along its last dimension.
     Arguments:
@@ -63,19 +62,19 @@ def split_tensor_along_last_dim(
 
 
 def _normalize(
-    mdl: nn.Module,
-    x: Array,
-    mean: Array,
-    var: Array,
-    reduction_axes: nn.Axes,
-    feature_axes: nn.Axes,
-    dtype: Optional[nn.Dtype],
-    param_dtype: nn.Dtype,
-    epsilon: float,
-    use_bias: bool,
-    use_scale: bool,
-    bias_init: nn.Initializer,
-    scale_init: nn.Initializer,
+        mdl: nn.Module,
+        x: Array,
+        mean: Array,
+        var: Array,
+        reduction_axes: nn.Axes,
+        feature_axes: nn.Axes,
+        dtype: Optional[nn.Dtype],
+        param_dtype: nn.Dtype,
+        epsilon: float,
+        use_bias: bool,
+        use_scale: bool,
+        bias_init: nn.Initializer,
+        scale_init: nn.Initializer,
 ):
     reduction_axes = nn._canonicalize_axes(x.ndim, reduction_axes)
     feature_axes = nn._canonicalize_axes(x.ndim, feature_axes)
@@ -170,7 +169,7 @@ class RotaryEmbedding(nn.Module):
 
     def setup(self) -> None:
         self.inv_freq = 1.0 / (
-            10000 ** (jnp.arange(0, self.dim, 2, dtype=self.dtype) / self.dim)
+                10000 ** (jnp.arange(0, self.dim, 2, dtype=self.dtype) / self.dim)
         )
 
     def forward(self, seq_len: int, n_elem: int, base: int = 10000):
@@ -230,7 +229,7 @@ class CoreAttention(nn.Module):
         # Per attention head and per partition values.
         self.hidden_size_per_partition = projection_size
         self.hidden_size_per_attention_head = (
-            projection_size // config.num_attention_heads
+                projection_size // config.num_attention_heads
         )
         self.num_attention_heads_per_partition = config.num_attention_heads
 
@@ -257,12 +256,12 @@ class CoreAttention(nn.Module):
         )
 
     def __call__(
-        self,
-        query_layer: jax.Array,
-        key_layer: jax.Array,
-        value_layer: jax.Array,
-        attention_mask: jax.Array,
-        causal_mask: jax.Array,
+            self,
+            query_layer: jax.Array,
+            key_layer: jax.Array,
+            value_layer: jax.Array,
+            attention_mask: jax.Array,
+            causal_mask: jax.Array,
     ):
         batch_size = query_layer.shape[0]
         causal_mask = jnp.broadcast_to(
@@ -311,7 +310,7 @@ class FlaxChatGLMAttention(BaseJAXAttentionModule):
 
         # Per attention head and per partition values.
         self.hidden_size_per_attention_head = (
-            self.projection_size // config.num_attention_heads
+                self.projection_size // config.num_attention_heads
         )
         self.num_attention_heads_per_partition = config.num_attention_heads
 
@@ -320,8 +319,8 @@ class FlaxChatGLMAttention(BaseJAXAttentionModule):
         if self.multi_query_attention:
             self.num_multi_query_groups_per_partition = config.multi_query_group_num
             self.qkv_hidden_size = (
-                self.projection_size
-                + 2 * self.hidden_size_per_attention_head * config.multi_query_group_num
+                    self.projection_size
+                    + 2 * self.hidden_size_per_attention_head * config.multi_query_group_num
             )
         self.query_key_value = nn.Dense(
             self.qkv_hidden_size,
@@ -352,33 +351,15 @@ class FlaxChatGLMAttention(BaseJAXAttentionModule):
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.num_num_key_value_groupsreps = (
-            self.num_attention_heads_per_partition
-            // self.num_multi_query_groups_per_partition
+                self.num_attention_heads_per_partition
+                // self.num_multi_query_groups_per_partition
         )
 
     def _merge_heads(self, hidden_states):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
 
-    @staticmethod
-    def _transpose_sequence_head(query, key, value):
-        """The _transpose_sequence_head function transposes the query, key and value matrices.
-
-        Args:
-            query: Get the attention weights for each of the heads
-            key: Determine the number of heads
-            value: Store the values of the input
-
-        Returns:
-            The transpose of the query, key and value matrices
-        """
-        return (
-            jnp.transpose(query, (0, 2, 1, 3)),
-            jnp.transpose(key, (0, 2, 1, 3)),
-            jnp.transpose(value, (0, 2, 1, 3)),
-        )
-
     def apply_rotary(
-        self, batch_size, sequence_length, query, key, value, freq_cis, position_ids
+            self, batch_size, sequence_length, query, key, value, freq_cis, position_ids
     ):
         """The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
         The main difference is that it takes in an additional argument, freq_cis, which are used to calculate
@@ -399,36 +380,25 @@ class FlaxChatGLMAttention(BaseJAXAttentionModule):
         Returns:
             A tuple of 3 tensors: query, key and value
         """
-        query = query.reshape(
-            batch_size, sequence_length, self.config.num_attention_heads, self.head_dim
-        )
-        key = key.reshape(
-            batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim
-        )
-        value = value.reshape(
-            batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim
-        )
 
         query, key, value = self._transpose_sequence_head(query, key, value)
         query, key = self.rotary(
             position_ids=position_ids, query=query, key=key, freq_cis=freq_cis
         )
-        key = repeat_kv_bnsh(key, self.num_key_value_groups)
-        value = repeat_kv_bnsh(value, self.num_key_value_groups)
         return self._transpose_sequence_head(query, key, value)
 
     def __call__(
-        self,
-        hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
-        causal_mask: chex.Array,
-        segment_ids: Optional[chex.Array] = None,
-        deterministic: bool = True,
-        init_cache: bool = False,
-        output_attentions: bool = False,
-        fcm_mask=None,
+            self,
+            hidden_states: chex.Array,
+            freq_cis: Tuple[chex.Array, chex.Array],
+            attention_mask: chex.Array,
+            position_ids: chex.Array,
+            causal_mask: chex.Array,
+            segment_ids: Optional[chex.Array] = None,
+            deterministic: bool = True,
+            init_cache: bool = False,
+            output_attentions: bool = False,
+            fcm_mask=None,
     ):
         """
         The function takes various inputs related to attention mechanisms in a neural
@@ -540,16 +510,6 @@ class FlaxChatGLMAttention(BaseJAXAttentionModule):
             sequence_length=sequence_length,
         )
 
-        assert_msg = (
-            "num_attention_heads repeat wont work likely\n"
-            f"INFO :\n\trepeat_kv_bnsh Used with num_key_value_groups = {self.num_key_value_groups}\n\t"
-            f"NH : {self.config.num_attention_heads} KVH : {self.config.num_attention_heads}"
-        )
-
-        assert query_layer.shape[-2] == self.config.num_attention_heads, assert_msg
-        assert key_layer.shape[-2] == self.config.num_attention_heads, assert_msg
-        assert value_layer.shape[-2] == self.config.num_attention_heads, assert_msg
-
         query_length, key_length = query_layer.shape[1], key_layer.shape[1]
 
         if self.has_variable("cache", "cached_key"):
@@ -576,7 +536,16 @@ class FlaxChatGLMAttention(BaseJAXAttentionModule):
             key_layer, value_layer, attention_mask = self._concatenate_to_cache(
                 key_layer, value_layer, query_layer, attention_mask
             )
+        key_layer, value_layer = self.repeat_key_value(key_layer, value_layer, self.num_num_key_value_groupsreps)
+        assert_msg = (
+            "num_attention_heads repeat wont work likely\n"
+            f"INFO :\n\trepeat_key_values Used with num_key_value_groups = {self.num_key_value_groups}\n\t"
+            f"NH : {self.config.num_attention_heads} KVH : {self.config.num_attention_heads}"
+        )
 
+        assert query_layer.shape[-2] == self.config.num_attention_heads, assert_msg
+        assert key_layer.shape[-2] == self.config.num_attention_heads, assert_msg
+        assert value_layer.shape[-2] == self.config.num_attention_heads, assert_msg
         attn_output = self.core_attention(
             query_layer, key_layer, value_layer, attention_mask, causal_mask
         )
@@ -639,9 +608,9 @@ class MLP(nn.Module):
         )
 
     def __call__(
-        self,
-        hidden_states,
-        e: bool = True,  # Ignore
+            self,
+            hidden_states,
+            e: bool = True,  # Ignore
     ):
         """
         This function takes hidden states as input, applies some transformations, and
@@ -673,7 +642,7 @@ class FlaxChatGLMBlock(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(
-        self,
+            self,
     ):
         layer_number = self.layer_number
         config = self.config
@@ -751,15 +720,15 @@ class FlaxChatGLMBlock(nn.Module):
         )
 
     def __call__(
-        self,
-        hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
-        causal_mask: chex.Array,
-        segment_ids: Optional[chex.Array] = None,
-        deterministic: bool = True,
-        init_cache: bool = False,
+            self,
+            hidden_states: chex.Array,
+            freq_cis: Tuple[chex.Array, chex.Array],
+            attention_mask: chex.Array,
+            position_ids: chex.Array,
+            causal_mask: chex.Array,
+            segment_ids: Optional[chex.Array] = None,
+            deterministic: bool = True,
+            init_cache: bool = False,
     ):
         """
         The function takes input hidden states and various masks, applies self-attention and
@@ -867,13 +836,13 @@ class FlaxChatGLMPreTrainedModel(EasyDeLFlaxPretrainedModel):
     module_class: nn.Module = None
 
     def __init__(
-        self,
-        config: ChatGLMConfig,
-        input_shape: Tuple = (1, 1),
-        seed: int = 0,
-        dtype: jnp.dtype = jnp.float32,
-        _do_init: bool = True,
-        **kwargs,
+            self,
+            config: ChatGLMConfig,
+            input_shape: Tuple = (1, 1),
+            seed: int = 0,
+            dtype: jnp.dtype = jnp.float32,
+            _do_init: bool = True,
+            **kwargs,
     ):
         """The __init__ function is called when the class is instantiated.
         It sets up the instance of the class, and defines what happens when it's created.
@@ -906,7 +875,7 @@ class FlaxChatGLMPreTrainedModel(EasyDeLFlaxPretrainedModel):
         )
 
     def init_weights(
-        self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
+            self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
     ) -> FrozenDict:
         """The init_weights function is used to initialize the weights of a model.
 
@@ -988,20 +957,20 @@ class FlaxChatGLMPreTrainedModel(EasyDeLFlaxPretrainedModel):
         return init_variables["cache"]
 
     def __call__(
-        self,
-        input_ids: chex.Array,
-        attention_mask: chex.Array = None,
-        position_ids: chex.Array = None,
-        params: dict = None,
-        past_key_values: dict = None,
-        dropout_rng: jax.random.PRNGKey = None,
-        train: bool = False,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
-        add_params_field: bool = False,
-        **kwargs,
+            self,
+            input_ids: chex.Array,
+            attention_mask: chex.Array = None,
+            position_ids: chex.Array = None,
+            params: dict = None,
+            past_key_values: dict = None,
+            dropout_rng: jax.random.PRNGKey = None,
+            train: bool = False,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+            extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+            add_params_field: bool = False,
+            **kwargs,
     ):
         """The __call__ function is the main function of a JAX module.
         It takes in inputs and returns outputs, but it also has some other important features:
@@ -1051,7 +1020,7 @@ class FlaxChatGLMPreTrainedModel(EasyDeLFlaxPretrainedModel):
         batch_size, sequence_length = input_ids.shape
 
         assert (
-            sequence_length <= self.config.max_position_embeddings
+                sequence_length <= self.config.max_position_embeddings
         ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
 
         if position_ids is None:
@@ -1132,17 +1101,17 @@ class FlaxChatGLMBlockCollection(nn.Module):
         ]
 
     def __call__(
-        self,
-        hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
-        causal_mask: chex.Array,
-        deterministic: bool = True,
-        init_cache: bool = False,
-        output_attentions: bool = False,
-        output_hidden_states: bool = False,
-        return_dict: bool = True,
+            self,
+            hidden_states: chex.Array,
+            freq_cis: Tuple[chex.Array, chex.Array],
+            attention_mask: chex.Array,
+            position_ids: chex.Array,
+            causal_mask: chex.Array,
+            deterministic: bool = True,
+            init_cache: bool = False,
+            output_attentions: bool = False,
+            output_hidden_states: bool = False,
+            return_dict: bool = True,
     ):
         """The __call__ function is the main function of a JAX nn.Module.
         It defines how the module behaves when called as a function, and it's what you'll use to call your model
@@ -1228,16 +1197,16 @@ class FlaxChatGLMTransformer(nn.Module):
             )
 
     def __call__(
-        self,
-        hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
-        causal_mask: chex.Array,
-        deterministic: bool = True,
-        init_cache: bool = False,
-        output_hidden_states: bool = False,
-        return_dict: bool = True,
+            self,
+            hidden_states: chex.Array,
+            freq_cis: Tuple[chex.Array, chex.Array],
+            attention_mask: chex.Array,
+            position_ids: chex.Array,
+            causal_mask: chex.Array,
+            deterministic: bool = True,
+            init_cache: bool = False,
+            output_hidden_states: bool = False,
+            return_dict: bool = True,
     ):
         all_self_attentions = None
         all_hidden_states = () if output_hidden_states else None
@@ -1317,15 +1286,15 @@ class FlaxChatGLMModel(nn.Module):
         )
 
     def __call__(
-        self,
-        input_ids,
-        position_ids: Optional[jax.Array] = None,
-        attention_mask: Optional[jax.Array] = None,
-        inputs_embeds: Optional[jax.Array] = None,
-        init_cache: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        deterministic: bool = True,
+            self,
+            input_ids,
+            position_ids: Optional[jax.Array] = None,
+            attention_mask: Optional[jax.Array] = None,
+            inputs_embeds: Optional[jax.Array] = None,
+            init_cache: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+            deterministic: bool = True,
     ):
         output_hidden_states = (
             output_hidden_states

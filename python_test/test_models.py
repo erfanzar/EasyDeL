@@ -36,9 +36,9 @@ class EasyModelsTest(TestCase):
     def setUp(self) -> None:
         self.batch_size: int = 1
         self.vocab_size: int = 32000
-        self.hidden_size: int = 256
-        self.intermediate_size: int = 512
-        self.num_hidden_layers: int = 32
+        self.hidden_size: int = 128
+        self.intermediate_size: int = 256
+        self.num_hidden_layers: int = 6
         self.num_attention_heads: int = 8
         self.num_key_value_heads: Optional[int] = 4
         self.num_experts_per_tok = 4
@@ -87,6 +87,8 @@ class EasyModelsTest(TestCase):
         self.sequence_length = 64
         self.scan_mlp_chunk_size = self.sequence_length // 2
         self.head_dim = 256
+        self.use_parallel_residual = True
+        self.qk_layernorm = True
         self.max_position_embeddings: int = self.sequence_length
         self.use_sharding_constraint = False
         self.header_config = None
@@ -120,6 +122,8 @@ class EasyModelsTest(TestCase):
                 multi_query=True,
                 num_ln_in_parallel_attn=1,
                 parallel_attn=True,
+                use_parallel_residual=self.use_parallel_residual,
+                qk_layernorm=self.qk_layernorm
                 # tie_word_embedding=True,
                 # residual_in_fp32=True
             )
@@ -309,14 +313,14 @@ class EasyModelsTest(TestCase):
         )
         for k, v in self.__dict__.items():
             if isinstance(
-                v,
-                (
-                    bool,
-                    str,
-                    float,
-                    type(None),
-                    int,
-                ),
+                    v,
+                    (
+                            bool,
+                            str,
+                            float,
+                            type(None),
+                            int,
+                    ),
             ):
                 try:
                     setattr(conf, k, v)
@@ -363,7 +367,7 @@ class EasyModelsTest(TestCase):
 
     def test_olmo(self):
         res, err = self.create_test_for_models("olmo", transformers.OlmoForCausalLM)
-        self.assertTrue(res, f"OLMO model Failed [ERROR {err}]")
+        self.assertTrue(res, f"OLMo model Failed [ERROR {err}]")
 
     def test_phi(self):
         res, err = self.create_test_for_models("phi", transformers.PhiForCausalLM)
@@ -405,14 +409,14 @@ class EasyModelsTest(TestCase):
         )
         for k, v in self.__dict__.items():
             if isinstance(
-                v,
-                (
-                    bool,
-                    str,
-                    float,
-                    type(None),
-                    int,
-                ),
+                    v,
+                    (
+                            bool,
+                            str,
+                            float,
+                            type(None),
+                            int,
+                    ),
             ):
                 setattr(conf, k, v)
         res, err = self.create_test_for_models(
@@ -433,14 +437,14 @@ class EasyModelsTest(TestCase):
         )
         for k, v in self.__dict__.items():
             if isinstance(
-                v,
-                (
-                    bool,
-                    str,
-                    float,
-                    type(None),
-                    int,
-                ),
+                    v,
+                    (
+                            bool,
+                            str,
+                            float,
+                            type(None),
+                            int,
+                    ),
             ):
                 setattr(conf, k, v)
         conf._attn_implementation = "eager"
@@ -484,14 +488,14 @@ class EasyModelsTest(TestCase):
         )
         for k, v in self.__dict__.items():
             if isinstance(
-                v,
-                (
-                    bool,
-                    str,
-                    float,
-                    type(None),
-                    int,
-                ),
+                    v,
+                    (
+                            bool,
+                            str,
+                            float,
+                            type(None),
+                            int,
+                    ),
             ):
                 setattr(conf, k, v)
         res, err = self.create_test_for_models(
@@ -555,10 +559,10 @@ class EasyModelsTest(TestCase):
 
     @staticmethod
     def compare_torch_to_jax(
-        name, hf_out, ed_out, ed_loss, atol: float = 1e-035, rtol: float = 1e-08
+            name, hf_out, ed_out, ed_loss, atol: float = 1e-035, rtol: float = 1e-08
     ):
         to, jo = hf_out.logits.cpu().detach().numpy(), ed_out.logits
-        err = jnp.mean(to - jo)
+        err = jnp.mean(jnp.sum(to)) - jnp.mean(jnp.sum(jo))
         hf_loss = hf_out.loss.cpu().detach().numpy()
         all_close = jnp.allclose(to, jo, atol=atol, rtol=rtol)
         all_close_loss = jnp.allclose(hf_loss, ed_loss, atol=1e-02, rtol=rtol)
@@ -574,6 +578,7 @@ class EasyModelsTest(TestCase):
                     )
                 ),
             )
+            print(f"{name} ERROR : {err}")
             print(f"{name} LOSS F HF : ", hf_loss)
             print(f"{name} LOSS F ED : ", ed_loss)
             print("IS LOSS CLOSE    : ", all_close_loss)

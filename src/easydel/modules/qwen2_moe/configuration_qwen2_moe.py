@@ -33,6 +33,7 @@ class Qwen2MoeConfig(EasyDeLPretrainedConfig):
             norm_topk_prob=False,
             output_router_logits=False,
             router_aux_loss_coef=0.001,
+            mlp_only_layers=None,
             gradient_checkpointing: str = "nothing_saveable",
             bits: Optional[int] = None,
             **kwargs,
@@ -66,6 +67,7 @@ class Qwen2MoeConfig(EasyDeLPretrainedConfig):
         self.router_aux_loss_coef = router_aux_loss_coef
         self.gradient_checkpointing = gradient_checkpointing
         self.bits = bits
+        self.mlp_only_layers = mlp_only_layers or []
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
