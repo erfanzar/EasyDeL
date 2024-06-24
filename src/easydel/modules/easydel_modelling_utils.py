@@ -864,7 +864,7 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
             open(os.path.join(save_directory, "README.md"), "w").write(self._md_info())
         func = fjformer.checkpoint.CheckpointManager.save_checkpoint_safe if (
             safe
-        ) else fjformer.checkpoint.CheckpointManager.save_checkpoint
+        ) else fjformer.checkpoint.CheckpointManager.save_state_to_file
         func(
             path=output_model_file,
             gather_fns=gather_fns,

@@ -641,6 +641,8 @@ class AutoEasyDeLModelForCausalLM:
                     gc.collect()
                     torch.cuda.empty_cache()
             else:
+                class torch:
+                    bfloat16 = None
 
                 def _clear():
                     gc.collect()
@@ -735,48 +737,47 @@ class AutoEasyDeLModelForCausalLM:
                 input_shape=input_shape,  # type:ignore
                 config_kwargs=config_kwargs,
             )
-        with cfg.get_mesh():
-            logger.debug("converting huggingface-model to easydel-model.")
-            params_pattern_selection = None
-            if load_in_8bit:
-                if bit_targeted_params is None:
-                    warnings.warn(
-                        "since `bit_targeted_params` is set to None, auto loader will convert all of"
-                        " kernels(weights) and embeddings to 8bit by default"
-                    )
-                    bit_targeted_params = ["kernel", "embedding"]
-
-                    params_pattern_selection = re.compile(
-                        "({})".format("|".join(bit_targeted_params))
-                    )
-            uses_tie_word_embedding = getattr(config, "tie_word_embeddings", False)
-            params = trf(
-                state_dict,
-                config=config,
-                device=device,
-                shard_fns=shard_fns,
-                convert_to_8bit=load_in_8bit,
-                params_pattern_selection=params_pattern_selection,
-                remove_state_dict=True,
-                uses_tie_word_embedding=uses_tie_word_embedding,
-                dtype=param_dtype,
-            )
-
-            # Clear and collect memory after converting the model
-            del state_dict
-            _clear()
-
-            if is_flatten(params):
-                logger.info("converted parameters are flatten making them unflatten ")
-                params = unflatten_dict(params)
-
-            if verbose_params:
-                print(
-                    f"JAX - EasyDeL Model contains "
-                    f"{sum(n.size for n in jax.tree_util.tree_flatten(flax.core.unfreeze(params))[0]) / 1e9}"
-                    f" Billion Parameters"
+        logger.debug("converting huggingface-model to easydel-model.")
+        params_pattern_selection = None
+        if load_in_8bit:
+            if bit_targeted_params is None:
+                warnings.warn(
+                    "since `bit_targeted_params` is set to None, auto loader will convert all of"
+                    " kernels(weights) and embeddings to 8bit by default"
                 )
-            return ed_model, params
+                bit_targeted_params = ["kernel", "embedding"]
+
+                params_pattern_selection = re.compile(
+                    "({})".format("|".join(bit_targeted_params))
+                )
+        uses_tie_word_embedding = getattr(config, "tie_word_embeddings", False)
+        params = trf(
+            state_dict,
+            config=config,
+            device=device,
+            shard_fns=shard_fns,
+            convert_to_8bit=load_in_8bit,
+            params_pattern_selection=params_pattern_selection,
+            remove_state_dict=True,
+            uses_tie_word_embedding=uses_tie_word_embedding,
+            dtype=param_dtype,
+        )
+
+        # Clear and collect memory after converting the model
+        del state_dict
+        _clear()
+
+        if is_flatten(params):
+            logger.info("converted parameters are flatten making them unflatten ")
+            params = unflatten_dict(params)
+
+        if verbose_params:
+            print(
+                f"JAX - EasyDeL Model contains "
+                f"{sum(n.size for n in jax.tree_util.tree_flatten(flax.core.unfreeze(params))[0]) / 1e9}"
+                f" Billion Parameters"
+            )
+        return ed_model, params
 
     @staticmethod
     def _from_easydel_params(
