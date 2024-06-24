@@ -934,6 +934,16 @@ class AutoShardAndGatherFunctions:
 
         return shard_fns, gather_fns
 
+    @staticmethod
+    def from_params(params, partition_rules, mesh):
+        partition_specs = match_partition_rules(
+            partition_rules, params
+        )
+        return make_shard_and_gather_fns(
+            partition_specs=partition_specs,
+            mesh=mesh,
+        )
+
     @classmethod
     def from_pretrained(
             cls,
