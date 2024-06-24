@@ -1,18 +1,29 @@
 import os
-import threading
+import sys
 
-import fjformer.linen
+os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
 
-os.environ["XLA_FLAGS"] = '--xla_force_host_platform_device_count=2'
+try:
+    import easydel as ed
+except ModuleNotFoundError:
+    dirname = os.path.dirname(os.path.abspath(__file__))
+    sys.path.append(dirname)  # noqa: E402
+    sys.path.append(
+        os.path.join(
+            dirname,
+            "../src",
+        )
+    )
+    import easydel as ed
 
-from easydel import (
+from easydel import (  # noqa: E402
     FlaxLlamaForCausalLM,
     LlamaConfig,
     GenerationPipelineConfig,
-    GenerationPipeline
+    GenerationPipeline,
 )
-from jax import numpy as jnp, random, lax, jit
-from transformers import AutoTokenizer, PreTrainedTokenizer, TextIteratorStreamer
+from jax import numpy as jnp, lax
+from transformers import AutoTokenizer
 
 
 def main():
@@ -26,7 +37,7 @@ def main():
         max_position_embeddings=512,
         use_scan_mlp=False,
         axis_dims=(1, 1, 1, -1),
-        quantize_kv_cache=True
+        quantize_kv_cache=False,
     )
     model = FlaxLlamaForCausalLM(
         config=config,
@@ -34,19 +45,26 @@ def main():
         param_dtype=jnp.float16,
         precision=lax.Precision("fastest"),
         input_shape=(1, 2),
-        _do_init=True
+        _do_init=True,
     )
-    tokens = tokenizer("SOME TEXT", return_tensors="np", max_length=32, padding="max_length")
+    tokens = tokenizer(
+        "SOME TEXT", return_tensors="np", max_length=32, padding="max_length"
+    )
     input_ids = tokens["input_ids"]
     attention_mask = tokens["attention_mask"]
     params = model.params
     # params = fjformer.linen.quantize_int8_parameters(["kernel", "embedding"], params)
     pipeline = GenerationPipeline(
         model=model,
-        params={"params": params},
+        params= params,
         tokenizer=tokenizer,
-        add_params_field=False,
-        generation_config=GenerationPipelineConfig(max_new_tokens=128, do_sample=True)
+        generation_config=GenerationPipelineConfig(
+            max_new_tokens=128,
+            temprature=0,
+            eos_token_id=23070,
+            length_penalty=1,
+            repetition_penalty=1,
+        ),
     )
     for token in pipeline.generate(input_ids, attention_mask):
         print(token, end="")
