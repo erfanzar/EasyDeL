@@ -45,6 +45,8 @@ of machine learning models, particularly in the domain of large language models 
 
 ### Latest News 🔥
 
+- StableLM and DBrX model bugs are fixed.
+- All the Models have their AttentionStructure Changed, and now they are faster and more memory efficient for inference.
 - OLMo models are supported.
 - Now Flash attention will automatically switch on pallas_flash in case that your on GPUs.
 - GPU Flash Attention Bugs are now fixed.

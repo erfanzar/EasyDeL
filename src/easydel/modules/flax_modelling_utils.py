@@ -140,54 +140,6 @@ def get_gradient_checkpoint_policy(name):
     )
     return gradients[name]
 
-
-def repeat_kv_bnsh(x: chex.Array, n_rep: int) -> chex.Array:
-    """The repeat_kv_bnsh function is used to repeat the key and value vectors for each head in a multi-head attention
-    module. This function takes as input an array of shape (batch_size, n_heads, sequence_length, head_dim) and returns
-    an array of shape (batch_size, n_heads * nrep, sequence length, head dim). The reason this is necessary is because the
-    attention module expects keys/values/queries to be repeated across heads but not across batches. However we want our
-    keys/values/queries to be repeated both across heads AND batches so that we can use them
-
-    Args:
-        x: chex.Array: Pass in the input to the function
-        n_rep: int: Repeat the key and value heads
-
-    Returns:
-        A new array with the same shape as x, except for the second
-        dimension which is n_kv_heads * n_rep
-    """
-    bs, n_kv_heads, s, head_dim = x.shape
-    if n_rep == 1:
-        return x
-    x = x[:, :, jax.numpy.newaxis, :, :]
-    x = jax.numpy.repeat(x, n_rep, axis=2)
-
-    return x.reshape(bs, n_kv_heads * n_rep, s, head_dim)
-
-
-def repeat_kv_bsnh(x: chex.Array, n_rep: int) -> chex.Array:
-    """The repeat_kv_bsnh function is used to repeat the key and value vectors for each head.
-
-    Args:
-        x: chex.Array: Specify the input array
-        n_rep: int: Repeat the key-value attention heads n_rep times
-
-    Returns:
-        A new array with the same batch size, sequence length, and head
-        dimension as the input array
-    """
-    bs, s, n_kv_heads, head_dim = x.shape
-    x = x.transpose(0, 2, 1, 3)
-    if n_rep == 1:
-        return x
-    x = x[:, :, jax.numpy.newaxis, :, :]
-    x = jax.numpy.repeat(x, n_rep, axis=2)
-
-    x = x.transpose(0, 2, 1, 3)
-
-    return x.reshape(bs, s, n_kv_heads * n_rep, head_dim)
-
-
 def precompute_freq_cis(
     dim,
     max_position_embeddings=2048,
@@ -453,6 +405,24 @@ def get_dot_general_by_bits(
 
 class BaseJAXAttentionModule(nn.Module):
     config: "EasyDeLPretrainedConfig"  # type: ignore  # noqa
+
+    @staticmethod
+    def _transpose_sequence_head(query, key, value):
+        """The _transpose_sequence_head function transposes the query, key and value matrices.
+
+        Args:
+            query: Get the attention weights for each of the heads
+            key: Determine the number of heads
+            value: Store the values of the input
+
+        Returns:
+            The transpose of the query, key and value matrices
+        """
+        return (
+            jnp.transpose(query, (0, 2, 1, 3)),
+            jnp.transpose(key, (0, 2, 1, 3)),
+            jnp.transpose(value, (0, 2, 1, 3)),
+        )
 
     @nn.compact
     def _concatenate_to_cache(self, key, value, query_states, attention_mask):

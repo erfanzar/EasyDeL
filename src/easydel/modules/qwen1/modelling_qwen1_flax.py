@@ -86,17 +86,6 @@ class FlaxQwen1EmbeddingApplyer(nn.Module):
                 key = jnp.concatenate(key_list, axis=0)
         return query.astype(self.dtype), key.astype(self.dtype)
 
-
-def repeat_kv(x: chex.Array, n_rep: int) -> chex.Array:
-    bs, s, n_kv_heads, head_dim = x.shape
-    if n_rep == 1:
-        return x
-    x = x[:, :, jnp.newaxis, :, :]
-    x = jnp.repeat(x, n_rep, axis=2)
-
-    return x.reshape(bs, s, n_kv_heads * n_rep, head_dim)
-
-
 def compute_qwen1_rope(dim: int, seqlen, base: int | float = 10000, ntk_alpha=1):
     base = base * ntk_alpha ** (dim / (dim - 2))
     inv_freq = 1.0 / (base ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim))
@@ -242,23 +231,6 @@ class FlaxQwen1Attention(BaseJAXAttentionModule):
     def _merge_heads(self, hidden_states):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
 
-    @staticmethod
-    def _transpose_sequence_head(query, key, value):
-        """The _transpose_sequence_head function transposes the query, key and value matrices.
-
-        Args:
-            query: Get the attention weights for each of the heads
-            key: Determine the number of heads
-            value: Store the values of the input
-
-        Returns:
-            The transpose of the query, key and value matrices
-        """
-        return (
-            jnp.transpose(query, (0, 2, 1, 3)),
-            jnp.transpose(key, (0, 2, 1, 3)),
-            jnp.transpose(value, (0, 2, 1, 3)),
-        )
 
     def apply_rotary(
         self,

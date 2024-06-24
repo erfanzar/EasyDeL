@@ -29,7 +29,6 @@ from easydel.modules.flax_modelling_utils import (
     get_dot_general_by_bits,
     get_gradient_checkpoint_policy,
     precompute_freq_cis,
-    repeat_kv_bnsh,
     with_sharding_constraint,
 )
 from easydel.modules.arctic.arctic_configuration import ArcticConfig
@@ -150,23 +149,11 @@ class FlaxArcticAttention(BaseJAXAttentionModule):
             backward_pass_impl=self.config.flash_attention_backward_pass_impl
         )
 
-    @staticmethod
-    def _transpose_sequence_head(query, key, value):
-        return jnp.transpose(query, (0, 2, 1, 3)), jnp.transpose(key, (0, 2, 1, 3)), jnp.transpose(value, (0, 2, 1, 3))
-
     def apply_rotary(self, batch_size, sequence_length, query, key, value, freq_cis, position_ids):
-        query = query.reshape(batch_size, sequence_length,
-                              self.config.num_attention_heads, self.head_dim)
-        key = key.reshape(batch_size, sequence_length,
-                          self.config.num_key_value_heads, self.head_dim)
-        value = value.reshape(batch_size, sequence_length,
-                              self.config.num_key_value_heads, self.head_dim)
 
         query, key, value = self._transpose_sequence_head(query, key, value)
         query, key = self.rotary(
             position_ids=position_ids, query=query, key=key, freq_cis=freq_cis)
-        key = repeat_kv_bnsh(key, self.num_key_value_groups)
-        value = repeat_kv_bnsh(value, self.num_key_value_groups)
         return self._transpose_sequence_head(query, key, value)
 
     def _merge_heads(self, hidden_states):
@@ -212,11 +199,14 @@ class FlaxArcticAttention(BaseJAXAttentionModule):
             hidden_states)
 
         query_states = query_states.reshape(
-            batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
+            batch_size, sequence_length, self.config.num_attention_heads, self.head_dim
+        )
         key_states = key_states.reshape(
-            batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
+            batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim
+        )
         value_states = value_states.reshape(
-            batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
+            batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim
+        )
 
         query_states, key_states, value_states = self.apply_rotary(
             query=query_states,
@@ -227,16 +217,6 @@ class FlaxArcticAttention(BaseJAXAttentionModule):
             batch_size=batch_size,
             sequence_length=sequence_length
         )
-
-        assert_msg = (
-            "num_attention_heads repeat wont work likely\n"
-            f"INFO :\n\trepeat_kv_bnsh Used with num_key_value_groups = {self.num_key_value_groups}\n\t"
-            f"NH : {self.config.num_attention_heads} KVH : {self.config.num_attention_heads}"
-        )
-
-        assert query_states.shape[-2] == self.config.num_attention_heads, assert_msg
-        assert key_states.shape[-2] == self.config.num_attention_heads, assert_msg
-        assert value_states.shape[-2] == self.config.num_attention_heads, assert_msg
 
         query_length, key_length = query_states.shape[1], key_states.shape[1]
 
@@ -271,6 +251,17 @@ class FlaxArcticAttention(BaseJAXAttentionModule):
                 query_states,
                 attention_mask
             )
+
+        key_states, value_states = self.repeat_key_value(key_states, value_states, self.num_key_value_groups)
+        assert_msg = (
+            "num_attention_heads repeat wont work likely\n"
+            f"INFO :\n\trepeat_key_values Used with num_key_value_groups = {self.num_key_value_groups}\n\t"
+            f"NH : {self.config.num_attention_heads} KVH : {self.config.num_attention_heads}"
+        )
+
+        assert query_states.shape[-2] == self.config.num_attention_heads, assert_msg
+        assert key_states.shape[-2] == self.config.num_attention_heads, assert_msg
+        assert value_states.shape[-2] == self.config.num_attention_heads, assert_msg
         # if self.config.use_sharding_constraint:
         #     query_states = with_sharding_constraint(
         #         query_states, PartitionSpec(("dp", "fsdp"), "sp" if query_states.shape[1] != 1 else None, "tp", None)

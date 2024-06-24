@@ -27,7 +27,6 @@ from easydel.modules.flax_modelling_utils import (
     control_mlp_sharding,
     get_dot_general_by_bits,
     precompute_freq_cis,
-    repeat_kv_bnsh,
     with_sharding_constraint,
 )
 
@@ -136,24 +135,6 @@ class FlaxDbrxAttention(BaseJAXAttentionModule):
     def _merge_heads(self, hidden_states):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
 
-    @staticmethod
-    def _transpose_sequence_head(query, key, value):
-        """The _transpose_sequence_head function transposes the query, key and value matrices.
-
-        Args:
-            query: Get the attention weights for each of the heads
-            key: Determine the number of heads
-            value: Store the values of the input
-
-        Returns:
-            The transpose of the query, key and value matrices
-        """
-        return (
-            jnp.transpose(query, (0, 2, 1, 3)),
-            jnp.transpose(key, (0, 2, 1, 3)),
-            jnp.transpose(value, (0, 2, 1, 3)),
-        )
-
     def apply_rotary(
             self, batch_size, sequence_length, query, key, value, freq_cis, position_ids
     ):
@@ -176,22 +157,11 @@ class FlaxDbrxAttention(BaseJAXAttentionModule):
         Returns:
             A tuple of 3 tensors: query, key and value
         """
-        query = query.reshape(
-            batch_size, sequence_length, self.num_attention_heads, self.head_dim
-        )
-        key = key.reshape(
-            batch_size, sequence_length, self.num_key_value_heads, self.head_dim
-        )
-        value = value.reshape(
-            batch_size, sequence_length, self.num_key_value_heads, self.head_dim
-        )
 
         query, key, value = self._transpose_sequence_head(query, key, value)
         query, key = self.rotary(
             position_ids=position_ids, query=query, key=key, freq_cis=freq_cis
         )
-        key = repeat_kv_bnsh(key, self.num_key_value_groups)
-        value = repeat_kv_bnsh(value, self.num_key_value_groups)
         return self._transpose_sequence_head(query, key, value)
 
     def __call__(
@@ -247,7 +217,15 @@ class FlaxDbrxAttention(BaseJAXAttentionModule):
 
         query_states, key_value_states = jnp.split(qkv_states, [query_size], axis=2)
         key_states, value_states = jnp.split(key_value_states, [key_size], axis=2)
-
+        query_states = query_states.reshape(
+            batch_size, sequence_length, self.num_attention_heads, self.head_dim
+        )
+        key_states = key_states.reshape(
+            batch_size, sequence_length, self.num_key_value_heads, self.head_dim
+        )
+        value_states = value_states.reshape(
+            batch_size, sequence_length, self.num_key_value_heads, self.head_dim
+        )
         query_states, key_states, value_states = self.apply_rotary(
             query=query_states,
             key=key_states,
@@ -257,16 +235,6 @@ class FlaxDbrxAttention(BaseJAXAttentionModule):
             batch_size=batch_size,
             sequence_length=sequence_length,
         )
-
-        assert_msg = (
-            "num_attention_heads repeat wont work likely\n"
-            f"INFO :\n\trepeat_kv_bnsh Used with num_key_value_groups = {self.num_key_value_groups}\n\t"
-            f"NH : {self.num_attention_heads} KVH : {self.num_attention_heads}"
-        )
-
-        assert query_states.shape[-2] == self.num_attention_heads, assert_msg
-        assert key_states.shape[-2] == self.num_attention_heads, assert_msg
-        assert value_states.shape[-2] == self.num_attention_heads, assert_msg
 
         query_length, key_length = query_states.shape[1], key_states.shape[1]
 
@@ -301,6 +269,17 @@ class FlaxDbrxAttention(BaseJAXAttentionModule):
             key_states, value_states, attention_mask = self._concatenate_to_cache(
                 key_states, value_states, query_states, attention_mask
             )
+
+        key_states, value_states = self.repeat_key_value(key_states, value_states, self.num_key_value_groups)
+        assert_msg = (
+            "num_attention_heads repeat wont work likely\n"
+            f"INFO :\n\trepeat_key_values Used with num_key_value_groups = {self.num_key_value_groups}\n\t"
+            f"NH : {self.num_attention_heads} KVH : {self.num_attention_heads}"
+        )
+
+        assert query_states.shape[-2] == self.num_attention_heads, assert_msg
+        assert key_states.shape[-2] == self.num_attention_heads, assert_msg
+        assert value_states.shape[-2] == self.num_attention_heads, assert_msg
 
         attention_bias = lax.select(
             attention_mask > 0,
@@ -1157,8 +1136,8 @@ class FlaxDbrxForCausalLMModule(nn.Module):
                         for logit in outputs.router_logits
                     ]  # type:ignore
                 ),
-                num_experts=self.config.num_local_experts,
-                top_k=self.config.num_experts_per_tok,
+                num_experts=self.config.ffn_config.moe_num_experts,
+                top_k=self.config.ffn_config.moe_top_k,
                 attention_mask=attention_mask,
             )
             aux_loss = aux_loss * self.config.router_aux_loss_coef

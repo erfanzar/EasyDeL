@@ -32,7 +32,6 @@ from easydel.modules.flax_modelling_utils import (
     get_dot_general_by_bits,
     get_gradient_checkpoint_policy,
     precompute_freq_cis,
-    repeat_kv_bnsh,
     with_sharding_constraint,
 )
 from easydel.modules.stablelm.stablelm_configuration import (
@@ -105,6 +104,58 @@ class FlaxStableLmMLP(nn.Module):
 
         x = control_mlp_sharding(x, self.config.partition_axis)
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+
+class StableLmLayerNormPerHeadStack(nn.Module):
+    num_heads: int
+    eps: float = 1e-5
+    bias: bool = False
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[Union[jax.lax.Precision, str]] = None
+
+    def setup(self):
+        self.norms = [
+            nn.LayerNorm(
+                epsilon=self.eps,
+                use_bias=self.bias,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+                name=str(idx)
+            ) for idx in range(self.num_heads)
+        ]
+
+    def __call__(self, hidden_states):
+        # Split along the num_heads axis to get per-head inputs
+        # [batch_size, num_heads, seq_len, head_dim] -> [batch_size, 1, seq_len, head_dim] * num_heads
+        states_per_heads = jnp.split(hidden_states, 1, axis=1)
+        # Normalize and merge the heads back together
+        return jnp.concatenate(
+            [norm(hidden_states) for norm, hidden_states in zip(self.norms, states_per_heads)],
+            axis=1
+        )
+
+
+class StableLmLayerNormPerHead(nn.Module):
+    num_heads: int
+    eps: float = 1e-5
+    bias: bool = False
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[Union[jax.lax.Precision, str]] = None
+
+    def setup(self):
+        self.norms = StableLmLayerNormPerHeadStack(
+            self.num_heads,
+            self.eps,
+            self.bias,
+            self.dtype,
+            self.param_dtype,
+            self.precision
+        )
+
+    def __call__(self, hidden_states):
+        return self.norms(hidden_states)
 
 
 class FlaxStableLmAttention(BaseJAXAttentionModule):
@@ -193,29 +244,26 @@ class FlaxStableLmAttention(BaseJAXAttentionModule):
             backward_pass_impl=self.config.flash_attention_backward_pass_impl,
         )
 
+        self.qk_layernorm = config.qk_layernorm
+        if self.qk_layernorm:
+            self.q_layernorm = StableLmLayerNormPerHead(
+                self.num_heads,
+                eps=config.layer_norm_eps,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype
+            )
+            self.k_layernorm = StableLmLayerNormPerHead(
+                self.num_key_value_heads,
+                eps=config.layer_norm_eps,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype
+            )
+
     def _merge_heads(self, hidden_states):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
 
-    @staticmethod
-    def _transpose_sequence_head(query, key, value):
-        """The _transpose_sequence_head function transposes the query, key and value matrices.
-
-        Args:
-            query: Get the attention weights for each of the heads
-            key: Determine the number of heads
-            value: Store the values of the input
-
-        Returns:
-            The transpose of the query, key and value matrices
-        """
-        return (
-            jnp.transpose(query, (0, 2, 1, 3)),
-            jnp.transpose(key, (0, 2, 1, 3)),
-            jnp.transpose(value, (0, 2, 1, 3)),
-        )
-
     def apply_rotary(
-        self, batch_size, sequence_length, query, key, value, freq_cis, position_ids
+            self, batch_size, sequence_length, query, key, value, freq_cis, position_ids
     ):
         """The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
         The main difference is that it takes in an additional argument, freq_cis, which are used to calculate
@@ -237,16 +285,6 @@ class FlaxStableLmAttention(BaseJAXAttentionModule):
         Returns:
             A tuple of 3 tensors: query_states, key and value
         """
-        query = query.reshape(
-            batch_size, sequence_length, self.config.num_attention_heads, self.head_dim
-        )
-        key = key.reshape(
-            batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim
-        )
-        value = value.reshape(
-            batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim
-        )
-
         query, key, value = self._transpose_sequence_head(query, key, value)
 
         sin, cos = freq_cis
@@ -256,11 +294,11 @@ class FlaxStableLmAttention(BaseJAXAttentionModule):
 
         query_rot, query_pass = (
             query[..., : self.rotary_emb_dim],
-            query[..., self.rotary_emb_dim :],
+            query[..., self.rotary_emb_dim:],
         )
         key_rot, key_pass = (
             key[..., : self.rotary_emb_dim],
-            key[..., self.rotary_emb_dim :],
+            key[..., self.rotary_emb_dim:],
         )
 
         key_rot = apply_rotary_pos_emb(key_rot, sin, cos)
@@ -269,22 +307,20 @@ class FlaxStableLmAttention(BaseJAXAttentionModule):
         query = jnp.concatenate((query_rot, query_pass), axis=-1)
         key = jnp.concatenate((key_rot, key_pass), axis=-1)
 
-        key = repeat_kv_bnsh(key, self.num_key_value_groups)
-        value = repeat_kv_bnsh(value, self.num_key_value_groups)
         return self._transpose_sequence_head(query, key, value)
 
     def __call__(
-        self,
-        hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
-        causal_mask: chex.Array,
-        segment_ids: Optional[chex.Array] = None,
-        deterministic: bool = True,
-        init_cache: bool = False,
-        output_attentions: bool = False,
-        fcm_mask=None,
+            self,
+            hidden_states: chex.Array,
+            freq_cis: Tuple[chex.Array, chex.Array],
+            attention_mask: chex.Array,
+            position_ids: chex.Array,
+            causal_mask: chex.Array,
+            segment_ids: Optional[chex.Array] = None,
+            deterministic: bool = True,
+            init_cache: bool = False,
+            output_attentions: bool = False,
+            fcm_mask=None,
     ):
         """The __call__ function is the main function of a JAX module. It defines how the module behaves when called
         with inputs. The __call__ function can be thought of as a &quot;forward pass&quot; through the model,
@@ -330,6 +366,10 @@ class FlaxStableLmAttention(BaseJAXAttentionModule):
             batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim
         )
 
+        if self.qk_layernorm:
+            query_states = self.q_layernorm(query_states.transpose(0, 2, 1, 3)).transpose(0, 2, 1, 3)
+            key_states = self.k_layernorm(key_states.transpose(0, 2, 1, 3)).transpose(0, 2, 1, 3)
+
         query_states, key_states, value_states = self.apply_rotary(
             query=query_states,
             key=key_states,
@@ -339,16 +379,6 @@ class FlaxStableLmAttention(BaseJAXAttentionModule):
             batch_size=batch_size,
             sequence_length=sequence_length,
         )
-
-        assert_msg = (
-            "num_attention_heads repeat wont work likely\n"
-            f"INFO :\n\trepeat_kv_bnsh Used with num_key_value_groups = {self.num_key_value_groups}\n\t"
-            f"NH : {self.config.num_attention_heads} KVH : {self.config.num_attention_heads}"
-        )
-
-        assert query_states.shape[-2] == self.config.num_attention_heads, assert_msg
-        assert key_states.shape[-2] == self.config.num_attention_heads, assert_msg
-        assert value_states.shape[-2] == self.config.num_attention_heads, assert_msg
 
         query_length, key_length = query_states.shape[1], key_states.shape[1]
 
@@ -383,6 +413,8 @@ class FlaxStableLmAttention(BaseJAXAttentionModule):
             key_states, value_states, attention_mask = self._concatenate_to_cache(
                 key_states, value_states, query_states, attention_mask
             )
+
+        key_states, value_states = self.repeat_key_value(key_states, value_states, self.num_key_value_groups)
         # if self.config.use_sharding_constraint:
         #     query_states = with_sharding_constraint(
         #         query_states, PartitionSpec(("dp", "fsdp"), "sp" if query_states.shape[1] != 1 else None, "tp", None)
@@ -445,7 +477,7 @@ class FlaxStableLmDecoderLayer(nn.Module):
     def setup(self):
         attn_block = FlaxStableLmAttention
         mlp_block = FlaxStableLmMLP
-
+        self.use_parallel_residual = self.config.use_parallel_residual
         if self.config.gradient_checkpointing != "":
             mlp_block = flax.linen.partitioning.remat(
                 mlp_block,
@@ -487,28 +519,30 @@ class FlaxStableLmDecoderLayer(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
         )
-        self.post_attention_layernorm = nn.LayerNorm(
-            epsilon=self.config.layer_norm_eps,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-        )
+        if not self.use_parallel_residual:
+            self.post_attention_layernorm = nn.LayerNorm(
+                epsilon=self.config.layer_norm_eps,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+            )
         self.dropout = flax.linen.Dropout(self.config.hidden_dropout)
 
     def __call__(
-        self,
-        hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
-        attention_mask: Optional[chex.Array],
-        position_ids: Optional[chex.Array],
-        causal_mask: Optional[chex.Array],
-        segment_ids: Optional[chex.Array] = None,
-        deterministic: bool = True,
-        output_attentions: bool = False,
-        init_cache: bool = False,
+            self,
+            hidden_states: chex.Array,
+            freq_cis: Tuple[chex.Array, chex.Array],
+            attention_mask: Optional[chex.Array],
+            position_ids: Optional[chex.Array],
+            causal_mask: Optional[chex.Array],
+            segment_ids: Optional[chex.Array] = None,
+            deterministic: bool = True,
+            output_attentions: bool = False,
+            init_cache: bool = False,
     ):
         residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
         attn_out = self.self_attn(
-            self.input_layernorm(hidden_states),
+            hidden_states,
             freq_cis,
             attention_mask,
             position_ids,
@@ -519,27 +553,44 @@ class FlaxStableLmDecoderLayer(nn.Module):
             output_attentions,
             None,
         )
-        hidden_states, self_attn_weights = (
+        attn_out, self_attn_weights = (
             (attn_out[0], attn_out[1]) if len(attn_out) == 2 else (attn_out[0], None)
         )
 
-        hidden_states = residual + hidden_states
+        if self.use_parallel_residual:
 
-        residual = hidden_states
-        if self.config.use_scan_mlp:
-            hidden_states = block_wise_ffn(
-                self.mlp,
-                self.post_attention_layernorm(hidden_states),
-                self.config.scan_mlp_chunk_size,
-                deterministic,
-            )
+            if self.config.use_scan_mlp:
+                hidden_states = block_wise_ffn(
+                    self.mlp,
+                    hidden_states,
+                    self.config.scan_mlp_chunk_size,
+                    deterministic,
+                )
+            else:
+                hidden_states = self.mlp(
+                    hidden_states,
+                    deterministic,
+                )
+
+            hidden_states = self.dropout(hidden_states, deterministic=deterministic)
+            hidden_states = hidden_states + residual + attn_out
         else:
-            hidden_states = self.mlp(
-                self.post_attention_layernorm(hidden_states),
-                deterministic,
-            )
-        hidden_states = self.dropout(hidden_states, deterministic=deterministic)
-        hidden_states = hidden_states + residual
+
+            residual = residual + attn_out
+            if self.config.use_scan_mlp:
+                hidden_states = block_wise_ffn(
+                    self.mlp,
+                    self.post_attention_layernorm(residual),
+                    self.config.scan_mlp_chunk_size,
+                    deterministic,
+                )
+            else:
+                hidden_states = self.mlp(
+                    self.post_attention_layernorm(residual),
+                    deterministic,
+                )
+            hidden_states = self.dropout(hidden_states, deterministic=deterministic)
+            hidden_states = hidden_states + residual
         outputs = (hidden_states,)
 
         if output_attentions:
@@ -567,17 +618,17 @@ class FlaxStableLmDecoderLayerCollection(nn.Module):
         ]
 
     def __call__(
-        self,
-        hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
-        attention_mask: Optional[chex.Array],
-        position_ids: Optional[chex.Array],
-        causal_mask: Optional[chex.Array],
-        deterministic: bool = True,
-        output_attentions: bool = False,
-        output_hidden_states: bool = False,
-        init_cache: bool = False,
-        return_dict: bool = True,
+            self,
+            hidden_states: chex.Array,
+            freq_cis: Tuple[chex.Array, chex.Array],
+            attention_mask: Optional[chex.Array],
+            position_ids: Optional[chex.Array],
+            causal_mask: Optional[chex.Array],
+            deterministic: bool = True,
+            output_attentions: bool = False,
+            output_hidden_states: bool = False,
+            init_cache: bool = False,
+            return_dict: bool = True,
     ) -> tuple[tuple, ...] | FlaxBaseModelOutput:
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
@@ -693,17 +744,17 @@ class FlaxStableLmModule(nn.Module):
         )
 
     def __call__(
-        self,
-        input_ids: Optional[chex.Array] = None,
-        inputs_embeds: Optional[chex.Array] = None,
-        attention_mask: Optional[chex.Array] = None,
-        position_ids: Optional[chex.Array] = None,
-        extra_embedding: Optional[chex.Array] = None,
-        deterministic: bool = True,
-        output_attentions: bool = False,
-        output_hidden_states: bool = False,
-        init_cache: bool = False,
-        return_dict: bool = True,
+            self,
+            input_ids: Optional[chex.Array] = None,
+            inputs_embeds: Optional[chex.Array] = None,
+            attention_mask: Optional[chex.Array] = None,
+            position_ids: Optional[chex.Array] = None,
+            extra_embedding: Optional[chex.Array] = None,
+            deterministic: bool = True,
+            output_attentions: bool = False,
+            output_hidden_states: bool = False,
+            init_cache: bool = False,
+            return_dict: bool = True,
     ) -> tuple[tuple[Any, ...], ...] | FlaxBaseModelOutput:
         if input_ids is None and inputs_embeds is None:
             raise RuntimeError("Both `input_ids` and `inputs_embeds` can not be None !")
@@ -720,7 +771,7 @@ class FlaxStableLmModule(nn.Module):
                 .astype("i4")
             )
         assert (
-            sequence_length <= self.config.max_position_embeddings
+                sequence_length <= self.config.max_position_embeddings
         ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
 
         inputs_embeds = (
@@ -785,17 +836,17 @@ class FlaxStableLmForCausalLMModule(nn.Module):
         )
 
     def __call__(
-        self,
-        input_ids: Optional[chex.Array] = None,
-        inputs_embeds: Optional[chex.Array] = None,
-        attention_mask: Optional[chex.Array] = None,
-        position_ids: Optional[chex.Array] = None,
-        extra_embedding: Optional[chex.Array] = None,
-        deterministic: bool = True,
-        output_attentions: bool = False,
-        output_hidden_states: bool = False,
-        init_cache: bool = False,
-        return_dict: bool = True,
+            self,
+            input_ids: Optional[chex.Array] = None,
+            inputs_embeds: Optional[chex.Array] = None,
+            attention_mask: Optional[chex.Array] = None,
+            position_ids: Optional[chex.Array] = None,
+            extra_embedding: Optional[chex.Array] = None,
+            deterministic: bool = True,
+            output_attentions: bool = False,
+            output_hidden_states: bool = False,
+            init_cache: bool = False,
+            return_dict: bool = True,
     ) -> tuple[Any, ...] | FlaxMaskedLMOutput:
         res = self.model(
             input_ids=input_ids,
@@ -838,14 +889,14 @@ class FlaxStableLmPreTrainedModel(EasyDeLFlaxPretrainedModel):
     base_model_prefix = "model"
 
     def __init__(
-        self,
-        config: StableLmConfig,
-        dtype: jnp.dtype = jnp.float32,
-        param_dtype: jnp.dtype = jnp.float32,
-        precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
-        input_shape=(1, 1),
-        seed: int = 42,
-        _do_init: bool = False,
+            self,
+            config: StableLmConfig,
+            dtype: jnp.dtype = jnp.float32,
+            param_dtype: jnp.dtype = jnp.float32,
+            precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
+            input_shape=(1, 1),
+            seed: int = 42,
+            _do_init: bool = False,
     ) -> None:
         module = self.module_class(
             config=config, dtype=dtype, param_dtype=param_dtype, precision=precision
@@ -876,7 +927,7 @@ class FlaxStableLmPreTrainedModel(EasyDeLFlaxPretrainedModel):
         return init_variables["cache"]
 
     def init_weights(
-        self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
+            self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
     ) -> FrozenDict:
         input_ids = jnp.zeros(input_shape, dtype="i4")
         attention_mask = jnp.ones_like(input_ids)
@@ -898,20 +949,20 @@ class FlaxStableLmPreTrainedModel(EasyDeLFlaxPretrainedModel):
             return random_params
 
     def __call__(
-        self,
-        input_ids: chex.Array,
-        attention_mask: chex.Array = None,
-        position_ids: chex.Array = None,
-        params: dict = None,
-        past_key_values: dict = None,
-        dropout_rng: jax.random.PRNGKey = None,
-        train: bool = False,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = True,
-        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
-        add_params_field: bool = False,
-        **kwargs,
+            self,
+            input_ids: chex.Array,
+            attention_mask: chex.Array = None,
+            position_ids: chex.Array = None,
+            params: dict = None,
+            past_key_values: dict = None,
+            dropout_rng: jax.random.PRNGKey = None,
+            train: bool = False,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = True,
+            extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+            add_params_field: bool = False,
+            **kwargs,
     ):
         output_attentions = (
             output_attentions
@@ -930,7 +981,7 @@ class FlaxStableLmPreTrainedModel(EasyDeLFlaxPretrainedModel):
         batch_size, sequence_length = input_ids.shape
 
         assert (
-            sequence_length <= self.config.max_position_embeddings
+                sequence_length <= self.config.max_position_embeddings
         ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
 
         if attention_mask is None:
