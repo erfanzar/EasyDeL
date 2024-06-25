@@ -93,37 +93,37 @@ class EasyDeLPretrainedConfig(PretrainedConfig):
     """
 
     def __init__(
-            self,
-            axis_dims: Sequence[int] = (1, -1, 1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = "sharded_vanilla",
-            block_k: int = 128,
-            block_q: int = 128,
-            block_b: int = 1,
-            block_k_major: int | None = None,
-            block_q_major_dkv: int | None = None,
-            block_k_major_dkv: int | None = None,
-            block_k_dkv: int | None = None,
-            block_q_dkv: int | None = None,
-            block_k_major_dq: int | None = None,
-            block_k_dq: int | None = None,
-            block_q_dq: int | None = None,
-            partition_axis: PartitionAxis = PartitionAxis(),
-            shard_attention_computation: bool = True,
-            use_sharded_kv_caching: bool = True,
-            use_sharding_constraint: bool = False,
-            backend: Optional[None] = jax.default_backend(),
-            easy_method: Literal["train", "serve", "convert"] = EasyMethod.TRAIN,
-            bits: Optional[int] = None,
-            scan_ring_attention: bool = True,
-            scan_attention_layers: bool = False,
-            use_scan_mlp: bool = True,
-            scan_mlp_chunk_size: int = 1024,
-            attention_axis_name: str = "sp",
-            quantize_kv_cache: bool = False,
-            flash_attention_backward_pass_impl: Literal["triton", "xla"] = "triton",
-            attn_dtype: jnp.dtype = jnp.float32,
-            **kwargs,
+        self,
+        axis_dims: Sequence[int] = (1, -1, 1, 1),
+        axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+        attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = "sharded_vanilla",
+        block_k: int = 128,
+        block_q: int = 128,
+        block_b: int = 1,
+        block_k_major: int | None = None,
+        block_q_major_dkv: int | None = None,
+        block_k_major_dkv: int | None = None,
+        block_k_dkv: int | None = None,
+        block_q_dkv: int | None = None,
+        block_k_major_dq: int | None = None,
+        block_k_dq: int | None = None,
+        block_q_dq: int | None = None,
+        partition_axis: PartitionAxis = PartitionAxis(),
+        shard_attention_computation: bool = True,
+        use_sharded_kv_caching: bool = True,
+        use_sharding_constraint: bool = False,
+        backend: Optional[None] = jax.default_backend(),
+        easy_method: Literal["train", "serve", "convert"] = EasyMethod.TRAIN,
+        bits: Optional[int] = None,
+        scan_ring_attention: bool = True,
+        scan_attention_layers: bool = False,
+        use_scan_mlp: bool = True,
+        scan_mlp_chunk_size: int = 1024,
+        attention_axis_name: str = "sp",
+        quantize_kv_cache: bool = False,
+        flash_attention_backward_pass_impl: Literal["triton", "xla"] = "triton",
+        attn_dtype: jnp.dtype = jnp.float32,
+        **kwargs,
     ):
         self.axis_dims = axis_dims
         self.axis_names = axis_names
@@ -158,9 +158,9 @@ class EasyDeLPretrainedConfig(PretrainedConfig):
 
     @staticmethod
     def create_mesh(
-            axis_dims: Sequence[int] = (1, -1, 1, 1),
-            axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            backend="",
+        axis_dims: Sequence[int] = (1, -1, 1, 1),
+        axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+        backend="",
     ):
         """The create_mesh function creates a mesh object that can be used to shard arrays.
 
@@ -292,36 +292,36 @@ class EasyDeLPretrainedConfig(PretrainedConfig):
         )
 
     def add_basic_configurations(
-            self,
-            axis_dims: Sequence[int] = ...,
-            axis_names: Sequence[str] = ...,
-            attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = ...,
-            block_k: int = ...,
-            block_q: int = ...,
-            block_b: int = ...,
-            block_k_major: int = ...,
-            block_q_major_dkv: int | None = ...,
-            block_k_major_dkv: int | None = ...,
-            block_k_dkv: int | None = ...,
-            block_q_dkv: int | None = ...,
-            block_k_major_dq: int | None = ...,
-            block_k_dq: int | None = ...,
-            block_q_dq: int | None = ...,
-            partition_axis: PartitionAxis = ...,
-            shard_attention_computation: bool = ...,
-            use_sharded_kv_caching: bool = ...,
-            backend: Optional[None] = ...,
-            easy_method: Literal["train", "serve", "convert"] = ...,
-            bits: Optional[int] = ...,
-            scan_ring_attention: bool = ...,
-            scan_attention_layers: bool = ...,
-            use_sharding_constraint: bool = ...,
-            use_scan_mlp: bool = ...,
-            scan_mlp_chunk_size: int = ...,
-            attention_axis_name: str = ...,
-            quantize_kv_cache: bool = ...,
-            flash_attention_backward_pass_impl: Literal["triton", "xla"] = ...,
-            attn_dtype: jnp.dtype = ...,
+        self,
+        axis_dims: Sequence[int] = ...,
+        axis_names: Sequence[str] = ...,
+        attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = ...,
+        block_k: int = ...,
+        block_q: int = ...,
+        block_b: int = ...,
+        block_k_major: int = ...,
+        block_q_major_dkv: int | None = ...,
+        block_k_major_dkv: int | None = ...,
+        block_k_dkv: int | None = ...,
+        block_q_dkv: int | None = ...,
+        block_k_major_dq: int | None = ...,
+        block_k_dq: int | None = ...,
+        block_q_dq: int | None = ...,
+        partition_axis: PartitionAxis = ...,
+        shard_attention_computation: bool = ...,
+        use_sharded_kv_caching: bool = ...,
+        backend: Optional[None] = ...,
+        easy_method: Literal["train", "serve", "convert"] = ...,
+        bits: Optional[int] = ...,
+        scan_ring_attention: bool = ...,
+        scan_attention_layers: bool = ...,
+        use_sharding_constraint: bool = ...,
+        use_scan_mlp: bool = ...,
+        scan_mlp_chunk_size: int = ...,
+        attention_axis_name: str = ...,
+        quantize_kv_cache: bool = ...,
+        flash_attention_backward_pass_impl: Literal["triton", "xla"] = ...,
+        attn_dtype: jnp.dtype = ...,
     ):
         """It initializes all the attributes of an object, and it's called when you create a new instance of that class.
 
@@ -480,15 +480,15 @@ class EasyDeLPretrainedConfig(PretrainedConfig):
 
 class EasyDeLFlaxPretrainedModel(FlaxPreTrainedModel):
     def __init__(
-            self,
-            config: Optional[PretrainedConfig] = None,
-            module: Optional[flax.linen.Module] = None,
-            input_shape: Tuple = (1, 1),
-            seed: int = 0,
-            dtype: jnp.dtype = jnp.float32,
-            param_dtype: jnp.dtype = jnp.float32,  # Ignored
-            precision: Optional[Union[jax.lax.Precision, str]] = None,  # Ignored
-            _do_init: bool = True,
+        self,
+        config: Optional[PretrainedConfig] = None,
+        module: Optional[flax.linen.Module] = None,
+        input_shape: Tuple = (1, 1),
+        seed: int = 0,
+        dtype: jnp.dtype = jnp.float32,
+        param_dtype: jnp.dtype = jnp.float32,  # Ignored
+        precision: Optional[Union[jax.lax.Precision, str]] = None,  # Ignored
+        _do_init: bool = True,
     ):
         assert config is not None, "`config` must be provided.`"
         assert module is not None, "`module` must be provided.`"
@@ -594,7 +594,7 @@ class EasyDeLFlaxPretrainedModel(FlaxPreTrainedModel):
         raise NotImplementedError("init_cache is not Implemented Yet!")
 
     def prepare_inputs_for_generation(
-            self, input_ids, max_length, attention_mask: Optional[chex.Array] = None
+        self, input_ids, max_length, attention_mask: Optional[chex.Array] = None
     ):
         """The prepare_inputs_for_generation function is used to prepare the inputs for a generation task.
 
@@ -635,21 +635,21 @@ class EasyDeLFlaxPretrainedModel(FlaxPreTrainedModel):
         return model_kwargs
 
     def __call__(
-            self,
-            input_ids: chex.Array,
-            attention_mask: Optional[chex.Array] = None,
-            position_ids: Optional[chex.Array] = None,
-            params: dict = None,
-            past_key_values: dict = None,
-            dropout_rng: jax.random.PRNGKey = None,
-            train: bool = False,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
-            extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
-            add_params_field: bool = False,
-            vision_mask: Optional[chex.Array] = None,
-            **kwargs,
+        self,
+        input_ids: chex.Array,
+        attention_mask: Optional[chex.Array] = None,
+        position_ids: Optional[chex.Array] = None,
+        params: dict = None,
+        past_key_values: dict = None,
+        dropout_rng: jax.random.PRNGKey = None,
+        train: bool = False,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+        add_params_field: bool = False,
+        vision_mask: Optional[chex.Array] = None,
+        **kwargs,
     ):
         raise NotImplementedError("Not Implemented Yet")
 
@@ -696,7 +696,7 @@ class EasyDeLFlaxPretrainedModel(FlaxPreTrainedModel):
         return self._config  # type:ignore
 
     def to_easydel_state(
-            self, params: flax.core.FrozenDict, auto_check_params: bool = True
+        self, params: flax.core.FrozenDict, auto_check_params: bool = True
     ):
         """
         Convert the Model to EasyDeLState
@@ -716,10 +716,10 @@ class EasyDeLFlaxPretrainedModel(FlaxPreTrainedModel):
         )
 
     def to_pytorch(
-            self,
-            params: FrozenDict,
-            base_hf_auto_class=AutoModelForCausalLM,
-            easystate_to_huggingface_model_kwargs: Optional[dict] = None,
+        self,
+        params: FrozenDict,
+        base_hf_auto_class=AutoModelForCausalLM,
+        easystate_to_huggingface_model_kwargs: Optional[dict] = None,
     ):
         """
         Return the Huggingface / Pytorch implementation of the model with same weights  (if model is available in HF)
@@ -827,17 +827,17 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
         return md
 
     def save_pretrained(  # noqa
-            self,
-            save_directory: Union[str, os.PathLike],
-            params,
-            push_to_hub=False,
-            token: Optional[Union[str, bool]] = None,
-            gather_fns: dict[Callable] = None,
-            float_dtype=None,
-            verbose: bool = True,
-            mismatch_allowed: bool = True,
-            safe=True,
-            **kwargs,
+        self,
+        save_directory: Union[str, os.PathLike],
+        params,
+        push_to_hub=False,
+        token: Optional[Union[str, bool]] = None,
+        gather_fns: dict[Callable] = None,
+        float_dtype=None,
+        verbose: bool = True,
+        mismatch_allowed: bool = True,
+        safe=True,
+        **kwargs,
     ):
         if token is not None:
             kwargs["token"] = token
@@ -862,9 +862,11 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
         output_model_file = os.path.join(save_directory, "easydel-model.parameters")
         if not os.path.exists(os.path.join(save_directory, "README.md")):
             open(os.path.join(save_directory, "README.md"), "w").write(self._md_info())
-        func = fjformer.checkpoint.CheckpointManager.save_checkpoint_safe if (
-            safe
-        ) else fjformer.checkpoint.CheckpointManager.save_state_to_file
+        func = (
+            fjformer.checkpoint.CheckpointManager.save_checkpoint_safe
+            if (safe)
+            else fjformer.checkpoint.CheckpointManager.save_state_to_file
+        )
         func(
             path=output_model_file,
             gather_fns=gather_fns,
@@ -894,39 +896,39 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
         # Detects whether `prepare_inputs_for_generation` has been overwritten, which is a requirement for generation.
         # Alternativelly, the model can also have a custom `generate` function.
         if "GenerationMixin" in str(
-                cls.prepare_inputs_for_generation
+            cls.prepare_inputs_for_generation
         ) and "GenerationMixin" in str(cls.generate):
             return False
         return True
 
     @classmethod
     def from_pretrained(
-            cls,
-            pretrained_model_name_or_path: Union[str, os.PathLike],
-            sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
-            sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            partition_axis: PartitionAxis = PartitionAxis(),
-            dtype: jnp.dtype = jnp.float32,
-            param_dtype: jnp.dtype = jnp.float32,
-            safe: bool = True,
-            precision: jax.lax.PrecisionLike = jax.lax.Precision("fastest"),
-            input_shape: Optional[Tuple[int, int]] = None,
-            config_kwargs: Optional[dict[str, Any]] = None,
-            partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
-            shard_fns: dict[Callable] = None,
-            auto_shard_params: bool = False,
-            remove_dict_prefix=None,
-            verbose: bool = True,
-            mismatch_allowed: bool = True,
-            *model_args,
-            config: Optional[Union[EasyDeLPretrainedConfig, str, os.PathLike]] = None,
-            cache_dir: Optional[Union[str, os.PathLike]] = None,
-            ignore_mismatched_sizes: bool = False,
-            force_download: bool = False,
-            local_files_only: bool = False,
-            token: Optional[Union[str, bool]] = None,
-            revision: str = "main",
-            **kwargs,
+        cls,
+        pretrained_model_name_or_path: Union[str, os.PathLike],
+        sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
+        sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+        partition_axis: PartitionAxis = PartitionAxis(),
+        dtype: jnp.dtype = jnp.float32,
+        param_dtype: jnp.dtype = jnp.float32,
+        safe: bool = True,
+        precision: jax.lax.PrecisionLike = jax.lax.Precision("fastest"),
+        input_shape: Optional[Tuple[int, int]] = None,
+        config_kwargs: Optional[dict[str, Any]] = None,
+        partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
+        shard_fns: dict[Callable] = None,
+        auto_shard_params: bool = False,
+        remove_dict_prefix=None,
+        verbose: bool = True,
+        mismatch_allowed: bool = True,
+        *model_args,
+        config: Optional[Union[EasyDeLPretrainedConfig, str, os.PathLike]] = None,
+        cache_dir: Optional[Union[str, os.PathLike]] = None,
+        ignore_mismatched_sizes: bool = False,
+        force_download: bool = False,
+        local_files_only: bool = False,
+        token: Optional[Union[str, bool]] = None,
+        revision: str = "main",
+        **kwargs,
     ):
         """
         loads EasyDeL Models
@@ -1004,7 +1006,7 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
                 config=config,
                 input_shape=input_shape,
                 flatten=False,
-                partition_rules=partition_rules
+                partition_rules=partition_rules,
             )
             fns = {"params": shard_fns}
             fns.update(shard_fns)
@@ -1018,9 +1020,9 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
             is_local = os.path.isdir(pretrained_model_name_or_path)
             if os.path.isdir(pretrained_model_name_or_path):
                 if os.path.isfile(
-                        os.path.join(
-                            pretrained_model_name_or_path, subfolder, FLAX_WEIGHTS_NAME
-                        )
+                    os.path.join(
+                        pretrained_model_name_or_path, subfolder, FLAX_WEIGHTS_NAME
+                    )
                 ):
                     archive_file = os.path.join(
                         pretrained_model_name_or_path, subfolder, FLAX_WEIGHTS_NAME

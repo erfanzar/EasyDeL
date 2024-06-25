@@ -2,45 +2,46 @@ import math
 import time
 import warnings
 from functools import partial
-from typing import Tuple, Optional, Literal, Any
-
-import jax
-
-from jax import numpy as jnp, lax, random
-from jax.experimental.shard_map import shard_map
-from jax.sharding import PartitionSpec, Mesh
-
-from flax.linen.dtypes import promote_dtype
-from flax.struct import dataclass
-
-from chex import Array
+from typing import Any, Literal, Optional, Tuple
 
 import fjformer
-from fjformer.pallas_operations.pallas_attention import flash_attention
+import jax
+from chex import Array
 from fjformer import with_sharding_constraint
+from fjformer.pallas_operations.pallas_attention import flash_attention
+from fjformer.pallas_operations.tpu.flash_attention import (
+    BlockSizes as BlockSizesFlashAttn,
+)
 from fjformer.pallas_operations.tpu.flash_attention import (
     flash_attention as tpu_flash_attention,
-    BlockSizes as BlockSizesFlashAttn,
 )
 from fjformer.pallas_operations.tpu.ring_attention import ring_flash_attention_tpu
 from fjformer.pallas_operations.tpu.splash_attention import (
-    make_splash_mha,
+    BlockSizes as BlockSizesSplashAttn,
+)
+from fjformer.pallas_operations.tpu.splash_attention import (
     CausalMask,
     MultiHeadMask,
     SegmentIds,
-    BlockSizes as BlockSizesSplashAttn,
+    make_splash_mha,
 )
+from flax.linen.dtypes import promote_dtype
+from flax.struct import dataclass
+from jax import lax, random
+from jax import numpy as jnp
+from jax.experimental.shard_map import shard_map
+from jax.sharding import Mesh, PartitionSpec
 
-from easydel.modules._vanilla_attention import (
-    vanilla_attention,
-    shard_vanilla_attention,
-)
-from easydel.modules._ring_attention import ring_attention_standard, wise_ring_attention
-from easydel.modules._blockwise_attention import blockwise_attn
-from easydel.modules.flax_modelling_utils import get_gradient_checkpoint_policy
 from easydel.etils.etils import get_logger
-from easydel.modules.easydel_modelling_utils import EasyDeLPretrainedConfig
 from easydel.etils.partition_module import PartitionAxis
+from easydel.modules._blockwise_attention import blockwise_attn
+from easydel.modules._ring_attention import ring_attention_standard, wise_ring_attention
+from easydel.modules._vanilla_attention import (
+    shard_vanilla_attention,
+    vanilla_attention,
+)
+from easydel.modules.easydel_modelling_utils import EasyDeLPretrainedConfig
+from easydel.modules.flax_modelling_utils import get_gradient_checkpoint_policy
 
 logger = get_logger(__name__)
 
@@ -93,13 +94,13 @@ def combine_flash_masks(causal_mask, segment_ids):
         raise ValueError("unexpected shape for `segment_ids`")
 
     assert (
-            seq_query_sequence_length == query_sequence_length
+        seq_query_sequence_length == query_sequence_length
     ), "`segment_ids` and `causal_mask` don't have same query axis length"
     assert (
-            seq_key_sequence_length == key_sequence_length
+        seq_key_sequence_length == key_sequence_length
     ), "`segment_ids` and `causal_mask` don't have same key/value axis length"
     assert (
-            segment_ids.ndim == 2
+        segment_ids.ndim == 2
     ), f"`segment_ids` don't have excepted shape {segment_ids.shape}"
     segment_ids = jnp.expand_dims(
         ~jnp.equal(
@@ -111,11 +112,11 @@ def combine_flash_masks(causal_mask, segment_ids):
 
 
 def set_attrs_smartly_with_prp(
-        self,
-        attr_name: str,
-        default: Any,
-        new_attr: Any,
-        prp: EasyDeLPretrainedConfig = None,
+    self,
+    attr_name: str,
+    default: Any,
+    new_attr: Any,
+    prp: EasyDeLPretrainedConfig = None,
 ):
     if not hasattr(self, attr_name) or getattr(self, attr_name, ...) == Ellipsis:
         setattr(self, attr_name, default if prp is None else getattr(prp, attr_name))
@@ -189,48 +190,48 @@ class AttentionModule:
     """
 
     def __init__(
-            self,
-            mesh: Mesh,
-            attn_mechanism: Literal[
-                "vanilla",
-                "flash",
-                "splash",
-                "ring",
-                "cudnn",
-                "local_ring",
-                "sharded_vanilla",
-                "legacy_sharded_vanilla",
-                "wise_ring",
-                "blockwise",
-                "pallas_flash",
-            ],
-            sm_scale: float,
-            num_attention_heads: int,
-            head_dims: int,
-            block_k: int = ...,
-            block_q: int = ...,
-            block_b: int = ...,
-            block_k_major: int = ...,
-            block_q_major_dkv: int = ...,
-            block_k_major_dkv: int = ...,
-            block_k_dkv: int = ...,
-            block_q_dkv: int = ...,
-            block_k_major_dq: int = ...,
-            block_k_dq: int = ...,
-            block_q_dq: int = ...,
-            partition_axis: PartitionAxis = ...,
-            scan_ring_attention: bool = ...,
-            scan_attention_layers: bool = ...,
-            attention_dropout: float = 0.0,
-            dtype: jnp.dtype = jnp.float32,
-            precision: lax.Precision = ...,
-            force_float32_tpu: bool = ...,
-            shard_attention_computation: bool = ...,
-            use_sharding_constraint: Optional[bool] = ...,
-            axis_name: str = ...,
-            backward_pass_impl: Literal["triton", "xla"] = "triton",
-            base_module_class: Optional[EasyDeLPretrainedConfig] = None,
-            _do_check: bool = True,
+        self,
+        mesh: Mesh,
+        attn_mechanism: Literal[
+            "vanilla",
+            "flash",
+            "splash",
+            "ring",
+            "cudnn",
+            "local_ring",
+            "sharded_vanilla",
+            "legacy_sharded_vanilla",
+            "wise_ring",
+            "blockwise",
+            "pallas_flash",
+        ],
+        sm_scale: float,
+        num_attention_heads: int,
+        head_dims: int,
+        block_k: int = ...,
+        block_q: int = ...,
+        block_b: int = ...,
+        block_k_major: int = ...,
+        block_q_major_dkv: int = ...,
+        block_k_major_dkv: int = ...,
+        block_k_dkv: int = ...,
+        block_q_dkv: int = ...,
+        block_k_major_dq: int = ...,
+        block_k_dq: int = ...,
+        block_q_dq: int = ...,
+        partition_axis: PartitionAxis = ...,
+        scan_ring_attention: bool = ...,
+        scan_attention_layers: bool = ...,
+        attention_dropout: float = 0.0,
+        dtype: jnp.dtype = jnp.float32,
+        precision: lax.Precision = ...,
+        force_float32_tpu: bool = ...,
+        shard_attention_computation: bool = ...,
+        use_sharding_constraint: Optional[bool] = ...,
+        axis_name: str = ...,
+        backward_pass_impl: Literal["triton", "xla"] = "triton",
+        base_module_class: Optional[EasyDeLPretrainedConfig] = None,
+        _do_check: bool = True,
     ):
         self.block_k: int = ...
         self.block_q: int = ...
@@ -369,7 +370,7 @@ class AttentionModule:
         )
 
     def get_bshd_partition_specs(
-            self, query_sequence_length
+        self, query_sequence_length
     ) -> Tuple[
         PartitionSpec, PartitionSpec, PartitionSpec, PartitionSpec, PartitionSpec, bool
     ]:
@@ -436,7 +437,7 @@ class AttentionModule:
         )
 
     def get_bhsd_partition_specs(
-            self, query_sequence_length
+        self, query_sequence_length
     ) -> Tuple[
         PartitionSpec, PartitionSpec, PartitionSpec, PartitionSpec, PartitionSpec, bool
     ]:
@@ -503,16 +504,16 @@ class AttentionModule:
         )
 
     def _check_states(
-            self,
-            query_states: Array,
-            key_states: Array,
-            value_states: Array,
-            query_sequence_length: int,
-            key_value_sequence_length: int,
+        self,
+        query_states: Array,
+        key_states: Array,
+        value_states: Array,
+        query_sequence_length: int,
+        key_value_sequence_length: int,
     ):
         batch_size = query_states.shape[0]
         assert (
-                batch_size == key_states.shape[0] == value_states.shape[0]
+            batch_size == key_states.shape[0] == value_states.shape[0]
         ), "Batch Size for q,k,v wont match"
         k_v_req_shape = (
             batch_size,
@@ -546,20 +547,20 @@ class AttentionModule:
         )
 
     def __call__(
-            self,
-            query_states: Array,
-            key_states: Array,
-            value_states: Array,
-            causal_mask: Optional[Array] = None,
-            query_sequence_length: Optional[int] = None,
-            key_value_sequence_length: Optional[int] = None,
-            bias: Optional[Array] = None,
-            attention_mask: Optional[Array] = None,
-            segment_ids: Optional[Array] = None,
-            causal: bool = True,
-            deterministic: bool = False,
-            dropout_rng: Optional[random.PRNGKey] = None,
-            uses_cache: bool = False,
+        self,
+        query_states: Array,
+        key_states: Array,
+        value_states: Array,
+        causal_mask: Optional[Array] = None,
+        query_sequence_length: Optional[int] = None,
+        key_value_sequence_length: Optional[int] = None,
+        bias: Optional[Array] = None,
+        attention_mask: Optional[Array] = None,
+        segment_ids: Optional[Array] = None,
+        causal: bool = True,
+        deterministic: bool = False,
+        dropout_rng: Optional[random.PRNGKey] = None,
+        uses_cache: bool = False,
     ):
         if query_sequence_length is None:
             query_sequence_length = query_states.shape[1]
@@ -750,14 +751,14 @@ class AttentionModule:
                 )
 
     def local_ring_attention(
-            self,
-            *,  # it's Kwarg Only
-            query_states: Array,
-            key_states: Array,
-            value_states: Array,
-            query_sequence_length: int,
-            key_value_sequence_length: int,
-            bias: Optional[Array] = None,
+        self,
+        *,  # it's Kwarg Only
+        query_states: Array,
+        key_states: Array,
+        value_states: Array,
+        query_sequence_length: int,
+        key_value_sequence_length: int,
+        bias: Optional[Array] = None,
     ):
         qps, kps, vps, bps, aps, _ = self.get_bshd_partition_specs(
             query_sequence_length
@@ -784,18 +785,18 @@ class AttentionModule:
         )
 
     def ring_attention(
-            self,
-            *,  # it's Kwarg Only
-            query_states: Array,
-            key_states: Array,
-            value_states: Array,
-            query_sequence_length: int,
-            key_value_sequence_length: int,
-            bias: Optional[Array] = None,
-            attention_mask: Optional[Array] = None,
-            deterministic: bool = False,
-            dropout_rng: Optional[random.PRNGKey] = None,
-            segment_ids: Optional[Array] = None,
+        self,
+        *,  # it's Kwarg Only
+        query_states: Array,
+        key_states: Array,
+        value_states: Array,
+        query_sequence_length: int,
+        key_value_sequence_length: int,
+        bias: Optional[Array] = None,
+        attention_mask: Optional[Array] = None,
+        deterministic: bool = False,
+        dropout_rng: Optional[random.PRNGKey] = None,
+        segment_ids: Optional[Array] = None,
     ):
         qps, kps, vps, bps, aps, _ = self.get_bshd_partition_specs(
             query_sequence_length
@@ -805,7 +806,7 @@ class AttentionModule:
                 (query_states.shape[0], query_sequence_length), dtype="i4"
             )
         if self.scan_ring_attention and query_states.shape[1] > max(
-                self.block_q, self.block_k
+            self.block_q, self.block_k
         ):
             if self.platform == "tpu":
                 ring_attention_fn = ring_flash_attention_tpu
@@ -891,17 +892,17 @@ class AttentionModule:
         return AttentionOutput(attention_weights=None, attention_outputs=attn_output)
 
     def wise_ring_attention(
-            self,
-            *,  # it's Kwarg Only
-            query_states: Array,
-            key_states: Array,
-            value_states: Array,
-            query_sequence_length: int,
-            key_value_sequence_length: int,
-            bias: Optional[Array] = None,
-            deterministic: bool = False,
-            dropout_rng: Optional[random.PRNGKey] = None,
-            segment_ids: Optional[Array] = None,
+        self,
+        *,  # it's Kwarg Only
+        query_states: Array,
+        key_states: Array,
+        value_states: Array,
+        query_sequence_length: int,
+        key_value_sequence_length: int,
+        bias: Optional[Array] = None,
+        deterministic: bool = False,
+        dropout_rng: Optional[random.PRNGKey] = None,
+        segment_ids: Optional[Array] = None,
     ):
         qps, kps, vps, bps, aps, _ = self.get_bshd_partition_specs(
             query_sequence_length
@@ -911,7 +912,7 @@ class AttentionModule:
                 (query_states.shape[0], query_sequence_length), dtype="i4"
             )
         if self.scan_ring_attention and query_states.shape[1] > max(
-                self.block_q, self.block_k
+            self.block_q, self.block_k
         ):
             ring_attention_sharded = shard_map(
                 partial(
@@ -960,16 +961,16 @@ class AttentionModule:
             )
 
     def vanilla_attention(
-            self,
-            *,  # it's Kwarg Only
-            query_states: Array,
-            key_states: Array,
-            value_states: Array,
-            bias: Optional[Array] = None,
-            deterministic: bool = False,
-            dropout_rng: Optional[random.PRNGKey] = None,
-            query_sequence_length: int,
-            key_value_sequence_length: int,
+        self,
+        *,  # it's Kwarg Only
+        query_states: Array,
+        key_states: Array,
+        value_states: Array,
+        bias: Optional[Array] = None,
+        deterministic: bool = False,
+        dropout_rng: Optional[random.PRNGKey] = None,
+        query_sequence_length: int,
+        key_value_sequence_length: int,
     ) -> AttentionOutput:
         with self.mesh:
             o, w = vanilla_attention(
@@ -987,16 +988,16 @@ class AttentionModule:
             return AttentionOutput(attention_weights=w, attention_outputs=o)
 
     def blockwise_attention(
-            self,
-            *,  # it's Kwarg Only
-            query_states: Array,
-            key_states: Array,
-            value_states: Array,
-            bias: Optional[Array] = None,
-            deterministic: bool = False,
-            dropout_rng: Optional[random.PRNGKey] = None,
-            query_sequence_length: int,
-            key_value_sequence_length: int,
+        self,
+        *,  # it's Kwarg Only
+        query_states: Array,
+        key_states: Array,
+        value_states: Array,
+        bias: Optional[Array] = None,
+        deterministic: bool = False,
+        dropout_rng: Optional[random.PRNGKey] = None,
+        query_sequence_length: int,
+        key_value_sequence_length: int,
     ) -> AttentionOutput:
         qps, kps, vps, bps, aps, is_gen = self.get_bshd_partition_specs(
             query_sequence_length
@@ -1030,16 +1031,16 @@ class AttentionModule:
             return AttentionOutput(attention_weights=None, attention_outputs=o)
 
     def sharded_vanilla_attention(
-            self,
-            *,  # it's Kwarg Only
-            query_states: Array,
-            key_states: Array,
-            value_states: Array,
-            bias: Optional[Array] = None,
-            deterministic: bool = False,
-            dropout_rng: Optional[random.PRNGKey] = None,
-            query_sequence_length: int,
-            key_value_sequence_length: int,
+        self,
+        *,  # it's Kwarg Only
+        query_states: Array,
+        key_states: Array,
+        value_states: Array,
+        bias: Optional[Array] = None,
+        deterministic: bool = False,
+        dropout_rng: Optional[random.PRNGKey] = None,
+        query_sequence_length: int,
+        key_value_sequence_length: int,
     ) -> AttentionOutput:
         qps, kps, vps, bps, aps, is_gen = self.get_bshd_partition_specs(
             query_sequence_length
@@ -1071,7 +1072,7 @@ class AttentionModule:
             if not deterministic and self.attention_dropout > 0.0:
                 keep_prob = 1.0 - self.attention_dropout
                 dropout_shape = (
-                        tuple([1] * (key_states.ndim - 2)) + attention_weight.shape[-2:]
+                    tuple([1] * (key_states.ndim - 2)) + attention_weight.shape[-2:]
                 )
                 keep = random.bernoulli(dropout_rng, keep_prob, dropout_shape)  # type: ignore
 
@@ -1092,16 +1093,16 @@ class AttentionModule:
             )
 
     def legacy_sharded_vanilla_attention(
-            self,
-            *,  # it's Kwarg Only
-            query_states: Array,
-            key_states: Array,
-            value_states: Array,
-            bias: Optional[Array] = None,
-            deterministic: bool = False,
-            dropout_rng: Optional[random.PRNGKey] = None,
-            query_sequence_length: int,
-            key_value_sequence_length: int,
+        self,
+        *,  # it's Kwarg Only
+        query_states: Array,
+        key_states: Array,
+        value_states: Array,
+        bias: Optional[Array] = None,
+        deterministic: bool = False,
+        dropout_rng: Optional[random.PRNGKey] = None,
+        query_sequence_length: int,
+        key_value_sequence_length: int,
     ) -> AttentionOutput:
         qps, kps, vps, bps, aps, is_gen = self.get_bshd_partition_specs(
             query_sequence_length
@@ -1140,16 +1141,16 @@ class AttentionModule:
             )
 
     def flash_attention(
-            self,
-            *,  # it's Kwarg Only
-            query_states: Array,
-            key_states: Array,
-            value_states: Array,
-            query_sequence_length: int,
-            key_value_sequence_length: int,
-            attention_mask: Optional[Array] = None,
-            bias: Optional[Array] = None,
-            causal: bool = False,
+        self,
+        *,  # it's Kwarg Only
+        query_states: Array,
+        key_states: Array,
+        value_states: Array,
+        query_sequence_length: int,
+        key_value_sequence_length: int,
+        attention_mask: Optional[Array] = None,
+        bias: Optional[Array] = None,
+        causal: bool = False,
     ) -> AttentionOutput:
         if self.platform == "tpu":
             qps, kps, vps, bps, aps, is_gen = self.get_bhsd_partition_specs(
@@ -1212,13 +1213,13 @@ class AttentionModule:
             )
 
     def splash_attention(
-            self,
-            query_states: Array,
-            key_states: Array,
-            value_states: Array,
-            query_sequence_length: int,
-            key_value_sequence_length: int,
-            attention_mask: Array,
+        self,
+        query_states: Array,
+        key_states: Array,
+        value_states: Array,
+        query_sequence_length: int,
+        key_value_sequence_length: int,
+        attention_mask: Array,
     ) -> AttentionOutput:
         qps, kps, vps, bps, aps, is_gen = self.get_bhsd_partition_specs(
             query_sequence_length
@@ -1272,13 +1273,13 @@ class AttentionModule:
         return AttentionOutput(attention_outputs=attention_o, attention_weights=None)
 
     def pallas_flash_attention(
-            self,
-            *,
-            query_states: Array,
-            key_states: Array,
-            value_states: Array,
-            query_sequence_length: int = None,
-            bias: Optional[Array] = None,
+        self,
+        *,
+        query_states: Array,
+        key_states: Array,
+        value_states: Array,
+        query_sequence_length: int = None,
+        bias: Optional[Array] = None,
     ) -> AttentionOutput:
         if query_sequence_length is None:
             query_sequence_length = query_states.shape[1]
@@ -1286,7 +1287,9 @@ class AttentionModule:
             query_sequence_length
         )
 
-        if is_gen and self.platform == "gpu":  # prevents ValueError: all dimensions of x and y must be >= 16
+        if (
+            is_gen and self.platform == "gpu"
+        ):  # prevents ValueError: all dimensions of x and y must be >= 16
 
             return self.sharded_vanilla_attention(
                 query_states=query_states,
@@ -1294,7 +1297,7 @@ class AttentionModule:
                 value_states=value_states,
                 bias=bias,
                 query_sequence_length=query_sequence_length,
-                key_value_sequence_length=key_states.shape[1]
+                key_value_sequence_length=key_states.shape[1],
             )
         query_states, key_states, value_states = map(
             lambda s: s.astype(self.dtype), (query_states, key_states, value_states)
@@ -1325,16 +1328,16 @@ class AttentionModule:
         )
 
     def cuddn_flash_attention(
-            self,
-            *,  # it's Kwarg Only
-            query_states: Array,
-            key_states: Array,
-            value_states: Array,
-            bias: Optional[Array] = None,
-            causal: bool = False,
-            deterministic: bool = True,
-            query_sequence_length: int,
-            key_value_sequence_length: int,
+        self,
+        *,  # it's Kwarg Only
+        query_states: Array,
+        key_states: Array,
+        value_states: Array,
+        bias: Optional[Array] = None,
+        causal: bool = False,
+        deterministic: bool = True,
+        query_sequence_length: int,
+        key_value_sequence_length: int,
     ) -> AttentionOutput:
         """CUDNN Flash Attention with Transformer Engine."""
         try:
@@ -1420,27 +1423,27 @@ class AttentionModule:
 
     @staticmethod
     def test_attentions(
-            batch_size=8,
-            sequence_length=128 * 8,
-            num_attention_heads=32,
-            num_key_value_heads=32,
-            chunk_size=128,
-            axis_dims=(1, -1, 1, 1),
-            head_dim=128,
-            dtype=jnp.float16,
-            calculate_gradients: bool = True,
-            test_attentions=[
-                "local_ring",
-                "blockwise",
-                "vanilla",
-                "wise_ring",
-                "sharded_vanilla",
-                "legacy_sharded_vanilla",
-                "flash",
-                "splash",
-                "pallas_flash",
-                "cudnn",
-            ],
+        batch_size=8,
+        sequence_length=128 * 8,
+        num_attention_heads=32,
+        num_key_value_heads=32,
+        chunk_size=128,
+        axis_dims=(1, -1, 1, 1),
+        head_dim=128,
+        dtype=jnp.float16,
+        calculate_gradients: bool = True,
+        test_attentions=[
+            "local_ring",
+            "blockwise",
+            "vanilla",
+            "wise_ring",
+            "sharded_vanilla",
+            "legacy_sharded_vanilla",
+            "flash",
+            "splash",
+            "pallas_flash",
+            "cudnn",
+        ],
     ):
         """creates a test for attention module to help you find the best attention mechanism you can use."""
         import flax
@@ -1450,8 +1453,9 @@ class AttentionModule:
         except (ModuleNotFoundError, ImportError):
             warnings.warn("couldn't import pandas ... please install pandas")
             pandas = None
-        from easydel.modules.mistral import MistralConfig
         from fjformer import GenerateRNG
+
+        from easydel.modules.mistral import MistralConfig
 
         rng = GenerateRNG()
 
@@ -1477,10 +1481,10 @@ class AttentionModule:
 
         @value_and_grad_wrapper
         def call_dot_product(
-                q,
-                k,
-                v,
-                b,
+            q,
+            k,
+            v,
+            b,
         ):
             attention_pred = flax.linen.dot_product_attention(
                 q,
@@ -1528,7 +1532,7 @@ class AttentionModule:
                 jnp.ones((batch_size, sequence_length))
             )
             a = jnp.ones((batch_size, sequence_length))
-            a = a.at[:, sequence_length // 2:].set(0)
+            a = a.at[:, sequence_length // 2 :].set(0)
             b = jnp.where(
                 flax.linen.attention.combine_masks(
                     jnp.expand_dims(jnp.expand_dims(a, 1), 1), c
