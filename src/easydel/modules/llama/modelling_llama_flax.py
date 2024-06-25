@@ -139,7 +139,6 @@ class FlaxLlamaAttention(BaseJAXAttentionModule):
     def _merge_heads(self, hidden_states):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
 
-
     def apply_rotary(
         self, batch_size, sequence_length, query, key, value, freq_cis, position_ids
     ):

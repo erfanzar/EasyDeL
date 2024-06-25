@@ -1,6 +1,6 @@
 from fjformer import linen as nn
-from jax import numpy as jnp
 from jax import lax
+from jax import numpy as jnp
 
 
 class RMSNorm(nn.Module):

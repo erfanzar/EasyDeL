@@ -37,7 +37,7 @@ def main():
         max_position_embeddings=512,
         use_scan_mlp=False,
         axis_dims=(1, 1, 1, -1),
-        quantize_kv_cache=False,
+        quantize_kv_cache=True,
     )
     model = FlaxLlamaForCausalLM(
         config=config,
@@ -46,6 +46,7 @@ def main():
         precision=lax.Precision("fastest"),
         input_shape=(1, 2),
         _do_init=True,
+        seed=81, 
     )
     tokens = tokenizer(
         "SOME TEXT", return_tensors="np", max_length=32, padding="max_length"
@@ -56,11 +57,13 @@ def main():
     # params = fjformer.linen.quantize_int8_parameters(["kernel", "embedding"], params)
     pipeline = GenerationPipeline(
         model=model,
-        params= params,
+        params=params,
         tokenizer=tokenizer,
         generation_config=GenerationPipelineConfig(
             max_new_tokens=128,
-            temprature=0,
+            temprature=0.8,
+            top_p=0.95,
+            top_k=10,
             eos_token_id=23070,
             length_penalty=1,
             repetition_penalty=1,

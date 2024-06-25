@@ -1,41 +1,22 @@
-from easydel.inference.generation_pipeline import utils as inference_utils
 import functools
 import warnings
 from typing import Optional, Union
+
 import fjformer
 import flax.core
 import jax
-from jax.sharding import PartitionSpec
-from easydel.modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
-from jax import numpy as jnp, random, lax, sharding
 from fjformer import GenerateRNG
+from jax import lax, random
+from jax import numpy as jnp
+from jax.sharding import PartitionSpec, NamedSharding
 from transformers import PreTrainedTokenizer
 
-RNG_GEN = GenerateRNG()
+from easydel.inference.generation_pipeline import utils as inference_utils
+from easydel.modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 
-
-class GenerationPipelineConfig:
-    def __init__(self, **kwargs):
-        self.max_new_tokens = kwargs.pop("max_new_tokens", 64)
-
-        self.temperature = kwargs.pop("temperature", 0)
-        self.top_p = kwargs.pop("top_p", 0.95)
-        self.top_k = kwargs.pop("top_k", 50)
-        self.repetition_penalty = kwargs.pop("repetition_penalty", 1.0)
-        self.length_penalty = kwargs.pop("length_penalty", 1.0)
-
-        self.pad_token_id = kwargs.pop("pad_token_id", None)
-        self.bos_token_id = kwargs.pop("bos_token_id", None)
-        self.eos_token_id = kwargs.pop("eos_token_id", None)
-
-
-class _DynamicGenerationConfig:
-    def __init__(self, config):
-        self.temperature = config.temperature
-        self.top_k = config.top_k
-        self.top_p = config.top_p
-        self.repetition_penalty = config.repetition_penalty
-        self.length_penalty = config.length_penalty
+RNG_GEN = inference_utils.RNG_GEN
+GenerationPipelineConfig = inference_utils.GenerationPipelineConfig
+_DynamicGenerationConfig = inference_utils._DynamicGenerationConfig
 
 
 class GenerationPipeline:
@@ -47,9 +28,7 @@ class GenerationPipeline:
         generation_config: Optional[GenerationPipelineConfig] = None,
         add_params_field=None,
         seed: Optional[int] = None,
-        input_partition_spec: sharding.PartitionSpec = sharding.PartitionSpec(
-            ("dp", "fsdp")
-        ),
+        input_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp")),
         partition_rules=None,
     ):
         if add_params_field is not None:
@@ -75,18 +54,16 @@ class GenerationPipeline:
         self.model_sharding = self.model.get_named_sharding(
             partition_rules=partition_rules
         )
-        self.input_sharding = jax.sharding.NamedSharding(
+        self.input_sharding = NamedSharding(
             spec=input_partition_spec, mesh=self.model.mesh
         )
-        self.empty_sharding = jax.sharding.NamedSharding(
-            spec=PartitionSpec(), mesh=self.model.mesh
-        )
-        self.gen_input_sharding = jax.sharding.NamedSharding(
-            spec=jax.sharding.PartitionSpec(input_partition_spec[0], None),
+        self.empty_sharding = NamedSharding(spec=PartitionSpec(), mesh=self.model.mesh)
+        self.gen_input_sharding = NamedSharding(
+            spec=PartitionSpec(input_partition_spec[0], None),
             mesh=self.model.mesh,
         )
-        self.state_sample = None
-        self.state_sample_ms = None  # multi sequences
+        self.compiled_sample_fn = None
+        self.compiled_sample_fn_ms = None  # multi sequences
         # Ensure essential token IDs are set
         if self.generation_config.pad_token_id is None:
             self.generation_config.pad_token_id = tokenizer.pad_token_id
@@ -129,42 +106,31 @@ class GenerationPipeline:
             attention_mask = jnp.ones_like(input_ids)
 
         if position_ids is None:
-            position_ids = (
-                attention_mask.cumsum(axis=-1, dtype="i4") - 1
-            )  # Check this logic
+            position_ids = attention_mask.cumsum(axis=-1, dtype="i4") - 1
         with mesh:
             input_ids = fjformer.with_sharding_constraint(
                 input_ids,
-                PartitionSpec(
-                    paxis.batch_axis,
-                    paxis.key_sequence_axis,
-                ),
+                PartitionSpec(paxis.batch_axis, paxis.key_sequence_axis),
             )
             attention_mask = fjformer.with_sharding_constraint(
                 attention_mask,
-                PartitionSpec(
-                    paxis.batch_axis,
-                    paxis.key_sequence_axis,
-                ),
+                PartitionSpec(paxis.batch_axis, paxis.key_sequence_axis),
             )
             position_ids = fjformer.with_sharding_constraint(
                 position_ids,
-                PartitionSpec(
-                    paxis.batch_axis,
-                    paxis.key_sequence_axis,
-                ),
+                PartitionSpec(paxis.batch_axis, paxis.key_sequence_axis),
             )
         assert (
             position_ids.shape == attention_mask.shape
         ), "`position_ids` and `attention_mask` must have the same shape."
-        _model_kwargs_sharding = self.get_model_arguments_sharding(
+        model_kwargs_sharding = self.get_model_arguments_sharding(
             input_ids, max_length, attention_mask
         )
         model_kwargs = jax.jit(
             lambda: self.model.prepare_inputs_for_generation(
                 input_ids, max_length, attention_mask
             ),
-            out_shardings=_model_kwargs_sharding,
+            out_shardings=model_kwargs_sharding,
         )()
         # Initial GenerationContent
         generation_state = inference_utils.SampleState(
@@ -181,7 +147,7 @@ class GenerationPipeline:
             all_sequence_finished = jnp.all(state.is_sent_finished)
             return ~jnp.logical_or(all_sequence_finished, state.cur_len >= max_length)
 
-        def generation_func_body(params, state: inference_utils.SampleState):
+        def sample_fn(params, state: inference_utils.SampleState):
             model_outputs = self.model(
                 input_ids=state.running_token,
                 params=params,
@@ -189,17 +155,8 @@ class GenerationPipeline:
                 return_dict=True,
                 **state.model_kwargs,
             )
-
-            logits = model_outputs.logits
-
-            # logits,
-            # tokens,
-            # prng_key,
-            # config,
-            # cur_len,
-            # max_length,
             next_token = inference_utils.inference_step_compiled(
-                logits[:, -1],
+                model_outputs.logits[:, -1],
                 state.sequences,
                 state.prng_key,
                 self.generation_config,
@@ -211,9 +168,9 @@ class GenerationPipeline:
                 next_token * ~state.is_sent_finished
                 + pad_token_id * state.is_sent_finished
             )
-            next_is_sent_finished = state.is_sent_finished | (
-                next_token == eos_token_id
-            )
+
+            next_is_sent_finished = state.is_sent_finished | next_token == eos_token_id
+
             next_token = next_token[:, None]
             next_sequences = lax.dynamic_update_slice(
                 state.sequences, next_token, (0, state.cur_len)
@@ -226,59 +183,13 @@ class GenerationPipeline:
                 sequences=next_sequences,
                 running_token=next_token,
                 is_sent_finished=next_is_sent_finished,
-                prng_key=random.split(state.prng_key, 2)[-1],
+                prng_key=random.split(state.prng_key, 2)[0],
                 model_kwargs=next_model_kwargs,
             )
 
         with self.mesh:
             if input_ids.shape[1] > 1:
-                generation_state = generation_func_body(self.params, generation_state)
-
-            yield (
-                generation_state.sequences[:, cur_len : generation_state.cur_len]
-                if echo
-                else generation_state.running_token
-            )
-            if self.state_sample is None:
-                state_sharding = inference_utils.SampleState(
-                    self.empty_sharding,
-                    self.input_sharding,
-                    self.gen_input_sharding,
-                    self.empty_sharding,
-                    self.empty_sharding,
-                    _model_kwargs_sharding,
-                )
-
-                @functools.partial(
-                    jax.jit,
-                    in_shardings=(
-                        inference_utils.SampleState(
-                            self.empty_sharding,
-                            self.input_sharding,
-                            self.gen_input_sharding,
-                            self.empty_sharding,
-                            self.empty_sharding,
-                            self.empty_sharding,
-                        ),
-                    ),
-                    out_shardings=state_sharding,
-                )
-                def _shard_state(st):
-                    return st
-
-                self._shard_state = _shard_state
-                self.state_sample = inference_utils.compile_function(
-                    generation_func_body,
-                    (self.params, generation_state),
-                    {},
-                    mesh=self.mesh,
-                    in_shardings=(
-                        self.model_sharding,
-                        state_sharding,
-                    ),
-                    out_shardings=state_sharding,
-                )
-
+                generation_state = sample_fn(self.params, generation_state)
             while True:
                 if sample_search_cond_fn(generation_state):
                     yield (
@@ -288,7 +199,11 @@ class GenerationPipeline:
                         if echo
                         else generation_state.running_token
                     )
-                    generation_state = self.state_sample(self.params, generation_state)
+                    generation_state = self.compiled_sample_state(
+                        sample_fn=sample_fn,
+                        generation_state=generation_state,
+                        model_kwargs_sharding=model_kwargs_sharding,
+                    )(self.params, generation_state)
                 else:
                     break
             del generation_state.model_kwargs
@@ -300,67 +215,55 @@ class GenerationPipeline:
     def partition_rules(self):
         paxis = self.model.config.partition_axis
         return (
-            ("position_ids", PartitionSpec(paxis.batch_axis, None)),
-            ("attention_mask", PartitionSpec(paxis.batch_axis, None)),
+            (
+                "position_ids",
+                PartitionSpec(paxis.batch_axis, None),
+            ),
+            (
+                "attention_mask",
+                PartitionSpec(paxis.batch_axis, None),
+            ),
             (
                 "cached_key_scale",
                 PartitionSpec(
-                    paxis.batch_axis,
-                    paxis.key_sequence_axis,
-                    paxis.head_axis,
-                    None,
+                    paxis.batch_axis, paxis.key_sequence_axis, paxis.head_axis, None
                 ),
             ),
             (
                 "cached_value_scale",
                 PartitionSpec(
-                    paxis.batch_axis,
-                    paxis.key_sequence_axis,
-                    paxis.head_axis,
-                    None,
+                    paxis.batch_axis, paxis.key_sequence_axis, paxis.head_axis, None
                 ),
             ),
             (
                 "cached_key_minval",
                 PartitionSpec(
-                    paxis.batch_axis,
-                    paxis.key_sequence_axis,
-                    paxis.head_axis,
-                    None,
+                    paxis.batch_axis, paxis.key_sequence_axis, paxis.head_axis, None
                 ),
             ),
             (
                 "cached_value_minval",
                 PartitionSpec(
-                    paxis.batch_axis,
-                    paxis.key_sequence_axis,
-                    paxis.head_axis,
-                    None,
+                    paxis.batch_axis, paxis.key_sequence_axis, paxis.head_axis, None
                 ),
             ),
             (
                 "cached_key",
                 PartitionSpec(
-                    paxis.batch_axis,
-                    paxis.key_sequence_axis,
-                    paxis.head_axis,
-                    None,
+                    paxis.batch_axis, paxis.key_sequence_axis, paxis.head_axis, None
                 ),
             ),
             (
                 "cached_value",
                 PartitionSpec(
-                    paxis.batch_axis,
-                    paxis.key_sequence_axis,
-                    paxis.head_axis,
-                    None,
+                    paxis.batch_axis, paxis.key_sequence_axis, paxis.head_axis, None
                 ),
             ),
         )
 
     def get_model_arguments_sharding(self, input_ids, max_length, attention_mask):
         return jax.tree_util.tree_map(
-            lambda spec: jax.sharding.NamedSharding(spec=spec, mesh=self.mesh),
+            lambda spec: NamedSharding(spec=spec, mesh=self.mesh),
             fjformer.match_partition_rules(
                 self.partition_rules,
                 jax.eval_shape(
@@ -373,9 +276,67 @@ class GenerationPipeline:
 
     def update_generation_config(self, **kwargs):
         for key, value in kwargs.items():
-            if hasattr(self.dynamic_config, key):
-                setattr(self.dynamic_config, key, value)
+            if hasattr(self._dynamic_config, key):
+                setattr(self._dynamic_config, key, value)
             else:
                 raise AttributeError(
                     f"DynamicGenerationConfig has no attribute '{key}'"
                 )
+
+    def _compile_sample_fn(
+        self,
+        model_kwargs_sharding,
+        generation_state,
+        sample_fn,
+    ):
+
+        state_sharding = inference_utils.SampleState(
+            self.empty_sharding,
+            self.input_sharding,
+            self.gen_input_sharding,
+            self.empty_sharding,
+            self.empty_sharding,
+            model_kwargs_sharding,
+        )
+
+        @functools.partial(
+            jax.jit,
+            in_shardings=(
+                inference_utils.SampleState(
+                    self.empty_sharding,
+                    self.input_sharding,
+                    self.gen_input_sharding,
+                    self.empty_sharding,
+                    self.empty_sharding,
+                    self.empty_sharding,
+                ),
+            ),
+            out_shardings=state_sharding,
+        )
+        def _shard_state(st):
+            return st
+
+        self._shard_state = _shard_state
+        self.compiled_sample_fn = inference_utils.compile_function(
+            sample_fn,
+            (self.params, generation_state),
+            {},
+            mesh=self.mesh,
+            in_shardings=(self.model_sharding, state_sharding),
+            out_shardings=state_sharding,
+        )
+
+    def compiled_sample_state(
+        self,
+        model_kwargs_sharding,
+        generation_state,
+        sample_fn,
+    ):
+
+        if self.compiled_sample_fn is None:
+            self._compile_sample_fn(
+                model_kwargs_sharding,
+                generation_state,
+                sample_fn,
+            )
+        return self.compiled_sample_fn

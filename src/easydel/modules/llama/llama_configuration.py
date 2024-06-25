@@ -1,4 +1,4 @@
-from typing import Optional, Dict, Union
+from typing import Dict, Optional, Union
 
 from jax.sharding import PartitionSpec
 
@@ -9,37 +9,37 @@ class LlamaConfig(EasyDeLPretrainedConfig):
     model_type: str = "llama"
 
     def __init__(
-            self,
-            vocab_size: int = 32000,
-            hidden_size: int = 4096,
-            intermediate_size: int = 11008,
-            num_hidden_layers: int = 32,
-            num_attention_heads: int = 32,
-            number_rep_kv: int = 1,
-            num_key_value_heads: Optional[int] = None,
-            max_position_embeddings: int = 2048,
-            rms_norm_eps: float = 1e-6,
-            initializer_range: float = 0.02,
-            use_cache: bool = True,
-            bos_token_id: int = 0,
-            eos_token_id: int = 1,
-            resid_pdrop: float = 0.0,
-            embd_pdrop: float = 0.0,
-            attention_dropout: float = 0.0,
-            rope_theta: float = 10000.,
-            attention_bias: bool = False,
-            tie_word_embeddings: bool = False,
-            gradient_checkpointing: str = "nothing_saveable",
-            fcm_min_ratio: float = -1,
-            fcm_max_ratio: float = -1,
-            rope_scaling: Dict[str, Union[str, float]] = None,
-            scan_mlp_chunk_size: int = 1024,
-            bits: Optional[int] = None,
-            hidden_act: str = 'silu',
-            pretraining_tp: int = 1,
-            mlp_bias:bool=False,
-            scan_layers: bool = False,
-            **kwargs,
+        self,
+        vocab_size: int = 32000,
+        hidden_size: int = 4096,
+        intermediate_size: int = 11008,
+        num_hidden_layers: int = 32,
+        num_attention_heads: int = 32,
+        number_rep_kv: int = 1,
+        num_key_value_heads: Optional[int] = None,
+        max_position_embeddings: int = 2048,
+        rms_norm_eps: float = 1e-6,
+        initializer_range: float = 0.02,
+        use_cache: bool = True,
+        bos_token_id: int = 0,
+        eos_token_id: int = 1,
+        resid_pdrop: float = 0.0,
+        embd_pdrop: float = 0.0,
+        attention_dropout: float = 0.0,
+        rope_theta: float = 10000.0,
+        attention_bias: bool = False,
+        tie_word_embeddings: bool = False,
+        gradient_checkpointing: str = "nothing_saveable",
+        fcm_min_ratio: float = -1,
+        fcm_max_ratio: float = -1,
+        rope_scaling: Dict[str, Union[str, float]] = None,
+        scan_mlp_chunk_size: int = 1024,
+        bits: Optional[int] = None,
+        hidden_act: str = "silu",
+        pretraining_tp: int = 1,
+        mlp_bias: bool = False,
+        scan_layers: bool = False,
+        **kwargs,
     ):
         """The __init__ function is called when the class is instantiated.
         It sets up the attributes of an object, which are sometimes called fields or properties.
@@ -124,7 +124,7 @@ class LlamaConfig(EasyDeLPretrainedConfig):
         self.embd_pdrop = embd_pdrop
         self.attention_dropout = attention_dropout
         self.gradient_checkpointing = gradient_checkpointing
-        self.mlp_bias=mlp_bias
+        self.mlp_bias = mlp_bias
         self.fcm_min_ratio = fcm_min_ratio
         self.hidden_act = hidden_act
         self.fcm_max_ratio = fcm_max_ratio
@@ -154,57 +154,57 @@ class LlamaConfig(EasyDeLPretrainedConfig):
             A list of tuples
         """
         return (
-
-            ("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
-
-            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
-
-            ("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-            ("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-
-            ("input_layernorm/kernel", PartitionSpec(None)),
-            ("post_attention_layernorm/kernel", PartitionSpec(None)),
-
-            ("model/norm/kernel", PartitionSpec(None)),
-            ("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            (".*", PartitionSpec(None)),
-        ) if not fully_sharded_data_parallel else (
-
-            ("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"))),
-
-            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
-
-            ("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("mlp/down_proj/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"))),
-
-            ("input_layernorm/kernel", PartitionSpec(None)),
-            ("post_attention_layernorm/kernel", PartitionSpec(None)),
-
-            ("model/norm/kernel", PartitionSpec(None)),
-            ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
-            (".*", PartitionSpec(("fsdp", "sp"))),
+            (
+                ("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
+                (
+                    "self_attn/(q_proj|k_proj|v_proj)/kernel",
+                    PartitionSpec(("fsdp", "sp"), "tp"),
+                ),
+                ("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
+                ("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+                ("mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+                ("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+                ("input_layernorm/kernel", PartitionSpec(None)),
+                ("post_attention_layernorm/kernel", PartitionSpec(None)),
+                ("model/norm/kernel", PartitionSpec(None)),
+                ("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+                (".*", PartitionSpec(None)),
+            )
+            if not fully_sharded_data_parallel
+            else (
+                ("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"))),
+                (
+                    "self_attn/(q_proj|k_proj|v_proj)/kernel",
+                    PartitionSpec(("fsdp", "sp"), "tp"),
+                ),
+                ("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
+                ("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("mlp/down_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("input_layernorm/kernel", PartitionSpec(None)),
+                ("post_attention_layernorm/kernel", PartitionSpec(None)),
+                ("model/norm/kernel", PartitionSpec(None)),
+                ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
+                (".*", PartitionSpec(("fsdp", "sp"))),
+            )
         )
 
     def add_jax_args(
-            self,
-            resid_pdrop: float = 0.0,
-            embd_pdrop: float = 0.0,
-            attention_dropout: float = 0.0,
-            tie_word_embeddings: bool = False,
-            gradient_checkpointing: str = "nothing_saveable",
-            fcm_min_ratio: float = 0.0,
-            fcm_max_ratio: float = 0.0,
-            number_rep_kv: int = 1,
-            bits: Optional[int] = None,
-            rope_theta: float = 10000.,
-            attention_bias: bool = False,
-            hidden_act: str = 'silu',
-            scan_layers: bool = True,
-            **kwargs,
+        self,
+        resid_pdrop: float = 0.0,
+        embd_pdrop: float = 0.0,
+        attention_dropout: float = 0.0,
+        tie_word_embeddings: bool = False,
+        gradient_checkpointing: str = "nothing_saveable",
+        fcm_min_ratio: float = 0.0,
+        fcm_max_ratio: float = 0.0,
+        number_rep_kv: int = 1,
+        bits: Optional[int] = None,
+        rope_theta: float = 10000.0,
+        attention_bias: bool = False,
+        hidden_act: str = "silu",
+        scan_layers: bool = True,
+        **kwargs,
     ):
         """The add_jax_args function adds the following arguments to the Transformer class:
 
@@ -254,4 +254,4 @@ class LlamaConfig(EasyDeLPretrainedConfig):
 
     @staticmethod
     def rng_keys():
-        return 'params', 'dropout', 'fcm'
+        return "params", "dropout", "fcm"

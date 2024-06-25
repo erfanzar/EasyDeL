@@ -1,10 +1,36 @@
 import dataclasses
-from typing import Dict
+from typing import Dict, Union
+
 import jax
-from jax import numpy as jnp, random
 from fjformer import GenerateRNG
+from jax import numpy as jnp
+from jax import random, sharding
 
 RNG_GEN = GenerateRNG()
+
+
+class GenerationPipelineConfig:
+    def __init__(self, **kwargs):
+        self.max_new_tokens = kwargs.pop("max_new_tokens", 64)
+
+        self.temperature = kwargs.pop("temperature", 0)
+        self.top_p = kwargs.pop("top_p", 0.95)
+        self.top_k = kwargs.pop("top_k", 50)
+        self.repetition_penalty = kwargs.pop("repetition_penalty", 1.0)
+        self.length_penalty = kwargs.pop("length_penalty", 1.0)
+
+        self.pad_token_id = kwargs.pop("pad_token_id", None)
+        self.bos_token_id = kwargs.pop("bos_token_id", None)
+        self.eos_token_id = kwargs.pop("eos_token_id", None)
+
+
+class _DynamicGenerationConfig:
+    def __init__(self, config):
+        self.temperature = config.temperature
+        self.top_k = config.top_k
+        self.top_p = config.top_p
+        self.repetition_penalty = config.repetition_penalty
+        self.length_penalty = config.length_penalty
 
 
 def compile_function(
@@ -46,12 +72,12 @@ def compile_function(
 @jax.tree_util.register_pytree_node_class
 @dataclasses.dataclass
 class SampleState:
-    cur_len: jnp.ndarray
-    sequences: jnp.ndarray
-    running_token: jnp.ndarray
-    is_sent_finished: jnp.ndarray
-    prng_key: random.PRNGKey
-    model_kwargs: Dict[str, jnp.ndarray]
+    cur_len: Union[jax.Array, sharding.NamedSharding]
+    sequences: Union[jax.Array, sharding.NamedSharding]
+    running_token: Union[jax.Array, sharding.NamedSharding]
+    is_sent_finished: Union[jax.Array, sharding.NamedSharding]
+    prng_key: Union[random.PRNGKey, sharding.NamedSharding]
+    model_kwargs: Union[Dict[str, jax.Array], sharding.NamedSharding]
 
     def tree_flatten(self):
         return (
@@ -70,8 +96,6 @@ class SampleState:
 
 def apply_repetition_penalty(logits, tokens, penalty):
     """Applies repetition penalty efficiently using JAX operations."""
-    if penalty == 1.0:
-        return logits
 
     # Create a mask for the tokens that appear in the input
     vocab_size = logits.shape[-1]
@@ -86,8 +110,6 @@ def apply_repetition_penalty(logits, tokens, penalty):
 
 def apply_length_penalty(logits, cur_len, max_len, length_penalty):
     """Applies length penalty to logits."""
-    if length_penalty == 1.0:
-        return logits
 
     # Calculate the penalty factor
     penalty_factor = ((5 + cur_len) / 6) ** length_penalty
@@ -98,25 +120,37 @@ def apply_length_penalty(logits, cur_len, max_len, length_penalty):
 
 def apply_top_k_sampling(logits, top_k):
     """Applies top-k sampling to the logits."""
-    top_k = jnp.minimum(top_k, logits.shape[-1])  # Safety check
-    values, _ = jax.lax.top_k(logits, top_k)
-    min_value = values[..., -1, jnp.newaxis]
-    return jnp.where(logits < min_value, -jnp.inf, logits)
+    chosen_k = jax.lax.min(top_k, logits.shape[-1])  # Safety check
+    values = jax.lax.top_k(operand=logits, k=chosen_k)[0]
+    return jnp.where(logits < values[..., -1, jnp.newaxis], -jnp.inf, logits)
 
 
 def apply_top_p_sampling(logits, top_p, prng_key):
     """Applies top-p (nucleus) sampling to the logits."""
-    assert 0 <= top_p <= 1
+    sorted_probs, sorted_indices = jax.lax.sort(logits, dimension=-1)
 
-    probs_sort, probs_idx = jax.lax.sort_key_val(logits, -jnp.ones_like(logits))
-    probs_sum = jnp.cumsum(probs_sort, axis=-1)
-    mask = probs_sum - probs_sort > top_p
-    probs_sort = jnp.where(mask, 0.0, probs_sort)
-    probs_sort = probs_sort / jnp.sum(probs_sort, axis=-1, keepdims=True)
-    next_token = jax.random.categorical(
-        prng_key, probs_sort, axis=-1, shape=probs_sort.shape[:-1] + (1,)
-    )
-    return jnp.take_along_axis(probs_idx, jnp.squeeze(next_token, axis=-1), axis=-1)
+    # Calculate the cumulative sum of the sorted probabilities
+    cumulative_probs = jnp.cumsum(sorted_probs, axis=-1)
+
+    # Create a mask to filter out the probabilities that contribute to more than top_p
+    mask = cumulative_probs <= top_p
+
+    # Ensure at least one token is always included (the most probable one)
+    mask = mask.at[-1].set(True)
+
+    # Mask out the probabilities that are not in the top_p set
+    filtered_probs = sorted_probs * mask
+    filtered_probs /= jnp.sum(
+        filtered_probs
+    )  # Renormalize to make it a valid distribution
+
+    # Sample from the filtered distribution using the sorted indices
+    sampled_index = jax.random.categorical(prng_key, jnp.log(filtered_probs))
+
+    # Map the sampled index back to the original indices
+    result = sorted_indices[sampled_index]
+
+    return result
 
 
 def inference_step(
@@ -127,21 +161,70 @@ def inference_step(
     cur_len,
     max_length,
 ):
+    top_k = config.top_k
+    top_p = config.top_p
+    temperature = config.temperature
+    length_penalty = config.length_penalty
+    repetition_penalty = config.repetition_penalty
     # Apply repetition penalty
-    logits = apply_repetition_penalty(logits, tokens, config.repetition_penalty)
+    logits = jax.lax.cond(
+        repetition_penalty == 1.0,
+        apply_repetition_penalty,
+        lambda x, *u: x,
+        logits,
+        tokens,
+        repetition_penalty,
+    )
 
     # Apply length penalty
-    logits = apply_length_penalty(logits, cur_len, max_length, config.length_penalty)
-    if config.temperature > 0.0:
-        logits = jax.nn.softmax(logits / config.temperature, axis=-1)
-        if config.top_k > 0:
-            logits = apply_top_k_sampling(logits, config.top_k)
+    logits = jax.lax.cond(
+        length_penalty == 1.0,
+        apply_length_penalty,
+        lambda x, *u: x,
+        logits,
+        cur_len,
+        max_length,
+        length_penalty,
+    )
 
-        if config.top_p < 1.0:
-            return apply_top_p_sampling(logits, config.top_p, prng_key)
-        else:
-            return jax.random.categorical(prng_key, logits, axis=-1)
-    return jnp.argmax(jax.nn.softmax(logits, axis=-1), axis=-1).reshape(-1)
+    def temperature_branch(logits, prng_key):
+        logits = jax.nn.softmax(logits / temperature, axis=-1)
+        # logits = jax.lax.cond(
+        #     top_k > 0,
+        #     apply_top_k_sampling,
+        #     lambda x, k: x,
+        #     logits,
+        #     top_k,
+        # )
+        if config.top_k > 0:
+            logits = apply_top_k_sampling(
+                logits=logits,
+                top_k=top_k,
+            )
+        return jax.lax.cond(
+            top_p < 1.0,
+            lambda x, k, p: apply_top_p_sampling(x, p, k),
+            lambda x, k, p: jax.random.categorical(k, x, -1),
+            logits,
+            prng_key,
+            top_p,
+        )
+
+    def gready_branch(logits, prng_key):
+        return jnp.argmax(
+            jax.nn.softmax(logits, axis=-1),
+            axis=-1,
+        ).reshape(-1)
+
+    if temperature > 0.0:
+        return temperature_branch(
+            logits=logits,
+            prng_key=prng_key,
+        )
+    return gready_branch(
+        logits=logits,
+        prng_key=prng_key,
+    )
 
 
 inference_step_compiled = jax.jit(

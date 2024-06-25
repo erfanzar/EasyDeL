@@ -3,31 +3,30 @@ import gc
 import re
 import warnings
 from functools import partial
-from typing import Sequence, Optional, Tuple, Mapping, Callable, Type, Any, List
-from easydel.etils.partition_module import PartitionAxis
+from typing import Any, Callable, List, Mapping, Optional, Sequence, Tuple, Type
 
 # import fjformer.linen.linen
 import flax.traverse_util
 import jax.numpy
-from fjformer import match_partition_rules, make_shard_and_gather_fns
-
+from fjformer import make_shard_and_gather_fns, match_partition_rules
 from flax.traverse_util import unflatten_dict
+from jax.sharding import PartitionSpec
 from transformers import AutoConfig, AutoModelForCausalLM
 
+from easydel.etils.errors import EasyDeLRuntimeError
 from easydel.etils.etils import get_logger
-from easydel.transform.easydel_transform import huggingface_to_easydel
+from easydel.etils.partition_module import PartitionAxis
 from easydel.modules.easydel_modelling_utils import (
     EasyDeLFlaxPretrainedModel,
     EasyDeLPretrainedConfig,
 )
-from easydel.etils.errors import EasyDeLRuntimeError
-from jax.sharding import PartitionSpec
+from easydel.transform.easydel_transform import huggingface_to_easydel
 
 logger = get_logger(name=__name__)
 
 
 def get_modules_by_type(
-        model_type: str,
+    model_type: str,
 ) -> Tuple[
     Type[EasyDeLPretrainedConfig], Type[EasyDeLFlaxPretrainedModel] | Any, partial | Any
 ]:
@@ -42,8 +41,8 @@ def get_modules_by_type(
 
     """
     if model_type == "llama":
-        from easydel.modules.llama import LlamaConfig as _LlamaConfig
         from easydel.modules.llama import FlaxLlamaForCausalLM as _FlaxLlamaForCausalLM
+        from easydel.modules.llama import LlamaConfig as _LlamaConfig
 
         return (
             _LlamaConfig,
@@ -56,8 +55,8 @@ def get_modules_by_type(
             ),
         )
     elif model_type == "gemma":
-        from easydel.modules.gemma import GemmaConfig as _GemmaConfig
         from easydel.modules.gemma import FlaxGemmaForCausalLM as _FlaxGemmaForCausalLM
+        from easydel.modules.gemma import GemmaConfig as _GemmaConfig
 
         return (
             _GemmaConfig,
@@ -70,10 +69,10 @@ def get_modules_by_type(
             ),
         )
     elif model_type == "falcon":
+        from easydel.modules.falcon import FalconConfig as _FalconConfig
         from easydel.modules.falcon import (
             FlaxFalconForCausalLM as _FlaxFalconForCausalLM,
         )
-        from easydel.modules.falcon import FalconConfig as _FalconConfig
 
         return (
             _FalconConfig,
@@ -175,10 +174,10 @@ def get_modules_by_type(
             ),
         )
     elif model_type == "lt":
+        from easydel.modules.lucid_transformer import FlaxLTConfig as _FlaxLTConfig
         from easydel.modules.lucid_transformer import (
             FlaxLTForCausalLM as _FlaxLTForCausalLM,
         )
-        from easydel.modules.lucid_transformer import FlaxLTConfig as _FlaxLTConfig
 
         return (
             _FlaxLTConfig,
@@ -242,8 +241,8 @@ def get_modules_by_type(
             ),
         )
     elif model_type == "qwen":
-        from easydel.modules.qwen1 import Qwen1Config as _Qwen1Config
         from easydel.modules.qwen1 import FlaxQwen1ForCausalLM as _FlaxQwen1ForCausalLM
+        from easydel.modules.qwen1 import Qwen1Config as _Qwen1Config
 
         return (
             _Qwen1Config,
@@ -257,8 +256,8 @@ def get_modules_by_type(
         )
 
     elif model_type == "qwen2":
-        from easydel.modules.qwen2 import Qwen2Config as _Qwen2Config
         from easydel.modules.qwen2 import FlaxQwen2ForCausalLM as _FlaxQwen2ForCausalLM
+        from easydel.modules.qwen2 import Qwen2Config as _Qwen2Config
 
         return (
             _Qwen2Config,
@@ -271,10 +270,10 @@ def get_modules_by_type(
             ),
         )
     elif model_type == "stablelm":
-        from easydel.modules.stablelm import StableLmConfig as _StableLmConfig
         from easydel.modules.stablelm import (
             FlaxStableLmForCausalLM as _FlaxStableLmForCausalLM,
         )
+        from easydel.modules.stablelm import StableLmConfig as _StableLmConfig
 
         return (
             _StableLmConfig,
@@ -286,15 +285,15 @@ def get_modules_by_type(
                     "input_layernorm",
                     "post_attention_layernorm",
                     "norm",
-                    "norms"
+                    "norms",
                 ],
                 rnn_based_or_rwkv=False,
                 lm_head_name="lm_head",
             ),
         )
     elif model_type == "rwkv":
-        from easydel.modules.rwkv import RwkvConfig as _RwkvConfig
         from easydel.modules.rwkv import FlaxRwkvForCausalLM as _FlaxRwkvForCausalLM
+        from easydel.modules.rwkv import RwkvConfig as _RwkvConfig
 
         return (
             _RwkvConfig,
@@ -308,8 +307,8 @@ def get_modules_by_type(
             ),
         )
     elif model_type == "mamba":
-        from easydel.modules.mamba import MambaConfig as _MambaConfig
         from easydel.modules.mamba import FlaxMambaForCausalLM as _FlaxMambaForCausalLM
+        from easydel.modules.mamba import MambaConfig as _MambaConfig
 
         return (
             _MambaConfig,
@@ -322,8 +321,8 @@ def get_modules_by_type(
             ),
         )
     elif model_type == "grok-1":
-        from easydel.modules.grok_1 import Grok1Config as _Grok1Config
         from easydel.modules.grok_1 import FlaxGrok1ForCausalLM as _FlaxGrok1ForCausalLM
+        from easydel.modules.grok_1 import Grok1Config as _Grok1Config
 
         return (
             _Grok1Config,
@@ -336,10 +335,10 @@ def get_modules_by_type(
             ),
         )
     elif model_type == "qwen2_moe":
-        from easydel.modules.qwen2_moe import Qwen2MoeConfig as _Qwen2MoeConfig
         from easydel.modules.qwen2_moe import (
             FlaxQwen2MoeForCausalLM as _FlaxQwen2MoeForCausalLM,
         )
+        from easydel.modules.qwen2_moe import Qwen2MoeConfig as _Qwen2MoeConfig
 
         return (
             _Qwen2MoeConfig,
@@ -383,8 +382,8 @@ def get_modules_by_type(
             ),
         )
     elif model_type == "phi3":
-        from easydel.modules.phi3 import Phi3Config as _Phi3Config
         from easydel.modules.phi3 import FlaxPhi3ForCausalLM as _FlaxPhi3ForCausalLM
+        from easydel.modules.phi3 import Phi3Config as _Phi3Config
 
         return (
             _Phi3Config,
@@ -414,10 +413,10 @@ def get_modules_by_type(
             ),
         )
     elif model_type == "openelm":
-        from easydel.modules.openelm import OpenELMConfig as _OpenELMConfig
         from easydel.modules.openelm import (
             FlaxOpenELMForCausalLM as _FlaxOpenELMForCausalLM,
         )
+        from easydel.modules.openelm import OpenELMConfig as _OpenELMConfig
 
         return (
             _OpenELMConfig,
@@ -446,8 +445,8 @@ def get_modules_by_type(
             ),
         )
     elif model_type == "olmo":
-        from easydel.modules.olmo import OlmoConfig as _OlmoConfig
         from easydel.modules.olmo import FlaxOlmoForCausalLM as _FlaxOlmoForCausalLM
+        from easydel.modules.olmo import OlmoConfig as _OlmoConfig
 
         return (
             _OlmoConfig,
@@ -514,28 +513,28 @@ class AutoEasyDeLModelForCausalLM:
 
     @classmethod
     def from_pretrained(
-            cls,
-            pretrained_model_name_or_path: str,
-            device=jax.devices("cpu")[0],
-            dtype: jax.numpy.dtype = jax.numpy.float32,
-            param_dtype: jax.numpy.dtype = jax.numpy.float32,
-            precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
-            sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
-            sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            partition_axis: PartitionAxis = PartitionAxis(),
-            shard_attention_computation: bool = True,
-            input_shape: Tuple[int, int] = (1, 1),
-            shard_fns: Optional[Mapping[tuple, Callable] | dict] = None,
-            backend: Optional[str] = None,
-            config_kwargs: Optional[Mapping[str, Any]] = None,
-            auto_shard_params: bool = False,
-            partition_rules: Optional[Tuple[Tuple[str, PartitionSpec], ...]] = None,
-            load_in_8bit: bool = False,
-            bit_targeted_params: Optional[List[str]] = None,
-            verbose_params: bool = False,
-            safe: bool = True,
-            from_torch: bool = True,
-            **kwargs,
+        cls,
+        pretrained_model_name_or_path: str,
+        device=jax.devices("cpu")[0],
+        dtype: jax.numpy.dtype = jax.numpy.float32,
+        param_dtype: jax.numpy.dtype = jax.numpy.float32,
+        precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
+        sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
+        sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+        partition_axis: PartitionAxis = PartitionAxis(),
+        shard_attention_computation: bool = True,
+        input_shape: Tuple[int, int] = (1, 1),
+        shard_fns: Optional[Mapping[tuple, Callable] | dict] = None,
+        backend: Optional[str] = None,
+        config_kwargs: Optional[Mapping[str, Any]] = None,
+        auto_shard_params: bool = False,
+        partition_rules: Optional[Tuple[Tuple[str, PartitionSpec], ...]] = None,
+        load_in_8bit: bool = False,
+        bit_targeted_params: Optional[List[str]] = None,
+        verbose_params: bool = False,
+        safe: bool = True,
+        from_torch: bool = True,
+        **kwargs,
     ) -> Tuple[EasyDeLFlaxPretrainedModel, dict]:
         """Loads and shards a pretrained causal language model from the Hugging Face Hub and converts it into an
         EasyDeL compatible model.
@@ -612,25 +611,25 @@ class AutoEasyDeLModelForCausalLM:
 
     @staticmethod
     def _from_torch(
-            pretrained_model_name_or_path,
-            device,
-            dtype: jax.numpy.dtype,
-            param_dtype: jax.numpy.dtype,
-            precision: Optional[jax.lax.Precision],
-            sharding_axis_dims: Sequence[int],
-            sharding_axis_names: Sequence[str],
-            partition_axis: PartitionAxis,
-            shard_attention_computation: bool,
-            input_shape: Tuple[int, int],
-            shard_fns: Optional[Mapping[tuple, Callable] | dict],
-            backend: Optional[str],
-            config_kwargs: Optional[Mapping[str, Any]],
-            auto_shard_params: bool,
-            partition_rules: Optional[Tuple[Tuple[str, PartitionSpec], ...]],
-            load_in_8bit: bool,
-            bit_targeted_params: Optional[List[str]],
-            verbose_params: bool,
-            **kwargs,
+        pretrained_model_name_or_path,
+        device,
+        dtype: jax.numpy.dtype,
+        param_dtype: jax.numpy.dtype,
+        precision: Optional[jax.lax.Precision],
+        sharding_axis_dims: Sequence[int],
+        sharding_axis_names: Sequence[str],
+        partition_axis: PartitionAxis,
+        shard_attention_computation: bool,
+        input_shape: Tuple[int, int],
+        shard_fns: Optional[Mapping[tuple, Callable] | dict],
+        backend: Optional[str],
+        config_kwargs: Optional[Mapping[str, Any]],
+        auto_shard_params: bool,
+        partition_rules: Optional[Tuple[Tuple[str, PartitionSpec], ...]],
+        load_in_8bit: bool,
+        bit_targeted_params: Optional[List[str]],
+        verbose_params: bool,
+        **kwargs,
     ):
         try:
             import torch
@@ -640,12 +639,15 @@ class AutoEasyDeLModelForCausalLM:
                 def _clear():
                     gc.collect()
                     torch.cuda.empty_cache()
+
             else:
+
                 class torch:
                     bfloat16 = None
 
                 def _clear():
                     gc.collect()
+
         except ModuleNotFoundError:
             raise ModuleNotFoundError(
                 "in order to load model from torch you should install torch first "
@@ -781,21 +783,21 @@ class AutoEasyDeLModelForCausalLM:
 
     @staticmethod
     def _from_easydel_params(
-            pretrained_model_name_or_path,
-            dtype: jax.numpy.dtype,
-            param_dtype: jax.numpy.dtype,
-            precision: Optional[jax.lax.Precision],
-            sharding_axis_dims: Sequence[int],
-            sharding_axis_names: Sequence[str],
-            partition_axis: PartitionAxis,
-            input_shape: Tuple[int, int],
-            shard_fns: Optional[Mapping[tuple, Callable] | dict],
-            config_kwargs: Optional[Mapping[str, Any]],
-            auto_shard_params: bool,
-            partition_rules: Optional[Tuple[Tuple[str, PartitionSpec], ...]],
-            safe: bool,
-            # load_in_8bit: bool,
-            # bit_targeted_params: Optional[List[str]],
+        pretrained_model_name_or_path,
+        dtype: jax.numpy.dtype,
+        param_dtype: jax.numpy.dtype,
+        precision: Optional[jax.lax.Precision],
+        sharding_axis_dims: Sequence[int],
+        sharding_axis_names: Sequence[str],
+        partition_axis: PartitionAxis,
+        input_shape: Tuple[int, int],
+        shard_fns: Optional[Mapping[tuple, Callable] | dict],
+        config_kwargs: Optional[Mapping[str, Any]],
+        auto_shard_params: bool,
+        partition_rules: Optional[Tuple[Tuple[str, PartitionSpec], ...]],
+        safe: bool,
+        # load_in_8bit: bool,
+        # bit_targeted_params: Optional[List[str]],
     ):
         from easydel.modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 
@@ -819,15 +821,15 @@ class AutoEasyDeLModelForCausalLM:
 class AutoEasyDeLConfig:
     @classmethod
     def from_pretrained(
-            cls,
-            pretrained_model_name_or_path: str,
-            sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
-            sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            partition_axis: PartitionAxis = PartitionAxis(),
-            shard_attention_computation: bool = True,
-            backend: Optional[str] = None,
-            from_torch: bool = False,
-            **kwargs,
+        cls,
+        pretrained_model_name_or_path: str,
+        sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
+        sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+        partition_axis: PartitionAxis = PartitionAxis(),
+        shard_attention_computation: bool = True,
+        backend: Optional[str] = None,
+        from_torch: bool = False,
+        **kwargs,
     ) -> EasyDeLPretrainedConfig:
         """The from_pretrained function is a helper function that allows you to instantiate a model from the pretrained
         model repository. It takes as input the name of the model (e.g., 'bert-base-uncased') and returns an instance of
@@ -886,12 +888,12 @@ class AutoShardAndGatherFunctions:
 
     @classmethod
     def from_config(
-            cls,
-            config: EasyDeLPretrainedConfig,
-            partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
-            flatten: bool = True,
-            input_shape: Tuple[int, int] = (1, 1),
-            depth_target: Optional[List[str]] = None,
+        cls,
+        config: EasyDeLPretrainedConfig,
+        partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
+        flatten: bool = True,
+        input_shape: Tuple[int, int] = (1, 1),
+        depth_target: Optional[List[str]] = None,
     ):
         """
         Generates shard and gather functions based on a provided `EasyDeLPretrainedConfig` object.
@@ -937,9 +939,7 @@ class AutoShardAndGatherFunctions:
 
     @staticmethod
     def from_params(params, partition_rules, mesh):
-        partition_specs = match_partition_rules(
-            partition_rules, params
-        )
+        partition_specs = match_partition_rules(partition_rules, params)
         return make_shard_and_gather_fns(
             partition_specs=partition_specs,
             mesh=mesh,
@@ -947,19 +947,19 @@ class AutoShardAndGatherFunctions:
 
     @classmethod
     def from_pretrained(
-            cls,
-            pretrained_model_name_or_path: str,
-            input_shape: Tuple[int, int] = (1, 1),
-            sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
-            sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            partition_axis: PartitionAxis = PartitionAxis(),
-            shard_attention_computation: bool = True,
-            backend: Optional[str] = None,
-            partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
-            flatten: bool = True,
-            config_kwargs: Optional[Mapping[str, Any]] = None,
-            depth_target: Optional[List[str]] = None,
-            from_torch: bool = False,
+        cls,
+        pretrained_model_name_or_path: str,
+        input_shape: Tuple[int, int] = (1, 1),
+        sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
+        sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+        partition_axis: PartitionAxis = PartitionAxis(),
+        shard_attention_computation: bool = True,
+        backend: Optional[str] = None,
+        partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
+        flatten: bool = True,
+        config_kwargs: Optional[Mapping[str, Any]] = None,
+        depth_target: Optional[List[str]] = None,
+        from_torch: bool = False,
     ) -> Tuple[Mapping[str, Callable], Mapping[str, Callable]]:
         """
         Generates shard and gather functions based on a pretrained model name or path.
