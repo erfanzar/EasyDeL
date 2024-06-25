@@ -1,7 +1,0 @@
-``opt/modelling opt flax`` module
-=================================
-
-.. automodule:: easydel.modules.opt.modelling_opt_flax
-    :members:
-    :undoc-members:
-    :show-inheritance:
