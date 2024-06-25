@@ -58,7 +58,7 @@ def get_files(path: str):
 
 
 def run(
-        project_locations="easydel",
+        project_locations="src/easydel",
         docs_file="docs/api_docs/",
         start_head="easydel",
 ):
