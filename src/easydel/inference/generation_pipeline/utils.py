@@ -206,14 +206,9 @@ def inference_step(
                 logits=logits,
                 top_k=top_k,
             )
-        return jax.lax.cond(
-            top_p < 1.0,
-            lambda x, k, p: apply_top_p_sampling(x, p, k),
-            lambda x, k, p: jax.random.categorical(k, x, -1),
-            logits,
-            prng_key,
-            top_p,
-        )
+        if 0 < top_p < 1.0:
+            return apply_top_p_sampling(logits, top_p, prng_key)
+        return jax.random.categorical(prng_key, logits, -1)
 
     def gready_branch(logits, prng_key):
         return jnp.argmax(
