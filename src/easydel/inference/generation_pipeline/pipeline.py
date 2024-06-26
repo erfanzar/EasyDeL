@@ -386,5 +386,5 @@ class ChatPipeline:
         )
         decoded_sequence = ""
         for sequence in self.pipeline.generate(echo=True, **inputs):
-            decoded_sequence = self.tokenizer.decode(sequence[0])
+            decoded_sequence = self.pipeline.tokenizer.decode(sequence[0])
         return decoded_sequence
