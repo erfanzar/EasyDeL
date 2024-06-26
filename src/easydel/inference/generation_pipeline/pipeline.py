@@ -8,7 +8,7 @@ import jax
 from fjformer import GenerateRNG
 from jax import lax, random
 from jax import numpy as jnp
-from jax.sharding import PartitionSpec, NamedSharding
+from jax.sharding import NamedSharding, PartitionSpec
 from transformers import PreTrainedTokenizer
 
 from easydel.inference.generation_pipeline import utils as inference_utils
@@ -340,3 +340,51 @@ class GenerationPipeline:
                 sample_fn,
             )
         return self.compiled_sample_fn
+
+
+class ChatPipeline:
+
+    def __init__(
+        self,
+        pipeline: GenerationPipeline,
+        max_prefill_length: int,
+        chat_template: str | None = None,
+    ):
+        self.pipeline = pipeline
+        self.max_prefill_length = max_prefill_length
+        self.chat_template = chat_template
+
+    def stream_generate(self, conversation):
+        self.pipeline.tokenizer.padding_side = "left"
+        inputs = self.pipeline.tokenizer.apply_chat_template(
+            conversation=conversation,
+            max_length=self.max_prefill_length,
+            padding="max_length",
+            return_tensors="np",
+            return_dict=True,
+            add_generation_prompt=True,
+            tokenize=True,
+            chat_template=self.chat_template,
+        )
+        captured_length = 0
+        for sequence in self.pipeline.generate(echo=True, **inputs):
+            decoded_sequence = self.tokenizer.decode(sequence[0])[captured_length:]
+            yield decoded_sequence
+            captured_length += len(decoded_sequence)
+
+    def generate(self, conversation):
+        self.pipeline.tokenizer.padding_side = "left"
+        inputs = self.pipeline.tokenizer.apply_chat_template(
+            conversation=conversation,
+            max_length=self.max_prefill_length,
+            padding="max_length",
+            return_tensors="np",
+            return_dict=True,
+            add_generation_prompt=True,
+            tokenize=True,
+            chat_template=self.chat_template,
+        )
+        decoded_sequence = ""
+        for sequence in self.pipeline.generate(echo=True, **inputs):
+            decoded_sequence = self.tokenizer.decode(sequence[0])
+        return decoded_sequence

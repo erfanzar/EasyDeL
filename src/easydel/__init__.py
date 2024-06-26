@@ -1,6 +1,8 @@
 import os as _os
 
-if bool(_os.environ.get("EASYDEL_AUTO", "true")):
+if bool(
+    _os.environ.get("EASYDEL_AUTO", "true")
+):  # Taking care of some optional GPU FLAGs
     _os.environ["XLA_FLAGS"] = (
         _os.environ.get("XLA_FLAGS", "") + " --xla_gpu_enable_command_buffer="
     )
@@ -12,6 +14,7 @@ if bool(_os.environ.get("EASYDEL_AUTO", "true")):
 from easydel.inference.generation_pipeline import (
     GenerationPipelineConfig as GenerationPipelineConfig,
     GenerationPipeline as GenerationPipeline,
+    ChatPipeline as ChatPipeline,
 )
 
 # INFERENCE IMPORT END HERE
@@ -101,9 +104,9 @@ from easydel.modules.qwen2 import (
     Qwen2Config as Qwen2Config,
 )
 from easydel.modules.olmo import (
-    FlaxOlmoModel,
-    FlaxOlmoForCausalLM,
-    OlmoConfig,
+    FlaxOlmoModel as FlaxOlmoModel,
+    FlaxOlmoForCausalLM as FlaxOlmoForCausalLM,
+    OlmoConfig as OlmoConfig,
 )
 from easydel.modules.gemma import (
     FlaxGemmaModel as FlaxGemmaModel,
