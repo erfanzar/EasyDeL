@@ -158,7 +158,26 @@ def sampling(sampling_logits, tokens_ids, key):
     ).reshape(-1, 1)
     selected_token = jnp.take_along_axis(tokens_ids, sampling_index, axis=-1)
     return selected_token.reshape(-1)
- 
+
+
+def temperature_branch(logits, prng_key, top_k, temperature, top_p):
+    token_ids = None
+    if top_k > 1:
+        logits, token_ids = apply_top_k_sampling(
+            logits=logits, top_k=top_k, temperature=temperature
+        )
+        temperature = 1
+    if 0 < top_p < 1.0:
+        logits, token_ids = apply_top_p_sampling(
+            logits=logits, token_ids=token_ids, temperature=temperature, top_p=top_p
+        )
+        temperature = 1
+    return sampling(logits / temperature, token_ids=token_ids, key=prng_key)
+
+
+def gready_branch(logits):
+    return jnp.argmax(jax.nn.softmax(logits, axis=-1), axis=-1).reshape(-1)
+
 
 def inference_step(
     logits,
@@ -190,23 +209,6 @@ def inference_step(
         max_length,
         length_penalty,
     )
-
-    def temperature_branch(logits, prng_key, top_k, temperature, top_p):
-        token_ids = None
-        if config.top_k > 1:
-            logits, token_ids = apply_top_k_sampling(
-                logits=logits, top_k=top_k, temperature=temperature
-            )
-            temperature = 1
-        if 0 < top_p < 1.0:
-            logits, token_ids = apply_top_p_sampling(
-                logits=logits, token_ids=token_ids, temperature=temperature, top_p=top_p
-            )
-            temperature = 1
-        return sampling(logits / temperature, token_ids=token_ids, key=prng_key)
-
-    def gready_branch(logits):
-        return jnp.argmax(jax.nn.softmax(logits, axis=-1), axis=-1).reshape(-1)
 
     if config.temperature > 0.0:
         return temperature_branch(
