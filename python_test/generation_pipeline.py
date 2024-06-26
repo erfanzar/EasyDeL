@@ -48,6 +48,7 @@ def main():
         _do_init=True,
         seed=81,
     )
+    tokenizer.padding_side="left"
     tokens = tokenizer(
         "SOME TEXT", return_tensors="np", max_length=32, padding="max_length"
     )
