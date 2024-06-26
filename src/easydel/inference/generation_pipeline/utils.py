@@ -191,7 +191,7 @@ def inference_step(
     repetition_penalty = config.repetition_penalty
     # Apply repetition penalty
     logits = jax.lax.cond(
-        repetition_penalty == 1.0,
+        repetition_penalty != 1.0,
         apply_repetition_penalty,
         lambda x, *u: x,
         logits,
@@ -201,7 +201,7 @@ def inference_step(
 
     # Apply length penalty
     logits = jax.lax.cond(
-        length_penalty == 1.0,
+        length_penalty != 1.0,
         apply_length_penalty,
         lambda x, *u: x,
         logits,
