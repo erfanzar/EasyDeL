@@ -158,7 +158,7 @@ def sampling(sampling_logits, tokens_ids, key):
     ).reshape(-1, 1)
     selected_token = jnp.take_along_axis(tokens_ids, sampling_index, axis=-1)
     return selected_token.reshape(-1)
-
+ 
 
 def inference_step(
     logits,
