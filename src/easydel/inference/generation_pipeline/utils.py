@@ -1,4 +1,5 @@
 import dataclasses
+from functools import partial
 from typing import Dict, Union
 
 import jax
@@ -118,11 +119,22 @@ def apply_length_penalty(logits, cur_len, max_len, length_penalty):
     return logits / penalty_factor
 
 
+@partial(jax.jit, static_argnames=["top_k"])
 def apply_top_k_sampling(logits, top_k):
     """Applies top-k sampling to the logits."""
-    chosen_k = jax.lax.min(top_k, logits.shape[-1])  # Safety check
-    values = jax.lax.top_k(operand=logits, k=chosen_k)[0]
-    return jnp.where(logits < values[..., -1, jnp.newaxis], -jnp.inf, logits)
+    batch_size, vocab_size = logits.shape
+    next_scores_flat = jnp.full(batch_size * vocab_size, -float("Inf"))
+
+    topk = min(top_k, logits.shape[-1])  # Safety check
+    topk_scores, topk_indices = jax.lax.top_k(logits, topk)
+    shift = jnp.broadcast_to(
+        (jnp.arange(batch_size) * vocab_size)[:, None], (batch_size, topk)
+    ).flatten()
+    topk_scores_flat = topk_scores.flatten()
+    topk_indices_flat = topk_indices.flatten() + shift
+
+    next_scores_flat = next_scores_flat.at[topk_indices_flat].set(topk_scores_flat)
+    return next_scores_flat.reshape(batch_size, vocab_size)
 
 
 def apply_top_p_sampling(logits, top_p, prng_key):
@@ -189,13 +201,6 @@ def inference_step(
 
     def temperature_branch(logits, prng_key):
         logits = jax.nn.softmax(logits / temperature, axis=-1)
-        # logits = jax.lax.cond(
-        #     top_k > 0,
-        #     apply_top_k_sampling,
-        #     lambda x, k: x,
-        #     logits,
-        #     top_k,
-        # )
         if config.top_k > 0:
             logits = apply_top_k_sampling(
                 logits=logits,

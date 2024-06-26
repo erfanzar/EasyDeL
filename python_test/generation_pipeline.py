@@ -32,12 +32,12 @@ def main():
     tokenizer.pad_token = tokenizer.eos_token
     config = LlamaConfig(
         hidden_size=128,
-        intermediate_size=512,
+        intermediate_size=256,
         num_hidden_layers=4,
         max_position_embeddings=512,
         use_scan_mlp=False,
         axis_dims=(1, 1, 1, -1),
-        quantize_kv_cache=True,
+        quantize_kv_cache=False,
     )
     model = FlaxLlamaForCausalLM(
         config=config,
@@ -65,8 +65,8 @@ def main():
             top_p=0.95,
             top_k=10,
             eos_token_id=23070,
-            length_penalty=1,
-            repetition_penalty=1,
+            length_penalty=1.2,
+            repetition_penalty=1.2,
         ),
     )
     for token in pipeline.generate(input_ids, attention_mask):
