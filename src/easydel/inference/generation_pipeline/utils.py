@@ -152,11 +152,11 @@ def apply_top_p_sampling(
     return logits, token_ids
 
 
-def sampling(sampling_logits, tokens_ids, key):
+def sampling(sampling_logits, token_ids, key):
     sampling_index = jax.random.categorical(
         key, jax.nn.softmax(sampling_logits)
     ).reshape(-1, 1)
-    selected_token = jnp.take_along_axis(tokens_ids, sampling_index, axis=-1)
+    selected_token = jnp.take_along_axis(token_ids, sampling_index, axis=-1)
     return selected_token.reshape(-1)
 
 
