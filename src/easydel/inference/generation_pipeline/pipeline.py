@@ -368,7 +368,9 @@ class ChatPipeline:
         )
         captured_length = 0
         for sequence in self.pipeline.generate(echo=True, **inputs):
-            decoded_sequence = self.tokenizer.decode(sequence[0])[captured_length:]
+            decoded_sequence = self.pipeline.tokenizer.decode(sequence[0])[
+                captured_length:
+            ]
             yield decoded_sequence
             captured_length += len(decoded_sequence)
 
