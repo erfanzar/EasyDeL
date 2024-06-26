@@ -14,15 +14,15 @@ except ModuleNotFoundError:
             "../src",
         )
     )
-    import easydel as ed
 
 from easydel import (  # noqa: E402
     FlaxLlamaForCausalLM,
-    LlamaConfig,
-    GenerationPipelineConfig,
     GenerationPipeline,
+    GenerationPipelineConfig,
+    LlamaConfig,
 )
-from jax import numpy as jnp, lax
+from jax import lax
+from jax import numpy as jnp
 from transformers import AutoTokenizer
 
 
@@ -46,7 +46,7 @@ def main():
         precision=lax.Precision("fastest"),
         input_shape=(1, 2),
         _do_init=True,
-        seed=81, 
+        seed=81,
     )
     tokens = tokenizer(
         "SOME TEXT", return_tensors="np", max_length=32, padding="max_length"

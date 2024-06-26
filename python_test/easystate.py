@@ -1,18 +1,21 @@
-import jax
+import os
 import sys
 
-import os
+import jax
 
-dirname = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(dirname)  # noqa: E402
-sys.path.append(
-    os.path.join(
-        dirname,
-        "../src",
+try:
+    import easydel as ed
+except ModuleNotFoundError:
+    dirname = os.path.dirname(os.path.abspath(__file__))
+    sys.path.append(dirname)  # noqa: E402
+    sys.path.append(
+        os.path.join(
+            dirname,
+            "../src",
+        )
     )
-)
-from easydel import LlamaConfig, FlaxLlamaForCausalLM
-from easydel import EasyDeLState
+
+from easydel import EasyDeLState, FlaxLlamaForCausalLM, LlamaConfig
 from easydel.etils.auto_tx import get_optimizer_and_scheduler
 
 
