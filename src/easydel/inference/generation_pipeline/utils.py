@@ -122,20 +122,20 @@ def apply_length_penalty(logits, cur_len, max_len, length_penalty):
 @partial(jax.jit, static_argnames=["top_k", "temperature"])
 def apply_top_k_sampling(logits, temperature, top_k):
     """Applies top-k sampling to the logits."""
-    logits, ids = jax.lax.top_k(logits, top_k)  # along the last axis
-    return logits / temperature, ids
+    logits, token_ids = jax.lax.top_k(logits, top_k)  # along the last axis
+    return logits / temperature, token_ids
 
 
 def apply_top_p_sampling(
     logits,
     *,
-    k_ids=None,
+    token_ids=None,
     temperature: float = 1.0,
     top_p: float,
 ):
-    if k_ids is None:
-        k_ids = jnp.argsort(-logits, axis=-1)
-        logits = jnp.take_along_axis(logits, k_ids, axis=-1)
+    if token_ids is None:
+        token_ids = jnp.argsort(-logits, axis=-1)
+        logits = jnp.take_along_axis(logits, token_ids, axis=-1)
 
     cutoff_index = jnp.sum(
         jnp.cumsum(jax.nn.softmax(logits, axis=-1), axis=-1) < top_p, axis=-1
@@ -149,7 +149,7 @@ def apply_top_p_sampling(
         / temperature
     )
 
-    return logits, k_ids
+    return logits, token_ids
 
 
 def sampling(sampling_logits, tokens_ids, key):
@@ -200,10 +200,10 @@ def inference_step(
             temperature = 1
         if 0 < top_p < 1.0:
             logits, token_ids = apply_top_p_sampling(
-                logits=logits, k_ids=token_ids, temperature=temperature, top_p=top_p
+                logits=logits, token_ids=token_ids, temperature=temperature, top_p=top_p
             )
             temperature = 1
-        return sampling(logits / temperature, token_ids, prng_key)
+        return sampling(logits / temperature, token_ids=token_ids, key=prng_key)
 
     def gready_branch(logits):
         return jnp.argmax(jax.nn.softmax(logits, axis=-1), axis=-1).reshape(-1)
