@@ -119,60 +119,53 @@ def apply_length_penalty(logits, cur_len, max_len, length_penalty):
     return logits / penalty_factor
 
 
-@partial(jax.jit, static_argnames=["top_k", "temperature"])
-def apply_top_k_sampling(logits, temperature, top_k):
+@partial(jax.jit, static_argnames=["top_k"])
+def apply_top_k_sampling(logits, top_k):
     """Applies top-k sampling to the logits."""
-    logits, token_ids = jax.lax.top_k(logits, top_k)  # along the last axis
-    return logits / temperature, token_ids
+    batch_size, vocab_size = logits.shape
+    next_logits_flat = jnp.full(batch_size * vocab_size, -float("Inf"))
+
+    topk = min(top_k, logits.shape[-1])  # Safety check
+    topk_logits, topk_indices = jax.lax.top_k(logits, topk)
+    shift = jnp.broadcast_to(
+        (jnp.arange(batch_size) * vocab_size)[:, None], (batch_size, topk)
+    ).flatten()
+    topk_logits_flat = topk_logits.flatten()
+    topk_indices_flat = topk_indices.flatten() + shift
+
+    next_logits_flat = next_logits_flat.at[topk_indices_flat].set(topk_logits_flat)
+    next_logits = next_logits_flat.reshape(batch_size, vocab_size)
+    return next_logits
 
 
-def apply_top_p_sampling(
-    logits,
-    *,
-    token_ids=None,
-    temperature: float = 1.0,
-    top_p: float,
-):
-    if token_ids is None:
-        token_ids = jnp.argsort(-logits, axis=-1)
-        logits = jnp.take_along_axis(logits, token_ids, axis=-1)
+def apply_top_p_sampling(logits, top_p):
+    """Applies top-p (nucleus) sampling to the logits."""
+    topk_logits, topk_indices = jax.lax.top_k(logits, logits.shape[-1])
 
-    cutoff_index = jnp.sum(
-        jnp.cumsum(jax.nn.softmax(logits, axis=-1), axis=-1) < top_p, axis=-1
-    ).reshape(-1, 1)
-    logits = (
-        jnp.where(
-            jnp.arange(logits.shape[-1])[None, :] <= cutoff_index,
-            logits,
-            -jnp.inf,
-        )
-        / temperature
-    )
+    mask_logits = jnp.full_like(logits, -float("Inf"))
+    cumulative_probs = jax.nn.softmax(topk_logits, axis=-1).cumsum(axis=-1)
+    score_mask = cumulative_probs < top_p
+    score_mask = jnp.roll(score_mask, 1)
+    score_mask |= score_mask.at[:, 0].set(True)
+    score_mask = score_mask.at[:, :1].set(True)
 
-    return logits, token_ids
+    topk_next_logits = jnp.where(score_mask, topk_logits, mask_logits)
+    next_logits = jax.lax.sort_key_val(topk_indices, topk_next_logits)[-1]
+
+    return next_logits
 
 
-def sampling(sampling_logits, token_ids, key):
-    sampling_index = jax.random.categorical(
-        key, jax.nn.softmax(sampling_logits)
-    ).reshape(-1, 1)
-    selected_token = jnp.take_along_axis(token_ids, sampling_index, axis=-1)
-    return selected_token.reshape(-1)
+def sampling(sampling_logits, key):
+    return jax.random.categorical(key, sampling_logits).reshape(-1)
 
 
 def temperature_branch(logits, prng_key, top_k, temperature, top_p):
-    token_ids = None
+    logits = jax.nn.softmax(logits / temperature, axis=-1)
     if top_k > 1:
-        logits, token_ids = apply_top_k_sampling(
-            logits=logits, top_k=top_k, temperature=temperature
-        )
-        temperature = 1
+        logits = apply_top_k_sampling(logits=logits, top_k=top_k)
     if 0 < top_p < 1.0:
-        logits, token_ids = apply_top_p_sampling(
-            logits=logits, token_ids=token_ids, temperature=temperature, top_p=top_p
-        )
-        temperature = 1
-    return sampling(logits / temperature, token_ids=token_ids, key=prng_key)
+        logits = apply_top_p_sampling(logits=logits, top_p=top_p)
+    return sampling(logits, key=prng_key)
 
 
 def gready_branch(logits):
