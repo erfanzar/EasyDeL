@@ -134,8 +134,8 @@ def apply_top_p_sampling(
     top_p: float,
 ):
     if k_ids is None:
-        tokens_ids = jnp.argsort(-logits, axis=-1)
-        logits = jnp.take_along_axis(logits, tokens_ids, axis=-1)
+        k_ids = jnp.argsort(-logits, axis=-1)
+        logits = jnp.take_along_axis(logits, k_ids, axis=-1)
 
     cutoff_index = jnp.sum(
         jnp.cumsum(jax.nn.softmax(logits, axis=-1), axis=-1) < top_p, axis=-1
@@ -149,7 +149,7 @@ def apply_top_p_sampling(
         / temperature
     )
 
-    return logits, tokens_ids
+    return logits, k_ids
 
 
 def sampling(sampling_logits, tokens_ids, key):
@@ -157,7 +157,7 @@ def sampling(sampling_logits, tokens_ids, key):
         key, jax.nn.softmax(sampling_logits)
     ).reshape(-1, 1)
     selected_token = jnp.take_along_axis(tokens_ids, sampling_index, axis=-1)
-    return selected_token
+    return selected_token.reshape(-1)
 
 
 def inference_step(
@@ -168,9 +168,6 @@ def inference_step(
     cur_len,
     max_length,
 ):
-    top_k = config.top_k
-    top_p = config.top_p
-    temperature = config.temperature
     length_penalty = config.length_penalty
     repetition_penalty = config.repetition_penalty
     # Apply repetition penalty
@@ -194,7 +191,7 @@ def inference_step(
         length_penalty,
     )
 
-    def temperature_branch(logits, prng_key):
+    def temperature_branch(logits, prng_key, top_k, temperature, top_p):
         token_ids = None
         if config.top_k > 1:
             logits, token_ids = apply_top_k_sampling(
@@ -205,26 +202,23 @@ def inference_step(
             logits, token_ids = apply_top_p_sampling(
                 logits=logits, k_ids=token_ids, temperature=temperature, top_p=top_p
             )
-        return sampling(logits, token_ids, prng_key)
+            temperature = 1
+        return sampling(logits / temperature, token_ids, prng_key)
 
-    def gready_branch(logits, prng_key):
-        return jnp.argmax(
-            jax.nn.softmax(logits, axis=-1),
-            axis=-1,
-        ).reshape(-1)
+    def gready_branch(logits):
+        return jnp.argmax(jax.nn.softmax(logits, axis=-1), axis=-1).reshape(-1)
 
-    if temperature > 0.0:
+    if config.temperature > 0.0:
         return temperature_branch(
             logits=logits,
             prng_key=prng_key,
+            top_k=config.top_k,
+            top_p=config.top_p,
+            temperature=config.temperature,
         )
-    return gready_branch(
-        logits=logits,
-        prng_key=prng_key,
-    )
+    return gready_branch(logits=logits)
 
 
 inference_step_compiled = jax.jit(
-    inference_step,
-    static_argnames=["max_length", "config"],
+    inference_step, static_argnames=["max_length", "config"]
 )
