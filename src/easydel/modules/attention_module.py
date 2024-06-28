@@ -768,7 +768,7 @@ class AttentionModule:
                 ring_attention_standard,
                 axis_name=self.axis_name,
                 scale=1 / self.sm_scale,
-                float32_logits=True,
+                float32_logits=self.platform == "tpu" and self.force_float32_tpu,
             ),
             mesh=self.mesh,
             in_specs=(
@@ -811,7 +811,7 @@ class AttentionModule:
             if self.platform == "tpu":
                 ring_attention_fn = ring_flash_attention_tpu
             else:
-                ring_attention_fn = fjformer.pallas_operations.ring_attention
+                ring_attention_fn = fjformer.pallas_operations.gpu
             ring_attention_sharded = shard_map(
                 partial(
                     ring_attention_fn,
@@ -1436,6 +1436,7 @@ class AttentionModule:
             "blockwise",
             "vanilla",
             "wise_ring",
+            "ring",
             "sharded_vanilla",
             "legacy_sharded_vanilla",
             "flash",
