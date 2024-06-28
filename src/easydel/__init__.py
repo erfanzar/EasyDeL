@@ -113,6 +113,12 @@ from easydel.modules.gemma import (
     GemmaConfig as GemmaConfig,
     FlaxGemmaForCausalLM as FlaxGemmaForCausalLM,
 )
+
+from easydel.modules.gemma2 import (
+    FlaxGemma2ForCausalLM as FlaxGemma2ForCausalLM,
+    FlaxGemma2Model as FlaxGemma2Model,
+    Gemma2Config as Gemma2Config,
+)
 from easydel.modules.stablelm import (
     StableLmConfig as StableLmConfig,
     FlaxStableLmForCausalLM as FlaxStableLmForCausalLM,

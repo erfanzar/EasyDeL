@@ -1055,8 +1055,7 @@ class AttentionModule:
                 query_states, key_states, value_states, dtype=self.dtype
             )
 
-            depth = query_states.shape[-1]
-            query_states = query_states / jnp.sqrt(depth).astype(self.dtype)
+            query_states = query_states * self.sm_scale
             attention_weight = jnp.einsum(
                 "...qhd,...khd->...hqk",
                 query_states,
