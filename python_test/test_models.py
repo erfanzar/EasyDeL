@@ -123,7 +123,7 @@ class EasyModelsTest(TestCase):
                 num_ln_in_parallel_attn=1,
                 parallel_attn=True,
                 use_parallel_residual=self.use_parallel_residual,
-                qk_layernorm=self.qk_layernorm
+                qk_layernorm=self.qk_layernorm,
                 # tie_word_embedding=True,
                 # residual_in_fp32=True
             )
@@ -313,14 +313,14 @@ class EasyModelsTest(TestCase):
         )
         for k, v in self.__dict__.items():
             if isinstance(
-                    v,
-                    (
-                            bool,
-                            str,
-                            float,
-                            type(None),
-                            int,
-                    ),
+                v,
+                (
+                    bool,
+                    str,
+                    float,
+                    type(None),
+                    int,
+                ),
             ):
                 try:
                     setattr(conf, k, v)
@@ -409,14 +409,14 @@ class EasyModelsTest(TestCase):
         )
         for k, v in self.__dict__.items():
             if isinstance(
-                    v,
-                    (
-                            bool,
-                            str,
-                            float,
-                            type(None),
-                            int,
-                    ),
+                v,
+                (
+                    bool,
+                    str,
+                    float,
+                    type(None),
+                    int,
+                ),
             ):
                 setattr(conf, k, v)
         res, err = self.create_test_for_models(
@@ -437,14 +437,14 @@ class EasyModelsTest(TestCase):
         )
         for k, v in self.__dict__.items():
             if isinstance(
-                    v,
-                    (
-                            bool,
-                            str,
-                            float,
-                            type(None),
-                            int,
-                    ),
+                v,
+                (
+                    bool,
+                    str,
+                    float,
+                    type(None),
+                    int,
+                ),
             ):
                 setattr(conf, k, v)
         conf._attn_implementation = "eager"
@@ -488,14 +488,14 @@ class EasyModelsTest(TestCase):
         )
         for k, v in self.__dict__.items():
             if isinstance(
-                    v,
-                    (
-                            bool,
-                            str,
-                            float,
-                            type(None),
-                            int,
-                    ),
+                v,
+                (
+                    bool,
+                    str,
+                    float,
+                    type(None),
+                    int,
+                ),
             ):
                 setattr(conf, k, v)
         res, err = self.create_test_for_models(
@@ -513,6 +513,15 @@ class EasyModelsTest(TestCase):
     def test_rwkv(self):
         res, err = self.create_test_for_models("rwkv", transformers.RwkvForCausalLM)
         self.assertTrue(res, f"RWKV model Failed [ERROR {err}]")
+
+    def test_gemma2(self):
+        self.header_config = ed.Gemma2Config(
+            32000, 128, 256, 4, 8, 4, 128 // 8, use_scan_mlp=False
+        )
+        # self.sequence_length=8
+        # self.max_position_embeddings=16
+        res, err = self.create_test_for_models("gemma2", transformers.Gemma2ForCausalLM)
+        self.assertTrue(res, f"Gemma2 model Failed [ERROR {err}]")
 
     def test_mamba(self):
         res, err = self.create_test_for_models("mamba", transformers.MambaForCausalLM)
@@ -559,7 +568,7 @@ class EasyModelsTest(TestCase):
 
     @staticmethod
     def compare_torch_to_jax(
-            name, hf_out, ed_out, ed_loss, atol: float = 1e-035, rtol: float = 1e-08
+        name, hf_out, ed_out, ed_loss, atol: float = 1e-035, rtol: float = 1e-08
     ):
         to, jo = hf_out.logits.cpu().detach().numpy(), ed_out.logits
         err = jnp.mean(jnp.sum(to)) - jnp.mean(jnp.sum(jo))
@@ -597,4 +606,5 @@ if __name__ == "__main__":
     unittest.main()
     # test = EasyModelsTest()
     # test.setUp()
+    # test.test_gemma2()
     # test.test_llama()

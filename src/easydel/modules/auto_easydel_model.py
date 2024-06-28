@@ -68,6 +68,20 @@ def get_modules_by_type(
                 lm_head_name="lm_head",
             ),
         )
+    elif model_type == "gemma2":
+        from easydel.modules.gemma2 import FlaxGemma2ForCausalLM as _FlaxGemma2ForCausalLM
+        from easydel.modules.gemma2 import Gemma2Config as _Gemma2Config
+
+        return (
+            _Gemma2Config,
+            _FlaxGemma2ForCausalLM,
+            functools.partial(
+                huggingface_to_easydel,
+                embedding_layer_names=["embed_tokens"],
+                rnn_based_or_rwkv=False,
+                lm_head_name="lm_head",
+            ),
+        )
     elif model_type == "falcon":
         from easydel.modules.falcon import FalconConfig as _FalconConfig
         from easydel.modules.falcon import (

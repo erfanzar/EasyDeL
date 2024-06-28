@@ -44,7 +44,7 @@ With its comprehensive set of features and tools, EasyDeL aims to streamline and
 of machine learning models, particularly in the domain of large language models and video-related applications.
 
 ### Latest News 🔥
-
+- Gemma2 Is now available.
 - StableLM and DBrX model bugs are fixed.
 - All the Models have their AttentionStructure Changed, and now they are faster and more memory efficient for inference.
 - OLMo models are supported.

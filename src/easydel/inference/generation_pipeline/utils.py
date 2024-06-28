@@ -160,16 +160,16 @@ def sampling(sampling_logits, key):
 
 
 def temperature_branch(logits, prng_key, top_k, temperature, top_p):
-    logits = jax.nn.softmax(logits / temperature, axis=-1)
+    logits = logits / temperature
     if top_k > 1:
         logits = apply_top_k_sampling(logits=logits, top_k=top_k)
     if 0 < top_p < 1.0:
         logits = apply_top_p_sampling(logits=logits, top_p=top_p)
-    return sampling(logits, key=prng_key)
+    return sampling(jax.nn.softmax(logits, axis=-1), key=prng_key)
 
 
 def gready_branch(logits):
-    return jnp.argmax(jax.nn.softmax(logits, axis=-1), axis=-1).reshape(-1)
+    return jnp.argmax(logits, axis=-1).reshape(-1)
 
 
 def inference_step(
