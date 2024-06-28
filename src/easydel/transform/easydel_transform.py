@@ -6,7 +6,6 @@ from typing import Callable, List, Mapping, Optional, Union
 import fjformer
 import jax
 import msgpack
-import numpy
 import transformers
 from fjformer.checkpoint import get_dtype
 from flax import traverse_util
