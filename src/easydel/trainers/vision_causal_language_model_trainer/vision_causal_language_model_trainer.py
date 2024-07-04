@@ -60,16 +60,16 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
         return collate_fn
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
-        """The configure_functions function is responsible for configuring the functions that will be used in training.
-        It does this by first defining a function called function_configurations, which initializes the model parameters and returns
-        them as a EasyDeLState object. The EasyDeLState object contains all the information needed to train or evaluate
-        on a batch of data, including:
+        """
+        Configures and JIT-compiles the training and evaluation step functions.
 
-        Args:
-            self: Access the class attributes
+        This method sets up the necessary functions for training and evaluation, including:
+            - Initialization of the model state.
+            - Sharding of the model parameters and optimizer state.
+            - JIT-compilation of the training and evaluation step functions.
 
         Returns:
-            A TrainerConfigureFunctionOutput object
+            TrainerConfigureFunctionOutput: An object containing the configured functions and other relevant information.
         """
 
         def initialize_state_function():
@@ -630,7 +630,22 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
             return output
 
     def eval(self, model_state: EasyDeLState) -> typing.Iterator[dict]:
-        """Evaluate the Given Model State and yield the eval metrics"""
+        """
+        Evaluates the VCLM model using the provided model state.
+
+        This method iterates over the evaluation dataset, performs evaluation steps,
+        calculates metrics, logs metrics, and yields a dictionary of metrics for each step.
+
+        Args:
+            model_state (EasyDeLState): The EasyDeLState object containing the model parameters
+                                        and other relevant information.
+
+        Yields:
+            Iterator[dict]: An iterator that yields a dictionary of evaluation metrics for each step.
+
+        Raises:
+            AssertionError: If the evaluation dataset is not set.
+        """
         assert (
             self.dataloader_eval is not None
         ), "`dataloader_eval` is required by evaluator function."

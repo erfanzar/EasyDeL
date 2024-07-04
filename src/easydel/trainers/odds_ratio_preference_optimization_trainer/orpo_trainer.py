@@ -5,7 +5,6 @@ import typing
 import warnings
 from abc import ABC
 from collections import defaultdict
-from glob import glob  # noqa
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple, Union
 
 import flax.core
@@ -50,8 +49,51 @@ logger = get_logger(__name__)
 
 class ORPOTrainer(BaseTrainer, ABC):
     """
-    easydel ORPO Trainer Class
+    Trainer for Odds Ratio Preference Optimization (ORPO).
+
+    This trainer handles the training, evaluation, and checkpointing of language models
+    using the ORPO algorithm. It supports sharding, gradient accumulation, mixed precision
+    training, LoRA.
+
+    Attributes:
+        arguments (TrainArguments): The training arguments.
+        max_length (Optional[int]): The maximum sequence length.
+        max_prompt_length (Optional[int]): The maximum prompt length.
+        max_completion_length (Optional[int]): The maximum completion length.
+        beta (float): The strength of the regularization term in the ORPO loss.
+        disable_dropout (bool): Whether to disable dropout during training.
+        label_pad_token_id (int): The ID of the padding token for labels.
+        is_encoder_decoder (bool): Whether the model is an encoder-decoder architecture.
+        padding_value (int): The padding value for input sequences.
+        data_collator (Optional[DPODataCollatorWithPadding]): The data collator used for batching.
+        train_dataset (Optional[Dataset]): The training dataset.
+        eval_dataset (Optional[Union[Dataset, Dict[str, Dataset]]]): The evaluation dataset.
+        tokenizer (Optional[PreTrainedTokenizerBase]): The tokenizer used for preprocessing.
+        dataset_num_proc (Optional[int]): The number of processes to use for dataset mapping.
+        low_mem_usage (bool): Whether to prioritize low memory usage during training.
+
+    Methods:
+        build_tokenized_answer(self, prompt: str, answer: str) -> Dict: Tokenizes a prompt and answer pair, handling special tokens and padding/truncation.
+        tokenize_row(self, feature: Dict, state: EasyDeLState = None) -> Dict: Tokenizes a single row of data from the ORPO dataset.
+        configure_functions(self) -> TrainerConfigureFunctionOutput: Configures and JIT-compiles the training and evaluation step functions.
+        initialize_state(self, model_parameters: Optional[flax.core.FrozenDict] = None, state: Optional[EasyDeLState] = None) -> Tuple[EasyDeLState, Mapping[str, Callable], Mapping[str, Callable]]:
+            Initializes the training state, either from scratch, pretrained parameters, or a checkpoint.
+        initialize_trainer_utils(self): Initializes trainer utilities (logging, timer, dataloaders, model, etc.).
+        _configure_dataloaders(self): Configures the dataloaders for training and evaluation.
+        _configure_model(self): Configures the model, optimizer, scheduler, and configuration.
+        _configure_functions(self):  Configures and JIT-compiles the training and evaluation step functions.
+        create_collect_function(self, max_sequence_length: int, truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end") -> Callable:
+            Creates a data collection function for batching.
+        configure_dataloaders(self) -> TrainerConfigureDataloaderOutput: Configures the dataloaders for training and evaluation.
+        _get_train_dataloader(self) -> tensorflow.data.Dataset: Creates the training dataloader.
+        _get_eval_dataloader(self, eval_dataset: Optional[Dataset] = None) -> tensorflow.data.Dataset: Creates the evaluation dataloader.
+        get_train_dataloader(self) -> tensorflow.data.Dataset: Returns the training dataloader.
+        get_eval_dataloader(self, eval_dataset: Optional[Dataset] = None) -> tensorflow.data.Dataset: Returns the evaluation dataloader.
+        train(self, model_parameters: Optional[flax.core.FrozenDict] = None, state: Optional[EasyDeLState] = None) -> ORPOTrainerOutput: 
+            Trains the ORPO model and returns the training output.
+        eval(self, model_state: EasyDeLState) -> typing.Iterator[dict]: Evaluates the ORPO model and yields evaluation metrics.
     """
+
 
     def __init__(
         self,
@@ -74,26 +116,29 @@ class ORPOTrainer(BaseTrainer, ABC):
         low_mem_usage: bool = False,
     ):
         """
-        The __init__ function is called when the class is instantiated.
-        It sets up the attributes of an object.
+        Initializes the ORPOTrainer.
 
-        :param self: Refer to the object itself
-        :param beta: float: Control the strength of the regularization term
-        :param arguments: TrainArguments: Pass the arguments to the trainer
-        :param label_pad_token_id: int: Pad the labels
-        :param padding_value: int: Specify the value that is used for padding
-        :param train_dataset: Optional[Dataset]: Load the training dataset
-        :param eval_dataset: Optional[Union[Dataset, Dict[str, Dataset]]] : Pass the evaluation dataset to the trainer
-        :param tokenizer: Optional[PreTrainedTokenizerBase]: Pass the tokenizer to the trainer
-        :param max_length: Optional[int]: Set the maximum length of the input sequence
-        :param max_prompt_length: Optional[int]: Set the maximum length of the prompt
-        :param max_completion_length: Optional[int]: Truncate the target sequence
-        :param data_collator: Optional[Callable]: Function to be used for creating datasets.
-        tokenizing process with `dataset.map`.
-        :parma dataset_num_proc: Optional[int]: The number of processes to use for the dataset mapping.
-        :param _do_init_fns: bool : preferred to set ture to trainer will automatically configure
-        model with provided training Arguments
-        :param : Set the padding value for the model
+        Args:
+            arguments (TrainArguments): The training arguments.
+            max_length (Optional[int], optional): The maximum sequence length. Defaults to None.
+            max_prompt_length (Optional[int], optional): The maximum prompt length. Defaults to None.
+            max_completion_length (Optional[int], optional): The maximum completion length. Defaults to None.
+            beta (float, optional): The strength of the regularization term in the ORPO loss. Defaults to 0.1.
+            disable_dropout (bool, optional): Whether to disable dropout during training. Defaults to True.
+            label_pad_token_id (int, optional): The ID of the padding token for labels. Defaults to -100.
+            is_encoder_decoder (bool, optional): Whether the model is an encoder-decoder architecture. Defaults to False.
+            padding_value (int, optional): The padding value for input sequences. Defaults to None.
+            data_collator (Optional[DPODataCollatorWithPadding], optional): The data collator used for batching. Defaults to None.
+            train_dataset (Optional[Dataset], optional): The training dataset. Defaults to None.
+            eval_dataset (Optional[Union[Dataset, Dict[str, Dataset]]], optional): The evaluation dataset. Defaults to None.
+            tokenizer (Optional[PreTrainedTokenizerBase], optional): The tokenizer used for preprocessing. Defaults to None.
+            dataset_num_proc (Optional[int], optional): The number of processes to use for dataset mapping. Defaults to None.
+            _do_init_fns (bool, optional): Whether to automatically initialize trainer functions. Defaults to True.
+            dataset_map_arguments (Optional[Dict[str, Any]], optional): Arguments to pass to the dataset `map` function for tokenization. Defaults to None.
+            low_mem_usage (bool, optional): Whether to prioritize low memory usage during training. Defaults to False.
+
+        Raises:
+            ValueError: If `arguments` is not provided or is not a `TrainArguments` instance, or if `tokenizer` is not provided.
         """
 
         assert arguments is not None, (
@@ -202,8 +247,18 @@ class ORPOTrainer(BaseTrainer, ABC):
 
     def build_tokenized_answer(self, prompt, answer):
         """
-        Llama tokenizer does satisfy `enc(a + b) = enc(a) + enc(b)`.
-        It does ensure `enc(a + b) = enc(a) + enc(a + b)[len(enc(a)):]`.
+        Tokenizes a prompt and answer pair, handling special tokens and padding/truncation.
+
+        This method tokenizes the prompt and answer separately, then concatenates them
+        while ensuring correct token alignment. It also handles adding special tokens
+        (BOS and EOS) and padding/truncating sequences to the appropriate lengths.
+
+        Args:
+            prompt (str): The prompt text.
+            answer (str): The answer text.
+
+        Returns:
+            Dict: A dictionary containing the tokenized prompt and answer, along with attention masks.
         """
 
         full_tokenized = self.tokenizer(prompt + answer, add_special_tokens=False)
@@ -256,16 +311,21 @@ class ORPOTrainer(BaseTrainer, ABC):
 
     def tokenize_row(self, feature, state: EasyDeLState = None) -> Dict:
         """
-        The tokenize_row function is responsible for taking a single row of data and converting it into the format that
-        the model expects. This includes:
-        - Tokenizing the text (using HuggingFace's tokenizer)
-        - Padding/truncating sequences to a fixed length (if necessary)
-        - Creating attention masks, which tell the model which tokens are padding and which aren't.
+        Tokenizes a single row of data from the ORPO dataset.
 
-        :param self: Represent the instance of the class
-        :param feature: Pass in the data from the dataset
-        :param state: EasyDeLState: Keep track of the state of the tokenizer
-        :return: A dictionary of the following keys
+        This method tokenizes the prompt, chosen response, and rejected response,
+        handles padding and truncation, and prepares the data for input to the DPO model.
+
+        Args:
+            feature (Dict): A dictionary containing the "prompt", "chosen", and "rejected" texts.
+            state (EasyDeLState, optional): Not used in this implementation. Defaults to None.
+
+        Returns:
+            Dict: A dictionary containing the tokenized prompt, chosen response, and rejected response,
+                  along with attention masks and labels.
+
+        Raises:
+            ValueError: If the input data types are incorrect.
         """
         batch = {}
         prompt = feature["prompt"]
@@ -489,14 +549,15 @@ class ORPOTrainer(BaseTrainer, ABC):
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
         """
-        The configure_functions function is responsible for configuring the functions that will be used in training.
-        It does this by first defining a function called function_configurations, which initializes the model parameters
-         and returns
-        them as a EasyDeLState object. The EasyDeLState object contains all the information needed to train or evaluate
-        on a batch of data, including:
-        :param self: Access the class attributes
-        :return: A TrainerConfigureFunctionOutput object
+        Configures and JIT-compiles the training and evaluation step functions.
 
+        This method sets up the necessary functions for training and evaluation, including:
+            - Initialization of the model state.
+            - Sharding of the model parameters and optimizer state.
+            - JIT-compilation of the training and evaluation step functions.
+
+        Returns:
+            TrainerConfigureFunctionOutput: An object containing the configured functions and other relevant information.
         """
         mesh = self.arguments.get_mesh()
 
@@ -803,6 +864,13 @@ class ORPOTrainer(BaseTrainer, ABC):
             return sharded_state, shard_fns, gather_fns
 
     def initialize_trainer_utils(self):
+        """
+        Initializes various utilities used by the trainer.
+
+        This includes setting up Weights & Biases, initializing the training timer,
+        configuring dataloaders, configuring the model and optimizer, sharding the
+        model and reference model states, and configuring the training and evaluation functions.
+        """
         self._initialize_wandb()
         self._initialize_timer()
         self._configure_dataloaders()
@@ -810,6 +878,13 @@ class ORPOTrainer(BaseTrainer, ABC):
         self._configure_functions()
 
     def _configure_dataloaders(self):
+        """
+        Configures the dataloaders for training and evaluation.
+
+        This method retrieves the dataloaders from the `configure_dataloaders` method,
+        sets the maximum training and evaluation steps, and logs the time taken for
+        this configuration.
+        """
 
         operation_name = "configure dataloaders"
 
@@ -822,6 +897,13 @@ class ORPOTrainer(BaseTrainer, ABC):
         self.timer.log(operation_name)
 
     def _configure_model(self):
+        """
+        Configures the model, optimizer, scheduler, and configuration.
+
+        This method retrieves the model, optimizer, scheduler, and configuration from
+        the `configure_model` method and configures LoRA (if enabled). It also logs
+        the time taken for this configuration.
+        """
         operation_name = "configure Model, Optimizer, Scheduler and Config"
         with self.timer(operation_name):
             model_configurations = self.configure_model()
@@ -848,9 +930,15 @@ class ORPOTrainer(BaseTrainer, ABC):
         self.timer.log(operation_name)
 
     def _configure_functions(self):
+        """
+        Configures and JIT-compiles the training and evaluation step functions.
+
+        This method retrieves the configured functions from the `configure_functions`
+        method, sets up the mesh, checkpoint manager, and state initialization
+        function, and logs the time taken for this configuration.
+        """
         operation_name = "configure functions and sharding them"
         with self.timer(operation_name):
-
             function_configurations = self.configure_functions()
             self.create_sharded_state_from_params_function = (
                 function_configurations.create_sharded_state_from_params_function
@@ -876,6 +964,17 @@ class ORPOTrainer(BaseTrainer, ABC):
         return self.data_collator
 
     def configure_dataloaders(self) -> TrainerConfigureDataloaderOutput:
+        """
+        Configures the dataloaders for training and evaluation.
+
+        This method creates the training and evaluation dataloaders using the provided
+        datasets and data collator. It also determines the maximum number of training
+        and evaluation steps based on the dataset sizes and training arguments.
+
+        Returns:
+            TrainerConfigureDataloaderOutput: An object containing the configured dataloaders and the
+                                            maximum number of training and evaluation steps.
+        """
         dataloader_train = self.get_train_dataloader()
         max_evaluation_steps = None
         dataloader_eval = None
@@ -897,10 +996,16 @@ class ORPOTrainer(BaseTrainer, ABC):
 
     def _get_train_dataloader(self) -> tensorflow.data.Dataset:
         """
-        The _get_train_dataloader function is used to create a tensorflow.data.Dataset object for the training dataset.
+        Creates the training dataloader as a TensorFlow Dataset.
 
-        :param self: Represent the instance of the class
-        :return: A dataloader object
+        This method retrieves the training dataset, applies the data collator, and converts
+        it into a TensorFlow Dataset for efficient batching and data loading during training.
+
+        Returns:
+            tensorflow.data.Dataset: The training dataloader.
+
+        Raises:
+            ValueError: If the training dataset is not set.
         """
         if self.train_dataset is None:
             raise ValueError("Trainer: training requires a train_dataset.")
@@ -922,14 +1027,21 @@ class ORPOTrainer(BaseTrainer, ABC):
         self, eval_dataset: Optional[Dataset] = None
     ) -> tensorflow.data.Dataset:
         """
-        Returns the evaluation [`~tensorflow.data.Dataset`].
+        Creates the evaluation dataloader as a TensorFlow Dataset.
 
-        Subclass and override this method if you want to inject some custom behavior.
+        This method retrieves the evaluation dataset (either provided as an argument or
+        from the `self.eval_dataset` attribute), applies the data collator, and converts
+        it into a TensorFlow Dataset for efficient batching and data loading during evaluation.
 
         Args:
-            eval_dataset (`torch.utils.data.Dataset`, *optional*):
-                If provided, will override `self.eval_dataset`. If it is a [`~datasets.Dataset`], columns not accepted
-                by the `model.forward()` method are automatically removed. It must implement `__len__`.
+            eval_dataset (Optional[Dataset], optional):
+                An optional evaluation dataset to use. If None, `self.eval_dataset` is used. Defaults to None.
+
+        Returns:
+            tensorflow.data.Dataset: The evaluation dataloader.
+
+        Raises:
+            ValueError: If no evaluation dataset is provided or set.
         """
         if eval_dataset is None and self.eval_dataset is None:
             raise ValueError("Trainer: evaluation requires an eval_dataset.")
@@ -949,7 +1061,10 @@ class ORPOTrainer(BaseTrainer, ABC):
         self,
     ) -> tensorflow.data.Dataset:
         """
-        Returns the training [`~tensorflow.data.Dataset`].
+        Returns the training dataloader
+
+        Returns:
+            tensorflow.data.Dataset: The training dataloader.
         """
         return self._get_train_dataloader()
 
@@ -957,7 +1072,13 @@ class ORPOTrainer(BaseTrainer, ABC):
         self, eval_dataset: Optional[Dataset] = None
     ) -> tensorflow.data.Dataset:
         """
-        Returns the evaluation [`~tensorflow.data.Dataset`].
+        Returns the evaluation dataloader
+        Args:
+            eval_dataset (Optional[Dataset], optional):
+                An optional evaluation dataset to use. If None, `self.eval_dataset` is used. Defaults to None.
+
+        Returns:
+            tensorflow.data.Dataset: The evaluation dataloader.
         """
         if eval_dataset is None and self.eval_dataset is None:
             raise ValueError("Trainer: evaluation requires an eval_dataset.")
@@ -969,6 +1090,22 @@ class ORPOTrainer(BaseTrainer, ABC):
         model_parameters: Optional[flax.core.FrozenDict] = None,
         state: Optional[EasyDeLState] = None,
     ) -> ORPOTrainerOutput:
+        """
+        Trains the ORPO model.
+
+        This method orchestrates the training process, iterating over epochs and batches,
+        performing training steps, logging metrics, saving checkpoints, handling keyboard
+        interrupts and timeouts, and optionally evaluating the model.
+
+        Args:
+            model_parameters (Optional[flax.core.FrozenDict], optional): 
+                Pretrained model parameters for initialization. Defaults to None.
+            state (Optional[EasyDeLState], optional): 
+                An existing EasyDeLState to resume training from. Defaults to None.
+
+        Returns:
+            ORPOTrainerOutput: An object containing the trained model state and other training information.
+        """
         def get_layer_names(frozen_dict, prefix=""):
             layer_names = {}
             for key, value in frozen_dict.items():
@@ -1150,7 +1287,22 @@ class ORPOTrainer(BaseTrainer, ABC):
         return output
 
     def eval(self, model_state: EasyDeLState) -> typing.Iterator[dict]:
-        """Evaluate the Given Model State and yield the eval metrics"""
+        """
+        Evaluates the ORPO model using the provided model state.
+
+        This method iterates over the evaluation dataset, performs evaluation steps,
+        calculates metrics, logs metrics, and yields a dictionary of metrics for each step.
+
+        Args:
+            model_state (EasyDeLState): The EasyDeLState object containing the model parameters
+                                        and other relevant information.
+
+        Yields:
+            Iterator[dict]: An iterator that yields a dictionary of evaluation metrics for each step.
+
+        Raises:
+            AssertionError: If the evaluation dataset is not set.
+        """
         assert (
             self.eval_dataset is not None
         ), "`dataloader_eval` is required by evaluator function."

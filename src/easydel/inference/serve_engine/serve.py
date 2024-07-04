@@ -20,6 +20,41 @@ from aiohttp import web
 
 
 class ApiEngine:
+    """
+    **Examples:**
+    
+    ```python
+    import easydel as ed
+    from transformers import AutoTokenizer
+    from jax import numpy as jnp
+
+    # Load your pre-trained model and tokenizer
+    model, params = ed.AutoEasyDeLModelForCausalLM.from_pretrained(...)
+    tokenizer = AutoTokenizer.from_pretrained(...)
+    tokenizer.padding_side = "left"
+    tokenizer.truncation_side = "left"
+
+    # Create a GenerationPipeline
+    pipeline = ed.ChatPipeline(
+        pipeline=ed.GenerationPipeline(
+            model=model,
+            params=params,
+            tokenizer=tokenizer,
+            generation_config=ed.GenerationPipelineConfig(
+                max_new_tokens=256,
+                temperature=0.4,
+            ),
+        ),
+        max_prefill_length=2048,
+    )
+    engine = ed.ApiEngine(
+        pipeline=pipeline,
+        hostname="0.0.0.0",
+        port=11550
+    )
+    engine.fire()
+    ```
+    """
 
     def __init__(
         self,
@@ -360,7 +395,7 @@ class ApiEngine:
                     server_port=self.port + 2,
                     share=False,
                     prevent_thread_lock=True,
-                    quiet=True
+                    quiet=True,
                 )
             else:
                 self.logger.error(
