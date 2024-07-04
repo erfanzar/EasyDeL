@@ -1,33 +1,52 @@
 import os
+import sys
 
-os.environ["XLA_FLAGS"] = '--xla_force_host_platform_device_count=8'
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
-import fjformer.linen.linen
-import jax
-from jax import numpy as jnp
+os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
+dirname = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(dirname)  # noqa: E402
+sys.path.append(
+    os.path.join(
+        dirname,
+        "../../src",
+    )
+)  # noqa: E402
+import jax  # noqa: E402
 
-from easydel import EasyDeLState, FlaxLlamaForCausalLM, LlamaConfig, DPOTrainer, TrainArguments
+jax.config.update("jax_platform_name", "cpu")  # CPU Test !
+import fjformer.linen.linen  # noqa: E402
+import jax  # noqa: E402
+from jax import numpy as jnp  # noqa: E402
 
-from typing import Dict, Optional
+from easydel import (  # noqa: E402
+    EasyDeLState,
+    FlaxLlamaForCausalLM,
+    LlamaConfig,
+    DPOTrainer,
+    TrainArguments,
+)
 
-import torch
-
-torch.cuda.is_available = lambda: False
-
-torch.set_default_device("cpu")
-from datasets import Dataset, load_dataset
-from transformers import AutoTokenizer
+from typing import Dict, Optional  # noqa: E402
+from datasets import Dataset, load_dataset  # noqa: E402
+from transformers import AutoTokenizer  # noqa: E402
 
 
 def extract_anthropic_prompt(prompt_and_response):
     """Extract the anthropic prompt from a prompt and response pair."""
     search_term = "\n\nAssistant:"
     search_term_idx = prompt_and_response.rfind(search_term)
-    assert search_term_idx != -1, f"Prompt and response does not contain '{search_term}'"
+    assert (
+        search_term_idx != -1
+    ), f"Prompt and response does not contain '{search_term}'"
     return prompt_and_response[: search_term_idx + len(search_term)]
 
 
-def get_hh(split: str, sanity_check: bool = False, silent: bool = False, cache_dir: Optional[str] = None) -> Dataset:
+def get_hh(
+    split: str,
+    sanity_check: bool = False,
+    silent: bool = False,
+    cache_dir: Optional[str] = None,
+) -> Dataset:
     """Load the Anthropic Helpful-Harmless dataset from Hugging Face and convert it to the necessary format.
 
     The dataset is converted to a dictionary with the following structure:
@@ -41,7 +60,11 @@ def get_hh(split: str, sanity_check: bool = False, silent: bool = False, cache_d
       \n\nHuman: <prompt>\n\nAssistant:
     Multiple turns are allowed, but the prompt should always start with \n\nHuman: and end with \n\nAssistant:.
     """
-    dataset = load_dataset("Anthropic/hh-rlhf", split=split, cache_dir=cache_dir, )
+    dataset = load_dataset(
+        "Anthropic/hh-rlhf",
+        split=split,
+        cache_dir=cache_dir,
+    )
     if sanity_check:
         dataset = dataset.select(range(min(len(dataset), 1000)))
 
@@ -49,8 +72,8 @@ def get_hh(split: str, sanity_check: bool = False, silent: bool = False, cache_d
         prompt = extract_anthropic_prompt(sample["chosen"])
         return {
             "prompt": prompt,
-            "chosen": sample["chosen"][len(prompt):],
-            "rejected": sample["rejected"][len(prompt):],
+            "chosen": sample["chosen"][len(prompt) :],
+            "rejected": sample["rejected"][len(prompt) :],
         }
 
     return dataset.map(split_prompt_and_responses)
@@ -61,19 +84,20 @@ def main():
     with jax.default_device(jax.devices("cpu")[0]):
         model_name_or_path = "erfanzar/LLamaStory-70M"
         conf = LlamaConfig(
-            hidden_size=64,
-            intermediate_size=128,
+            hidden_size=128,
+            intermediate_size=256,
             num_hidden_layers=4,
-            num_attention_heads=4,
-            num_key_value_heads=2,
+            num_attention_heads=8,
+            num_key_value_heads=4,
             max_position_embeddings=512,
-            use_scan_mlp=False
+            use_scan_mlp=False,
+            attention_bias=False,
         )
         arguments = TrainArguments(
             num_train_epochs=4,
             model_name="DPO_TEST",
-            total_batch_size=4,
-            use_wandb=False
+            total_batch_size=8,
+            use_wandb=False,
         )
 
         tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
@@ -92,28 +116,28 @@ def main():
             dtype=jnp.float32,
             param_dtype=jnp.float32,
             _do_init=True,
-            input_shape=(8, 8)
+            input_shape=(8, 8),
         )
         ref_module = FlaxLlamaForCausalLM(
             config=conf,
             dtype=jnp.float32,
             param_dtype=jnp.float32,
             _do_init=True,
-            input_shape=(8, 8)
+            input_shape=(8, 8),
         )
-        ref_module.params = fjformer.linen.linen.quantize_int8_parameters(
-            ["kernel", "embedding"],
-            ref_module.params,
-        )
+        # ref_module.params = fjformer.linen.linen.quantize_int8_parameters(
+        #     ["kernel", "embedding"],
+        #     ref_module.params,
+        # )
         state = EasyDeLState.load(
             module=module,
             apply_fn=module.__call__,
-            params={"params": module.params}
+            params={"params": module.params},
         )
         ref_state = EasyDeLState.load(
             module=ref_module,
             apply_fn=ref_module.__call__,
-            params={"params": ref_module.params}
+            params={"params": ref_module.params},
         )
 
         max_length = 512
@@ -133,7 +157,7 @@ def main():
             max_prompt_length=max_prompt_length,
             dataset_map_arguments={
                 "num_proc": os.cpu_count(),
-            }
+            },
         )
 
         dpo_trainer.train()
