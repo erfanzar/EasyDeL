@@ -1,14 +1,9 @@
-Src
-===
+Modules
+=======
 
 .. toctree::
    :maxdepth: 2
 
-   cli.train.cl_train_cli
-   cli.cli
-   data_preprocessing.data_processor
-   kernels.rms_norm
-   kernels.utils
    modules._ring_attention
    modules.dbrx.dbrx_configuration
    modules.dbrx.modelling_dbrx_flax
@@ -87,44 +82,3 @@ Src
    modules.gpt_neo_x.modelling_gpt_neo_x_flax
    modules.cohere.modelling_cohere_flax
    modules.cohere.cohere_configuration
-   utils.lazy_import
-   utils.helpers
-   utils.checker
-   smi.smi
-   transform.easydel_transform
-   transform.utils
-   trainers.base_trainer
-   trainers.utils
-   trainers.odds_ratio_preference_optimization_trainer.orpo_trainer
-   trainers.odds_ratio_preference_optimization_trainer.modelling_output
-   trainers.odds_ratio_preference_optimization_trainer.fwd_bwd_functions
-   trainers.causal_language_model_trainer.causal_language_model_trainer
-   trainers.causal_language_model_trainer.modeling_output
-   trainers.causal_language_model_trainer.fwd_bwd_functions
-   trainers.supervised_fine_tuning_trainer.utils
-   trainers.supervised_fine_tuning_trainer.stf_trainer
-   trainers.training_configurations
-   trainers.direct_preference_optimization_trainer.utils
-   trainers.direct_preference_optimization_trainer.dpo_trainer
-   trainers.direct_preference_optimization_trainer.modelling_output
-   trainers.direct_preference_optimization_trainer.fwd_bwd_functions
-   trainers.vision_causal_language_model_trainer.vision_causal_language_model_trainer
-   trainers.vision_causal_language_model_trainer.modelling_output
-   trainers.vision_causal_language_model_trainer.fwd_bwd_functions
-   inference.serve_engine.serve
-   inference.serve_engine.client
-   inference.generation_pipeline.utils
-   inference.generation_pipeline.pipeline
-   reinforcement_learning.core
-   reinforcement_learning.trainer.ppo_trainer
-   reinforcement_learning.trainer.ppo_config
-   reinforcement_learning.trainer.utils
-   reinforcement_learning.trainer.partitioner_config
-   reinforcement_learning.trainer.training_configs
-   reinforcement_learning.utils.collectors
-   reinforcement_learning.models.modelling_casual_language_rl
-   etils.etils
-   etils.partition_module
-   etils.auto_tx
-   etils.easystate
-   etils.errors
