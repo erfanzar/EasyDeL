@@ -5,10 +5,6 @@ import typing
 
 import termcolor
 
-try:
-    import wandb
-except ModuleNotFoundError:
-    wandb = None
 
 from typing import Callable, Mapping, Optional
 
@@ -417,22 +413,18 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
             text_accuracy_sum = None
             pbar.update(sharded_state.step.tolist())  # type: ignore
             learning_rates = []
-            if self.wandb_runtime is not None:
-                model_parameters_number = (
-                    sum(
-                        n.size
-                        for n in jax.tree_util.tree_flatten(
-                            flax.core.unfreeze(sharded_state.params)
-                        )[0]
-                    )
-                    / 1e9
+            model_parameters_number = (
+                sum(
+                    n.size
+                    for n in jax.tree_util.tree_flatten(
+                        flax.core.unfreeze(sharded_state.params)
+                    )[0]
                 )
-                self.wandb_runtime.log(
-                    {"Number of Model Parameters (Billion)": model_parameters_number}
-                )
-                wandb.summary["Number of Model Parameters (Billion)"] = (
-                    model_parameters_number
-                )
+                / 1e9
+            )
+            self.arguments.log_metrics()(
+                {"Number of Model Parameters (Billion)": model_parameters_number}, 0
+            )
             try:
                 for epoch in range(self.arguments.num_train_epochs):
                     for batch in self.dataloader_train:
@@ -546,7 +538,7 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
                                 }
                             )
                             self.arguments.ensure_training_time(
-                                time.time() - time_start
+                                time.time() - start_time
                             )
                         else:
                             break

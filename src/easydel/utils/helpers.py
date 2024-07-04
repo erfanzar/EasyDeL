@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import termcolor
 
 try:
-    import wandb
+    import wandb  # type: ignore
 except ModuleNotFoundError:
     wandb = None
 
