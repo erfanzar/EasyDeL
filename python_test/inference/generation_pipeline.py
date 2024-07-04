@@ -1,29 +1,28 @@
 import os
 import sys
 
+os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
-
-try:
-    import easydel as ed
-except ModuleNotFoundError:
-    dirname = os.path.dirname(os.path.abspath(__file__))
-    sys.path.append(dirname)  # noqa: E402
-    sys.path.append(
-        os.path.join(
-            dirname,
-            "../src",
-        )
+dirname = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(dirname)  # noqa: E402
+sys.path.append(
+    os.path.join(
+        dirname,
+        "../../src",
     )
+)  # noqa: E402
+import jax  # noqa: E402
 
+jax.config.update("jax_platform_name", "cpu")  # CPU Test !
 from easydel import (  # noqa: E402
     FlaxLlamaForCausalLM,
     GenerationPipeline,
     GenerationPipelineConfig,
     LlamaConfig,
 )
-from jax import lax
-from jax import numpy as jnp
-from transformers import AutoTokenizer
+from jax import lax  # noqa: E402
+from jax import numpy as jnp  # noqa: E402
+from transformers import AutoTokenizer  # noqa: E402
 
 
 def main():
@@ -48,7 +47,7 @@ def main():
         _do_init=True,
         seed=81,
     )
-    tokenizer.padding_side="left"
+    tokenizer.padding_side = "left"
     tokens = tokenizer(
         "SOME TEXT", return_tensors="np", max_length=32, padding="max_length"
     )

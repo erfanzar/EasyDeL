@@ -27,3 +27,4 @@
 >    These improvements make the `BaseTrainer` class more robust, easier to understand, and more maintainable. >    The abstract methods `train` and `eval` still need to be implemented in subclasses to provide the specific >    training and evaluation logic for different model types.
 
 - Overall improvement in `OrpoTrainer`, `DPOTrainer`, `CLMTrainer`, `SFTTrainer`.
+- `ApiEngine` and `engine_client` are added.

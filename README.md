@@ -44,6 +44,7 @@ With its comprehensive set of features and tools, EasyDeL aims to streamline and
 of machine learning models, particularly in the domain of large language models and video-related applications.
 
 ### Latest News 🔥
+- `ApiEngine` and `engine_client`'s are Added.
 - `SFT`, `DPO`, `ORPO`, `CLM` Trainers improvement.
 - Gemma2 Is now available.
 - StableLM and DBrX model bugs are fixed.
@@ -148,9 +149,79 @@ input_text = "The quick brown fox jumps over the "
 The `GenerationPipeline` offers a user-friendly interface to harness the power of EasyDeL's language models for a wide
 range of text generation applications.
 
+### ApiEngine A ServeEngine with what you need!
+
+```python
+import easydel as ed
+from transformers import AutoTokenizer
+from jax import numpy as jnp
+
+# Load your pre-trained model and tokenizer
+model, params = ed.AutoEasyDeLModelForCausalLM.from_pretrained(...)
+tokenizer = AutoTokenizer.from_pretrained(...)
+tokenizer.padding_side = "left"
+tokenizer.truncation_side = "left"
+
+# Create a GenerationPipeline
+pipeline = ed.ChatPipeline(
+    pipeline=ed.GenerationPipeline(
+        model=model,
+        params=params,
+        tokenizer=tokenizer,
+        generation_config=ed.GenerationPipelineConfig(
+            max_new_tokens=256,
+            temperature=0.4,
+        ),
+    ),
+    max_prefill_length=2048,
+)
+engine = ed.ApiEngine(
+    pipeline=pipeline,
+    hostname="0.0.0.0",
+    port=11550
+)
+engine.fire()
+```
+
+Output:
+```shell
+2024-07-04 18:22:50,707 INFO     [easydel.inference.serve_engine.serve] HTTP server started on http://0.0.0.0:11550
+2024-07-04 18:22:50,707 INFO     [easydel.inference.serve_engine.serve] WebSocket server started on ws://0.0.0.0:11551
+2024-07-04 18:22:50,707 INFO     [easydel.inference.serve_engine.serve] Gradio server started on http://0.0.0.0:11552
+```
+
+#### Run and use With client
+
+```python
+from easydel import engine_client
+
+def main():
+    print("Gradio " + "*" * 50)
+    for response in engine_client.generate_gradio(
+        "http://127.0.0.1:11552/",
+        conversation=[{"content": "hi", "role": "user"}],
+    ):
+        print(response.sequence_stream, end="")
+    print()
+    print(f"{response.tokens_per_second=}")
+    print(f"{response.elapsed_time=}")
+
+    print("WebSocket " + "*" * 50)
+    for response in engine_client.generate_websocket(
+        "127.0.0.1:11551",
+        conversation=[{"content": "hi", "role": "user"}],
+    ):
+        print(response.response, end="")
+    print()
+    print(response.progress)
+
+
+if __name__ == "__main__":
+    main()
+```
 
 > [!NOTE]
-> you can use `EasyDeLServeEngine` which is a Serve API Engine for production purpose sice that's more stable provide
+> you can use `ApiEngine` which is a Serve API Engine for production purpose sice that's more stable provide
 > versioned
 > API and efficient.
 
