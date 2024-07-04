@@ -1,5 +1,9 @@
 import os
+import sys
 
+dirname = os.path.dirname(os.path.basename(__file__))
+sys.path.append(dirname)
+sys.path.append(os.path.join(dirname, "src"))
 static_joins = "\n\t:members:\n\t:undoc-members:\n\t:show-inheritance:"
 
 cache = {}
@@ -58,8 +62,7 @@ def get_files(path: str):
 
 
 def run(
-    project_locations="src/easydel",
-    docs_file="docs/api_docs/",
+    project_locations="src/easydel/",
     start_head="easydel",
 ):
     global cache
@@ -70,14 +73,13 @@ def run(
                 and not os.path.isdir(current_file)
                 and current_file.endswith(".py")
             ):
+                # print(current_file)
                 doted = start_head.replace(os.path.sep, ".").replace("/", ".") + "."
-
                 name = (
                     current_file.replace(".py", "")
                     .replace(os.path.sep, ".")
                     .replace("/", ".")
-                )
-
+                ).replace("src.","")
                 # markdown_documentation = f"{name.replace(doted, '')}\n========\n.. automodule:: {name}" + static_joins
                 categorical_name = name.replace(doted, "")
                 markdown_filename = name.replace(doted, "") + ".rst"
@@ -100,7 +102,7 @@ def run(
                     + markdown_filename.replace(".py", "")
                 )
             else:
-                run(current_file)
+                run(current_file, start_head=start_head)
     except NotADirectoryError:
         ...
 
@@ -124,14 +126,14 @@ def create_rst(name, children, output_dir):
                     child_value = flatten_dict(child_value)
                 create_rst(child_name, child_value, output_dir)
     else:
-        children_name = children.replace("easydel.", "").replace("src.", "")
+        children_name = children.replace("easydel.", "")
         ca = "/".join(
             [s.replace("_", " ").strip() for s in children_name.split(".")[1:-1]]
         )
         name = f"``{ca}`` module"
         with open(os.path.join(output_dir, children_name), "w") as rst_file:
             rst_file.write(f"{name.replace('_', ' ')}\n{'=' * len(name)}\n\n")
-            children = children.replace(".rst", "").replace("src.", "")
+            children = children.replace(".rst", "")
             rst_file.write(
                 f".. automodule:: {children}\n"
                 f"    :members:\n"
@@ -159,6 +161,7 @@ def main():
     run()
 
     cache = {("APIs",) + k: v for k, v in cache.items()}
+    # print(cache)
     pages = unflatten_dict(cache)
     base_dir = "docs/api_docs/"
     generate_api_docs(
