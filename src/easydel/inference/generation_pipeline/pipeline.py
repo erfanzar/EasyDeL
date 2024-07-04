@@ -6,15 +6,16 @@ import fjformer
 import flax.core
 import jax
 from fjformer import GenerateRNG
+
 from jax import lax, random
 from jax import numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec
 from transformers import PreTrainedTokenizer
 
 from easydel.inference.generation_pipeline import utils as inference_utils
+
 from easydel.modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 
-RNG_GEN = inference_utils.RNG_GEN
 GenerationPipelineConfig = inference_utils.GenerationPipelineConfig
 _DynamicGenerationConfig = inference_utils._DynamicGenerationConfig
 

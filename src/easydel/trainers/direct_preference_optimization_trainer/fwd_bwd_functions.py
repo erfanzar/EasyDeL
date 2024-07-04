@@ -8,7 +8,7 @@ from typing import Literal, Dict, Union, Tuple, List, Callable
 from jax import numpy as jnp
 from easydel.etils.easystate import EasyDeLState
 from flax.struct import dataclass
-from easydel.trainer.direct_preference_optimization_trainer.utils import pad_to_length
+from easydel.trainers.direct_preference_optimization_trainer.utils import pad_to_length
 
 
 @dataclass

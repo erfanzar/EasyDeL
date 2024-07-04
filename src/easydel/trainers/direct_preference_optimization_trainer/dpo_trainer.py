@@ -28,27 +28,26 @@ from transformers import PreTrainedTokenizerBase
 from easydel.etils.easystate import EasyDeLState
 from easydel.etils.errors import EasyDeLTimerError
 from easydel.etils.etils import get_logger
-from easydel.trainer.base_trainer import (
+from easydel.trainers.base_trainer import (
     BaseTrainer,
-    TrainerConfigureDataloaderFuncOutput,
-    TrainerConfigureFunctionFuncOutput,
-    TrainerConfigureModelFuncOutput,
+    TrainerConfigureDataloaderOutput,
+    TrainerConfigureFunctionOutput,
+    TrainerConfigureModelOutput,
 )
-from easydel.trainer.direct_preference_optimization_trainer.fwd_bwd_functions import (
+from easydel.trainers.direct_preference_optimization_trainer.fwd_bwd_functions import (
     create_dpo_concatenated_forward,
     create_dpo_eval_function,
     create_dpo_train_function,
 )
-from easydel.trainer.direct_preference_optimization_trainer.modelling_output import (
+from easydel.trainers.direct_preference_optimization_trainer.modelling_output import (
     DPOTrainerOutput,
 )
-from easydel.trainer.direct_preference_optimization_trainer.utils import (
+from easydel.trainers.direct_preference_optimization_trainer.utils import (
     DPODataCollatorWithPadding,
     leave_alone_context_manager,
     pad_to_length,
 )
-from easydel.trainer.training_configurations import TrainArguments
-from easydel.utils import Timers
+from easydel.trainers.training_configurations import TrainArguments
 
 logger = get_logger(__name__)
 
@@ -262,50 +261,55 @@ class DPOTrainer(BaseTrainer, ABC):
         )
 
     def initialize_trainer_utils(self):
-        """
-        The initialize_trainer_utils function is responsible for initializing the following:
-            - wandb_runtime (if you use_wandb is True)
-            - timer object (for logging time taken by various functions)
-            - dataloader objects for training and evaluation data, along with max steps per epoch.
-              The configure_dataloader function accomplishes this task.
+        self._initialize_wandb()
+        self._initialize_timer()
+        self._configure_dataloaders()
+        self._configure_model()
+        self._shard_states()
+        self._configure_functions()
 
-        :param self: Represent the instance of the class
-        :return: A tuple of functions
+    def _configure_dataloaders(self):
+        operation_name = "configure dataloaders"
+        with self.timer(operation_name):
 
-        """
-        self.wandb_runtime = (
-            self.arguments.get_wandb_init() if self.arguments.use_wandb else None
-        )
-        self.timer = Timers(
-            use_wandb=False, tensorboard_writer=self.arguments.get_board()
-        )
+            dataset_configurations = self.configure_dataloaders()
+            self.dataloader_train = dataset_configurations.dataloader_train
+            self.max_training_steps = dataset_configurations.max_training_steps
+            self.dataloader_eval = dataset_configurations.dataloader_eval
+            self.max_evaluation_steps = dataset_configurations.max_evaluation_steps
+        self.timer.log(operation_name)
 
-        self.timer("configure dataloaders").start()
-        dataset_configurations = self.configure_dataloader()
-        self.dataloader_train = dataset_configurations.dataloader_train
-        self.max_training_steps = dataset_configurations.max_training_steps
-        self.dataloader_eval = dataset_configurations.dataloader_eval
-        self.max_evaluation_steps = dataset_configurations.max_evaluation_steps
+    def _configure_model(self):
+        with self.timer("configure Model, Optimizer, Scheduler and Config"):
+            model_configurations = self.configure_model()
+            self.model = model_configurations.model
+            self.tx = model_configurations.tx
+            self.scheduler = model_configurations.scheduler
+            self.config = model_configurations.config
+            self._configure_lora()
+        self.timer.log("configure Model, Optimizer, Scheduler and Config")
 
-        self.timer("configure dataloaders").stop()
+    def _configure_functions(self):
+        operation_name = "configure functions and sharding them"
+        with self.timer(operation_name):
+            functions = self.configure_functions()
 
-        self.timer.log(["configure dataloaders"])
+            self.create_sharded_state_from_params_function = (
+                functions.create_sharded_state_from_params_function
+            )
+            self.sharded_train_step_function = functions.sharded_train_step_function
+            self.sharded_eval_step_function = functions.sharded_eval_step_function
+            self.mesh = functions.mesh
+            self.checkpoint_manager = functions.checkpoint_manager
+            self.initialize_state_function = functions.initialize_state_function
+        self.timer.log(operation_name)
 
-        self.timer("configure Model, Optimizer, Scheduler and Config").start()
-        model_configurations = self.configure_model()
-        model = model_configurations.model
-        tx = model_configurations.tx
-        scheduler = model_configurations.scheduler
-        config = model_configurations.config
-        self.model = model
-        self.tx = tx
-        self.scheduler = scheduler
-        self.config = config
+    def _configure_lora(self):
         if self.rapture is not None:
             lora_modules = self.rapture.apply_lora(
-                module=model,
+                module=self.model,
                 parameters=self.arguments.rapture_config.parameters,
-                tx=tx,
+                tx=self.tx,
             )
             self.lora_parameters = lora_modules.lora_parameters
             self.lora_apply_fn = lora_modules.lora_module.__call__
@@ -313,95 +317,8 @@ class DPOTrainer(BaseTrainer, ABC):
             self.lora_model = lora_modules.lora_module
             self.lora_tx = lora_modules.lora_tx
 
-        self.timer("configure Model, Optimizer, Scheduler and Config").stop()
-        self.timer.log(["configure Model, Optimizer, Scheduler and Config"])
+    def configure_dataloaders(self) -> TrainerConfigureDataloaderOutput:
 
-        self.timer("configure functions and sharding them").start()
-
-        if self.auto_shard_model_state:
-            self.timer("Sharding Model State").start()
-            self.model_state: EasyDeLState = self.shard_states(
-                self.model_state,
-                self.model_state.module.config.get_partition_rules(
-                    self.arguments.fully_sharded_data_parallel
-                ),
-            )
-
-            termcolor.cprint(
-                "initializing TX and Schedulers for `model_state`",
-                force_color=True,
-                color="cyan",
-            )
-
-            params_with_opt = (
-                self.model_state.params["params"]
-                if "_overwrite_with_gradient" in self.model_state.params
-                else self.model_state.params
-            )
-            opt_state = self.tx.init(params_with_opt)
-
-            self.model_state = self.model_state.replace(opt_state=opt_state, tx=self.tx)
-
-            self.timer("Sharding Model State").stop()
-            self.timer.log(["Sharding Model State"])
-        if self.auto_shard_ref_model_state and self.ref_model_state is not None:
-            self.timer("Sharding Ref Model State").start()
-            self.ref_model_state = self.shard_states(
-                self.ref_model_state,
-                self.ref_model_state.module.config.get_partition_rules(
-                    self.arguments.fully_sharded_data_parallel
-                ),
-            )
-            self.timer("Sharding Ref Model State").stop()
-            self.timer.log(["Sharding Ref Model State"])
-
-        function_configurations = self.configure_functions()
-        self.create_sharded_state_from_params_function = (
-            function_configurations.create_sharded_state_from_params_function
-        )
-        self.sharded_train_step_function = (
-            function_configurations.sharded_train_step_function
-        )
-        self.sharded_eval_step_function = (
-            function_configurations.sharded_eval_step_function
-        )
-        self.mesh = function_configurations.mesh
-        self.checkpoint_manager = function_configurations.checkpoint_manager
-        self.initialize_state_function = (
-            function_configurations.initialize_state_function
-        )
-        self.timer("configure functions and sharding them").stop()
-        self.timer.log(["configure functions and sharding them"])
-
-    def create_collate_function(
-        self,
-        max_sequence_length: int,
-        truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
-    ) -> Callable:
-        return self.data_collator
-
-    def shard_states(self, state, rules):
-        with self.arguments.get_mesh():
-            partition_spec = match_partition_rules(
-                rules=rules, params=jax.eval_shape(lambda: state)
-            )
-
-            spec_named_sharding = self.specs_to_name_sharding(partition_spec)
-            empty_sharding = jax.sharding.NamedSharding(
-                spec=PartitionSpec(), mesh=self.arguments.get_mesh()
-            )
-
-            def _shard(x):
-                return x
-
-            shard = jax.jit(
-                _shard,
-                in_shardings=(empty_sharding,),
-                out_shardings=spec_named_sharding,
-            )
-            return shard(state)
-
-    def configure_dataloader(self) -> TrainerConfigureDataloaderFuncOutput:
         dataloader_train = self.get_train_dataloader()
         max_evaluation_steps = None
         dataloader_eval = None
@@ -414,14 +331,26 @@ class DPOTrainer(BaseTrainer, ABC):
         if self.eval_dataset is not None:
             dataloader_eval = self.get_eval_dataloader(self.eval_dataset)
             max_evaluation_steps = len(dataloader_eval)
-        return TrainerConfigureDataloaderFuncOutput(
-            dataloader_train=dataloader_train,  # type:ignore
-            max_training_steps=max_training_steps,
+        return TrainerConfigureDataloaderOutput(
             dataloader_eval=dataloader_eval,
+            dataloader_train=dataloader_train,
             max_evaluation_steps=max_evaluation_steps,
+            max_training_steps=max_training_steps,
         )
 
-    def configure_functions(self) -> TrainerConfigureFunctionFuncOutput:
+    def configure_model(self) -> TrainerConfigureModelOutput:
+
+        config = self.model_state.module.config
+        tx, scheduler = self.arguments.get_optimizer_and_scheduler(
+            self.max_training_steps
+        )
+        model = (self.model_state.module,)
+        return TrainerConfigureModelOutput(
+            model=model, tx=tx, scheduler=scheduler, config=config
+        )
+
+    def configure_functions(self) -> TrainerConfigureFunctionOutput:
+
         def initialize_state_function():
             initialized_parameters = self.model.init_weights(
                 jax.random.PRNGKey(0), self.arguments.init_input_shape
@@ -472,6 +401,7 @@ class DPOTrainer(BaseTrainer, ABC):
                 )
 
         def create_state_from_params_function(parameters):
+
             if self.rapture is None:
                 return EasyDeLState.create(
                     tx=self.tx,
@@ -564,32 +494,89 @@ class DPOTrainer(BaseTrainer, ABC):
             out_shardings=(spec_named_sharding, empty_sharding),
         )
 
-        self.arguments.ckpt_path_exists()
+        self.arguments.ensure_checkpoint_path()
         self.state_partition_spec = state_partition_spec
         self.state_named_sharding = spec_named_sharding
         self.state_shape = state_shape
         checkpoint_manager = self.arguments.get_streaming_checkpointer()
         mesh = self.arguments.get_mesh()
-        return TrainerConfigureFunctionFuncOutput(
-            initialize_state_function=initialize_state_function,
-            sharded_train_step_function=sharded_train_step_function,
+        return TrainerConfigureFunctionOutput(
             create_sharded_state_from_params_function=create_sharded_state_from_params_function,
-            checkpoint_manager=checkpoint_manager,
-            mesh=mesh,
+            sharded_train_step_function=sharded_train_step_function,
             sharded_eval_step_function=sharded_eval_step_function,
+            mesh=mesh,
+            checkpoint_manager=checkpoint_manager,
+            initialize_state_function=initialize_state_function,
         )
 
-    def configure_model(self) -> TrainerConfigureModelFuncOutput:
-        config = self.model_state.module.config
-        tx, scheduler = self.arguments.get_optimizer_and_scheduler(
-            self.max_training_steps
-        )
-        return TrainerConfigureModelFuncOutput(
-            model=self.model_state.module,
-            config=config,  # type: ignore
-            scheduler=scheduler,
-            tx=tx,
-        )
+    def _shard_states(self):
+        module_operation_name = "configure functions and sharding them"
+        with self.timer(module_operation_name):
+            if self.auto_shard_model_state:
+                target_operation_name = "Sharding Model State"
+                with self.timer(target_operation_name):
+                    self.model_state: EasyDeLState = self.shard_states(
+                        self.model_state,
+                        self.model_state.module.config.get_partition_rules(
+                            self.arguments.fully_sharded_data_parallel
+                        ),
+                    )
+                    inner_module_operation_name = (
+                        "initializing TX and Schedulers for `model_state`"
+                    )
+                    with self.timer(inner_module_operation_name):
+                        params_with_opt = (
+                            self.model_state.params["params"]
+                            if "_overwrite_with_gradient" in self.model_state.params
+                            else self.model_state.params
+                        )
+                        opt_state = self.tx.init(params_with_opt)
+
+                        self.model_state = self.model_state.replace(
+                            opt_state=opt_state, tx=self.tx
+                        )
+                    self.timer.log(inner_module_operation_name)
+
+                self.timer.log(target_operation_name)
+            if self.auto_shard_ref_model_state and self.ref_model_state is not None:
+                target_operation_name = "Sharding Ref Model State"
+                with self.timer(target_operation_name):
+                    self.ref_model_state = self.shard_states(
+                        self.ref_model_state,
+                        self.ref_model_state.module.config.get_partition_rules(
+                            self.arguments.fully_sharded_data_parallel
+                        ),
+                    )
+                self.timer.log(target_operation_name)
+        self.timer.log(module_operation_name)
+
+    def create_collect_function(
+        self,
+        max_sequence_length: int,
+        truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
+    ) -> Callable:
+        return self.data_collator
+
+    def shard_states(self, state, rules):
+        with self.arguments.get_mesh():
+            partition_spec = match_partition_rules(
+                rules=rules, params=jax.eval_shape(lambda: state)
+            )
+
+            spec_named_sharding = self.specs_to_name_sharding(partition_spec)
+            empty_sharding = jax.sharding.NamedSharding(
+                spec=PartitionSpec(), mesh=self.arguments.get_mesh()
+            )
+
+            def _shard(x):
+                return x
+
+            shard = jax.jit(
+                _shard,
+                in_shardings=(empty_sharding,),
+                out_shardings=spec_named_sharding,
+            )
+            return shard(state)
 
     def _get_train_dataloader(self) -> tensorflow.data.Dataset:
         """
@@ -1074,7 +1061,7 @@ class DPOTrainer(BaseTrainer, ABC):
         checkpoint_name = f"{self.arguments.model_name}-S{step}"
         filename = f"{checkpoint_name}_{step}" if milestone else f"{checkpoint_name}"
         filename += ".easy"
-        termcolor.cprint(f"Saving Model {filename}.", color="cyan", force_color=True)
+        termcolor.cprint(f"Saving Model {filename}.", color="red", force_color=True)
         state.save_state(
             filename=filename,
             checkpoint_dir=os.path.join(
@@ -1172,10 +1159,11 @@ class DPOTrainer(BaseTrainer, ABC):
                                     "train/TFLOPs": flops,
                                 }
                                 log_metrics = copy.deepcopy(train_metrics)
-                                train_metrics.update(self.arguments.captured_memory)
-                                if self.arguments.use_wandb:
-                                    with jax.spmd_mode("allow_all"):
-                                        self.wandb_runtime.log(train_metrics)
+                                train_metrics.update(self.arguments._captured_memory)
+                                self.arguments.log_metrics(
+                                    metrics=train_metrics,
+                                    step=current_step,
+                                )
                                 pbar.update(1)
                                 pbar.set_postfix(
                                     **{
@@ -1328,10 +1316,8 @@ class DPOTrainer(BaseTrainer, ABC):
                         "eval/TFLOPs": flops,
                     }
                     log_metrics = copy.deepcopy(eval_metrics)
-                    eval_metrics.update(self.arguments.captured_memory)
-                    if self.arguments.use_wandb:
-                        with jax.spmd_mode("allow_all"):
-                            self.wandb_runtime.log(eval_metrics)
+                    eval_metrics.update(self.arguments._captured_memory)
+                    self.arguments.log_metrics(metrics=eval_metrics, step=current_step)
 
                     pbar.update(1)
                     pbar.set_postfix(
