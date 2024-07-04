@@ -8,14 +8,10 @@ from collections import defaultdict
 
 import flax.core
 import jax
-import tensorflow.data  # type:ignore # noqa
+import tensorflow.data  # type:ignore
 import tensorflow_datasets
 import termcolor
 
-try:
-    import wandb
-except ModuleNotFoundError:
-    wandb = None
 from typing import Any, Callable, Dict, Literal, Mapping, Optional, Union
 
 from datasets import Dataset

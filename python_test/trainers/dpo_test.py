@@ -14,7 +14,6 @@ sys.path.append(
 import jax  # noqa: E402
 
 jax.config.update("jax_platform_name", "cpu")  # CPU Test !
-import fjformer.linen.linen  # noqa: E402
 import jax  # noqa: E402
 from jax import numpy as jnp  # noqa: E402
 

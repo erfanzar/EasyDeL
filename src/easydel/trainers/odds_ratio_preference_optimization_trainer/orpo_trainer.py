@@ -43,7 +43,7 @@ from easydel.trainers.odds_ratio_preference_optimization_trainer.modelling_outpu
     ORPOTrainerOutput,
 )
 from easydel.trainers.training_configurations import TrainArguments
-from easydel.utils import Timers, prefix_print
+from easydel.utils import prefix_print
 
 logger = get_logger(__name__)
 

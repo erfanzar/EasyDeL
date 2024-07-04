@@ -6,11 +6,6 @@ import typing
 import termcolor
 from flax.core import FrozenDict
 
-try:
-    import wandb
-except ModuleNotFoundError:
-    wandb = None
-
 from typing import Callable, Mapping, Optional, Tuple
 
 import flax
@@ -410,13 +405,6 @@ class CausalLanguageModelTrainer(BaseTrainer):
             )
 
         checkpoint_path = "SAVING_SKIPPED"
-        if self.arguments.performance_mode:
-            termcolor.cprint(
-                "Performance Mode is ON, we will ignore the Memory Tracking, WANDB Logging, and extra information "
-                "Process.",
-                color="red",
-                force_color=True,
-            )
         start_time = time.time()
         sharded_state, shard_fns, gather_fns = self.initialize_state(
             model_parameters=model_parameters, state=state
@@ -431,22 +419,20 @@ class CausalLanguageModelTrainer(BaseTrainer):
             loss_sum = None
             accuracy_sum = None
             pbar.update(sharded_state.step.tolist())  # type: ignore
-            if self.wandb_runtime is not None:
-                model_parameters_number = (
-                    sum(
-                        n.size
-                        for n in jax.tree_util.tree_flatten(
-                            flax.core.unfreeze(sharded_state.params)
-                        )[0]
-                    )
-                    / 1e9
+
+            model_parameters_number = (
+                sum(
+                    n.size
+                    for n in jax.tree_util.tree_flatten(
+                        flax.core.unfreeze(sharded_state.params)
+                    )[0]
                 )
-                self.wandb_runtime.log(
-                    {"Number of Model Parameters (Billion)": model_parameters_number}
-                )
-                wandb.summary["Number of Model Parameters (Billion)"] = (
-                    model_parameters_number
-                )
+                / 1e9
+            )
+            self.arguments.log_metrics(
+                {"Number of Model Parameters (Billion)": model_parameters_number},
+                step=0,
+            )
             try:
                 train_iter = iter(self.dataloader_train)
                 for epoch in range(self.arguments.num_train_epochs):
