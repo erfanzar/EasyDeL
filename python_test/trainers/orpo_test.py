@@ -1,21 +1,24 @@
 import os
 import sys
 
+os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 dirname = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(dirname)  # noqa: E402
 sys.path.append(
     os.path.join(
         dirname,
-        "..",
+        "../../src",
     )
 )  # noqa: E402
+import jax  # noqa: E402
 
+jax.config.update("jax_platform_name", "cpu")  # CPU Test !
 
 import jax.numpy  # noqa: E402
 from flax.core import FrozenDict  # noqa: E402
 
 from easydel import MistralConfig, FlaxMistralForCausalLM  # noqa: E402
-from easydel.trainer.odds_ratio_preference_optimization_trainer import (  # noqa: E402
+from easydel.trainers.odds_ratio_preference_optimization_trainer import (  # noqa: E402
     ORPOTrainer,
 )
 from easydel import TrainArguments  # noqa: E402
@@ -89,7 +92,7 @@ def orpo_main():
         train_dataset=train_dataset,
         tokenizer=tokenizer,
         arguments=TrainArguments(
-            model_name="ORPO",
+            model_name="ORPO_TEST",
             num_train_epochs=NUM_TRAIN_EPOCHS,
             total_batch_size=TOTAL_BATCH_SIZE,
             gradient_accumulation_steps=2,

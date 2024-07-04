@@ -1,19 +1,26 @@
 import os
-
-import flax.core
-from transformers import AutoTokenizer
-
-from easydel.trainer import conversations_formatting_function
+import sys
 
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
-from easydel.trainer.supervised_fine_tuning_trainer import SFTTrainer
-from easydel import (
-    TrainArguments,
-    FlaxMistralForCausalLM,
-    MistralConfig
-)
-from jax import numpy as jnp
-from datasets import load_dataset
+dirname = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(dirname)  # noqa: E402
+sys.path.append(
+    os.path.join(
+        dirname,
+        "../../src",
+    )
+)  # noqa: E402
+import jax  # noqa: E402
+
+jax.config.update("jax_platform_name", "cpu")  # CPU Test !
+
+import flax.core  # noqa: E402
+from transformers import AutoTokenizer  # noqa: E402
+from easydel.trainers import conversations_formatting_function  # noqa: E402
+from easydel.trainers.supervised_fine_tuning_trainer import SFTTrainer  # noqa: E402
+from easydel import TrainArguments, FlaxMistralForCausalLM, MistralConfig  # noqa: E402
+from jax import numpy as jnp  # noqa: E402
+from datasets import load_dataset  # noqa: E402
 
 
 def main():
@@ -31,7 +38,11 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-Instruct-v0.2")
 
     def prompter(sample):
-        return [conversations_formatting_function(tokenizer, messages_field="messages")(sample)]
+        return [
+            conversations_formatting_function(tokenizer, messages_field="messages")(
+                sample
+            )
+        ]
 
     train_dataset = load_dataset("HuggingFaceH4/deita-10k-v0-sft", split="train_sft")
 
@@ -41,7 +52,7 @@ def main():
     dtype = jnp.float32
     trainer = SFTTrainer(
         arguments=TrainArguments(
-            model_name="SFTTrainer-Debug",
+            model_name="SFTTrainer_TEST",
             num_train_epochs=3,
             total_batch_size=2,
             gradient_accumulation_steps=2,
@@ -55,7 +66,7 @@ def main():
                 "config": model.config,
                 "input_shape": (1, 1),
                 "dtype": dtype,
-                "param_dtype": dtype
+                "param_dtype": dtype,
             },
             dtype=dtype,
             param_dtype=dtype,
@@ -64,7 +75,7 @@ def main():
             label_smoothing_factor=0.1,
             z_loss=0.0001,
             train_on_inputs=True,
-            save_steps=50,
+            save_steps=500,
             save_total_limit=1,
             do_last_save=False,
         ),
@@ -74,7 +85,9 @@ def main():
         dataset_text_field=None,
         formatting_func=prompter,
         packing=True,
-        num_of_sequences=1024
+        num_of_sequences=1024,
+        chars_per_token=2.1,
+        dataset_num_proc=32
     )
     return trainer.train(model_parameters=flax.core.FrozenDict({"params": params}))
 

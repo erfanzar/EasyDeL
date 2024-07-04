@@ -1,27 +1,29 @@
 import os
 import sys
 
-# dirname = os.path.dirname(os.path.abspath(__file__))
-# sys.path.append(dirname)  # noqa: E402
-# sys.path.append(
-#     os.path.join(
-#         dirname,
-#         "..",
-#     )
-# )  # noqa: E402
-import flax.core  # noqa: E402
-
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
+dirname = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(dirname)  # noqa: E402
+sys.path.append(
+    os.path.join(
+        dirname,
+        "../../src",
+    )
+)  # noqa: E402
+import jax  # noqa: E402
 
+jax.config.update("jax_platform_name", "cpu")  # CPU Test !
+import flax.core  # noqa: E402
+from datasets import Dataset, IterableDataset  # noqa: E402
 from easydel import (  # noqa: E402
+    AttentionMechanisms,
     CausalLanguageModelTrainer,
-    TrainArguments,
     FlaxMistralForCausalLM,
     MistralConfig,
-    AttentionMechanisms
+    TrainArguments,
 )
+
 from jax import numpy as jnp, random  # noqa: E402
-from datasets import Dataset, IterableDataset  # noqa: E402
 
 NUM_TRAIN_EXAMPLES = 100000
 NUM_EVAL_EXAMPLES = 12
@@ -44,7 +46,7 @@ def main(use_iterable_dataset: bool):
         attn_dtype=jnp.float16,
         attn_mechanism=AttentionMechanisms.pallas_flash,
         block_k=128,
-        block_q=128
+        block_q=128,
     )
 
     model = FlaxMistralForCausalLM(config=config, _do_init=True)
@@ -76,7 +78,7 @@ def main(use_iterable_dataset: bool):
     dtype = jnp.float16
     trainer = CausalLanguageModelTrainer(
         arguments=TrainArguments(
-            model_name="MistralSmoothZlossTest",
+            model_name="CLM_TEST",
             num_train_epochs=NUM_TRAIN_EPOCHS,
             total_batch_size=TOTAL_BATCH_SIZE,
             gradient_accumulation_steps=2,
