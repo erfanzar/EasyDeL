@@ -44,11 +44,11 @@ With its comprehensive set of features and tools, EasyDeL aims to streamline and
 of machine learning models, particularly in the domain of large language models and video-related applications.
 
 ### Latest News 🔥
+- `SFT`, `DPO`, `ORPO`, `CLM` Trainers improvement.
 - Gemma2 Is now available.
 - StableLM and DBrX model bugs are fixed.
 - All the Models have their AttentionStructure Changed, and now they are faster and more memory efficient for inference.
 - OLMo models are supported.
-- Now Flash attention will automatically switch on pallas_flash in case that your on GPUs.
 - GPU Flash Attention Bugs are now fixed.
 - changing required version of jax from `>=0.4.23` to `>=0.4.28`, but `0.4.29` or higher versions (if available) are
   recommended.
@@ -59,14 +59,7 @@ of machine learning models, particularly in the domain of large language models 
 - removing *(q,k,v,b,a)_partition_specs and using `PartitionAxis` instead of them.
 - Sharding Strategies are changed.
 - Now EasyDeL is more Memory efficient Multi-GPUs
-- Aya Model is Supported.
-- Falcon Model is Updated and now Falcon11B is supported wih flash attention support.
-- `pallas_flash` is now available for CPU/GPU/TPU with custom pallas kernel.
-- DeepseekV2 Model is Added (beta mood).
-- OpenELM Model is Added.
-- EasyDeL project structure has changed now you have to import EasyDel as `easydel`.
-- `ORPOTrainer` is Added
-- Phi3 Model bugs are fixed, Arctic Model is added.
+
 
 > [!TIP]
 >
