@@ -17,6 +17,11 @@ from easydel.inference.generation_pipeline import (
     ChatPipeline as ChatPipeline,
 )
 
+from easydel.inference.serve_engine import (
+    ApiEngine as ApiEngine,
+    engine_client as engine_client,
+)
+
 # INFERENCE IMPORT END HERE
 
 # MODULES IMPORT START HERE

@@ -1,6 +1,6 @@
 import dataclasses
 from functools import partial
-from typing import Dict, Union
+from typing import Optional, Union,Dict
 
 import jax
 from jax import numpy as jnp
@@ -8,18 +8,29 @@ from jax import random, sharding
 
 
 class GenerationPipelineConfig:
-    def __init__(self, **kwargs):
-        self.max_new_tokens = kwargs.pop("max_new_tokens", 64)
 
-        self.temperature = kwargs.pop("temperature", 0)
-        self.top_p = kwargs.pop("top_p", 0.95)
-        self.top_k = kwargs.pop("top_k", 50)
-        self.repetition_penalty = kwargs.pop("repetition_penalty", 1.0)
-        self.length_penalty = kwargs.pop("length_penalty", 1.0)
-
-        self.pad_token_id = kwargs.pop("pad_token_id", None)
-        self.bos_token_id = kwargs.pop("bos_token_id", None)
-        self.eos_token_id = kwargs.pop("eos_token_id", None)
+    def __init__(
+        self,
+        max_new_tokens: int = 64,
+        temperature: float = 0.0,
+        top_p: float = 0.95,
+        top_k: int = 50,
+        repetition_penalty: float = 1.0,
+        length_penalty: float = 1.0,
+        pad_token_id: Optional[int] = None,
+        bos_token_id: Optional[int] = None,
+        eos_token_id: Optional[int] = None,
+        **kwargs,
+    ):
+        self.max_new_tokens = max_new_tokens
+        self.temperature = temperature
+        self.top_p = top_p
+        self.top_k = top_k
+        self.repetition_penalty = repetition_penalty
+        self.length_penalty = length_penalty
+        self.pad_token_id = pad_token_id
+        self.bos_token_id = bos_token_id
+        self.eos_token_id = eos_token_id
 
 
 class _DynamicGenerationConfig:
