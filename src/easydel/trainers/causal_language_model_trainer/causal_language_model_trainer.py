@@ -22,19 +22,22 @@ from tqdm.autonotebook import tqdm
 
 from easydel.etils.easystate import EasyDeLState
 from easydel.etils.errors import EasyDeLTimerError
-from easydel.trainer.base_trainer import BaseTrainer, TrainerConfigureFunctionFuncOutput
-from easydel.trainer.causal_language_model_trainer.fwd_bwd_functions import (
+from easydel.trainers.base_trainer import (
+    BaseTrainer,
+    TrainerConfigureFunctionOutput,
+)
+from easydel.trainers.causal_language_model_trainer.fwd_bwd_functions import (
     create_casual_language_model_evaluation_step,
     create_casual_language_model_train_step,
 )
-from easydel.trainer.causal_language_model_trainer.modeling_output import (
+from easydel.trainers.causal_language_model_trainer.modeling_output import (
     CausalLMTrainerOutput,
 )
 from easydel.utils.helpers import prefix_print
 
 
 class CausalLanguageModelTrainer(BaseTrainer):
-    def create_collate_function(
+    def create_collect_function(
         self,
         max_sequence_length: int,
         truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
@@ -57,7 +60,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
 
         return collate_fn
 
-    def configure_functions(self) -> TrainerConfigureFunctionFuncOutput:
+    def configure_functions(self) -> TrainerConfigureFunctionOutput:
         """The configure_functions function is responsible for configuring the functions that will be used in training.
         It does this by first defining a function called function_configurations, which initializes the model parameters and returns
         them as a EasyDeLState object. The EasyDeLState object contains all the information needed to train or evaluate
@@ -67,7 +70,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
             self: Access the class attributes
 
         Returns:
-            A TrainerConfigureFunctionFuncOutput object
+            A TrainerConfigureFunctionOutput object
         """
 
         def initialize_state_function():
@@ -194,13 +197,13 @@ class CausalLanguageModelTrainer(BaseTrainer):
         )
 
         mesh = self.arguments.get_mesh()
-        self.arguments.ckpt_path_exists()
+        self.arguments.ensure_checkpoint_path()
         checkpoint_manager = self.arguments.get_streaming_checkpointer()
         self.state_partition_spec = state_partition_spec
         self.state_named_sharding = spec_named_sharding
         self.state_shape = state_shape
 
-        return TrainerConfigureFunctionFuncOutput(
+        return TrainerConfigureFunctionOutput(
             create_sharded_state_from_params_function=create_sharded_state_from_params_function,
             sharded_train_step_function=sharded_train_step_function,
             sharded_eval_step_function=sharded_eval_step_function,
@@ -561,19 +564,14 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                         )
                                     }
                                 )
-                                train_metrics.update(self.arguments.captured_memory)
-                            if (
-                                self.wandb_runtime is not None
-                                and not self.arguments.performance_mode
-                            ):
-                                with jax.spmd_mode("allow_all"):
-                                    self.wandb_runtime.log(train_metrics)
-                            if self.arguments.training_time is not None:
-                                if (
-                                    time.time() - start_time
-                                    > self.arguments.training_time
-                                ):
-                                    raise EasyDeLTimerError("Time Out")
+                                train_metrics.update(self.arguments._captured_memory)
+                            self.arguments.log_metrics(
+                                metrics=train_metrics,
+                                step=current_step,
+                            )
+                            self.arguments.ensure_training_time(
+                                time_passed=time.time() - start_time
+                            )
                         else:
                             break
                         if (
@@ -717,10 +715,8 @@ class CausalLanguageModelTrainer(BaseTrainer):
                     if aux_loss is not None:
                         eval_metrics.update({"eval/aux_loss": aux_loss})
                     log_metrics = copy.deepcopy(eval_metrics)
-                    eval_metrics.update(self.arguments.captured_memory)
-                    if self.arguments.use_wandb:
-                        with jax.spmd_mode("allow_all"):
-                            self.wandb_runtime.log(eval_metrics)
+                    eval_metrics.update(self.arguments._captured_memory)
+                    self.arguments.log_metrics(metrics=eval_metrics, step=current_step)
 
                     pbar.update(1)
                     pbar.set_postfix(

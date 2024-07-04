@@ -25,24 +25,24 @@ from transformers import PreTrainedTokenizerBase
 from easydel.etils.easystate import EasyDeLState
 from easydel.etils.errors import EasyDeLTimerError
 from easydel.etils.etils import get_logger
-from easydel.trainer.base_trainer import (
+from easydel.trainers.base_trainer import (
     BaseTrainer,
-    TrainerConfigureDataloaderFuncOutput,
-    TrainerConfigureFunctionFuncOutput,
+    TrainerConfigureDataloaderOutput,
+    TrainerConfigureFunctionOutput,
 )
-from easydel.trainer.direct_preference_optimization_trainer.utils import (
+from easydel.trainers.direct_preference_optimization_trainer.utils import (
     DPODataCollatorWithPadding,
     leave_alone_context_manager,
     pad_to_length,
 )
-from easydel.trainer.odds_ratio_preference_optimization_trainer.fwd_bwd_functions import (
+from easydel.trainers.odds_ratio_preference_optimization_trainer.fwd_bwd_functions import (
     create_orpo_concatenated_forward,
     create_orpo_step_function,
 )
-from easydel.trainer.odds_ratio_preference_optimization_trainer.modelling_output import (
+from easydel.trainers.odds_ratio_preference_optimization_trainer.modelling_output import (
     ORPOTrainerOutput,
 )
-from easydel.trainer.training_configurations import TrainArguments
+from easydel.trainers.training_configurations import TrainArguments
 from easydel.utils import Timers, prefix_print
 
 logger = get_logger(__name__)
@@ -487,7 +487,7 @@ class ORPOTrainer(BaseTrainer, ABC):
                 batch[f"{k}{type_key}"] = tokens
         return batch
 
-    def configure_functions(self) -> TrainerConfigureFunctionFuncOutput:
+    def configure_functions(self) -> TrainerConfigureFunctionOutput:
         """
         The configure_functions function is responsible for configuring the functions that will be used in training.
         It does this by first defining a function called function_configurations, which initializes the model parameters
@@ -495,7 +495,7 @@ class ORPOTrainer(BaseTrainer, ABC):
         them as a EasyDeLState object. The EasyDeLState object contains all the information needed to train or evaluate
         on a batch of data, including:
         :param self: Access the class attributes
-        :return: A TrainerConfigureFunctionFuncOutput object
+        :return: A TrainerConfigureFunctionOutput object
 
         """
         mesh = self.arguments.get_mesh()
@@ -629,13 +629,13 @@ class ORPOTrainer(BaseTrainer, ABC):
             ),
         )
 
-        self.arguments.ckpt_path_exists()
+        self.arguments.ensure_checkpoint_path()
         checkpoint_manager = self.arguments.get_streaming_checkpointer()
         self.state_partition_spec = state_partition_spec
         self.state_named_sharding = spec_named_sharding
         self.state_shape = state_shape
 
-        return TrainerConfigureFunctionFuncOutput(
+        return TrainerConfigureFunctionOutput(
             create_sharded_state_from_params_function=create_sharded_state_from_params_function,
             sharded_train_step_function=sharded_train_step_function,
             sharded_eval_step_function=sharded_eval_step_function,
@@ -803,108 +803,79 @@ class ORPOTrainer(BaseTrainer, ABC):
             return sharded_state, shard_fns, gather_fns
 
     def initialize_trainer_utils(self):
-        """
-        The initialize_trainer_utils function is responsible for initializing the following:
-            - wandb_runtime (if you use_wandb is True)
-            - timer object (for logging time taken by various functions)
-            - dataloader objects for training and evaluation data, along with max steps per epoch.
-              The configure_dataloader function accomplishes this task.
+        self._initialize_wandb()
+        self._initialize_timer()
+        self._configure_dataloaders()
+        self._configure_model()
+        self._configure_functions()
 
-        :param self: Represent the instance of the class
-        :return: A tuple of functions
+    def _configure_dataloaders(self):
 
-        """
-        self.wandb_runtime = (
-            self.arguments.get_wandb_init() if self.arguments.use_wandb else None
-        )
-        self.timer = Timers(
-            use_wandb=False, tensorboard_writer=self.arguments.get_board()
-        )
+        operation_name = "configure dataloaders"
 
-        self.timer("configure dataloaders").start()
-        dataset_configurations = self.configure_dataloader()
-        self.dataloader_train = dataset_configurations.dataloader_train
-        self.max_training_steps = dataset_configurations.max_training_steps
-        self.dataloader_eval = dataset_configurations.dataloader_eval
-        self.max_evaluation_steps = dataset_configurations.max_evaluation_steps
+        with self.timer(operation_name):
+            dataset_configurations = self.configure_dataloaders()
+            self.dataloader_train = dataset_configurations.dataloader_train
+            self.max_training_steps = dataset_configurations.max_training_steps
+            self.dataloader_eval = dataset_configurations.dataloader_eval
+            self.max_evaluation_steps = dataset_configurations.max_evaluation_steps
+        self.timer.log(operation_name)
 
-        self.timer("configure dataloaders").stop()
+    def _configure_model(self):
+        operation_name = "configure Model, Optimizer, Scheduler and Config"
+        with self.timer(operation_name):
+            model_configurations = self.configure_model()
+            model = model_configurations.model
+            tx = model_configurations.tx
+            scheduler = model_configurations.scheduler
+            config = model_configurations.config
+            self.model = model
+            self.tx = tx
+            self.scheduler = scheduler
+            self.config = config
+            if self.rapture is not None:
+                lora_modules = self.rapture.apply_lora(
+                    module=model,
+                    parameters=self.arguments.rapture_config.parameters,
+                    tx=tx,
+                )
+                self.lora_parameters = lora_modules.lora_parameters
+                self.lora_apply_fn = lora_modules.lora_module.__call__
+                self.lora_opt_state = lora_modules.lora_opt_state
+                self.lora_model = lora_modules.lora_module
+                self.lora_tx = lora_modules.lora_tx
 
-        self.timer.log(["configure dataloaders"])
+        self.timer.log(operation_name)
 
-        self.timer("configure Model, Optimizer, Scheduler and Config").start()
-        model_configurations = self.configure_model()
-        model = model_configurations.model
-        tx = model_configurations.tx
-        scheduler = model_configurations.scheduler
-        config = model_configurations.config
-        self.model = model
-        self.tx = tx
-        self.scheduler = scheduler
-        self.config = config
-        if self.rapture is not None:
-            lora_modules = self.rapture.apply_lora(
-                module=model,
-                parameters=self.arguments.rapture_config.parameters,
-                tx=tx,
+    def _configure_functions(self):
+        operation_name = "configure functions and sharding them"
+        with self.timer(operation_name):
+
+            function_configurations = self.configure_functions()
+            self.create_sharded_state_from_params_function = (
+                function_configurations.create_sharded_state_from_params_function
             )
-            self.lora_parameters = lora_modules.lora_parameters
-            self.lora_apply_fn = lora_modules.lora_module.__call__
-            self.lora_opt_state = lora_modules.lora_opt_state
-            self.lora_model = lora_modules.lora_module
-            self.lora_tx = lora_modules.lora_tx
+            self.sharded_train_step_function = (
+                function_configurations.sharded_train_step_function
+            )
+            self.sharded_eval_step_function = (
+                function_configurations.sharded_eval_step_function
+            )
+            self.mesh = function_configurations.mesh
+            self.checkpoint_manager = function_configurations.checkpoint_manager
+            self.initialize_state_function = (
+                function_configurations.initialize_state_function
+            )
+        self.timer.log(operation_name)
 
-        self.timer("configure Model, Optimizer, Scheduler and Config").stop()
-        self.timer.log(["configure Model, Optimizer, Scheduler and Config"])
-
-        self.timer("configure functions and sharding them").start()
-
-        function_configurations = self.configure_functions()
-        self.create_sharded_state_from_params_function = (
-            function_configurations.create_sharded_state_from_params_function
-        )
-        self.sharded_train_step_function = (
-            function_configurations.sharded_train_step_function
-        )
-        self.sharded_eval_step_function = (
-            function_configurations.sharded_eval_step_function
-        )
-        self.mesh = function_configurations.mesh
-        self.checkpoint_manager = function_configurations.checkpoint_manager
-        self.initialize_state_function = (
-            function_configurations.initialize_state_function
-        )
-        self.timer("configure functions and sharding them").stop()
-        self.timer.log(["configure functions and sharding them"])
-
-    def create_collate_function(
+    def create_collect_function(
         self,
         max_sequence_length: int,
         truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> Callable:
         return self.data_collator
 
-    def shard_states(self, state, rules):
-        with self.arguments.get_mesh():
-            partition_spec = match_partition_rules(
-                rules=rules, params=jax.eval_shape(lambda: state)
-            )
-
-            def _shard(x):
-                return x
-
-            spec_named_sharding = self.specs_to_name_sharding(partition_spec)
-            empty_sharding = jax.sharding.NamedSharding(
-                spec=PartitionSpec(), mesh=self.arguments.get_mesh()
-            )
-            shard = jit(
-                _shard,
-                in_shardings=(empty_sharding,),
-                out_shardings=spec_named_sharding,
-            )
-            return shard(state)
-
-    def configure_dataloader(self) -> TrainerConfigureDataloaderFuncOutput:
+    def configure_dataloaders(self) -> TrainerConfigureDataloaderOutput:
         dataloader_train = self.get_train_dataloader()
         max_evaluation_steps = None
         dataloader_eval = None
@@ -917,7 +888,7 @@ class ORPOTrainer(BaseTrainer, ABC):
         if self.eval_dataset is not None:
             dataloader_eval = self.get_eval_dataloader(self.eval_dataset)
             max_evaluation_steps = len(dataloader_eval)
-        return TrainerConfigureDataloaderFuncOutput(
+        return TrainerConfigureDataloaderOutput(
             dataloader_train=dataloader_train,  # type:ignore
             max_training_steps=max_training_steps,
             dataloader_eval=dataloader_eval,
@@ -1089,10 +1060,11 @@ class ORPOTrainer(BaseTrainer, ABC):
                                 }
                                 train_metrics.update(metrics)
                                 log_metrics = copy.deepcopy(train_metrics)
-                                train_metrics.update(self.arguments.captured_memory)
-                                if self.arguments.use_wandb:
-                                    with jax.spmd_mode("allow_all"):
-                                        self.wandb_runtime.log(train_metrics)
+                                train_metrics.update(self.arguments._captured_memory)
+                                self.arguments.log_metrics(
+                                    metrics=train_metrics,
+                                    step=current_step,
+                                )
                                 pbar.update(1)
                                 pbar.set_postfix(
                                     **{
@@ -1221,10 +1193,8 @@ class ORPOTrainer(BaseTrainer, ABC):
                     }
                     eval_metrics.update(metrics)
                     log_metrics = copy.deepcopy(eval_metrics)
-                    eval_metrics.update(self.arguments.captured_memory)
-                    if self.arguments.use_wandb:
-                        with jax.spmd_mode("allow_all"):
-                            self.wandb_runtime.log(eval_metrics)
+                    eval_metrics.update(self.arguments._captured_memory)
+                    self.arguments.log_metrics(metrics=eval_metrics, step=current_step)
 
                     pbar.update(1)
                     pbar.set_postfix(

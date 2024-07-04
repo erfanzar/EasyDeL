@@ -25,21 +25,21 @@ from tqdm.autonotebook import tqdm
 
 from easydel.etils.easystate import EasyDeLState
 from easydel.etils.errors import EasyDeLTimerError
-from easydel.trainer.base_trainer import TrainerConfigureFunctionFuncOutput
-from easydel.trainer.causal_language_model_trainer import CausalLanguageModelTrainer
-from easydel.trainer.vision_causal_language_model_trainer.fwd_bwd_functions import (
+from easydel.trainers.base_trainer import TrainerConfigureFunctionOutput
+from easydel.trainers.causal_language_model_trainer import CausalLanguageModelTrainer
+from easydel.trainers.vision_causal_language_model_trainer.fwd_bwd_functions import (
     VisionCausalLanguageModelStepOutput,
     create_vision_casual_language_model_evaluation_step,
     create_vision_casual_language_model_train_step,
 )
-from easydel.trainer.vision_causal_language_model_trainer.modelling_output import (
+from easydel.trainers.vision_causal_language_model_trainer.modelling_output import (
     VisionCausalLMTrainerOutput,
 )
 from easydel.utils import prefix_print
 
 
 class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
-    def create_collate_function(
+    def create_collect_function(
         self,
         max_sequence_length: int,
         truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
@@ -63,7 +63,7 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
 
         return collate_fn
 
-    def configure_functions(self) -> TrainerConfigureFunctionFuncOutput:
+    def configure_functions(self) -> TrainerConfigureFunctionOutput:
         """The configure_functions function is responsible for configuring the functions that will be used in training.
         It does this by first defining a function called function_configurations, which initializes the model parameters and returns
         them as a EasyDeLState object. The EasyDeLState object contains all the information needed to train or evaluate
@@ -73,7 +73,7 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
             self: Access the class attributes
 
         Returns:
-            A TrainerConfigureFunctionFuncOutput object
+            A TrainerConfigureFunctionOutput object
         """
 
         def initialize_state_function():
@@ -198,13 +198,13 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
         )
 
         mesh = self.arguments.get_mesh()
-        self.arguments.ckpt_path_exists()
+        self.arguments.ensure_checkpoint_path()
         checkpoint_manager = self.arguments.get_streaming_checkpointer()
         self.state_partition_spec = state_partition_spec
         self.state_named_sharding = spec_named_sharding
         self.state_shape = state_shape
 
-        return TrainerConfigureFunctionFuncOutput(
+        return TrainerConfigureFunctionOutput(
             create_sharded_state_from_params_function=create_sharded_state_from_params_function,
             sharded_train_step_function=sharded_train_step_function,
             sharded_eval_step_function=sharded_eval_step_function,
@@ -533,9 +533,11 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
                                 }
 
                                 log_metrics = copy.deepcopy(train_metrics)
-                                train_metrics.update(**self.arguments.captured_memory)
-                                if self.wandb_runtime is not None:
-                                    self.wandb_runtime.log(train_metrics)
+                                train_metrics.update(**self.arguments._captured_memory)
+                                self.arguments.log_metrics(
+                                    metrics=train_metrics,
+                                    step=current_step,
+                                )
 
                             pbar.set_postfix(
                                 **{
@@ -543,12 +545,9 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
                                     for k, v in log_metrics.items()
                                 }
                             )
-                            if self.arguments.training_time is not None:
-                                if (
-                                    time.time() - start_time
-                                    > self.arguments.training_time
-                                ):
-                                    raise EasyDeLTimerError("Time Out")
+                            self.arguments.ensure_training_time(
+                                time.time() - time_start
+                            )
                         else:
                             break
                         if (
@@ -719,7 +718,9 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
                         "eval/TFLOPs": flops,
                     }
                     log_metrics = copy.deepcopy(eval_metrics)
-                    eval_metrics.update(**self.arguments.captured_memory)
+                    eval_metrics.update(**self.arguments._captured_memory)
+
+                    self.arguments.log_metrics(metrics=eval_metrics, step=current_step)
                     pbar.update(1)
                     pbar.set_postfix(
                         **{k.replace("eval/", ""): v for k, v in log_metrics.items()}

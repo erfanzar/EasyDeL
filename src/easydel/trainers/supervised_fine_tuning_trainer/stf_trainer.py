@@ -1,21 +1,21 @@
 import warnings
-from typing import Union, Optional, Callable, Dict
 from abc import ABC
+from typing import Callable, Dict, Optional, Union
 
+import tensorflow_datasets as tfds
+from datasets import Dataset
 from datasets.arrow_writer import SchemaInferenceError
 from datasets.builder import DatasetGenerationError
 from transformers import PreTrainedTokenizerBase
-from datasets import Dataset
-from easydel.trainer.base_trainer import TrainerConfigureDataloaderFuncOutput
-from easydel.trainer.training_configurations import TrainArguments
-from easydel.trainer.utils import (
-    get_formatting_func_from_dataset,
-    create_constant_length_dataset
-)
-from easydel.trainer.causal_language_model_trainer import CausalLanguageModelTrainer
-from easydel.etils.etils import get_logger
 
-import tensorflow_datasets as tfds
+from easydel.etils.etils import get_logger
+from easydel.trainers.base_trainer import TrainerConfigureDataloaderOutput
+from easydel.trainers.causal_language_model_trainer import CausalLanguageModelTrainer
+from easydel.trainers.training_configurations import TrainArguments
+from easydel.trainers.utils import (
+    create_constant_length_dataset,
+    get_formatting_func_from_dataset,
+)
 
 logger = get_logger(__name__)
 
@@ -23,24 +23,24 @@ logger = get_logger(__name__)
 class SFTTrainer(CausalLanguageModelTrainer, ABC):
 
     def __init__(
-            self,
-            arguments: TrainArguments,
-            tokenizer: PreTrainedTokenizerBase,
-            train_dataset: Optional[Dataset] = None,
-            eval_dataset: Optional[Union[Dataset, Dict[str, Dataset]]] = None,
-            dataset_text_field: Optional[str] = None,
-            packing: Optional[bool] = False,
-            formatting_func: Optional[Callable] = None,
-            num_of_sequences: Optional[int] = 1024,
-            chars_per_token: Optional[float] = 3.6,
-            dataset_num_proc: Optional[int] = None,
-            dataset_batch_size: int = 1000,
-            neftune_noise_alpha: Optional[float] = None,
-            dataset_kwargs: Optional[Dict] = None,
-            eval_packing: Optional[bool] = None,
-            checkpoint_path: Optional[str] = None,
-            remove_unused_columns=True,
-            _do_init_fns: bool = True
+        self,
+        arguments: TrainArguments,
+        tokenizer: PreTrainedTokenizerBase,
+        train_dataset: Optional[Dataset] = None,
+        eval_dataset: Optional[Union[Dataset, Dict[str, Dataset]]] = None,
+        dataset_text_field: Optional[str] = None,
+        packing: Optional[bool] = False,
+        formatting_func: Optional[Callable] = None,
+        num_of_sequences: Optional[int] = 1024,
+        chars_per_token: Optional[float] = 3.6,
+        dataset_num_proc: Optional[int] = None,
+        dataset_batch_size: int = 1000,
+        neftune_noise_alpha: Optional[float] = None,
+        dataset_kwargs: Optional[Dict] = None,
+        eval_packing: Optional[bool] = None,
+        checkpoint_path: Optional[str] = None,
+        remove_unused_columns=True,
+        _do_init_fns: bool = True,
     ):
 
         if getattr(tokenizer, "pad_token", None) is None:
@@ -122,13 +122,12 @@ class SFTTrainer(CausalLanguageModelTrainer, ABC):
             _do_init_fns=_do_init_fns,
         )
 
-    def configure_dataloader(self) -> TrainerConfigureDataloaderFuncOutput:
-
+    def configure_dataloaders(self) -> TrainerConfigureDataloaderOutput:
         """
-        The configure_dataloader function is used to configure the dataloader for training and evaluation.
+        The configure_dataloaders function is used to configure the dataloader for training and evaluation.
 
         :param self: Refer to the class instance itself
-        :return: A TrainerConfigureDataloaderFuncOutput object
+        :return: A TrainerConfigureDataloaderOutput object
 
         """
 
@@ -137,15 +136,17 @@ class SFTTrainer(CausalLanguageModelTrainer, ABC):
                 batch_size=self.arguments.total_batch_size,
                 drop_remainder=True,
                 num_workers=self.arguments.dataloader_num_workers,
-                collate_fn=self.create_collate_function(
+                collate_fn=self.create_collect_function(
                     max_sequence_length=self.arguments.max_sequence_length,
-                    truncation_mode=self.arguments.truncation_mode
-                )
+                    truncation_mode=self.arguments.truncation_mode,
+                ),
             )
         )
-        max_training_steps = self.arguments.num_train_epochs * len(
-            dataloader_train
-        ) if self.arguments.max_training_steps is None else self.arguments.max_training_steps
+        max_training_steps = (
+            self.arguments.num_train_epochs * len(dataloader_train)
+            if self.arguments.max_training_steps is None
+            else self.arguments.max_training_steps
+        )
         if self.dataset_eval is not None and self.arguments.do_eval:
             dataloader_eval = tfds.as_numpy(
                 self.dataset_eval.to_tf_dataset(
@@ -153,38 +154,40 @@ class SFTTrainer(CausalLanguageModelTrainer, ABC):
                     drop_remainder=True,
                     shuffle=True,
                     num_workers=self.arguments.dataloader_num_workers,
-                    collate_fn=self.create_collate_function(
+                    collate_fn=self.create_collect_function(
                         max_sequence_length=self.arguments.max_sequence_length,
-                        truncation_mode=self.arguments.truncation_mode
-                    )
+                        truncation_mode=self.arguments.truncation_mode,
+                    ),
                 )
             )
-            max_evaluation_steps = len(
-                dataloader_eval
-            ) if self.arguments.max_training_steps is None else self.arguments.max_training_steps
+            max_evaluation_steps = (
+                len(dataloader_eval)
+                if self.arguments.max_training_steps is None
+                else self.arguments.max_training_steps
+            )
         else:
             dataloader_eval, max_evaluation_steps = None, 0
 
-        return TrainerConfigureDataloaderFuncOutput(
+        return TrainerConfigureDataloaderOutput(
             dataloader_train=dataloader_train,
             max_training_steps=max_training_steps,
             dataloader_eval=dataloader_eval,
-            max_evaluation_steps=max_evaluation_steps
+            max_evaluation_steps=max_evaluation_steps,
         )
 
     def _prepare_dataset(
-            self,
-            dataset,
-            tokenizer,
-            packing,
-            dataset_text_field,
-            max_seq_length,
-            formatting_func,
-            num_of_sequences,
-            chars_per_token,
-            remove_unused_columns=True,
-            append_concat_token=True,
-            add_special_tokens=True,
+        self,
+        dataset,
+        tokenizer,
+        packing,
+        dataset_text_field,
+        max_seq_length,
+        formatting_func,
+        num_of_sequences,
+        chars_per_token,
+        remove_unused_columns=True,
+        append_concat_token=True,
+        add_special_tokens=True,
     ):
         if dataset is None:
             raise ValueError("The dataset should not be None")
@@ -214,20 +217,24 @@ class SFTTrainer(CausalLanguageModelTrainer, ABC):
             )
 
     def _prepare_non_packed_dataloader(
-            self,
-            tokenizer,
-            dataset,
-            dataset_text_field,
-            max_seq_length,
-            formatting_func=None,
-            add_special_tokens=True,
-            remove_unused_columns=True,
+        self,
+        tokenizer,
+        dataset,
+        dataset_text_field,
+        max_seq_length,
+        formatting_func=None,
+        add_special_tokens=True,
+        remove_unused_columns=True,
     ):
         use_formatting_func = formatting_func is not None and dataset_text_field is None
         self._dataset_sanity_checked = False
 
         def tokenize(element):
-            inner = element[dataset_text_field] if not use_formatting_func else formatting_func(element)
+            inner = (
+                element[dataset_text_field]
+                if not use_formatting_func
+                else formatting_func(element)
+            )
             outputs = tokenizer(
                 inner,
                 add_special_tokens=add_special_tokens,
@@ -247,7 +254,10 @@ class SFTTrainer(CausalLanguageModelTrainer, ABC):
                 else:
                     self._dataset_sanity_checked = True
 
-            return {"input_ids": outputs["input_ids"], "attention_mask": outputs["attention_mask"]}
+            return {
+                "input_ids": outputs["input_ids"],
+                "attention_mask": outputs["attention_mask"],
+            }
 
         signature_columns = ["input_ids", "labels", "attention_mask"]
 
@@ -274,15 +284,15 @@ class SFTTrainer(CausalLanguageModelTrainer, ABC):
 
     @staticmethod
     def _prepare_packed_dataloader(
-            tokenizer,
-            dataset,
-            dataset_text_field,
-            max_seq_length,
-            num_of_sequences,
-            chars_per_token,
-            formatting_func=None,
-            append_concat_token=True,
-            add_special_tokens=True,
+        tokenizer,
+        dataset,
+        dataset_text_field,
+        max_seq_length,
+        num_of_sequences,
+        chars_per_token,
+        formatting_func=None,
+        append_concat_token=True,
+        add_special_tokens=True,
     ):
         if dataset_text_field is not None or formatting_func is not None:
             if tokenizer is None:
@@ -310,7 +320,10 @@ class SFTTrainer(CausalLanguageModelTrainer, ABC):
 
             try:
                 packed_dataset = Dataset.from_generator(
-                    data_generator, gen_kwargs={"inner_constant_length_iterator": constant_length_iterator}
+                    data_generator,
+                    gen_kwargs={
+                        "inner_constant_length_iterator": constant_length_iterator
+                    },
                 )
             except (DatasetGenerationError, SchemaInferenceError) as exc:
                 raise ValueError(

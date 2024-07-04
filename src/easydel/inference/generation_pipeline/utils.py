@@ -3,11 +3,8 @@ from functools import partial
 from typing import Dict, Union
 
 import jax
-from fjformer import GenerateRNG
 from jax import numpy as jnp
 from jax import random, sharding
-
-RNG_GEN = GenerateRNG()
 
 
 class GenerationPipelineConfig:

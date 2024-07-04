@@ -195,7 +195,7 @@ from easydel.modules.attention_module import (
 # MODULES IMPORT END HERE
 
 # TRAINER IMPORT START HERE
-from easydel.trainer import (
+from easydel.trainers import (
     VisionCausalLanguageModelTrainer as VisionCausalLanguageModelTrainer,
     VisionCausalLMTrainerOutput as VisionCausalLMTrainerOutput,
     DPOTrainer as DPOTrainer,
