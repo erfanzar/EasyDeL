@@ -76,6 +76,27 @@ extensive libraries, and a wide range of pre-trained models, which can be advant
 Additionally, the choice of framework often depends on the specific requirements of the project and the familiarity of
 the team with a particular toolset.
 
+Future Updates and Vision 🚀
+---------------------------------------------------------------
+EasyDeL is constantly evolving to meet the needs of the machine learning community. In upcoming updates, we plan to introduce:
+
+- **Cutting-Edge**: EasyDeL is committed to long-term maintenance and continuous improvement. We provide frequent updates, often on a daily basis, introducing new features, optimizations, and bug fixes. Our goal is to ensure that EasyDeL remains at the cutting edge of machine learning technology, providing researchers and developers with the most up-to-date tools and capabilities.
+- **Ready-to-Use Blocks**: Pre-configured, optimized building blocks for quick model assembly and experimentation.
+- **Enhanced Scalability**: Improved tools and methods for effortlessly scaling LLMs to handle larger datasets and more complex tasks.
+- **Advanced Customization Options**: More flexibility in model architecture and training pipeline customization.
+
+Why Choose EasyDeL?
+---------------------------------------------------------------
+1. **Flexibility**: EasyDeL offers a modular design that allows researchers and developers to easily mix and match components, experiment with different architectures (including Transformers, Mamba, RWKV, and ...), and adapt models to specific use cases.
+
+2. **Performance**: Leveraging the power of JAX and Flax, EasyDeL provides high-performance implementations of state-of-the-art models and training techniques, optimized for both TPUs and GPUs.
+
+3. **Scalability**: From small experiments to large-scale model training, EasyDeL provides tools and optimizations to efficiently scale your models and workflows.
+
+4. **Ease of Use**: Despite its powerful features, EasyDeL maintains an intuitive API, making it accessible for both beginners and experienced practitioners.
+
+5. **Cutting-Edge Research**: quickly implementing the latest advancements in model architectures, training techniques, and optimization methods.
+
 Hands on Code Kaggle Examples
 ---------------------------------------------------------------
 

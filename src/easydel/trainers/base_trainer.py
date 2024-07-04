@@ -65,7 +65,6 @@ class TrainerConfigureFunctionOutput:
 
 
 class BaseTrainer(abc.ABC):
-
     def __init__(
         self,
         arguments: TrainArguments,
@@ -170,6 +169,13 @@ class BaseTrainer(abc.ABC):
         return threading.Thread(target=_start)
 
     def initialize_trainer_utils(self):
+        """
+        Initializes various utilities used by the trainer.
+
+        This includes setting up Weights & Biases, initializing the training timer,
+        configuring dataloaders, configuring the model and optimizer, sharding the
+        model and reference model states, and configuring the training and evaluation functions.
+        """
         self._initialize_wandb()
         self._initialize_timer()
         self._configure_dataloaders()
@@ -186,6 +192,13 @@ class BaseTrainer(abc.ABC):
         )
 
     def _configure_dataloaders(self):
+        """
+        Configures the dataloaders for training and evaluation.
+
+        This method retrieves the dataloaders from the `configure_dataloaders` method,
+        sets the maximum training and evaluation steps, and logs the time taken for
+        this configuration.
+        """
         with self.timer("configure dataloaders"):
             dataset_configurations = self.configure_dataloaders()
             self.dataloader_train = dataset_configurations.dataloader_train
@@ -195,6 +208,13 @@ class BaseTrainer(abc.ABC):
         self.timer.log("configure dataloaders")
 
     def _configure_model(self):
+        """
+        Configures the model, optimizer, scheduler, and configuration.
+
+        This method retrieves the model, optimizer, scheduler, and configuration from
+        the `configure_model` method and configures LoRA (if enabled). It also logs
+        the time taken for this configuration.
+        """
         with self.timer("configure Model, Optimizer, Scheduler and Config"):
             model_configurations = self.configure_model()
             self.model = model_configurations.model
@@ -205,6 +225,12 @@ class BaseTrainer(abc.ABC):
         self.timer.log("configure Model, Optimizer, Scheduler and Config")
 
     def _configure_lora(self):
+        """
+        Configures LoRA (Low-Rank Adaptation) if enabled in the training arguments.
+
+        This method applies LoRA to the model, sets up the LoRA parameters, apply function,
+        optimizer state, model, and optimizer, and logs the time taken for this configuration.
+        """
         if self.rapture is not None:
             lora_modules = self.rapture.apply_lora(
                 module=self.model,
@@ -218,6 +244,13 @@ class BaseTrainer(abc.ABC):
             self.lora_tx = lora_modules.lora_tx
 
     def _configure_functions(self):
+        """
+        Configures and JIT-compiles the training and evaluation step functions.
+
+        This method retrieves the configured functions from the `configure_functions`
+        method, sets up the mesh, checkpoint manager, and state initialization
+        function, and logs the time taken for this configuration.
+        """
         with self.timer("configure functions and sharding them"):
             function_configurations = self.configure_functions()
             self.create_sharded_state_from_params_function = (
@@ -242,17 +275,63 @@ class BaseTrainer(abc.ABC):
         max_sequence_length: int,
         truncation_mode: Literal["keep_end", "keep_start"],
     ) -> Callable:
+        """
+        Creates a function to collect and process batches of data for training or evaluation.
+
+        This function handles padding or truncating sequences to the specified `max_sequence_length`
+        based on the chosen `truncation_mode`.
+
+        Args:
+            max_sequence_length (int): The maximum allowed sequence length.
+            truncation_mode (typing.Literal["keep_end", "keep_start"], optional):
+                The truncation mode. Defaults to "keep_end".
+
+        Returns:
+            Callable: A function that takes a batch of data and returns a processed batch.
+        """
         raise NotImplementedError
 
     @abstractmethod
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
+        """
+        Configures and JIT-compiles the training and evaluation step functions.
+
+        This method sets up the necessary functions for training and evaluation, including:
+            - Initialization of the model state.
+            - Sharding of the model parameters and optimizer state.
+            - JIT-compilation of the training and evaluation step functions.
+
+        Returns:
+            TrainerConfigureFunctionOutput: An object containing the configured functions and other relevant information.
+        """
         raise NotImplementedError
 
     def configure_dataloaders(self) -> TrainerConfigureDataloaderOutput:
+        """
+        Configures the dataloaders for training and evaluation.
 
+        This method creates the training and evaluation dataloaders using the provided
+        datasets and data collator. It also determines the maximum number of training
+        and evaluation steps based on the dataset sizes and training arguments.
+
+        Returns:
+            TrainerConfigureDataloaderOutput: An object containing the configured dataloaders and the
+                                            maximum number of training and evaluation steps.
+        """
         def create_tf_dataset(
-            dataset: "Dataset", is_train: bool  # noqa: F821 # type:ignore
+            dataset: "Dataset",  # noqa: F821 # type:ignore
+            is_train: bool,  # noqa: F821 # type:ignore
         ) -> Iterator[np.ndarray]:
+            """
+            Creates a TensorFlow dataset from a Hugging Face Dataset.
+
+            Args:
+                dataset (Dataset): The Hugging Face Dataset.
+                is_train (bool): Whether the dataset is for training.
+
+            Returns:
+                Iterator[np.ndarray]: The TensorFlow dataset iterator.
+            """
             return (
                 dataset.to_tf_dataset(
                     collate_fn=self.create_collect_function(
@@ -270,8 +349,19 @@ class BaseTrainer(abc.ABC):
             )
 
         def create_tf_dataset_from_iterable(
-            dataset: "IterableDataset", is_train: bool  # noqa: F821 # type:ignore
+            dataset: "IterableDataset",  # noqa: F821 # type:ignore
+            is_train: bool,  # noqa: F821 # type:ignore
         ) -> Iterator[np.ndarray]:
+            """
+            Creates a TensorFlow dataset from an iterable Hugging Face Dataset.
+
+            Args:
+                dataset (IterableDataset): The iterable Hugging Face Dataset.
+                is_train (bool): Whether the dataset is for training.
+
+            Returns:
+                Iterator[np.ndarray]: The TensorFlow dataset iterator.
+            """
             return (
                 tf.data.Dataset.from_generator(
                     lambda: dataset,
@@ -292,6 +382,19 @@ class BaseTrainer(abc.ABC):
             dataset: Union["Dataset", "IterableDataset"],  # noqa: F821 # type:ignore
             is_train: bool,
         ) -> int:
+            """
+            Calculates the number of training or evaluation steps based on dataset length and arguments.
+
+            Args:
+                dataset (Union[Dataset, IterableDataset]): The dataset to calculate steps for.
+                is_train (bool): Whether the dataset is for training.
+
+            Returns:
+                int: The number of steps.
+
+            Raises:
+                ValueError: If the dataset is a generator/streaming dataset and the number of steps is not specified.
+            """
             if hasattr(dataset, "__len__"):
                 total_data_len = len(dataset)
                 batch_size = (
@@ -326,6 +429,16 @@ class BaseTrainer(abc.ABC):
             dataset: Union["Dataset", "IterableDataset"],  # noqa: F821 # type:ignore
             is_train: bool,
         ) -> Iterator[np.ndarray]:
+            """
+            Converts a Hugging Face Dataset to a TensorFlow dataloader.
+
+            Args:
+                dataset (Union[Dataset, IterableDataset]): The Hugging Face Dataset.
+                is_train (bool): Whether the dataset is for training.
+
+            Returns:
+                Iterator[np.ndarray]: The TensorFlow dataloader iterator.
+            """
             if hasattr(dataset, "__len__"):
                 return create_tf_dataset(dataset, is_train)
             else:
@@ -348,6 +461,16 @@ class BaseTrainer(abc.ABC):
         )
 
     def configure_model(self) -> TrainerConfigureModelOutput:
+        """
+        Configures the model, optimizer, scheduler, and configuration.
+
+        This method retrieves the model configuration from the model state, creates
+        the optimizer and scheduler using the training arguments, and returns an
+        object containing the configured model, optimizer, scheduler, and configuration.
+
+        Returns:
+            TrainerConfigureModelOutput: An object containing the configured model, optimizer, scheduler, and configuration.
+        """
         extra_configs = self.arguments.extra_configs or {}
 
         if self.arguments.model_class is not None:
@@ -366,6 +489,22 @@ class BaseTrainer(abc.ABC):
         )
 
     def _configure_custom_model(self, extra_configs):
+        """
+        Configures a custom model provided by the user.
+
+        This method checks if a custom rule for partitioning is provided, sets the axis dimensions
+        for the model configuration, and initializes the custom model class with the provided
+        configurations.
+
+        Args:
+            extra_configs (dict): Additional configurations to apply to the model.
+
+        Returns:
+            EasyDeLFlaxPretrainedModel: The configured custom model.
+
+        Raises:
+            AssertionError: If no custom rule is provided when initializing a custom model.
+        """
         if not hasattr(
             self.arguments.configs_to_initialize_model_class["config"],
             "get_partition_rules",
@@ -375,15 +514,32 @@ class BaseTrainer(abc.ABC):
                 "pass custom_rule for partition rules."
             )
 
-        self.arguments.configs_to_initialize_model_class["config"].axis_dims = (
-            self.arguments.sharding_array
-        )
+        self.arguments.configs_to_initialize_model_class[
+            "config"
+        ].axis_dims = self.arguments.sharding_array
 
         return self.arguments.model_class(
             **self.arguments.configs_to_initialize_model_class, _do_init=False
         )
 
     def _configure_auto_model(self, extra_configs):
+        """
+        Configures a model automatically using AutoEasyDeLModelForCausalLM.
+
+        This method retrieves a pre-trained model using AutoEasyDeLModelForCausalLM, applies
+        extra configurations, sets the data type and parameter data type, and handles
+        gradient checkpointing.
+
+        Args:
+            extra_configs (dict): Additional configurations to apply to the model.
+
+        Returns:
+            EasyDeLFlaxPretrainedModel: The configured model.
+
+        Warnings:
+            If no model configuration is detected, the `config` attribute is set to None, which
+            may cause errors later.
+        """
         extra_configs["gradient_checkpointing"] = self.arguments.gradient_checkpointing
 
         model = AutoEasyDeLModelForCausalLM.from_pretrained(
@@ -411,6 +567,24 @@ class BaseTrainer(abc.ABC):
         milestone: bool = False,
         save_dir: Optional[str] = None,
     ) -> str:
+        """
+        Saves the model state to a checkpoint file.
+
+        This method handles generating the filename, managing the checkpoint limit, saving the
+        state using the `EasyDeLState.save_state` method, and creating a README file with
+        information about the trained model.
+
+        Args:
+            state (EasyDeLState): The EasyDeLState object containing the model state to save.
+            gather_fns (Optional[Any | Mapping[str, Callable] | dict[Callable]], optional):
+                Functions for gathering sharded parameters. Defaults to None.
+            milestone (bool, optional): Whether this checkpoint is a milestone (e.g., end of epoch). Defaults to False.
+            save_dir (Optional[str], optional): The directory to save the checkpoint to. If None, defaults to the
+                                                directory specified in the training arguments. Defaults to None.
+
+        Returns:
+            str: The filename of the saved checkpoint.
+        """
         step = self._get_current_step(state)
         checkpoint_dir = self._get_checkpoint_dir(save_dir)
         self._manage_checkpoint_limit(checkpoint_dir)
