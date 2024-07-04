@@ -44,7 +44,7 @@ def get_dirs(path: str):
         os.path.join(path, o)
         for o in os.listdir(path)
         if os.path.exists(os.path.join(path, o))
-           and os.path.isdir(os.path.join(path, o))
+        and os.path.isdir(os.path.join(path, o))
     ]
 
 
@@ -53,22 +53,22 @@ def get_files(path: str):
         os.path.join(path, o)
         for o in os.listdir(path)
         if os.path.exists(os.path.join(path, o))
-           and not os.path.isdir(os.path.join(path, o))
+        and not os.path.isdir(os.path.join(path, o))
     ]
 
 
 def run(
-        project_locations="src/easydel",
-        docs_file="docs/api_docs/",
-        start_head="easydel",
+    project_locations="src/easydel",
+    docs_file="docs/api_docs/",
+    start_head="easydel",
 ):
     global cache
     try:
         for current_file in get_inner(project_locations):
             if (
-                    not current_file.endswith("__init__.py")
-                    and not os.path.isdir(current_file)
-                    and current_file.endswith(".py")
+                not current_file.endswith("__init__.py")
+                and not os.path.isdir(current_file)
+                and current_file.endswith(".py")
             ):
                 doted = start_head.replace(os.path.sep, ".").replace("/", ".") + "."
 
@@ -95,9 +95,9 @@ def run(
                     edited_category_tuple += (" ".join(capitalized_words),)
                 #
                 cache[edited_category_tuple] = (
-                        start_head.replace("/", ".")
-                        + "."
-                        + markdown_filename.replace(".py", "")
+                    start_head.replace("/", ".")
+                    + "."
+                    + markdown_filename.replace(".py", "")
                 )
             else:
                 run(current_file)
@@ -116,20 +116,22 @@ def create_rst(name, children, output_dir):
             for child_name, child_value in children.items():
                 if isinstance(child_value, str):
                     children_name = child_value.replace("easydel.", "")
-                    rst_file.write(f"   {children_name.replace('.rst', '')}\n")
+                    rst_file.write(
+                        f"   {children_name.replace('.rst', '').replace('src.', '')}\n"
+                    )
                 else:
                     assert isinstance(child_value, dict)
                     child_value = flatten_dict(child_value)
                 create_rst(child_name, child_value, output_dir)
     else:
-        children_name = children.replace("easydel.", "")
+        children_name = children.replace("easydel.", "").replace("src.", "")
         ca = "/".join(
             [s.replace("_", " ").strip() for s in children_name.split(".")[1:-1]]
         )
         name = f"``{ca}`` module"
         with open(os.path.join(output_dir, children_name), "w") as rst_file:
             rst_file.write(f"{name.replace('_', ' ')}\n{'=' * len(name)}\n\n")
-            children = children.replace(".rst", "").replace("", "")
+            children = children.replace(".rst", "").replace("src.", "")
             rst_file.write(
                 f".. automodule:: {children}\n"
                 f"    :members:\n"
