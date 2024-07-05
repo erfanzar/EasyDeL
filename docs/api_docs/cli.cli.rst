@@ -1,7 +1,8 @@
 ``cli`` module
 ==============
 
+```{eval-rst}
 .. automodule:: easydel.cli.cli
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

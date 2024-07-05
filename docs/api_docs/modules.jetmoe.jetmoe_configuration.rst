@@ -1,7 +1,8 @@
 ``jetmoe/jetmoe configuration`` module
 ======================================
 
+```{eval-rst}
 .. automodule:: easydel.modules.jetmoe.jetmoe_configuration
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

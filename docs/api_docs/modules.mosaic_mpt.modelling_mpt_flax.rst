@@ -1,7 +1,8 @@
 ``mosaic mpt/modelling mpt flax`` module
 ========================================
 
+```{eval-rst}
 .. automodule:: easydel.modules.mosaic_mpt.modelling_mpt_flax
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

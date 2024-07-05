@@ -1,7 +1,8 @@
 ``jetmoe/modelling jetmoe flax`` module
 =======================================
 
+```{eval-rst}
 .. automodule:: easydel.modules.jetmoe.modelling_jetmoe_flax
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

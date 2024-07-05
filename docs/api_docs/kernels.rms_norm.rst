@@ -1,7 +1,8 @@
 ``rms norm`` module
 ===================
 
+```{eval-rst}
 .. automodule:: easydel.kernels.rms_norm
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

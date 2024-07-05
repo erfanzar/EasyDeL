@@ -1,7 +1,8 @@
 ``trainer/utils`` module
 ========================
 
+```{eval-rst}
 .. automodule:: easydel.reinforcement_learning.trainer.utils
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

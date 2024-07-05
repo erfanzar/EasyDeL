@@ -1,7 +1,8 @@
 ``falcon/falcon configuration`` module
 ======================================
 
+```{eval-rst}
 .. automodule:: easydel.modules.falcon.falcon_configuration
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

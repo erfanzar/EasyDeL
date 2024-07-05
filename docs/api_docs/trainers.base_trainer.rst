@@ -1,7 +1,8 @@
 ``base trainer`` module
 =======================
 
+```{eval-rst}
 .. automodule:: easydel.trainers.base_trainer
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

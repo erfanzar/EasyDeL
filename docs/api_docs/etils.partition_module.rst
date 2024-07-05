@@ -1,7 +1,8 @@
 ``partition module`` module
 ===========================
 
+```{eval-rst}
 .. automodule:: easydel.etils.partition_module
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

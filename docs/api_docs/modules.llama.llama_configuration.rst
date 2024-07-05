@@ -1,7 +1,8 @@
 ``llama/llama configuration`` module
 ====================================
 
+```{eval-rst}
 .. automodule:: easydel.modules.llama.llama_configuration
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

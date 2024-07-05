@@ -1,7 +1,8 @@
 ``qwen1/modelling qwen1 flax`` module
 =====================================
 
+```{eval-rst}
 .. automodule:: easydel.modules.qwen1.modelling_qwen1_flax
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

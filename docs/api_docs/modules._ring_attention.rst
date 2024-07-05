@@ -1,7 +1,8 @@
 ``ring attention`` module
 =========================
 
+```{eval-rst}
 .. automodule:: easydel.modules._ring_attention
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

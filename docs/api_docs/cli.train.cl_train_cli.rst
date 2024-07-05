@@ -1,7 +1,8 @@
 ``train/cl train cli`` module
 =============================
 
+```{eval-rst}
 .. automodule:: easydel.cli.train.cl_train_cli
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

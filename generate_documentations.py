@@ -4,7 +4,7 @@ import sys
 dirname = os.path.dirname(os.path.basename(__file__))
 sys.path.append(dirname)
 sys.path.append(os.path.join(dirname, "src"))
-static_joins = "\n\t:special-members:\n\t:undoc-members:\n\t:show-inheritance:"
+static_joins = "\n\t:members:\n\t:undoc-members:\n\t:show-inheritance:"
 
 cache = {}
 
@@ -135,8 +135,9 @@ def create_rst(name, children, output_dir):
             rst_file.write(f"{name.replace('_', ' ')}\n{'=' * len(name)}\n\n")
             children = children.replace(".rst", "")
             rst_file.write(
+                "```{eval-rst}\n"+
                 f".. automodule:: {children}\n"
-                f"    :special-members:\n"
+                f"    :members:\n"
                 f"    :undoc-members:\n"
                 f"    :show-inheritance:\n"
             )

@@ -1,7 +1,8 @@
 ``blockwise attention`` module
 ==============================
 
+```{eval-rst}
 .. automodule:: easydel.modules._blockwise_attention
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

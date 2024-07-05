@@ -1,7 +1,8 @@
 ``errors`` module
 =================
 
+```{eval-rst}
 .. automodule:: easydel.etils.errors
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

@@ -1,7 +1,8 @@
 ``rwkv/rwkv configuration`` module
 ==================================
 
+```{eval-rst}
 .. automodule:: easydel.modules.rwkv.rwkv_configuration
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

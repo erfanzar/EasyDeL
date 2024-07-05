@@ -1,7 +1,8 @@
 ``easystate`` module
 ====================
 
+```{eval-rst}
 .. automodule:: easydel.etils.easystate
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

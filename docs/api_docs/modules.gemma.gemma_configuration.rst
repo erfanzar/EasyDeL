@@ -1,7 +1,8 @@
 ``gemma/gemma configuration`` module
 ====================================
 
+```{eval-rst}
 .. automodule:: easydel.modules.gemma.gemma_configuration
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

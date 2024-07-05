@@ -1,7 +1,8 @@
 ``mixtral/mixtral configuration`` module
 ========================================
 
+```{eval-rst}
 .. automodule:: easydel.modules.mixtral.mixtral_configuration
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:
