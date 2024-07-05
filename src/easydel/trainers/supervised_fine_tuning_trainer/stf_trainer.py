@@ -34,150 +34,149 @@ class SFTTrainer(CausalLanguageModelTrainer, ABC):
         eval_dataset (Optional[Union[Dataset, Dict[str, Dataset]]], optional):
             Evaluation dataset(s). Can be a single dataset or a dictionary of datasets.
             Defaults to None.
-        dataset_text_field (Optional[str], optional): 
+        dataset_text_field (Optional[str], optional):
             Name of the text field in the dataset. If not provided,
-            the trainer will try to infer it or use a `formatting_func`. 
+            the trainer will try to infer it or use a `formatting_func`.
             Defaults to None.
-        packing (Optional[bool], optional): 
+        packing (Optional[bool], optional):
             Whether to pack multiple sequences into a single sample for efficient training.
             Defaults to False.
-        formatting_func (Optional[Callable], optional): 
+        formatting_func (Optional[Callable], optional):
             A function to format dataset samples. It should take a dataset sample
             as input and return a dictionary with a "text" key containing the processed text.
             Defaults to None.
-        num_of_sequences (Optional[int], optional): 
+        num_of_sequences (Optional[int], optional):
             Number of sequences to pack into a single sample (if `packing=True`).
             Defaults to 1024.
-        chars_per_token (Optional[float], optional): 
+        chars_per_token (Optional[float], optional):
             Average number of characters per token. Used for packing estimation.
             Defaults to 3.6.
-        dataset_num_proc (Optional[int], optional): 
+        dataset_num_proc (Optional[int], optional):
             Number of processes to use for dataset preprocessing. Defaults to None.
-        dataset_batch_size (int, optional): 
+        dataset_batch_size (int, optional):
             Batch size for dataset preprocessing. Defaults to 1000.
-        neftune_noise_alpha (Optional[float], optional): 
+        neftune_noise_alpha (Optional[float], optional):
             NEFTune noise alpha parameter (if supported by the model). Defaults to None.
-        dataset_kwargs (Optional[Dict], optional): 
+        dataset_kwargs (Optional[Dict], optional):
             Additional keyword arguments passed to the dataset loading/processing functions.
             Defaults to None.
-        eval_packing (Optional[bool], optional): 
+        eval_packing (Optional[bool], optional):
             Whether to pack sequences for the evaluation dataset.
             If None, defaults to the value of the `packing` argument. Defaults to None.
-        checkpoint_path (Optional[str], optional): 
+        checkpoint_path (Optional[str], optional):
             Path to a checkpoint to load the model from. Defaults to None.
-        remove_unused_columns (bool, optional): 
+        remove_unused_columns (bool, optional):
             Whether to remove unused columns from the dataset. Defaults to True.
-        _do_init_fns (bool, optional): 
+        _do_init_fns (bool, optional):
             Internal flag for controlling initialization functions. Defaults to True.
-    
+
     **Examples:**
 
-    ```python
-    import jax.lax
-    from easydel import (
-        TrainArguments,
-        AutoEasyDeLModelForCausalLM,
-        EasyDeLOptimizers,
-        EasyDeLSchedulers,
-        EasyDeLGradientCheckPointers,
-        SFTTrainer,
-        PartitionAxis,
-        conversations_formatting_function 
-    )
-    from datasets import load_dataset
-    import flax
-    from jax import numpy as jnp
-    from transformers import AutoTokenizer
+    .. code-block:: python
+        >>> import jax.lax
+        >>> from easydel import (
+        ...     TrainArguments,
+        ...     AutoEasyDeLModelForCausalLM,
+        ...     EasyDeLOptimizers,
+        ...     EasyDeLSchedulers,
+        ...     EasyDeLGradientCheckPointers,
+        ...     SFTTrainer,
+        ...     PartitionAxis,
+        ...     conversations_formatting_function
+        ... )
+        >>> from datasets import load_dataset
+        >>> import flax
+        >>> from jax import numpy as jnp
+        >>> from transformers import AutoTokenizer
 
-    # Load your pre-trained model and tokenizer
-    huggingface_repo_id_or_path = "mistralai/Mistral-7B-Instruct-v0.2"
-    max_length = 4096
-    dtype = jnp.bfloat16
-    input_shape = (1, 1)
-    partition_axis = PartitionAxis()
-    sharding_axis_dims = (1, -1, 1, 1)  # Change to 1,1,1,-1 for Sequence Sharding
+        >>> # Load your pre-trained model and tokenizer
+        >>> huggingface_repo_id_or_path = "mistralai/Mistral-7B-Instruct-v0.2"
+        >>> max_length = 4096
+        >>> dtype = jnp.bfloat16
+        >>> input_shape = (1, 1)
+        >>> partition_axis = PartitionAxis()
+        >>> sharding_axis_dims = (1, -1, 1, 1)  # Change to 1,1,1,-1 for Sequence Sharding
 
-    model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
-        huggingface_repo_id_or_path,
-        dtype=dtype,
-        param_dtype=dtype,
-        precision=jax.lax.Precision("fastest"),
-        auto_shard_params=True,
-        sharding_axis_dims=sharding_axis_dims,
-        verbose_params=True,
-        config_kwargs=dict(
-            use_scan_mlp=False,
-            partition_axis=partition_axis
-        ),
-        partition_axis=partition_axis,
-    )
+        >>> model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
+        ...     huggingface_repo_id_or_path,
+        ...     dtype=dtype,
+        ...     param_dtype=dtype,
+        ...     precision=jax.lax.Precision("fastest"),
+        ...     auto_shard_params=True,
+        ...     sharding_axis_dims=sharding_axis_dims,
+        ...     verbose_params=True,
+        ...     config_kwargs=dict(
+        ...         use_scan_mlp=False,
+        ...         partition_axis=partition_axis
+        ...     ),
+        ...     partition_axis=partition_axis,
+        ... )
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        huggingface_repo_id_or_path,
-        trust_remote_code=True
-    )
-    tokenizer.pad_token = tokenizer.eos_token
+        >>> tokenizer = AutoTokenizer.from_pretrained(
+        ...     huggingface_repo_id_or_path,
+        ...     trust_remote_code=True
+        ... )
+        >>> tokenizer.pad_token = tokenizer.eos_token
 
-    # Define configurations for model initialization
-    configs_to_initialize_model_class = {
-        "config": model.config,
-        "dtype": dtype,
-        "param_dtype": dtype,
-        "input_shape": input_shape
-    }
+        >>> # Define configurations for model initialization
+        >>> configs_to_initialize_model_class = {
+        ...     "config": model.config,
+        ...     "dtype": dtype,
+        ...     "param_dtype": dtype,
+        ...     "input_shape": input_shape
+        ... }
 
-    # Create TrainArguments
-    train_arguments = TrainArguments(
-        model_class=type(model),
-        model_name="SFT-EasyDeL",
-        num_train_epochs=3,
-        configs_to_initialize_model_class=configs_to_initialize_model_class,
-        learning_rate=5e-5,
-        learning_rate_end=1e-6,
-        optimizer=EasyDeLOptimizers.ADAMW,
-        scheduler=EasyDeLSchedulers.WARM_UP_COSINE,
-        weight_decay=0.01,
-        total_batch_size=32,
-        max_training_steps=None, 
-        do_train=True,
-        do_eval=False, 
-        backend="tpu", 
-        max_sequence_length=max_length, 
-        gradient_checkpointing=EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
-        sharding_array=sharding_axis_dims,
-        remove_ckpt_after_load=True,
-        gradient_accumulation_steps=8,
-        loss_re_mat="",
-        dtype=dtype,
-        param_dtype=dtype,
-        init_input_shape=input_shape,
-    )
+        >>> # Create TrainArguments
+        >>> train_arguments = TrainArguments(
+        ...     model_class=type(model),
+        ...     model_name="SFT-EasyDeL",
+        ...     num_train_epochs=3,
+        ...     configs_to_initialize_model_class=configs_to_initialize_model_class,
+        ...     learning_rate=5e-5,
+        ...     learning_rate_end=1e-6,
+        ...     optimizer=EasyDeLOptimizers.ADAMW,
+        ...     scheduler=EasyDeLSchedulers.WARM_UP_COSINE,
+        ...     weight_decay=0.01,
+        ...     total_batch_size=32,
+        ...     max_training_steps=None,
+        ...     do_train=True,
+        ...     do_eval=False,
+        ...     backend="tpu",
+        ...     max_sequence_length=max_length,
+        ...     gradient_checkpointing=EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
+        ...     sharding_array=sharding_axis_dims,
+        ...     remove_ckpt_after_load=True,
+        ...     gradient_accumulation_steps=8,
+        ...     loss_re_mat="",
+        ...     dtype=dtype,
+        ...     param_dtype=dtype,
+        ...     init_input_shape=input_shape,
+        ... )
 
-    # Define a formatting function for the dataset
-    def prompter(sample):
-        return [conversations_formatting_function(tokenizer, messages_field="messages")(sample)]
+        >>> # Define a formatting function for the dataset
+        >>> def prompter(sample):
+        ...     return [conversations_formatting_function(tokenizer, messages_field="messages")(sample)]
 
-    # Load your dataset
-    train_dataset = load_dataset("HuggingFaceH4/deita-10k-v0-sft", split="train_sft")
+        >>> # Load your dataset
+        >>> train_dataset = load_dataset("HuggingFaceH4/deita-10k-v0-sft", split="train_sft")
 
-    # Create the SFTTrainer
-    trainer = SFTTrainer(
-        arguments=train_arguments,
-        train_dataset=train_dataset,
-        eval_dataset=None,  
-        tokenizer=tokenizer,
-        dataset_text_field=None,
-        formatting_func=prompter,
-        packing=True,
-        num_of_sequences=max_length,
-    )
+        >>> # Create the SFTTrainer
+        >>> trainer = SFTTrainer(
+        ...     arguments=train_arguments,
+        ...     train_dataset=train_dataset,
+        ...     eval_dataset=None,
+        ...     tokenizer=tokenizer,
+        ...     dataset_text_field=None,
+        ...     formatting_func=prompter,
+        ...     packing=True,
+        ...     num_of_sequences=max_length,
+        ... )
 
-    # Start training
-    output = trainer.train(flax.core.FrozenDict({"params": params}))
-    print(f"Hey ! , here's where your model saved {output.checkpoint_path}")
-    ```
-
+        >>> # Start training
+        >>> output = trainer.train(flax.core.FrozenDict({"params": params}))
+        >>> print(f"Hey ! , here's where your model saved {output.checkpoint_path}")
     """
+
     def __init__(
         self,
         arguments: TrainArguments,
@@ -198,7 +197,6 @@ class SFTTrainer(CausalLanguageModelTrainer, ABC):
         remove_unused_columns=True,
         _do_init_fns: bool = True,
     ):
-
         if getattr(tokenizer, "pad_token", None) is None:
             tokenizer.pad_token = tokenizer.eos_token
 
@@ -348,7 +346,7 @@ class SFTTrainer(CausalLanguageModelTrainer, ABC):
         remove_unused_columns=True,
         append_concat_token=True,
         add_special_tokens=True,
-    ): 
+    ):
         """
         Prepares the dataset for training by applying tokenization and packing (if enabled).
 

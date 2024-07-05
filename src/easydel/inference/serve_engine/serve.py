@@ -1,5 +1,5 @@
 import asyncio
-from asyncio import wait_for, TimeoutError
+from asyncio import TimeoutError, wait_for
 
 try:
     import websockets  # type: ignore
@@ -14,46 +14,48 @@ except ModuleNotFoundError:
 
 import json
 import time
+
+from aiohttp import web
+
 from easydel.etils.etils import get_logger
 from easydel.inference.generation_pipeline.pipeline import ChatPipeline
-from aiohttp import web
 
 
 class ApiEngine:
     """
-    **Examples:**
-    
-    ```python
-    import easydel as ed
-    from transformers import AutoTokenizer
-    from jax import numpy as jnp
+    **Example:**
 
-    # Load your pre-trained model and tokenizer
-    model, params = ed.AutoEasyDeLModelForCausalLM.from_pretrained(...)
-    tokenizer = AutoTokenizer.from_pretrained(...)
-    tokenizer.padding_side = "left"
-    tokenizer.truncation_side = "left"
+    .. code-block:: python
 
-    # Create a GenerationPipeline
-    pipeline = ed.ChatPipeline(
-        pipeline=ed.GenerationPipeline(
-            model=model,
-            params=params,
-            tokenizer=tokenizer,
-            generation_config=ed.GenerationPipelineConfig(
-                max_new_tokens=256,
-                temperature=0.4,
-            ),
-        ),
-        max_prefill_length=2048,
-    )
-    engine = ed.ApiEngine(
-        pipeline=pipeline,
-        hostname="0.0.0.0",
-        port=11550
-    )
-    engine.fire()
-    ```
+        >>> import easydel as ed
+        >>> from transformers import AutoTokenizer
+        >>> from jax import numpy as jnp
+
+        >>> # Load your pre-trained model and tokenizer
+        >>> model, params = ed.AutoEasyDeLModelForCausalLM.from_pretrained(...)
+        >>> tokenizer = AutoTokenizer.from_pretrained(...)
+        >>> tokenizer.padding_side = "left"
+        >>> tokenizer.truncation_side = "left"
+
+        >>> # Create a GenerationPipeline
+        >>> pipeline = ed.ChatPipeline(
+        ...     pipeline=ed.GenerationPipeline(
+        ...         model=model,
+        ...         params=params,
+        ...         tokenizer=tokenizer,
+        ...         generation_config=ed.GenerationPipelineConfig(
+        ...             max_new_tokens=256,
+        ...             temperature=0.4,
+        ...         ),
+        ...     ),
+        ...     max_prefill_length=2048,
+        ... )
+        >>> engine = ed.ApiEngine(
+        ...     pipeline=pipeline,
+        ...     hostname="0.0.0.0",
+        ...     port=11550
+        ... )
+        >>> engine.fire()
     """
 
     def __init__(
