@@ -9,3 +9,10 @@ sphinx-autobuild
 sphinx-autodoc-typehints
 sphinx-book-theme
 myst-parser
+sphinx-book-theme
+ipykernel
+myst_nb
+recommonmark
+ipython_genutils
+sphinx-design
+docutils==0.16

@@ -9,11 +9,16 @@ author = "Erfan Zare Chavoshi"
 
 extensions = [
     "sphinx.ext.autodoc",
+    "sphinx.ext.autosummary",
+    "sphinx.ext.autosectionlabel",
+    "sphinx.ext.doctest",
+    "sphinx.ext.intersphinx",
+    "sphinx.ext.mathjax",
     "sphinx.ext.napoleon",
     "sphinx.ext.viewcode",
-    "sphinx.ext.intersphinx",
-    "sphinx_autodoc_typehints",
     "myst_parser",
+    "myst_nb",
+    "sphinx_design",
 ]
 
 templates_path = ["_templates"]
@@ -32,3 +37,4 @@ html_css_files = [
 ]
 
 source_suffix = [".rst", ".md", ".ipynb"]
+autosummary_generate = True
