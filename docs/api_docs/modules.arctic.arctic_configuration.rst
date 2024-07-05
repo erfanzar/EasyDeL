@@ -2,6 +2,6 @@
 ======================================
 
 .. automodule:: easydel.modules.arctic.arctic_configuration
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

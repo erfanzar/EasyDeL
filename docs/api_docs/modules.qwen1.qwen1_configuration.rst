@@ -2,6 +2,6 @@
 ====================================
 
 .. automodule:: easydel.modules.qwen1.qwen1_configuration
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

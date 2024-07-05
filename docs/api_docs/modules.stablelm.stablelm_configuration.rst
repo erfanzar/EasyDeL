@@ -2,6 +2,6 @@
 ==========================================
 
 .. automodule:: easydel.modules.stablelm.stablelm_configuration
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

@@ -2,6 +2,6 @@
 =======================================
 
 .. automodule:: easydel.modules.arctic.modelling_arctic_flax
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

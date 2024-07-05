@@ -2,6 +2,6 @@
 ================
 
 .. automodule:: easydel.kernels.utils
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

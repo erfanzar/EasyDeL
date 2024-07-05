@@ -2,6 +2,6 @@
 ========================================
 
 .. automodule:: easydel.modules.chatglm.chatglm_configuration
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

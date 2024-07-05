@@ -2,6 +2,6 @@
 ============================================
 
 .. automodule:: easydel.modules.llama.modelling_vision_llama_flax
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

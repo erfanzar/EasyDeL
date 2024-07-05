@@ -2,6 +2,6 @@
 ==============================
 
 .. automodule:: easydel.inference.serve_engine.client
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

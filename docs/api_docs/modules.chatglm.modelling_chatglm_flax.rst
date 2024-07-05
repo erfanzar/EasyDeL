@@ -2,6 +2,6 @@
 =========================================
 
 .. automodule:: easydel.modules.chatglm.modelling_chatglm_flax
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

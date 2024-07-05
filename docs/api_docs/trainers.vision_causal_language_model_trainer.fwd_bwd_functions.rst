@@ -2,6 +2,6 @@
 =================================================================
 
 .. automodule:: easydel.trainers.vision_causal_language_model_trainer.fwd_bwd_functions
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

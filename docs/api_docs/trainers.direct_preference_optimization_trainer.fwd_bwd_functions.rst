@@ -2,6 +2,6 @@
 ===================================================================
 
 .. automodule:: easydel.trainers.direct_preference_optimization_trainer.fwd_bwd_functions
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

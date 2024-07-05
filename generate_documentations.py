@@ -4,7 +4,7 @@ import sys
 dirname = os.path.dirname(os.path.basename(__file__))
 sys.path.append(dirname)
 sys.path.append(os.path.join(dirname, "src"))
-static_joins = "\n\t:members:\n\t:undoc-members:\n\t:show-inheritance:"
+static_joins = "\n\t:special-members:\n\t:undoc-members:\n\t:show-inheritance:"
 
 cache = {}
 
@@ -79,7 +79,7 @@ def run(
                     current_file.replace(".py", "")
                     .replace(os.path.sep, ".")
                     .replace("/", ".")
-                ).replace("src.","")
+                ).replace("src.", "")
                 # markdown_documentation = f"{name.replace(doted, '')}\n========\n.. automodule:: {name}" + static_joins
                 categorical_name = name.replace(doted, "")
                 markdown_filename = name.replace(doted, "") + ".rst"
@@ -136,7 +136,7 @@ def create_rst(name, children, output_dir):
             children = children.replace(".rst", "")
             rst_file.write(
                 f".. automodule:: {children}\n"
-                f"    :members:\n"
+                f"    :special-members:\n"
                 f"    :undoc-members:\n"
                 f"    :show-inheritance:\n"
             )
@@ -180,7 +180,9 @@ def main():
    :maxdepth: 2
    
    {form}
-   """.format(form="\n   ".join(sorted(st)))
+   """.format(
+        form="\n   ".join(sorted(st))
+    )
     open(os.path.join(str(base_dir), "APIs.rst"), "w", encoding="utf-8").write(
         apis_index
     )

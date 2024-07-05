@@ -2,6 +2,6 @@
 ======================================================================
 
 .. automodule:: easydel.trainers.odds_ratio_preference_optimization_trainer.modelling_output
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

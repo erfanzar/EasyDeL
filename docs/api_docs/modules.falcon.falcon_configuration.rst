@@ -2,6 +2,6 @@
 ======================================
 
 .. automodule:: easydel.modules.falcon.falcon_configuration
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

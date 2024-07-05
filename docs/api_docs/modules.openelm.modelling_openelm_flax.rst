@@ -2,6 +2,6 @@
 =========================================
 
 .. automodule:: easydel.modules.openelm.modelling_openelm_flax
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

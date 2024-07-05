@@ -2,6 +2,6 @@
 =====================================
 
 .. automodule:: easydel.modules.gemma.modelling_gemma_flax
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

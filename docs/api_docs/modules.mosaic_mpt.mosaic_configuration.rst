@@ -2,6 +2,6 @@
 ==========================================
 
 .. automodule:: easydel.modules.mosaic_mpt.mosaic_configuration
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

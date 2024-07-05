@@ -2,6 +2,6 @@
 =======================================
 
 .. automodule:: easydel.modules.grok_1.modelling_grok_1_flax
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

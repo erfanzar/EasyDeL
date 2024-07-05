@@ -2,6 +2,6 @@
 ==================================
 
 .. automodule:: easydel.modules.olmo.olmo_configuration
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

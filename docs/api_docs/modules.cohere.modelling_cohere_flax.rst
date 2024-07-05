@@ -2,6 +2,6 @@
 =======================================
 
 .. automodule:: easydel.modules.cohere.modelling_cohere_flax
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

@@ -2,6 +2,6 @@
 ==================
 
 .. automodule:: easydel.etils.auto_tx
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

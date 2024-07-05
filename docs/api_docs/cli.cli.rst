@@ -2,6 +2,6 @@
 ==============
 
 .. automodule:: easydel.cli.cli
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

@@ -2,6 +2,6 @@
 ===============================================
 
 .. automodule:: easydel.trainers.supervised_fine_tuning_trainer.utils
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

@@ -2,6 +2,6 @@
 ========================================
 
 .. automodule:: easydel.modules.openelm.openelm_configuration
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

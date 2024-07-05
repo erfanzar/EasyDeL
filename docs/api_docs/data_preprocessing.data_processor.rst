@@ -2,6 +2,6 @@
 =========================
 
 .. automodule:: easydel.data_preprocessing.data_processor
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

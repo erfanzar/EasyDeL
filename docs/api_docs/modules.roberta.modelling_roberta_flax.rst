@@ -2,6 +2,6 @@
 =========================================
 
 .. automodule:: easydel.modules.roberta.modelling_roberta_flax
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

@@ -2,6 +2,6 @@
 ===================================
 
 .. automodule:: easydel.modules.rwkv.modelling_rwkv_flax
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:
