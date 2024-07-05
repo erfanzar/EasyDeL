@@ -1,5 +1,5 @@
-``llama/modelling llama flax`` module
-=====================================
+llama.modelling_llama_flax package
+==================================
 
 .. automodule:: easydel.modules.llama.modelling_llama_flax
     :members:

@@ -1,5 +1,5 @@
-``core`` module
-===============
+core package
+============
 
 .. automodule:: easydel.reinforcement_learning.core
     :members:

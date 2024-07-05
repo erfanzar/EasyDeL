@@ -1,5 +1,5 @@
-``common`` module
-=================
+common package
+==============
 
 .. automodule:: easydel.modules.common
     :members:

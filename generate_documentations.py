@@ -128,12 +128,12 @@ def create_rst(name, children, output_dir):
                 create_rst(child_name, child_value, output_dir)
     else:
         children_name = children.replace("easydel.", "")
-        ca = "/".join(
-            [s.replace("_", " ").strip() for s in children_name.split(".")[1:-1]]
+        ca = ".".join(
+            [s.strip() for s in children_name.split(".")[1:-1]]
         )
-        name = f"``{ca}`` module"
+        name = f"{ca} package"
         with open(os.path.join(output_dir, children_name), "w") as rst_file:
-            rst_file.write(f"{name.replace('_', ' ')}\n{'=' * len(name)}\n\n")
+            rst_file.write(f"{name}\n{'=' * len(name)}\n\n")
             children = children.replace(".rst", "")
             rst_file.write(
                 # "```{eval-rst}\n"+

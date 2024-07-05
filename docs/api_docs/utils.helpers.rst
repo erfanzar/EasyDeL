@@ -1,5 +1,5 @@
-``helpers`` module
-==================
+helpers package
+===============
 
 .. automodule:: easydel.utils.helpers
     :members:

@@ -1,5 +1,5 @@
-``training configurations`` module
-==================================
+training_configurations package
+===============================
 
 .. automodule:: easydel.trainers.training_configurations
     :members:

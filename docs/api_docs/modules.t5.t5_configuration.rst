@@ -1,5 +1,5 @@
-``t5/t5 configuration`` module
-==============================
+t5.t5_configuration package
+===========================
 
 .. automodule:: easydel.modules.t5.t5_configuration
     :members:

@@ -1,5 +1,5 @@
-``vision causal language model trainer/modelling output`` module
-================================================================
+vision_causal_language_model_trainer.modelling_output package
+=============================================================
 
 .. automodule:: easydel.trainers.vision_causal_language_model_trainer.modelling_output
     :members:

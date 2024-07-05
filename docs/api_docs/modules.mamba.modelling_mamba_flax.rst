@@ -1,5 +1,5 @@
-``mamba/modelling mamba flax`` module
-=====================================
+mamba.modelling_mamba_flax package
+==================================
 
 .. automodule:: easydel.modules.mamba.modelling_mamba_flax
     :members:

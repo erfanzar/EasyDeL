@@ -1,5 +1,5 @@
-``attention module`` module
-===========================
+attention_module package
+========================
 
 .. automodule:: easydel.modules.attention_module
     :members:

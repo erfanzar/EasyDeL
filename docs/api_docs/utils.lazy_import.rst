@@ -1,5 +1,5 @@
-``lazy import`` module
-======================
+lazy_import package
+===================
 
 .. automodule:: easydel.utils.lazy_import
     :members:

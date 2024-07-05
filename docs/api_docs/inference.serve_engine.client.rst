@@ -1,5 +1,5 @@
-``serve engine/client`` module
-==============================
+serve_engine.client package
+===========================
 
 .. automodule:: easydel.inference.serve_engine.client
     :members:

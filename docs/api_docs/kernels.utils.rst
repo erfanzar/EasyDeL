@@ -1,5 +1,5 @@
-``utils`` module
-================
+utils package
+=============
 
 .. automodule:: easydel.kernels.utils
     :members:

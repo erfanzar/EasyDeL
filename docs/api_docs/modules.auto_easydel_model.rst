@@ -1,5 +1,5 @@
-``auto easydel model`` module
-=============================
+auto_easydel_model package
+==========================
 
 .. automodule:: easydel.modules.auto_easydel_model
     :members:

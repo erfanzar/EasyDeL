@@ -1,5 +1,5 @@
-``jetmoe/jetmoe configuration`` module
-======================================
+jetmoe.jetmoe_configuration package
+===================================
 
 .. automodule:: easydel.modules.jetmoe.jetmoe_configuration
     :members:

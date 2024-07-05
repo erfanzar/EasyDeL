@@ -1,5 +1,5 @@
-``mistral/vision mistral configuration`` module
-===============================================
+mistral.vision_mistral_configuration package
+============================================
 
 .. automodule:: easydel.modules.mistral.vision_mistral_configuration
     :members:

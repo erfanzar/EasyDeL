@@ -1,5 +1,5 @@
-``train/cl train cli`` module
-=============================
+train.cl_train_cli package
+==========================
 
 .. automodule:: easydel.cli.train.cl_train_cli
     :members:

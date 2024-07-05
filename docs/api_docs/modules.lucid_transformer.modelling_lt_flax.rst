@@ -1,5 +1,5 @@
-``lucid transformer/modelling lt flax`` module
-==============================================
+lucid_transformer.modelling_lt_flax package
+===========================================
 
 .. automodule:: easydel.modules.lucid_transformer.modelling_lt_flax
     :members:

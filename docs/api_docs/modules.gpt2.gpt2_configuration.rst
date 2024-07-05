@@ -1,5 +1,5 @@
-``gpt2/gpt2 configuration`` module
-==================================
+gpt2.gpt2_configuration package
+===============================
 
 .. automodule:: easydel.modules.gpt2.gpt2_configuration
     :members:

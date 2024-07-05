@@ -1,5 +1,5 @@
-``opt/modelling opt flax`` module
-=================================
+opt.modelling_opt_flax package
+==============================
 
 .. automodule:: easydel.modules.opt.modelling_opt_flax
     :members:

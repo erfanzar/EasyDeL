@@ -1,5 +1,5 @@
-``qwen2/qwen configuration`` module
-===================================
+qwen2.qwen_configuration package
+================================
 
 .. automodule:: easydel.modules.qwen2.qwen_configuration
     :members:

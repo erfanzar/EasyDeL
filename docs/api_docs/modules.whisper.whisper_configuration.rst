@@ -1,5 +1,5 @@
-``whisper/whisper configuration`` module
-========================================
+whisper.whisper_configuration package
+=====================================
 
 .. automodule:: easydel.modules.whisper.whisper_configuration
     :members:

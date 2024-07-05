@@ -1,5 +1,5 @@
-``llama/llama configuration`` module
-====================================
+llama.llama_configuration package
+=================================
 
 .. automodule:: easydel.modules.llama.llama_configuration
     :members:

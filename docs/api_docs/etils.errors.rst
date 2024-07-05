@@ -1,5 +1,5 @@
-``errors`` module
-=================
+errors package
+==============
 
 .. automodule:: easydel.etils.errors
     :members:

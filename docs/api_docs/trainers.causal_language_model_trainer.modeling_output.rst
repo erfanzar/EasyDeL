@@ -1,5 +1,5 @@
-``causal language model trainer/modeling output`` module
-========================================================
+causal_language_model_trainer.modeling_output package
+=====================================================
 
 .. automodule:: easydel.trainers.causal_language_model_trainer.modeling_output
     :members:

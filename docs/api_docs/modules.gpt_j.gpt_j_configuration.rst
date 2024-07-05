@@ -1,5 +1,5 @@
-``gpt j/gpt j configuration`` module
-====================================
+gpt_j.gpt_j_configuration package
+=================================
 
 .. automodule:: easydel.modules.gpt_j.gpt_j_configuration
     :members:

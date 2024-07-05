@@ -1,5 +1,5 @@
-``roberta/roberta configuration`` module
-========================================
+roberta.roberta_configuration package
+=====================================
 
 .. automodule:: easydel.modules.roberta.roberta_configuration
     :members:

@@ -1,5 +1,5 @@
-``etils`` module
-================
+etils package
+=============
 
 .. automodule:: easydel.etils.etils
     :members:

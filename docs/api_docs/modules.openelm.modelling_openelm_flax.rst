@@ -1,5 +1,5 @@
-``openelm/modelling openelm flax`` module
-=========================================
+openelm.modelling_openelm_flax package
+======================================
 
 .. automodule:: easydel.modules.openelm.modelling_openelm_flax
     :members:

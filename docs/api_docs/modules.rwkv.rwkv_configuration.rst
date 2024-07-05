@@ -1,5 +1,5 @@
-``rwkv/rwkv configuration`` module
-==================================
+rwkv.rwkv_configuration package
+===============================
 
 .. automodule:: easydel.modules.rwkv.rwkv_configuration
     :members:

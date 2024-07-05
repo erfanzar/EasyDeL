@@ -1,5 +1,5 @@
-``blockwise attention`` module
-==============================
+_blockwise_attention package
+============================
 
 .. automodule:: easydel.modules._blockwise_attention
     :members:

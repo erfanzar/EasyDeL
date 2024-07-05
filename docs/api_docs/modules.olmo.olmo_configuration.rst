@@ -1,5 +1,5 @@
-``olmo/olmo configuration`` module
-==================================
+olmo.olmo_configuration package
+===============================
 
 .. automodule:: easydel.modules.olmo.olmo_configuration
     :members:

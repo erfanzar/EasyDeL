@@ -1,5 +1,5 @@
-``cohere/cohere configuration`` module
-======================================
+cohere.cohere_configuration package
+===================================
 
 .. automodule:: easydel.modules.cohere.cohere_configuration
     :members:

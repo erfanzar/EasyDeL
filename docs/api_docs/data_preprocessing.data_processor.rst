@@ -1,5 +1,5 @@
-``data processor`` module
-=========================
+data_processor package
+======================
 
 .. automodule:: easydel.data_preprocessing.data_processor
     :members:
