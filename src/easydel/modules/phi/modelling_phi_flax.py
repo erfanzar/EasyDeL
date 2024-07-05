@@ -21,11 +21,11 @@ from transformers.modeling_flax_outputs import (
     FlaxMaskedLMOutput,
 )
 
-from easydel.modules.attention_module import AttentionModule
+from easydel.modules.attention_module import FlexibleAttentionModule
 from easydel.modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 from easydel.modules.flax_modelling_utils import (
     ACT2FN,
-    BaseJAXAttentionModule,
+    BaseAttentionModule,
     apply_rotary_pos_emb,
     block_wise_ffn,
     control_mlp_sharding,
@@ -88,7 +88,7 @@ class FlaxPhiMLP(nn.Module):
         return self.fc2(self.act(self.fc1(hidden_states)))
 
 
-class FlaxPhiAttention(BaseJAXAttentionModule):
+class FlaxPhiAttention(BaseAttentionModule):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
     config: PhiConfig
@@ -146,7 +146,7 @@ class FlaxPhiAttention(BaseJAXAttentionModule):
                 use_bias=True,
             )
 
-        self.attention_performer = AttentionModule(
+        self.attention_module = FlexibleAttentionModule(
             use_sharding_constraint=self.config.use_sharding_constraint,
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,
@@ -177,7 +177,6 @@ class FlaxPhiAttention(BaseJAXAttentionModule):
 
     def _merge_heads(self, hidden_states):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
-
 
     def apply_rotary(
         self, batch_size, sequence_length, query, key, value, freq_cis, position_ids
@@ -313,7 +312,9 @@ class FlaxPhiAttention(BaseJAXAttentionModule):
                 key_states, value_states, query_states, attention_mask
             )
 
-        key_states, value_states = self.repeat_key_value(key_states, value_states, self.num_key_value_groups)
+        key_states, value_states = self.repeat_key_value(
+            key_states, value_states, self.num_key_value_groups
+        )
         # if self.config.use_sharding_constraint:
         #     query_states = with_sharding_constraint(
         #         query_states, PartitionSpec(("dp", "fsdp"), "sp" if query_states.shape[1] != 1 else None, "tp", None)
@@ -334,7 +335,7 @@ class FlaxPhiAttention(BaseJAXAttentionModule):
 
         query_length, key_length = query_states.shape[1], key_states.shape[1]
 
-        attentions = self.attention_performer.__call__(
+        attentions = self.attention_module.__call__(
             query_states=query_states,
             key_states=key_states,
             value_states=value_states,
@@ -345,7 +346,6 @@ class FlaxPhiAttention(BaseJAXAttentionModule):
             deterministic=deterministic,
             query_sequence_length=query_length,
             key_value_sequence_length=key_length,
-            uses_cache=self.has_variable("cache", "cached_key") or init_cache,
             segment_ids=segment_ids,
             causal_mask=causal_mask,
         )

@@ -15,13 +15,13 @@ from jax import lax
 from jax.sharding import PartitionSpec
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 
-from easydel.modules.attention_module import AttentionModule
+from easydel.modules.attention_module import FlexibleAttentionModule
 from easydel.modules.cohere.cohere_configuration import CohereConfig as CohereConfig
 from easydel.modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 
 # easydel.modules
 from easydel.modules.flax_modelling_utils import (
-    BaseJAXAttentionModule,
+    BaseAttentionModule,
     apply_rotary_pos_emb,
     block_wise_ffn,
     control_mlp_sharding,
@@ -86,7 +86,7 @@ class RMSNorm(nn.Module):
         return output * weight
 
 
-class FlaxCohereAttention(BaseJAXAttentionModule):
+class FlaxCohereAttention(BaseAttentionModule):
     config: CohereConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -97,7 +97,7 @@ class FlaxCohereAttention(BaseJAXAttentionModule):
         self.hidden_size = config.hidden_size
         self.head_dim = self.config.hidden_size // self.config.num_attention_heads
         self.num_key_value_groups = (
-                self.config.num_attention_heads // self.config.num_key_value_heads
+            self.config.num_attention_heads // self.config.num_key_value_heads
         )
 
         if self.num_key_value_groups == 1:
@@ -159,7 +159,7 @@ class FlaxCohereAttention(BaseJAXAttentionModule):
         )
 
         self.rotary = FlaxCohereEmbedding(self.dtype)
-        self.attention_performer = AttentionModule(
+        self.attention_module = FlexibleAttentionModule(
             use_sharding_constraint=self.config.use_sharding_constraint,
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,
@@ -192,7 +192,7 @@ class FlaxCohereAttention(BaseJAXAttentionModule):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
 
     def apply_rotary(
-            self, batch_size, sequence_length, query, key, value, freq_cis, position_ids
+        self, batch_size, sequence_length, query, key, value, freq_cis, position_ids
     ):
         """The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
         The main difference is that it takes in an additional argument, freq_cis, which are used to calculate
@@ -220,17 +220,17 @@ class FlaxCohereAttention(BaseJAXAttentionModule):
         return self._transpose_sequence_head(query, key, value)
 
     def __call__(
-            self,
-            hidden_states: chex.Array,
-            freq_cis: Tuple[chex.Array, chex.Array],
-            attention_mask: chex.Array,
-            position_ids: chex.Array,
-            causal_mask: chex.Array,
-            segment_ids: Optional[chex.Array] = None,
-            deterministic: bool = True,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            fcm_mask=None,
+        self,
+        hidden_states: chex.Array,
+        freq_cis: Tuple[chex.Array, chex.Array],
+        attention_mask: chex.Array,
+        position_ids: chex.Array,
+        causal_mask: chex.Array,
+        segment_ids: Optional[chex.Array] = None,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        fcm_mask=None,
     ):
         """The __call__ function is the main function of a JAX module. It defines how the module behaves when called
         with inputs. The __call__ function can be thought of as a &quot;forward pass&quot; through the model,
@@ -323,7 +323,9 @@ class FlaxCohereAttention(BaseJAXAttentionModule):
                 key_states, value_states, query_states, attention_mask
             )
 
-        key_states, value_states = self.repeat_key_value(key_states, value_states, self.num_key_value_groups)
+        key_states, value_states = self.repeat_key_value(
+            key_states, value_states, self.num_key_value_groups
+        )
         assert_msg = (
             "num_attention_heads repeat wont work likely\n"
             f"INFO :\n\trepeat_key_values Used with num_key_value_groups = {self.num_key_value_groups}\n\t"
@@ -353,7 +355,7 @@ class FlaxCohereAttention(BaseJAXAttentionModule):
 
         query_length, key_length = query_states.shape[1], key_states.shape[1]
 
-        attentions = self.attention_performer.__call__(
+        attentions = self.attention_module.__call__(
             query_states=query_states,
             key_states=key_states,
             value_states=value_states,
@@ -364,7 +366,6 @@ class FlaxCohereAttention(BaseJAXAttentionModule):
             deterministic=deterministic,
             query_sequence_length=query_length,
             key_value_sequence_length=key_length,
-            uses_cache=self.has_variable("cache", "cached_key") or init_cache,
             segment_ids=segment_ids,
             causal_mask=causal_mask,
         )
@@ -492,17 +493,17 @@ class FlaxCohereBlock(nn.Module):
         )
 
     def __call__(
-            self,
-            hidden_states: chex.Array,
-            freq_cis: Tuple[chex.Array, chex.Array],
-            attention_mask: chex.Array,
-            position_ids: chex.Array,
-            causal_mask: chex.Array,
-            segment_ids: Optional[chex.Array] = None,
-            deterministic: bool = True,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            fcm_mask: Optional[jnp.ndarray] = None,
+        self,
+        hidden_states: chex.Array,
+        freq_cis: Tuple[chex.Array, chex.Array],
+        attention_mask: chex.Array,
+        position_ids: chex.Array,
+        causal_mask: chex.Array,
+        segment_ids: Optional[chex.Array] = None,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        fcm_mask: Optional[jnp.ndarray] = None,
     ):
         """The __call__ function is the main function of a TransformerEncoderLayer.
         It takes in hidden states, frequency-domain inputs, and masks as input. It then
@@ -573,13 +574,13 @@ class FlaxCoherePreTrainedModel(EasyDeLFlaxPretrainedModel):
     module_class: nn.Module = None
 
     def __init__(
-            self,
-            config: CohereConfig,
-            input_shape: Tuple = (1, 1),
-            seed: int = 0,
-            dtype: jnp.dtype = jnp.float32,
-            _do_init: bool = True,
-            **kwargs,
+        self,
+        config: CohereConfig,
+        input_shape: Tuple = (1, 1),
+        seed: int = 0,
+        dtype: jnp.dtype = jnp.float32,
+        _do_init: bool = True,
+        **kwargs,
     ):
         """The __init__ function is called when the class is instantiated.
         It sets up the instance of the class, and defines what happens when it's created.
@@ -612,7 +613,7 @@ class FlaxCoherePreTrainedModel(EasyDeLFlaxPretrainedModel):
         )
 
     def init_weights(
-            self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
+        self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
     ) -> FrozenDict:
         """The init_weights function is used to initialize the weights of a model.
 
@@ -694,20 +695,20 @@ class FlaxCoherePreTrainedModel(EasyDeLFlaxPretrainedModel):
         return init_variables["cache"]
 
     def __call__(
-            self,
-            input_ids: chex.Array,
-            attention_mask: chex.Array = None,
-            position_ids: chex.Array = None,
-            params: dict = None,
-            past_key_values: dict = None,
-            dropout_rng: jax.random.PRNGKey = None,
-            train: bool = False,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
-            extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
-            add_params_field: bool = False,
-            **kwargs,
+        self,
+        input_ids: chex.Array,
+        attention_mask: chex.Array = None,
+        position_ids: chex.Array = None,
+        params: dict = None,
+        past_key_values: dict = None,
+        dropout_rng: jax.random.PRNGKey = None,
+        train: bool = False,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+        add_params_field: bool = False,
+        **kwargs,
     ):
         """The __call__ function is the main function of a JAX module.
         It takes in inputs and returns outputs, but it also has some other important features:
@@ -757,7 +758,7 @@ class FlaxCoherePreTrainedModel(EasyDeLFlaxPretrainedModel):
         batch_size, sequence_length = input_ids.shape
 
         assert (
-                sequence_length <= self.config.max_position_embeddings
+            sequence_length <= self.config.max_position_embeddings
         ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
 
         if position_ids is None:
@@ -837,17 +838,17 @@ class FlaxCohereBlockCollection(nn.Module):
         ]
 
     def __call__(
-            self,
-            hidden_states: chex.Array,
-            freq_cis: Tuple[chex.Array, chex.Array],
-            attention_mask: chex.Array,
-            position_ids: chex.Array,
-            causal_mask: chex.Array,
-            deterministic: bool = True,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            output_hidden_states: bool = False,
-            return_dict: bool = True,
+        self,
+        hidden_states: chex.Array,
+        freq_cis: Tuple[chex.Array, chex.Array],
+        attention_mask: chex.Array,
+        position_ids: chex.Array,
+        causal_mask: chex.Array,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        return_dict: bool = True,
     ):
         """The __call__ function is the main function of a JAX nn.Module.
         It defines how the module behaves when called as a function, and it's what you'll use to call your model
@@ -892,10 +893,10 @@ class FlaxCohereBlockCollection(nn.Module):
                 maxval=self.config.fcm_max_ratio,
             )
             fcm_mask = (
-                    jax.random.uniform(
-                        self.make_rng("fcm"), shape=(batch_size, 1, seq_length, seq_length)
-                    )
-                    > fcm_ratio
+                jax.random.uniform(
+                    self.make_rng("fcm"), shape=(batch_size, 1, seq_length, seq_length)
+                )
+                > fcm_ratio
             )
             fcm_mask = fcm_mask.at[:, :, :, 0].set(True)
             fcm_mask = fcm_mask.astype("bool")
@@ -993,17 +994,17 @@ class FlaxCohereModule(nn.Module):
         )
 
     def __call__(
-            self,
-            input_ids: chex.Array,
-            attention_mask: chex.Array,
-            position_ids: chex.Array,
-            deterministic: bool = True,
-            inputs_embeds: chex.Array = None,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            output_hidden_states: bool = False,
-            return_dict: bool = True,
-            extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+        self,
+        input_ids: chex.Array,
+        attention_mask: chex.Array,
+        position_ids: chex.Array,
+        deterministic: bool = True,
+        inputs_embeds: chex.Array = None,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        return_dict: bool = True,
+        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
     ):
         """The __call__ function is the main function of a Flax model. It takes in input_ids, attention_mask, and position_ids
         and returns the output of the model. The __call__ function also has optional arguments that can be used to control
@@ -1039,7 +1040,7 @@ class FlaxCohereModule(nn.Module):
         batch_size, sequence_length, _ = inputs_embeds.shape
 
         assert (
-                sequence_length <= self.config.max_position_embeddings
+            sequence_length <= self.config.max_position_embeddings
         ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
 
         inputs_embeds = (
@@ -1118,16 +1119,16 @@ class FlaxCohereForCausalLMModule(nn.Module):
         self.logit_scale = self.config.logit_scale
 
     def __call__(
-            self,
-            input_ids: chex.Array,
-            attention_mask: chex.Array = None,
-            position_ids: chex.Array = None,
-            deterministic: bool = True,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            output_hidden_states: bool = False,
-            return_dict: bool = True,
-            extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+        self,
+        input_ids: chex.Array,
+        attention_mask: chex.Array = None,
+        position_ids: chex.Array = None,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        return_dict: bool = True,
+        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
     ):
         """The __call__ function is the main function of a Flax module. It takes in inputs and returns outputs.
 
@@ -1200,7 +1201,7 @@ class FlaxCohereForCausalLM(FlaxCoherePreTrainedModel):
     module_class = FlaxCohereForCausalLMModule
 
     def prepare_inputs_for_generation(
-            self, input_ids, max_length, attention_mask: Optional[chex.Array] = None
+        self, input_ids, max_length, attention_mask: Optional[chex.Array] = None
     ):
         """
         The prepare_inputs_for_generation function is used to prepare the inputs for a generation task.

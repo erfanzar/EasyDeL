@@ -17,11 +17,11 @@ from jax.sharding import PartitionSpec
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 
 from easydel.etils.etils import get_logger
-from easydel.modules.attention_module import AttentionModule
+from easydel.modules.attention_module import FlexibleAttentionModule
 from easydel.modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 from easydel.modules.flax_modelling_utils import (
     ACT2FN,
-    BaseJAXAttentionModule,
+    BaseAttentionModule,
     apply_rotary_pos_emb,
     block_wise_ffn,
     control_mlp_sharding,
@@ -115,7 +115,7 @@ class FlaxGemma2RotaryEmbedding(nn.Module):
         return query.astype(self.dtype), key.astype(self.dtype)
 
 
-class FlaxGemma2Attention(BaseJAXAttentionModule):
+class FlaxGemma2Attention(BaseAttentionModule):
     config: Gemma2Config
     layer_idx: int
     dtype: jnp.dtype = jnp.float32
@@ -152,7 +152,7 @@ class FlaxGemma2Attention(BaseJAXAttentionModule):
         self.sliding_window = (
             config.sliding_window if (self.layer_idx % 2 == 0) else None
         )
-        self.attention_performer = AttentionModule(
+        self.attention_module = FlexibleAttentionModule(
             use_sharding_constraint=self.config.use_sharding_constraint,
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,
@@ -317,7 +317,7 @@ class FlaxGemma2Attention(BaseJAXAttentionModule):
 
         query_length, key_length = query_states.shape[1], key_states.shape[1]
 
-        attentions = self.attention_performer.__call__(
+        attentions = self.attention_module.__call__(
             query_states=query_states,
             key_states=key_states,
             value_states=value_states,
@@ -328,7 +328,6 @@ class FlaxGemma2Attention(BaseJAXAttentionModule):
             deterministic=deterministic,
             query_sequence_length=query_length,
             key_value_sequence_length=key_length,
-            uses_cache=self.has_variable("cache", "cached_key") or init_cache,
             segment_ids=segment_ids,
             causal_mask=causal_mask,
         )

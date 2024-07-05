@@ -26,13 +26,13 @@ from transformers.modeling_flax_outputs import (
     FlaxSequenceClassifierOutput,
 )
 
-from easydel.modules.attention_module import AttentionModule
+from easydel.modules.attention_module import FlexibleAttentionModule
 from easydel.modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 
 # easydel.modules
 from easydel.modules.flax_modelling_utils import (
     ACT2FN,
-    BaseJAXAttentionModule,
+    BaseAttentionModule,
     get_dot_general_by_bits,
     get_gradient_checkpoint_policy,
     with_sharding_constraint,
@@ -56,7 +56,7 @@ def sinusoidal_embedding_init(key, shape, dtype=jnp.float_) -> jax.Array:
     )
 
 
-class FlaxWhisperAttention(BaseJAXAttentionModule):
+class FlaxWhisperAttention(BaseAttentionModule):
     config: WhisperConfig
     embed_dim: int
     num_heads: int
@@ -90,7 +90,7 @@ class FlaxWhisperAttention(BaseJAXAttentionModule):
         self.v_proj = dense(use_bias=self.bias)
         self.out_proj = dense(use_bias=self.bias)
 
-        self.attention_performer = AttentionModule(
+        self.attention_module = FlexibleAttentionModule(
             use_sharding_constraint=self.config.use_sharding_constraint,
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,
@@ -120,13 +120,13 @@ class FlaxWhisperAttention(BaseJAXAttentionModule):
         )
 
     def __call__(
-            self,
-            hidden_states: jnp.ndarray,
-            key_value_states: Optional[jnp.ndarray] = None,
-            attention_mask: Optional[jnp.ndarray] = None,
-            causal_mask: Optional[jnp.ndarray] = None,
-            init_cache: bool = False,
-            deterministic: bool = True,
+        self,
+        hidden_states: jnp.ndarray,
+        key_value_states: Optional[jnp.ndarray] = None,
+        attention_mask: Optional[jnp.ndarray] = None,
+        causal_mask: Optional[jnp.ndarray] = None,
+        init_cache: bool = False,
+        deterministic: bool = True,
     ) -> tuple[Any, Any]:
         is_cross_attention = key_value_states is not None
         batch_size = hidden_states.shape[0]
@@ -198,7 +198,7 @@ class FlaxWhisperAttention(BaseJAXAttentionModule):
         if not deterministic and self.dropout > 0.0:
             dropout_rng = self.make_rng("dropout")
 
-        attentions = self.attention_performer.__call__(
+        attentions = self.attention_module.__call__(
             query_states=query_states,
             key_states=key_states,
             value_states=value_states,
@@ -209,7 +209,6 @@ class FlaxWhisperAttention(BaseJAXAttentionModule):
             deterministic=deterministic,
             query_sequence_length=query_length,
             key_value_sequence_length=key_length,
-            uses_cache=self.has_variable("cache", "cached_key") or init_cache,
             segment_ids=None,
             causal_mask=causal_mask,
         )
@@ -277,12 +276,12 @@ class FlaxWhisperEncoderLayer(nn.Module):
         self.final_layer_norm = nn.LayerNorm(dtype=self.dtype, epsilon=1e-05)
 
     def __call__(
-            self,
-            hidden_states: jnp.ndarray,
-            attention_mask: jnp.ndarray,
-            causal_mask: Optional[jnp.ndarray] = None,
-            output_attentions: bool = True,
-            deterministic: bool = True,
+        self,
+        hidden_states: jnp.ndarray,
+        attention_mask: jnp.ndarray,
+        causal_mask: Optional[jnp.ndarray] = None,
+        output_attentions: bool = True,
+        deterministic: bool = True,
     ) -> Tuple[jnp.ndarray]:
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
@@ -335,14 +334,14 @@ class FlaxWhisperEncoderLayerCollection(nn.Module):
         self.layerdrop = self.config.encoder_layerdrop
 
     def __call__(
-            self,
-            hidden_states,
-            attention_mask,
-            causal_mask: Optional[jnp.ndarray] = None,
-            deterministic: bool = True,
-            output_attentions: bool = False,
-            output_hidden_states: bool = False,
-            return_dict: bool = True,
+        self,
+        hidden_states,
+        attention_mask,
+        causal_mask: Optional[jnp.ndarray] = None,
+        deterministic: bool = True,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        return_dict: bool = True,
     ):
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
@@ -352,7 +351,7 @@ class FlaxWhisperEncoderLayerCollection(nn.Module):
                 all_hidden_states = all_hidden_states + (hidden_states,)
             dropout_probability = random.uniform(0, 1)
             if not deterministic and (
-                    dropout_probability < self.layerdrop
+                dropout_probability < self.layerdrop
             ):  # skip the layer
                 layer_outputs = (None, None)
             else:
@@ -436,15 +435,15 @@ class FlaxWhisperDecoderLayer(nn.Module):
         self.final_layer_norm = nn.LayerNorm(dtype=self.dtype, epsilon=1e-05)
 
     def __call__(
-            self,
-            hidden_states: jnp.ndarray,
-            attention_mask: jnp.ndarray,
-            causal_mask: Optional[jnp.ndarray] = None,
-            encoder_hidden_states: Optional[jnp.ndarray] = None,
-            encoder_attention_mask: Optional[jnp.ndarray] = None,
-            init_cache: bool = False,
-            output_attentions: bool = True,
-            deterministic: bool = True,
+        self,
+        hidden_states: jnp.ndarray,
+        attention_mask: jnp.ndarray,
+        causal_mask: Optional[jnp.ndarray] = None,
+        encoder_hidden_states: Optional[jnp.ndarray] = None,
+        encoder_attention_mask: Optional[jnp.ndarray] = None,
+        init_cache: bool = False,
+        output_attentions: bool = True,
+        deterministic: bool = True,
     ) -> Tuple[jnp.ndarray]:
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
@@ -520,17 +519,17 @@ class FlaxWhisperDecoderLayerCollection(nn.Module):
         self.layerdrop = self.config.decoder_layerdrop
 
     def __call__(
-            self,
-            hidden_states,
-            attention_mask,
-            causal_mask: Optional[jnp.ndarray] = None,
-            encoder_hidden_states: Optional[jnp.ndarray] = None,
-            encoder_attention_mask: Optional[jnp.ndarray] = None,
-            deterministic: bool = True,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            output_hidden_states: bool = False,
-            return_dict: bool = True,
+        self,
+        hidden_states,
+        attention_mask,
+        causal_mask: Optional[jnp.ndarray] = None,
+        encoder_hidden_states: Optional[jnp.ndarray] = None,
+        encoder_attention_mask: Optional[jnp.ndarray] = None,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        return_dict: bool = True,
     ):
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
@@ -634,17 +633,17 @@ class FlaxWhisperEncoder(nn.Module):
         self.layer_norm = nn.LayerNorm(dtype=self.dtype, epsilon=1e-05)
 
     def __call__(
-            self,
-            input_features: jnp.ndarray,
-            causal_mask: Optional[jnp.ndarray] = None,
-            output_attentions: bool = False,
-            output_hidden_states: bool = False,
-            return_dict: bool = True,
-            deterministic: bool = True,
+        self,
+        input_features: jnp.ndarray,
+        causal_mask: Optional[jnp.ndarray] = None,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        return_dict: bool = True,
+        deterministic: bool = True,
     ) -> tuple[Any | None, ...] | FlaxBaseModelOutput:
         if input_features.shape[1:] != (
-                self.config.num_mel_bins,
-                self.config.max_source_positions * 2,
+            self.config.num_mel_bins,
+            self.config.max_source_positions * 2,
         ):
             raise ValueError(
                 "input_features.shape[1:], must be equal to (self.config.num_mel_bins,"
@@ -729,17 +728,17 @@ class FlaxWhisperDecoder(nn.Module):
         self.layer_norm = nn.LayerNorm(dtype=self.dtype, epsilon=1e-5)
 
     def __call__(
-            self,
-            input_ids: jnp.ndarray,
-            attention_mask: jnp.ndarray,
-            position_ids: jnp.ndarray,
-            causal_mask: Optional[jnp.ndarray] = None,
-            encoder_hidden_states: Optional[jnp.ndarray] = None,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            output_hidden_states: bool = False,
-            return_dict: bool = True,
-            deterministic: bool = True,
+        self,
+        input_ids: jnp.ndarray,
+        attention_mask: jnp.ndarray,
+        position_ids: jnp.ndarray,
+        causal_mask: Optional[jnp.ndarray] = None,
+        encoder_hidden_states: Optional[jnp.ndarray] = None,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        return_dict: bool = True,
+        deterministic: bool = True,
     ) -> tuple[Any, ...] | FlaxBaseModelOutputWithPastAndCrossAttentions:
         input_embeds = self.embed_tokens(input_ids)
         position_embeds = self.embed_positions(position_ids)
@@ -813,15 +812,15 @@ class FlaxWhisperModule(nn.Module):
         )
 
     def __call__(
-            self,
-            input_features: jnp.ndarray,
-            decoder_input_ids: jnp.ndarray,
-            decoder_attention_mask: jnp.ndarray,
-            decoder_position_ids: jnp.ndarray,
-            output_attentions: bool = False,
-            output_hidden_states: bool = False,
-            return_dict: bool = True,
-            deterministic: bool = True,
+        self,
+        input_features: jnp.ndarray,
+        decoder_input_ids: jnp.ndarray,
+        decoder_attention_mask: jnp.ndarray,
+        decoder_position_ids: jnp.ndarray,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        return_dict: bool = True,
+        deterministic: bool = True,
     ):
         encoder_outputs = self.encoder(
             input_features,
@@ -871,15 +870,15 @@ class FlaxWhisperPreTrainedModel(EasyDeLFlaxPretrainedModel):
     module_class: nn.Module = None
 
     def __init__(
-            self,
-            config: WhisperConfig,
-            input_shape: Tuple[int] = None,
-            seed: int = 0,
-            dtype: jnp.dtype = jnp.float32,
-            param_dtype: jnp.dtype = jnp.float32,
-            precision: Optional[Union[str, lax.Precision]] = None,
-            _do_init: bool = True,
-            **kwargs,
+        self,
+        config: WhisperConfig,
+        input_shape: Tuple[int] = None,
+        seed: int = 0,
+        dtype: jnp.dtype = jnp.float32,
+        param_dtype: jnp.dtype = jnp.float32,
+        precision: Optional[Union[str, lax.Precision]] = None,
+        _do_init: bool = True,
+        **kwargs,
     ):
         module = self.module_class(
             config=config,
@@ -907,7 +906,7 @@ class FlaxWhisperPreTrainedModel(EasyDeLFlaxPretrainedModel):
         )
 
     def init_weights(
-            self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
+        self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
     ) -> FrozenDict:
         # init input tensors
         input_features = jnp.zeros(input_shape, dtype="f4")
@@ -951,11 +950,11 @@ class FlaxWhisperPreTrainedModel(EasyDeLFlaxPretrainedModel):
         )
 
         def _decoder_forward(
-                module,
-                decoder_input_ids,
-                decoder_attention_mask,
-                decoder_position_ids,
-                **kwargs,
+            module,
+            decoder_input_ids,
+            decoder_attention_mask,
+            decoder_position_ids,
+            **kwargs,
         ):
             decoder_module = module._get_decoder_module()
             return decoder_module(
@@ -977,17 +976,17 @@ class FlaxWhisperPreTrainedModel(EasyDeLFlaxPretrainedModel):
         return unfreeze(init_variables["cache"])
 
     def encode(
-            self,
-            input_features: jnp.ndarray,
-            attention_mask: Optional[jnp.ndarray] = None,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
-            train: bool = False,
-            params: dict = None,
-            dropout_rng: PRNGKey = None,
-            add_params_field: bool = False,
-            **kwargs,
+        self,
+        input_features: jnp.ndarray,
+        attention_mask: Optional[jnp.ndarray] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        train: bool = False,
+        params: dict = None,
+        dropout_rng: PRNGKey = None,
+        add_params_field: bool = False,
+        **kwargs,
     ):
         output_attentions = (
             output_attentions
@@ -1027,20 +1026,20 @@ class FlaxWhisperPreTrainedModel(EasyDeLFlaxPretrainedModel):
         )
 
     def decode(
-            self,
-            decoder_input_ids,
-            encoder_outputs,
-            encoder_attention_mask: Optional[jnp.ndarray] = None,
-            decoder_attention_mask: Optional[jnp.ndarray] = None,
-            decoder_position_ids: Optional[jnp.ndarray] = None,
-            past_key_values: dict = None,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
-            train: bool = False,
-            params: dict = None,
-            dropout_rng: PRNGKey = None,
-            add_params_field: bool = False,
+        self,
+        decoder_input_ids,
+        encoder_outputs,
+        encoder_attention_mask: Optional[jnp.ndarray] = None,
+        decoder_attention_mask: Optional[jnp.ndarray] = None,
+        decoder_position_ids: Optional[jnp.ndarray] = None,
+        past_key_values: dict = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        train: bool = False,
+        params: dict = None,
+        dropout_rng: PRNGKey = None,
+        add_params_field: bool = False,
     ):
 
         output_attentions = (
@@ -1068,8 +1067,8 @@ class FlaxWhisperPreTrainedModel(EasyDeLFlaxPretrainedModel):
 
             if decoder_attention_mask is not None:
                 decoder_position_ids = (
-                                               decoder_attention_mask.cumsum(-1) * decoder_attention_mask
-                                       ) - 1
+                    decoder_attention_mask.cumsum(-1) * decoder_attention_mask
+                ) - 1
             else:
                 decoder_position_ids = jnp.broadcast_to(
                     jnp.arange(sequence_length)[None, :], (batch_size, sequence_length)
@@ -1095,11 +1094,11 @@ class FlaxWhisperPreTrainedModel(EasyDeLFlaxPretrainedModel):
             mutable = False
 
         def _decoder_forward(
-                module,
-                decoder_input_ids,
-                decoder_attention_mask,
-                decoder_position_ids,
-                **kwargs,
+            module,
+            decoder_input_ids,
+            decoder_attention_mask,
+            decoder_position_ids,
+            **kwargs,
         ):
             decoder_module = module._get_decoder_module()
             return decoder_module(
@@ -1136,21 +1135,21 @@ class FlaxWhisperPreTrainedModel(EasyDeLFlaxPretrainedModel):
         return outputs
 
     def __call__(
-            self,
-            input_features: jnp.ndarray,
-            decoder_input_ids: jnp.ndarray,
-            attention_mask: Optional[jnp.ndarray] = None,
-            decoder_attention_mask: Optional[jnp.ndarray] = None,
-            position_ids: Optional[jnp.ndarray] = None,
-            decoder_position_ids: Optional[jnp.ndarray] = None,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
-            train: bool = False,
-            params: dict = None,
-            dropout_rng: PRNGKey = None,
-            extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
-            add_params_field: bool = False,
+        self,
+        input_features: jnp.ndarray,
+        decoder_input_ids: jnp.ndarray,
+        attention_mask: Optional[jnp.ndarray] = None,
+        decoder_attention_mask: Optional[jnp.ndarray] = None,
+        position_ids: Optional[jnp.ndarray] = None,
+        decoder_position_ids: Optional[jnp.ndarray] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        train: bool = False,
+        params: dict = None,
+        dropout_rng: PRNGKey = None,
+        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+        add_params_field: bool = False,
     ):
         output_attentions = (
             output_attentions
@@ -1170,8 +1169,8 @@ class FlaxWhisperPreTrainedModel(EasyDeLFlaxPretrainedModel):
         if decoder_position_ids is None:
             if decoder_attention_mask is not None:
                 decoder_position_ids = (
-                                               decoder_attention_mask.cumsum(-1) * decoder_attention_mask
-                                       ) - 1
+                    decoder_attention_mask.cumsum(-1) * decoder_attention_mask
+                ) - 1
             else:
                 batch_size, sequence_length = decoder_input_ids.shape
                 decoder_position_ids = jnp.broadcast_to(
@@ -1239,17 +1238,17 @@ class FlaxWhisperForConditionalGenerationModule(nn.Module):
         return self.model.decoder
 
     def __call__(
-            self,
-            input_features,
-            decoder_input_ids,
-            decoder_attention_mask: jnp.ndarray = None,
-            decoder_position_ids: jnp.ndarray = None,
-            position_ids: jnp.ndarray = None,
-            attention_mask: jnp.ndarray = None,
-            output_attentions: bool = False,
-            output_hidden_states: bool = False,
-            return_dict: bool = True,
-            deterministic: bool = True,
+        self,
+        input_features,
+        decoder_input_ids,
+        decoder_attention_mask: jnp.ndarray = None,
+        decoder_position_ids: jnp.ndarray = None,
+        position_ids: jnp.ndarray = None,
+        attention_mask: jnp.ndarray = None,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        return_dict: bool = True,
+        deterministic: bool = True,
     ):
         outputs = self.model(
             input_features=input_features,
@@ -1300,20 +1299,20 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
     precision: Optional[Union[str, lax.Precision]] = None
 
     def decode(
-            self,
-            decoder_input_ids,
-            encoder_outputs,
-            encoder_attention_mask: Optional[jnp.ndarray] = None,
-            decoder_attention_mask: Optional[jnp.ndarray] = None,
-            decoder_position_ids: Optional[jnp.ndarray] = None,
-            past_key_values: dict = None,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
-            train: bool = False,
-            params: dict = None,
-            dropout_rng: PRNGKey = None,
-            add_params_field: Optional[bool] = False,
+        self,
+        decoder_input_ids,
+        encoder_outputs,
+        encoder_attention_mask: Optional[jnp.ndarray] = None,
+        decoder_attention_mask: Optional[jnp.ndarray] = None,
+        decoder_position_ids: Optional[jnp.ndarray] = None,
+        past_key_values: dict = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        train: bool = False,
+        params: dict = None,
+        dropout_rng: PRNGKey = None,
+        add_params_field: Optional[bool] = False,
     ):
         output_attentions = (
             output_attentions
@@ -1340,8 +1339,8 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
 
             if decoder_attention_mask is not None:
                 decoder_position_ids = (
-                                               decoder_attention_mask.cumsum(-1) * decoder_attention_mask
-                                       ) - 1
+                    decoder_attention_mask.cumsum(-1) * decoder_attention_mask
+                ) - 1
             else:
                 decoder_position_ids = jnp.broadcast_to(
                     jnp.arange(sequence_length)[None, :], (batch_size, sequence_length)
@@ -1367,11 +1366,11 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
             mutable = False
 
         def _decoder_forward(
-                module,
-                decoder_input_ids,
-                decoder_attention_mask,
-                decoder_position_ids,
-                **kwargs,
+            module,
+            decoder_input_ids,
+            decoder_attention_mask,
+            decoder_position_ids,
+            **kwargs,
         ):
             decoder_module = module._get_decoder_module()
             outputs = decoder_module(
@@ -1438,15 +1437,15 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
         return outputs
 
     def generate(
-            self,
-            input_features,
-            generation_config=None,
-            logits_processor=None,
-            return_timestamps=None,
-            task=None,
-            language=None,
-            is_multilingual=None,
-            **kwargs,
+        self,
+        input_features,
+        generation_config=None,
+        logits_processor=None,
+        return_timestamps=None,
+        task=None,
+        language=None,
+        is_multilingual=None,
+        **kwargs,
     ):
         if generation_config is None:
             generation_config = self.generation_config
@@ -1471,8 +1470,8 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
         forced_decoder_ids = []
 
         if (
-                hasattr(generation_config, "is_multilingual")
-                and generation_config.is_multilingual
+            hasattr(generation_config, "is_multilingual")
+            and generation_config.is_multilingual
         ):
             if hasattr(generation_config, "language"):
                 forced_decoder_ids.append(
@@ -1491,8 +1490,8 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
                 )
 
         if (
-                hasattr(generation_config, "return_timestamps")
-                and generation_config.return_timestamps
+            hasattr(generation_config, "return_timestamps")
+            and generation_config.return_timestamps
         ) or return_timestamps:
             logits_processor = [
                 FlaxWhisperTimeStampLogitsProcessor(
@@ -1501,9 +1500,9 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
             ]
         else:
             if (
-                    forced_decoder_ids
-                    and forced_decoder_ids[-1][0]
-                    != generation_config.no_timestamps_token_id
+                forced_decoder_ids
+                and forced_decoder_ids[-1][0]
+                != generation_config.no_timestamps_token_id
             ):
                 idx = forced_decoder_ids[-1][0] + 1 if forced_decoder_ids else 1
                 forced_decoder_ids.append(
@@ -1521,13 +1520,13 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
         )
 
     def prepare_inputs_for_generation(
-            self,
-            decoder_input_ids,
-            max_length,
-            attention_mask: Optional[jax.Array] = None,
-            decoder_attention_mask: Optional[jax.Array] = None,
-            encoder_outputs=None,
-            **kwargs,
+        self,
+        decoder_input_ids,
+        max_length,
+        attention_mask: Optional[jax.Array] = None,
+        decoder_attention_mask: Optional[jax.Array] = None,
+        encoder_outputs=None,
+        **kwargs,
     ):
         # initializing the cache
         batch_size, seq_length = decoder_input_ids.shape
@@ -1555,7 +1554,7 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
     def update_inputs_for_generation(self, model_outputs, model_kwargs):
         model_kwargs["past_key_values"] = model_outputs.past_key_values
         model_kwargs["decoder_position_ids"] = (
-                model_kwargs["decoder_position_ids"][:, -1:] + 1
+            model_kwargs["decoder_position_ids"][:, -1:] + 1
         )
         return model_kwargs
 
@@ -1593,12 +1592,12 @@ class FlaxWhisperForAudioClassificationModule(nn.Module):
         )
 
     def __call__(
-            self,
-            input_features,
-            encoder_outputs=None,
-            output_attentions=None,
-            output_hidden_states: bool = True,
-            return_dict: bool = True,
+        self,
+        input_features,
+        encoder_outputs=None,
+        output_attentions=None,
+        output_hidden_states: bool = True,
+        return_dict: bool = True,
     ):
         output_attentions = (
             output_attentions
@@ -1653,7 +1652,7 @@ class FlaxWhisperForAudioClassification(FlaxWhisperPreTrainedModel):
     precision: Optional[Union[str, lax.Precision]] = None
 
     def init_weights(
-            self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
+        self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
     ) -> FrozenDict:
         # init input tensors
         input_features = jnp.zeros(input_shape, dtype="f4")
@@ -1678,17 +1677,17 @@ class FlaxWhisperForAudioClassification(FlaxWhisperPreTrainedModel):
             return random_params
 
     def __call__(
-            self,
-            input_features: jnp.ndarray,
-            attention_mask: Optional[jnp.ndarray] = None,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
-            train: bool = False,
-            params: dict = None,
-            dropout_rng: PRNGKey = None,
-            add_params_field: Optional[bool] = False,
-            **kwargs,
+        self,
+        input_features: jnp.ndarray,
+        attention_mask: Optional[jnp.ndarray] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        train: bool = False,
+        params: dict = None,
+        dropout_rng: PRNGKey = None,
+        add_params_field: Optional[bool] = False,
+        **kwargs,
     ):
         output_attentions = (
             output_attentions

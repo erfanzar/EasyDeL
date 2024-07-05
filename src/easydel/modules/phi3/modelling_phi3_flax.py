@@ -21,12 +21,12 @@ from transformers.modeling_flax_outputs import (
     FlaxMaskedLMOutput,
 )
 
-from easydel.modules.attention_module import AttentionModule
+from easydel.modules.attention_module import FlexibleAttentionModule
 from easydel.modules.common import RMSNorm as RMSNorm
 from easydel.modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 from easydel.modules.flax_modelling_utils import (
     ACT2FN,
-    BaseJAXAttentionModule,
+    BaseAttentionModule,
     apply_rotary_pos_emb,
     block_wise_ffn,
     control_mlp_sharding,
@@ -96,7 +96,7 @@ class FlaxPhi3MLP(nn.Module):
         return self.down_proj(up_states)
 
 
-class FlaxPhi3Attention(BaseJAXAttentionModule):
+class FlaxPhi3Attention(BaseAttentionModule):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
     config: Phi3Config
@@ -141,7 +141,7 @@ class FlaxPhi3Attention(BaseJAXAttentionModule):
         self.o_proj = dense_class(self.hidden_size)
         self.qkv_proj = dense_class(op_size)
         self.rotary = FlaxPhi3Embedding(self.dtype)
-        self.attention_performer = AttentionModule(
+        self.attention_module = FlexibleAttentionModule(
             use_sharding_constraint=self.config.use_sharding_constraint,
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,
@@ -245,7 +245,6 @@ class FlaxPhi3Attention(BaseJAXAttentionModule):
             sequence_length=sequence_length,
         )
 
-
         query_length, key_length = query_states.shape[1], key_states.shape[1]
 
         if self.has_variable("cache", "cached_key"):
@@ -280,7 +279,9 @@ class FlaxPhi3Attention(BaseJAXAttentionModule):
                 key_states, value_states, query_states, attention_mask
             )
 
-        key_states, value_states = self.repeat_key_value(key_states, value_states, self.num_key_value_groups)
+        key_states, value_states = self.repeat_key_value(
+            key_states, value_states, self.num_key_value_groups
+        )
         attention_bias = lax.select(
             attention_mask > 0,
             jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
@@ -291,7 +292,7 @@ class FlaxPhi3Attention(BaseJAXAttentionModule):
 
         query_length, key_length = query_states.shape[1], key_states.shape[1]
 
-        attentions = self.attention_performer.__call__(
+        attentions = self.attention_module.__call__(
             query_states=query_states,
             key_states=key_states,
             value_states=value_states,
@@ -302,7 +303,6 @@ class FlaxPhi3Attention(BaseJAXAttentionModule):
             deterministic=deterministic,
             query_sequence_length=query_length,
             key_value_sequence_length=key_length,
-            uses_cache=self.has_variable("cache", "cached_key") or init_cache,
             segment_ids=segment_ids,
             causal_mask=causal_mask,
         )

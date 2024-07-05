@@ -124,7 +124,7 @@ def set_attrs_smartly_with_prp(
         setattr(self, attr_name, new_attr)
 
 
-class AttentionModule:
+class FlexibleAttentionModule(object):
     """
     Manages different attention mechanisms for efficient computation in EasyDeL models.
 
@@ -151,42 +151,33 @@ class AttentionModule:
 
     Example Usage:
 
-    ```python
-    # Initialize an AttentionModule instance
-    attention_module = AttentionModule(
-        mesh=mesh,
-        attn_mechanism="ring",  # Select the desired attention mechanism
-        sm_scale=1.0 / math.sqrt(head_dim),
-        num_attention_heads=num_heads,
-        head_dims=head_dim,
-        # ... other configuration parameters ...
-    )
+    >>> # Initialize an FlexibleAttentionModule instance
+    >>> attention_module = FlexibleAttentionModule(
+    ...    mesh=mesh,
+    ...    attn_mechanism="ring",  # Select the desired attention mechanism
+    ...    sm_scale=1.0 / math.sqrt(head_dim),
+    ...    num_attention_heads=num_heads,
+    ...    head_dims=head_dim,
+    ...    # ... other configuration parameters ...
+    >>> )
 
-    # Compute attention outputs
-    attention_output = attention_module(
-        query_states=query_states,
-        key_states=key_states,
-        value_states=value_states,
-        # ... other attention inputs ...
-    )
+    >>> # Compute attention outputs
+    >>> attention_output = attention_module(
+    ...    query_states=query_states,
+    ...    key_states=key_states,
+    ...    value_states=value_states,
+    ...     # ... other attention inputs ...
+    >>> )
 
-    # Access attention outputs
-    attention_outputs = attention_output.attention_outputs
-    attention_weights = attention_output.attention_weights
-    ```
-    The AttentionModule class is a crucial component within EasyDeL, responsible for managing and optimizing attention
+    >>> # Access attention outputs
+    >>> attention_outputs = attention_output.attention_outputs
+    >>> attention_weights = attention_output.attention_weights
+
+    The FlexibleAttentionModule class is a crucial component within EasyDeL, responsible for managing and optimizing attention
     computations. It provides a user-friendly way to select and execute different attention mechanisms,
     leveraging JAX's sharding capabilities and offering performance enhancements through specialized implementations
      like FlashAttention and SplashAttention. Its ability to handle block-wise computations and customization options
       makes it adaptable to a variety of model architectures and hardware configurations.
-
-    Attributes:
-        mesh (Mesh): JAX mesh for device distribution.
-        attn_mechanism (str): The selected attention mechanism.
-        sm_scale (float): Scaling factor for attention scores.
-        num_attention_heads (int): Number of attention heads.
-        head_dims (int): Dimensionality of each attention head.
-        # ... other attributes for block sizes, partitioning, dropout, etc. ...
     """
 
     def __init__(
@@ -230,7 +221,7 @@ class AttentionModule:
         use_sharding_constraint: Optional[bool] = ...,
         axis_name: str = ...,
         backward_pass_impl: Literal["triton", "xla"] = "triton",
-        base_module_class: Optional[EasyDeLPretrainedConfig] = None,
+        base_config: Optional[EasyDeLPretrainedConfig] = None,
         _do_check: bool = True,
     ):
         self.block_k: int = ...
@@ -256,64 +247,64 @@ class AttentionModule:
             "use_sharding_constraint",
             False,
             use_sharding_constraint,
-            base_module_class,
+            base_config,
         )
 
         set_attrs_smartly_with_prp(
-            self, "block_q", DEFAULT_Q_BLOCK, block_q, base_module_class
+            self, "block_q", DEFAULT_Q_BLOCK, block_q, base_config
         )
         set_attrs_smartly_with_prp(
-            self, "block_k", DEFAULT_K_BLOCK, block_k, base_module_class
+            self, "block_k", DEFAULT_K_BLOCK, block_k, base_config
         )
-        set_attrs_smartly_with_prp(self, "block_b", 1, block_b, base_module_class)
+        set_attrs_smartly_with_prp(self, "block_b", 1, block_b, base_config)
         set_attrs_smartly_with_prp(
             self,
             "block_q_major_dkv",
             self.block_q,
             block_q_major_dkv,
-            base_module_class,
+            base_config,
         )
         set_attrs_smartly_with_prp(
             self,
             "block_k_major_dkv",
             self.block_k,
             block_k_major_dkv,
-            base_module_class,
+            base_config,
         )
         set_attrs_smartly_with_prp(
             self,
             "block_k_major_dq",
             self.block_k,
             block_k_major_dq,
-            base_module_class,
+            base_config,
         )
         set_attrs_smartly_with_prp(
-            self, "block_k_dkv", self.block_k, block_k_dkv, base_module_class
+            self, "block_k_dkv", self.block_k, block_k_dkv, base_config
         )
         set_attrs_smartly_with_prp(
-            self, "block_q_dkv", self.block_q, block_q_dkv, base_module_class
+            self, "block_q_dkv", self.block_q, block_q_dkv, base_config
         )
         set_attrs_smartly_with_prp(
-            self, "block_q_dq", self.block_q, block_q_dq, base_module_class
+            self, "block_q_dq", self.block_q, block_q_dq, base_config
         )
         set_attrs_smartly_with_prp(
-            self, "block_k_dq", self.block_k, block_k_dq, base_module_class
+            self, "block_k_dq", self.block_k, block_k_dq, base_config
         )
         set_attrs_smartly_with_prp(
-            self, "block_k_major", self.block_k, block_k_major, base_module_class
+            self, "block_k_major", self.block_k, block_k_major, base_config
         )
         set_attrs_smartly_with_prp(
             self,
             "shard_attention_computation",
             True,
             shard_attention_computation,
-            base_module_class,
+            base_config,
         )
         set_attrs_smartly_with_prp(
-            self, "scan_ring_attention", True, scan_ring_attention, base_module_class
+            self, "scan_ring_attention", True, scan_ring_attention, base_config
         )
         set_attrs_smartly_with_prp(
-            self, "partition_axis", PartitionAxis(), partition_axis, base_module_class
+            self, "partition_axis", PartitionAxis(), partition_axis, base_config
         )
         set_attrs_smartly_with_prp(
             self, "precision", lax.Precision("fastest"), precision
@@ -551,7 +542,6 @@ class AttentionModule:
         query_states: Array,
         key_states: Array,
         value_states: Array,
-        causal_mask: Optional[Array] = None,
         query_sequence_length: Optional[int] = None,
         key_value_sequence_length: Optional[int] = None,
         bias: Optional[Array] = None,
@@ -560,7 +550,6 @@ class AttentionModule:
         causal: bool = True,
         deterministic: bool = False,
         dropout_rng: Optional[random.PRNGKey] = None,
-        uses_cache: bool = False,
     ):
         if query_sequence_length is None:
             query_sequence_length = query_states.shape[1]
@@ -1289,7 +1278,6 @@ class AttentionModule:
         if (
             is_gen and self.platform == "gpu"
         ):  # prevents ValueError: all dimensions of x and y must be >= 16
-
             return self.sharded_vanilla_attention(
                 query_states=query_states,
                 key_states=key_states,
@@ -1496,7 +1484,7 @@ class AttentionModule:
 
         @value_and_grad_wrapper
         def call_attention_module(q, k, v, b, a, attn_mechanism):
-            attention_pred = AttentionModule(
+            attention_pred = FlexibleAttentionModule(
                 attn_mechanism=attn_mechanism,
                 axis_name="sp",
                 dtype=dtype,
@@ -1506,7 +1494,7 @@ class AttentionModule:
                 num_attention_heads=q.shape[-2],
                 block_q=config.block_q,
                 block_k=config.block_k,
-                base_module_class=config,
+                base_config=config,
             )(
                 query_states=q, key_states=k, value_states=v, bias=b, attention_mask=a
             ).attention_outputs

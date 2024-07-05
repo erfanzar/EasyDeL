@@ -1,32 +1,23 @@
+import functools
 import math
 from typing import Optional, Tuple, Union
 
 import chex
-import fjformer.linen.linen
-import flax.linen
 import jax
 import jax.numpy as jnp
-from fjformer import linen as nn
-from fjformer.linen import Dense
+from flax import nnx
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
-from flax.linen import combine_masks
-from flax.linen import partitioning as nn_partitioning
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax.sharding import PartitionSpec
-from transformers.modeling_flax_outputs import (
-    FlaxBaseModelOutput,
-    FlaxCausalLMOutput,
-    FlaxSequenceClassifierOutput,
-)
 
-from easydel.modules.attention_module import AttentionModule
+from easydel.modules.attention_module import FlexibleAttentionModule
 from easydel.modules.common import RMSNorm
 from easydel.modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 
 # easydel.modules
 from easydel.modules.flax_modelling_utils import (
-    BaseJAXAttentionModule,
+    BaseAttentionModule,
     apply_rotary_pos_emb,
     block_wise_ffn,
     control_mlp_sharding,
@@ -34,114 +25,97 @@ from easydel.modules.flax_modelling_utils import (
     get_gradient_checkpoint_policy,
     precompute_freq_cis,
     with_sharding_constraint,
+    ACT2FN,
 )
 from easydel.modules.llama.llama_configuration import LlamaConfig as LlamaConfig
 
 
-class FlaxLlamaEmbedding(nn.Module):
-    dtype: jnp.dtype = jnp.float32
+def apply_rope(query, key, freq_cis, position_ids, dtype: jnp.dtype = jnp.float32):
+    sin, cos = freq_cis
 
-    def __call__(self, query, key, freq_cis, position_ids):
-        sin, cos = freq_cis
+    sin = sin[position_ids][:, None, :, :]
+    cos = cos[position_ids][:, None, :, :]
 
-        sin = sin[position_ids][:, None, :, :]
-        cos = cos[position_ids][:, None, :, :]
+    key = apply_rotary_pos_emb(key, sin, cos)
+    query = apply_rotary_pos_emb(query, sin, cos)
 
-        key = apply_rotary_pos_emb(key, sin, cos)
-        query = apply_rotary_pos_emb(query, sin, cos)
-
-        return query.astype(self.dtype), key.astype(self.dtype)
+    return query.astype(dtype), key.astype(dtype)
 
 
-class FlaxLlamaAttention(BaseJAXAttentionModule):
-    config: LlamaConfig
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
-
-    def setup(self):
-        config = self.config
+class LlamaAttention(BaseAttentionModule):
+    def __init__(
+        self,
+        config: LlamaConfig,
+        layer_idx: int,
+        dtype: jnp.dtype = jnp.float32,
+        param_dtype: jnp.dtype = jnp.float32,
+        precision: Optional[Union[jax.lax.Precision, str]] = None,
+    ) -> None:
+        super().__init__()
+        self.config: LlamaConfig = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
-        self.head_dim = self.config.hidden_size // self.config.num_attention_heads
+        self.head_dim = config.hidden_size // config.num_attention_heads
         self.num_key_value_groups = (
-            self.config.num_attention_heads // self.config.num_key_value_heads
+            config.num_attention_heads // config.num_key_value_heads
         )
 
         if self.num_key_value_groups == 1:
-            assert self.config.num_attention_heads == self.config.num_key_value_heads
-        self.q_proj = Dense(
+            assert config.num_attention_heads == config.num_key_value_heads
+        self.q_proj = nnx.Linear(
+            self.hidden_size,
             config.num_attention_heads * self.head_dim,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            use_bias=self.config.attention_bias,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-            precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=config.attention_bias,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            # **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
-        self.k_proj = Dense(
+        self.k_proj = nnx.Linear(
             config.num_key_value_heads * self.head_dim,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            use_bias=self.config.attention_bias,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-            precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=config.attention_bias,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            # **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
-        self.v_proj = Dense(
+        self.v_proj = nnx.Linear(
             config.num_key_value_heads * self.head_dim,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            use_bias=self.config.attention_bias,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-            precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=config.attention_bias,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            # **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
-        self.o_proj = Dense(
+        self.o_proj = nnx.Linear(
             config.hidden_size,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
+            dtype=dtype,
+            param_dtype=param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-            precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            # **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
 
-        self.rotary = FlaxLlamaEmbedding(self.dtype)
-        self.attention_performer = AttentionModule(
-            use_sharding_constraint=self.config.use_sharding_constraint,
-            block_k_major=self.config.block_k_major,
-            block_b=self.config.block_b,
-            block_q=self.config.block_q,
-            block_k=self.config.block_k,
-            block_q_major_dkv=self.config.block_q_major_dkv,
-            block_k_major_dkv=self.config.block_k_major_dkv,
-            block_k_major_dq=self.config.block_k_major_dq,
-            block_k_dkv=self.config.block_k_dkv,
-            block_q_dkv=self.config.block_q_dkv,
-            block_q_dq=self.config.block_q_dq,
-            block_k_dq=self.config.block_k_dq,
-            num_attention_heads=self.config.num_attention_heads,
-            attention_dropout=self.config.attention_dropout,
-            head_dims=self.head_dim,
-            shard_attention_computation=self.config.shard_attention_computation,
-            precision=self.precision,
-            force_float32_tpu=True,
-            attn_mechanism=self.config.attn_mechanism,
-            dtype=self.config.attn_dtype,
-            partition_axis=self.config.partition_axis,
-            scan_ring_attention=self.config.scan_ring_attention,
-            mesh=self.config.get_mesh(),
+        self.rotary = functools.partial(apply_rope, dtype=dtype)
+        self.attention_module: FlexibleAttentionModule = FlexibleAttentionModule(
             sm_scale=1 / math.sqrt(self.head_dim),
-            axis_name=self.config.attention_axis_name,
+            num_attention_heads=config.num_attention_heads,
+            head_dims=self.head_dim,
+            precision=precision,
+            base_config=config,
         )
-        self.resid_dropout = flax.linen.Dropout(rate=config.resid_pdrop)
+        self.resid_dropout = nnx.Dropout(rate=config.resid_pdrop)
 
     def _merge_heads(self, hidden_states):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
 
-    def apply_rotary(
-        self, batch_size, sequence_length, query, key, value, freq_cis, position_ids
-    ):
+    def apply_rotary(self, query, key, freq_cis, position_ids):
         """The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
         The main difference is that it takes in an additional argument, freq_cis, which are used to calculate
         the rotary attention weights. The other differences are minor and mostly related to reshaping tensors.
@@ -161,11 +135,14 @@ class FlaxLlamaAttention(BaseJAXAttentionModule):
         Returns:
             A tuple of 3 tensors: query, key and value
         """
-        query, key, value = self._transpose_sequence_head(query, key, value)
+        query, key = self._transpose_sequence_head(query, key)
         query, key = self.rotary(
-            position_ids=position_ids, query=query, key=key, freq_cis=freq_cis
+            position_ids=position_ids,
+            query=query,
+            key=key,
+            freq_cis=freq_cis,
         )
-        return self._transpose_sequence_head(query, key, value)
+        return self._transpose_sequence_head(query, key)
 
     def __call__(
         self,
@@ -173,12 +150,7 @@ class FlaxLlamaAttention(BaseJAXAttentionModule):
         freq_cis: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
         position_ids: chex.Array,
-        causal_mask: chex.Array,
         segment_ids: Optional[chex.Array] = None,
-        deterministic: bool = True,
-        init_cache: bool = False,
-        output_attentions: bool = False,
-        fcm_mask=None,
     ):
         """The __call__ function is the main function of a JAX module. It defines how the module behaves when called
         with inputs. The __call__ function can be thought of as a &quot;forward pass&quot; through the model,
@@ -186,131 +158,82 @@ class FlaxLlamaAttention(BaseJAXAttentionModule):
 
         Args:
             self: Access variables that belong to the class
-            hidden_states: chex.Array: Pass the hidden states of the
-                previous layer
-            freq_cis: Tuple[chex.Array, chex.Array],: Pass in the
-                frequency coefficients for each position
-            attention_mask: chex.Array: Mask out certain tokens in the
-                input sequence
-            position_ids: chex.Array: Determine the position of each
-                token in a sequence
-            causal_mask: chex.Array: Mask out the future tokens in the
-                decoder
-            deterministic: bool: Determine whether to use dropout or not
-            init_cache: bool: Initialize the cache
-            output_attentions: bool: Determine whether to return the
-                attention weights or not
-            fcm_mask: Mask out the attention weights between the input
-                and output tokens
-        :param : Determine if the attention is causal or not
+            hidden_states: chex.Array: Pass the hidden states of the previous layer
+            freq_cis: Tuple[chex.Array, chex.Array],: Pass in the frequency coefficients for each position
+            attention_mask: chex.Array: Mask out certain tokens in the input sequence
+            position_ids: chex.Array: Determine the position of each token in a sequence
 
         Returns:
             A tuple of two arrays
         """
         batch_size, sequence_length = hidden_states.shape[:2]
-        (query_states, key_states, value_states) = (
+        query_states, key_states, value_states = (
             self.q_proj(hidden_states),
             self.k_proj(hidden_states),
             self.v_proj(hidden_states),
         )
 
         query_states = query_states.reshape(
-            batch_size, sequence_length, self.config.num_attention_heads, self.head_dim
+            batch_size,
+            sequence_length,
+            self.config.num_attention_heads,
+            self.head_dim,
         )
         key_states = key_states.reshape(
-            batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim
+            batch_size,
+            sequence_length,
+            self.config.num_key_value_heads,
+            self.head_dim,
         )
         value_states = value_states.reshape(
-            batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim
+            batch_size,
+            sequence_length,
+            self.config.num_key_value_heads,
+            self.head_dim,
         )
 
-        query_states, key_states, value_states = self.apply_rotary(
+        query_states, key_states = self.apply_rotary(
             query=query_states,
             key=key_states,
-            value=value_states,
             position_ids=position_ids,
             freq_cis=freq_cis,
-            batch_size=batch_size,
-            sequence_length=sequence_length,
         )
 
         query_length, key_length = query_states.shape[1], key_states.shape[1]
 
-        if self.has_variable("cache", "cached_key"):
-            mask_shift = self.variables["cache"]["cache_index"]
-            max_decoder_length = self.variables["cache"]["cached_key"].shape[1]
-            causal_mask = lax.dynamic_slice(
-                causal_mask,
-                (0, 0, mask_shift, 0),
-                (1, 1, query_length, max_decoder_length),
-            )
-        else:
-            causal_mask = causal_mask[:, :, :query_length, :key_length]
-
-        batch_size = hidden_states.shape[0]
-        causal_mask = jnp.broadcast_to(
-            causal_mask, (batch_size,) + causal_mask.shape[1:]
-        )
-        attention_mask = jnp.broadcast_to(
-            jnp.expand_dims(attention_mask, axis=(-3, -2)), causal_mask.shape
-        )
-        attention_mask = combine_masks(attention_mask, causal_mask, fcm_mask)
-
-        dropout_rng = None
-
-        if not deterministic and self.config.attention_dropout > 0.0:
-            dropout_rng = self.make_rng("dropout")
-
-        if self.has_variable("cache", "cached_key") or init_cache:
-            key_states, value_states, attention_mask = self._concatenate_to_cache(
-                key_states, value_states, query_states, attention_mask
-            )
+        # TODO: Implement new cache system.
+        # if self.has_variable("cache", "cached_key") or init_cache:
+        #     key_states, value_states, attention_mask = self._concatenate_to_cache(
+        #         key_states, value_states, query_states, attention_mask
+        #     )
         key_states, value_states = self.repeat_key_value(
-            key_states, value_states, self.num_key_value_groups
+            key_states,
+            value_states,
+            self.num_key_value_groups,
         )
-        assert_msg = (
-            "num_attention_heads repeat wont work likely\n"
-            f"INFO :\n\trepeat_key_values Used with num_key_value_groups = {self.num_key_value_groups}\n\t"
-            f"NH : {self.config.num_attention_heads} KVH : {self.config.num_attention_heads}"
-        )
-
-        assert query_states.shape[-2] == self.config.num_attention_heads, assert_msg
-        assert key_states.shape[-2] == self.config.num_attention_heads, assert_msg
-        assert value_states.shape[-2] == self.config.num_attention_heads, assert_msg
-        # if self.config.use_sharding_constraint:
-        #     query_states = with_sharding_constraint(
-        #         query_states, PartitionSpec(("dp", "fsdp"), "sp" if query_states.shape[1] != 1 else None, "tp", None)
-        #     )
-        #     key_states = with_sharding_constraint(
-        #         key_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
-        #     )
-        #     value_states = with_sharding_constraint(
-        #         value_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
-        #     )
-        attention_bias = lax.select(
-            attention_mask > 0,
-            jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-            jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(
-                self.dtype
-            ),
-        )
+        attention_bias = None
+        if attention_mask is not None:
+            attention_bias = lax.select(
+                attention_mask > 0,
+                jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
+                jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(
+                    self.dtype
+                ),
+            )
 
         query_length, key_length = query_states.shape[1], key_states.shape[1]
 
-        attentions = self.attention_performer.__call__(
+        attentions = self.attention_module(
             query_states=query_states,
             key_states=key_states,
             value_states=value_states,
             bias=attention_bias,
             attention_mask=attention_mask,
             causal=True,
-            dropout_rng=dropout_rng,
-            deterministic=deterministic,
+            deterministic=self.deterministic,
             query_sequence_length=query_length,
             key_value_sequence_length=key_length,
-            uses_cache=self.has_variable("cache", "cached_key") or init_cache,
             segment_ids=segment_ids,
-            causal_mask=causal_mask,
         )
 
         attn_output = self._merge_heads(attentions.attention_outputs)
@@ -318,59 +241,59 @@ class FlaxLlamaAttention(BaseJAXAttentionModule):
             attn_output = with_sharding_constraint(
                 attn_output,
                 PartitionSpec(
-                    ("dp", "fsdp"), "sp" if attn_output.shape[1] != 1 else None, "tp"
+                    self.config.partition_axis.batch_axis,
+                    self.config.partition_axis.sequence_axis
+                    if attn_output.shape[1] != 1
+                    else None,
+                    self.config.partition_axis.hidden_state_axis,
                 ),
             )
-        attn_output = self.o_proj(attn_output)
-
-        attn_output = self.resid_dropout(attn_output, deterministic=deterministic)
-        outputs = (
-            (attn_output, attentions.attention_weights)
-            if output_attentions
-            else (attn_output,)
-        )
-        return outputs
+        attn_output = self.resid_dropout(self.o_proj(attn_output))
+        return attn_output, attentions.attention_weights
 
 
-class FlaxLlamaMLP(nn.Module):
-    config: LlamaConfig
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
-
-    def setup(self) -> None:
-        config = self.config
-
-        self.gate_proj = Dense(
-            config.intermediate_size,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            use_bias=self.config.mlp_bias,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-            precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
-        )
-        self.down_proj = Dense(
+class LlamaMLP(nnx.Module):
+    def __init__(
+        self,
+        config: LlamaConfig,
+        dtype: jnp.dtype = jnp.float32,
+        param_dtype: jnp.dtype = jnp.float32,
+        precision: Optional[Union[jax.lax.Precision, str]] = None,
+    ) -> None:
+        super().__init__()
+        self.config: LlamaConfig = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.gate_proj = nnx.Linear(
             config.hidden_size,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            use_bias=self.config.mlp_bias,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-            precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
-        )
-        self.up_proj = Dense(
             config.intermediate_size,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            use_bias=self.config.mlp_bias,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-            precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=config.mlp_bias,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
         )
-        self.dropout = flax.linen.Dropout(rate=self.config.resid_pdrop)
+        self.down_proj = nnx.Linear(
+            config.intermediate_size,
+            config.hidden_size,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=config.mlp_bias,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+        )
+        self.up_proj = nnx.Linear(
+            config.hidden_size,
+            config.intermediate_size,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=config.mlp_bias,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+        )
+        self.dropout = nnx.Dropout(rate=config.resid_pdrop)
 
-    def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         """The __call__ function is the main function of a class.
         It is called when an instance of the class (an object) is invoked as a function, i.e., obj(arguments).
         The __call__ method enables instances of a class to be called like standard Python functions.
@@ -378,7 +301,6 @@ class FlaxLlamaMLP(nn.Module):
         Args:
             self: Represent the instance of the class
             x: jnp.ndarray: Pass in the input to the layer
-            deterministic: bool: Determine whether to use dropout
 
         Returns:
             A tensor that is the result of applying a dropout function
@@ -386,50 +308,50 @@ class FlaxLlamaMLP(nn.Module):
         """
 
         x = control_mlp_sharding(x, self.config.partition_axis)
-        x = self.down_proj(jax.nn.silu(self.gate_proj(x)) * self.up_proj(x))
-        x = self.dropout(x, deterministic=deterministic)
-        return x
+        return self.dropout(
+            self.down_proj(
+                ACT2FN[self.config.hidden_act](self.gate_proj(x)) * self.up_proj(x),
+            )
+        )
 
 
-class FlaxLlamaBlock(nn.Module):
-    config: LlamaConfig
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
-
-    def setup(self) -> None:
-        attn_block = FlaxLlamaAttention
-        if self.config.gradient_checkpointing != "":
-            attn_block = nn_partitioning.remat(
-                FlaxLlamaAttention,
+class LlamaBlock(nnx.Module):
+    def __init__(
+        self,
+        config: LlamaConfig,
+        layer_idx: int,
+        dtype: jnp.dtype = jnp.float32,
+        param_dtype: jnp.dtype = jnp.float32,
+        precision: Optional[Union[jax.lax.Precision, str]] = None,
+    ) -> None:
+        super().__init__()
+        attn_block = LlamaAttention
+        mlp_block = LlamaMLP
+        if config.gradient_checkpointing != "":
+            attn_block = nnx.remat(
+                LlamaAttention,
                 static_argnums=(1, 3, 4, 6, 7, 8),
-                policy=get_gradient_checkpoint_policy(
-                    self.config.gradient_checkpointing
-                ),
+                policy=get_gradient_checkpoint_policy(config.gradient_checkpointing),
+            )
+            mlp_block = nnx.remat(
+                LlamaMLP,
+                static_argnums=(),
+                policy=get_gradient_checkpoint_policy(config.gradient_checkpointing),
             )
 
         self.self_attn = attn_block(
-            self.config,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            precision=self.precision,
+            config,
+            layer_idx=layer_idx,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
         )
-        mlp_block = FlaxLlamaMLP
-
-        if self.config.gradient_checkpointing != "":
-            mlp_block = nn_partitioning.remat(
-                FlaxLlamaMLP,
-                static_argnums=(1,),
-                policy=get_gradient_checkpoint_policy(
-                    self.config.gradient_checkpointing
-                ),
-            )
 
         self.mlp = mlp_block(
-            self.config,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            precision=self.precision,
+            config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
         )
         self.input_layernorm = RMSNorm(
             self.config.hidden_size,
@@ -453,9 +375,6 @@ class FlaxLlamaBlock(nn.Module):
         causal_mask: chex.Array,
         segment_ids: Optional[chex.Array] = None,
         deterministic: bool = True,
-        init_cache: bool = False,
-        output_attentions: bool = False,
-        fcm_mask: Optional[jnp.ndarray] = None,
     ):
         """The __call__ function is the main function of a TransformerEncoderLayer.
         It takes in hidden states, frequency-domain inputs, and masks as input. It then
@@ -464,22 +383,10 @@ class FlaxLlamaBlock(nn.Module):
 
         Args:
             self: Refer to the class instance itself
-            hidden_states: chex.Array: Pass in the hidden state of the
-                previous layer
-            freq_cis: Tuple[chex.Array, chex.Array],: Pass in the
-                frequency information
-            attention_mask: chex.Array: Mask out the attention weights
-                for padding tokens
-            position_ids: chex.Array: Determine the position of each
-                token in the sequence
-            causal_mask: chex.Array: Mask the attention weights
-            deterministic: bool: Control whether the dropout is applied
-                or not
-            init_cache: bool: Initialize the cache in the attention
-                layer
-            output_attentions: bool: Return the attention weights
-            fcm_mask: Optional[jnp.ndarray]: Mask the self-attention
-        :param : Control the dropout in the self attention layer
+            hidden_states: chex.Array: Pass in the hidden state of the previous layer
+            freq_cis: Tuple[chex.Array, chex.Array],: Pass in the frequency information
+            attention_mask: chex.Array: Mask out the attention weights for padding tokens
+            position_ids: chex.Array: Determine the position of each token in the sequence
 
         Returns:
             A tuple of two items
@@ -491,10 +398,6 @@ class FlaxLlamaBlock(nn.Module):
             position_ids,
             causal_mask,
             segment_ids,
-            deterministic,
-            init_cache,
-            output_attentions,
-            fcm_mask,
         )
         attn_output = attn_outputs[0]
         hidden_states = hidden_states + attn_output
@@ -519,258 +422,7 @@ class FlaxLlamaBlock(nn.Module):
         return (hidden_states,) + attn_outputs[1:]
 
 
-class FlaxLlamaPreTrainedModel(EasyDeLFlaxPretrainedModel):
-    config_class = LlamaConfig
-    base_model_prefix = "model"
-    module_class: nn.Module = None
-
-    def __init__(
-        self,
-        config: LlamaConfig,
-        input_shape: Tuple = (1, 1),
-        seed: int = 0,
-        dtype: jnp.dtype = jnp.float32,
-        _do_init: bool = True,
-        **kwargs,
-    ):
-        """The __init__ function is called when the class is instantiated.
-        It sets up the instance of the class, and defines what happens when it's created.
-        The __init__ function can take arguments, but self is always required (it refers to the instance of the object).
-
-        Args:
-            self: Refer to the object itself
-            config: LlamaConfig: Pass the configuration to the module
-            input_shape: Tuple: Specify the shape of the input to the
-                model
-            seed: int: Set the seed for random number generation
-            dtype: jnp.dtype: Specify the data type of the input
-            _do_init: bool: Control whether the module is initialized or
-                not
-            **kwargs: Pass in any additional parameters that the
-                module_class might need
-        :param : Specify the number of layers in the network
-
-        Returns:
-            The super() of the class
-        """
-        module = self.module_class(config=config, dtype=dtype, **kwargs)
-        super().__init__(
-            config,
-            module,
-            input_shape=input_shape,
-            seed=seed,
-            dtype=dtype,
-            _do_init=_do_init,
-        )
-
-    def init_weights(
-        self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
-    ) -> FrozenDict:
-        """The init_weights function is used to initialize the weights of a model.
-
-        Args:
-            self: Access variables that belong to the class
-            rng: jax.random.PRNGKey: Initialize the weights of the model
-            input_shape: Tuple: Specify the shape of the input tensor
-            params: FrozenDict: Pass in the parameters of a pre-trained
-                model
-
-        Returns:
-            A frozendict of parameters
-        """
-        input_ids = jnp.zeros(input_shape, dtype="i4")
-        attention_mask = jnp.ones_like(input_ids)
-        position_ids = jnp.broadcast_to(
-            jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_shape
-        )
-        params_rng, dropout_rng = jax.random.split(rng)
-        rngs = {"params": params_rng, "dropout": dropout_rng}
-
-        if self.config.add_cross_attention:
-            encoder_hidden_states = jnp.zeros(input_shape + (self.config.hidden_size,))
-            encoder_attention_mask = attention_mask
-            module_init_outputs = self.module.init(
-                rngs,
-                input_ids,
-                attention_mask,
-                position_ids,
-                encoder_hidden_states,
-                encoder_attention_mask,
-                return_dict=False,
-            )
-        else:
-            module_init_outputs = self.module.init(
-                rngs, input_ids, attention_mask, position_ids, return_dict=False
-            )
-
-        random_params = module_init_outputs["params"]
-
-        if params is not None:
-            random_params = flatten_dict(unfreeze(random_params))
-            params = flatten_dict(unfreeze(params))
-            for missing_key in self._missing_keys:
-                params[missing_key] = random_params[missing_key]
-            self._missing_keys = set()
-            return freeze(unflatten_dict(params))
-        else:
-            return random_params
-
-    def init_cache(self, batch_size, max_length):
-        """The init_cache function is used to initialize the cache for a given batch size and sequence length.
-        The cache is a dictionary that contains all the intermediate states from each layer in the model.
-        This allows us to run inference on multiple batches without having to re-run forward passes through every layer in
-        the model, which would be very slow.
-
-        Args:
-            self: Access the module
-            batch_size: Define the batch size of the input tensors
-            max_length: Set the length of the input sequence
-
-        Returns:
-            A dictionary with the following keys:
-        """
-        input_ids = jnp.ones((batch_size, max_length))
-        attention_mask = jnp.ones_like(input_ids)
-        position_ids = jnp.broadcast_to(
-            jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape
-        )
-
-        init_variables = self.module.init(
-            jax.random.PRNGKey(0),
-            input_ids,
-            attention_mask,
-            position_ids,
-            return_dict=False,
-            init_cache=True,
-        )
-        return init_variables["cache"]
-
-    def __call__(
-        self,
-        input_ids: chex.Array,
-        attention_mask: chex.Array = None,
-        position_ids: chex.Array = None,
-        params: dict = None,
-        past_key_values: dict = None,
-        dropout_rng: jax.random.PRNGKey = None,
-        train: bool = False,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
-        add_params_field: bool = False,
-        **kwargs,
-    ):
-        """The __call__ function is the main function of a JAX module.
-        It takes in inputs and returns outputs, but it also has some other important features:
-        - It can take in mutable state (e.g., past_key_values) that will be updated during the call and returned at the end.
-        - It can take in random number generators (rngs) that are used to generate random numbers for dropout or sampling operations.
-
-        Args:
-            self: Represent the instance of the class
-            input_ids: chex.Array: Pass in the input tokens
-            attention_mask: chex.Array: Mask out certain tokens in the
-                input
-            position_ids: chex.Array: Create the positional embeddings
-            params: dict: Pass in the parameters of the model
-            past_key_values: dict: Pass in the past key values from a
-                previous call to __call__
-            dropout_rng: jax.random.PRNGKey: Make sure that the dropout
-                is applied in a random way
-            train: bool: Determine whether to use dropout or not
-            output_attentions: Optional[bool]: Determine whether to
-                return the attention weights
-            output_hidden_states: Optional[bool]: Return the hidden
-                states of all layers
-            return_dict: Optional[bool]: Determine whether to return a
-                dictionary or not
-            extra_embedding: Optional[Union[jnp.ndarray,None]]: Pass in
-                the embedding for the input_ids
-            add_params_field: bool: Add the params field to the inputs
-                dictionary
-
-        Returns:
-            A tuple of the following:
-        """
-        output_attentions = (
-            output_attentions
-            if output_attentions is not None
-            else self.config.output_attentions
-        )
-        output_hidden_states = (
-            output_hidden_states
-            if output_hidden_states is not None
-            else self.config.output_hidden_states
-        )
-        return_dict = (
-            return_dict if return_dict is not None else self.config.return_dict
-        )
-
-        batch_size, sequence_length = input_ids.shape
-
-        assert (
-            sequence_length <= self.config.max_position_embeddings
-        ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
-
-        if position_ids is None:
-            if past_key_values is not None:
-                raise ValueError(
-                    "Make sure to provide `position_ids` when passing `past_key_values`."
-                )
-
-            position_ids = jnp.broadcast_to(
-                jnp.arange(sequence_length)[None, :], (batch_size, sequence_length)
-            )
-
-        if attention_mask is None:
-            attention_mask = jnp.ones((batch_size, sequence_length))
-
-        rngs = {}
-        if dropout_rng is not None:
-            rngs["dropout"] = dropout_rng
-
-        if self.config.bits is not None:
-            rngs["params"] = jax.random.key(0)
-
-        inputs = (
-            {"params": params or self.params}
-            if add_params_field
-            else params or self.params
-        )
-
-        if past_key_values is not None:
-            inputs["cache"] = past_key_values
-            mutable = ["cache"]
-        else:
-            mutable = False
-
-        outputs = self.module.apply(
-            inputs,
-            jnp.array(input_ids, dtype="i4"),
-            jnp.array(attention_mask, dtype="i4"),
-            jnp.array(position_ids, dtype="i4"),
-            not train,
-            False,
-            output_attentions,
-            output_hidden_states,
-            return_dict,
-            extra_embedding,
-            rngs=rngs,
-            mutable=mutable,
-        )
-
-        if past_key_values is not None and return_dict:
-            outputs, past_key_values = outputs
-            outputs["past_key_values"] = unfreeze(past_key_values["cache"])
-            return outputs
-        elif past_key_values is not None and not return_dict:
-            outputs, past_key_values = outputs
-            outputs = outputs[:1] + (unfreeze(past_key_values["cache"]),) + outputs[1:]
-
-        return outputs
-
-
-class FlaxLlamaBlockCollection(nn.Module):
+class LlamaBlockCollection(nn.Module):
     config: LlamaConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -834,26 +486,6 @@ class FlaxLlamaBlockCollection(nn.Module):
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
 
-        if not deterministic and self.config.fcm_max_ratio > 0:
-            # Apply forgetful causal mask
-            batch_size, seq_length = hidden_states.shape[0], hidden_states.shape[1]
-            fcm_ratio = jax.random.uniform(
-                self.make_rng("fcm"),
-                shape=(batch_size, 1, 1, 1),
-                minval=self.config.fcm_min_ratio,
-                maxval=self.config.fcm_max_ratio,
-            )
-            fcm_mask = (
-                jax.random.uniform(
-                    self.make_rng("fcm"), shape=(batch_size, 1, seq_length, seq_length)
-                )
-                > fcm_ratio
-            )
-            fcm_mask = fcm_mask.at[:, :, :, 0].set(True)
-            fcm_mask = fcm_mask.astype("bool")
-        else:
-            fcm_mask = None
-
         for block in self.blocks:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -863,11 +495,6 @@ class FlaxLlamaBlockCollection(nn.Module):
                 freq_cis=freq_cis,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
-                causal_mask=causal_mask,
-                deterministic=deterministic,
-                init_cache=init_cache,
-                output_attentions=output_attentions,
-                fcm_mask=fcm_mask,
             )
             hidden_states = layer_outputs[0]
 
@@ -879,7 +506,7 @@ class FlaxLlamaBlockCollection(nn.Module):
         return outputs
 
 
-class FlaxLlamaModule(nn.Module):
+class LlamaModule(nn.Module):
     config: LlamaConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -1031,7 +658,7 @@ class FlaxLlamaModule(nn.Module):
         )
 
 
-class FlaxLlamaModel(FlaxLlamaPreTrainedModel):
+class LlamaModel(FlaxLlamaPreTrainedModel):
     module_class = FlaxLlamaModule
 
     def set_input_embeddings(self, value):
@@ -1041,7 +668,7 @@ class FlaxLlamaModel(FlaxLlamaPreTrainedModel):
         return self.module.embed_tokens
 
 
-class FlaxLlamaForCausalLMModule(nn.Module):
+class LlamaForCausalLMModule(nn.Module):
     config: LlamaConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -1146,7 +773,7 @@ class FlaxLlamaForCausalLMModule(nn.Module):
         )
 
 
-class FlaxLlamaForCausalLM(FlaxLlamaPreTrainedModel):
+class LlamaForCausalLM(FlaxLlamaPreTrainedModel):
     module_class = FlaxLlamaForCausalLMModule
 
     def set_input_embeddings(self, value):
@@ -1209,7 +836,7 @@ class FlaxLlamaForCausalLM(FlaxLlamaPreTrainedModel):
         return model_kwargs
 
 
-class FlaxLlamaForSequenceClassificationModule(nn.Module):
+class LlamaForSequenceClassificationModule(nn.Module):
     num_classes: int
     config: LlamaConfig
     dtype: jnp.dtype = jnp.float32
@@ -1306,5 +933,5 @@ class FlaxLlamaForSequenceClassificationModule(nn.Module):
             return (prediction,)
 
 
-class FlaxLlamaForSequenceClassification(FlaxLlamaPreTrainedModel):
+class LlamaForSequenceClassification(FlaxLlamaPreTrainedModel):
     module_class = FlaxLlamaForSequenceClassificationModule

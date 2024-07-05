@@ -21,11 +21,11 @@ from transformers.modeling_flax_outputs import (
     FlaxSequenceClassifierOutput,
 )
 
-from easydel.modules.attention_module import AttentionModule
+from easydel.modules.attention_module import FlexibleAttentionModule
 from easydel.modules.common import RMSNorm as RMSNorm
 from easydel.modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 from easydel.modules.flax_modelling_utils import (
-    BaseJAXAttentionModule,
+    BaseAttentionModule,
     control_mlp_sharding,
     get_dot_general_by_bits,
     get_gradient_checkpoint_policy,
@@ -85,6 +85,7 @@ class FlaxQwen1EmbeddingApplyer(nn.Module):
                 query = jnp.concatenate(query_list, axis=0)
                 key = jnp.concatenate(key_list, axis=0)
         return query.astype(self.dtype), key.astype(self.dtype)
+
 
 def compute_qwen1_rope(dim: int, seqlen, base: int | float = 10000, ntk_alpha=1):
     base = base * ntk_alpha ** (dim / (dim - 2))
@@ -156,7 +157,7 @@ class FlaxQwen1MLP(nn.Module):
         return x
 
 
-class FlaxQwen1Attention(BaseJAXAttentionModule):
+class FlaxQwen1Attention(BaseAttentionModule):
     config: Qwen1Config
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -199,7 +200,7 @@ class FlaxQwen1Attention(BaseJAXAttentionModule):
         logn_tensor = jnp.asarray(logn_list)[None, :, None, None]
         self.logn_tensor = logn_tensor
         self.rotary = FlaxQwen1EmbeddingApplyer(self.dtype)
-        self.attention_performer = AttentionModule(
+        self.attention_module = FlexibleAttentionModule(
             use_sharding_constraint=self.config.use_sharding_constraint,
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,
@@ -230,7 +231,6 @@ class FlaxQwen1Attention(BaseJAXAttentionModule):
 
     def _merge_heads(self, hidden_states):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
-
 
     def apply_rotary(
         self,
@@ -387,7 +387,7 @@ class FlaxQwen1Attention(BaseJAXAttentionModule):
 
         query_length, key_length = query_states.shape[1], key_states.shape[1]
 
-        attentions = self.attention_performer.__call__(
+        attentions = self.attention_module.__call__(
             query_states=query_states,
             key_states=key_states,
             value_states=value_states,
@@ -398,7 +398,6 @@ class FlaxQwen1Attention(BaseJAXAttentionModule):
             deterministic=deterministic,
             query_sequence_length=query_length,
             key_value_sequence_length=key_length,
-            uses_cache=self.has_variable("cache", "cached_key") or init_cache,
             segment_ids=segment_ids,
             causal_mask=causal_mask,
         )

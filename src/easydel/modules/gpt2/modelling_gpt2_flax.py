@@ -17,10 +17,11 @@ from typing import Any, Optional, Tuple
 
 import fjformer
 import flax.linen
-from fjformer import linen as nn
 import flax.linen.partitioning
 import jax
 import jax.numpy as jnp
+from fjformer import linen as nn
+from fjformer.linen import Dense
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks, make_causal_mask
 from flax.linen.attention import dot_product_attention_weights
@@ -31,17 +32,17 @@ from transformers.modeling_flax_outputs import (
     FlaxBaseModelOutputWithPastAndCrossAttentions,
     FlaxCausalLMOutputWithCrossAttentions,
 )
+
+from easydel.modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 from easydel.modules.flax_modelling_utils import (
     ACT2FN,
-    with_sharding_constraint,
-    get_dot_general_by_bits,
-    BaseJAXAttentionModule,
-    get_gradient_checkpoint_policy,
+    BaseAttentionModule,
     block_wise_ffn,
+    get_dot_general_by_bits,
+    get_gradient_checkpoint_policy,
+    with_sharding_constraint,
 )
 from easydel.modules.gpt2.gpt2_configuration import GPT2Config as GPT2Config
-from easydel.modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
-from fjformer.linen import Dense
 
 
 class FlaxConv1D(nn.Module):
@@ -80,7 +81,7 @@ class FlaxConv1D(nn.Module):
         return y
 
 
-class FlaxGPT2Attention(BaseJAXAttentionModule):
+class FlaxGPT2Attention(BaseAttentionModule):
     config: GPT2Config
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32

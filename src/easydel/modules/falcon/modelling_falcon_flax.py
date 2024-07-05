@@ -1,31 +1,33 @@
 import math
+from typing import Optional, Tuple, Union
 
-import flax.linen.partitioning
-from flax import linen as nn
-from flax.core import FrozenDict, unfreeze, freeze
-from typing import Optional, Union, Tuple
+import chex
 import flax.linen
-from flax.linen import combine_masks
-from flax.traverse_util import unflatten_dict, flatten_dict
-from jax import numpy as jnp, lax
+import flax.linen.partitioning
 import jax
 from fjformer.linen import Dense
+from flax import linen as nn
+from flax.core import FrozenDict, freeze, unfreeze
+from flax.linen import combine_masks
+from flax.traverse_util import flatten_dict, unflatten_dict
+from jax import lax
+from jax import numpy as jnp
 from jax.sharding import PartitionSpec
-from transformers.modeling_flax_outputs import FlaxCausalLMOutput, FlaxBaseModelOutput
-from easydel.modules.flax_modelling_utils import (
-    get_gradient_checkpoint_policy,
-    with_sharding_constraint,
-    get_dot_general_by_bits,
-    BaseJAXAttentionModule,
-    block_wise_ffn,
-    precompute_freq_cis,
-    apply_rotary_pos_emb,
-    control_mlp_sharding,
-)
-import chex
-from easydel.modules.falcon.falcon_configuration import FalconConfig as FalconConfig
+from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
+
+from easydel.modules.attention_module import FlexibleAttentionModule
 from easydel.modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
-from easydel.modules.attention_module import AttentionModule
+from easydel.modules.falcon.falcon_configuration import FalconConfig as FalconConfig
+from easydel.modules.flax_modelling_utils import (
+    BaseAttentionModule,
+    apply_rotary_pos_emb,
+    block_wise_ffn,
+    control_mlp_sharding,
+    get_dot_general_by_bits,
+    get_gradient_checkpoint_policy,
+    precompute_freq_cis,
+    with_sharding_constraint,
+)
 
 
 def built_bloom_alibi(attention_mask, num_attention_heads):
@@ -57,17 +59,17 @@ def built_bloom_alibi(attention_mask, num_attention_heads):
         extra_power = jnp.arange(1, 1 + 2 * num_rem_heads, 2, dtype=jnp.dtype)
         slops = jnp.concatenate([slops, jnp.power(extra_base, extra_power)], axis=0)
     arange_tensor = (((jnp.cumsum(attention_mask, axis=-1)) - 1) * attention_mask)[
-                    :, jnp.newaxis, :
-                    ]
+        :, jnp.newaxis, :
+    ]
     alibi = slops[..., jnp.newaxis].astype(jnp.bfloat16) * arange_tensor
     return alibi.reshape(batch_size, num_attention_heads, 1, sequence_length)
 
 
 def dropout_add(
-        linen_drop: flax.linen.Dropout,
-        x: chex.Array,
-        residual: chex.Array,
-        deterministic: bool,
+    linen_drop: flax.linen.Dropout,
+    x: chex.Array,
+    residual: chex.Array,
+    deterministic: bool,
 ) -> chex.Array:
     """The dropout_add function is a helper function that adds the residual to the output of
     the dropout layer. This is necessary because we want to use deterministic=True when
@@ -105,7 +107,7 @@ class FlaxFalconRotaryEmbedding(nn.Module):
         return query.astype(self.dtype), key.astype(self.dtype)
 
 
-class FlaxFalconAttention(BaseJAXAttentionModule):
+class FlaxFalconAttention(BaseAttentionModule):
     config: FalconConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -116,8 +118,8 @@ class FlaxFalconAttention(BaseJAXAttentionModule):
         head_dim = config.hidden_size // config.num_attention_heads
         if config.new_decoder_architecture:
             qkv_out_dim = (
-                                  config.num_kv_heads * 2 + config.num_attention_heads
-                          ) * head_dim
+                config.num_kv_heads * 2 + config.num_attention_heads
+            ) * head_dim
         elif config.multi_query:
             qkv_out_dim = config.hidden_size + 2 * head_dim
         else:
@@ -148,7 +150,7 @@ class FlaxFalconAttention(BaseJAXAttentionModule):
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         self.rotary = FlaxFalconRotaryEmbedding(self.dtype)
-        self.attention_performer = AttentionModule(
+        self.attention_module = FlexibleAttentionModule(
             attention_dropout=0.0,
             num_attention_heads=config.num_attention_heads,
             head_dims=self.head_dim,
@@ -159,12 +161,12 @@ class FlaxFalconAttention(BaseJAXAttentionModule):
             mesh=config.get_mesh(),
             sm_scale=self.inv_norm_factor,
             axis_name=config.attention_axis_name,
-            base_module_class=config,
+            base_config=config,
             _do_check=False,
         )
 
     def _split_heads(
-            self, qkv: chex.Array
+        self, qkv: chex.Array
     ) -> Tuple[chex.Array, chex.Array, chex.Array]:
         batch_size, sequence_length, _ = qkv.shape
 
@@ -213,16 +215,16 @@ class FlaxFalconAttention(BaseJAXAttentionModule):
         )
 
     def __call__(
-            self,
-            hidden_states: chex.Array,
-            attention_mask: chex.Array,
-            position_ids: chex.Array,
-            causal_mask: chex.Array = None,
-            alibi: chex.Array = None,
-            freq_cis: Tuple[chex.Array, chex.Array] = None,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            deterministic: bool = False,
+        self,
+        hidden_states: chex.Array,
+        attention_mask: chex.Array,
+        position_ids: chex.Array,
+        causal_mask: chex.Array = None,
+        alibi: chex.Array = None,
+        freq_cis: Tuple[chex.Array, chex.Array] = None,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        deterministic: bool = False,
     ):
         fused_qkv = self.query_key_value(
             hidden_states
@@ -292,7 +294,7 @@ class FlaxFalconAttention(BaseJAXAttentionModule):
         )
 
         if alibi is None:
-            attention = self.attention_performer.__call__(
+            attention = self.attention_module.__call__(
                 query_states=query_layer,
                 key_states=key_layer,
                 value_states=value_layer,
@@ -302,7 +304,6 @@ class FlaxFalconAttention(BaseJAXAttentionModule):
                 segment_ids=None,
                 query_sequence_length=query_length,
                 key_value_sequence_length=key_length,
-                uses_cache=self.has_variable("cache", "cached_key") or init_cache,
                 bias=attention_bias,
                 causal=False,
             )
@@ -445,16 +446,16 @@ class FlaxFalconBlock(nn.Module):
         self.dropout_mlp = flax.linen.Dropout(self.config.hidden_dropout)
 
     def __call__(
-            self,
-            hidden_states: chex.Array,
-            alibi: chex.Array,
-            attention_mask: chex.Array,
-            freq_cis: Tuple[chex.Array, chex.Array],
-            position_ids: chex.Array,
-            causal_mask: chex.Array,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            deterministic: bool = True,
+        self,
+        hidden_states: chex.Array,
+        alibi: chex.Array,
+        attention_mask: chex.Array,
+        freq_cis: Tuple[chex.Array, chex.Array],
+        position_ids: chex.Array,
+        causal_mask: chex.Array,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        deterministic: bool = True,
     ):
         residual = hidden_states
 
@@ -534,17 +535,17 @@ class FlaxFalconCollection(nn.Module):
         ]
 
     def __call__(
-            self,
-            hidden_states: chex.Array,
-            attention_mask: chex.Array,
-            alibi: chex.Array,
-            freq_cis: Tuple[chex.Array, chex.Array],
-            position_ids: chex.Array,
-            causal_mask: chex.Array,
-            output_attentions: bool = False,
-            output_hidden_states: bool = False,
-            init_cache: bool = False,
-            deterministic: bool = True,
+        self,
+        hidden_states: chex.Array,
+        attention_mask: chex.Array,
+        alibi: chex.Array,
+        freq_cis: Tuple[chex.Array, chex.Array],
+        position_ids: chex.Array,
+        causal_mask: chex.Array,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        init_cache: bool = False,
+        deterministic: bool = True,
     ):
         all_hidden_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
@@ -631,15 +632,15 @@ class FlaxFalconModule(nn.Module):
             )
 
     def __call__(
-            self,
-            input_ids: chex.Array,
-            attention_mask: Optional[chex.Array] = None,
-            head_mask: Optional[chex.Array] = None,
-            position_ids: Optional[chex.Array] = None,
-            output_attentions: bool = False,
-            deterministic: bool = True,
-            init_cache: bool = False,
-            return_dict: Optional[bool] = True,
+        self,
+        input_ids: chex.Array,
+        attention_mask: Optional[chex.Array] = None,
+        head_mask: Optional[chex.Array] = None,
+        position_ids: Optional[chex.Array] = None,
+        output_attentions: bool = False,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        return_dict: Optional[bool] = True,
     ):
         batch, sequence_length = input_ids.shape
 
@@ -691,15 +692,15 @@ class FlaxFalconPretrainedModel(EasyDeLFlaxPretrainedModel):
     config_class = FalconConfig
 
     def __init__(
-            self,
-            config,
-            _do_init=False,
-            dtype: jnp.dtype = jnp.float32,
-            param_dtype: jnp.dtype = jnp.float32,
-            input_shape: Tuple = (1, 1),
-            precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision(
-                "fastest"
-            ),
+        self,
+        config,
+        _do_init=False,
+        dtype: jnp.dtype = jnp.float32,
+        param_dtype: jnp.dtype = jnp.float32,
+        input_shape: Tuple = (1, 1),
+        precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision(
+            "fastest"
+        ),
     ):
         module = self.module_class(
             config=config, dtype=dtype, param_dtype=param_dtype, precision=precision
@@ -713,7 +714,7 @@ class FlaxFalconPretrainedModel(EasyDeLFlaxPretrainedModel):
         )
 
     def init_weights(
-            self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
+        self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
     ) -> FrozenDict:
         """The init_weights function is used to initialize the weights of a model.
 
@@ -765,17 +766,17 @@ class FlaxFalconPretrainedModel(EasyDeLFlaxPretrainedModel):
             return random_params
 
     def __call__(
-            self,
-            input_ids: chex.Array,
-            attention_mask: Optional[chex.Array] = None,
-            position_ids: Optional[chex.Array] = None,
-            past_key_values: Optional[nn.Module] = None,
-            output_attentions: bool = False,
-            train: bool = True,
-            return_dict: Optional[bool] = True,
-            params: FrozenDict = None,
-            add_params_field: bool = False,
-            **kwargs,
+        self,
+        input_ids: chex.Array,
+        attention_mask: Optional[chex.Array] = None,
+        position_ids: Optional[chex.Array] = None,
+        past_key_values: Optional[nn.Module] = None,
+        output_attentions: bool = False,
+        train: bool = True,
+        return_dict: Optional[bool] = True,
+        params: FrozenDict = None,
+        add_params_field: bool = False,
+        **kwargs,
     ):
         input_ids = jnp.asarray(input_ids, dtype=jnp.int32)
         inputs = (
@@ -845,7 +846,7 @@ class FlaxFalconPretrainedModel(EasyDeLFlaxPretrainedModel):
         return init_variables["cache"]
 
     def prepare_inputs_for_generation(
-            self, input_ids, max_length, attention_mask: Optional[chex.Array] = None
+        self, input_ids, max_length, attention_mask: Optional[chex.Array] = None
     ):
         batch_size, seq_length = input_ids.shape
 
@@ -904,14 +905,14 @@ class FlaxFalconForCausalLMModule(nn.Module):
         )
 
     def __call__(
-            self,
-            input_ids: chex.Array,
-            attention_mask: Optional[chex.Array] = None,
-            position_ids: Optional[chex.Array] = None,
-            output_attentions: bool = False,
-            deterministic: bool = True,
-            init_cache: Optional[bool] = None,
-            return_dict: Optional[bool] = False,
+        self,
+        input_ids: chex.Array,
+        attention_mask: Optional[chex.Array] = None,
+        position_ids: Optional[chex.Array] = None,
+        output_attentions: bool = False,
+        deterministic: bool = True,
+        init_cache: Optional[bool] = None,
+        return_dict: Optional[bool] = False,
     ):
         transformer_output = self.transformer(
             input_ids=input_ids,

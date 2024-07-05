@@ -10,32 +10,29 @@ import jax
 from einops import rearrange
 from fjformer.bit_quantization import config as q_config
 from fjformer.bit_quantization import q_flax
-from flax import linen as nn
-from flax.linen import combine_masks
+from flax import nnx
 from jax import lax
 from jax import numpy as jnp
 from jax.experimental.mesh_utils import create_device_mesh
-from jax.experimental.shard_map import shard_map
 from jax.interpreters import pxla
-from jax.sharding import PartitionSpec
 
 from easydel.etils.errors import EasyDeLBlockWiseFFNError
 from easydel.etils.partition_module import PartitionAxis
 from easydel.modules.easydel_modelling_utils import EasyMethod
 
 ACT2FN = {
-    "gelu": partial(nn.gelu, approximate=False),
-    "relu": nn.relu,
-    "silu": nn.swish,
-    "swish": nn.swish,
-    "gelu_new": partial(nn.gelu, approximate=True),
-    "gelu_pytorch_tanh": partial(nn.gelu, approximate=True),
-    "tanh": nn.tanh,
-    "sigmoid": nn.sigmoid,
-    "leaky_relu": partial(nn.leaky_relu, negative_slope=0.01),
-    "glu": nn.glu,
-    "elu": nn.elu,
-    "softmax": nn.softmax,
+    "gelu": partial(nnx.gelu, approximate=False),
+    "relu": nnx.relu,
+    "silu": nnx.swish,
+    "swish": nnx.swish,
+    "gelu_new": partial(nnx.gelu, approximate=True),
+    "gelu_pytorch_tanh": partial(nnx.gelu, approximate=True),
+    "tanh": nnx.tanh,
+    "sigmoid": nnx.sigmoid,
+    "leaky_relu": partial(nnx.leaky_relu, negative_slope=0.01),
+    "glu": nnx.glu,
+    "elu": nnx.elu,
+    "softmax": nnx.softmax,
 }
 
 
@@ -396,7 +393,7 @@ def get_dot_general_by_bits(
         raise ValueError("Unknown Quant Method for EasyMethod")
     if bits is not None:
         return {
-            "dot_general_cls": functools.partial(
+            "dot_general": functools.partial(
                 q_flax.QDotGeneral,
                 q_config.fully_quantized(fwd_bits=bits, bwd_bits=bits),
                 rhs_quant_mode=rhs_quant_mode,
@@ -405,223 +402,217 @@ def get_dot_general_by_bits(
     return {}  # empty just in case of not getting any error
 
 
-class BaseJAXAttentionModule(nn.Module):
+class BaseAttentionModule(nnx.Module):
     config: "EasyDeLPretrainedConfig"  # type: ignore  # noqa
 
     @staticmethod
-    def _transpose_sequence_head(query, key, value):
+    def _transpose_sequence_head(*args):
         """The _transpose_sequence_head function transposes the query, key and value matrices.
 
         Args:
-            query: Get the attention weights for each of the heads
-            key: Determine the number of heads
-            value: Store the values of the input
+            *args: arrays to transpose
 
         Returns:
             The transpose of the query, key and value matrices
         """
-        return (
-            jnp.transpose(query, (0, 2, 1, 3)),
-            jnp.transpose(key, (0, 2, 1, 3)),
-            jnp.transpose(value, (0, 2, 1, 3)),
-        )
+        return map(lambda x: jnp.transpose(x, (0, 2, 1, 3), args))
 
-    @nn.compact
-    def _concatenate_to_cache(self, key, value, query_states, attention_mask):
-        """The _concatenate_to_cache function is used to concatenate the key and value vectors
-        of a query_states with those of previous queries. This allows for the attention mechanism to
-        look at all previous queries when computing its output. The function takes in three
-        arguments: key, value, and query_states. It also uses two variables that are stored in the cache:
-        cached_key and cached_value.
+    # def _concatenate_to_cache(self, key, value, query_states, attention_mask):
+    #     """The _concatenate_to_cache function is used to concatenate the key and value vectors
+    #     of a query_states with those of previous queries. This allows for the attention mechanism to
+    #     look at all previous queries when computing its output. The function takes in three
+    #     arguments: key, value, and query_states. It also uses two variables that are stored in the cache:
+    #     cached_key and cached_value.
 
-        Args:
-            self: Access the variables stored in the cache
-            key: Store the keys of the encoder-decoder attention
-            value: Initialize the cached_value variable
-            query_states: Determine the number of cache vectors to
-                update
-            attention_mask: Mask out the padded vectors in the cache
+    #     Args:
+    #         self: Access the variables stored in the cache
+    #         key: Store the keys of the encoder-decoder attention
+    #         value: Initialize the cached_value variable
+    #         query_states: Determine the number of cache vectors to
+    #             update
+    #         attention_mask: Mask out the padded vectors in the cache
 
-        Returns:
-            The key, value and attention_mask
-        """
-        do_quantize_kv_cache = self.config.quantize_kv_cache
-        is_initialized = self.has_variable("cache", "cached_key")
-        if do_quantize_kv_cache:
-            cached_key = self.variable(
-                "cache", "cached_key", jnp.zeros, key.shape, jnp.uint8
-            )
-            cached_value = self.variable(
-                "cache", "cached_value", jnp.zeros, value.shape, jnp.uint8
-            )
-            cached_key_scale = self.variable(
-                "cache",
-                "cached_key_scale",
-                jnp.zeros,
-                key.shape[0:-1] + (1,),
-                key.dtype,
-            )
-            cached_value_scale = self.variable(
-                "cache",
-                "cached_value_scale",
-                jnp.zeros,
-                value.shape[0:-1] + (1,),
-                value.dtype,
-            )
-            cached_key_minval = self.variable(
-                "cache",
-                "cached_key_minval",
-                jnp.zeros,
-                key.shape[0:-1] + (1,),
-                key.dtype,
-            )
-            cached_value_minval = self.variable(
-                "cache",
-                "cached_value_minval",
-                jnp.zeros,
-                value.shape[0:-1] + (1,),
-                value.dtype,
-            )
-            cache_index = self.variable(
-                "cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32)
-            )
-        else:
-            cached_key_scale = None
-            cached_value_scale = None
-            cached_value_minval = None
-            cached_key_minval = None
-            cached_key = self.variable(
-                "cache", "cached_key", jnp.zeros, key.shape, key.dtype
-            )
-            cached_value = self.variable(
-                "cache", "cached_value", jnp.zeros, value.shape, value.dtype
-            )
-            cache_index = self.variable(
-                "cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32)
-            )
-        paxs: PartitionAxis = self.config.partition_axis
-        if is_initialized:
-            *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
-            cur_index = cache_index.value
-            if query_states.shape[1] == 1 and self.config.use_sharded_kv_caching:
-                mesh = self.config.get_mesh()
+    #     Returns:
+    #         The key, value and attention_mask
+    #     """
+    #     do_quantize_kv_cache = self.config.quantize_kv_cache
+    #     is_initialized = self.has_variable("cache", "cached_key")
+    #     if do_quantize_kv_cache:
+    #         cached_key = self.variable(
+    #             "cache", "cached_key", jnp.zeros, key.shape, jnp.uint8
+    #         )
+    #         cached_value = self.variable(
+    #             "cache", "cached_value", jnp.zeros, value.shape, jnp.uint8
+    #         )
+    #         cached_key_scale = self.variable(
+    #             "cache",
+    #             "cached_key_scale",
+    #             jnp.zeros,
+    #             key.shape[0:-1] + (1,),
+    #             key.dtype,
+    #         )
+    #         cached_value_scale = self.variable(
+    #             "cache",
+    #             "cached_value_scale",
+    #             jnp.zeros,
+    #             value.shape[0:-1] + (1,),
+    #             value.dtype,
+    #         )
+    #         cached_key_minval = self.variable(
+    #             "cache",
+    #             "cached_key_minval",
+    #             jnp.zeros,
+    #             key.shape[0:-1] + (1,),
+    #             key.dtype,
+    #         )
+    #         cached_value_minval = self.variable(
+    #             "cache",
+    #             "cached_value_minval",
+    #             jnp.zeros,
+    #             value.shape[0:-1] + (1,),
+    #             value.dtype,
+    #         )
+    #         cache_index = self.variable(
+    #             "cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32)
+    #         )
+    #     else:
+    #         cached_key_scale = None
+    #         cached_value_scale = None
+    #         cached_value_minval = None
+    #         cached_key_minval = None
+    #         cached_key = self.variable(
+    #             "cache", "cached_key", jnp.zeros, key.shape, key.dtype
+    #         )
+    #         cached_value = self.variable(
+    #             "cache", "cached_value", jnp.zeros, value.shape, value.dtype
+    #         )
+    #         cache_index = self.variable(
+    #             "cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32)
+    #         )
+    #     paxs: PartitionAxis = self.config.partition_axis
+    #     if is_initialized:
+    #         *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
+    #         cur_index = cache_index.value
+    #         if query_states.shape[1] == 1 and self.config.use_sharded_kv_caching:
+    #             mesh = self.config.get_mesh()
 
-                def fn(_cached_key, _cached_value, _key, _value, _cur_index):
-                    assert _key.shape[1] == 1 and _value.shape[1] == 1, (
-                        _key.shape,
-                        _value.shape,
-                    )
-                    sp_size = max_length // mesh.shape["sp"]
-                    axis_index = jax.lax.axis_index("sp")
-                    _cur_index = _cur_index - axis_index * sp_size
-                    _key, _value = jax.lax.cond(
-                        jnp.logical_and(_cur_index >= 0, _cur_index < sp_size),
-                        lambda: (
-                            _cached_key.at[:, _cur_index].set(_key[:, -1]),
-                            _cached_value.at[:, _cur_index].set(_value[:, -1]),
-                        ),
-                        lambda: (_cached_key, _cached_value),
-                    )
-                    return _key, _value
+    #             def fn(_cached_key, _cached_value, _key, _value, _cur_index):
+    #                 assert _key.shape[1] == 1 and _value.shape[1] == 1, (
+    #                     _key.shape,
+    #                     _value.shape,
+    #                 )
+    #                 sp_size = max_length // mesh.shape["sp"]
+    #                 axis_index = jax.lax.axis_index("sp")
+    #                 _cur_index = _cur_index - axis_index * sp_size
+    #                 _key, _value = jax.lax.cond(
+    #                     jnp.logical_and(_cur_index >= 0, _cur_index < sp_size),
+    #                     lambda: (
+    #                         _cached_key.at[:, _cur_index].set(_key[:, -1]),
+    #                         _cached_value.at[:, _cur_index].set(_value[:, -1]),
+    #                     ),
+    #                     lambda: (_cached_key, _cached_value),
+    #                 )
+    #                 return _key, _value
 
-                fn = shard_map(
-                    fn,
-                    mesh=mesh,
-                    in_specs=(
-                        PartitionSpec(
-                            paxs.batch_axis,
-                            paxs.key_sequence_axis,
-                            paxs.head_axis,
-                            paxs.attention_dim_axis,
-                        ),
-                        PartitionSpec(
-                            paxs.batch_axis,
-                            paxs.key_sequence_axis,
-                            paxs.head_axis,
-                            paxs.attention_dim_axis,
-                        ),
-                        PartitionSpec(
-                            paxs.batch_axis,
-                            None,
-                            paxs.head_axis,
-                            paxs.attention_dim_axis,
-                        ),
-                        PartitionSpec(
-                            paxs.batch_axis,
-                            None,
-                            paxs.head_axis,
-                            paxs.attention_dim_axis,
-                        ),
-                        PartitionSpec(),
-                    ),
-                    out_specs=(
-                        PartitionSpec(
-                            paxs.batch_axis,
-                            paxs.key_sequence_axis,
-                            paxs.head_axis,
-                            paxs.attention_dim_axis,
-                        ),
-                        PartitionSpec(
-                            paxs.batch_axis,
-                            paxs.key_sequence_axis,
-                            paxs.head_axis,
-                            paxs.attention_dim_axis,
-                        ),
-                    ),
-                    check_rep=False,
-                )
-                key, value = fn(
-                    cached_key.value, cached_value.value, key, value, cur_index
-                )
-            else:
-                *batch_dims, max_length, num_heads, depth_per_head = (
-                    cached_key.value.shape
-                )
-                cur_index = cache_index.value
-                indices = (0,) * len(batch_dims) + (cur_index, 0, 0)  # type:ignore
-                if do_quantize_kv_cache:
-                    key_val = dequantize_kv_cache(
-                        cached_key.value,
-                        cached_key_scale.value,
-                        cached_key_minval.value,
-                        key.dtype,
-                    )
-                    value_val = dequantize_kv_cache(
-                        cached_value.value,
-                        cached_value_scale.value,
-                        cached_key_minval.value,
-                        value.dtype,
-                    )
-                else:
-                    key_val = cached_key.value
-                    value_val = cached_value.value
+    #             fn = shard_map(
+    #                 fn,
+    #                 mesh=mesh,
+    #                 in_specs=(
+    #                     PartitionSpec(
+    #                         paxs.batch_axis,
+    #                         paxs.key_sequence_axis,
+    #                         paxs.head_axis,
+    #                         paxs.attention_dim_axis,
+    #                     ),
+    #                     PartitionSpec(
+    #                         paxs.batch_axis,
+    #                         paxs.key_sequence_axis,
+    #                         paxs.head_axis,
+    #                         paxs.attention_dim_axis,
+    #                     ),
+    #                     PartitionSpec(
+    #                         paxs.batch_axis,
+    #                         None,
+    #                         paxs.head_axis,
+    #                         paxs.attention_dim_axis,
+    #                     ),
+    #                     PartitionSpec(
+    #                         paxs.batch_axis,
+    #                         None,
+    #                         paxs.head_axis,
+    #                         paxs.attention_dim_axis,
+    #                     ),
+    #                     PartitionSpec(),
+    #                 ),
+    #                 out_specs=(
+    #                     PartitionSpec(
+    #                         paxs.batch_axis,
+    #                         paxs.key_sequence_axis,
+    #                         paxs.head_axis,
+    #                         paxs.attention_dim_axis,
+    #                     ),
+    #                     PartitionSpec(
+    #                         paxs.batch_axis,
+    #                         paxs.key_sequence_axis,
+    #                         paxs.head_axis,
+    #                         paxs.attention_dim_axis,
+    #                     ),
+    #                 ),
+    #                 check_rep=False,
+    #             )
+    #             key, value = fn(
+    #                 cached_key.value, cached_value.value, key, value, cur_index
+    #             )
+    #         else:
+    #             *batch_dims, max_length, num_heads, depth_per_head = (
+    #                 cached_key.value.shape
+    #             )
+    #             cur_index = cache_index.value
+    #             indices = (0,) * len(batch_dims) + (cur_index, 0, 0)  # type:ignore
+    #             if do_quantize_kv_cache:
+    #                 key_val = dequantize_kv_cache(
+    #                     cached_key.value,
+    #                     cached_key_scale.value,
+    #                     cached_key_minval.value,
+    #                     key.dtype,
+    #                 )
+    #                 value_val = dequantize_kv_cache(
+    #                     cached_value.value,
+    #                     cached_value_scale.value,
+    #                     cached_key_minval.value,
+    #                     value.dtype,
+    #                 )
+    #             else:
+    #                 key_val = cached_key.value
+    #                 value_val = cached_value.value
 
-                key = lax.dynamic_update_slice(key_val, key, indices)
-                value = lax.dynamic_update_slice(value_val, value, indices)
-                num_updated_cache_vectors = query_states.shape[1]
-                pad_mask = jnp.broadcast_to(
-                    jnp.arange(max_length) < cur_index + num_updated_cache_vectors,
-                    tuple(batch_dims) + (1, num_updated_cache_vectors, max_length),
-                )
-                attention_mask = combine_masks(pad_mask, attention_mask)
-            if do_quantize_kv_cache:
-                kq, ks, km = quantize_kv_cache(key)
-                vq, vs, vm = quantize_kv_cache(value)
+    #             key = lax.dynamic_update_slice(key_val, key, indices)
+    #             value = lax.dynamic_update_slice(value_val, value, indices)
+    #             num_updated_cache_vectors = query_states.shape[1]
+    #             pad_mask = jnp.broadcast_to(
+    #                 jnp.arange(max_length) < cur_index + num_updated_cache_vectors,
+    #                 tuple(batch_dims) + (1, num_updated_cache_vectors, max_length),
+    #             )
+    #             attention_mask = combine_masks(pad_mask, attention_mask)
+    #         if do_quantize_kv_cache:
+    #             kq, ks, km = quantize_kv_cache(key)
+    #             vq, vs, vm = quantize_kv_cache(value)
 
-                cached_key.value = kq
-                cached_key_scale.value = ks.astype(self.dtype)
-                cached_key_minval.value = km.astype(self.dtype)
+    #             cached_key.value = kq
+    #             cached_key_scale.value = ks.astype(self.dtype)
+    #             cached_key_minval.value = km.astype(self.dtype)
 
-                cached_value.value = vq
-                cached_value_scale.value = vs.astype(self.dtype)
-                cached_value_minval.value = vm.astype(self.dtype)
-            else:
-                cached_key.value = key
-                cached_value.value = value
+    #             cached_value.value = vq
+    #             cached_value_scale.value = vs.astype(self.dtype)
+    #             cached_value_minval.value = vm.astype(self.dtype)
+    #         else:
+    #             cached_key.value = key
+    #             cached_value.value = value
 
-            num_updated_cache_vectors = query_states.shape[1]
-            cache_index.value = cache_index.value + num_updated_cache_vectors
-        return key, value, attention_mask
+    #         num_updated_cache_vectors = query_states.shape[1]
+    #         cache_index.value = cache_index.value + num_updated_cache_vectors
+    #     return key, value, attention_mask
+    # TODO: need to be re-created
 
     @staticmethod
     def repeat_key_value(key, value, num_reps: int):
@@ -651,9 +642,9 @@ def block_wise_ffn(remat_ffn, inputs, chunk_size: int, deterministic: bool):
                 return carry, outputs
 
             scan_axis = inputs.ndim - 2
-            _, output = nn.scan(
+            _, output = nnx.scan(
                 scan_ffn,
-                variable_broadcast="params",
+                # variable_broadcast="params",
                 split_rngs={"params": False, "dropout": True},
                 in_axes=scan_axis,
                 out_axes=scan_axis,

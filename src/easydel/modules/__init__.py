@@ -2,7 +2,9 @@ from easydel.modules.arctic import ArcticConfig as ArcticConfig
 from easydel.modules.arctic import FlaxArcticForCausalLM as FlaxArcticForCausalLM
 from easydel.modules.arctic import FlaxArcticModel as FlaxArcticModel
 from easydel.modules.attention_module import AttentionMechanisms as AttentionMechanisms
-from easydel.modules.attention_module import AttentionModule as AttentionModule
+from easydel.modules.attention_module import (
+    FlexibleAttentionModule as FlexibleAttentionModule,
+)
 from easydel.modules.auto_easydel_model import AutoEasyDeLConfig as AutoEasyDeLConfig
 from easydel.modules.auto_easydel_model import (
     AutoEasyDeLModelForCausalLM as AutoEasyDeLModelForCausalLM,

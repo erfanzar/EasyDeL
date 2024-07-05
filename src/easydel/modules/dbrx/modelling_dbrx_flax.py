@@ -6,8 +6,8 @@ import flax.linen
 import flax.struct
 import jax
 import jax.numpy as jnp
-from fjformer.functions import auxiliary_load_balancing_loss_func
 from fjformer import linen as nn
+from fjformer.functions import auxiliary_load_balancing_loss_func
 from fjformer.linen import Dense
 from flax.core import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks
@@ -16,24 +16,27 @@ from jax import lax
 from jax.sharding import PartitionSpec
 from transformers.modeling_flax_outputs import FlaxMaskedLMOutput
 
-from easydel.modules.attention_module import AttentionModule
+from easydel.modules.attention_module import FlexibleAttentionModule
+from easydel.modules.dbrx.dbrx_configuration import (
+    DbrxAttentionConfig as DbrxAttentionConfig,
+)
+from easydel.modules.dbrx.dbrx_configuration import (
+    DbrxConfig as DbrxConfig,
+)
+from easydel.modules.dbrx.dbrx_configuration import (
+    DbrxFFNConfig as DbrxFFNConfig,
+)
 from easydel.modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 
 # easydel.modules
 from easydel.modules.flax_modelling_utils import (
     ACT2FN,
-    BaseJAXAttentionModule,
+    BaseAttentionModule,
     apply_rotary_pos_emb,
     control_mlp_sharding,
     get_dot_general_by_bits,
     precompute_freq_cis,
     with_sharding_constraint,
-)
-
-from easydel.modules.dbrx.dbrx_configuration import (
-    DbrxConfig as DbrxConfig,
-    DbrxFFNConfig as DbrxFFNConfig,
-    DbrxAttentionConfig as DbrxAttentionConfig,
 )
 
 
@@ -66,7 +69,7 @@ class FlaxDbrxEmbedding(nn.Module):
         return query.astype(self.dtype), key.astype(self.dtype)
 
 
-class FlaxDbrxAttention(BaseJAXAttentionModule):
+class FlaxDbrxAttention(BaseAttentionModule):
     config: DbrxConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -102,7 +105,7 @@ class FlaxDbrxAttention(BaseJAXAttentionModule):
         )
 
         self.rotary = FlaxDbrxEmbedding(self.dtype)
-        self.attention_performer = AttentionModule(
+        self.attention_module = FlexibleAttentionModule(
             use_sharding_constraint=self.config.use_sharding_constraint,
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,
@@ -136,7 +139,7 @@ class FlaxDbrxAttention(BaseJAXAttentionModule):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
 
     def apply_rotary(
-            self, batch_size, sequence_length, query, key, value, freq_cis, position_ids
+        self, batch_size, sequence_length, query, key, value, freq_cis, position_ids
     ):
         """The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
         The main difference is that it takes in an additional argument, freq_cis, which are used to calculate
@@ -165,17 +168,17 @@ class FlaxDbrxAttention(BaseJAXAttentionModule):
         return self._transpose_sequence_head(query, key, value)
 
     def __call__(
-            self,
-            hidden_states: chex.Array,
-            freq_cis: Tuple[chex.Array, chex.Array],
-            attention_mask: chex.Array,
-            position_ids: chex.Array,
-            causal_mask: chex.Array,
-            segment_ids: Optional[chex.Array] = None,
-            deterministic: bool = True,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            fcm_mask=None,
+        self,
+        hidden_states: chex.Array,
+        freq_cis: Tuple[chex.Array, chex.Array],
+        attention_mask: chex.Array,
+        position_ids: chex.Array,
+        causal_mask: chex.Array,
+        segment_ids: Optional[chex.Array] = None,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        fcm_mask=None,
     ):
         """The __call__ function is the main function of a JAX module. It defines how the module behaves when called
         with inputs. The __call__ function can be thought of as a &quot;forward pass&quot; through the model,
@@ -270,7 +273,9 @@ class FlaxDbrxAttention(BaseJAXAttentionModule):
                 key_states, value_states, query_states, attention_mask
             )
 
-        key_states, value_states = self.repeat_key_value(key_states, value_states, self.num_key_value_groups)
+        key_states, value_states = self.repeat_key_value(
+            key_states, value_states, self.num_key_value_groups
+        )
         assert_msg = (
             "num_attention_heads repeat wont work likely\n"
             f"INFO :\n\trepeat_key_values Used with num_key_value_groups = {self.num_key_value_groups}\n\t"
@@ -291,7 +296,7 @@ class FlaxDbrxAttention(BaseJAXAttentionModule):
 
         query_length, key_length = query_states.shape[1], key_states.shape[1]
 
-        attentions = self.attention_performer.__call__(
+        attentions = self.attention_module.__call__(
             query_states=query_states,
             key_states=key_states,
             value_states=value_states,
@@ -302,7 +307,6 @@ class FlaxDbrxAttention(BaseJAXAttentionModule):
             deterministic=deterministic,
             query_sequence_length=query_length,
             key_value_sequence_length=key_length,
-            uses_cache=self.has_variable("cache", "cached_key") or init_cache,
             segment_ids=segment_ids,
             causal_mask=causal_mask,
         )
@@ -344,17 +348,17 @@ class FlaxDbrxNormAttentionNorm(nn.Module):
         self.dropout = flax.linen.Dropout(self.config.resid_pdrop)
 
     def __call__(
-            self,
-            hidden_states: chex.Array,
-            freq_cis: Tuple[chex.Array, chex.Array],
-            attention_mask: chex.Array,
-            position_ids: chex.Array,
-            causal_mask: chex.Array,
-            segment_ids: Optional[chex.Array] = None,
-            deterministic: bool = True,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            fcm_mask=None,
+        self,
+        hidden_states: chex.Array,
+        freq_cis: Tuple[chex.Array, chex.Array],
+        attention_mask: chex.Array,
+        position_ids: chex.Array,
+        causal_mask: chex.Array,
+        segment_ids: Optional[chex.Array] = None,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        fcm_mask=None,
     ):
         residual_states = hidden_states
         hidden_states = self.norm_1(hidden_states)
@@ -438,20 +442,20 @@ class FlaxDbrxExperts(nn.Module):
         )
 
     def __call__(
-            self,
-            x: chex.Array,
-            weights: chex.Array,
-            top_weights: chex.Array,
-            top_experts: chex.Array,
+        self,
+        x: chex.Array,
+        weights: chex.Array,
+        top_weights: chex.Array,
+        top_experts: chex.Array,
     ):
         final_hidden_state = jnp.zeros_like(x)
         for index in range(self.config.ffn_config.moe_num_experts):
             output_moe_layer = self.mlp(x, index)
             final_hidden_state += (
-                    jnp.sum(jnp.multiply(index == top_experts, top_weights), axis=-1)[
+                jnp.sum(jnp.multiply(index == top_experts, top_weights), axis=-1)[
                     :, :, None
-                    ]
-                    * output_moe_layer
+                ]
+                * output_moe_layer
             )
         return final_hidden_state
 
@@ -491,7 +495,7 @@ class FlaxDbrxRouter(nn.Module):
         return low + noise * (high - low)
 
     def __call__(
-            self, x: chex.Array, deterministic: bool = True
+        self, x: chex.Array, deterministic: bool = True
     ) -> Tuple[chex.Array, chex.Array, chex.Array]:
         if not deterministic and self.moe_jitter_eps is not None:
             x = x * self.jitter(x)
@@ -513,15 +517,15 @@ class FlaxDbrxRouter(nn.Module):
         if self.uniform_expert_assignment:
             top_experts = jax.lax.stop_gradient(
                 (
-                        jnp.arange(
-                            0,
-                            jnp.prod(
-                                jnp.asarray(top_experts.shape, dtype=jnp.int32),
-                                dtype=jnp.int32,
-                            ),
-                            dtype=top_experts.dtype,
-                        )
-                        % self.moe_num_experts
+                    jnp.arange(
+                        0,
+                        jnp.prod(
+                            jnp.asarray(top_experts.shape, dtype=jnp.int32),
+                            dtype=jnp.int32,
+                        ),
+                        dtype=top_experts.dtype,
+                    )
+                    % self.moe_num_experts
                 ).reshape(top_experts.shape)
             )
 
@@ -552,7 +556,7 @@ class FlaxDbrxFFN(nn.Module):
         )
 
     def __call__(
-            self, x: chex.Array, deterministic: bool = False
+        self, x: chex.Array, deterministic: bool = False
     ) -> Tuple[chex.Array, chex.Array]:
         x = control_mlp_sharding(x, self.config.partition_axis)
         weights, top_weights, top_experts = self.router(x, deterministic=deterministic)
@@ -583,18 +587,18 @@ class FlaxDbrxBlock(nn.Module):
         )
 
     def __call__(
-            self,
-            hidden_states: chex.Array,
-            freq_cis: Tuple[chex.Array, chex.Array],
-            attention_mask: chex.Array,
-            position_ids: chex.Array,
-            causal_mask: chex.Array,
-            segment_ids: Optional[chex.Array] = None,
-            deterministic: bool = True,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            output_router_logits: bool = False,
-            fcm_mask=None,
+        self,
+        hidden_states: chex.Array,
+        freq_cis: Tuple[chex.Array, chex.Array],
+        attention_mask: chex.Array,
+        position_ids: chex.Array,
+        causal_mask: chex.Array,
+        segment_ids: Optional[chex.Array] = None,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        output_router_logits: bool = False,
+        fcm_mask=None,
     ):
         resid_states, hidden_states, self_attn_weights = self.norm_attn_norm(
             hidden_states=hidden_states,
@@ -641,19 +645,19 @@ class FlaxDbrxBlockCollection(nn.Module):
         ]
 
     def __call__(
-            self,
-            hidden_states: chex.Array,
-            freq_cis: Tuple[chex.Array, chex.Array],
-            attention_mask: chex.Array,
-            position_ids: chex.Array,
-            causal_mask: chex.Array,
-            segment_ids: Optional[chex.Array] = None,
-            deterministic: bool = True,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            output_router_logits: bool = False,
-            output_hidden_states: bool = False,
-            fcm_mask=None,
+        self,
+        hidden_states: chex.Array,
+        freq_cis: Tuple[chex.Array, chex.Array],
+        attention_mask: chex.Array,
+        position_ids: chex.Array,
+        causal_mask: chex.Array,
+        segment_ids: Optional[chex.Array] = None,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        output_router_logits: bool = False,
+        output_hidden_states: bool = False,
+        fcm_mask=None,
     ):
         all_hidden_states = ()
         all_router_logits = ()
@@ -693,15 +697,15 @@ class DbrxPreTrainedModel(EasyDeLFlaxPretrainedModel):
     base_model_prefix = "model"
 
     def __init__(
-            self,
-            config: DbrxConfig,
-            dtype: jnp.dtype = jnp.bfloat16,
-            param_dtype: jnp.dtype = jnp.bfloat16,
-            precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
-            input_shape: Tuple[int, int] = (1, 1),
-            seed: int = 0,
-            _do_init: bool = False,
-            **kwargs,
+        self,
+        config: DbrxConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
+        input_shape: Tuple[int, int] = (1, 1),
+        seed: int = 0,
+        _do_init: bool = False,
+        **kwargs,
     ):
         module = self.module_class(
             config=config,
@@ -721,7 +725,7 @@ class DbrxPreTrainedModel(EasyDeLFlaxPretrainedModel):
         )
 
     def init_weights(
-            self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
+        self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
     ) -> FrozenDict:
         """The init_weights function is used to initialize the weights of a model.
         It takes in a rng, which is a random number generator key that can be used to generate random numbers.
@@ -801,20 +805,20 @@ class DbrxPreTrainedModel(EasyDeLFlaxPretrainedModel):
         return init_variables["cache"]
 
     def __call__(
-            self,
-            input_ids: chex.Array,
-            attention_mask: Optional[chex.Array] = None,
-            position_ids: Optional[chex.Array] = None,
-            params: dict = None,
-            past_key_values: dict = None,
-            dropout_rng: jax.random.PRNGKey = None,
-            train: bool = False,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            output_router_logits: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
-            add_params_field: bool = False,
-            **kwargs,
+        self,
+        input_ids: chex.Array,
+        attention_mask: Optional[chex.Array] = None,
+        position_ids: Optional[chex.Array] = None,
+        params: dict = None,
+        past_key_values: dict = None,
+        dropout_rng: jax.random.PRNGKey = None,
+        train: bool = False,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        output_router_logits: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        add_params_field: bool = False,
+        **kwargs,
     ):
         """The __call__ function is the main function of a JAX module.
         It takes as input:
@@ -985,17 +989,17 @@ class FlaxDbrxModule(nn.Module):
         )
 
     def __call__(
-            self,
-            input_ids: chex.Array,
-            attention_mask: chex.Array,
-            position_ids: chex.Array,
-            inputs_embeds: Optional[chex.Array] = None,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            output_router_logits: Optional[bool] = None,
-            init_cache: bool = False,
-            deterministic: bool = True,
-            return_dict: bool = True,
+        self,
+        input_ids: chex.Array,
+        attention_mask: chex.Array,
+        position_ids: chex.Array,
+        inputs_embeds: Optional[chex.Array] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        output_router_logits: Optional[bool] = None,
+        init_cache: bool = False,
+        deterministic: bool = True,
+        return_dict: bool = True,
     ) -> Union[Tuple, MoeModelOutput]:
         if output_router_logits is None:
             output_router_logits = self.config.output_router_logits
@@ -1098,17 +1102,17 @@ class FlaxDbrxForCausalLMModule(nn.Module):
         )
 
     def __call__(
-            self,
-            input_ids: chex.Array,
-            attention_mask: Optional[chex.Array] = None,
-            position_ids: Optional[chex.Array] = None,
-            inputs_embeds: Optional[chex.Array] = None,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            output_router_logits: Optional[bool] = None,
-            init_cache: bool = False,
-            deterministic: bool = True,
-            return_dict: bool = True,
+        self,
+        input_ids: chex.Array,
+        attention_mask: Optional[chex.Array] = None,
+        position_ids: Optional[chex.Array] = None,
+        inputs_embeds: Optional[chex.Array] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        output_router_logits: Optional[bool] = None,
+        init_cache: bool = False,
+        deterministic: bool = True,
+        return_dict: bool = True,
     ) -> MoeCausalLMOutput | Tuple:
 
         if output_router_logits is None:
@@ -1167,7 +1171,7 @@ class FlaxDbrxForCausalLM(DbrxPreTrainedModel):
     module_class = FlaxDbrxForCausalLMModule
 
     def prepare_inputs_for_generation(
-            self, input_ids, max_length, attention_mask: Optional[chex.Array] = None
+        self, input_ids, max_length, attention_mask: Optional[chex.Array] = None
     ):
         """
         The prepare_inputs_for_generation function is used to prepare the inputs for a generation task.

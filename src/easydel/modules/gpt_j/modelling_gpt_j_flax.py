@@ -43,15 +43,14 @@ from jax.sharding import PartitionSpec
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 from transformers.utils import logging
 
-from easydel.modules.attention_module import AttentionModule
+from easydel.modules.attention_module import FlexibleAttentionModule
 from easydel.modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 from easydel.modules.flax_modelling_utils import (
     ACT2FN,
-    BaseJAXAttentionModule,
+    BaseAttentionModule,
     block_wise_ffn,
     get_gradient_checkpoint_policy,
 )
-
 from easydel.modules.gpt_j.gpt_j_configuration import GPTJConfig as GPTJConfig
 
 logger = logging.get_logger(__name__)
@@ -89,7 +88,7 @@ def apply_rotary_pos_emb(tensor, sincos):
     return (tensor * cos_pos) + (rotate_every_two(tensor) * sin_pos)
 
 
-class FlaxGPTJAttention(BaseJAXAttentionModule):
+class FlaxGPTJAttention(BaseAttentionModule):
     config: GPTJConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -137,7 +136,7 @@ class FlaxGPTJAttention(BaseJAXAttentionModule):
             config.max_position_embeddings, pos_embd_dim
         )
 
-        self.attention_performer = AttentionModule(
+        self.attention_module = FlexibleAttentionModule(
             use_sharding_constraint=self.config.use_sharding_constraint,
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,
@@ -262,7 +261,7 @@ class FlaxGPTJAttention(BaseJAXAttentionModule):
 
         query_length, key_length = query.shape[1], key.shape[1]
         # usual dot product attention
-        attentions = self.attention_performer.__call__(
+        attentions = self.attention_module.__call__(
             query_states=query,
             key_states=key,
             value_states=value,
@@ -273,7 +272,6 @@ class FlaxGPTJAttention(BaseJAXAttentionModule):
             deterministic=deterministic,
             query_sequence_length=query_length,
             key_value_sequence_length=key_length,
-            uses_cache=self.has_variable("cache", "cached_key") or init_cache,
             segment_ids=segment_ids,
             causal_mask=causal_mask,
         )

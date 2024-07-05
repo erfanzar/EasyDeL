@@ -1,6 +1,6 @@
-# AttentionModule: A Versatile Attention Mechanism Factory
+# FlexibleAttentionModule: A Versatile Attention Mechanism Factory
 
-The `AttentionModule` class is designed to simplify the creation and execution of different attention mechanisms within
+The `FlexibleAttentionModule` class is designed to simplify the creation and execution of different attention mechanisms within
 your EasyDeL models. It provides a unified interface for working with various attention types, allowing you to easily
 switch between them and experiment with different configurations.
 
@@ -25,9 +25,9 @@ switch between them and experiment with different configurations.
     - During initialization, you provide the desired `attn_mechanism`, JAX `mesh` for sharding, scaling
       factor (`sm_scale`), number of attention heads, head dimensions, and other configuration parameters.
     - The class automatically sets default values for many parameters based on the chosen attention mechanism and the
-      provided EasyDeL configuration (`base_module_class`).
+      provided EasyDeL configuration (`base_config`).
 2. **Calling the Module:**
-    - When you call the `AttentionModule` object, you pass in the query, key, and value states, along with optional
+    - When you call the `FlexibleAttentionModule` object, you pass in the query, key, and value states, along with optional
       parameters like attention masks, biases, and causal flags.
     - The module internally selects the appropriate attention function based on the specified `attn_mechanism`.
     - It performs any necessary sharding and partitioning based on the configured partition specifications.
@@ -38,7 +38,7 @@ switch between them and experiment with different configurations.
 * **Flexibility:**  Allows you to easily switch between different attention mechanisms without major code changes.
 * **Efficiency:**  Supports advanced JAX sharding for distributed computation, enabling the handling of large models.
 
-AttentionModule is a EasyDeL module that can perform attention operation with different strategies to help user achieve
+FlexibleAttentionModule is a EasyDeL module that can perform attention operation with different strategies to help user achieve
 the best possible performance and numerical stability, here are some strategies supported right now.
 
 1. Flash Attention TPU known as "flash"
@@ -55,10 +55,10 @@ the best possible performance and numerical stability, here are some strategies 
 
 in order to test which attention module in what axis dims works best for you you can run
 ```python
-from easydel import AttentionModule
+from easydel import FlexibleAttentionModule
 
 print(
-    AttentionModule.test_attentions(
+    FlexibleAttentionModule.test_attentions(
         axis_dims=(1, 1, 1, -1),
         sequence_length=128 * 8,
         num_attention_heads=32,
@@ -76,7 +76,7 @@ import jax
 import flax.linen.attention as flt
 from fjformer import GenerateRNG
 from easydel import PartitionAxis
-from easydel.modules.attention_module import AttentionModule
+from easydel.modules.attention_module import FlexibleAttentionModule
 from easydel.modules.easydel_modelling_utils import EasyDeLPretrainedConfig
 from jax import numpy as jnp, random, lax
 import math
@@ -130,7 +130,7 @@ q, k, v, attention_mask, causal_mask, attention_bias = make_fake_input_data(
     HEAD_DIM
 )
 
-flash_attention = AttentionModule(
+flash_attention = FlexibleAttentionModule(
 
     block_k_major=config.block_k_major,
     block_b=config.block_b,
@@ -163,7 +163,7 @@ flash_attention = AttentionModule(
     sm_scale=1 / math.sqrt(q.shape[-1]),
 )
 
-normal_attention = AttentionModule(
+normal_attention = FlexibleAttentionModule(
 
     block_k_major=config.block_k_major,
     block_b=config.block_b,
