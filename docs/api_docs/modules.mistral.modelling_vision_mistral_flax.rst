@@ -2,6 +2,6 @@
 ================================================
 
 .. automodule:: easydel.modules.mistral.modelling_vision_mistral_flax
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

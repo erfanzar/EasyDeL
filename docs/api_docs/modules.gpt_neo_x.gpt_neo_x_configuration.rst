@@ -2,6 +2,6 @@
 ============================================
 
 .. automodule:: easydel.modules.gpt_neo_x.gpt_neo_x_configuration
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

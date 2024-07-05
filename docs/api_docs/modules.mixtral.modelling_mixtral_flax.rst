@@ -2,6 +2,6 @@
 =========================================
 
 .. automodule:: easydel.modules.mixtral.modelling_mixtral_flax
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

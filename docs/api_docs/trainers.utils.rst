@@ -2,6 +2,6 @@
 ================
 
 .. automodule:: easydel.trainers.utils
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

@@ -2,6 +2,6 @@
 ======================================
 
 .. automodule:: easydel.modules.grok_1.grok_1_configuration
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

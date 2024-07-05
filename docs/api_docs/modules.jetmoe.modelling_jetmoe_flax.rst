@@ -2,6 +2,6 @@
 =======================================
 
 .. automodule:: easydel.modules.jetmoe.modelling_jetmoe_flax
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

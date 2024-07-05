@@ -2,6 +2,6 @@
 ==================================
 
 .. automodule:: easydel.modules.dbrx.dbrx_configuration
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

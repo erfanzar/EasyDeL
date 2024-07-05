@@ -2,6 +2,6 @@
 ===================================
 
 .. automodule:: easydel.modules.olmo.modelling_olmo_flax
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

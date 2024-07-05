@@ -2,6 +2,6 @@
 ============================
 
 .. automodule:: easydel.modules._vanilla_attention
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

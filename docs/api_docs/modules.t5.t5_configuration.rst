@@ -2,6 +2,6 @@
 ==============================
 
 .. automodule:: easydel.modules.t5.t5_configuration
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

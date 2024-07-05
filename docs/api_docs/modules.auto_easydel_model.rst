@@ -2,6 +2,6 @@
 =============================
 
 .. automodule:: easydel.modules.auto_easydel_model
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

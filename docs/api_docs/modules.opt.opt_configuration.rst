@@ -2,6 +2,6 @@
 ================================
 
 .. automodule:: easydel.modules.opt.opt_configuration
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

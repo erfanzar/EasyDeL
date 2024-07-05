@@ -2,6 +2,6 @@
 =============================================
 
 .. automodule:: easydel.modules.lucid_transformer.lt_configuration
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

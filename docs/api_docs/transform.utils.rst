@@ -2,6 +2,6 @@
 ================
 
 .. automodule:: easydel.transform.utils
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

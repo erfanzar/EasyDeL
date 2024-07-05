@@ -2,6 +2,6 @@
 ===========================================
 
 .. automodule:: easydel.modules.stablelm.modelling_stablelm_flax
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

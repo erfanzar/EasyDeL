@@ -2,6 +2,6 @@
 ==============================================
 
 .. automodule:: easydel.modules.lucid_transformer.modelling_lt_flax
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

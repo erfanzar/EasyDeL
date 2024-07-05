@@ -2,6 +2,6 @@
 ===============================
 
 .. automodule:: easydel.modules.t5.modelling_t5_flax
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

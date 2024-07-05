@@ -2,6 +2,6 @@
 ===================================
 
 .. automodule:: easydel.modules.gpt2.modelling_gpt2_flax
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

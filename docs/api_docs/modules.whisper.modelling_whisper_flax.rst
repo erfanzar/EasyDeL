@@ -2,6 +2,6 @@
 =========================================
 
 .. automodule:: easydel.modules.whisper.modelling_whisper_flax
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

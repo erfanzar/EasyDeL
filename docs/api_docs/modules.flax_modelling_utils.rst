@@ -2,6 +2,6 @@
 ===============================
 
 .. automodule:: easydel.modules.flax_modelling_utils
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

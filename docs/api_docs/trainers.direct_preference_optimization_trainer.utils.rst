@@ -2,6 +2,6 @@
 =======================================================
 
 .. automodule:: easydel.trainers.direct_preference_optimization_trainer.utils
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

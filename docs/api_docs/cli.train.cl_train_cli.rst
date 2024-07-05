@@ -2,6 +2,6 @@
 =============================
 
 .. automodule:: easydel.cli.train.cl_train_cli
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

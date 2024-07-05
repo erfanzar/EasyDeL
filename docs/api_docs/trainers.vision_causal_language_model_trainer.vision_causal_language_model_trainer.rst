@@ -2,6 +2,6 @@
 ====================================================================================
 
 .. automodule:: easydel.trainers.vision_causal_language_model_trainer.vision_causal_language_model_trainer
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

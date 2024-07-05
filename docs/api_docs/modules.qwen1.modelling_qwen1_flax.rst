@@ -2,6 +2,6 @@
 =====================================
 
 .. automodule:: easydel.modules.qwen1.modelling_qwen1_flax
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

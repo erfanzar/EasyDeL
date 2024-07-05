@@ -2,6 +2,6 @@
 ====================================
 
 .. automodule:: easydel.inference.generation_pipeline.utils
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

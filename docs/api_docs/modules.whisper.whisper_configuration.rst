@@ -2,6 +2,6 @@
 ========================================
 
 .. automodule:: easydel.modules.whisper.whisper_configuration
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

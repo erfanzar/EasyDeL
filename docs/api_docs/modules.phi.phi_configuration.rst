@@ -2,6 +2,6 @@
 ================================
 
 .. automodule:: easydel.modules.phi.phi_configuration
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

@@ -2,6 +2,6 @@
 ===================
 
 .. automodule:: easydel.kernels.rms_norm
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

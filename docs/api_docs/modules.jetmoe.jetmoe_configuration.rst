@@ -2,6 +2,6 @@
 ======================================
 
 .. automodule:: easydel.modules.jetmoe.jetmoe_configuration
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

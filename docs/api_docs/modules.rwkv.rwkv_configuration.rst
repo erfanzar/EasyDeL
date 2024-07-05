@@ -2,6 +2,6 @@
 ==================================
 
 .. automodule:: easydel.modules.rwkv.rwkv_configuration
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

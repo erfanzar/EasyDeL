@@ -2,6 +2,6 @@
 ========================================
 
 .. automodule:: easydel.modules.mosaic_mpt.modelling_mpt_flax
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

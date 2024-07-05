@@ -2,6 +2,6 @@
 =============================================
 
 .. automodule:: easydel.modules.deepseek_v2.modeling_deepseek_flax
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

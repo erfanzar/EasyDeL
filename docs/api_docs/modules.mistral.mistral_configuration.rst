@@ -2,6 +2,6 @@
 ========================================
 
 .. automodule:: easydel.modules.mistral.mistral_configuration
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

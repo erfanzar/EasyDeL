@@ -2,6 +2,6 @@
 ===================================
 
 .. automodule:: easydel.modules.phi3.modelling_phi3_flax
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

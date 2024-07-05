@@ -2,6 +2,6 @@
 =================
 
 .. automodule:: easydel.etils.errors
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

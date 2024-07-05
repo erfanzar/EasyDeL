@@ -2,6 +2,6 @@
 ====================
 
 .. automodule:: easydel.etils.easystate
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

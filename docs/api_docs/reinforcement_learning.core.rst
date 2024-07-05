@@ -2,6 +2,6 @@
 ===============
 
 .. automodule:: easydel.reinforcement_learning.core
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

@@ -2,6 +2,6 @@
 ====================================
 
 .. automodule:: easydel.modules.llama.llama_configuration
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

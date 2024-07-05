@@ -2,6 +2,6 @@
 ==============================
 
 .. automodule:: easydel.modules._blockwise_attention
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

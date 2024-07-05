@@ -2,6 +2,6 @@
 =============================
 
 .. automodule:: easydel.reinforcement_learning.trainer.ppo_config
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

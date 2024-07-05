@@ -2,6 +2,6 @@
 ========================================
 
 .. automodule:: easydel.modules.mixtral.mixtral_configuration
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

@@ -2,6 +2,6 @@
 ======================
 
 .. automodule:: easydel.utils.lazy_import
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

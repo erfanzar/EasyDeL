@@ -2,6 +2,6 @@
 ==================================
 
 .. automodule:: easydel.modules.palm.palm_configuration
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

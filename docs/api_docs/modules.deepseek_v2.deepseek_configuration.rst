@@ -2,6 +2,6 @@
 =============================================
 
 .. automodule:: easydel.modules.deepseek_v2.deepseek_configuration
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

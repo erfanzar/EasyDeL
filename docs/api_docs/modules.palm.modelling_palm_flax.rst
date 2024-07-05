@@ -2,6 +2,6 @@
 ===================================
 
 .. automodule:: easydel.modules.palm.modelling_palm_flax
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

@@ -2,6 +2,6 @@
 ===================================
 
 .. automodule:: easydel.modules.dbrx.modelling_dbrx_flax
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:

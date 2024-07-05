@@ -2,6 +2,6 @@
 ======================================
 
 .. automodule:: easydel.modules.cohere.cohere_configuration
-    :members:
+    :special-members:
     :undoc-members:
     :show-inheritance:
