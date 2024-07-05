@@ -1,7 +1,6 @@
 ``core`` module
 ===============
 
-```{eval-rst}
 .. automodule:: easydel.reinforcement_learning.core
     :members:
     :undoc-members:

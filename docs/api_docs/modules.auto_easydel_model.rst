@@ -1,7 +1,6 @@
 ``auto easydel model`` module
 =============================
 
-```{eval-rst}
 .. automodule:: easydel.modules.auto_easydel_model
     :members:
     :undoc-members:

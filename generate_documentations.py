@@ -135,7 +135,7 @@ def create_rst(name, children, output_dir):
             rst_file.write(f"{name.replace('_', ' ')}\n{'=' * len(name)}\n\n")
             children = children.replace(".rst", "")
             rst_file.write(
-                "```{eval-rst}\n"+
+                # "```{eval-rst}\n"+
                 f".. automodule:: {children}\n"
                 f"    :members:\n"
                 f"    :undoc-members:\n"

@@ -1,7 +1,6 @@
 ``llama/modelling vision llama flax`` module
 ============================================
 
-```{eval-rst}
 .. automodule:: easydel.modules.llama.modelling_vision_llama_flax
     :members:
     :undoc-members:
