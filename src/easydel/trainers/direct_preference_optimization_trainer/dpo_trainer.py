@@ -5,15 +5,13 @@ import typing
 import warnings
 from abc import ABC
 from collections import defaultdict
+from typing import Any, Callable, Dict, Literal, Mapping, Optional, Union
 
 import flax.core
 import jax
 import tensorflow.data  # type:ignore
 import tensorflow_datasets
 import termcolor
-
-from typing import Any, Callable, Dict, Literal, Mapping, Optional, Union
-
 from datasets import Dataset
 from fjformer import make_shard_and_gather_fns, match_partition_rules
 from jax import numpy as jnp
@@ -103,10 +101,10 @@ class DPOTrainer(BaseTrainer, ABC):
             train(self) -> DPOTrainerOutput: Trains the DPO model and returns the training output.
             eval(self, model_state: EasyDeLState) -> Iterator[dict]: Evaluates the DPO model and yields evaluation metrics.
 
-        **Examples:**
+    **Examples:**
 
 
-    .. code-block:: python
+
 
         >>> import easydel
         >>> from easydel import (

@@ -2,15 +2,13 @@ import copy
 import os
 import time
 import typing
-
-import termcolor
-from flax.core import FrozenDict
-
 from typing import Callable, Mapping, Optional, Tuple
 
 import flax
 import jax
+import termcolor
 from fjformer import make_shard_and_gather_fns, match_partition_rules
+from flax.core import FrozenDict
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from tqdm.autonotebook import tqdm
@@ -54,7 +52,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
                 eval(self, model_state: EasyDeLState) -> typing.Iterator[dict]:
                     Evaluates the CLM and yields evaluation metrics.
 
-        .. code-block:: python
+
 
         >>> import jax.lax
         >>> from easydel import (
@@ -183,7 +181,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
 
     ### With Using LoRA and XRapture
 
-    .. code-block:: python
+
 
         >>> from flax.core import FrozenDict
         >>> from easydel import (
@@ -316,6 +314,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
         >>> # you are using LoRA or transfer Learning
         >>> print(f"Hey ! , here's where your model saved {output.checkpoint_path}")
     """
+
     def create_collect_function(
         self,
         max_sequence_length: int,
@@ -335,6 +334,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
         Returns:
             Callable: A function that takes a batch of data and returns a processed batch.
         """
+
         def collate_fn(batch):
             results = {}
             for key in batch[0].keys():
@@ -1007,12 +1007,12 @@ class CausalLanguageModelTrainer(BaseTrainer):
         """
         Evaluates the Causal Language Model (CLM) using the provided model state.
 
-        This method iterates over the evaluation dataset, performs forward passes, 
-        calculates evaluation metrics, logs the metrics, and yields the metrics for 
+        This method iterates over the evaluation dataset, performs forward passes,
+        calculates evaluation metrics, logs the metrics, and yields the metrics for
         each evaluation step.
 
         Args:
-            model_state (EasyDeLState): The EasyDeLState object containing the model parameters 
+            model_state (EasyDeLState): The EasyDeLState object containing the model parameters
                                         and other relevant information.
 
         Yields:

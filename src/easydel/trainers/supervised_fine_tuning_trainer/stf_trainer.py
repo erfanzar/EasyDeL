@@ -72,7 +72,7 @@ class SFTTrainer(CausalLanguageModelTrainer, ABC):
 
     **Examples:**
 
-    .. code-block:: python
+
         >>> import jax.lax
         >>> from easydel import (
         ...     TrainArguments,
