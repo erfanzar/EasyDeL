@@ -1,7 +1,8 @@
 ``serve engine/client`` module
 ==============================
 
+```{eval-rst}
 .. automodule:: easydel.inference.serve_engine.client
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

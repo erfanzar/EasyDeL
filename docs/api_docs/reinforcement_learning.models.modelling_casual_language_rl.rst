@@ -1,7 +1,8 @@
 ``models/modelling casual language rl`` module
 ==============================================
 
+```{eval-rst}
 .. automodule:: easydel.reinforcement_learning.models.modelling_casual_language_rl
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

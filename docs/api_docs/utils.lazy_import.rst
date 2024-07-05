@@ -1,7 +1,8 @@
 ``lazy import`` module
 ======================
 
+```{eval-rst}
 .. automodule:: easydel.utils.lazy_import
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

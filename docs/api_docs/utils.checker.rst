@@ -1,7 +1,8 @@
 ``checker`` module
 ==================
 
+```{eval-rst}
 .. automodule:: easydel.utils.checker
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

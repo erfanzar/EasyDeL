@@ -1,7 +1,8 @@
 ``core`` module
 ===============
 
+```{eval-rst}
 .. automodule:: easydel.reinforcement_learning.core
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

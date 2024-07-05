@@ -1,7 +1,8 @@
 ``utils`` module
 ================
 
+```{eval-rst}
 .. automodule:: easydel.trainers.utils
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

@@ -1,7 +1,8 @@
 ``common`` module
 =================
 
+```{eval-rst}
 .. automodule:: easydel.modules.common
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

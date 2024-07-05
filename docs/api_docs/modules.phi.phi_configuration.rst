@@ -1,7 +1,8 @@
 ``phi/phi configuration`` module
 ================================
 
+```{eval-rst}
 .. automodule:: easydel.modules.phi.phi_configuration
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

@@ -1,7 +1,8 @@
 ``mistral/modelling mistral flax`` module
 =========================================
 
+```{eval-rst}
 .. automodule:: easydel.modules.mistral.modelling_mistral_flax
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

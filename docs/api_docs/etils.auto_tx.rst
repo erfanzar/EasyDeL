@@ -1,7 +1,8 @@
 ``auto tx`` module
 ==================
 
+```{eval-rst}
 .. automodule:: easydel.etils.auto_tx
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

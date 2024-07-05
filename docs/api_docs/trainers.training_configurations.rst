@@ -1,7 +1,8 @@
 ``training configurations`` module
 ==================================
 
+```{eval-rst}
 .. automodule:: easydel.trainers.training_configurations
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

@@ -1,7 +1,8 @@
 ``etils`` module
 ================
 
+```{eval-rst}
 .. automodule:: easydel.etils.etils
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

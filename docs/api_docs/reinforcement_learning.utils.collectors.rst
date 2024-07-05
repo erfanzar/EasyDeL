@@ -1,7 +1,8 @@
 ``utils/collectors`` module
 ===========================
 
+```{eval-rst}
 .. automodule:: easydel.reinforcement_learning.utils.collectors
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

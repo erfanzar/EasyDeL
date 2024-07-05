@@ -1,7 +1,8 @@
 ``mamba/modelling mamba flax`` module
 =====================================
 
+```{eval-rst}
 .. automodule:: easydel.modules.mamba.modelling_mamba_flax
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

@@ -1,7 +1,8 @@
 ``generation pipeline/utils`` module
 ====================================
 
+```{eval-rst}
 .. automodule:: easydel.inference.generation_pipeline.utils
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

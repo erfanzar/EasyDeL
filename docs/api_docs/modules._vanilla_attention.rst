@@ -1,7 +1,8 @@
 ``vanilla attention`` module
 ============================
 
+```{eval-rst}
 .. automodule:: easydel.modules._vanilla_attention
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

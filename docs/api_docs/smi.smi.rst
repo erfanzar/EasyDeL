@@ -1,7 +1,8 @@
 ``smi`` module
 ==============
 
+```{eval-rst}
 .. automodule:: easydel.smi.smi
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

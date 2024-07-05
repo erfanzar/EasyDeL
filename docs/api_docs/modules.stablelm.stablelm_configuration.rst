@@ -1,7 +1,8 @@
 ``stablelm/stablelm configuration`` module
 ==========================================
 
+```{eval-rst}
 .. automodule:: easydel.modules.stablelm.stablelm_configuration
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

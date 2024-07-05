@@ -1,7 +1,8 @@
 ``data processor`` module
 =========================
 
+```{eval-rst}
 .. automodule:: easydel.data_preprocessing.data_processor
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

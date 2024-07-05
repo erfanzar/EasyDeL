@@ -1,7 +1,8 @@
 ``helpers`` module
 ==================
 
+```{eval-rst}
 .. automodule:: easydel.utils.helpers
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

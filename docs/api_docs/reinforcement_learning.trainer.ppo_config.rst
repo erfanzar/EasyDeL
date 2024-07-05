@@ -1,7 +1,8 @@
 ``trainer/ppo config`` module
 =============================
 
+```{eval-rst}
 .. automodule:: easydel.reinforcement_learning.trainer.ppo_config
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

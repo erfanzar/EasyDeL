@@ -1,7 +1,8 @@
 ``easydel transform`` module
 ============================
 
+```{eval-rst}
 .. automodule:: easydel.transform.easydel_transform
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

@@ -1,7 +1,8 @@
 ``arctic/modelling arctic flax`` module
 =======================================
 
+```{eval-rst}
 .. automodule:: easydel.modules.arctic.modelling_arctic_flax
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

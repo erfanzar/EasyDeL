@@ -1,7 +1,8 @@
 ``olmo/olmo configuration`` module
 ==================================
 
+```{eval-rst}
 .. automodule:: easydel.modules.olmo.olmo_configuration
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:

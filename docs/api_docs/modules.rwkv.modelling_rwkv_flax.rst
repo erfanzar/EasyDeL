@@ -1,7 +1,8 @@
 ``rwkv/modelling rwkv flax`` module
 ===================================
 
+```{eval-rst}
 .. automodule:: easydel.modules.rwkv.modelling_rwkv_flax
-    :special-members:
+    :members:
     :undoc-members:
     :show-inheritance:
