@@ -50,247 +50,235 @@ logger = get_logger(__name__)
 
 class DPOTrainer(BaseTrainer, ABC):
     """
-    Trainer for Direct Preference Optimization (DPO).
+        Trainer for Direct Preference Optimization (DPO).
 
-    This trainer handles the training, evaluation, and checkpointing of language models
-    using the DPO algorithm. It supports sharding, gradient accumulation, mixed precision
-    training, LoRA, and precomputed reference model log probabilities.
+        This trainer handles the training, evaluation, and checkpointing of language models
+        using the DPO algorithm. It supports sharding, gradient accumulation, mixed precision
+        training, LoRA, and precomputed reference model log probabilities.
 
-    Attributes:
-        arguments (TrainArguments): The training arguments.
-        model_state (EasyDeLState): The EasyDeLState object for the model being trained.
-        ref_model_state (Optional[EasyDeLState]): The EasyDeLState object for the reference model (if used).
-        beta (float): The strength of the regularization term in the DPO loss.
-        label_smoothing (float): The amount of label smoothing to apply.
-        loss_type (Literal["sigmoid", "hinge", "ipo", "kto"]): The type of loss function to use.
-        label_pad_token_id (int): The ID of the padding token for labels.
-        padding_value (int): The padding value for input sequences.
-        train_dataset (Optional[Dataset]): The training dataset.
-        eval_dataset (Optional[Union[Dataset, Dict[str, Dataset]]]): The evaluation dataset.
-        tokenizer (Optional[PreTrainedTokenizerBase]): The tokenizer used for preprocessing.
-        data_collator (Optional[Callable]): The data collator used for batching.
-        max_length (Optional[int]): The maximum sequence length.
-        max_prompt_length (Optional[int]): The maximum prompt length.
-        max_target_length (Optional[int]): The maximum target length.
-        precompute_ref_log_probs (bool): Whether to precompute reference model log probabilities.
-        reference_free (bool): Whether to use a reference-free DPO variant.
-        is_encoder_decoder (bool): Whether the model is an encoder-decoder architecture.
-        auto_shard_model_state (bool): Whether to automatically shard the model state.
-        auto_shard_ref_model_state (bool): Whether to automatically shard the reference model state.
-        dataset_map_arguments (Optional[dict]): Arguments to pass to the dataset `map` function for tokenization.
-        low_mem_usage (bool): Whether to prioritize low memory usage during training.
-        auto_fix_data (bool): Whether to automatically fix data issues.
-        _do_init_fns (bool): Whether to automatically initialize trainer functions.
+        Attributes:
+            arguments (TrainArguments): The training arguments.
+            model_state (EasyDeLState): The EasyDeLState object for the model being trained.
+            ref_model_state (Optional[EasyDeLState]): The EasyDeLState object for the reference model (if used).
+            beta (float): The strength of the regularization term in the DPO loss.
+            label_smoothing (float): The amount of label smoothing to apply.
+            loss_type (Literal["sigmoid", "hinge", "ipo", "kto"]): The type of loss function to use.
+            label_pad_token_id (int): The ID of the padding token for labels.
+            padding_value (int): The padding value for input sequences.
+            train_dataset (Optional[Dataset]): The training dataset.
+            eval_dataset (Optional[Union[Dataset, Dict[str, Dataset]]]): The evaluation dataset.
+            tokenizer (Optional[PreTrainedTokenizerBase]): The tokenizer used for preprocessing.
+            data_collator (Optional[Callable]): The data collator used for batching.
+            max_length (Optional[int]): The maximum sequence length.
+            max_prompt_length (Optional[int]): The maximum prompt length.
+            max_target_length (Optional[int]): The maximum target length.
+            precompute_ref_log_probs (bool): Whether to precompute reference model log probabilities.
+            reference_free (bool): Whether to use a reference-free DPO variant.
+            is_encoder_decoder (bool): Whether the model is an encoder-decoder architecture.
+            auto_shard_model_state (bool): Whether to automatically shard the model state.
+            auto_shard_ref_model_state (bool): Whether to automatically shard the reference model state.
+            dataset_map_arguments (Optional[dict]): Arguments to pass to the dataset `map` function for tokenization.
+            low_mem_usage (bool): Whether to prioritize low memory usage during training.
+            auto_fix_data (bool): Whether to automatically fix data issues.
+            _do_init_fns (bool): Whether to automatically initialize trainer functions.
 
-    Methods:
-        initialize_trainer_utils(self): Initializes trainer utilities (logging, timer, dataloaders, model, etc.).
-        configure_dataloaders(self) -> TrainerConfigureDataloaderOutput: Configures the dataloaders for training and evaluation.
-        configure_model(self) -> TrainerConfigureModelOutput: Configures the model, optimizer, scheduler, and configuration.
-        configure_functions(self) -> TrainerConfigureFunctionOutput: Configures and JIT-compiles the training and evaluation step functions.
-        _configure_lora(self): Configures LoRA if enabled.
-        shard_states(self, state: EasyDeLState, rules: Any) -> EasyDeLState: Shards the provided state according to the given rules.
-        create_collect_function(self, max_sequence_length: int, truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end") -> Callable:
-            Creates a data collection function for batching.
-        _get_train_dataloader(self) -> tensorflow.data.Dataset: Creates the training dataloader.
-        _get_eval_dataloader(self, eval_dataset: Optional[Dataset] = None) -> tensorflow.data.Dataset: Creates the evaluation dataloader.
-        get_train_dataloader(self) -> tensorflow.data.Dataset: Returns the training dataloader, potentially with precomputed reference log probabilities.
-        get_eval_dataloader(self, eval_dataset: Optional[Dataset] = None) -> tensorflow.data.Dataset: Returns the evaluation dataloader, potentially with precomputed reference log probabilities.
-        build_tokenized_answer(self, prompt: str, answer: str) -> Dict: Tokenizes a prompt and answer pair, handling special tokens and padding/truncation.
-        tokenize_row(self, feature: Dict, state: EasyDeLState = None) -> Dict: Tokenizes a single row of data from the DPO dataset.
-        compute_reference_log_probs(self, state: EasyDeLState, padded_batch: Dict) -> tuple[Any, Any]: Computes log probabilities for the chosen and rejected responses using the reference model.
-        _save_state(self, state: EasyDeLState, gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]], milestone: bool = False) -> str:
-            Saves the model state to a checkpoint file.
-        train(self) -> DPOTrainerOutput: Trains the DPO model and returns the training output.
-        eval(self, model_state: EasyDeLState) -> Iterator[dict]: Evaluates the DPO model and yields evaluation metrics.
-    
-    **Examples:**
-    
-    ```python
-    import easydel
-    from easydel import (
-        TrainArguments,
-        EasyDeLOptimizers,
-        EasyDeLSchedulers,
-        EasyDeLGradientCheckPointers,
-        DPOTrainer,
-        EasyDeLState,
-        easystate_to_huggingface_model
-    )
+        Methods:
+            initialize_trainer_utils(self): Initializes trainer utilities (logging, timer, dataloaders, model, etc.).
+            configure_dataloaders(self) -> TrainerConfigureDataloaderOutput: Configures the dataloaders for training and evaluation.
+            configure_model(self) -> TrainerConfigureModelOutput: Configures the model, optimizer, scheduler, and configuration.
+            configure_functions(self) -> TrainerConfigureFunctionOutput: Configures and JIT-compiles the training and evaluation step functions.
+            _configure_lora(self): Configures LoRA if enabled.
+            shard_states(self, state: EasyDeLState, rules: Any) -> EasyDeLState: Shards the provided state according to the given rules.
+            create_collect_function(self, max_sequence_length: int, truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end") -> Callable:
+                Creates a data collection function for batching.
+            _get_train_dataloader(self) -> tensorflow.data.Dataset: Creates the training dataloader.
+            _get_eval_dataloader(self, eval_dataset: Optional[Dataset] = None) -> tensorflow.data.Dataset: Creates the evaluation dataloader.
+            get_train_dataloader(self) -> tensorflow.data.Dataset: Returns the training dataloader, potentially with precomputed reference log probabilities.
+            get_eval_dataloader(self, eval_dataset: Optional[Dataset] = None) -> tensorflow.data.Dataset: Returns the evaluation dataloader, potentially with precomputed reference log probabilities.
+            build_tokenized_answer(self, prompt: str, answer: str) -> Dict: Tokenizes a prompt and answer pair, handling special tokens and padding/truncation.
+            tokenize_row(self, feature: Dict, state: EasyDeLState = None) -> Dict: Tokenizes a single row of data from the DPO dataset.
+            compute_reference_log_probs(self, state: EasyDeLState, padded_batch: Dict) -> tuple[Any, Any]: Computes log probabilities for the chosen and rejected responses using the reference model.
+            _save_state(self, state: EasyDeLState, gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]], milestone: bool = False) -> str:
+                Saves the model state to a checkpoint file.
+            train(self) -> DPOTrainerOutput: Trains the DPO model and returns the training output.
+            eval(self, model_state: EasyDeLState) -> Iterator[dict]: Evaluates the DPO model and yields evaluation metrics.
 
-    from datasets import load_dataset
-    from huggingface_hub import HfApi
-    from transformers import AutoTokenizer, LlamaForCausalLM as module_pt
-    from jax import numpy as jnp
-    import jax
-    from jax.sharding import PartitionSpec
-    from fjformer import GenerateRNG
-    from typing import Optional, Dict
-    from datasets import Dataset
-
-    rng_g = GenerateRNG()
-    api = HfApi()
-
-    max_length = 512  # Overall maximum length
-    max_target_length = 1024  # Maximum Length for target column in Dataset
-    max_prompt_length = 1024  # Maximum Length for prompt column in Dataset
-
-    model_name_or_path = "erfanzar/LinguaMatic-Tiny"
-    ref_model_name_or_path = "teknium/OpenHermes-2.5-Mistral-7B"
-    dtype = jnp.bfloat16
-
-    sharding_axis_dims = (1, -1, 1, 1)
-    sharding_axis_names = ("dp", "fsdp", "tp", "sp")
+        **Examples:**
 
 
-    def extract_anthropic_prompt(prompt_and_response):
-        '''
-        Extract the anthropic prompt from a prompt and response pair.
-        '''
-        search_term = "\n\nAssistant:"
-        search_term_idx = prompt_and_response.rfind(search_term)
-        assert search_term_idx != -1, f"Prompt and response does not contain '{search_term}'"
-        return prompt_and_response[: search_term_idx + len(search_term)]
+    .. code-block:: python
+
+        >>> import easydel
+        >>> from easydel import (
+        ...     TrainArguments,
+        ...     EasyDeLOptimizers,
+        ...     EasyDeLSchedulers,
+        ...     EasyDeLGradientCheckPointers,
+        ...     DPOTrainer,
+        ...     EasyDeLState,
+        ...     easystate_to_huggingface_model
+        ... )
+        >>> from datasets import load_dataset
+        >>> from huggingface_hub import HfApi
+        >>> from transformers import AutoTokenizer, LlamaForCausalLM as module_pt
+        >>> from jax import numpy as jnp
+        >>> import jax
+        >>> from jax.sharding import PartitionSpec
+        >>> from fjformer import GenerateRNG
+        >>> from typing import Optional, Dict
+        >>> from datasets import Dataset
+
+        >>> rng_g = GenerateRNG()
+        >>> api = HfApi()
+
+        >>> max_length = 512  # Overall maximum length
+        >>> max_target_length = 1024  # Maximum Length for target column in Dataset
+        >>> max_prompt_length = 1024  # Maximum Length for prompt column in Dataset
+
+        >>> model_name_or_path = "erfanzar/LinguaMatic-Tiny"
+        >>> ref_model_name_or_path = "teknium/OpenHermes-2.5-Mistral-7B"
+        >>> dtype = jnp.bfloat16
+
+        >>> sharding_axis_dims = (1, -1, 1, 1)
+        >>> sharding_axis_names = ("dp", "fsdp", "tp", "sp")
 
 
-    def get_hh(split: str, sanity_check: bool = False, silent: bool = False, cache_dir: Optional[str] = None) -> Dataset:
-        '''
-        Load the Anthropic Helpful-Harmless dataset from Hugging Face and convert it to the necessary format.
-
-        The dataset is converted to a dictionary with the following structure:
-        {
-            'prompt': List[str],
-            'chosen': List[str],
-            'rejected': List[str],
-        }
-
-        Prompts should be structured as follows:
-        \n\nHuman: <prompt>\n\nAssistant:
-        Multiple turns are allowed, but the prompt should always start with \n\nHuman: and end with \n\nAssistant:.
-        '''
-        dataset = load_dataset("Anthropic/hh-rlhf", split=split, cache_dir=cache_dir)
-        if sanity_check:
-            dataset = dataset.select(range(min(len(dataset), 1000)))
-
-        def split_prompt_and_responses(sample) -> Dict[str, str]:
-            prompt = extract_anthropic_prompt(sample["chosen"])
-            return {
-                "prompt": prompt,
-                "chosen": sample["chosen"][len(prompt):],
-                "rejected": sample["rejected"][len(prompt):],
-            }
-
-        return dataset.map(split_prompt_and_responses)
+        >>> def extract_anthropic_prompt(prompt_and_response):
+        ...     '''
+        ...     Extract the anthropic prompt from a prompt and response pair.
+        ...     '''
+        ...     search_term = "\n\nAssistant:"
+        ...     search_term_idx = prompt_and_response.rfind(search_term)
+        ...     assert search_term_idx != -1, f"Prompt and response does not contain '{search_term}'"
+        ...     return prompt_and_response[: search_term_idx + len(search_term)]
 
 
-    arguments = TrainArguments(
-        model_name="EasyDeL-DPO",
-        num_train_epochs=5,
-        learning_rate=1e-4,
-        learning_rate_end=3e-5,
-        warmup_steps=200,
-        optimizer=EasyDeLOptimizers.ADAMW,
-        scheduler=EasyDeLSchedulers.LINEAR,
-        weight_decay=0.02,
-        total_batch_size=128,
-        gradient_checkpointing=EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
-        sharding_array=sharding_axis_dims,
-        fully_sharded_data_parallel=True,
-        gradient_accumulation_steps=2,
-        dtype=dtype,
-        param_dtype=dtype,
-        step_start_point=0,
-        training_time="7H",
-        do_train=True,
-        do_eval=True,
-        track_memory=False  # Performance boost.
-        # You can set other options too or play with them but for now I just stick with these arguments.
-    )
+        >>> def get_hh(split: str, sanity_check: bool = False, silent: bool = False, cache_dir: Optional[str] = None) -> Dataset:
+        ...     '''
+        ...     Load the Anthropic Helpful-Harmless dataset from Hugging Face and convert it to the necessary format.
+        ...
+        ...     The dataset is converted to a dictionary with the following structure:
+        ...     {
+        ...         'prompt': List[str],
+        ...         'chosen': List[str],
+        ...         'rejected': List[str],
+        ...     }
+        ...
+        ...     Prompts should be structured as follows:
+        ...     \n\nHuman: <prompt>\n\nAssistant:
+        ...     Multiple turns are allowed, but the prompt should always start with \n\nHuman: and end with \n\nAssistant:.
+        ...     '''
+        ...     dataset = load_dataset("Anthropic/hh-rlhf", split=split, cache_dir=cache_dir)
+        ...     if sanity_check:
+        ...         dataset = dataset.select(range(min(len(dataset), 1000)))
+        ...
+        ...     def split_prompt_and_responses(sample) -> Dict[str, str]:
+        ...         prompt = extract_anthropic_prompt(sample["chosen"])
+        ...         return {
+        ...             "prompt": prompt,
+        ...             "chosen": sample["chosen"][len(prompt):],
+        ...             "rejected": sample["rejected"][len(prompt):],
+        ...         }
+        ...
+        ...     return dataset.map(split_prompt_and_responses)
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
 
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+        >>> arguments = TrainArguments(
+        ...     model_name="EasyDeL-DPO",
+        ...     num_train_epochs=5,
+        ...     learning_rate=1e-4,
+        ...     learning_rate_end=3e-5,
+        ...     warmup_steps=200,
+        ...     optimizer=EasyDeLOptimizers.ADAMW,
+        ...     scheduler=EasyDeLSchedulers.LINEAR,
+        ...     weight_decay=0.02,
+        ...     total_batch_size=128,
+        ...     gradient_checkpointing=EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
+        ...     sharding_array=sharding_axis_dims,
+        ...     fully_sharded_data_parallel=True,
+        ...     gradient_accumulation_steps=2,
+        ...     dtype=dtype,
+        ...     param_dtype=dtype,
+        ...     step_start_point=0,
+        ...     training_time="7H",
+        ...     do_train=True,
+        ...     do_eval=True,
+        ...     track_memory=False  # Performance boost.
+        ...     # You can set other options too or play with them but for now I just stick with these arguments.
+        ... )
 
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
+        >>> tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
 
-    train_dataset = get_hh("train", sanity_check=True)
-    eval_dataset = get_hh("test", sanity_check=True)
+        >>> if tokenizer.pad_token is None:
+        ...     tokenizer.pad_token = tokenizer.eos_token
 
-    state = EasyDeLState.from_pretrained(
-        pretrained_model_name_or_path=model_name_or_path,
-        dtype=dtype,
-        param_dtype=dtype,
-        init_optimizer_state=False,
-        free_optimizer_state=True,
-        sharding_axis_dims=sharding_axis_dims,
-        sharding_axis_names=sharding_axis_names,
-        partition_axis=easydel.PartitionAxis(
-            batch_axis=("dp", "fsdp"),
-            query_sequence_axis="sp",
-            key_sequence_axis="sp",
-            head_axis="tp",
-            attention_dim_axis=None
-        )
-    )
+        >>> if tokenizer.pad_token_id is None:
+        ...     tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    ref_state = EasyDeLState.from_pretrained(
-        pretrained_model_name_or_path=ref_model_name_or_path,
-        dtype=dtype,
-        param_dtype=dtype,
-        init_optimizer_state=False,
-        free_optimizer_state=True,
-        sharding_axis_dims=sharding_axis_dims,
-        sharding_axis_names=sharding_axis_names,
-        partition_axis=easydel.PartitionAxis(
-            batch_axis=("dp", "fsdp"),
-            query_sequence_axis="sp",
-            key_sequence_axis="sp",
-            head_axis="tp",
-            attention_dim_axis=None
-        )
-    )
+        >>> train_dataset = get_hh("train", sanity_check=True)
+        >>> eval_dataset = get_hh("test", sanity_check=True)
 
-    dpo_trainer = DPOTrainer(
-        model_state=state,
-        ref_model_state=ref_state,
-        beta=0.1,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        tokenizer=tokenizer,
-        arguments=arguments,
-        max_length=max_length,
-        max_target_length=max_target_length,
-        max_prompt_length=max_prompt_length,
-        ref_model_init_kwargs=None,  # In case that you pass the ref_model_state a string you have to pass this one too
-        model_init_kwargs=None,  # In case that you pass the model_state a string you have to pass this one too
-        dataset_map_arguments={
-            "num_proc": 8,
-            "batched": True,
-            "batch_size": 100,
-        },
-        auto_shard_model_state=True,
-        auto_shard_ref_model_state=True,
-        loss_type="sigmoid",
-        data_collator=None,  # Pass None in order to use default data_collector (you can create your own)
-    )
+        >>> state = EasyDeLState.from_pretrained(
+        ...     pretrained_model_name_or_path=model_name_or_path,
+        ...     dtype=dtype,
+        ...     param_dtype=dtype,
+        ...     init_optimizer_state=False,
+        ...     free_optimizer_state=True,
+        ...     sharding_axis_dims=sharding_axis_dims,
+        ...     sharding_axis_names=sharding_axis_names,
+        ...     partition_axis=easydel.PartitionAxis(
+        ...         batch_axis=("dp", "fsdp"),
+        ...         query_sequence_axis="sp",
+        ...         key_sequence_axis="sp",
+        ...         head_axis="tp",
+        ...         attention_dim_axis=None
+        ...     )
+        ... )
 
-    output = dpo_trainer.train()
+        >>> ref_state = EasyDeLState.from_pretrained(
+        ...     pretrained_model_name_or_path=ref_model_name_or_path,
+        ...     dtype=dtype,
+        ...     param_dtype=dtype,
+        ...     init_optimizer_state=False,
+        ...     free_optimizer_state=True,
+        ...     sharding_axis_dims=sharding_axis_dims,
+        ...     sharding_axis_names=sharding_axis_names,
+        ...     partition_axis=easydel.PartitionAxis(
+        ...         batch_axis=("dp", "fsdp"),
+        ...         query_sequence_axis="sp",
+        ...         key_sequence_axis="sp",
+        ...         head_axis="tp",
+        ...         attention_dim_axis=None
+        ...     )
+        ... )
 
-    easydel_jax_model = output.state  # Here's you EasyDeL Model
+        >>> dpo_trainer = DPOTrainer(
+        ...     model_state=state,
+        ...     ref_model_state=ref_state,
+        ...     beta=0.1,
+        ...     train_dataset=train_dataset,
+        ...     eval_dataset=eval_dataset,
+        ...     tokenizer=tokenizer,
+        ...     arguments=arguments,
+        ...     max_length=max_length,
+        ...     max_target_length=max_target_length,
+        ...     max_prompt_length=max_prompt_length,
+        ...     ref_model_init_kwargs=None,  # In case that you pass the ref_model_state a string you have to pass this one too
+        ...     model_init_kwargs=None,  # In case that you pass the model_state a string you have to pass this one too
+        ...     dataset_map_arguments={
+        ...         "num_proc": 8,
+        ...         "batched": True,
+        ...         "batch_size": 100,
+        ...     },
+        ...     auto_shard_model_state=True,
+        ...     auto_shard_ref_model_state=True,
+        ...     loss_type="sigmoid",
+        ...     data_collator=None,  # Pass None in order to use default data_collector (you can create your own)
+        ... )
 
-    with jax.default_device(jax.devices("cpu")[0]):
-        model = easystate_to_huggingface_model(
-            state=EasyDeLState.load_state(
-                output.checkpoint_path
-            ),
-            base_huggingface_module=module_pt,
-            config=dpo_trainer.model_state.module.config
-        )  # Here's you PyTorch Model
+        >>> output = dpo_trainer.train()
 
-    model.push_to_hub("<REPO_ID>", private=False)  # Hope you love open-source too :)
-    tokenizer.push_to_hub("<REPO_ID>", private=False)  # Hope you love open-source too :)
-    ```
+        >>> easydel_jax_model = output.state  # Here's you EasyDeL Model
     """
 
     def __init__(

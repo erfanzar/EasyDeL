@@ -1,3 +1,4 @@
+import flax.core
 import os
 import sys
 
@@ -141,7 +142,6 @@ def create_rst(name, children, output_dir):
                 f"    :undoc-members:\n"
                 f"    :show-inheritance:\n"
             )
-
 
 def generate_api_docs(structure, output_dir):
     """Recursively generate .rst files based on the given dictionary structure."""
