@@ -1,5 +1,5 @@
-``grok 1/grok 1 configuration`` module
-======================================
+grok_1.grok_1_configuration package
+===================================
 
 .. automodule:: easydel.modules.grok_1.grok_1_configuration
     :members:

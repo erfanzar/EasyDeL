@@ -1,5 +1,5 @@
-``generation pipeline/utils`` module
-====================================
+generation_pipeline.utils package
+=================================
 
 .. automodule:: easydel.inference.generation_pipeline.utils
     :members:

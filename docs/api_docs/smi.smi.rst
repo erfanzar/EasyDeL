@@ -1,5 +1,5 @@
-``smi`` module
-==============
+smi package
+===========
 
 .. automodule:: easydel.smi.smi
     :members:

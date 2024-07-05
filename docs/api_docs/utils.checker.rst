@@ -1,5 +1,5 @@
-``checker`` module
-==================
+checker package
+===============
 
 .. automodule:: easydel.utils.checker
     :members:

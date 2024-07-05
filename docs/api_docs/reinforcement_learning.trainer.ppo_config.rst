@@ -1,5 +1,5 @@
-``trainer/ppo config`` module
-=============================
+trainer.ppo_config package
+==========================
 
 .. automodule:: easydel.reinforcement_learning.trainer.ppo_config
     :members:

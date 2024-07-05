@@ -1,5 +1,5 @@
-``easystate`` module
-====================
+easystate package
+=================
 
 .. automodule:: easydel.etils.easystate
     :members:

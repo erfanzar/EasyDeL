@@ -1,5 +1,5 @@
-``cli`` module
-==============
+cli package
+===========
 
 .. automodule:: easydel.cli.cli
     :members:

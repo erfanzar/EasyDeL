@@ -1,5 +1,5 @@
-``t5/modelling t5 flax`` module
-===============================
+t5.modelling_t5_flax package
+============================
 
 .. automodule:: easydel.modules.t5.modelling_t5_flax
     :members:

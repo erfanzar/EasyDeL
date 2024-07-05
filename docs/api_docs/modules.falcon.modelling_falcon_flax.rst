@@ -1,5 +1,5 @@
-``falcon/modelling falcon flax`` module
-=======================================
+falcon.modelling_falcon_flax package
+====================================
 
 .. automodule:: easydel.modules.falcon.modelling_falcon_flax
     :members:

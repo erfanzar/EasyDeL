@@ -1,5 +1,5 @@
-``olmo/modelling olmo flax`` module
-===================================
+olmo.modelling_olmo_flax package
+================================
 
 .. automodule:: easydel.modules.olmo.modelling_olmo_flax
     :members:

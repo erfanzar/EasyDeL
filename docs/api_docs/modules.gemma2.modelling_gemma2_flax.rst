@@ -1,5 +1,5 @@
-``gemma2/modelling gemma2 flax`` module
-=======================================
+gemma2.modelling_gemma2_flax package
+====================================
 
 .. automodule:: easydel.modules.gemma2.modelling_gemma2_flax
     :members:

@@ -1,5 +1,5 @@
-``grok 1/modelling grok 1 flax`` module
-=======================================
+grok_1.modelling_grok_1_flax package
+====================================
 
 .. automodule:: easydel.modules.grok_1.modelling_grok_1_flax
     :members:

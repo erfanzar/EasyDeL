@@ -1,5 +1,5 @@
-``arctic/arctic configuration`` module
-======================================
+arctic.arctic_configuration package
+===================================
 
 .. automodule:: easydel.modules.arctic.arctic_configuration
     :members:

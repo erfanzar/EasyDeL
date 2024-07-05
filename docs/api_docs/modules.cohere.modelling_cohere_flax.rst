@@ -1,5 +1,5 @@
-``cohere/modelling cohere flax`` module
-=======================================
+cohere.modelling_cohere_flax package
+====================================
 
 .. automodule:: easydel.modules.cohere.modelling_cohere_flax
     :members:

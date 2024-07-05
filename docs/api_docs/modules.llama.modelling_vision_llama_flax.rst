@@ -1,5 +1,5 @@
-``llama/modelling vision llama flax`` module
-============================================
+llama.modelling_vision_llama_flax package
+=========================================
 
 .. automodule:: easydel.modules.llama.modelling_vision_llama_flax
     :members:

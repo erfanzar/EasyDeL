@@ -1,5 +1,5 @@
-``gpt neo x/gpt neo x configuration`` module
-============================================
+gpt_neo_x.gpt_neo_x_configuration package
+=========================================
 
 .. automodule:: easydel.modules.gpt_neo_x.gpt_neo_x_configuration
     :members:

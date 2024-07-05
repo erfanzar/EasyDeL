@@ -1,5 +1,5 @@
-``phi3/phi3 configuration`` module
-==================================
+phi3.phi3_configuration package
+===============================
 
 .. automodule:: easydel.modules.phi3.phi3_configuration
     :members:

@@ -1,5 +1,5 @@
-``phi/phi configuration`` module
-================================
+phi.phi_configuration package
+=============================
 
 .. automodule:: easydel.modules.phi.phi_configuration
     :members:

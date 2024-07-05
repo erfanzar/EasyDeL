@@ -1,5 +1,5 @@
-``utils`` module
-================
+utils package
+=============
 
 .. automodule:: easydel.trainers.utils
     :members:

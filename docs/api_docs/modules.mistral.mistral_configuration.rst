@@ -1,5 +1,5 @@
-``mistral/mistral configuration`` module
-========================================
+mistral.mistral_configuration package
+=====================================
 
 .. automodule:: easydel.modules.mistral.mistral_configuration
     :members:

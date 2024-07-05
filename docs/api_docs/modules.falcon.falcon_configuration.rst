@@ -1,5 +1,5 @@
-``falcon/falcon configuration`` module
-======================================
+falcon.falcon_configuration package
+===================================
 
 .. automodule:: easydel.modules.falcon.falcon_configuration
     :members:

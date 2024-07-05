@@ -1,5 +1,5 @@
-``partition module`` module
-===========================
+partition_module package
+========================
 
 .. automodule:: easydel.etils.partition_module
     :members:

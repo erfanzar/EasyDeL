@@ -1,5 +1,5 @@
-``odds ratio preference optimization trainer/orpo trainer`` module
-==================================================================
+odds_ratio_preference_optimization_trainer.orpo_trainer package
+===============================================================
 
 .. automodule:: easydel.trainers.odds_ratio_preference_optimization_trainer.orpo_trainer
     :members:

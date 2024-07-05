@@ -1,5 +1,5 @@
-``roberta/modelling roberta flax`` module
-=========================================
+roberta.modelling_roberta_flax package
+======================================
 
 .. automodule:: easydel.modules.roberta.modelling_roberta_flax
     :members:

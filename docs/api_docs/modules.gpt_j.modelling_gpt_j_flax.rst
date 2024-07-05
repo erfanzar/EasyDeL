@@ -1,5 +1,5 @@
-``gpt j/modelling gpt j flax`` module
-=====================================
+gpt_j.modelling_gpt_j_flax package
+==================================
 
 .. automodule:: easydel.modules.gpt_j.modelling_gpt_j_flax
     :members:

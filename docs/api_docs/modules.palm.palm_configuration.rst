@@ -1,5 +1,5 @@
-``palm/palm configuration`` module
-==================================
+palm.palm_configuration package
+===============================
 
 .. automodule:: easydel.modules.palm.palm_configuration
     :members:

@@ -1,5 +1,5 @@
-``mamba/mamba configuration`` module
-====================================
+mamba.mamba_configuration package
+=================================
 
 .. automodule:: easydel.modules.mamba.mamba_configuration
     :members:

@@ -1,5 +1,5 @@
-``models/modelling casual language rl`` module
-==============================================
+models.modelling_casual_language_rl package
+===========================================
 
 .. automodule:: easydel.reinforcement_learning.models.modelling_casual_language_rl
     :members:

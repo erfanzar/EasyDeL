@@ -1,5 +1,5 @@
-``qwen2/modelling qwen flax`` module
-====================================
+qwen2.modelling_qwen_flax package
+=================================
 
 .. automodule:: easydel.modules.qwen2.modelling_qwen_flax
     :members:

@@ -1,5 +1,5 @@
-``rms norm`` module
-===================
+rms_norm package
+================
 
 .. automodule:: easydel.kernels.rms_norm
     :members:

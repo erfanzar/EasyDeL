@@ -1,5 +1,5 @@
-``trainer/partitioner config`` module
-=====================================
+trainer.partitioner_config package
+==================================
 
 .. automodule:: easydel.reinforcement_learning.trainer.partitioner_config
     :members:

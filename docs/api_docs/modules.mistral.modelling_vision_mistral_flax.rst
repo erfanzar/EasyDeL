@@ -1,5 +1,5 @@
-``mistral/modelling vision mistral flax`` module
-================================================
+mistral.modelling_vision_mistral_flax package
+=============================================
 
 .. automodule:: easydel.modules.mistral.modelling_vision_mistral_flax
     :members:

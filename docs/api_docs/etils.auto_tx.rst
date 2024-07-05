@@ -1,5 +1,5 @@
-``auto tx`` module
-==================
+auto_tx package
+===============
 
 .. automodule:: easydel.etils.auto_tx
     :members:

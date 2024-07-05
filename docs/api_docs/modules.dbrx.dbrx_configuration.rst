@@ -1,5 +1,5 @@
-``dbrx/dbrx configuration`` module
-==================================
+dbrx.dbrx_configuration package
+===============================
 
 .. automodule:: easydel.modules.dbrx.dbrx_configuration
     :members:

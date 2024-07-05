@@ -1,5 +1,5 @@
-``deepseek v2/modeling deepseek flax`` module
-=============================================
+deepseek_v2.modeling_deepseek_flax package
+==========================================
 
 .. automodule:: easydel.modules.deepseek_v2.modeling_deepseek_flax
     :members:
