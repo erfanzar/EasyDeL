@@ -25,7 +25,7 @@ class ApiEngine:
     """
     **Example:**
 
-    .. code-block:: python
+
 
         >>> import easydel as ed
         >>> from transformers import AutoTokenizer
