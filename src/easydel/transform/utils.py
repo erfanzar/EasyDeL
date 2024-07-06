@@ -1,6 +1,5 @@
 import os
 from typing import Optional
-
 import jax
 from fjformer.checkpoint import CheckpointManager, float_tensor_to_dtype
 from flax.traverse_util import flatten_dict

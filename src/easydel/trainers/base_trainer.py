@@ -33,7 +33,7 @@ from easydel.modules.easydel_modelling_utils import (
 )
 from easydel.smi import get_capacity_matrix, initialise_tracking
 from easydel.trainers.training_configurations import TrainArguments
-from easydel.utils.helpers import Timers, prefix_print
+from easydel.utils.helpers import Timers
 
 logger = get_logger(__name__)
 
@@ -86,8 +86,7 @@ class BaseTrainer(abc.ABC):
         if _do_init_fns:
             self.initialize_trainer_utils()
         else:
-            prefix_print(
-                "Warning",
+            logger.warn(
                 "You have set `_do_init_fns = False`. Functions will not be initialized automatically. "
                 "Call `trainer.initialize_trainer_utils()` manually.",
             )
@@ -318,6 +317,7 @@ class BaseTrainer(abc.ABC):
             TrainerConfigureDataloaderOutput: An object containing the configured dataloaders and the
                                             maximum number of training and evaluation steps.
         """
+
         def create_tf_dataset(
             dataset: "Dataset",  # noqa: F821 # type:ignore
             is_train: bool,  # noqa: F821 # type:ignore

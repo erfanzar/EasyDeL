@@ -42,7 +42,7 @@ from easydel.trainers.odds_ratio_preference_optimization_trainer.modelling_outpu
     ORPOTrainerOutput,
 )
 from easydel.trainers.training_configurations import TrainArguments
-from easydel.utils import prefix_print
+
 
 logger = get_logger(__name__)
 
@@ -89,11 +89,10 @@ class ORPOTrainer(BaseTrainer, ABC):
         _get_eval_dataloader(self, eval_dataset: Optional[Dataset] = None) -> tensorflow.data.Dataset: Creates the evaluation dataloader.
         get_train_dataloader(self) -> tensorflow.data.Dataset: Returns the training dataloader.
         get_eval_dataloader(self, eval_dataset: Optional[Dataset] = None) -> tensorflow.data.Dataset: Returns the evaluation dataloader.
-        train(self, model_parameters: Optional[flax.core.FrozenDict] = None, state: Optional[EasyDeLState] = None) -> ORPOTrainerOutput: 
+        train(self, model_parameters: Optional[flax.core.FrozenDict] = None, state: Optional[EasyDeLState] = None) -> ORPOTrainerOutput:
             Trains the ORPO model and returns the training output.
         eval(self, model_state: EasyDeLState) -> typing.Iterator[dict]: Evaluates the ORPO model and yields evaluation metrics.
     """
-
 
     def __init__(
         self,
@@ -739,9 +738,7 @@ class ORPOTrainer(BaseTrainer, ABC):
                 )
                 sharded_state.params = params
                 if sharded_state.opt_state is None:
-                    prefix_print(
-                        "Action", "Optimizer State is not Found!, initializing one."
-                    )
+                    logger.info("Optimizer State is not Found!, initializing one.")
                     with jax.default_device(self.arguments.offload_device):
                         sharded_state = sharded_state.init_opt_state()
                         opt_state = (
@@ -756,7 +753,7 @@ class ORPOTrainer(BaseTrainer, ABC):
                         sharded_state = sharded_state.replace(opt_state=opt_state)
             elif self.finetune:
                 if model_parameters is None and self.checkpoint_path is not None:
-                    prefix_print("Action", f"Loading Model From {self.checkpoint_path}")
+                    logger.info(f"Loading Model From {self.checkpoint_path}")
                     with jax.default_device(self.arguments.offload_device):
                         sharded_state = EasyDeLState.load_state(
                             verbose=self.arguments.verbose,
@@ -821,10 +818,9 @@ class ORPOTrainer(BaseTrainer, ABC):
                     if self.arguments.remove_ckpt_after_load:
                         os.remove(self.checkpoint_path)
                 elif model_parameters is not None and self.checkpoint_path is None:
-                    prefix_print("Action", "Sharding Passed Parameters")
+                    logger.ifno("Sharding Passed Parameters")
                     if not isinstance(model_parameters, flax.core.FrozenDict):
-                        prefix_print(
-                            "Warning",
+                        logger.warn(
                             "Model Parameters should be like FrozenDict({'params': params}) make sure to "
                             "pass as type FrozenDict in case of not getting UnExcepted Errors ",
                         )
@@ -1098,14 +1094,15 @@ class ORPOTrainer(BaseTrainer, ABC):
         interrupts and timeouts, and optionally evaluating the model.
 
         Args:
-            model_parameters (Optional[flax.core.FrozenDict], optional): 
+            model_parameters (Optional[flax.core.FrozenDict], optional):
                 Pretrained model parameters for initialization. Defaults to None.
-            state (Optional[EasyDeLState], optional): 
+            state (Optional[EasyDeLState], optional):
                 An existing EasyDeLState to resume training from. Defaults to None.
 
         Returns:
             ORPOTrainerOutput: An object containing the trained model state and other training information.
         """
+
         def get_layer_names(frozen_dict, prefix=""):
             layer_names = {}
             for key, value in frozen_dict.items():

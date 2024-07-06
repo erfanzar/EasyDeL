@@ -26,7 +26,9 @@ from easydel.trainers.causal_language_model_trainer.fwd_bwd_functions import (
 from easydel.trainers.causal_language_model_trainer.modeling_output import (
     CausalLMTrainerOutput,
 )
-from easydel.utils.helpers import prefix_print
+from easydel.etils.etils import get_logger
+
+logger = get_logger(__name__)
 
 
 class CausalLanguageModelTrainer(BaseTrainer):
@@ -577,9 +579,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
                 )
                 sharded_state.params = params
                 if sharded_state.opt_state is None:
-                    prefix_print(
-                        "Action", "Optimizer State is not Found!, initializing one."
-                    )
+                    logger.info("Optimizer State is not Found!, initializing one.")
                     with jax.default_device(self.arguments.offload_device):
                         sharded_state = sharded_state.init_opt_state()
                         opt_state = (
@@ -594,7 +594,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
                         sharded_state = sharded_state.replace(opt_state=opt_state)
             elif self.finetune:
                 if model_parameters is None and self.checkpoint_path is not None:
-                    prefix_print("Action", f"Loading Model From {self.checkpoint_path}")
+                    logger.info(f"Loading Model From {self.checkpoint_path}")
                     with jax.default_device(self.arguments.offload_device):
                         sharded_state = EasyDeLState.load_state(
                             verbose=self.arguments.verbose,
@@ -659,10 +659,9 @@ class CausalLanguageModelTrainer(BaseTrainer):
                     if self.arguments.remove_ckpt_after_load:
                         os.remove(self.checkpoint_path)
                 elif model_parameters is not None and self.checkpoint_path is None:
-                    prefix_print("Action", "Sharding Passed Parameters")
+                    logger.info("Sharding Passed Parameters")
                     if not isinstance(model_parameters, flax.core.FrozenDict):
-                        prefix_print(
-                            "Warning",
+                        logger.warn(
                             "Model Parameters should be like FrozenDict({'params': params}) make sure to "
                             "pass as type FrozenDict in case of not getting UnExcepted Errors ",
                         )
