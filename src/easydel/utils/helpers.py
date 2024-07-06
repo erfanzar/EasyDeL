@@ -4,8 +4,6 @@ import time
 import contextlib
 
 import flax.metrics.tensorboard
-import jax
-import jax.numpy as jnp
 import termcolor
 
 try:
