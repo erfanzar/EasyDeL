@@ -797,7 +797,7 @@ partition_rules = {partition_rules}
         easystate_to_huggingface_model_kwargs,
         torch_save_pretrained_kwargs,
     ):
-        from easydel.transform.easydel_transform import easystate_to_huggingface_model
+        from easydel.transform.transform import easystate_to_huggingface_model
 
         easystate_to_huggingface_model_kwargs = (
             easystate_to_huggingface_model_kwargs or {}

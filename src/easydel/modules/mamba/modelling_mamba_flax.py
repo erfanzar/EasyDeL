@@ -1,40 +1,41 @@
 import functools
 import itertools
-from typing import Optional, Tuple, Union, List, Dict, Any, Callable, Sequence, TypeVar
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar, Union
 
-from jax.core import ShapedArray
 import chex
-from fjformer import linen as nn
+import flax.struct
 import jax
 import jax.numpy as jnp
-from fjformer.linen import Dense
 import numpy as np
-from chex import PRNGKey, Shape, Array
+from chex import Array, PRNGKey, Shape
 from einops import einsum
+from fjformer import linen as nn
+from fjformer.linen import Dense
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import partitioning as nn_partitioning
 from flax.linen.dtypes import promote_dtype
 from flax.linen.linear import (
-    default_kernel_init,
     ConvGeneralDilatedT,
-    PrecisionLike,
     Dtype,
     PaddingLike,
-    canonicalize_padding,
+    PrecisionLike,
     _conv_dimension_numbers,
+    canonicalize_padding,
+    default_kernel_init,
 )
 from flax.traverse_util import flatten_dict, unflatten_dict
-from jax import lax, eval_shape
-import flax.struct
+from jax import eval_shape, lax
+from jax.core import ShapedArray
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput
-from easydel.modules.mamba.mamba_configuration import MambaConfig as MambaConfig
+
+from easydel.modules.common import RMSNorm as MambaRMSNorm
 from easydel.modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 from easydel.modules.flax_modelling_utils import (
-    get_gradient_checkpoint_policy,
-    get_dot_general_by_bits,
     ACT2FN,
+    get_dot_general_by_bits,
+    get_gradient_checkpoint_policy,
 )
-from easydel.modules.common import RMSNorm as MambaRMSNorm
+from easydel.modules.mamba.mamba_configuration import MambaConfig as MambaConfig
 
 
 def init_to_value(x, dtype):
@@ -948,7 +949,7 @@ class FlaxMambaPretrainedModel(EasyDeLFlaxPretrainedModel):
         train: bool = False,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+        extra_embedding: Optional[jnp.ndarray] = None,
         add_params_field: bool = False,
         attention_mask: Optional[
             chex.Array

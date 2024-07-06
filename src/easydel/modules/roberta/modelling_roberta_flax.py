@@ -174,7 +174,7 @@ class FlaxRobertaSelfAttention(BaseAttentionModule):
                         1,
                         getattr(
                             self.config,
-                            "c_max_position_embeddings",
+                            "causal_mask_max_position_embeddings",
                             self.config.max_position_embeddings,
                         ),
                     ),

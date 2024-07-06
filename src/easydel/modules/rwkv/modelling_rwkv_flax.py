@@ -1,17 +1,18 @@
 import math
-from typing import Optional, Tuple, Any, Union, List, Mapping
+from typing import Any, List, Mapping, Optional, Tuple, Union
+
 import chex
 import jax.lax
-from transformers.modeling_flax_outputs import ModelOutput
-from flax.core import FrozenDict, freeze, unfreeze
-from flax.traverse_util import unflatten_dict, flatten_dict
-from jax import numpy as jnp
-from flax import linen as nn
-from easydel.modules.rwkv.rwkv_configuration import RwkvConfig as RwkvConfig
-from easydel.modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
-from flax.struct import dataclass
-
 from fjformer.linen import Dense
+from flax import linen as nn
+from flax.core import FrozenDict, freeze, unfreeze
+from flax.struct import dataclass
+from flax.traverse_util import flatten_dict, unflatten_dict
+from jax import numpy as jnp
+from transformers.modeling_flax_outputs import ModelOutput
+
+from easydel.modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
+from easydel.modules.rwkv.rwkv_configuration import RwkvConfig as RwkvConfig
 
 
 @dataclass
@@ -43,7 +44,9 @@ def init_state(hidden_size):
 
 
 @jax.jit
-def rwkv_linear_attention(time_decay, time_first, key, value, state=None, return_state=False):
+def rwkv_linear_attention(
+    time_decay, time_first, key, value, state=None, return_state=False
+):
     current_sequence_length = key.shape[1]
     output = jnp.zeros_like(key)
 
@@ -93,21 +96,23 @@ class FlaxRwkvSelfAttention(nn.Module):
         layer_id = self.layer_id
         hidden_size = self.config.hidden_size
         attention_hidden_size = (
-            config.attention_hidden_size if config.attention_hidden_size is not None else hidden_size
+            config.attention_hidden_size
+            if config.attention_hidden_size is not None
+            else hidden_size
         )
         self.attention_hidden_size = attention_hidden_size
 
         ratio_0_to_1 = layer_id / (num_hidden_layers - 1)
         ratio_1_to_almost_0 = 1.0 - (layer_id / num_hidden_layers)
-        zigzag = .5 * (jnp.arange(1, hidden_size + 1) % 3 - 1)
-        time_first = jnp.full(hidden_size, math.log(.3)) + zigzag
+        zigzag = 0.5 * (jnp.arange(1, hidden_size + 1) % 3 - 1)
+        time_first = jnp.full(hidden_size, math.log(0.3)) + zigzag
         h = jnp.arange(0, hidden_size)
-        time_decay = -5 + 8 * (h / (hidden_size - 1)) ** (.7 + 1.3 * ratio_0_to_1)
+        time_decay = -5 + 8 * (h / (hidden_size - 1)) ** (0.7 + 1.3 * ratio_0_to_1)
         x = jnp.arange(hidden_size) / hidden_size
 
         time_mix_key = jnp.power(x, ratio_1_to_almost_0)
-        time_mix_value = time_mix_key + .3 * ratio_0_to_1
-        time_mix_receptance = jnp.power(x, .5 * ratio_1_to_almost_0)
+        time_mix_value = time_mix_key + 0.3 * ratio_0_to_1
+        time_mix_receptance = jnp.power(x, 0.5 * ratio_1_to_almost_0)
 
         # This makes it easier to convert torch model into easydel since we use automated/small translation between
         # jax and torch
@@ -144,44 +149,48 @@ class FlaxRwkvSelfAttention(nn.Module):
             use_bias=False,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            precision=self.precision
+            precision=self.precision,
         )
         self.value = Dense(
             attention_hidden_size,
             use_bias=False,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            precision=self.precision
+            precision=self.precision,
         )
         self.receptance = Dense(
             attention_hidden_size,
             use_bias=False,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            precision=self.precision
+            precision=self.precision,
         )
         self.output = Dense(
             hidden_size,
             use_bias=False,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            precision=self.precision
+            precision=self.precision,
         )
 
     def __call__(
-            self,
-            hidden: chex.Array,
-            state: Tuple[chex.Array, chex.Array, chex.Array, chex.Array],
+        self,
+        hidden: chex.Array,
+        state: Tuple[chex.Array, chex.Array, chex.Array, chex.Array],
     ):
         sx, aa, bb, pp = state
         c_x = jnp.concatenate(
-            (
-                jnp.expand_dims(sx, 0), hidden[:-1, :]
-            ),
+            (jnp.expand_dims(sx, 0), hidden[:-1, :]),
         )
-        key_x = hidden * self.time_mix_key.reshape(-1) + c_x * (1 - self.time_mix_key.reshape(-1))
-        value_x = hidden * self.time_mix_value.reshape(-1) + c_x * (1 - self.time_mix_value.reshape(-1))
-        receptance_x = hidden * self.time_mix_receptance.reshape(-1) + c_x * (1 - self.time_mix_receptance.reshape(-1))
+        key_x = hidden * self.time_mix_key.reshape(-1) + c_x * (
+            1 - self.time_mix_key.reshape(-1)
+        )
+        value_x = hidden * self.time_mix_value.reshape(-1) + c_x * (
+            1 - self.time_mix_value.reshape(-1)
+        )
+        receptance_x = hidden * self.time_mix_receptance.reshape(-1) + c_x * (
+            1 - self.time_mix_receptance.reshape(-1)
+        )
         receptance_state = nn.sigmoid(self.receptance(receptance_x))
         key_states = self.key(key_x)
         value_states = self.value(value_x)
@@ -192,9 +201,9 @@ class FlaxRwkvSelfAttention(nn.Module):
             p = jnp.maximum(inner_p, ww)
             e1 = jnp.exp(inner_p - p)
             e2 = jnp.exp(ww - p)
-            next_c_x = (
-                    (e1 * inner_aa + e2 * vv) / (e1 * inner_bb + e2)
-            ).astype(dtype=receptance_state.dtype)
+            next_c_x = ((e1 * inner_aa + e2 * vv) / (e1 * inner_bb + e2)).astype(
+                dtype=receptance_state.dtype
+            )
 
             ww = -jnp.exp(self.time_decay.reshape(-1)) + inner_p
             p = jnp.maximum(ww, kk)
@@ -206,11 +215,7 @@ class FlaxRwkvSelfAttention(nn.Module):
             next_inner_state = (inner_aa, inner_bb, inner_p)
             return next_inner_state, next_c_x
 
-        (aa, bb, pp), c_x = jax.lax.scan(
-            step,
-            (aa, bb, pp),
-            (key_states, value_states)
-        )
+        (aa, bb, pp), c_x = jax.lax.scan(step, (aa, bb, pp), (key_states, value_states))
         out = hidden + self.output(receptance_state * c_x)
         next_state = (hidden[-1, :], aa, bb, pp)
         return out, next_state
@@ -229,14 +234,16 @@ class FlaxRwkvFeedForward(nn.Module):
         layer_id = self.layer_id
         num_hidden_layers = self.config.num_hidden_layers
         intermediate_size = (
-            config.intermediate_size if config.intermediate_size is not None else 4 * config.hidden_size
+            config.intermediate_size
+            if config.intermediate_size is not None
+            else 4 * config.hidden_size
         )
 
         x = jnp.arange(hidden_size) / hidden_size
 
         ratio_1_to_almost_0 = 1.0 - (layer_id / num_hidden_layers)
         time_mix_key = jnp.power(x, ratio_1_to_almost_0)
-        time_mix_receptance = jnp.power(x, .5 * ratio_1_to_almost_0)
+        time_mix_receptance = jnp.power(x, 0.5 * ratio_1_to_almost_0)
 
         # This makes it easier to convert torch model into easydel since we use automated/small translation between
         # jax and torch
@@ -245,12 +252,11 @@ class FlaxRwkvFeedForward(nn.Module):
         # time_mix_receptance = time_mix_receptance.reshape(1, 1, -1)
 
         self.time_mix_key = self.param(
-            "time_mix_key",
-            init_fn=init_to_value(time_mix_key, self.param_dtype)
+            "time_mix_key", init_fn=init_to_value(time_mix_key, self.param_dtype)
         )
         self.time_mix_receptance = self.param(
             "time_mix_receptance",
-            init_fn=init_to_value(time_mix_receptance, self.param_dtype)
+            init_fn=init_to_value(time_mix_receptance, self.param_dtype),
         )
 
         self.key = Dense(
@@ -258,33 +264,31 @@ class FlaxRwkvFeedForward(nn.Module):
             use_bias=False,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            precision=self.precision
+            precision=self.precision,
         )
         self.receptance = Dense(
             hidden_size,
             use_bias=False,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            precision=self.precision
+            precision=self.precision,
         )
         self.value = Dense(
             hidden_size,
             use_bias=False,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            precision=self.precision
+            precision=self.precision,
         )
 
-    def __call__(
-            self,
-            hidden,
-            state
-    ):
-        sx = jnp.concatenate(
-            (jnp.expand_dims(state, 0), hidden[:-1, :])
+    def __call__(self, hidden, state):
+        sx = jnp.concatenate((jnp.expand_dims(state, 0), hidden[:-1, :]))
+        xk = hidden * self.time_mix_key.reshape(-1) + sx * (
+            1 - self.time_mix_key.reshape(-1)
         )
-        xk = hidden * self.time_mix_key.reshape(-1) + sx * (1 - self.time_mix_key.reshape(-1))
-        xr = hidden * self.time_mix_receptance.reshape(-1) + sx * (1 - self.time_mix_receptance.reshape(-1))
+        xr = hidden * self.time_mix_receptance.reshape(-1) + sx * (
+            1 - self.time_mix_receptance.reshape(-1)
+        )
         r = nn.sigmoid(self.receptance(xr))
         k = jnp.square(nn.relu(self.key(xk)))
         return r * self.value(k), hidden[-1, :]
@@ -325,22 +329,17 @@ class SingleStandFlaxRwkvBlock(nn.Module):
             layer_id=layer_id,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            precision=self.precision
+            precision=self.precision,
         )
         self.feed_forward = FlaxRwkvFeedForward(
             config=config,
             layer_id=layer_id,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            precision=self.precision
+            precision=self.precision,
         )
 
-    def __call__(
-            self,
-            hidden,
-            state=None,
-            output_attentions: bool = False
-    ):
+    def __call__(self, hidden, state=None, output_attentions: bool = False):
 
         if state is None:
             state = init_state(self.config.hidden_size)
@@ -355,10 +354,7 @@ class SingleStandFlaxRwkvBlock(nn.Module):
         )
         hidden = hidden + attention
 
-        feed_forward, ffd_state = self.feed_forward(
-            self.ln2(hidden),
-            state=ffd_state
-        )
+        feed_forward, ffd_state = self.feed_forward(self.ln2(hidden), state=ffd_state)
         hidden = hidden + feed_forward
 
         outputs = (hidden, (self_state, ffd_state))
@@ -375,7 +371,7 @@ FlaxRwkvBlock = nn.vmap(
     in_axes=0,
     out_axes=0,
     split_rngs={"params": False},
-    variable_axes={"params": None}
+    variable_axes={"params": None},
 )
 
 
@@ -393,7 +389,7 @@ class FlaxRwkvBlockCollection(nn.Module):
                 param_dtype=self.param_dtype,
                 precision=self.precision,
                 layer_id=idx,
-                name=str(idx)
+                name=str(idx),
             )
             for idx in range(self.config.num_hidden_layers)
         ]
@@ -401,19 +397,23 @@ class FlaxRwkvBlockCollection(nn.Module):
         self.layers_are_rescaled = False
 
     def __call__(
-            self,
-            hidden_states: chex.Array,
-            attention_mask: Optional[chex.Array] = None,
-            state: Optional[List[chex.Array]] = None,
-            use_cache: Optional[bool] = None,
-            deterministic: Optional[bool] = True,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
+        self,
+        hidden_states: chex.Array,
+        attention_mask: Optional[chex.Array] = None,
+        state: Optional[List[chex.Array]] = None,
+        use_cache: Optional[bool] = None,
+        deterministic: Optional[bool] = True,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
     ):
         all_hidden_states = ()
         all_self_attentions = ()
-        use_cache = use_cache if use_cache is not None else (self.config.use_cache if not deterministic else False)
+        use_cache = (
+            use_cache
+            if use_cache is not None
+            else (self.config.use_cache if not deterministic else False)
+        )
         for idx, block in enumerate(self.blocks):
 
             hidden_states, state, attentions = block(
@@ -421,9 +421,9 @@ class FlaxRwkvBlockCollection(nn.Module):
             )
 
             if (
-                    self.layers_are_rescaled
-                    and self.config.rescale_every > 0
-                    and (idx + 1) % self.config.rescale_every == 0
+                self.layers_are_rescaled
+                and self.config.rescale_every > 0
+                and (idx + 1) % self.config.rescale_every == 0
             ):
                 hidden_states = hidden_states / 2
 
@@ -447,13 +447,13 @@ class FlaxRwkvModule(nn.Module):
             config.vocab_size,
             config.hidden_size,
             dtype=self.dtype,
-            param_dtype=self.param_dtype
+            param_dtype=self.param_dtype,
         )
         self.blocks = FlaxRwkvBlockCollection(
             config=self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            precision=self.precision
+            precision=self.precision,
         )
 
         self.ln_out = nn.LayerNorm(
@@ -462,26 +462,40 @@ class FlaxRwkvModule(nn.Module):
         )
 
     def __call__(
-            self,
-            input_ids: Optional[chex.Array] = None,
-            attention_mask: Optional[chex.Array] = None,
-            inputs_embeds: Optional[chex.Array] = None,
-            state: Optional[List[chex.Array]] = None,
-            deterministic: bool = True,
-            use_cache: Optional[bool] = None,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
+        self,
+        input_ids: Optional[chex.Array] = None,
+        attention_mask: Optional[chex.Array] = None,
+        inputs_embeds: Optional[chex.Array] = None,
+        state: Optional[List[chex.Array]] = None,
+        deterministic: bool = True,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
     ) -> Union[Tuple, RwkvOutput]:
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
         )
-        use_cache = use_cache if use_cache is not None else (self.config.use_cache if not deterministic else False)
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
+        )
+        use_cache = (
+            use_cache
+            if use_cache is not None
+            else (self.config.use_cache if not deterministic else False)
+        )
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
 
         if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+            raise ValueError(
+                "You cannot specify both input_ids and inputs_embeds at the same time"
+            )
         elif input_ids is None and inputs_embeds is None:
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
@@ -489,10 +503,15 @@ class FlaxRwkvModule(nn.Module):
             inputs_embeds = self.embeddings(input_ids)
 
         if use_cache and state is None:
-            shape = (inputs_embeds.shape[0], self.config.hidden_size, self.config.num_hidden_layers)
+            shape = (
+                inputs_embeds.shape[0],
+                self.config.hidden_size,
+                self.config.num_hidden_layers,
+            )
             state = [
                 jnp.zeros(
-                    *shape, dtype=inputs_embeds.dtype if i <= 1 else jnp.float32,
+                    *shape,
+                    dtype=inputs_embeds.dtype if i <= 1 else jnp.float32,
                 )
                 for i in range(5)
             ]
@@ -517,7 +536,11 @@ class FlaxRwkvModule(nn.Module):
             all_hidden_states = all_hidden_states + (hidden_states,)
 
         if not return_dict:
-            return tuple(x for x in [hidden_states, state, all_hidden_states, all_self_attentions] if x is not None)
+            return tuple(
+                x
+                for x in [hidden_states, state, all_hidden_states, all_self_attentions]
+                if x is not None
+            )
 
         return RwkvOutput(
             last_hidden_state=hidden_states,
@@ -539,29 +562,31 @@ class FlaxRwkvForCausalLMModule(nn.Module):
             config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            precision=self.precision
+            precision=self.precision,
         )
         self.head = Dense(
             config.vocab_size,
             use_bias=False,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            precision=self.precision
+            precision=self.precision,
         )
 
     def __call__(
-            self,
-            input_ids: Optional[chex.Array] = None,
-            attention_mask: Optional[chex.Array] = None,
-            inputs_embeds: Optional[chex.Array] = None,
-            state: Optional[List[chex.Array]] = None,
-            deterministic: bool = True,
-            use_cache: Optional[bool] = None,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
+        self,
+        input_ids: Optional[chex.Array] = None,
+        attention_mask: Optional[chex.Array] = None,
+        inputs_embeds: Optional[chex.Array] = None,
+        state: Optional[List[chex.Array]] = None,
+        deterministic: bool = True,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
     ) -> Union[Tuple, RwkvCausalLMOutput]:
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
 
         rwkv_outputs = self.rwkv(
             input_ids,
@@ -571,7 +596,7 @@ class FlaxRwkvForCausalLMModule(nn.Module):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            deterministic=deterministic
+            deterministic=deterministic,
         )
         hidden_states = rwkv_outputs[0]
 
@@ -593,15 +618,15 @@ class FlaxRwkvPretrainedModel(EasyDeLFlaxPretrainedModel):
     config_class = RwkvConfig
 
     def __init__(
-            self,
-            config: RwkvConfig,
-            input_shape: Tuple = (1, 1),
-            seed: int = 0,
-            dtype: jnp.dtype = jnp.float32,
-            param_dtype: jnp.dtype = jnp.float32,
-            precision: Optional[Union[jax.lax.Precision, str]] = None,
-            _do_init: bool = True,
-            **kwargs
+        self,
+        config: RwkvConfig,
+        input_shape: Tuple = (1, 1),
+        seed: int = 0,
+        dtype: jnp.dtype = jnp.float32,
+        param_dtype: jnp.dtype = jnp.float32,
+        precision: Optional[Union[jax.lax.Precision, str]] = None,
+        _do_init: bool = True,
+        **kwargs,
     ):
         super().__init__(
             config=config,
@@ -610,19 +635,17 @@ class FlaxRwkvPretrainedModel(EasyDeLFlaxPretrainedModel):
                 dtype=dtype,
                 param_dtype=param_dtype,
                 precision=precision,
-                **kwargs
+                **kwargs,
             ),
             input_shape=input_shape,
             seed=seed,
             dtype=dtype,
-            _do_init=_do_init
+            _do_init=_do_init,
         )
 
     def init_weights(
-            self,
-            rng: jax.random.PRNGKey,
-            input_shape: Tuple,
-            params: FrozenDict = None) -> FrozenDict[Any, Any] | Mapping[str, Any] | Any:
+        self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
+    ) -> FrozenDict[Any, Any] | Mapping[str, Any] | Any:
         input_ids = jnp.zeros(input_shape, dtype="i4")
         attention_mask = jnp.ones_like(input_ids)
         params_rng, dropout_rng = jax.random.split(rng)
@@ -644,26 +667,34 @@ class FlaxRwkvPretrainedModel(EasyDeLFlaxPretrainedModel):
             return random_params
 
     def __call__(  # noqa
-            self,
-            input_ids: Optional[chex.Array] = None,
-            attention_mask: Optional[chex.Array] = None,
-            inputs_embeds: Optional[chex.Array] = None,
-            state: Optional[List[chex.Array]] = None,
-            use_cache: Optional[bool] = None,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
-            params: dict = None,
-            dropout_rng: jax.random.PRNGKey = None,
-            train: bool = False,
-            extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
-            add_params_field: bool = False,
+        self,
+        input_ids: Optional[chex.Array] = None,
+        attention_mask: Optional[chex.Array] = None,
+        inputs_embeds: Optional[chex.Array] = None,
+        state: Optional[List[chex.Array]] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        params: dict = None,
+        dropout_rng: jax.random.PRNGKey = None,
+        train: bool = False,
+        extra_embedding: Optional[jnp.ndarray] = None,
+        add_params_field: bool = False,
     ):
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
         )
-        return_dict = return_dict if return_dict is not None else self.config.return_dict
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
+        )
+        return_dict = (
+            return_dict if return_dict is not None else self.config.return_dict
+        )
 
         batch_size, sequence_length = input_ids.shape
 
@@ -674,11 +705,14 @@ class FlaxRwkvPretrainedModel(EasyDeLFlaxPretrainedModel):
         if dropout_rng is not None:
             rng_s["dropout"] = dropout_rng
 
-        inputs = {
-            "params": params or self.params} if add_params_field else params or self.params
+        inputs = (
+            {"params": params or self.params}
+            if add_params_field
+            else params or self.params
+        )
 
         if self.config.bits is not None:
-            rng_s['params'] = jax.random.key(0)
+            rng_s["params"] = jax.random.key(0)
 
         mutable = False
 
@@ -712,7 +746,9 @@ class FlaxRwkvPretrainedModel(EasyDeLFlaxPretrainedModel):
                 raise exc
         return gen_output
 
-    def prepare_inputs_for_generation(self, input_ids, state=None, inputs_embeds=None, **kwargs):
+    def prepare_inputs_for_generation(
+        self, input_ids, state=None, inputs_embeds=None, **kwargs
+    ):
         if state is not None:
             input_ids = input_ids[:, -1].unsqueeze(-1)
         if inputs_embeds is not None and state is None:

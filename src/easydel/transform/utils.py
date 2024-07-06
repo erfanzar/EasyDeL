@@ -41,9 +41,9 @@ def jax2pt(x: jax.Array):
     _jax_device = list(x.devices())[0].platform
     cpu_force = not cuda.is_available()
     if (
-            _jax_device in ["cpu", "gpu"]
-            and not cpu_force
-            and not bool(os.environ.get("EASYDEL_FORCE_TORCH_USE_CPU", "false"))
+        _jax_device in ["cpu", "gpu"]
+        and not cpu_force
+        and not bool(os.environ.get("EASYDEL_FORCE_TORCH_USE_CPU", "false"))
     ):
         dl_pack_jax = dlpack.to_dlpack(
             x,
@@ -105,3 +105,7 @@ def pt2jax(x, transpose_raw: Optional[tuple] = None):
     #     else:
     #         raise OSError(e)
     return jax.numpy.asarray(x.detach().cpu().numpy())
+
+
+def str_to_int(keys: tuple[str]):
+    return tuple((int(k) if k.isnumeric() else k) for k in keys)

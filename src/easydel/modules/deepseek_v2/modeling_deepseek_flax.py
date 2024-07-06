@@ -504,7 +504,7 @@ class FlaxDeepseekV2Attention(BaseAttentionModule):
     def __call__(
         self,
         hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        freqs_cis: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
         position_ids: chex.Array,
         causal_mask: chex.Array,
@@ -542,7 +542,7 @@ class FlaxDeepseekV2Attention(BaseAttentionModule):
             :, :, :, self.qk_nope_head_dim : self.qk_nope_head_dim + self.v_head_dim
         ]
 
-        sin, cos = freq_cis
+        sin, cos = freqs_cis
 
         q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
 
@@ -659,7 +659,7 @@ class FlaxDeepseekV2DecoderLayer(nn.Module):
 
         if self.config.gradient_checkpointing != "":
             # hidden_states: chex.Array,
-            # freq_cis: Tuple[chex.Array, chex.Array],
+            # freqs_cis: Tuple[chex.Array, chex.Array],
             # attention_mask: chex.Array,
             # position_ids: chex.Array,
             # causal_mask: chex.Array,
@@ -734,7 +734,7 @@ class FlaxDeepseekV2DecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        freqs_cis: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
         causal_mask: chex.Array,
         position_ids: chex.Array,
@@ -750,7 +750,7 @@ class FlaxDeepseekV2DecoderLayer(nn.Module):
         # Self Attention
         hidden_states, self_attn_weights = self.self_attn(
             hidden_states,
-            freq_cis,
+            freqs_cis,
             attention_mask,
             position_ids,
             causal_mask,
@@ -810,7 +810,7 @@ class FlaxDeepseekV2DecoratorCollection(nn.Module):
     def __call__(
         self,
         hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        freqs_cis: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
         causal_mask: chex.Array,
         position_ids: chex.Array,
@@ -826,7 +826,7 @@ class FlaxDeepseekV2DecoratorCollection(nn.Module):
                 all_hidden_states += (hidden_states,)
 
             # hidden_states: chex.Array,
-            # freq_cis: Tuple[chex.Array, chex.Array],
+            # freqs_cis: Tuple[chex.Array, chex.Array],
             # attention_mask: chex.Array,
             # causal_mask: chex.Array,
             # position_ids: chex.Array,
@@ -837,7 +837,7 @@ class FlaxDeepseekV2DecoratorCollection(nn.Module):
 
             output = layer(
                 hidden_states,
-                freq_cis,
+                freqs_cis,
                 attention_mask,
                 causal_mask,
                 position_ids,
@@ -908,7 +908,7 @@ class FlaxDeepseekV2Module(nn.Module):
                 initial_rope_kwargs["scaling_factor"] = self.config.rope_scaling[
                     "factor"
                 ]
-        self.freq_cis = init_deepseek_rotary_embedding(
+        self.freqs_cis = init_deepseek_rotary_embedding(
             dim=self.config.hidden_size // self.config.num_attention_heads,
             max_position_embeddings=(
                 getattr(
@@ -927,7 +927,7 @@ class FlaxDeepseekV2Module(nn.Module):
                     1,
                     getattr(
                         self.config,
-                        "c_max_position_embeddings",
+                        "causal_mask_max_position_embeddings",
                         self.config.max_position_embeddings,
                     ),
                 ),
@@ -984,7 +984,7 @@ class FlaxDeepseekV2Module(nn.Module):
             hidden_states=inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            freq_cis=self.freq_cis,
+            freqs_cis=self.freqs_cis,
             init_cache=init_cache,
             output_attentions=output_attentions,
             deterministic=deterministic,

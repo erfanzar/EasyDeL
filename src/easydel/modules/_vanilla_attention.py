@@ -1,3 +1,4 @@
+import jax.random
 import math
 from functools import partial
 from typing import Optional, Union
@@ -310,9 +311,11 @@ def attention_production(
     value_states: jax.Array,
     attention_bias: jax.Array | None = None,
     deterministic: bool = True,
-    dropout_rng: jax.random.PRNGKey = jax.random.PRNGKey(0),
+    dropout_rng: Optional[jax.random.PRNGKey] = None,
     dropout_rate: float = 0.0,
 ):
+    if dropout_rng is None:
+        dropout_rng = jax.random.PRNGKey(0)
     batch, q_sequence_length, q_num_head, head_dim = query_states.shape
     _, kv_sequence_length, kv_num_head, _ = key_states.shape
     assert q_num_head % kv_num_head == 0, (
@@ -356,9 +359,10 @@ def static_sharded_attention_production(
     value_states: jax.Array,
     attention_bias: jax.Array | None = None,
     deterministic: bool = True,
-    dropout_rng: jax.random.PRNGKey = jax.random.PRNGKey(0),
+    dropout_rng: Optional[jax.random.PRNGKey] = None,
     dropout_rate: float = 0.0,
 ):
+    dropout_rng = dropout_rng or jax.random.PRNGKey(0)
     assert (
         key_states.shape[1] == value_states.shape[1]
     ), "miss match on key_states and value_states sequence length"

@@ -1,20 +1,19 @@
 import gc
-import os
 import re
-from typing import Callable, List, Mapping, Optional, Union
+from typing import Callable, List, Mapping, Optional
 
 import fjformer
 import jax
-import msgpack
 import transformers
 from fjformer.checkpoint import get_dtype
-from flax import traverse_util
-from flax.serialization import from_bytes, to_bytes, to_state_dict
+from flax import nnx
+from flax.nnx import VariableState
 from flax.traverse_util import flatten_dict
 from jax import numpy as jnp
 from tqdm.autonotebook import tqdm
-from easydel.transform.utils import pt2jax, jax2pt
+
 from easydel.etils.etils import get_logger
+from easydel.transform.utils import jax2pt, pt2jax, str_to_int
 
 logger = get_logger(__name__)
 
@@ -74,46 +73,38 @@ class _DummyContextManager:
         pass
 
 
-def huggingface_to_easydel(
-        state_dict,
-        *,
-        device,
-        embedding_layer_names: Optional[List[str]] = None,
-        layer_norm_names: Optional[List[str]] = None,
-        shard_fns: Optional[Mapping[tuple, Callable]] = None,
-        convert_to_8bit: bool = False,
-        params_pattern_selection: Optional[re.Pattern] = None,
-        dtype: jax.numpy.dtype = jax.numpy.float16,
-        rnn_based_or_rwkv: bool = False,
-        verbose: bool = True,
-        remove_state_dict: bool = False,
-        lm_head_name: Optional[str] = None,
-        uses_tie_word_embedding: bool = False,
-        **kwargs,
+def toch_dict_to_flatten_dict(
+    state_dict,
+    *,
+    device,
+    embedding_layer_names: Optional[List[str]] = None,
+    layer_norm_names: Optional[List[str]] = None,
+    shard_fns: Optional[Mapping[tuple, Callable]] = None,
+    dtype: jax.numpy.dtype = jax.numpy.float32,
+    rnn_based_or_rwkv: bool = False,
+    verbose: bool = True,
+    remove_state_dict: bool = False,
+    lm_head_name: Optional[str] = None,
+    uses_tie_word_embedding: bool = False,
+    convert_str_to_int: bool = True,
+    **kwargs,
 ):
-    """The huggingface_to_easydel function takes a huggingface model's state_dict and converts it to an easydel
+    """The toch_dict_to_flatten_dict function takes a huggingface model's state_dict and converts it to an easydel
     model's flax_dict. The function is designed to be used in conjunction with the load_huggingface function, which
     loads a huggingface model from disk. The embedding layer name must be specified as well as the device on which
     the conversion will take place.
 
     Args:
         state_dict: Load the weights from a huggingface model
-        embedding_layer_names: List[str]: Identify the embedding layer
-            in the huggingface model
+        embedding_layer_names: List[str]: Identify the embedding layer in the huggingface model
         device: Determine which device the model will be loaded on
         layer_norm_names: Replaces weight or kernel with (scale)
-        shard_fns: Optional[Mapping[tuple, Callable]]: Sharding Function
-            to be used to shard model
-        convert_to_8bit: bool: whenever to convert the into 8bit format
-        params_pattern_selection: Optional[re.Pattern]: patter to use to
-            find the parameters of the model which will
+        shard_fns: Optional[Mapping[tuple, Callable]]: Sharding Function to be used to shard model
         dtype: jax.numpy.dtype: Specify the data type of the tensors
-        rnn_based_or_rwkv: bool: rnn_based_or_rwkv is a conditioner
-            which decide whenever it finds a value in tree
+        rnn_based_or_rwkv: bool: rnn_based_or_rwkv is a conditioner which decide whenever it finds a value in tree
         verbose: bool: whenever to log sharding or converting process
-        remove_state_dict: bool : whether to remove state dict during
-            the transforming process
-    be converted to 8bit format.
+        remove_state_dict: bool : whether to remove state dict during the transforming process be converted to 8bit format.
+
     that start with time_mix_ it will automatically reshape that for easydel use case
 
     Returns:
@@ -135,6 +126,7 @@ def huggingface_to_easydel(
                 gc.collect()
 
     except ModuleNotFoundError:
+
         class torch:
             bfloat16 = None
 
@@ -146,11 +138,6 @@ def huggingface_to_easydel(
     _l = len(".weight")
     _b = len(".bias")
 
-    if convert_to_8bit:
-        assert params_pattern_selection is not None, (
-            "in case of converting parameters to 8bit you should pass "
-            "`params_pattern_selection` too, to tell the quantizer which parameters should be quantized."
-        )
     ctx_m = jax.default_device(device) if shard_fns is None else _DummyContextManager()
     with ctx_m:
         flax_dict = {}
@@ -187,86 +174,29 @@ def huggingface_to_easydel(
                 del tensor
                 _clear()
 
-            # Apply sharding functions if
             if shard_fns is not None:
                 if key_tuple in shard_fns:
                     array = shard_fns[key_tuple](array)
                 else:
                     missed_shardings += 1
-            if convert_to_8bit and params_pattern_selection.search("/".join(key_tuple)):
-                array = fjformer.linen.linen.Int8Params(*fjformer.linen.quantize(array))
-            flax_dict[key_tuple] = array
+            flax_dict[str_to_int(key_tuple) if convert_str_to_int else key_tuple] = (
+                array
+            )
             pbar.set_postfix(missed_shardings=missed_shardings)
             pbar.update(1)
 
         pbar.close()
         _clear()
-        return traverse_util.unflatten_dict(flax_dict)
-
-
-def read_ckpt(
-        path: Union[str, os.PathLike], shard_fns=None, add_extra_past_fix: list = None
-):
-    """The read_ckpt function reads a checkpoint file and returns the tensors in it.
-
-    Args:
-        path: [str, os.PathLike]: Specify the path to the checkpoint
-            file
-        shard_fns: Shard the tensors
-        add_extra_past_fix: list: Add an extra past to the key
-
-    Returns:
-        A dictionary of tensors
-    """
-    tensors = {}
-    with open(path, "rb") as stream:
-        unpacker = msgpack.Unpacker(stream, read_size=83886080, max_buffer_size=0)
-        for key, value in unpacker:
-            if add_extra_past_fix is not None:
-                key = add_extra_past_fix + key
-            key = tuple(key)
-            tensor = from_bytes(None, value)
-            if shard_fns is not None:
-                tensor = shard_fns[key](tensor)
-            tensors[key] = tensor
-    return tensors
-
-
-def save_ckpt(train_state, path, gather_fns=None, float_dtype=None):
-    """The save_ckpt function saves the state of a training run to disk.
-
-    Args:
-        train_state: Store the current state of the training process
-        path: Specify the location of the checkpoint file
-        gather_fns: Specify a function that will be used to convert the
-            tensor to bytes
-        float_dtype: Convert the tensor to a specific dtype
-
-    Returns:
-        Nothing
-    """
-
-    train_state = to_state_dict(train_state)
-    packer = msgpack.Packer()
-    flatten_train_state = flatten_dict(train_state)
-    if gather_fns is not None:
-        gather_fns = flatten_dict(to_state_dict(gather_fns))
-
-    with open(path, "wb") as stream:
-        for key, value in flatten_train_state.items():
-            if gather_fns is not None:
-                value = gather_fns[key](value)
-            value = float_tensor_to_dtype(value, float_dtype)
-            stream.write(packer.pack((key, to_bytes(value))))
+        return flax_dict
 
 
 def easystate_to_torch(
-        state,
-        dtype=jnp.float16,
-        transpose_needed=None,
-        transpose_not_needed=None,
-        select_params_field: bool = True,
-        rnn_based_or_rwkv: bool = False,
+    state,
+    dtype=jnp.float16,
+    transpose_needed=None,
+    transpose_not_needed=None,
+    select_params_field: bool = True,
+    rnn_based_or_rwkv: bool = False,
 ):
     if transpose_needed is None:
         transpose_needed = ["kernel"]
@@ -312,20 +242,20 @@ def easystate_to_torch(
 
 
 def easystate_to_huggingface_model(
-        state,
-        config,
-        base_huggingface_module: transformers.PreTrainedModel,
-        base_huggingface_module_kwarguments=None,
-        dtype=jnp.float16,
-        transpose_needed=None,
-        transpose_not_needed=None,
-        select_params_field: bool = True,
-        rnn_based_or_rwkv: bool = False,
-        auto_correct: bool = True,
+    state,
+    config,
+    base_huggingface_module: transformers.PreTrainedModel,
+    base_huggingface_module_kwarguments=None,
+    dtype=jnp.float16,
+    transpose_needed=None,
+    transpose_not_needed=None,
+    select_params_field: bool = True,
+    rnn_based_or_rwkv: bool = False,
+    auto_correct: bool = True,
 ):
     if not rnn_based_or_rwkv and auto_correct:
         if isinstance(
-                base_huggingface_module, transformers.RwkvForCausalLM
+            base_huggingface_module, transformers.RwkvForCausalLM
         ) or isinstance(base_huggingface_module, transformers.RwkvModel):
             logger.warning(
                 "Rnn Based Model detected 'setting `rnn_based_or_rwkv = True`' for correct weight handling"

@@ -31,7 +31,7 @@ from easydel.modules.flax_modelling_utils import (
     control_mlp_sharding,
     get_dot_general_by_bits,
     get_gradient_checkpoint_policy,
-    precompute_freq_cis,
+    precompute_freqs_cis,
     with_sharding_constraint,
 )
 from easydel.modules.phi.phi_configuration import PhiConfig as PhiConfig
@@ -40,8 +40,8 @@ from easydel.modules.phi.phi_configuration import PhiConfig as PhiConfig
 class FlaxPhiEmbedding(nn.Module):
     dtype: jnp.dtype = jnp.float32
 
-    def __call__(self, query, key, freq_cis, position_ids):
-        sin, cos = freq_cis
+    def __call__(self, query, key, freqs_cis, position_ids):
+        sin, cos = freqs_cis
 
         sin = sin[position_ids][:, None, :, :]
         cos = cos[position_ids][:, None, :, :]
@@ -179,10 +179,10 @@ class FlaxPhiAttention(BaseAttentionModule):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
 
     def apply_rotary(
-        self, batch_size, sequence_length, query, key, value, freq_cis, position_ids
+        self, batch_size, sequence_length, query, key, value, freqs_cis, position_ids
     ):
         """The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
-        The main difference is that it takes in an additional argument, freq_cis, which are used to calculate
+        The main difference is that it takes in an additional argument, freqs_cis, which are used to calculate
         the rotary attention weights. The other differences are minor and mostly related to reshaping tensors.
 
         Args:
@@ -193,7 +193,7 @@ class FlaxPhiAttention(BaseAttentionModule):
             query: Calculate the attention weights
             key: Calculate the attention
             value: Compute the attention weights
-            freq_cis: Calculate the frequency of each word in the
+            freqs_cis: Calculate the frequency of each word in the
                 vocabulary
             position_ids: Identify the position of each token in the
                 sequence
@@ -213,7 +213,7 @@ class FlaxPhiAttention(BaseAttentionModule):
 
         query, key, value = self._transpose_sequence_head(query, key, value)
 
-        sin, cos = freq_cis
+        sin, cos = freqs_cis
 
         sin = sin[position_ids][:, None, :, :]
         cos = cos[position_ids][:, None, :, :]
@@ -238,7 +238,7 @@ class FlaxPhiAttention(BaseAttentionModule):
     def __call__(
         self,
         hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        freqs_cis: Tuple[chex.Array, chex.Array],
         attention_mask: Optional[chex.Array],
         position_ids: Optional[chex.Array],
         causal_mask: Optional[chex.Array],
@@ -273,7 +273,7 @@ class FlaxPhiAttention(BaseAttentionModule):
             key=key_states,
             value=value_states,
             position_ids=position_ids,
-            freq_cis=freq_cis,
+            freqs_cis=freqs_cis,
             batch_size=batch_size,
             sequence_length=sequence_length,
         )
@@ -400,7 +400,7 @@ class FlaxPhiDecoderLayer(nn.Module):
     def __call__(
         self,
         hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        freqs_cis: Tuple[chex.Array, chex.Array],
         attention_mask: Optional[chex.Array],
         position_ids: Optional[chex.Array],
         causal_mask: Optional[chex.Array],
@@ -418,7 +418,7 @@ class FlaxPhiDecoderLayer(nn.Module):
             position_ids=position_ids,
             output_attentions=output_attentions,
             deterministic=deterministic,
-            freq_cis=freq_cis,
+            freqs_cis=freqs_cis,
             causal_mask=causal_mask,
             init_cache=init_cache,
             segment_ids=segment_ids,
@@ -460,7 +460,7 @@ class FlaxPhiDecoderLayerCollection(nn.Module):
         block = FlaxPhiDecoderLayer
         if self.config.gradient_checkpointing != "":
             # hidden_states: chex.Array,
-            # freq_cis: Tuple[chex.Array, chex.Array],
+            # freqs_cis: Tuple[chex.Array, chex.Array],
             # attention_mask: Optional[chex.Array],
             # position_ids: Optional[chex.Array],
             # causal_mask: Optional[chex.Array],
@@ -491,7 +491,7 @@ class FlaxPhiDecoderLayerCollection(nn.Module):
     def __call__(
         self,
         hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        freqs_cis: Tuple[chex.Array, chex.Array],
         attention_mask: Optional[chex.Array],
         position_ids: Optional[chex.Array],
         causal_mask: Optional[chex.Array],
@@ -509,7 +509,7 @@ class FlaxPhiDecoderLayerCollection(nn.Module):
                 all_hidden_states += (hidden_states,)
 
             # hidden_states: chex.Array,
-            # freq_cis: Tuple[chex.Array, chex.Array],
+            # freqs_cis: Tuple[chex.Array, chex.Array],
             # attention_mask: Optional[chex.Array],
             # position_ids: Optional[chex.Array],
             # causal_mask: Optional[chex.Array],
@@ -519,7 +519,7 @@ class FlaxPhiDecoderLayerCollection(nn.Module):
             # init_cache: bool = False,
             layer_outputs = decoder_layer(
                 hidden_states,
-                freq_cis,
+                freqs_cis,
                 attention_mask,
                 position_ids,
                 causal_mask,
@@ -582,7 +582,7 @@ class FlaxPhiModule(nn.Module):
                     1,
                     getattr(
                         self.config,
-                        "c_max_position_embeddings",
+                        "causal_mask_max_position_embeddings",
                         self.config.max_position_embeddings,
                     ),
                 ),
@@ -599,7 +599,7 @@ class FlaxPhiModule(nn.Module):
                 initial_rope_kwargs = dict(
                     scaling_factor=scaling_factor, rope_type=scaling_type
                 )
-        self.freq_cis = precompute_freq_cis(
+        self.freqs_cis = precompute_freqs_cis(
             max_position_embeddings=(
                 getattr(
                     self.config,
@@ -655,7 +655,7 @@ class FlaxPhiModule(nn.Module):
 
         outputs = self.layers(
             hidden_states=inputs_embeds,
-            freq_cis=self.freq_cis,
+            freqs_cis=self.freqs_cis,
             attention_mask=attention_mask,
             position_ids=position_ids,
             causal_mask=self.causal_mask,
@@ -834,7 +834,7 @@ class FlaxPhiPreTrainedModel(EasyDeLFlaxPretrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = True,
-        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+        extra_embedding: Optional[jnp.ndarray] = None,
         add_params_field: bool = False,
         **kwargs,
     ):

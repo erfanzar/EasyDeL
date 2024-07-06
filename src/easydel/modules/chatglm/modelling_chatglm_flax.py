@@ -359,10 +359,10 @@ class FlaxChatGLMAttention(BaseAttentionModule):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
 
     def apply_rotary(
-        self, batch_size, sequence_length, query, key, value, freq_cis, position_ids
+        self, batch_size, sequence_length, query, key, value, freqs_cis, position_ids
     ):
         """The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
-        The main difference is that it takes in an additional argument, freq_cis, which are used to calculate
+        The main difference is that it takes in an additional argument, freqs_cis, which are used to calculate
         the rotary attention weights. The other differences are minor and mostly related to reshaping tensors.
 
         Args:
@@ -372,7 +372,7 @@ class FlaxChatGLMAttention(BaseAttentionModule):
             query: Calculate the attention weights
             key: Calculate the attention
             value: Compute the attention weights
-            freq_cis: Calculate the frequency of each word in the
+            freqs_cis: Calculate the frequency of each word in the
                 vocabulary
             position_ids: Identify the position of each token in the
                 sequence
@@ -383,14 +383,14 @@ class FlaxChatGLMAttention(BaseAttentionModule):
 
         query, key, value = self._transpose_sequence_head(query, key, value)
         query, key = self.rotary(
-            position_ids=position_ids, query=query, key=key, freq_cis=freq_cis
+            position_ids=position_ids, query=query, key=key, freqs_cis=freqs_cis
         )
         return self._transpose_sequence_head(query, key, value)
 
     def __call__(
         self,
         hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        freqs_cis: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
         position_ids: chex.Array,
         causal_mask: chex.Array,
@@ -410,7 +410,7 @@ class FlaxChatGLMAttention(BaseAttentionModule):
         array representing the input hidden states. The shape of this array should be
         `(batch_size, sequence_length, hidden_size)`, where `batch_size` is the number of
         sequences in the batch, `sequence_length` is the length
-          freq_cis (Tuple[chex.Array, chex.Array]): The `freq_cis` parameter is a tuple
+          freqs_cis (Tuple[chex.Array, chex.Array]): The `freqs_cis` parameter is a tuple
         containing two arrays.
           attention_mask (chex.Array): The `attention_mask` parameter is a binary mask
         indicating which positions should be attended to and which should not. It is used to
@@ -505,7 +505,7 @@ class FlaxChatGLMAttention(BaseAttentionModule):
             key=key_layer,
             value=value_layer,
             position_ids=position_ids,
-            freq_cis=freq_cis,
+            freqs_cis=freqs_cis,
             batch_size=batch_size,
             sequence_length=sequence_length,
         )
@@ -724,7 +724,7 @@ class FlaxChatGLMBlock(nn.Module):
     def __call__(
         self,
         hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        freqs_cis: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
         position_ids: chex.Array,
         causal_mask: chex.Array,
@@ -742,7 +742,7 @@ class FlaxChatGLMBlock(nn.Module):
         typically the output of the previous layer in a neural network model. In the context
         of the code snippet, `hidden_states` is passed through various layers and operations
         such as self
-          freq_cis (Tuple[chex.Array, chex.Array]): The `freq_cis` parameter is a tuple
+          freqs_cis (Tuple[chex.Array, chex.Array]): The `freqs_cis` parameter is a tuple
         containing two arrays.
           attention_mask (chex.Array): The `attention_mask` parameter is used to mask
         certain positions in the input so that the model does not attend to them during
@@ -781,7 +781,7 @@ class FlaxChatGLMBlock(nn.Module):
         # Self attention.
 
         # hidden_states: chex.Array,
-        # freq_cis: Tuple[chex.Array, chex.Array],
+        # freqs_cis: Tuple[chex.Array, chex.Array],
         # attention_mask: chex.Array,
         # position_ids: chex.Array,
         # causal_mask: chex.Array,
@@ -792,7 +792,7 @@ class FlaxChatGLMBlock(nn.Module):
         # fcm_mask=None,
         attention_output = self.self_attention(
             layernorm_output,
-            freq_cis,
+            freqs_cis,
             attention_mask,
             position_ids,
             causal_mask,
@@ -970,7 +970,7 @@ class FlaxChatGLMPreTrainedModel(EasyDeLFlaxPretrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+        extra_embedding: Optional[jnp.ndarray] = None,
         add_params_field: bool = False,
         **kwargs,
     ):
@@ -1105,7 +1105,7 @@ class FlaxChatGLMBlockCollection(nn.Module):
     def __call__(
         self,
         hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        freqs_cis: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
         position_ids: chex.Array,
         causal_mask: chex.Array,
@@ -1125,7 +1125,7 @@ class FlaxChatGLMBlockCollection(nn.Module):
             self: Represent the instance of the class
             hidden_states: chex.Array: Pass the input tensor to the
                 encoder
-            freq_cis: Tuple[chex.Array, chex.Array],: Pass in the
+            freqs_cis: Tuple[chex.Array, chex.Array],: Pass in the
                 frequency of each token
             attention_mask: chex.Array: Mask out certain tokens in the
                 input sequence
@@ -1153,7 +1153,7 @@ class FlaxChatGLMBlockCollection(nn.Module):
 
             layer_outputs = block(
                 hidden_states=hidden_states,
-                freq_cis=freq_cis,
+                freqs_cis=freqs_cis,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 causal_mask=causal_mask,
@@ -1201,7 +1201,7 @@ class FlaxChatGLMTransformer(nn.Module):
     def __call__(
         self,
         hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        freqs_cis: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
         position_ids: chex.Array,
         causal_mask: chex.Array,
@@ -1217,7 +1217,7 @@ class FlaxChatGLMTransformer(nn.Module):
 
         hidden_states, hs = self.layers(
             hidden_states=hidden_states,
-            freq_cis=freq_cis,
+            freqs_cis=freqs_cis,
             attention_mask=attention_mask,
             position_ids=position_ids,
             causal_mask=causal_mask,
@@ -1323,7 +1323,7 @@ class FlaxChatGLMModel(nn.Module):
             attention_mask=attention_mask,
             causal_mask=self.causal_mask,
             hidden_states=inputs_embeds,
-            freq_cis=rotary_pos_emb,
+            freqs_cis=rotary_pos_emb,
             deterministic=deterministic,
             init_cache=init_cache,
             output_hidden_states=output_hidden_states,

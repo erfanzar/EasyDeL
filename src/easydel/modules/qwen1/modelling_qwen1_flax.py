@@ -738,7 +738,7 @@ class FlaxQwen1PreTrainedModel(EasyDeLFlaxPretrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = True,
-        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+        extra_embedding: Optional[jnp.ndarray] = None,
         add_params_field: bool = False,
         **kwargs,
     ):
@@ -1048,7 +1048,12 @@ class FlaxQwen1Module(nn.Module):
             self.rotary_ndims = int(config.kv_channels * config.rotary_pct)
         self.causal_mask = make_causal_mask(
             jnp.ones(
-                (1, getattr(config, "c_max_position_embeddings", config.seq_length)),
+                (
+                    1,
+                    getattr(
+                        config, "causal_mask_max_position_embeddings", config.seq_length
+                    ),
+                ),
                 dtype="bool",
             ),
             dtype="bool",
@@ -1074,7 +1079,7 @@ class FlaxQwen1Module(nn.Module):
         output_attentions: bool = False,
         output_hidden_states: bool = False,
         return_dict: bool = True,
-        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+        extra_embedding: Optional[jnp.ndarray] = None,
     ):
         """The __call__ function is the main function of a Flax model. It takes in input_ids, attention_mask, and position_ids
         and returns the output of the model. The __call__ function also has optional arguments that can be used to control
@@ -1097,7 +1102,7 @@ class FlaxQwen1Module(nn.Module):
             output_hidden_states: bool: Determine whether to return
                 hidden states
             return_dict: bool: Return a dictionary of the output or not
-            extra_embedding: Optional[Union[jnp.ndarray, None]]: Pass in
+            extra_embedding: Optional[jnp.ndarray]: Pass in
                 the embedding of the
 
         Returns:
@@ -1220,7 +1225,7 @@ class FlaxQwen1ForCausalLMModule(nn.Module):
         output_attentions: bool = False,
         output_hidden_states: bool = False,
         return_dict: bool = True,
-        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+        extra_embedding: Optional[jnp.ndarray] = None,
     ):
         """The __call__ function is the main function of a Flax module. It takes in inputs and returns outputs.
 
@@ -1350,7 +1355,7 @@ class FlaxQwen1ForSequenceClassificationModule(nn.Module):
         output_attentions: bool = False,
         output_hidden_states: bool = False,
         return_dict: bool = True,
-        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+        extra_embedding: Optional[jnp.ndarray] = None,
     ):
         """The __call__ function is the main function of a Flax module.
         It takes in all the inputs to the model and returns all outputs from it.

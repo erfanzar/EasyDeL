@@ -1,7 +1,5 @@
 from typing import Dict, Optional, Union
-
 from jax.sharding import PartitionSpec
-
 from easydel.modules.easydel_modelling_utils import EasyDeLPretrainedConfig
 
 
@@ -29,7 +27,7 @@ class LlamaConfig(EasyDeLPretrainedConfig):
         rope_theta: float = 10000.0,
         attention_bias: bool = False,
         tie_word_embeddings: bool = False,
-        gradient_checkpointing: str = "nothing_saveable",
+        gradient_checkpointing: str = "",
         fcm_min_ratio: float = -1,
         fcm_max_ratio: float = -1,
         rope_scaling: Dict[str, Union[str, float]] = None,
@@ -48,61 +46,38 @@ class LlamaConfig(EasyDeLPretrainedConfig):
         Args:
             self: Refer to the object itself
             vocab_size: int: Set the size of the vocabulary
-            hidden_size: int: Set the size of the hidden layers in each
-                transformer block
-            intermediate_size: int: Set the size of the intermediate
-                layer
-            num_hidden_layers: int: Determine the number of layers in
-                the transformer
-            num_attention_heads: int: Determine the number of attention
-                heads
-            number_rep_kv: int: Set the number of times to repeat the
-                key and value vectors
-            num_key_value_heads: Optional[int]: Define the number of
-                key-value heads
-            max_position_embeddings: int: Set the maximum length of a
-                sequence
-            rms_norm_eps: float: Prevent division by zero in the rms
-                normalization
-            initializer_range: float: Initialize the weights of the
-                model
-            use_cache: bool: Determine whether the attention layer
-                should use a cache for faster computation
+            hidden_size: int: Set the size of the hidden layers in each transformer block
+            intermediate_size: int: Set the size of the intermediate layer
+            num_hidden_layers: int: Determine the number of layers in the transformer
+            num_attention_heads: int: Determine the number of attention heads
+            number_rep_kv: int: Set the number of times to repeat the key and value vectors
+            num_key_value_heads: Optional[int]: Define the number of key-value heads
+            max_position_embeddings: int: Set the maximum length of a sequence
+            rms_norm_eps: float: Prevent division by zero in the rms normalization
+            initializer_range: float: Initialize the weights of the model
+            use_cache: bool: Determine whether the attention layer should use a cache for faster computation
             bos_token_id: int: Set the beginning of sequence token
             eos_token_id: int: Specify the end of sentence token
-            resid_pdrop: float: Set the dropout rate for residual
-                connections
+            resid_pdrop: float: Set the dropout rate for residual connections
             embd_pdrop: float: Dropout the embedding layer
             attention_dropout: float: Dropout the attention weights
-            tie_word_embeddings: bool: Tie the word embeddings and
-                output layer weights
-            gradient_checkpointing: str: Specify how to checkpoint the
-                gradients
-            fcm_min_ratio: float: Set the minimum ratio of the number of
-                elements in a tensor to be processed by flash
+            tie_word_embeddings: bool: Tie the word embeddings and output layer weights
+            gradient_checkpointing: str: Specify how to checkpoint the gradients
+            fcm_min_ratio: float: Set the minimum ratio of the number of elements in a tensor to be processed by flash
             fcm_max_ratio: float: Determine the maximum ratio of
-            rope_scaling: Dict[str: Define the scaling of the rope
-            Union[str: Specify the type of the parameter
-            float]]: Specify the type of the parameter
-            shard_attention_computation: bool: when ever to use
-                shard_map for attention
-            bits: Optional[int]: Specify the number of bits used to
-                quantize the weights
+            rope_scaling: Dict[str, float]: Define the scaling of the rope
+            shard_attention_computation: bool: when ever to use shard_map for attention
+            bits: Optional[int]: Specify the number of bits used to quantize the weights
             rope_theta: float : rope_theta for compute rope
             attention_bias: bool : whenever to use attention bias or no
             hidden_act: str : hidden_act for mlp
-            axis_dims: Sequence[int]: Specify the dimensions of each
-                axis
-            axis_names: Sequence[str]: Specify the names of the axes in
-                a tensor
-            scan_layers: bool: Determine whether to use the scan_layers
-                or not
-            **kwargs: Pass a variable number of keyword arguments to a
-                function
-        :param : Define the number of layers in the model
+            axis_dims: Sequence[int]: Specify the dimensions of each axis
+            axis_names: Sequence[str]: Specify the names of the axes in a tensor
+            scan_layers: bool: Determine whether to use the scan_layers or not
+            **kwargs: Pass a variable number of keyword arguments to a function
 
         Returns:
-            Nothing
+            LlamaConfig class
         """
         num_key_value_heads = num_key_value_heads or number_rep_kv * num_attention_heads
         self.num_key_value_heads = num_key_value_heads
@@ -195,13 +170,14 @@ class LlamaConfig(EasyDeLPretrainedConfig):
         embd_pdrop: float = 0.0,
         attention_dropout: float = 0.0,
         tie_word_embeddings: bool = False,
-        gradient_checkpointing: str = "nothing_saveable",
+        gradient_checkpointing: str = "",
         fcm_min_ratio: float = 0.0,
         fcm_max_ratio: float = 0.0,
         number_rep_kv: int = 1,
         bits: Optional[int] = None,
         rope_theta: float = 10000.0,
         attention_bias: bool = False,
+        mlp_bias: bool = False,
         hidden_act: str = "silu",
         scan_layers: bool = True,
         **kwargs,
@@ -210,29 +186,20 @@ class LlamaConfig(EasyDeLPretrainedConfig):
 
         Args:
             self: Refer to the current object
-            resid_pdrop: float: Set the dropout rate for residual
-                connections
-            embd_pdrop: float: Set the probability of dropping an
-                embedding
-            attention_dropout: float: Set the probability of dropping
-                out the attention layer
-            tie_word_embeddings: bool: Tie the word embeddings to the
-                decoder
-            gradient_checkpointing: str: Control the amount of memory
-                used by jax
-            fcm_min_ratio: float: Control the minimum ratio of the
-                number of chunks to be used in flash-based computation
-            fcm_max_ratio: float: Set the maximum ratio of the number of
-                input tokens to output tokens
-            number_rep_kv: int: Determine how many times the key and
-                value vectors are repeated
-            bits: Optional[int]: Determine the number of bits used in
-                the quantization
+            resid_pdrop: float: Set the dropout rate for residual connections
+            embd_pdrop: float: Set the probability of dropping an embedding
+            attention_dropout: float: Set the probability of dropping out the attention layer
+            tie_word_embeddings: bool: Tie the word embeddings to the decoder
+            gradient_checkpointing: str: Control the amount of memory used by jax
+            fcm_min_ratio: float: Control the minimum ratio of the number of chunks to be used in flash-based computation
+            fcm_max_ratio: float: Set the maximum ratio of the number of input tokens to output tokens
+            number_rep_kv: int: Determine how many times the key and value vectors are repeated
+            bits: Optional[int]: Determine the number of bits used in the quantization
             rope_theta: float : rope_theta for compute rope
             attention_bias: bool : whenever to use attention bias or no
+            mlp_bias: bool: whenever to use bias for mlp or no
             hidden_act: str : hidden_act for mlp
-            scan_layers: bool: Determine whether to use scan layers or
-                not
+            scan_layers: bool: Determine whether to use scan layers or not
         """
         self.scan_layers = scan_layers
         self.embd_pdrop = embd_pdrop
@@ -240,6 +207,7 @@ class LlamaConfig(EasyDeLPretrainedConfig):
         self.resid_pdrop = resid_pdrop
         self.rope_theta = rope_theta
         self.attention_bias = attention_bias
+        self.mlp_bias = mlp_bias
         self.attention_dropout = attention_dropout
         self.hidden_act = hidden_act
         self.tie_word_embeddings = tie_word_embeddings

@@ -31,7 +31,7 @@ from easydel.modules.flax_modelling_utils import (
     control_mlp_sharding,
     get_dot_general_by_bits,
     get_gradient_checkpoint_policy,
-    precompute_freq_cis,
+    precompute_freqs_cis,
     with_sharding_constraint,
 )
 from easydel.modules.stablelm.stablelm_configuration import (
@@ -267,10 +267,10 @@ class FlaxStableLmAttention(BaseAttentionModule):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
 
     def apply_rotary(
-        self, batch_size, sequence_length, query, key, value, freq_cis, position_ids
+        self, batch_size, sequence_length, query, key, value, freqs_cis, position_ids
     ):
         """The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
-        The main difference is that it takes in an additional argument, freq_cis, which are used to calculate
+        The main difference is that it takes in an additional argument, freqs_cis, which are used to calculate
         the rotary attention weights. The other differences are minor and mostly related to reshaping tensors.
 
         Args:
@@ -281,7 +281,7 @@ class FlaxStableLmAttention(BaseAttentionModule):
             query: Calculate the attention weights
             key: Calculate the attention
             value: Compute the attention weights
-            freq_cis: Calculate the frequency of each word in the
+            freqs_cis: Calculate the frequency of each word in the
                 vocabulary
             position_ids: Identify the position of each token in the
                 sequence
@@ -291,7 +291,7 @@ class FlaxStableLmAttention(BaseAttentionModule):
         """
         query, key, value = self._transpose_sequence_head(query, key, value)
 
-        sin, cos = freq_cis
+        sin, cos = freqs_cis
 
         sin = sin[position_ids][:, None, :, :]
         cos = cos[position_ids][:, None, :, :]
@@ -316,7 +316,7 @@ class FlaxStableLmAttention(BaseAttentionModule):
     def __call__(
         self,
         hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        freqs_cis: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
         position_ids: chex.Array,
         causal_mask: chex.Array,
@@ -334,7 +334,7 @@ class FlaxStableLmAttention(BaseAttentionModule):
             self: Access variables that belong to the class
             hidden_states: chex.Array: Pass the hidden states of the
                 previous layer
-            freq_cis: Tuple[chex.Array, chex.Array],: Pass in the
+            freqs_cis: Tuple[chex.Array, chex.Array],: Pass in the
                 frequency coefficients for each position
             attention_mask: chex.Array: Mask out certain tokens in the
                 input sequence
@@ -383,7 +383,7 @@ class FlaxStableLmAttention(BaseAttentionModule):
             key=key_states,
             value=value_states,
             position_ids=position_ids,
-            freq_cis=freq_cis,
+            freqs_cis=freqs_cis,
             batch_size=batch_size,
             sequence_length=sequence_length,
         )
@@ -496,7 +496,7 @@ class FlaxStableLmDecoderLayer(nn.Module):
                 ),
             )
             # hidden_states: chex.Array,
-            # freq_cis: Tuple[chex.Array, chex.Array],
+            # freqs_cis: Tuple[chex.Array, chex.Array],
             # attention_mask: chex.Array,
             # position_ids: chex.Array,
             # causal_mask: chex.Array,
@@ -539,7 +539,7 @@ class FlaxStableLmDecoderLayer(nn.Module):
     def __call__(
         self,
         hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        freqs_cis: Tuple[chex.Array, chex.Array],
         attention_mask: Optional[chex.Array],
         position_ids: Optional[chex.Array],
         causal_mask: Optional[chex.Array],
@@ -552,7 +552,7 @@ class FlaxStableLmDecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
         attn_out = self.self_attn(
             hidden_states,
-            freq_cis,
+            freqs_cis,
             attention_mask,
             position_ids,
             causal_mask,
@@ -629,7 +629,7 @@ class FlaxStableLmDecoderLayerCollection(nn.Module):
     def __call__(
         self,
         hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        freqs_cis: Tuple[chex.Array, chex.Array],
         attention_mask: Optional[chex.Array],
         position_ids: Optional[chex.Array],
         causal_mask: Optional[chex.Array],
@@ -646,7 +646,7 @@ class FlaxStableLmDecoderLayerCollection(nn.Module):
                 all_hidden_states += (hidden_states,)
 
             # hidden_states: chex.Array,
-            # freq_cis: Tuple[chex.Array, chex.Array],
+            # freqs_cis: Tuple[chex.Array, chex.Array],
             # attention_mask: Optional[chex.Array],
             # position_ids: Optional[chex.Array],
             # causal_mask: Optional[chex.Array],
@@ -656,7 +656,7 @@ class FlaxStableLmDecoderLayerCollection(nn.Module):
 
             layer_outputs = decoder_layer(
                 hidden_states,
-                freq_cis,
+                freqs_cis,
                 attention_mask,
                 position_ids,
                 causal_mask,
@@ -718,7 +718,7 @@ class FlaxStableLmModule(nn.Module):
                     1,
                     getattr(
                         self.config,
-                        "c_max_position_embeddings",
+                        "causal_mask_max_position_embeddings",
                         self.config.max_position_embeddings,
                     ),
                 ),
@@ -735,7 +735,7 @@ class FlaxStableLmModule(nn.Module):
                 initial_rope_kwargs = dict(
                     scaling_factor=scaling_factor, rope_type=scaling_type
                 )
-        self.freq_cis = precompute_freq_cis(
+        self.freqs_cis = precompute_freqs_cis(
             max_position_embeddings=(
                 getattr(
                     self.config,
@@ -791,7 +791,7 @@ class FlaxStableLmModule(nn.Module):
 
         outputs = self.layers(
             hidden_states=inputs_embeds,
-            freq_cis=self.freq_cis,
+            freqs_cis=self.freqs_cis,
             attention_mask=attention_mask,
             position_ids=position_ids,
             causal_mask=self.causal_mask,
@@ -969,7 +969,7 @@ class FlaxStableLmPreTrainedModel(EasyDeLFlaxPretrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = True,
-        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+        extra_embedding: Optional[jnp.ndarray] = None,
         add_params_field: bool = False,
         **kwargs,
     ):

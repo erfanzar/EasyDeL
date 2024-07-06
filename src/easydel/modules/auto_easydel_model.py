@@ -20,7 +20,7 @@ from easydel.modules.easydel_modelling_utils import (
     EasyDeLFlaxPretrainedModel,
     EasyDeLPretrainedConfig,
 )
-from easydel.transform.easydel_transform import huggingface_to_easydel
+from easydel.transform.transform import toch_dict_to_flatten_dict
 
 logger = get_logger(name=__name__)
 
@@ -48,7 +48,7 @@ def get_modules_by_type(
             _LlamaConfig,
             _FlaxLlamaForCausalLM,
             functools.partial(
-                huggingface_to_easydel,
+                toch_dict_to_flatten_dict,
                 embedding_layer_names=["embed_tokens"],
                 rnn_based_or_rwkv=False,
                 lm_head_name="lm_head",
@@ -62,21 +62,23 @@ def get_modules_by_type(
             _GemmaConfig,
             _FlaxGemmaForCausalLM,
             functools.partial(
-                huggingface_to_easydel,
+                toch_dict_to_flatten_dict,
                 embedding_layer_names=["embed_tokens"],
                 rnn_based_or_rwkv=False,
                 lm_head_name="lm_head",
             ),
         )
     elif model_type == "gemma2":
-        from easydel.modules.gemma2 import FlaxGemma2ForCausalLM as _FlaxGemma2ForCausalLM
+        from easydel.modules.gemma2 import (
+            FlaxGemma2ForCausalLM as _FlaxGemma2ForCausalLM,
+        )
         from easydel.modules.gemma2 import Gemma2Config as _Gemma2Config
 
         return (
             _Gemma2Config,
             _FlaxGemma2ForCausalLM,
             functools.partial(
-                huggingface_to_easydel,
+                toch_dict_to_flatten_dict,
                 embedding_layer_names=["embed_tokens"],
                 rnn_based_or_rwkv=False,
                 lm_head_name="lm_head",
@@ -92,7 +94,7 @@ def get_modules_by_type(
             _FalconConfig,
             _FlaxFalconForCausalLM,
             functools.partial(
-                huggingface_to_easydel,
+                toch_dict_to_flatten_dict,
                 embedding_layer_names=["word_embeddings"],
                 layer_norm_names=[
                     "input_layernorm",
@@ -113,7 +115,7 @@ def get_modules_by_type(
             _MptConfig,
             _FlaxMptForCausalLM,
             functools.partial(
-                huggingface_to_easydel,
+                toch_dict_to_flatten_dict,
                 embedding_layer_names=["wte"],
                 rnn_based_or_rwkv=False,
                 layer_norm_names=["norm_1", "norm_2", "norm_f"],
@@ -131,7 +133,7 @@ def get_modules_by_type(
             _MistralConfig,
             _FlaxMistralForCausalLM,
             functools.partial(
-                huggingface_to_easydel,
+                toch_dict_to_flatten_dict,
                 embedding_layer_names=["embed_tokens"],
                 rnn_based_or_rwkv=False,
                 lm_head_name="lm_head",
@@ -145,7 +147,7 @@ def get_modules_by_type(
             _GPTJConfig,
             _FlaxGPTJForCausalLM,
             functools.partial(
-                huggingface_to_easydel,
+                toch_dict_to_flatten_dict,
                 embedding_layer_names="wte",
                 layer_norm_names=[
                     "ln_1",
@@ -167,7 +169,7 @@ def get_modules_by_type(
             _GPTNeoXConfig,
             _FlaxGPTNeoXForCausalLM,
             functools.partial(
-                huggingface_to_easydel,
+                toch_dict_to_flatten_dict,
                 embedding_layer_names="wte",
                 rnn_based_or_rwkv=False,
                 lm_head_name="lm_head",
@@ -181,7 +183,7 @@ def get_modules_by_type(
             _PalmConfig,
             _FlaxPalmForCausalLM,
             functools.partial(
-                huggingface_to_easydel,
+                toch_dict_to_flatten_dict,
                 embedding_layer_names="wte",
                 rnn_based_or_rwkv=False,
                 lm_head_name="lm_head",
@@ -197,7 +199,7 @@ def get_modules_by_type(
             _FlaxLTConfig,
             _FlaxLTForCausalLM,
             functools.partial(
-                huggingface_to_easydel,
+                toch_dict_to_flatten_dict,
                 embedding_layer_names="wte",
                 rnn_based_or_rwkv=False,
                 lm_head_name="lm_head",
@@ -211,7 +213,7 @@ def get_modules_by_type(
             _GPT2Config,
             _FlaxGPT2LMHeadModel,
             functools.partial(
-                huggingface_to_easydel,
+                toch_dict_to_flatten_dict,
                 embedding_layer_names=["wte", "wpe"],
                 layer_norm_names=["ln_1", "ln_2", "ln_f"],
                 rnn_based_or_rwkv=False,
@@ -228,7 +230,7 @@ def get_modules_by_type(
             _MixtralConfig,
             _FlaxMixtralForCausalLM,
             functools.partial(
-                huggingface_to_easydel,
+                toch_dict_to_flatten_dict,
                 embedding_layer_names=["embed_tokens"],
                 rnn_based_or_rwkv=False,
                 lm_head_name="lm_head",
@@ -242,7 +244,7 @@ def get_modules_by_type(
             _PhiConfig,
             _FlaxPhiForCausalLM,
             functools.partial(
-                huggingface_to_easydel,
+                toch_dict_to_flatten_dict,
                 embedding_layer_names=["embed_tokens"],
                 layer_norm_names=[
                     "input_layernorm",
@@ -262,7 +264,7 @@ def get_modules_by_type(
             _Qwen1Config,
             _FlaxQwen1ForCausalLM,
             functools.partial(
-                huggingface_to_easydel,
+                toch_dict_to_flatten_dict,
                 embedding_layer_names=["wte"],
                 rnn_based_or_rwkv=False,
                 lm_head_name="lm_head",
@@ -277,7 +279,7 @@ def get_modules_by_type(
             _Qwen2Config,
             _FlaxQwen2ForCausalLM,
             functools.partial(
-                huggingface_to_easydel,
+                toch_dict_to_flatten_dict,
                 embedding_layer_names=["embed_tokens"],
                 rnn_based_or_rwkv=False,
                 lm_head_name="lm_head",
@@ -293,7 +295,7 @@ def get_modules_by_type(
             _StableLmConfig,
             _FlaxStableLmForCausalLM,
             functools.partial(
-                huggingface_to_easydel,
+                toch_dict_to_flatten_dict,
                 embedding_layer_names=["embed_tokens"],
                 layer_norm_names=[
                     "input_layernorm",
@@ -313,7 +315,7 @@ def get_modules_by_type(
             _RwkvConfig,
             _FlaxRwkvForCausalLM,
             functools.partial(
-                huggingface_to_easydel,
+                toch_dict_to_flatten_dict,
                 embedding_layer_names=["embeddings"],
                 layer_norm_names=["ln_out", "ln2", "ln1", "pre_ln"],
                 rnn_based_or_rwkv=True,
@@ -328,7 +330,7 @@ def get_modules_by_type(
             _MambaConfig,
             _FlaxMambaForCausalLM,
             functools.partial(
-                huggingface_to_easydel,
+                toch_dict_to_flatten_dict,
                 embedding_layer_names=["embeddings"],
                 rnn_based_or_rwkv=False,
                 lm_head_name="lm_head",
@@ -342,7 +344,7 @@ def get_modules_by_type(
             _Grok1Config,
             _FlaxGrok1ForCausalLM,
             functools.partial(
-                huggingface_to_easydel,
+                toch_dict_to_flatten_dict,
                 embedding_layer_names=["embed_tokens"],
                 rnn_based_or_rwkv=False,
                 lm_head_name="lm_head",
@@ -358,7 +360,7 @@ def get_modules_by_type(
             _Qwen2MoeConfig,
             _FlaxQwen2MoeForCausalLM,
             functools.partial(
-                huggingface_to_easydel,
+                toch_dict_to_flatten_dict,
                 embedding_layer_names=["embed_tokens"],
                 rnn_based_or_rwkv=False,
                 lm_head_name="lm_head",
@@ -374,7 +376,7 @@ def get_modules_by_type(
             _CohereConfig,
             _FlaxCohereForCausalLM,
             functools.partial(
-                huggingface_to_easydel,
+                toch_dict_to_flatten_dict,
                 embedding_layer_names=["embed_tokens"],
                 rnn_based_or_rwkv=False,
                 lm_head_name="lm_head",
@@ -388,7 +390,7 @@ def get_modules_by_type(
             _DbrxConfig,
             _FlaxDbrxForCausalLM,
             functools.partial(
-                huggingface_to_easydel,
+                toch_dict_to_flatten_dict,
                 embedding_layer_names=["wte"],
                 rnn_based_or_rwkv=False,
                 layer_norm_names=["norm_1", "norm_2", "norm_f"],
@@ -403,7 +405,7 @@ def get_modules_by_type(
             _Phi3Config,
             _FlaxPhi3ForCausalLM,
             functools.partial(
-                huggingface_to_easydel,
+                toch_dict_to_flatten_dict,
                 embedding_layer_names=["embed_tokens"],
                 rnn_based_or_rwkv=False,
                 lm_head_name="lm_head",
@@ -420,7 +422,7 @@ def get_modules_by_type(
             _ArcticConfig,
             _FlaxArcticForCausalLM,
             functools.partial(
-                huggingface_to_easydel,
+                toch_dict_to_flatten_dict,
                 embedding_layer_names=["embed_tokens"],
                 rnn_based_or_rwkv=False,
                 lm_head_name="lm_head",
@@ -436,7 +438,7 @@ def get_modules_by_type(
             _OpenELMConfig,
             _FlaxOpenELMForCausalLM,
             functools.partial(
-                huggingface_to_easydel,
+                toch_dict_to_flatten_dict,
                 embedding_layer_names=["token_embeddings"],
                 rnn_based_or_rwkv=False,
                 lm_head_name="lm_head",
@@ -452,7 +454,7 @@ def get_modules_by_type(
             _DeepseekV2Config,
             _FlaxDeepseekV2ForCausalLM,
             functools.partial(
-                huggingface_to_easydel,
+                toch_dict_to_flatten_dict,
                 embedding_layer_names=["embed_tokens"],
                 rnn_based_or_rwkv=False,
                 lm_head_name="lm_head",
@@ -466,7 +468,7 @@ def get_modules_by_type(
             _OlmoConfig,
             _FlaxOlmoForCausalLM,
             functools.partial(
-                huggingface_to_easydel,
+                toch_dict_to_flatten_dict,
                 embedding_layer_names=["embed_tokens"],
                 rnn_based_or_rwkv=False,
                 lm_head_name="lm_head",

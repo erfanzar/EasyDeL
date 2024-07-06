@@ -27,7 +27,7 @@ from easydel.modules.flax_modelling_utils import (
     control_mlp_sharding,
     get_dot_general_by_bits,
     get_gradient_checkpoint_policy,
-    precompute_freq_cis,
+    precompute_freqs_cis,
 )
 from easydel.modules.gemma.gemma_configuration import GemmaConfig as GemmaConfig
 
@@ -103,8 +103,8 @@ class FlaxGemmaRotaryEmbedding(nn.Module):
     config: GemmaConfig
     dtype: jnp.dtype = jnp.float32
 
-    def __call__(self, freq_cis, key_states, query_states, position_ids):
-        sin, cos = freq_cis
+    def __call__(self, freqs_cis, key_states, query_states, position_ids):
+        sin, cos = freqs_cis
 
         sin = sin[position_ids][:, None, :, :]
         cos = cos[position_ids][:, None, :, :]
@@ -211,10 +211,10 @@ class FlaxGemmaAttention(BaseAttentionModule):
         )
 
     def apply_rotary(
-        self, batch_size, sequence_length, query, key, value, freq_cis, position_ids
+        self, batch_size, sequence_length, query, key, value, freqs_cis, position_ids
     ):
         """The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
-        The main difference is that it takes in an additional argument, freq_cis, which are used to calculate
+        The main difference is that it takes in an additional argument, freqs_cis, which are used to calculate
         the rotary attention weights. The other differences are minor and mostly related to reshaping tensors.
 
         Args:
@@ -224,7 +224,7 @@ class FlaxGemmaAttention(BaseAttentionModule):
             query: Calculate the attention weights
             key: Calculate the attention
             value: Compute the attention weights
-            freq_cis: Calculate the frequency of each word in the
+            freqs_cis: Calculate the frequency of each word in the
                 vocabulary
             position_ids: Identify the position of each token in the
                 sequence
@@ -237,7 +237,7 @@ class FlaxGemmaAttention(BaseAttentionModule):
             position_ids=position_ids,
             query_states=query,
             key_states=key,
-            freq_cis=freq_cis,
+            freqs_cis=freqs_cis,
         )
         return self._transpose_sequence_head(query, key, value)
 
@@ -246,7 +246,7 @@ class FlaxGemmaAttention(BaseAttentionModule):
         hidden_states: chex.Array,
         attention_mask: chex.Array,
         position_ids: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        freqs_cis: Tuple[chex.Array, chex.Array],
         causal_mask: chex.Array,
         segment_ids: Optional[chex.Array] = None,
         deterministic: bool = True,
@@ -275,7 +275,7 @@ class FlaxGemmaAttention(BaseAttentionModule):
             query_states,
             key_states,
             value_states,
-            freq_cis,
+            freqs_cis,
             position_ids,
         )
 
@@ -466,7 +466,7 @@ class FlaxGemmaDecoderLayer(nn.Module):
         hidden_states: chex.Array,
         attention_mask: chex.Array,
         position_ids: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        freqs_cis: Tuple[chex.Array, chex.Array],
         causal_mask: chex.Array,
         segment_ids: Optional[chex.Array] = None,
         deterministic: bool = True,
@@ -479,7 +479,7 @@ class FlaxGemmaDecoderLayer(nn.Module):
             hidden_states,
             attention_mask,
             position_ids,
-            freq_cis,
+            freqs_cis,
             causal_mask,
             segment_ids,
             deterministic,
@@ -617,7 +617,7 @@ class FlaxGemmaPreTrainedModel(EasyDeLFlaxPretrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+        extra_embedding: Optional[jnp.ndarray] = None,
         add_params_field: bool = False,
         **kwargs,
     ):
@@ -714,7 +714,7 @@ class FlaxGemmaLayerCollection(nn.Module):
         hidden_states: chex.Array,
         attention_mask: chex.Array,
         position_ids: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        freqs_cis: Tuple[chex.Array, chex.Array],
         causal_mask: chex.Array,
         deterministic: bool = True,
         init_cache: bool = False,
@@ -732,7 +732,7 @@ class FlaxGemmaLayerCollection(nn.Module):
                 hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
-                freq_cis=freq_cis,
+                freqs_cis=freqs_cis,
                 causal_mask=causal_mask,
                 deterministic=deterministic,
                 init_cache=init_cache,
@@ -775,7 +775,7 @@ class FlaxGemmaModule(nn.Module):
             self.config,
             dtype=self.dtype,
         )
-        self.freq_cis = precompute_freq_cis(
+        self.freqs_cis = precompute_freqs_cis(
             max_position_embeddings=self.config.max_position_embeddings,
             dim=self.config.head_dim,
             base=self.config.rope_theta,
@@ -805,7 +805,7 @@ class FlaxGemmaModule(nn.Module):
             input_embeds,
             position_ids=position_ids,
             attention_mask=attention_mask,
-            freq_cis=self.freq_cis,
+            freqs_cis=self.freqs_cis,
             causal_mask=self.causal_mask,
             deterministic=deterministic,
             init_cache=init_cache,

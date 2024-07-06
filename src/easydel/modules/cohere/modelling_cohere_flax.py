@@ -27,7 +27,7 @@ from easydel.modules.flax_modelling_utils import (
     control_mlp_sharding,
     get_dot_general_by_bits,
     get_gradient_checkpoint_policy,
-    precompute_freq_cis,
+    precompute_freqs_cis,
     with_sharding_constraint,
 )
 
@@ -37,8 +37,8 @@ re_mat = flax.linen.partitioning.remat
 class FlaxCohereEmbedding(nn.Module):
     dtype: jnp.dtype = jnp.float32
 
-    def __call__(self, query, key, freq_cis, position_ids):
-        sin, cos = freq_cis
+    def __call__(self, query, key, freqs_cis, position_ids):
+        sin, cos = freqs_cis
 
         sin = sin[position_ids][:, None, :, :]
         cos = cos[position_ids][:, None, :, :]
@@ -192,10 +192,10 @@ class FlaxCohereAttention(BaseAttentionModule):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
 
     def apply_rotary(
-        self, batch_size, sequence_length, query, key, value, freq_cis, position_ids
+        self, batch_size, sequence_length, query, key, value, freqs_cis, position_ids
     ):
         """The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
-        The main difference is that it takes in an additional argument, freq_cis, which are used to calculate
+        The main difference is that it takes in an additional argument, freqs_cis, which are used to calculate
         the rotary attention weights. The other differences are minor and mostly related to reshaping tensors.
 
         Args:
@@ -205,7 +205,7 @@ class FlaxCohereAttention(BaseAttentionModule):
             query: Calculate the attention weights
             key: Calculate the attention
             value: Compute the attention weights
-            freq_cis: Calculate the frequency of each word in the
+            freqs_cis: Calculate the frequency of each word in the
                 vocabulary
             position_ids: Identify the position of each token in the
                 sequence
@@ -215,14 +215,14 @@ class FlaxCohereAttention(BaseAttentionModule):
         """
         query, key, value = self._transpose_sequence_head(query, key, value)
         query, key = self.rotary(
-            position_ids=position_ids, query=query, key=key, freq_cis=freq_cis
+            position_ids=position_ids, query=query, key=key, freqs_cis=freqs_cis
         )
         return self._transpose_sequence_head(query, key, value)
 
     def __call__(
         self,
         hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        freqs_cis: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
         position_ids: chex.Array,
         causal_mask: chex.Array,
@@ -240,7 +240,7 @@ class FlaxCohereAttention(BaseAttentionModule):
             self: Access variables that belong to the class
             hidden_states: chex.Array: Pass the hidden states of the
                 previous layer
-            freq_cis: Tuple[chex.Array, chex.Array],: Pass in the
+            freqs_cis: Tuple[chex.Array, chex.Array],: Pass in the
                 frequency coefficients for each position
             attention_mask: chex.Array: Mask out certain tokens in the
                 input sequence
@@ -284,7 +284,7 @@ class FlaxCohereAttention(BaseAttentionModule):
             key=key_states,
             value=value_states,
             position_ids=position_ids,
-            freq_cis=freq_cis,
+            freqs_cis=freqs_cis,
             batch_size=batch_size,
             sequence_length=sequence_length,
         )
@@ -495,7 +495,7 @@ class FlaxCohereBlock(nn.Module):
     def __call__(
         self,
         hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        freqs_cis: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
         position_ids: chex.Array,
         causal_mask: chex.Array,
@@ -514,7 +514,7 @@ class FlaxCohereBlock(nn.Module):
             self: Refer to the class instance itself
             hidden_states: chex.Array: Pass in the hidden state of the
                 previous layer
-            freq_cis: Tuple[chex.Array, chex.Array],: Pass in the
+            freqs_cis: Tuple[chex.Array, chex.Array],: Pass in the
                 frequency information
             attention_mask: chex.Array: Mask out the attention weights
                 for padding tokens
@@ -536,7 +536,7 @@ class FlaxCohereBlock(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
         attn_outputs = self.self_attn(
             hidden_states,
-            freq_cis,
+            freqs_cis,
             attention_mask,
             position_ids,
             causal_mask,
@@ -706,7 +706,7 @@ class FlaxCoherePreTrainedModel(EasyDeLFlaxPretrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+        extra_embedding: Optional[jnp.ndarray] = None,
         add_params_field: bool = False,
         **kwargs,
     ):
@@ -840,7 +840,7 @@ class FlaxCohereBlockCollection(nn.Module):
     def __call__(
         self,
         hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        freqs_cis: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
         position_ids: chex.Array,
         causal_mask: chex.Array,
@@ -860,7 +860,7 @@ class FlaxCohereBlockCollection(nn.Module):
             self: Represent the instance of the class
             hidden_states: chex.Array: Pass the input tensor to the
                 encoder
-            freq_cis: Tuple[chex.Array, chex.Array],: Pass in the
+            freqs_cis: Tuple[chex.Array, chex.Array],: Pass in the
                 frequency of each token
             attention_mask: chex.Array: Mask out certain tokens in the
                 input sequence
@@ -909,7 +909,7 @@ class FlaxCohereBlockCollection(nn.Module):
 
             layer_outputs = block(
                 hidden_states=hidden_states,
-                freq_cis=freq_cis,
+                freqs_cis=freqs_cis,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 causal_mask=causal_mask,
@@ -964,7 +964,7 @@ class FlaxCohereModule(nn.Module):
                     1,
                     getattr(
                         self.config,
-                        "c_max_position_embeddings",
+                        "causal_mask_max_position_embeddings",
                         self.config.max_position_embeddings,
                     ),
                 ),
@@ -980,7 +980,7 @@ class FlaxCohereModule(nn.Module):
             initial_rope_kwargs = dict(
                 scaling_factor=scaling_factor, rope_type=scaling_type
             )
-        self.freq_cis = precompute_freq_cis(
+        self.freqs_cis = precompute_freqs_cis(
             max_position_embeddings=(
                 getattr(
                     self.config,
@@ -1004,7 +1004,7 @@ class FlaxCohereModule(nn.Module):
         output_attentions: bool = False,
         output_hidden_states: bool = False,
         return_dict: bool = True,
-        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+        extra_embedding: Optional[jnp.ndarray] = None,
     ):
         """The __call__ function is the main function of a Flax model. It takes in input_ids, attention_mask, and position_ids
         and returns the output of the model. The __call__ function also has optional arguments that can be used to control
@@ -1051,7 +1051,7 @@ class FlaxCohereModule(nn.Module):
 
         outputs = self.layers(
             hidden_states=inputs_embeds,
-            freq_cis=self.freq_cis,
+            freqs_cis=self.freqs_cis,
             attention_mask=attention_mask,
             position_ids=position_ids,
             causal_mask=self.causal_mask,
@@ -1128,7 +1128,7 @@ class FlaxCohereForCausalLMModule(nn.Module):
         output_attentions: bool = False,
         output_hidden_states: bool = False,
         return_dict: bool = True,
-        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+        extra_embedding: Optional[jnp.ndarray] = None,
     ):
         """The __call__ function is the main function of a Flax module. It takes in inputs and returns outputs.
 

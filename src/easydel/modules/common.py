@@ -3,9 +3,6 @@ from jax import lax
 from jax import numpy as jnp
 
 
-nnx.Linear()
-
-
 class RMSNorm(nnx.Module):
     def __init__(
         self,
@@ -20,7 +17,7 @@ class RMSNorm(nnx.Module):
         self.dtype = dtype
         self.kernel = nnx.Param(
             nnx.initializers.ones(
-                rngs,
+                rngs.params(),
                 (dim,),
                 param_dtype,
             ),
@@ -34,4 +31,3 @@ class RMSNorm(nnx.Module):
         output = self._norm(x).astype(self.dtype)
         weight = self.kernel.value.astype(self.dtype)
         return output * weight
-

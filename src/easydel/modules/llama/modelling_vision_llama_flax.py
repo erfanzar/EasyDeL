@@ -1,31 +1,30 @@
 # Adapted from https://github.com/LargeWorldModel/LWM/blob/main/lwm/vision_llama.py
+import copy
 import warnings
 from typing import Dict, Optional, Tuple, Union
-import copy
 
 import chex
 import fjformer
 import jax
 import jax.numpy as jnp
-from jax import lax
 from fjformer import linen as nn
-from flax.core.frozen_dict import unfreeze, freeze, FrozenDict
+from fjformer.linen import Dense
+from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.traverse_util import flatten_dict, unflatten_dict
-
-from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
-from easydel.modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
+from jax import lax
+from transformers import GenerationConfig
 from transformers.generation.flax_utils import (
-    SampleState,
     FlaxLogitsProcessorList,
     FlaxSampleOutput,
+    SampleState,
 )
-from transformers import GenerationConfig
-from easydel.modules.llama.vision_llama_configuration import VisionLlamaConfig
-from easydel.modules.llama.modelling_llama_flax import FlaxLlamaBlockCollection, RMSNorm
-from easydel.modules.flax_modelling_utils import precompute_freq_cis
-from fjformer.linen import Dense
+from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 
 from easydel.etils.etils import get_logger
+from easydel.modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
+from easydel.modules.flax_modelling_utils import precompute_freqs_cis
+from easydel.modules.llama.modelling_llama_flax import FlaxLlamaBlockCollection, RMSNorm
+from easydel.modules.llama.vision_llama_configuration import VisionLlamaConfig
 
 logger = get_logger(__name__)
 
@@ -126,7 +125,7 @@ class FlaxVisionLlamaPreTrainedModel(EasyDeLFlaxPretrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+        extra_embedding: Optional[jnp.ndarray] = None,
         add_params_field: bool = False,
         **kwargs,
     ):
@@ -243,7 +242,7 @@ class FlaxVisionLlamaModule(nn.Module):
                     1,
                     getattr(
                         self.config,
-                        "c_max_position_embeddings",
+                        "causal_mask_max_position_embeddings",
                         self.config.max_position_embeddings,
                     ),
                 ),
@@ -259,7 +258,7 @@ class FlaxVisionLlamaModule(nn.Module):
             initial_rope_kwargs = dict(
                 scaling_factor=scaling_factor, rope_type=scaling_type
             )
-        self.freq_cis = precompute_freq_cis(
+        self.freqs_cis = precompute_freqs_cis(
             max_position_embeddings=(
                 getattr(
                     self.config,
@@ -318,7 +317,7 @@ class FlaxVisionLlamaModule(nn.Module):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             causal_mask=self.causal_mask,
-            freq_cis=self.freq_cis,
+            freqs_cis=self.freqs_cis,
         )
 
         hidden_states = outputs[0]

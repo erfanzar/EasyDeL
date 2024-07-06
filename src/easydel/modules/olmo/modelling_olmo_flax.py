@@ -29,7 +29,7 @@ from easydel.modules.flax_modelling_utils import (
     control_mlp_sharding,
     get_dot_general_by_bits,
     get_gradient_checkpoint_policy,
-    precompute_freq_cis,
+    precompute_freqs_cis,
     with_sharding_constraint,
 )
 from easydel.modules.olmo.olmo_configuration import OlmoConfig
@@ -40,8 +40,8 @@ re_mat = remat
 class FlaxOlmoRotaryEmbedding(nn.Module):
     dtype: jnp.dtype = jnp.float32
 
-    def __call__(self, key, query, freq_cis, position_ids):
-        sin, cos = freq_cis
+    def __call__(self, key, query, freqs_cis, position_ids):
+        sin, cos = freqs_cis
 
         sin = sin[position_ids][:, None, :, :]
         cos = cos[position_ids][:, None, :, :]
@@ -150,10 +150,10 @@ class FlaxOlmoAttention(BaseAttentionModule):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
 
     def apply_rotary(
-        self, batch_size, sequence_length, query, key, value, freq_cis, position_ids
+        self, batch_size, sequence_length, query, key, value, freqs_cis, position_ids
     ):
         """The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
-        The main difference is that it takes in an additional argument, freq_cis, which are used to calculate
+        The main difference is that it takes in an additional argument, freqs_cis, which are used to calculate
         the rotary attention weights. The other differences are minor and mostly related to reshaping tensors.
 
         Args:
@@ -163,7 +163,7 @@ class FlaxOlmoAttention(BaseAttentionModule):
             query: Calculate the attention weights
             key: Calculate the attention
             value: Compute the attention weights
-            freq_cis: Calculate the frequency of each word in the
+            freqs_cis: Calculate the frequency of each word in the
                 vocabulary
             position_ids: Identify the position of each token in the
                 sequence
@@ -174,14 +174,14 @@ class FlaxOlmoAttention(BaseAttentionModule):
 
         query, key, value = self._transpose_sequence_head(query, key, value)
         query, key = self.rotary(
-            position_ids=position_ids, query=query, key=key, freq_cis=freq_cis
+            position_ids=position_ids, query=query, key=key, freqs_cis=freqs_cis
         )
         return self._transpose_sequence_head(query, key, value)
 
     def __call__(
         self,
         hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        freqs_cis: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
         position_ids: chex.Array,
         causal_mask: chex.Array,
@@ -199,7 +199,7 @@ class FlaxOlmoAttention(BaseAttentionModule):
             self: Access variables that belong to the class
             hidden_states: chex.Array: Pass the hidden states of the
                 previous layer
-            freq_cis: Tuple[chex.Array, chex.Array],: Pass in the
+            freqs_cis: Tuple[chex.Array, chex.Array],: Pass in the
                 frequency coefficients for each position
             attention_mask: chex.Array: Mask out certain tokens in the
                 input sequence
@@ -248,7 +248,7 @@ class FlaxOlmoAttention(BaseAttentionModule):
             key=key_states,
             value=value_states,
             position_ids=position_ids,
-            freq_cis=freq_cis,
+            freqs_cis=freqs_cis,
             batch_size=batch_size,
             sequence_length=sequence_length,
         )
@@ -387,7 +387,7 @@ class FlaxOlmoDecoderLayer(nn.Module):
     def __call__(
         self,
         hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        freqs_cis: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
         causal_mask: chex.Array,
         position_ids: chex.Array,
@@ -400,7 +400,7 @@ class FlaxOlmoDecoderLayer(nn.Module):
         It takes in the following arguments:
             hidden_states (chex.Array): The input to the encoder layer, which is also its output after being processed
             by all sublayers.
-            freq_cis (chex.Array): A tensor containing frequency-domain representations of each token's context vector,
+            freqs_cis (chex.Array): A tensor containing frequency-domain representations of each token's context vector,
             used for computing self-attention weights and biases in a more efficient manner than using position
             embeddings or sinusoidal positional encoding vectors would allow for [2].
 
@@ -408,7 +408,7 @@ class FlaxOlmoDecoderLayer(nn.Module):
             self: Represent the instance of the class
             hidden_states: chex.Array: Represent the input to the
                 encoder layer
-            freq_cis: Tuple[chex.Array, chex.Array],: Pass the frequency
+            freqs_cis: Tuple[chex.Array, chex.Array],: Pass the frequency
                 information to the attention layer
             attention_mask: chex.Array: Mask out the attention weights
                 for certain positions
@@ -426,7 +426,7 @@ class FlaxOlmoDecoderLayer(nn.Module):
         """
 
         # hidden_states: chex.Array,
-        # freq_cis: Tuple[chex.Array, chex.Array],
+        # freqs_cis: Tuple[chex.Array, chex.Array],
         # attention_mask: chex.Array,
         # position_ids: chex.Array,
         # causal_mask: chex.Array,
@@ -438,7 +438,7 @@ class FlaxOlmoDecoderLayer(nn.Module):
         residual = hidden_states
         attention_output = self.self_attn(
             self.input_layernorm(hidden_states),
-            freq_cis,
+            freqs_cis,
             attention_mask,
             position_ids,
             causal_mask,
@@ -710,7 +710,7 @@ class FlaxOlmoDecoratorCollection(nn.Module):
     def __call__(
         self,
         hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        freqs_cis: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
         causal_mask: chex.Array,
         position_ids: chex.Array,
@@ -726,7 +726,7 @@ class FlaxOlmoDecoratorCollection(nn.Module):
                 all_hidden_states += (hidden_states,)
 
             # hidden_states: chex.Array,
-            # freq_cis: Tuple[chex.Array, chex.Array],
+            # freqs_cis: Tuple[chex.Array, chex.Array],
             # attention_mask: chex.Array,
             # causal_mask: chex.Array,
             # position_ids: chex.Array,
@@ -737,7 +737,7 @@ class FlaxOlmoDecoratorCollection(nn.Module):
 
             output = layer(
                 hidden_states,
-                freq_cis,
+                freqs_cis,
                 attention_mask,
                 causal_mask,
                 position_ids,
@@ -789,7 +789,7 @@ class FlaxOlmoModule(nn.Module):
             initial_rope_kwargs = dict(
                 scaling_factor=scaling_factor, rope_type=scaling_type
             )
-        self.freq_cis = precompute_freq_cis(
+        self.freqs_cis = precompute_freqs_cis(
             max_position_embeddings=(
                 getattr(
                     self.config,
@@ -807,7 +807,7 @@ class FlaxOlmoModule(nn.Module):
                     1,
                     getattr(
                         self.config,
-                        "c_max_position_embeddings",
+                        "causal_mask_max_position_embeddings",
                         self.config.max_position_embeddings,
                     ),
                 ),
@@ -864,7 +864,7 @@ class FlaxOlmoModule(nn.Module):
             hidden_states=inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            freq_cis=self.freq_cis,
+            freqs_cis=self.freqs_cis,
             init_cache=init_cache,
             output_attentions=output_attentions,
             deterministic=deterministic,

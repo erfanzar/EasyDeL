@@ -1148,7 +1148,7 @@ class FlaxWhisperPreTrainedModel(EasyDeLFlaxPretrainedModel):
         train: bool = False,
         params: dict = None,
         dropout_rng: PRNGKey = None,
-        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+        extra_embedding: Optional[jnp.ndarray] = None,
         add_params_field: bool = False,
     ):
         output_attentions = (

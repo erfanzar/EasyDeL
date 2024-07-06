@@ -1,32 +1,40 @@
+import flax.struct
 import os
 import warnings
+from copy import deepcopy
+from dataclasses import dataclass
+from typing import Any, Callable, Literal, Optional, Sequence, Tuple, Union
 
 import chex
 import fjformer.linen
 import flax
-from flax.core import unfreeze, FrozenDict
-from flax.traverse_util import unflatten_dict, flatten_dict
-from jax.experimental.mesh_utils import create_device_mesh
-from transformers import (
-    PretrainedConfig,
-    FlaxPreTrainedModel,
-    AutoModelForCausalLM,
-    GenerationConfig,
-)
 import jax
+from flax.core import FrozenDict, unfreeze
+from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import numpy as jnp
-from typing import Sequence, Union, Optional, Literal, Tuple, Any, Callable
-from dataclasses import dataclass
-from jax.sharding import PartitionSpec, Mesh
+from jax.experimental.mesh_utils import create_device_mesh
+from jax.sharding import Mesh, PartitionSpec
+from transformers import (
+    AutoModelForCausalLM,
+    FlaxPreTrainedModel,
+    GenerationConfig,
+    PretrainedConfig,
+)
 from transformers.utils import (
-    is_offline_mode as _is_offline_mode,
     cached_file as _cached_file,
-    is_remote_url as _is_remote_url,
+)
+from transformers.utils import (
     download_url as _download_url,
 )
-from copy import deepcopy
-from easydel.etils.etils import get_logger
+from transformers.utils import (
+    is_offline_mode as _is_offline_mode,
+)
+from transformers.utils import (
+    is_remote_url as _is_remote_url,
+)
+
 from easydel.etils.easystate import EasyDeLState
+from easydel.etils.etils import get_logger
 from easydel.etils.partition_module import PartitionAxis
 
 logger = get_logger(__name__)
@@ -66,11 +74,9 @@ class EasyDeLPretrainedConfig(PretrainedConfig):
 
     Args:
         self: Refer to the instance of the class
-        axis_dims: Sequence[int]: Specify the number of dimensions for
-            each axis
+        axis_dims: Sequence[int]: Specify the number of dimensions for each axis
         axis_names: Sequence[str]: Set the names of the axes
-        attn_mechanism: Literal["vanilla", "flash", "splash", "ring"]:
-            attention mechanism to use
+        attn_mechanism: Literal["vanilla", "flash", "splash", "ring"]: attention mechanism to use
         block_k: int: block size of key_states
         block_q: int: block size of query_states
         block_b: int: block size of bias
@@ -82,14 +88,11 @@ class EasyDeLPretrainedConfig(PretrainedConfig):
         block_k_dq: int: block size of block_k_dq
         block_q_dq: int: block size of block_q_dq
         partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
-        shard_attention_computation: bool: whenever to shard qkv b for
-            attention
-        use_sharding_constraint: bool: whether to use sharding
-            constraint for the arrays
+        shard_attention_computation: bool: whenever to shard qkv b for attention
+        use_sharding_constraint: bool: whether to use sharding  constraint for the arrays
         use_scan_mlp: bool: Determine whether to use scan_mlp or not
         backend: Optional[None]: Specify the backend to use
-        flash_attention_backward_pass_impl: Literal["triton", "xla"]:
-            Specify the backward pass kernel for flash attention
+        flash_attention_backward_pass_impl: Literal["triton", "xla"]: Specify the backward pass kernel for flash attention
     """
 
     def __init__(
@@ -646,7 +649,7 @@ class EasyDeLFlaxPretrainedModel(FlaxPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+        extra_embedding: Optional[jnp.ndarray] = None,
         add_params_field: bool = False,
         vision_mask: Optional[chex.Array] = None,
         **kwargs,
@@ -725,7 +728,7 @@ class EasyDeLFlaxPretrainedModel(FlaxPreTrainedModel):
         Return the Huggingface / Pytorch implementation of the model with same weights  (if model is available in HF)
         """
 
-        from easydel.transform.easydel_transform import easystate_to_huggingface_model
+        from easydel.transform.transform import easystate_to_huggingface_model
 
         state = self.to_easydel_state(params=params)
         if easystate_to_huggingface_model_kwargs is None:

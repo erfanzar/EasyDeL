@@ -139,7 +139,7 @@ def get_gradient_checkpoint_policy(name):
     return gradients[name]
 
 
-def precompute_freq_cis(
+def precompute_freqs_cis(
     dim,
     max_position_embeddings=2048,
     base=10000,
@@ -415,7 +415,10 @@ class BaseAttentionModule(nnx.Module):
         Returns:
             The transpose of the query, key and value matrices
         """
-        return map(lambda x: jnp.transpose(x, (0, 2, 1, 3), args))
+        return map(
+            lambda x: jnp.transpose(x, (0, 2, 1, 3)),
+            args,
+        )
 
     # def _concatenate_to_cache(self, key, value, query_states, attention_mask):
     #     """The _concatenate_to_cache function is used to concatenate the key and value vectors
@@ -629,16 +632,16 @@ class BaseAttentionModule(nnx.Module):
         return key, value
 
 
-def block_wise_ffn(remat_ffn, inputs, chunk_size: int, deterministic: bool):
+def block_wise_ffn(remat_ffn, inputs, chunk_size: int):
     generating = inputs.shape[1] == 1
     try:
         if generating:
-            return remat_ffn(inputs, deterministic)
+            return remat_ffn(inputs)
         else:
             inputs = rearrange(inputs, "b (c n) d -> b c n d", c=chunk_size)
 
             def scan_ffn(remat_ffn_, carry, hidden_states):
-                outputs = remat_ffn_(hidden_states, deterministic)
+                outputs = remat_ffn_(hidden_states)
                 return carry, outputs
 
             scan_axis = inputs.ndim - 2

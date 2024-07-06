@@ -25,7 +25,7 @@ from easydel.modules.flax_modelling_utils import (
     control_mlp_sharding,
     get_dot_general_by_bits,
     get_gradient_checkpoint_policy,
-    precompute_freq_cis,
+    precompute_freqs_cis,
     with_sharding_constraint,
 )
 
@@ -96,8 +96,8 @@ def dropout_add(
 class FlaxFalconRotaryEmbedding(nn.Module):
     dtype: jnp.dtype = jnp.float32
 
-    def __call__(self, query, key, freq_cis, position_ids):
-        sin, cos = freq_cis
+    def __call__(self, query, key, freqs_cis, position_ids):
+        sin, cos = freqs_cis
 
         sin = sin[position_ids][:, jnp.newaxis, :, :]
         cos = cos[position_ids][:, jnp.newaxis, :, :]
@@ -221,7 +221,7 @@ class FlaxFalconAttention(BaseAttentionModule):
         position_ids: chex.Array,
         causal_mask: chex.Array = None,
         alibi: chex.Array = None,
-        freq_cis: Tuple[chex.Array, chex.Array] = None,
+        freqs_cis: Tuple[chex.Array, chex.Array] = None,
         init_cache: bool = False,
         output_attentions: bool = False,
         deterministic: bool = False,
@@ -268,7 +268,7 @@ class FlaxFalconAttention(BaseAttentionModule):
                 lambda x: x.transpose(0, 2, 1, 3), [query_layer, key_layer]
             )  # noqa
             query_layer, key_layer = self.rotary(
-                query_layer, key_layer, freq_cis, position_ids
+                query_layer, key_layer, freqs_cis, position_ids
             )
             query_layer, key_layer = map(
                 lambda x: x.transpose(0, 2, 1, 3), [query_layer, key_layer]
@@ -450,7 +450,7 @@ class FlaxFalconBlock(nn.Module):
         hidden_states: chex.Array,
         alibi: chex.Array,
         attention_mask: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        freqs_cis: Tuple[chex.Array, chex.Array],
         position_ids: chex.Array,
         causal_mask: chex.Array,
         init_cache: bool = False,
@@ -470,7 +470,7 @@ class FlaxFalconBlock(nn.Module):
         # position_ids: chex.Array
         # causal_mask: chex.Array = None
         # alibi: chex.Array = None
-        # freq_cis: Tuple[chex.Array, chex.Array] = None
+        # freqs_cis: Tuple[chex.Array, chex.Array] = None
         # init_cache: bool = False
         # output_attentions: bool = False
         # deterministic: bool = False
@@ -481,7 +481,7 @@ class FlaxFalconBlock(nn.Module):
             position_ids,
             causal_mask,
             alibi,
-            freq_cis,
+            freqs_cis,
             init_cache,
             output_attentions,
             deterministic,
@@ -539,7 +539,7 @@ class FlaxFalconCollection(nn.Module):
         hidden_states: chex.Array,
         attention_mask: chex.Array,
         alibi: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        freqs_cis: Tuple[chex.Array, chex.Array],
         position_ids: chex.Array,
         causal_mask: chex.Array,
         output_attentions: bool = False,
@@ -553,7 +553,7 @@ class FlaxFalconCollection(nn.Module):
             # hidden_states: chex.Array
             # alibi: chex.Array
             # attention_mask: chex.Array
-            # freq_cis: Tuple[chex.Array, chex.Array]
+            # freqs_cis: Tuple[chex.Array, chex.Array]
             # position_ids: chex.Array
             # causal_mask: chex.Array
             # init_cache: bool = False
@@ -564,7 +564,7 @@ class FlaxFalconCollection(nn.Module):
                 hidden_states,
                 alibi,
                 attention_mask,
-                freq_cis,
+                freqs_cis,
                 position_ids,
                 causal_mask,
                 init_cache,
@@ -605,7 +605,9 @@ class FlaxFalconModule(nn.Module):
             epsilon=config.layer_norm_epsilon,
         )
         c_length = getattr(
-            config, "c_max_position_embeddings", config.max_position_embeddings
+            config,
+            "causal_mask_max_position_embeddings",
+            config.max_position_embeddings,
         )
         freqs_length = getattr(
             self.config,
@@ -615,7 +617,7 @@ class FlaxFalconModule(nn.Module):
         self.causal_mask = flax.linen.make_causal_mask(
             jnp.ones((1, c_length), dtype="bool"), dtype="bool"
         )
-        self.freq_cis = None
+        self.freqs_cis = None
         if not self.config.alibi:
             initial_rope_kwargs = dict(rope_type="none")
             if config.rope_scaling is not None:
@@ -624,7 +626,7 @@ class FlaxFalconModule(nn.Module):
                 initial_rope_kwargs = dict(
                     scaling_factor=scaling_factor, rope_type=scaling_type
                 )
-            self.freq_cis = precompute_freq_cis(
+            self.freqs_cis = precompute_freqs_cis(
                 max_position_embeddings=freqs_length,
                 dim=config.hidden_size // config.num_attention_heads,
                 base=config.rope_theta,
@@ -662,7 +664,7 @@ class FlaxFalconModule(nn.Module):
             attention_mask=attention_mask,
             position_ids=position_ids,
             alibi=alibi,
-            freq_cis=self.freq_cis,
+            freqs_cis=self.freqs_cis,
             causal_mask=self.causal_mask,
             output_attentions=output_attentions,
             deterministic=deterministic,
