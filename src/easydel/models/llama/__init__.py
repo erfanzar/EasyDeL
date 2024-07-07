@@ -7,4 +7,5 @@ from easydel.models.llama.modelling_llama_flax import (
     LlamaModel as LlamaModel,
     VisionLlamaForCausalLM as VisionLlamaForCausalLM,
     VisionLlamaModel as VisionLlamaModel,
+    LlamaForSequenceClassification as LlamaForSequenceClassification,
 )

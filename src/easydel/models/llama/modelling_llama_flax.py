@@ -1,6 +1,6 @@
 import functools
 import math
-from typing import Optional, Tuple, Union, List
+from typing import List, Optional, Tuple, Union
 
 import chex
 import jax
@@ -10,6 +10,7 @@ from jax import lax
 from jax.sharding import PartitionSpec
 
 from easydel.models.attention_module import FlexibleAttentionModule
+from easydel.models.caching_utils import KVCache
 from easydel.models.common import RMSNorm
 
 # easydel.modules
@@ -33,7 +34,6 @@ from easydel.models.modeling_flax_outputs import (
     FlaxSequenceClassifierOutput,
 )
 from easydel.models.modelling_utils import BaseNNXModule
-from easydel.models.caching_utils import KVCache
 
 
 def apply_rope(query, key, freqs_cis, position_ids, dtype: jnp.dtype = jnp.float32):
@@ -180,7 +180,7 @@ class LlamaAttention(BaseAttentionModule):
             position_ids: (Optional(chex.Array)): Determine the position of each token in a sequence
 
         Returns:
-            A tuple of two arrays
+            A tuple of two arrays HiddenState and attentionWeight
         """
         batch_size, sequence_length = hidden_states.shape[:2]
         query_states, key_states, value_states = (
@@ -218,7 +218,7 @@ class LlamaAttention(BaseAttentionModule):
         query_length, key_length = query_states.shape[1], key_states.shape[1]
 
         if past_key_values is not None:
-            past_key_values.update(key_states=key_length, value_states=value_states)
+            past_key_values.update(key_states=key_states, value_states=value_states)
             key_length, value_states, attention_mask = past_key_values.get(
                 attention_mask=attention_mask
             )
@@ -590,14 +590,14 @@ class LlamaModel(BaseNNXModule):
                 jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
                 (batch_size, seq_length),
             ).astype(jnp.int32)
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
         if attention_mask.ndim == 2:
             attention_mask = attention_mask.reshape(batch_size, 1, seq_length, 1)
             attention_mask = jnp.logical_and(
                 attention_mask, self.causal_mask[:, :, :seq_length, :]
             )
 
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
         batch_size, sequence_length, _ = inputs_embeds.shape
 
         assert (

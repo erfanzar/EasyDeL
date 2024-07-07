@@ -1,6 +1,6 @@
 import functools
 import math
-from typing import Optional, Tuple, Union, List
+from typing import List, Optional, Tuple, Union
 
 import chex
 import flax
@@ -224,7 +224,7 @@ class ArcticAttention(BaseAttentionModule):
         query_length, key_length = query_states.shape[1], key_states.shape[1]
 
         if past_key_values is not None:
-            past_key_values.update(key_states=key_length, value_states=value_states)
+            past_key_values.update(key_states=key_states, value_states=value_states)
             key_length, value_states, attention_mask = past_key_values.get(
                 attention_mask=attention_mask
             )
