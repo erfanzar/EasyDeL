@@ -65,7 +65,7 @@ class TrainArguments:
     Attributes:
         model_name (Optional[str]): Name of the model.
         num_train_epochs (Optional[int]): Number of training epochs.
-        model_class (Optional[EasyDeLFlaxPretrainedModel]):
+        model_class (Optional[BaseNNXModule]):
             The EasyDeL Flax Pretrained Model class to use.
         model_huggingface_repo_id (Optional[str]):
             Hugging Face repository ID for the model.
@@ -208,7 +208,7 @@ class TrainArguments:
 
     model_name: str = "Model"
     num_train_epochs: int = 10
-    model_class: Optional["EasyDeLFlaxPretrainedModel"] = None  # type: ignore # noqa: F821
+    model_class: Optional["BaseNNXModule"] = None  # type: ignore # noqa: F821
     model_huggingface_repo_id: Optional[str] = None
     total_batch_size: int = 32
     max_training_steps: Optional[int] = None

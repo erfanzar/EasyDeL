@@ -110,10 +110,10 @@
 #     FlaxDeepseekV2Model as FlaxDeepseekV2Model,
 # )
 # from easydel.modules.easydel_modelling_utils import (
-#     EasyDeLFlaxPretrainedModel as EasyDeLFlaxPretrainedModel,
+#     BaseNNXModule as BaseNNXModule,
 # )
 # from easydel.modules.easydel_modelling_utils import (
-#     EasyDeLPretrainedConfig as EasyDeLPretrainedConfig,
+#     EDPretrainedConfig as EDPretrainedConfig,
 # )
 # from easydel.modules.falcon import (
 #     FalconConfig as FalconConfig,

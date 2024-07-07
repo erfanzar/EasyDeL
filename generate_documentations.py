@@ -1,4 +1,3 @@
-import flax.core
 import os
 import sys
 
@@ -128,9 +127,7 @@ def create_rst(name, children, output_dir):
                 create_rst(child_name, child_value, output_dir)
     else:
         children_name = children.replace("easydel.", "")
-        ca = ".".join(
-            [s.strip() for s in children_name.split(".")[1:-1]]
-        )
+        ca = ".".join([s.strip() for s in children_name.split(".")[1:-1]])
         name = f"{ca} package"
         with open(os.path.join(output_dir, children_name), "w") as rst_file:
             rst_file.write(f"{name}\n{'=' * len(name)}\n\n")
@@ -142,6 +139,7 @@ def create_rst(name, children, output_dir):
                 f"    :undoc-members:\n"
                 f"    :show-inheritance:\n"
             )
+
 
 def generate_api_docs(structure, output_dir):
     """Recursively generate .rst files based on the given dictionary structure."""
@@ -181,9 +179,7 @@ def main():
    :maxdepth: 2
    
    {form}
-   """.format(
-        form="\n   ".join(sorted(st))
-    )
+   """.format(form="\n   ".join(sorted(st)))
     open(os.path.join(str(base_dir), "APIs.rst"), "w", encoding="utf-8").write(
         apis_index
     )

@@ -1,25 +1,24 @@
 import copy
+import gc
 import os
-from typing import Any, Callable, Optional, Mapping, Sequence, Tuple, Union, List
+from typing import Any, Callable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import fjformer
 import jax.tree_util
-from flax import core
-from flax import struct
-from flax.traverse_util import flatten_dict, unflatten_dict
+import optax
+from flax import core, struct
 from flax.core import FrozenDict
 from flax.linen.fp8_ops import OVERWRITE_WITH_GRADIENT
-import optax
+from flax.traverse_util import flatten_dict, unflatten_dict
+from jax import numpy as jnp
+from jax.sharding import Mesh, PartitionSpec
 from safetensors._safetensors_rust import SafetensorError
 from transformers import AutoModelForCausalLM
 
 from easydel.etils.auto_tx import get_optimizer_and_scheduler
-from easydel.etils.partition_module import PartitionAxis
-from easydel.etils.etils import AVAILABLE_SCHEDULERS, AVAILABLE_OPTIMIZERS
 from easydel.etils.errors import EasyDeLRuntimeError
-from jax.sharding import Mesh, PartitionSpec
-from jax import numpy as jnp
-import gc
+from easydel.etils.etils import AVAILABLE_OPTIMIZERS, AVAILABLE_SCHEDULERS
+from easydel.etils.partition_module import PartitionAxis
 
 TYPE_SEP = "<*TYPE*>"
 VALUE_SEP = "<*VALUE*>"
@@ -113,8 +112,8 @@ class EasyDeLState(struct.PyTreeNode):
 
     Attributes:
         step (int): Current training step.
-        module (Optional[EasyDeLFlaxPretrainedModel]): An instance of an EasyDeL model.
-        module_config (Optional[EasyDeLPretrainedConfig]): Configuration of the EasyDeL model.
+        module (Optional[BaseNNXModule]): An instance of an EasyDeL model.
+        module_config (Optional[EDPretrainedConfig]): Configuration of the EasyDeL model.
         module_config_args (Optional[dict]): Dictionary of arguments used to initialize the model configuration.
         apply_fn (Callable): Function to apply the model to input data.
         params (core.FrozenDict[str, Any]): Model parameters, stored as a frozen dictionary.
@@ -138,11 +137,11 @@ class EasyDeLState(struct.PyTreeNode):
     """
 
     step: int
-    module: Optional["EasyDeLFlaxPretrainedModel"] = struct.field(  # type:ignore # noqa
+    module: Optional["BaseNNXModule"] = struct.field(  # type:ignore # noqa
         pytree_node=False
     )
-    module_config: Optional["EasyDeLPretrainedConfig"] = (  # type:ignore # noqa
-        struct.field(pytree_node=False)
+    module_config: Optional["EDPretrainedConfig"] = struct.field(  # type:ignore # noqa
+        pytree_node=False
     )
     module_config_args: Optional[dict] = struct.field(pytree_node=True)
     apply_fn: Callable = struct.field(pytree_node=False)
@@ -199,8 +198,8 @@ class EasyDeLState(struct.PyTreeNode):
         tx: optax.GradientTransformation,
         tx_init: Optional[dict] = None,
         hyperparameters: Optional[dict] = None,
-        module: Optional["EasyDeLFlaxPretrainedModel"] = None,  # type:ignore #noqa
-        module_config: Optional["EasyDeLPretrainedConfig"] = None,  # type:ignore #noqa
+        module: Optional["BaseNNXModule"] = None,  # type:ignore #noqa
+        module_config: Optional["EDPretrainedConfig"] = None,  # type:ignore #noqa
         module_config_args: Optional[dict] = None,
         **kwargs,
     ):
@@ -215,8 +214,8 @@ class EasyDeLState(struct.PyTreeNode):
             tx (optax.GradientTransformation): An optax optimizer.
             tx_init (Optional[dict]): A dictionary of optimizer initialization parameters.
             hyperparameters (Optional[dict]): A dictionary of additional hyperparameters.
-            module (Optional[EasyDeLFlaxPretrainedModel]): An instance of an EasyDeL model.
-            module_config (Optional[EasyDeLPretrainedConfig]): An instance of an EasyDeL model configuration.
+            module (Optional[BaseNNXModule]): An instance of an EasyDeL model.
+            module_config (Optional[EDPretrainedConfig]): An instance of an EasyDeL model configuration.
             module_config_args (Optional[dict]): A dictionary of arguments used to initialize the model configuration.
             **kwargs: Additional keyword arguments.
 
@@ -256,8 +255,8 @@ class EasyDeLState(struct.PyTreeNode):
         opt_state: Optional[optax.OptState] = None,
         tx_init: Optional[dict] = None,
         hyperparameters: Optional[dict] = None,
-        module: Optional["EasyDeLFlaxPretrainedModel"] = None,  # type:ignore #noqa
-        module_config: Optional["EasyDeLPretrainedConfig"] = None,  # type:ignore #noqa
+        module: Optional["BaseNNXModule"] = None,  # type:ignore #noqa
+        module_config: Optional["EDPretrainedConfig"] = None,  # type:ignore #noqa
         module_config_args: Optional[dict] = None,
         **kwargs,
     ):
@@ -273,8 +272,8 @@ class EasyDeLState(struct.PyTreeNode):
             opt_state (Optional[optax.OptState], optional): The optimizer state to load. Defaults to None.
             tx_init (Optional[dict], optional): A dictionary of optimizer initialization parameters. Defaults to None.
             hyperparameters (Optional[dict], optional): A dictionary of additional hyperparameters. Defaults to None.
-            module (Optional[EasyDeLFlaxPretrainedModel], optional): An instance of an EasyDeL model. Defaults to None.
-            module_config (Optional[EasyDeLPretrainedConfig], optional): An instance of an EasyDeL model configuration. Defaults to None.
+            module (Optional[BaseNNXModule], optional): An instance of an EasyDeL model. Defaults to None.
+            module_config (Optional[EDPretrainedConfig], optional): An instance of an EasyDeL model configuration. Defaults to None.
             module_config_args (Optional[dict], optional): A dictionary of arguments used to initialize the model configuration. Defaults to None.
             **kwargs: Additional keyword arguments.
 
@@ -356,7 +355,7 @@ class EasyDeLState(struct.PyTreeNode):
         config_kwargs: Optional[dict] = None,
         sharding_axes_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
         sharding_axes_dims: Sequence[int] = (1, -1, 1, 1),
-        module_config: Optional["EasyDeLPretrainedConfig"] = None,  # type:ignore #noqa
+        module_config: Optional["EDPretrainedConfig"] = None,  # type:ignore #noqa
         safe: bool = False,
         auto_shard_state: bool = False,
         partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
@@ -379,7 +378,7 @@ class EasyDeLState(struct.PyTreeNode):
             config_kwargs (Optional[dict], optional): Keyword arguments to pass to the model configuration. Defaults to None.
             sharding_axes_names (Sequence[str], optional): Names of the axes for sharding. Defaults to ("dp", "fsdp", "tp", "sp").
             sharding_axes_dims (Sequence[int], optional): Dimensions of the axes for sharding. Defaults to (1, -1, 1, 1).
-            module_config (Optional[EasyDeLPretrainedConfig], optional): An instance of an EasyDeL model configuration. Defaults to None.
+            module_config (Optional[EDPretrainedConfig], optional): An instance of an EasyDeL model configuration. Defaults to None.
             auto_shard_state (bool, optional): Whether to automatically shard the model state. Defaults to False.
             partition_rules (Optional[Tuple[Tuple[str, PartitionSpec]]], optional): Rules for partitioning the model parameters. Defaults to None.
             depth_target (Optional[List[str]], optional): Target depth for partitioning. Defaults to None.
@@ -389,11 +388,12 @@ class EasyDeLState(struct.PyTreeNode):
         """
         if depth_target is None:
             depth_target = ["params", "params"]
-        from easydel.modules.auto_easydel_model import (
-            get_modules_by_type,
-            AutoShardAndGatherFunctions,
-        )
         from fjformer.sharding import create_mesh
+
+        from easydel.models.auto_easydel_model import (
+            AutoShardAndGatherFunctions,
+            get_modules_by_type,
+        )
 
         mesh = create_mesh(sharding_axes_dims, sharding_axes_names)
         if auto_shard_state:
@@ -655,7 +655,7 @@ class EasyDeLState(struct.PyTreeNode):
             )
 
         if filename is None:
-            from easydel.modules.auto_easydel_model import AutoEasyDeLModelForCausalLM
+            from easydel.models.auto_easydel_model import AutoEasyDeLModelForCausalLM
 
             model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
                 pretrained_model_name_or_path,
@@ -753,7 +753,7 @@ class EasyDeLState(struct.PyTreeNode):
                 "the model doesn't carrying `module_config` you should pass `shard_fns` or `rules`"
             )
         elif shard_fns is None and rules is not None or self.module_config is not None:
-            from fjformer import match_partition_rules, make_shard_and_gather_fns
+            from fjformer import make_shard_and_gather_fns, match_partition_rules
 
             rules = rules or self.module_config.get_partition_rules(
                 fully_sharded_data_parallel

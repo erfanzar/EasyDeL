@@ -26,10 +26,10 @@ except ImportError:
     wandb = None
 
 from easydel.etils.etils import get_logger
-from easydel.modules.auto_easydel_model import AutoEasyDeLModelForCausalLM
-from easydel.modules.easydel_modelling_utils import (
-    EasyDeLFlaxPretrainedModel,
-    EasyDeLPretrainedConfig,
+from easydel.models.auto_easydel_model import AutoEasyDeLModelForCausalLM
+from easydel.models.modelling_utils import (
+    BaseNNXModule,
+    EDPretrainedConfig,
 )
 from easydel.smi import get_capacity_matrix, initialise_tracking
 from easydel.trainers.training_configurations import TrainArguments
@@ -48,10 +48,10 @@ class TrainerConfigureDataloaderOutput:
 
 @dataclass
 class TrainerConfigureModelOutput:
-    model: EasyDeLFlaxPretrainedModel
+    model: BaseNNXModule
     tx: GradientTransformation
     scheduler: Schedule
-    config: Optional[EasyDeLPretrainedConfig] = None
+    config: Optional[EDPretrainedConfig] = None
 
 
 @dataclass
@@ -500,7 +500,7 @@ class BaseTrainer(abc.ABC):
             extra_configs (dict): Additional configurations to apply to the model.
 
         Returns:
-            EasyDeLFlaxPretrainedModel: The configured custom model.
+            BaseNNXModule: The configured custom model.
 
         Raises:
             AssertionError: If no custom rule is provided when initializing a custom model.
@@ -514,9 +514,9 @@ class BaseTrainer(abc.ABC):
                 "pass custom_rule for partition rules."
             )
 
-        self.arguments.configs_to_initialize_model_class[
-            "config"
-        ].axis_dims = self.arguments.sharding_array
+        self.arguments.configs_to_initialize_model_class["config"].axis_dims = (
+            self.arguments.sharding_array
+        )
 
         return self.arguments.model_class(
             **self.arguments.configs_to_initialize_model_class, _do_init=False
@@ -534,7 +534,7 @@ class BaseTrainer(abc.ABC):
             extra_configs (dict): Additional configurations to apply to the model.
 
         Returns:
-            EasyDeLFlaxPretrainedModel: The configured model.
+            BaseNNXModule: The configured model.
 
         Warnings:
             If no model configuration is detected, the `config` attribute is set to None, which

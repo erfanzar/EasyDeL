@@ -6,15 +6,13 @@ import fjformer
 import flax.core
 import jax
 from fjformer import GenerateRNG
-
 from jax import lax, random
 from jax import numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec
 from transformers import PreTrainedTokenizer
 
 from easydel.inference.generation_pipeline import utils as inference_utils
-
-from easydel.modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
+from easydel.models.modelling_utils import BaseNNXModule
 
 GenerationPipelineConfig = inference_utils.GenerationPipelineConfig
 _DynamicGenerationConfig = inference_utils._DynamicGenerationConfig
@@ -23,7 +21,7 @@ _DynamicGenerationConfig = inference_utils._DynamicGenerationConfig
 class GenerationPipeline:
     def __init__(
         self,
-        model: EasyDeLFlaxPretrainedModel,
+        model: BaseNNXModule,
         params: Union[flax.core.FrozenDict, dict],
         tokenizer: PreTrainedTokenizer,
         generation_config: Optional[GenerationPipelineConfig] = None,

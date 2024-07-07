@@ -4,7 +4,7 @@ import jax.experimental.pallas as pl
 import jax.random
 
 from easydel.kernels.utils import calculate_settings
-from easydel.modules.common import RMSNorm
+from easydel.models.common import RMSNorm
 from jax import numpy as jnp
 
 

@@ -1,20 +1,28 @@
+from dataclasses import dataclass
 from functools import partial
+from typing import Callable, Mapping, Optional, Sequence, Tuple
 
 import chex
 import flax.core
 import jax
-from jax.experimental import pjit
-from transformers import PretrainedConfig, GenerationConfig
+from fjformer import (
+    GenerateRNG,
+    make_shard_and_gather_fns,
+    match_partition_rules,
+    with_sharding_constraint,
+)
+from fjformer.linen import Dense
 from flax import linen as nn
-from typing import Sequence, Optional, Type, Tuple, Any, Callable, Mapping
 from jax import numpy as jnp
+from jax.experimental import pjit
+from transformers import GenerationConfig, PretrainedConfig
 
 from easydel.etils.partition_module import PartitionAxis
-from easydel.modules.auto_easydel_model import AutoEasyDeLModelForCausalLM
-from easydel.modules.easydel_modelling_utils import EasyDeLPretrainedConfig, EasyDeLFlaxPretrainedModel
-from fjformer import GenerateRNG, with_sharding_constraint, make_shard_and_gather_fns, match_partition_rules
-from dataclasses import dataclass
-from fjformer.linen import Dense
+from easydel.models.auto_easydel_model import AutoEasyDeLModelForCausalLM
+from easydel.models.modelling_utils import (
+    BaseNNXModule,
+    EDPretrainedConfig,
+)
 
 
 @dataclass
@@ -57,7 +65,7 @@ class ValueHead(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision,
             kernel_init=self.kernel_init,
-            use_bias=False
+            use_bias=False,
         )
 
     def __call__(self, hidden_states: chex.Array, deterministic: bool = True):
@@ -79,18 +87,20 @@ class ValueHead(nn.Module):
 
 class AutoRLModelForCasualLMWithValueHead:
     def __init__(
-            self,
-            module: EasyDeLFlaxPretrainedModel,
-            config: EasyDeLPretrainedConfig | PretrainedConfig,
-            module_params: dict | flax.core.FrozenDict,
-            summary_dropout_prob: float = 0.0,
-            dtype: jnp.dtype = jnp.float32,
-            param_dtype: jnp.dtype = jnp.float32,
-            precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
-            kernel_init: Callable = nn.initializers.orthogonal(),
-            generation_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp"),
-            generation_config: GenerationConfig = GenerationConfig(),
-            seed: int = 42
+        self,
+        module: BaseNNXModule,
+        config: EDPretrainedConfig | PretrainedConfig,
+        module_params: dict | flax.core.FrozenDict,
+        summary_dropout_prob: float = 0.0,
+        dtype: jnp.dtype = jnp.float32,
+        param_dtype: jnp.dtype = jnp.float32,
+        precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
+        kernel_init: Callable = nn.initializers.orthogonal(),
+        generation_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
+            "dp", "fsdp"
+        ),
+        generation_config: GenerationConfig = GenerationConfig(),
+        seed: int = 42,
     ):
         self.module = module
         self.module_config = config
@@ -100,7 +110,7 @@ class AutoRLModelForCasualLMWithValueHead:
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
-            kernel_init=kernel_init
+            kernel_init=kernel_init,
         )
         self.seed = seed
         self._rng_generator = GenerateRNG(seed)
@@ -126,47 +136,48 @@ class AutoRLModelForCasualLMWithValueHead:
             elif hasattr(self.module_config, "word_embed_proj_dim"):
                 hidden_size = self.module_config.word_embed_proj_dim
             elif hasattr(self.module_config, "is_encoder_decoder"):
-                if self.module_config.is_encoder_decoder and hasattr(self.module_config, "decoder"):
+                if self.module_config.is_encoder_decoder and hasattr(
+                    self.module_config, "decoder"
+                ):
                     if hasattr(self.module_config, "hidden_size"):
                         hidden_size = self.module_config.decoder.hidden_size
 
-            assert hidden_size is not None, "Seems like the models doesn't have any hidden_size"
-            params = self.v_head.init(
-                {
-                    "params": self._get_rng()
-                },
-                jnp.ones(
-                    (
-                        1, hidden_size
-                    )
-                )
-            )["params"] | params
+            assert (
+                hidden_size is not None
+            ), "Seems like the models doesn't have any hidden_size"
+            params = (
+                self.v_head.init(
+                    {"params": self._get_rng()}, jnp.ones((1, hidden_size))
+                )["params"]
+                | params
+            )
         return params
 
     def create_generation_function(self, generation_config):
         @partial(
             pjit.pjit,
             in_shardings=(
-                    match_partition_rules(
-                        self.module.config.get_partition_rules(True),
-                        self.module_params
-                    ),
-                    jax.sharding.PartitionSpec(),
-                    jax.sharding.PartitionSpec()
+                match_partition_rules(
+                    self.module.config.get_partition_rules(True), self.module_params
+                ),
+                jax.sharding.PartitionSpec(),
+                jax.sharding.PartitionSpec(),
             ),
-            out_shardings=(
-                    jax.sharding.PartitionSpec()
-            )
+            out_shardings=(jax.sharding.PartitionSpec()),
         )
         def generate(parameters, input_ids, attention_mask):
-            input_ids = with_sharding_constraint(input_ids, self.generation_partition_spec)
-            attention_mask = with_sharding_constraint(attention_mask, self.generation_partition_spec)
+            input_ids = with_sharding_constraint(
+                input_ids, self.generation_partition_spec
+            )
+            attention_mask = with_sharding_constraint(
+                attention_mask, self.generation_partition_spec
+            )
             predict = self.module.generate(
                 input_ids,
                 attention_mask=attention_mask,
                 params=parameters,
-                generation_config=generation_config
-            ).sequences[:, input_ids.shape[1]:]
+                generation_config=generation_config,
+            ).sequences[:, input_ids.shape[1] :]
             return predict
 
         return generate
@@ -174,27 +185,26 @@ class AutoRLModelForCasualLMWithValueHead:
     def get_mesh(self):
         return self.module.config.get_mesh()
 
-    def generate(self, input_id, attention_mask, params: dict | flax.core.FrozenDict = None):
+    def generate(
+        self, input_id, attention_mask, params: dict | flax.core.FrozenDict = None
+    ):
         params = self.module_params if params is None else params
-        return self.generation_function(
-            params,
-            input_id,
-            attention_mask
-        )
+        return self.generation_function(params, input_id, attention_mask)
 
     def shard_parameters(self, params, partition_rules=None):
-        partition_rules = self.module.config.get_partition_rules(True) if partition_rules is None else partition_rules
+        partition_rules = (
+            self.module.config.get_partition_rules(True)
+            if partition_rules is None
+            else partition_rules
+        )
         with self.get_mesh():
             return jax.tree_util.tree_map(
                 lambda f, p: f(p),
                 make_shard_and_gather_fns(
-                    match_partition_rules(
-                        partition_rules,
-                        params
-                    ),
+                    match_partition_rules(partition_rules, params),
                     mesh=self.module.config.get_mesh(),
                 )[0],
-                params
+                params,
             )
 
     def __str__(self):
@@ -203,12 +213,12 @@ class AutoRLModelForCasualLMWithValueHead:
         return string
 
     def __call__(
-            self,
-            input_ids: chex.Array = None,
-            past_key_values: chex.Array | dict = None,
-            attention_mask: chex.Array = None,
-            params: Optional[dict | flax.core.FrozenDict] = None,
-            **kwargs,
+        self,
+        input_ids: chex.Array = None,
+        past_key_values: chex.Array | dict = None,
+        attention_mask: chex.Array = None,
+        params: Optional[dict | flax.core.FrozenDict] = None,
+        **kwargs,
     ) -> ValueHeadModuleOutput:
         params = self.module_params if params is None else params
         kwargs["return_dict"] = True
@@ -219,41 +229,36 @@ class AutoRLModelForCasualLMWithValueHead:
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             params=params,
-            **kwargs
+            **kwargs,
         )
         logits = base_model_output.logits
         last_hidden_state = base_model_output.hidden_states[-1]
-        summery = self.v_head.apply(
-            params,
-            last_hidden_state,
-            True
-        )
-        return ValueHeadModuleOutput(
-            summery=summery,
-            logits=logits
-        )
+        summery = self.v_head.apply(params, last_hidden_state, True)
+        return ValueHeadModuleOutput(summery=summery, logits=logits)
 
     @classmethod
     def from_pretrained(
-            cls,
-            pretrained_model_name_or_path: str,
-            device=jax.devices('cpu')[0],
-            dtype: jax.numpy.dtype = jax.numpy.float32,
-            param_dtype: jax.numpy.dtype = jax.numpy.float32,
-            precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
-            sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
-            sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-            partition_axis: PartitionAxis = PartitionAxis(),
-            shard_attention_computation: bool = True,
-            input_shape: Tuple[int, int] = (1, 1),
-            backend: Optional[str] = None,
-            kernel_init: Callable = nn.initializers.orthogonal(),
-            generation_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec("dp", "fsdp"),
-            generation_config: GenerationConfig = GenerationConfig(),
-            shard_fns: Optional[Mapping[tuple, Callable]] = None,
-            seed: int = 42,
-            summary_dropout_prob: float = 0.0,
-            **kwargs
+        cls,
+        pretrained_model_name_or_path: str,
+        device=jax.devices("cpu")[0],
+        dtype: jax.numpy.dtype = jax.numpy.float32,
+        param_dtype: jax.numpy.dtype = jax.numpy.float32,
+        precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
+        sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
+        sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+        partition_axis: PartitionAxis = PartitionAxis(),
+        shard_attention_computation: bool = True,
+        input_shape: Tuple[int, int] = (1, 1),
+        backend: Optional[str] = None,
+        kernel_init: Callable = nn.initializers.orthogonal(),
+        generation_partition_spec: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
+            "dp", "fsdp"
+        ),
+        generation_config: GenerationConfig = GenerationConfig(),
+        shard_fns: Optional[Mapping[tuple, Callable]] = None,
+        seed: int = 42,
+        summary_dropout_prob: float = 0.0,
+        **kwargs,
     ):
         model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
@@ -268,7 +273,7 @@ class AutoRLModelForCasualLMWithValueHead:
             input_shape=input_shape,
             shard_fns=shard_fns,
             backend=backend,
-            **kwargs
+            **kwargs,
         )
         rl_model = cls(
             module=model,
@@ -281,7 +286,7 @@ class AutoRLModelForCasualLMWithValueHead:
             summary_dropout_prob=summary_dropout_prob,
             seed=seed,
             generation_config=generation_config,
-            generation_partition_spec=generation_partition_spec
+            generation_partition_spec=generation_partition_spec,
         )
 
         return rl_model, rl_model.module_params

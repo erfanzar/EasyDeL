@@ -3,8 +3,8 @@ import math
 import flax.linen.attention as flt
 import jax
 from easydel import PartitionAxis
-from easydel.modules.attention_module import FlexibleAttentionModule
-from easydel.modules.easydel_modelling_utils import EasyDeLPretrainedConfig
+from easydel.models.attention_module import FlexibleAttentionModule
+from easydel.models.modelling_utils import EDPretrainedConfig
 from fjformer import GenerateRNG
 from jax import lax, random
 from jax import numpy as jnp
@@ -17,7 +17,7 @@ HEAD_DIM = 256
 
 def main():
     rng_gen = GenerateRNG(seed=42)
-    config = EasyDeLPretrainedConfig(
+    config = EDPretrainedConfig(
         axis_dims=(1, -1, 1, 1),
         axis_names=("dp", "fsdp", "tp", "sp"),
         block_q=512,

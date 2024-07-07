@@ -1,5 +1,5 @@
 import gc
-from typing import Callable, List, Mapping, Optional
+from typing import Callable, List, Mapping, Optional, Union
 import jax
 import transformers
 from fjformer.checkpoint import get_dtype
@@ -71,9 +71,9 @@ class _DummyContextManager:
 def toch_dict_to_flatten_dict(
     state_dict,
     *,
-    device,
-    embedding_layer_names: Optional[List[str]] = None,
-    layer_norm_names: Optional[List[str]] = None,
+    device: Optional[jax.Device] = None,
+    embedding_layer_names: Optional[Union[List[str], str]] = None,
+    layer_norm_names: Optional[Union[List[str], str]] = None,
     shard_fns: Optional[Mapping[tuple, Callable]] = None,
     dtype: jax.numpy.dtype = jax.numpy.float32,
     rnn_based_or_rwkv: bool = False,
@@ -106,19 +106,15 @@ def toch_dict_to_flatten_dict(
         A dictionary of the weights and biases in a format that can be
         used by flax (it's an UnFlattenDict)
     """
+    if device is None:
+        device = jax.devices()[0]  # Set JAX-recommended backend
     try:
         import torch
 
-        if torch.cuda.is_available():
-
-            def _clear():
-                gc.collect()
+        def _clear():
+            gc.collect()
+            if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-
-        else:
-
-            def _clear():
-                gc.collect()
 
     except ModuleNotFoundError:
 
@@ -127,23 +123,30 @@ def toch_dict_to_flatten_dict(
 
         def _clear():
             gc.collect()
+            
+    if isinstance(embedding_layer_names, str):
+        embedding_layer_names = [embedding_layer_names]
+    if isinstance(layer_norm_names, str):
+        layer_norm_names = [layer_norm_names]
 
     embedding_layer_names = set(embedding_layer_names or [])
     layer_norm_names = set(layer_norm_names or [])
-    _l = len(".weight")
-    _b = len(".bias")
+    context_manager = (
+        jax.default_device(device) if shard_fns is None else _DummyContextManager()
+    )
 
-    ctx_m = jax.default_device(device) if shard_fns is None else _DummyContextManager()
-    with ctx_m:
-        flax_dict = {}
-        pbar = tqdm(total=len(state_dict), disable=not verbose)
-        pbar.set_description("Converting Model")
-        missed_shardings = 0
+    pbar = tqdm(total=len(state_dict), disable=not verbose)
+    pbar.set_description("Converting Model")
+
+    flax_dict = {}
+    missed_shardings = 0
+
+    with context_manager:
         for key in list(state_dict.keys()):
             tensor = state_dict.pop(key)
             new_key = key
             if any(layer_name in key for layer_name in embedding_layer_names):
-                new_key = key[:-_l] + ".embedding"
+                new_key = key[: -len(".weight")] + ".embedding"
             elif rnn_based_or_rwkv and ("time_mix_" in key or "time_" in key):
                 tensor = tensor.reshape(-1)
             elif any(layer_norm in key for layer_norm in layer_norm_names):
