@@ -132,24 +132,21 @@ class LlamaAttention(BaseAttentionModule):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
 
     def apply_rotary(self, query, key, freqs_cis, position_ids):
-        """The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
+        """
+        The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
         The main difference is that it takes in an additional argument, freqs_cis, which are used to calculate
         the rotary attention weights. The other differences are minor and mostly related to reshaping tensors.
 
         Args:
             self: Access variables that belong to the class
-            batch_size: Reshape the query, key and value tensors
-            sequence_length: Reshape the query, key and value tensors
             query: Calculate the attention weights
             key: Calculate the attention
             value: Compute the attention weights
-            freqs_cis: Calculate the frequency of each word in the
-                vocabulary
-            position_ids: Identify the position of each token in the
-                sequence
+            freqs_cis: Calculate the frequency of each word in the vocabulary
+            position_ids: Identify the position of each token in the sequence
 
         Returns:
-            A tuple of 3 tensors: query, key and value
+            A tuple of 2 tensors: query, key
         """
         query, key = self._transpose_sequence_head(query, key)
         query, key = self.rotary(
@@ -169,7 +166,8 @@ class LlamaAttention(BaseAttentionModule):
         past_key_values: Optional[KVCache] = None,
         segment_ids: Optional[chex.Array] = None,
     ):
-        """The __call__ function is the main function of a JAX module. It defines how the module behaves when called
+        """
+        The __call__ function is the main function of a JAX module. It defines how the module behaves when called
         with inputs. The __call__ function can be thought of as a &quot;forward pass&quot; through the model,
         and it should return all outputs that are needed for training or inference.
 
@@ -429,7 +427,7 @@ class LlamaBlock(nnx.Module):
             position_ids: (Optional(chex.Array)): Determine the position of each token in a sequence
 
         Returns:
-            A tuple of two items
+            A tuple of two items HiddenState and attentionWeight(if any)
         """
         attn_output, attn_weight = self.self_attn(
             self.input_layernorm(hidden_states),
@@ -578,7 +576,7 @@ class LlamaModel(BaseNNXModule):
             extra_embedding: Optional[Union[jnp.ndarray]]: Pass in the extra embedding
 
         Returns:
-            A tuple of:
+            A tuple of: predictions
         """
 
         all_attentions = () if output_attentions else None

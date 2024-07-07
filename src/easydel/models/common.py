@@ -10,9 +10,11 @@ class RMSNorm(nnx.Module):
         eps: float = 1e-6,
         dtype: jnp.dtype = jnp.float32,
         param_dtype: jnp.dtype = jnp.float32,
+        do_transpose: bool = False,
         *,
         rngs: nnx.Rngs,
     ) -> None:
+        self.do_transpose = do_transpose
         self.eps = eps
         self.dtype = dtype
         self.kernel = nnx.Param(
@@ -30,4 +32,6 @@ class RMSNorm(nnx.Module):
         x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
         output = self._norm(x).astype(self.dtype)
         weight = self.kernel.value.astype(self.dtype)
+        if self.do_transpose:
+            weight = jnp.transpose(weight, (1, 0))
         return output * weight

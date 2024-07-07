@@ -136,6 +136,22 @@ class ArcticAttention(BaseAttentionModule):
         )
 
     def apply_rotary(self, query, key, freqs_cis, position_ids):
+        """
+        The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
+        The main difference is that it takes in an additional argument, freqs_cis, which are used to calculate
+        the rotary attention weights. The other differences are minor and mostly related to reshaping tensors.
+
+        Args:
+            self: Access variables that belong to the class
+            query: Calculate the attention weights
+            key: Calculate the attention
+            value: Compute the attention weights
+            freqs_cis: Calculate the frequency of each word in the vocabulary
+            position_ids: Identify the position of each token in the sequence
+
+        Returns:
+            A tuple of 2 tensors: query, key
+        """
         query, key = self._transpose_sequence_head(query, key)
         query, key = self.rotary(
             position_ids=position_ids,
