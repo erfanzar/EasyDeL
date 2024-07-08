@@ -29,7 +29,6 @@ from easydel.models.flax_modelling_utils import (
     apply_rotary_pos_emb,
     block_wise_ffn,
     control_mlp_sharding,
-    get_dot_general_by_bits,
     get_gradient_checkpoint_policy,
     precompute_freqs_cis,
     with_sharding_constraint,
@@ -90,7 +89,6 @@ class FlaxQwen2MoeMLP(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.down_proj = Dense(
             config.hidden_size,
@@ -99,7 +97,6 @@ class FlaxQwen2MoeMLP(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.up_proj = Dense(
             intermediate_size,
@@ -108,7 +105,6 @@ class FlaxQwen2MoeMLP(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
 
     def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
@@ -154,7 +150,6 @@ class FlaxQwen2MoeAttention(BaseAttentionModule):
             use_bias=True,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.k_proj = Dense(
             config.num_key_value_heads * self.head_dim,
@@ -163,7 +158,6 @@ class FlaxQwen2MoeAttention(BaseAttentionModule):
             use_bias=True,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.v_proj = Dense(
             config.num_key_value_heads * self.head_dim,
@@ -172,7 +166,6 @@ class FlaxQwen2MoeAttention(BaseAttentionModule):
             use_bias=True,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.o_proj = Dense(
             config.hidden_size,
@@ -181,7 +174,6 @@ class FlaxQwen2MoeAttention(BaseAttentionModule):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
 
         self.rotary = FlaxQwen2MoeEmbedding(self.dtype)
@@ -1165,8 +1157,7 @@ class FlaxQwen2MoeModule(nn.Module):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
 
-        batch_size, sequence_length, _ = inputs_embeds.shape
-
+        batch_size, sequence_length = input_ids.shape
         assert (
             sequence_length <= self.config.max_position_embeddings
         ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
@@ -1242,7 +1233,6 @@ class FlaxQwen2MoeForCausalLMModule(nn.Module):
                 stddev=self.config.initializer_range
             ),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
 
     def __call__(

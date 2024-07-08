@@ -625,7 +625,7 @@ class FlaxPhi3Module(nn.Module):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
         inputs_embeds = self.embed_dropout(inputs_embeds, deterministic=deterministic)
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        batch_size,sequence_length=input_ids.shape
         if attention_mask is None:
             attention_mask = jnp.ones((batch_size, sequence_length), dtype="i4")
         if position_ids is None:

@@ -25,7 +25,6 @@ from easydel.models.flax_modelling_utils import (
     apply_rotary_pos_emb,
     block_wise_ffn,
     control_mlp_sharding,
-    get_dot_general_by_bits,
     get_gradient_checkpoint_policy,
     precompute_freqs_cis,
     with_sharding_constraint,
@@ -88,7 +87,6 @@ class FlaxMixtralAttention(BaseAttentionModule):
             param_dtype=self.param_dtype,
             precision=self.precision,
             kernel_init=nn.initializers.normal(),
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
 
         self.q_proj = dense(self.num_heads * self.head_dim)
@@ -298,7 +296,6 @@ class FlaxMixtralBLockSparseTop2MLP(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision,
             kernel_init=nn.initializers.normal(),
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.w1 = dense(self.config.intermediate_size)
         self.w3 = dense(self.config.intermediate_size)
@@ -1074,7 +1071,6 @@ class FlaxMixtralForCausalLMModule(nn.Module):
             precision=self.precision,
             use_bias=False,
             kernel_init=nn.initializers.normal(self.config.initializer_range),
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
 
     def __call__(

@@ -18,7 +18,6 @@ from easydel.models.attention_module import FlexibleAttentionModule
 from easydel.models.flax_modelling_utils import (
     BaseAttentionModule,
     control_mlp_sharding,
-    get_dot_general_by_bits,
     get_gradient_checkpoint_policy,
 )
 from easydel.models.modelling_utils import BaseNNXModule
@@ -43,7 +42,6 @@ class FlaxMptMLP(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.down_proj = Dense(
             self.config.hidden_size,
@@ -54,7 +52,6 @@ class FlaxMptMLP(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.hidden_dropout = nn.Dropout(self.config.attn_config.attn_pdrop)
 
@@ -89,7 +86,6 @@ class FlaxMptAttention(BaseAttentionModule):
                 stddev=self.config.initializer_range
             ),
             use_bias=self.config.use_bias,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
@@ -103,7 +99,6 @@ class FlaxMptAttention(BaseAttentionModule):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.dropout = nn.Dropout(self.config.attn_config.attn_pdrop)
 
@@ -616,7 +611,6 @@ class FlaxMptForCausalLMModule(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
 
     def __call__(

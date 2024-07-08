@@ -219,12 +219,12 @@ class DbrxAttention(BaseAttentionModule):
         )
         attention_bias = None
         if attention_mask is not None:
-            causal_mask = attention_mask[:, :, :, :key_length]
+            attention_mask = attention_mask[:, :, :, :key_length]
             attention_bias = lax.select(
-                causal_mask > 0,
-                jnp.full(causal_mask.shape, 0.0).astype(self.dtype),
+                attention_mask > 0,
+                jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
                 jnp.full(
-                    causal_mask.shape,
+                    attention_mask.shape,
                     jnp.finfo(self.dtype).min,
                 ).astype(self.dtype),
             )
@@ -753,31 +753,29 @@ class DbrxModel(BaseNNXModule):
             raise ValueError(
                 "You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time"
             )
-
-        batch_size, seq_length = input_ids.shape
-        if attention_mask is None:
-            attention_mask = jnp.ones_like(input_ids)
-        if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
-                (batch_size, seq_length),
-            ).astype(jnp.int32)
-        if attention_mask.ndim == 2:
-            attention_mask = attention_mask.reshape(batch_size, 1, seq_length, 1)
-            attention_mask = jnp.logical_and(
-                attention_mask, self.causal_mask[:, :, :seq_length, :]
-            )
-
         if inputs_embeds is None and input_ids is not None:
             inputs_embeds = self.wte(input_ids.astype("i4"))
         else:
             raise ValueError(
                 "you should specify inputs_embeds or input_ids one of them"
             )
-        sequence_length = inputs_embeds.shape[1]
+        batch_size, sequence_length, _ = inputs_embeds.shape
         assert (
             sequence_length <= self.config.max_position_embeddings
         ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
+
+        if attention_mask is None:
+            attention_mask = jnp.ones_like(input_ids)
+        if position_ids is None:
+            position_ids = jnp.broadcast_to(
+                jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
+                (batch_size, sequence_length),
+            ).astype(jnp.int32)
+        if attention_mask.ndim == 2:
+            attention_mask = attention_mask.reshape(batch_size, 1, sequence_length, 1)
+            attention_mask = jnp.logical_and(
+                attention_mask, self.causal_mask[:, :, :sequence_length, :]
+            )
 
         inputs_embeds = (
             inputs_embeds + extra_embedding
@@ -900,9 +898,15 @@ class DbrxForCausalLM(BaseNNXModule):
             output_hidden_states=output_hidden_states,
             output_router_logits=output_router_logits,
             past_key_values=past_key_values,
-            return_dict=True,
+            return_dict=return_dict,
         )
-        logits = self.lm_head(outputs.last_hidden_state)
+        hidden_states = outputs[0]
+
+        if self.config.tie_word_embeddings:
+            self.lm_head.kernel.value = self.model.wte.embedding.value.T
+            logits = self.lm_head(hidden_states)
+        else:
+            logits = self.lm_head(hidden_states)
         batch_size, seq_length, hd = logits.shape
         aux_loss = None
         if output_router_logits and outputs.router_logits is not None:

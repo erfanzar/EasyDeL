@@ -24,7 +24,6 @@ from easydel.models.common import RMSNorm
 # easydel.modules
 from easydel.models.flax_modelling_utils import (
     BaseAttentionModule,
-    get_dot_general_by_bits,
     get_gradient_checkpoint_policy,
     with_sharding_constraint,
 )
@@ -329,7 +328,6 @@ class FlaxChatGLMAttention(BaseAttentionModule):
             param_dtype=self.param_dtype,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
 
         self.core_attention = CoreAttention(
@@ -348,7 +346,6 @@ class FlaxChatGLMAttention(BaseAttentionModule):
             param_dtype=self.param_dtype,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.num_num_key_value_groupsreps = (
             self.num_attention_heads_per_partition
@@ -589,7 +586,6 @@ class MLP(nn.Module):
             param_dtype=self.param_dtype,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
 
         def swiglu(x):
@@ -606,7 +602,6 @@ class MLP(nn.Module):
             param_dtype=self.param_dtype,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
 
     def __call__(
@@ -1281,7 +1276,6 @@ class FlaxChatGLMModel(nn.Module):
             param_dtype=self.param_dtype,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.causal_mask = nn.make_causal_mask(
             jnp.ones((1, self.config.seq_length), dtype="bool"), dtype="bool"

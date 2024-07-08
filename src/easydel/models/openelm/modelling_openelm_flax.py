@@ -24,7 +24,6 @@ from easydel.models.flax_modelling_utils import (
     apply_rotary_pos_emb,
     block_wise_ffn,
     control_mlp_sharding,
-    get_dot_general_by_bits,
     get_gradient_checkpoint_policy,
     precompute_freqs_cis,
     with_sharding_constraint,
@@ -86,7 +85,6 @@ class FlaxOpenELMMultiHeadCausalAttention(BaseAttentionModule):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         if config.normalize_qk_projections:
             self.q_norm = RMSNorm(
@@ -112,7 +110,6 @@ class FlaxOpenELMMultiHeadCausalAttention(BaseAttentionModule):
             use_bias=False,
             precision=self.precision,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.head_dim = head_dim
         self.rotary = FlaxOpenELMRotaryEmbedding(self.dtype)
@@ -376,7 +373,6 @@ class FlaxOpenELMFeedForwardNetwork(nn.Module):
                 param_dtype=self.param_dtype,
                 precision=self.precision,
                 kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-                **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
             )
             self.proj_2 = nn.Dense(
                 config.model_dim,
@@ -385,7 +381,6 @@ class FlaxOpenELMFeedForwardNetwork(nn.Module):
                 param_dtype=self.param_dtype,
                 precision=self.precision,
                 kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-                **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
             )
             self.ffn_with_glu = True
         else:
@@ -396,7 +391,6 @@ class FlaxOpenELMFeedForwardNetwork(nn.Module):
                 param_dtype=self.param_dtype,
                 precision=self.precision,
                 kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-                **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
             )
             self.proj_2 = nn.Dense(
                 config.model_dim,
@@ -405,7 +399,6 @@ class FlaxOpenELMFeedForwardNetwork(nn.Module):
                 param_dtype=self.param_dtype,
                 precision=self.precision,
                 kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-                **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
             )
             self.ffn_with_glu = False
 
@@ -998,7 +991,6 @@ class FlaxOpenELMForCausalLMModule(nn.Module):
                 stddev=self.config.initializer_range
             ),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
 
     def __call__(

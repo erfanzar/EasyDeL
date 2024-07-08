@@ -26,7 +26,6 @@ from easydel.models.common import RMSNorm as RMSNorm
 from easydel.models.flax_modelling_utils import (
     BaseAttentionModule,
     control_mlp_sharding,
-    get_dot_general_by_bits,
     get_gradient_checkpoint_policy,
     rotate_half,
     with_sharding_constraint,
@@ -116,7 +115,6 @@ class FlaxQwen1MLP(nn.Module):
             use_bias=not self.config.no_bias,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.w2 = Dense(
             config.intermediate_size // 2,
@@ -125,7 +123,6 @@ class FlaxQwen1MLP(nn.Module):
             use_bias=not self.config.no_bias,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.c_proj = Dense(
             config.hidden_size,
@@ -134,7 +131,6 @@ class FlaxQwen1MLP(nn.Module):
             use_bias=not self.config.no_bias,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
 
     def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
@@ -181,7 +177,6 @@ class FlaxQwen1Attention(BaseAttentionModule):
             use_bias=True,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
         self.c_proj = Dense(
@@ -191,7 +186,6 @@ class FlaxQwen1Attention(BaseAttentionModule):
             use_bias=not self.config.no_bias,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         logn_list = [
             math.log(i, self.config.seq_length) if i > self.config.seq_length else 1
@@ -793,8 +787,8 @@ class FlaxQwen1PreTrainedModel(BaseNNXModule):
             sequence_length <= self.config.seq_length
         ), "Maximum Position Embedding Reached !"
 
-        if position_ids is None:
-            if past_key_values is not None:
+        if position_ids is None: 
+            if past_key_values is None:
                 raise ValueError(
                     "Make sure to provide `position_ids` when passing `past_key_values`."
                 )
@@ -1111,7 +1105,7 @@ class FlaxQwen1Module(nn.Module):
         if inputs_embeds is None:
             inputs_embeds = self.wte(input_ids.astype("i4"))
 
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        batch_size, sequence_length = input_ids.shape
         kv_seq_len = sequence_length
 
         if self.h.blocks[0].attn.has_variable("cache", "cached_key"):
@@ -1120,23 +1114,6 @@ class FlaxQwen1Module(nn.Module):
             )
             kv_seq_len += cache_index
 
-        # if deterministic or not self.config.use_dynamic_ntk:
-        #     ntk_alpha_list = [1.0]
-        # elif kv_seq_len != inputs_embeds.shape[1]:
-        #     ntk_alpha_list = self.rotary_emb._ntk_alpha_cached_list
-        # else:
-        #     ntk_alpha_list = []
-        #     if attention_mask is not None and kv_seq_len > self.seq_length:
-        #         true_seq_lens = jnp.sum(attention_mask.reshape(batch_size, 1, 1, -1) == 0, axis=-1, dtype=jnp.float32)
-        #         for i in range(inputs_embeds.shape[0]):
-        #             true_seq_len = true_seq_lens[i].item()
-        #             ntk_alpha = self.get_ntk_alpha(true_seq_len)
-        #             ntk_alpha_list.append(ntk_alpha)
-        #     else:
-        #         ntk_alpha = self.get_ntk_alpha(kv_seq_len)
-        #         ntk_alpha_list.append(ntk_alpha)
-        # self.rotary_emb.set_ntk_alpha_cached_list(ntk_alpha_list)
-        # rotary_pos_emb_list = []
         assert (
             sequence_length <= self.config.seq_length
         ), "Maximum Position Embedding Reached !"
@@ -1212,7 +1189,6 @@ class FlaxQwen1ForCausalLMModule(nn.Module):
                 stddev=self.config.initializer_range
             ),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
 
     def __call__(

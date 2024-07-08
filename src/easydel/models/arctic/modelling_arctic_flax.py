@@ -236,12 +236,12 @@ class ArcticAttention(BaseAttentionModule):
         )
         attention_bias = None
         if attention_mask is not None:
-            causal_mask = attention_mask[:, :, :, :key_length]
+            attention_mask = attention_mask[:, :, :, :key_length]
             attention_bias = lax.select(
-                causal_mask > 0,
-                jnp.full(causal_mask.shape, 0.0).astype(self.dtype),
+                attention_mask > 0,
+                jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
                 jnp.full(
-                    causal_mask.shape,
+                    attention_mask.shape,
                     jnp.finfo(self.dtype).min,
                 ).astype(self.dtype),
             )
@@ -954,7 +954,11 @@ class ArcticForCausalLM(BaseNNXModule):
             past_key_values=past_key_values,
             segment_ids=segment_ids,
         )
-        logits = self.lm_head(outputs.last_hidden_state)
+        if self.config.tie_word_embeddings:
+            self.lm_head.kernel.value = self.model.embed_tokens.embedding.value.T
+            logits = self.lm_head(outputs.hidden_states)
+        else:
+            logits = self.lm_head(outputs.hidden_states)
 
         aux_loss = sum(outputs[-1]) * self.config.router_aux_loss_coef
         if not return_dict:

@@ -476,7 +476,7 @@ class EDPretrainedConfig(PretrainedConfig):
 class BaseNNXModule(PushToHubMixin, nnx.Module):
     def __init__(
         self,
-        config: Optional[PretrainedConfig] = None,
+        config: PretrainedConfig,
     ):
         self.config = config
         super().__init__()

@@ -1,17 +1,12 @@
 import functools
 import math
 import typing
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import chex
-import fjformer
 import flax
 import jax
-from fjformer import linen as nn
-from flax.core import FrozenDict, freeze, unfreeze
-from flax.linen import combine_masks
-from flax.linen import partitioning as nn_partitioning
-from flax.traverse_util import flatten_dict, unflatten_dict
+from flax import nnx
 from jax import lax
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
@@ -22,6 +17,7 @@ from transformers.modeling_flax_outputs import (
 )
 
 from easydel.models.attention_module import FlexibleAttentionModule
+from easydel.models.caching_utils import KVCache
 from easydel.models.common import RMSNorm
 from easydel.models.deepseek_v2.deepseek_configuration import (
     DeepseekV2Config as DeepseekV2Config,
@@ -31,13 +27,9 @@ from easydel.models.flax_modelling_utils import (
     BaseAttentionModule,
     block_wise_ffn,
     control_mlp_sharding,
-    get_dot_general_by_bits,
-    get_gradient_checkpoint_policy,
     with_sharding_constraint,
 )
 from easydel.models.modelling_utils import BaseNNXModule
-
-re_mat = nn_partitioning.remat
 
 
 @flax.struct.dataclass
@@ -190,46 +182,77 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
-class FlaxDeepseekV2MLP(nn.Module):
-    config: DeepseekV2Config
-    dtype: jnp.dtype = jnp.bfloat16
-    param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
-    hidden_size: Optional[int] = None
-    intermediate_size: Optional[int] = None
-
-    def setup(self) -> None:
-        dense = functools.partial(
-            nn.Dense,
+class DeepseekV2MLP(nnx.Module):
+    def __init__(
+        self,
+        config: DeepseekV2Config,
+        layer_idx: int,
+        dtype: jnp.dtype = jnp.float32,
+        param_dtype: jnp.dtype = jnp.float32,
+        precision: Optional[Union[jax.lax.Precision, str]] = None,
+        hidden_size: Optional[int] = None,
+        intermediate_size: Optional[int] = None,
+        *,
+        rngs: nnx.Rngs,
+    ) -> None:
+        super().__init__()
+        self.config: DeepseekV2Config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.layer_idx = layer_idx
+        self.precision = precision
+        linear = functools.partial(
+            nnx.Linear,
             use_bias=False,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            precision=self.precision,
-            kernel_init=nn.initializers.normal(),
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            kernel_init=nnx.initializers.normal(),
         )
-        self.gate_proj = dense(self.intermediate_size or self.config.intermediate_size)
-        self.up_proj = dense(self.intermediate_size or self.config.intermediate_size)
-        self.down_proj = dense(self.hidden_size or self.config.hidden_size)
-        self.act_fn = ACT2FN[self.config.hidden_act]
+        self.gate_proj = linear(
+            hidden_size or config.hidden_size,
+            intermediate_size or config.intermediate_size,
+            rngs=rngs,
+        )
+        self.up_proj = linear(
+            hidden_size or config.hidden_size,
+            intermediate_size or config.intermediate_size,
+            rngs=rngs,
+        )
+        self.down_proj = linear(
+            intermediate_size or config.intermediate_size,
+            hidden_size or config.hidden_size,
+            rngs=rngs,
+        )
+        self.act_fn = ACT2FN[config.hidden_act]
 
     def __call__(
         self,
-        x: chex.Array,
-        e: bool = False,  # Ignored
+        hidden_states: chex.Array,
     ):
-        x = control_mlp_sharding(x, self.config.partition_axis)
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
+        return self.down_proj(
+            self.act_fn(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
+        )
 
 
-class FlaxMoEGate(nn.Module):
-    config: DeepseekV2Config
-    dtype: jnp.dtype = jnp.bfloat16
-    param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+class MoEGate(nnx.Module):
 
-    def setup(self) -> None:
-        config = self.config
+    def __init__(
+        self,
+        config: DeepseekV2Config,
+        dtype: jnp.dtype = jnp.float32,
+        param_dtype: jnp.dtype = jnp.float32,
+        precision: Optional[Union[str, jax.lax.Precision]] = None,
+        *,
+        rngs: nnx.Rngs,
+    ) -> None:
+        super().__init__()
+
+        self.config: DeepseekV2Config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
         self.top_k = config.num_experts_per_tok
         self.n_routed_experts = config.n_routed_experts
         self.routed_scaling_factor = config.routed_scaling_factor
@@ -242,18 +265,24 @@ class FlaxMoEGate(nn.Module):
 
         self.norm_topk_prob = config.norm_topk_prob
         self.gating_dim = config.hidden_size
-        self.weight = self.param(
-            "kernel",
-            nn.initializers.kaiming_uniform(dtype=self.param_dtype),
-            (self.n_routed_experts, self.gating_dim),
+        self.kernel = nnx.Param(
+            nnx.initializers.kaiming_uniform(
+                dtype=self.param_dtype,
+            )(
+                rngs.params(),
+                (
+                    self.n_routed_experts,
+                    self.gating_dim,
+                ),
+            ),
         )
 
-    def __call__(self, hidden_states, deterministic: bool = True):
+    def __call__(self, hidden_states):
         bsz, seq_len, h = hidden_states.shape
         hidden_states = hidden_states.reshape(-1, h)
         logits = jax.lax.batch_matmul(
             hidden_states.astype(jnp.float32),
-            self.weight.astype(jnp.float32),
+            self.kernel.astype(jnp.float32),
             precision=self.precision,
         )
         if self.scoring_func == "softmax":
@@ -265,7 +294,7 @@ class FlaxMoEGate(nn.Module):
 
         ### select top-k experts
         if self.topk_method == "gready":
-            topk_weight, topk_idx = jax.lax.top_k(scores, k=self.top_k)
+            topk_kernel, topk_idx = jax.lax.top_k(scores, k=self.top_k)
         elif self.topk_method == "group_limited_greedy":
             group_scores = scores.reshape(bsz * seq_len, self.n_group, -1).max(
                 axis=-1
@@ -293,17 +322,17 @@ class FlaxMoEGate(nn.Module):
             masked_scores = jnp.where(score_mask, scores, 0.0)  # [n, e]
 
             # Compute the top k scores after masking
-            topk_weight, topk_idx = lax.top_k(masked_scores, self.top_k)
+            topk_kernel, topk_idx = lax.top_k(masked_scores, self.top_k)
         else:
             raise ValueError()
         ### norm gate to sum 1
         if self.top_k > 1 and self.norm_topk_prob:
-            denominator = jnp.sum(topk_weight, axis=-1, keepdims=True) + 1e-20
-            topk_weight = topk_weight / denominator
+            denominator = jnp.sum(topk_kernel, axis=-1, keepdims=True) + 1e-20
+            topk_kernel = topk_kernel / denominator
         else:
-            topk_weight = topk_weight * self.routed_scaling_factor
+            topk_kernel = topk_kernel * self.routed_scaling_factor
         ### expert-level computation auxiliary loss
-        if not deterministic and self.alpha > 0.0:
+        if self.alpha > 0.0:
             scores_for_aux = scores
             aux_topk = self.top_k
             topk_idx_for_aux_loss = topk_idx.reshape(bsz, -1)
@@ -330,67 +359,59 @@ class FlaxMoEGate(nn.Module):
                 aux_loss = jnp.sum(Pi * fi) * self.alpha
         else:
             aux_loss = None
-        return topk_idx, topk_weight, aux_loss
+        return topk_idx, topk_kernel, aux_loss
 
 
-class FlaxDeepseekV2MLPCollection(nn.Module):
-    config: DeepseekV2Config
-    dtype: jnp.dtype = jnp.bfloat16
-    param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+class DeepseekV2MoE(nnx.Module):
 
-    def setup(self) -> None:
-        self.experts = [
-            FlaxDeepseekV2MLP(
-                config=self.config,
-                dtype=self.dtype,
-                param_dtype=self.param_dtype,
-                precision=self.precision,
-                intermediate_size=self.config.moe_intermediate_size,
-                name=str(i),
-            )
-            for i in range(self.config.n_routed_experts)
-        ]
+    def __init__(
+        self,
+        config: DeepseekV2Config,
+        dtype: jnp.dtype = jnp.float32,
+        param_dtype: jnp.dtype = jnp.float32,
+        precision: Optional[Union[str, jax.lax.Precision]] = None,
+        *,
+        rngs: nnx.Rngs,
+    ) -> None:
+        super().__init__()
 
-    def __call__(self, hidden_states, flat_topk_idx):
-        y = jnp.empty_like(hidden_states)
-        for i, expert in enumerate(self.experts):
-            y[flat_topk_idx == i] = expert(hidden_states[flat_topk_idx == i])
-        return y
+        self.config: DeepseekV2Config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
 
-
-class FlaxDeepseekV2MoE(nn.Module):
-    config: DeepseekV2Config
-    dtype: jnp.dtype = jnp.bfloat16
-    param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
-
-    def setup(self) -> None:
         config = self.config
         self.num_experts_per_tok = config.num_experts_per_tok
 
         self.ep_size = 1
         self.experts_per_rank = config.n_routed_experts
         self.ep_rank = 0
-        self.experts = FlaxDeepseekV2MLPCollection(
-            config=self.config,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            precision=self.precision,
-        )
-        self.gate = FlaxMoEGate(
+        self.experts = [
+            DeepseekV2MLP(
+                config=config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                intermediate_size=config.moe_intermediate_size,
+                rngs=rngs,
+                layer_idx=i,
+            )
+            for i in range(config.n_routed_experts)
+        ]
+        self.gate = MoEGate(
             config=config,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            precision=self.precision,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
         )
         if config.n_shared_experts is not None:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-            self.shared_experts = FlaxDeepseekV2MoE(
-                config=self.config,
-                dtype=self.dtype,
-                param_dtype=self.param_dtype,
-                precision=self.precision,
+            self.shared_experts = DeepseekV2MoE(
+                config=config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
                 intermediate_size=intermediate_size,
             )
 
@@ -402,12 +423,17 @@ class FlaxDeepseekV2MoE(nn.Module):
         hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
         identity = hidden_states
         orig_shape = hidden_states.shape
-        topk_idx, topk_weight, aux_loss = self.gate(hidden_states)
+        topk_idx, topk_kernel, aux_loss = self.gate(hidden_states)
         hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
         flat_topk_idx = topk_idx.reshape(-1)
         hidden_states = hidden_states.repeat(self.num_experts_per_tok, axis=0)
-        y = self.experts(hidden_states=hidden_states, flat_topk_idx=flat_topk_idx)
-        y = (y.reshape(*topk_weight.shape, -1) * jnp.expand_dims(topk_weight, -1)).sum(
+        # y = self.experts(hidden_states=hidden_states, flat_topk_idx=flat_topk_idx)
+
+        y = jnp.empty_like(hidden_states)
+        for i, expert in enumerate(self.experts):
+            y[flat_topk_idx == i] = expert(hidden_states[flat_topk_idx == i])
+
+        y = (y.reshape(*topk_kernel.shape, -1) * jnp.expand_dims(topk_kernel, -1)).sum(
             axis=1
         )
         y = y.reshape(*orig_shape)
@@ -416,14 +442,24 @@ class FlaxDeepseekV2MoE(nn.Module):
         return y
 
 
-class FlaxDeepseekV2Attention(BaseAttentionModule):
-    config: DeepseekV2Config
-    layer_idx: int
-    dtype: jnp.dtype = jnp.bfloat16
-    param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
-
-    def setup(self) -> None:
+class DeepseekV2Attention(BaseAttentionModule):
+    def __init__(
+        self,
+        config: DeepseekV2Config,
+        layer_idx: int,
+        dtype: jnp.dtype = jnp.float32,
+        param_dtype: jnp.dtype = jnp.float32,
+        precision: Optional[Union[jax.lax.Precision, str]] = None,
+        *,
+        rngs: nnx.Rngs,
+    ) -> None:
+        super().__init__()
+        self.config: DeepseekV2Config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.layer_idx = layer_idx
+        self.precision = precision
+        self.rngs = rngs
         config = self.config
 
         self.attention_dropout = config.attention_dropout
@@ -441,29 +477,53 @@ class FlaxDeepseekV2Attention(BaseAttentionModule):
 
         self.is_causal = True
 
-        dense_class = functools.partial(
-            nn.Dense,
+        linear_class = functools.partial(
+            nnx.Linear,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
         )
 
-        self.q_a_proj = dense_class(config.q_lora_rank, use_bias=config.attention_bias)
-        self.q_a_layernorm = RMSNorm(config.q_lora_rank)
-        self.q_b_proj = dense_class(self.num_heads * self.q_head_dim, use_bias=False)
+        self.q_a_proj = linear_class(
+            self.hidden_size,
+            config.q_lora_rank,
+            use_bias=config.attention_bias,
+            rngs=rngs,
+        )
+        self.q_a_layernorm = RMSNorm(
+            config.q_lora_rank,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+        self.q_b_proj = linear_class(
+            self.hidden_size,
+            self.num_heads * self.q_head_dim,
+            use_bias=False,
+            rngs=rngs,
+        )
 
-        self.kv_a_proj_with_mqa = dense_class(
+        self.kv_a_proj_with_mqa = linear_class(
+            self.hidden_size,
             config.kv_lora_rank + config.qk_rope_head_dim,
             use_bias=config.attention_bias,
+            rngs=rngs,
         )
         self.kv_a_layernorm = RMSNorm(config.kv_lora_rank)
-        self.kv_b_proj = dense_class(
+        self.kv_b_proj = linear_class(
+            self.hidden_size,
             self.num_heads
             * (self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim),
             use_bias=False,
+            rngs=rngs,
         )
 
-        self.o_proj = dense_class(self.hidden_size, use_bias=config.attention_bias)
+        self.o_proj = linear_class(
+            self.num_heads * self.q_head_dim,
+            self.hidden_size,
+            use_bias=config.attention_bias,
+            rngs=rngs,
+        )
 
         softmax_scale = self.q_head_dim ** (-0.5)
         if self.config.rope_scaling is not None:
@@ -473,32 +533,14 @@ class FlaxDeepseekV2Attention(BaseAttentionModule):
                 mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
                 softmax_scale = self.softmax_scale * mscale * mscale
 
-        self.attention_module = FlexibleAttentionModule(
-            use_sharding_constraint=self.config.use_sharding_constraint,
-            block_k_major=self.config.block_k_major,
-            block_b=self.config.block_b,
-            block_q=self.config.block_q,
-            block_k=self.config.block_k,
-            block_q_major_dkv=self.config.block_q_major_dkv,
-            block_k_major_dkv=self.config.block_k_major_dkv,
-            block_k_major_dq=self.config.block_k_major_dq,
-            block_k_dkv=self.config.block_k_dkv,
-            block_q_dkv=self.config.block_q_dkv,
-            block_q_dq=self.config.block_q_dq,
-            block_k_dq=self.config.block_k_dq,
-            num_attention_heads=self.config.num_attention_heads,
-            attention_dropout=self.config.attention_dropout,
-            head_dims=self.q_head_dim,
-            shard_attention_computation=self.config.shard_attention_computation,
-            precision=self.precision,
-            force_float32_tpu=True,
-            attn_mechanism=self.config.attn_mechanism,
-            dtype=self.config.attn_dtype,
-            partition_axis=self.config.partition_axis,
-            scan_ring_attention=self.config.scan_ring_attention,
-            mesh=self.config.get_mesh(),
+        self.attention_module: FlexibleAttentionModule = FlexibleAttentionModule(
+            mesh=config.mesh,
+            attn_mechanism=config.attn_mechanism,
             sm_scale=softmax_scale,
-            axis_name=self.config.attention_axis_name,
+            num_attention_heads=config.num_attention_heads,
+            head_dims=self.q_head_dim,
+            precision=precision,
+            base_config=config,
         )
 
     def __call__(
@@ -507,12 +549,8 @@ class FlaxDeepseekV2Attention(BaseAttentionModule):
         freqs_cis: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
         position_ids: chex.Array,
-        causal_mask: chex.Array,
+        past_key_values: Optional[KVCache] = None,
         segment_ids: Optional[chex.Array] = None,
-        deterministic: bool = True,
-        init_cache: bool = False,
-        output_attentions: bool = False,
-        fcm_mask=None,
     ):
         bsz, q_len, _ = hidden_states.shape
 
@@ -560,67 +598,36 @@ class FlaxDeepseekV2Attention(BaseAttentionModule):
 
         query_length, key_length = query_states.shape[1], key_states.shape[1]
 
-        if self.has_variable("cache", "cached_key"):
-            mask_shift = self.variables["cache"]["cache_index"]
-            max_decoder_length = self.variables["cache"]["cached_key"].shape[1]
-            causal_mask = lax.dynamic_slice(
-                causal_mask,
-                (0, 0, mask_shift, 0),
-                (1, 1, query_length, max_decoder_length),
+        if past_key_values is not None:
+            past_key_values.update(key_states=key_states, value_states=value_states)
+            key_length, value_states, attention_mask = past_key_values.get(
+                attention_mask=attention_mask
             )
-        else:
-            causal_mask = causal_mask[:, :, :query_length, :key_length]
 
-        batch_size = hidden_states.shape[0]
-        causal_mask = jnp.broadcast_to(
-            causal_mask, (batch_size,) + causal_mask.shape[1:]
-        )
-        if attention_mask.ndim == 2:
-            attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
-        attention_mask = jnp.broadcast_to(attention_mask, causal_mask.shape)
-        attention_mask = combine_masks(attention_mask, causal_mask, fcm_mask)
-
-        dropout_rng = None
-
-        if not deterministic and self.config.attention_dropout > 0.0:
-            dropout_rng = self.make_rng("dropout")
-        if self.has_variable("cache", "cached_key") or init_cache:
-            key_states, value_states, attention_mask = self._concatenate_to_cache(
-                key_states, value_states, query_states, attention_mask
+        attention_bias = None
+        if attention_mask is not None:
+            attention_mask = attention_mask[:, :, :, :key_length]
+            attention_bias = lax.select(
+                attention_mask > 0,
+                jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
+                jnp.full(
+                    attention_mask.shape,
+                    jnp.finfo(self.dtype).min,
+                ).astype(self.dtype),
             )
-        # if self.config.use_sharding_constraint:
-        #     query_states = with_sharding_constraint(
-        #         query_states, PartitionSpec(("dp", "fsdp"), "sp" if query_states.shape[1] != 1 else None, "tp", None)
-        #     )
-        #     key_states = with_sharding_constraint(
-        #         key_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
-        #     )
-        #     value_states = with_sharding_constraint(
-        #         value_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
-        #     )
-        attention_bias = lax.select(
-            attention_mask > 0,
-            jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-            jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(
-                self.dtype
-            ),
-        )
 
         query_length, key_length = query_states.shape[1], key_states.shape[1]
 
-        attentions = self.attention_module.__call__(
+        attentions = self.attention_module(
             query_states=query_states,
             key_states=key_states,
             value_states=value_states,
             bias=attention_bias,
             attention_mask=attention_mask,
             causal=True,
-            dropout_rng=dropout_rng,
-            deterministic=deterministic,
             query_sequence_length=query_length,
             key_value_sequence_length=key_length,
             segment_ids=segment_ids,
-            causal_mask=causal_mask,
         )
 
         attn_output = self._merge_heads(attentions.attention_outputs)
@@ -633,78 +640,79 @@ class FlaxDeepseekV2Attention(BaseAttentionModule):
             )
         attn_output = self.o_proj(attn_output)
 
-        outputs = (
-            (attn_output, attentions.attention_weights)
-            if output_attentions
-            else (attn_output,)
-        )
-        return outputs
+        return attn_output, attentions.attention_weights
 
 
-class FlaxDeepseekV2DecoderLayer(nn.Module):
-    config: DeepseekV2Config
-    layer_idx: int
-    dtype: jnp.dtype = jnp.bfloat16
-    param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
-
-    def setup(self):
+class DeepseekV2DecoderLayer(nnx.Module):
+    def __init__(
+        self,
+        config: DeepseekV2Config,
+        layer_idx: int,
+        dtype: jnp.dtype = jnp.float32,
+        param_dtype: jnp.dtype = jnp.float32,
+        precision: Optional[Union[jax.lax.Precision, str]] = None,
+        *,
+        rngs: nnx.Rngs,
+    ) -> None:
+        super().__init__()
+        self.config: DeepseekV2Config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.layer_idx = layer_idx
+        self.precision = precision
+        self.rngs = rngs
         config = self.config
         layer_idx = self.layer_idx
         self.hidden_size = config.hidden_size
 
-        attn_block = FlaxDeepseekV2Attention
-        mlp_block = FlaxDeepseekV2MLP
-        mlp_moe_block = FlaxDeepseekV2MoE
+        attn_block = DeepseekV2Attention
+        mlp_block = DeepseekV2MLP
+        mlp_moe_block = DeepseekV2MoE
 
-        if self.config.gradient_checkpointing != "":
-            # hidden_states: chex.Array,
-            # freqs_cis: Tuple[chex.Array, chex.Array],
-            # attention_mask: chex.Array,
-            # position_ids: chex.Array,
-            # causal_mask: chex.Array,
-            # segment_ids: Optional[chex.Array] = None,
-            # deterministic: bool = True,
-            # init_cache: bool = False,
-            # output_attentions: bool = False,
-            # fcm_mask = None,
-            attn_block = re_mat(
-                attn_block,
-                policy=get_gradient_checkpoint_policy(
-                    self.config.gradient_checkpointing
-                ),
-                static_argnums=(1, 3, 4, 6, 7, 8),
-            )
-            mlp_block = re_mat(
-                mlp_block,
-                policy=get_gradient_checkpoint_policy(
-                    self.config.gradient_checkpointing
-                ),
-                static_argnums=(1,),
-            )
+        # if self.config.gradient_checkpointing != "":
 
-            mlp_moe_block = re_mat(
-                mlp_moe_block,
-                policy=get_gradient_checkpoint_policy(
-                    self.config.gradient_checkpointing
-                ),
-                static_argnums=(1,),
-            )
+        # attn_block = re_mat(
+        #     attn_block,
+        #     policy=get_gradient_checkpoint_policy(
+        #         self.config.gradient_checkpointing
+        #     ),
+        #     static_argnums=(
+        #         1,
+        #         4,
+        #     ),
+        # )
+        # mlp_block = re_mat(
+        #     mlp_block,
+        #     policy=get_gradient_checkpoint_policy(
+        #         self.config.gradient_checkpointing
+        #     ),
+        #     static_argnums=(),
+        # )
+
+        # mlp_moe_block = re_mat(
+        #     mlp_moe_block,
+        #     policy=get_gradient_checkpoint_policy(
+        #         self.config.gradient_checkpointing
+        #     ),
+        #     static_argnums=(),
+        # )
 
         self.self_attn = attn_block(
             config=config,
-            layer_idx=self.layer_idx,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            precision=self.precision,
+            layer_idx=layer_idx,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
         )
 
         self.mlp = (
             mlp_moe_block(
                 config=config,
-                dtype=self.dtype,
-                param_dtype=self.param_dtype,
-                precision=self.precision,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
             )
             if (
                 config.n_routed_experts is not None
@@ -713,22 +721,25 @@ class FlaxDeepseekV2DecoderLayer(nn.Module):
             )
             else mlp_block(
                 config=config,
-                dtype=self.dtype,
-                param_dtype=self.param_dtype,
-                precision=self.precision,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
             )
         )
         self.input_layernorm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
         )
 
     def forward(
@@ -736,12 +747,9 @@ class FlaxDeepseekV2DecoderLayer(nn.Module):
         hidden_states: chex.Array,
         freqs_cis: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
-        causal_mask: chex.Array,
         position_ids: chex.Array,
+        past_key_values: Optional[KVCache] = None,
         segment_ids: Optional[chex.Array] = None,
-        deterministic: bool = True,
-        init_cache: bool = False,
-        output_attentions: bool = True,
     ) -> Tuple[chex.Array, Optional[chex.Array]]:
         residual = hidden_states
 
@@ -753,12 +761,8 @@ class FlaxDeepseekV2DecoderLayer(nn.Module):
             freqs_cis,
             attention_mask,
             position_ids,
-            causal_mask,
+            past_key_values,
             segment_ids,
-            deterministic,
-            init_cache,
-            output_attentions,
-            None,
         )
         hidden_states = residual + hidden_states
 
@@ -771,560 +775,294 @@ class FlaxDeepseekV2DecoderLayer(nn.Module):
                 self.mlp,
                 hidden_states,
                 self.config.scan_mlp_chunk_size,
-                deterministic,
             )
         else:
             feed_forward_hidden_states = self.mlp(
                 hidden_states,
-                deterministic,
             )
         hidden_states = residual + feed_forward_hidden_states
 
-        outputs = (hidden_states,)
-
-        if output_attentions:
-            outputs += (self_attn_weights,)
-
-        return outputs  # type:ignore
+        return (hidden_states, self_attn_weights)  # type:ignore
 
 
-class FlaxDeepseekV2DecoratorCollection(nn.Module):
-    config: DeepseekV2Config
-    dtype: jnp.dtype = jnp.bfloat16
-    param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
-
-    def setup(self) -> None:
-        self.layers = [
-            FlaxDeepseekV2DecoderLayer(
-                config=self.config,
-                dtype=self.dtype,
-                param_dtype=self.param_dtype,
-                precision=self.precision,
-                layer_idx=i,
-                name=str(i),
-            )
-            for i in range(self.config.num_hidden_layers)
-        ]
-
-    def __call__(
-        self,
-        hidden_states: chex.Array,
-        freqs_cis: Tuple[chex.Array, chex.Array],
-        attention_mask: chex.Array,
-        causal_mask: chex.Array,
-        position_ids: chex.Array,
-        deterministic: bool = True,
-        init_cache: bool = False,
-        output_attentions: bool = False,
-        output_hidden_states: bool = False,
-    ):
-        all_attentions = () if output_attentions else None
-        all_hidden_states = () if output_hidden_states else None
-        for layer in self.layers:
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
-
-            # hidden_states: chex.Array,
-            # freqs_cis: Tuple[chex.Array, chex.Array],
-            # attention_mask: chex.Array,
-            # causal_mask: chex.Array,
-            # position_ids: chex.Array,
-            # segment_ids: Optional[chex.Array] = None,
-            # deterministic: bool = True,
-            # init_cache: bool = False,
-            # output_attentions: bool = True
-
-            output = layer(
-                hidden_states,
-                freqs_cis,
-                attention_mask,
-                causal_mask,
-                position_ids,
-                None,
-                deterministic,
-                init_cache,
-                output_attentions,
-            )
-            hidden_states = output[0]
-
-            if output_attentions:
-                output_attentions += (output[1],)
-
-        return hidden_states, all_hidden_states, all_attentions
-
-
-class FlaxDeepseekV2Module(nn.Module):
-    config: DeepseekV2Config
-    dtype: jnp.dtype = jnp.bfloat16
-    param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[jax.lax.Precision, str]] = None
-
-    def setup(self):
-        self.embed_tokens = nn.Embed(
-            self.config.vocab_size,
-            self.config.hidden_size,
-            embedding_init=jax.nn.initializers.normal(
-                stddev=self.config.initializer_range
-            ),
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-        )
-
-        self.layers = FlaxDeepseekV2DecoratorCollection(
-            self.config,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            precision=self.precision,
-        )
-        self.norm = RMSNorm(
-            self.config.hidden_size,
-            eps=self.config.rms_norm_eps,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-        )
-
-        initial_rope_kwargs = {}
-        method = None
-        if self.config.rope_scaling is not None:
-            scaling_type = self.config.rope_scaling["type"]
-            method = scaling_type
-            if scaling_type != "yarn":
-                initial_rope_kwargs = dict(
-                    scaling_factor=self.config.rope_scaling["factor"]
-                )
-            else:
-                initial_rope_kwargs = {
-                    key: self.config.rope_scaling[key]
-                    for key in [
-                        "original_max_position_embeddings",
-                        "beta_fast",
-                        "beta_slow",
-                        "mscale",
-                        "mscale_all_dim",
-                    ]
-                    if key in self.config.rope_scaling
-                }
-                initial_rope_kwargs["scaling_factor"] = self.config.rope_scaling[
-                    "factor"
-                ]
-        self.freqs_cis = init_deepseek_rotary_embedding(
-            dim=self.config.hidden_size // self.config.num_attention_heads,
-            max_position_embeddings=(
-                getattr(
-                    self.config,
-                    "freq_max_position_embeddings",
-                    self.config.max_position_embeddings,
-                )
-            ),
-            base=self.config.rope_theta,
-            method=method,  # type:ignore
-            kwargs=initial_rope_kwargs,
-        )
-        self.causal_mask = flax.linen.make_causal_mask(
-            jnp.ones(
-                (
-                    1,
-                    getattr(
-                        self.config,
-                        "causal_mask_max_position_embeddings",
-                        self.config.max_position_embeddings,
-                    ),
-                ),
-                dtype="bool",
-            ),
-            dtype="bool",
-        )
-
-    def __call__(
-        self,
-        input_ids: Optional[chex.Array] = None,
-        attention_mask: Optional[chex.Array] = None,
-        position_ids: Optional[chex.Array] = None,
-        deterministic: bool = True,
-        inputs_embeds: chex.Array = None,
-        init_cache: bool = False,
-        output_attentions: bool = False,
-        output_hidden_states: bool = False,
-        return_dict: bool = True,
-    ) -> typing.Union[Tuple[chex.Array, ...], FlaxBaseModelOutput]:
-        """The __call__ function is the main function of a Flax model.
-        It takes in input_ids, attention_mask, and position_ids as inputs to the model.
-        The output is a tuple containing: last hidden state (hidden states), all hidden states (if output_hidden_states=True), attentions (if output attentions=True).
-
-        Args:
-            self: Represent the instance of the class
-            input_ids: chex.Array: Pass in the input ids
-            attention_mask: chex.Array: Mask out the attention weights
-                for certain tokens
-            position_ids: chex.Array: Determine the position of each
-                token in a sequence
-            deterministic: bool: Determine whether to use dropout or not
-            inputs_embeds: chex.Array: Pass in the embedding of the
-                input_ids
-            init_cache: bool: Initialize the cache for the decoder
-            output_attentions: bool: Determine whether to return the
-                attention weights or not
-            output_hidden_states: bool: Return all hidden states or just
-                the last one
-            return_dict: bool: Return a dictionary of the outputs or not
-        :param : Determine whether the model is in training mode or not
-
-        Returns:
-            A tuple of the hidden states, all hidden states, and
-            attentions
-        """
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
-        if attention_mask.ndim == 2:
-            b, s = attention_mask.shape
-            attention_mask = attention_mask.reshape(b, 1, 1, s)
-
-        outputs = self.layers(
-            hidden_states=inputs_embeds,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            freqs_cis=self.freqs_cis,
-            init_cache=init_cache,
-            output_attentions=output_attentions,
-            deterministic=deterministic,
-            causal_mask=self.causal_mask,
-        )
-
-        hidden_states = outputs[0]
-        hidden_states = self.norm(hidden_states)
-
-        if output_hidden_states:
-            all_hidden_states = outputs[1] + (hidden_states,)
-            outputs = (hidden_states, all_hidden_states) + outputs[2:]
-        else:
-            outputs = (hidden_states,) + outputs[1:]
-
-        if not return_dict:
-            return tuple(value for value in outputs if value is not None)
-
-        return FlaxBaseModelOutput(
-            last_hidden_state=hidden_states,
-            hidden_states=outputs[1],
-            attentions=outputs[-1],
-        )
-
-
-class DeepseekV2PreTrainedModel(BaseNNXModule):
-    config_class: DeepseekV2Config = DeepseekV2Config
-    module_class: nn.Module = None
-    base_model_prefix = "model"
-
+class DeepseekV2Model(BaseNNXModule):
     def __init__(
         self,
         config: DeepseekV2Config,
-        dtype: jnp.dtype = jnp.bfloat16,
-        param_dtype: jnp.dtype = jnp.bfloat16,
-        precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
-        input_shape: Tuple[int, int] = (1, 1),
-        seed: int = 0,
-        _do_init: bool = False,
-        **kwargs,
-    ):
-        module = self.module_class(
-            config=config,
+        layer_idx: int,
+        dtype: jnp.dtype = jnp.float32,
+        param_dtype: jnp.dtype = jnp.float32,
+        precision: Optional[Union[jax.lax.Precision, str]] = None,
+        *,
+        rngs: nnx.Rngs,
+    ) -> None:
+        super().__init__(config=config)
+        self.config: DeepseekV2Config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.layer_idx = layer_idx
+        self.precision = precision
+        self.rngs = rngs
+        self.embed_tokens = nnx.Embed(
+            config.vocab_size,
+            config.hidden_size,
+            embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
             dtype=dtype,
             param_dtype=param_dtype,
-            precision=precision,
-            **kwargs,
+            rngs=rngs,
         )
 
-        super().__init__(
+        self.layers = [
+            DeepseekV2DecoderLayer(
+                config=config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                layer_idx=i,
+                rngs=rngs,
+            )
+            for i in range(self.config.num_hidden_layers)
+        ]
+        self.norm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
             dtype=dtype,
-            _do_init=_do_init,
-            module=module,
-            config=config,
-            input_shape=input_shape,
-            seed=seed,
+            param_dtype=param_dtype,
+            rngs=rngs,
         )
 
-    def init_weights(
-        self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
-    ) -> FrozenDict:
-        """The init_weights function is used to initialize the weights of a model.
-        It takes in a rng, which is a random number generator key that can be used to generate random numbers.
-        The input_shape parameter specifies the shape of the inputs that will be fed into this model.
-        The params parameter allows you to pass in pre-trained weights for your model, if you have them available.
+        self._causal_mask = None
+        self._freqs_cis = None
 
-        Args:
-            self: Access variables that belong to the class
-            rng: jax.random.PRNGKey: Initialize the weights of the model
-            input_shape: Tuple: Initialize the input_ids, attention_mask
-                and position_ids
-            params: flax.core.FrozenDict: Pass in the parameters of a
-                pre-trained model
-
-        Returns:
-            A frozendict of parameters
-        """
-
-        self.config.initialization_of_moe = True
-        input_ids = jnp.zeros(input_shape, dtype="i4")
-        attention_mask = jnp.ones_like(input_ids, dtype="i4")
-        position_ids = jnp.broadcast_to(
-            jnp.arange(jnp.atleast_2d(input_ids).shape[-1], dtype="i4"),
-            input_shape,
-        )
-        params_rng, dropout_rng = jax.random.split(rng)
-        rngs = {"params": params_rng, "dropout": dropout_rng}
-        if self.config.add_cross_attention:
-            encoder_hidden_states = jnp.zeros(input_shape + (self.config.hidden_size,))
-            encoder_attention_mask = attention_mask
-            module_init_outputs = self.module.init(
-                rngs,
-                input_ids,
-                attention_mask,
-                position_ids,
-                encoder_hidden_states,
-                encoder_attention_mask,
-                return_dict=False,
+    @property
+    def freqs_cis(self):
+        if self._freqs_cis is None:
+            config = self.config
+            initial_rope_kwargs = {}
+            method = None
+            if config.rope_scaling is not None:
+                scaling_type = config.rope_scaling["type"]
+                method = scaling_type
+                if scaling_type != "yarn":
+                    initial_rope_kwargs = dict(
+                        scaling_factor=config.rope_scaling["factor"]
+                    )
+                else:
+                    initial_rope_kwargs = {
+                        key: config.rope_scaling[key]
+                        for key in [
+                            "original_max_position_embeddings",
+                            "beta_fast",
+                            "beta_slow",
+                            "mscale",
+                            "mscale_all_dim",
+                        ]
+                        if key in config.rope_scaling
+                    }
+                    initial_rope_kwargs["scaling_factor"] = config.rope_scaling[
+                        "factor"
+                    ]
+            self._freqs_cis = init_deepseek_rotary_embedding(
+                dim=config.hidden_size // config.num_attention_heads,
+                max_position_embeddings=(
+                    getattr(
+                        config,
+                        "freq_max_position_embeddings",
+                        config.max_position_embeddings,
+                    )
+                ),
+                base=config.rope_theta,
+                method=method,  # type:ignore
+                kwargs=initial_rope_kwargs,
             )
-        else:
-            module_init_outputs = self.module.init(
-                rngs,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                return_dict=False,
+        return self._freqs_cis
+
+    @property
+    def causal_mask(self):
+        if self._causal_mask is None:
+            self._causal_mask = nnx.make_causal_mask(
+                jnp.ones(
+                    (
+                        1,
+                        getattr(
+                            self.config,
+                            "causal_mask_max_position_embeddings",
+                            self.config.max_position_embeddings,
+                        ),
+                    ),
+                    dtype=jnp.bool,
+                ),
+                dtype=jnp.bool,
             )
-        random_params = module_init_outputs["params"]
-
-        self.config.initialization_of_moe = False
-        if params is not None:
-            random_params = flatten_dict(unfreeze(random_params))
-            params = flatten_dict(unfreeze(params))
-            for missing_key in self._missing_keys:
-                params[missing_key] = random_params[missing_key]
-            self._missing_keys = set()
-            return freeze(unflatten_dict(params))
-        else:
-            return random_params
-
-    def init_cache(self, batch_size, max_length):
-        input_ids = jnp.ones((batch_size, max_length))
-        attention_mask = jnp.ones_like(input_ids)
-        position_ids = jnp.broadcast_to(
-            jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape
-        )
-
-        init_variables = self.module.init(
-            jax.random.PRNGKey(0),
-            input_ids,
-            attention_mask,
-            position_ids,
-            return_dict=False,
-            init_cache=True,
-        )
-        return init_variables["cache"]
+        return self._causal_mask
 
     def __call__(
         self,
         input_ids: chex.Array,
         attention_mask: Optional[chex.Array] = None,
         position_ids: Optional[chex.Array] = None,
-        params: dict = None,
-        past_key_values: dict = None,
-        dropout_rng: jax.random.PRNGKey = None,
-        train: bool = False,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        output_router_logits: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        add_params_field: bool = False,
-        **kwargs,
-    ):
-        """The __call__ function is the main function of a JAX module.
-        It takes as input:
-        - The parameters of the model (self.params)
-        - The inputs to the model (input_ids, attention_mask, position_ids)
-        - Whether we are training (train=True/False) and whether we want to return all hidden states and
-        attentions weights at each layer in addition to just the last layer output (output_hidden_states=True/False).
-
-        Args:
-            self: Represent the instance of the class
-            input_ids: Pass the input sequence to the model
-            attention_mask: Mask out the padding tokens
-            position_ids: Specify the position of each token in the
-                sequence
-            params: dict: Pass in the parameters of the model
-            past_key_values: dict: Pass the past key values to the model
-            dropout_rng: jax.random.PRNGKey: Pass in a random number
-                generator key to the model
-            train: bool: Determine whether to use dropout or not
-            output_attentions: Optional[bool]: Determine whether to
-                return the attention weights
-            output_hidden_states: Optional[bool]: Determine whether to
-                return the hidden states of all layers
-            return_dict: Optional[bool]: Return a dictionary of the
-                outputs
-            add_params_field: bool: Add a params field to the inputs
-                dictionary
-
-        Returns:
-            A tuple of (last_hidden_state, past_key_values)
-        """
-
-        output_attentions = (
-            output_attentions
-            if output_attentions is not None
-            else self.config.output_attentions
-        )
-        output_hidden_states = (
-            output_hidden_states
-            if output_hidden_states is not None
-            else self.config.output_hidden_states
-        )
-        return_dict = (
-            return_dict if return_dict is not None else self.config.return_dict
-        )
-
-        batch_size, sequence_length = input_ids.shape
-
-        if position_ids is None:
-            if past_key_values is not None:
-                raise ValueError(
-                    "Make sure to provide `position_ids` when passing `past_key_values`."
-                )
-
-            position_ids = jnp.broadcast_to(
-                jnp.arange(sequence_length)[None, :], (batch_size, sequence_length)
-            )
-
-        if attention_mask is None:
-            attention_mask = jnp.ones((batch_size, sequence_length))
-
-        rng_s = {}
-        if dropout_rng is not None:
-            rng_s["dropout"] = dropout_rng
-
-        inputs = (
-            {"params": params or self.params}
-            if add_params_field
-            else params or self.params
-        )
-
-        if self.config.bits is not None:
-            rng_s["params"] = jax.random.key(0)
-        if past_key_values is not None:
-            inputs["cache"] = past_key_values
-            mutable = ["cache"]
-        else:
-            mutable = False
-
-        outputs = self.module.apply(
-            inputs,
-            jnp.array(input_ids, dtype="i4"),  # input_ids: chex.Array
-            # attention_mask: Optional[chex.Array] = None
-            jnp.array(attention_mask, dtype="i4"),
-            # position_ids: Optional[chex.Array] = None
-            jnp.array(position_ids, dtype="i4"),
-            None,  # inputs_embeds: Optional[chex.Array] = None
-            output_attentions,  # output_attentions: Optional[bool] = None
-            # output_hidden_states: Optional[bool] = None
-            output_hidden_states,
-            # output_router_logits: Optional[bool] = None
-            output_router_logits,
-            False,  # init_cache: bool = False
-            not train,  # deterministic: bool = True
-            return_dict,  # return_dict: bool = True
-            rngs=rng_s,
-            mutable=mutable,
-        )
-
-        if past_key_values is not None and return_dict:
-            outputs, past_key_values = outputs
-            outputs["past_key_values"] = unfreeze(past_key_values["cache"])
-            return outputs
-        elif past_key_values is not None and not return_dict:
-            outputs, past_key_values = outputs
-            outputs = outputs[:1] + (unfreeze(past_key_values["cache"]),) + outputs[1:]
-
-        return outputs
-
-
-class FlaxDeepseekV2ForCausalLMModule(nn.Module):
-    config: DeepseekV2Config
-    dtype: jnp.dtype = jnp.bfloat16
-    param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
-
-    def setup(self) -> None:
-        self.model = FlaxDeepseekV2Module(
-            config=self.config,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            precision=self.precision,
-        )
-        self.lm_head = nn.Dense(
-            self.config.vocab_size,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            precision=self.precision,
-            use_bias=False,
-            kernel_init=nn.initializers.normal(self.config.initializer_range),
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
-        )
-
-    def __call__(
-        self,
-        input_ids: chex.Array,
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
-        deterministic: bool = True,
-        inputs_embeds: chex.Array = None,
-        init_cache: bool = False,
+        inputs_embeds: Optional[chex.Array] = None,
+        past_key_values: Optional[List[KVCache]] = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
         return_dict: bool = True,
-    ):
-        """The __call__ function is the main function of a Flax module. It defines how the model will be called,
-        and what it returns. In this case, we are calling our Transformer model with input_ids and attention_mask
-        as inputs (these are defined in __init__). We also have some optional arguments that can be passed to
-        the call function: deterministic (whether to use dropout), inputs_embeds (if you want to pass your own embeddings),
-        output_attentions and output_hidden states which return additional outputs from the transformer layers if set True. Finally,
+        extra_embedding: Optional[jnp.ndarray] = None,
+    ) -> typing.Union[Tuple[chex.Array, ...], FlaxBaseModelOutput]:
+        """
+        The __call__ function is the main function of a Flax model. It takes in input_ids, attention_mask, and position_ids
+        and returns the output of the model. These optional arguments are passed as keyword arguments when calling a Flax model.
 
         Args:
-            self: Refer to the object itself
-            input_ids: chex.Array: Pass in the input tokens
-            attention_mask: chex.Array: Mask out the padding tokens
-            position_ids: chex.Array: Specify the position of each token
-                in the sequence
-            deterministic: bool: Determine whether to use dropout in the
-                model
-            inputs_embeds: chex.Array: Pass in the embeddings of the
-                input tokens
-            init_cache: bool: Initialize the cache for the decoder
-            output_attentions: bool: Return the attention weights
-            output_hidden_states: bool: Return the hidden states of all
-                layers
-            return_dict: bool: Return a dictionary of the outputs or
-                just the logits
-        :param : Determine whether to return the logits or not
+            self: Represent the instance of the class
+            input_ids: chex.Array: Pass in the input token ids
+            attention_mask: (Optional(chex.Array)): Mask out the padding tokens
+            position_ids: (Optional(chex.Array)): Indicate the position of each token in a sequence
+            inputs_embeds: (Optional(chex.Array)): Pass in the embeddings of the input tokens
+            past_key_values: (Optional(List[KVCache])): Past key and values used for generation
+            output_attentions: bool: Determine whether to return the attentions or not
+            output_hidden_states: bool: Determine whether to return hidden states
+            return_dict: bool: Return a dictionary of the output or not
+            extra_embedding: Optional[Union[jnp.ndarray]]: Pass in the extra embedding
 
         Returns:
-            A tuple of (lm_logits, hidden_states, attentions)
+            A tuple of: predictions
         """
-        batch_size, seq_length = input_ids.shape
 
+        all_attentions = () if output_attentions else None
+        all_hidden_states = () if output_hidden_states else None
+
+        batch_size, seq_length = input_ids.shape
         if attention_mask is None:
             attention_mask = jnp.ones_like(input_ids)
         if position_ids is None:
             position_ids = jnp.broadcast_to(
                 jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
                 (batch_size, seq_length),
+            ).astype(jnp.int32)
+        if attention_mask.ndim == 2:
+            attention_mask = attention_mask.reshape(batch_size, 1, seq_length, 1)
+            attention_mask = jnp.logical_and(
+                attention_mask, self.causal_mask[:, :, :seq_length, :]
             )
+
+        if past_key_values is None:
+            past_key_values = [None] * self.config.num_hidden_layers
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
+        inputs_embeds = (
+            inputs_embeds + extra_embedding
+            if extra_embedding is not None
+            else inputs_embeds
+        )
+        hidden_states = inputs_embeds
+
+        for idx, block in enumerate(self.layers):
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+            hidden_states, attn_weight = block(
+                hidden_states=hidden_states,
+                freqs_cis=self.freqs_cis,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values[idx],
+            )
+            if output_attentions:
+                all_attentions += (attn_weight,)
+
+        hidden_states = self.norm(hidden_states)
+
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        if not return_dict:
+            return tuple(
+                value
+                for value in (hidden_states, all_attentions, all_attentions)
+                if value is not None
+            )
+
+        return FlaxBaseModelOutput(
+            last_hidden_state=hidden_states,
+            hidden_states=all_attentions,
+            attentions=all_attentions,
+        )
+
+
+class DeepseekV2ForCausalLM(BaseNNXModule):
+    def __init__(
+        self,
+        config: DeepseekV2Config,
+        layer_idx: int,
+        dtype: jnp.dtype = jnp.float32,
+        param_dtype: jnp.dtype = jnp.float32,
+        precision: Optional[Union[jax.lax.Precision, str]] = None,
+        *,
+        rngs: nnx.Rngs,
+    ) -> None:
+        super().__init__(config=config)
+        self.config: DeepseekV2Config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.layer_idx = layer_idx
+        self.precision = precision
+        self.rngs = rngs
+        self.model = DeepseekV2Model(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        self.lm_head = nnx.Linear(
+            config.hidden_size,
+            config.vocab_size,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            use_bias=False,
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
+            rngs=rngs,
+        )
+
+    def __call__(
+        self,
+        input_ids: chex.Array,
+        attention_mask: Optional[chex.Array] = None,
+        position_ids: Optional[chex.Array] = None,
+        inputs_embeds: Optional[chex.Array] = None,
+        past_key_values: Optional[List[KVCache]] = None,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        return_dict: bool = True,
+        extra_embedding: Optional[jnp.ndarray] = None,
+    ):
+        """
+        The __call__ function is the main function of a Flax model. It takes in input_ids, attention_mask, and position_ids
+        and returns the output of the model. These optional arguments are passed as keyword arguments when calling a Flax model.
+
+        Args:
+            self: Represent the instance of the class
+            input_ids: chex.Array: Pass in the input token ids
+            attention_mask: (Optional(chex.Array)): Mask out the padding tokens
+            position_ids: (Optional(chex.Array)): Indicate the position of each token in a sequence
+            inputs_embeds: (Optional(chex.Array)): Pass in the embeddings of the input tokens
+            past_key_values: (Optional(List[KVCache])): Past key and values used for generation
+            output_attentions: bool: Determine whether to return the attentions or not
+            output_hidden_states: bool: Determine whether to return hidden states
+            return_dict: bool: Return a dictionary of the output or not
+            extra_embedding: Optional[Union[jnp.ndarray]]: Pass in the extra embedding
+
+        Returns:
+            A tuple of (lm_logits, hidden_states, attentions)
+        """
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            deterministic=deterministic,
             inputs_embeds=inputs_embeds,
-            init_cache=init_cache,
+            past_key_values=past_key_values,
+            extra_embedding=extra_embedding,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
@@ -1333,19 +1071,10 @@ class FlaxDeepseekV2ForCausalLMModule(nn.Module):
         hidden_states = outputs[0]
 
         if self.config.tie_word_embeddings:
-            shared_kernel = self.transformer.variables["params"]["embed_tokens"][
-                "embedding"
-            ]
-            shared_kernel = fjformer.linen.control_quantization(
-                shared_kernel, self.param_dtype
-            ).T
-            lm_logits = self.lm_head.apply(
-                {"params": {"kernel": shared_kernel}}, hidden_states
-            )
+            self.lm_head.kernel.value = self.model.embed_tokens.embedding.value.T
+            lm_logits = self.lm_head(hidden_states)
         else:
             lm_logits = self.lm_head(hidden_states)
-
-        # lm_logits = lm_logits.astype(jnp.float32)
 
         if not return_dict:
             return (lm_logits,) + outputs[1:]
@@ -1355,14 +1084,6 @@ class FlaxDeepseekV2ForCausalLMModule(nn.Module):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
-
-
-class FlaxDeepseekV2Model(DeepseekV2PreTrainedModel):
-    module_class = FlaxDeepseekV2Module
-
-
-class FlaxDeepseekV2ForCausalLM(DeepseekV2PreTrainedModel):
-    module_class = FlaxDeepseekV2ForCausalLMModule
 
     def set_input_embeddings(self, value):
         self.module.model.embed_tokens = value
@@ -1382,43 +1103,6 @@ class FlaxDeepseekV2ForCausalLM(DeepseekV2PreTrainedModel):
     def set_output_embeddings(self, new_embeddings):
         self.module.lm_head = new_embeddings
 
-    def prepare_inputs_for_generation(
-        self, input_ids, max_length, attention_mask: Optional[chex.Array] = None
-    ):
-        """The prepare_inputs_for_generation function is used to prepare the inputs for a generation task.
-
-        Args:
-            self: Access variables that belong to the class
-            input_ids: Pass in the input tokens
-            max_length: Set the length of the sequence to be generated
-            attention_mask: Optional[chex.Array]: Mask the attention
-                weights
-
-        Returns:
-            A dictionary of the past_key_values, attention_mask and
-            position ids
-        """
-        batch_size, seq_length = input_ids.shape
-
-        past_key_values = self.init_cache(batch_size, max_length)
-        extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
-        if attention_mask is not None:
-            position_ids = attention_mask.cumsum(axis=-1) - 1
-            extended_attention_mask = lax.dynamic_update_slice(
-                extended_attention_mask, attention_mask, (0, 0)
-            )
-        else:
-            position_ids = jnp.broadcast_to(
-                jnp.arange(seq_length, dtype="i4")[None, :], (batch_size, seq_length)
-            )
-
-        return {
-            "past_key_values": past_key_values,
-            "attention_mask": extended_attention_mask,
-            "position_ids": position_ids,
-        }
-
-    def update_inputs_for_generation(self, model_outputs, model_kwargs):
-        model_kwargs["past_key_values"] = model_outputs.past_key_values
-        model_kwargs["position_ids"] = model_kwargs["position_ids"][:, -1:] + 1
-        return model_kwargs
+    @property
+    def can_generate(self):
+        return True

@@ -25,7 +25,6 @@ from easydel.models.flax_modelling_utils import (
     apply_rotary_pos_emb,
     block_wise_ffn,
     control_mlp_sharding,
-    get_dot_general_by_bits,
     get_gradient_checkpoint_policy,
     precompute_freqs_cis,
     with_sharding_constraint,
@@ -88,7 +87,6 @@ class FlaxGrok1Attention(BaseAttentionModule):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.k_proj = Dense(
             config.num_key_value_heads * self.head_dim,
@@ -97,7 +95,6 @@ class FlaxGrok1Attention(BaseAttentionModule):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.v_proj = Dense(
             config.num_key_value_heads * self.head_dim,
@@ -106,7 +103,6 @@ class FlaxGrok1Attention(BaseAttentionModule):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.o_proj = Dense(
             config.hidden_size,
@@ -115,7 +111,6 @@ class FlaxGrok1Attention(BaseAttentionModule):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
 
         self.rotary = FlaxGrok1Embedding(self.dtype)
@@ -354,7 +349,6 @@ class FlaxGrok1BLockSparseMLP(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.linear_1 = Dense(
             config.hidden_size,
@@ -363,7 +357,6 @@ class FlaxGrok1BLockSparseMLP(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.linear_v = Dense(
             config.intermediate_size,
@@ -372,7 +365,6 @@ class FlaxGrok1BLockSparseMLP(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
 
     def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
@@ -1159,7 +1151,6 @@ class FlaxGrok1ForCausalLMModule(nn.Module):
             precision=self.precision,
             use_bias=False,
             kernel_init=nn.initializers.normal(self.config.initializer_range),
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
 
         self.output_multiplier_scale = self.config.output_multiplier_scale

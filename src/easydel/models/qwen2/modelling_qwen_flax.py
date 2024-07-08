@@ -29,7 +29,6 @@ from easydel.models.flax_modelling_utils import (
     apply_rotary_pos_emb,
     block_wise_ffn,
     control_mlp_sharding,
-    get_dot_general_by_bits,
     get_gradient_checkpoint_policy,
     precompute_freqs_cis,
     with_sharding_constraint,
@@ -69,7 +68,6 @@ class FlaxQwen2MLP(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.down_proj = Dense(
             config.hidden_size,
@@ -78,7 +76,6 @@ class FlaxQwen2MLP(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.up_proj = Dense(
             config.intermediate_size,
@@ -87,7 +84,6 @@ class FlaxQwen2MLP(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.dropout = flax.linen.Dropout(rate=self.config.resid_pdrop)
 
@@ -135,7 +131,6 @@ class FlaxQwen2Attention(BaseAttentionModule):
             use_bias=True,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.k_proj = Dense(
             config.num_key_value_heads * self.head_dim,
@@ -144,7 +139,6 @@ class FlaxQwen2Attention(BaseAttentionModule):
             use_bias=True,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.v_proj = Dense(
             config.num_key_value_heads * self.head_dim,
@@ -153,7 +147,6 @@ class FlaxQwen2Attention(BaseAttentionModule):
             use_bias=True,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.o_proj = Dense(
             config.hidden_size,
@@ -162,7 +155,6 @@ class FlaxQwen2Attention(BaseAttentionModule):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
 
         self.rotary = FlaxQwen2Embedding(self.dtype)
@@ -983,10 +975,9 @@ class FlaxQwen2Module(nn.Module):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
 
-        batch_size, sequence_length, _ = inputs_embeds.shape
-
+        batch_size,sequence_length=input_ids.shape
         assert (
-            sequence_length <= self.config.max_position_embeddings
+             sequence_length<= self.config.max_position_embeddings
         ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
 
         inputs_embeds = (
@@ -1061,7 +1052,6 @@ class FlaxQwen2ForCausalLMModule(nn.Module):
                 stddev=self.config.initializer_range
             ),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
 
     def __call__(

@@ -28,7 +28,6 @@ from easydel.models.flax_modelling_utils import (
     apply_rotary_pos_emb,
     block_wise_ffn,
     control_mlp_sharding,
-    get_dot_general_by_bits,
     get_gradient_checkpoint_policy,
     precompute_freqs_cis,
     with_sharding_constraint,
@@ -65,7 +64,6 @@ class FlaxStableLmMLP(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.down_proj = Dense(
             config.hidden_size,
@@ -74,7 +72,6 @@ class FlaxStableLmMLP(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.up_proj = Dense(
             config.intermediate_size,
@@ -83,7 +80,6 @@ class FlaxStableLmMLP(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.act_fn = ACT2FN[config.hidden_act]
 
@@ -188,7 +184,6 @@ class FlaxStableLmAttention(BaseAttentionModule):
             use_bias=self.config.use_qkv_bias,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.k_proj = Dense(
             config.num_key_value_heads * self.head_dim,
@@ -197,7 +192,6 @@ class FlaxStableLmAttention(BaseAttentionModule):
             use_bias=self.config.use_qkv_bias,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.v_proj = Dense(
             config.num_key_value_heads * self.head_dim,
@@ -206,7 +200,6 @@ class FlaxStableLmAttention(BaseAttentionModule):
             use_bias=self.config.use_qkv_bias,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.o_proj = Dense(
             config.hidden_size,
@@ -215,7 +208,6 @@ class FlaxStableLmAttention(BaseAttentionModule):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
 
         self.rotary_emb_dim = int(self.config.partial_rotary_factor * self.head_dim)

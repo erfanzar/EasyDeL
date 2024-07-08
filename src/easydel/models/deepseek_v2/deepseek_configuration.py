@@ -164,12 +164,11 @@ class DeepseekV2Config(EDPretrainedConfig):
 
     def add_jax_args(
         self,
-        gradient_checkpointing: str = "nothing_saveable",
+        gradient_checkpointing: str = "",
         use_scan_mlp: bool = False,
         scan_mlp_chunk_size: int = 1024,
         bits: Optional[int] = None,
         rope_scaling: Dict[str, Union[str, float]] = None,
-        **kwargs,
     ):
         """The add_jax_args function adds the following arguments to the model:
 
@@ -191,21 +190,16 @@ class DeepseekV2Config(EDPretrainedConfig):
             initialization_of_moe: bool: initialization of moe needs to
                 disable some dynamic part's this boolean variable will
                 turn them off.
-            rope_scaling: Dict[str, Union[str, float]]: rope_scaling for
-                rope
+            rope_scaling: Dict[str, Union[str, float]]: rope_scaling for rope
 
         Returns:
             A tuple of the following:
         """
-        self.attention_dropout = attention_dropout
-        self.attention_bias = attention_bias
         self.rope_scaling = rope_scaling
-        self.number_rep_kv = number_rep_kv
         self.gradient_checkpointing = gradient_checkpointing
         self.use_scan_mlp = use_scan_mlp
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.bits = bits
-        self.initialization_of_moe = initialization_of_moe
 
     @staticmethod
     def get_weight_decay_exclusions():

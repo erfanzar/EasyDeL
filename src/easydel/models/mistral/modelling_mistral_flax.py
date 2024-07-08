@@ -230,12 +230,12 @@ class MistralAttention(BaseAttentionModule):
         )
         attention_bias = None
         if attention_mask is not None:
-            causal_mask = attention_mask[:, :, :, :key_length]
+            attention_mask = attention_mask[:, :, :, :key_length]
             attention_bias = lax.select(
-                causal_mask > 0,
-                jnp.full(causal_mask.shape, 0.0).astype(self.dtype),
+                attention_mask > 0,
+                jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
                 jnp.full(
-                    causal_mask.shape,
+                    attention_mask.shape,
                     jnp.finfo(self.dtype).min,
                 ).astype(self.dtype),
             )
@@ -598,11 +598,9 @@ class MistralModel(BaseNNXModule):
                 attention_mask, self.causal_mask[:, :, :seq_length, :]
             )
 
-        batch_size, sequence_length, _ = inputs_embeds.shape
-
         assert (
-            sequence_length <= self.config.max_position_embeddings
-        ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
+            seq_length <= self.config.max_position_embeddings
+        ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {seq_length})"
 
         inputs_embeds = (
             inputs_embeds + extra_embedding
@@ -718,8 +716,7 @@ class MistralForCausalLM(BaseNNXModule):
         hidden_states = outputs[0]
 
         if self.config.tie_word_embeddings:
-            shared_kernel = self.model.variables["params"]["embed_tokens"]["embedding"]
-            self.lm_head.kernel.value = shared_kernel
+            self.lm_head.kernel.value = self.model.embed_tokens.embedding.value.T
             lm_logits = self.lm_head(hidden_states)
         else:
             lm_logits = self.lm_head(hidden_states)

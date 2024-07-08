@@ -230,12 +230,12 @@ class LlamaAttention(BaseAttentionModule):
         )
         attention_bias = None
         if attention_mask is not None:
-            causal_mask = attention_mask[:, :, :, :key_length]
+            attention_mask = attention_mask[:, :, :, :key_length]
             attention_bias = lax.select(
-                causal_mask > 0,
-                jnp.full(causal_mask.shape, 0.0).astype(self.dtype),
+                attention_mask > 0,
+                jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
                 jnp.full(
-                    causal_mask.shape,
+                    attention_mask.shape,
                     jnp.finfo(self.dtype).min,
                 ).astype(self.dtype),
             )
@@ -560,7 +560,8 @@ class LlamaModel(BaseNNXModule):
         return_dict: bool = True,
         extra_embedding: Optional[jnp.ndarray] = None,
     ):
-        """The __call__ function is the main function of a Flax model. It takes in input_ids, attention_mask, and position_ids
+        """
+        The __call__ function is the main function of a Flax model. It takes in input_ids, attention_mask, and position_ids
         and returns the output of the model. These optional arguments are passed as keyword arguments when calling a Flax model.
 
         Args:
@@ -582,34 +583,33 @@ class LlamaModel(BaseNNXModule):
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
 
-        batch_size, seq_length = input_ids.shape
+        batch_size, sequence_length = input_ids.shape
         if attention_mask is None:
             attention_mask = jnp.ones_like(input_ids)
         if position_ids is None:
             position_ids = jnp.broadcast_to(
                 jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
-                (batch_size, seq_length),
+                (batch_size, sequence_length),
             ).astype(jnp.int32)
         if attention_mask.ndim == 2:
-            attention_mask = attention_mask.reshape(batch_size, 1, seq_length, 1)
+            attention_mask = attention_mask.reshape(batch_size, 1, sequence_length, 1)
             attention_mask = jnp.logical_and(
-                attention_mask, self.causal_mask[:, :, :seq_length, :]
+                attention_mask, self.causal_mask[:, :, :sequence_length, :]
             )
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
-        batch_size, sequence_length, _ = inputs_embeds.shape
 
         assert (
             sequence_length <= self.config.max_position_embeddings
         ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
 
-        inputs_embeds = (
+        hidden_states = (
             inputs_embeds + extra_embedding
             if extra_embedding is not None
             else inputs_embeds
         )
-        hidden_states = self.dropout(inputs_embeds)
+        hidden_states = self.dropout(hidden_states)
         if past_key_values is None:
             past_key_values = [None] * self.config.num_hidden_layers
         for idx, block in enumerate(self.layers):
@@ -718,8 +718,7 @@ class LlamaForCausalLM(BaseNNXModule):
         hidden_states = outputs[0]
 
         if self.config.tie_word_embeddings:
-            shared_kernel = self.model.variables["params"]["embed_tokens"]["embedding"]
-            self.lm_head.kernel.value = shared_kernel
+            self.lm_head.kernel.value = self.model.embed_tokens.embedding.value.T
             lm_logits = self.lm_head(hidden_states)
         else:
             lm_logits = self.lm_head(hidden_states)
@@ -779,7 +778,6 @@ class LlamaForSequenceClassification(BaseNNXModule):
         return_dict: bool = True,
         extra_embedding: Optional[jnp.ndarray] = None,
     ):
-        batch_size, seq_length = input_ids.shape
 
         outputs = self.model(
             input_ids=input_ids,

@@ -40,8 +40,8 @@ from easydel.models._vanilla_attention import (
     shard_vanilla_attention,
     vanilla_attention,
 )
-from easydel.models.modelling_utils import EDPretrainedConfig
 from easydel.models.flax_modelling_utils import get_gradient_checkpoint_policy
+from easydel.models.modelling_utils import EDPretrainedConfig
 
 logger = get_logger(__name__)
 
@@ -117,9 +117,18 @@ def set_attrs_smartly_with_prp(
     default: Any,
     new_attr: Any,
     prp: EDPretrainedConfig = None,
+    pickup_name=None,
 ):
     if not hasattr(self, attr_name) or getattr(self, attr_name, ...) == Ellipsis:
-        setattr(self, attr_name, default if prp is None else getattr(prp, attr_name))
+        setattr(
+            self,
+            attr_name,
+            (
+                default
+                if prp is None
+                else getattr(prp, (attr_name if pickup_name is None else pickup_name))
+            ),
+        )
     if not new_attr == Ellipsis:
         setattr(self, attr_name, new_attr)
 
@@ -214,7 +223,7 @@ class FlexibleAttentionModule(object):
         scan_ring_attention: bool = ...,
         scan_attention_layers: bool = ...,
         attention_dropout: float = 0.0,
-        dtype: jnp.dtype = jnp.float32,
+        dtype: jnp.dtype = ...,
         precision: lax.Precision = ...,
         force_float32_tpu: bool = ...,
         shard_attention_computation: bool = ...,
@@ -251,12 +260,26 @@ class FlexibleAttentionModule(object):
         )
 
         set_attrs_smartly_with_prp(
-            self, "block_q", DEFAULT_Q_BLOCK, block_q, base_config
+            self,
+            "block_q",
+            DEFAULT_Q_BLOCK,
+            block_q,
+            base_config,
         )
         set_attrs_smartly_with_prp(
-            self, "block_k", DEFAULT_K_BLOCK, block_k, base_config
+            self,
+            "block_k",
+            DEFAULT_K_BLOCK,
+            block_k,
+            base_config,
         )
-        set_attrs_smartly_with_prp(self, "block_b", 1, block_b, base_config)
+        set_attrs_smartly_with_prp(
+            self,
+            "block_b",
+            1,
+            block_b,
+            base_config,
+        )
         set_attrs_smartly_with_prp(
             self,
             "block_q_major_dkv",
@@ -279,20 +302,50 @@ class FlexibleAttentionModule(object):
             base_config,
         )
         set_attrs_smartly_with_prp(
-            self, "block_k_dkv", self.block_k, block_k_dkv, base_config
+            self,
+            "block_k_dkv",
+            self.block_k,
+            block_k_dkv,
+            base_config,
         )
         set_attrs_smartly_with_prp(
-            self, "block_q_dkv", self.block_q, block_q_dkv, base_config
+            self,
+            "block_q_dkv",
+            self.block_q,
+            block_q_dkv,
+            base_config,
         )
         set_attrs_smartly_with_prp(
-            self, "block_q_dq", self.block_q, block_q_dq, base_config
+            self,
+            "block_q_dq",
+            self.block_q,
+            block_q_dq,
+            base_config,
         )
         set_attrs_smartly_with_prp(
-            self, "block_k_dq", self.block_k, block_k_dq, base_config
+            self,
+            "block_k_dq",
+            self.block_k,
+            block_k_dq,
+            base_config,
         )
         set_attrs_smartly_with_prp(
-            self, "block_k_major", self.block_k, block_k_major, base_config
+            self,
+            "block_k_major",
+            self.block_k,
+            block_k_major,
+            base_config,
         )
+
+        set_attrs_smartly_with_prp(
+            self,
+            "dtype",
+            jnp.float32,
+            dtype,
+            base_config,
+            "attn_dtype",
+        )
+
         set_attrs_smartly_with_prp(
             self,
             "shard_attention_computation",
@@ -301,19 +354,36 @@ class FlexibleAttentionModule(object):
             base_config,
         )
         set_attrs_smartly_with_prp(
-            self, "scan_ring_attention", True, scan_ring_attention, base_config
+            self,
+            "scan_ring_attention",
+            True,
+            scan_ring_attention,
+            base_config,
         )
         set_attrs_smartly_with_prp(
-            self, "partition_axis", PartitionAxis(), partition_axis, base_config
+            self,
+            "partition_axis",
+            PartitionAxis(),
+            partition_axis,
+            base_config,
         )
         set_attrs_smartly_with_prp(
-            self, "precision", lax.Precision("fastest"), precision
+            self,
+            "precision",
+            lax.Precision("fastest"),
+            precision,
         )  # DON'T READ FROM CONFIG
         set_attrs_smartly_with_prp(
-            self, "force_float32_tpu", True, force_float32_tpu
+            self,
+            "force_float32_tpu",
+            True,
+            force_float32_tpu,
         )  # DON'T READ FROM CONFIG
         set_attrs_smartly_with_prp(
-            self, "axis_name", "sp", axis_name
+            self,
+            "axis_name",
+            "sp",
+            axis_name,
         )  # DON'T READ FROM CONFIG
 
         self.mesh = mesh
@@ -325,7 +395,6 @@ class FlexibleAttentionModule(object):
 
         self.scan_attention_layers = scan_attention_layers
         self.attention_dropout = attention_dropout
-        self.dtype = dtype
         self.backward_pass_impl = backward_pass_impl
         self._do_check = _do_check
         if attn_mechanism == "splash" and self.platform != "tpu":

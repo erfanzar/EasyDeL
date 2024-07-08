@@ -31,7 +31,6 @@ from transformers.modeling_flax_outputs import FlaxBaseModelOutput
 from easydel.models.common import RMSNorm as MambaRMSNorm
 from easydel.models.flax_modelling_utils import (
     ACT2FN,
-    get_dot_general_by_bits,
     get_gradient_checkpoint_policy,
 )
 from easydel.models.mamba.mamba_configuration import MambaConfig as MambaConfig
@@ -487,7 +486,6 @@ class FlaxMambaMixer(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
         self.in_proj = dense_class(intermediate_size * 2, use_bias=config.use_bias)
         self.x_proj = dense_class(time_step_rank + ssm_state_size * 2, use_bias=False)
