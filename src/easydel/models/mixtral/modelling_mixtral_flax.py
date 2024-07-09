@@ -869,7 +869,7 @@ class MixtralPreTrainedModel(BaseNNXModule):
             jnp.array(attention_mask, dtype="i4"),
             # position_ids: Optional[chex.Array] = None
             jnp.array(position_ids, dtype="i4"),
-            None,  # inputs_embeds: Optional[chex.Array] = None
+            None,  # input_embeds: Optional[chex.Array] = None
             output_attentions,  # output_attentions: Optional[bool] = None
             # output_hidden_states: Optional[bool] = None
             output_hidden_states,
@@ -960,7 +960,7 @@ class FlaxMixtralModule(nn.Module):
         input_ids: chex.Array,
         attention_mask: chex.Array,
         position_ids: chex.Array,
-        inputs_embeds: Optional[chex.Array] = None,
+        input_embeds: Optional[chex.Array] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         output_router_logits: Optional[bool] = None,
@@ -970,17 +970,15 @@ class FlaxMixtralModule(nn.Module):
     ) -> MoeModelOutput | Tuple:
         if output_router_logits is None:
             output_router_logits = self.config.output_router_logits
-        if input_ids is not None and inputs_embeds is not None:
+        if input_ids is not None and input_embeds is not None:
             raise ValueError(
-                "You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time"
+                "You cannot specify both decoder_input_ids and decoder_input_embeds at the same time"
             )
 
-        if inputs_embeds is None and input_ids is not None:
-            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
+        if input_embeds is None and input_ids is not None:
+            input_embeds = self.embed_tokens(input_ids.astype("i4"))
         else:
-            raise ValueError(
-                "you should specify inputs_embeds or input_ids one of them"
-            )
+            raise ValueError("you should specify input_embeds or input_ids one of them")
         output_attentions = (
             output_attentions
             if output_attentions is not None
@@ -997,7 +995,7 @@ class FlaxMixtralModule(nn.Module):
             else self.config.output_hidden_states
         )
         collection_outputs = self.layers(
-            hidden_states=inputs_embeds,
+            hidden_states=input_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
             causal_mask=self.causal_mask,
@@ -1078,7 +1076,7 @@ class FlaxMixtralForCausalLMModule(nn.Module):
         input_ids: chex.Array,
         attention_mask: Optional[chex.Array] = None,
         position_ids: Optional[chex.Array] = None,
-        inputs_embeds: Optional[chex.Array] = None,
+        input_embeds: Optional[chex.Array] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         output_router_logits: Optional[bool] = None,
@@ -1093,7 +1091,7 @@ class FlaxMixtralForCausalLMModule(nn.Module):
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
+            input_embeds=input_embeds,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             output_router_logits=output_router_logits,

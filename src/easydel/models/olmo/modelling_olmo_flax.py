@@ -816,7 +816,7 @@ class FlaxOlmoModule(nn.Module):
         attention_mask: Optional[chex.Array] = None,
         position_ids: Optional[chex.Array] = None,
         deterministic: bool = True,
-        inputs_embeds: chex.Array = None,
+        input_embeds: chex.Array = None,
         init_cache: bool = False,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
@@ -834,7 +834,7 @@ class FlaxOlmoModule(nn.Module):
             position_ids: chex.Array: Determine the position of each
                 token in a sequence
             deterministic: bool: Determine whether to use dropout or not
-            inputs_embeds: chex.Array: Pass in the embedding of the
+            input_embeds: chex.Array: Pass in the embedding of the
                 input_ids
             init_cache: bool: Initialize the cache for the decoder
             output_attentions: bool: Determine whether to return the
@@ -848,14 +848,14 @@ class FlaxOlmoModule(nn.Module):
             A tuple of the hidden states, all hidden states, and
             attentions
         """
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
+        if input_embeds is None:
+            input_embeds = self.embed_tokens(input_ids.astype("i4"))
         if attention_mask.ndim == 2:
             b, s = attention_mask.shape
             attention_mask = attention_mask.reshape(b, 1, 1, s)
 
         outputs = self.layers(
-            hidden_states=inputs_embeds,
+            hidden_states=input_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
             freqs_cis=self.freqs_cis,
@@ -925,7 +925,7 @@ class FlaxOlmoForCausalLMModule(nn.Module):
         attention_mask: chex.Array,
         position_ids: chex.Array,
         deterministic: bool = True,
-        inputs_embeds: chex.Array = None,
+        input_embeds: chex.Array = None,
         init_cache: bool = False,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
@@ -934,7 +934,7 @@ class FlaxOlmoForCausalLMModule(nn.Module):
         """The __call__ function is the main function of a Flax module. It defines how the model will be called,
         and what it returns. In this case, we are calling our Transformer model with input_ids and attention_mask
         as inputs (these are defined in __init__). We also have some optional arguments that can be passed to
-        the call function: deterministic (whether to use dropout), inputs_embeds (if you want to pass your own embeddings),
+        the call function: deterministic (whether to use dropout), input_embeds (if you want to pass your own embeddings),
         output_attentions and output_hidden states which return additional outputs from the transformer layers if set True. Finally,
 
         Args:
@@ -945,7 +945,7 @@ class FlaxOlmoForCausalLMModule(nn.Module):
                 in the sequence
             deterministic: bool: Determine whether to use dropout in the
                 model
-            inputs_embeds: chex.Array: Pass in the embeddings of the
+            input_embeds: chex.Array: Pass in the embeddings of the
                 input tokens
             init_cache: bool: Initialize the cache for the decoder
             output_attentions: bool: Return the attention weights
@@ -972,7 +972,7 @@ class FlaxOlmoForCausalLMModule(nn.Module):
             attention_mask=attention_mask,
             position_ids=position_ids,
             deterministic=deterministic,
-            inputs_embeds=inputs_embeds,
+            input_embeds=input_embeds,
             init_cache=init_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,

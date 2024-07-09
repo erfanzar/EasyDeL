@@ -1,9 +1,9 @@
-from typing import Any, Optional, List, Union
+from typing import Any, List, Optional, Union
 
-
-from flax import nnx
+import chex
 import jax
 import jax.numpy as jnp
+from flax import nnx
 from flax.linen.attention import dot_product_attention_weights
 from jax import lax
 from jax.sharding import PartitionSpec
@@ -11,8 +11,8 @@ from transformers.modeling_flax_outputs import (
     FlaxBaseModelOutputWithPastAndCrossAttentions,
     FlaxCausalLMOutputWithCrossAttentions,
 )
+
 from easydel.models.caching_utils import KVCache
-import chex
 from easydel.models.flax_modelling_utils import (
     ACT2FN,
     BaseAttentionModule,
@@ -169,13 +169,14 @@ class GPT2Attention(BaseAttentionModule):
         query = self._split_heads(query)
         key = self._split_heads(key)
         value = self._split_heads(value)
-        key_length = key.shape[1]
+
         if past_key_values is not None:
             past_key_values.update(key_states=key, value_states=value)
             key, value, attention_mask = past_key_values.get(
                 attention_mask=attention_mask
             )
 
+        key_length = key.shape[1]
         attention_bias = None
         if attention_mask is not None:
             attention_mask = attention_mask[:, :, :, :key_length]
@@ -518,10 +519,10 @@ class GPT2Model(BaseNNXModule):
                 attention_mask, self.causal_mask[:, :, :sequence_length, :]
             )
 
-        inputs_embeds = self.wte(input_ids.astype("i4"))
+        input_embeds = self.wte(input_ids.astype("i4"))
         position_embeds = self.wpe(position_ids.astype("i4"))
 
-        hidden_states = inputs_embeds + position_embeds
+        hidden_states = input_embeds + position_embeds
         hidden_states = self.dropout(hidden_states)
         for idx, block in enumerate(self.h):
             if output_hidden_states:

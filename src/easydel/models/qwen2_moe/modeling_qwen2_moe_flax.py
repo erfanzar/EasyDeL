@@ -1123,7 +1123,7 @@ class FlaxQwen2MoeModule(nn.Module):
         attention_mask: chex.Array,
         position_ids: chex.Array,
         deterministic: bool = True,
-        inputs_embeds: chex.Array = None,
+        input_embeds: chex.Array = None,
         init_cache: bool = False,
         output_attentions: Optional[bool] = False,
         output_hidden_states: Optional[bool] = False,
@@ -1145,7 +1145,7 @@ class FlaxQwen2MoeModule(nn.Module):
         :param attention_mask: chex.Array: Mask out the padding tokens
         :param position_ids: chex.Array: Indicate the position of each token in a sequence
         :param deterministic: bool: Control whether dropout is applied or not
-        :param inputs_embeds: chex.Array: Pass in the embeddings of the input tokens
+        :param input_embeds: chex.Array: Pass in the embeddings of the input tokens
         :param init_cache: bool: Initialize the cache
         :param output_attentions: bool: Determine whether to return the attentions or not
         :param output_hidden_states: bool: Determine whether to return hidden states
@@ -1154,23 +1154,23 @@ class FlaxQwen2MoeModule(nn.Module):
         :return: A tuple of:
 
         """
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
+        if input_embeds is None:
+            input_embeds = self.embed_tokens(input_ids.astype("i4"))
 
         batch_size, sequence_length = input_ids.shape
         assert (
             sequence_length <= self.config.max_position_embeddings
         ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
 
-        inputs_embeds = (
-            inputs_embeds + extra_embedding
+        input_embeds = (
+            input_embeds + extra_embedding
             if extra_embedding is not None
-            else inputs_embeds
+            else input_embeds
         )
 
         hidden_states, all_hidden_states, all_attentions, all_router_logits = (
             self.layers(
-                hidden_states=inputs_embeds,
+                hidden_states=input_embeds,
                 freqs_cis=self.freqs_cis,
                 attention_mask=attention_mask,
                 position_ids=position_ids,

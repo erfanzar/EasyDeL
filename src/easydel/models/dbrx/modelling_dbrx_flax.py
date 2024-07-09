@@ -191,13 +191,22 @@ class DbrxAttention(BaseAttentionModule):
         query_states, key_value_states = jnp.split(qkv_states, [query_size], axis=2)
         key_states, value_states = jnp.split(key_value_states, [key_size], axis=2)
         query_states = query_states.reshape(
-            batch_size, sequence_length, self.num_attention_heads, self.head_dim
+            batch_size,
+            sequence_length,
+            self.num_attention_heads,
+            self.head_dim,
         )
         key_states = key_states.reshape(
-            batch_size, sequence_length, self.num_key_value_heads, self.head_dim
+            batch_size,
+            sequence_length,
+            self.num_key_value_heads,
+            self.head_dim,
         )
         value_states = value_states.reshape(
-            batch_size, sequence_length, self.num_key_value_heads, self.head_dim
+            batch_size,
+            sequence_length,
+            self.num_key_value_heads,
+            self.head_dim,
         )
         query_states, key_states = self.apply_rotary(
             query=query_states,
@@ -208,9 +217,11 @@ class DbrxAttention(BaseAttentionModule):
 
         if past_key_values is not None:
             past_key_values.update(key_states=key_states, value_states=value_states)
-            key_length, value_states, attention_mask = past_key_values.get(
+            key_states, value_states, attention_mask = past_key_values.get(
                 attention_mask=attention_mask
             )
+
+        query_length, key_length = query_states.shape[1], key_states.shape[1]
 
         key_states, value_states = self.repeat_key_value(
             key_states,
@@ -720,7 +731,7 @@ class DbrxModel(BaseNNXModule):
         input_ids: chex.Array,
         attention_mask: Optional[chex.Array] = None,
         position_ids: Optional[chex.Array] = None,
-        inputs_embeds: Optional[chex.Array] = None,
+        input_embeds: Optional[chex.Array] = None,
         past_key_values: Optional[List[KVCache]] = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
@@ -736,7 +747,7 @@ class DbrxModel(BaseNNXModule):
             input_ids: chex.Array: Pass in the input token ids
             attention_mask: (Optional(chex.Array)): Mask out the padding tokens
             position_ids: (Optional(chex.Array)): Indicate the position of each token in a sequence
-            inputs_embeds: (Optional(chex.Array)): Pass in the embeddings of the input tokens
+            input_embeds: (Optional(chex.Array)): Pass in the embeddings of the input tokens
             past_key_values: (Optional(List[KVCache])): Past key and values used for generation
             output_attentions: bool: Determine whether to return the attentions or not
             output_hidden_states: bool: Determine whether to return hidden states
@@ -749,17 +760,15 @@ class DbrxModel(BaseNNXModule):
         """
         if output_router_logits is None:
             output_router_logits = self.config.output_router_logits
-        if input_ids is not None and inputs_embeds is not None:
+        if input_ids is not None and input_embeds is not None:
             raise ValueError(
-                "You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time"
+                "You cannot specify both decoder_input_ids and decoder_input_embeds at the same time"
             )
-        if inputs_embeds is None and input_ids is not None:
-            inputs_embeds = self.wte(input_ids.astype("i4"))
+        if input_embeds is None and input_ids is not None:
+            input_embeds = self.wte(input_ids.astype("i4"))
         else:
-            raise ValueError(
-                "you should specify inputs_embeds or input_ids one of them"
-            )
-        batch_size, sequence_length, _ = inputs_embeds.shape
+            raise ValueError("you should specify input_embeds or input_ids one of them")
+        batch_size, sequence_length, _ = input_embeds.shape
         assert (
             sequence_length <= self.config.max_position_embeddings
         ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
@@ -777,10 +786,10 @@ class DbrxModel(BaseNNXModule):
                 attention_mask, self.causal_mask[:, :, :sequence_length, :]
             )
 
-        inputs_embeds = (
-            inputs_embeds + extra_embedding
+        input_embeds = (
+            input_embeds + extra_embedding
             if extra_embedding is not None
-            else inputs_embeds
+            else input_embeds
         )
         output_attentions = (
             output_attentions
@@ -801,14 +810,14 @@ class DbrxModel(BaseNNXModule):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         all_router_logits = () if output_router_logits else None
-        hidden_states = inputs_embeds
+        hidden_states = input_embeds
         if past_key_values is None:
             past_key_values = [None] * self.config.num_hidden_layers
         for idx, block in enumerate(self.blocks):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
             hidden_states, self_attn_weights, router_logits = block(
-                hidden_states=inputs_embeds,
+                hidden_states=input_embeds,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 freqs_cis=self.freqs_cis,
@@ -880,7 +889,7 @@ class DbrxForCausalLM(BaseNNXModule):
         input_ids: chex.Array,
         attention_mask: Optional[chex.Array] = None,
         position_ids: Optional[chex.Array] = None,
-        inputs_embeds: Optional[chex.Array] = None,
+        input_embeds: Optional[chex.Array] = None,
         past_key_values: Optional[List[KVCache]] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -893,7 +902,7 @@ class DbrxForCausalLM(BaseNNXModule):
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
+            input_embeds=input_embeds,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             output_router_logits=output_router_logits,
@@ -907,13 +916,13 @@ class DbrxForCausalLM(BaseNNXModule):
             logits = self.lm_head(hidden_states)
         else:
             logits = self.lm_head(hidden_states)
-        batch_size, seq_length, hd = logits.shape
+        batch_size, sequence_length, hd = logits.shape
         aux_loss = None
         if output_router_logits and outputs.router_logits is not None:
             aux_loss = auxiliary_load_balancing_loss_func(
                 gate_logits=tuple(  # type:ignore
                     [
-                        logit.reshape(batch_size * seq_length, -1)
+                        logit.reshape(batch_size * sequence_length, -1)
                         for logit in outputs.router_logits
                     ]  # type:ignore
                 ),

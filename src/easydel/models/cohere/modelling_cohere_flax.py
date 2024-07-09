@@ -232,13 +232,13 @@ class CohereAttention(BaseAttentionModule):
             freqs_cis=freqs_cis,
         )
 
-        query_length, key_length = query_states.shape[1], key_states.shape[1]
-
         if past_key_values is not None:
             past_key_values.update(key_states=key_states, value_states=value_states)
-            key_length, value_states, attention_mask = past_key_values.get(
+            key_states, value_states, attention_mask = past_key_values.get(
                 attention_mask=attention_mask
             )
+
+        query_length, key_length = query_states.shape[1], key_states.shape[1]
 
         key_states, value_states = self.repeat_key_value(
             key_states,
@@ -560,7 +560,7 @@ class CohereModel(BaseNNXModule):
         input_ids: chex.Array,
         attention_mask: Optional[chex.Array] = None,
         position_ids: Optional[chex.Array] = None,
-        inputs_embeds: Optional[chex.Array] = None,
+        input_embeds: Optional[chex.Array] = None,
         past_key_values: Optional[List[KVCache]] = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
@@ -575,7 +575,7 @@ class CohereModel(BaseNNXModule):
             input_ids: chex.Array: Pass in the input token ids
             attention_mask: (Optional(chex.Array)): Mask out the padding tokens
             position_ids: (Optional(chex.Array)): Indicate the position of each token in a sequence
-            inputs_embeds: (Optional(chex.Array)): Pass in the embeddings of the input tokens
+            input_embeds: (Optional(chex.Array)): Pass in the embeddings of the input tokens
             past_key_values: (Optional(List[KVCache])): Past key and values used for generation
             output_attentions: bool: Determine whether to return the attentions or not
             output_hidden_states: bool: Determine whether to return hidden states
@@ -587,33 +587,38 @@ class CohereModel(BaseNNXModule):
         """
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
-
-        batch_size, seq_length = input_ids.shape
+        if input_ids is not None and input_embeds is not None:
+            raise ValueError(
+                "You cannot specify both decoder_input_ids and decoder_input_embeds at the same time"
+            )
+        if input_embeds is None and input_ids is not None:
+            input_embeds = self.embed_tokens(input_ids.astype("i4"))
+        else:
+            raise ValueError("you should specify input_embeds or input_ids one of them")
+        batch_size, sequence_length, _ = input_embeds.shape
         if attention_mask is None:
             attention_mask = jnp.ones_like(input_ids)
         if position_ids is None:
             position_ids = jnp.broadcast_to(
                 jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
-                (batch_size, seq_length),
+                (batch_size, sequence_length),
             ).astype(jnp.int32)
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
         if attention_mask.ndim == 2:
-            attention_mask = attention_mask.reshape(batch_size, 1, seq_length, 1)
+            attention_mask = attention_mask.reshape(batch_size, 1, sequence_length, 1)
             attention_mask = jnp.logical_and(
-                attention_mask, self.causal_mask[:, :, :seq_length, :]
+                attention_mask, self.causal_mask[:, :, :sequence_length, :]
             )
 
         assert (
-            seq_length <= self.config.max_position_embeddings
-        ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {seq_length})"
+            sequence_length <= self.config.max_position_embeddings
+        ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
 
-        inputs_embeds = (
-            inputs_embeds + extra_embedding
+        input_embeds = (
+            input_embeds + extra_embedding
             if extra_embedding is not None
-            else inputs_embeds
+            else input_embeds
         )
-        hidden_states = self.dropout(inputs_embeds)
+        hidden_states = self.dropout(input_embeds)
         if past_key_values is None:
             past_key_values = [None] * self.config.num_hidden_layers
         for idx, block in enumerate(self.layers):

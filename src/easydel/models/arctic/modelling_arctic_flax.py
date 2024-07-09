@@ -221,13 +221,13 @@ class ArcticAttention(BaseAttentionModule):
             freqs_cis=freqs_cis,
         )
 
-        query_length, key_length = query_states.shape[1], key_states.shape[1]
-
         if past_key_values is not None:
             past_key_values.update(key_states=key_states, value_states=value_states)
-            key_length, value_states, attention_mask = past_key_values.get(
+            key_states, value_states, attention_mask = past_key_values.get(
                 attention_mask=attention_mask
             )
+
+        query_length, key_length = query_states.shape[1], key_states.shape[1]
 
         key_states, value_states = self.repeat_key_value(
             key_states,
@@ -326,56 +326,6 @@ class ArcticMLP(nnx.Module):
         """
         hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
         return self.w2(self.act_fn(self.w1(hidden_states)) * self.w3(hidden_states))
-
-
-# class ArcticBlocKSparesMLPCollection(nnx.Module):
-#     config: ArcticConfig
-#     dtype: jnp.dtype = jnp.bfloat16
-#     param_dtype: jnp.dtype = jnp.bfloat16
-#     precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
-
-#     def setup(self) -> None:
-#         self.layers = [
-#             ArcticMLP(
-#                 config=self.config,
-#                 dtype=self.dtype,
-#                 param_dtype=self.param_dtype,
-#                 precision=self.precision,
-#             )
-#             for i in range(self.config.num_local_experts)
-#         ]
-
-#     def __call__(
-#         self,
-#         selected_experts: chex.Array,
-#         hidden_states: chex.Array,
-#         routing_weights: chex.Array,
-#         batch_size: int,
-#         sequence_length: int,
-#         hidden_dim: int,
-#     ) -> chex.Array:
-#         final_hidden_state = jnp.zeros_like(hidden_states)
-
-#         for index in range(self.config.num_local_experts):
-#             expert_layer_output = (
-#                 block_wise_ffn(
-#                     self.layers[index],
-#                     hidden_states,
-#                     self.config.scan_mlp_chunk_size,
-#                     False,
-#                 )
-#                 if self.config.use_scan_mlp
-#                 else self.layers[index](hidden_states)
-#             )
-#             expert_layer_output_exp = (
-#                 jnp.sum(
-#                     jnp.multiply(selected_experts == index, routing_weights), axis=-1
-#                 )[:, :, None]
-#                 * expert_layer_output
-#             )
-#             final_hidden_state += expert_layer_output_exp
-
-#         return final_hidden_state
 
 
 class ArcticMoE(nnx.Module):
@@ -798,10 +748,11 @@ class ArcticModel(BaseNNXModule):
         position_ids: Optional[chex.Array] = None,
         segment_ids: Optional[chex.Array] = None,
         past_key_values: Optional[List[KVCache]] = None,
-        inputs_embeds: Optional[chex.Array] = None,
+        input_embeds: Optional[chex.Array] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: bool = True,
+        extra_embedding: Optional[jax.Array] = None,
     ) -> MoeModelOutput | Tuple:
         output_attentions = (
             output_attentions
@@ -819,37 +770,36 @@ class ArcticModel(BaseNNXModule):
         all_self_attns = () if output_attentions else None
         all_router_losses = ()
 
-        if input_ids is not None and inputs_embeds is not None:
+        if input_ids is not None and input_embeds is not None:
             raise ValueError(
-                "You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time"
+                "You cannot specify both decoder_input_ids and decoder_input_embeds at the same time"
             )
-
-        if inputs_embeds is None and input_ids is not None:
-            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
+        if input_embeds is None and input_ids is not None:
+            input_embeds = self.embed_tokens(input_ids.astype("i4"))
         else:
-            raise ValueError(
-                "you should specify inputs_embeds or input_ids one of them"
-            )
+            raise ValueError("you should specify input_embeds or input_ids one of them")
+        batch_size, sequence_length, _ = input_embeds.shape
 
-        batch_size, seq_length = input_ids.shape
         if attention_mask is None:
             attention_mask = jnp.ones_like(input_ids)
         if position_ids is None:
             position_ids = jnp.broadcast_to(
                 jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
-                (batch_size, seq_length),
+                (batch_size, sequence_length),
             ).astype(jnp.int32)
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
 
         if past_key_values is None:
             past_key_values = [None] * self.config.num_hidden_layers
         if attention_mask.ndim == 2:
-            attention_mask = attention_mask.reshape(batch_size, 1, seq_length, 1)
+            attention_mask = attention_mask.reshape(batch_size, 1, sequence_length, 1)
             attention_mask = jnp.logical_and(
-                attention_mask, self.causal_mask[:, :, :seq_length, :]
+                attention_mask, self.causal_mask[:, :, :sequence_length, :]
             )
-        hidden_states = inputs_embeds
+        hidden_states = (
+            input_embeds + extra_embedding
+            if extra_embedding is not None
+            else input_embeds
+        )
         for layer in self.layers:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -938,21 +888,23 @@ class ArcticForCausalLM(BaseNNXModule):
         position_ids: Optional[chex.Array] = None,
         segment_ids: Optional[chex.Array] = None,
         past_key_values: Optional[List[KVCache]] = None,
-        inputs_embeds: Optional[chex.Array] = None,
+        input_embeds: Optional[chex.Array] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
+        extra_embedding: Optional[jax.Array] = None,
         return_dict: bool = True,
     ) -> MoeCausalLMOutput | Tuple:
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
+            input_embeds=input_embeds,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=True,
             past_key_values=past_key_values,
             segment_ids=segment_ids,
+            extra_embedding=extra_embedding,
         )
         if self.config.tie_word_embeddings:
             self.lm_head.kernel.value = self.model.embed_tokens.embedding.value.T

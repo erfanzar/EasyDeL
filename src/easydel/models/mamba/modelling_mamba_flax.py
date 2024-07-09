@@ -715,7 +715,7 @@ class FlaxMambaModule(nn.Module):
     def __call__(
         self,
         input_ids: Optional[chex.Array] = None,
-        inputs_embeds: Optional[chex.Array] = None,
+        input_embeds: Optional[chex.Array] = None,
         cache_params: Optional[chex.Array] = None,
         deterministic: bool = True,
         use_cache: Optional[bool] = None,
@@ -737,29 +737,29 @@ class FlaxMambaModule(nn.Module):
             return_dict if return_dict is not None else self.config.use_return_dict
         )
 
-        if (input_ids is None) ^ (inputs_embeds is not None):
+        if (input_ids is None) ^ (input_embeds is not None):
             raise ValueError(
-                "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
+                "You cannot specify both input_ids and input_embeds at the same time, and must specify either one"
             )
 
-        if inputs_embeds is None:
-            inputs_embeds = self.embeddings(input_ids)
+        if input_embeds is None:
+            input_embeds = self.embeddings(input_ids)
 
         if deterministic and use_cache:
             use_cache = False
 
         if cache_params is None and use_cache:
             cache_params = FlaxMambaCache(
-                self.config, inputs_embeds.shape[0], dtype=inputs_embeds.dtype
+                self.config, input_embeds.shape[0], dtype=input_embeds.dtype
             )
 
-        hidden_states = inputs_embeds
+        hidden_states = input_embeds
         hidden_states, all_hidden_states = self.layers(
             hidden_states, cache_params=cache_params
         )
 
         if use_cache:
-            cache_params.seqlen_offset += inputs_embeds.shape[1]
+            cache_params.seqlen_offset += input_embeds.shape[1]
 
         hidden_states = self.norm_f(hidden_states)
 
@@ -801,7 +801,7 @@ class FlaxMambaForCausalLMModule(nn.Module):
     def __call__(
         self,
         input_ids: Optional[chex.Array] = None,
-        inputs_embeds: Optional[chex.Array] = None,
+        input_embeds: Optional[chex.Array] = None,
         cache_params: Optional[chex.Array] = None,
         deterministic: bool = True,
         use_cache: Optional[bool] = None,
@@ -814,7 +814,7 @@ class FlaxMambaForCausalLMModule(nn.Module):
         )
 
         # input_ids: Optional[chex.Array] = None,
-        # inputs_embeds: Optional[chex.Array] = None,
+        # input_embeds: Optional[chex.Array] = None,
         # deterministic: bool = True,
         # cache_params: Optional[List[chex.Array]] = None,
         # use_cache: Optional[bool] = None,
@@ -823,7 +823,7 @@ class FlaxMambaForCausalLMModule(nn.Module):
 
         mamba_outputs = self.backbone(
             input_ids=input_ids,
-            inputs_embeds=inputs_embeds,
+            input_embeds=input_embeds,
             deterministic=deterministic,
             cache_params=cache_params,
             use_cache=use_cache,
@@ -939,7 +939,7 @@ class FlaxMambaPretrainedModel(BaseNNXModule):
     def __call__(
         self,
         input_ids: Optional[chex.Array] = None,
-        inputs_embeds: Optional[chex.Array] = None,
+        input_embeds: Optional[chex.Array] = None,
         cache_params: dict = None,
         deterministic: bool = True,
         params: dict = None,
@@ -960,7 +960,7 @@ class FlaxMambaPretrainedModel(BaseNNXModule):
         Args:
             self: Represent the instance of the class
             input_ids: Optional[chex.Array]: Pass in the input tokens
-            inputs_embeds: Optional[chex.Array]: Pass in the embedded
+            input_embeds: Optional[chex.Array]: Pass in the embedded
                 tokens
             cache_params: dict: Pass in the past cache_params from a
                 previous call to __call__
@@ -1011,7 +1011,7 @@ class FlaxMambaPretrainedModel(BaseNNXModule):
         )
 
         # input_ids: Optional[chex.Array] = None,
-        # inputs_embeds: Optional[chex.Array] = None,
+        # input_embeds: Optional[chex.Array] = None,
         # cache_params: Optional[chex.Array] = None,
         # deterministic: bool = True,
         # use_cache: Optional[bool] = None,
@@ -1021,7 +1021,7 @@ class FlaxMambaPretrainedModel(BaseNNXModule):
         return self.module.apply(
             inputs,
             input_ids,
-            inputs_embeds,
+            input_embeds,
             cache_params,
             train,
             use_cache,
