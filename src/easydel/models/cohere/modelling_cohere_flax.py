@@ -96,7 +96,7 @@ class CohereAttention(BaseAttentionModule):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=self.config.attention_bias,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             precision=self.precision,
             rngs=rngs,
         )
@@ -106,7 +106,7 @@ class CohereAttention(BaseAttentionModule):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=self.config.attention_bias,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             precision=self.precision,
             rngs=rngs,
         )
@@ -116,7 +116,7 @@ class CohereAttention(BaseAttentionModule):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=self.config.attention_bias,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             precision=self.precision,
             rngs=rngs,
         )
@@ -126,7 +126,7 @@ class CohereAttention(BaseAttentionModule):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             precision=self.precision,
             rngs=rngs,
         )
@@ -305,7 +305,7 @@ class CohereMLP(nnx.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             precision=self.precision,
             rngs=rngs,
         )
@@ -315,7 +315,7 @@ class CohereMLP(nnx.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             precision=self.precision,
             rngs=rngs,
         )
@@ -325,7 +325,7 @@ class CohereMLP(nnx.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             precision=self.precision,
             rngs=rngs,
         )
@@ -484,7 +484,7 @@ class CohereModel(BaseNNXModule):
         self.embed_tokens = nnx.Embed(
             config.vocab_size,
             config.hidden_size,
-            embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+            embedding_init=nnx.initializers.normal(stddev=config.initializer_range),
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
@@ -681,7 +681,7 @@ class CohereForCausalLM(nnx.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+            kernel_init=nnx.initializers.normal(stddev=config.initializer_range),
             precision=precision,
             rngs=rngs,
         )

@@ -257,7 +257,7 @@ class FlaxPalmModule(nn.Module):
             self.config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.dtype,
-            embedding_init=jax.nn.initializers.normal,
+            embedding_init=nnx.initializers.normal,
         )
         self.block = ParallelCollection(
             config=self.config,
@@ -342,7 +342,7 @@ class FlaxPalmForCausalLMModule(nn.Module):
             self.lm_head = fjformer.linen.control_quantization(
                 self.param(
                     "kernel",
-                    jax.nn.initializers.normal,
+                    nnx.initializers.normal,
                     (self.config.hidden_size, self.config.vocab_size),
                     self.param_dtype,
                 ),

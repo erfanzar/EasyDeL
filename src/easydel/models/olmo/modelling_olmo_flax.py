@@ -97,7 +97,7 @@ class FlaxOlmoAttention(BaseAttentionModule):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=self.config.attention_bias,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             precision=self.precision,
         )
         self.k_proj = Dense(
@@ -105,7 +105,7 @@ class FlaxOlmoAttention(BaseAttentionModule):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=self.config.attention_bias,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             precision=self.precision,
         )
         self.v_proj = Dense(
@@ -113,7 +113,7 @@ class FlaxOlmoAttention(BaseAttentionModule):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=self.config.attention_bias,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             precision=self.precision,
         )
         self.o_proj = Dense(
@@ -121,7 +121,7 @@ class FlaxOlmoAttention(BaseAttentionModule):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             precision=self.precision,
         )
 
@@ -759,7 +759,7 @@ class FlaxOlmoModule(nn.Module):
         self.embed_tokens = nn.Embed(
             self.config.vocab_size,
             self.config.hidden_size,
-            embedding_init=jax.nn.initializers.normal(
+            embedding_init=nnx.initializers.normal(
                 stddev=self.config.initializer_range
             ),
             dtype=self.dtype,
@@ -913,9 +913,7 @@ class FlaxOlmoForCausalLMModule(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(
-                stddev=self.config.initializer_range
-            ),
+            kernel_init=nnx.initializers.normal(stddev=self.config.initializer_range),
             precision=self.precision,
         )
 

@@ -52,7 +52,7 @@ class FlaxRobertaEmbeddings(nn.Module):
         self.word_embeddings = nn.Embed(
             self.config.vocab_size,
             self.config.hidden_size,
-            embedding_init=jax.nn.initializers.normal(
+            embedding_init=nnx.initializers.normal(
                 stddev=self.config.initializer_range
             ),
             dtype=self.dtype,
@@ -60,7 +60,7 @@ class FlaxRobertaEmbeddings(nn.Module):
         self.position_embeddings = nn.Embed(
             self.config.max_position_embeddings,
             self.config.hidden_size,
-            embedding_init=jax.nn.initializers.normal(
+            embedding_init=nnx.initializers.normal(
                 stddev=self.config.initializer_range
             ),
             dtype=self.dtype,
@@ -68,7 +68,7 @@ class FlaxRobertaEmbeddings(nn.Module):
         self.token_type_embeddings = nn.Embed(
             self.config.type_vocab_size,
             self.config.hidden_size,
-            embedding_init=jax.nn.initializers.normal(
+            embedding_init=nnx.initializers.normal(
                 stddev=self.config.initializer_range
             ),
             dtype=self.dtype,
@@ -143,7 +143,7 @@ class FlaxRobertaSelfAttention(BaseAttentionModule):
             self.config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             **get_dot_general_by_bits(
                 bits=self.config.bits, mode=self.config.easy_method
             ),
@@ -152,7 +152,7 @@ class FlaxRobertaSelfAttention(BaseAttentionModule):
             self.config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             **get_dot_general_by_bits(
                 bits=self.config.bits, mode=self.config.easy_method
             ),
@@ -161,7 +161,7 @@ class FlaxRobertaSelfAttention(BaseAttentionModule):
             self.config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             **get_dot_general_by_bits(
                 bits=self.config.bits, mode=self.config.easy_method
             ),
@@ -315,7 +315,7 @@ class FlaxRobertaSelfOutput(nn.Module):
     def setup(self):
         self.dense = Dense(
             self.config.hidden_size,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
@@ -393,7 +393,7 @@ class FlaxRobertaIntermediate(nn.Module):
     def setup(self):
         self.dense = Dense(
             self.config.intermediate_size,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
@@ -418,7 +418,7 @@ class FlaxRobertaOutput(nn.Module):
     def setup(self):
         self.dense = Dense(
             self.config.hidden_size,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             dtype=self.dtype,
             precision=self.precision,
             param_dtype=self.param_dtype,
@@ -660,7 +660,7 @@ class FlaxRobertaPooler(nn.Module):
     def setup(self):
         self.dense = Dense(
             self.config.hidden_size,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
@@ -687,7 +687,7 @@ class FlaxRobertaLMHead(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             **get_dot_general_by_bits(
                 bits=self.config.bits, mode=self.config.easy_method
             ),
@@ -701,7 +701,7 @@ class FlaxRobertaLMHead(nn.Module):
             use_bias=False,
             param_dtype=self.param_dtype,
             precision=self.precision,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             **get_dot_general_by_bits(
                 bits=self.config.bits, mode=self.config.easy_method
             ),
@@ -737,7 +737,7 @@ class FlaxRobertaClassificationHead(nn.Module):
         self.dense = Dense(
             self.config.hidden_size,
             dtype=self.dtype,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             param_dtype=self.param_dtype,
             precision=self.precision,
             **get_dot_general_by_bits(
@@ -755,7 +755,7 @@ class FlaxRobertaClassificationHead(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             **get_dot_general_by_bits(
                 bits=self.config.bits, mode=self.config.easy_method
             ),

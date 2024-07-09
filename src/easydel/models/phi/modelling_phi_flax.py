@@ -122,7 +122,7 @@ class FlaxPhiAttention(BaseAttentionModule):
             precision=self.precision,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             **get_dot_general_by_bits(self.config.bits),
         )
 
@@ -702,7 +702,7 @@ class FlaxPhiForCausalLMModule(nn.Module):
         self.lm_head = Dense(
             self.config.vocab_size,
             use_bias=True,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,

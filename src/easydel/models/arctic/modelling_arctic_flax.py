@@ -89,7 +89,7 @@ class ArcticAttention(BaseAttentionModule):
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=getattr(self.config, "attention_bias", False),
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            kernel_init=nnx.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
         )
@@ -99,7 +99,7 @@ class ArcticAttention(BaseAttentionModule):
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=getattr(self.config, "attention_bias", False),
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            kernel_init=nnx.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
         )
@@ -109,7 +109,7 @@ class ArcticAttention(BaseAttentionModule):
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=getattr(self.config, "attention_bias", False),
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            kernel_init=nnx.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
         )
@@ -119,7 +119,7 @@ class ArcticAttention(BaseAttentionModule):
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            kernel_init=nnx.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
         )

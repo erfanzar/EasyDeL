@@ -66,7 +66,7 @@ class FlaxQwen2MLP(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             precision=self.precision,
         )
         self.down_proj = Dense(
@@ -74,7 +74,7 @@ class FlaxQwen2MLP(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             precision=self.precision,
         )
         self.up_proj = Dense(
@@ -82,7 +82,7 @@ class FlaxQwen2MLP(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             precision=self.precision,
         )
         self.dropout = flax.linen.Dropout(rate=self.config.resid_pdrop)
@@ -129,7 +129,7 @@ class FlaxQwen2Attention(BaseAttentionModule):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=True,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             precision=self.precision,
         )
         self.k_proj = Dense(
@@ -137,7 +137,7 @@ class FlaxQwen2Attention(BaseAttentionModule):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=True,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             precision=self.precision,
         )
         self.v_proj = Dense(
@@ -145,7 +145,7 @@ class FlaxQwen2Attention(BaseAttentionModule):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=True,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             precision=self.precision,
         )
         self.o_proj = Dense(
@@ -153,7 +153,7 @@ class FlaxQwen2Attention(BaseAttentionModule):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             precision=self.precision,
         )
 
@@ -876,7 +876,7 @@ class FlaxQwen2Module(nn.Module):
         self.embed_tokens = nn.Embed(
             self.config.vocab_size,
             self.config.hidden_size,
-            embedding_init=jax.nn.initializers.normal(
+            embedding_init=nnx.initializers.normal(
                 stddev=self.config.initializer_range
             ),
             dtype=self.dtype,
@@ -1048,9 +1048,7 @@ class FlaxQwen2ForCausalLMModule(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(
-                stddev=self.config.initializer_range
-            ),
+            kernel_init=nnx.initializers.normal(stddev=self.config.initializer_range),
             precision=self.precision,
         )
 
@@ -1219,9 +1217,7 @@ class FlaxQwen2ForSequenceClassificationModule(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(
-                stddev=self.config.initializer_range
-            ),
+            kernel_init=nnx.initializers.normal(stddev=self.config.initializer_range),
             precision=self.precision,
         )
 

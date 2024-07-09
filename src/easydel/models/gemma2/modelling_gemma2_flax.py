@@ -108,7 +108,7 @@ class Gemma2Attention(BaseAttentionModule):
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
 
-        kernel = jax.nn.initializers.normal(self.config.initializer_range)
+        kernel = nnx.initializers.normal(self.config.initializer_range)
 
         dense_class = partial(
             nnx.Linear,
@@ -315,7 +315,7 @@ class Gemma2MLP(nnx.Module):
             else 4 * embed_dim
         )
 
-        kernel_init = jax.nn.initializers.normal(self.config.initializer_range)
+        kernel_init = nnx.initializers.normal(self.config.initializer_range)
         hidden_activation = self.config.hidden_activation
         self.act = ACT2FN[hidden_activation]
 
@@ -484,7 +484,7 @@ class Gemma2Model(BaseNNXModule):
         self.embed_tokens = nnx.Embed(
             config.vocab_size,
             config.hidden_size,
-            embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+            embedding_init=nnx.initializers.normal(stddev=config.initializer_range),
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
@@ -577,9 +577,7 @@ class Gemma2Model(BaseNNXModule):
         if input_embeds is None and input_ids is not None:
             input_embeds = self.embed_tokens(input_ids.astype("i4"))
         else:
-            raise ValueError(
-                "you should specify input_embeds or input_ids one of them"
-            )
+            raise ValueError("you should specify input_embeds or input_ids one of them")
         batch_size, sequence_length, _ = input_embeds.shape
 
         if past_key_values is None:
@@ -656,7 +654,7 @@ class Gemma2ForCausalLM(BaseNNXModule):
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+            kernel_init=nnx.initializers.normal(stddev=config.initializer_range),
             rngs=rngs,
         )
 

@@ -80,7 +80,7 @@ class FlaxWhisperAttention(BaseAttentionModule):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
-            kernel_init=jax.nn.initializers.normal(self.config.init_std),
+            kernel_init=nnx.initializers.normal(self.config.init_std),
         )
 
         self.q_proj = dense(use_bias=self.bias)
@@ -260,14 +260,14 @@ class FlaxWhisperEncoderLayer(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
-            kernel_init=jax.nn.initializers.normal(self.config.init_std),
+            kernel_init=nnx.initializers.normal(self.config.init_std),
         )
         self.fc2 = Dense(
             self.embed_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
-            kernel_init=jax.nn.initializers.normal(self.config.init_std),
+            kernel_init=nnx.initializers.normal(self.config.init_std),
         )
         self.final_layer_norm = nn.LayerNorm(dtype=self.dtype, epsilon=1e-05)
 
@@ -417,14 +417,14 @@ class FlaxWhisperDecoderLayer(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
-            kernel_init=jax.nn.initializers.normal(self.config.init_std),
+            kernel_init=nnx.initializers.normal(self.config.init_std),
         )
         self.fc2 = Dense(
             self.embed_dim,
             param_dtype=self.param_dtype,
             precision=self.precision,
             dtype=self.dtype,
-            kernel_init=jax.nn.initializers.normal(self.config.init_std),
+            kernel_init=nnx.initializers.normal(self.config.init_std),
         )
         self.final_layer_norm = nn.LayerNorm(dtype=self.dtype, epsilon=1e-05)
 
@@ -591,7 +591,7 @@ class FlaxWhisperEncoder(nn.Module):
             self.config.d_model,
             kernel_size=(3,),
             padding=1,
-            kernel_init=jax.nn.initializers.normal(self.config.init_std),
+            kernel_init=nnx.initializers.normal(self.config.init_std),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
@@ -601,7 +601,7 @@ class FlaxWhisperEncoder(nn.Module):
             kernel_size=(3,),
             strides=2,
             padding=1,
-            kernel_init=jax.nn.initializers.normal(self.config.init_std),
+            kernel_init=nnx.initializers.normal(self.config.init_std),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
@@ -1221,7 +1221,7 @@ class FlaxWhisperForConditionalGenerationModule(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
-            kernel_init=jax.nn.initializers.normal(self.config.init_std),
+            kernel_init=nnx.initializers.normal(self.config.init_std),
         )
 
     def _get_encoder_module(self):

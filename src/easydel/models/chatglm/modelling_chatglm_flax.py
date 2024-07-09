@@ -1,5 +1,5 @@
 import math
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import chex
 import jax
@@ -16,7 +16,6 @@ from easydel.models.attention_module import FlexibleAttentionModule
 from easydel.models.caching_utils import KVCache
 from easydel.models.chatglm.chatglm_configuration import ChatGLMConfig as ChatGLMConfig
 from easydel.models.common import RMSNorm
-from typing import List
 from easydel.models.flax_modelling_utils import (
     BaseAttentionModule,
     with_sharding_constraint,
@@ -235,7 +234,7 @@ class ChatGLMAttention(BaseAttentionModule):
             use_bias=config.add_bias_linear or config.add_qkv_bias,
             dtype=dtype,
             param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            kernel_init=nnx.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
         )
@@ -254,7 +253,7 @@ class ChatGLMAttention(BaseAttentionModule):
             use_bias=config.add_bias_linear,
             dtype=dtype,
             param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            kernel_init=nnx.initializers.normal(config.initializer_range),
             precision=precision,
         )
         self.num_num_key_value_groupsreps = (
@@ -427,7 +426,7 @@ class MLP(nnx.Module):
             use_bias=self.add_bias,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             precision=self.precision,
             rngs=rngs,
         )
@@ -445,7 +444,7 @@ class MLP(nnx.Module):
             bias=self.add_bias,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             precision=self.precision,
             rngs=rngs,
         )
@@ -731,7 +730,7 @@ class ChatGLMModel(nnx.Module):
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            kernel_init=nnx.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
         )

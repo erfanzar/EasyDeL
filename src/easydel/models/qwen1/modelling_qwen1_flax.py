@@ -113,7 +113,7 @@ class FlaxQwen1MLP(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=not self.config.no_bias,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             precision=self.precision,
         )
         self.w2 = Dense(
@@ -121,7 +121,7 @@ class FlaxQwen1MLP(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=not self.config.no_bias,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             precision=self.precision,
         )
         self.c_proj = Dense(
@@ -129,7 +129,7 @@ class FlaxQwen1MLP(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=not self.config.no_bias,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             precision=self.precision,
         )
 
@@ -175,7 +175,7 @@ class FlaxQwen1Attention(BaseAttentionModule):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=True,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            kernel_init=nnx.initializers.normal(config.initializer_range),
             precision=self.precision,
         )
 
@@ -184,7 +184,7 @@ class FlaxQwen1Attention(BaseAttentionModule):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=not self.config.no_bias,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             precision=self.precision,
         )
         logn_list = [
@@ -1015,7 +1015,7 @@ class FlaxQwen1Module(nn.Module):
         self.wte = nn.Embed(
             self.config.vocab_size,
             self.config.hidden_size,
-            embedding_init=jax.nn.initializers.normal(
+            embedding_init=nnx.initializers.normal(
                 stddev=self.config.initializer_range
             ),
             dtype=self.dtype,
@@ -1185,9 +1185,7 @@ class FlaxQwen1ForCausalLMModule(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(
-                stddev=self.config.initializer_range
-            ),
+            kernel_init=nnx.initializers.normal(stddev=self.config.initializer_range),
             precision=self.precision,
         )
 
@@ -1315,9 +1313,7 @@ class FlaxQwen1ForSequenceClassificationModule(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(
-                stddev=self.config.initializer_range
-            ),
+            kernel_init=nnx.initializers.normal(stddev=self.config.initializer_range),
             precision=self.precision,
         )
 

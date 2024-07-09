@@ -71,7 +71,7 @@ class FlaxOPTAttention(BaseAttentionModule):
             self.embed_dim,
             use_bias=self.bias,
             dtype=self.dtype,
-            kernel_init=jax.nn.initializers.normal(self.config.init_std),
+            kernel_init=nnx.initializers.normal(self.config.init_std),
         )
 
         self.q_proj, self.k_proj, self.v_proj = dense(), dense(), dense()
@@ -230,12 +230,12 @@ class FlaxOPTDecoderLayer(nn.Module):
         self.fc1 = Dense(
             self.config.ffn_dim,
             dtype=self.dtype,
-            kernel_init=jax.nn.initializers.normal(self.config.init_std),
+            kernel_init=nnx.initializers.normal(self.config.init_std),
         )
         self.fc2 = Dense(
             self.embed_dim,
             dtype=self.dtype,
-            kernel_init=jax.nn.initializers.normal(self.config.init_std),
+            kernel_init=nnx.initializers.normal(self.config.init_std),
         )
         self.final_layer_norm = nn.LayerNorm(dtype=self.dtype, epsilon=1e-05)
 
@@ -381,14 +381,14 @@ class FlaxOPTDecoder(nn.Module):
         self.embed_tokens = nn.Embed(
             self.config.vocab_size,
             self.config.word_embed_proj_dim,
-            embedding_init=jax.nn.initializers.normal(self.config.init_std),
+            embedding_init=nnx.initializers.normal(self.config.init_std),
             dtype=self.dtype,
         )
 
         self.embed_positions = FlaxOPTLearnedPositionalEmbedding(
             self.config.max_position_embeddings,
             embed_dim,
-            embedding_init=jax.nn.initializers.normal(self.config.init_std),
+            embedding_init=nnx.initializers.normal(self.config.init_std),
             dtype=self.dtype,
         )
 
@@ -670,7 +670,7 @@ class FlaxOPTForCausalLMModule(nn.Module):
             self.config.vocab_size,
             use_bias=False,
             dtype=self.dtype,
-            kernel_init=jax.nn.initializers.normal(self.config.init_std),
+            kernel_init=nnx.initializers.normal(self.config.init_std),
         )
 
     def __call__(

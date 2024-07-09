@@ -100,13 +100,13 @@ class FlaxT5DenseActDense(nn.Module):
         self.wi = Dense(
             self.config.d_ff,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(wi_init_std),
+            kernel_init=nnx.initializers.normal(wi_init_std),
             dtype=self.dtype,
         )
         self.wo = Dense(
             self.config.d_model,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(wo_init_std),
+            kernel_init=nnx.initializers.normal(wo_init_std),
             dtype=self.dtype,
         )
         self.dropout = flax.linen.Dropout(self.config.dropout_rate)
@@ -131,19 +131,19 @@ class FlaxT5DenseGatedActDense(nn.Module):
         self.wi_0 = Dense(
             self.config.d_ff,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(wi_init_std),
+            kernel_init=nnx.initializers.normal(wi_init_std),
             dtype=self.dtype,
         )
         self.wi_1 = Dense(
             self.config.d_ff,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(wi_init_std),
+            kernel_init=nnx.initializers.normal(wi_init_std),
             dtype=self.dtype,
         )
         self.wo = Dense(
             self.config.d_model,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(wo_init_std),
+            kernel_init=nnx.initializers.normal(wo_init_std),
             dtype=self.dtype,
         )
         self.dropout = flax.linen.Dropout(self.config.dropout_rate)
@@ -213,25 +213,25 @@ class FlaxT5Attention(BaseAttentionModule):
         self.q = Dense(
             self.inner_dim,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(q_init_std),
+            kernel_init=nnx.initializers.normal(q_init_std),
             dtype=self.dtype,
         )
         self.k = Dense(
             self.inner_dim,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(kv_init_std),
+            kernel_init=nnx.initializers.normal(kv_init_std),
             dtype=self.dtype,
         )
         self.v = Dense(
             self.inner_dim,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(kv_init_std),
+            kernel_init=nnx.initializers.normal(kv_init_std),
             dtype=self.dtype,
         )
         self.o = Dense(
             self.d_model,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(o_init_std),
+            kernel_init=nnx.initializers.normal(o_init_std),
             dtype=self.dtype,
         )
 
@@ -239,7 +239,7 @@ class FlaxT5Attention(BaseAttentionModule):
             self.relative_attention_bias = nn.Embed(
                 self.relative_attention_num_buckets,
                 self.n_heads,
-                embedding_init=jax.nn.initializers.normal(kv_init_std),
+                embedding_init=nnx.initializers.normal(kv_init_std),
                 dtype=self.dtype,
             )
 
@@ -1157,7 +1157,7 @@ class FlaxT5Module(nn.Module):
         self.shared = nn.Embed(
             self.config.vocab_size,
             self.config.d_model,
-            embedding_init=jax.nn.initializers.normal(
+            embedding_init=nnx.initializers.normal(
                 self.config.initializer_factor * 1.0
             ),
             dtype=self.dtype,
@@ -1248,7 +1248,7 @@ class FlaxT5EncoderModule(nn.Module):
         self.shared = nn.Embed(
             self.config.vocab_size,
             self.config.d_model,
-            embedding_init=jax.nn.initializers.normal(
+            embedding_init=nnx.initializers.normal(
                 self.config.initializer_factor * 1.0
             ),
             dtype=self.dtype,
@@ -1352,7 +1352,7 @@ class FlaxT5ForConditionalGenerationModule(nn.Module):
         self.shared = nn.Embed(
             self.config.vocab_size,
             self.config.d_model,
-            embedding_init=jax.nn.initializers.normal(self.config.initializer_factor),
+            embedding_init=nnx.initializers.normal(self.config.initializer_factor),
             dtype=self.dtype,
         )
 
@@ -1381,7 +1381,7 @@ class FlaxT5ForConditionalGenerationModule(nn.Module):
         self.lm_head = Dense(
             self.config.vocab_size,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_factor),
+            kernel_init=nnx.initializers.normal(self.config.initializer_factor),
             dtype=self.dtype,
         )
 

@@ -804,7 +804,7 @@ class DeepseekV2Model(BaseNNXModule):
         self.embed_tokens = nnx.Embed(
             config.vocab_size,
             config.hidden_size,
-            embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+            embedding_init=nnx.initializers.normal(stddev=config.initializer_range),
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,

@@ -78,7 +78,7 @@ class MistralAttention(BaseAttentionModule):
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            kernel_init=nnx.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
         )
@@ -88,7 +88,7 @@ class MistralAttention(BaseAttentionModule):
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            kernel_init=nnx.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
         )
@@ -98,7 +98,7 @@ class MistralAttention(BaseAttentionModule):
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            kernel_init=nnx.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
         )
@@ -108,7 +108,7 @@ class MistralAttention(BaseAttentionModule):
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            kernel_init=nnx.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
         )
@@ -293,7 +293,7 @@ class MistralMLP(nnx.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            kernel_init=nnx.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
         )
@@ -303,7 +303,7 @@ class MistralMLP(nnx.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            kernel_init=nnx.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
         )
@@ -313,7 +313,7 @@ class MistralMLP(nnx.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            kernel_init=nnx.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
         )
@@ -474,7 +474,7 @@ class MistralModel(BaseNNXModule):
         self.embed_tokens = nnx.Embed(
             config.vocab_size,
             config.hidden_size,
-            embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+            embedding_init=nnx.initializers.normal(stddev=config.initializer_range),
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
@@ -676,7 +676,7 @@ class MistralForCausalLM(BaseNNXModule):
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+            kernel_init=nnx.initializers.normal(stddev=config.initializer_range),
             precision=precision,
             rngs=rngs,
         )
@@ -768,7 +768,7 @@ class MistralForSequenceClassification(BaseNNXModule):
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+            kernel_init=nnx.initializers.normal(stddev=config.initializer_range),
             precision=precision,
         )
 
@@ -830,7 +830,7 @@ class VisionMistralModel(BaseNNXModule):
         self.embed_vision = nnx.Embed(
             config.vision_vocab_size,
             config.hidden_size,
-            embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+            embedding_init=nnx.initializers.normal(stddev=config.initializer_range),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             rngs=rngs,
@@ -839,7 +839,7 @@ class VisionMistralModel(BaseNNXModule):
         self.embed_tokens = nnx.Embed(
             config.vocab_size,
             config.hidden_size,
-            embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+            embedding_init=nnx.initializers.normal(stddev=config.initializer_range),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             rngs=rngs,
@@ -1022,7 +1022,7 @@ class VisionMistralForCausalLM(BaseNNXModule):
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+            kernel_init=nnx.initializers.normal(stddev=config.initializer_range),
             precision=precision,
             rngs=rngs,
         )
@@ -1032,7 +1032,7 @@ class VisionMistralForCausalLM(BaseNNXModule):
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+            kernel_init=nnx.initializers.normal(stddev=config.initializer_range),
             precision=precision,
             rngs=rngs,
         )

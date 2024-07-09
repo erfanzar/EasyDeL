@@ -35,9 +35,7 @@ class FlaxMptMLP(nn.Module):
     def setup(self) -> None:
         self.up_proj = Dense(
             self.config.expansion_ratio * self.config.hidden_size,
-            kernel_init=jax.nn.initializers.normal(
-                stddev=self.config.initializer_range
-            ),
+            kernel_init=nnx.initializers.normal(stddev=self.config.initializer_range),
             use_bias=self.config.use_bias,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -45,9 +43,7 @@ class FlaxMptMLP(nn.Module):
         )
         self.down_proj = Dense(
             self.config.hidden_size,
-            kernel_init=jax.nn.initializers.normal(
-                stddev=self.config.initializer_range
-            ),
+            kernel_init=nnx.initializers.normal(stddev=self.config.initializer_range),
             use_bias=self.config.use_bias,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -82,9 +78,7 @@ class FlaxMptAttention(BaseAttentionModule):
     def setup(self) -> None:
         self.Wqkv = Dense(
             self.config.hidden_size * 3,
-            kernel_init=jax.nn.initializers.normal(
-                stddev=self.config.initializer_range
-            ),
+            kernel_init=nnx.initializers.normal(stddev=self.config.initializer_range),
             use_bias=self.config.use_bias,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -92,9 +86,7 @@ class FlaxMptAttention(BaseAttentionModule):
         )
         self.out_proj = Dense(
             self.config.hidden_size,
-            kernel_init=jax.nn.initializers.normal(
-                stddev=self.config.initializer_range
-            ),
+            kernel_init=nnx.initializers.normal(stddev=self.config.initializer_range),
             use_bias=self.config.use_bias,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -604,9 +596,7 @@ class FlaxMptForCausalLMModule(nn.Module):
 
         self.lm_head = Dense(
             self.config.vocab_size,
-            kernel_init=jax.nn.initializers.normal(
-                stddev=self.config.initializer_range
-            ),
+            kernel_init=nnx.initializers.normal(stddev=self.config.initializer_range),
             use_bias=self.config.use_bias,
             dtype=self.dtype,
             param_dtype=self.param_dtype,

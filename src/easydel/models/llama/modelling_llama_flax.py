@@ -78,7 +78,7 @@ class LlamaAttention(BaseAttentionModule):
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=config.attention_bias,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            kernel_init=nnx.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
         )
@@ -88,7 +88,7 @@ class LlamaAttention(BaseAttentionModule):
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=config.attention_bias,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            kernel_init=nnx.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
         )
@@ -98,7 +98,7 @@ class LlamaAttention(BaseAttentionModule):
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=config.attention_bias,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            kernel_init=nnx.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
         )
@@ -108,7 +108,7 @@ class LlamaAttention(BaseAttentionModule):
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            kernel_init=nnx.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
         )
@@ -292,7 +292,7 @@ class LlamaMLP(nnx.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=config.mlp_bias,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            kernel_init=nnx.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
         )
@@ -302,7 +302,7 @@ class LlamaMLP(nnx.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=config.mlp_bias,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            kernel_init=nnx.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
         )
@@ -312,7 +312,7 @@ class LlamaMLP(nnx.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=config.mlp_bias,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            kernel_init=nnx.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
         )
@@ -473,7 +473,7 @@ class LlamaModel(BaseNNXModule):
         self.embed_tokens = nnx.Embed(
             config.vocab_size,
             config.hidden_size,
-            embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+            embedding_init=nnx.initializers.normal(stddev=config.initializer_range),
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
@@ -676,7 +676,7 @@ class LlamaForCausalLM(BaseNNXModule):
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+            kernel_init=nnx.initializers.normal(stddev=config.initializer_range),
             precision=precision,
             rngs=rngs,
         )
@@ -768,7 +768,7 @@ class LlamaForSequenceClassification(BaseNNXModule):
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+            kernel_init=nnx.initializers.normal(stddev=config.initializer_range),
             precision=precision,
         )
 
@@ -828,7 +828,7 @@ class VisionLlamaModel(BaseNNXModule):
         self.embed_vision = nnx.Embed(
             config.vision_vocab_size,
             config.hidden_size,
-            embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+            embedding_init=nnx.initializers.normal(stddev=config.initializer_range),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             rngs=rngs,
@@ -837,7 +837,7 @@ class VisionLlamaModel(BaseNNXModule):
         self.embed_tokens = nnx.Embed(
             config.vocab_size,
             config.hidden_size,
-            embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+            embedding_init=nnx.initializers.normal(stddev=config.initializer_range),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             rngs=rngs,
@@ -1020,7 +1020,7 @@ class VisionLlamaForCausalLM(BaseNNXModule):
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+            kernel_init=nnx.initializers.normal(stddev=config.initializer_range),
             precision=precision,
             rngs=rngs,
         )
@@ -1030,7 +1030,7 @@ class VisionLlamaForCausalLM(BaseNNXModule):
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+            kernel_init=nnx.initializers.normal(stddev=config.initializer_range),
             precision=precision,
             rngs=rngs,
         )

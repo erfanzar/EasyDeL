@@ -62,7 +62,7 @@ class FlaxStableLmMLP(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             precision=self.precision,
         )
         self.down_proj = Dense(
@@ -70,7 +70,7 @@ class FlaxStableLmMLP(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             precision=self.precision,
         )
         self.up_proj = Dense(
@@ -78,7 +78,7 @@ class FlaxStableLmMLP(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             precision=self.precision,
         )
         self.act_fn = ACT2FN[config.hidden_act]
@@ -182,7 +182,7 @@ class FlaxStableLmAttention(BaseAttentionModule):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=self.config.use_qkv_bias,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             precision=self.precision,
         )
         self.k_proj = Dense(
@@ -190,7 +190,7 @@ class FlaxStableLmAttention(BaseAttentionModule):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=self.config.use_qkv_bias,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             precision=self.precision,
         )
         self.v_proj = Dense(
@@ -198,7 +198,7 @@ class FlaxStableLmAttention(BaseAttentionModule):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=self.config.use_qkv_bias,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             precision=self.precision,
         )
         self.o_proj = Dense(
@@ -206,7 +206,7 @@ class FlaxStableLmAttention(BaseAttentionModule):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             precision=self.precision,
         )
 
@@ -830,7 +830,7 @@ class FlaxStableLmForCausalLMModule(nn.Module):
         self.lm_head = Dense(
             self.config.vocab_size,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,

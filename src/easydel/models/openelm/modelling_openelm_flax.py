@@ -83,7 +83,7 @@ class FlaxOpenELMMultiHeadCausalAttention(BaseAttentionModule):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
             precision=self.precision,
         )
         if config.normalize_qk_projections:
@@ -109,7 +109,7 @@ class FlaxOpenELMMultiHeadCausalAttention(BaseAttentionModule):
             param_dtype=self.param_dtype,
             use_bias=False,
             precision=self.precision,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=nnx.initializers.normal(self.config.initializer_range),
         )
         self.head_dim = head_dim
         self.rotary = FlaxOpenELMRotaryEmbedding(self.dtype)
@@ -372,7 +372,7 @@ class FlaxOpenELMFeedForwardNetwork(nn.Module):
                 dtype=self.dtype,
                 param_dtype=self.param_dtype,
                 precision=self.precision,
-                kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+                kernel_init=nnx.initializers.normal(self.config.initializer_range),
             )
             self.proj_2 = nn.Dense(
                 config.model_dim,
@@ -380,7 +380,7 @@ class FlaxOpenELMFeedForwardNetwork(nn.Module):
                 dtype=self.dtype,
                 param_dtype=self.param_dtype,
                 precision=self.precision,
-                kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+                kernel_init=nnx.initializers.normal(self.config.initializer_range),
             )
             self.ffn_with_glu = True
         else:
@@ -390,7 +390,7 @@ class FlaxOpenELMFeedForwardNetwork(nn.Module):
                 dtype=self.dtype,
                 param_dtype=self.param_dtype,
                 precision=self.precision,
-                kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+                kernel_init=nnx.initializers.normal(self.config.initializer_range),
             )
             self.proj_2 = nn.Dense(
                 config.model_dim,
@@ -398,7 +398,7 @@ class FlaxOpenELMFeedForwardNetwork(nn.Module):
                 dtype=self.dtype,
                 param_dtype=self.param_dtype,
                 precision=self.precision,
-                kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+                kernel_init=nnx.initializers.normal(self.config.initializer_range),
             )
             self.ffn_with_glu = False
 
@@ -987,9 +987,7 @@ class FlaxOpenELMForCausalLMModule(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(
-                stddev=self.config.initializer_range
-            ),
+            kernel_init=nnx.initializers.normal(stddev=self.config.initializer_range),
             precision=self.precision,
         )
 

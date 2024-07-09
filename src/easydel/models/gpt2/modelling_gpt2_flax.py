@@ -430,7 +430,7 @@ class GPT2Model(BaseNNXModule):
         self.wte = nnx.Embed(
             config.vocab_size,
             self.embed_dim,
-            embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+            embedding_init=nnx.initializers.normal(stddev=config.initializer_range),
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
@@ -438,7 +438,7 @@ class GPT2Model(BaseNNXModule):
         self.wpe = nnx.Embed(
             config.max_position_embeddings,
             self.embed_dim,
-            embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+            embedding_init=nnx.initializers.normal(stddev=config.initializer_range),
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
@@ -598,9 +598,7 @@ class FlaxGPT2LMHeadModule(BaseNNXModule):
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
-            kernel_init=jax.nn.initializers.normal(
-                stddev=self.config.initializer_range
-            ),
+            kernel_init=nnx.initializers.normal(stddev=self.config.initializer_range),
             rngs=rngs,
         )
 

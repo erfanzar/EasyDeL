@@ -329,7 +329,7 @@ class GemmaMLP(nnx.Module):
             else 4 * embed_dim
         )
 
-        kernel_init = jax.nn.initializers.normal(self.config.initializer_range)
+        kernel_init = nnx.initializers.normal(self.config.initializer_range)
         if self.config.hidden_activation is None:
             warnings.warn(
                 "Gemma's activation function should be approximate GeLU and not exact GeLU. "
@@ -493,7 +493,7 @@ class GemmaModel(BaseNNXModule):
         self.embed_tokens = nnx.Embed(
             config.vocab_size,
             config.hidden_size,
-            embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+            embedding_init=nnx.initializers.normal(stddev=config.initializer_range),
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
@@ -678,7 +678,7 @@ class GemmaForCausalLM(BaseNNXModule):
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+            kernel_init=nnx.initializers.normal(stddev=config.initializer_range),
             rngs=rngs,
         )
 
@@ -769,7 +769,7 @@ class GemmaForSequenceClassification(BaseNNXModule):
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+            kernel_init=nnx.initializers.normal(stddev=config.initializer_range),
             precision=precision,
         )
 

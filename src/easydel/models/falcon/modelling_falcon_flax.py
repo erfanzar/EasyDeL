@@ -870,7 +870,7 @@ class FalconForSequenceClassification(BaseNNXModule):
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+            kernel_init=nnx.initializers.normal(stddev=config.initializer_range),
             precision=precision,
         )
 
