@@ -130,7 +130,7 @@ class Gemma2Attention(BaseAttentionModule):
             num_attention_heads=self.config.num_attention_heads,
             head_dims=self.head_dim,
             attn_mechanism=self.config.attn_mechanism,
-            mesh=self.config.get_mesh(),
+            mesh=self.config.mesh,
             sm_scale=self.config.query_pre_attn_scalar**-0.5,
             axis_name=self.config.attention_axis_name,
             base_config=config,

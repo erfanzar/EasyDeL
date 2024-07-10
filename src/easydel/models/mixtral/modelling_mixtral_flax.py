@@ -117,7 +117,7 @@ class FlaxMixtralAttention(BaseAttentionModule):
             dtype=self.config.attn_dtype,
             partition_axis=self.config.partition_axis,
             scan_ring_attention=self.config.scan_ring_attention,
-            mesh=self.config.get_mesh(),
+            mesh=self.config.mesh,
             sm_scale=1 / math.sqrt(self.head_dim),
             axis_name=self.config.attention_axis_name,
         )

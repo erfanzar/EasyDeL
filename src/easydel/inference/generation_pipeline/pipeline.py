@@ -47,7 +47,7 @@ class GenerationPipeline:
         self.over_compiled_func = None
         self._rng_gen = GenerateRNG(seed or 42)
         self.input_partition_spec = input_partition_spec
-        self.mesh = self.model.config.get_mesh()
+        self.mesh = self.model.config.mesh
         if partition_rules is None:
             partition_rules = self.model.config.get_partition_rules(True)
         self.model_sharding = self.model.get_named_sharding(

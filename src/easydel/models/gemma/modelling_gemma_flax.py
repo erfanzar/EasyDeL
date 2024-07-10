@@ -154,7 +154,7 @@ class GemmaAttention(BaseAttentionModule):
             precision=self.precision,
             force_float32_tpu=True,
             dtype=self.config.attn_dtype,
-            mesh=self.config.get_mesh(),
+            mesh=self.config.mesh,
             sm_scale=self.head_dim**-0.5,
             base_config=config,
         )

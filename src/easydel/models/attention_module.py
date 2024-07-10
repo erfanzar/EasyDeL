@@ -1557,7 +1557,7 @@ class FlexibleAttentionModule(object):
                 attn_mechanism=attn_mechanism,
                 axis_name="sp",
                 dtype=dtype,
-                mesh=config.get_mesh(),
+                mesh=config.mesh,
                 head_dims=q.shape[-1],
                 sm_scale=1 / math.sqrt(q.shape[-1]),
                 num_attention_heads=q.shape[-2],

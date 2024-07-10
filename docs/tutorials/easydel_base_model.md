@@ -17,7 +17,7 @@ The `BaseNNXModule` class serves as the base class for all pre-trained models in
       - `_do_init` (`bool`): Whether to immediately initialize the model's parameters.
 
 2. **Sharding and Partitioning:**
-   - **`mesh` Property:** Returns the JAX mesh used for distributed training, as defined in the model's configuration (`self.config.get_mesh()`).
+   - **`mesh` Property:** Returns the JAX mesh used for distributed training, as defined in the model's configuration (`self.config.mesh`).
    - **`get_named_sharding(...)`:** Generates named sharding specifications based on the model's parameters and configured partitioning rules.
 
 3. **Embedding Accessors:**

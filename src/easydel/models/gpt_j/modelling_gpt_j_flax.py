@@ -108,7 +108,7 @@ class GPTJAttention(BaseAttentionModule):
             head_dims=self.head_dim,
             precision=precision,
             attn_mechanism=config.attn_mechanism,
-            mesh=config.get_mesh(),
+            mesh=config.mesh,
             sm_scale=1 / math.sqrt(self.head_dim),
             base_config=config,
         )

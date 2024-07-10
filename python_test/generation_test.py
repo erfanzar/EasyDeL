@@ -1,6 +1,6 @@
 import gc
-from unittest import TestCase
 import unittest
+from unittest import TestCase
 
 import flax.traverse_util
 from fjformer import make_shard_and_gather_fns, match_partition_rules
@@ -15,14 +15,14 @@ except ModuleNotFoundError:
     sys.path.append(cp)
     import src.python.easydel as ed
 
-from jax import numpy as jnp
-import torch
-import numpy as np
-
 import copy
+from typing import Dict, Literal, Optional, Union
+
 import jax
+import numpy as np
+import torch
 import transformers
-from typing import Optional, Dict, Union, Literal
+from jax import numpy as jnp
 
 torch.manual_seed(42)
 
@@ -49,7 +49,7 @@ class EasyModelsGenerationTest(TestCase):
         self.resid_pdrop: float = 0.0
         self.embd_pdrop: float = 0.0
         self.attention_dropout: float = 0.0
-        self.rope_theta: float = 10000.
+        self.rope_theta: float = 10000.0
         self.attention_bias: bool = False
         self.tie_word_embeddings: bool = False
         self.gradient_checkpointing: str = "nothing_saveable"  #
@@ -76,7 +76,7 @@ class EasyModelsGenerationTest(TestCase):
             "legacy_sharded_vanilla",
             "wise_ring",
             "blockwise",
-            "pallas_flash"
+            "pallas_flash",
         ] = "sharded_vanilla"
         self.block_k: int = 64
         self.block_q: int = 64
@@ -84,10 +84,12 @@ class EasyModelsGenerationTest(TestCase):
         self.quantize_kv_cache = True
 
     def create_generation_test_for_models(
-            self,
-            module_name: str,
+        self,
+        module_name: str,
     ):
-        module_config, module_class, transform_function = ed.get_modules_by_type(module_name)
+        module_config, module_class, transform_function = ed.get_modules_by_type(
+            module_name
+        )
         config = module_config(
             vocab_size=self.vocab_size,
             hidden_size=self.hidden_size,
@@ -109,7 +111,7 @@ class EasyModelsGenerationTest(TestCase):
         config.add_jax_args()
         config.add_basic_configurations(
             shard_attention_computation=self.shard_attention_computation,
-            scan_mlp_chunk_size=self.scan_mlp_chunk_size
+            scan_mlp_chunk_size=self.scan_mlp_chunk_size,
         )
 
         model = module_class(
@@ -117,28 +119,26 @@ class EasyModelsGenerationTest(TestCase):
             dtype=self.dtype,
             param_dtype=self.dtype,
             precision=self.precision,
-            _do_init=True
+            _do_init=True,
         )
-        mesh = config.get_mesh()
+        mesh = config.mesh
         server_config = ed.JAXServerConfig(
             batch_size=1,
             max_sequence_length=self.max_position_embeddings,
             dtype=self.dtype,
             use_prefix_tokenizer=True,
             max_compile_tokens=self.max_position_embeddings // 4,
-            max_new_tokens=self.max_position_embeddings
+            max_new_tokens=self.max_position_embeddings,
         )
         server = ed.JAXServer.from_parameters(
             config_model=config,
             model=model,
             params=model.params,
             server_config=server_config,
-            tokenizer=self.tokenizer
+            tokenizer=self.tokenizer,
         )
         response = None
-        for response, tokens_used in server.sample(
-                ""
-        ):
+        for response, tokens_used in server.sample(""):
             ...
         return response
 
@@ -166,9 +166,7 @@ class EasyModelsGenerationTest(TestCase):
     def test_mixtral(self):
         response = self.create_generation_test_for_models("mixtral")
         print(f"Mixtral EasyDeL Generated Sequence:\n{response}")
-        self.assertTrue(
-            True
-        )
+        self.assertTrue(True)
 
     def test_gpt2(self):
         response = self.create_generation_test_for_models("gpt2")
@@ -227,14 +225,11 @@ class EasyModelsGenerationTest(TestCase):
     #     )
 
     @staticmethod
-    def make_input_id(
-            vocab_size: int,
-            input_shape: tuple[int, int]
-    ):
+    def make_input_id(vocab_size: int, input_shape: tuple[int, int]):
         np_input_ids = np.random.randint(0, vocab_size, input_shape)
         return (
             torch.from_numpy(np_input_ids).reshape(1, -1).to(torch.long),
-            jnp.asarray(np_input_ids, dtype="i4").reshape(1, -1)
+            jnp.asarray(np_input_ids, dtype="i4").reshape(1, -1),
         )
 
 

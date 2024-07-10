@@ -183,7 +183,7 @@ class AutoRLModelForCasualLMWithValueHead:
         return generate
 
     def get_mesh(self):
-        return self.module.config.get_mesh()
+        return self.module.config.mesh
 
     def generate(
         self, input_id, attention_mask, params: dict | flax.core.FrozenDict = None
@@ -202,7 +202,7 @@ class AutoRLModelForCasualLMWithValueHead:
                 lambda f, p: f(p),
                 make_shard_and_gather_fns(
                     match_partition_rules(partition_rules, params),
-                    mesh=self.module.config.get_mesh(),
+                    mesh=self.module.config.mesh,
                 )[0],
                 params,
             )

@@ -95,7 +95,7 @@ def main():
             attention_dim_axis=None,
         ),
         scan_ring_attention=config.scan_ring_attention,
-        mesh=config.get_mesh(),
+        mesh=config.mesh,
         sm_scale=1 / math.sqrt(q.shape[-1]),
         axis_name=config.attention_axis_name,
     )
@@ -128,12 +128,12 @@ def main():
         attn_mechanism="sharded_vanilla",
         dtype=jnp.float32,
         scan_ring_attention=config.scan_ring_attention,
-        mesh=config.get_mesh(),
+        mesh=config.mesh,
         sm_scale=1 / math.sqrt(q.shape[-1]),
         axis_name=config.attention_axis_name,
     )
 
-    with config.get_mesh():
+    with config.mesh:
         flash_attn_out = flash_attention(
             query_states=q,
             key_states=k,

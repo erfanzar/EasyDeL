@@ -936,7 +936,7 @@ class AutoShardAndGatherFunctions:
         )
         shard_fns, gather_fns = make_shard_and_gather_fns(
             partition_specs=partition_specs,
-            mesh=config.get_mesh(),
+            mesh=config.mesh,
         )
         if depth_target is not None:
             for dp in depth_target[::-1]:

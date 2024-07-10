@@ -110,7 +110,7 @@ class FlaxMptAttention(BaseAttentionModule):
             force_float32_tpu=True,
             attn_mechanism=self.config.attn_mechanism,
             dtype=self.config.attn_dtype,
-            mesh=self.config.get_mesh(),
+            mesh=self.config.mesh,
             sm_scale=1 / math.sqrt(self.head_dim),
             axis_name=self.config.attention_axis_name,
             base_config=self.config,
