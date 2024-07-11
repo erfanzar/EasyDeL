@@ -31,7 +31,7 @@ class MambaConfig(EDPretrainedConfig):
         time_step_floor=1e-4,
         rescale_prenorm_residual=False,
         use_cache=True,
-        gradient_checkpointing: str = "nothing_saveable",
+        gradient_checkpointing: str = "",
         **kwargs,
     ):
         self.vocab_size = vocab_size

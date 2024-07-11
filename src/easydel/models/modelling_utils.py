@@ -558,8 +558,19 @@ class BaseNNXModule(PushToHubMixin, nnx.Module):
     def init_cache(self, batch_size: int, max_length: int):
         raise NotImplementedError("init_cache is not Implemented Yet!")
 
+    def update_inputs_for_generation(
+        self,
+        model_outputs,  # Keep it here, just in case that this might be needed.
+        model_kwargs,
+    ):
+        model_kwargs["position_ids"] = model_kwargs["position_ids"][:, -1:] + 1
+        return model_kwargs
+
     def prepare_inputs_for_generation(
-        self, input_ids, max_length, attention_mask: Optional[chex.Array] = None
+        self,
+        input_ids,
+        max_length,
+        attention_mask: Optional[chex.Array] = None,
     ):
         """The prepare_inputs_for_generation function is used to prepare the inputs for a generation task.
 
@@ -567,8 +578,7 @@ class BaseNNXModule(PushToHubMixin, nnx.Module):
             self: Access variables that belong to the class
             input_ids: Pass in the input tokens
             max_length: Set the length of the sequence to be generated
-            attention_mask: Optional[chex.Array]: Mask the attention
-                weights
+            attention_mask: Optional[chex.Array]: Mask the attention weights
 
         Returns:
             A dictionary of the past_key_values, attention_mask and
@@ -576,7 +586,6 @@ class BaseNNXModule(PushToHubMixin, nnx.Module):
         """
         batch_size, seq_length = input_ids.shape
 
-        past_key_values = self.init_cache(batch_size, max_length)
         extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
         if attention_mask is not None:
             position_ids = attention_mask.cumsum(axis=-1) - 1
@@ -589,15 +598,9 @@ class BaseNNXModule(PushToHubMixin, nnx.Module):
             )
 
         return {
-            "past_key_values": past_key_values,
             "attention_mask": extended_attention_mask,
             "position_ids": position_ids,
         }
-
-    def update_inputs_for_generation(self, model_outputs, model_kwargs):
-        model_kwargs["past_key_values"] = model_outputs.past_key_values
-        model_kwargs["position_ids"] = model_kwargs["position_ids"][:, -1:] + 1
-        return model_kwargs
 
     def __call__(
         self,
@@ -655,6 +658,10 @@ class BaseNNXModule(PushToHubMixin, nnx.Module):
     @property
     def can_generate(self):
         return False
+
+    @property
+    def model_architecure_type(self):
+        return "causal_language_model_transformer"
 
     def to_state(self):
         """

@@ -929,7 +929,7 @@ class EasyDeLState(struct.PyTreeNode):
         Returns:
             A PyTorch model equivalent to the EasyDeL model.
         """
-        return self.module.to_pytorch(
+        return self.to_pytorch(
             params=self.params,
             base_hf_auto_class=base_hf_auto_class,
             easystate_to_huggingface_model_kwargs=easystate_to_huggingface_model_kwargs,

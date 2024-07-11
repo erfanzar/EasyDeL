@@ -969,7 +969,7 @@ class FlaxT5PreTrainedModel(BaseNNXModule):
         # Handle any PRNG if needed
         rngs = {"dropout": dropout_rng} if dropout_rng is not None else {}
 
-        return self.module.apply(
+        return self.apply(
             {"params": params or self.params},
             input_ids=jnp.array(input_ids, dtype="i4"),
             attention_mask=jnp.array(attention_mask, dtype="i4"),
@@ -1043,7 +1043,7 @@ class FlaxT5PreTrainedModel(BaseNNXModule):
             encode_module = module._get_encoder_module()
             return encode_module(input_ids, attention_mask, **kwargs)
 
-        return self.module.apply(
+        return self.apply(
             {"params": params or self.params},
             input_ids=jnp.array(input_ids, dtype="i4"),
             attention_mask=jnp.array(attention_mask, dtype="i4"),
@@ -1323,7 +1323,7 @@ class FlaxT5EncoderModel(FlaxT5PreTrainedModel):
         # Handle any PRNG if needed
         rngs = {"dropout": dropout_rng} if dropout_rng is not None else {}
 
-        return self.module.apply(
+        return self.apply(
             {"params": params or self.params},
             input_ids=jnp.array(input_ids, dtype="i4"),
             attention_mask=jnp.array(attention_mask, dtype="i4"),

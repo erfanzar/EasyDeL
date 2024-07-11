@@ -716,7 +716,7 @@ class FlaxRwkvPretrainedModel(BaseNNXModule):
 
         mutable = False
 
-        return self.module.apply(
+        return self.apply(
             inputs,
             input_ids,
             attention_mask,

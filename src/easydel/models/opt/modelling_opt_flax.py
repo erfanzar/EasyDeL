@@ -657,7 +657,7 @@ class FlaxOPTModel(FlaxOPTPreTrainedModel):
         self.module.embed_tokens = value
 
     def get_input_embeddings(self):
-        return self.module.embed_tokens
+        return self.embed_tokens
 
 
 class FlaxOPTForCausalLMModule(nn.Module):
@@ -727,16 +727,16 @@ class FlaxOPTForCausalLM(FlaxOPTPreTrainedModel):
         self.module.model.embed_tokens = value
 
     def get_input_embeddings(self):
-        return self.module.model.embed_tokens
+        return self.model.embed_tokens
 
     def set_decoder(self, decoder):
         self.module.model = decoder
 
     def get_decoder(self):
-        return self.module.model
+        return self.model
 
     def get_output_embeddings(self):
-        return self.module.lm_head
+        return self.lm_head
 
     def set_output_embeddings(self, new_embeddings):
         self.module.lm_head = new_embeddings

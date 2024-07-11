@@ -1,4 +1,5 @@
-from typing import Optional, Mapping
+from typing import Mapping, Optional
+
 from jax.sharding import PartitionSpec
 
 from easydel.models.modelling_utils import EDPretrainedConfig
@@ -28,7 +29,7 @@ class Qwen2Config(EDPretrainedConfig):
         attention_dropout=0.0,
         resid_pdrop: float = 0.0,
         embd_pdrop: float = 0.0,
-        gradient_checkpointing: str = "nothing_saveable",
+        gradient_checkpointing: str = "",
         fcm_min_ratio: float = 0.0,
         fcm_max_ratio: float = 0.0,
         use_scan_mlp: bool = False,
@@ -135,7 +136,7 @@ class Qwen2Config(EDPretrainedConfig):
         embd_pdrop: float = 0.0,
         attention_dropout: float = 0.0,
         tie_word_embeddings: bool = False,
-        gradient_checkpointing: str = "nothing_saveable",
+        gradient_checkpointing: str = "",
         fcm_min_ratio: float = 0.0,
         fcm_max_ratio: float = 0.0,
         use_scan_mlp: bool = False,

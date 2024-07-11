@@ -178,6 +178,7 @@ class MistralAttention(BaseAttentionModule):
             attention_mask: (chex.Array): Mask out certain tokens in the input sequence
             past_key_values: (Optional(KVCache)): Past key and values used for generation
             position_ids: (Optional(chex.Array)): Determine the position of each token in a sequence
+            segment_ids: (Optional(chex.Array)): Determine the Segment.
 
         Returns:
             A tuple of two arrays
@@ -551,32 +552,31 @@ class MistralModel(BaseNNXModule):
     def __call__(
         self,
         input_ids: chex.Array,
+        input_embeds: Optional[chex.Array] = None,
         attention_mask: Optional[chex.Array] = None,
         position_ids: Optional[chex.Array] = None,
-        input_embeds: Optional[chex.Array] = None,
         past_key_values: Optional[List[KVCache]] = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
         return_dict: bool = True,
-        extra_embedding: Optional[jnp.ndarray] = None,
+        extra_embedding: Optional[jax.Array] = None,
     ):
-        """The __call__ function is the main function of a Flax model. It takes in input_ids, attention_mask, and position_ids
-        and returns the output of the model. These optional arguments are passed as keyword arguments when calling a Flax model.
+        """The __call__ function is the main function of a Flax module. It takes in inputs and returns outputs.
 
         Args:
-            self: Represent the instance of the class
-            input_ids: chex.Array: Pass in the input token ids
+            self: Refer to the object itself
+            input_ids: chex.Array: Pass the input token ids to the model
+            input_embeds: (Optional(chex.Array)): input_embeds to be used instead of input_ids if passed.
             attention_mask: (Optional(chex.Array)): Mask out the padding tokens
-            position_ids: (Optional(chex.Array)): Indicate the position of each token in a sequence
-            input_embeds: (Optional(chex.Array)): Pass in the embeddings of the input tokens
+            position_ids: (Optional(chex.Array)): Specify the position of each token in the input sequence
             past_key_values: (Optional(List[KVCache])): Past key and values used for generation
-            output_attentions: bool: Determine whether to return the attentions or not
-            output_hidden_states: bool: Determine whether to return hidden states
-            return_dict: bool: Return a dictionary of the output or not
-            extra_embedding: Optional[Union[jnp.ndarray]]: Pass in the extra embedding
+            output_attentions: bool: Return the attention weights
+            output_hidden_states: bool: Determine whether to return the hidden states
+            return_dict: bool: Return a dictionary of the outputs or not
+            extra_embedding: (Optional(chex.Array)): Pass in the embedding of the word that we want to predict
 
         Returns:
-            A tuple of: predictions
+            The logits and the hidden states
         """
 
         all_attentions = () if output_attentions else None
@@ -608,12 +608,12 @@ class MistralModel(BaseNNXModule):
             sequence_length <= self.config.max_position_embeddings
         ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
 
-        input_embeds = (
+        hidden_states = (
             input_embeds + extra_embedding
             if extra_embedding is not None
             else input_embeds
         )
-        hidden_states = self.dropout(input_embeds)
+        hidden_states = self.dropout(hidden_states)
         if past_key_values is None:
             past_key_values = [None] * self.config.num_hidden_layers
         for idx, block in enumerate(self.layers):
@@ -684,6 +684,7 @@ class MistralForCausalLM(BaseNNXModule):
     def __call__(
         self,
         input_ids: chex.Array,
+        input_embeds: Optional[chex.Array] = None,
         attention_mask: Optional[chex.Array] = None,
         position_ids: Optional[chex.Array] = None,
         past_key_values: Optional[List[KVCache]] = None,
@@ -697,6 +698,7 @@ class MistralForCausalLM(BaseNNXModule):
         Args:
             self: Refer to the object itself
             input_ids: chex.Array: Pass the input token ids to the model
+            input_embeds: (Optional(chex.Array)): input_embeds to be used instead of input_ids if passed.
             attention_mask: (Optional(chex.Array)): Mask out the padding tokens
             position_ids: (Optional(chex.Array)): Specify the position of each token in the input sequence
             past_key_values: (Optional(List[KVCache])): Past key and values used for generation
@@ -710,6 +712,7 @@ class MistralForCausalLM(BaseNNXModule):
         """
         outputs = self.model(
             input_ids=input_ids,
+            input_embeds=input_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,

@@ -1,11 +1,10 @@
 import math
-from typing import Dict, Optional, Tuple, Union, List
+from typing import List, Optional, Tuple, Union
 
 import chex
 import jax
 from flax import nnx
 from jax import numpy as jnp
-from transformers.modeling_flax_outputs import FlaxBaseModelOutput
 
 from easydel.models.attention_module import FlexibleAttentionModule
 from easydel.models.caching_utils import KVCache
@@ -13,11 +12,11 @@ from easydel.models.flax_modelling_utils import (
     ACT2FN,
     BaseAttentionModule,
     control_mlp_sharding,
-    get_gradient_checkpoint_policy,
 )
 from easydel.models.gpt_neo_x.gpt_neo_x_configuration import (
     GPTNeoXConfig as GPTNeoXConfig,
 )
+from easydel.models.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 from easydel.models.modelling_utils import BaseNNXModule
 
 
@@ -131,7 +130,9 @@ class GPTNeoXAttention(BaseAttentionModule):
     ):
 
         query, key, value = jnp.split(
-            self.w_qkv(hidden_states), indices_or_sections=3, axis=-1
+            self.w_qkv(hidden_states),
+            indices_or_sections=3,
+            axis=-1,
         )
 
         query = self._split_heads(query)
@@ -330,7 +331,7 @@ class GPTNeoXModel(BaseNNXModule):
             dtype=self.dtype,
             param_dtype=param_dtype,
             rngs=rngs,
-        )   
+        )
         self._causal_mask = None
         self._freqs_cis = None
 
@@ -341,8 +342,7 @@ class GPTNeoXModel(BaseNNXModule):
                 self.config.rotary_dim or self.config.hidden_size,
                 self.config.max_position_embeddings,
                 theta=self.config.rotary_emb_base,
-                dtype=self.dtype
-
+                dtype=self.dtype,
             )
         return self._freqs_cis
 
@@ -385,7 +385,7 @@ class GPTNeoXModel(BaseNNXModule):
                 "You cannot specify both decoder_input_ids and decoder_input_embeds at the same time"
             )
         if input_embeds is None and input_ids is not None:
-            input_embeds = self.wte(input_ids.astype("i4"))
+            input_embeds = self.embed_in(input_ids.astype("i4"))
         else:
             raise ValueError("you should specify input_embeds or input_ids one of them")
         batch_size, sequence_length, _ = input_embeds.shape
@@ -411,137 +411,130 @@ class GPTNeoXModel(BaseNNXModule):
             if extra_embedding is not None
             else input_embeds
         )
-        hidden_state = self.embed_in(inputs=input_ids)
-        for block in self.blocks:
-            hidden_states ,attn_weight= block(
+        for idx, block in enumerate(self.layers):
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+            hidden_states, attn_weight = block(
                 hidden_states=hidden_states,
-                freqs_cis=freqs_cis,
+                freqs_cis=self.freqs_cis,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
-                past_key_values=past_key_values,
+                past_key_values=(
+                    past_key_values[idx] if past_key_values is not None else None
+                ),
                 segment_ids=segment_ids,
             )
-        hidden_state = self.final_layer_norm(
-            
+            if output_attentions:
+                all_attentions += (attn_weight,)
+        hidden_states = self.final_layer_norm(hidden_states)
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        outputs = (
+            hidden_states,
+            all_hidden_states,
+            all_attentions,
         )
         if return_dict:
-            return FlaxBaseModelOutput(last_hidden_state=hidden_state)
-        else:
-            return (hidden_state,)
-
-
-class FlaxGPTNeoXPretrainedModel(BaseNNXModule):
-    module_class: nn.Module = None
-    config_class = GPTNeoXConfig
-
-    def __init__(
-        self,
-        config,
-        _do_init=False,
-        dtype: jnp.dtype = jnp.float32,
-        param_dtype: jnp.dtype = jnp.float32,
-        input_shape: Tuple = (1, 12),
-    ):
-        module = self.module_class(config=config, dtype=dtype, param_dtype=param_dtype)
-        super().__init__(
-            _do_init=_do_init,
-            module=module,
-            config=config,
-            dtype=dtype,
-            input_shape=input_shape,
-        )
-
-    def init_weights(
-        self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
-    ) -> Dict:
-        if params is None:
-            params = self.module.init(
-                rngs=rng,
-                input_ids=jnp.ones(input_shape),
-                attention_mask=jnp.ones(input_shape),
+            return FlaxBaseModelOutput(
+                last_hidden_state=hidden_states,
+                all_hidden_states=outputs[1],
+                attentions=outputs[2],
             )
-        return params["params"]
 
-    def __call__(
-        self,
-        input_ids,
-        attention_mask=None,
-        params: FrozenDict = None,
-        add_params_field: bool = False,
-        return_dict: bool = True,
-        **kwargs,
-    ):
-        params = (
-            {"params": params or self.params}
-            if add_params_field
-            else params or self.params
-        )
-        predict = self.module.apply(
-            params,
-            input_ids=jnp.asarray(input_ids, dtype=jnp.int32),
-            attention_mask=(
-                jnp.asarray(attention_mask, dtype=jnp.int32)
-                if attention_mask is not None
-                else attention_mask
-            ),
-            return_dict=return_dict,
-        )
-        return predict
-
-    def prepare_inputs_for_generation(
-        self, input_ids, max_length, attention_mask: Optional[chex.Array] = None
-    ):
-        return {
-            "attention_mask": attention_mask,
-        }
-
-    def update_inputs_for_generation(self, model_outputs, model_kwargs):
-        return model_kwargs
-
-
-class FlaxGPTNeoXModel(FlaxGPTNeoXPretrainedModel):
-    module_class = FlaxGPTNeoXModule
+        return tuple([v for v in outputs if v is not None])
 
     def get_input_embeddings(self):
-        return self.module.wte
+        return self.wte
 
     def set_input_embeddings(self, value):
         self.module.wte = value
 
 
-class FlaxGPTNeoXForCausalLMModule(nn.Module):
-    config: GPTNeoXConfig
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+class GPTNeoXForCausalLM(BaseNNXModule):
 
-    def setup(self) -> None:
-        self.transformer = FlaxGPTNeoXModule(
-            config=self.config,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            precision=self.precision,
+    def __init__(
+        self,
+        config: GPTNeoXConfig,
+        dtype: jnp.dtype = jnp.float32,
+        param_dtype: jnp.dtype = jnp.float32,
+        precision: Optional[Union[jax.lax.Precision, str]] = None,
+        *,
+        rngs: nnx.Rngs,
+    ) -> None:
+        super().__init__(config=config)
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.transformer = GPTNeoXModel(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
         )
-        self.lm_head = Dense(self.config.vocab_size, use_bias=False)
+        self.lm_head = nnx.Linear(
+            config.hidden_size,
+            config.vocab_size,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
 
-    def __call__(self, input_ids, attention_mask, return_dict: bool = False):
-        pred = self.transformer(
-            input_ids=input_ids, attention_mask=attention_mask, return_dict=True
-        ).last_hidden_state
-        return self.lm_head(pred)
+    def __call__(
+        self,
+        input_ids,
+        attention_mask: Optional[chex.Array] = None,
+        position_ids: Optional[chex.Array] = None,
+        past_key_values: Optional[List[KVCache]] = None,
+        input_embeds: Optional[chex.Array] = None,
+        segment_ids: Optional[chex.Array] = None,
+        extra_embedding: Optional[chex.Array] = None,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        return_dict: bool = True,
+    ):
+        outputs = self.transformer(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            input_embeds=input_embeds,
+            segment_ids=segment_ids,
+            extra_embedding=extra_embedding,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        hidden_states = outputs[0]
 
+        if self.config.tie_word_embeddings:
+            self.lm_head.kernel.value = self.model.embed_tokens.embedding.value.T
+            lm_logits = self.lm_head(hidden_states)
+        else:
+            lm_logits = self.lm_head(hidden_states)
 
-class FlaxGPTNeoXForCausalLM(FlaxGPTNeoXPretrainedModel):
-    module_class = FlaxGPTNeoXForCausalLMModule
+        lm_logits = lm_logits.astype(jnp.float32)
+
+        if not return_dict:
+            return (lm_logits,) + outputs[1:]
+
+        return FlaxCausalLMOutput(
+            logits=lm_logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
 
     def get_output_embeddings(self):
-        return self.module.lm_head
+        return self.lm_head
 
     def get_decoder(self):
-        return self.module.transformer
+        return self.transformer
 
     def get_input_embeddings(self):
-        return self.module.transformer.wte
+        return self.transformer.wte
 
     def set_output_embeddings(self, new_embeddings):
         self.module.lm_head = new_embeddings
@@ -551,3 +544,7 @@ class FlaxGPTNeoXForCausalLM(FlaxGPTNeoXPretrainedModel):
 
     def set_input_embeddings(self, value):
         self.module.transformer.wte = value
+
+    @property
+    def can_generate(self):
+        return True

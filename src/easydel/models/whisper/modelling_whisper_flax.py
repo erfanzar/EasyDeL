@@ -1004,7 +1004,7 @@ class FlaxWhisperPreTrainedModel(BaseNNXModule):
             encode_module = module._get_encoder_module()
             return encode_module(input_features, **kwargs)
 
-        return self.module.apply(
+        return self.apply(
             (
                 {"params": params or self.params}
                 if add_params_field
@@ -1176,7 +1176,7 @@ class FlaxWhisperPreTrainedModel(BaseNNXModule):
         # Handle any PRNG if needed
         rngs = {"dropout": dropout_rng} if dropout_rng is not None else {}
 
-        return self.module.apply(
+        return self.apply(
             (
                 {"params": params or self.params}
                 if add_params_field
@@ -1699,7 +1699,7 @@ class FlaxWhisperForAudioClassification(FlaxWhisperPreTrainedModel):
         if dropout_rng is not None:
             rngs["dropout"] = dropout_rng
 
-        return self.module.apply(
+        return self.apply(
             (
                 {"params": params or self.params}
                 if add_params_field

@@ -1,6 +1,5 @@
 from typing import Optional
 
-
 from easydel.models.modelling_utils import EDPretrainedConfig
 
 
@@ -51,7 +50,7 @@ class WhisperConfig(EDPretrainedConfig):
         mask_feature_min_masks=0,
         median_filter_width=7,
         bits: Optional[int] = None,
-        gradient_checkpointing: str = "nothing_saveable",
+        gradient_checkpointing: str = "",
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -109,7 +108,7 @@ class WhisperConfig(EDPretrainedConfig):
     def add_jax_args(
         self,
         bits: Optional[int] = None,
-        gradient_checkpointing: str = "nothing_saveable",
+        gradient_checkpointing: str = "",
         **kwargs,
     ):
         self.bits = bits

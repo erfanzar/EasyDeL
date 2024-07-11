@@ -1,6 +1,8 @@
-from easydel.models.modelling_utils import EDPretrainedConfig
 from typing import Optional
+
 from jax.sharding import PartitionSpec
+
+from easydel.models.modelling_utils import EDPretrainedConfig
 
 
 class Grok1Config(EDPretrainedConfig):
@@ -29,7 +31,7 @@ class Grok1Config(EDPretrainedConfig):
         num_experts=8,
         output_router_logits=False,
         router_aux_loss_coef=0.001,
-        gradient_checkpointing: str = "nothing_saveable",
+        gradient_checkpointing: str = "",
         bits: Optional[int] = None,
         **kwargs,
     ):
@@ -121,7 +123,7 @@ class Grok1Config(EDPretrainedConfig):
     def add_jax_args(
         self,
         tie_word_embeddings: bool = False,
-        gradient_checkpointing: str = "nothing_saveable",
+        gradient_checkpointing: str = "",
         bits: Optional[int] = None,
         **kwargs,
     ):

@@ -199,7 +199,7 @@ class PalmPretrainedModel(BaseNNXModule):
         self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
     ) -> Union[Mapping[str, Any], FrozenDict]:
         if params is None:
-            return self.module.init(
+            return self.init(
                 rngs=rng,
                 input_ids=jnp.ones(input_shape, dtype="i4"),
                 attention_mask=jnp.ones(input_shape, dtype="i4"),
@@ -319,7 +319,7 @@ class FlaxPalmModel(PalmPretrainedModel):
     module_class = FlaxPalmModule
 
     def get_input_embeddings(self):
-        return self.module.wte
+        return self.wte
 
     def set_input_embeddings(self, value):
         self.module.wte = value
@@ -383,10 +383,10 @@ class FlaxPalmForCausalLM(PalmPretrainedModel):
     module_class = FlaxPalmForCausalLMModule
 
     def get_input_embeddings(self):
-        return self.module.path_way.wte
+        return self.path_way.wte
 
     def get_decoder(self):
-        return self.module.path_way
+        return self.path_way
 
     def set_input_embeddings(self, value):
         self.module.path_way.wte = value
@@ -398,4 +398,4 @@ class FlaxPalmForCausalLM(PalmPretrainedModel):
         self.module.lm_head = new_embeddings
 
     def get_output_embeddings(self):
-        return self.module.lm_head
+        return self.lm_head

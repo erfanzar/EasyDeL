@@ -823,13 +823,13 @@ class FalconForCausalLM(BaseNNXModule):
         )
 
     def get_decoder(self):
-        return self.module.transformer
+        return self.transformer
 
     def get_output_embeddings(self):
-        return self.module.lm_head
+        return self.lm_head
 
     def get_input_embeddings(self):
-        return self.module.transformer.word_embeddings
+        return self.transformer.word_embeddings
 
     def set_input_embeddings(self, value):
         self.module.transformer.word_embeddings = value

@@ -1,7 +1,9 @@
-from transformers.utils import logging
-from typing import Optional, Dict, Union
-from easydel.models.modelling_utils import EDPretrainedConfig
+from typing import Dict, Optional, Union
+
 from jax.sharding import PartitionSpec
+from transformers.utils import logging
+
+from easydel.models.modelling_utils import EDPretrainedConfig
 
 logger = logging.get_logger(__name__)
 
@@ -40,7 +42,7 @@ class ArcticConfig(EDPretrainedConfig):
         moe_min_capacity=0,
         moe_token_dropping=True,
         quantization=None,
-        gradient_checkpointing: str = "nothing_saveable",
+        gradient_checkpointing: str = "",
         use_scan_mlp: bool = False,
         scan_mlp_chunk_size: int = 1024,
         bits: Optional[int] = None,
@@ -145,7 +147,7 @@ class ArcticConfig(EDPretrainedConfig):
 
     def add_jax_args(
         self,
-        gradient_checkpointing: str = "nothing_saveable",
+        gradient_checkpointing: str = "",
         use_scan_mlp: bool = False,
         scan_mlp_chunk_size: int = 1024,
         bits: Optional[int] = None,

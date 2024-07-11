@@ -29,7 +29,7 @@ class OPTConfig(EDPretrainedConfig):
         eos_token_id: int = 2,
         enable_bias: bool = True,
         layer_norm_elementwise_affine: bool = True,
-        gradient_checkpointing: str = "nothing_saveable",
+        gradient_checkpointing: str = "",
         **kwargs,
     ):
         super().__init__(
@@ -88,7 +88,7 @@ class OPTConfig(EDPretrainedConfig):
         eos_token_id: int = 2,
         enable_bias: bool = True,
         layer_norm_elementwise_affine: bool = True,
-        gradient_checkpointing: str = "nothing_saveable",
+        gradient_checkpointing: str = "",
         **kwargs,
     ):
         basics = dict(

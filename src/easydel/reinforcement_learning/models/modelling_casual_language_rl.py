@@ -183,7 +183,7 @@ class AutoRLModelForCasualLMWithValueHead:
         return generate
 
     def get_mesh(self):
-        return self.module.config.mesh
+        return self.config.mesh
 
     def generate(
         self, input_id, attention_mask, params: dict | flax.core.FrozenDict = None

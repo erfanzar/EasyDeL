@@ -1163,7 +1163,7 @@ class FlaxQwen1Model(FlaxQwen1PreTrainedModel):
         self.module.wte = value
 
     def get_input_embeddings(self):
-        return self.module.wte
+        return self.wte
 
 
 class FlaxQwen1ForCausalLMModule(nn.Module):
@@ -1275,16 +1275,16 @@ class FlaxQwen1ForCausalLM(FlaxQwen1PreTrainedModel):
         self.module.model.wte = value
 
     def get_input_embeddings(self):
-        return self.module.model.wte
+        return self.model.wte
 
     def set_decoder(self, decoder):
         self.module.model = decoder
 
     def get_decoder(self):
-        return self.module.model
+        return self.model
 
     def get_output_embeddings(self):
-        return self.module.lm_head
+        return self.lm_head
 
     def set_output_embeddings(self, new_embeddings):
         self.module.lm_head = new_embeddings

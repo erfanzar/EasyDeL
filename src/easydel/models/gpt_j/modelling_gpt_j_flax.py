@@ -1,6 +1,6 @@
 import math
 from functools import partial
-from typing import Optional, Tuple, Union, List
+from typing import List, Optional, Tuple, Union
 
 import chex
 import flax.linen.partitioning
@@ -473,7 +473,7 @@ class GPTJModel(nnx.Module):
         )
 
     def get_input_embeddings(self):
-        return self.module.wte
+        return self.wte
 
     def set_input_embeddings(self, value):
         self.module.wte = value
@@ -554,13 +554,13 @@ class GPTJForCausalLM(nnx.Module):
         )
 
     def get_output_embeddings(self):
-        return self.module.lm_head
+        return self.lm_head
 
     def get_decoder(self):
-        return self.module.transformer
+        return self.transformer
 
     def get_input_embeddings(self):
-        return self.module.transformer.wte
+        return self.transformer.wte
 
     def set_output_embeddings(self, new_embeddings):
         self.module.lm_head = new_embeddings

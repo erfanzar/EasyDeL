@@ -1,6 +1,8 @@
-from easydel.models.modelling_utils import EDPretrainedConfig
-from jax.sharding import PartitionSpec
 from typing import Optional
+
+from jax.sharding import PartitionSpec
+
+from easydel.models.modelling_utils import EDPretrainedConfig
 
 
 class Qwen2MoeConfig(EDPretrainedConfig):
@@ -34,7 +36,7 @@ class Qwen2MoeConfig(EDPretrainedConfig):
         output_router_logits=False,
         router_aux_loss_coef=0.001,
         mlp_only_layers=None,
-        gradient_checkpointing: str = "nothing_saveable",
+        gradient_checkpointing: str = "",
         bits: Optional[int] = None,
         **kwargs,
     ):
@@ -128,7 +130,7 @@ class Qwen2MoeConfig(EDPretrainedConfig):
 
     def add_jax_args(
         self,
-        gradient_checkpointing: str = "nothing_saveable",
+        gradient_checkpointing: str = "",
         bits: Optional[int] = None,
         **kwargs,
     ):

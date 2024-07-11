@@ -192,6 +192,7 @@ class CohereAttention(BaseAttentionModule):
             attention_mask: (chex.Array): Mask out certain tokens in the input sequence
             past_key_values: (Optional(KVCache)): Past key and values used for generation
             position_ids: (Optional(chex.Array)): Determine the position of each token in a sequence
+            segment_ids: (Optional(chex.Array)): Determine the Segment.
 
         Returns:
             A tuple of two arrays
