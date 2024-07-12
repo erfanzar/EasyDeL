@@ -390,7 +390,6 @@ class MixtralSparseMoeBlock(nnx.Module):
         self,
         hidden_states: chex.Array,
     ) -> Tuple[chex.Array, chex.Array]:
-
         hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
 
         router_logits = self.gate(hidden_states).astype(  # no reshaping is needed
@@ -620,6 +619,7 @@ class MixtralModel(BaseNNXModule):
         input_embeds: Optional[chex.Array] = None,
         attention_mask: Optional[chex.Array] = None,
         position_ids: Optional[chex.Array] = None,
+        segment_ids: Optional[chex.Array] = None,
         past_key_values: Optional[List[KVCache]] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -635,6 +635,7 @@ class MixtralModel(BaseNNXModule):
             input_embeds: (Optional(chex.Array)): input_embeds to be used instead of input_ids if passed.
             attention_mask: (Optional(chex.Array)): Mask out the padding tokens
             position_ids: (Optional(chex.Array)): Specify the position of each token in the input sequence
+            segment_ids: (Optional(chex.Array)): Determine the Segment.
             past_key_values: (Optional(List[KVCache])): Past key and values used for generation
             output_attentions: (Optional(bool)): Return the attention weights.
             output_hidden_states: (Optional(bool)): Determine whether to return the hidden states.
@@ -708,7 +709,7 @@ class MixtralModel(BaseNNXModule):
                     past_key_values[idx] if past_key_values is not None else None
                 ),
                 position_ids=position_ids,
-                segment_ids=None,
+                segment_ids=segment_ids,
             )
             if output_attentions:
                 all_attentions += (attn_weight,)

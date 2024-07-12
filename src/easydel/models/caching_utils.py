@@ -48,11 +48,11 @@ class KVCache:
 
         self.moved_idx += value_states.shape[1]
 
-    def get(self, attention_mask: Optional[jax.Array]):
+    def get(self, attention_mask: Optional[jax.Array], causal: bool = True):
         assert self.key_states is not None
         assert self.value_states is not None
         max_length = self.value_states.shape[1]
-        if attention_mask is not None:
+        if attention_mask is not None and not causal:
             pad_mask = jnp.broadcast_to(
                 jnp.arange(max_length) < self.moved_idx - 1 + attention_mask.shape[2],
                 (self.key_states.shape[1], 1, attention_mask.shape[2], max_length),

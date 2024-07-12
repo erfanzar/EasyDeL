@@ -63,6 +63,8 @@ class LlamaAttention(BaseAttentionModule):
         self.config: LlamaConfig = config
         self.dtype = dtype
         self.param_dtype = param_dtype
+        self.precision = precision
+        self.rngs = rngs
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
         self.head_dim = config.hidden_size // config.num_attention_heads
@@ -178,6 +180,7 @@ class LlamaAttention(BaseAttentionModule):
             attention_mask: (chex.Array): Mask out certain tokens in the input sequence
             past_key_values: (Optional(KVCache)): Past key and values used for generation
             position_ids: (Optional(chex.Array)): Determine the position of each token in a sequence
+            segment_ids: (Optional(chex.Array)): Determine the Segment.
 
         Returns:
             A tuple of two arrays HiddenState and attentionWeight
@@ -686,24 +689,28 @@ class LlamaForCausalLM(BaseNNXModule):
         input_ids: chex.Array,
         attention_mask: Optional[chex.Array] = None,
         position_ids: Optional[chex.Array] = None,
+        input_embeds: Optional[chex.Array] = None,
         past_key_values: Optional[List[KVCache]] = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
         return_dict: bool = True,
-        extra_embedding: Optional[jax.Array] = None,
+        extra_embedding: Optional[jnp.ndarray] = None,
     ):
-        """The __call__ function is the main function of a Flax module. It takes in inputs and returns outputs.
+        """
+        The __call__ function is the main function of a Flax model. It takes in input_ids, attention_mask, and position_ids
+        and returns the output of the model. These optional arguments are passed as keyword arguments when calling a Flax model.
 
         Args:
-            self: Refer to the object itself
-            input_ids: chex.Array: Pass the input token ids to the model
+            self: Represent the instance of the class
+            input_ids: chex.Array: Pass in the input token ids
             attention_mask: (Optional(chex.Array)): Mask out the padding tokens
-            position_ids: (Optional(chex.Array)): Specify the position of each token in the input sequence
+            position_ids: (Optional(chex.Array)): Indicate the position of each token in a sequence
+            input_embeds: (Optional(chex.Array)): Pass in the embeddings of the input tokens
             past_key_values: (Optional(List[KVCache])): Past key and values used for generation
-            output_attentions: bool: Return the attention weights
-            output_hidden_states: bool: Determine whether to return the hidden states
-            return_dict: bool: Return a dictionary of the outputs or not
-            extra_embedding: (Optional(chex.Array)): Pass in the embedding of the word that we want to predict
+            output_attentions: bool: Determine whether to return the attentions or not
+            output_hidden_states: bool: Determine whether to return hidden states
+            return_dict: bool: Return a dictionary of the output or not
+            extra_embedding: Optional[Union[jnp.ndarray]]: Pass in the extra embedding
 
         Returns:
             The logits and the hidden states
@@ -717,6 +724,7 @@ class LlamaForCausalLM(BaseNNXModule):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             extra_embedding=extra_embedding,
+            input_embeds=input_embeds,
         )
 
         hidden_states = outputs[0]
