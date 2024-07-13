@@ -2,16 +2,19 @@
 
 import jax
 from flax import nnx
+from typing import TypeVar, Type
+
+M = TypeVar("M")
 
 
 def nnx_init(
-    module: nnx.Module,
+    module: Type[M],
     _add_rngs: bool = True,
     _rng_key: str = "rngs",
     _seed: int = 0,
     _lazy: bool = True,
     **kwargs,
-) -> nnx.State:
+) -> M:
     """Initializes an nnx module with lazy initialization support.
 
     This function provides a convenient way to initialize nnx modules while
@@ -302,3 +305,9 @@ def attach_tree_to_nnx_state(tree: dict, state: nnx.State) -> nnx.State:
     others = recreate_meta_values(others)
     state = refine_graphs(others, params)
     return state
+
+
+def attech_tree_to_nnx_model(model: M, tree: dict) -> M:
+    graphdef, graphstate = nnx.split(model)
+    graphstate = attach_tree_to_nnx_state(tree=tree, state=graphstate)
+    return nnx.merge(graphdef, graphstate)

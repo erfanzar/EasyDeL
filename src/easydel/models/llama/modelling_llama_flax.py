@@ -555,6 +555,7 @@ class LlamaModel(BaseNNXModule):
         input_ids: chex.Array,
         attention_mask: Optional[chex.Array] = None,
         position_ids: Optional[chex.Array] = None,
+        segment_ids: Optional[chex.Array] = None,
         input_embeds: Optional[chex.Array] = None,
         past_key_values: Optional[List[KVCache]] = None,
         output_attentions: bool = False,
@@ -571,6 +572,7 @@ class LlamaModel(BaseNNXModule):
             input_ids: chex.Array: Pass in the input token ids
             attention_mask: (Optional(chex.Array)): Mask out the padding tokens
             position_ids: (Optional(chex.Array)): Indicate the position of each token in a sequence
+            segment_ids: (Optional(chex.Array)): Determine the Segment.
             input_embeds: (Optional(chex.Array)): Pass in the embeddings of the input tokens
             past_key_values: (Optional(List[KVCache])): Past key and values used for generation
             output_attentions: bool: Determine whether to return the attentions or not
@@ -579,7 +581,7 @@ class LlamaModel(BaseNNXModule):
             extra_embedding: Optional[Union[jnp.ndarray]]: Pass in the extra embedding
 
         Returns:
-            A tuple of: predictions
+            The logits and the hidden states
         """
 
         all_attentions = () if output_attentions else None
@@ -629,6 +631,7 @@ class LlamaModel(BaseNNXModule):
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values[idx],
+                segment_ids=segment_ids
             )
 
             if output_attentions:
@@ -689,6 +692,7 @@ class LlamaForCausalLM(BaseNNXModule):
         input_ids: chex.Array,
         attention_mask: Optional[chex.Array] = None,
         position_ids: Optional[chex.Array] = None,
+        segment_ids: Optional[chex.Array] = None,
         input_embeds: Optional[chex.Array] = None,
         past_key_values: Optional[List[KVCache]] = None,
         output_attentions: bool = False,
@@ -705,6 +709,7 @@ class LlamaForCausalLM(BaseNNXModule):
             input_ids: chex.Array: Pass in the input token ids
             attention_mask: (Optional(chex.Array)): Mask out the padding tokens
             position_ids: (Optional(chex.Array)): Indicate the position of each token in a sequence
+            segment_ids: (Optional(chex.Array)): Determine the Segment.
             input_embeds: (Optional(chex.Array)): Pass in the embeddings of the input tokens
             past_key_values: (Optional(List[KVCache])): Past key and values used for generation
             output_attentions: bool: Determine whether to return the attentions or not
@@ -725,6 +730,7 @@ class LlamaForCausalLM(BaseNNXModule):
             return_dict=return_dict,
             extra_embedding=extra_embedding,
             input_embeds=input_embeds,
+            segment_ids=segment_ids
         )
 
         hidden_states = outputs[0]

@@ -351,7 +351,6 @@ class Qwen1Attention(BaseAttentionModule):
             bias=attention_bias,
             attention_mask=attention_mask,
             causal=True,
-            deterministic=self.resid_dropout.deterministic,
             query_sequence_length=query_length,
             key_value_sequence_length=key_length,
             segment_ids=segment_ids,

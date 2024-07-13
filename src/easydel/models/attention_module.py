@@ -384,6 +384,7 @@ class FlexibleAttentionModule(object):
             "axis_name",
             "sp",
             axis_name,
+            base_config,
             "attention_axis_name",
         )  # DON'T READ FROM CONFIG
 

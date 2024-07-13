@@ -8,14 +8,14 @@ import jax
 import torch
 
 try:
-    from easydel import AutoShardAndGatherFunctions, get_modules_by_type
+    from easydel import AutoShardAndGatherFunctions, get_models_by_type
 except ModuleNotFoundError:
     import sys
     from pathlib import Path
 
     cp = Path.cwd().__str__()
     sys.path.append(cp)
-    from easydel import AutoShardAndGatherFunctions, get_modules_by_type
+    from easydel import AutoShardAndGatherFunctions, get_models_by_type
 
 from fjformer import make_shard_and_gather_fns, match_partition_rules
 from transformers import FalconForCausalLM
@@ -23,7 +23,7 @@ from transformers import FalconForCausalLM
 
 def main():
     torch.manual_seed(42)
-    FalconConfig, FlaxFalconForCausalLM, transform_fn = get_modules_by_type("falcon")
+    FalconConfig, FlaxFalconForCausalLM, transform_fn = get_models_by_type("falcon")
     config = FalconConfig(
         vocab_size=1200,
         hidden_size=256,

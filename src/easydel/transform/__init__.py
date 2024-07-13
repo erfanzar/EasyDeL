@@ -5,5 +5,5 @@ from easydel.transform.transform import (
     easystate_to_torch as easystate_to_torch,
 )
 from easydel.transform.transform import (
-    toch_dict_to_flatten_dict as toch_dict_to_flatten_dict,
+    torch_dict_to_flatten_dict as torch_dict_to_flatten_dict,
 )

@@ -88,7 +88,7 @@ class EasyModelsTest(TestCase):
         self.use_sharding_constraint = False
 
     def create_test_for_models(self, module_name: str, hf_module_class):
-        module_config, module_class, transform_function = ed.get_modules_by_type(
+        module_config, module_class, transform_function = ed.get_models_by_type(
             module_name
         )
         config = module_config(
@@ -177,7 +177,7 @@ class EasyModelsTest(TestCase):
             return self.compare_torch_to_jax(module_name, hf_output, ed_output, loss)
 
     def create_moe_test_for_models(self, module_name: str, hf_module_class):
-        module_config, module_class, transform_function = ed.get_modules_by_type(
+        module_config, module_class, transform_function = ed.get_models_by_type(
             module_name
         )
         config = module_config(

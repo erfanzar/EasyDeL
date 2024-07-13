@@ -577,7 +577,7 @@ class GPT2Model(BaseNNXModule):
         return False
 
 
-class FlaxGPT2LMHeadModule(BaseNNXModule):
+class GPT2LMHeadModel(BaseNNXModule):
     def __init__(
         self,
         config: GPT2Config,

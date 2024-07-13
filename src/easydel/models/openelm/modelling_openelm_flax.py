@@ -672,7 +672,7 @@ class OpenELMModel(BaseNNXModule):
         )
 
 
-class FlaxOpenELMForCausalLMModule(BaseNNXModule):
+class OpenELMForCausalLM(BaseNNXModule):
     def __init__(
         self,
         config: OpenELMConfig,

@@ -5,7 +5,7 @@ try:
     from easydel import (
         AutoEasyDeLConfig,
         AutoEasyDeLModelForCausalLM,
-        get_modules_by_type,
+        get_models_by_type,
     )
 except ModuleNotFoundError:
     import sys
@@ -16,7 +16,7 @@ except ModuleNotFoundError:
     from easydel import (
         AutoEasyDeLConfig,
         AutoEasyDeLModelForCausalLM,
-        get_modules_by_type,
+        get_models_by_type,
     )
 
 from fjformer import make_shard_and_gather_fns, match_partition_rules
@@ -25,7 +25,7 @@ from fjformer import make_shard_and_gather_fns, match_partition_rules
 def main():
     model_id = "erfanzar/LLamaStory-70M"
     config = AutoEasyDeLConfig.from_pretrained(pretrained_model_name_or_path=model_id)
-    _, module, _ = get_modules_by_type(config.model_type)
+    _, module, _ = get_models_by_type(config.model_type)
 
     dummy_model = module(config=config, _do_init=False)
     partition_specs = match_partition_rules(

@@ -1,7 +1,9 @@
 import gc
 import os
 import sys
-import unittest
+import jax
+
+jax.config.update("jax_platform_name", "cpu")
 from unittest import TestCase
 
 from fjformer import make_shard_and_gather_fns, match_partition_rules
@@ -22,12 +24,12 @@ except ModuleNotFoundError:
 import copy
 from typing import Dict, Literal, Optional, Union
 
-import jax
 import numpy as np
 import torch
 import transformers
 from fjformer.functions import cross_entropy_loss_and_accuracy
 from jax import numpy as jnp
+
 
 torch.manual_seed(42)
 
@@ -95,7 +97,7 @@ class EasyModelsTest(TestCase):
         self.pad_token_id = None
 
     def create_test_for_models(self, module_name: str, hf_module_class):
-        module_config, module_class, transform_function = ed.get_modules_by_type(
+        module_config, module_class, transform_function = ed.get_models_by_type(
             module_name
         )
         if self.header_config is None:
@@ -132,13 +134,12 @@ class EasyModelsTest(TestCase):
 
         hf_model = hf_module_class(config=copy.deepcopy(config))
         hf_model.eval()
-        params = {
-            "params": transform_function(
-                state_dict=hf_model.state_dict(),
-                device=jax.devices("cpu")[0],
-                remove_state_dict=True,
-            )
-        }
+        params = transform_function(
+            state_dict=hf_model.state_dict(),
+            device=jax.devices("cpu")[0],
+            remove_state_dict=True,
+        )
+
         config.add_jax_args()
         config.add_basic_configurations(
             shard_attention_computation=self.shard_attention_computation,
@@ -168,22 +169,17 @@ class EasyModelsTest(TestCase):
                 input_ids=torch_input_ids[:, :-1],
                 labels=torch_input_ids[:, 1:],
             )
-            ed_model = module_class(
+            ed_model = ed.traversal.nnx_init(
+                module_class,
                 config=config,
                 dtype=self.dtype,
                 param_dtype=self.dtype,
                 precision=self.precision,
-                _do_init=False,
-                input_shape=(self.batch_size, self.sequence_length),
             )
-
+            ed_model = ed.traversal.attech_tree_to_nnx_model(ed_model, tree=params)
             ed_output = ed_model(
                 input_ids=jax_input_ids[:, :-1],
-                params=params,
                 return_dict=True,
-                add_params_field=False,
-                train=False,
-                determinstic=True,
             )
             loss, _ = cross_entropy_loss_and_accuracy(
                 ed_output.logits,
@@ -196,7 +192,7 @@ class EasyModelsTest(TestCase):
             return self.compare_torch_to_jax(module_name, hf_output, ed_output, loss)
 
     def create_moe_test_for_models(self, module_name: str, hf_module_class):
-        module_config, module_class, transform_function = ed.get_modules_by_type(
+        module_config, module_class, transform_function = ed.get_models_by_type(
             module_name
         )
         if self.header_config is None:
@@ -256,8 +252,6 @@ class EasyModelsTest(TestCase):
                 dtype=self.dtype,
                 param_dtype=self.dtype,
                 precision=self.precision,
-                _do_init=False,
-                input_shape=(self.batch_size, self.sequence_length),
             )
 
             torch_input_ids, jax_input_ids = self.make_input_id(
@@ -603,8 +597,8 @@ class EasyModelsTest(TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
-    # test = EasyModelsTest()
-    # test.setUp()
-    # test.test_gemma2()
+    # unittest.main()
+    test = EasyModelsTest()
+    test.setUp()
+    test.test_gemma2()
     # test.test_llama()

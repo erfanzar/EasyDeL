@@ -1,5 +1,6 @@
 import gc
 from typing import Callable, List, Mapping, Optional, Union
+
 import jax
 import transformers
 from fjformer.checkpoint import get_dtype
@@ -68,7 +69,7 @@ class _DummyContextManager:
         pass
 
 
-def toch_dict_to_flatten_dict(
+def torch_dict_to_flatten_dict(
     state_dict,
     *,
     device: Optional[jax.Device] = None,
@@ -84,7 +85,7 @@ def toch_dict_to_flatten_dict(
     convert_str_to_int: bool = True,
     **kwargs,
 ):
-    """The toch_dict_to_flatten_dict function takes a huggingface model's state_dict and converts it to an easydel
+    """The torch_dict_to_flatten_dict function takes a huggingface model's state_dict and converts it to an easydel
     model's flax_dict. The function is designed to be used in conjunction with the load_huggingface function, which
     loads a huggingface model from disk. The embedding layer name must be specified as well as the device on which
     the conversion will take place.
@@ -123,7 +124,7 @@ def toch_dict_to_flatten_dict(
 
         def _clear():
             gc.collect()
-            
+
     if isinstance(embedding_layer_names, str):
         embedding_layer_names = [embedding_layer_names]
     if isinstance(layer_norm_names, str):

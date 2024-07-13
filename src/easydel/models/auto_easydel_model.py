@@ -20,18 +20,19 @@ from easydel.models.modelling_utils import (
     BaseNNXModule,
     EDPretrainedConfig,
 )
-from easydel.transform.transform import toch_dict_to_flatten_dict
+from easydel.transform.transform import torch_dict_to_flatten_dict
+from easydel.utils.traversal import nnx_init, attech_tree_to_nnx_model
 
 logger = get_logger(name=__name__)
 
 
-def get_modules_by_type(
+def get_models_by_type(
     model_type: str,
 ) -> Tuple[Type[EDPretrainedConfig], Type[BaseNNXModule] | Any, partial | Any]:
     """
-    The get_modules_by_type function is a helper function that returns the following:
+    The get_models_by_type function is a helper function that returns the following:
         1. The config class for the model type specified (e.g., LlamaConfig, FalconConfig)
-        2. The Flax Model class for the model type specified (e.g., FlaxLlamaForCausalLM, FlaxFalconForCausalLM)
+        2. The  Model class for the model type specified (e.g., LlamaForCausalLM, FalconForCausalLM)
         3. A function to convert a HuggingFace pretrained checkpoint into an easydel checkpoint
 
     :param model_type: str: Determine which model to use
@@ -39,28 +40,28 @@ def get_modules_by_type(
 
     """
     if model_type == "llama":
-        from easydel.models.llama import FlaxLlamaForCausalLM as _FlaxLlamaForCausalLM
+        from easydel.models.llama import LlamaForCausalLM as _LlamaForCausalLM
         from easydel.models.llama import LlamaConfig as _LlamaConfig
 
         return (
             _LlamaConfig,
-            _FlaxLlamaForCausalLM,
+            _LlamaForCausalLM,
             functools.partial(
-                toch_dict_to_flatten_dict,
+                torch_dict_to_flatten_dict,
                 embedding_layer_names=["embed_tokens"],
                 rnn_based_or_rwkv=False,
                 lm_head_name="lm_head",
             ),
         )
     elif model_type == "gemma":
-        from easydel.models.gemma import FlaxGemmaForCausalLM as _FlaxGemmaForCausalLM
+        from easydel.models.gemma import GemmaForCausalLM as _GemmaForCausalLM
         from easydel.models.gemma import GemmaConfig as _GemmaConfig
 
         return (
             _GemmaConfig,
-            _FlaxGemmaForCausalLM,
+            _GemmaForCausalLM,
             functools.partial(
-                toch_dict_to_flatten_dict,
+                torch_dict_to_flatten_dict,
                 embedding_layer_names=["embed_tokens"],
                 rnn_based_or_rwkv=False,
                 lm_head_name="lm_head",
@@ -68,15 +69,15 @@ def get_modules_by_type(
         )
     elif model_type == "gemma2":
         from easydel.models.gemma2 import (
-            FlaxGemma2ForCausalLM as _FlaxGemma2ForCausalLM,
+            Gemma2ForCausalLM as _Gemma2ForCausalLM,
         )
         from easydel.models.gemma2 import Gemma2Config as _Gemma2Config
 
         return (
             _Gemma2Config,
-            _FlaxGemma2ForCausalLM,
+            _Gemma2ForCausalLM,
             functools.partial(
-                toch_dict_to_flatten_dict,
+                torch_dict_to_flatten_dict,
                 embedding_layer_names=["embed_tokens"],
                 rnn_based_or_rwkv=False,
                 lm_head_name="lm_head",
@@ -85,14 +86,14 @@ def get_modules_by_type(
     elif model_type == "falcon":
         from easydel.models.falcon import FalconConfig as _FalconConfig
         from easydel.models.falcon import (
-            FlaxFalconForCausalLM as _FlaxFalconForCausalLM,
+            FalconForCausalLM as _FalconForCausalLM,
         )
 
         return (
             _FalconConfig,
-            _FlaxFalconForCausalLM,
+            _FalconForCausalLM,
             functools.partial(
-                toch_dict_to_flatten_dict,
+                torch_dict_to_flatten_dict,
                 embedding_layer_names=["word_embeddings"],
                 layer_norm_names=[
                     "input_layernorm",
@@ -106,14 +107,14 @@ def get_modules_by_type(
             ),
         )
     elif model_type == "mpt":
-        from easydel.models.mosaic_mpt import FlaxMptForCausalLM as _FlaxMptForCausalLM
+        from easydel.models.mosaic_mpt import MptForCausalLM as _MptForCausalLM
         from easydel.models.mosaic_mpt import MptConfig as _MptConfig
 
         return (
             _MptConfig,
-            _FlaxMptForCausalLM,
+            _MptForCausalLM,
             functools.partial(
-                toch_dict_to_flatten_dict,
+                torch_dict_to_flatten_dict,
                 embedding_layer_names=["wte"],
                 rnn_based_or_rwkv=False,
                 layer_norm_names=["norm_1", "norm_2", "norm_f"],
@@ -123,29 +124,29 @@ def get_modules_by_type(
 
     elif model_type == "mistral":
         from easydel.models.mistral import (
-            FlaxMistralForCausalLM as _FlaxMistralForCausalLM,
+            MistralForCausalLM as _MistralForCausalLM,
         )
         from easydel.models.mistral import MistralConfig as _MistralConfig
 
         return (
             _MistralConfig,
-            _FlaxMistralForCausalLM,
+            _MistralForCausalLM,
             functools.partial(
-                toch_dict_to_flatten_dict,
+                torch_dict_to_flatten_dict,
                 embedding_layer_names=["embed_tokens"],
                 rnn_based_or_rwkv=False,
                 lm_head_name="lm_head",
             ),
         )
     elif model_type == "gptj":
-        from easydel.models.gpt_j import FlaxGPTJForCausalLM as _FlaxGPTJForCausalLM
+        from easydel.models.gpt_j import GPTJForCausalLM as _GPTJForCausalLM
         from easydel.models.gpt_j import GPTJConfig as _GPTJConfig
 
         return (
             _GPTJConfig,
-            _FlaxGPTJForCausalLM,
+            _GPTJForCausalLM,
             functools.partial(
-                toch_dict_to_flatten_dict,
+                torch_dict_to_flatten_dict,
                 embedding_layer_names="wte",
                 layer_norm_names=[
                     "ln_1",
@@ -159,59 +160,30 @@ def get_modules_by_type(
 
     elif model_type == "gpt_neox":
         from easydel.models.gpt_neo_x import (
-            FlaxGPTNeoXForCausalLM as _FlaxGPTNeoXForCausalLM,
+            GPTNeoXForCausalLM as _GPTNeoXForCausalLM,
         )
         from easydel.models.gpt_neo_x import GPTNeoXConfig as _GPTNeoXConfig
 
         return (
             _GPTNeoXConfig,
-            _FlaxGPTNeoXForCausalLM,
+            _GPTNeoXForCausalLM,
             functools.partial(
-                toch_dict_to_flatten_dict,
+                torch_dict_to_flatten_dict,
                 embedding_layer_names="wte",
                 rnn_based_or_rwkv=False,
                 lm_head_name="lm_head",
             ),
-        )
-    elif model_type == "palm":
-        from easydel.models.palm import FlaxPalmForCausalLM as _FlaxPalmForCausalLM
-        from easydel.models.palm import PalmConfig as _PalmConfig
-
-        return (
-            _PalmConfig,
-            _FlaxPalmForCausalLM,
-            functools.partial(
-                toch_dict_to_flatten_dict,
-                embedding_layer_names="wte",
-                rnn_based_or_rwkv=False,
-                lm_head_name="lm_head",
-            ),
-        )
-    elif model_type == "lt":
-        from easydel.models.lucid_transformer import FlaxLTConfig as _FlaxLTConfig
-        from easydel.models.lucid_transformer import (
-            FlaxLTForCausalLM as _FlaxLTForCausalLM,
         )
 
-        return (
-            _FlaxLTConfig,
-            _FlaxLTForCausalLM,
-            functools.partial(
-                toch_dict_to_flatten_dict,
-                embedding_layer_names="wte",
-                rnn_based_or_rwkv=False,
-                lm_head_name="lm_head",
-            ),
-        )
     elif model_type == "gpt2":
-        from easydel.models.gpt2 import FlaxGPT2LMHeadModel as _FlaxGPT2LMHeadModel
+        from easydel.models.gpt2 import GPT2LMHeadModel as _GPT2LMHeadModel
         from easydel.models.gpt2 import GPT2Config as _GPT2Config
 
         return (
             _GPT2Config,
-            _FlaxGPT2LMHeadModel,
+            _GPT2LMHeadModel,
             functools.partial(
-                toch_dict_to_flatten_dict,
+                torch_dict_to_flatten_dict,
                 embedding_layer_names=["wte", "wpe"],
                 layer_norm_names=["ln_1", "ln_2", "ln_f"],
                 rnn_based_or_rwkv=False,
@@ -220,29 +192,29 @@ def get_modules_by_type(
         )
     elif model_type == "mixtral":
         from easydel.models.mixtral import (
-            FlaxMixtralForCausalLM as _FlaxMixtralForCausalLM,
+            MixtralForCausalLM as _MixtralForCausalLM,
         )
         from easydel.models.mixtral import MixtralConfig as _MixtralConfig
 
         return (
             _MixtralConfig,
-            _FlaxMixtralForCausalLM,
+            _MixtralForCausalLM,
             functools.partial(
-                toch_dict_to_flatten_dict,
+                torch_dict_to_flatten_dict,
                 embedding_layer_names=["embed_tokens"],
                 rnn_based_or_rwkv=False,
                 lm_head_name="lm_head",
             ),
         )
     elif model_type == "phi":
-        from easydel.models.phi import FlaxPhiForCausalLM as _FlaxPhiForCausalLM
+        from easydel.models.phi import PhiForCausalLM as _PhiForCausalLM
         from easydel.models.phi import PhiConfig as _PhiConfig
 
         return (
             _PhiConfig,
-            _FlaxPhiForCausalLM,
+            _PhiForCausalLM,
             functools.partial(
-                toch_dict_to_flatten_dict,
+                torch_dict_to_flatten_dict,
                 embedding_layer_names=["embed_tokens"],
                 layer_norm_names=[
                     "input_layernorm",
@@ -255,14 +227,14 @@ def get_modules_by_type(
             ),
         )
     elif model_type == "qwen":
-        from easydel.models.qwen1 import FlaxQwen1ForCausalLM as _FlaxQwen1ForCausalLM
+        from easydel.models.qwen1 import Qwen1ForCausalLM as _Qwen1ForCausalLM
         from easydel.models.qwen1 import Qwen1Config as _Qwen1Config
 
         return (
             _Qwen1Config,
-            _FlaxQwen1ForCausalLM,
+            _Qwen1ForCausalLM,
             functools.partial(
-                toch_dict_to_flatten_dict,
+                torch_dict_to_flatten_dict,
                 embedding_layer_names=["wte"],
                 rnn_based_or_rwkv=False,
                 lm_head_name="lm_head",
@@ -270,14 +242,14 @@ def get_modules_by_type(
         )
 
     elif model_type == "qwen2":
-        from easydel.models.qwen2 import FlaxQwen2ForCausalLM as _FlaxQwen2ForCausalLM
+        from easydel.models.qwen2 import Qwen2ForCausalLM as _Qwen2ForCausalLM
         from easydel.models.qwen2 import Qwen2Config as _Qwen2Config
 
         return (
             _Qwen2Config,
-            _FlaxQwen2ForCausalLM,
+            _Qwen2ForCausalLM,
             functools.partial(
-                toch_dict_to_flatten_dict,
+                torch_dict_to_flatten_dict,
                 embedding_layer_names=["embed_tokens"],
                 rnn_based_or_rwkv=False,
                 lm_head_name="lm_head",
@@ -285,15 +257,15 @@ def get_modules_by_type(
         )
     elif model_type == "stablelm":
         from easydel.models.stablelm import (
-            FlaxStableLmForCausalLM as _FlaxStableLmForCausalLM,
+            StableLmForCausalLM as _StableLmForCausalLM,
         )
         from easydel.models.stablelm import StableLmConfig as _StableLmConfig
 
         return (
             _StableLmConfig,
-            _FlaxStableLmForCausalLM,
+            _StableLmForCausalLM,
             functools.partial(
-                toch_dict_to_flatten_dict,
+                torch_dict_to_flatten_dict,
                 embedding_layer_names=["embed_tokens"],
                 layer_norm_names=[
                     "input_layernorm",
@@ -306,14 +278,14 @@ def get_modules_by_type(
             ),
         )
     elif model_type == "rwkv":
-        from easydel.models.rwkv import FlaxRwkvForCausalLM as _FlaxRwkvForCausalLM
+        from easydel.models.rwkv import RwkvForCausalLM as _RwkvForCausalLM
         from easydel.models.rwkv import RwkvConfig as _RwkvConfig
 
         return (
             _RwkvConfig,
-            _FlaxRwkvForCausalLM,
+            _RwkvForCausalLM,
             functools.partial(
-                toch_dict_to_flatten_dict,
+                torch_dict_to_flatten_dict,
                 embedding_layer_names=["embeddings"],
                 layer_norm_names=["ln_out", "ln2", "ln1", "pre_ln"],
                 rnn_based_or_rwkv=True,
@@ -321,28 +293,28 @@ def get_modules_by_type(
             ),
         )
     elif model_type == "mamba":
-        from easydel.models.mamba import FlaxMambaForCausalLM as _FlaxMambaForCausalLM
+        from easydel.models.mamba import MambaForCausalLM as _MambaForCausalLM
         from easydel.models.mamba import MambaConfig as _MambaConfig
 
         return (
             _MambaConfig,
-            _FlaxMambaForCausalLM,
+            _MambaForCausalLM,
             functools.partial(
-                toch_dict_to_flatten_dict,
+                torch_dict_to_flatten_dict,
                 embedding_layer_names=["embeddings"],
                 rnn_based_or_rwkv=False,
                 lm_head_name="lm_head",
             ),
         )
     elif model_type == "grok-1":
-        from easydel.models.grok_1 import FlaxGrok1ForCausalLM as _FlaxGrok1ForCausalLM
+        from easydel.models.grok_1 import Grok1ForCausalLM as _Grok1ForCausalLM
         from easydel.models.grok_1 import Grok1Config as _Grok1Config
 
         return (
             _Grok1Config,
-            _FlaxGrok1ForCausalLM,
+            _Grok1ForCausalLM,
             functools.partial(
-                toch_dict_to_flatten_dict,
+                torch_dict_to_flatten_dict,
                 embedding_layer_names=["embed_tokens"],
                 rnn_based_or_rwkv=False,
                 lm_head_name="lm_head",
@@ -350,15 +322,15 @@ def get_modules_by_type(
         )
     elif model_type == "qwen2_moe":
         from easydel.models.qwen2_moe import (
-            FlaxQwen2MoeForCausalLM as _FlaxQwen2MoeForCausalLM,
+            Qwen2MoeForCausalLM as _Qwen2MoeForCausalLM,
         )
         from easydel.models.qwen2_moe import Qwen2MoeConfig as _Qwen2MoeConfig
 
         return (
             _Qwen2MoeConfig,
-            _FlaxQwen2MoeForCausalLM,
+            _Qwen2MoeForCausalLM,
             functools.partial(
-                toch_dict_to_flatten_dict,
+                torch_dict_to_flatten_dict,
                 embedding_layer_names=["embed_tokens"],
                 rnn_based_or_rwkv=False,
                 lm_head_name="lm_head",
@@ -367,14 +339,14 @@ def get_modules_by_type(
     elif model_type == "cohere":
         from easydel.models.cohere import CohereConfig as _CohereConfig
         from easydel.models.cohere import (
-            FlaxCohereForCausalLM as _FlaxCohereForCausalLM,
+            CohereForCausalLM as _CohereForCausalLM,
         )
 
         return (
             _CohereConfig,
-            _FlaxCohereForCausalLM,
+            _CohereForCausalLM,
             functools.partial(
-                toch_dict_to_flatten_dict,
+                torch_dict_to_flatten_dict,
                 embedding_layer_names=["embed_tokens"],
                 rnn_based_or_rwkv=False,
                 lm_head_name="lm_head",
@@ -382,13 +354,13 @@ def get_modules_by_type(
         )
     elif model_type == "dbrx":
         from easydel.models.dbrx import DbrxConfig as _DbrxConfig
-        from easydel.models.dbrx import FlaxDbrxForCausalLM as _FlaxDbrxForCausalLM
+        from easydel.models.dbrx import DbrxForCausalLM as _DbrxForCausalLM
 
         return (
             _DbrxConfig,
-            _FlaxDbrxForCausalLM,
+            _DbrxForCausalLM,
             functools.partial(
-                toch_dict_to_flatten_dict,
+                torch_dict_to_flatten_dict,
                 embedding_layer_names=["wte"],
                 rnn_based_or_rwkv=False,
                 layer_norm_names=["norm_1", "norm_2", "norm_f"],
@@ -396,14 +368,14 @@ def get_modules_by_type(
             ),
         )
     elif model_type == "phi3":
-        from easydel.models.phi3 import FlaxPhi3ForCausalLM as _FlaxPhi3ForCausalLM
+        from easydel.models.phi3 import Phi3ForCausalLM as _Phi3ForCausalLM
         from easydel.models.phi3 import Phi3Config as _Phi3Config
 
         return (
             _Phi3Config,
-            _FlaxPhi3ForCausalLM,
+            _Phi3ForCausalLM,
             functools.partial(
-                toch_dict_to_flatten_dict,
+                torch_dict_to_flatten_dict,
                 embedding_layer_names=["embed_tokens"],
                 rnn_based_or_rwkv=False,
                 lm_head_name="lm_head",
@@ -413,14 +385,14 @@ def get_modules_by_type(
     elif model_type == "arctic":
         from easydel.models.arctic import ArcticConfig as _ArcticConfig
         from easydel.models.arctic import (
-            FlaxArcticForCausalLM as _FlaxArcticForCausalLM,
+            ArcticForCausalLM as _ArcticForCausalLM,
         )
 
         return (
             _ArcticConfig,
-            _FlaxArcticForCausalLM,
+            _ArcticForCausalLM,
             functools.partial(
-                toch_dict_to_flatten_dict,
+                torch_dict_to_flatten_dict,
                 embedding_layer_names=["embed_tokens"],
                 rnn_based_or_rwkv=False,
                 lm_head_name="lm_head",
@@ -428,15 +400,15 @@ def get_modules_by_type(
         )
     elif model_type == "openelm":
         from easydel.models.openelm import (
-            FlaxOpenELMForCausalLM as _FlaxOpenELMForCausalLM,
+            OpenELMForCausalLM as _OpenELMForCausalLM,
         )
         from easydel.models.openelm import OpenELMConfig as _OpenELMConfig
 
         return (
             _OpenELMConfig,
-            _FlaxOpenELMForCausalLM,
+            _OpenELMForCausalLM,
             functools.partial(
-                toch_dict_to_flatten_dict,
+                torch_dict_to_flatten_dict,
                 embedding_layer_names=["token_embeddings"],
                 rnn_based_or_rwkv=False,
                 lm_head_name="lm_head",
@@ -445,28 +417,28 @@ def get_modules_by_type(
     elif model_type == "deepseek_v2":
         from easydel.models.deepseek_v2 import DeepseekV2Config as _DeepseekV2Config
         from easydel.models.deepseek_v2 import (
-            FlaxDeepseekV2ForCausalLM as _FlaxDeepseekV2ForCausalLM,
+            DeepseekV2ForCausalLM as _DeepseekV2ForCausalLM,
         )
 
         return (
             _DeepseekV2Config,
-            _FlaxDeepseekV2ForCausalLM,
+            _DeepseekV2ForCausalLM,
             functools.partial(
-                toch_dict_to_flatten_dict,
+                torch_dict_to_flatten_dict,
                 embedding_layer_names=["embed_tokens"],
                 rnn_based_or_rwkv=False,
                 lm_head_name="lm_head",
             ),
         )
     elif model_type == "olmo":
-        from easydel.models.olmo import FlaxOlmoForCausalLM as _FlaxOlmoForCausalLM
+        from easydel.models.olmo import OlmoForCausalLM as _OlmoForCausalLM
         from easydel.models.olmo import OlmoConfig as _OlmoConfig
 
         return (
             _OlmoConfig,
-            _FlaxOlmoForCausalLM,
+            _OlmoForCausalLM,
             functools.partial(
-                toch_dict_to_flatten_dict,
+                torch_dict_to_flatten_dict,
                 embedding_layer_names=["embed_tokens"],
                 rnn_based_or_rwkv=False,
                 lm_head_name="lm_head",
@@ -537,7 +509,6 @@ class AutoEasyDeLModelForCausalLM:
         sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
         partition_axis: PartitionAxis = PartitionAxis(),
         shard_attention_computation: bool = True,
-        input_shape: Tuple[int, int] = (1, 1),
         shard_fns: Optional[Mapping[tuple, Callable] | dict] = None,
         backend: Optional[str] = None,
         config_kwargs: Optional[Mapping[str, Any]] = None,
@@ -563,7 +534,6 @@ class AutoEasyDeLModelForCausalLM:
             sharding_axis_names (Sequence[str], optional): Names of the sharding axes. Defaults to ("dp", "fsdp", "tp", "sp").
             partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
             shard_attention_computation (bool, optional): Whether to shard attention computation. Defaults to True.
-            input_shape (Tuple[int, int], optional): Shape of the input to the model. Defaults to (1, 1).
             shard_fns (Optional[Mapping[tuple, Callable] | dict], optional): Sharding functions to use for the model. If None,
                 auto-sharding is used if auto_shard_params is True. Defaults to None.
             backend (Optional[str], optional): Backend to use for the model. Defaults to None.
@@ -600,7 +570,6 @@ class AutoEasyDeLModelForCausalLM:
                 bit_targeted_params=bit_targeted_params,
                 sharding_axis_names=sharding_axis_names,
                 sharding_axis_dims=sharding_axis_dims,
-                input_shape=input_shape,
                 config_kwargs=config_kwargs,
                 device=device,
                 shard_attention_computation=shard_attention_computation,
@@ -609,7 +578,6 @@ class AutoEasyDeLModelForCausalLM:
         with jax.default_device(device):
             return cls._from_easydel_params(
                 auto_shard_params=auto_shard_params,
-                input_shape=input_shape,
                 partition_axis=partition_axis,
                 sharding_axis_dims=sharding_axis_dims,
                 sharding_axis_names=sharding_axis_names,
@@ -634,7 +602,6 @@ class AutoEasyDeLModelForCausalLM:
         sharding_axis_names: Sequence[str],
         partition_axis: PartitionAxis,
         shard_attention_computation: bool,
-        input_shape: Tuple[int, int],
         shard_fns: Optional[Mapping[tuple, Callable] | dict],
         backend: Optional[str],
         config_kwargs: Optional[Mapping[str, Any]],
@@ -672,7 +639,7 @@ class AutoEasyDeLModelForCausalLM:
         config = AutoConfig.from_pretrained(pretrained_model_name_or_path)
         model_type: str = config.model_type
 
-        cfg, module, trf = get_modules_by_type(model_type)
+        cfg, module, trf = get_models_by_type(model_type)
 
         logger.debug(f"Downloading model weights from {pretrained_model_name_or_path}")
         model = AutoModelForCausalLM.from_pretrained(
@@ -703,35 +670,13 @@ class AutoEasyDeLModelForCausalLM:
             for k, v in config_kwargs.items():
                 setattr(cfg, k, v)
         logger.debug("creating easydel model")
-        ed_model = module(
+        ed_model = nnx_init(
+            module,
             config=cfg,
-            _do_init=False,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
-            input_shape=input_shape,
         )
-
-        needs = [
-            s.replace(".kernel", ".weight")
-            .replace(".scale", ".weight")
-            .replace(".embedding", ".weight")
-            for s in list(
-                flax.traverse_util.flatten_dict(
-                    ed_model.params_shape_tree, sep="."
-                ).keys()
-            )
-        ]
-        for k in list(state_dict.keys()):
-            if k not in needs:
-                tensor = state_dict.pop(k)
-                del tensor
-                _clear()
-                logger.debug(
-                    f"removing {k} from weights as it was not needed by flax model"
-                )
-
-        _clear()
 
         if shard_fns is not None:
             if auto_shard_params:
@@ -750,7 +695,6 @@ class AutoEasyDeLModelForCausalLM:
                 partition_axis=partition_axis,
                 shard_attention_computation=shard_attention_computation,
                 backend=backend,
-                input_shape=input_shape,  # type:ignore
                 config_kwargs=config_kwargs,
             )
         logger.debug("converting huggingface-model to easydel-model.")
@@ -793,7 +737,8 @@ class AutoEasyDeLModelForCausalLM:
                 f"{sum(n.size for n in jax.tree_util.tree_flatten(flax.core.unfreeze(params))[0]) / 1e9}"
                 f" Billion Parameters"
             )
-        return ed_model, params
+        ed_model = attech_tree_to_nnx_model(model=ed_model, tree=params)
+        return ed_model
 
     @staticmethod
     def _from_easydel_params(
@@ -804,7 +749,6 @@ class AutoEasyDeLModelForCausalLM:
         sharding_axis_dims: Sequence[int],
         sharding_axis_names: Sequence[str],
         partition_axis: PartitionAxis,
-        input_shape: Tuple[int, int],
         shard_fns: Optional[Mapping[tuple, Callable] | dict],
         config_kwargs: Optional[Mapping[str, Any]],
         auto_shard_params: bool,
@@ -817,7 +761,6 @@ class AutoEasyDeLModelForCausalLM:
 
         return BaseNNXModule.from_pretrained(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
-            input_shape=input_shape,
             dtype=dtype,
             precision=precision,
             param_dtype=param_dtype,
@@ -868,7 +811,7 @@ class AutoEasyDeLConfig:
         config = cls_main.from_pretrained(pretrained_model_name_or_path)
         model_type: str = config.model_type
 
-        cfg, module, trf = get_modules_by_type(model_type)
+        cfg, module, trf = get_models_by_type(model_type)
         cfg = cfg.from_pretrained(pretrained_model_name_or_path)
         if hasattr(cfg, "add_jax_args"):
             cfg.add_jax_args()
@@ -906,7 +849,6 @@ class AutoShardAndGatherFunctions:
         config: EDPretrainedConfig,
         partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
         flatten: bool = True,
-        input_shape: Tuple[int, int] = (1, 1),
         depth_target: Optional[List[str]] = None,
     ):
         """
@@ -917,7 +859,6 @@ class AutoShardAndGatherFunctions:
             partition_rules: A tuple of tuples containing partition rule names and `PartitionSpec` objects.
                 If None, uses the default partition rules from the `config`.
             flatten: Whether to flatten the shard and gather functions. Defaults to True.
-            input_shape: The input shape of the model. Defaults to (1, 1).
             depth_target: Pad the sharding to depth, for example make {params:tensor} with depth_target = ["row"] to {row:{params:tensor}}. Defaults to None.
 
         Returns:
@@ -928,8 +869,8 @@ class AutoShardAndGatherFunctions:
                 "Using config partition rules from `get_partition_rules(fully_sharded_data_parallel=True)`"
             )
             partition_rules = config.get_partition_rules(True)
-        _, module, _ = get_modules_by_type(config.model_type)
-        model = module(config=config, _do_init=False, input_shape=input_shape)
+        _, module, _ = get_models_by_type(config.model_type)
+        model = module(config=config)
 
         partition_specs = match_partition_rules(
             partition_rules, model.params_shape_tree
@@ -963,7 +904,6 @@ class AutoShardAndGatherFunctions:
     def from_pretrained(
         cls,
         pretrained_model_name_or_path: str,
-        input_shape: Tuple[int, int] = (1, 1),
         sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
         sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
         partition_axis: PartitionAxis = PartitionAxis(),
@@ -980,7 +920,6 @@ class AutoShardAndGatherFunctions:
 
         Args:
             pretrained_model_name_or_path: The name or path of the pretrained model.
-            input_shape: The input shape of the model. Defaults to (1, 1).
             sharding_axis_dims: The dimensions of the sharding axes. Defaults to (1, -1, 1, 1).
             sharding_axis_names: The names of the sharding axes. Defaults to ("dp", "fsdp", "tp", "sp").
             partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
@@ -1011,6 +950,5 @@ class AutoShardAndGatherFunctions:
             config=config,
             partition_rules=partition_rules,
             flatten=flatten,
-            input_shape=input_shape,
             depth_target=depth_target,
         )

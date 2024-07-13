@@ -8,6 +8,13 @@ import chex
 
 # import flax
 import jax
+from fjformer.checkpoint import CheckpointManager
+
+# from transformers.utils import cached_file as _cached_file
+# from transformers.utils import download_url as _download_url
+# from transformers.utils import is_offline_mode as _is_offline_mode
+# from transformers.utils import is_remote_url as _is_remote_url
+from flax import nnx
 
 # from flax.core import FrozenDict, unfreeze
 # from flax.traverse_util import flatten_dict, unflatten_dict
@@ -17,12 +24,6 @@ from jax.sharding import Mesh, PartitionSpec
 from transformers import AutoModelForCausalLM, PretrainedConfig
 from transformers.utils.hub import PushToHubMixin
 
-# from transformers.utils import cached_file as _cached_file
-# from transformers.utils import download_url as _download_url
-# from transformers.utils import is_offline_mode as _is_offline_mode
-# from transformers.utils import is_remote_url as _is_remote_url
-from flax import nnx
-from fjformer.checkpoint import CheckpointManager
 from easydel.etils.etils import get_logger
 from easydel.etils.partition_module import PartitionAxis
 
@@ -911,7 +912,7 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
         # from easydel.modules.auto_easydel_model import (
         #     AutoEasyDeLConfig,
         #     AutoShardAndGatherFunctions,
-        #     get_modules_by_type,
+        #     get_models_by_type,
         # )
 
         # config = AutoEasyDeLConfig.from_pretrained(
@@ -1027,7 +1028,7 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
         #     # if they are using BaseNNXModule.from_pretrained
         #     # they will get error AssertionError: `module` must be provided.` so we autoset this to make sure user don't
         #     # experience this error.
-        #     _, cls, _ = get_modules_by_type(config.model_type)
+        #     _, cls, _ = get_models_by_type(config.model_type)
         # model = cls(
         #     config,
         #     *model_args,

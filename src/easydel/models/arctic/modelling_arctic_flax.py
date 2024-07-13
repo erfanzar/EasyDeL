@@ -30,7 +30,7 @@ from easydel.models.flax_modelling_utils import (
 from easydel.models.modeling_flax_outputs import (
     FlaxMaskedLMOutput,
 )
-from src.easydel.models.modelling_utils import BaseNNXModule
+from easydel.models.modelling_utils import BaseNNXModule
 
 
 @flax.struct.dataclass
@@ -255,7 +255,6 @@ class ArcticAttention(BaseAttentionModule):
             bias=attention_bias,
             attention_mask=attention_mask,
             causal=True,
-            deterministic=self.resid_dropout.deterministic,
             query_sequence_length=query_length,
             key_value_sequence_length=key_length,
             segment_ids=segment_ids,
@@ -275,7 +274,7 @@ class ArcticAttention(BaseAttentionModule):
                     self.config.partition_axis.hidden_state_axis,
                 ),
             )
-        attn_output = self.resid_dropout(self.o_proj(attn_output))
+        attn_output = self.o_proj(attn_output)
         return attn_output, attentions.attention_weights
 
 

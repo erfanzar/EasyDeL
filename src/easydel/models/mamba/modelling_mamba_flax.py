@@ -6,21 +6,21 @@ import chex
 import jax
 import jax.numpy as jnp
 from einops import einsum
-from flax.traverse_util import flatten_dict, unflatten_dict
-from jax import lax
 from flax import nnx
+from jax import lax
+
 from easydel.models.common import RMSNorm as MambaRMSNorm
 from easydel.models.flax_modelling_utils import ACT2FN
+from easydel.models.modeling_flax_outputs import MambaCausalLMOutput, MambaOutput
 from easydel.models.mamba.mamba_configuration import MambaConfig as MambaConfig
 from easydel.models.modelling_utils import BaseNNXModule
-from easydel.models.flax_modelling_utils import MambaOutput, MambaCausalLMOutput
 
 
 def init_to_value(x, dtype):
     return lambda _: x.astype(dtype)
 
 
-class FlaxMambaCache:
+class MambaCache:
     def __init__(
         self,
         config: MambaConfig,
@@ -447,7 +447,7 @@ class MambaBlock(nnx.Module):
     def __call__(
         self,
         hidden_states: chex.Array,
-        cache_params: Optional[FlaxMambaCache] = None,
+        cache_params: Optional[MambaCache] = None,
     ) -> chex.Array:
         residual = hidden_states
         hidden_states = self.norm(hidden_states)
@@ -537,7 +537,7 @@ class MambaModel(BaseNNXModule):
             use_cache = False
 
         if cache_params is None and use_cache:
-            cache_params = FlaxMambaCache(
+            cache_params = MambaCache(
                 self.config, input_embeds.shape[0], dtype=input_embeds.dtype
             )
 

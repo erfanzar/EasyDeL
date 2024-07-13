@@ -4,20 +4,13 @@ from functools import partial
 from typing import Any, Optional, Tuple, Union
 
 import fjformer
-import flax.linen
 import jax
 import jax.numpy as jnp
-from fjformer import linen as nn
-from fjformer.linen import Dense
-from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
-from flax.linen import combine_masks, make_causal_mask
-from flax.linen import partitioning as nn_partitioning
-from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax.random import PRNGKey
 from jax.sharding import PartitionSpec
 from transformers import FlaxWhisperTimeStampLogitsProcessor
-from transformers.modeling_flax_outputs import (
+from easydel.models.modeling_flax_outputs import (
     FlaxBaseModelOutput,
     FlaxBaseModelOutputWithPastAndCrossAttentions,
     FlaxCausalLMOutputWithCrossAttentions,
@@ -27,18 +20,17 @@ from transformers.modeling_flax_outputs import (
 )
 
 from easydel.models.attention_module import FlexibleAttentionModule
-
-# easydel.modules
+from flax import nnx
 from easydel.models.flax_modelling_utils import (
     ACT2FN,
     BaseAttentionModule,
     get_gradient_checkpoint_policy,
     with_sharding_constraint,
+    make_attention_mask,
 )
+from easydel.models.caching_utils import KVCache
 from easydel.models.modelling_utils import BaseNNXModule
 from easydel.models.whisper.whisper_configuration import WhisperConfig as WhisperConfig
-
-remat = nn_partitioning.remat
 
 
 def sinusoidal_embedding_init(key, shape, dtype=jnp.float_) -> jax.Array:
@@ -55,18 +47,32 @@ def sinusoidal_embedding_init(key, shape, dtype=jnp.float_) -> jax.Array:
     )
 
 
-class FlaxWhisperAttention(BaseAttentionModule):
-    config: WhisperConfig
-    embed_dim: int
-    num_heads: int
-    dropout: float = 0.0
-    causal: bool = False
-    bias: bool = True
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[str, lax.Precision]] = None
-
-    def setup(self) -> None:
+class WhisperAttention(BaseAttentionModule):
+    def __init__(
+        self,
+        config: WhisperConfig,
+        embed_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        causal: bool = False,
+        bias: bool = True,
+        dtype: jnp.dtype = jnp.float32,
+        param_dtype: jnp.dtype = jnp.float32,
+        precision: Optional[Union[str, lax.Precision]] = None,
+        *,
+        rngs: nnx.Rngs,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.dropout = dropout
+        self.causal = causal
+        self.bias = bias
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.rngs = rngs
         self.head_dim = self.embed_dim // self.num_heads
         if self.head_dim * self.num_heads != self.embed_dim:
             raise ValueError(
@@ -74,60 +80,68 @@ class FlaxWhisperAttention(BaseAttentionModule):
                 f" and `num_heads`: {self.num_heads})."
             )
 
-        dense = partial(
-            Dense,
+        linear = partial(
+            nnx.Linear,
             self.embed_dim,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            precision=self.precision,
-            kernel_init=nnx.initializers.normal(self.config.init_std),
+            self.embed_dim,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            kernel_init=nnx.initializers.normal(config.init_std),
         )
 
-        self.q_proj = dense(use_bias=self.bias)
-        self.k_proj = dense(use_bias=False)
-        self.v_proj = dense(use_bias=self.bias)
-        self.out_proj = dense(use_bias=self.bias)
+        self.q_proj = linear(use_bias=self.bias, rngs=rngs)
+        self.k_proj = linear(use_bias=False, rngs=rngs)
+        self.v_proj = linear(use_bias=self.bias, rngs=rngs)
+        self.out_proj = linear(use_bias=self.bias, rngs=rngs)
 
-        self.attention_module = FlexibleAttentionModule(
-            use_sharding_constraint=self.config.use_sharding_constraint,
-            block_k_major=self.config.block_k_major,
-            block_b=self.config.block_b,
-            block_q=self.config.block_q,
-            block_k=self.config.block_k,
-            block_q_major_dkv=self.config.block_q_major_dkv,
-            block_k_major_dkv=self.config.block_k_major_dkv,
-            block_k_major_dq=self.config.block_k_major_dq,
-            block_k_dkv=self.config.block_k_dkv,
-            block_q_dkv=self.config.block_q_dkv,
-            block_q_dq=self.config.block_q_dq,
-            block_k_dq=self.config.block_k_dq,
-            num_attention_heads=self.config.num_attention_heads,
-            attention_dropout=self.config.attention_dropout,
-            head_dims=self.head_dim,
-            shard_attention_computation=self.config.shard_attention_computation,
-            precision=self.precision,
-            force_float32_tpu=True,
-            attn_mechanism=self.config.attn_mechanism,
-            dtype=self.config.attn_dtype,
-            partition_axis=self.config.partition_axis,
-            scan_ring_attention=self.config.scan_ring_attention,
-            mesh=self.config.mesh,
+        self.attention_module: FlexibleAttentionModule = FlexibleAttentionModule(
+            mesh=config.mesh,
+            attn_mechanism=config.attn_mechanism,
             sm_scale=1 / math.sqrt(self.head_dim),
-            axis_name=self.config.attention_axis_name,
-            backward_pass_impl=self.config.flash_attention_backward_pass_impl,
+            num_attention_heads=config.num_attention_heads,
+            head_dims=self.head_dim,
+            precision=precision,
+            base_config=config,
         )
+
+        self._causal_mask = None
+
+    @property
+    def causal_mask(self):
+        if self._causal_mask is None:
+            self._causal_mask = nnx.make_causal_mask(
+                jnp.ones(
+                    (
+                        1,
+                        getattr(
+                            self.config,
+                            "causal_mask_max_position_embeddings",
+                            self.config.max_position_embeddings,
+                        ),
+                    ),
+                    dtype=jnp.bool,
+                ),
+                dtype=jnp.bool,
+            )
+        return self._causal_mask
+
+    def _split_heads(self, hidden_state) -> jnp.ndarray:
+        return hidden_state.reshape(
+            hidden_state.shape[:2] + (self.num_heads, self.head_dim)
+        )
+
+    def _merge_heads(self, hidden_state) -> jnp.ndarray:
+        return hidden_state.reshape(hidden_state.shape[:2] + (self.embed_dim,))
 
     def __call__(
         self,
         hidden_states: jnp.ndarray,
         key_value_states: Optional[jnp.ndarray] = None,
+        past_key_values: Optional[KVCache] = None,
         attention_mask: Optional[jnp.ndarray] = None,
-        causal_mask: Optional[jnp.ndarray] = None,
-        init_cache: bool = False,
-        deterministic: bool = True,
     ) -> tuple[Any, Any]:
         is_cross_attention = key_value_states is not None
-        batch_size = hidden_states.shape[0]
 
         query_states = self.q_proj(hidden_states)
 
@@ -141,74 +155,39 @@ class FlaxWhisperAttention(BaseAttentionModule):
         query_states = self._split_heads(query_states)
         key_states = self._split_heads(key_states)
         value_states = self._split_heads(value_states)
-
         if self.causal:
-            assert causal_mask is not None, "seems like you forgot to pass causal_mask"
-            query_length, key_length = query_states.shape[1], key_states.shape[1]
-            if self.has_variable("cache", "cached_key"):
-                mask_shift = self.variables["cache"]["cache_index"]
-                max_decoder_length = self.variables["cache"]["cached_key"].shape[1]
-                causal_mask = lax.dynamic_slice(
-                    causal_mask,
-                    (0, 0, mask_shift, 0),
-                    (1, 1, query_length, max_decoder_length),
-                )
-            else:
-                causal_mask = causal_mask[:, :, :query_length, :key_length]
-            causal_mask = jnp.broadcast_to(
-                causal_mask, (batch_size,) + causal_mask.shape[1:]
-            )
-
-        # combine masks if needed
-        if attention_mask is not None and self.causal:
-            attention_mask = jnp.broadcast_to(
-                jnp.expand_dims(attention_mask, axis=(-3, -2)), causal_mask.shape
-            )
-            attention_mask = combine_masks(attention_mask, causal_mask)
-        elif self.causal:
-            attention_mask = causal_mask
-        elif attention_mask is not None:
-            attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
-
-        # During fast autoregressive decoding, we feed one position at a time,
-        # and cache the keys and values step by step.
-
-        if self.causal and (self.has_variable("cache", "cached_key") or init_cache):
-            key_states, value_states, attention_mask = self._concatenate_to_cache(
-                key_states, value_states, query_states, attention_mask
+            attention_mask = make_attention_mask(attention_mask, self.causal_mask)
+        if past_key_values is not None:
+            past_key_values.update(key_states=key_states, value_states=value_states)
+            key_states, value_states, attention_mask = past_key_values.get(
+                attention_mask=attention_mask, causal=self.causal
             )
 
         query_length, key_length = query_states.shape[1], key_states.shape[1]
-        # Convert the boolean attention mask to an attention bias.
+        attention_bias = None
         if attention_mask is not None:
-            # attention mask in the form of attention bias
+            attention_mask = attention_mask[:, :, :, :key_length]
             attention_bias = lax.select(
                 attention_mask > 0,
                 jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-                jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(
-                    self.dtype
-                ),
+                jnp.full(
+                    attention_mask.shape,
+                    jnp.finfo(self.dtype).min,
+                ).astype(self.dtype),
             )
-        else:
-            attention_bias = None
 
-        dropout_rng = None
-        if not deterministic and self.dropout > 0.0:
-            dropout_rng = self.make_rng("dropout")
+        query_length, key_length = query_states.shape[1], key_states.shape[1]
 
-        attentions = self.attention_module.__call__(
+        attentions = self.attention_module(
             query_states=query_states,
             key_states=key_states,
             value_states=value_states,
             bias=attention_bias,
             attention_mask=attention_mask,
             causal=False,
-            dropout_rng=dropout_rng,
-            deterministic=deterministic,
             query_sequence_length=query_length,
             key_value_sequence_length=key_length,
             segment_ids=None,
-            causal_mask=causal_mask,
         )
 
         attn_output = self._merge_heads(attentions.attention_outputs)
@@ -216,60 +195,88 @@ class FlaxWhisperAttention(BaseAttentionModule):
             attn_output = with_sharding_constraint(
                 attn_output,
                 PartitionSpec(
-                    ("dp", "fsdp"), "sp" if attn_output.shape[1] != 1 else None, "tp"
+                    self.config.partition_axis.batch_axis,
+                    (
+                        self.config.partition_axis.sequence_axis
+                        if attn_output.shape[1] != 1
+                        else None
+                    ),
+                    self.config.partition_axis.hidden_state_axis,
                 ),
             )
         attn_output = self.out_proj(attn_output)
 
         return attn_output, attentions.attention_outputs
 
-    def _split_heads(self, hidden_state) -> jnp.ndarray:
-        return hidden_state.reshape(
-            hidden_state.shape[:2] + (self.num_heads, self.head_dim)
-        )
 
-    def _merge_heads(self, hidden_state) -> jnp.ndarray:
-        return hidden_state.reshape(hidden_state.shape[:2] + (self.embed_dim,))
+class WhisperEncoderLayer(nnx.Module):
+    def __init__(
+        self,
+        config: WhisperConfig,
+        dtype: jnp.dtype = jnp.float32,
+        param_dtype: jnp.dtype = jnp.float32,
+        precision: Optional[Union[str, lax.Precision]] = None,
+        *,
+        rngs: nnx.Rngs,
+    ) -> None:
 
-
-class FlaxWhisperEncoderLayer(nn.Module):
-    config: WhisperConfig
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[str, lax.Precision]] = None
-
-    def setup(self) -> None:
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.rngs = rngs
         self.embed_dim = self.config.d_model
-        self.self_attn = FlaxWhisperAttention(
-            config=self.config,
+        self.self_attn = WhisperAttention(
+            config=config,
             embed_dim=self.embed_dim,
-            num_heads=self.config.encoder_attention_heads,
-            dropout=self.config.attention_dropout,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            precision=self.precision,
+            num_heads=config.encoder_attention_heads,
+            dropout=config.attention_dropout,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
         )
-        self.self_attn_layer_norm = nn.LayerNorm(dtype=self.dtype, epsilon=1e-05)
-        self.dropout_layer = flax.linen.Dropout(rate=self.config.dropout)
-        self.activation_fn = ACT2FN[self.config.activation_function]
-        self.activation_dropout_layer = flax.linen.Dropout(
-            rate=self.config.activation_dropout
-        )
-        self.fc1 = Dense(
-            self.config.encoder_ffn_dim,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            precision=self.precision,
-            kernel_init=nnx.initializers.normal(self.config.init_std),
-        )
-        self.fc2 = Dense(
+        self.self_attn_layer_norm = nnx.LayerNorm(
             self.embed_dim,
             dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            precision=self.precision,
-            kernel_init=nnx.initializers.normal(self.config.init_std),
+            param_dtype=param_dtype,
+            epsilon=1e-05,
+            rngs=rngs,
         )
-        self.final_layer_norm = nn.LayerNorm(dtype=self.dtype, epsilon=1e-05)
+        self.dropout_layer = nnx.Dropout(
+            rate=self.config.dropout,
+            rngs=rngs,
+        )
+        self.activation_fn = ACT2FN[self.config.activation_function]
+        self.activation_dropout_layer = nnx.Dropout(
+            rate=self.config.activation_dropout,
+            rngs=rngs,
+        )
+        self.fc1 = nnx.Linear(
+            self.embed_dim,
+            self.config.encoder_ffn_dim,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            kernel_init=nnx.initializers.normal(self.config.init_std),
+            rngs=rngs,
+        )
+        self.fc2 = nnx.Linear(
+            self.config.encoder_ffn_dim,
+            self.embed_dim,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            kernel_init=nnx.initializers.normal(self.config.init_std),
+            rngs=rngs,
+        )
+        self.final_layer_norm = nnx.LayerNorm(
+            self.embed_dim,
+            dtype=self.dtype,
+            param_dtype=param_dtype,
+            epsilon=1e-05,
+            rngs=rngs,
+        )
 
     def __call__(
         self,

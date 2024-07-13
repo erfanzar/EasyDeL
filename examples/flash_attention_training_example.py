@@ -7,7 +7,7 @@ from easydel import (
     EasyDeLOptimizers,
     EasyDeLSchedulers,
     TrainArguments,
-    get_modules_by_type,
+    get_models_by_type,
 )
 from fjformer import GenerateRNG
 from flax.core import FrozenDict
@@ -75,7 +75,7 @@ def launch():
         tokenization_process, num_proc=18, remove_columns=dataset.column_names
     )
     train_args = TrainArguments(
-        model_class=get_modules_by_type(config.model_type)[1],
+        model_class=get_models_by_type(config.model_type)[1],
         configs_to_initialize_model_class=configs_to_initialize_model_class,
         custom_rule=config.get_partition_rules(True),
         model_name="FlashAttentionTest",

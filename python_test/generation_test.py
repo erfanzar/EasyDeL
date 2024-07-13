@@ -87,7 +87,7 @@ class EasyModelsGenerationTest(TestCase):
         self,
         module_name: str,
     ):
-        module_config, module_class, transform_function = ed.get_modules_by_type(
+        module_config, module_class, transform_function = ed.get_models_by_type(
             module_name
         )
         config = module_config(

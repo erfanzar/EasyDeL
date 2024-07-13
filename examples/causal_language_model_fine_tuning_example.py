@@ -1,21 +1,21 @@
 import os
 
+import jax
+from datasets import load_dataset
 from easydel import (
     AutoEasyDeLModelForCausalLM,
-    TrainArguments,
     CausalLanguageModelTrainer,
+    EasyDeLGradientCheckPointers,
     EasyDeLOptimizers,
     EasyDeLSchedulers,
-    EasyDeLGradientCheckPointers,
-    get_modules_by_type,
-    easystate_to_huggingface_model, EasyDeLState
+    EasyDeLState,
+    TrainArguments,
+    easystate_to_huggingface_model,
+    get_models_by_type,
 )
-from transformers import MixtralForCausalLM
-from datasets import load_dataset
 from flax.core import FrozenDict
-from transformers import AutoTokenizer
 from jax import numpy as jnp
-import jax
+from transformers import AutoTokenizer, MixtralForCausalLM
 
 
 def main():
@@ -28,7 +28,7 @@ def main():
         device=jax.devices("cpu")[0],
         input_shape=(1, 1),
         device_map="auto",
-        sharding_axis_dims=(1, -1, 1, 1)
+        sharding_axis_dims=(1, -1, 1, 1),
     )
 
     model_parameters = FrozenDict({"params": params})
@@ -42,8 +42,7 @@ def main():
     )
 
     tokenizer = AutoTokenizer.from_pretrained(
-        pretrained_model_name_or_path,
-        trust_remote_code=True
+        pretrained_model_name_or_path, trust_remote_code=True
     )
 
     if tokenizer.pad_token is None:
@@ -59,22 +58,22 @@ def main():
             data_chunk["prompt"],
             add_special_tokens=False,
             max_length=max_length,
-            padding="max_length"
+            padding="max_length",
         )
 
     dataset = dataset.map(
         tokenization_process,
         num_proc=os.cpu_count(),
-        remove_columns=dataset.column_names
+        remove_columns=dataset.column_names,
     )
 
     train_args = TrainArguments(
-        model_class=get_modules_by_type(model.config.model_type)[1],
+        model_class=get_models_by_type(model.config.model_type)[1],
         configs_to_initialize_model_class={
             "config": model.config,
             "dtype": dtype,
             "param_dtype": dtype,
-            "input_shape": (1, max_length)
+            "input_shape": (1, max_length),
         },
         custom_rule=model.config.get_partition_rules(True),
         model_name="Mixtral-Tune",
@@ -95,30 +94,30 @@ def main():
         param_dtype=dtype,
         step_start_point=0,
         training_time="10H",  # Set training limit time to 10 hours you can set this to None
-        wandb_entity=None  # Set WANDB team to send logs to
+        wandb_entity=None,  # Set WANDB team to send logs to
         # Read docs for more and better understanding of options
     )
 
     trainer = CausalLanguageModelTrainer(
         train_args,
         dataset.shuffle().shuffle().shuffle(),
-        checkpoint_path=None  # In Case of resuming from a checkpoint you can pass checkpoint path here and simply just
+        checkpoint_path=None,  # In Case of resuming from a checkpoint you can pass checkpoint path here and simply just
         # don't create and run model and params steps above.
     )
 
     output = trainer.train(
         model_parameters=model_parameters,  # pass this as none in case of resuming from last checkpoint
-        state=None
+        state=None,
     )
 
-    with jax.default_device(jax.devices("cpu")[0]):  # Converting easydel model to huggingface model and offloading that
+    with jax.default_device(
+        jax.devices("cpu")[0]
+    ):  # Converting easydel model to huggingface model and offloading that
         # on to cpu.
         model = easystate_to_huggingface_model(
-            state=EasyDeLState.load_state(
-                output.checkpoint_path
-            ),
+            state=EasyDeLState.load_state(output.checkpoint_path),
             base_huggingface_module=MixtralForCausalLM,
-            config=model.config
+            config=model.config,
         )
     model = model.half()
     model.push_to_hub("EasyDeL-Mixtral")

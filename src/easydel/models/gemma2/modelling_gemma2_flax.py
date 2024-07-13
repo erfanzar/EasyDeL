@@ -119,10 +119,26 @@ class Gemma2Attention(BaseAttentionModule):
             kernel_init=kernel,
             rngs=rngs,
         )
-        self.q_proj = dense_class(self.num_heads * self.head_dim)
-        self.k_proj = dense_class(self.num_key_value_heads * self.head_dim)
-        self.v_proj = dense_class(self.num_key_value_heads * self.head_dim)
-        self.o_proj = dense_class(self.embed_dim)
+        self.q_proj = dense_class(
+            self.embed_dim,
+            self.num_heads * self.head_dim,
+            rngs=rngs,
+        )
+        self.k_proj = dense_class(
+            self.embed_dim,
+            self.num_key_value_heads * self.head_dim,
+            rngs=rngs,
+        )
+        self.v_proj = dense_class(
+            self.embed_dim,
+            self.num_key_value_heads * self.head_dim,
+            rngs=rngs,
+        )
+        self.o_proj = dense_class(
+            self.num_heads * self.head_dim,
+            self.embed_dim,
+            rngs=rngs,
+        )
         self.sliding_window = (
             config.sliding_window if (self.layer_idx % 2 == 0) else None
         )
@@ -166,8 +182,8 @@ class Gemma2Attention(BaseAttentionModule):
         query, key = self._transpose_sequence_head(query, key)
         query, key = self.rotary_emb(
             position_ids=position_ids,
-            query_states=query,
-            key_states=key,
+            query=query,
+            key=key,
             freqs_cis=freqs_cis,
         )
         return self._transpose_sequence_head(query, key)
@@ -255,6 +271,8 @@ class Gemma2Attention(BaseAttentionModule):
 
                 if attention_mask.shape[-1] <= 1:  # when decoding
                     attention_mask = attention_mask[:, :, :, -self.sliding_window :]
+
+            attention_mask = attention_mask[:, :, :, :key_length]
             attention_bias = lax.select(
                 attention_mask > 0,
                 jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
@@ -272,7 +290,6 @@ class Gemma2Attention(BaseAttentionModule):
             bias=attention_bias,
             attention_mask=attention_mask,
             causal=True,
-            deterministic=self.resid_dropout.deterministic,
             query_sequence_length=query_length,
             key_value_sequence_length=key_length,
             segment_ids=segment_ids,
@@ -292,7 +309,7 @@ class Gemma2Attention(BaseAttentionModule):
                     self.config.partition_axis.hidden_state_axis,
                 ),
             )
-        attn_output = self.resid_dropout(self.o_proj(attn_output))
+        attn_output = self.o_proj(attn_output)
         return attn_output, attentions.attention_weights
 
 
@@ -373,24 +390,13 @@ class Gemma2DecoderLayer(nnx.Module):
         rngs: nnx.Rngs,
     ):
         super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
         mlp_block = Gemma2MLP
         attn_block = Gemma2Attention
-
-        # if self.config.gradient_checkpointing != "":
-        #     mlp_block = flax.linen.partitioning.remat(
-        #         mlp_block,
-        #         policy=get_gradient_checkpoint_policy(
-        #             self.config.gradient_checkpointing
-        #         ),
-        #         static_argnums=(1,),
-        #     )
-        #     attn_block = flax.linen.partitioning.remat(
-        #         attn_block,
-        #         policy=get_gradient_checkpoint_policy(
-        #             self.config.gradient_checkpointing
-        #         ),
-        #         static_argnums=(3, 4, 6, 7, 8),
-        #     )
         self.is_sliding = bool(self.layer_idx % 2)
         self.self_attn = attn_block(
             config,
@@ -480,6 +486,9 @@ class Gemma2Model(BaseNNXModule):
         rngs: nnx.Rngs,
     ):
         super().__init__(config=config)
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
         self.hidden_size = self.config.hidden_size
         self.embed_tokens = nnx.Embed(
             config.vocab_size,
@@ -611,7 +620,7 @@ class Gemma2Model(BaseNNXModule):
                 position_ids=position_ids,
                 freqs_cis=self.freqs_cis,
                 past_key_values=past_key_values[idx],
-                output_attentions=output_attentions,
+            
             )
 
             if output_attentions:
@@ -644,6 +653,9 @@ class Gemma2ForCausalLM(BaseNNXModule):
         rngs: nnx.Rngs,
     ):
         super().__init__(config=config)
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
         self.model = Gemma2Model(
             config, dtype=dtype, param_dtype=param_dtype, precision=precision, rngs=rngs
         )

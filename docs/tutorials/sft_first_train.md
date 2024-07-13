@@ -164,7 +164,7 @@ This section allows for more fine-grained control over how model parameters are 
 
 ```python
 train_arguments = ed.TrainArguments(
-    model_class=ed.get_modules_by_type(config.model_type)[1],
+    model_class=ed.get_models_by_type(config.model_type)[1],
     configs_to_initialize_model_class=configs_to_initialize_model_class,
     custom_rule=config.get_partition_rules(True), 
     num_train_epochs=4,

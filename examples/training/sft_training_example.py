@@ -1,27 +1,26 @@
-import transformers
-
 import easydel
+import jax
+import transformers
+from datasets import load_dataset
 from easydel import (
     AutoEasyDeLModelForCausalLM,
-    TrainArguments,
+    EasyDeLGradientCheckPointers,
     EasyDeLOptimizers,
     EasyDeLSchedulers,
-    EasyDeLGradientCheckPointers,
     EasyDeLState,
     EasyDeLXRapTureConfig,
     SFTTrainer,
-    get_modules_by_type,
+    TrainArguments,
+    conversations_formatting_function,
     easystate_to_huggingface_model,
-    conversations_formatting_function
+    get_models_by_type,
 )
-from datasets import load_dataset
-from flax.core import FrozenDict
-from transformers import AutoTokenizer
-from jax import numpy as jnp, sharding
-import jax
-from transformers import AutoConfig
-from huggingface_hub import HfApi
 from easydel.etils import define_flags_with_default
+from flax.core import FrozenDict
+from huggingface_hub import HfApi
+from jax import numpy as jnp
+from jax import sharding
+from transformers import AutoConfig, AutoTokenizer
 
 PartitionSpec = sharding.PartitionSpec
 api = HfApi()
@@ -55,15 +54,15 @@ FLAGS, DEF_FLAGS = define_flags_with_default(
     packing_sft=True,
     messages_field="conversation",
     training_time="90H",
-    _required_fields=["pretrained_model_name_or_path", "new_repo_id", "train_dataset"]
+    _required_fields=["pretrained_model_name_or_path", "new_repo_id", "train_dataset"],
 )
 
 
 def main():
     pretrained_model_name_or_path_tokenizer = (
-        FLAGS.pretrained_model_name_or_path_tokenizer if (
-                FLAGS.pretrained_model_name_or_path_tokenizer != ""
-        ) else FLAGS.pretrained_model_name_or_path
+        FLAGS.pretrained_model_name_or_path_tokenizer
+        if (FLAGS.pretrained_model_name_or_path_tokenizer != "")
+        else FLAGS.pretrained_model_name_or_path
     )
 
     dtype = jnp.bfloat16
@@ -78,21 +77,21 @@ def main():
         batch_axis=("dp", "fsdp"),
         query_sequence_axis="sp",
         key_sequence_axis="sp",
-        head_axis="tp"
+        head_axis="tp",
     )
 
     model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
         FLAGS.pretrained_model_name_or_path,
-        device=jax.devices('cpu')[0],
+        device=jax.devices("cpu")[0],
         input_shape=FLAGS.input_shape,
         device_map="auto",
         sharding_axis_dims=sharding_axis_dims,
         config_kwargs=dict(
             use_scan_mlp=False,
             attn_mechanism=FLAGS.attn_mechanism,
-            partition_axis=partition_axis
+            partition_axis=partition_axis,
         ),
-        partition_axis=partition_axis
+        partition_axis=partition_axis,
     )
 
     config = model.config
@@ -102,41 +101,43 @@ def main():
     model_parameters = FrozenDict({"params": params})
 
     tokenizer = AutoTokenizer.from_pretrained(
-        pretrained_model_name_or_path_tokenizer,
-        trust_remote_code=True
+        pretrained_model_name_or_path_tokenizer, trust_remote_code=True
     )
 
     config.add_basic_configurations(
         attn_mechanism=FLAGS.attn_mechanism,
         shard_attention_computation=True,
-        partition_axis=partition_axis
+        partition_axis=partition_axis,
     )
 
     configs_to_initialize_model_class = {
         "config": config,
         "dtype": dtype,
         "param_dtype": dtype,
-        "input_shape": FLAGS.input_shape
+        "input_shape": FLAGS.input_shape,
     }
 
     if tokenizer.pad_token == None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    rapture_config = EasyDeLXRapTureConfig(
-        model_parameters,
-        lora_dim=FLAGS.lora_dim,
-        fully_fine_tune_parameters=FLAGS.fully_fine_tune_parameters,
-        lora_fine_tune_parameters=FLAGS.lora_fine_tune_parameters,
-        verbose=True
-    ) if FLAGS.use_lora else None
+    rapture_config = (
+        EasyDeLXRapTureConfig(
+            model_parameters,
+            lora_dim=FLAGS.lora_dim,
+            fully_fine_tune_parameters=FLAGS.fully_fine_tune_parameters,
+            lora_fine_tune_parameters=FLAGS.lora_fine_tune_parameters,
+            verbose=True,
+        )
+        if FLAGS.use_lora
+        else None
+    )
 
     train_dataset = load_dataset(FLAGS.train_dataset, split="train")
 
     train_arguments = TrainArguments(
-        model_class=get_modules_by_type(config.model_type)[1],
+        model_class=get_models_by_type(config.model_type)[1],
         configs_to_initialize_model_class=configs_to_initialize_model_class,
         custom_rule=config.get_partition_rules(True),
-
         num_train_epochs=FLAGS.num_train_epochs,
         learning_rate=FLAGS.learning_rate,
         learning_rate_end=FLAGS.learning_rate_end,
@@ -153,13 +154,11 @@ def main():
         sharding_array=sharding_axis_dims,
         gradient_accumulation_steps=FLAGS.gradient_accumulation_steps,
         step_start_point=FLAGS.step_start_point,
-
         dtype=dtype,
         param_dtype=dtype,
-
         force_batch_and_gradient_accumulation_steps_calculation=False,
         rapture_config=rapture_config,
-        track_memory=True
+        track_memory=True,
     )
 
     trainer = SFTTrainer(
@@ -169,21 +168,25 @@ def main():
         tokenizer=tokenizer,
         dataset_text_field=None,
         formatting_func=lambda x: [
-            conversations_formatting_function(tokenizer, messages_field=FLAGS.messages_field)(x)],
+            conversations_formatting_function(
+                tokenizer, messages_field=FLAGS.messages_field
+            )(x)
+        ],
         packing=FLAGS.packing_sft,
         num_of_sequences=FLAGS.max_length,
     )
 
     output = trainer.train(
-        model_parameters=model_parameters if not FLAGS.use_lora else None,
-        state=None
+        model_parameters=model_parameters if not FLAGS.use_lora else None, state=None
     )
 
     api.create_repo(FLAGS.new_repo_id, exist_ok=True)
 
     api.create_repo(FLAGS.new_repo_id, exist_ok=True)
     file_path = "/".join(output.checkpoint_path.split("/")[:-1])
-    output.state.module.save_pretrained(file_path, output.state.params, float_dtype=dtype)
+    output.state.module.save_pretrained(
+        file_path, output.state.params, float_dtype=dtype
+    )
 
     api.upload_folder(
         repo_id=FLAGS.new_repo_id,
@@ -198,9 +201,12 @@ def main():
 
         if model_use_tie_word_embedding:
             state_new_params = {
-                "params": state.params["params"] | {
+                "params": state.params["params"]
+                | {
                     "lm_head": {
-                        "kernel": state.params["params"]["model"]["embed_tokens"]["embedding"].T
+                        "kernel": state.params["params"]["model"]["embed_tokens"][
+                            "embedding"
+                        ].T
                     }
                 }
             }
@@ -213,8 +219,10 @@ def main():
     with jax.default_device(jax.devices("cpu")[0]):
         model = easystate_to_huggingface_model(
             state=state,
-            base_huggingface_module=type(transformers.AutoModelForCausalLM.from_config(config)),
-            config=config
+            base_huggingface_module=type(
+                transformers.AutoModelForCausalLM.from_config(config)
+            ),
+            config=config,
         )
 
     half_model = model.half()

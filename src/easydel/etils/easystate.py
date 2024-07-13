@@ -392,7 +392,7 @@ class EasyDeLState(struct.PyTreeNode):
 
         from easydel.models.auto_easydel_model import (
             AutoShardAndGatherFunctions,
-            get_modules_by_type,
+            get_models_by_type,
         )
 
         mesh = create_mesh(sharding_axes_dims, sharding_axes_names)
@@ -454,7 +454,7 @@ class EasyDeLState(struct.PyTreeNode):
 
             checkpoint["params"] = unflatten_dict(checkpoint["params"])
             hyperparameters = checkpoint.get("hyperparameters")
-            cfg, module, convertor = get_modules_by_type(
+            cfg, module, convertor = get_models_by_type(
                 model_type=cls.get_model_type(hyperparameters)
             )
             checkpoint.pop("module_config", None)

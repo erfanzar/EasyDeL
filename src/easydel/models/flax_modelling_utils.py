@@ -813,3 +813,10 @@ def dequantize_kv_cache(
     if reformat:
         uq = uq.transpose(0, 2, 1, 3)
     return uq
+
+
+def make_attention_mask(attention_mask, causal_mask):
+    batch_size, seq_length = attention_mask.shape
+    if attention_mask.ndim == 2:
+        attention_mask = attention_mask.reshape(batch_size, 1, seq_length, 1)
+    return jnp.logical_and(attention_mask, causal_mask[:, :, :seq_length, :])
