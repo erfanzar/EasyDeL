@@ -5,12 +5,11 @@ EasyDeL APIs 🔮
    :maxdepth: 2
    
    Cli
-   Data Preprocessing
    Etils
+   Generation
    Inference
    Kernels
    Modules
-   Reinforcement Learning
    Smi
    Trainers
    Transform

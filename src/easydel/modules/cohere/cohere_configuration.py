@@ -1,38 +1,38 @@
-from typing import Sequence, Optional
+from typing import Optional
 
 from jax.sharding import PartitionSpec
 
-from easydel.modules.easydel_modelling_utils import EasyDeLPretrainedConfig
+from easydel.modules.modeling_utils import EDPretrainedConfig
 
 
-class CohereConfig(EasyDeLPretrainedConfig):
+class CohereConfig(EDPretrainedConfig):
     model_type: str = "cohere"
 
     def __init__(
-            self,
-            vocab_size=256000,
-            hidden_size=8192,
-            intermediate_size=22528,
-            logit_scale=0.0625,
-            num_hidden_layers=40,
-            num_attention_heads=64,
-            num_key_value_heads=None,
-            hidden_act="silu",
-            max_position_embeddings=8192,
-            initializer_range=0.02,
-            layer_norm_eps=1e-5,
-            use_cache=True,
-            pad_token_id=0,
-            bos_token_id=5,
-            eos_token_id=255001,
-            tie_word_embeddings=True,
-            rope_theta=10000.0,
-            attention_bias=False,
-            attention_dropout=0.0,
-            use_qk_norm: bool = False,
-            gradient_checkpointing: str = "nothing_saveable",
-            bits: Optional[int] = None,
-            **kwargs,
+        self,
+        vocab_size=256000,
+        hidden_size=8192,
+        intermediate_size=22528,
+        logit_scale=0.0625,
+        num_hidden_layers=40,
+        num_attention_heads=64,
+        num_key_value_heads=None,
+        hidden_act="silu",
+        max_position_embeddings=8192,
+        initializer_range=0.02,
+        layer_norm_eps=1e-5,
+        use_cache=True,
+        pad_token_id=0,
+        bos_token_id=5,
+        eos_token_id=255001,
+        tie_word_embeddings=True,
+        rope_theta=10000.0,
+        attention_bias=False,
+        attention_dropout=0.0,
+        use_qk_norm: bool = False,
+        gradient_checkpointing: str = "nothing_saveable",
+        bits: Optional[int] = None,
+        **kwargs,
     ):
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
@@ -78,52 +78,49 @@ class CohereConfig(EasyDeLPretrainedConfig):
             A list of tuples
         """
         return (
-
-            ("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
-
-            ("attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("attn/o_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-
-            ("linear/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("linear_1/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-            ("linear_v/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("gate/kernel", PartitionSpec(("fsdp", "sp"))),
-
-            ("post_attn_norm/kernel", PartitionSpec(None)),
-            ("pre_attn_norm/kernel", PartitionSpec(None)),
-            ("pre_moe_norm/kernel", PartitionSpec(None)),
-            ("post_moe_norm/kernel", PartitionSpec(None)),
-
-            ("model/norm/kernel", PartitionSpec(None)),
-            ("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            (".*", PartitionSpec(None)),
-        ) if not fully_sharded_data_parallel else (
-
-            ("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"))),
-
-            ("attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"))),
-
-            ("linear/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("linear_1/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("linear_v/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("gate/kernel", PartitionSpec(("fsdp", "sp"))),
-
-            ("post_attn_norm/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("pre_attn_norm/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("pre_moe_norm/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("post_moe_norm/kernel", PartitionSpec(("fsdp", "sp"))),
-
-            ("model/norm/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
-            (".*", PartitionSpec(("fsdp", "sp"))),
+            (
+                ("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
+                (
+                    "attn/(q_proj|k_proj|v_proj)/kernel",
+                    PartitionSpec(("fsdp", "sp"), "tp"),
+                ),
+                ("attn/o_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+                ("linear/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+                ("linear_1/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+                ("linear_v/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+                ("gate/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("post_attn_norm/kernel", PartitionSpec(None)),
+                ("pre_attn_norm/kernel", PartitionSpec(None)),
+                ("pre_moe_norm/kernel", PartitionSpec(None)),
+                ("post_moe_norm/kernel", PartitionSpec(None)),
+                ("model/norm/kernel", PartitionSpec(None)),
+                ("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+                (".*", PartitionSpec(None)),
+            )
+            if not fully_sharded_data_parallel
+            else (
+                ("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"))),
+                ("attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("linear/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("linear_1/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("linear_v/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("gate/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("post_attn_norm/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("pre_attn_norm/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("pre_moe_norm/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("post_moe_norm/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("model/norm/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
+                (".*", PartitionSpec(("fsdp", "sp"))),
+            )
         )
 
     def add_jax_args(
-            self,
-            gradient_checkpointing: str = "nothing_saveable",
-            bits: Optional[int] = None,
-            **kwargs,
+        self,
+        gradient_checkpointing: str = "nothing_saveable",
+        bits: Optional[int] = None,
+        **kwargs,
     ):
         """The add_jax_args function adds the following arguments to the Transformer class:
 
@@ -143,4 +140,4 @@ class CohereConfig(EasyDeLPretrainedConfig):
 
     @staticmethod
     def rng_keys():
-        return 'params', 'dropout'
+        return "params", "dropout"

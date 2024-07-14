@@ -6,4 +6,3 @@ Utils
 
    utils.lazy_import
    utils.helpers
-   utils.checker

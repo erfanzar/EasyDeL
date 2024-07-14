@@ -1,39 +1,39 @@
-from typing import Optional, Dict, Union
+from typing import Optional
 
 from jax.sharding import PartitionSpec
 
-from easydel.modules.easydel_modelling_utils import EasyDeLPretrainedConfig
+from easydel.modules.modeling_utils import EDPretrainedConfig
 
 
-class GemmaConfig(EasyDeLPretrainedConfig):
+class GemmaConfig(EDPretrainedConfig):
     model_type: str = "gemma"
 
     def __init__(
-            self,
-            vocab_size=256000,
-            hidden_size=3072,
-            intermediate_size=24576,
-            num_hidden_layers=28,
-            num_attention_heads=16,
-            num_key_value_heads=16,
-            head_dim=256,
-            hidden_act="gelu_pytorch_tanh",
-            max_position_embeddings=8192,
-            initializer_range=0.02,
-            rms_norm_eps=1e-6,
-            use_cache=True,
-            pad_token_id=0,
-            eos_token_id=1,
-            bos_token_id=2,
-            tie_word_embeddings=True,
-            rope_theta=10000.0,
-            attention_bias=False,
-            attention_dropout=0.0,
-            gradient_checkpointing: str = "nothing_saveable",
-            bits: Optional[int] = None,
-            scan_layers: bool = False,
-            hidden_activation=None,
-            **kwargs,
+        self,
+        vocab_size=256000,
+        hidden_size=3072,
+        intermediate_size=24576,
+        num_hidden_layers=28,
+        num_attention_heads=16,
+        num_key_value_heads=16,
+        head_dim=256,
+        hidden_act="gelu_pytorch_tanh",
+        max_position_embeddings=8192,
+        initializer_range=0.02,
+        rms_norm_eps=1e-6,
+        use_cache=True,
+        pad_token_id=0,
+        eos_token_id=1,
+        bos_token_id=2,
+        tie_word_embeddings=True,
+        rope_theta=10000.0,
+        attention_bias=False,
+        attention_dropout=0.0,
+        gradient_checkpointing: str = "nothing_saveable",
+        bits: Optional[int] = None,
+        scan_layers: bool = False,
+        hidden_activation=None,
+        **kwargs,
     ):
         """The __init__ function is called when the class is instantiated.
         It sets up the attributes of an object, which are sometimes called fields or properties.
@@ -82,46 +82,46 @@ class GemmaConfig(EasyDeLPretrainedConfig):
             A list of tuples
         """
         return (
-
-            ("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
-
-            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("self_attn/o_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-
-            ("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-            ("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-
-            ("input_layernorm/kernel", PartitionSpec(None)),
-            ("post_attention_layernorm/kernel", PartitionSpec(None)),
-
-            ("model/norm/kernel", PartitionSpec(None)),
-            ("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            (".*", PartitionSpec(None)),
-        ) if not fully_sharded_data_parallel else (
-
-            ("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"))),
-
-            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"))),
-
-            ("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("mlp/down_proj/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"))),
-
-            ("input_layernorm/kernel", PartitionSpec(None)),
-            ("post_attention_layernorm/kernel", PartitionSpec(None)),
-
-            ("model/norm/kernel", PartitionSpec(None)),
-            ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
-            (".*", PartitionSpec(("fsdp", "sp"))),
+            (
+                ("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
+                (
+                    "self_attn/(q_proj|k_proj|v_proj)/kernel",
+                    PartitionSpec(("fsdp", "sp"), "tp"),
+                ),
+                ("self_attn/o_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+                ("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+                ("mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+                ("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+                ("input_layernorm/kernel", PartitionSpec(None)),
+                ("post_attention_layernorm/kernel", PartitionSpec(None)),
+                ("model/norm/kernel", PartitionSpec(None)),
+                ("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+                (".*", PartitionSpec(None)),
+            )
+            if not fully_sharded_data_parallel
+            else (
+                ("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"))),
+                (
+                    "self_attn/(q_proj|k_proj|v_proj)/kernel",
+                    PartitionSpec(("fsdp", "sp")),
+                ),
+                ("self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("mlp/down_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("input_layernorm/kernel", PartitionSpec(None)),
+                ("post_attention_layernorm/kernel", PartitionSpec(None)),
+                ("model/norm/kernel", PartitionSpec(None)),
+                ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
+                (".*", PartitionSpec(("fsdp", "sp"))),
+            )
         )
 
     def add_jax_args(
-            self,
-            gradient_checkpointing: str = "nothing_saveable",
-            bits: Optional[int] = None,
-            **kwargs,
+        self,
+        gradient_checkpointing: str = "nothing_saveable",
+        bits: Optional[int] = None,
+        **kwargs,
     ):
         """The add_jax_args function adds the following arguments to the Transformer class:
 
@@ -141,4 +141,4 @@ class GemmaConfig(EasyDeLPretrainedConfig):
 
     @staticmethod
     def rng_keys():
-        return 'params', 'dropout', 'fcm'
+        return "params", "dropout", "fcm"

@@ -1,38 +1,36 @@
-from typing import Sequence, Optional
-
 from jax.sharding import PartitionSpec
 
-from easydel.modules.easydel_modelling_utils import EasyDeLPretrainedConfig
+from easydel.modules.modeling_utils import EDPretrainedConfig
 
 
-class OPTConfig(EasyDeLPretrainedConfig):
+class OPTConfig(EDPretrainedConfig):
     model_type: str = "opt"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
-            self,
-            vocab_size: int = 50272,
-            hidden_size: int = 768,
-            num_hidden_layers: int = 12,
-            ffn_dim: int = 3072,
-            max_position_embeddings: int = 2048,
-            do_layer_norm_before: bool = True,
-            _remove_final_layer_norm: bool = False,
-            word_embed_proj_dim: int = None,
-            dropout: float = 0.1,
-            attention_dropout: float = 0.0,
-            num_attention_heads: int = 12,
-            activation_function: str = "relu",
-            layerdrop: float = 0.0,
-            init_std: float = 0.02,
-            use_cache: bool = True,
-            pad_token_id: int = 1,
-            bos_token_id: int = 2,
-            eos_token_id: int = 2,
-            enable_bias: bool = True,
-            layer_norm_elementwise_affine: bool = True,
-            gradient_checkpointing: str = "nothing_saveable",
-            **kwargs,
+        self,
+        vocab_size: int = 50272,
+        hidden_size: int = 768,
+        num_hidden_layers: int = 12,
+        ffn_dim: int = 3072,
+        max_position_embeddings: int = 2048,
+        do_layer_norm_before: bool = True,
+        _remove_final_layer_norm: bool = False,
+        word_embed_proj_dim: int = None,
+        dropout: float = 0.1,
+        attention_dropout: float = 0.0,
+        num_attention_heads: int = 12,
+        activation_function: str = "relu",
+        layerdrop: float = 0.0,
+        init_std: float = 0.02,
+        use_cache: bool = True,
+        pad_token_id: int = 1,
+        bos_token_id: int = 2,
+        eos_token_id: int = 2,
+        enable_bias: bool = True,
+        layer_norm_elementwise_affine: bool = True,
+        gradient_checkpointing: str = "nothing_saveable",
+        **kwargs,
     ):
         super().__init__(
             pad_token_id=pad_token_id,
@@ -44,7 +42,9 @@ class OPTConfig(EasyDeLPretrainedConfig):
         self.gradient_checkpointing = gradient_checkpointing
         self.max_position_embeddings = max_position_embeddings
         self.num_attention_heads = num_attention_heads
-        self.word_embed_proj_dim = word_embed_proj_dim if word_embed_proj_dim is not None else hidden_size
+        self.word_embed_proj_dim = (
+            word_embed_proj_dim if word_embed_proj_dim is not None else hidden_size
+        )
         self.ffn_dim = ffn_dim
         self.hidden_size = hidden_size
         self.num_hidden_layers = num_hidden_layers
@@ -64,34 +64,32 @@ class OPTConfig(EasyDeLPretrainedConfig):
         if not fully_sharded_data_parallel:
             raise NotImplementedError
         else:
-            return (
-                (".*", PartitionSpec(("fsdp", "sp")))
-            )
+            return (".*", PartitionSpec(("fsdp", "sp")))
 
     def add_jax_args(
-            self,
-            vocab_size: int = 50272,
-            hidden_size: int = 768,
-            num_hidden_layers: int = 12,
-            ffn_dim: int = 3072,
-            max_position_embeddings: int = 2048,
-            do_layer_norm_before: bool = True,
-            _remove_final_layer_norm: bool = False,
-            word_embed_proj_dim: int = None,
-            dropout: float = 0.1,
-            attention_dropout: float = 0.0,
-            num_attention_heads: int = 12,
-            activation_function: str = "relu",
-            layerdrop: float = 0.0,
-            init_std: float = 0.02,
-            use_cache: bool = True,
-            pad_token_id: int = 1,
-            bos_token_id: int = 2,
-            eos_token_id: int = 2,
-            enable_bias: bool = True,
-            layer_norm_elementwise_affine: bool = True,
-            gradient_checkpointing: str = "nothing_saveable",
-            **kwargs,
+        self,
+        vocab_size: int = 50272,
+        hidden_size: int = 768,
+        num_hidden_layers: int = 12,
+        ffn_dim: int = 3072,
+        max_position_embeddings: int = 2048,
+        do_layer_norm_before: bool = True,
+        _remove_final_layer_norm: bool = False,
+        word_embed_proj_dim: int = None,
+        dropout: float = 0.1,
+        attention_dropout: float = 0.0,
+        num_attention_heads: int = 12,
+        activation_function: str = "relu",
+        layerdrop: float = 0.0,
+        init_std: float = 0.02,
+        use_cache: bool = True,
+        pad_token_id: int = 1,
+        bos_token_id: int = 2,
+        eos_token_id: int = 2,
+        enable_bias: bool = True,
+        layer_norm_elementwise_affine: bool = True,
+        gradient_checkpointing: str = "nothing_saveable",
+        **kwargs,
     ):
         basics = dict(
             vocab_size=vocab_size,
@@ -115,7 +113,7 @@ class OPTConfig(EasyDeLPretrainedConfig):
             enable_bias=enable_bias,
             layer_norm_elementwise_affine=layer_norm_elementwise_affine,
             gradient_checkpointing=gradient_checkpointing,
-            **kwargs
+            **kwargs,
         )
         for k, v in basics.items():
             if not hasattr(self, k):

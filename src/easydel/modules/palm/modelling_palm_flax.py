@@ -1,5 +1,6 @@
-from typing import Union, Optional, Tuple, Any, Mapping
+from typing import Any, Mapping, Optional, Tuple, Union
 
+import chex
 import fjformer
 import jax
 import jax.numpy as jnp
@@ -9,12 +10,12 @@ from einops import rearrange
 from fjformer import linen as nn
 from flax.core import FrozenDict
 from jax import numpy as np
-from transformers.modeling_flax_outputs import FlaxCausalLMOutput
-import chex
-from easydel.modules.flax_modelling_utils import get_gradient_checkpoint_policy
-from easydel.modules.palm.palm_configuration import PalmConfig as PalmConfig
-from easydel.modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
+
 from easydel.modules.common import RMSNorm
+from easydel.modules.flax_modeling_utils import get_gradient_checkpoint_policy
+from easydel.modules.modeling_flax_outputs import FlaxCausalLMOutput
+from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.palm.palm_configuration import PalmConfig as PalmConfig
 
 
 def pre_compute_freq_cis(dim, max_length, theta: int = 10000.0, dtype=jnp.bfloat16):
@@ -176,7 +177,7 @@ class ParallelCollection(nn.Module):
         return hidden_state, saves
 
 
-class PalmPretrainedModel(EasyDeLFlaxPretrainedModel):
+class PalmPretrainedModel(EDPretrainedModel):
     module_class: nn.Module
     config_class = PalmConfig
     dtype: jnp.dtype = jnp.bfloat16
@@ -223,9 +224,11 @@ class PalmPretrainedModel(EasyDeLFlaxPretrainedModel):
         predict = self.module.apply(
             params,
             input_ids=jnp.asarray(input_ids, dtype="i4"),
-            attention_mask=jnp.asarray(attention_mask, dtype="i4")
-            if attention_mask is not None
-            else attention_mask,
+            attention_mask=(
+                jnp.asarray(attention_mask, dtype="i4")
+                if attention_mask is not None
+                else attention_mask
+            ),
             return_dict=return_dict,
             output_attention=output_attention,
         )

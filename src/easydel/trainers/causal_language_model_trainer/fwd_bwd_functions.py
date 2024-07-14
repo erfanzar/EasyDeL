@@ -8,14 +8,14 @@ from fjformer.functions.loss_func import (
 import jax
 from jax.sharding import PartitionSpec
 from jax import numpy as jnp
-from fjformer import with_sharding_constraint
+from fjformer.sharding import with_sharding_constraint
 
 
 def create_casual_language_model_train_step(
-        partition_spec=PartitionSpec(("dp", "fsdp"), "sp"),
-        label_smoothing_factor=0.0,
-        z_loss=0.0,
-        gradient_accumulation_steps: int = 1,
+    partition_spec=PartitionSpec(("dp", "fsdp"), "sp"),
+    label_smoothing_factor=0.0,
+    z_loss=0.0,
+    gradient_accumulation_steps: int = 1,
 ):
     """The create_casual_language_model_train_step function is a training step function that takes in the current state
     of the model,and a batch of data. It then calculates the loss and accuracy for this batch, and returns
@@ -35,7 +35,9 @@ def create_casual_language_model_train_step(
         A casual_language_model_train_step function that takes in the
         current state of the model,
     """
-    assert gradient_accumulation_steps > 0, "gradient_accumulation_steps must be greater than 0"  # Ignore
+    assert (
+        gradient_accumulation_steps > 0
+    ), "gradient_accumulation_steps must be greater than 0"  # Ignore
 
     def casual_language_model_train_step(state, batch):
         """The casual_language_model_train_step function is a training step function that takes in the current state
@@ -94,7 +96,9 @@ def create_casual_language_model_train_step(
             return loss, (accuracy, z_loss_computed, aux_loss)
 
         grad_fn = jax.value_and_grad(calculate_loss, has_aux=True)
-        (loss__, (accuracy__, z_loss_computed__, aux_loss__)), grad = grad_fn(state.params)
+        (loss__, (accuracy__, z_loss_computed__, aux_loss__)), grad = grad_fn(
+            state.params
+        )
         state = state.apply_gradients(grads=grad)
 
         grad_norms = jax.tree_map(jnp.linalg.norm, grad)
@@ -117,7 +121,7 @@ def create_casual_language_model_train_step(
 
 
 def create_casual_language_model_evaluation_step(
-        partition_spec=PartitionSpec(("dp", "fsdp"), "sp")
+    partition_spec=PartitionSpec(("dp", "fsdp"), "sp"),
 ):
     """The create_casual_language_model_evaluation_step function is used to create a function that calculates the loss
      and accuracy of a model. It takes in a set of parameters, which are then passed into the state.apply_fn function
@@ -164,7 +168,9 @@ def create_casual_language_model_evaluation_step(
                 labels = batch_eval["input_ids"][..., 1:]
             else:
                 labels = labels[..., 1:]
-            model_outputs = state.apply_fn(params=params, **batch_eval, return_dict=True)
+            model_outputs = state.apply_fn(
+                params=params, **batch_eval, return_dict=True
+            )
             logits = model_outputs.logits
             aux_loss = getattr(model_outputs, "aux_loss", None)
             valid = jnp.where(

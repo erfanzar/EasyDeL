@@ -1,6 +1,6 @@
 import gc
-from unittest import TestCase
 import unittest
+from unittest import TestCase
 
 import fjformer.linen
 import flax.traverse_util
@@ -16,14 +16,15 @@ except ModuleNotFoundError:
     sys.path.append(cp)
     import src.python.easydel as ed
 
-from jax import numpy as jnp
-import torch
-import numpy as np
-from fjformer.functions import cross_entropy_loss_and_accuracy
 import copy
+from typing import Dict, Literal, Optional, Union
+
 import jax
+import numpy as np
+import torch
 import transformers
-from typing import Optional, Dict, Union, Literal
+from fjformer.functions import cross_entropy_loss_and_accuracy
+from jax import numpy as jnp
 
 torch.manual_seed(42)
 
@@ -50,7 +51,7 @@ class EasyModelsTest(TestCase):
         self.resid_pdrop: float = 0.0
         self.embd_pdrop: float = 0.0
         self.attention_dropout: float = 0.0
-        self.rope_theta: float = 10000.
+        self.rope_theta: float = 10000.0
         self.attention_bias: bool = False
         self.tie_word_embeddings: bool = False
         self.gradient_checkpointing: str = "nothing_saveable"
@@ -76,7 +77,7 @@ class EasyModelsTest(TestCase):
             "sharded_vanilla",
             "wise_ring",
             "blockwise",
-            "pallas_flash"
+            "pallas_flash",
         ] = "sharded_vanilla"
         self.block_k: int = 32
         self.block_q: int = 32
@@ -86,12 +87,10 @@ class EasyModelsTest(TestCase):
         self.max_position_embeddings: int = self.sequence_length
         self.use_sharding_constraint = False
 
-    def create_test_for_models(
-            self,
-            module_name: str,
-            hf_module_class
-    ):
-        module_config, module_class, transform_function = ed.get_modules_by_type(module_name)
+    def create_test_for_models(self, module_name: str, hf_module_class):
+        module_config, module_class, transform_function = ed.get_modules_by_type(
+            module_name
+        )
         config = module_config(
             num_experts_per_tok=self.num_experts_per_tok,
             num_experts=self.num_experts,
@@ -109,43 +108,41 @@ class EasyModelsTest(TestCase):
             rms_norm_eps=self.rms_norm_eps,
             layer_norm_eps=self.layer_norm_eps,
             axis_dims=(1, -1, 1, 1),
-            head_dim=self.head_dim
+            head_dim=self.head_dim,
         )
 
-        hf_model = hf_module_class(
-            config=copy.deepcopy(config)
-        )
+        hf_model = hf_module_class(config=copy.deepcopy(config))
         hf_model.eval()
         params = {
-            "params":
-                transform_function(
-                    state_dict=hf_model.state_dict(),
-                    device=jax.devices("cpu")[0],
-                )
+            "params": transform_function(
+                state_dict=hf_model.state_dict(),
+                device=jax.devices("cpu")[0],
+            )
         }
         config.add_jax_args()
         config.add_basic_configurations(
             shard_attention_computation=self.shard_attention_computation,
             use_sharding_constraint=self.use_sharding_constraint,
-            scan_mlp_chunk_size=self.scan_mlp_chunk_size
+            scan_mlp_chunk_size=self.scan_mlp_chunk_size,
         )
-        mesh = config.get_mesh()
+        mesh = config.mesh
 
         with mesh:
-            partition_specs = match_partition_rules(config.get_partition_rules(True), params)
+            partition_specs = match_partition_rules(
+                config.get_partition_rules(True), params
+            )
             shard, _ = make_shard_and_gather_fns(partition_specs, mesh)
 
             params = jax.tree_map(lambda p, f: f(p), params, shard)
             config.add_basic_configurations(
                 attn_mechanism=self.attn_mechanism,
                 block_k=self.block_k,
-                block_q=self.block_q
+                block_q=self.block_q,
             )
             prm = flax.traverse_util.flatten_dict(params, sep=".")
 
             torch_input_ids, jax_input_ids = self.make_input_id(
-                self.vocab_size,
-                (self.batch_size, self.sequence_length + 1)
+                self.vocab_size, (self.batch_size, self.sequence_length + 1)
             )
             hf_output = hf_model(
                 input_ids=torch_input_ids[:, :-1],
@@ -157,15 +154,17 @@ class EasyModelsTest(TestCase):
                 param_dtype=self.dtype,
                 precision=self.precision,
                 _do_init=False,
-                input_shape=(self.batch_size, self.sequence_length)
+                input_shape=(self.batch_size, self.sequence_length),
             )
 
             ed_output = ed_model(
                 input_ids=jax_input_ids[:, :-1],
-                params=fjformer.linen.quantize_int8_parameters(["kernel", "embedding"], params),
+                params=fjformer.linen.quantize_int8_parameters(
+                    ["kernel", "embedding"], params
+                ),
                 return_dict=True,
                 add_params_field=False,
-                train=False
+                train=False,
             )
             loss, _ = cross_entropy_loss_and_accuracy(
                 ed_output.logits,
@@ -175,19 +174,12 @@ class EasyModelsTest(TestCase):
             del params
             del hf_model
             gc.collect()
-            return self.compare_torch_to_jax(
-                module_name,
-                hf_output,
-                ed_output,
-                loss
-            )
+            return self.compare_torch_to_jax(module_name, hf_output, ed_output, loss)
 
-    def create_moe_test_for_models(
-            self,
-            module_name: str,
-            hf_module_class
-    ):
-        module_config, module_class, transform_function = ed.get_modules_by_type(module_name)
+    def create_moe_test_for_models(self, module_name: str, hf_module_class):
+        module_config, module_class, transform_function = ed.get_modules_by_type(
+            module_name
+        )
         config = module_config(
             num_experts_per_tok=self.num_experts_per_tok,
             num_experts=self.num_experts,
@@ -204,37 +196,36 @@ class EasyModelsTest(TestCase):
             rotary_dim=self.rotary_dim,
             rms_norm_eps=self.rms_norm_eps,
             layer_norm_eps=self.layer_norm_eps,
-            head_dim=self.head_dim
+            head_dim=self.head_dim,
         )
 
-        hf_model = hf_module_class(
-            config=copy.deepcopy(config)
-        )
+        hf_model = hf_module_class(config=copy.deepcopy(config))
         hf_model.eval()
         params = {
-            "params":
-                transform_function(
-                    state_dict=hf_model.state_dict(),
-                    device=jax.devices("cpu")[0],
-                )
+            "params": transform_function(
+                state_dict=hf_model.state_dict(),
+                device=jax.devices("cpu")[0],
+            )
         }
         config.add_jax_args()
         config.add_basic_configurations(
             shard_attention_computation=self.shard_attention_computation,
             scan_mlp_chunk_size=self.scan_mlp_chunk_size,
-            use_sharding_constraint=self.use_sharding_constraint
+            use_sharding_constraint=self.use_sharding_constraint,
         )
-        mesh = config.get_mesh()
+        mesh = config.mesh
 
         with mesh:
-            partition_specs = match_partition_rules(config.get_partition_rules(True), params)
+            partition_specs = match_partition_rules(
+                config.get_partition_rules(True), params
+            )
             shard, _ = make_shard_and_gather_fns(partition_specs, mesh)
 
             params = jax.tree_map(lambda p, f: f(p), params, shard)
             config.add_basic_configurations(
                 attn_mechanism=self.attn_mechanism,
                 block_k=self.block_k,
-                block_q=self.block_q
+                block_q=self.block_q,
             )
             prm = flax.traverse_util.flatten_dict(params, sep=".")
             ed_model = module_class(
@@ -243,26 +234,27 @@ class EasyModelsTest(TestCase):
                 param_dtype=self.dtype,
                 precision=self.precision,
                 _do_init=False,
-                input_shape=(self.batch_size, self.sequence_length)
+                input_shape=(self.batch_size, self.sequence_length),
             )
 
             torch_input_ids, jax_input_ids = self.make_input_id(
-                self.vocab_size,
-                (self.batch_size, self.sequence_length + 1)
+                self.vocab_size, (self.batch_size, self.sequence_length + 1)
             )
             hf_output = hf_model(
                 input_ids=torch_input_ids[:, :-1],
                 labels=torch_input_ids[:, 1:],
-                output_router_logits=True
+                output_router_logits=True,
             )
 
             ed_output = ed_model(
                 input_ids=jax_input_ids[:, :-1],
-                params=fjformer.linen.quantize_int8_parameters(["kernel", "embedding"], params),
+                params=fjformer.linen.quantize_int8_parameters(
+                    ["kernel", "embedding"], params
+                ),
                 return_dict=True,
                 add_params_field=False,
                 train=False,
-                output_router_logits=True
+                output_router_logits=True,
             )
             loss, _ = cross_entropy_loss_and_accuracy(
                 ed_output.logits,
@@ -278,106 +270,81 @@ class EasyModelsTest(TestCase):
 
     def test_llama(self):
         res, err = self.create_test_for_models("llama", transformers.LlamaForCausalLM)
-        self.assertTrue(
-            res,
-            f"Llama model Failed [ERROR {err}]"
-        )
+        self.assertTrue(res, f"Llama model Failed [ERROR {err}]")
 
     def test_falcon(self):
         res, err = self.create_test_for_models("falcon", transformers.FalconForCausalLM)
-        self.assertTrue(
-            res,
-            f"Falcon model Failed [ERROR {err}]"
-        )
+        self.assertTrue(res, f"Falcon model Failed [ERROR {err}]")
 
     def test_mistral(self):
-        res, err = self.create_test_for_models("mistral", transformers.MistralForCausalLM)
-        self.assertTrue(
-            res,
-            f"Mistral model Failed [ERROR {err}]"
+        res, err = self.create_test_for_models(
+            "mistral", transformers.MistralForCausalLM
         )
+        self.assertTrue(res, f"Mistral model Failed [ERROR {err}]")
 
     def test_mixtral(self):
-        res, err = self.create_test_for_models("mixtral", transformers.MixtralForCausalLM)
-        self.assertTrue(
-            res,
-            f"Mixtral model Failed [ERROR {err}]"
+        res, err = self.create_test_for_models(
+            "mixtral", transformers.MixtralForCausalLM
         )
+        self.assertTrue(res, f"Mixtral model Failed [ERROR {err}]")
 
     def test_gpt2(self):
         res, err = self.create_test_for_models("gpt2", transformers.GPT2LMHeadModel)
-        self.assertTrue(
-            res,
-            f"GPT2 model Failed [ERROR {err}]"
-        )
+        self.assertTrue(res, f"GPT2 model Failed [ERROR {err}]")
 
     def test_gptj(self):
         res, err = self.create_test_for_models("gptj", transformers.GPTJForCausalLM)
-        self.assertTrue(
-            res,
-            f"GPT-J model Failed [ERROR {err}]"
-        )
+        self.assertTrue(res, f"GPT-J model Failed [ERROR {err}]")
 
     def test_qwen2(self):
         res, err = self.create_test_for_models("qwen2", transformers.Qwen2ForCausalLM)
-        self.assertTrue(
-            res,
-            f"Qwen 2 model Failed [ERROR {err}]"
-        )
+        self.assertTrue(res, f"Qwen 2 model Failed [ERROR {err}]")
 
     def test_phi(self):
         res, err = self.create_test_for_models("phi", transformers.PhiForCausalLM)
-        self.assertTrue(
-            res,
-            f"PHI 2 model Failed [ERROR {err}]"
-        )
+        self.assertTrue(res, f"PHI 2 model Failed [ERROR {err}]")
 
     def test_gemma(self):
         res, err = self.create_test_for_models("gemma", transformers.GemmaForCausalLM)
-        self.assertTrue(
-            res,
-            f"Gemma model Failed [ERROR {err}]"
-        )
+        self.assertTrue(res, f"Gemma model Failed [ERROR {err}]")
 
     def test_stablelm(self):
-        res, err = self.create_test_for_models("stablelm", transformers.StableLmForCausalLM)
-        self.assertTrue(
-            res,
-            f"StableLM model Failed [ERROR {err}]"
+        res, err = self.create_test_for_models(
+            "stablelm", transformers.StableLmForCausalLM
         )
+        self.assertTrue(res, f"StableLM model Failed [ERROR {err}]")
 
     def test_rwkv(self):
         res, err = self.create_test_for_models("rwkv", transformers.RwkvForCausalLM)
-        self.assertTrue(
-            res,
-            f"RWKV model Failed [ERROR {err}]"
-        )
+        self.assertTrue(res, f"RWKV model Failed [ERROR {err}]")
 
     def test_mamba(self):
         res, err = self.create_test_for_models("mamba", transformers.MambaForCausalLM)
 
-        self.assertTrue(
-            res,
-            f"MAMBA model Failed [ERROR {err}]"
-        )
+        self.assertTrue(res, f"MAMBA model Failed [ERROR {err}]")
 
     def test_qwen2_moe(self):
-        res, err = self.create_test_for_models("qwen2_moe", transformers.Qwen2MoeForCausalLM)
-        self.assertTrue(
-            res,
-            f"Qwen2Moe model Failed [ERROR {err}]"
+        res, err = self.create_test_for_models(
+            "qwen2_moe", transformers.Qwen2MoeForCausalLM
         )
+        self.assertTrue(res, f"Qwen2Moe model Failed [ERROR {err}]")
 
     def test_moe_mixtral(self):
-        res = self.create_moe_test_for_models("mixtral", transformers.MixtralForCausalLM)
+        res = self.create_moe_test_for_models(
+            "mixtral", transformers.MixtralForCausalLM
+        )
         self.assertTrue(res)
 
     def test_moe_qwen2_moe(self):
-        res = self.create_moe_test_for_models("qwen2_moe", transformers.Qwen2MoeForCausalLM)
+        res = self.create_moe_test_for_models(
+            "qwen2_moe", transformers.Qwen2MoeForCausalLM
+        )
         self.assertTrue(res)
 
     @staticmethod
-    def compare_torch_to_jax(name, hf_out, ed_out, ed_loss, atol: float = 1e-035, rtol: float = 1e-08):
+    def compare_torch_to_jax(
+        name, hf_out, ed_out, ed_loss, atol: float = 1e-035, rtol: float = 1e-08
+    ):
         to, jo = hf_out.logits.cpu().detach().numpy(), ed_out.logits
         err = jnp.mean(to - jo)
         hf_loss = hf_out.loss.cpu().detach().numpy()
@@ -387,25 +354,25 @@ class EasyModelsTest(TestCase):
         if not all_close:
             print(f"\n{name} LAST F HF : ", to[0, -1, -5:])
             print(f"{name} LAST F ED : ", jo[0, -1, -5:])
-            print(f"{name} CORRECT % : ", jnp.mean(
-                jnp.where(
-                    jnp.isclose(to, jo, atol=atol, rtol=rtol), 1, 0).reshape(-1)
+            print(
+                f"{name} CORRECT % : ",
+                jnp.mean(
+                    jnp.where(jnp.isclose(to, jo, atol=atol, rtol=rtol), 1, 0).reshape(
+                        -1
+                    )
+                ),
             )
-                  )
             print(f"{name} LOSS F HF : ", hf_loss)
             print(f"{name} LOSS F ED : ", ed_loss)
-            print(f"IS LOSS CLOSE    : ", all_close_loss)
+            print("IS LOSS CLOSE    : ", all_close_loss)
         return all_close or all_close_loss, err
 
     @staticmethod
-    def make_input_id(
-            vocab_size: int,
-            input_shape: tuple[int, int]
-    ):
+    def make_input_id(vocab_size: int, input_shape: tuple[int, int]):
         np_input_ids = np.random.randint(0, vocab_size, input_shape)
         return (
             torch.from_numpy(np_input_ids).to(torch.long),
-            jnp.asarray(np_input_ids, dtype="i4")
+            jnp.asarray(np_input_ids, dtype="i4"),
         )
 
 

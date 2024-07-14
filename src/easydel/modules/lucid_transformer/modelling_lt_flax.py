@@ -1,21 +1,24 @@
 import math
-
-import jax.nn.initializers
-from jax import numpy as jnp
-
 from functools import partial
-
-from flax import linen as nn
-from fjformer.linen import Dense
-from transformers import FlaxPreTrainedModel
-import flax
-from einops import rearrange
 from typing import Dict, Optional
-from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 
 import chex
-from easydel.modules.lucid_transformer.lt_configuration import FlaxLTConfig as FlaxLTConfig
-from easydel.modules.flax_modelling_utils import BaseJAXAttentionModule
+import flax
+import jax.nn.initializers
+from einops import rearrange
+from fjformer.linen import Dense
+from flax import linen as nn
+from jax import numpy as jnp
+from transformers import FlaxPreTrainedModel
+
+from easydel.modules.flax_modeling_utils import FlaxAttentionModule
+from easydel.modules.lucid_transformer.lt_configuration import (
+    FlaxLTConfig as FlaxLTConfig,
+)
+from easydel.modules.modeling_flax_outputs import (
+    FlaxBaseModelOutput,
+    FlaxCausalLMOutput,
+)
 
 ACT2CLS = {
     "gelu": nn.gelu,
@@ -28,17 +31,18 @@ ACT2CLS = {
 }
 
 
-class LTSelfAttention(BaseJAXAttentionModule):
+class LTSelfAttention(FlaxAttentionModule):
     config: FlaxLTConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
 
     def setup(self) -> None:
-        dense = partial(Dense,
-                        features=self.config.hidden_size,
-                        use_bias=False,
-                        kernel_init=jax.nn.initializers.normal(self.config.initializer_range)
-                        )
+        dense = partial(
+            Dense,
+            features=self.config.hidden_size,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+        )
         self.q_proj = dense()
         self.o_proj = dense()
         self.k_proj = dense()
@@ -47,11 +51,15 @@ class LTSelfAttention(BaseJAXAttentionModule):
 
     def __call__(self, hidden_state: chex.Array, attention_mask=None):
         b, t, c = hidden_state.shape
-        wq, wk, wv = self.q_proj(hidden_state), self.k_proj(hidden_state), self.v_proj(hidden_state)
+        wq, wk, wv = (
+            self.q_proj(hidden_state),
+            self.k_proj(hidden_state),
+            self.v_proj(hidden_state),
+        )
 
-        wq = rearrange(wq, 'b s (h d) -> b h s d', h=self.config.num_attention_heads)
-        wk = rearrange(wk, 'b s (h d) -> b h d s', h=self.config.num_attention_heads)
-        wv = rearrange(wv, 'b s (h d) -> b h s d', h=self.config.num_attention_heads)
+        wq = rearrange(wq, "b s (h d) -> b h s d", h=self.config.num_attention_heads)
+        wk = rearrange(wk, "b s (h d) -> b h d s", h=self.config.num_attention_heads)
+        wv = rearrange(wv, "b s (h d) -> b h s d", h=self.config.num_attention_heads)
 
         attn_weights = jnp.matmul(wq, wk) / self.scale
 
@@ -73,16 +81,12 @@ class LTMlp(nn.Module):
         self.up = Dense(
             self.config.intermediate_size,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(
-                self.config.initializer_range
-            )
+            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
         )
         self.down = Dense(
             self.config.hidden_size,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(
-                self.config.initializer_range
-            )
+            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
         )
         self.act = ACT2CLS[self.config.hidden_act]
 
@@ -97,21 +101,13 @@ class LTBlock(nn.Module):
 
     def setup(self) -> None:
         self.attn = LTSelfAttention(
-            config=self.config,
-            param_dtype=self.param_dtype,
-            dtype=self.dtype
+            config=self.config, param_dtype=self.param_dtype, dtype=self.dtype
         )
         self.mlp = LTMlp(
-            config=self.config,
-            param_dtype=self.param_dtype,
-            dtype=self.dtype
+            config=self.config, param_dtype=self.param_dtype, dtype=self.dtype
         )
-        self.ln1 = nn.LayerNorm(
-            use_bias=False
-        )
-        self.ln2 = nn.LayerNorm(
-            use_bias=False
-        )
+        self.ln1 = nn.LayerNorm(use_bias=False)
+        self.ln2 = nn.LayerNorm(use_bias=False)
 
     def __call__(self, hidden_state: chex.Array, attention_mask: chex.Array = None):
         hidden_state = hidden_state + self.attn(self.ln1(hidden_state), attention_mask)
@@ -125,8 +121,10 @@ class LTCollection(nn.Module):
     param_dtype: jnp.dtype = jnp.float32
 
     def setup(self) -> None:
-        self.layers = [LTBlock(config=self.config, dtype=self.dtype, param_dtype=self.param_dtype) for _ in
-                       range(self.config.num_hidden_layers)]
+        self.layers = [
+            LTBlock(config=self.config, dtype=self.dtype, param_dtype=self.param_dtype)
+            for _ in range(self.config.num_hidden_layers)
+        ]
 
     def __call__(self, hidden_state: chex.Array, attention_mask: chex.Array = None):
         cache = []
@@ -139,45 +137,66 @@ class LTCollection(nn.Module):
 class FlaxLTPretrainedModel(FlaxPreTrainedModel):
     module_class: nn.Module = None
     module_config: FlaxLTConfig
-    base_model_prefix: str = 'model'
+    base_model_prefix: str = "model"
 
     def __init__(
-            self,
-            config: FlaxLTConfig,
-            input_shape=(1, 256),
-            seed: int = 0,
-            dtype: jnp.dtype = jnp.float32,
-            _do_init: bool = False,
-            **kwargs,
+        self,
+        config: FlaxLTConfig,
+        input_shape=(1, 256),
+        seed: int = 0,
+        dtype: jnp.dtype = jnp.float32,
+        _do_init: bool = False,
+        **kwargs,
     ):
         module = self.module_class(config=config, dtype=dtype, **kwargs)
-        super().__init__(config, module, input_shape=input_shape, seed=seed, dtype=dtype, _do_init=_do_init)
+        super().__init__(
+            config,
+            module,
+            input_shape=input_shape,
+            seed=seed,
+            dtype=dtype,
+            _do_init=_do_init,
+        )
 
-    def init_weights(self, rng: jax.random.PRNGKey, input_shape,
-                     params: flax.core.FrozenDict = None, add_params_field=True) -> Dict:
-        input_ids = jnp.ones(input_shape, dtype='i4')
-        attention_mask = jnp.ones(input_shape, dtype='i4')
+    def init_weights(
+        self,
+        rng: jax.random.PRNGKey,
+        input_shape,
+        params: flax.core.FrozenDict = None,
+        add_params_field=True,
+    ) -> Dict:
+        input_ids = jnp.ones(input_shape, dtype="i4")
+        attention_mask = jnp.ones(input_shape, dtype="i4")
         if params is None:
-            params = self.module.init(rng, input_ids, attention_mask)['params']
-        return {'params': params} if add_params_field else params
+            params = self.module.init(rng, input_ids, attention_mask)["params"]
+        return {"params": params} if add_params_field else params
 
     def __call__(
-            self,
-            input_ids: jnp.ndarray,
-            attention_mask: Optional[jnp.ndarray] = None,
-            params: dict = None,
-            return_dict: Optional[bool] = None,
-            add_params_field: bool = False,
+        self,
+        input_ids: jnp.ndarray,
+        attention_mask: Optional[jnp.ndarray] = None,
+        params: dict = None,
+        return_dict: Optional[bool] = None,
+        add_params_field: bool = False,
     ):
-        return_dict = return_dict if return_dict is not None else self.config.return_dict
-        inputs = {'params': params or self.params} if add_params_field else params or {'params': self.params}
+        return_dict = (
+            return_dict if return_dict is not None else self.config.return_dict
+        )
+        inputs = (
+            {"params": params or self.params}
+            if add_params_field
+            else params or {"params": self.params}
+        )
 
         outputs = self.module.apply(
             inputs,
             input_ids=jnp.array(input_ids, dtype="i4"),
-            attention_mask=jnp.array(attention_mask, dtype="i4") if attention_mask is not None else attention_mask,
+            attention_mask=(
+                jnp.array(attention_mask, dtype="i4")
+                if attention_mask is not None
+                else attention_mask
+            ),
             return_dict=return_dict,
-
         )
 
         return outputs
@@ -193,12 +212,10 @@ class FlaxLTModule(nn.Module):
             self.config.vocab_size,
             self.config.hidden_size,
             dtype=self.dtype,
-            param_dtype=self.param_dtype
+            param_dtype=self.param_dtype,
         )
         self.blocks = LTCollection(
-            config=self.config,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype
+            config=self.config, dtype=self.dtype, param_dtype=self.param_dtype
         )
 
         self.ln = nn.LayerNorm(use_bias=False)
@@ -210,20 +227,31 @@ class FlaxLTModule(nn.Module):
         base_mxl = mxh * (self.config.alibi_bias_max / cp2)
         slope = 1 / jnp.power(2, base_mxl)
         if self.config.num_attention_heads != cp2:
-            slope = jnp.concatenate([slope[1::2], slope[::2]], axis=-1)[:self.config.num_attention_heads]
-        mxl = (mxl * slope).reshape(1, self.config.num_attention_heads, 1, sequence_length)
+            slope = jnp.concatenate([slope[1::2], slope[::2]], axis=-1)[
+                : self.config.num_attention_heads
+            ]
+        mxl = (mxl * slope).reshape(
+            1, self.config.num_attention_heads, 1, sequence_length
+        )
         return mxl
 
-    def __call__(self, input_ids: chex.Array, attention_mask: chex.Array = None, return_dict: bool = True):
+    def __call__(
+        self,
+        input_ids: chex.Array,
+        attention_mask: chex.Array = None,
+        return_dict: bool = True,
+    ):
         b, s = input_ids.shape
-        hidden_state = self.wte(input_ids.astype(dtype='i4'))
+        hidden_state = self.wte(input_ids.astype(dtype="i4"))
         alibi = self.build_alibi(s)
         if attention_mask is None:
             attention_mask = jnp.ones((b, s))
         if attention_mask.ndim == 2:
             attention_mask = attention_mask[:, jnp.newaxis, jnp.newaxis, :]
         assert attention_mask.ndim == 4
-        attention_mask = jnp.where(attention_mask == 1, 0, jnp.finfo(hidden_state.dtype).min)
+        attention_mask = jnp.where(
+            attention_mask == 1, 0, jnp.finfo(hidden_state.dtype).min
+        )
 
         attention_mask = jnp.add(attention_mask, alibi)
 
@@ -239,8 +267,7 @@ class FlaxLTModule(nn.Module):
         hidden_state = self.ln(hidden_state)
         if return_dict:
             return FlaxBaseModelOutput(
-                last_hidden_state=hidden_state,
-                hidden_states=hidden_states
+                last_hidden_state=hidden_state, hidden_states=hidden_states
             )
         else:
             return hidden_state, hidden_states
@@ -262,24 +289,33 @@ class FlaxLTModelForCausalLMModule(nn.Module):
         self.lm_head = Dense(
             self.config.vocab_size,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range)
+            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
         )
 
-    def __call__(self, input_ids: chex.Array, attention_mask: chex.Array = None, return_dict: bool = True):
+    def __call__(
+        self,
+        input_ids: chex.Array,
+        attention_mask: chex.Array = None,
+        return_dict: bool = True,
+    ):
         base_model_prediction = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            return_dict=return_dict
+            input_ids=input_ids, attention_mask=attention_mask, return_dict=return_dict
         )
 
-        hidden_state = base_model_prediction.last_hidden_state if return_dict else base_model_prediction[0]
-        hidden_states = base_model_prediction.hidden_states if return_dict else base_model_prediction[1]
+        hidden_state = (
+            base_model_prediction.last_hidden_state
+            if return_dict
+            else base_model_prediction[0]
+        )
+        hidden_states = (
+            base_model_prediction.hidden_states
+            if return_dict
+            else base_model_prediction[1]
+        )
         logits = self.lm_head(hidden_state)
         if return_dict:
             return FlaxCausalLMOutput(
-                logits=logits,
-                hidden_states=hidden_states,
-                attentions=None
+                logits=logits, hidden_states=hidden_states, attentions=None
             )
         else:
             return logits, hidden_states

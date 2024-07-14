@@ -15,23 +15,23 @@ from flax.linen import partitioning as nn_partitioning
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax.sharding import PartitionSpec
-from transformers.modeling_flax_outputs import (
-    FlaxBaseModelOutput,
-    FlaxCausalLMOutput,
-    FlaxSequenceClassifierOutput,
-)
 
-from easydel.modules.attention_module import AttentionModule
+from easydel.modules.attention_module import FlexibleAttentionModule
 from easydel.modules.common import RMSNorm as RMSNorm
-from easydel.modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
-from easydel.modules.flax_modelling_utils import (
-    BaseJAXAttentionModule,
+from easydel.modules.flax_modeling_utils import (
+    FlaxAttentionModule,
     control_mlp_sharding,
     get_dot_general_by_bits,
     get_gradient_checkpoint_policy,
     rotate_half,
     with_sharding_constraint,
 )
+from easydel.modules.modeling_flax_outputs import (
+    FlaxBaseModelOutput,
+    FlaxCausalLMOutput,
+    FlaxSequenceClassifierOutput,
+)
+from easydel.modules.modeling_utils import EDPretrainedModel
 from easydel.modules.qwen1.qwen1_configuration import Qwen1Config as Qwen1Config
 
 
@@ -85,6 +85,7 @@ class FlaxQwen1EmbeddingApplyer(nn.Module):
                 query = jnp.concatenate(query_list, axis=0)
                 key = jnp.concatenate(key_list, axis=0)
         return query.astype(self.dtype), key.astype(self.dtype)
+
 
 def compute_qwen1_rope(dim: int, seqlen, base: int | float = 10000, ntk_alpha=1):
     base = base * ntk_alpha ** (dim / (dim - 2))
@@ -156,7 +157,7 @@ class FlaxQwen1MLP(nn.Module):
         return x
 
 
-class FlaxQwen1Attention(BaseJAXAttentionModule):
+class FlaxQwen1Attention(FlaxAttentionModule):
     config: Qwen1Config
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -199,7 +200,7 @@ class FlaxQwen1Attention(BaseJAXAttentionModule):
         logn_tensor = jnp.asarray(logn_list)[None, :, None, None]
         self.logn_tensor = logn_tensor
         self.rotary = FlaxQwen1EmbeddingApplyer(self.dtype)
-        self.attention_performer = AttentionModule(
+        self.attention_performer = FlexibleAttentionModule(
             use_sharding_constraint=self.config.use_sharding_constraint,
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,
@@ -222,7 +223,7 @@ class FlaxQwen1Attention(BaseJAXAttentionModule):
             dtype=self.config.attn_dtype,
             partition_axis=self.config.partition_axis,
             scan_ring_attention=self.config.scan_ring_attention,
-            mesh=self.config.get_mesh(),
+            mesh=self.config.mesh,
             sm_scale=1 / math.sqrt(self.head_dim),
             axis_name=self.config.attention_axis_name,
             backward_pass_impl=self.config.flash_attention_backward_pass_impl,
@@ -230,7 +231,6 @@ class FlaxQwen1Attention(BaseJAXAttentionModule):
 
     def _merge_heads(self, hidden_states):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
-
 
     def apply_rotary(
         self,
@@ -387,7 +387,7 @@ class FlaxQwen1Attention(BaseJAXAttentionModule):
 
         query_length, key_length = query_states.shape[1], key_states.shape[1]
 
-        attentions = self.attention_performer.__call__(
+        attentions = self.attention_performer(
             query_states=query_states,
             key_states=key_states,
             value_states=value_states,
@@ -512,7 +512,7 @@ class FlaxQwen1Block(nn.Module):
                 layer
             output_attentions: bool: Return the attention weights
             fcm_mask: Optional[jnp.ndarray]: Mask the self-attention
-        :param : Control the dropout in the self attention layer
+
 
         Returns:
             A tuple of two items
@@ -581,7 +581,7 @@ class FlaxQwen1Block(nn.Module):
         return (hidden_states,) + attn_outputs[1:]
 
 
-class FlaxQwen1PreTrainedModel(EasyDeLFlaxPretrainedModel):
+class FlaxQwen1PreTrainedModel(EDPretrainedModel):
     config_class = Qwen1Config
     base_model_prefix = "model"
     module_class: nn.Module = None

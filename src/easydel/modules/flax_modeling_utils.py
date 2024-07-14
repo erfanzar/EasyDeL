@@ -21,7 +21,7 @@ from jax.sharding import PartitionSpec
 
 from easydel.etils.errors import EasyDeLBlockWiseFFNError
 from easydel.etils.partition_module import PartitionAxis
-from easydel.modules.easydel_modelling_utils import EasyMethod
+from easydel.modules.modeling_utils import EasyMethod
 
 ACT2FN = {
     "gelu": partial(nn.gelu, approximate=False),
@@ -405,25 +405,22 @@ def get_dot_general_by_bits(
     return {}  # empty just in case of not getting any error
 
 
-class BaseJAXAttentionModule(nn.Module):
-    config: "EasyDeLPretrainedConfig"  # type: ignore  # noqa
+class FlaxAttentionModule(nn.Module):
+    config: "EDPretrainedConfig"  # type: ignore  # noqa
 
     @staticmethod
-    def _transpose_sequence_head(query, key, value):
+    def _transpose_sequence_head(*args):
         """The _transpose_sequence_head function transposes the query, key and value matrices.
 
         Args:
-            query: Get the attention weights for each of the heads
-            key: Determine the number of heads
-            value: Store the values of the input
+            *args: arrays to transpose
 
         Returns:
             The transpose of the query, key and value matrices
         """
-        return (
-            jnp.transpose(query, (0, 2, 1, 3)),
-            jnp.transpose(key, (0, 2, 1, 3)),
-            jnp.transpose(value, (0, 2, 1, 3)),
+        return map(
+            lambda x: jnp.transpose(x, (0, 2, 1, 3)),
+            args,
         )
 
     @nn.compact
@@ -504,7 +501,7 @@ class BaseJAXAttentionModule(nn.Module):
             *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
             cur_index = cache_index.value
             if query_states.shape[1] == 1 and self.config.use_sharded_kv_caching:
-                mesh = self.config.get_mesh()
+                mesh = self.config.mesh
 
                 def fn(_cached_key, _cached_value, _key, _value, _cur_index):
                     assert _key.shape[1] == 1 and _value.shape[1] == 1, (

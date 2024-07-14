@@ -15,25 +15,27 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
-from transformers.modeling_flax_outputs import (
-    FlaxBaseModelOutput,
-    FlaxCausalLMOutput,
-    FlaxMaskedLMOutput,
-)
 
-from easydel.modules.attention_module import AttentionModule
+from easydel.modules.attention_module import FlexibleAttentionModule
 from easydel.modules.common import RMSNorm
-from easydel.modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
-from easydel.modules.flax_modelling_utils import (
+from easydel.modules.deepseek_v2.deepseek_configuration import (
+    DeepseekV2Config as DeepseekV2Config,
+)
+from easydel.modules.flax_modeling_utils import (
     ACT2FN,
-    BaseJAXAttentionModule,
+    FlaxAttentionModule,
     block_wise_ffn,
     control_mlp_sharding,
     get_dot_general_by_bits,
     get_gradient_checkpoint_policy,
     with_sharding_constraint,
 )
-from easydel.modules.deepseek_v2.deepseek_configuration import DeepseekV2Config as DeepseekV2Config
+from easydel.modules.modeling_flax_outputs import (
+    FlaxBaseModelOutput,
+    FlaxCausalLMOutput,
+    FlaxMaskedLMOutput,
+)
+from easydel.modules.modeling_utils import EDPretrainedModel
 
 re_mat = nn_partitioning.remat
 
@@ -53,15 +55,15 @@ class MoeCausalLMOutput(FlaxMaskedLMOutput):
 
 
 def yarn_find_correction_dim(
-        num_rotations, dim, base=10000, max_position_embeddings=2048
+    num_rotations, dim, base=10000, max_position_embeddings=2048
 ):
     return (dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (
-            2 * math.log(base)
+        2 * math.log(base)
     )
 
 
 def yarn_find_correction_range(
-        low_rot, high_rot, dim, base=10000, max_position_embeddings=2048
+    low_rot, high_rot, dim, base=10000, max_position_embeddings=2048
 ):
     low = math.floor(
         yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings)
@@ -87,11 +89,11 @@ def yarn_linear_ramp_mask(min, max, dim):
 
 
 def init_deepseek_rotary_embedding(
-        dim,
-        max_position_embeddings=2048,
-        base=10000,
-        method: typing.Literal["linear", "yarn", "dynamic", None] = None,
-        kwargs: typing.Optional[dict] = None,
+    dim,
+    max_position_embeddings=2048,
+    base=10000,
+    method: typing.Literal["linear", "yarn", "dynamic", None] = None,
+    kwargs: typing.Optional[dict] = None,
 ):
     if method is None:
         inv_freq = 1.0 / (base ** (jnp.arange(0, dim, 2).astype("float32") / dim))
@@ -113,8 +115,8 @@ def init_deepseek_rotary_embedding(
         targeted_len = kwargs.get("targeted_len", max_position_embeddings)
         if targeted_len > max_position_embeddings:
             base = base * (
-                    (kwargs.get("scaling_factor") * targeted_len / max_position_embeddings)
-                    - (kwargs.get("scaling_factor") - 1)
+                (kwargs.get("scaling_factor") * targeted_len / max_position_embeddings)
+                - (kwargs.get("scaling_factor") - 1)
             ) ** (dim / (dim - 2))
             inv_freq = 1.0 / (base ** (jnp.arange(0, dim, 2).astype("float32") / dim))
 
@@ -138,7 +140,7 @@ def init_deepseek_rotary_embedding(
         mscale_all_dim = kwargs.get("mscale_all_dim", 0)
         freq_extra = 1.0 / (base ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim))
         freq_inter = 1.0 / (
-                scaling_factor * base ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim)
+            scaling_factor * base ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim)
         )
 
         low, high = yarn_find_correction_range(
@@ -163,13 +165,13 @@ def init_deepseek_rotary_embedding(
 
         emb = jnp.concatenate((freqs, freqs), axis=-1)
         return (jnp.sin(emb) * _mscale).astype("float32"), (
-                jnp.cos(emb) * _mscale
+            jnp.cos(emb) * _mscale
         ).astype("float32")
 
 
 def rotate_half(x):
     x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2:]
+    x2 = x[..., x.shape[-1] // 2 :]
     return jnp.concatenate((-x2, x1), axis=-1)
 
 
@@ -212,9 +214,9 @@ class FlaxDeepseekV2MLP(nn.Module):
         self.act_fn = ACT2FN[self.config.hidden_act]
 
     def __call__(
-            self,
-            x: chex.Array,
-            e: bool = False,  # Ignored
+        self,
+        x: chex.Array,
+        e: bool = False,  # Ignored
     ):
         x = control_mlp_sharding(x, self.config.partition_axis)
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
@@ -313,10 +315,10 @@ class FlaxMoEGate(nn.Module):
                 )
                 ce = jnp.divide(ce, (seq_len * aux_topk / self.n_routed_experts))
                 aux_loss = (
-                        jnp.mean(
-                            jnp.sum((ce * jnp.mean(scores_for_seq_aux, axis=-1)), axis=1)
-                        )
-                        * self.alpha
+                    jnp.mean(
+                        jnp.sum((ce * jnp.mean(scores_for_seq_aux, axis=-1)), axis=1)
+                    )
+                    * self.alpha
                 )
             else:
                 mask_ce = jax.nn.one_hot(
@@ -393,9 +395,9 @@ class FlaxDeepseekV2MoE(nn.Module):
             )
 
     def __call__(
-            self,
-            hidden_states: chex.Array,
-            e: bool = False,  # ignored !
+        self,
+        hidden_states: chex.Array,
+        e: bool = False,  # ignored !
     ):
         hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
         identity = hidden_states
@@ -414,7 +416,7 @@ class FlaxDeepseekV2MoE(nn.Module):
         return y
 
 
-class FlaxDeepseekV2Attention(BaseJAXAttentionModule):
+class FlaxDeepseekV2Attention(FlaxAttentionModule):
     config: DeepseekV2Config
     layer_idx: int
     dtype: jnp.dtype = jnp.bfloat16
@@ -471,7 +473,7 @@ class FlaxDeepseekV2Attention(BaseJAXAttentionModule):
                 mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
                 softmax_scale = self.softmax_scale * mscale * mscale
 
-        self.attention_performer = AttentionModule(
+        self.attention_performer = FlexibleAttentionModule(
             use_sharding_constraint=self.config.use_sharding_constraint,
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,
@@ -494,36 +496,36 @@ class FlaxDeepseekV2Attention(BaseJAXAttentionModule):
             dtype=self.config.attn_dtype,
             partition_axis=self.config.partition_axis,
             scan_ring_attention=self.config.scan_ring_attention,
-            mesh=self.config.get_mesh(),
+            mesh=self.config.mesh,
             sm_scale=softmax_scale,
             axis_name=self.config.attention_axis_name,
         )
 
     def __call__(
-            self,
-            hidden_states: chex.Array,
-            freq_cis: Tuple[chex.Array, chex.Array],
-            attention_mask: chex.Array,
-            position_ids: chex.Array,
-            causal_mask: chex.Array,
-            segment_ids: Optional[chex.Array] = None,
-            deterministic: bool = True,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            fcm_mask=None,
+        self,
+        hidden_states: chex.Array,
+        freq_cis: Tuple[chex.Array, chex.Array],
+        attention_mask: chex.Array,
+        position_ids: chex.Array,
+        causal_mask: chex.Array,
+        segment_ids: Optional[chex.Array] = None,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        fcm_mask=None,
     ):
         bsz, q_len, _ = hidden_states.shape
 
         q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
         q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(0, 2, 1, 3)
         q_nope = q[:, :, :, : self.qk_nope_head_dim]
-        q_pe = q[:, :, :, self.qk_nope_head_dim:]
+        q_pe = q[:, :, :, self.qk_nope_head_dim :]
 
         compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
 
         k_pe = compressed_kv[
-               :, :, :, self.kv_lora_rank: self.kv_lora_rank + self.qk_rope_head_dim
-               ]
+            :, :, :, self.kv_lora_rank : self.kv_lora_rank + self.qk_rope_head_dim
+        ]
         compressed_kv = compressed_kv[:, :, :, : self.kv_lora_rank]
 
         k_pe = k_pe.reshape(bsz, q_len, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
@@ -537,8 +539,8 @@ class FlaxDeepseekV2Attention(BaseJAXAttentionModule):
 
         k_nope = kv[:, :, :, : self.qk_nope_head_dim]
         value_states = kv[
-                       :, :, :, self.qk_nope_head_dim: self.qk_nope_head_dim + self.v_head_dim
-                       ]
+            :, :, :, self.qk_nope_head_dim : self.qk_nope_head_dim + self.v_head_dim
+        ]
 
         sin, cos = freq_cis
 
@@ -546,11 +548,11 @@ class FlaxDeepseekV2Attention(BaseJAXAttentionModule):
 
         query_states = k_pe.new_empty(bsz, self.num_heads, q_len, self.q_head_dim)
         query_states[:, :, :, : self.qk_nope_head_dim] = q_nope
-        query_states[:, :, :, self.qk_nope_head_dim:] = q_pe
+        query_states[:, :, :, self.qk_nope_head_dim :] = q_pe
 
         key_states = k_pe.new_empty(bsz, self.num_heads, q_len, self.q_head_dim)
         key_states[:, :, :, : self.qk_nope_head_dim] = k_nope
-        key_states[:, :, :, self.qk_nope_head_dim:] = k_pe
+        key_states[:, :, :, self.qk_nope_head_dim :] = k_pe
 
         query_states = query_states.transpose(0, 2, 1, 3)
         key_states = key_states.transpose(0, 2, 1, 3)
@@ -606,7 +608,7 @@ class FlaxDeepseekV2Attention(BaseJAXAttentionModule):
 
         query_length, key_length = query_states.shape[1], key_states.shape[1]
 
-        attentions = self.attention_performer.__call__(
+        attentions = self.attention_performer(
             query_states=query_states,
             key_states=key_states,
             value_states=value_states,
@@ -706,9 +708,9 @@ class FlaxDeepseekV2DecoderLayer(nn.Module):
                 precision=self.precision,
             )
             if (
-                    config.n_routed_experts is not None
-                    and layer_idx >= config.first_k_dense_replace
-                    and layer_idx % config.moe_layer_freq == 0
+                config.n_routed_experts is not None
+                and layer_idx >= config.first_k_dense_replace
+                and layer_idx % config.moe_layer_freq == 0
             )
             else mlp_block(
                 config=config,
@@ -731,16 +733,16 @@ class FlaxDeepseekV2DecoderLayer(nn.Module):
         )
 
     def forward(
-            self,
-            hidden_states: chex.Array,
-            freq_cis: Tuple[chex.Array, chex.Array],
-            attention_mask: chex.Array,
-            causal_mask: chex.Array,
-            position_ids: chex.Array,
-            segment_ids: Optional[chex.Array] = None,
-            deterministic: bool = True,
-            init_cache: bool = False,
-            output_attentions: bool = True,
+        self,
+        hidden_states: chex.Array,
+        freq_cis: Tuple[chex.Array, chex.Array],
+        attention_mask: chex.Array,
+        causal_mask: chex.Array,
+        position_ids: chex.Array,
+        segment_ids: Optional[chex.Array] = None,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: bool = True,
     ) -> Tuple[chex.Array, Optional[chex.Array]]:
         residual = hidden_states
 
@@ -807,16 +809,16 @@ class FlaxDeepseekV2DecoratorCollection(nn.Module):
         ]
 
     def __call__(
-            self,
-            hidden_states: chex.Array,
-            freq_cis: Tuple[chex.Array, chex.Array],
-            attention_mask: chex.Array,
-            causal_mask: chex.Array,
-            position_ids: chex.Array,
-            deterministic: bool = True,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            output_hidden_states: bool = False,
+        self,
+        hidden_states: chex.Array,
+        freq_cis: Tuple[chex.Array, chex.Array],
+        attention_mask: chex.Array,
+        causal_mask: chex.Array,
+        position_ids: chex.Array,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
     ):
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
@@ -936,16 +938,16 @@ class FlaxDeepseekV2Module(nn.Module):
         )
 
     def __call__(
-            self,
-            input_ids: Optional[chex.Array] = None,
-            attention_mask: Optional[chex.Array] = None,
-            position_ids: Optional[chex.Array] = None,
-            deterministic: bool = True,
-            inputs_embeds: chex.Array = None,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            output_hidden_states: bool = False,
-            return_dict: bool = True,
+        self,
+        input_ids: Optional[chex.Array] = None,
+        attention_mask: Optional[chex.Array] = None,
+        position_ids: Optional[chex.Array] = None,
+        deterministic: bool = True,
+        inputs_embeds: chex.Array = None,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        return_dict: bool = True,
     ) -> typing.Union[Tuple[chex.Array, ...], FlaxBaseModelOutput]:
         """The __call__ function is the main function of a Flax model.
         It takes in input_ids, attention_mask, and position_ids as inputs to the model.
@@ -1009,21 +1011,21 @@ class FlaxDeepseekV2Module(nn.Module):
         )
 
 
-class DeepseekV2PreTrainedModel(EasyDeLFlaxPretrainedModel):
+class DeepseekV2PreTrainedModel(EDPretrainedModel):
     config_class: DeepseekV2Config = DeepseekV2Config
     module_class: nn.Module = None
     base_model_prefix = "model"
 
     def __init__(
-            self,
-            config: DeepseekV2Config,
-            dtype: jnp.dtype = jnp.bfloat16,
-            param_dtype: jnp.dtype = jnp.bfloat16,
-            precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
-            input_shape: Tuple[int, int] = (1, 1),
-            seed: int = 0,
-            _do_init: bool = False,
-            **kwargs,
+        self,
+        config: DeepseekV2Config,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
+        input_shape: Tuple[int, int] = (1, 1),
+        seed: int = 0,
+        _do_init: bool = False,
+        **kwargs,
     ):
         module = self.module_class(
             config=config,
@@ -1043,7 +1045,7 @@ class DeepseekV2PreTrainedModel(EasyDeLFlaxPretrainedModel):
         )
 
     def init_weights(
-            self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
+        self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
     ) -> FrozenDict:
         """The init_weights function is used to initialize the weights of a model.
         It takes in a rng, which is a random number generator key that can be used to generate random numbers.
@@ -1122,20 +1124,20 @@ class DeepseekV2PreTrainedModel(EasyDeLFlaxPretrainedModel):
         return init_variables["cache"]
 
     def __call__(
-            self,
-            input_ids: chex.Array,
-            attention_mask: Optional[chex.Array] = None,
-            position_ids: Optional[chex.Array] = None,
-            params: dict = None,
-            past_key_values: dict = None,
-            dropout_rng: jax.random.PRNGKey = None,
-            train: bool = False,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            output_router_logits: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
-            add_params_field: bool = False,
-            **kwargs,
+        self,
+        input_ids: chex.Array,
+        attention_mask: Optional[chex.Array] = None,
+        position_ids: Optional[chex.Array] = None,
+        params: dict = None,
+        past_key_values: dict = None,
+        dropout_rng: jax.random.PRNGKey = None,
+        train: bool = False,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        output_router_logits: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        add_params_field: bool = False,
+        **kwargs,
     ):
         """The __call__ function is the main function of a JAX module.
         It takes as input:
@@ -1270,16 +1272,16 @@ class FlaxDeepseekV2ForCausalLMModule(nn.Module):
         )
 
     def __call__(
-            self,
-            input_ids: chex.Array,
-            attention_mask: chex.Array,
-            position_ids: chex.Array,
-            deterministic: bool = True,
-            inputs_embeds: chex.Array = None,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            output_hidden_states: bool = False,
-            return_dict: bool = True,
+        self,
+        input_ids: chex.Array,
+        attention_mask: chex.Array,
+        position_ids: chex.Array,
+        deterministic: bool = True,
+        inputs_embeds: chex.Array = None,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        return_dict: bool = True,
     ):
         """The __call__ function is the main function of a Flax module. It defines how the model will be called,
         and what it returns. In this case, we are calling our Transformer model with input_ids and attention_mask
@@ -1382,7 +1384,7 @@ class FlaxDeepseekV2ForCausalLM(DeepseekV2PreTrainedModel):
         self.module.lm_head = new_embeddings
 
     def prepare_inputs_for_generation(
-            self, input_ids, max_length, attention_mask: Optional[chex.Array] = None
+        self, input_ids, max_length, attention_mask: Optional[chex.Array] = None
     ):
         """The prepare_inputs_for_generation function is used to prepare the inputs for a generation task.
 

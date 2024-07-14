@@ -2,10 +2,10 @@ from typing import Dict, Optional, Union
 
 from jax.sharding import PartitionSpec
 
-from easydel.modules.easydel_modelling_utils import EasyDeLPretrainedConfig
+from easydel.modules.modeling_utils import EDPretrainedConfig
 
 
-class LlamaConfig(EasyDeLPretrainedConfig):
+class LlamaConfig(EDPretrainedConfig):
     model_type: str = "llama"
 
     def __init__(

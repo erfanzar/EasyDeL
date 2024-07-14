@@ -10,15 +10,13 @@ from dataclasses import dataclass
 from glob import glob
 from typing import Any, Callable, Iterator, Literal, Mapping, Optional, Union
 
-import flax.core
+from flax.core import unfreeze
 import jax
 import numpy as np
-import tensorflow as tf
 import termcolor
-from fjformer import CheckpointManager
+from fjformer.checkpoint import CheckpointManager
 from jax.sharding import Mesh
 from optax import GradientTransformation, Schedule
-from transformers import AutoConfig, AutoModelForCausalLM
 
 try:
     import wandb  # noqa: F821 # type:ignore
@@ -26,14 +24,14 @@ except ImportError:
     wandb = None
 
 from easydel.etils.etils import get_logger
-from easydel.modules.auto_easydel_model import AutoEasyDeLModelForCausalLM
-from easydel.modules.easydel_modelling_utils import (
-    EasyDeLFlaxPretrainedModel,
-    EasyDeLPretrainedConfig,
+from easydel.modules.auto_models import AutoEasyDeLModelForCausalLM
+from easydel.modules.modeling_utils import (
+    EDPretrainedModel,
+    EDPretrainedConfig,
 )
 from easydel.smi import get_capacity_matrix, initialise_tracking
 from easydel.trainers.training_configurations import TrainArguments
-from easydel.utils.helpers import Timers, prefix_print
+from easydel.utils import Timers
 
 logger = get_logger(__name__)
 
@@ -48,10 +46,10 @@ class TrainerConfigureDataloaderOutput:
 
 @dataclass
 class TrainerConfigureModelOutput:
-    model: EasyDeLFlaxPretrainedModel
+    model: EDPretrainedModel
     tx: GradientTransformation
     scheduler: Schedule
-    config: Optional[EasyDeLPretrainedConfig] = None
+    config: Optional[EDPretrainedConfig] = None
 
 
 @dataclass
@@ -86,8 +84,7 @@ class BaseTrainer(abc.ABC):
         if _do_init_fns:
             self.initialize_trainer_utils()
         else:
-            prefix_print(
-                "Warning",
+            logger.warn(
                 "You have set `_do_init_fns = False`. Functions will not be initialized automatically. "
                 "Call `trainer.initialize_trainer_utils()` manually.",
             )
@@ -318,6 +315,7 @@ class BaseTrainer(abc.ABC):
             TrainerConfigureDataloaderOutput: An object containing the configured dataloaders and the
                                             maximum number of training and evaluation steps.
         """
+
         def create_tf_dataset(
             dataset: "Dataset",  # noqa: F821 # type:ignore
             is_train: bool,  # noqa: F821 # type:ignore
@@ -332,6 +330,8 @@ class BaseTrainer(abc.ABC):
             Returns:
                 Iterator[np.ndarray]: The TensorFlow dataset iterator.
             """
+            import tensorflow as tf
+
             return (
                 dataset.to_tf_dataset(
                     collate_fn=self.create_collect_function(
@@ -362,6 +362,8 @@ class BaseTrainer(abc.ABC):
             Returns:
                 Iterator[np.ndarray]: The TensorFlow dataset iterator.
             """
+            import tensorflow as tf
+
             return (
                 tf.data.Dataset.from_generator(
                     lambda: dataset,
@@ -500,7 +502,7 @@ class BaseTrainer(abc.ABC):
             extra_configs (dict): Additional configurations to apply to the model.
 
         Returns:
-            EasyDeLFlaxPretrainedModel: The configured custom model.
+            EDPretrainedModel: The configured custom model.
 
         Raises:
             AssertionError: If no custom rule is provided when initializing a custom model.
@@ -534,7 +536,7 @@ class BaseTrainer(abc.ABC):
             extra_configs (dict): Additional configurations to apply to the model.
 
         Returns:
-            EasyDeLFlaxPretrainedModel: The configured model.
+            EDPretrainedModel: The configured model.
 
         Warnings:
             If no model configuration is detected, the `config` attribute is set to None, which
@@ -767,7 +769,7 @@ partition_rules = {partition_rules}
         save_dir: Optional[str] = None,
         gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]] = None,
         to_torch: bool = False,
-        base_hf_auto_class=AutoModelForCausalLM,
+        base_hf_auto_class=None,
         easystate_to_huggingface_model_kwargs: Optional[dict] = None,
         add_params_field_to_torch_convertation: bool = False,
         torch_save_pretrained_kwargs: Optional[dict] = None,
@@ -776,6 +778,8 @@ partition_rules = {partition_rules}
             self.arguments.save_dir, self.arguments.model_name
         )
 
+        if base_hf_auto_class is None:
+            from transformers import AutoModelForCausalLM as base_hf_auto_class
         if to_torch:
             return self._save_to_torch(
                 state,
@@ -797,7 +801,9 @@ partition_rules = {partition_rules}
         easystate_to_huggingface_model_kwargs,
         torch_save_pretrained_kwargs,
     ):
-        from easydel.transform.easydel_transform import easystate_to_huggingface_model
+        from easydel.transform.parameters_transformation import (
+            easystate_to_huggingface_model,
+        )
 
         easystate_to_huggingface_model_kwargs = (
             easystate_to_huggingface_model_kwargs or {}
@@ -827,6 +833,8 @@ partition_rules = {partition_rules}
         model_config,
         model_type,
     ):
+        from transformers import AutoConfig
+
         hf_model_config = AutoConfig.for_model(model_type=model_type)
         unsafe_dict = state.unsafe_dict(model_config.__dict__)
         blocked_statics = ["torch_dtype"]
@@ -853,9 +861,6 @@ partition_rules = {partition_rules}
     def calculate_number_total_flops_per_device(self, params):
         return (
             6
-            * sum(
-                x.size
-                for x in jax.tree_util.tree_flatten(flax.core.unfreeze(params))[0]
-            )
+            * sum(x.size for x in jax.tree_util.tree_flatten(unfreeze(params))[0])
             * (self.arguments.total_batch_size * self.arguments.max_sequence_length)
         ) / jax.device_count()

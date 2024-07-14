@@ -21,11 +21,11 @@ Modules
    modules.llama.modelling_llama_flax
    modules.llama.modelling_vision_llama_flax
    modules.llama.vision_llama_configuration
-   modules.easydel_modelling_utils
    modules.whisper.modelling_whisper_flax
    modules.whisper.whisper_configuration
    modules.phi3.phi3_configuration
    modules.phi3.modelling_phi3_flax
+   modules.auto_models
    modules.falcon.modelling_falcon_flax
    modules.falcon.falcon_configuration
    modules.gpt2.modelling_gpt2_flax
@@ -38,10 +38,10 @@ Modules
    modules.mosaic_mpt.mosaic_configuration
    modules.qwen2.qwen_configuration
    modules.qwen2.modelling_qwen_flax
+   modules.modeling_utils
    modules.mixtral.modelling_mixtral_flax
    modules.mixtral.mixtral_configuration
    modules.mistral.vision_mistral_configuration
-   modules.mistral.modelling_vision_mistral_flax
    modules.mistral.modelling_mistral_flax
    modules.mistral.mistral_configuration
    modules.grok_1.grok_1_configuration
@@ -57,8 +57,8 @@ Modules
    modules.common
    modules.olmo.modelling_olmo_flax
    modules.olmo.olmo_configuration
-   modules.auto_easydel_model
-   modules.flax_modelling_utils
+   modules.modeling_flax_outputs
+   modules.flax_modeling_utils
    modules.gemma.modelling_gemma_flax
    modules.gemma.gemma_configuration
    modules.gemma2.gemma2_configuration

@@ -12,8 +12,7 @@ import jax
 import tensorflow.data  # type:ignore
 import tensorflow_datasets
 import termcolor
-from datasets import Dataset
-from fjformer import make_shard_and_gather_fns, match_partition_rules
+from fjformer.sharding import make_shard_and_gather_fns, match_partition_rules
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from tqdm.autonotebook import tqdm
@@ -142,9 +141,6 @@ class DPOTrainer(BaseTrainer, ABC):
 
 
         >>> def extract_anthropic_prompt(prompt_and_response):
-        ...     '''
-        ...     Extract the anthropic prompt from a prompt and response pair.
-        ...     '''
         ...     search_term = "\n\nAssistant:"
         ...     search_term_idx = prompt_and_response.rfind(search_term)
         ...     assert search_term_idx != -1, f"Prompt and response does not contain '{search_term}'"
@@ -152,24 +148,9 @@ class DPOTrainer(BaseTrainer, ABC):
 
 
         >>> def get_hh(split: str, sanity_check: bool = False, silent: bool = False, cache_dir: Optional[str] = None) -> Dataset:
-        ...     '''
-        ...     Load the Anthropic Helpful-Harmless dataset from Hugging Face and convert it to the necessary format.
-        ...
-        ...     The dataset is converted to a dictionary with the following structure:
-        ...     {
-        ...         'prompt': List[str],
-        ...         'chosen': List[str],
-        ...         'rejected': List[str],
-        ...     }
-        ...
-        ...     Prompts should be structured as follows:
-        ...     \n\nHuman: <prompt>\n\nAssistant:
-        ...     Multiple turns are allowed, but the prompt should always start with \n\nHuman: and end with \n\nAssistant:.
-        ...     '''
         ...     dataset = load_dataset("Anthropic/hh-rlhf", split=split, cache_dir=cache_dir)
         ...     if sanity_check:
         ...         dataset = dataset.select(range(min(len(dataset), 1000)))
-        ...
         ...     def split_prompt_and_responses(sample) -> Dict[str, str]:
         ...         prompt = extract_anthropic_prompt(sample["chosen"])
         ...         return {
@@ -289,8 +270,10 @@ class DPOTrainer(BaseTrainer, ABC):
         loss_type: Literal["sigmoid", "hinge", "ipo", "kto"] = "sigmoid",
         label_pad_token_id: int = -100,
         padding_value: int = None,
-        train_dataset: Optional[Dataset] = None,
-        eval_dataset: Optional[Union[Dataset, Dict[str, Dataset]]] = None,
+        train_dataset: Optional["Dataset"] = None,  # noqa #type:ignore
+        eval_dataset: Optional[
+            Union["Dataset", Dict[str, "Dataset"]]  # noqa #type:ignore
+        ] = None,
         tokenizer: Optional[PreTrainedTokenizerBase] = None,
         data_collator: Optional[Callable] = None,
         max_length: Optional[int] = None,
@@ -920,7 +903,8 @@ class DPOTrainer(BaseTrainer, ABC):
         )
 
     def _get_eval_dataloader(
-        self, eval_dataset: Optional[Dataset] = None
+        self,
+        eval_dataset: Optional["Dataset"] = None,  # noqa #type:ignore
     ) -> tensorflow.data.Dataset:
         """
         Creates the evaluation dataloader as a TensorFlow Dataset.
@@ -1006,7 +990,8 @@ class DPOTrainer(BaseTrainer, ABC):
         return self._get_train_dataloader()
 
     def get_eval_dataloader(
-        self, eval_dataset: Optional[Dataset] = None
+        self,
+        eval_dataset: Optional["Dataset"] = None,  # noqa #type:ignore
     ) -> tensorflow.data.Dataset:
         """
         Returns the evaluation dataloader, potentially with precomputed reference log probabilities.

@@ -1,51 +1,48 @@
-from transformers.utils import logging
-from typing import Sequence, Optional, Dict, Union
-from easydel.modules.easydel_modelling_utils import EasyDeLPretrainedConfig
+from typing import Dict, Optional, Union
 from jax.sharding import PartitionSpec
+from easydel.modules.modeling_utils import EDPretrainedConfig
 
-logger = logging.get_logger(__name__)
 
-
-class ArcticConfig(EasyDeLPretrainedConfig):
+class ArcticConfig(EDPretrainedConfig):
     model_type: str = "arctic"
 
     def __init__(
-            self,
-            vocab_size=32000,
-            hidden_size=4096,
-            intermediate_size=14336,
-            num_hidden_layers=32,
-            num_attention_heads=32,
-            num_key_value_heads=None,
-            hidden_act="silu",
-            max_position_embeddings=4096,
-            initializer_range=0.02,
-            rms_norm_eps=1e-5,
-            use_cache=True,
-            pad_token_id=None,
-            bos_token_id=1,
-            eos_token_id=2,
-            tie_word_embeddings=False,
-            rope_theta=1e6,
-            sliding_window=None,
-            attention_dropout=0.0,
-            num_experts_per_tok=1,
-            num_local_experts=8,
-            router_aux_loss_coef=0.001,
-            moe_layer_frequency=2,
-            parallel_attn_mlp_res=False,
-            moe_train_capacity_factor=1,
-            moe_eval_capacity_factor=1,
-            enable_expert_tensor_parallelism=False,
-            moe_min_capacity=0,
-            moe_token_dropping=True,
-            quantization=None,
-            gradient_checkpointing: str = "nothing_saveable",
-            use_scan_mlp: bool = False,
-            scan_mlp_chunk_size: int = 1024,
-            bits: Optional[int] = None,
-            rope_scaling: Dict[str, Union[str, float]] = None,
-            **kwargs,
+        self,
+        vocab_size=32000,
+        hidden_size=4096,
+        intermediate_size=14336,
+        num_hidden_layers=32,
+        num_attention_heads=32,
+        num_key_value_heads=None,
+        hidden_act="silu",
+        max_position_embeddings=4096,
+        initializer_range=0.02,
+        rms_norm_eps=1e-5,
+        use_cache=True,
+        pad_token_id=None,
+        bos_token_id=1,
+        eos_token_id=2,
+        tie_word_embeddings=False,
+        rope_theta=1e6,
+        sliding_window=None,
+        attention_dropout=0.0,
+        num_experts_per_tok=1,
+        num_local_experts=8,
+        router_aux_loss_coef=0.001,
+        moe_layer_frequency=2,
+        parallel_attn_mlp_res=False,
+        moe_train_capacity_factor=1,
+        moe_eval_capacity_factor=1,
+        enable_expert_tensor_parallelism=False,
+        moe_min_capacity=0,
+        moe_token_dropping=True,
+        quantization=None,
+        gradient_checkpointing: str = "nothing_saveable",
+        use_scan_mlp: bool = False,
+        scan_mlp_chunk_size: int = 1024,
+        bits: Optional[int] = None,
+        rope_scaling: Dict[str, Union[str, float]] = None,
+        **kwargs,
     ):
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
@@ -106,50 +103,51 @@ class ArcticConfig(EasyDeLPretrainedConfig):
 
         """
         return (
-
-            ("model/embed_tokens/embedding", PartitionSpec("sp", "fsdp")),
-
-            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
-
-            ("w1/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("w2/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("w3/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("gate/kernel", PartitionSpec(("fsdp", "sp"))),
-
-            ("input_layernorm/kernel", PartitionSpec(None)),
-            ("post_attention_layernorm/kernel", PartitionSpec(None)),
-
-            ("model/norm/kernel", PartitionSpec(None)),
-            ("lm_head/kernel", PartitionSpec("fsdp", "sp")),
-            (".*", PartitionSpec(None)),
-        ) if not fully_sharded_data_parallel else (
-            ("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"))),
-
-            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
-
-            ("w1/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("w2/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("w3/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("gate/kernel", PartitionSpec(("fsdp", "sp"))),
-
-            ("input_layernorm/kernel", PartitionSpec(None)),
-            ("post_attention_layernorm/kernel", PartitionSpec(None)),
-
-            ("model/norm/kernel", PartitionSpec(None)),
-            ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
-            (".*", PartitionSpec(("fsdp", "sp"))),
+            (
+                ("model/embed_tokens/embedding", PartitionSpec("sp", "fsdp")),
+                (
+                    "self_attn/(q_proj|k_proj|v_proj)/kernel",
+                    PartitionSpec(("fsdp", "sp"), "tp"),
+                ),
+                ("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
+                ("w1/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("w2/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("w3/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("gate/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("input_layernorm/kernel", PartitionSpec(None)),
+                ("post_attention_layernorm/kernel", PartitionSpec(None)),
+                ("model/norm/kernel", PartitionSpec(None)),
+                ("lm_head/kernel", PartitionSpec("fsdp", "sp")),
+                (".*", PartitionSpec(None)),
+            )
+            if not fully_sharded_data_parallel
+            else (
+                ("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"))),
+                (
+                    "self_attn/(q_proj|k_proj|v_proj)/kernel",
+                    PartitionSpec(("fsdp", "sp"), "tp"),
+                ),
+                ("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
+                ("w1/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("w2/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("w3/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("gate/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("input_layernorm/kernel", PartitionSpec(None)),
+                ("post_attention_layernorm/kernel", PartitionSpec(None)),
+                ("model/norm/kernel", PartitionSpec(None)),
+                ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
+                (".*", PartitionSpec(("fsdp", "sp"))),
+            )
         )
 
     def add_jax_args(
-            self,
-            gradient_checkpointing: str = "nothing_saveable",
-            use_scan_mlp: bool = False,
-            scan_mlp_chunk_size: int = 1024,
-            bits: Optional[int] = None,
-            rope_scaling: Dict[str, Union[str, float]] = None,
-            **kwargs,
+        self,
+        gradient_checkpointing: str = "nothing_saveable",
+        use_scan_mlp: bool = False,
+        scan_mlp_chunk_size: int = 1024,
+        bits: Optional[int] = None,
+        rope_scaling: Dict[str, Union[str, float]] = None,
+        **kwargs,
     ):
         """
         The add_jax_args function adds the following arguments to the model:
@@ -176,4 +174,4 @@ class ArcticConfig(EasyDeLPretrainedConfig):
 
     @staticmethod
     def rng_keys():
-        return 'params', 'dropout', 'fcm'
+        return "params", "dropout", "fcm"

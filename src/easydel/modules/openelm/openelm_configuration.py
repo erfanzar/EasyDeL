@@ -1,14 +1,16 @@
 from numbers import Number
-from typing import Optional, Dict, Union, List
+from typing import Dict, List, Optional, Union
+
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
-from easydel.modules.easydel_modelling_utils import EasyDeLPretrainedConfig
+
+from easydel.modules.modeling_utils import EDPretrainedConfig
 
 
 def make_divisible(
-        v: Union[float, int],
-        divisor: Optional[int] = 8,
-        min_value: Optional[Union[float, int]] = None,
+    v: Union[float, int],
+    divisor: Optional[int] = 8,
+    min_value: Optional[Union[float, int]] = None,
 ) -> Union[float, int]:
     """This function is taken from the original tf repo.
     It ensures that all layers have a channel number that is divisible by the divisor
@@ -48,38 +50,38 @@ def compute_heads(model_dim: int, head_dim: int) -> int:
         )
 
 
-class OpenELMConfig(EasyDeLPretrainedConfig):
+class OpenELMConfig(EDPretrainedConfig):
     model_type: str = "openelm"
 
     def __init__(
-            self,
-            vocab_size: int = 32000,
-            max_context_length: int = 2048,
-            num_transformer_layers: int = 12,
-            model_dim: int = 2048,
-            head_dim: int = 128,
-            qkv_multipliers: Union[Number, List[Number]] = 1.0,
-            num_query_heads: Union[int, None] = None,
-            num_gqa_groups: int = 1,
-            ffn_multipliers: Union[Number, List[Number]] = 4.0,
-            ffn_with_glu: bool = True,
-            ffn_dim_divisor: int = 256,
-            activation_fn_name: str = "swish",
-            normalization_layer_name: str = "rms_norm",
-            normalize_qk_projections: bool = False,
-            share_input_output_layers: bool = False,
-            rope_freq_constant: int = 10000,
-            rope_max_length: int = 4096,
-            initializer_range: float = 0.02,
-            use_cache: bool = True,
-            bos_token_id: int = 1,
-            eos_token_id: int = 2,
-            rope_scaling: Dict[str, Union[str, float]] = None,
-            gradient_checkpointing: str = "nothing_saveable",
-            use_scan_mlp: bool = False,
-            scan_mlp_chunk_size: int = 1024,
-            bits: Optional[int] = None,
-            **kwargs,
+        self,
+        vocab_size: int = 32000,
+        max_context_length: int = 2048,
+        num_transformer_layers: int = 12,
+        model_dim: int = 2048,
+        head_dim: int = 128,
+        qkv_multipliers: Union[Number, List[Number]] = 1.0,
+        num_query_heads: Union[int, None] = None,
+        num_gqa_groups: int = 1,
+        ffn_multipliers: Union[Number, List[Number]] = 4.0,
+        ffn_with_glu: bool = True,
+        ffn_dim_divisor: int = 256,
+        activation_fn_name: str = "swish",
+        normalization_layer_name: str = "rms_norm",
+        normalize_qk_projections: bool = False,
+        share_input_output_layers: bool = False,
+        rope_freq_constant: int = 10000,
+        rope_max_length: int = 4096,
+        initializer_range: float = 0.02,
+        use_cache: bool = True,
+        bos_token_id: int = 1,
+        eos_token_id: int = 2,
+        rope_scaling: Dict[str, Union[str, float]] = None,
+        gradient_checkpointing: str = "nothing_saveable",
+        use_scan_mlp: bool = False,
+        scan_mlp_chunk_size: int = 1024,
+        bits: Optional[int] = None,
+        **kwargs,
     ):
         """The __init__ function is called when the class is instantiated.
         It allows the class to initialize the attributes of a class.
@@ -192,48 +194,49 @@ class OpenELMConfig(EasyDeLPretrainedConfig):
             A list of tuples
         """
         return (
-
-            ("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"))),
-
-            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("self_attn/o_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-
-            ("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("mlp/down_proj/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"))),
-
-            ("input_layernorm/kernel", PartitionSpec(None)),
-            ("post_attention_layernorm/kernel", PartitionSpec(None)),
-
-            ("model/norm/kernel", PartitionSpec(None)),
-            ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
-            (".*", PartitionSpec(("fsdp", "sp"))),
-        ) if not fully_sharded_data_parallel else (
-            ("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"))),
-
-            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
-
-            ("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("mlp/down_proj/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"))),
-
-            ("input_layernorm/kernel", PartitionSpec(None)),
-            ("post_attention_layernorm/kernel", PartitionSpec(None)),
-
-            ("model/norm/kernel", PartitionSpec(None)),
-            ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
-            (".*", PartitionSpec(("fsdp", "sp"))),
+            (
+                ("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"))),
+                (
+                    "self_attn/(q_proj|k_proj|v_proj)/kernel",
+                    PartitionSpec(("fsdp", "sp"), "tp"),
+                ),
+                ("self_attn/o_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+                ("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("mlp/down_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("input_layernorm/kernel", PartitionSpec(None)),
+                ("post_attention_layernorm/kernel", PartitionSpec(None)),
+                ("model/norm/kernel", PartitionSpec(None)),
+                ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
+                (".*", PartitionSpec(("fsdp", "sp"))),
+            )
+            if not fully_sharded_data_parallel
+            else (
+                ("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"))),
+                (
+                    "self_attn/(q_proj|k_proj|v_proj)/kernel",
+                    PartitionSpec(("fsdp", "sp"), "tp"),
+                ),
+                ("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
+                ("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("mlp/down_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("input_layernorm/kernel", PartitionSpec(None)),
+                ("post_attention_layernorm/kernel", PartitionSpec(None)),
+                ("model/norm/kernel", PartitionSpec(None)),
+                ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
+                (".*", PartitionSpec(("fsdp", "sp"))),
+            )
         )
 
     def add_jax_args(
-            self,
-            gradient_checkpointing: str = "nothing_saveable",
-            use_scan_mlp: bool = False,
-            scan_mlp_chunk_size: int = 1024,
-            bits: Optional[int] = None,
-            rope_scaling: Dict[str, Union[str, float]] = None,
-            **kwargs,
+        self,
+        gradient_checkpointing: str = "nothing_saveable",
+        use_scan_mlp: bool = False,
+        scan_mlp_chunk_size: int = 1024,
+        bits: Optional[int] = None,
+        rope_scaling: Dict[str, Union[str, float]] = None,
+        **kwargs,
     ):
         """The add_jax_args function adds the following arguments to the model:
 
@@ -266,7 +269,7 @@ class OpenELMConfig(EasyDeLPretrainedConfig):
 
     @staticmethod
     def rng_keys():
-        return 'params', 'dropout', 'fcm'
+        return "params", "dropout", "fcm"
 
     def __post_init__(self) -> None:
         if self.num_gqa_groups is not None:
@@ -283,8 +286,8 @@ class OpenELMConfig(EasyDeLPretrainedConfig):
             query_dims = [int(qkv_dim)] * self.num_transformer_layers
 
         elif (
-                isinstance(self.qkv_multipliers, (tuple, list))
-                and len(self.qkv_multipliers) == 2
+            isinstance(self.qkv_multipliers, (tuple, list))
+            and len(self.qkv_multipliers) == 2
         ):
             # Each attention layer have different latent dimensions assuming qkv_multipliers[0] != qkv_multipliers[1].
             # This results in variable allocation of parameters in attention layer.
@@ -342,7 +345,7 @@ class OpenELMConfig(EasyDeLPretrainedConfig):
                 ]
             else:
                 assert (
-                        len(self.ffn_multipliers) == self.num_transformer_layers
+                    len(self.ffn_multipliers) == self.num_transformer_layers
                 ), f"{len(self.ffn_multipliers)=}!={self.num_transformer_layers=}"
         else:
             raise NotImplementedError(

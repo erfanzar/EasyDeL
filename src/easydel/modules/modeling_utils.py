@@ -1,32 +1,39 @@
 import os
 import warnings
+from copy import deepcopy
+from dataclasses import dataclass
+from typing import Any, Callable, Literal, Optional, Sequence, Tuple, Union
 
 import chex
 import fjformer.linen
 import flax
-from flax.core import unfreeze, FrozenDict
-from flax.traverse_util import unflatten_dict, flatten_dict
-from jax.experimental.mesh_utils import create_device_mesh
-from transformers import (
-    PretrainedConfig,
-    FlaxPreTrainedModel,
-    AutoModelForCausalLM,
-    GenerationConfig,
-)
 import jax
+from flax.core import FrozenDict, unfreeze
+from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import numpy as jnp
-from typing import Sequence, Union, Optional, Literal, Tuple, Any, Callable
-from dataclasses import dataclass
-from jax.sharding import PartitionSpec, Mesh
+from jax.experimental.mesh_utils import create_device_mesh
+from jax.sharding import Mesh, PartitionSpec
+from transformers import (
+    AutoModelForCausalLM,
+    FlaxPreTrainedModel,
+    GenerationConfig,
+    PretrainedConfig,
+)
 from transformers.utils import (
-    is_offline_mode as _is_offline_mode,
     cached_file as _cached_file,
-    is_remote_url as _is_remote_url,
+)
+from transformers.utils import (
     download_url as _download_url,
 )
-from copy import deepcopy
-from easydel.etils.etils import get_logger
+from transformers.utils import (
+    is_offline_mode as _is_offline_mode,
+)
+from transformers.utils import (
+    is_remote_url as _is_remote_url,
+)
+
 from easydel.etils.easystate import EasyDeLState
+from easydel.etils.etils import get_logger
 from easydel.etils.partition_module import PartitionAxis
 
 logger = get_logger(__name__)
@@ -61,7 +68,7 @@ class EasyMethod:
     CONVERT: str = "convert"
 
 
-class EasyDeLPretrainedConfig(PretrainedConfig):
+class EDPretrainedConfig(PretrainedConfig):
     """It initializes all the attributes of an object, and it's called when you create a new instance of that class.
 
     Args:
@@ -193,8 +200,9 @@ class EasyDeLPretrainedConfig(PretrainedConfig):
 
         return Mesh(create_device_mesh(resh), axis_names)
 
-    def get_mesh(self) -> Mesh:
-        """The get_mesh function is a helper function that creates a Mesh object from the
+    @property
+    def mesh(self):
+        """The mesh property is a helper property that creates a Mesh object from the
         axis_dims and axis_names attributes of an object, which are assumed to be lists of integers and strings, respectively.
         The backend attribute is also used if it exists.
 
@@ -221,10 +229,6 @@ class EasyDeLPretrainedConfig(PretrainedConfig):
                 else ""
             ),
         )
-
-    @property
-    def mesh(self):
-        return self.get_mesh()
 
     def jax_mesh(self):
         warnings.warn("`jax_mesh` is deprecated use `get_mesh` or `mesh`")
@@ -478,7 +482,7 @@ class EasyDeLPretrainedConfig(PretrainedConfig):
         return self.__repr__()
 
 
-class EasyDeLFlaxPretrainedModel(FlaxPreTrainedModel):
+class EDPretrainedModel(FlaxPreTrainedModel):
     def __init__(
         self,
         config: Optional[PretrainedConfig] = None,
@@ -503,7 +507,7 @@ class EasyDeLFlaxPretrainedModel(FlaxPreTrainedModel):
 
     @property
     def mesh(self):
-        return self.config.get_mesh()
+        return self.config.mesh
 
     def get_named_sharding(self, partition_rules=None, partition_specs=None):
         if partition_rules is None:
@@ -692,7 +696,7 @@ class EasyDeLFlaxPretrainedModel(FlaxPreTrainedModel):
         return self.__repr__()
 
     @property
-    def config(self) -> EasyDeLPretrainedConfig:
+    def config(self) -> EDPretrainedConfig:
         return self._config  # type:ignore
 
     def to_easydel_state(
@@ -725,7 +729,9 @@ class EasyDeLFlaxPretrainedModel(FlaxPreTrainedModel):
         Return the Huggingface / Pytorch implementation of the model with same weights  (if model is available in HF)
         """
 
-        from easydel.transform.easydel_transform import easystate_to_huggingface_model
+        from easydel.transform.parameters_transformation import (
+            easystate_to_huggingface_model,
+        )
 
         state = self.to_easydel_state(params=params)
         if easystate_to_huggingface_model_kwargs is None:
@@ -921,7 +927,7 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
         verbose: bool = True,
         mismatch_allowed: bool = True,
         *model_args,
-        config: Optional[Union[EasyDeLPretrainedConfig, str, os.PathLike]] = None,
+        config: Optional[Union[EDPretrainedConfig, str, os.PathLike]] = None,
         cache_dir: Optional[Union[str, os.PathLike]] = None,
         ignore_mismatched_sizes: bool = False,
         force_download: bool = False,
@@ -966,7 +972,7 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
             cl_di = len(jax.devices())
             input_shape = (cl_di, cl_di)  # safest way to perform loading ...
         config_path = config if config is not None else pretrained_model_name_or_path
-        from easydel.modules.auto_easydel_model import (
+        from easydel.modules.auto_models import (
             AutoEasyDeLConfig,
             AutoShardAndGatherFunctions,
             get_modules_by_type,
@@ -983,7 +989,7 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
         if config_kwargs is not None:
             for k, v in config_kwargs.items():
                 setattr(config, k, v)
-        _, model_kwargs = EasyDeLPretrainedConfig.from_pretrained(
+        _, model_kwargs = EDPretrainedConfig.from_pretrained(
             config_path,
             cache_dir=cache_dir,
             return_unused_kwargs=True,
@@ -1081,8 +1087,8 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
         else:
             resolved_archive_file = None
 
-        if cls.__name__ == "EasyDeLFlaxPretrainedModel":
-            # if they are using EasyDeLFlaxPretrainedModel.from_pretrained
+        if cls.__name__ == "EDPretrainedModel":
+            # if they are using EDPretrainedModel.from_pretrained
             # they will get error AssertionError: `module` must be provided.` so we autoset this to make sure user don't
             # experience this error.
             _, cls, _ = get_modules_by_type(config.model_type)

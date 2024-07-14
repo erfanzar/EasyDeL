@@ -9,17 +9,13 @@ from typing import Any, Callable, Dict, Mapping, Optional, Tuple, Union
 
 import flax.core
 import jax
-import tensorflow.data  # type:ignore # noqa  # type:ignore #noqa
-import tensorflow_datasets
 import termcolor
-from datasets import Dataset
-from fjformer import make_shard_and_gather_fns, match_partition_rules
+from fjformer.sharding import make_shard_and_gather_fns, match_partition_rules
 from flax.core import FrozenDict
 from jax import jit
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from tqdm.autonotebook import tqdm
-from transformers import PreTrainedTokenizerBase
 
 from easydel.etils.easystate import EasyDeLState
 from easydel.etils.errors import EasyDeLTimerError
@@ -42,7 +38,6 @@ from easydel.trainers.odds_ratio_preference_optimization_trainer.modelling_outpu
     ORPOTrainerOutput,
 )
 from easydel.trainers.training_configurations import TrainArguments
-from easydel.utils import prefix_print
 
 logger = get_logger(__name__)
 
@@ -89,11 +84,10 @@ class ORPOTrainer(BaseTrainer, ABC):
         _get_eval_dataloader(self, eval_dataset: Optional[Dataset] = None) -> tensorflow.data.Dataset: Creates the evaluation dataloader.
         get_train_dataloader(self) -> tensorflow.data.Dataset: Returns the training dataloader.
         get_eval_dataloader(self, eval_dataset: Optional[Dataset] = None) -> tensorflow.data.Dataset: Returns the evaluation dataloader.
-        train(self, model_parameters: Optional[flax.core.FrozenDict] = None, state: Optional[EasyDeLState] = None) -> ORPOTrainerOutput: 
+        train(self, model_parameters: Optional[flax.core.FrozenDict] = None, state: Optional[EasyDeLState] = None) -> ORPOTrainerOutput:
             Trains the ORPO model and returns the training output.
         eval(self, model_state: EasyDeLState) -> typing.Iterator[dict]: Evaluates the ORPO model and yields evaluation metrics.
     """
-
 
     def __init__(
         self,
@@ -107,9 +101,9 @@ class ORPOTrainer(BaseTrainer, ABC):
         is_encoder_decoder: bool = False,
         padding_value: int = None,
         data_collator: Optional[DPODataCollatorWithPadding] = None,
-        train_dataset: Optional[Dataset] = None,
-        eval_dataset: Optional[Union[Dataset, Dict[str, Dataset]]] = None,
-        tokenizer: Optional[PreTrainedTokenizerBase] = None,
+        train_dataset: Optional["Dataset"] = None,  # noqa #type:ignore
+        eval_dataset: Optional[Union["Dataset", Dict[str, "Dataset"]]] = None,  # noqa #type:ignore
+        tokenizer: Optional["transformers.PreTrainedTokenizerBase"] = None,  # noqa #type:ignore
         dataset_num_proc: Optional[int] = None,
         _do_init_fns: bool = True,
         dataset_map_arguments: Optional[Dict[str, Any]] = None,
@@ -739,9 +733,7 @@ class ORPOTrainer(BaseTrainer, ABC):
                 )
                 sharded_state.params = params
                 if sharded_state.opt_state is None:
-                    prefix_print(
-                        "Action", "Optimizer State is not Found!, initializing one."
-                    )
+                    logger.info("Optimizer State is not Found!, initializing one.")
                     with jax.default_device(self.arguments.offload_device):
                         sharded_state = sharded_state.init_opt_state()
                         opt_state = (
@@ -756,7 +748,7 @@ class ORPOTrainer(BaseTrainer, ABC):
                         sharded_state = sharded_state.replace(opt_state=opt_state)
             elif self.finetune:
                 if model_parameters is None and self.checkpoint_path is not None:
-                    prefix_print("Action", f"Loading Model From {self.checkpoint_path}")
+                    logger.info(f"Loading Model From {self.checkpoint_path}")
                     with jax.default_device(self.arguments.offload_device):
                         sharded_state = EasyDeLState.load_state(
                             verbose=self.arguments.verbose,
@@ -821,10 +813,9 @@ class ORPOTrainer(BaseTrainer, ABC):
                     if self.arguments.remove_ckpt_after_load:
                         os.remove(self.checkpoint_path)
                 elif model_parameters is not None and self.checkpoint_path is None:
-                    prefix_print("Action", "Sharding Passed Parameters")
+                    logger.info("Sharding Passed Parameters")
                     if not isinstance(model_parameters, flax.core.FrozenDict):
-                        prefix_print(
-                            "Warning",
+                        logger.warn(
                             "Model Parameters should be like FrozenDict({'params': params}) make sure to "
                             "pass as type FrozenDict in case of not getting UnExcepted Errors ",
                         )
@@ -994,7 +985,7 @@ class ORPOTrainer(BaseTrainer, ABC):
             max_evaluation_steps=max_evaluation_steps,
         )
 
-    def _get_train_dataloader(self) -> tensorflow.data.Dataset:
+    def _get_train_dataloader(self) -> "tensorflow.data.Dataset":  # noqa #type:ignore
         """
         Creates the training dataloader as a TensorFlow Dataset.
 
@@ -1007,6 +998,9 @@ class ORPOTrainer(BaseTrainer, ABC):
         Raises:
             ValueError: If the training dataset is not set.
         """
+
+        import tensorflow_datasets
+
         if self.train_dataset is None:
             raise ValueError("Trainer: training requires a train_dataset.")
 
@@ -1024,8 +1018,9 @@ class ORPOTrainer(BaseTrainer, ABC):
         )
 
     def _get_eval_dataloader(
-        self, eval_dataset: Optional[Dataset] = None
-    ) -> tensorflow.data.Dataset:
+        self,
+        eval_dataset: Optional["Dataset"] = None,  # noqa #type:ignore
+    ) -> "tensorflow.data.Dataset":  # noqa #type:ignore
         """
         Creates the evaluation dataloader as a TensorFlow Dataset.
 
@@ -1043,6 +1038,9 @@ class ORPOTrainer(BaseTrainer, ABC):
         Raises:
             ValueError: If no evaluation dataset is provided or set.
         """
+
+        import tensorflow_datasets
+
         if eval_dataset is None and self.eval_dataset is None:
             raise ValueError("Trainer: evaluation requires an eval_dataset.")
         eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
@@ -1057,9 +1055,7 @@ class ORPOTrainer(BaseTrainer, ABC):
             )
         )
 
-    def get_train_dataloader(
-        self,
-    ) -> tensorflow.data.Dataset:
+    def get_train_dataloader(self) -> "tensorflow.data.Dataset":  # noqa #type:ignore
         """
         Returns the training dataloader
 
@@ -1069,8 +1065,9 @@ class ORPOTrainer(BaseTrainer, ABC):
         return self._get_train_dataloader()
 
     def get_eval_dataloader(
-        self, eval_dataset: Optional[Dataset] = None
-    ) -> tensorflow.data.Dataset:
+        self,
+        eval_dataset: Optional["Dataset"] = None,  # noqa #type:ignore
+    ) -> "tensorflow.data.Dataset":  # noqa #type:ignore
         """
         Returns the evaluation dataloader
         Args:
@@ -1098,14 +1095,15 @@ class ORPOTrainer(BaseTrainer, ABC):
         interrupts and timeouts, and optionally evaluating the model.
 
         Args:
-            model_parameters (Optional[flax.core.FrozenDict], optional): 
+            model_parameters (Optional[flax.core.FrozenDict], optional):
                 Pretrained model parameters for initialization. Defaults to None.
-            state (Optional[EasyDeLState], optional): 
+            state (Optional[EasyDeLState], optional):
                 An existing EasyDeLState to resume training from. Defaults to None.
 
         Returns:
             ORPOTrainerOutput: An object containing the trained model state and other training information.
         """
+
         def get_layer_names(frozen_dict, prefix=""):
             layer_names = {}
             for key, value in frozen_dict.items():

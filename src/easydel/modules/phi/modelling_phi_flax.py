@@ -15,17 +15,11 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
-from transformers.modeling_flax_outputs import (
-    FlaxBaseModelOutput,
-    FlaxCausalLMOutput,
-    FlaxMaskedLMOutput,
-)
 
-from easydel.modules.attention_module import AttentionModule
-from easydel.modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
-from easydel.modules.flax_modelling_utils import (
+from easydel.modules.attention_module import FlexibleAttentionModule
+from easydel.modules.flax_modeling_utils import (
     ACT2FN,
-    BaseJAXAttentionModule,
+    FlaxAttentionModule,
     apply_rotary_pos_emb,
     block_wise_ffn,
     control_mlp_sharding,
@@ -34,6 +28,12 @@ from easydel.modules.flax_modelling_utils import (
     precompute_freq_cis,
     with_sharding_constraint,
 )
+from easydel.modules.modeling_flax_outputs import (
+    FlaxBaseModelOutput,
+    FlaxCausalLMOutput,
+    FlaxMaskedLMOutput,
+)
+from easydel.modules.modeling_utils import EDPretrainedModel
 from easydel.modules.phi.phi_configuration import PhiConfig as PhiConfig
 
 
@@ -88,7 +88,7 @@ class FlaxPhiMLP(nn.Module):
         return self.fc2(self.act(self.fc1(hidden_states)))
 
 
-class FlaxPhiAttention(BaseJAXAttentionModule):
+class FlaxPhiAttention(FlaxAttentionModule):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
     config: PhiConfig
@@ -146,7 +146,7 @@ class FlaxPhiAttention(BaseJAXAttentionModule):
                 use_bias=True,
             )
 
-        self.attention_performer = AttentionModule(
+        self.attention_performer = FlexibleAttentionModule(
             use_sharding_constraint=self.config.use_sharding_constraint,
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,
@@ -169,7 +169,7 @@ class FlaxPhiAttention(BaseJAXAttentionModule):
             dtype=self.config.attn_dtype,
             partition_axis=self.config.partition_axis,
             scan_ring_attention=self.config.scan_ring_attention,
-            mesh=self.config.get_mesh(),
+            mesh=self.config.mesh,
             sm_scale=1 / math.sqrt(self.head_dim),
             axis_name=self.config.attention_axis_name,
             backward_pass_impl=self.config.flash_attention_backward_pass_impl,
@@ -177,7 +177,6 @@ class FlaxPhiAttention(BaseJAXAttentionModule):
 
     def _merge_heads(self, hidden_states):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
-
 
     def apply_rotary(
         self, batch_size, sequence_length, query, key, value, freq_cis, position_ids
@@ -313,7 +312,9 @@ class FlaxPhiAttention(BaseJAXAttentionModule):
                 key_states, value_states, query_states, attention_mask
             )
 
-        key_states, value_states = self.repeat_key_value(key_states, value_states, self.num_key_value_groups)
+        key_states, value_states = self.repeat_key_value(
+            key_states, value_states, self.num_key_value_groups
+        )
         # if self.config.use_sharding_constraint:
         #     query_states = with_sharding_constraint(
         #         query_states, PartitionSpec(("dp", "fsdp"), "sp" if query_states.shape[1] != 1 else None, "tp", None)
@@ -334,7 +335,7 @@ class FlaxPhiAttention(BaseJAXAttentionModule):
 
         query_length, key_length = query_states.shape[1], key_states.shape[1]
 
-        attentions = self.attention_performer.__call__(
+        attentions = self.attention_performer(
             query_states=query_states,
             key_states=key_states,
             value_states=value_states,
@@ -754,7 +755,7 @@ class FlaxPhiForCausalLMModule(nn.Module):
         )
 
 
-class FlaxPhiPreTrainedModel(EasyDeLFlaxPretrainedModel):
+class FlaxPhiPreTrainedModel(EDPretrainedModel):
     """Phi pre-trained model."""
 
     module_class = None

@@ -1,23 +1,20 @@
 # Example of loading model across mutiple devices
 import copy
 
-import flax.traverse_util
 # Need the latest version 0.0.43 or git+https://github.com/erfanzar/EasyDeL.git
-
 import jax
 import torch
 
 try:
-    from easydel import get_modules_by_type, AutoShardAndGatherFunctions
+    from easydel import AutoShardAndGatherFunctions, get_modules_by_type
 except ModuleNotFoundError:
     import sys
     from pathlib import Path
 
     cp = Path.cwd().__str__()
     sys.path.append(cp)
-    from easydel import get_modules_by_type, AutoShardAndGatherFunctions
+    from easydel import AutoShardAndGatherFunctions, get_modules_by_type
 
-from fjformer import make_shard_and_gather_fns, match_partition_rules
 from transformers import FalconForCausalLM
 
 
@@ -33,25 +30,22 @@ def main():
         alibi=False,
     )
 
-    torch_model = FalconForCausalLM(
-        config=copy.deepcopy(config)
-    )
-    easy_model = FlaxFalconForCausalLM(
-        config=config
-    )
+    torch_model = FalconForCausalLM(config=copy.deepcopy(config))
+    easy_model = FlaxFalconForCausalLM(config=config)
 
     shard_fns, gather_fns = AutoShardAndGatherFunctions.from_config(
-        config=config,
-        flatten=True
+        config=config, flatten=True
     )
 
     pytorch_dict = torch_model.state_dict()
-    with config.get_mesh():
+    with config.mesh:
         params = transform_fn(
             pytorch_dict,
-            device=jax.devices("cpu")[0],  # This got no use but incase that some key missmatch and not getting
+            device=jax.devices("cpu")[
+                0
+            ],  # This got no use but incase that some key missmatch and not getting
             # Kwargs req error we just pass that (No any params will be load on CPU for suer :) )
-            shard_fns=shard_fns
+            shard_fns=shard_fns,
         )
     print("Sharded Successfully")
 

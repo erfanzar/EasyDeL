@@ -2,11 +2,6 @@ import warnings
 from abc import ABC
 from typing import Callable, Dict, Optional, Union
 
-import tensorflow_datasets as tfds
-from datasets import Dataset
-from datasets.arrow_writer import SchemaInferenceError
-from datasets.builder import DatasetGenerationError
-from transformers import PreTrainedTokenizerBase
 
 from easydel.etils.etils import get_logger
 from easydel.trainers.base_trainer import TrainerConfigureDataloaderOutput
@@ -180,9 +175,11 @@ class SFTTrainer(CausalLanguageModelTrainer, ABC):
     def __init__(
         self,
         arguments: TrainArguments,
-        tokenizer: PreTrainedTokenizerBase,
-        train_dataset: Optional[Dataset] = None,
-        eval_dataset: Optional[Union[Dataset, Dict[str, Dataset]]] = None,
+        tokenizer: "PreTrainedTokenizerBase",  # noqa # type:ignore
+        train_dataset: Optional["Dataset"] = None,  # noqa # type:ignore
+        eval_dataset: Optional[
+            Union["Dataset", Dict[str, "Dataset"]]  # noqa # type:ignore
+        ] = None,
         dataset_text_field: Optional[str] = None,
         packing: Optional[bool] = False,
         formatting_func: Optional[Callable] = None,
@@ -288,7 +285,8 @@ class SFTTrainer(CausalLanguageModelTrainer, ABC):
             TrainerConfigureDataloaderOutput: An object containing the configured dataloaders and the
                                             maximum number of training and evaluation steps.
         """
-
+                
+        import tensorflow_datasets as tfds
         dataloader_train = tfds.as_numpy(
             self.dataset_train.to_tf_dataset(
                 batch_size=self.arguments.total_batch_size,
@@ -547,6 +545,11 @@ class SFTTrainer(CausalLanguageModelTrainer, ABC):
             def data_generator(inner_constant_length_iterator):
                 for d in inner_constant_length_iterator():
                     yield d
+
+            # Import Only and Only when needed, don't dst the runtime.
+            from datasets import Dataset
+            from datasets.arrow_writer import SchemaInferenceError
+            from datasets.builder import DatasetGenerationError
 
             try:
                 packed_dataset = Dataset.from_generator(

@@ -1,41 +1,42 @@
-from typing import Optional, Mapping
+from typing import Optional
+
 from jax.sharding import PartitionSpec
 
-from easydel.modules.easydel_modelling_utils import EasyDeLPretrainedConfig
+from easydel.modules.modeling_utils import EDPretrainedConfig
 
 
-class Qwen1Config(EasyDeLPretrainedConfig):
+class Qwen1Config(EDPretrainedConfig):
     model_type: str = "qwen"
 
     def __init__(
-            self,
-            vocab_size=151936,
-            hidden_size=4096,
-            num_hidden_layers=32,
-            num_attention_heads=32,
-            emb_dropout_prob=0.0,
-            attn_dropout_prob=0.0,
-            layer_norm_epsilon=1e-6,
-            initializer_range=0.02,
-            seq_length=8192,
-            scale_attn_weights=True,
-            use_cache=True,
-            kv_channels=128,
-            rotary_pct=1.0,
-            rotary_emb_base=10000,
-            use_dynamic_ntk=True,
-            use_logn_attn=True,
-            intermediate_size=22016,
-            no_bias=True,
-            tie_word_embeddings=False,
-            softmax_in_fp32=False,
-            gradient_checkpointing: str = "nothing_saveable",
-            use_scan_mlp: bool = False,
-            scan_mlp_chunk_size: int = 1024,
-            bits: Optional[int] = None,
-            scan_layers: bool = True,
-            init_rope_cache_auto: bool = False,
-            **kwargs,
+        self,
+        vocab_size=151936,
+        hidden_size=4096,
+        num_hidden_layers=32,
+        num_attention_heads=32,
+        emb_dropout_prob=0.0,
+        attn_dropout_prob=0.0,
+        layer_norm_epsilon=1e-6,
+        initializer_range=0.02,
+        seq_length=8192,
+        scale_attn_weights=True,
+        use_cache=True,
+        kv_channels=128,
+        rotary_pct=1.0,
+        rotary_emb_base=10000,
+        use_dynamic_ntk=True,
+        use_logn_attn=True,
+        intermediate_size=22016,
+        no_bias=True,
+        tie_word_embeddings=False,
+        softmax_in_fp32=False,
+        gradient_checkpointing: str = "nothing_saveable",
+        use_scan_mlp: bool = False,
+        scan_mlp_chunk_size: int = 1024,
+        bits: Optional[int] = None,
+        scan_layers: bool = True,
+        init_rope_cache_auto: bool = False,
+        **kwargs,
     ):
         self.vocab_size = vocab_size
         self.seq_length = seq_length
@@ -85,51 +86,47 @@ class Qwen1Config(EasyDeLPretrainedConfig):
             A list of tuples
         """
         return (
-
-            ("model/wte/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
-
-            ("self_attn/c_attn/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("self_attn/c_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-
-            ("mlp/w1/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("mlp/w2/kernel", PartitionSpec(("fsdp", "sp")), "tp"),
-            ("mlp/c_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-
-            ("ln_1/kernel", PartitionSpec(None)),
-            ("ln_2/kernel", PartitionSpec(None)),
-
-            ("model/ln_f/kernel", PartitionSpec(None)),
-            ("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            (".*", PartitionSpec(None)),
-        ) if not fully_sharded_data_parallel else (
-
-            ("model/wte/embedding", PartitionSpec(("fsdp", "sp"))),
-
-            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
-
-            ("mlp/w1/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("mlp/w2/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("mlp/c_proj/kernel", PartitionSpec(("fsdp", "sp"))),
-
-            ("ln_1/kernel", PartitionSpec(None)),
-            ("ln_2/kernel", PartitionSpec(None)),
-
-            ("model/ln_f/kernel", PartitionSpec(None)),
-            ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
-            (".*", PartitionSpec(None)),
-
+            (
+                ("model/wte/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
+                ("self_attn/c_attn/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+                ("self_attn/c_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+                ("mlp/w1/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+                ("mlp/w2/kernel", PartitionSpec(("fsdp", "sp")), "tp"),
+                ("mlp/c_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+                ("ln_1/kernel", PartitionSpec(None)),
+                ("ln_2/kernel", PartitionSpec(None)),
+                ("model/ln_f/kernel", PartitionSpec(None)),
+                ("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+                (".*", PartitionSpec(None)),
+            )
+            if not fully_sharded_data_parallel
+            else (
+                ("model/wte/embedding", PartitionSpec(("fsdp", "sp"))),
+                (
+                    "self_attn/(q_proj|k_proj|v_proj)/kernel",
+                    PartitionSpec(("fsdp", "sp"), "tp"),
+                ),
+                ("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
+                ("mlp/w1/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("mlp/w2/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("mlp/c_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("ln_1/kernel", PartitionSpec(None)),
+                ("ln_2/kernel", PartitionSpec(None)),
+                ("model/ln_f/kernel", PartitionSpec(None)),
+                ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
+                (".*", PartitionSpec(None)),
+            )
         )
 
     def add_jax_args(
-            self,
-            gradient_checkpointing: str = "nothing_saveable",
-            use_scan_mlp: bool = False,
-            scan_mlp_chunk_size: int = 1024,
-            bits: Optional[int] = None,
-            scan_layers: bool = True,
-            init_rope_cache_auto: bool = False,
-            **kwargs,
+        self,
+        gradient_checkpointing: str = "nothing_saveable",
+        use_scan_mlp: bool = False,
+        scan_mlp_chunk_size: int = 1024,
+        bits: Optional[int] = None,
+        scan_layers: bool = True,
+        init_rope_cache_auto: bool = False,
+        **kwargs,
     ):
         """The add_jax_args function adds the following arguments to the Transformer class:
 

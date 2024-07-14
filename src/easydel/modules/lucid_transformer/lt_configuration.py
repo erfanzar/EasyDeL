@@ -1,29 +1,27 @@
-from typing import Sequence, Optional
-
 from jax.sharding import PartitionSpec
 
-from easydel.modules.easydel_modelling_utils import EasyDeLPretrainedConfig
+from easydel.modules.modeling_utils import EDPretrainedConfig
 
 
-class FlaxLTConfig(EasyDeLPretrainedConfig):
+class FlaxLTConfig(EDPretrainedConfig):
     def __init__(
-            self,
-            initializer_range: float = 0.02,
-            hidden_size: int = 4096,
-            bos_token_id=2,
-            eos_token_id=1,
-            pad_token_id=0,
-            intermediate_size: int = 8192,
-            num_hidden_layers: int = 32,
-            vocab_size: int = 32000,
-            num_attention_heads: int = 32,
-            weight_decay: float = 0.02,
-            max_sequence_length: int = 2048,
-            softmax_scale: float = None,
-            alibi_bias_max: int = 8,
-            fsdp=False,
-            hidden_act="silu",
-            **kwargs
+        self,
+        initializer_range: float = 0.02,
+        hidden_size: int = 4096,
+        bos_token_id=2,
+        eos_token_id=1,
+        pad_token_id=0,
+        intermediate_size: int = 8192,
+        num_hidden_layers: int = 32,
+        vocab_size: int = 32000,
+        num_attention_heads: int = 32,
+        weight_decay: float = 0.02,
+        max_sequence_length: int = 2048,
+        softmax_scale: float = None,
+        alibi_bias_max: int = 8,
+        fsdp=False,
+        hidden_act="silu",
+        **kwargs,
     ):
         self.max_sequence_length = max_sequence_length
         self.weight_decay = weight_decay
@@ -45,7 +43,7 @@ class FlaxLTConfig(EasyDeLPretrainedConfig):
             eos_token_id=eos_token_id,
             bos_token_id=bos_token_id,
             pad_token_id=pad_token_id,
-            **kwargs
+            **kwargs,
         )
 
     @staticmethod
@@ -59,9 +57,9 @@ class FlaxLTConfig(EasyDeLPretrainedConfig):
             ("mlp/up/kernel", PartitionSpec("fsdp")),
             ("lm_head/kernel", PartitionSpec("fsdp", "sp")),
             (".*", PartitionSpec(("fsdp", "sp"))),
-            ('ln/kernel', PartitionSpec(None)),
-            ('ln1/kernel', PartitionSpec(None)),
-            ('ln2/kernel', PartitionSpec(None)),
+            ("ln/kernel", PartitionSpec(None)),
+            ("ln1/kernel", PartitionSpec(None)),
+            ("ln2/kernel", PartitionSpec(None)),
         )
 
     @staticmethod
@@ -70,7 +68,6 @@ class FlaxLTConfig(EasyDeLPretrainedConfig):
 
     @staticmethod
     def rng_keys():
-        return 'params', 'dropout', 'fcm'
+        return "params", "dropout", "fcm"
 
-    def add_jax_args(self, *args, **kwargs):
-        ...
+    def add_jax_args(self, *args, **kwargs): ...

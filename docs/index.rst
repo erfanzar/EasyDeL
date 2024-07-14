@@ -138,7 +138,7 @@ Zare Chavoshi, Erfan. "EasyDeL, an open-source library, is specifically designed
     finetuning_example.md
     lora_transferlearning_example.md
     parameterquantization.md
-    attentionmodule_example.md
+    FlexibleAttentionModule_example.md
     data_processing.md
 
 

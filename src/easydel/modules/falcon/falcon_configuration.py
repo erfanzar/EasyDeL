@@ -1,11 +1,11 @@
-from typing import Sequence, Optional
+from typing import Optional
 
 from jax.sharding import PartitionSpec
 
-from easydel.modules.easydel_modelling_utils import EasyDeLPretrainedConfig
+from easydel.modules.modeling_utils import EDPretrainedConfig
 
 
-class FalconConfig(EasyDeLPretrainedConfig):
+class FalconConfig(EDPretrainedConfig):
     model_type: str = "falcon"
     attribute_map = {
         "num_hidden_layers": "num_hidden_layers",
@@ -13,34 +13,34 @@ class FalconConfig(EasyDeLPretrainedConfig):
     }
 
     def __init__(
-            self,
-            vocab_size=65024,
-            hidden_size=4544,
-            num_hidden_layers=32,
-            num_attention_heads=71,
-            num_ln_in_parallel_attn=None,
-            layer_norm_epsilon=1e-5,
-            initializer_range=0.02,
-            use_cache=True,
-            hidden_dropout=0.0,
-            attention_dropout=0.0,
-            num_kv_heads=None,
-            alibi=False,
-            new_decoder_architecture=False,
-            multi_query=True,
-            parallel_attn=True,
-            bias=False,
-            max_position_embeddings=2048,
-            rope_theta=10000.0,
-            rope_scaling=None,
-            bos_token_id=11,
-            eos_token_id=11,
-            ffn_hidden_size=None,
-            ff_factor=None,
-            activation="gelu",
-            gradient_checkpointing: str = "",
-            bits: Optional[int] = None,
-            **kwargs
+        self,
+        vocab_size=65024,
+        hidden_size=4544,
+        num_hidden_layers=32,
+        num_attention_heads=71,
+        num_ln_in_parallel_attn=None,
+        layer_norm_epsilon=1e-5,
+        initializer_range=0.02,
+        use_cache=True,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        num_kv_heads=None,
+        alibi=False,
+        new_decoder_architecture=False,
+        multi_query=True,
+        parallel_attn=True,
+        bias=False,
+        max_position_embeddings=2048,
+        rope_theta=10000.0,
+        rope_scaling=None,
+        bos_token_id=11,
+        eos_token_id=11,
+        ffn_hidden_size=None,
+        ff_factor=None,
+        activation="gelu",
+        gradient_checkpointing: str = "",
+        bits: Optional[int] = None,
+        **kwargs,
     ):
         self.vocab_size = vocab_size
         n_embed = kwargs.pop("n_embed", None)
@@ -80,10 +80,7 @@ class FalconConfig(EasyDeLPretrainedConfig):
             ff_factor = ffn_hidden_size // hidden_size
         self.ff_factor = ff_factor
         super().__init__(
-            bos_token_id=bos_token_id,
-            eos_token_id=eos_token_id,
-            bits=bits,
-            **kwargs
+            bos_token_id=bos_token_id, eos_token_id=eos_token_id, bits=bits, **kwargs
         )
 
     @property
@@ -92,31 +89,53 @@ class FalconConfig(EasyDeLPretrainedConfig):
 
     def get_partition_rules(self, fully_sharded_data_parallel: bool = False):
         return (
-            ("word_embeddings/embedding", PartitionSpec("dp", ("fsdp", "sp"))),
-            ("self_attention/query_key_value/(kernel)", PartitionSpec("dp", ("fsdp", "sp"))),
-            ("self_attention/dense/(kernel)", PartitionSpec("dp", ("fsdp", "sp"))),
-            ("mlp/dense_4h_to_h/(kernel)", PartitionSpec("dp", ("fsdp", "sp"))),
-            ("mlp/dense_h_to_4h/(kernel)", PartitionSpec("dp", ("fsdp", "sp"))),
-            ("lm_head/kernel", PartitionSpec("dp", ("fsdp", "sp"))),
-            ("transformer/ln_f/bias", PartitionSpec(("fsdp", "sp"))),
-            ("transformer/ln_f/scale", PartitionSpec(("fsdp", "sp"))),
-            ("transformer/post_attention_layernorm/scale", PartitionSpec(("fsdp", "sp"))),
-            ("transformer/post_attention_layernorm/bias", PartitionSpec(("fsdp", "sp"))),
-            ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
-            (".*", PartitionSpec(("fsdp", "sp")))
-        ) if not fully_sharded_data_parallel else (
-            ("word_embeddings/embedding", PartitionSpec(("fsdp", "sp"))),
-            ("self_attention/query_key_value/(kernel|bias)", PartitionSpec(("fsdp", "sp"))),
-            ("self_attention/dense/(kernel|bias)", PartitionSpec(("fsdp", "sp"))),
-            ("mlp/dense_4h_to_h/(kernel|bias)", PartitionSpec(("fsdp", "sp"))),
-            ("mlp/dense_h_to_4h/(kernel|bias)", PartitionSpec(("fsdp", "sp"))),
-            ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("transformer/ln_f/bias", PartitionSpec(("fsdp", "sp"))),
-            ("transformer/ln_f/scale", PartitionSpec(("fsdp", "sp"))),
-            ("transformer/post_attention_layernorm/scale", PartitionSpec(("fsdp", "sp"))),
-            ("transformer/post_attention_layernorm/bias", PartitionSpec(("fsdp", "sp"))),
-            ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
-            (".*", PartitionSpec(("fsdp", "sp")))
+            (
+                ("word_embeddings/embedding", PartitionSpec("dp", ("fsdp", "sp"))),
+                (
+                    "self_attention/query_key_value/(kernel)",
+                    PartitionSpec("dp", ("fsdp", "sp")),
+                ),
+                ("self_attention/dense/(kernel)", PartitionSpec("dp", ("fsdp", "sp"))),
+                ("mlp/dense_4h_to_h/(kernel)", PartitionSpec("dp", ("fsdp", "sp"))),
+                ("mlp/dense_h_to_4h/(kernel)", PartitionSpec("dp", ("fsdp", "sp"))),
+                ("lm_head/kernel", PartitionSpec("dp", ("fsdp", "sp"))),
+                ("transformer/ln_f/bias", PartitionSpec(("fsdp", "sp"))),
+                ("transformer/ln_f/scale", PartitionSpec(("fsdp", "sp"))),
+                (
+                    "transformer/post_attention_layernorm/scale",
+                    PartitionSpec(("fsdp", "sp")),
+                ),
+                (
+                    "transformer/post_attention_layernorm/bias",
+                    PartitionSpec(("fsdp", "sp")),
+                ),
+                ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
+                (".*", PartitionSpec(("fsdp", "sp"))),
+            )
+            if not fully_sharded_data_parallel
+            else (
+                ("word_embeddings/embedding", PartitionSpec(("fsdp", "sp"))),
+                (
+                    "self_attention/query_key_value/(kernel|bias)",
+                    PartitionSpec(("fsdp", "sp")),
+                ),
+                ("self_attention/dense/(kernel|bias)", PartitionSpec(("fsdp", "sp"))),
+                ("mlp/dense_4h_to_h/(kernel|bias)", PartitionSpec(("fsdp", "sp"))),
+                ("mlp/dense_h_to_4h/(kernel|bias)", PartitionSpec(("fsdp", "sp"))),
+                ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("transformer/ln_f/bias", PartitionSpec(("fsdp", "sp"))),
+                ("transformer/ln_f/scale", PartitionSpec(("fsdp", "sp"))),
+                (
+                    "transformer/post_attention_layernorm/scale",
+                    PartitionSpec(("fsdp", "sp")),
+                ),
+                (
+                    "transformer/post_attention_layernorm/bias",
+                    PartitionSpec(("fsdp", "sp")),
+                ),
+                ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
+                (".*", PartitionSpec(("fsdp", "sp"))),
+            )
         )
 
     @staticmethod
@@ -124,15 +143,13 @@ class FalconConfig(EasyDeLPretrainedConfig):
         return "dp", "fsdp", "tp", "sp"
 
     def add_jax_args(
-            self,
-            gradient_checkpointing: str = "",
-            bits: Optional[int] = None,
-            **kwargs,
+        self,
+        gradient_checkpointing: str = "",
+        bits: Optional[int] = None,
+        **kwargs,
     ):
         basics = dict(
-            bits=bits,
-            gradient_checkpointing=gradient_checkpointing,
-            **kwargs
+            bits=bits, gradient_checkpointing=gradient_checkpointing, **kwargs
         )
         for key_states, value_states in basics.items():
             if not hasattr(self, key_states):

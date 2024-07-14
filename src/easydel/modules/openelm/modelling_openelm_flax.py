@@ -14,13 +14,12 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import Array, lax
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
-from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
-from easydel.modules.attention_module import AttentionModule
+
+from easydel.modules.attention_module import FlexibleAttentionModule
 from easydel.modules.common import RMSNorm
-from easydel.modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
-from easydel.modules.flax_modelling_utils import (
+from easydel.modules.flax_modeling_utils import (
     ACT2FN,
-    BaseJAXAttentionModule,
+    FlaxAttentionModule,
     apply_rotary_pos_emb,
     block_wise_ffn,
     control_mlp_sharding,
@@ -29,7 +28,17 @@ from easydel.modules.flax_modelling_utils import (
     precompute_freq_cis,
     with_sharding_constraint,
 )
-from easydel.modules.openelm.openelm_configuration import OpenELMConfig as OpenELMConfig, make_divisible
+from easydel.modules.modeling_flax_outputs import (
+    FlaxBaseModelOutput,
+    FlaxCausalLMOutput,
+)
+from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.openelm.openelm_configuration import (
+    OpenELMConfig as OpenELMConfig,
+)
+from easydel.modules.openelm.openelm_configuration import (
+    make_divisible,
+)
 
 re_mat = nn_partitioning.remat
 
@@ -48,8 +57,8 @@ class FlaxOpenELMRotaryEmbedding(nn.Module):
         key = apply_rotary_pos_emb(key, sin[..., :key_len, :], cos[..., :key_len, :])
         query = apply_rotary_pos_emb(
             query,
-            sin[..., key_len - query_len: key_len, :],
-            cos[..., key_len - query_len: key_len, :],
+            sin[..., key_len - query_len : key_len, :],
+            cos[..., key_len - query_len : key_len, :],
         )
 
         return query.astype(self.dtype), key.astype(self.dtype)
@@ -62,7 +71,7 @@ class FlaxOpenELMMLP(nn.Module):
     precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
 
 
-class FlaxOpenELMMultiHeadCausalAttention(BaseJAXAttentionModule):
+class FlaxOpenELMMultiHeadCausalAttention(FlaxAttentionModule):
     config: OpenELMConfig
     layer_idx: int
     dtype: jnp.dtype = jnp.float32
@@ -114,7 +123,7 @@ class FlaxOpenELMMultiHeadCausalAttention(BaseJAXAttentionModule):
         )
         self.head_dim = head_dim
         self.rotary = FlaxOpenELMRotaryEmbedding(self.dtype)
-        self.attention_performer = AttentionModule(
+        self.attention_performer = FlexibleAttentionModule(
             use_sharding_constraint=self.config.use_sharding_constraint,
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,
@@ -137,7 +146,7 @@ class FlaxOpenELMMultiHeadCausalAttention(BaseJAXAttentionModule):
             dtype=self.config.attn_dtype,
             partition_axis=self.config.partition_axis,
             scan_ring_attention=self.config.scan_ring_attention,
-            mesh=self.config.get_mesh(),
+            mesh=self.config.mesh,
             sm_scale=1 / math.sqrt(self.head_dim),
             axis_name=self.config.attention_axis_name,
             backward_pass_impl=self.config.flash_attention_backward_pass_impl,
@@ -155,9 +164,8 @@ class FlaxOpenELMMultiHeadCausalAttention(BaseJAXAttentionModule):
             hidden_states.shape[:2] + (self.num_q_heads * self.head_dim,)
         )
 
-
     def apply_rotary(
-            self, batch_size, sequence_length, query, key, value, freq_cis, position_ids
+        self, batch_size, sequence_length, query, key, value, freq_cis, position_ids
     ):
         """The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
         The main difference is that it takes in an additional argument, freq_cis, which are used to calculate
@@ -193,17 +201,17 @@ class FlaxOpenELMMultiHeadCausalAttention(BaseJAXAttentionModule):
         return self._transpose_sequence_head(query, key, value)
 
     def __call__(
-            self,
-            hidden_states: chex.Array,
-            freq_cis: Tuple[chex.Array, chex.Array],
-            attention_mask: chex.Array,
-            position_ids: chex.Array,
-            causal_mask: chex.Array,
-            segment_ids: Optional[chex.Array] = None,
-            deterministic: bool = True,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            fcm_mask=None,
+        self,
+        hidden_states: chex.Array,
+        freq_cis: Tuple[chex.Array, chex.Array],
+        attention_mask: chex.Array,
+        position_ids: chex.Array,
+        causal_mask: chex.Array,
+        segment_ids: Optional[chex.Array] = None,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        fcm_mask=None,
     ):
         """The __call__ function is the main function of a JAX module. It defines how the module behaves when called
         with inputs. The __call__ function can be thought of as a &quot;forward pass&quot; through the model,
@@ -249,9 +257,9 @@ class FlaxOpenELMMultiHeadCausalAttention(BaseJAXAttentionModule):
         # [B, (q_h + k_h + v_h), S, h] --> [B, q_h, S h], [B, k_h, S, h], [B, v_h, S, h]
         query_states = qkv[:, : self.num_q_heads, :, :]
         key_states = qkv[
-                     :, self.num_q_heads: self.num_k_heads + self.num_q_heads, :, :
-                     ]
-        value_states = qkv[:, self.num_k_heads + self.num_q_heads:, :, :]
+            :, self.num_q_heads : self.num_k_heads + self.num_q_heads, :, :
+        ]
+        value_states = qkv[:, self.num_k_heads + self.num_q_heads :, :, :]
         if self.q_norm is not None:
             query_states = self.q_norm(query_states)
 
@@ -303,7 +311,9 @@ class FlaxOpenELMMultiHeadCausalAttention(BaseJAXAttentionModule):
                 key_states, value_states, query_states, attention_mask
             )
 
-        key_states, value_states = self.repeat_key_value(key_states, value_states, self.num_groups)
+        key_states, value_states = self.repeat_key_value(
+            key_states, value_states, self.num_groups
+        )
         attention_bias = lax.select(
             attention_mask > 0,
             jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
@@ -314,7 +324,7 @@ class FlaxOpenELMMultiHeadCausalAttention(BaseJAXAttentionModule):
 
         query_length, key_length = query_states.shape[1], key_states.shape[1]
 
-        attentions = self.attention_performer.__call__(
+        attentions = self.attention_performer(
             query_states=query_states,
             key_states=key_states,
             value_states=value_states,
@@ -483,16 +493,16 @@ class FlaxOpenELMDecoderLayer(nn.Module):
         )
 
     def __call__(
-            self,
-            hidden_states: chex.Array,
-            freq_cis: Tuple[chex.Array, chex.Array],
-            causal_mask: chex.Array,
-            attention_mask: Optional[chex.Array] = None,
-            position_ids: Optional[chex.Array] = None,
-            segment_ids: Optional[chex.Array] = None,
-            output_attentions: Optional[bool] = False,
-            init_cache: Optional[bool] = False,
-            deterministic: bool = True,
+        self,
+        hidden_states: chex.Array,
+        freq_cis: Tuple[chex.Array, chex.Array],
+        causal_mask: chex.Array,
+        attention_mask: Optional[chex.Array] = None,
+        position_ids: Optional[chex.Array] = None,
+        segment_ids: Optional[chex.Array] = None,
+        output_attentions: Optional[bool] = False,
+        init_cache: Optional[bool] = False,
+        deterministic: bool = True,
     ) -> Tuple[chex.Array, Optional[chex.Array]]:
         residual = hidden_states
         hidden_states = self.attn_norm(hidden_states)
@@ -568,16 +578,16 @@ class FlaxOpenELMDecoderLayerCollection(nn.Module):
         ]
 
     def __call__(
-            self,
-            hidden_states: chex.Array,
-            freq_cis: Tuple[chex.Array, chex.Array],
-            attention_mask: chex.Array,
-            causal_mask: chex.Array,
-            position_ids: chex.Array,
-            deterministic: bool = True,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            output_hidden_states: bool = False,
+        self,
+        hidden_states: chex.Array,
+        freq_cis: Tuple[chex.Array, chex.Array],
+        attention_mask: chex.Array,
+        causal_mask: chex.Array,
+        position_ids: chex.Array,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
     ):
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
@@ -675,16 +685,16 @@ class FlaxOpenELMModule(nn.Module):
         )
 
     def __call__(
-            self,
-            input_ids: Optional[chex.Array] = None,
-            attention_mask: Optional[chex.Array] = None,
-            position_ids: Optional[chex.Array] = None,
-            deterministic: bool = True,
-            inputs_embeds: chex.Array = None,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            output_hidden_states: bool = False,
-            return_dict: bool = True,
+        self,
+        input_ids: Optional[chex.Array] = None,
+        attention_mask: Optional[chex.Array] = None,
+        position_ids: Optional[chex.Array] = None,
+        deterministic: bool = True,
+        inputs_embeds: chex.Array = None,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        return_dict: bool = True,
     ) -> typing.Union[Tuple[Array, ...], FlaxBaseModelOutput]:
         """The __call__ function is the main function of a Flax model.
         It takes in input_ids, attention_mask, and position_ids as inputs to the model.
@@ -749,20 +759,20 @@ class FlaxOpenELMModule(nn.Module):
         )
 
 
-class FlaxOpenELMPretrainedModel(EasyDeLFlaxPretrainedModel):
+class FlaxOpenELMPretrainedModel(EDPretrainedModel):
     config_class = OpenELMConfig
     base_model_prefix = "openelm"
     module_class: nn.Module = None
 
     def __init__(
-            self,
-            config: OpenELMConfig,
-            input_shape: Tuple = (1, 1),
-            seed: int = 0,
-            dtype: jnp.dtype = jnp.bfloat16,
-            param_dtype: jnp.dtype = jnp.bfloat16,
-            _do_init: bool = True,
-            **kwargs,
+        self,
+        config: OpenELMConfig,
+        input_shape: Tuple = (1, 1),
+        seed: int = 0,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        _do_init: bool = True,
+        **kwargs,
     ):
         super().__init__(
             config,
@@ -776,10 +786,10 @@ class FlaxOpenELMPretrainedModel(EasyDeLFlaxPretrainedModel):
         )
 
     def init_weights(
-            self,
-            rng: jax.random.PRNGKey,
-            input_shape: Tuple,
-            params: flax.core.FrozenDict = None,
+        self,
+        rng: jax.random.PRNGKey,
+        input_shape: Tuple,
+        params: flax.core.FrozenDict = None,
     ) -> flax.core.FrozenDict:
         """The init_weights function is used to initialize the weights of a model.
         It takes in a rng, which is a random number generator key that can be used to generate random numbers.
@@ -852,19 +862,19 @@ class FlaxOpenELMPretrainedModel(EasyDeLFlaxPretrainedModel):
         return init_variables["cache"]
 
     def __call__(
-            self,
-            input_ids,
-            attention_mask=None,
-            position_ids=None,
-            params: dict = None,
-            past_key_values: dict = None,
-            dropout_rng: jax.random.PRNGKey = None,
-            train: bool = False,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
-            add_params_field: bool = False,
-            **kwargs,
+        self,
+        input_ids,
+        attention_mask=None,
+        position_ids=None,
+        params: dict = None,
+        past_key_values: dict = None,
+        dropout_rng: jax.random.PRNGKey = None,
+        train: bool = False,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        add_params_field: bool = False,
+        **kwargs,
     ):
         """The __call__ function is the main function of a JAX module.
         It takes as input:
@@ -1000,16 +1010,16 @@ class FlaxOpenELMForCausalLMModule(nn.Module):
         )
 
     def __call__(
-            self,
-            input_ids: chex.Array,
-            attention_mask: chex.Array,
-            position_ids: chex.Array,
-            deterministic: bool = True,
-            inputs_embeds: chex.Array = None,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            output_hidden_states: bool = False,
-            return_dict: bool = True,
+        self,
+        input_ids: chex.Array,
+        attention_mask: chex.Array,
+        position_ids: chex.Array,
+        deterministic: bool = True,
+        inputs_embeds: chex.Array = None,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        return_dict: bool = True,
     ):
         """The __call__ function is the main function of a Flax module. It defines how the model will be called,
         and what it returns. In this case, we are calling our Transformer model with input_ids and attention_mask
@@ -1089,7 +1099,7 @@ class FlaxOpenELMForCausalLM(FlaxOpenELMPretrainedModel):
     module_class = FlaxOpenELMForCausalLMModule
 
     def prepare_inputs_for_generation(
-            self, input_ids, max_length, attention_mask: Optional[chex.Array] = None
+        self, input_ids, max_length, attention_mask: Optional[chex.Array] = None
     ):
         batch_size, seq_length = input_ids.shape
 
@@ -1112,7 +1122,7 @@ class FlaxOpenELMForCausalLM(FlaxOpenELMPretrainedModel):
         }
 
     def update_inputs_for_generation(
-            self, model_outputs, model_kwargs
+        self, model_outputs, model_kwargs
     ):  # noqa:E722 # type:ignore
         model_kwargs["past_key_values"] = model_outputs.past_key_values
         model_kwargs["position_ids"] = model_kwargs["position_ids"][:, -1:] + 1

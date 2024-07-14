@@ -1,45 +1,45 @@
-from typing import Optional, Dict, Union
+from typing import Dict, Optional, Union
 
 from jax.sharding import PartitionSpec
 
-from easydel.modules.easydel_modelling_utils import EasyDeLPretrainedConfig
+from easydel.modules.modeling_utils import EDPretrainedConfig
 
 
-class ChatGLMConfig(EasyDeLPretrainedConfig):
+class ChatGLMConfig(EDPretrainedConfig):
     model_type: str = "chatglm"
 
     def __init__(
-            self,
-            num_layers=28,
-            padded_vocab_size=65024,
-            hidden_size=4096,
-            ffn_hidden_size=13696,
-            kv_channels=128,
-            num_attention_heads=32,
-            seq_length=2048,
-            hidden_dropout=0.0,
-            classifier_dropout=None,
-            attention_dropout=0.0,
-            layernorm_epsilon=1e-5,
-            rmsnorm=True,
-            apply_residual_connection_post_layernorm=False,
-            post_layer_norm=True,
-            add_bias_linear=False,
-            add_qkv_bias=False,
-            bias_dropout_fusion=True,
-            multi_query_attention=False,
-            multi_query_group_num=1,
-            rope_ratio=1,
-            apply_query_key_layer_scaling=True,
-            attention_softmax_in_fp32=True,
-            fp32_residual_connection=False,
-            gradient_checkpointing: str = "nothing_saveable",
-            rope_scaling: Dict[str, Union[str, float]] = None,
-            scan_mlp_chunk_size: int = 1024,
-            bits: Optional[int] = None,
-            mlp_bias: bool = False,
-            scan_layers: bool = False,
-            **kwargs,
+        self,
+        num_layers=28,
+        padded_vocab_size=65024,
+        hidden_size=4096,
+        ffn_hidden_size=13696,
+        kv_channels=128,
+        num_attention_heads=32,
+        seq_length=2048,
+        hidden_dropout=0.0,
+        classifier_dropout=None,
+        attention_dropout=0.0,
+        layernorm_epsilon=1e-5,
+        rmsnorm=True,
+        apply_residual_connection_post_layernorm=False,
+        post_layer_norm=True,
+        add_bias_linear=False,
+        add_qkv_bias=False,
+        bias_dropout_fusion=True,
+        multi_query_attention=False,
+        multi_query_group_num=1,
+        rope_ratio=1,
+        apply_query_key_layer_scaling=True,
+        attention_softmax_in_fp32=True,
+        fp32_residual_connection=False,
+        gradient_checkpointing: str = "nothing_saveable",
+        rope_scaling: Dict[str, Union[str, float]] = None,
+        scan_mlp_chunk_size: int = 1024,
+        bits: Optional[int] = None,
+        mlp_bias: bool = False,
+        scan_layers: bool = False,
+        **kwargs,
     ):
         self.num_layers = num_layers
         self.vocab_size = padded_vocab_size
@@ -54,7 +54,9 @@ class ChatGLMConfig(EasyDeLPretrainedConfig):
         self.attention_dropout = attention_dropout
         self.layernorm_epsilon = layernorm_epsilon
         self.rmsnorm = rmsnorm
-        self.apply_residual_connection_post_layernorm = apply_residual_connection_post_layernorm
+        self.apply_residual_connection_post_layernorm = (
+            apply_residual_connection_post_layernorm
+        )
         self.post_layer_norm = post_layer_norm
         self.add_bias_linear = add_bias_linear
         self.add_qkv_bias = add_qkv_bias
@@ -90,47 +92,47 @@ class ChatGLMConfig(EasyDeLPretrainedConfig):
             A list of tuples
         """
         return (
-
-            ("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
-
-            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
-
-            ("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-            ("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-
-            ("input_layernorm/kernel", PartitionSpec(None)),
-            ("post_attention_layernorm/kernel", PartitionSpec(None)),
-
-            ("model/norm/kernel", PartitionSpec(None)),
-            ("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            (".*", PartitionSpec(None)),
-        ) if not fully_sharded_data_parallel else (
-
-            ("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"))),
-
-            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
-
-            ("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("mlp/down_proj/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"))),
-
-            ("input_layernorm/kernel", PartitionSpec(None)),
-            ("post_attention_layernorm/kernel", PartitionSpec(None)),
-
-            ("model/norm/kernel", PartitionSpec(None)),
-            ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
-            (".*", PartitionSpec(("fsdp", "sp"))),
+            (
+                ("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
+                (
+                    "self_attn/(q_proj|k_proj|v_proj)/kernel",
+                    PartitionSpec(("fsdp", "sp"), "tp"),
+                ),
+                ("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
+                ("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+                ("mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+                ("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+                ("input_layernorm/kernel", PartitionSpec(None)),
+                ("post_attention_layernorm/kernel", PartitionSpec(None)),
+                ("model/norm/kernel", PartitionSpec(None)),
+                ("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+                (".*", PartitionSpec(None)),
+            )
+            if not fully_sharded_data_parallel
+            else (
+                ("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"))),
+                (
+                    "self_attn/(q_proj|k_proj|v_proj)/kernel",
+                    PartitionSpec(("fsdp", "sp"), "tp"),
+                ),
+                ("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
+                ("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("mlp/down_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("input_layernorm/kernel", PartitionSpec(None)),
+                ("post_attention_layernorm/kernel", PartitionSpec(None)),
+                ("model/norm/kernel", PartitionSpec(None)),
+                ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
+                (".*", PartitionSpec(("fsdp", "sp"))),
+            )
         )
 
     def add_jax_args(
-            self,
-            gradient_checkpointing: str = "nothing_saveable",
-            bits: Optional[int] = None,
-            scan_layers: bool = False,
-            **kwargs,
+        self,
+        gradient_checkpointing: str = "nothing_saveable",
+        bits: Optional[int] = None,
+        scan_layers: bool = False,
+        **kwargs,
     ):
         self.scan_layers = scan_layers
         self.gradient_checkpointing = gradient_checkpointing
@@ -142,4 +144,4 @@ class ChatGLMConfig(EasyDeLPretrainedConfig):
 
     @staticmethod
     def rng_keys():
-        return 'params', 'dropout', 'fcm'
+        return "params", "dropout", "fcm"
