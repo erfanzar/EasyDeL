@@ -1,6 +1,6 @@
 [project]
 name = "easydel"
-version = "0.0.69"
+version = "0.0.80"
 authors = [{ name = "Erfan Zare Chavoshi", email = "Erfanzare810@gmail.com" }]
 description = "An open-source library to make training faster and more optimized in Jax/Flax"
 readme = "README.md"
