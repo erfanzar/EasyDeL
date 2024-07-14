@@ -533,7 +533,7 @@ def instructions_formatting_function(tokenizer: "AutoTokenizer"):  # type:ignore
 
 
 def get_formatting_func_from_dataset(
-    dataset: Union[Dataset, "ConstantLengthDataset"],  # type: ignore # noqa
+    dataset: Union["Dataset", "ConstantLengthDataset"],  # type: ignore # noqa
     tokenizer: "AutoTokenizer",  # type:ignore #noqa
 ) -> Optional[Callable]:
     r"""from TRL
