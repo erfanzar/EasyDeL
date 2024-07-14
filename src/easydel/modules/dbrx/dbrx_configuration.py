@@ -3,11 +3,7 @@
 import warnings
 from typing import Any, Optional
 
-from transformers.utils import logging
-
 from easydel.modules.modeling_utils import EDPretrainedConfig
-
-logger = logging.get_logger(__name__)
 
 DBRX_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
 

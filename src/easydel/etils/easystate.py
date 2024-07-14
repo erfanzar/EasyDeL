@@ -13,7 +13,6 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import numpy as jnp
 from jax.sharding import Mesh, PartitionSpec
 from safetensors._safetensors_rust import SafetensorError
-from transformers import AutoModelForCausalLM
 
 from easydel.etils.auto_tx import get_optimizer_and_scheduler
 from easydel.etils.errors import EasyDeLRuntimeError
@@ -916,7 +915,7 @@ class EasyDeLState(struct.PyTreeNode):
 
     def to_pytorch(
         self,
-        base_hf_auto_class=AutoModelForCausalLM,
+        base_hf_auto_class=None,
         easystate_to_huggingface_model_kwargs: Optional[dict] = None,
     ):
         """
@@ -929,6 +928,8 @@ class EasyDeLState(struct.PyTreeNode):
         Returns:
             A PyTorch model equivalent to the EasyDeL model.
         """
+        if base_hf_auto_class is None:
+            from transformers import AutoModelForCausalLM as base_hf_auto_class
         return self.module.to_pytorch(
             params=self.params,
             base_hf_auto_class=base_hf_auto_class,

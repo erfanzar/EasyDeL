@@ -1,26 +1,3 @@
-# Note
-# the GPT-j implemented by Huggingface is not supporting Partition spec s and using
-# fully with pjit and required creating
-# parameters even if you want to load already trained model so this one is the same
-# but include those bugs / non-features fixed
-
-
-# coding=utf-8
-# Copyright 2021 The EleutherAI and HuggingFace Teams. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""GPT-J model configuration"""
-
 import math
 from functools import partial
 from typing import Optional, Tuple, Union
@@ -40,7 +17,7 @@ from flax.core.frozen_dict import FrozenDict, unfreeze
 from flax.linen import combine_masks, make_causal_mask
 from jax import lax
 from jax.sharding import PartitionSpec
-from transformers.utils import logging
+from easydel.etils.etils import get_logger
 
 from easydel.modules.attention_module import FlexibleAttentionModule
 from easydel.modules.flax_modeling_utils import (
@@ -56,7 +33,7 @@ from easydel.modules.modeling_flax_outputs import (
 )
 from easydel.modules.modeling_utils import EDPretrainedModel
 
-logger = logging.get_logger(__name__)
+logger = get_logger(__name__)
 
 
 def create_sinusoidal_positions(num_pos, dim):

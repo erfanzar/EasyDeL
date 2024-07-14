@@ -13,25 +13,9 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import numpy as jnp
 from jax.experimental.mesh_utils import create_device_mesh
 from jax.sharding import Mesh, PartitionSpec
-from transformers import (
-    AutoModelForCausalLM,
-    FlaxPreTrainedModel,
-    GenerationConfig,
-    PretrainedConfig,
-)
-from transformers.utils import (
-    cached_file as _cached_file,
-)
-from transformers.utils import (
-    download_url as _download_url,
-)
-from transformers.utils import (
-    is_offline_mode as _is_offline_mode,
-)
-from transformers.utils import (
-    is_remote_url as _is_remote_url,
-)
 
+from transformers.configuration_utils import PretrainedConfig
+from transformers.modeling_flax_utils import FlaxPreTrainedModel
 from easydel.etils.easystate import EasyDeLState
 from easydel.etils.etils import get_logger
 from easydel.etils.partition_module import PartitionAxis
@@ -722,13 +706,14 @@ class EDPretrainedModel(FlaxPreTrainedModel):
     def to_pytorch(
         self,
         params: FrozenDict,
-        base_hf_auto_class=AutoModelForCausalLM,
+        base_hf_auto_class=None,
         easystate_to_huggingface_model_kwargs: Optional[dict] = None,
     ):
         """
         Return the Huggingface / Pytorch implementation of the model with same weights  (if model is available in HF)
         """
-
+        if base_hf_auto_class is None:
+            from transformers import AutoModelForCausalLM as base_hf_auto_class
         from easydel.transform.parameters_transformation import (
             easystate_to_huggingface_model,
         )
@@ -939,6 +924,15 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
         """
         loads EasyDeL Models
         """
+
+        from transformers import GenerationConfig
+        from transformers.utils import (
+            cached_file as _cached_file,
+            download_url as _download_url,
+            is_offline_mode as _is_offline_mode,
+            is_remote_url as _is_remote_url,
+        )
+
         resume_download = kwargs.pop("resume_download", False)
         proxies = kwargs.pop("proxies", None)
         trust_remote_code = kwargs.pop("trust_remote_code", None)
