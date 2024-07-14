@@ -9,8 +9,6 @@ from typing import Any, Callable, Dict, Literal, Mapping, Optional, Union
 
 import flax.core
 import jax
-import tensorflow.data  # type:ignore
-import tensorflow_datasets
 import termcolor
 from fjformer.sharding import make_shard_and_gather_fns, match_partition_rules
 from jax import numpy as jnp
@@ -873,7 +871,7 @@ class DPOTrainer(BaseTrainer, ABC):
             )
             return shard(state)
 
-    def _get_train_dataloader(self) -> tensorflow.data.Dataset:
+    def _get_train_dataloader(self) -> "tensorflow.data.Dataset":  # noqa #type:ignore
         """
         Creates the training dataloader as a TensorFlow Dataset.
 
@@ -886,6 +884,8 @@ class DPOTrainer(BaseTrainer, ABC):
         Raises:
             ValueError: If the training dataset is not set.
         """
+        import tensorflow_datasets
+
         if self.train_dataset is None:
             raise ValueError("Trainer: training requires a train_dataset.")
 
@@ -905,7 +905,7 @@ class DPOTrainer(BaseTrainer, ABC):
     def _get_eval_dataloader(
         self,
         eval_dataset: Optional["Dataset"] = None,  # noqa #type:ignore
-    ) -> tensorflow.data.Dataset:
+    ) -> "tensorflow.data.Dataset":  # noqa #type:ignore
         """
         Creates the evaluation dataloader as a TensorFlow Dataset.
 
@@ -923,6 +923,8 @@ class DPOTrainer(BaseTrainer, ABC):
         Raises:
             ValueError: If no evaluation dataset is provided or set.
         """
+        import tensorflow_datasets
+
         if eval_dataset is None and self.eval_dataset is None:
             raise ValueError("Trainer: evaluation requires an eval_dataset.")
         eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
@@ -937,9 +939,7 @@ class DPOTrainer(BaseTrainer, ABC):
             )
         )
 
-    def get_train_dataloader(
-        self,
-    ) -> tensorflow.data.Dataset:
+    def get_train_dataloader(self) -> "tensorflow.data.Dataset":  # noqa #type:ignore
         """
         Returns the training dataloader, potentially with precomputed reference log probabilities.
 
@@ -950,6 +950,9 @@ class DPOTrainer(BaseTrainer, ABC):
         Returns:
             tensorflow.data.Dataset: The training dataloader.
         """
+
+        import tensorflow_datasets
+
         if self.precompute_ref_log_probs and not self._precomputed_train_ref_log_probs:
             data_loader = tensorflow_datasets.as_numpy(
                 self.train_dataset.to_tf_dataset(
@@ -992,7 +995,7 @@ class DPOTrainer(BaseTrainer, ABC):
     def get_eval_dataloader(
         self,
         eval_dataset: Optional["Dataset"] = None,  # noqa #type:ignore
-    ) -> tensorflow.data.Dataset:
+    ) -> "tensorflow.data.Dataset":  # noqa #type:ignore
         """
         Returns the evaluation dataloader, potentially with precomputed reference log probabilities.
 
@@ -1007,6 +1010,9 @@ class DPOTrainer(BaseTrainer, ABC):
         Returns:
             tensorflow.data.Dataset: The evaluation dataloader.
         """
+
+        import tensorflow_datasets
+
         if eval_dataset is None and self.eval_dataset is None:
             raise ValueError("Trainer: evaluation requires an eval_dataset.")
         eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
