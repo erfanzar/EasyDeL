@@ -1,35 +1,41 @@
+import functools
 import math
 from typing import Optional, Tuple, Union
 
+import chex
 import flax
 import jax
 import jax.numpy as jnp
-from jax import lax
-from jax.sharding import PartitionSpec
 from fjformer import linen as nn
-from flax.traverse_util import flatten_dict, unflatten_dict
+from fjformer.linen import Dense
 from flax.core.frozen_dict import freeze, unfreeze
 from flax.linen import combine_masks
-from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
-
-from easydel.modules.common import LayerNormRaw
-# easydel.modules
-from easydel.modules.flax_modelling_utils import (
-    with_sharding_constraint,
-    get_gradient_checkpoint_policy,
-    apply_rotary_pos_emb,
-    get_dot_general_by_bits,
-    BaseJAXAttentionModule,
-    control_mlp_sharding,
-    ACT2FN, block_wise_ffn, precompute_freq_cis
-)
-from easydel.modules.attention_module import AttentionModule
-import functools
-from fjformer.linen import Dense
-from easydel.modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
-import chex
-from easydel.modules.olmo.olmo_configuration import OlmoConfig
 from flax.linen.partitioning import remat
+from flax.traverse_util import flatten_dict, unflatten_dict
+from jax import lax
+from jax.sharding import PartitionSpec
+
+from easydel.modules.attention_module import FlexibleAttentionModule
+from easydel.modules.common import LayerNormRaw
+
+# easydel.modules
+from easydel.modules.flax_modeling_utils import (
+    ACT2FN,
+    FlaxAttentionModule,
+    apply_rotary_pos_emb,
+    block_wise_ffn,
+    control_mlp_sharding,
+    get_dot_general_by_bits,
+    get_gradient_checkpoint_policy,
+    precompute_freq_cis,
+    with_sharding_constraint,
+)
+from easydel.modules.modeling_flax_outputs import (
+    FlaxBaseModelOutput,
+    FlaxCausalLMOutput,
+)
+from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.olmo.olmo_configuration import OlmoConfig
 
 re_mat = remat
 
@@ -75,7 +81,7 @@ class FlaxOlmoMLP(nn.Module):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
-class FlaxOlmoAttention(BaseJAXAttentionModule):
+class FlaxOlmoAttention(FlaxAttentionModule):
     config: OlmoConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -86,7 +92,7 @@ class FlaxOlmoAttention(BaseJAXAttentionModule):
         self.hidden_size = config.hidden_size
         self.head_dim = self.config.hidden_size // self.config.num_attention_heads
         self.num_key_value_groups = (
-                self.config.num_attention_heads // self.config.num_key_value_heads
+            self.config.num_attention_heads // self.config.num_key_value_heads
         )
 
         if self.num_key_value_groups == 1:
@@ -129,7 +135,7 @@ class FlaxOlmoAttention(BaseJAXAttentionModule):
         )
 
         self.rotary = FlaxOlmoRotaryEmbedding(self.dtype)
-        self.attention_performer = AttentionModule(
+        self.attention_performer = FlexibleAttentionModule(
             attention_dropout=self.config.attention_dropout,
             num_attention_heads=self.config.num_attention_heads,
             head_dims=self.head_dim,
@@ -137,7 +143,7 @@ class FlaxOlmoAttention(BaseJAXAttentionModule):
             force_float32_tpu=True,
             attn_mechanism=self.config.attn_mechanism,
             dtype=self.config.attn_dtype,
-            mesh=self.config.get_mesh(),
+            mesh=self.config.mesh,
             sm_scale=1 / math.sqrt(self.head_dim),
             axis_name=self.config.attention_axis_name,
             base_module_class=self.config,
@@ -147,7 +153,7 @@ class FlaxOlmoAttention(BaseJAXAttentionModule):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
 
     def apply_rotary(
-            self, batch_size, sequence_length, query, key, value, freq_cis, position_ids
+        self, batch_size, sequence_length, query, key, value, freq_cis, position_ids
     ):
         """The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
         The main difference is that it takes in an additional argument, freq_cis, which are used to calculate
@@ -169,7 +175,6 @@ class FlaxOlmoAttention(BaseJAXAttentionModule):
             A tuple of 3 tensors: query, key and value
         """
 
-
         query, key, value = self._transpose_sequence_head(query, key, value)
         query, key = self.rotary(
             position_ids=position_ids, query=query, key=key, freq_cis=freq_cis
@@ -177,17 +182,17 @@ class FlaxOlmoAttention(BaseJAXAttentionModule):
         return self._transpose_sequence_head(query, key, value)
 
     def __call__(
-            self,
-            hidden_states: chex.Array,
-            freq_cis: Tuple[chex.Array, chex.Array],
-            attention_mask: chex.Array,
-            position_ids: chex.Array,
-            causal_mask: chex.Array,
-            segment_ids: Optional[chex.Array] = None,
-            deterministic: bool = True,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            fcm_mask=None,
+        self,
+        hidden_states: chex.Array,
+        freq_cis: Tuple[chex.Array, chex.Array],
+        attention_mask: chex.Array,
+        position_ids: chex.Array,
+        causal_mask: chex.Array,
+        segment_ids: Optional[chex.Array] = None,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        fcm_mask=None,
     ):
         """The __call__ function is the main function of a JAX module. It defines how the module behaves when called
         with inputs. The __call__ function can be thought of as a &quot;forward pass&quot; through the model,
@@ -225,8 +230,10 @@ class FlaxOlmoAttention(BaseJAXAttentionModule):
 
         if self.config.clip_qkv is not None:
             query_states, key_states, value_states = map(
-                lambda x: jnp.clip(x, min=-self.config.clip_qkv, max=self.config.clip_qkv),
-                [query_states, key_states, value_states]
+                lambda x: jnp.clip(
+                    x, min=-self.config.clip_qkv, max=self.config.clip_qkv
+                ),
+                [query_states, key_states, value_states],
             )
 
         query_states = query_states.reshape(
@@ -280,7 +287,9 @@ class FlaxOlmoAttention(BaseJAXAttentionModule):
                 key_states, value_states, query_states, attention_mask
             )
 
-        key_states, value_states = self.repeat_key_value(key_states, value_states, self.num_key_value_groups)
+        key_states, value_states = self.repeat_key_value(
+            key_states, value_states, self.num_key_value_groups
+        )
         # if self.config.use_sharding_constraint:
         #     query_states = with_sharding_constraint(
         #         query_states, PartitionSpec(("dp", "fsdp"), "sp" if query_states.shape[1] != 1 else None, "tp", None)
@@ -301,7 +310,7 @@ class FlaxOlmoAttention(BaseJAXAttentionModule):
 
         query_length, key_length = query_states.shape[1], key_states.shape[1]
 
-        attentions = self.attention_performer.__call__(
+        attentions = self.attention_performer(
             query_states=query_states,
             key_states=key_states,
             value_states=value_states,
@@ -380,16 +389,16 @@ class FlaxOlmoDecoderLayer(nn.Module):
         )
 
     def __call__(
-            self,
-            hidden_states: chex.Array,
-            freq_cis: Tuple[chex.Array, chex.Array],
-            attention_mask: chex.Array,
-            causal_mask: chex.Array,
-            position_ids: chex.Array,
-            segment_ids: Optional[chex.Array] = None,
-            deterministic: bool = True,
-            init_cache: bool = False,
-            output_attentions: bool = True,
+        self,
+        hidden_states: chex.Array,
+        freq_cis: Tuple[chex.Array, chex.Array],
+        attention_mask: chex.Array,
+        causal_mask: chex.Array,
+        position_ids: chex.Array,
+        segment_ids: Optional[chex.Array] = None,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: bool = True,
     ):
         """The __call__ function is the main function of a TransformerEncoderLayer.
         It takes in the following arguments:
@@ -466,19 +475,19 @@ class FlaxOlmoDecoderLayer(nn.Module):
         return outputs
 
 
-class FlaxOlmoPretrainedModel(EasyDeLFlaxPretrainedModel):
+class FlaxOlmoPretrainedModel(EDPretrainedModel):
     config_class = OlmoConfig
     base_model_prefix = "mistral"
     module_class: nn.Module = None
 
     def __init__(
-            self,
-            config: OlmoConfig,
-            input_shape: Tuple = (1, 1),
-            seed: int = 0,
-            dtype: jnp.dtype = jnp.bfloat16,
-            _do_init: bool = True,
-            **kwargs,
+        self,
+        config: OlmoConfig,
+        input_shape: Tuple = (1, 1),
+        seed: int = 0,
+        dtype: jnp.dtype = jnp.bfloat16,
+        _do_init: bool = True,
+        **kwargs,
     ):
         module = self.module_class(config=config, dtype=dtype, **kwargs)
         super().__init__(
@@ -491,10 +500,10 @@ class FlaxOlmoPretrainedModel(EasyDeLFlaxPretrainedModel):
         )
 
     def init_weights(
-            self,
-            rng: jax.random.PRNGKey,
-            input_shape: Tuple,
-            params: flax.core.FrozenDict = None,
+        self,
+        rng: jax.random.PRNGKey,
+        input_shape: Tuple,
+        params: flax.core.FrozenDict = None,
     ) -> flax.core.FrozenDict:
         """The init_weights function is used to initialize the weights of a model.
         It takes in an rng, which is a random number generator key that can be used to generate random numbers.
@@ -568,19 +577,19 @@ class FlaxOlmoPretrainedModel(EasyDeLFlaxPretrainedModel):
         return init_variables["cache"]
 
     def __call__(
-            self,
-            input_ids,
-            attention_mask=None,
-            position_ids=None,
-            params: dict = None,
-            past_key_values: dict = None,
-            dropout_rng: jax.random.PRNGKey = None,
-            train: bool = False,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
-            add_params_field: bool = False,
-            **kwargs,
+        self,
+        input_ids,
+        attention_mask=None,
+        position_ids=None,
+        params: dict = None,
+        past_key_values: dict = None,
+        dropout_rng: jax.random.PRNGKey = None,
+        train: bool = False,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        add_params_field: bool = False,
+        **kwargs,
     ):
         """The __call__ function is the main function of a JAX module.
         It takes as input:
@@ -703,16 +712,16 @@ class FlaxOlmoDecoratorCollection(nn.Module):
         ]
 
     def __call__(
-            self,
-            hidden_states: chex.Array,
-            freq_cis: Tuple[chex.Array, chex.Array],
-            attention_mask: chex.Array,
-            causal_mask: chex.Array,
-            position_ids: chex.Array,
-            deterministic: bool = True,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            output_hidden_states: bool = False,
+        self,
+        hidden_states: chex.Array,
+        freq_cis: Tuple[chex.Array, chex.Array],
+        attention_mask: chex.Array,
+        causal_mask: chex.Array,
+        position_ids: chex.Array,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
     ):
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
@@ -812,16 +821,16 @@ class FlaxOlmoModule(nn.Module):
         )
 
     def __call__(
-            self,
-            input_ids: Optional[chex.Array] = None,
-            attention_mask: Optional[chex.Array] = None,
-            position_ids: Optional[chex.Array] = None,
-            deterministic: bool = True,
-            inputs_embeds: chex.Array = None,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            output_hidden_states: bool = False,
-            return_dict: bool = True,
+        self,
+        input_ids: Optional[chex.Array] = None,
+        attention_mask: Optional[chex.Array] = None,
+        position_ids: Optional[chex.Array] = None,
+        deterministic: bool = True,
+        inputs_embeds: chex.Array = None,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        return_dict: bool = True,
     ) -> Union[Tuple[jax.Array, ...], FlaxBaseModelOutput]:
         """The __call__ function is the main function of a Flax model.
         It takes in input_ids, attention_mask, and position_ids as inputs to the model.
@@ -922,16 +931,16 @@ class FlaxOlmoForCausalLMModule(nn.Module):
         )
 
     def __call__(
-            self,
-            input_ids: chex.Array,
-            attention_mask: chex.Array,
-            position_ids: chex.Array,
-            deterministic: bool = True,
-            inputs_embeds: chex.Array = None,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            output_hidden_states: bool = False,
-            return_dict: bool = True,
+        self,
+        input_ids: chex.Array,
+        attention_mask: chex.Array,
+        position_ids: chex.Array,
+        deterministic: bool = True,
+        inputs_embeds: chex.Array = None,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        return_dict: bool = True,
     ):
         """The __call__ function is the main function of a Flax module. It defines how the model will be called,
         and what it returns. In this case, we are calling our Transformer model with input_ids and attention_mask
@@ -987,9 +996,7 @@ class FlaxOlmoForCausalLMModule(nn.Module):
             shared_kernel = self.transformer.variables["params"]["embed_tokens"][
                 "embedding"
             ]
-            shared_kernel = nn.control_quantization(
-                shared_kernel, self.param_dtype
-            ).T
+            shared_kernel = nn.control_quantization(shared_kernel, self.param_dtype).T
             lm_logits = self.lm_head.apply(
                 {"params": {"kernel": shared_kernel}}, hidden_states
             )
@@ -1030,7 +1037,7 @@ class FlaxOlmoForCausalLM(FlaxOlmoPretrainedModel):
         self.module.lm_head = new_embeddings
 
     def prepare_inputs_for_generation(
-            self, input_ids, max_length, attention_mask: Optional[chex.Array] = None
+        self, input_ids, max_length, attention_mask: Optional[chex.Array] = None
     ):
         batch_size, seq_length = input_ids.shape
 

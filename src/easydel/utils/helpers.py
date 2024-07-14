@@ -1,17 +1,17 @@
-import typing
-import warnings
-import time
 import contextlib
+import time
+import warnings
 
 import flax.metrics.tensorboard
-import jax
-import jax.numpy as jnp
-import termcolor
+
+from easydel.etils.etils import get_logger
 
 try:
     import wandb  # type: ignore
 except ModuleNotFoundError:
     wandb = None
+
+logger = get_logger(__name__)
 
 
 class Timer:
@@ -52,33 +52,6 @@ class Timer:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.stop()
-
-
-Color = typing.Literal[
-    "black",
-    "grey",
-    "red",
-    "green",
-    "yellow",
-    "blue",
-    "magenta",
-    "cyan",
-    "light_grey",
-    "dark_grey",
-    "light_red",
-    "light_green",
-    "light_yellow",
-    "light_blue",
-    "light_magenta",
-    "light_cyan",
-    "white",
-]
-
-
-def prefix_print(prefix, string, prefix_color: typing.Optional[Color] = "red"):
-    print(
-        termcolor.colored(f"{prefix} : ", color=prefix_color, force_color=True) + string
-    )
 
 
 class Timers:
@@ -123,11 +96,8 @@ class Timers:
             self._print_log(name, elapsed_time)
 
     def _print_log(self, name, elapsed_time):
-        termcolor.cprint(
-            f"Time Took to Complete Task {name} (milliseconds) : "
-            f"{termcolor.colored(elapsed_time, color='white', force_color=True)}",
-            color="red",
-            force_color=True,
+        logger.info(
+            f"Time Took to Complete Task {name} (milliseconds) : {elapsed_time}"
         )
 
     @contextlib.contextmanager
@@ -143,43 +113,3 @@ class Timers:
                     timer.elapsed_time(reset=reset) * 1000.0
                 )  # Convert to milliseconds
                 self._print_log(name, elapsed_time)
-
-
-class RNG:
-
-    def __init__(self, seed):
-        self.rng = jax.random.PRNGKey(seed)
-
-    def __call__(self, keys=None):
-        if keys is None:
-            self.rng, split_rng = jax.random.split(self.rng)
-            return split_rng
-        elif isinstance(keys, int):
-            split_rngs = jax.random.split(self.rng, num=keys + 1)
-            self.rng = split_rngs[0]
-            return tuple(split_rngs[1:])
-        else:
-            split_rngs = jax.random.split(self.rng, num=len(keys) + 1)
-            self.rng = split_rngs[0]
-            return {key: val for key, val in zip(keys, split_rngs[1:])}
-
-
-def get_mesh(
-    shape: typing.Sequence[int] = (1, -1, 1, 1),
-    axis_names: typing.Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-):
-    """The get_mesh function is a helper function that creates a JAX Mesh object.
-
-    Args:
-        shape: typing.Sequence[int]: Specify the shape of the array that
-            is used to create the mesh
-        axis_names: typing.Sequence[int]: Specify the Axis Names in mesh
-
-    Returns:
-        A mesh object
-    """
-    from jax.sharding import Mesh
-    from jax.experimental import mesh_utils
-
-    array = jnp.ones((len(jax.devices()), 1)).reshape(shape)
-    return Mesh(mesh_utils.create_device_mesh(array.shape), axis_names)

@@ -14,19 +14,13 @@ from flax.linen import partitioning as nn_partitioning
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax.sharding import PartitionSpec
-from transformers.modeling_flax_outputs import (
-    FlaxBaseModelOutput,
-    FlaxCausalLMOutput,
-    FlaxSequenceClassifierOutput,
-)
 
-from easydel.modules.attention_module import AttentionModule
+from easydel.modules.attention_module import FlexibleAttentionModule
 from easydel.modules.common import RMSNorm
-from easydel.modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 
 # easydel.modules
-from easydel.modules.flax_modelling_utils import (
-    BaseJAXAttentionModule,
+from easydel.modules.flax_modeling_utils import (
+    FlaxAttentionModule,
     apply_rotary_pos_emb,
     block_wise_ffn,
     control_mlp_sharding,
@@ -36,6 +30,12 @@ from easydel.modules.flax_modelling_utils import (
     with_sharding_constraint,
 )
 from easydel.modules.llama.llama_configuration import LlamaConfig as LlamaConfig
+from easydel.modules.modeling_flax_outputs import (
+    FlaxBaseModelOutput,
+    FlaxCausalLMOutput,
+    FlaxSequenceClassifierOutput,
+)
+from easydel.modules.modeling_utils import EDPretrainedModel
 
 
 class FlaxLlamaEmbedding(nn.Module):
@@ -53,7 +53,7 @@ class FlaxLlamaEmbedding(nn.Module):
         return query.astype(self.dtype), key.astype(self.dtype)
 
 
-class FlaxLlamaAttention(BaseJAXAttentionModule):
+class FlaxLlamaAttention(FlaxAttentionModule):
     config: LlamaConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -107,7 +107,7 @@ class FlaxLlamaAttention(BaseJAXAttentionModule):
         )
 
         self.rotary = FlaxLlamaEmbedding(self.dtype)
-        self.attention_performer = AttentionModule(
+        self.attention_performer = FlexibleAttentionModule(
             use_sharding_constraint=self.config.use_sharding_constraint,
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,
@@ -130,7 +130,7 @@ class FlaxLlamaAttention(BaseJAXAttentionModule):
             dtype=self.config.attn_dtype,
             partition_axis=self.config.partition_axis,
             scan_ring_attention=self.config.scan_ring_attention,
-            mesh=self.config.get_mesh(),
+            mesh=self.config.mesh,
             sm_scale=1 / math.sqrt(self.head_dim),
             axis_name=self.config.attention_axis_name,
         )
@@ -297,7 +297,7 @@ class FlaxLlamaAttention(BaseJAXAttentionModule):
 
         query_length, key_length = query_states.shape[1], key_states.shape[1]
 
-        attentions = self.attention_performer.__call__(
+        attentions = self.attention_performer(
             query_states=query_states,
             key_states=key_states,
             value_states=value_states,
@@ -479,7 +479,7 @@ class FlaxLlamaBlock(nn.Module):
                 layer
             output_attentions: bool: Return the attention weights
             fcm_mask: Optional[jnp.ndarray]: Mask the self-attention
-        :param : Control the dropout in the self attention layer
+
 
         Returns:
             A tuple of two items
@@ -519,7 +519,7 @@ class FlaxLlamaBlock(nn.Module):
         return (hidden_states,) + attn_outputs[1:]
 
 
-class FlaxLlamaPreTrainedModel(EasyDeLFlaxPretrainedModel):
+class FlaxLlamaPreTrainedModel(EDPretrainedModel):
     config_class = LlamaConfig
     base_model_prefix = "model"
     module_class: nn.Module = None

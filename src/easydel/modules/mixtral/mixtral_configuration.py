@@ -1,47 +1,47 @@
-from typing import Sequence, Optional, Dict, Union
+from typing import Dict, Optional, Union
 
 from jax.sharding import PartitionSpec
 
-from easydel.modules.easydel_modelling_utils import EasyDeLPretrainedConfig
+from easydel.modules.modeling_utils import EDPretrainedConfig
 
 
-class MixtralConfig(EasyDeLPretrainedConfig):
+class MixtralConfig(EDPretrainedConfig):
     model_type: str = "mixtral"
 
     def __init__(
-            self,
-            vocab_size=32000,
-            hidden_size=4096,
-            intermediate_size=14336,
-            num_hidden_layers=32,
-            num_attention_heads=32,
-            num_key_value_heads=8,
-            hidden_act="silu",
-            max_position_embeddings=4096 * 32,
-            initializer_range=0.02,
-            rms_norm_eps=1e-5,
-            use_cache=True,
-            pad_token_id=None,
-            bos_token_id=1,
-            eos_token_id=2,
-            tie_word_embeddings=False,
-            rope_theta=1e6,
-            sliding_window=4096,
-            attention_dropout=0.0,
-            num_experts_per_tok=2,
-            num_local_experts=8,
-            output_router_logits=False,
-            router_aux_loss_coef=0.001,
-            gradient_checkpointing: str = "nothing_saveable",
-            use_scan_mlp: bool = False,
-            scan_mlp_chunk_size: int = 1024,
-            number_rep_kv: int = 1,
-            bits: Optional[int] = None,
-            rope_scaling: Dict[str, Union[str, float]] = None,
-            attention_bias: bool = False,
-            initialization_of_moe: bool = False,
-            router_jitter_noise=0.0,
-            **kwargs,
+        self,
+        vocab_size=32000,
+        hidden_size=4096,
+        intermediate_size=14336,
+        num_hidden_layers=32,
+        num_attention_heads=32,
+        num_key_value_heads=8,
+        hidden_act="silu",
+        max_position_embeddings=4096 * 32,
+        initializer_range=0.02,
+        rms_norm_eps=1e-5,
+        use_cache=True,
+        pad_token_id=None,
+        bos_token_id=1,
+        eos_token_id=2,
+        tie_word_embeddings=False,
+        rope_theta=1e6,
+        sliding_window=4096,
+        attention_dropout=0.0,
+        num_experts_per_tok=2,
+        num_local_experts=8,
+        output_router_logits=False,
+        router_aux_loss_coef=0.001,
+        gradient_checkpointing: str = "nothing_saveable",
+        use_scan_mlp: bool = False,
+        scan_mlp_chunk_size: int = 1024,
+        number_rep_kv: int = 1,
+        bits: Optional[int] = None,
+        rope_scaling: Dict[str, Union[str, float]] = None,
+        attention_bias: bool = False,
+        initialization_of_moe: bool = False,
+        router_jitter_noise=0.0,
+        **kwargs,
     ):
         """The __init__ function is called when the class is instantiated.
         It allows the class to initialize the attributes of a class.
@@ -161,54 +161,55 @@ class MixtralConfig(EasyDeLPretrainedConfig):
             A list of tuples
         """
         return (
-
-            ("model/embed_tokens/embedding", PartitionSpec("sp", "fsdp")),
-
-            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
-
-            ("w1/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("w2/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("w3/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("gate/kernel", PartitionSpec(("fsdp", "sp"))),
-
-            ("input_layernorm/kernel", PartitionSpec(None)),
-            ("post_attention_layernorm/kernel", PartitionSpec(None)),
-
-            ("model/norm/kernel", PartitionSpec(None)),
-            ("lm_head/kernel", PartitionSpec("fsdp", "sp")),
-            (".*", PartitionSpec(None)),
-        ) if not fully_sharded_data_parallel else (
-            ("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"))),
-
-            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
-
-            ("w1/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("w2/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("w3/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("gate/kernel", PartitionSpec(("fsdp", "sp"))),
-
-            ("input_layernorm/kernel", PartitionSpec(None)),
-            ("post_attention_layernorm/kernel", PartitionSpec(None)),
-
-            ("model/norm/kernel", PartitionSpec(None)),
-            ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
-            (".*", PartitionSpec(("fsdp", "sp"))),
+            (
+                ("model/embed_tokens/embedding", PartitionSpec("sp", "fsdp")),
+                (
+                    "self_attn/(q_proj|k_proj|v_proj)/kernel",
+                    PartitionSpec(("fsdp", "sp"), "tp"),
+                ),
+                ("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
+                ("w1/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("w2/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("w3/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("gate/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("input_layernorm/kernel", PartitionSpec(None)),
+                ("post_attention_layernorm/kernel", PartitionSpec(None)),
+                ("model/norm/kernel", PartitionSpec(None)),
+                ("lm_head/kernel", PartitionSpec("fsdp", "sp")),
+                (".*", PartitionSpec(None)),
+            )
+            if not fully_sharded_data_parallel
+            else (
+                ("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"))),
+                (
+                    "self_attn/(q_proj|k_proj|v_proj)/kernel",
+                    PartitionSpec(("fsdp", "sp"), "tp"),
+                ),
+                ("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
+                ("w1/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("w2/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("w3/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("gate/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("input_layernorm/kernel", PartitionSpec(None)),
+                ("post_attention_layernorm/kernel", PartitionSpec(None)),
+                ("model/norm/kernel", PartitionSpec(None)),
+                ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
+                (".*", PartitionSpec(("fsdp", "sp"))),
+            )
         )
 
     def add_jax_args(
-            self,
-            gradient_checkpointing: str = "nothing_saveable",
-            use_scan_mlp: bool = False,
-            scan_mlp_chunk_size: int = 1024,
-            number_rep_kv: int = 1,
-            bits: Optional[int] = None,
-            attention_dropout: float = 0.0,
-            rope_scaling: Dict[str, Union[str, float]] = None,
-            attention_bias: bool = False,
-            initialization_of_moe: bool = False,
-            **kwargs,
+        self,
+        gradient_checkpointing: str = "nothing_saveable",
+        use_scan_mlp: bool = False,
+        scan_mlp_chunk_size: int = 1024,
+        number_rep_kv: int = 1,
+        bits: Optional[int] = None,
+        attention_dropout: float = 0.0,
+        rope_scaling: Dict[str, Union[str, float]] = None,
+        attention_bias: bool = False,
+        initialization_of_moe: bool = False,
+        **kwargs,
     ):
         """The add_jax_args function adds the following arguments to the model:
 
@@ -252,4 +253,4 @@ class MixtralConfig(EasyDeLPretrainedConfig):
 
     @staticmethod
     def rng_keys():
-        return 'params', 'dropout', 'fcm'
+        return "params", "dropout", "fcm"

@@ -2,8 +2,14 @@ import json
 from dataclasses import dataclass
 from typing import Dict, Generator, List
 import requests
+from easydel.etils.etils import get_logger
 
-from websocket import create_connection
+logger = get_logger(__name__)
+try:
+    from websocket import create_connection
+except ModuleNotFoundError:
+    create_connection = None
+    logger.warn("couldn't import websocket, ServerEngine client side won't work.")
 
 
 @dataclass

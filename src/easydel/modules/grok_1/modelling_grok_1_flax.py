@@ -14,15 +14,13 @@ from flax.linen import combine_masks
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax.sharding import PartitionSpec
-from transformers.modeling_flax_outputs import FlaxMaskedLMOutput
 
-from easydel.modules.attention_module import AttentionModule
+from easydel.modules.attention_module import FlexibleAttentionModule
 from easydel.modules.common import RMSNorm as FlaxGrok1RMSNorm
-from easydel.modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 
 # easydel.modules
-from easydel.modules.flax_modelling_utils import (
-    BaseJAXAttentionModule,
+from easydel.modules.flax_modeling_utils import (
+    FlaxAttentionModule,
     apply_rotary_pos_emb,
     block_wise_ffn,
     control_mlp_sharding,
@@ -32,6 +30,8 @@ from easydel.modules.flax_modelling_utils import (
     with_sharding_constraint,
 )
 from easydel.modules.grok_1.grok_1_configuration import Grok1Config as Grok1Config
+from easydel.modules.modeling_flax_outputs import FlaxMaskedLMOutput
+from easydel.modules.modeling_utils import EDPretrainedModel
 
 re_mat = flax.linen.partitioning.remat
 
@@ -65,7 +65,7 @@ class FlaxGrok1Embedding(nn.Module):
         return query.astype(self.dtype), key.astype(self.dtype)
 
 
-class FlaxGrok1Attention(BaseJAXAttentionModule):
+class FlaxGrok1Attention(FlaxAttentionModule):
     config: Grok1Config
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -119,7 +119,7 @@ class FlaxGrok1Attention(BaseJAXAttentionModule):
         )
 
         self.rotary = FlaxGrok1Embedding(self.dtype)
-        self.attention_performer = AttentionModule(
+        self.attention_performer = FlexibleAttentionModule(
             use_sharding_constraint=self.config.use_sharding_constraint,
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,
@@ -142,7 +142,7 @@ class FlaxGrok1Attention(BaseJAXAttentionModule):
             dtype=self.config.attn_dtype,
             partition_axis=self.config.partition_axis,
             scan_ring_attention=self.config.scan_ring_attention,
-            mesh=self.config.get_mesh(),
+            mesh=self.config.mesh,
             sm_scale=1 / math.sqrt(self.head_dim),
             axis_name=self.config.attention_axis_name,
         )
@@ -150,7 +150,6 @@ class FlaxGrok1Attention(BaseJAXAttentionModule):
 
     def _merge_heads(self, hidden_states):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
-
 
     def apply_rotary(
         self, batch_size, sequence_length, query, key, value, freq_cis, position_ids
@@ -282,7 +281,9 @@ class FlaxGrok1Attention(BaseJAXAttentionModule):
                 key_states, value_states, query_states, attention_mask
             )
 
-        key_states, value_states = self.repeat_key_value(key_states, value_states, self.num_key_value_groups)
+        key_states, value_states = self.repeat_key_value(
+            key_states, value_states, self.num_key_value_groups
+        )
         # if self.config.use_sharding_constraint:
         #     query_states = with_sharding_constraint(
         #         query_states, PartitionSpec(("dp", "fsdp"), "sp" if query_states.shape[1] != 1 else None, "tp", None)
@@ -303,7 +304,7 @@ class FlaxGrok1Attention(BaseJAXAttentionModule):
 
         query_length, key_length = query_states.shape[1], key_states.shape[1]
 
-        attentions = self.attention_performer.__call__(
+        attentions = self.attention_performer(
             query_states=query_states,
             key_states=key_states,
             value_states=value_states,
@@ -743,7 +744,7 @@ class FlaxGrok1DecoderLayerCollection(nn.Module):
         return outputs
 
 
-class Grok1PreTrainedModel(EasyDeLFlaxPretrainedModel):
+class Grok1PreTrainedModel(EDPretrainedModel):
     config_class: Grok1Config = Grok1Config
     module_class: nn.Module = None
     base_model_prefix = "model"

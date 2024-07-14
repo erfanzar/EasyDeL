@@ -1,60 +1,57 @@
-import math
-from typing import Sequence, Optional
+from typing import Optional
 
-from jax.sharding import PartitionSpec
-
-from easydel.modules.easydel_modelling_utils import EasyDeLPretrainedConfig
+from easydel.modules.modeling_utils import EDPretrainedConfig
 
 
-class WhisperConfig(EasyDeLPretrainedConfig):
+class WhisperConfig(EDPretrainedConfig):
     model_type: str = "whisper"
     attribute_map = {
         "num_attention_heads": "encoder_attention_heads",
-        "hidden_size": "d_model"
+        "hidden_size": "d_model",
     }
 
     def __init__(
-            self,
-            vocab_size=51865,
-            num_mel_bins=80,
-            encoder_layers=4,
-            encoder_attention_heads=6,
-            decoder_layers=4,
-            decoder_attention_heads=6,
-            decoder_ffn_dim=1536,
-            encoder_ffn_dim=1536,
-            encoder_layerdrop=0.0,
-            decoder_layerdrop=0.0,
-            decoder_start_token_id=50257,
-            use_cache=True,
-            is_encoder_decoder=True,
-            activation_function="gelu",
-            d_model=384,
-            dropout=0.0,
-            attention_dropout=0.0,
-            activation_dropout=0.0,
-            init_std=0.02,
-            scale_embedding=False,
-            max_source_positions=1500,
-            max_target_positions=448,
-            pad_token_id=50256,
-            bos_token_id=50256,
-            eos_token_id=50256,
-            suppress_tokens=None,
-            begin_suppress_tokens=[220, 50256],
-            use_weighted_layer_sum=False,
-            classifier_proj_size=256,
-            apply_spec_augment=False,
-            mask_time_prob=0.05,
-            mask_time_length=10,
-            mask_time_min_masks=2,
-            mask_feature_prob=0.0,
-            mask_feature_length=10,
-            mask_feature_min_masks=0,
-            median_filter_width=7,
-            bits: Optional[int] = None,
-            gradient_checkpointing: str = "nothing_saveable",
-            **kwargs,
+        self,
+        vocab_size=51865,
+        num_mel_bins=80,
+        encoder_layers=4,
+        encoder_attention_heads=6,
+        decoder_layers=4,
+        decoder_attention_heads=6,
+        decoder_ffn_dim=1536,
+        encoder_ffn_dim=1536,
+        encoder_layerdrop=0.0,
+        decoder_layerdrop=0.0,
+        decoder_start_token_id=50257,
+        use_cache=True,
+        is_encoder_decoder=True,
+        activation_function="gelu",
+        d_model=384,
+        dropout=0.0,
+        attention_dropout=0.0,
+        activation_dropout=0.0,
+        init_std=0.02,
+        scale_embedding=False,
+        max_source_positions=1500,
+        max_target_positions=448,
+        pad_token_id=50256,
+        bos_token_id=50256,
+        eos_token_id=50256,
+        suppress_tokens=None,
+        begin_suppress_tokens=[220, 50256],
+        use_weighted_layer_sum=False,
+        classifier_proj_size=256,
+        apply_spec_augment=False,
+        mask_time_prob=0.05,
+        mask_time_length=10,
+        mask_time_min_masks=2,
+        mask_feature_prob=0.0,
+        mask_feature_length=10,
+        mask_feature_min_masks=0,
+        median_filter_width=7,
+        bits: Optional[int] = None,
+        gradient_checkpointing: str = "nothing_saveable",
+        **kwargs,
     ):
         self.vocab_size = vocab_size
         self.num_mel_bins = num_mel_bins
@@ -74,7 +71,9 @@ class WhisperConfig(EasyDeLPretrainedConfig):
         self.decoder_layerdrop = decoder_layerdrop
         self.use_cache = use_cache
         self.num_hidden_layers = encoder_layers
-        self.scale_embedding = scale_embedding  # scale factor will be sqrt(d_model) if True
+        self.scale_embedding = (
+            scale_embedding  # scale factor will be sqrt(d_model) if True
+        )
         self.max_source_positions = max_source_positions
         self.max_target_positions = max_target_positions
 
@@ -107,10 +106,10 @@ class WhisperConfig(EasyDeLPretrainedConfig):
         )
 
     def add_jax_args(
-            self,
-            bits: Optional[int] = None,
-            gradient_checkpointing: str = "nothing_saveable",
-            **kwargs
+        self,
+        bits: Optional[int] = None,
+        gradient_checkpointing: str = "nothing_saveable",
+        **kwargs,
     ):
         self.bits = bits
         self.gradient_checkpointing = gradient_checkpointing

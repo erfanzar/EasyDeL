@@ -1,36 +1,38 @@
-from easydel.modules.easydel_modelling_utils import EasyDeLPretrainedConfig
-from typing import Union, Optional
+from typing import Optional
+
 from jax.sharding import PartitionSpec
 
+from easydel.modules.modeling_utils import EDPretrainedConfig
 
-class JetMoEConfig(EasyDeLPretrainedConfig):
+
+class JetMoEConfig(EDPretrainedConfig):
     model_type: str = "jetmoe"
 
     def __init__(
-            self,
-            vocab_size=32000,
-            hidden_size=2048,
-            num_hidden_layers=12,
-            num_attention_heads=32,
-            num_key_value_heads=16,
-            kv_channels=128,
-            ffn_hidden_size=5632,
-            max_position_embeddings=4096,
-            activation_function="silu",
-            glu=True,
-            moe_num_experts=8,
-            moe_top_k=2,
-            use_cache=True,
-            bos_token_id=1,
-            eos_token_id=2,
-            tie_word_embeddings=True,
-            bias=True,
-            rope_theta=10000.0,
-            rms_norm_eps=1e-6,
-            initializer_range=0.01,
-            gradient_checkpointing: str = "nothing_saveable",
-            bits: Optional[int] = None,
-            **kwargs
+        self,
+        vocab_size=32000,
+        hidden_size=2048,
+        num_hidden_layers=12,
+        num_attention_heads=32,
+        num_key_value_heads=16,
+        kv_channels=128,
+        ffn_hidden_size=5632,
+        max_position_embeddings=4096,
+        activation_function="silu",
+        glu=True,
+        moe_num_experts=8,
+        moe_top_k=2,
+        use_cache=True,
+        bos_token_id=1,
+        eos_token_id=2,
+        tie_word_embeddings=True,
+        bias=True,
+        rope_theta=10000.0,
+        rms_norm_eps=1e-6,
+        initializer_range=0.01,
+        gradient_checkpointing: str = "nothing_saveable",
+        bits: Optional[int] = None,
+        **kwargs,
     ):
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
@@ -75,16 +77,14 @@ class JetMoEConfig(EasyDeLPretrainedConfig):
         Returns:
             A list of tuples
         """
-        return (
-            (".*", PartitionSpec(("fsdp", "sp"))),
-        )
+        return ((".*", PartitionSpec(("fsdp", "sp"))),)
 
     def add_jax_args(
-            self,
-            tie_word_embeddings: bool = False,
-            gradient_checkpointing: str = "nothing_saveable",
-            bits: Optional[int] = None,
-            **kwargs,
+        self,
+        tie_word_embeddings: bool = False,
+        gradient_checkpointing: str = "nothing_saveable",
+        bits: Optional[int] = None,
+        **kwargs,
     ):
         """The add_jax_args function adds the following arguments to the Transformer class:
 
@@ -107,4 +107,4 @@ class JetMoEConfig(EasyDeLPretrainedConfig):
 
     @staticmethod
     def rng_keys():
-        return 'params', 'dropout'
+        return "params", "dropout"

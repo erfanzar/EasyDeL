@@ -4,14 +4,15 @@ import warnings
 from typing import Any, Optional
 
 from transformers.utils import logging
-from easydel.modules.easydel_modelling_utils import EasyDeLPretrainedConfig
+
+from easydel.modules.modeling_utils import EDPretrainedConfig
 
 logger = logging.get_logger(__name__)
 
 DBRX_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
 
 
-class DbrxAttentionConfig(EasyDeLPretrainedConfig):
+class DbrxAttentionConfig(EDPretrainedConfig):
     def __init__(
         self,
         attn_pdrop: float = 0,
@@ -58,7 +59,7 @@ class DbrxAttentionConfig(EasyDeLPretrainedConfig):
         return cls.from_dict(config_dict, **kwargs)
 
 
-class DbrxFFNConfig(EasyDeLPretrainedConfig):
+class DbrxFFNConfig(EDPretrainedConfig):
     def __init__(
         self,
         ffn_act_fn: Optional[dict] = None,
@@ -92,7 +93,7 @@ class DbrxFFNConfig(EasyDeLPretrainedConfig):
     @classmethod
     def from_pretrained(
         cls, pretrained_model_name_or_path: str, **kwargs: Any
-    ) -> "EasyDeLPretrainedConfig":
+    ) -> "EDPretrainedConfig":
         cls._set_token_in_kwargs(kwargs)
 
         config_dict, kwargs = cls.get_config_dict(
@@ -115,7 +116,7 @@ class DbrxFFNConfig(EasyDeLPretrainedConfig):
         return cls.from_dict(config_dict, **kwargs)
 
 
-class DbrxConfig(EasyDeLPretrainedConfig):
+class DbrxConfig(EDPretrainedConfig):
     model_type: str = "dbrx"
     attribute_map = {
         "num_attention_heads": "n_heads",

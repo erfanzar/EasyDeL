@@ -1,7 +1,7 @@
-data_processor package
+logits_process package
 ======================
 
-.. automodule:: easydel.data_preprocessing.data_processor
+.. automodule:: easydel.generation.logits_process
     :members:
     :undoc-members:
     :show-inheritance:

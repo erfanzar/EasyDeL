@@ -1,37 +1,39 @@
-from easydel.modules.easydel_modelling_utils import EasyDeLPretrainedConfig
-from typing import Union, Optional
+from typing import Optional
+
 from jax.sharding import PartitionSpec
 
+from easydel.modules.modeling_utils import EDPretrainedConfig
 
-class Grok1Config(EasyDeLPretrainedConfig):
+
+class Grok1Config(EDPretrainedConfig):
     model_type: str = "grok-1"
 
     def __init__(
-            self,
-            vocab_size=32000,
-            hidden_size=4096,
-            intermediate_size=32768,
-            num_hidden_layers=32,
-            num_attention_heads=32,
-            num_key_value_heads=32,
-            attn_output_multiplier=1.0,
-            max_attn_value=1.0,
-            max_position_embeddings=4096,
-            embedding_multiplier_scale: float = 1.0,
-            output_multiplier_scale: float = 1.0,
-            rms_norm_eps=1e-5,
-            use_cache=True,
-            pad_token_id=None,
-            bos_token_id=1,
-            eos_token_id=2,
-            tie_word_embeddings=True,
-            num_experts_per_tok=2,
-            num_experts=8,
-            output_router_logits=False,
-            router_aux_loss_coef=0.001,
-            gradient_checkpointing: str = "nothing_saveable",
-            bits: Optional[int] = None,
-            **kwargs
+        self,
+        vocab_size=32000,
+        hidden_size=4096,
+        intermediate_size=32768,
+        num_hidden_layers=32,
+        num_attention_heads=32,
+        num_key_value_heads=32,
+        attn_output_multiplier=1.0,
+        max_attn_value=1.0,
+        max_position_embeddings=4096,
+        embedding_multiplier_scale: float = 1.0,
+        output_multiplier_scale: float = 1.0,
+        rms_norm_eps=1e-5,
+        use_cache=True,
+        pad_token_id=None,
+        bos_token_id=1,
+        eos_token_id=2,
+        tie_word_embeddings=True,
+        num_experts_per_tok=2,
+        num_experts=8,
+        output_router_logits=False,
+        router_aux_loss_coef=0.001,
+        gradient_checkpointing: str = "nothing_saveable",
+        bits: Optional[int] = None,
+        **kwargs,
     ):
         self.vocab_size = vocab_size
         self.attn_output_multiplier = attn_output_multiplier
@@ -80,53 +82,50 @@ class Grok1Config(EasyDeLPretrainedConfig):
             A list of tuples
         """
         return (
-
-            ("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
-
-            ("attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("attn/o_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-
-            ("linear/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("linear_1/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-            ("linear_v/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("gate/kernel", PartitionSpec(("fsdp", "sp"))),
-
-            ("post_attn_norm/kernel", PartitionSpec(None)),
-            ("pre_attn_norm/kernel", PartitionSpec(None)),
-            ("pre_moe_norm/kernel", PartitionSpec(None)),
-            ("post_moe_norm/kernel", PartitionSpec(None)),
-
-            ("model/norm/kernel", PartitionSpec(None)),
-            ("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            (".*", PartitionSpec(None)),
-        ) if not fully_sharded_data_parallel else (
-
-            ("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"))),
-
-            ("attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"))),
-
-            ("linear/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("linear_1/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("linear_v/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("gate/kernel", PartitionSpec(("fsdp", "sp"))),
-
-            ("post_attn_norm/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("pre_attn_norm/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("pre_moe_norm/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("post_moe_norm/kernel", PartitionSpec(("fsdp", "sp"))),
-
-            ("model/norm/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
-            (".*", PartitionSpec(("fsdp", "sp"))),
+            (
+                ("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
+                (
+                    "attn/(q_proj|k_proj|v_proj)/kernel",
+                    PartitionSpec(("fsdp", "sp"), "tp"),
+                ),
+                ("attn/o_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+                ("linear/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+                ("linear_1/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+                ("linear_v/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+                ("gate/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("post_attn_norm/kernel", PartitionSpec(None)),
+                ("pre_attn_norm/kernel", PartitionSpec(None)),
+                ("pre_moe_norm/kernel", PartitionSpec(None)),
+                ("post_moe_norm/kernel", PartitionSpec(None)),
+                ("model/norm/kernel", PartitionSpec(None)),
+                ("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+                (".*", PartitionSpec(None)),
+            )
+            if not fully_sharded_data_parallel
+            else (
+                ("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"))),
+                ("attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("linear/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("linear_1/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("linear_v/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("gate/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("post_attn_norm/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("pre_attn_norm/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("pre_moe_norm/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("post_moe_norm/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("model/norm/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
+                (".*", PartitionSpec(("fsdp", "sp"))),
+            )
         )
 
     def add_jax_args(
-            self,
-            tie_word_embeddings: bool = False,
-            gradient_checkpointing: str = "nothing_saveable",
-            bits: Optional[int] = None,
-            **kwargs,
+        self,
+        tie_word_embeddings: bool = False,
+        gradient_checkpointing: str = "nothing_saveable",
+        bits: Optional[int] = None,
+        **kwargs,
     ):
         """The add_jax_args function adds the following arguments to the Transformer class:
 
@@ -149,4 +148,4 @@ class Grok1Config(EasyDeLPretrainedConfig):
 
     @staticmethod
     def rng_keys():
-        return 'params', 'dropout'
+        return "params", "dropout"

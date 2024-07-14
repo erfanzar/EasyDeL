@@ -1,39 +1,41 @@
 from typing import Optional
+
 from jax.sharding import PartitionSpec
-from easydel.modules.easydel_modelling_utils import EasyDeLPretrainedConfig
+
+from easydel.modules.modeling_utils import EDPretrainedConfig
 
 
-class OlmoConfig(EasyDeLPretrainedConfig):
+class OlmoConfig(EDPretrainedConfig):
     """OLMo (model) configuration."""
 
     model_type = "olmo"
 
     def __init__(
-            self,
-            vocab_size=50304,
-            hidden_size=4096,
-            intermediate_size=11008,
-            num_hidden_layers=32,
-            num_attention_heads=32,
-            num_key_value_heads=None,
-            hidden_act="silu",
-            max_position_embeddings=2048,
-            initializer_range=0.02,
-            use_cache=True,
-            pad_token_id=1,
-            bos_token_id=None,
-            eos_token_id=50279,
-            tie_word_embeddings=False,
-            rope_theta=10000.0,
-            rope_scaling=None,
-            attention_bias=False,
-            attention_dropout=0.0,
-            clip_qkv=None,
-            gradient_checkpointing: str = "nothing_saveable",
-            use_scan_mlp: bool = False,
-            scan_mlp_chunk_size: int = 1024,
-            bits: Optional[int] = None,
-            **kwargs
+        self,
+        vocab_size=50304,
+        hidden_size=4096,
+        intermediate_size=11008,
+        num_hidden_layers=32,
+        num_attention_heads=32,
+        num_key_value_heads=None,
+        hidden_act="silu",
+        max_position_embeddings=2048,
+        initializer_range=0.02,
+        use_cache=True,
+        pad_token_id=1,
+        bos_token_id=None,
+        eos_token_id=50279,
+        tie_word_embeddings=False,
+        rope_theta=10000.0,
+        rope_scaling=None,
+        attention_bias=False,
+        attention_dropout=0.0,
+        clip_qkv=None,
+        gradient_checkpointing: str = "nothing_saveable",
+        use_scan_mlp: bool = False,
+        scan_mlp_chunk_size: int = 1024,
+        bits: Optional[int] = None,
+        **kwargs,
     ):
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
@@ -64,15 +66,15 @@ class OlmoConfig(EasyDeLPretrainedConfig):
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
             tie_word_embeddings=tie_word_embeddings,
-            **kwargs
+            **kwargs,
         )
 
     def add_jax_args(
-            self,
-            gradient_checkpointing: str = "nothing_saveable",
-            use_scan_mlp: bool = False,
-            scan_mlp_chunk_size: int = 1024,
-            bits: Optional[int] = None,
+        self,
+        gradient_checkpointing: str = "nothing_saveable",
+        use_scan_mlp: bool = False,
+        scan_mlp_chunk_size: int = 1024,
+        bits: Optional[int] = None,
     ):
         self.gradient_checkpointing = gradient_checkpointing
         self.use_scan_mlp = use_scan_mlp
@@ -93,37 +95,37 @@ class OlmoConfig(EasyDeLPretrainedConfig):
             A list of tuples
         """
         return (
-
-            ("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
-
-            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("self_attn/o_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-
-            ("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-            ("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-
-            ("input_layernorm/kernel", PartitionSpec(None)),
-            ("post_attention_layernorm/kernel", PartitionSpec(None)),
-
-            ("model/norm/kernel", PartitionSpec(None)),
-            ("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            (".*", PartitionSpec(None)),
-        ) if not fully_sharded_data_parallel else (
-
-            ("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"))),
-
-            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"))),
-
-            ("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("mlp/down_proj/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"))),
-
-            ("input_layernorm/kernel", PartitionSpec(None)),
-            ("post_attention_layernorm/kernel", PartitionSpec(None)),
-
-            ("model/norm/kernel", PartitionSpec(None)),
-            ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
-            (".*", PartitionSpec(("fsdp", "sp"))),
+            (
+                ("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
+                (
+                    "self_attn/(q_proj|k_proj|v_proj)/kernel",
+                    PartitionSpec(("fsdp", "sp"), "tp"),
+                ),
+                ("self_attn/o_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+                ("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+                ("mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+                ("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+                ("input_layernorm/kernel", PartitionSpec(None)),
+                ("post_attention_layernorm/kernel", PartitionSpec(None)),
+                ("model/norm/kernel", PartitionSpec(None)),
+                ("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+                (".*", PartitionSpec(None)),
+            )
+            if not fully_sharded_data_parallel
+            else (
+                ("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"))),
+                (
+                    "self_attn/(q_proj|k_proj|v_proj)/kernel",
+                    PartitionSpec(("fsdp", "sp")),
+                ),
+                ("self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("mlp/down_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("input_layernorm/kernel", PartitionSpec(None)),
+                ("post_attention_layernorm/kernel", PartitionSpec(None)),
+                ("model/norm/kernel", PartitionSpec(None)),
+                ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
+                (".*", PartitionSpec(("fsdp", "sp"))),
+            )
         )

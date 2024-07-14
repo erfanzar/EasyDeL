@@ -15,18 +15,13 @@ from flax.linen import partitioning as nn_partitioning
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax.sharding import PartitionSpec
-from transformers.modeling_flax_outputs import (
-    FlaxMaskedLMOutput,
-    FlaxSequenceClassifierOutput,
-)
 
-from easydel.modules.attention_module import AttentionModule
+from easydel.modules.attention_module import FlexibleAttentionModule
 from easydel.modules.common import RMSNorm as RMSNorm
-from easydel.modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
 
 # easydel.modules
-from easydel.modules.flax_modelling_utils import (
-    BaseJAXAttentionModule,
+from easydel.modules.flax_modeling_utils import (
+    FlaxAttentionModule,
     apply_rotary_pos_emb,
     block_wise_ffn,
     control_mlp_sharding,
@@ -35,6 +30,11 @@ from easydel.modules.flax_modelling_utils import (
     precompute_freq_cis,
     with_sharding_constraint,
 )
+from easydel.modules.modeling_flax_outputs import (
+    FlaxMaskedLMOutput,
+    FlaxSequenceClassifierOutput,
+)
+from easydel.modules.modeling_utils import EDPretrainedModel
 from easydel.modules.qwen2_moe.configuration_qwen2_moe import (
     Qwen2MoeConfig as Qwen2MoeConfig,
 )
@@ -131,7 +131,7 @@ class FlaxQwen2MoeMLP(nn.Module):
         return x
 
 
-class FlaxQwen2MoeAttention(BaseJAXAttentionModule):
+class FlaxQwen2MoeAttention(FlaxAttentionModule):
     config: Qwen2MoeConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -142,7 +142,7 @@ class FlaxQwen2MoeAttention(BaseJAXAttentionModule):
         self.hidden_size = config.hidden_size
         self.head_dim = self.config.hidden_size // self.config.num_attention_heads
         self.num_key_value_groups = (
-                self.config.num_attention_heads // self.config.num_key_value_heads
+            self.config.num_attention_heads // self.config.num_key_value_heads
         )
 
         if self.num_key_value_groups == 1:
@@ -185,7 +185,7 @@ class FlaxQwen2MoeAttention(BaseJAXAttentionModule):
         )
 
         self.rotary = FlaxQwen2MoeEmbedding(self.dtype)
-        self.attention_performer = AttentionModule(
+        self.attention_performer = FlexibleAttentionModule(
             use_sharding_constraint=self.config.use_sharding_constraint,
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,
@@ -208,7 +208,7 @@ class FlaxQwen2MoeAttention(BaseJAXAttentionModule):
             dtype=self.config.attn_dtype,
             partition_axis=self.config.partition_axis,
             scan_ring_attention=self.config.scan_ring_attention,
-            mesh=self.config.get_mesh(),
+            mesh=self.config.mesh,
             sm_scale=1 / math.sqrt(self.head_dim),
             axis_name=self.config.attention_axis_name,
             backward_pass_impl=self.config.flash_attention_backward_pass_impl,
@@ -219,7 +219,7 @@ class FlaxQwen2MoeAttention(BaseJAXAttentionModule):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
 
     def apply_rotary(
-            self, batch_size, sequence_length, query, key, value, freq_cis, position_ids
+        self, batch_size, sequence_length, query, key, value, freq_cis, position_ids
     ):
         """The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
         The main difference is that it takes in an additional argument, freq_cis, which are used to calculate
@@ -247,17 +247,17 @@ class FlaxQwen2MoeAttention(BaseJAXAttentionModule):
         return self._transpose_sequence_head(query, key, value)
 
     def __call__(
-            self,
-            hidden_states: chex.Array,
-            freq_cis: Tuple[chex.Array, chex.Array],
-            attention_mask: chex.Array,
-            position_ids: chex.Array,
-            causal_mask: chex.Array,
-            segment_ids: Optional[chex.Array] = None,
-            deterministic: bool = True,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            fcm_mask=None,
+        self,
+        hidden_states: chex.Array,
+        freq_cis: Tuple[chex.Array, chex.Array],
+        attention_mask: chex.Array,
+        position_ids: chex.Array,
+        causal_mask: chex.Array,
+        segment_ids: Optional[chex.Array] = None,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        fcm_mask=None,
     ):
         """The __call__ function is the main function of a JAX module. It defines how the module behaves when called
         with inputs. The __call__ function can be thought of as a &quot;forward pass&quot; through the model,
@@ -347,7 +347,9 @@ class FlaxQwen2MoeAttention(BaseJAXAttentionModule):
                 key_states, value_states, query_states, attention_mask
             )
 
-        key_states, value_states = self.repeat_key_value(key_states, value_states, self.num_key_value_groups)
+        key_states, value_states = self.repeat_key_value(
+            key_states, value_states, self.num_key_value_groups
+        )
 
         if self.config.use_sharding_constraint:
             query_states = with_sharding_constraint(
@@ -375,7 +377,7 @@ class FlaxQwen2MoeAttention(BaseJAXAttentionModule):
         )
         query_length, key_length = query_states.shape[1], key_states.shape[1]
 
-        attentions = self.attention_performer.__call__(
+        attentions = self.attention_performer(
             query_states=query_states,
             key_states=key_states,
             value_states=value_states,
@@ -430,13 +432,13 @@ class FlaxQwen2MoeBlocKSparesTop2MLPCollection(nn.Module):
         ]
 
     def __call__(
-            self,
-            selected_experts: chex.Array,
-            hidden_states: chex.Array,
-            routing_weights: chex.Array,
-            batch_size: int,
-            sequence_length: int,
-            hidden_dim: int,
+        self,
+        selected_experts: chex.Array,
+        hidden_states: chex.Array,
+        routing_weights: chex.Array,
+        batch_size: int,
+        sequence_length: int,
+        hidden_dim: int,
     ) -> chex.Array:
         final_hidden_state = jnp.zeros_like(hidden_states)
 
@@ -452,10 +454,10 @@ class FlaxQwen2MoeBlocKSparesTop2MLPCollection(nn.Module):
                 else self.layers[index](hidden_states)
             )
             expert_layer_output_exp = (
-                    jnp.sum(
-                        jnp.multiply(selected_experts == index, routing_weights), axis=-1
-                    )[:, :, None]
-                    * expert_layer_output
+                jnp.sum(
+                    jnp.multiply(selected_experts == index, routing_weights), axis=-1
+                )[:, :, None]
+                * expert_layer_output
             )
             final_hidden_state += expert_layer_output_exp
 
@@ -511,7 +513,7 @@ class FlaxQwen2MoeSparseMoeBlock(nn.Module):
         )
 
     def __call__(
-            self, hidden_states: chex.Array, e: bool = False  # Ignored
+        self, hidden_states: chex.Array, e: bool = False  # Ignored
     ) -> Tuple[chex.Array, chex.Array]:
         hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
         batch_size, sequence_length, hidden_dim = hidden_states.shape
@@ -540,8 +542,8 @@ class FlaxQwen2MoeSparseMoeBlock(nn.Module):
         )
         shared_expert_output = self.shared_expert(hidden_states)
         shared_expert_output = (
-                jax.nn.sigmoid(self.shared_expert_gate(hidden_states))
-                * shared_expert_output
+            jax.nn.sigmoid(self.shared_expert_gate(hidden_states))
+            * shared_expert_output
         )
         final_hidden_state = final_hidden_state + shared_expert_output
 
@@ -574,8 +576,10 @@ class FlaxQwen2MoeBlock(nn.Module):
         )
         mlp_block = (
             FlaxQwen2MoeSparseMoeBlock
-            if (self.layer_idx not in self.config.mlp_only_layers) and (
-                    self.config.num_experts > 0 and (self.layer_idx + 1) % self.config.decoder_sparse_step == 0
+            if (self.layer_idx not in self.config.mlp_only_layers)
+            and (
+                self.config.num_experts > 0
+                and (self.layer_idx + 1) % self.config.decoder_sparse_step == 0
             )
             else FlaxQwen2MoeMLP
         )
@@ -609,20 +613,20 @@ class FlaxQwen2MoeBlock(nn.Module):
         )
 
     def __call__(
-            self,
-            hidden_states: chex.Array,
-            freq_cis: Tuple[chex.Array, chex.Array],
-            attention_mask: chex.Array,
-            position_ids: chex.Array,
-            causal_mask: chex.Array,
-            deterministic: bool = True,
-            init_cache: bool = False,
-            output_attentions: Optional[bool] = False,
-            output_hidden_states: Optional[bool] = False,
-            output_router_logits: Optional[bool] = None,
-            return_dict: bool = True,
-            segment_ids: Optional[chex.Array] = None,
-            fcm_mask: Optional[jnp.ndarray] = None,
+        self,
+        hidden_states: chex.Array,
+        freq_cis: Tuple[chex.Array, chex.Array],
+        attention_mask: chex.Array,
+        position_ids: chex.Array,
+        causal_mask: chex.Array,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: Optional[bool] = False,
+        output_hidden_states: Optional[bool] = False,
+        output_router_logits: Optional[bool] = None,
+        return_dict: bool = True,
+        segment_ids: Optional[chex.Array] = None,
+        fcm_mask: Optional[jnp.ndarray] = None,
     ):
         """The __call__ function is the main function of a TransformerEncoderLayer.
         It takes in hidden states, frequency-domain inputs, and masks as input. It then
@@ -646,7 +650,7 @@ class FlaxQwen2MoeBlock(nn.Module):
                 layer
             output_attentions: bool: Return the attention weights
             fcm_mask: Optional[jnp.ndarray]: Mask the self-attention
-        :param : Control the dropout in the self attention layer
+
 
         Returns:
             A tuple of two items
@@ -684,19 +688,19 @@ class FlaxQwen2MoeBlock(nn.Module):
         return (hidden_states,) + attn_outputs[1:] + (router_logits,)
 
 
-class FlaxQwen2MoePreTrainedModel(EasyDeLFlaxPretrainedModel):
+class FlaxQwen2MoePreTrainedModel(EDPretrainedModel):
     config_class = Qwen2MoeConfig
     base_model_prefix = "model"
     module_class: nn.Module = None
 
     def __init__(
-            self,
-            config: Qwen2MoeConfig,
-            input_shape: Tuple = (1, 1),
-            seed: int = 0,
-            dtype: jnp.dtype = jnp.float32,
-            _do_init: bool = True,
-            **kwargs,
+        self,
+        config: Qwen2MoeConfig,
+        input_shape: Tuple = (1, 1),
+        seed: int = 0,
+        dtype: jnp.dtype = jnp.float32,
+        _do_init: bool = True,
+        **kwargs,
     ):
         """The __init__ function is called when the class is instantiated.
         It sets up the instance of the class, and defines what happens when it's created.
@@ -729,7 +733,7 @@ class FlaxQwen2MoePreTrainedModel(EasyDeLFlaxPretrainedModel):
         )
 
     def init_weights(
-            self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
+        self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
     ) -> FrozenDict:
         """The init_weights function is used to initialize the weights of a model.
 
@@ -811,21 +815,21 @@ class FlaxQwen2MoePreTrainedModel(EasyDeLFlaxPretrainedModel):
         return init_variables["cache"]
 
     def __call__(
-            self,
-            input_ids: chex.Array,
-            attention_mask: chex.Array = None,
-            position_ids: chex.Array = None,
-            params: dict = None,
-            past_key_values: dict = None,
-            dropout_rng: jax.random.PRNGKey = None,
-            train: bool = False,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            output_router_logits: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
-            extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
-            add_params_field: bool = False,
-            **kwargs,
+        self,
+        input_ids: chex.Array,
+        attention_mask: chex.Array = None,
+        position_ids: chex.Array = None,
+        params: dict = None,
+        past_key_values: dict = None,
+        dropout_rng: jax.random.PRNGKey = None,
+        train: bool = False,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        output_router_logits: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+        add_params_field: bool = False,
+        **kwargs,
     ):
         """The __call__ function is the main function of a JAX module.
         It takes in inputs and returns outputs, but it also has some other important features:
@@ -881,7 +885,7 @@ class FlaxQwen2MoePreTrainedModel(EasyDeLFlaxPretrainedModel):
         batch_size, sequence_length = input_ids.shape
 
         assert (
-                sequence_length <= self.config.max_position_embeddings
+            sequence_length <= self.config.max_position_embeddings
         ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
 
         if position_ids is None:
@@ -963,18 +967,18 @@ class FlaxQwen2MoeBlockCollection(nn.Module):
         ]
 
     def __call__(
-            self,
-            hidden_states: chex.Array,
-            freq_cis: Tuple[chex.Array, chex.Array],
-            attention_mask: chex.Array,
-            position_ids: chex.Array,
-            causal_mask: chex.Array,
-            deterministic: bool = True,
-            init_cache: bool = False,
-            output_attentions: Optional[bool] = False,
-            output_hidden_states: Optional[bool] = False,
-            output_router_logits: Optional[bool] = None,
-            return_dict: bool = True,
+        self,
+        hidden_states: chex.Array,
+        freq_cis: Tuple[chex.Array, chex.Array],
+        attention_mask: chex.Array,
+        position_ids: chex.Array,
+        causal_mask: chex.Array,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: Optional[bool] = False,
+        output_hidden_states: Optional[bool] = False,
+        output_router_logits: Optional[bool] = None,
+        return_dict: bool = True,
     ):
         """The __call__ function is the main function of a JAX nn.Module.
         It defines how the module behaves when called as a function, and it's what you'll use to call your model
@@ -1020,10 +1024,10 @@ class FlaxQwen2MoeBlockCollection(nn.Module):
                 maxval=self.config.fcm_max_ratio,
             )
             fcm_mask = (
-                    jax.random.uniform(
-                        self.make_rng("fcm"), shape=(batch_size, 1, seq_length, seq_length)
-                    )
-                    > fcm_ratio
+                jax.random.uniform(
+                    self.make_rng("fcm"), shape=(batch_size, 1, seq_length, seq_length)
+                )
+                > fcm_ratio
             )
             fcm_mask = fcm_mask.at[:, :, :, 0].set(True)
             fcm_mask = fcm_mask.astype("bool")
@@ -1123,18 +1127,18 @@ class FlaxQwen2MoeModule(nn.Module):
         )
 
     def __call__(
-            self,
-            input_ids: chex.Array,
-            attention_mask: chex.Array,
-            position_ids: chex.Array,
-            deterministic: bool = True,
-            inputs_embeds: chex.Array = None,
-            init_cache: bool = False,
-            output_attentions: Optional[bool] = False,
-            output_hidden_states: Optional[bool] = False,
-            output_router_logits: Optional[bool] = None,
-            return_dict: bool = True,
-            extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+        self,
+        input_ids: chex.Array,
+        attention_mask: chex.Array,
+        position_ids: chex.Array,
+        deterministic: bool = True,
+        inputs_embeds: chex.Array = None,
+        init_cache: bool = False,
+        output_attentions: Optional[bool] = False,
+        output_hidden_states: Optional[bool] = False,
+        output_router_logits: Optional[bool] = None,
+        return_dict: bool = True,
+        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
     ) -> tuple | MoeModelOutput:
 
         if output_router_logits is None:
@@ -1165,7 +1169,7 @@ class FlaxQwen2MoeModule(nn.Module):
         batch_size, sequence_length, _ = inputs_embeds.shape
 
         assert (
-                sequence_length <= self.config.max_position_embeddings
+            sequence_length <= self.config.max_position_embeddings
         ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
 
         inputs_embeds = (
@@ -1243,17 +1247,17 @@ class FlaxQwen2MoeForCausalLMModule(nn.Module):
         )
 
     def __call__(
-            self,
-            input_ids: chex.Array,
-            attention_mask: chex.Array = None,
-            position_ids: chex.Array = None,
-            deterministic: bool = True,
-            init_cache: bool = False,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            output_router_logits: Optional[bool] = None,
-            return_dict: bool = True,
-            extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+        self,
+        input_ids: chex.Array,
+        attention_mask: chex.Array = None,
+        position_ids: chex.Array = None,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        output_router_logits: Optional[bool] = None,
+        return_dict: bool = True,
+        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
     ):
         """The __call__ function is the main function of a Flax module. It takes in inputs and returns outputs.
 
@@ -1366,7 +1370,7 @@ class FlaxQwen2MoeForCausalLM(FlaxQwen2MoePreTrainedModel):
         self.module.lm_head = new_embeddings
 
     def prepare_inputs_for_generation(
-            self, input_ids, max_length, attention_mask: Optional[chex.Array] = None
+        self, input_ids, max_length, attention_mask: Optional[chex.Array] = None
     ):
         """The prepare_inputs_for_generation function is used to prepare the inputs for a generation task.
 
@@ -1437,16 +1441,16 @@ class FlaxQwen2MoeForSequenceClassificationModule(nn.Module):
         )
 
     def __call__(
-            self,
-            input_ids: chex.Array,
-            attention_mask: chex.Array = None,
-            position_ids: chex.Array = None,
-            deterministic: bool = True,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            output_hidden_states: bool = False,
-            return_dict: bool = True,
-            extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+        self,
+        input_ids: chex.Array,
+        attention_mask: chex.Array = None,
+        position_ids: chex.Array = None,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        return_dict: bool = True,
+        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
     ):
         """The __call__ function is the main function of a Flax module.
         It takes in all the inputs to the model and returns all outputs from it.

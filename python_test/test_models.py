@@ -1,7 +1,6 @@
 import gc
 import os
 import sys
-import unittest
 from unittest import TestCase
 
 from fjformer import make_shard_and_gather_fns, match_partition_rules
@@ -145,7 +144,7 @@ class EasyModelsTest(TestCase):
             use_sharding_constraint=self.use_sharding_constraint,
             scan_mlp_chunk_size=self.scan_mlp_chunk_size,
         )
-        mesh = config.get_mesh()
+        mesh = config.mesh
 
         with mesh:
             partition_specs = match_partition_rules(
@@ -236,7 +235,7 @@ class EasyModelsTest(TestCase):
             scan_mlp_chunk_size=self.scan_mlp_chunk_size,
             use_sharding_constraint=self.use_sharding_constraint,
         )
-        mesh = config.get_mesh()
+        mesh = config.mesh
 
         with mesh:
             partition_specs = match_partition_rules(
@@ -603,8 +602,8 @@ class EasyModelsTest(TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
-    # test = EasyModelsTest()
-    # test.setUp()
-    # test.test_gemma2()
+    # unittest.main()
+    test = EasyModelsTest()
+    test.setUp()
+    test.test_gemma2()
     # test.test_llama()

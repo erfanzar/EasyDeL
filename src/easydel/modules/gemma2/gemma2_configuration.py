@@ -2,10 +2,10 @@ from typing import Optional
 
 from jax.sharding import PartitionSpec
 
-from easydel.modules.easydel_modelling_utils import EasyDeLPretrainedConfig
+from easydel.modules.modeling_utils import EDPretrainedConfig
 
 
-class Gemma2Config(EasyDeLPretrainedConfig):
+class Gemma2Config(EDPretrainedConfig):
     model_type: str = "gemma2"
 
     def __init__(

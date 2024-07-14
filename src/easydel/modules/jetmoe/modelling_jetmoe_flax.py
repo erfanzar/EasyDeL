@@ -1,24 +1,26 @@
 import functools
+from typing import Optional, Tuple, Union
 
+import chex
 import fjformer
-from jax import numpy as jnp, lax
 import jax
-from flax import linen as nn
-from typing import Union, Optional, Tuple
-from flax.struct import dataclass
 from fjformer.linen import Dense
+from flax import linen as nn
 from flax.linen import partitioning as nn_partitioning
-from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
+from flax.struct import dataclass
+from jax import lax
+from jax import numpy as jnp
 
-from easydel.modules.flax_modelling_utils import (
+from easydel.modules.flax_modeling_utils import (
     ACT2FN,
     apply_rotary_pos_emb,
-    get_dot_general_by_bits,
     control_mlp_sharding,
+    get_dot_general_by_bits,
 )
-import chex
 from easydel.modules.jetmoe.jetmoe_configuration import JetMoEConfig
-from transformers.modeling_flax_outputs import (
+from easydel.modules.modeling_flax_outputs import (
+    FlaxBaseModelOutput,
+    FlaxCausalLMOutput,
     FlaxSequenceClassifierOutput,
 )
 

@@ -1,66 +1,63 @@
 import warnings
-from typing import Optional, Dict, Union
+from typing import Dict, Optional, Union
 
 from jax.sharding import PartitionSpec
 
-from easydel.modules.easydel_modelling_utils import EasyDeLPretrainedConfig
+from easydel.modules.modeling_utils import EDPretrainedConfig
 
 
-class DeepseekV2Config(EasyDeLPretrainedConfig):
+class DeepseekV2Config(EDPretrainedConfig):
     model_type: str = "deepseek_v2"
 
     def __init__(
-            self,
-            vocab_size=102400,
-            hidden_size=4096,
-            intermediate_size=11008,
-            moe_intermediate_size=1407,
-            num_hidden_layers=30,
-            num_attention_heads=32,
-            num_key_value_heads=32,
-            n_shared_experts=None,
-            n_routed_experts=None,
-            ep_size=1,
-            routed_scaling_factor=1.0,
-            kv_lora_rank=512,
-            q_lora_rank=1536,
-            qk_rope_head_dim=64,
-            v_head_dim=128,
-            qk_nope_head_dim=128,
-            topk_method='gready',
-            n_group=None,
-            topk_group=None,
-            num_experts_per_tok=None,
-            moe_layer_freq=1,
-            first_k_dense_replace=0,
-            norm_topk_prob=False,
-            scoring_func='softmax',
-            aux_loss_alpha=0.001,
-            seq_aux=True,
-            hidden_act="silu",
-            max_position_embeddings=2048,
-            initializer_range=0.02,
-            rms_norm_eps=1e-6,
-            use_cache=True,
-            pad_token_id=None,
-            bos_token_id=100000,
-            eos_token_id=100001,
-            pretraining_tp=1,
-            tie_word_embeddings=False,
-            rope_theta=10000.0,
-            attention_bias=False,
-            attention_dropout=0.0,
-            gradient_checkpointing: str = "nothing_saveable",
-            use_scan_mlp: bool = False,
-            scan_mlp_chunk_size: int = 1024,
-            bits: Optional[int] = None,
-            rope_scaling: Dict[str, Union[str, float]] = None,
-            **kwargs,
+        self,
+        vocab_size=102400,
+        hidden_size=4096,
+        intermediate_size=11008,
+        moe_intermediate_size=1407,
+        num_hidden_layers=30,
+        num_attention_heads=32,
+        num_key_value_heads=32,
+        n_shared_experts=None,
+        n_routed_experts=None,
+        ep_size=1,
+        routed_scaling_factor=1.0,
+        kv_lora_rank=512,
+        q_lora_rank=1536,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        qk_nope_head_dim=128,
+        topk_method="gready",
+        n_group=None,
+        topk_group=None,
+        num_experts_per_tok=None,
+        moe_layer_freq=1,
+        first_k_dense_replace=0,
+        norm_topk_prob=False,
+        scoring_func="softmax",
+        aux_loss_alpha=0.001,
+        seq_aux=True,
+        hidden_act="silu",
+        max_position_embeddings=2048,
+        initializer_range=0.02,
+        rms_norm_eps=1e-6,
+        use_cache=True,
+        pad_token_id=None,
+        bos_token_id=100000,
+        eos_token_id=100001,
+        pretraining_tp=1,
+        tie_word_embeddings=False,
+        rope_theta=10000.0,
+        attention_bias=False,
+        attention_dropout=0.0,
+        gradient_checkpointing: str = "nothing_saveable",
+        use_scan_mlp: bool = False,
+        scan_mlp_chunk_size: int = 1024,
+        bits: Optional[int] = None,
+        rope_scaling: Dict[str, Union[str, float]] = None,
+        **kwargs,
     ):
-        warnings.warn(
-            "`DeepseekV2` is still in beta mode.",
-            UserWarning
-        )
+        warnings.warn("`DeepseekV2` is still in beta mode.", UserWarning)
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
@@ -128,50 +125,51 @@ class DeepseekV2Config(EasyDeLPretrainedConfig):
             A list of tuples
         """
         return (
-
-            ("model/embed_tokens/embedding", PartitionSpec("sp", "fsdp")),
-
-            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
-
-            ("w1/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("w2/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("w3/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("gate/kernel", PartitionSpec(("fsdp", "sp"))),
-
-            ("input_layernorm/kernel", PartitionSpec(None)),
-            ("post_attention_layernorm/kernel", PartitionSpec(None)),
-
-            ("model/norm/kernel", PartitionSpec(None)),
-            ("lm_head/kernel", PartitionSpec("fsdp", "sp")),
-            (".*", PartitionSpec(None)),
-        ) if not fully_sharded_data_parallel else (
-            ("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"))),
-
-            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
-
-            ("w1/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("w2/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("w3/kernel", PartitionSpec(("fsdp", "sp"))),
-            ("gate/kernel", PartitionSpec(("fsdp", "sp"))),
-
-            ("input_layernorm/kernel", PartitionSpec(None)),
-            ("post_attention_layernorm/kernel", PartitionSpec(None)),
-
-            ("model/norm/kernel", PartitionSpec(None)),
-            ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
-            (".*", PartitionSpec(("fsdp", "sp"))),
+            (
+                ("model/embed_tokens/embedding", PartitionSpec("sp", "fsdp")),
+                (
+                    "self_attn/(q_proj|k_proj|v_proj)/kernel",
+                    PartitionSpec(("fsdp", "sp"), "tp"),
+                ),
+                ("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
+                ("w1/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("w2/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("w3/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("gate/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("input_layernorm/kernel", PartitionSpec(None)),
+                ("post_attention_layernorm/kernel", PartitionSpec(None)),
+                ("model/norm/kernel", PartitionSpec(None)),
+                ("lm_head/kernel", PartitionSpec("fsdp", "sp")),
+                (".*", PartitionSpec(None)),
+            )
+            if not fully_sharded_data_parallel
+            else (
+                ("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"))),
+                (
+                    "self_attn/(q_proj|k_proj|v_proj)/kernel",
+                    PartitionSpec(("fsdp", "sp"), "tp"),
+                ),
+                ("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
+                ("w1/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("w2/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("w3/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("gate/kernel", PartitionSpec(("fsdp", "sp"))),
+                ("input_layernorm/kernel", PartitionSpec(None)),
+                ("post_attention_layernorm/kernel", PartitionSpec(None)),
+                ("model/norm/kernel", PartitionSpec(None)),
+                ("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
+                (".*", PartitionSpec(("fsdp", "sp"))),
+            )
         )
 
     def add_jax_args(
-            self,
-            gradient_checkpointing: str = "nothing_saveable",
-            use_scan_mlp: bool = False,
-            scan_mlp_chunk_size: int = 1024,
-            bits: Optional[int] = None,
-            rope_scaling: Dict[str, Union[str, float]] = None,
-            **kwargs,
+        self,
+        gradient_checkpointing: str = "nothing_saveable",
+        use_scan_mlp: bool = False,
+        scan_mlp_chunk_size: int = 1024,
+        bits: Optional[int] = None,
+        rope_scaling: Dict[str, Union[str, float]] = None,
+        **kwargs,
     ):
         """The add_jax_args function adds the following arguments to the model:
 
@@ -215,4 +213,4 @@ class DeepseekV2Config(EasyDeLPretrainedConfig):
 
     @staticmethod
     def rng_keys():
-        return 'params', 'dropout', 'fcm'
+        return "params", "dropout", "fcm"

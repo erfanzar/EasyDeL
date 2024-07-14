@@ -2,22 +2,21 @@ import typing
 import warnings
 
 import chex
-import fjformer
-import flax.core
 import jax
-
+from flax.core import FrozenDict
 from typing import Literal, Dict, Union, Tuple, List, Callable, Mapping
 
 from jax import numpy as jnp
 from easydel.etils.easystate import EasyDeLState
 
 from fjformer.functions import cross_entropy_loss_and_accuracy
+from fjformer.sharding import with_sharding_constraint
 from flax.struct import dataclass
 from jax.sharding import PartitionSpec
 
 
 def pad_to_length(
-        tensor: chex.Array, length: int, pad_value: Union[int, float], axis: int = -1
+    tensor: chex.Array, length: int, pad_value: Union[int, float], axis: int = -1
 ) -> chex.Array:
     if tensor.shape[axis] >= length:
         if tensor.ndim == 2:
@@ -42,11 +41,11 @@ class ORPOStepOut:
 
 
 def create_orpo_concatenated_forward(
-        is_encoder_decoder,
-        label_pad_token_id,
-        padding_value,
-        truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
-        fixed_max_length: int | None = None,
+    is_encoder_decoder,
+    label_pad_token_id,
+    padding_value,
+    truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
+    fixed_max_length: int | None = None,
 ):
     """The create_orpo_concatenated_forward function is a helper function that creates a forward pass function for the
     model. The forward pass function takes in an apply_fn, which is the model's apply_fn, and runs it on concatenated
@@ -69,15 +68,15 @@ def create_orpo_concatenated_forward(
     """
 
     def concatenated_forward(
-            apply_fn: Callable,
-            params: dict | flax.core.FrozenDict,
-            batch: Mapping[str, Union[List, chex.Array]],
+        apply_fn: Callable,
+        params: dict | FrozenDict,
+        batch: Mapping[str, Union[List, chex.Array]],
     ) -> Tuple[chex.Array, chex.Array, chex.Array, chex.Array, chex.Array]:
         """The concatenated_forward function is used to compute the log-probabilities of both chosen and rejected labels.
 
         Args:
             apply_fn: Callable: Pass in the model function
-            params: dict | flax.core.FrozenDict: Pass the model
+            params: dict | FrozenDict: Pass the model
                 parameters to the function
             batch: Dict[str, Union[List, chex.Array]] : Pass the batch
                 of data to the concatenated_forward function
@@ -87,7 +86,7 @@ def create_orpo_concatenated_forward(
             their corresponding logits
         """
         assert (
-                padding_value is not None
+            padding_value is not None
         ), "`padding_value` can not be set as `None` it must be an integer."
         concatenated_batch = concatenated_inputs(
             batch,
@@ -167,11 +166,11 @@ def create_orpo_concatenated_forward(
 
 
 def get_batch_log_probs(
-        logits: chex.Array,
-        labels: chex.Array,
-        average_log_prob: bool = False,
-        label_pad_token_id: int = -100,
-        is_encoder_decoder: bool = False,
+    logits: chex.Array,
+    labels: chex.Array,
+    average_log_prob: bool = False,
+    label_pad_token_id: int = -100,
+    is_encoder_decoder: bool = False,
 ) -> chex.Array:
     """The get_batch_log_probs function computes the log probability of a batch of sequences.
 
@@ -220,12 +219,12 @@ def get_batch_log_probs(
 
 
 def concatenated_inputs(
-        batch: Dict[str, Union[List, chex.Array]],
-        is_encoder_decoder: bool = False,
-        label_pad_token_id: int = -100,
-        padding_value: int = 0,
-        truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
-        fixed_max_length: int | None = None,
+    batch: Dict[str, Union[List, chex.Array]],
+    is_encoder_decoder: bool = False,
+    label_pad_token_id: int = -100,
+    padding_value: int = 0,
+    truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
+    fixed_max_length: int | None = None,
 ) -> Dict[str, chex.Array]:
     """The concatenated_inputs function takes a batch of chosen and rejected examples,
     and concatenates them together. This is useful for training the model to predict whether an example was chosen
@@ -286,7 +285,7 @@ def concatenated_inputs(
                 pad_value = label_pad_token_id
             elif k.endswith("_input_ids"):
                 assert (
-                        padding_value is not None
+                    padding_value is not None
                 ), "`padding_value` can not be set as `None`"
                 pad_value = padding_value
             elif k.endswith("_attention_mask"):
@@ -322,13 +321,13 @@ def concatenated_inputs(
 
 
 def odds_ratio_loss(
-        beta: float,
-        policy_chosen_logps: chex.Array,
-        policy_rejected_logps: chex.Array,
+    beta: float,
+    policy_chosen_logps: chex.Array,
+    policy_rejected_logps: chex.Array,
 ) -> Tuple[chex.Array, chex.Array, chex.Array, chex.Array, chex.Array]:
     log_odds = (policy_chosen_logps - policy_rejected_logps) - (
-            jnp.log1p(-jnp.exp(policy_chosen_logps))
-            - jnp.log1p(-jnp.exp(policy_rejected_logps))
+        jnp.log1p(-jnp.exp(policy_chosen_logps))
+        - jnp.log1p(-jnp.exp(policy_rejected_logps))
     )
     sig_ratio = jax.nn.sigmoid(log_odds)
     ratio = jnp.log(sig_ratio)
@@ -347,10 +346,10 @@ def odds_ratio_loss(
 
 
 def create_orpo_step_function(
-        concatenated_forward: Callable,
-        beta: float = 0.1,
-        mode: Literal["train", "eval"] = "train",
-        batch_partition_spec: PartitionSpec = PartitionSpec(("fsdp", "dp"), "sp"),
+    concatenated_forward: Callable,
+    beta: float = 0.1,
+    mode: Literal["train", "eval"] = "train",
+    batch_partition_spec: PartitionSpec = PartitionSpec(("fsdp", "dp"), "sp"),
 ):
     """The create_orpo_step_function function is a helper function that creates the ORPO training step.
 
@@ -380,11 +379,12 @@ def create_orpo_step_function(
             A new state, which is a collection of the parameters and
             apply_fn
         """
-        batch = fjformer.with_sharding_constraint(
-            batch, partition_specs=batch_partition_spec
+        batch = with_sharding_constraint(
+            batch,
+            partition_specs=batch_partition_spec,
         )
 
-        def calculate_loss(params: dict | flax.core.FrozenDict):
+        def calculate_loss(params: dict | FrozenDict):
             (
                 policy_chosen_log_probs,
                 policy_rejected_log_probs,
@@ -412,7 +412,7 @@ def create_orpo_step_function(
             metrics[f"{prefix}rewards/rejected"] = rejected_rewards.mean()
             metrics[f"{prefix}rewards/accuracies"] = reward_accuracies.mean()
             metrics[f"{prefix}rewards/margins"] = (
-                    chosen_rewards - rejected_rewards
+                chosen_rewards - rejected_rewards
             ).mean()
             metrics[f"{prefix}logps/rejected"] = policy_rejected_log_probs.mean()
             metrics[f"{prefix}logps/chosen"] = policy_chosen_log_probs.mean()

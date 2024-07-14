@@ -1,43 +1,42 @@
-import math
-from typing import Sequence, Optional
+from typing import Optional
 
 from jax.sharding import PartitionSpec
 
-from easydel.modules.easydel_modelling_utils import EasyDeLPretrainedConfig
+from easydel.modules.modeling_utils import EDPretrainedConfig
 
 
-class Phi3Config(EasyDeLPretrainedConfig):
+class Phi3Config(EDPretrainedConfig):
     """Phi configuration."""
 
     model_type: str = "phi3"
 
     def __init__(
-            self,
-            vocab_size=32064,
-            hidden_size=3072,
-            intermediate_size=8192,
-            num_hidden_layers=32,
-            num_attention_heads=32,
-            num_key_value_heads=None,
-            resid_pdrop=0.0,
-            embd_pdrop=0.0,
-            attention_dropout=0.0,
-            hidden_act="silu",
-            max_position_embeddings=4096,
-            original_max_position_embeddings=4096,
-            initializer_range=0.02,
-            rms_norm_eps=1e-5,
-            use_cache=True,
-            tie_word_embeddings=False,
-            rope_theta=10000.0,
-            rope_scaling=None,
-            bos_token_id=1,
-            eos_token_id=32000,
-            pad_token_id=32000,
-            sliding_window=None,
-            bits: Optional[int] = None,
-            gradient_checkpointing: str = "nothing_saveable",
-            **kwargs
+        self,
+        vocab_size=32064,
+        hidden_size=3072,
+        intermediate_size=8192,
+        num_hidden_layers=32,
+        num_attention_heads=32,
+        num_key_value_heads=None,
+        resid_pdrop=0.0,
+        embd_pdrop=0.0,
+        attention_dropout=0.0,
+        hidden_act="silu",
+        max_position_embeddings=4096,
+        original_max_position_embeddings=4096,
+        initializer_range=0.02,
+        rms_norm_eps=1e-5,
+        use_cache=True,
+        tie_word_embeddings=False,
+        rope_theta=10000.0,
+        rope_scaling=None,
+        bos_token_id=1,
+        eos_token_id=32000,
+        pad_token_id=32000,
+        sliding_window=None,
+        bits: Optional[int] = None,
+        gradient_checkpointing: str = "nothing_saveable",
+        **kwargs,
     ) -> None:
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
@@ -70,14 +69,14 @@ class Phi3Config(EasyDeLPretrainedConfig):
             eos_token_id=eos_token_id,
             tie_word_embeddings=tie_word_embeddings,
             bits=bits,
-            **kwargs
+            **kwargs,
         )
 
     def add_jax_args(
-            self,
-            bits: Optional[int] = None,
-            gradient_checkpointing: str = "nothing_saveable",
-            **kwargs
+        self,
+        bits: Optional[int] = None,
+        gradient_checkpointing: str = "nothing_saveable",
+        **kwargs,
     ):
         self.bits = bits
         self.gradient_checkpointing = gradient_checkpointing
@@ -87,34 +86,77 @@ class Phi3Config(EasyDeLPretrainedConfig):
 
     def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
         return (
-            ("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
-
-            ("norm/kernel", PartitionSpec(("fsdp", "sp"), )),
-            ("post_attention_layernorm/kernel", PartitionSpec(("fsdp", "sp"), )),
-            ("input_layernorm/kernel", PartitionSpec(("fsdp", "sp"),)),
-
-            ("mlp/gate_up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("mlp/down_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-
-            ("self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("self_attn/qkv_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            (".*", PartitionSpec(None, ))
-
-        ) if fully_sharded_data_parallel else (
-            ("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
-
-            ("norm/kernel", PartitionSpec(None, )),
-            ("post_attention_layernorm/kernel", PartitionSpec(None, )),
-            ("input_layernorm/kernel", PartitionSpec(None, )),
-
-            ("mlp/gate_up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-
-            ("self_attn/o_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"), )),
-            ("self_attn/qkv_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            (".*", PartitionSpec(None, ))
+            (
+                ("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
+                (
+                    "norm/kernel",
+                    PartitionSpec(
+                        ("fsdp", "sp"),
+                    ),
+                ),
+                (
+                    "post_attention_layernorm/kernel",
+                    PartitionSpec(
+                        ("fsdp", "sp"),
+                    ),
+                ),
+                (
+                    "input_layernorm/kernel",
+                    PartitionSpec(
+                        ("fsdp", "sp"),
+                    ),
+                ),
+                ("mlp/gate_up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+                ("mlp/down_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+                ("self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+                ("self_attn/qkv_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+                ("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+                (
+                    ".*",
+                    PartitionSpec(
+                        None,
+                    ),
+                ),
+            )
+            if fully_sharded_data_parallel
+            else (
+                ("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
+                (
+                    "norm/kernel",
+                    PartitionSpec(
+                        None,
+                    ),
+                ),
+                (
+                    "post_attention_layernorm/kernel",
+                    PartitionSpec(
+                        None,
+                    ),
+                ),
+                (
+                    "input_layernorm/kernel",
+                    PartitionSpec(
+                        None,
+                    ),
+                ),
+                ("mlp/gate_up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+                ("mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+                (
+                    "self_attn/o_proj/kernel",
+                    PartitionSpec(
+                        "tp",
+                        ("fsdp", "sp"),
+                    ),
+                ),
+                ("self_attn/qkv_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+                ("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+                (
+                    ".*",
+                    PartitionSpec(
+                        None,
+                    ),
+                ),
+            )
         )
 
     def _rope_scaling_validation(self):
@@ -131,26 +173,34 @@ class Phi3Config(EasyDeLPretrainedConfig):
         rope_scaling_short_factor = self.rope_scaling.get("short_factor", None)
         rope_scaling_long_factor = self.rope_scaling.get("long_factor", None)
         if rope_scaling_type is None or rope_scaling_type not in ["su", "yarn"]:
-            raise ValueError(f"`rope_scaling`'s type field must be one of ['su', 'yarn'], got {rope_scaling_type}")
+            raise ValueError(
+                f"`rope_scaling`'s type field must be one of ['su', 'yarn'], got {rope_scaling_type}"
+            )
         if not (
-                isinstance(rope_scaling_short_factor, list)
-                and all(isinstance(x, (int, float)) for x in rope_scaling_short_factor)
+            isinstance(rope_scaling_short_factor, list)
+            and all(isinstance(x, (int, float)) for x in rope_scaling_short_factor)
         ):
             raise ValueError(
                 f"`rope_scaling`'s short_factor field must be a list of numbers, got {rope_scaling_short_factor}"
             )
-        if not len(rope_scaling_short_factor) == self.hidden_size // self.num_attention_heads // 2:
+        if (
+            not len(rope_scaling_short_factor)
+            == self.hidden_size // self.num_attention_heads // 2
+        ):
             raise ValueError(
                 f"`rope_scaling`'s short_factor field must have length {self.hidden_size // self.num_attention_heads // 2}, got {len(rope_scaling_short_factor)}"
             )
         if not (
-                isinstance(rope_scaling_long_factor, list)
-                and all(isinstance(x, (int, float)) for x in rope_scaling_long_factor)
+            isinstance(rope_scaling_long_factor, list)
+            and all(isinstance(x, (int, float)) for x in rope_scaling_long_factor)
         ):
             raise ValueError(
                 f"`rope_scaling`'s long_factor field must be a list of numbers, got {rope_scaling_long_factor}"
             )
-        if not len(rope_scaling_long_factor) == self.hidden_size // self.num_attention_heads // 2:
+        if (
+            not len(rope_scaling_long_factor)
+            == self.hidden_size // self.num_attention_heads // 2
+        ):
             raise ValueError(
                 f"`rope_scaling`'s long_factor field must have length {self.hidden_size // self.num_attention_heads // 2}, got {len(rope_scaling_long_factor)}"
             )

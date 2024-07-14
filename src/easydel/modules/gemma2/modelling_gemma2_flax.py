@@ -14,14 +14,12 @@ from flax.linen import combine_masks, make_causal_mask
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax.sharding import PartitionSpec
-from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 
 from easydel.etils.etils import get_logger
-from easydel.modules.attention_module import AttentionModule
-from easydel.modules.easydel_modelling_utils import EasyDeLFlaxPretrainedModel
-from easydel.modules.flax_modelling_utils import (
+from easydel.modules.attention_module import FlexibleAttentionModule
+from easydel.modules.flax_modeling_utils import (
     ACT2FN,
-    BaseJAXAttentionModule,
+    FlaxAttentionModule,
     apply_rotary_pos_emb,
     block_wise_ffn,
     control_mlp_sharding,
@@ -30,6 +28,11 @@ from easydel.modules.flax_modelling_utils import (
     precompute_freq_cis,
 )
 from easydel.modules.gemma2.gemma2_configuration import Gemma2Config as Gemma2Config
+from easydel.modules.modeling_flax_outputs import (
+    FlaxBaseModelOutput,
+    FlaxCausalLMOutput,
+)
+from easydel.modules.modeling_utils import EDPretrainedModel
 
 logger = get_logger(__name__)
 
@@ -115,7 +118,7 @@ class FlaxGemma2RotaryEmbedding(nn.Module):
         return query.astype(self.dtype), key.astype(self.dtype)
 
 
-class FlaxGemma2Attention(BaseJAXAttentionModule):
+class FlaxGemma2Attention(FlaxAttentionModule):
     config: Gemma2Config
     layer_idx: int
     dtype: jnp.dtype = jnp.float32
@@ -152,7 +155,7 @@ class FlaxGemma2Attention(BaseJAXAttentionModule):
         self.sliding_window = (
             config.sliding_window if (self.layer_idx % 2 == 0) else None
         )
-        self.attention_performer = AttentionModule(
+        self.attention_performer = FlexibleAttentionModule(
             use_sharding_constraint=self.config.use_sharding_constraint,
             block_k_major=self.config.block_k_major,
             block_b=self.config.block_b,
@@ -175,7 +178,7 @@ class FlaxGemma2Attention(BaseJAXAttentionModule):
             dtype=self.config.attn_dtype,
             partition_axis=self.config.partition_axis,
             scan_ring_attention=self.config.scan_ring_attention,
-            mesh=self.config.get_mesh(),
+            mesh=self.config.mesh,
             sm_scale=self.config.query_pre_attn_scalar**-0.5,
             axis_name=self.config.attention_axis_name,
         )
@@ -317,7 +320,7 @@ class FlaxGemma2Attention(BaseJAXAttentionModule):
 
         query_length, key_length = query_states.shape[1], key_states.shape[1]
 
-        attentions = self.attention_performer.__call__(
+        attentions = self.attention_performer(
             query_states=query_states,
             key_states=key_states,
             value_states=value_states,
@@ -483,7 +486,7 @@ class FlaxGemma2DecoderLayer(nn.Module):
         return hidden_states, attn_weight
 
 
-class FlaxGemma2PreTrainedModel(EasyDeLFlaxPretrainedModel):
+class FlaxGemma2PreTrainedModel(EDPretrainedModel):
     """An abstract class to handle weights initialization and a simple interface for downloading and loading pretrained
     models.
     """
