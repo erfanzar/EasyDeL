@@ -659,7 +659,8 @@ class CausalLanguageModelTrainer(BaseTrainer):
                     if self.arguments.remove_ckpt_after_load:
                         os.remove(self.checkpoint_path)
                 elif model_parameters is not None and self.checkpoint_path is None:
-                    logger.info("Sharding Passed Parameters")
+                    if self.arguments.do_shard_fns:
+                        logger.info("Sharding Passed Parameters")
                     if not isinstance(model_parameters, flax.core.FrozenDict):
                         logger.warn(
                             "Model Parameters should be like FrozenDict({'params': params}) make sure to "
