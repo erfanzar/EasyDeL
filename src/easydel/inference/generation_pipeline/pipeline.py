@@ -9,7 +9,6 @@ from fjformer import GenerateRNG
 from jax import lax, random
 from jax import numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec
-from transformers import PreTrainedTokenizer
 
 from easydel.inference.generation_pipeline import utils as inference_utils
 from easydel.modules.modeling_utils import EDPretrainedModel
@@ -23,7 +22,7 @@ class GenerationPipeline:
         self,
         model: EDPretrainedModel,
         params: Union[flax.core.FrozenDict, dict],
-        tokenizer: PreTrainedTokenizer,
+        tokenizer: "PreTrainedTokenizer",  # noqa #type:ignore
         generation_config: Optional[GenerationPipelineConfig] = None,
         add_params_field=None,
         seed: Optional[int] = None,
@@ -288,7 +287,6 @@ class GenerationPipeline:
         generation_state,
         sample_fn,
     ):
-
         state_sharding = inference_utils.SampleState(
             self.empty_sharding,
             self.input_sharding,
@@ -331,7 +329,6 @@ class GenerationPipeline:
         generation_state,
         sample_fn,
     ):
-
         if self.compiled_sample_fn is None:
             self._compile_sample_fn(
                 model_kwargs_sharding,
@@ -342,7 +339,6 @@ class GenerationPipeline:
 
 
 class ChatPipeline:
-
     def __init__(
         self,
         pipeline: GenerationPipeline,

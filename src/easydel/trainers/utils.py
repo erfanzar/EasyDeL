@@ -5,16 +5,10 @@ from ml_collections import ConfigDict
 from ml_collections.config_dict import placeholder
 import random
 from typing import Callable, Literal, Union, List, Optional, Any, Dict, Mapping, Tuple
-from transformers import (
-    AutoTokenizer,
-    PreTrainedTokenizerBase,
-    BertTokenizer,
-    BertTokenizerFast,
-)
+
 from jax import numpy as jnp
 import numpy as np
 import logging
-from datasets import Dataset, Value
 from easydel.etils.etils import get_logger
 
 logger = get_logger(__name__)
@@ -210,7 +204,7 @@ class DataCollatorForCompletionOnlyLM:
 
     def __init__(
         self,
-        tokenizer: Union[str, PreTrainedTokenizerBase],
+        tokenizer: Union[str, "PreTrainedTokenizerBase"],  # type:ignore #noqa
         response_template: Union[str, List[int]],
         instruction_template: Optional[Union[str, List[int]]] = None,
         *args,
@@ -218,6 +212,8 @@ class DataCollatorForCompletionOnlyLM:
         ignore_index: int = -100,
         **kwargs,
     ):
+        from transformers import AutoTokenizer
+
         if isinstance(tokenizer, str):
             tokenizer = AutoTokenizer.from_pretrained(tokenizer)
             self.tokenizer = tokenizer
@@ -252,6 +248,11 @@ class DataCollatorForCompletionOnlyLM:
         self.ignore_index = ignore_index
 
     def _whole_word_mask(self, input_tokens: List[str], max_predictions=512):
+        from transformers import (
+            BertTokenizer,
+            BertTokenizerFast,
+        )
+
         if not isinstance(self.tokenizer, (BertTokenizer, BertTokenizerFast)):
             warnings.warn(
                 "DataCollatorForWholeWordMask is only suitable for BertTokenizer-like tokenizers. "
@@ -476,22 +477,9 @@ class DataCollatorForCompletionOnlyLM:
         return batch
 
 
-FORMAT_MAPPING = {
-    "chatml": [
-        {
-            "content": Value(dtype="string", id=None),
-            "role": Value(dtype="string", id=None),
-        }
-    ],
-    "instruction": {
-        "completion": Value(dtype="string", id=None),
-        "prompt": Value(dtype="string", id=None),
-    },
-}
-
-
 def conversations_formatting_function(
-    tokenizer: AutoTokenizer, messages_field: Literal["messages", "conversations"]
+    tokenizer: "AutoTokenizer",  # type:ignore #noqa
+    messages_field: Literal["messages", "conversations"],
 ):
     r"""
     return a callable function that takes in a "messages" dataset and returns a formatted dataset, based on the tokenizer
@@ -516,7 +504,7 @@ def conversations_formatting_function(
     return format_dataset
 
 
-def instructions_formatting_function(tokenizer: AutoTokenizer):
+def instructions_formatting_function(tokenizer: "AutoTokenizer"):  # type:ignore #noqa
     r"""from TRL
     return a callable function that takes in an "instructions" dataset and returns a formatted dataset, based on the tokenizer
     apply chat template to the dataset
@@ -546,7 +534,7 @@ def instructions_formatting_function(tokenizer: AutoTokenizer):
 
 def get_formatting_func_from_dataset(
     dataset: Union[Dataset, "ConstantLengthDataset"],  # type: ignore # noqa
-    tokenizer: AutoTokenizer,
+    tokenizer: "AutoTokenizer",  # type:ignore #noqa
 ) -> Optional[Callable]:
     r"""from TRL
     Finds the correct formatting function based on the dataset structure. Currently supported datasets are:
@@ -560,6 +548,21 @@ def get_formatting_func_from_dataset(
     Returns:
         Callable: Formatting function if the dataset format is supported else None
     """
+    from datasets import Dataset, Value
+
+    FORMAT_MAPPING = {
+        "chatml": [
+            {
+                "content": Value(dtype="string", id=None),
+                "role": Value(dtype="string", id=None),
+            }
+        ],
+        "instruction": {
+            "completion": Value(dtype="string", id=None),
+            "prompt": Value(dtype="string", id=None),
+        },
+    }
+
     if isinstance(dataset, Dataset):
         if "messages" in dataset.features:
             if dataset.features["messages"] == FORMAT_MAPPING["chatml"]:

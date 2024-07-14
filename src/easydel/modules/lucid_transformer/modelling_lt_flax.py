@@ -9,8 +9,7 @@ from einops import rearrange
 from fjformer.linen import Dense
 from flax import linen as nn
 from jax import numpy as jnp
-from transformers import FlaxPreTrainedModel
-
+from easydel.modules.modeling_utils import EDPretrainedModel
 from easydel.modules.flax_modeling_utils import FlaxAttentionModule
 from easydel.modules.lucid_transformer.lt_configuration import (
     FlaxLTConfig as FlaxLTConfig,
@@ -134,7 +133,7 @@ class LTCollection(nn.Module):
         return hidden_state, cache
 
 
-class FlaxLTPretrainedModel(FlaxPreTrainedModel):
+class FlaxLTPretrainedModel(EDPretrainedModel):
     module_class: nn.Module = None
     module_config: FlaxLTConfig
     base_model_prefix: str = "model"
