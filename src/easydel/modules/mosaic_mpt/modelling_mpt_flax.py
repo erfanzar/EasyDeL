@@ -129,7 +129,7 @@ class FlaxMptAttention(FlaxAttentionModule):
             mesh=self.config.mesh,
             sm_scale=1 / math.sqrt(self.head_dim),
             axis_name=self.config.attention_axis_name,
-            base_module_class=self.config,
+            base_config=self.config,
         )
 
     def __call__(
