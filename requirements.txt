@@ -7,8 +7,8 @@ msgpack~=1.0.7
 ipython~=8.17.2
 tqdm~=4.64.1
 datasets~=2.19.2
-tensorflow~=2.16.1 
-tensorboard~=2.16.2
+tensorflow~=2.17.0
+tensorboard~=2.17.0
 numpy~=1.26.2
 tensorflow-datasets~=4.9.6
 scipy==1.13.1
