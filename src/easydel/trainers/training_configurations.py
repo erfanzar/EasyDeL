@@ -502,6 +502,10 @@ class TrainArguments:
         """
         if not metrics:
             return
+        try:
+            from torch import Tensor
+        except:
+            Tensor = None
         with jax.spmd_mode("allow_all"):
             # Log to WandB
             if self.use_wandb and wandb is not None and wandb.run is not None:
@@ -509,7 +513,7 @@ class TrainArguments:
                 for key, value in metrics.items():
                     if isinstance(value, (list, tuple, np.ndarray)):
                         wandb_metrics[key] = wandb.Histogram(value)
-                    elif isinstance(value, (jnp.ndarray, "torch.Tensor")):  # type: ignore
+                    elif isinstance(value, (jnp.ndarray, Tensor)):
                         wandb_metrics[key] = wandb.Histogram(
                             value.cpu().numpy()
                             if hasattr(value, "cpu")
@@ -524,7 +528,7 @@ class TrainArguments:
             for key, value in metrics.items():
                 if isinstance(value, (float, int)):
                     summary_writer.scalar(key, value, step=step)
-                elif isinstance(value, (list, tuple, np.ndarray, jnp.ndarray, "torch.Tensor")):  # type: ignore
+                elif isinstance(value, (list, tuple, np.ndarray, jnp.ndarray, Tensor)):  # type: ignore
                     if hasattr(value, "cpu"):
                         value = value.cpu().numpy()
                     elif isinstance(value, jnp.ndarray):
