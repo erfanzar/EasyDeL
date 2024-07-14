@@ -141,6 +141,7 @@ class FlaxFalconAttention(FlaxAttentionModule):
             features=qkv_out_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
+            precision=self.precision,
             use_bias=config.bias,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
@@ -150,6 +151,7 @@ class FlaxFalconAttention(FlaxAttentionModule):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=config.bias,
+            precision=self.precision,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         self.rotary = FlaxFalconRotaryEmbedding(self.dtype)
@@ -160,11 +162,11 @@ class FlaxFalconAttention(FlaxAttentionModule):
             precision=self.precision,
             force_float32_tpu=True,
             attn_mechanism=config.attn_mechanism,
-            dtype=self.dtype,
+            dtype=self.config.attn_dtype,
             mesh=config.mesh,
             sm_scale=self.inv_norm_factor,
             axis_name=config.attention_axis_name,
-            base_module_class=config,
+            base_config=config,
             _do_check=False,
         )
 
@@ -373,6 +375,7 @@ class FlaxFalconMlp(nn.Module):
         self.dense_h_to_4h = Dense(
             features=self.config.ff_factor * self.config.hidden_size,
             dtype=self.dtype,
+            precision=self.precision,
             param_dtype=self.param_dtype,
             use_bias=self.config.bias,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
@@ -381,6 +384,7 @@ class FlaxFalconMlp(nn.Module):
             features=self.config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
+            precision=self.precision,
             use_bias=self.config.bias,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
@@ -401,18 +405,26 @@ class FlaxFalconBlock(nn.Module):
 
         if config.new_decoder_architecture and config.num_ln_in_parallel_attn == 2:
             self.ln_attn = nn.LayerNorm(
-                epsilon=config.layer_norm_epsilon, dtype=self.dtype
+                epsilon=config.layer_norm_epsilon,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
             )
             self.ln_mlp = nn.LayerNorm(
-                epsilon=config.layer_norm_epsilon, dtype=self.dtype
+                epsilon=config.layer_norm_epsilon,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
             )
         else:
             self.input_layernorm = nn.LayerNorm(
-                epsilon=config.layer_norm_epsilon, dtype=self.dtype
+                epsilon=config.layer_norm_epsilon,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
             )
             if not config.parallel_attn:
                 self.post_attention_layernorm = nn.LayerNorm(
-                    epsilon=config.layer_norm_epsilon, dtype=self.dtype
+                    epsilon=config.layer_norm_epsilon,
+                    dtype=self.dtype,
+                    param_dtype=self.param_dtype,
                 )
         attn_block = FlaxFalconAttention
         mlp_block = FlaxFalconMlp
