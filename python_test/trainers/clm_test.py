@@ -10,9 +10,9 @@ sys.path.append(
         "../../src",
     )
 )  # noqa: E402
-import jax  # noqa: E402
+import jax  # noqa
 
-jax.config.update("jax_platform_name", "cpu")  # CPU Test !
+# jax.config.update("jax_platform_name", "cpu")  # CPU Test !
 import flax.core  # noqa: E402
 from datasets import Dataset, IterableDataset  # noqa: E402
 from easydel import (  # noqa: E402
@@ -106,6 +106,7 @@ def main(use_iterable_dataset: bool):
             # save_steps=50,
             # save_total_limit=1,
             do_last_save=True,
+            training_time="80Min"
         ),
         dataset_train=example_train_data,
         dataset_eval=example_eval_data,

@@ -479,9 +479,8 @@ class TrainArguments:
         )
 
     def ensure_training_time(self, time_passed):
-        if (
-            self.training_time is not None
-            and time_passed > self.training_time
+        if self.training_time is not None and time_passed > self._time_to_seconds(
+            self.training_time
         ):
             raise EasyDeLTimerError("Time Out")
 
