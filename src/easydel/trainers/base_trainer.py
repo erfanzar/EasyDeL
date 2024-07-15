@@ -147,21 +147,30 @@ class BaseTrainer(abc.ABC):
             wandb.finish()
 
     def _start_capturing_memory(
-        self, dir_prefix: str = "/dev/shm" if sys.platform != "win32" else "."
+        self,
+        dir_prefix: str = "/dev/shm" if sys.platform != "win32" else ".",
     ):
         def _start():
-            while not self.arguments.stop_capturing_memory:
-                information_queries = {
-                    f"accelerators/{device.replace('_', ' ')} ({key})": float(
-                        info[key].replace("%", "").replace("GB", "")
+            try:
+                while not self.arguments._stop_capturing_memory:
+                    information_queries = {
+                        f"accelerators/{device.replace('_', ' ')} ({key})": float(
+                            info[key].replace("%", "").replace("GB", "")
+                        )
+                        for key in ["Used", "Usage Percent"]
+                        for device, info in get_capacity_matrix(
+                            dir_prefix=dir_prefix
+                        ).items()
+                    }
+                    self.arguments._captured_memory = information_queries
+                    time.sleep(1.5)
+            except FileNotFoundError as err:
+                if "directory: 'go'" in err.__str__():
+                    logger.warn(
+                        "in order to capture memory you need to have `go-lang` already installed.(ignoring memory capture action)"
                     )
-                    for key in ["Used", "Usage Percent"]
-                    for device, info in get_capacity_matrix(
-                        dir_prefix=dir_prefix
-                    ).items()
-                }
-                self.arguments._captured_memory = information_queries
-                time.sleep(1.5)
+                else:
+                    raise FileNotFoundError(err)
 
         return threading.Thread(target=_start)
 
