@@ -441,7 +441,7 @@ class EDPretrainedConfig(PretrainedConfig):
 
         string = f"{self.__class__.__name__}(\n"
         for k, v in self.__dict__.items():
-            if not self._show_private_attrs and TYPE_SEP in k and TYPE_SEP in k:
+            if not self._show_private_attrs and VALUE_SEP in k and TYPE_SEP in k:
                 continue
             if not k.startswith("_"):
                 try:
