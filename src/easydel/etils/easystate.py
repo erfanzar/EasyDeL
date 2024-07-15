@@ -1,7 +1,7 @@
 import copy
 import gc
 import os
-from typing import Any, Callable, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, List, Mapping, Optional, Sequence, Tuple, Union, Dict
 
 import fjformer
 import jax.tree_util
@@ -13,12 +13,12 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import numpy as jnp
 from jax.sharding import Mesh, PartitionSpec
 from safetensors._safetensors_rust import SafetensorError
-
 from easydel.etils.auto_tx import get_optimizer_and_scheduler
 from easydel.etils.errors import EasyDeLRuntimeError
-from easydel.etils.etils import AVAILABLE_OPTIMIZERS, AVAILABLE_SCHEDULERS
+from easydel.etils.etils import AVAILABLE_OPTIMIZERS, AVAILABLE_SCHEDULERS, get_logger
 from easydel.etils.partition_module import PartitionAxis
 
+logger = get_logger(__name__)
 TYPE_SEP = "<*TYPE*>"
 VALUE_SEP = "<*VALUE*>"
 
@@ -136,12 +136,12 @@ class EasyDeLState(struct.PyTreeNode):
     """
 
     step: int
-    module: Optional["EDPretrainedModel"] = struct.field(  # type:ignore # noqa
-        pytree_node=False
-    )
-    module_config: Optional["EDPretrainedConfig"] = struct.field(  # type:ignore # noqa
-        pytree_node=False
-    )
+    module: Optional[
+        "easydel.modules.modeling_utils.EDPretrainedModel"  # type:ignore # noqa
+    ] = struct.field(pytree_node=False)
+    module_config: Optional[
+        "easydel.modules.modeling_utils.EDPretrainedConfig"  # type:ignore # noqa
+    ] = struct.field(pytree_node=False)
     module_config_args: Optional[dict] = struct.field(pytree_node=True)
     apply_fn: Callable = struct.field(pytree_node=False)
     params: core.FrozenDict[str, Any] = struct.field(pytree_node=True)
@@ -194,7 +194,7 @@ class EasyDeLState(struct.PyTreeNode):
         *,
         apply_fn: Callable,
         params: Union[core.FrozenDict[str, Any], Mapping[str, Any]],
-        tx: optax.GradientTransformation,
+        tx: Optional[optax.GradientTransformation] = None,
         tx_init: Optional[dict] = None,
         hyperparameters: Optional[dict] = None,
         module: Optional["EDPretrainedModel"] = None,  # type:ignore #noqa
@@ -226,7 +226,11 @@ class EasyDeLState(struct.PyTreeNode):
         params_with_opt = (
             params["params"] if OVERWRITE_WITH_GRADIENT in params else params
         )
-        opt_state = tx.init(params_with_opt)
+        if tx is None:
+            logger.warn(
+                "`tx` is set to None in case that you want to train model first add a tx. (use `state.replace_tx`)"
+            )
+        opt_state = tx.init(params_with_opt) if tx is not None else None
         if module_config is not None:
             module_config = copy.deepcopy(module_config)
             cls.safe_dict(module_config.__dict__)
@@ -237,12 +241,18 @@ class EasyDeLState(struct.PyTreeNode):
             params=params,
             tx=tx,
             opt_state=opt_state,
-            tx_init=cls.safe_dict(tx_init),
+            tx_init=cls.safe_dict(tx_init or {}),
             hyperparameters=hyperparameters,
             module_config=module_config,
             module_config_args=None,
             **kwargs,
         )
+
+    def replace_tx(self, tx: optax.GradientTransformation):
+        """
+        replaces or set a new optimizer/tx
+        """
+        return self.replace(tx=tx)
 
     @classmethod
     def load(
@@ -578,6 +588,9 @@ class EasyDeLState(struct.PyTreeNode):
         Returns:
             EasyDeLState: A new EasyDeLState object with an initialized optimizer state.
         """
+        assert (
+            self.tx is not None
+        ), "`tx` is set to None you have to first add an optimizer."
         if self.opt_state is None:
             params_with_opt = (
                 self.params["params"]
@@ -842,7 +855,7 @@ class EasyDeLState(struct.PyTreeNode):
         string = (
             f"{self.__class__.__name__}("
             f"\n\tstep = {self.step}"
-            f"\n\tmodule = {make_depth(self.module)}"
+            f"\n\tmodule = {make_depth(self.module.__class__.__name__)}"
             f"\n\tmodule_config = {make_depth(self.module_config)}"
             f"\n\tapply_fn: Callable = {make_depth(self.apply_fn)}"
             f"\n\tparams : {params_size} Parameters"
@@ -951,3 +964,60 @@ class EasyDeLState(struct.PyTreeNode):
             A string that is a valid python expression
         """
         return self.__str__()
+
+    def generate(
+        self,
+        input_ids: jnp.ndarray,
+        generation_config: Optional[
+            "transformers.GenerationConfig"  # noqa # type:ignore
+        ] = None,
+        prng_key: Optional[jnp.ndarray] = None,
+        trace: bool = True,
+        logits_processor: Optional[
+            "transformers.FlaxLogitsProcessorList"  # noqa # type:ignore
+        ] = None,
+        **kwargs,
+    ):
+        r"""
+        Generates sequences of token ids for models with a language modeling head.
+
+        Parameters:
+            input_ids (`jnp.ndarray` of shape `(batch_size, sequence_length)`):
+                The sequence used as a prompt for the generation.
+            generation_config (`~generation.GenerationConfig`, *optional*):
+                The generation configuration to be used as base parametrization for the generation call. `**kwargs`
+                passed to generate matching the attributes of `generation_config` will override them. If
+                `generation_config` is not provided, the default will be used, which had the following loading
+                priority: 1) from the `generation_config.json` model file, if it exists; 2) from the model
+                configuration. Please note that unspecified parameters will inherit [`~generation.GenerationConfig`]'s
+                default values, whose documentation should be checked to parameterize generation.
+            trace (`bool`, *optional*, defaults to `True`):
+                Whether to trace generation. Setting `trace=False` should only be used for debugging and will lead to a
+                considerably slower runtime.
+            params (`Dict[str, jnp.ndarray]`, *optional*):
+                Optionally the model parameters can be passed. Can be useful for parallelized generation.
+            logits_processor (`FlaxLogitsProcessorList `, *optional*):
+                Custom logits processors that complement the default logits processors built from arguments and
+                generation config. If a logit processor is passed that is already created with the arguments or a
+                generation config an error is thrown. This feature is intended for advanced users.
+            kwargs (`Dict[str, Any]`, *optional*):
+                Ad hoc parametrization of `generate_config` and/or additional model-specific kwargs that will be
+                forwarded to the `forward` function of the model. If the model is an encoder-decoder model, encoder
+                specific kwargs should not be prefixed and decoder specific kwargs should be prefixed with *decoder_*.
+
+        Return:
+            [`~utils.ModelOutput`].
+
+        """
+        params = self.params.get("params", None)
+        if params is None:
+            params = self.params
+        return self.module.generate(
+            input_ids=input_ids,
+            generation_config=generation_config,
+            prng_key=prng_key,
+            trace=trace,
+            params={"params": params},
+            logits_processor=logits_processor,
+            **kwargs,
+        )

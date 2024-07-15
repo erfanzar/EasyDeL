@@ -14,11 +14,14 @@ except ModuleNotFoundError:
 
 import json
 import time
-
-from aiohttp import web
-
 from easydel.etils.etils import get_logger
 from easydel.inference.generation_pipeline.pipeline import ChatPipeline
+
+try:
+    from aiohttp import web
+except ModuleNotFoundError:
+    get_logger(__name__).warn("`aiohttp` not found ApiEngine won't work as excepted.")
+    web = None
 
 
 class ApiEngine:

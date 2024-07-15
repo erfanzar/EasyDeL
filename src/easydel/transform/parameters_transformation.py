@@ -262,6 +262,7 @@ def easystate_to_huggingface_model(
     select_params_field: bool = True,
     rnn_based_or_rwkv: bool = False,
     auto_correct: bool = True,
+    use_meta_torch: bool = True,
 ):
     if not rnn_based_or_rwkv and auto_correct:
         if isinstance(
@@ -289,9 +290,17 @@ def easystate_to_huggingface_model(
     )
     import torch
 
-    with torch.device("meta"):
+    if use_meta_torch:
+        with torch.device("meta"):
+            model = base_huggingface_module(
+                config=config,
+                **base_huggingface_module_kwarguments,
+            )
+        model.load_state_dict(state_dict, assign=True, strict=True)
+    else:
         model = base_huggingface_module(
-            config=config, **base_huggingface_module_kwarguments
+            config=config,
+            **base_huggingface_module_kwarguments,
         )
-    model.load_state_dict(state_dict, assign=True, strict=True)
+        model.load_state_dict(state_dict, assign=True, strict=True)
     return model
