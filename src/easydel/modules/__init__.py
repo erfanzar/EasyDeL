@@ -11,6 +11,7 @@ from easydel.modules.auto_models import (
     AutoEasyDeLConfig as AutoEasyDeLConfig,
     AutoEasyDeLModelForCausalLM as AutoEasyDeLModelForCausalLM,
     AutoShardAndGatherFunctions as AutoShardAndGatherFunctions,
+    AutoStateForCausalLM as AutoStateForCausalLM,
     get_modules_by_type as get_modules_by_type,
 )
 from easydel.modules.cohere import (

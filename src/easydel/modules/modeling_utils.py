@@ -83,6 +83,8 @@ class EDPretrainedConfig(PretrainedConfig):
             Specify the backward pass kernel for flash attention
     """
 
+    _show_private_attrs: bool = False
+
     def __init__(
         self,
         axis_dims: Sequence[int] = (1, -1, 1, 1),
@@ -435,8 +437,12 @@ class EDPretrainedConfig(PretrainedConfig):
         Returns:
             A string representation of the object
         """
+        from easydel.etils.easystate import VALUE_SEP, TYPE_SEP
+
         string = f"{self.__class__.__name__}(\n"
         for k, v in self.__dict__.items():
+            if not self._show_private_attrs and TYPE_SEP in k and TYPE_SEP in k:
+                continue
             if not k.startswith("_"):
                 try:
                     repr_src = f"\t{k} : " + v.__str__().replace("\n", "\n\t") + "\n"
@@ -665,7 +671,7 @@ class EDPretrainedModel(FlaxPreTrainedModel):
                     )
                 except TypeError:
                     pass
-        return string + ")"
+        return string.strip() + "\n)"
 
     def __str__(self):
         """The __str__ function is called when you use the print function or when str() is used.

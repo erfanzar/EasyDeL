@@ -4,7 +4,6 @@ import re
 import warnings
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Type
 
-# import fjformer.linen.linen
 import flax.traverse_util
 import jax.numpy
 from fjformer import make_shard_and_gather_fns, match_partition_rules
@@ -19,6 +18,7 @@ from easydel.modules.modeling_utils import (
     EDPretrainedModel,
 )
 from easydel.transform.parameters_transformation import torch_dict_to_easydel_params
+from easydel.etils.easystate import EasyDeLState
 
 logger = get_logger(name=__name__)
 
@@ -801,4 +801,62 @@ class AutoShardAndGatherFunctions:
             flatten=flatten,
             input_shape=input_shape,
             depth_target=depth_target,
+        )
+
+
+class AutoStateForCausalLM:
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str,
+        device=jax.devices("cpu")[0],
+        dtype: jax.numpy.dtype = jax.numpy.float32,
+        param_dtype: jax.numpy.dtype = jax.numpy.float32,
+        precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
+        sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
+        sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+        partition_axis: PartitionAxis = PartitionAxis(),
+        shard_attention_computation: bool = True,
+        input_shape: Tuple[int, int] = (1, 1),
+        shard_fns: Optional[Mapping[tuple, Callable] | dict] = None,
+        backend: Optional[str] = None,
+        config_kwargs: Optional[Mapping[str, Any]] = None,
+        auto_shard_params: bool = False,
+        partition_rules: Optional[Tuple[Tuple[str, PartitionSpec], ...]] = None,
+        load_in_8bit: bool = False,
+        bit_targeted_params: Optional[List[str]] = None,
+        verbose_params: bool = False,
+        safe: bool = True,
+        from_torch: bool = True,
+        **kwargs,
+    ) -> EasyDeLState:
+        model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
+            pretrained_model_name_or_path=pretrained_model_name_or_path,
+            device=device,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            sharding_axis_dims=sharding_axis_dims,
+            sharding_axis_names=sharding_axis_names,
+            partition_axis=partition_axis,
+            shard_attention_computation=shard_attention_computation,
+            input_shape=input_shape,
+            shard_fns=shard_fns,
+            backend=backend,
+            config_kwargs=config_kwargs,
+            auto_shard_params=auto_shard_params,
+            partition_rules=partition_rules,
+            load_in_8bit=load_in_8bit,
+            bit_targeted_params=bit_targeted_params,
+            verbose_params=verbose_params,
+            safe=safe,
+            from_torch=from_torch,
+            **kwargs,
+        )
+        return EasyDeLState.create(
+            apply_fn=model.__call__,
+            params=params,
+            module=model,
+            module_config=model.config,
+            tx=None,
         )
