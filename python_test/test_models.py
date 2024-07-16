@@ -1,7 +1,7 @@
 import gc
 import os
 import sys
-from unittest import TestCase
+import unittest
 
 from fjformer import make_shard_and_gather_fns, match_partition_rules
 
@@ -31,7 +31,7 @@ from jax import numpy as jnp
 torch.manual_seed(42)
 
 
-class EasyModelsTest(TestCase):
+class EasyModelsTest(unittest.TestCase):
     def setUp(self) -> None:
         self.batch_size: int = 1
         self.vocab_size: int = 32000
@@ -602,8 +602,8 @@ class EasyModelsTest(TestCase):
 
 
 if __name__ == "__main__":
-    # unittest.main()
-    test = EasyModelsTest()
-    test.setUp()
-    test.test_gemma2()
+    unittest.main()
+    # test = EasyModelsTest()
+    # test.setUp()
+    # test.test_gemma2()
     # test.test_llama()

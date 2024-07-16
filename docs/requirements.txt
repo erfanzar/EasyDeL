@@ -8,7 +8,6 @@ sphinx
 sphinx-autobuild
 sphinx-autodoc-typehints
 sphinx-book-theme
-myst-parser
 sphinx-book-theme
 ipykernel
 myst_nb
