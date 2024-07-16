@@ -1,7 +1,13 @@
 import os
 import sys
 
-os.environ["JAX_TRACEBACK_FILTERING"] = "off"
+os.environ["JAX_TRACEBACK_FILTERING"] = "off"    
+os.environ["XLA_FLAGS"] = (
+    os.environ.get("XLA_FLAGS", "") + " --xla_gpu_enable_command_buffer="
+)
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.99"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 dirname = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(dirname)  # noqa: E402
 sys.path.append(
@@ -25,9 +31,9 @@ from easydel import (  # noqa: E402
 
 from jax import numpy as jnp, random  # noqa: E402
 
-NUM_TRAIN_EXAMPLES = 100000
-NUM_EVAL_EXAMPLES = 12
-TOTAL_BATCH_SIZE = 2
+TOTAL_BATCH_SIZE = 32
+NUM_TRAIN_EXAMPLES = TOTAL_BATCH_SIZE * 15
+NUM_EVAL_EXAMPLES = TOTAL_BATCH_SIZE * 15
 NUM_TRAIN_EPOCHS = 3
 
 
