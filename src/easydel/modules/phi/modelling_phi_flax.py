@@ -3,14 +3,12 @@ import math
 from typing import Any, Optional, Tuple, Union
 
 import chex
-import fjformer
 import flax.linen.partitioning
 import jax.lax
 from chex import Array
-from fjformer.linen import Dense
 from flax import linen as nn
 from flax.core import FrozenDict, freeze, unfreeze
-from flax.linen import combine_masks
+from flax.linen import Dense, combine_masks
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax import numpy as jnp
@@ -735,12 +733,12 @@ class FlaxPhiForCausalLMModule(nn.Module):
         )
         outputs = (res.last_hidden_state, res.hidden_states, res.attentions)
         if self.config.tie_word_embeddings:
-            shared_kernel = self.model.variables["params"]["embed_tokens"]["embedding"]
-            shared_kernel = fjformer.linen.control_quantization(
-                shared_kernel, self.param_dtype
-            ).T
+            shared_kernel = self.model.variables["params"]["embed_tokens"][
+                "embedding"
+            ].T.astype(self.param_dtype)
             lm_logits = self.lm_head.apply(
-                {"params": {"kernel": shared_kernel}}, res.last_hidden_state
+                {"params": {"kernel": shared_kernel}},
+                res.last_hidden_state,
             )
         else:
             lm_logits = self.lm_head(res.last_hidden_state)

@@ -21,7 +21,7 @@ from easydel import (  # noqa: E402
     FlaxMistralForCausalLM,
     MistralConfig,
     TrainArguments,
-    EasyDeLXRapTureConfig,
+    LoraRaptureConfig,
 )
 
 from jax import numpy as jnp, random  # noqa: E402
@@ -105,7 +105,7 @@ def main(use_iterable_dataset: bool):
             z_loss=0.0001,
             train_on_inputs=True,
             do_last_save=True,
-            rapture_config=EasyDeLXRapTureConfig(
+            rapture_config=LoraRaptureConfig(
                 parameters=flax.core.FrozenDict({"params": params}),
                 lora_dim=64,
                 fully_fine_tune_parameters=["o_proj"],

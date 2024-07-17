@@ -6,10 +6,10 @@ import chex
 import flax
 import jax.nn.initializers
 from einops import rearrange
-from fjformer.linen import Dense
 from flax import linen as nn
+from flax.linen import Dense
 from jax import numpy as jnp
-from easydel.modules.modeling_utils import EDPretrainedModel
+
 from easydel.modules.flax_modeling_utils import FlaxAttentionModule
 from easydel.modules.lucid_transformer.lt_configuration import (
     FlaxLTConfig as FlaxLTConfig,
@@ -18,6 +18,7 @@ from easydel.modules.modeling_flax_outputs import (
     FlaxBaseModelOutput,
     FlaxCausalLMOutput,
 )
+from easydel.modules.modeling_utils import EDPretrainedModel
 
 ACT2CLS = {
     "gelu": nn.gelu,

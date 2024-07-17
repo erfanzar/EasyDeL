@@ -5,17 +5,20 @@ from dataclasses import dataclass
 from typing import Any, Callable, Literal, Optional, Sequence, Tuple, Union
 
 import chex
-import fjformer.linen
 import flax
+import flax.linen
 import jax
+from fjformer.checkpoint import CheckpointManager
+from fjformer.custom_array import Array8Bit
+from fjformer.sharding import match_partition_rules
 from flax.core import FrozenDict, unfreeze
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import numpy as jnp
 from jax.experimental.mesh_utils import create_device_mesh
 from jax.sharding import Mesh, PartitionSpec
-
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_flax_utils import FlaxPreTrainedModel
+
 from easydel.etils.easystate import EasyDeLState
 from easydel.etils.etils import get_logger
 from easydel.etils.partition_module import PartitionAxis
@@ -437,7 +440,7 @@ class EDPretrainedConfig(PretrainedConfig):
         Returns:
             A string representation of the object
         """
-        from easydel.etils.easystate import VALUE_SEP, TYPE_SEP
+        from easydel.etils.easystate import TYPE_SEP, VALUE_SEP
 
         string = f"{self.__class__.__name__}(\n"
         for k, v in self.__dict__.items():
@@ -503,7 +506,7 @@ class EDPretrainedModel(FlaxPreTrainedModel):
         if partition_rules is None:
             partition_rules = self.config.get_partition_rules(True)
         if partition_specs is None:
-            partition_specs = fjformer.match_partition_rules(
+            partition_specs = match_partition_rules(
                 partition_rules, self.params_shape_tree
             )
         return jax.tree_util.tree_map(
@@ -745,7 +748,33 @@ class EDPretrainedModel(FlaxPreTrainedModel):
     def to_8bit(params, quantization_fields=None):
         if quantization_fields is None:
             quantization_fields = ["kernel", "embedding"]
-        return fjformer.linen.quantize_int8_parameters(quantization_fields, params)
+
+        def quantize_params(params: dict) -> dict:
+            """Quantizes model parameters using Array8Bit.
+
+            Args:
+                params: A dictionary of model parameters.
+
+            Returns:
+                A dictionary of quantized model parameters.
+            """
+
+            def q(path: str, array: Any) -> Array8Bit:
+                """Quantizes a single parameter array."""
+                path = [p for p in path[0].key]
+                for field in quantization_fields:
+                    if field in path:
+                        return Array8Bit.quantize(array, dtype=array.dtype)
+                return array
+
+            return unflatten_dict(
+                jax.tree_util.tree_map_with_path(
+                    q,
+                    flatten_dict(params),
+                )
+            )
+
+        return quantize_params(params)
 
     def _md_info(self):
         md = f"""
@@ -860,9 +889,9 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
         if not os.path.exists(os.path.join(save_directory, "README.md")):
             open(os.path.join(save_directory, "README.md"), "w").write(self._md_info())
         func = (
-            fjformer.checkpoint.CheckpointManager.save_checkpoint_safe
+            CheckpointManager.save_checkpoint_safe
             if (safe)
-            else fjformer.checkpoint.CheckpointManager.save_state_to_file
+            else CheckpointManager.save_state_to_file
         )
         func(
             path=output_model_file,
@@ -934,8 +963,14 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
         from transformers import GenerationConfig
         from transformers.utils import (
             cached_file as _cached_file,
+        )
+        from transformers.utils import (
             download_url as _download_url,
+        )
+        from transformers.utils import (
             is_offline_mode as _is_offline_mode,
+        )
+        from transformers.utils import (
             is_remote_url as _is_remote_url,
         )
 
@@ -1102,14 +1137,14 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
             **model_kwargs,
         )
         if safe:
-            state, _ = fjformer.checkpoint.CheckpointManager.load_checkpoint_safe(
+            state, _ = CheckpointManager.load_checkpoint_safe(
                 path=resolved_archive_file,
                 mismatch_allowed=mismatch_allowed,
                 verbose=verbose,
                 shard_fns=shard_fns,
             )
         else:
-            state = fjformer.checkpoint.CheckpointManager.load_checkpoint(
+            state = CheckpointManager.load_checkpoint(
                 path=resolved_archive_file,
                 mismatch_allowed=mismatch_allowed,
                 verbose=verbose,

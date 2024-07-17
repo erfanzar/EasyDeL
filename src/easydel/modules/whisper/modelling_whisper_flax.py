@@ -3,14 +3,12 @@ import random
 from functools import partial
 from typing import Any, Optional, Tuple, Union
 
-import fjformer
 import flax.linen
 import jax
 import jax.numpy as jnp
-from fjformer import linen as nn
-from fjformer.linen import Dense
+from flax import linen as nn
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
-from flax.linen import combine_masks, make_causal_mask
+from flax.linen import Dense, combine_masks, make_causal_mask
 from flax.linen import partitioning as nn_partitioning
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
@@ -1267,13 +1265,10 @@ class FlaxWhisperForConditionalGenerationModule(nn.Module):
         if self.config.tie_word_embeddings:
             shared_embedding = self.model.decoder.embed_tokens.variables["params"][
                 "embedding"
-            ]
-
-            shared_embedding = fjformer.linen.control_quantization(
-                shared_embedding, self.param_dtype
-            ).T
+            ].T.astype(self.param_dtype)
             lm_logits = self.lm_head.apply(
-                {"params": {"kernel": shared_embedding}}, hidden_states
+                {"params": {"kernel": shared_embedding}},
+                hidden_states,
             )
         else:
             lm_logits = self.lm_head(hidden_states)
@@ -1385,13 +1380,10 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
             if self.config.tie_word_embeddings:
                 shared_embedding = module.model.decoder.embed_tokens.variables[
                     "params"
-                ]["embedding"]
-
-                shared_embedding = fjformer.linen.control_quantization(
-                    shared_embedding, self.param_dtype
-                ).T
+                ]["embedding"].T.astype(self.param_dtype)
                 lm_logits = module.lm_head.apply(
-                    {"params": {"kernel": shared_embedding}}, hidden_states
+                    {"params": {"kernel": shared_embedding}},
+                    hidden_states,
                 )
             else:
                 lm_logits = module.lm_head(hidden_states)

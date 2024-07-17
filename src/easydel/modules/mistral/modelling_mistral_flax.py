@@ -4,13 +4,11 @@ import typing
 from typing import Dict, Optional, Tuple, Union
 
 import chex
-import fjformer
 import jax
 import transformers
-from fjformer.linen import Dense
 from flax import linen as nn
 from flax.core import FrozenDict, freeze, unfreeze
-from flax.linen import combine_masks
+from flax.linen import Dense, combine_masks
 from flax.linen import partitioning as nn_partitioning
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import Array, lax
@@ -1037,12 +1035,10 @@ class FlaxMistralForCausalLMModule(nn.Module):
         if self.config.tie_word_embeddings:
             shared_kernel = self.transformer.variables["params"]["embed_tokens"][
                 "embedding"
-            ]
-            shared_kernel = fjformer.linen.control_quantization(
-                shared_kernel, self.param_dtype
-            ).T
+            ].T.astype(self.param_dtype)
             lm_logits = self.lm_head.apply(
-                {"params": {"kernel": shared_kernel}}, hidden_states
+                {"params": {"kernel": shared_kernel}},
+                hidden_states,
             )
         else:
             lm_logits = self.lm_head(hidden_states)
@@ -1491,12 +1487,10 @@ class FlaxVisionMistralForCausalLMModule(nn.Module):
         if self.config.tie_vision_embeddings:
             shared_kernel = self.transformer.variables["params"]["embed_vision"][
                 "embedding"
-            ]
-            shared_kernel = fjformer.linen.control_quantization(
-                shared_kernel, self.param_dtype
-            ).T
+            ].T.astype(self.param_dtype)
             vision_logits = self.vision_head.apply(
-                {"params": {"kernel": shared_kernel}}, hidden_states
+                {"params": {"kernel": shared_kernel}},
+                hidden_states,
             )
         else:
             vision_logits = self.vision_head(hidden_states)
@@ -1504,12 +1498,10 @@ class FlaxVisionMistralForCausalLMModule(nn.Module):
         if self.config.tie_word_embeddings:
             shared_kernel = self.transformer.variables["params"]["embed_tokens"][
                 "embedding"
-            ]
-            shared_kernel = fjformer.linen.control_quantization(
-                shared_kernel, self.param_dtype
-            ).T
+            ].T.astype(self.param_dtype)
             lm_logits = self.lm_head.apply(
-                {"params": {"kernel": shared_kernel}}, hidden_states
+                {"params": {"kernel": shared_kernel}},
+                hidden_states,
             )
         else:
             lm_logits = self.lm_head(hidden_states)

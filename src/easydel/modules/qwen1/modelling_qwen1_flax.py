@@ -2,15 +2,13 @@ import math
 from typing import Optional, Tuple, Union
 
 import chex
-import fjformer
 import flax.linen
 import jax
 import jax.numpy as jnp
 from einops import einops, rearrange
-from fjformer import linen as nn
-from fjformer.linen import Dense
+from flax import linen as nn
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
-from flax.linen import combine_masks, make_causal_mask
+from flax.linen import Dense, combine_masks, make_causal_mask
 from flax.linen import partitioning as nn_partitioning
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
@@ -1268,12 +1266,12 @@ class FlaxQwen1ForCausalLMModule(nn.Module):
         hidden_states = outputs[0]
 
         if self.config.tie_word_embeddings:
-            shared_kernel = self.model.variables["params"]["wte"]["embedding"]
-            shared_kernel = fjformer.linen.control_quantization(
-                shared_kernel, self.param_dtype
-            ).T
+            shared_kernel = self.model.variables["params"]["wte"]["embedding"].T.astype(
+                self.param_dtype
+            )
             lm_logits = self.lm_head.apply(
-                {"params": {"kernel": shared_kernel}}, hidden_states
+                {"params": {"kernel": shared_kernel}},
+                hidden_states,
             )
         else:
             lm_logits = self.lm_head(hidden_states)

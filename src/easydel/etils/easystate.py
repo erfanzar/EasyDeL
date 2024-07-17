@@ -1,12 +1,12 @@
 import copy
 import gc
 import os
-from typing import Any, Callable, List, Mapping, Optional, Sequence, Tuple, Union, Dict
+from typing import Any, Callable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import fjformer
 import jax.tree_util
 import optax
-from flax import core, struct
+from flax import core, struct, traverse_util
 from flax.core import FrozenDict
 from flax.linen.fp8_ops import OVERWRITE_WITH_GRADIENT
 from flax.traverse_util import flatten_dict, unflatten_dict
@@ -17,6 +17,7 @@ from easydel.etils.auto_tx import get_optimizer_and_scheduler
 from easydel.etils.errors import EasyDeLRuntimeError
 from easydel.etils.etils import AVAILABLE_OPTIMIZERS, AVAILABLE_SCHEDULERS, get_logger
 from easydel.etils.partition_module import PartitionAxis
+from fjformer.custom_array import Array8Bit
 
 logger = get_logger(__name__)
 TYPE_SEP = "<*TYPE*>"
@@ -445,7 +446,7 @@ class EasyDeLState(struct.PyTreeNode):
                 #
                 # The following commented-out code would convert the data types, but it's avoided
                 # due to the above-mentioned reason:
-                # checkpoint["params"] = jax.tree_map(
+                # checkpoint["params"] = jax.tree_util.tree_map(
                 #     lambda x: (
                 #         jax.lax.convert_element_type(x, param_dtype)
                 #         if (hasattr(x, "dtype") and x.dtype != param_dtype)
@@ -729,10 +730,33 @@ class EasyDeLState(struct.PyTreeNode):
     def to_8bit(self, quantization_fields=None):
         if quantization_fields is None:
             quantization_fields = ["kernel", "embedding"]
-        params = fjformer.linen.quantize_int8_parameters(
-            quantization_fields, self.params
-        )  # type:ignore
-        self = self.replace(params=params)  # type:ignore #noqa
+
+        def quantize_params(params: dict) -> dict:
+            """Quantizes model parameters using Array8Bit.
+
+            Args:
+                params: A dictionary of model parameters.
+
+            Returns:
+                A dictionary of quantized model parameters.
+            """
+
+            def q(path: str, array: Any) -> Array8Bit:
+                """Quantizes a single parameter array."""
+                path = [p for p in path[0].key]
+                for field in quantization_fields:
+                    if field in path:
+                        return Array8Bit.quantize(array, dtype=array.dtype)
+                return array
+
+            return traverse_util.unflatten_dict(
+                jax.tree_util.tree_map_with_path(
+                    q,
+                    traverse_util.flatten_dict(params),
+                )
+            )
+
+        self = self.replace(params=quantize_params(self.params))  # type:ignore #noqa
         return self
 
     def shard_params(

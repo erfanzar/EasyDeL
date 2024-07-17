@@ -3,12 +3,11 @@ from gc import unfreeze
 from typing import Optional, Tuple
 
 import chex
-import fjformer
 import flax.linen
 import jax
-from fjformer.linen import Dense
 from flax import linen as nn
 from flax.core import FrozenDict, freeze
+from flax.linen import Dense
 from flax.linen.attention import (
     combine_masks,
     dot_product_attention_weights,
@@ -125,7 +124,7 @@ class FlaxRobertaSelfAttention(FlaxAttentionModule):
             sm_scale=1 / math.sqrt(self.head_dim),
             axis_name=self.config.attention_axis_name,
             backward_pass_impl=self.config.flash_attention_backward_pass_impl,
-            base_config=self.config
+            base_config=self.config,
         )
         self.query = Dense(
             self.config.hidden_size,
@@ -710,7 +709,7 @@ class FlaxRobertaLMHead(nn.Module):
         else:
             hidden_states = self.decoder(hidden_states)
 
-        bias = fjformer.linen.control_quantization(self.bias, self.dtype)
+        bias = self.bias.astype(self.dtype)
         hidden_states += bias
         return hidden_states
 
@@ -1130,10 +1129,7 @@ class FlaxRobertaForMaskedLMModule(nn.Module):
         if self.config.tie_word_embeddings:
             shared_embedding = self.roberta.variables["params"]["embeddings"][
                 "word_embeddings"
-            ]["embedding"]
-            shared_embedding = fjformer.linen.control_quantization(
-                shared_embedding, self.param_dtype
-            )
+            ]["embedding"].T.astype(self.param_dtype)
         else:
             shared_embedding = None
 
@@ -1504,10 +1500,7 @@ class FlaxRobertaForCausalLMModule(nn.Module):
         if self.config.tie_word_embeddings:
             shared_embedding = self.roberta.variables["params"]["embeddings"][
                 "word_embeddings"
-            ]["embedding"]
-            shared_embedding = fjformer.linen.control_quantization(
-                shared_embedding, self.param_dtype
-            )
+            ]["embedding"].T.astype(self.param_dtype)
         else:
             shared_embedding = None
 

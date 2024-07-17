@@ -4,9 +4,9 @@ import chex
 import flax
 import jax
 from einops import rearrange
-from fjformer.linen import Dense
 from flax import linen as nn
 from flax.core import FrozenDict
+from flax.linen import Dense
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 

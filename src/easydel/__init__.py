@@ -11,7 +11,6 @@ if bool(
     _os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     _os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.99"
     _os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-
 # EasyDel Imports
 from easydel.etils.easystate import EasyDeLState as EasyDeLState
 from easydel.etils.errors import (
@@ -217,7 +216,7 @@ from easydel.trainers import (
     CausalLMTrainerOutput as CausalLMTrainerOutput,
     DPOTrainer as DPOTrainer,
     DPOTrainerOutput as DPOTrainerOutput,
-    EasyDeLXRapTureConfig as EasyDeLXRapTureConfig,
+    LoraRaptureConfig as LoraRaptureConfig,
     JaxDistributedConfig as JaxDistributedConfig,
     ORPOTrainer as ORPOTrainer,
     ORPOTrainerOutput as ORPOTrainerOutput,
@@ -235,3 +234,9 @@ from easydel.transform import (
     easystate_to_torch as easystate_to_torch,
     torch_dict_to_easydel_params as torch_dict_to_easydel_params,
 )
+
+import fjformer as _fj
+
+assert (
+    _fj.__version__ == "0.0.70"
+), f"this version os EasyDeL is only compatible with fjformer==0.0.70, but found fjformer {_fj.__version__}"

@@ -130,7 +130,7 @@ tokenizer.padding_side = "right"
 to enable LoRA, a technique for reducing memory usage during fine-tuning:
 
 ```python 
-rapture_config = ed.EasyDeLXRapTureConfig(
+rapture_config = ed.LoraRaptureConfig(
     model_parameters,
     lora_dim=64,
     fully_fine_tune_parameters=["embed_tokens"], 

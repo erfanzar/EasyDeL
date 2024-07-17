@@ -2,15 +2,13 @@ from functools import partial
 from typing import Optional, Tuple, Union
 
 import chex
-import fjformer
 import flax.linen.partitioning
 import jax
 import jax.numpy as jnp
-from fjformer import linen as nn
 from fjformer import with_sharding_constraint
-from fjformer.linen import Dense
+from flax import linen as nn
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
-from flax.linen import combine_masks, make_causal_mask
+from flax.linen import Dense, combine_masks, make_causal_mask
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax.sharding import PartitionSpec
@@ -88,7 +86,9 @@ class FlaxGemma2RMSNorm(nn.Module):
     def setup(self):
         self.epsilon = self.config.rms_norm_eps
         self.weight_kernel = self.param(
-            "kernel", lambda _, shape: jnp.ones(shape), self.config.hidden_size
+            "kernel",
+            lambda _, shape: jnp.ones(shape),
+            self.config.hidden_size,
         )
 
     def __call__(self, hidden_states):
@@ -96,7 +96,7 @@ class FlaxGemma2RMSNorm(nn.Module):
         variance = jnp.power(variance, 2)
         variance = variance.mean(-1, keepdims=True)
         hidden_states = hidden_states / jnp.sqrt(variance + self.epsilon)
-        w = 1 + nn.linen.control_quantization(self.weight_kernel, self.dtype)
+        w = 1 + self.weight_kernel.astype(self.dtype)
         return (w * jnp.asarray(hidden_states, dtype=self.dtype)).astype(
             hidden_states.dtype
         )
@@ -864,12 +864,12 @@ class FlaxGemma2ForCausalLMModule(nn.Module):
 
         hidden_states = outputs[0]
         if self.config.tie_word_embeddings:
-            shared_kernel = self.model.variables["params"]["embed_tokens"]["embedding"]
-            shared_kernel = fjformer.linen.control_quantization(
-                shared_kernel, self.param_dtype
-            ).T
+            shared_kernel = self.model.variables["params"]["embed_tokens"][
+                "embedding"
+            ].T.astype(self.param_dtype)
             lm_logits = self.lm_head.apply(
-                {"params": {"kernel": shared_kernel}}, hidden_states
+                {"params": {"kernel": shared_kernel}},
+                hidden_states,
             )
         else:
             lm_logits = self.lm_head(hidden_states)

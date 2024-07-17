@@ -755,8 +755,8 @@ def quantize_kv_cache(fdata, reformat: bool = True):
     fmin = jnp.min(fdata_cal, axis=-1, keepdims=True)
 
     # Ensure qmax and qmin are on the same device as fdata
-    qmax = jax.tree_map(lambda x: jnp.array(x, dtype=fdata.dtype), qmax)
-    qmin = jax.tree_map(lambda x: jnp.array(x, dtype=fdata.dtype), qmin)
+    qmax = jax.tree_util.tree_map(lambda x: jnp.array(x, dtype=fdata.dtype), qmax)
+    qmin = jax.tree_util.tree_map(lambda x: jnp.array(x, dtype=fdata.dtype), qmin)
 
     scale = (fmax - fmin) / (qmax - qmin)
 

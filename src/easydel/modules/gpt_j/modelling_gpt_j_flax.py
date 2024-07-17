@@ -3,22 +3,20 @@ from functools import partial
 from typing import Optional, Tuple, Union
 
 import chex
-import fjformer
 import flax.linen.partitioning
 import jax
 import jax.numpy as jnp
 import numpy as np
-from fjformer import linen as nn
 from fjformer import with_sharding_constraint
 from fjformer.bit_quantization import config as q_config
 from fjformer.bit_quantization import q_flax
-from fjformer.linen import Dense
+from flax import linen as nn
 from flax.core.frozen_dict import FrozenDict, unfreeze
-from flax.linen import combine_masks, make_causal_mask
+from flax.linen import Dense, combine_masks, make_causal_mask
 from jax import lax
 from jax.sharding import PartitionSpec
-from easydel.etils.etils import get_logger
 
+from easydel.etils.etils import get_logger
 from easydel.modules.attention_module import FlexibleAttentionModule
 from easydel.modules.flax_modeling_utils import (
     ACT2FN,
@@ -785,12 +783,12 @@ class FlaxGPTJForCausalLMModule(nn.Module):
         hidden_states = outputs[0]
 
         if self.config.tie_word_embeddings:
-            shared_kernel = self.transformer.variables["params"]["wte"]["embedding"]
-            shared_kernel = fjformer.linen.control_quantization(
-                shared_kernel, self.param_dtype
-            ).T
+            shared_kernel = self.transformer.variables["params"]["wte"][
+                "embedding"
+            ].T.astype(self.param_dtype)
             lm_logits = self.lm_head.apply(
-                {"params": {"kernel": shared_kernel}}, hidden_states
+                {"params": {"kernel": shared_kernel}},
+                hidden_states,
             )
         else:
             lm_logits = self.lm_head(hidden_states)

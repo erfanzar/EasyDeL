@@ -243,7 +243,7 @@ class EasyModelsTest(unittest.TestCase):
             )
             shard, _ = make_shard_and_gather_fns(partition_specs, mesh)
 
-            params = jax.tree_map(lambda p, f: f(p), params, shard)
+            params = jax.tree_util.tree_map(lambda p, f: f(p), params, shard)
             config.add_basic_configurations(
                 attn_mechanism=self.attn_mechanism,
                 block_k=self.block_k,

@@ -1,14 +1,13 @@
-from fjformer.functions.loss_func import (
-    cross_entropy_loss_and_accuracy,
-    SpecialLossNormalizingFactor,
-    get_loss_normalizing_factor_and_weights,
-    compute_weighted_cross_entropy_and_accuracy,
-)
-
 import jax
-from jax.sharding import PartitionSpec
-from jax import numpy as jnp
+from fjformer.functions.loss_functions import (
+    SpecialLossNormalizingFactor,
+    compute_weighted_cross_entropy_and_accuracy,
+    cross_entropy_loss_and_accuracy,
+    get_loss_normalizing_factor_and_weights,
+)
 from fjformer.sharding import with_sharding_constraint
+from jax import numpy as jnp
+from jax.sharding import PartitionSpec
 
 
 def create_casual_language_model_train_step(
@@ -101,11 +100,13 @@ def create_casual_language_model_train_step(
         )
         state = state.apply_gradients(grads=grad)
 
-        grad_norms = jax.tree_map(jnp.linalg.norm, grad)
+        grad_norms = jax.tree_util.tree_map(jnp.linalg.norm, grad)
         max_grad_norm = jax.tree_util.tree_reduce(jnp.maximum, grad_norms)
         mean_grad_norm = jax.tree_util.tree_reduce(
-            jnp.add, jax.tree_map(jnp.sum, grad_norms)
-        ) / jax.tree_util.tree_reduce(jnp.add, jax.tree_map(jnp.size, grad_norms))
+            jnp.add, jax.tree_util.tree_map(jnp.sum, grad_norms)
+        ) / jax.tree_util.tree_reduce(
+            jnp.add, jax.tree_util.tree_map(jnp.size, grad_norms)
+        )
         metrics = {
             "accuracy": accuracy__,
             "regularization_z_loss": z_loss_computed__,

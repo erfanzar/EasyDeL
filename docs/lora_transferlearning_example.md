@@ -13,7 +13,7 @@ from easydel import (
     EasyDeLOptimizers,
     EasyDeLSchedulers,
     EasyDeLGradientCheckPointers,
-    EasyDeLXRapTureConfig
+    LoraRaptureConfig
 )
 from datasets import load_dataset
 import flax
@@ -51,7 +51,7 @@ configs_to_initialize_model_class = {
     "input_shape": (1, 1)
 }
 
-rapture = EasyDeLXRapTureConfig(
+rapture = LoraRaptureConfig(
     parameters=model_parameters,
     lora_dim=64,
     fully_fine_tune_parameters=["embed_tokens"],  # Model layer to be fully fine tuned

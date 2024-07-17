@@ -2,10 +2,9 @@ import functools
 from typing import Optional, Tuple, Union
 
 import chex
-import fjformer
 import jax
-from fjformer.linen import Dense
 from flax import linen as nn
+from flax.linen import Dense
 from flax.linen import partitioning as nn_partitioning
 from flax.struct import dataclass
 from jax import lax
@@ -251,7 +250,7 @@ class FlaxMoE(nn.Module):
         y = zeros.at[0, self.batch_index].add(expert_outputs)
         y = y.view((bsz, length, self.input_size))
         if self.bias_kernel is not None:
-            bias = fjformer.linen.control_quantization(self.bias_kernel, self.dtype)
+            bias = self.bias_kernel.astype(self.dtype)
             y = y + bias
         return y, loss
 

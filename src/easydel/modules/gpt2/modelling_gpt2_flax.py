@@ -15,15 +15,13 @@
 
 from typing import Any, Optional, Tuple
 
-import fjformer
 import flax.linen
 import flax.linen.partitioning
 import jax
 import jax.numpy as jnp
-from fjformer import linen as nn
-from fjformer.linen import Dense
+from flax import linen as nn
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
-from flax.linen import combine_masks, make_causal_mask
+from flax.linen import Dense, combine_masks, make_causal_mask
 from flax.linen.attention import dot_product_attention_weights
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
@@ -62,7 +60,7 @@ class FlaxConv1D(nn.Module):
             (self.features, inputs.shape[-1]),
         )
 
-        kernel = nn.linen.control_quantization(kernel, self.dtype).transpose()
+        kernel = kernel.astype(self.dtype).transpose()
         if self.dot_general is not None:
             dot_general = self.dot_general
         else:
@@ -848,12 +846,12 @@ class FlaxGPT2LMHeadModule(nn.Module):
         hidden_states = outputs[0]
 
         if self.config.tie_word_embeddings:
-            shared_kernel = self.transformer.variables["params"]["wte"]["embedding"]
-            shared_kernel = fjformer.linen.control_quantization(
-                shared_kernel, self.param_dtype
-            ).T
+            shared_kernel = self.transformer.variables["params"]["wte"][
+                "embedding"
+            ].T.astype(self.param_dtype)
             lm_logits = self.lm_head.apply(
-                {"params": {"kernel": shared_kernel}}, hidden_states
+                {"params": {"kernel": shared_kernel}},
+                hidden_states,
             )
         else:
             lm_logits = self.lm_head(hidden_states)

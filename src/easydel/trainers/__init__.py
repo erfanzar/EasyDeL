@@ -19,7 +19,7 @@ from easydel.trainers.odds_ratio_preference_optimization_trainer import (
 from easydel.trainers.base_trainer import BaseTrainer as BaseTrainer
 from easydel.trainers.training_configurations import (
     TrainArguments as TrainArguments,
-    EasyDeLXRapTureConfig as EasyDeLXRapTureConfig,
+    LoraRaptureConfig as LoraRaptureConfig,
 )
 from easydel.trainers.utils import (
     JaxDistributedConfig as JaxDistributedConfig,
