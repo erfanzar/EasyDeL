@@ -3,9 +3,9 @@ from typing import Any, List, Mapping, Optional, Tuple, Union
 
 import chex
 import jax.lax
-from fjformer.linen import Dense
 from flax import linen as nn
 from flax.core import FrozenDict, freeze, unfreeze
+from flax.linen import Dense
 from flax.struct import dataclass
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import numpy as jnp

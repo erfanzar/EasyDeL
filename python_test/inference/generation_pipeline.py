@@ -54,7 +54,7 @@ def main():
     input_ids = tokens["input_ids"]
     attention_mask = tokens["attention_mask"]
     params = model.params
-    # params = fjformer.linen.quantize_int8_parameters(["kernel", "embedding"], params)
+    
     pipeline = GenerationPipeline(
         model=model,
         params=params,

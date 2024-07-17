@@ -1,14 +1,12 @@
-from fjformer.functions.loss_func import cross_entropy_loss_and_accuracy
-
-import jax
-from jax.sharding import PartitionSpec
-from jax import numpy as jnp
-from fjformer import (
-    with_sharding_constraint
-)
 import chex
-from easydel.etils.easystate import EasyDeLState
+import jax
+from fjformer import with_sharding_constraint
+from fjformer.functions.loss_functions import cross_entropy_loss_and_accuracy
 from flax.struct import dataclass
+from jax import numpy as jnp
+from jax.sharding import PartitionSpec
+
+from easydel.etils.easystate import EasyDeLState
 
 
 @dataclass
@@ -20,7 +18,9 @@ class VisionCausalLanguageModelStepOutput:
     vision_accuracy: chex.Array
 
 
-def create_vision_casual_language_model_train_step(partition_spec=PartitionSpec(("dp", "fsdp"), "sp")):
+def create_vision_casual_language_model_train_step(
+    partition_spec=PartitionSpec(("dp", "fsdp"), "sp")
+):
     """The create_vision_casual_language_model_train_step function is a training step function that takes in the current
      state of the model,and a batch of data. It then calculates the loss and accuracy for this batch, and returns
     an updated state with new parameters based on these gradients.
@@ -34,11 +34,9 @@ def create_vision_casual_language_model_train_step(partition_spec=PartitionSpec(
         current state of the model,
     """
 
-    def vision_casual_language_model_train_step(state, batch) -> [
-        EasyDeLState,
-        chex.Array,
-        VisionCausalLanguageModelStepOutput
-    ]:
+    def vision_casual_language_model_train_step(
+        state, batch
+    ) -> [EasyDeLState, chex.Array, VisionCausalLanguageModelStepOutput]:
         """The vision_casual_language_model_train_step function is a training step function that takes in the current state
         of the model and a batch of data. It then calculates the loss and accuracy for this batch,
         and returns an updated state with new parameters based on these gradients.
@@ -68,22 +66,25 @@ def create_vision_casual_language_model_train_step(partition_spec=PartitionSpec(
             vision_loss, vision_accuracy = cross_entropy_loss_and_accuracy(
                 logits[:, :-1, :],
                 jnp.where(label_vision_mask, labels, 0),
-                batch["attention_mask"].astype(jnp.float32)[:, 1:] * label_vision_mask
+                batch["attention_mask"].astype(jnp.float32)[:, 1:] * label_vision_mask,
             )
             text_loss, text_accuracy = cross_entropy_loss_and_accuracy(
                 logits[:, :-1, :],
                 jnp.where(label_vision_mask, 0, labels),
-                batch["attention_mask"].astype(jnp.float32)[:, 1:] * (1.0 - label_vision_mask)
+                batch["attention_mask"].astype(jnp.float32)[:, 1:]
+                * (1.0 - label_vision_mask),
             )
 
-            loss = 0.5 * (vision_loss + text_loss + (aux_loss if aux_loss is not None else 0.))
+            loss = 0.5 * (
+                vision_loss + text_loss + (aux_loss if aux_loss is not None else 0.0)
+            )
 
             return loss, VisionCausalLanguageModelStepOutput(
                 loss=loss,
                 text_accuracy=text_accuracy,
                 vision_accuracy=vision_accuracy,
                 text_loss=text_loss,
-                vision_loss=vision_loss
+                vision_loss=vision_loss,
             )
 
         grad_fn = jax.value_and_grad(calculate_loss, has_aux=True)
@@ -94,7 +95,9 @@ def create_vision_casual_language_model_train_step(partition_spec=PartitionSpec(
     return vision_casual_language_model_train_step
 
 
-def create_vision_casual_language_model_evaluation_step(partition_spec=PartitionSpec(("dp", "fsdp"), "sp")):
+def create_vision_casual_language_model_evaluation_step(
+    partition_spec=PartitionSpec(("dp", "fsdp"), "sp")
+):
     """The create_vision_casual_language_model_evaluation_step function is used to create a function that calculates the
      loss and accuracy of a model. It takes in a set of parameters, which are then passed into the state.apply_fn function
     to generate logits for each token in the batch. The cross entropy loss and accuracy are then calculated from these
@@ -108,11 +111,9 @@ def create_vision_casual_language_model_evaluation_step(partition_spec=Partition
         of a model
     """
 
-    def vision_casual_language_model_evaluation_step(state, batch) -> [
-        EasyDeLState,
-        chex.Array,
-        VisionCausalLanguageModelStepOutput
-    ]:
+    def vision_casual_language_model_evaluation_step(
+        state, batch
+    ) -> [EasyDeLState, chex.Array, VisionCausalLanguageModelStepOutput]:
         """The vision_casual_language_model_train_step function is a training step function that takes in the current state
         of the model and a batch of data. It then calculates the loss and accuracy for this batch,
         and returns an updated state with new parameters based on these gradients.
@@ -141,22 +142,25 @@ def create_vision_casual_language_model_evaluation_step(partition_spec=Partition
             vision_loss, vision_accuracy = cross_entropy_loss_and_accuracy(
                 logits[:, :-1, :],
                 jnp.where(label_vision_mask, labels, 0),
-                batch["attention_mask"].astype(jnp.float32)[:, 1:] * label_vision_mask
+                batch["attention_mask"].astype(jnp.float32)[:, 1:] * label_vision_mask,
             )
             text_loss, text_accuracy = cross_entropy_loss_and_accuracy(
                 logits[:, :-1, :],
                 jnp.where(label_vision_mask, 0, labels),
-                batch["attention_mask"].astype(jnp.float32)[:, 1:] * (1.0 - label_vision_mask)
+                batch["attention_mask"].astype(jnp.float32)[:, 1:]
+                * (1.0 - label_vision_mask),
             )
 
-            loss = 0.5 * (vision_loss + text_loss + (aux_loss if aux_loss is not None else 0.))
+            loss = 0.5 * (
+                vision_loss + text_loss + (aux_loss if aux_loss is not None else 0.0)
+            )
 
             return loss, VisionCausalLanguageModelStepOutput(
                 loss=loss,
                 text_accuracy=text_accuracy,
                 vision_accuracy=vision_accuracy,
                 text_loss=text_loss,
-                vision_loss=vision_loss
+                vision_loss=vision_loss,
             )
 
         loss__, metrics = calculate_loss(state.params)

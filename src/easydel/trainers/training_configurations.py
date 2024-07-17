@@ -15,7 +15,7 @@ from typing import (
 import jax
 import jax.numpy as jnp
 import numpy as np
-from fjformer.xrapture import XRapTure, XRapTureConfig
+from fjformer.lora import LoraRapture, RaptureConfig
 from jax.sharding import PartitionSpec
 from jax.tree_util import PyTreeDef
 
@@ -39,10 +39,10 @@ except ImportError:
 import flax.metrics.tensorboard
 
 
-class EasyDeLXRapTureConfig(XRapTureConfig):  # Don't Make user involved with FJFormer
+class LoraRaptureConfig(RaptureConfig):  # Don't Make user involved with FJFormer
     """
     Configuration class for EasyDeL specific XRapTure settings.
-    Inherits from FJFormer's XRapTureConfig.
+    Inherits from FJFormer's RaptureConfig.
 
     Attributes:
         parameters (PyTreeDef | dict): Model parameters for XRapTure.
@@ -65,109 +65,68 @@ class TrainArguments:
     Attributes:
         model_name (Optional[str]): Name of the model.
         num_train_epochs (Optional[int]): Number of training epochs.
-        model_class (Optional[EDPretrainedModel]):
-            The EasyDeL Flax Pretrained Model class to use.
-        model_huggingface_repo_id (Optional[str]):
-            Hugging Face repository ID for the model.
+        model_class (Optional[EDPretrainedModel]): The EasyDeL Flax Pretrained Model class to use.
+        model_huggingface_repo_id (Optional[str]): Hugging Face repository ID for the model.
         total_batch_size (int): Total batch size for training.
-        max_training_steps (Optional[int]):
-            Maximum number of training steps.
-        max_evaluation_steps (Optional[int]):
-            Maximum number of evaluation steps.
+        max_training_steps (Optional[int]): Maximum number of training steps.
+        max_evaluation_steps (Optional[int]):  Maximum number of evaluation steps.
         optimizer (AVAILABLE_OPTIMIZERS): Optimizer to use for training.
         scheduler (AVAILABLE_SCHEDULERS): Learning rate scheduler to use.
         learning_rate (float): The initial learning rate.
-        learning_rate_end (Optional[float]):
-            The final learning rate for schedulers that support it.
-        gradient_accumulation_steps (int):
-            Number of steps for gradient accumulation.
+        learning_rate_end (Optional[float]): The final learning rate for schedulers that support it.
+        gradient_accumulation_steps (int): Number of steps for gradient accumulation.
         weight_decay (float): Weight decay applied to parameters.
         label_smoothing_factor (float): Label smoothing factor.
         z_loss (float): Coefficient for the z-loss term.
-        gradient_checkpointing (AVAILABLE_GRADIENT_CHECKPOINTS):
-            Gradient checkpointing strategy to use.
-        max_sequence_length (Optional[int]):
-            Maximum sequence length for model input.
-        sharding_array (Union[tuple, int]):
-            Sharding configuration for model parameters.
+        gradient_checkpointing (AVAILABLE_GRADIENT_CHECKPOINTS): Gradient checkpointing strategy to use.
+        clip_grad (Optional[float]): If provided, gradients will be clipped to this maximum norm.
+        max_sequence_length (Optional[int]): Maximum sequence length for model input.
+        sharding_array (Union[tuple, int]): Sharding configuration for model parameters.
         is_fine_tuning (bool): Whether the model is being fine-tuned.
         do_train (bool): Whether to run training.
         do_eval  (bool): Whether to run evaluation.
-        train_on_inputs (bool):
-            Whether to train on model inputs (as opposed to labels).
+        train_on_inputs (bool): Whether to train on model inputs (as opposed to labels).
         backend (Optional[str]): Backend to use for JAX computation.
-        extra_optimizer_kwargs (dict):
-            Extra keyword arguments passed to the optimizer.
-        save_steps (Optional[int]):
-            Save checkpoints every specified number of steps.
+        extra_optimizer_kwargs (dict):  Extra keyword arguments passed to the optimizer.
+        save_steps (Optional[int]): Save checkpoints every specified number of steps.
         save_dir (str): Directory to save checkpoints.
-        save_total_limit (Optional[int]):
-            Total number of checkpoints to keep.
+        save_total_limit (Optional[int]): Total number of checkpoints to keep.
         dtype (jnp.dtype): Data type for model computations.
         param_dtype (jnp.dtype): Data type for model parameters.
-        fully_sharded_data_parallel (bool):
-            Whether to use fully sharded data parallelism.
+        fully_sharded_data_parallel (bool): Whether to use fully sharded data parallelism.
         use_wandb (bool): Whether to use Weights & Biases for logging.
-        custom_rule (Optional[Dict[str, PartitionSpec]]):
-            Custom sharding rules for specific parameters.
-        extra_configs (Optional[dict]):
-            Extra configurations passed as a dictionary.
-        ids_to_pop_from_dataset (Optional[list]):
-            List of IDs to remove from the dataset.
-        remove_ckpt_after_load (bool):
-            Remove checkpoint files after loading the model.
-        configs_to_initialize_model_class (Optional[dict]):
-            Configurations used to initialize the model class.
-        do_last_save (bool):
-            Whether to save the final model checkpoint.
-        model_parameters (Optional[dict]):
-            Model parameters for initialization.
-        do_shard_fns (bool):
-            Whether to shard model functions for parallelism.
-        track_memory (Optional[bool]):
-            Whether to track memory usage during training.
+        custom_rule (Optional[Dict[str, PartitionSpec]]):  Custom sharding rules for specific parameters.
+        extra_configs (Optional[dict]): Extra configurations passed as a dictionary.
+        ids_to_pop_from_dataset (Optional[list]): List of IDs to remove from the dataset.
+        remove_ckpt_after_load (bool): Remove checkpoint files after loading the model.
+        configs_to_initialize_model_class (Optional[dict]): Configurations used to initialize the model class.
+        do_last_save (bool): Whether to save the final model checkpoint.
+        model_parameters (Optional[dict]): Model parameters for initialization.
+        do_shard_fns (bool): Whether to shard model functions for parallelism.
+        track_memory (Optional[bool]): Whether to track memory usage during training.
         loss_re_mat (str): Regular expression for loss rematerialization.
         loss_chunk (int): Chunk size for loss computation.
-        truncation_mode (Literal["keep_end", "keep_start"]):
-            Truncation mode for handling long sequences.
+        truncation_mode (Literal["keep_end", "keep_start"]): Truncation mode for handling long sequences.
         warmup_steps (int): Number of warm-up steps for the scheduler.
-        init_input_shape (Tuple[int, int]):
-            Initial input shape for model initialization.
-        step_partition_spec (PartitionSpec):
-            Partition specification for stepping the optimizer.
-        training_time (Optional[str]):
-            Maximum training time in the format "50min" or "23h".
-        dataloader_num_workers (Optional[int]):
-            Number of workers for the dataloader.
-        dataloader_pin_memory (Optional[bool]):
-            Pin memory for the dataloader.
-        jax_distributed_config (Optional[dict]):
-            Configuration for JAX distributed training.
-        log_all_workers (bool):
-            Log metrics from all workers (used with WandB).
-        wandb_entity (Optional[str]):
-            WandB entity to log metrics to.
-        save_optimizer_state (bool):
-            Save optimizer state in checkpoints.
-        step_start_point (Optional[int]):
-            Starting step for training (resuming from checkpoint).
+        init_input_shape (Tuple[int, int]): Initial input shape for model initialization.
+        step_partition_spec (PartitionSpec): Partition specification for stepping the optimizer.
+        training_time (Optional[str]): Maximum training time in the format "50min" or "23h".
+        dataloader_num_workers (Optional[int]): Number of workers for the dataloader.
+        dataloader_pin_memory (Optional[bool]): Pin memory for the dataloader.
+        jax_distributed_config (Optional[dict]): Configuration for JAX distributed training.
+        log_all_workers (bool): Log metrics from all workers (used with WandB).
+        wandb_entity (Optional[str]): WandB entity to log metrics to.
+        save_optimizer_state (bool): Save optimizer state in checkpoints.
+        step_start_point (Optional[int]): Starting step for training (resuming from checkpoint).
         verbose (bool): Print verbose logs during training.
-        offload_device (jax.Device):
-            Device to offload computations to.
-        rapture_config (Optional[EasyDeLXRapTureConfig]):
-            Configuration for XRapTure (LoRA).
-        merge_lora_rapture_parameters (bool):
-            Merge LoRA parameters with model parameters.
-        state_apply_fn_kwarguments_to_model (Optional[dict]):
-            Keyword arguments for the model's apply function.
-        remove_unused_columns (bool):
-            Remove unused columns from the dataset.
-        force_batch_and_gradient_accumulation_steps_calculation (bool):
-            Force calculation of batch and gradient accumulation steps.
-        performance_mode (bool):
-            Enable performance mode for faster training.
-        neftune_noise_alpha (Optional[float]):
-            NEFTune noise alpha parameter.
+        offload_device (jax.Device): Device to offload computations to.
+        rapture_config (Optional[LoraRaptureConfig]): Configuration for XRapTure (LoRA).
+        merge_lora_rapture_parameters (bool): Merge LoRA parameters with model parameters.
+        state_apply_fn_kwarguments_to_model (Optional[dict]): Keyword arguments for the model's apply function.
+        remove_unused_columns (bool): Remove unused columns from the dataset.
+        force_batch_and_gradient_accumulation_steps_calculation (bool): Force calculation of batch and gradient accumulation steps.
+        performance_mode (bool): Enable performance mode for faster training.
+        neftune_noise_alpha (Optional[float]): NEFTune noise alpha parameter.
         log_grad_norms (bool): Log gradient norms during training.
         loaded_model_config_kwargs (Optional[dict]): Keyword arguments from loaded model configuration.
 
@@ -218,6 +177,7 @@ class TrainArguments:
     learning_rate: float = 5e-5
     learning_rate_end: Optional[float] = None
     gradient_accumulation_steps: int = 1
+    clip_grad: Optional[float] = None
     weight_decay: float = 0.01
     label_smoothing_factor: float = 0.0
     z_loss: float = 0.0
@@ -264,7 +224,7 @@ class TrainArguments:
     step_start_point: Optional[int] = None
     verbose: bool = True
     offload_device: jax.Device = jax.devices("cpu")[0]
-    rapture_config: Optional[EasyDeLXRapTureConfig] = None
+    rapture_config: Optional[LoraRaptureConfig] = None
     merge_lora_rapture_parameters: bool = True
     state_apply_fn_kwarguments_to_model: Optional[dict] = None
     remove_unused_columns: bool = True
@@ -316,16 +276,21 @@ class TrainArguments:
         Configures the optimizer and learning rate scheduler based on the provided arguments.
         Sets up the optimizer_kwargs dictionary.
         """
+        extra_optimizer_kwargs = (
+            self.extra_optimizer_kwargs
+            if self.extra_optimizer_kwargs is not None
+            else {}
+        )
         self.optimizer_kwargs = {
             "learning_rate": self.learning_rate,
             "learning_rate_end": self.learning_rate_end,
             "optimizer": self.optimizer,
             "scheduler": self.scheduler,
-            "extra_optimizer_kwargs": self.extra_optimizer_kwargs,
             "warmup_steps": self.warmup_steps,
             "gradient_accumulation_steps": self.gradient_accumulation_steps,
             "weight_decay": self.weight_decay,
             "steps": self.max_training_steps,
+            **extra_optimizer_kwargs,
         }
 
     def _setup_logging(self):
@@ -349,7 +314,7 @@ class TrainArguments:
             if self.log_grad_norms:
                 warnings.warn("Gradient norm logging disabled when using LoRA")
                 self.log_grad_norms = False
-            self.rapture = XRapTure(config=self.rapture_config)
+            self.rapture = LoraRapture(config=self.rapture_config)
         else:
             self.rapture = None
 
@@ -503,7 +468,7 @@ class TrainArguments:
             return
         try:
             from torch import Tensor
-        except:
+        except ModuleNotFoundError:
             Tensor = None
         with jax.spmd_mode("allow_all"):
             # Log to WandB

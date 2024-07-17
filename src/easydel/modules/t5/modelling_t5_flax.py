@@ -19,15 +19,13 @@ import copy
 from typing import Callable, Optional, Tuple
 
 import chex
-import fjformer
 import flax.linen
 import jax
 import jax.numpy as jnp
 import numpy as np
-from fjformer import linen as nn
-from fjformer.linen import Dense
+from flax import linen as nn
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
-from flax.linen import combine_masks, make_causal_mask
+from flax.linen import Dense, combine_masks, make_causal_mask
 from flax.linen import partitioning as nn_partitioning
 from flax.linen.attention import dot_product_attention_weights
 from flax.traverse_util import flatten_dict, unflatten_dict
@@ -84,9 +82,7 @@ class FlaxT5LayerNorm(nn.Module):
         variance = jnp.power(hidden_states.astype("f4"), 2).mean(axis=-1, keepdims=True)
         hidden_states = hidden_states / jnp.sqrt(variance + self.eps)
 
-        return (
-            fjformer.linen.control_quantization(self.weight, self.dtype) * hidden_states
-        )
+        return self.weight.astype(self.dtype) * hidden_states
 
 
 class FlaxT5DenseActDense(nn.Module):
@@ -1431,12 +1427,12 @@ class FlaxT5ForConditionalGenerationModule(nn.Module):
             sequence_output = sequence_output * (self.model_dim**-0.5)
 
         if self.config.tie_word_embeddings:
-            shared_embedding = self.shared.variables["params"]["embedding"]
-            shared_embedding = fjformer.linen.control_quantization(
-                shared_embedding, self.dtype
-            ).T
+            shared_embedding = self.shared.variables["params"]["embedding"].T.astype(
+                self.param_dtype
+            )
             lm_logits = self.lm_head.apply(
-                {"params": {"kernel": shared_embedding}}, sequence_output
+                {"params": {"kernel": shared_embedding}},
+                sequence_output,
             )
         else:
             lm_logits = self.lm_head(sequence_output)
@@ -1525,12 +1521,12 @@ class FlaxT5ForConditionalGeneration(FlaxT5PreTrainedModel):
                 sequence_output = sequence_output * (self.config.d_model**-0.5)
 
             if self.config.tie_word_embeddings:
-                shared_embedding = module.shared.variables["params"]["embedding"]
-                shared_embedding = fjformer.linen.control_quantization(
-                    shared_embedding, self.dtype
-                ).T
+                shared_embedding = module.shared.variables["params"][
+                    "embedding"
+                ].T.astype(self.param_dtype)
                 lm_logits = module.lm_head.apply(
-                    {"params": {"kernel": shared_embedding}}, sequence_output
+                    {"params": {"kernel": shared_embedding}},
+                    sequence_output,
                 )
             else:
                 lm_logits = module.lm_head(sequence_output)

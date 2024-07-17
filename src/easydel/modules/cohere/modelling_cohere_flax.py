@@ -2,12 +2,11 @@ import math
 from typing import Optional, Tuple, Union
 
 import chex
-import fjformer
 import flax.linen.partitioning
 import flax.struct
 import jax
 import jax.numpy as jnp
-from fjformer import linen as nn
+from flax import linen as nn
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks
 from flax.traverse_util import flatten_dict, unflatten_dict
@@ -83,7 +82,7 @@ class RMSNorm(nn.Module):
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
         output = self._norm(x).astype(self.dtype)
-        weight = nn.linen.control_quantization(self.weight, self.dtype)
+        weight = self.weight.astype(self.dtype)
         if self.do_t:
             weight = weight.T
         return output * weight
@@ -939,7 +938,6 @@ class FlaxCohereModule(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self):
-
         self.embed_tokens = nn.Embed(
             self.config.vocab_size,
             self.config.hidden_size,
@@ -1179,10 +1177,9 @@ class FlaxCohereForCausalLMModule(nn.Module):
         hidden_states = outputs[0]
 
         if self.config.tie_word_embeddings:
-            shared_kernel = self.model.variables["params"]["embed_tokens"]["embedding"]
-            shared_kernel = fjformer.linen.control_quantization(
-                shared_kernel, self.param_dtype
-            ).T
+            shared_kernel = self.model.variables["params"]["embed_tokens"][
+                "embedding"
+            ].T
             lm_logits = self.lm_head.apply(
                 {"params": {"kernel": shared_kernel}}, hidden_states
             )

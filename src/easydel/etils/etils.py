@@ -1,8 +1,7 @@
+import argparse
 import logging
 from dataclasses import dataclass
-from typing import Literal, List, Tuple, Dict, Any
-
-import argparse
+from typing import Any, Dict, List, Literal, Tuple
 
 
 @dataclass
@@ -16,6 +15,7 @@ class EasyDeLOptimizers:
     ADAFACTOR: Literal["adafactor"] = "adafactor"
     LION: Literal["lion"] = "lion"
     ADAMW: Literal["adamw"] = "adamw"
+    RMSPROP: Literal["rmsprop"] = "rmsprop"
 
 
 @dataclass
@@ -61,18 +61,25 @@ AVAILABLE_SCHEDULERS = Literal[
     "cosine",
     "none",
     "warm_up_cosine",
-    "warm_up_linear"
+    "warm_up_linear",
 ]
 
-AVAILABLE_OPTIMIZERS = Literal["adafactor", "lion", "adamw"]
+AVAILABLE_OPTIMIZERS = Literal[
+    "adafactor",
+    "lion",
+    "adamw",
+    "rmsprop",
+]
 
 
 def get_logger(name, level: int = logging.INFO) -> logging.Logger:
     """
     Function to create and configure a logger.
-    :param name: str: The name of the logger.
-    :param level: int: The logging level. Defaults to logging.INFO.
-    :return logging.Logger: The configured logger instance.
+    Args:
+        name: str: The name of the logger.
+        level: int: The logging level. Defaults to logging.INFO.
+    Returns:
+        logging.Logger: The configured logger instance.
     """
     logger = logging.getLogger(name)
     logger.propagate = False
@@ -103,7 +110,7 @@ def set_loggers_level(level: int = logging.WARNING):
 
 
 def define_flags_with_default(
-        _required_fields: List = None, **kwargs
+    _required_fields: List = None, **kwargs
 ) -> Tuple[argparse.Namespace, Dict[str, Any]]:
     """Defines flags with default values using argparse.
 

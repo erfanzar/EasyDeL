@@ -7,10 +7,9 @@ import fjformer
 import flax
 import jax
 from fjformer.functions import auxiliary_load_balancing_loss_func
-from fjformer.linen import Dense
 from flax import linen as nn
 from flax.core import FrozenDict, freeze, unfreeze
-from flax.linen import combine_masks
+from flax.linen import Dense, combine_masks
 from flax.linen import partitioning as nn_partitioning
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
@@ -56,7 +55,7 @@ class ArcticRMSNorm(nn.Module):
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
         output = self._norm(x).astype(self.dtype)
-        weight = fjformer.linen.control_quantization(self.weight, self.dtype)
+        weight = self.weight.astype(self.dtype)
         return output * weight
 
 

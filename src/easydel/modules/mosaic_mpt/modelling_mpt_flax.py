@@ -5,10 +5,9 @@ import chex
 import flax
 import jax
 from einops import rearrange
-from fjformer import linen as nn
-from fjformer.linen import Dense
+from flax import linen as nn
 from flax.core import FrozenDict
-from flax.linen import combine_masks
+from flax.linen import Dense, combine_masks
 from flax.linen.partitioning import remat
 from jax import lax
 from jax import numpy as jnp
@@ -649,12 +648,12 @@ class FlaxMptForCausalLMModule(nn.Module):
         last_hidden_state = predict.last_hidden_state
 
         if self.config.use_lm_head:
-            shared_kernel = self.model.variables["params"]["wte"]["embedding"]
-            shared_kernel = nn.linen.control_quantization(
-                shared_kernel, self.param_dtype
-            ).T
+            shared_kernel = self.model.variables["params"]["wte"]["embedding"].T.astype(
+                self.param_dtype
+            )
             logits = self.lm_head.apply(
-                {"params": {"kernel": shared_kernel}}, last_hidden_state
+                {"params": {"kernel": shared_kernel}},
+                last_hidden_state,
             )
         else:
             logits = self.lm_head(last_hidden_state)

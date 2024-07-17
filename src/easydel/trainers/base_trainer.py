@@ -13,7 +13,6 @@ from typing import Any, Callable, Iterator, Literal, Mapping, Optional, Union
 from flax.core import unfreeze
 import jax
 import numpy as np
-import termcolor
 from fjformer.checkpoint import CheckpointManager
 from jax.sharding import Mesh
 from optax import GradientTransformation, Schedule
@@ -601,7 +600,7 @@ class BaseTrainer(abc.ABC):
         self._manage_checkpoint_limit(checkpoint_dir)
 
         filename = self._generate_checkpoint_filename(step, milestone)
-        termcolor.cprint(f"Saving Model {filename}.", color="cyan", force_color=True)
+        logger.info(f"Saving Model {filename}.")
 
         state.save_state(
             filename=filename,
@@ -634,10 +633,8 @@ class BaseTrainer(abc.ABC):
             checkpoint_files.sort(key=os.path.getmtime)
             for old_checkpoint in checkpoint_files[: -self.arguments.save_total_limit]:
                 os.remove(old_checkpoint)
-                termcolor.cprint(
+                logger.info(
                     f"Removed old checkpoint: {old_checkpoint}",
-                    color="red",
-                    force_color=True,
                 )
 
     def _generate_checkpoint_filename(self, step, milestone):

@@ -1,7 +1,7 @@
 import os
 import sys
 
-os.environ["JAX_TRACEBACK_FILTERING"] = "off"    
+os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 os.environ["XLA_FLAGS"] = (
     os.environ.get("XLA_FLAGS", "") + " --xla_gpu_enable_command_buffer="
 )
@@ -27,6 +27,8 @@ from easydel import (  # noqa: E402
     FlaxMistralForCausalLM,
     MistralConfig,
     TrainArguments,
+    EasyDeLOptimizers,
+    EasyDeLSchedulers,
 )
 
 from jax import numpy as jnp, random  # noqa: E402
@@ -109,10 +111,12 @@ def main(use_iterable_dataset: bool):
             label_smoothing_factor=0.1,
             z_loss=0.0001,
             train_on_inputs=True,
-            # save_steps=50,
-            # save_total_limit=1,
             do_last_save=True,
-            training_time="80Min"
+            training_time="80Min",
+            optimizer=EasyDeLOptimizers.ADAMW,
+            scheduler=EasyDeLSchedulers.COSINE,
+            clip_grad=1.0,
+            warmup_steps=5
         ),
         dataset_train=example_train_data,
         dataset_eval=example_eval_data,

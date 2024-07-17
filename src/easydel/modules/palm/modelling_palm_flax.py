@@ -1,13 +1,12 @@
 from typing import Any, Mapping, Optional, Tuple, Union
 
 import chex
-import fjformer
 import jax
 import jax.numpy as jnp
 import numpy as onp
 import transformers.modeling_flax_outputs
 from einops import rearrange
-from fjformer import linen as nn
+from flax import linen as nn
 from flax.core import FrozenDict
 from jax import numpy as np
 
@@ -61,34 +60,29 @@ class ParallelPalmBlock(nn.Module):
         )
 
         # INPUT WEIGHTS
-        self.wi = fjformer.linen.control_quantization(
-            self.param(
-                "kernel",
-                nn.initializers.normal,
-                (self.config.hidden_size, sum(self.fused_dims)),
-                self.param_dtype,
-            ),
+        self.wi = self.param(
+            "kernel",
+            nn.initializers.normal,
+            (self.config.hidden_size, sum(self.fused_dims)),
             self.param_dtype,
-        )
+        ).astype(self.param_dtype)
 
         # ATTENTION WEIGHT OUTPUT
-        self.attn_wo = fjformer.linen.control_quantization(
-            self.param(
-                "kernel",
-                nn.initializers.normal,
-                (attn_inner_dim, self.config.hidden_size),
-                self.param_dtype,
-            ),
+        self.attn_wo = self.param(
+            "kernel",
+            nn.initializers.normal,
+            (attn_inner_dim, self.config.hidden_size),
+            self.param_dtype,
+        ).astype(
             self.param_dtype,
         )
 
-        self.ff_wo = fjformer.linen.control_quantization(
-            self.param(
-                "kernel",
-                nn.initializers.normal,
-                (attn_inner_dim, self.config.hidden_size),
-                self.param_dtype,
-            ),
+        self.ff_wo = self.param(
+            "kernel",
+            nn.initializers.normal,
+            (attn_inner_dim, self.config.hidden_size),
+            self.param_dtype,
+        ).astype(
             self.param_dtype,
         )
 
@@ -339,13 +333,12 @@ class FlaxPalmForCausalLMModule(nn.Module):
             precision=self.precision,
         )
         if not self.config.use_tie_word_embedding:
-            self.lm_head = fjformer.linen.control_quantization(
-                self.param(
-                    "kernel",
-                    jax.nn.initializers.normal,
-                    (self.config.hidden_size, self.config.vocab_size),
-                    self.param_dtype,
-                ),
+            self.lm_head = self.param(
+                "kernel",
+                jax.nn.initializers.normal,
+                (self.config.hidden_size, self.config.vocab_size),
+                self.param_dtype,
+            ).astype(
                 self.param_dtype,
             )
 

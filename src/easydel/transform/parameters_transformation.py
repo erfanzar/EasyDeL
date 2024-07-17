@@ -2,7 +2,6 @@ import gc
 import re
 from typing import Callable, List, Mapping, Optional
 
-import fjformer
 import jax
 import transformers
 from fjformer.checkpoint import get_dtype
@@ -189,8 +188,9 @@ def torch_dict_to_easydel_params(
                     array = shard_fns[key_tuple](array)
                 else:
                     missed_shardings += 1
-            if convert_to_8bit and params_pattern_selection.search("/".join(key_tuple)):
-                array = fjformer.linen.linen.Int8Params(*fjformer.linen.quantize(array))
+            # TODO : FIX 4BIT and 8BIT Quant
+            # if convert_to_8bit and params_pattern_selection.search("/".join(key_tuple)):
+            #     array = flax.linen.linen.Int8Params(*flax.linen.quantize(array))
             flax_dict[key_tuple] = array
             pbar.set_postfix(missed_shardings=missed_shardings)
             pbar.update(1)

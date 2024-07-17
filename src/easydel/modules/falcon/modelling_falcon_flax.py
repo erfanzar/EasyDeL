@@ -5,10 +5,9 @@ import chex
 import flax.linen
 import flax.linen.partitioning
 import jax
-from fjformer.linen import Dense
 from flax import linen as nn
 from flax.core import FrozenDict, freeze, unfreeze
-from flax.linen import combine_masks
+from flax.linen import Dense, combine_masks
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax import numpy as jnp

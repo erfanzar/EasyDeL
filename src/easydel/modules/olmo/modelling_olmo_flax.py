@@ -6,10 +6,9 @@ import chex
 import flax
 import jax
 import jax.numpy as jnp
-from fjformer import linen as nn
-from fjformer.linen import Dense
+from flax import linen as nn
 from flax.core.frozen_dict import freeze, unfreeze
-from flax.linen import combine_masks
+from flax.linen import Dense, combine_masks
 from flax.linen.partitioning import remat
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
@@ -995,15 +994,13 @@ class FlaxOlmoForCausalLMModule(nn.Module):
         if self.config.tie_word_embeddings:
             shared_kernel = self.transformer.variables["params"]["embed_tokens"][
                 "embedding"
-            ]
-            shared_kernel = nn.control_quantization(shared_kernel, self.param_dtype).T
+            ].T.astype(self.param_dtype)
             lm_logits = self.lm_head.apply(
-                {"params": {"kernel": shared_kernel}}, hidden_states
+                {"params": {"kernel": shared_kernel}},
+                hidden_states,
             )
         else:
             lm_logits = self.lm_head(hidden_states)
-
-        # lm_logits = lm_logits.astype(jnp.float32)
 
         if not return_dict:
             return (lm_logits,) + outputs[1:]

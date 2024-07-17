@@ -2,15 +2,13 @@ import warnings
 from typing import Optional, Tuple, Union
 
 import chex
-import fjformer
 import flax.linen.partitioning
 import jax
 import jax.numpy as jnp
-from fjformer import linen as nn
 from fjformer import with_sharding_constraint
-from fjformer.linen import Dense
+from flax import linen as nn
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
-from flax.linen import combine_masks, make_causal_mask
+from flax.linen import Dense, combine_masks, make_causal_mask
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax.sharding import PartitionSpec
@@ -88,7 +86,9 @@ class FlaxGemmaRMSNorm(nn.Module):
     def setup(self):
         self.epsilon = self.config.rms_norm_eps
         self.weight_kernel = self.param(
-            "kernel", lambda _, shape: jnp.ones(shape), self.config.hidden_size
+            "kernel",
+            lambda _, shape: jnp.ones(shape),
+            self.config.hidden_size,
         )
 
     def __call__(self, hidden_states):
@@ -97,9 +97,9 @@ class FlaxGemmaRMSNorm(nn.Module):
         variance = variance.mean(-1, keepdims=True)
         hidden_states = hidden_states / jnp.sqrt(variance + self.epsilon)
 
-        return (
-            1 + nn.linen.control_quantization(self.weight_kernel, self.dtype)
-        ) * jnp.asarray(hidden_states, dtype=self.dtype)
+        return (1 + self.weight_kernel.astype(self.dtype)) * jnp.asarray(
+            hidden_states, dtype=self.dtype
+        )
 
 
 class FlaxGemmaRotaryEmbedding(nn.Module):
@@ -416,7 +416,6 @@ class FlaxGemmaMLP(nn.Module):
         )
 
     def __call__(self, hidden_states, deterministic=False):
-
         hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
         up_proj_states = self.up_proj(hidden_states)
         gate_states = self.act(self.gate_proj(hidden_states))
@@ -890,12 +889,12 @@ class FlaxGemmaForCausalLMModule(nn.Module):
 
         hidden_states = outputs[0]
         if self.config.tie_word_embeddings:
-            shared_kernel = self.model.variables["params"]["embed_tokens"]["embedding"]
-            shared_kernel = fjformer.linen.control_quantization(
-                shared_kernel, self.param_dtype
-            ).T
+            shared_kernel = self.model.variables["params"]["embed_tokens"][
+                "embedding"
+            ].T.astype(self.param_dtype)
             lm_logits = self.lm_head.apply(
-                {"params": {"kernel": shared_kernel}}, hidden_states
+                {"params": {"kernel": shared_kernel}},
+                hidden_states,
             )
         else:
             lm_logits = self.lm_head(hidden_states)
@@ -916,7 +915,6 @@ class FlaxGemmaForCausalLM(FlaxGemmaPreTrainedModel):
     def prepare_inputs_for_generation(
         self, input_ids, max_length, attention_mask: Optional[jax.Array] = None
     ):
-
         batch_size, seq_length = input_ids.shape
 
         past_key_values = self.init_cache(batch_size, max_length)
@@ -945,7 +943,6 @@ class FlaxGemmaForCausalLM(FlaxGemmaPreTrainedModel):
     def init_weights(
         self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
     ) -> FrozenDict:
-
         input_ids = jnp.zeros(input_shape, dtype="i4")
         attention_mask = jnp.ones_like(input_ids)
         position_ids = jnp.broadcast_to(

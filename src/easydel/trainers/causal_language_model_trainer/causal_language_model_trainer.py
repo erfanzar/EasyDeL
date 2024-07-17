@@ -193,7 +193,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
         ...     EasyDeLOptimizers,
         ...     EasyDeLSchedulers,
         ...     EasyDeLGradientCheckPointers,
-        ...     EasyDeLXRapTureConfig
+        ...     LoraRaptureConfig
         ... )
         >>> from datasets import load_dataset
         >>> import flax
@@ -231,7 +231,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
         ...     "input_shape": (1, 1)
         ... }
 
-        >>> rapture = EasyDeLXRapTureConfig(
+        >>> rapture = LoraRaptureConfig(
         ...     parameters=model_parameters,
         ...     lora_dim=64,
         ...     fully_fine_tune_parameters=["embed_tokens"],  # Model layer to be fully fine tuned

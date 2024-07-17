@@ -5,7 +5,7 @@ import chex
 import jax
 import jax.numpy as jnp
 import jax.tree_util
-from fjformer import linen as nn
+from flax import linen as nn
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks, initializers
 from flax.linen import partitioning as nn_partitioning
@@ -90,18 +90,20 @@ def _normalize(
     mul = lax.rsqrt(var + epsilon)
     args = [x]
     if use_scale:
-        scale = nn.control_quantization(
-            mdl.param("kernel", scale_init, reduced_feature_shape, param_dtype),
-            param_dtype,
-        ).reshape(feature_shape)
+        scale = (
+            (mdl.param("kernel", scale_init, reduced_feature_shape, param_dtype))
+            .astype(param_dtype)
+            .reshape(feature_shape)
+        )
         mul *= scale
         args.append(scale)
     y *= mul
     if use_bias:
-        bias = nn.control_quantization(
-            mdl.param("bias", bias_init, reduced_feature_shape, param_dtype),
-            param_dtype,
-        ).reshape(feature_shape)
+        bias = (
+            (mdl.param("bias", bias_init, reduced_feature_shape, param_dtype))
+            .astype(param_dtype)
+            .reshape(feature_shape)
+        )
         y += bias
         args.append(bias)
     dtype = nn.dtypes.canonicalize_dtype(*args, dtype=dtype)

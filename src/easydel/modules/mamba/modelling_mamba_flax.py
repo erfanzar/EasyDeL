@@ -9,9 +9,9 @@ import jax.numpy as jnp
 import numpy as np
 from chex import Array, PRNGKey, Shape
 from einops import einsum
-from fjformer import linen as nn
-from fjformer.linen import Dense
+from flax import linen as nn
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
+from flax.linen import Dense
 from flax.linen import partitioning as nn_partitioning
 from flax.linen.dtypes import promote_dtype
 from flax.linen.linear import (

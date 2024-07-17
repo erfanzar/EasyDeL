@@ -3,10 +3,9 @@ import typing
 from typing import Optional, Tuple, Union
 
 import chex
-import fjformer
 import flax.core
 import jax
-from fjformer import linen as nn
+from flax import linen as nn
 from flax.core import freeze, unfreeze
 from flax.linen import combine_masks
 from flax.linen import partitioning as nn_partitioning
@@ -1074,12 +1073,10 @@ class FlaxOpenELMForCausalLMModule(nn.Module):
         if self.config.share_input_output_layers:
             shared_kernel = self.transformer.variables["params"]["token_embeddings"][
                 "embedding"
-            ]
-            shared_kernel = fjformer.linen.control_quantization(
-                shared_kernel, self.param_dtype
-            ).T
+            ].T.astype(self.param_dtype)
             lm_logits = self.lm_head.apply(
-                {"params": {"kernel": shared_kernel}}, hidden_states
+                {"params": {"kernel": shared_kernel}},
+                hidden_states,
             )
         else:
             lm_logits = self.lm_head(hidden_states)
