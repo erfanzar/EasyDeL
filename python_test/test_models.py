@@ -260,7 +260,8 @@ class EasyModelsTest(unittest.TestCase):
             )
 
             torch_input_ids, jax_input_ids = self.make_input_id(
-                self.vocab_size, (self.batch_size, self.sequence_length + 1)
+                self.vocab_size,
+                (self.batch_size, self.sequence_length + 1),
             )
             hf_output = hf_model(
                 input_ids=torch_input_ids[:, :-1],
